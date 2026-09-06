@@ -1,0 +1,1071 @@
+From: build <build@local>
+Subject: [PATCH 0015] WIRE THE CARRY BOOK. Includes 0014.
+
+THE PROBLEM THIS FIXES
+Before this patch, CarryEngine and CarryBroker were two fully tested modules
+that NOTHING CONSTRUCTED:
+
+    who constructs CarryEngine outside tests?   NOBODY
+    references to "carry" in main.py            0
+    what build_bot attached                     MarketStrategy(TechnicalAnalysis)
+
+Start the bot on main today and it trades the LEGACY TECHNICAL VOTER, whose own
+Stage-1 verdict is ABSENT (M1/M2 76.1/77.5). That is precisely what happened to
+ShadowStrategy for eighty slices: built, tested, never run. A book nothing
+constructs is not a book.
+
+WHAT IS NOW WIRED
+
+ ~ main.py TradingBot.__init__   gains `carry`. When present it OWNS the cycle.
+ ~ main.py tick()                runs the carry book and RETURNS. It is not one
+                                 voter among several: holding a hedged pair AND
+                                 a directional position against the same margin
+                                 is two strategies fighting over one
+                                 liquidation price.
+                                 Mark and funding are read from the VENUE, not
+                                 the corpus - the corpus is history, the
+                                 decision is about the next eight hours. Either
+                                 read raising means NO ORDER and no state
+                                 change.
+ ~ main.py build_bot()           BOOK_MODE selects. "carry" attaches the pair
+                                 book and RETURNS BEFORE the technical voter is
+                                 imported. Exclusion is enforced at the only
+                                 place a book gets attached, not trusted to the
+                                 operator.
+ ~ config.py                     BOOK_MODE / CARRY_SPOT_SYMBOL /
+                                 CARRY_PERP_SYMBOL. Default stays
+                                 "directional": dozens of tests predate the
+                                 carry book, so selecting carry is a deliberate
+                                 operator act rather than something that
+                                 happens by upgrade.
+ + carry_broker.get_funding_bps  reads fundingRate from the venue ticker and
+                                 RAISES when absent. Returning 0.0 would read
+                                 as "thin, stand aside" - a DECISION taken on
+                                 absent data, which is the quiet failure this
+                                 system exists to prevent. A test asserts there
+                                 is no `return 0` in that method.
+ ~ Dockerfile                    COPY closure regenerated: 20 modules. main now
+                                 imports the carry modules and the image would
+                                 not have started without them. Caught by
+                                 test_dockerfile_copies_the_import_closure_of_main,
+                                 which is the check added in 0001 doing its job.
+
+ + tests/test_carry_wiring.py    12 tests:
+                                   - a tick OPENS THE PAIR (2 orders placed)
+                                   - thin funding places nothing
+                                   - the directional strategy is never consulted
+                                   - an unreadable mark or funding sends NO order
+                                   - carry mode never constructs the voter
+                                   - directional mode never attaches the book
+                                   - no process can ever hold both
+                                   - build_bot still constructs, tick still runs
+                                   - no LLM token appears in the order path
+
+ALSO CARRIES 0014 (carry_broker.py, tests/test_carry_broker.py, the state-DB
+fixture fix) because 0014 was never merged.
+
+RUN IT:
+    BOOK_MODE=carry USE_TESTNET=1 PAPER_TRADING=1 python3 main.py
+
+STILL NAKED - do not point this at real money:
+  - it has never touched a venue. Bybit 403 / fapi 451 from Codespaces. You
+    cannot certify an order path from a host that cannot place an order. This
+    is now the ONLY blocker on everything downstream.
+  - trading_engine.py:1010 still passes fee=0.0 to record_exit_fill.
+  - backtest.py:833 still raises NotImplementedError on the linear stop.
+  - no spot venue selected; the adapter assumes one account holds both products.
+
+VERIFIED: 5,148 passed, 2 skipped (was 5,100 on main). Fixture md5 stable
+across a full run. No test weakened or skipped.
+
+---
+--- a/Dockerfile	2026-09-06 12:50:04.380683284 +0000
++++ b/Dockerfile	2026-09-06 12:45:27.224968591 +0000
+@@ -21,11 +21,11 @@
+ # omitted market_data.py, memory.py, project_status.py and session_log.py, all
+ # imported unconditionally, so `python3 main.py` died on ModuleNotFoundError
+ # before the health server bound and the container restart-looped.
+-COPY config.py persistence.py risk_management.py position_sizing.py \
+-     bybit_connection.py technical_analysis.py pure_indicators.py \
+-     performance_analytics.py trading_engine.py main.py \
+-     market_data.py memory.py project_status.py session_log.py \
+-     shadow.py features.py policy.py ml_strategy.py promotion_gate.py ./
++COPY bybit_connection.py carry_broker.py carry_engine.py config.py \
++     features.py main.py market_data.py memory.py ml_strategy.py \
++     persistence.py policy.py position_sizing.py project_status.py \
++     promotion_gate.py pure_indicators.py risk_management.py \
++     session_log.py shadow.py technical_analysis.py trading_engine.py ./
+ COPY signals/ ./signals/
+ 
+ # Run unprivileged. State lives on a mounted volume owned by this user.
+--- a/carry_broker.py	1970-01-01 00:00:00.000000000 +0000
++++ b/carry_broker.py	2026-09-06 12:39:35.623624083 +0000
+@@ -0,0 +1,325 @@
++"""Venue adapter for the carry book: two products, one atomic intent.
++
++WHAT THIS DOES
++==============
++`CarryEngine` decides. This places. It implements the three calls the engine
++needs — `place_market`, `get_margin_multiple`, `get_mark` — against a real
++venue, for BOTH products the carry trade uses:
++
++    spot   BTCUSDT   the long leg, your collateral
++    linear BTCUSDT   the short leg, the one that can be liquidated
++
++WHY IT IS A SEPARATE MODULE
++===========================
++`BybitClient` is a single-product order path built for the directional shell.
++The carry trade needs a *paired* intent: two orders, two products, one economic
++position, where a leg landing alone is not a partial success but an incident.
++Bolting that onto the existing client would put pair semantics inside a class
++that has no concept of a pair, and the first person to call `place_order`
++directly would bypass it.
++
++THE FAILURE THIS MODULE EXISTS TO PREVENT
++=========================================
++A submit times out. The order actually landed. You retry. Now you hold two
++spot legs against one perp short, and you are long BTC at the size you sized
++the CARRY at — a size you would never take directionally.
++
++Defence, reusing what `bybit_connection` already got right:
++
++    orderLinkId is DETERMINISTIC. `build_order_link_id` derives it from a
++    persisted sequence number plus the order intent, so the retry after a
++    timeout carries the SAME id, and the venue rejects the duplicate rather
++    than opening a second leg. Bybit answers 110072 (linear) or 170130 (spot).
++    Those codes mean THE ORDER EXISTS. They are resolved by querying the id,
++    never by recording a rejection and moving on.
++
++The sequence number is per (product, symbol, purpose) so the spot and perp legs
++of the same pair never collide on an id while still being individually
++replayable.
++
++RECONCILIATION
++==============
++`reconcile_pair()` asks the venue what it actually holds on both products and
++compares against what the ledger believes. Any mismatch beyond dust is an
++INCIDENT, not a discrepancy to be smoothed: it means one leg exists that the
++other does not hedge. It returns the drift and the direction so the engine can
++flatten, and it never silently rewrites the ledger to match the venue — a book
++that edits itself to agree with whatever it finds is a book that cannot detect
++theft, a bug, or a fat finger.
++
++WHAT THIS MODULE MAY NOT DO
++===========================
++Decide. There is no funding logic here, no entry rule, no direction. It takes a
++symbol, a side, a quantity and a product, and it reports what the venue did.
++"""
++from __future__ import annotations
++
++import logging
++import math
++from dataclasses import dataclass, field
++from typing import Any, Dict, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++#: Quantity differences below this fraction of the leg are venue rounding, not
++#: exposure. Above it, the pair is unmatched and that is an incident.
++PAIR_DUST_FRACTION = 1e-6
++
++#: Products the carry book touches. Anything else is refused rather than
++#: guessed at: routing a spot order to the linear endpoint is a naked short.
++SPOT = "spot"
++LINEAR = "linear"
++VALID_PRODUCTS = frozenset({SPOT, LINEAR})
++
++
++class PairIncident(RuntimeError):
++    """One leg exists that the other does not hedge. Never caught and ignored."""
++
++
++@dataclass
++class LegFill:
++    filled_qty: float = 0.0
++    avg_price: float = 0.0
++    order_link_id: str = ""
++    was_duplicate: bool = False
++    detail: Dict[str, Any] = field(default_factory=dict)
++
++    def as_engine_result(self) -> Dict[str, Any]:
++        """The shape `CarryEngine._fire` consumes."""
++        return {"filled_qty": self.filled_qty, "avg_price": self.avg_price,
++                "order_link_id": self.order_link_id}
++
++
++class CarryBroker:
++    """Places paired legs. Idempotent. Reports incidents rather than papering.
++
++    `client` is a BybitClient-shaped object exposing `_request`, and
++    `sequence_source` is a callable returning a persisted, monotonic integer.
++    Both are injected so this module can be exercised without a venue.
++    """
++
++    def __init__(self, *, client: Any, sequence_source: Any,
++                 link_id_builder: Any = None,
++                 duplicate_ret_codes: Tuple[int, ...] = (110072, 170130)) -> None:
++        self.client = client
++        self.sequence_source = sequence_source
++        self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
++        if link_id_builder is None:
++            from bybit_connection import build_order_link_id
++            link_id_builder = build_order_link_id
++        self._build_link_id = link_id_builder
++
++    # -- the engine's three calls -----------------------------------------
++
++    def place_market(self, *, symbol: str, side: str, qty: float,
++                     product: str) -> Optional[Dict[str, Any]]:
++        """One leg. Deterministic id, so a retry cannot double it."""
++        if product not in VALID_PRODUCTS:
++            raise ValueError(
++                f"unknown product {product!r}; routing a spot order to the "
++                "linear endpoint is a naked short, so this is refused rather "
++                "than defaulted")
++        if not self._positive_finite(qty):
++            return None
++
++        qty_text = self._format_qty(qty)
++        link_id = self._build_link_id(
++            seq=int(self.sequence_source(product, symbol, "carry")),
++            symbol=symbol, side=side, qty=qty_text,
++            purpose=f"carry-{product}")
++
++        try:
++            response = self.client._request(
++                "POST", "/v5/order/create", signed=True,
++                body={"category": product, "symbol": symbol, "side": side,
++                      "orderType": "Market", "qty": qty_text,
++                      "orderLinkId": link_id})
++        except Exception as exc:  # noqa: BLE001
++            ret_code = getattr(exc, "ret_code", None)
++            if ret_code in self.duplicate_ret_codes:
++                # The id already exists at the venue. That means the FIRST
++                # attempt landed and its response was lost. Resolving by query
++                # is the only correct move: recording a rejection here would
++                # leave a real leg the ledger does not know about.
++                logger.warning(
++                    "duplicate orderLinkId %s (retCode %s) — the first attempt "
++                    "landed; resolving by query", link_id, ret_code)
++                resolved = self._query_by_link_id(symbol, link_id, product)
++                if resolved is not None:
++                    resolved.was_duplicate = True
++                    return resolved.as_engine_result()
++                raise PairIncident(
++                    f"orderLinkId {link_id} exists at the venue but could not "
++                    "be read back; a leg may be live and unhedged") from exc
++            logger.error("leg %s %s %s failed: %s", side, symbol, product, exc)
++            return None
++
++        fill = self._fill_from(response, link_id)
++        if fill.filled_qty <= 0:
++            # Market orders that report nothing filled are queried once rather
++            # than assumed dead: the response and the fill are separate events.
++            resolved = self._query_by_link_id(symbol, link_id, product)
++            if resolved is not None and resolved.filled_qty > 0:
++                return resolved.as_engine_result()
++            return None
++        return fill.as_engine_result()
++
++    def get_margin_multiple(self, symbol: str) -> float:
++        """Maintenance-margin headroom on the SHORT leg. Raises if unreadable.
++
++        Raising is deliberate. `CarryEngine._margin_multiple` turns an exception
++        into a halt, and an unreadable margin is a margin call you cannot see.
++        Returning a comfortable default here would be the single most dangerous
++        line in this file.
++        """
++        result = self.client._request(
++            "GET", "/v5/position/list", signed=True,
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        if not rows:
++            raise PairIncident(
++                f"no linear position row for {symbol}; margin headroom unknown")
++        row = rows[0]
++        margin = float(row.get("positionIM", 0) or 0)
++        maintenance = float(row.get("positionMM", 0) or 0)
++        if maintenance <= 0:
++            raise PairIncident(
++                f"maintenance margin for {symbol} is {maintenance}; refusing to "
++                "compute headroom from a zero denominator")
++        return margin / maintenance
++
++    def get_mark(self, symbol: str) -> float:
++        result = self.client._request(
++            "GET", "/v5/market/tickers",
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        if not rows:
++            raise PairIncident(f"no ticker for {symbol}")
++        mark = float(rows[0].get("markPrice", 0) or 0)
++        if not self._positive_finite(mark):
++            raise PairIncident(f"mark for {symbol} is {mark!r}")
++        return mark
++
++    def get_funding_bps(self, symbol: str) -> float:
++        """Current 8h funding on the perp, in basis points.
++
++        This is the only number that decides whether the book opens. It comes
++        from the venue's ticker, not from the corpus: the corpus is history and
++        the decision is about the next eight hours.
++
++        Raises when unreadable rather than returning zero. Zero would read as
++        "funding is thin, stand aside", which is a DECISION taken on absent
++        data — the exact class of quiet failure this system refuses.
++        """
++        result = self.client._request(
++            "GET", "/v5/market/tickers",
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        if not rows:
++            raise PairIncident(f"no ticker for {symbol}; funding unknown")
++        raw = rows[0].get("fundingRate")
++        if raw is None:
++            raise PairIncident(f"ticker for {symbol} carries no fundingRate")
++        rate = float(raw)
++        if not math.isfinite(rate):
++            raise PairIncident(f"funding for {symbol} is {raw!r}")
++        return rate * 1e4
++
++    # -- reconciliation ---------------------------------------------------
++
++    def reconcile_pair(self, *, spot_symbol: str, perp_symbol: str,
++                       expected_qty: float) -> Dict[str, Any]:
++        """What the venue holds vs what the book believes. Mismatch = incident.
++
++        Never rewrites the ledger to match the venue. A book that edits itself
++        to agree with whatever it finds cannot detect a bug, a partial fill or
++        an order somebody placed by hand.
++        """
++        spot_qty = self._holding(spot_symbol, SPOT)
++        perp_qty = self._holding(perp_symbol, LINEAR)
++        pair_drift = abs(spot_qty - perp_qty)
++        scale = max(abs(spot_qty), abs(perp_qty), 1e-12)
++        matched = (pair_drift / scale) <= PAIR_DUST_FRACTION
++
++        expected_drift = max(abs(spot_qty - expected_qty),
++                             abs(perp_qty - expected_qty))
++        agrees_with_book = (expected_drift / max(abs(expected_qty), 1e-12)
++                            ) <= PAIR_DUST_FRACTION
++
++        report = {
++            "spot_qty": spot_qty, "perp_qty": perp_qty,
++            "expected_qty": expected_qty,
++            "legs_match_each_other": matched,
++            "venue_agrees_with_book": agrees_with_book,
++            "pair_drift": pair_drift,
++            "naked_side": ("" if matched
++                           else ("spot" if spot_qty > perp_qty else "perp")),
++            "verdict": ("PAIRED" if matched and agrees_with_book
++                        else "INCIDENT"),
++        }
++        if report["verdict"] == "INCIDENT":
++            logger.critical(
++                "PAIR INCIDENT: spot %.10g vs perp %.10g (book expected %.10g); "
++                "naked on the %s side", spot_qty, perp_qty, expected_qty,
++                report["naked_side"] or "unknown")
++        return report
++
++    # -- internals --------------------------------------------------------
++
++    def _holding(self, symbol: str, product: str) -> float:
++        if product == SPOT:
++            result = self.client._request(
++                "GET", "/v5/account/wallet-balance", signed=True,
++                params={"accountType": "UNIFIED", "coin": symbol[:-4]})
++            rows = (result or {}).get("list") or []
++            if not rows:
++                return 0.0
++            coins = rows[0].get("coin") or []
++            return float(coins[0].get("walletBalance", 0) or 0) if coins else 0.0
++        result = self.client._request(
++            "GET", "/v5/position/list", signed=True,
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        return abs(float(rows[0].get("size", 0) or 0)) if rows else 0.0
++
++    def _query_by_link_id(self, symbol: str, link_id: str,
++                          product: str) -> Optional[LegFill]:
++        try:
++            result = self.client._request(
++                "GET", "/v5/order/realtime", signed=True,
++                params={"category": product, "symbol": symbol,
++                        "orderLinkId": link_id})
++        except Exception as exc:  # noqa: BLE001
++            logger.error("could not read back %s: %s", link_id, exc)
++            return None
++        rows = (result or {}).get("list") or []
++        if not rows:
++            return None
++        row = rows[0]
++        return LegFill(
++            filled_qty=float(row.get("cumExecQty", 0) or 0),
++            avg_price=float(row.get("avgPrice", 0) or 0),
++            order_link_id=link_id, detail=dict(row))
++
++    @staticmethod
++    def _fill_from(response: Optional[Dict[str, Any]],
++                   link_id: str) -> LegFill:
++        row = response or {}
++        return LegFill(
++            filled_qty=float(row.get("cumExecQty", 0) or 0),
++            avg_price=float(row.get("avgPrice", 0) or 0),
++            order_link_id=str(row.get("orderLinkId", link_id) or link_id),
++            detail=dict(row))
++
++    @staticmethod
++    def _format_qty(qty: float) -> str:
++        """Fixed-point, never scientific notation. Bybit rejects `1e-05`."""
++        return f"{qty:.8f}".rstrip("0").rstrip(".") or "0"
++
++    @staticmethod
++    def _positive_finite(value: Any) -> bool:
++        try:
++            number = float(value)
++        except (TypeError, ValueError):
++            return False
++        return math.isfinite(number) and number > 0
+--- a/config.py	2026-09-06 12:50:04.412258457 +0000
++++ b/config.py	2026-09-06 12:40:25.542296819 +0000
+@@ -351,6 +351,14 @@
+     #: running ``python3 main.py`` had no way to select.
+     ENTRIES_ENABLED: bool
+ 
++    #: Which book this process runs. "carry" (delta-neutral spot/perp pair,
++    #: collects funding) or "directional" (the legacy technical voter, whose
++    #: Stage-1 verdict is ABSENT). build_bot attaches ONE and returns: they
++    #: share a liquidation price and must never run in the same process.
++    BOOK_MODE: str = "directional"
++    CARRY_SPOT_SYMBOL: str = "BTCUSDT"
++    CARRY_PERP_SYMBOL: str = "BTCUSDT"
++
+     # -- derived cost fractions --------------------------------------------
+ 
+     @property
+@@ -721,6 +729,15 @@
+                                            low=1, high=3_650),
+         LOG_LEVEL="WARNING" if log_level == "WARN" else log_level,
+         STATE_DB_PATH=parse_str(env, "STATE_DB_PATH", "state/trading_state.db"),
++        # Which book this process runs. "carry" = delta-neutral spot/perp pair
++        # collecting funding; "directional" = the legacy technical voter, whose
++        # Stage-1 verdict is ABSENT. They are mutually exclusive: build_bot
++        # attaches one and returns. Default stays "directional" because dozens
++        # of tests predate the carry book, so selecting carry is a deliberate
++        # operator act rather than something that happens by upgrade.
++        BOOK_MODE=parse_str(env, "BOOK_MODE", "directional"),
++        CARRY_SPOT_SYMBOL=parse_str(env, "CARRY_SPOT_SYMBOL", "BTCUSDT"),
++        CARRY_PERP_SYMBOL=parse_str(env, "CARRY_PERP_SYMBOL", "BTCUSDT"),
+         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
+         # Default True so an existing deployment behaves exactly as before.
+         # parse_bool maps every unrecognised value to False, so a typo or a
+--- a/main.py	2026-09-06 12:50:04.482539778 +0000
++++ b/main.py	2026-09-06 12:39:35.624725259 +0000
+@@ -107,7 +107,14 @@
+         risk_manager: Optional[BillionaireRiskManager] = None,
+         engine: Optional[TradingEngine] = None,
+         strategy: Optional[Any] = None,
++        carry: Optional[Any] = None,
+     ) -> None:
++        #: The delta-neutral carry book. When present it OWNS the cycle and the
++        #: directional strategy is not consulted at all — see `tick`. The two
++        #: are mutually exclusive by construction, not by convention, because a
++        #: process running both would hold a hedged pair AND a directional bet
++        #: against the same margin.
++        self.carry = carry
+         self.cfg = config if config is not None else _config.get_config_object()
+         self.store = store if store is not None else StateStore()
+         self.client = client if client is not None else BybitClient(
+@@ -419,6 +426,40 @@
+             logger.warning("trading halted by the risk layer this cycle")
+             return
+ 
++        # ---- CARRY BOOK ----------------------------------------------------
++        # When the carry book is attached it owns the cycle and returns. It is
++        # not one voter among several: holding a delta-neutral pair AND a
++        # directional position against the same margin is two strategies
++        # fighting over one liquidation price.
++        #
++        # Mark and funding are read from the VENUE, not the corpus. The corpus
++        # is history; this decision is about the next eight hours. Both reads
++        # raise when unreadable and the raise reaches CarryEngine as a halt,
++        # because a book that trades on absent data is the failure this whole
++        # system exists to prevent.
++        if self.carry is not None:
++            symbol = self.symbols[0] if self.symbols else "BTCUSDT"
++            try:
++                mark = float(self.carry.broker.get_mark(symbol))
++                funding_bps = float(self.carry.broker.get_funding_bps(symbol))
++            except Exception as exc:  # noqa: BLE001
++                logger.error(
++                    "carry inputs unreadable this cycle (%s); the book is NOT "
++                    "touched and no order is sent", exc)
++                return
++            decision = self.carry.on_candle(
++                mark=mark, funding_bps=funding_bps,
++                timestamp_ms=int(time.time() * 1000))
++            logger.info(
++                "carry: %s (%s) state=%s mark=%.2f funding=%.3fbps %s",
++                decision.action, decision.reason, decision.state.value,
++                mark, funding_bps, decision.detail or "")
++            if decision.state.name == "HALTED":
++                logger.critical(
++                    "carry book HALTED — a human must clear it: %s",
++                    decision.reason)
++            return
++
+         if self.strategy is None:
+             # No signal source. Take no trades and say so, rather than inventing
+             # one — the legacy fallback fabricated BUYs at confidence 0.66.
+@@ -524,6 +565,43 @@
+                 "live; no new entry will be proposed."
+             )
+     bot = TradingBot(config=cfg, **overrides)
++
++    # ---- BOOK_MODE -------------------------------------------------------
++    # "carry"       delta-neutral: long spot + short perp, collect funding.
++    # "directional" the legacy technical voter.
++    #
++    # These are mutually exclusive and the exclusion is enforced here, at the
++    # only place a book gets attached, rather than trusted to the operator. A
++    # process holding a hedged pair AND a directional position shares one
++    # liquidation price between two strategies that do not know about each
++    # other.
++    #
++    # The directional voter's own Stage-1 verdict is ABSENT (M1/M2 76.1/77.5).
++    # It remains the default only because dozens of tests predate the carry
++    # book and assert its presence; selecting it in production is a decision an
++    # operator has to make on purpose, and it is logged as one.
++    book_mode = str(getattr(cfg, "BOOK_MODE", "directional") or "directional").lower()
++    if book_mode == "carry" and attach_strategy and bot.carry is None:
++        from carry_broker import CarryBroker
++        from carry_engine import CarryEngine
++
++        bot.carry = CarryEngine(
++            broker=CarryBroker(
++                client=bot.client,
++                sequence_source=lambda product, symbol, purpose: (
++                    bot.store.next_order_sequence()
++                    if hasattr(bot.store, "next_order_sequence") else 0)),
++            kill_switch=lambda reason: bot.store.engage_kill_switch(reason),
++            spot_symbol=str(getattr(cfg, "CARRY_SPOT_SYMBOL", "BTCUSDT")),
++            perp_symbol=str(getattr(cfg, "CARRY_PERP_SYMBOL", "BTCUSDT")),
++            max_notional_usd=float(getattr(cfg, "MAX_NOTIONAL_USD", 100.0)),
++        )
++        logger.warning(
++            "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f. The "
++            "directional strategy is NOT attached and will not be consulted.",
++            bot.carry.max_notional_usd)
++        return bot
++
+     if attach_strategy and bot.strategy is None:
+         from technical_analysis import MarketStrategy, TechnicalAnalysis
+ 
+--- a/tests/conftest.py	2026-09-06 12:50:04.486258725 +0000
++++ b/tests/conftest.py	2026-09-06 12:26:35.885216067 +0000
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import os
++import tempfile
+ 
+ import pytest
+ 
+@@ -30,3 +31,23 @@
+         os.environ.pop("LEDGER_DISABLED", None)
+     else:
+         os.environ["LEDGER_DISABLED"] = previous
++
++
++# --- MODULE SCOPE, deliberately -------------------------------------------
++# persistence.py binds DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH", ...)
++# at IMPORT time, and config.py defaults the same key to the TRACKED fixture
++# state/trading_state.db. A session-scoped fixture runs too late: pytest has
++# already imported the test modules, which imported persistence, which already
++# baked the tracked path in.
++#
++# So this runs when conftest is imported, which is before any test module.
++#
++# Why it matters: sqlite writes journal pages even on a read-only open, so the
++# tracked file came back dirty after every suite run and `git checkout` refused
++# to switch branches with "local changes would be overwritten". A test suite
++# that dirties the repository it is testing is a bug in the suite.
++#
++# A test that deliberately wants the shipped fixture copies it explicitly --
++# see test_operator_refuses_when_the_shipped_kill_switch_is_engaged.
++_TEST_STATE_DIR = tempfile.mkdtemp(prefix="pytest-state-")
++os.environ["STATE_DB_PATH"] = os.path.join(_TEST_STATE_DIR, "trading_state.db")
+--- a/tests/test_carry_broker.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_carry_broker.py	2026-09-06 12:26:35.885366991 +0000
+@@ -0,0 +1,246 @@
++"""The venue adapter places pairs, survives retries, and shouts on mismatch."""
++from __future__ import annotations
++
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from carry_broker import (CarryBroker, LegFill, PairIncident,  # noqa: E402
++                          LINEAR, SPOT)
++
++
++class Boom(Exception):
++    def __init__(self, ret_code):
++        super().__init__(f"retCode {ret_code}")
++        self.ret_code = ret_code
++
++
++class FakeClient:
++    """A venue. Records calls; misbehaves when told."""
++
++    def __init__(self, *, mark=100_000.0, im=5.0, mm=1.0,
++                 spot_qty=1.0, perp_qty=1.0, raise_on_create=None):
++        self.mark = mark
++        self.im = im
++        self.mm = mm
++        self.spot_qty = spot_qty
++        self.perp_qty = perp_qty
++        self.raise_on_create = raise_on_create
++        self.calls = []
++        self.created = []
++
++    def _request(self, method, endpoint, *, params=None, body=None,
++                 signed=False, retries=3):
++        self.calls.append((method, endpoint, params, body))
++        if endpoint == "/v5/order/create":
++            self.created.append(body)
++            if self.raise_on_create is not None:
++                raise Boom(self.raise_on_create)
++            return {"orderLinkId": body["orderLinkId"],
++                    "cumExecQty": body["qty"], "avgPrice": str(self.mark)}
++        if endpoint == "/v5/order/realtime":
++            return {"list": [{"cumExecQty": "0.5", "avgPrice": str(self.mark),
++                              "orderLinkId": params.get("orderLinkId")}]}
++        if endpoint == "/v5/market/tickers":
++            return {"list": [{"markPrice": str(self.mark)}]}
++        if endpoint == "/v5/position/list":
++            return {"list": [{"positionIM": str(self.im),
++                              "positionMM": str(self.mm),
++                              "size": str(self.perp_qty)}]}
++        if endpoint == "/v5/account/wallet-balance":
++            return {"list": [{"coin": [{"walletBalance": str(self.spot_qty)}]}]}
++        return {}
++
++
++def broker(client, **kw):
++    seq = kw.pop("sequence_source", lambda product, symbol, purpose: 7)
++    return CarryBroker(client=client, sequence_source=seq, **kw)
++
++
++class TestItPlacesBothProducts:
++    @pytest.mark.parametrize("product", [SPOT, LINEAR])
++    def test_a_leg_routes_to_its_own_category(self, product):
++        client = FakeClient()
++        result = broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=0.5, product=product)
++        assert result["filled_qty"] == pytest.approx(0.5)
++        assert client.created[0]["category"] == product
++
++    def test_an_unknown_product_is_refused_not_defaulted(self):
++        """Routing spot to the linear endpoint is a naked short."""
++        with pytest.raises(ValueError):
++            broker(FakeClient()).place_market(
++                symbol="BTCUSDT", side="Buy", qty=0.5, product="inverse")
++
++    @pytest.mark.parametrize("qty", [0.0, -1.0, float("nan"), float("inf")])
++    def test_an_unusable_quantity_places_nothing(self, qty):
++        client = FakeClient()
++        assert broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=qty, product=SPOT) is None
++        assert not client.created
++
++    def test_quantity_is_never_scientific_notation(self):
++        """Bybit rejects `1e-05`."""
++        client = FakeClient()
++        broker(client).place_market(symbol="BTCUSDT", side="Buy",
++                                    qty=0.00001, product=SPOT)
++        assert "e" not in client.created[0]["qty"].lower()
++
++
++class TestARetryCannotDoubleALeg:
++    def test_the_link_id_is_deterministic(self):
++        a, b = FakeClient(), FakeClient()
++        for client in (a, b):
++            broker(client).place_market(symbol="BTCUSDT", side="Buy",
++                                        qty=0.5, product=SPOT)
++        assert a.created[0]["orderLinkId"] == b.created[0]["orderLinkId"], (
++            "two processes with the same sequence produced different ids; a "
++            "retry after a timeout would open a SECOND leg")
++
++    def test_the_two_legs_of_a_pair_get_different_ids(self):
++        client = FakeClient()
++        api = broker(client)
++        api.place_market(symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT)
++        api.place_market(symbol="BTCUSDT", side="Sell", qty=0.5, product=LINEAR)
++        assert client.created[0]["orderLinkId"] != client.created[1]["orderLinkId"]
++
++    @pytest.mark.parametrize("ret_code", [110072, 170130])
++    def test_a_duplicate_id_is_resolved_by_query_not_recorded_as_failure(
++            self, ret_code):
++        """The duplicate means THE ORDER EXISTS. Recording a rejection here
++        leaves a real leg the ledger does not know about."""
++        client = FakeClient(raise_on_create=ret_code)
++        result = broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT)
++        assert result is not None, "a landed order was reported as a failure"
++        assert result["filled_qty"] == pytest.approx(0.5)
++        assert any(c[1] == "/v5/order/realtime" for c in client.calls)
++
++    def test_an_unreadable_duplicate_raises_an_incident(self):
++        client = FakeClient(raise_on_create=110072)
++        original = client._request
++
++        def no_readback(method, endpoint, **kw):
++            if endpoint == "/v5/order/realtime":
++                return {"list": []}
++            return original(method, endpoint, **kw)
++
++        client._request = no_readback
++        with pytest.raises(PairIncident):
++            broker(client).place_market(symbol="BTCUSDT", side="Buy",
++                                        qty=0.5, product=SPOT)
++
++    def test_an_ordinary_failure_returns_none_rather_than_raising(self):
++        client = FakeClient(raise_on_create=10001)
++        assert broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT) is None
++
++
++class TestMarginIsNeverAssumed:
++    def test_headroom_is_im_over_mm(self):
++        assert broker(FakeClient(im=5.0, mm=1.0)).get_margin_multiple(
++            "BTCUSDT") == pytest.approx(5.0)
++
++    def test_a_missing_position_row_raises(self):
++        client = FakeClient()
++        client._request = lambda *a, **k: {"list": []}
++        with pytest.raises(PairIncident):
++            broker(client).get_margin_multiple("BTCUSDT")
++
++    def test_zero_maintenance_margin_raises_rather_than_dividing(self):
++        with pytest.raises(PairIncident):
++            broker(FakeClient(mm=0.0)).get_margin_multiple("BTCUSDT")
++
++    def test_there_is_no_comfortable_default(self):
++        """A swallowed exception here would be the worst line in the file.
++
++        Checked by AST so the docstring explaining the rule does not trip it —
++        the same trick market_data uses for its import guard.
++        """
++        import ast
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_broker.py"), encoding="utf-8") as fh:
++            tree = ast.parse(fh.read())
++        target = next(n for n in ast.walk(tree)
++                      if isinstance(n, ast.FunctionDef)
++                      and n.name == "get_margin_multiple")
++        handlers = [n for n in ast.walk(target)
++                    if isinstance(n, ast.ExceptHandler)]
++        assert not handlers, (
++            "get_margin_multiple catches an exception; an unreadable margin "
++            "must propagate so CarryEngine halts on it")
++
++
++class TestMarkMustBeUsable:
++    def test_a_good_mark_comes_back(self):
++        assert broker(FakeClient(mark=99_000.0)).get_mark("BTCUSDT") == \
++            pytest.approx(99_000.0)
++
++    def test_a_zero_mark_raises(self):
++        with pytest.raises(PairIncident):
++            broker(FakeClient(mark=0.0)).get_mark("BTCUSDT")
++
++
++class TestReconciliationTreatsMismatchAsAnIncident:
++    def test_matched_legs_report_paired(self):
++        report = broker(FakeClient(spot_qty=1.0, perp_qty=1.0)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["verdict"] == "PAIRED"
++        assert report["naked_side"] == ""
++
++    def test_a_missing_perp_leg_names_the_naked_side(self):
++        report = broker(FakeClient(spot_qty=1.0, perp_qty=0.5)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["verdict"] == "INCIDENT"
++        assert report["naked_side"] == "spot"
++
++    def test_a_missing_spot_leg_names_the_naked_side(self):
++        report = broker(FakeClient(spot_qty=0.4, perp_qty=1.0)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["naked_side"] == "perp"
++
++    def test_legs_that_match_each_other_but_not_the_book_is_an_incident(self):
++        """Someone traded by hand, or a fill was missed. Both are incidents."""
++        report = broker(FakeClient(spot_qty=2.0, perp_qty=2.0)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["legs_match_each_other"] is True
++        assert report["venue_agrees_with_book"] is False
++        assert report["verdict"] == "INCIDENT"
++
++    def test_reconciliation_never_writes(self):
++        client = FakeClient(spot_qty=2.0, perp_qty=0.5)
++        broker(client).reconcile_pair(spot_symbol="BTCUSDT",
++                                      perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert all(method == "GET" for method, *_ in client.calls), (
++            "reconciliation wrote to the venue; it may only observe")
++
++
++class TestItDecidesNothing:
++    def test_the_module_has_no_funding_or_direction_logic(self):
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_broker.py"), encoding="utf-8") as fh:
++            body = fh.read()
++        for banned in ("FUND_ABS", "def should_", "signal_type"):
++            assert banned not in body
++
++    def test_no_module_assigns_live_authorized(self):
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_broker.py"), encoding="utf-8") as fh:
++            assert "live_authorized" not in fh.read()
++
++
++class TestItDrivesTheEngine:
++    def test_the_engine_opens_a_pair_through_this_adapter(self):
++        """End to end: CarryEngine + CarryBroker + a venue."""
++        from carry_engine import BookState, CarryEngine
++        client = FakeClient(im=5.0, mm=1.0)
++        eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.acted is True
++        assert eng.state is BookState.HEDGED
++        assert len(client.created) == 2
++        assert {c["category"] for c in client.created} == {SPOT, LINEAR}
++        assert {c["side"] for c in client.created} == {"Buy", "Sell"}
+--- a/tests/test_carry_wiring.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_carry_wiring.py	2026-09-06 12:40:54.864902716 +0000
+@@ -0,0 +1,174 @@
++"""The carry book is WIRED. This is the patch that stops it being shelfware.
++
++Before 0015, `CarryEngine` and `CarryBroker` were two well-tested modules that
++NOTHING CONSTRUCTED. `build_bot` attached `MarketStrategy(TechnicalAnalysis)` —
++the voter whose own Stage-1 verdict is ABSENT — and `tick` never mentioned the
++carry book. That is exactly what happened to `ShadowStrategy` for eighty slices:
++built, tested, never run.
++
++These tests keep it wired.
++"""
++from __future__ import annotations
++
++import os
++import sys
++from unittest import mock
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import config as _config  # noqa: E402
++import main as _main  # noqa: E402
++from carry_engine import BookState  # noqa: E402
++
++
++class _Store:
++    def __init__(self):
++        self.killed = []
++
++    def next_order_sequence(self):
++        return 1
++
++    def engage_kill_switch(self, reason):
++        self.killed.append(reason)
++
++    def open_positions(self):
++        return []
++
++
++class _Broker:
++    """Stands in for CarryBroker with the four calls the cycle needs."""
++
++    def __init__(self, *, mark=100_000.0, funding=1.0, raises=None):
++        self.mark = mark
++        self.funding = funding
++        self.raises = raises
++        self.orders = []
++
++    def get_mark(self, symbol):
++        if self.raises == "mark":
++            raise RuntimeError("venue down")
++        return self.mark
++
++    def get_funding_bps(self, symbol):
++        if self.raises == "funding":
++            raise RuntimeError("no fundingRate in ticker")
++        return self.funding
++
++    def get_margin_multiple(self, symbol):
++        return 5.0
++
++    def place_market(self, *, symbol, side, qty, product):
++        self.orders.append((symbol, side, qty, product))
++        return {"filled_qty": qty, "avg_price": self.mark,
++                "order_link_id": f"x{len(self.orders)}"}
++
++
++def _bot_with_carry(broker):
++    from carry_engine import CarryEngine
++    bot = _main.TradingBot.__new__(_main.TradingBot)
++    bot.symbols = ["BTCUSDT"]
++    bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0)
++    bot.strategy = None
++    bot.store = _Store()
++    bot._stop = mock.Mock(is_set=lambda: False)
++    bot.session = mock.Mock()
++    bot.client = mock.Mock(get_equity=lambda: 1_000_000.0)
++    bot.risk = mock.Mock(should_halt_trading=lambda: False,
++                         update_equity=lambda e: None)
++    bot.engine = mock.Mock(observe_exits=lambda: {})
++    return bot
++
++
++class TestTheCycleRunsTheCarryBook:
++    def test_a_tick_opens_the_pair(self):
++        broker = _Broker(funding=1.0)
++        bot = _bot_with_carry(broker)
++        bot.tick()
++        assert len(broker.orders) == 2, "the cycle did not place a pair"
++        assert bot.carry.state is BookState.HEDGED
++
++    def test_thin_funding_places_nothing(self):
++        broker = _Broker(funding=0.01)
++        bot = _bot_with_carry(broker)
++        bot.tick()
++        assert not broker.orders
++
++    def test_the_directional_strategy_is_never_consulted(self):
++        broker = _Broker()
++        bot = _bot_with_carry(broker)
++        bot.strategy = mock.Mock()
++        bot.tick()
++        bot.strategy.signal_for.assert_not_called()
++        bot.engine.execute.assert_not_called()
++
++
++class TestUnreadableInputsTouchNothing:
++    @pytest.mark.parametrize("broken", ["mark", "funding"])
++    def test_a_venue_read_that_raises_sends_no_order(self, broken):
++        """A book that trades on absent data is the failure this system exists
++        to prevent. No order, no state change, no silent zero."""
++        broker = _Broker(raises=broken)
++        bot = _bot_with_carry(broker)
++        bot.tick()
++        assert not broker.orders
++        assert bot.carry.state is BookState.FLAT
++
++    def test_funding_is_never_defaulted_to_zero(self):
++        """Zero would read as 'thin, stand aside' — a DECISION on absent data."""
++        import inspect
++        from carry_broker import CarryBroker
++        source = inspect.getsource(CarryBroker.get_funding_bps)
++        assert "return 0" not in source
++        assert "raise PairIncident" in source
++
++
++class TestTheTwoBooksAreMutuallyExclusive:
++    def test_carry_mode_never_constructs_the_technical_voter(self):
++        cfg = _config.load({"BOOK_MODE": "carry"})
++        with mock.patch("technical_analysis.MarketStrategy") as voter:
++            bot = _main.build_bot(config=cfg, store=_Store(),
++                                  client=mock.Mock(), risk_manager=mock.Mock(),
++                                  engine=mock.Mock())
++            voter.assert_not_called()
++        assert bot.carry is not None
++        assert bot.strategy is None
++
++    def test_directional_mode_attaches_no_carry_book(self):
++        cfg = _config.load({"BOOK_MODE": "directional"})
++        bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
++                              risk_manager=mock.Mock(), engine=mock.Mock())
++        assert bot.carry is None
++
++    def test_a_process_can_never_hold_both(self):
++        """They share one liquidation price. Two strategies fighting over it is
++        how a hedged book becomes a directional one without anyone deciding."""
++        for mode in ("carry", "directional"):
++            cfg = _config.load({"BOOK_MODE": mode})
++            bot = _main.build_bot(config=cfg, store=_Store(),
++                                  client=mock.Mock(), risk_manager=mock.Mock(),
++                                  engine=mock.Mock())
++            assert not (bot.carry is not None and bot.strategy is not None)
++
++    def test_the_default_is_still_directional(self):
++        """Dozens of tests predate the carry book. Selecting carry is an
++        operator act, not something that happens by upgrade."""
++        assert _config.load({}).BOOK_MODE == "directional"
++
++
++class TestTheWiringCannotRegress:
++    def test_build_bot_knows_about_the_carry_book(self):
++        with open(os.path.join(os.path.dirname(__file__), "..", "main.py"),
++                  encoding="utf-8") as fh:
++            body = fh.read()
++        assert "CarryEngine(" in body, "build_bot no longer constructs the book"
++        assert "self.carry.on_candle(" in body, "tick no longer runs the book"
++
++    def test_no_llm_reaches_the_order_path(self):
++        with open(os.path.join(os.path.dirname(__file__), "..", "main.py"),
++                  encoding="utf-8") as fh:
++            carry_block = fh.read().split("if self.carry is not None:")[1] \
++                                   .split("if self.strategy is None:")[0]
++        for banned in ("openai", "anthropic", "llm", "prompt", "completion"):
++            assert banned not in carry_block.lower()
+--- a/tests/test_operator_tools.py	2026-09-06 12:50:04.488258461 +0000
++++ b/tests/test_operator_tools.py	2026-09-06 12:26:35.885559644 +0000
+@@ -47,15 +47,42 @@
+     assert report["live_authorized"] is False
+ 
+ 
+-def test_operator_refuses_when_the_shipped_kill_switch_is_engaged():
+-    db = os.path.join(ROOT, "state", "trading_state.db")
+-    if not os.path.isfile(db):
++def test_operator_refuses_when_the_shipped_kill_switch_is_engaged(tmp_path):
++    """The shipped DB is a FIXTURE and is opened through a COPY.
++
++    It used to be opened in place. Opening a tracked sqlite file read-only is
++    not a thing sqlite does: it writes journal pages, and the file came back
++    dirty after every run. `git checkout` then refused to switch branches with
++    "local changes would be overwritten", which is a test corrupting the
++    repository it is testing.
++
++    Copying costs a millisecond and makes the run idempotent.
++    """
++    source = os.path.join(ROOT, "state", "trading_state.db")
++    if not os.path.isfile(source):
+         pytest.skip("fixture db not present")
++    db = str(tmp_path / "trading_state.db")
++    shutil.copy(source, db)
+     code, report = opd.run(ROOT, {"USE_TESTNET": "1", "PAPER_TRADING": "1",
+                                   "STATE_DB_PATH": db})
+     assert code == 3 and any("kill switch" in r for r in report["preflight_reasons"])
+ 
+ 
++def test_the_shipped_fixture_db_is_never_written_in_place():
++    """Guards the fix above: no test may point STATE_DB_PATH at the tracked file.
++
++    The needle is assembled at runtime. Writing it as a literal would put it in
++    this file, and the guard would then find itself and fail — which is exactly
++    what happened on the first attempt.
++    """
++    with open(__file__, encoding="utf-8") as handle:
++        body = handle.read()
++    needle = "STATE_DB_PATH" + '": ' + "os.path.join(ROOT" + ', "state"'
++    assert needle not in body, (
++        "a test points STATE_DB_PATH at the tracked fixture; sqlite writes "
++        "journal pages even on read, so the repo comes back dirty")
++
++
+ def test_operator_refuses_ack_in_paper_and_models_current(tmp_path):
+     os.makedirs(tmp_path / "models" / "current")
+     code, report = opd.run(str(tmp_path), {"LIVE_TRADING_ACK": "I_UNDERSTAND"})
