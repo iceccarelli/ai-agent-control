@@ -1,0 +1,115 @@
+From: build <build@local>
+Subject: [PATCH 0017] a receipt, not a reminder: refuse unverified test counts
+
+THE FIRST HOOK DID NOT WORK AND I SHIPPED IT ANYWAY.
+It checked whether .venv/bin/python had pytest installed. That is TRUE whether
+or not the venv is activated, so it never fired:
+
+    $ deactivate; git commit --allow-empty -m "fake 9999 passed"
+    [main bf13050] fake 9999 passed        <- sailed straight through
+
+It tested the wrong thing. A mechanism that cannot fail is not a mechanism.
+
+WHAT REPLACES IT
+scripts/verify.sh runs the suite and writes .verify-receipt containing the pass
+count AND `git write-tree` of the tree that produced it. The commit-msg hook
+compares a claimed count against that receipt on BOTH fields.
+
+Change one byte after the run and the tree hash moves and the receipt is void.
+The receipt is not a note, it is a fingerprint.
+
+VERIFIED, all four paths:
+  claim with no receipt      REFUSED: ...and there is no receipt
+  claim 9999, receipt 5162   REFUSED: message claims '9999', run produced '5162'
+  claim 5162, tree matches   COMMITTED
+  tree changed after the run REFUSED: receipt tree 913a75... staged tree c426f0...
+
+verify.sh also fails the run if the tracked fixture DB moved, so the checkout
+blocker from 0014 cannot come back silently.
+
+.verify-receipt is gitignored - it is local proof, not a shared artefact.
+
+WHY THIS PATCH EXISTS AT ALL
+Two commits in this repository claim "(5148 passed)" and "(5162 passed)" and
+were authored by a shell with no pytest on it. Both happened to be true; I had
+verified the same trees. Neither AUTHOR had. That is a record that cannot be
+audited, in a repository whose entire value is that its records can be.
+
+---
+--- /dev/null
++++ b/scripts/verify.sh
+@@ -0,0 +1,30 @@
++#!/usr/bin/env bash
++# The only sanctioned way to produce a test count.
++#
++# Runs the suite and writes a RECEIPT binding the number to the exact tree that
++# produced it. The commit-msg hook checks that receipt. A number you remembered,
++# copied from chat, or read off a run against different code cannot pass.
++set -euo pipefail
++root="$(git rev-parse --show-toplevel)"
++cd "$root"
++[ -d .venv ] || { echo "no .venv — python3 -m venv .venv first"; exit 1; }
++. .venv/bin/activate
++python3 -c "import pytest, numpy, scipy, sklearn" 2>/dev/null || \
++  pip install -q "requests<3" "numpy<3" "pytest>=8" "scipy<2" "scikit-learn<2"
++
++before=$(md5sum bot/state/trading_state.db | cut -d' ' -f1)
++out=$(cd bot && python3 -m pytest tests/ -q 2>&1 | tail -3)
++echo "$out"
++after=$(md5sum bot/state/trading_state.db | cut -d' ' -f1)
++[ "$before" = "$after" ] || { echo "FIXTURE DB MUTATED — do not commit"; exit 1; }
++
++count=$(echo "$out" | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1)
++[ -n "$count" ] || { echo "no pass count in output — refusing to write a receipt"; exit 1; }
++
++# The tree hash of what is STAGED+tracked right now. If a single byte changes
++# after this, the hook's comparison fails and the receipt is void. That is the
++# whole mechanism: the receipt is not a note, it is a fingerprint.
++tree=$(git write-tree)
++printf '%s %s\n' "$count" "$tree" > .verify-receipt
++echo "receipt: $count passed @ tree $tree"
++echo "quote '$count passed' in your commit message. Any other number is refused."
+--- /dev/null
++++ b/scripts/install-hooks.sh
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++set -euo pipefail
++root="$(git rev-parse --show-toplevel)"
++cat > "$root/.git/hooks/commit-msg" <<'HOOK'
++#!/usr/bin/env bash
++# Refuse a commit whose message claims a test count that no run produced FOR
++# THIS TREE.
++#
++# The first version of this hook checked whether .venv had pytest installed.
++# That is true whether or not you activated it, so it never fired: a commit
++# saying "fake 9999 passed" sailed through. It tested the wrong thing.
++#
++# This one compares against a receipt written by scripts/verify.sh containing
++# the count AND the git tree hash it was produced from. Change one byte and the
++# tree hash moves and the receipt is void.
++root="$(git rev-parse --show-toplevel)"
++claim=$(grep -oE '[0-9]{3,} passed' "$1" | head -1 | cut -d' ' -f1)
++[ -n "$claim" ] || exit 0
++
++receipt="$root/.verify-receipt"
++[ -f "$receipt" ] || {
++  echo "REFUSED: the message claims '$claim passed' and there is no receipt."
++  echo "         run ./scripts/verify.sh"
++  exit 1; }
++
++read -r rcount rtree < "$receipt"
++tree=$(git write-tree)
++
++[ "$claim" = "$rcount" ] || {
++  echo "REFUSED: message claims '$claim passed', the last run produced '$rcount'."
++  exit 1; }
++[ "$tree" = "$rtree" ] || {
++  echo "REFUSED: the tree changed since the run that produced '$rcount passed'."
++  echo "         receipt tree $rtree"
++  echo "         staged  tree $tree"
++  echo "         re-run ./scripts/verify.sh"
++  exit 1; }
++HOOK
++chmod +x "$root/.git/hooks/commit-msg"
++grep -qxF '.verify-receipt' "$root/.gitignore" 2>/dev/null || echo '.verify-receipt' >> "$root/.gitignore"
++echo "commit-msg hook installed (receipt-based)"
