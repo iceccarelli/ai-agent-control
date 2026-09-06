@@ -170,6 +170,86 @@ def record_read(ledger: Dict[str, Any], *, dataset: str, from_utc: str,
     return entry
 
 
+#: Set LEDGER_DISABLED=1 to suppress automatic recording. Tests set it so that
+#: a test run does not fabricate thousands of "reads" that never informed a
+#: hypothesis. Nothing else should ever set it, and `--status` reports when it
+#: is on so a suppressed ledger can never look like a clean one.
+DISABLE_ENV = "LEDGER_DISABLED"
+
+
+def auto_record(*, dataset: str, from_utc: str, to_utc: str, read_by: str,
+                purpose: str = "", path: str = DEFAULT_PATH) -> bool:
+    """Record a read from inside a loader. Idempotent, and NEVER fatal.
+
+    Called by `market_data.load_corpus`, the chokepoint every measurement tool
+    in this tree routes through. Instrumenting there rather than in each tool is
+    deliberate: the slice-57 contamination happened because a HUMAN was relied
+    on to notice that a window had been read before, and humans stop noticing.
+    An invariant that depends on anyone remembering is not an invariant.
+
+    Two rules:
+
+    * IDEMPOTENT — an identical (dataset, range, reader) tuple is recorded once.
+      Re-running the same measurement is not a second look at the data.
+    * NEVER FATAL — a read-only artifacts/ or a malformed ledger must not take
+      down a measurement. It logs and returns False. Losing a ledger entry is
+      bad; a measurement that dies at its last line is the bug this programme
+      already fixed once in slice 77.
+    """
+    if os.environ.get(DISABLE_ENV) == "1":
+        return False
+    try:
+        ledger = load(path)
+        key = (dataset, from_utc, to_utc, read_by)
+        for existing in ledger.get("reads", []):
+            if (existing["dataset"], existing["from_utc"],
+                    existing["to_utc"], existing["read_by"]) == key:
+                return False
+        record_read(ledger, dataset=dataset, from_utc=from_utc, to_utc=to_utc,
+                    read_by=read_by, purpose=purpose,
+                    result_seen="(auto-recorded at load; the result this read "
+                                "produced is not known to the loader)")
+        save(ledger, path)
+        return True
+    except Exception:  # noqa: BLE001 - a ledger write must never kill a run
+        return False
+
+
+def install(market_data_module=None, *, reader: str = "",
+            path: str = DEFAULT_PATH) -> bool:
+    """Attach this ledger to `market_data.READ_OBSERVER`. Idempotent.
+
+    The arrow points UP: market_data knows nothing about the ledger, publishes
+    raw epoch-ms facts to an observer that defaults to None, and this function
+    is what sets it. INTEGRATION_MAP §1 stays satisfied and the recording still
+    happens at the single chokepoint every measurement tool routes through.
+
+    Every tool that calls `market_data.load_corpus` must call this first.
+    `tests/test_slice78_ledger_is_automatic.py` fails the build if one does not,
+    which is what turns "remember to record your reads" from a good intention
+    into an invariant.
+    """
+    if market_data_module is None:
+        import market_data as market_data_module  # noqa: PLC0415
+    label = reader or os.path.basename(sys.argv[0] or "") or "unknown-reader"
+
+    def _observe(symbol: str, first_ms: int, last_ms: int) -> None:
+        auto_record(dataset=symbol,
+                    from_utc=_iso_from_ms(first_ms),
+                    to_utc=_iso_from_ms(last_ms),
+                    read_by=label,
+                    purpose="market_data.load_corpus",
+                    path=path)
+
+    market_data_module.READ_OBSERVER = _observe
+    return True
+
+
+def _iso_from_ms(ms: int) -> str:
+    return dt.datetime.fromtimestamp(
+        int(ms) / 1000.0, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def overlaps(ledger: Dict[str, Any], *, dataset: str, from_utc: str,
              to_utc: str) -> List[Dict[str, Any]]:
     start, end = _utc(from_utc), _utc(to_utc)
