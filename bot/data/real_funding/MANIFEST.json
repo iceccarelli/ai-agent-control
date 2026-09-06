@@ -1,0 +1,32 @@
+{
+  "synthetic": false,
+  "asset_class": "funding",
+  "venue": "binance_usdtm",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "interval": "8h",
+  "source": "public_rest_funding_history",
+  "endpoint": "GET /fapi/v1/fundingRate",
+  "fetched_utc": "2026-08-09T13:47:43Z",
+  "date_range_utc": {
+    "BTCUSDT": {
+      "start": "2022-08-09",
+      "end": "2026-08-25",
+      "rows": 4431
+    },
+    "ETHUSDT": {
+      "start": "2022-08-09",
+      "end": "2026-08-14",
+      "rows": 4397
+    },
+    "SOLUSDT": {
+      "start": "2022-08-09",
+      "end": "2026-08-14",
+      "rows": 4397
+    }
+  },
+  "notes": "No forward-fill. No synthetic rates. Pagination complete. Stage-1 only."
+}

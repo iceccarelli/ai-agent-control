@@ -1,0 +1,361 @@
+From bb5d9c765a9963a98472e4d92db4ce3336f6d6bd Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Fri, 4 Sep 2026 22:35:53 +0000
+Subject: [PATCH 04/10] engine: observe exchange-side exits every cycle and
+ book them in the ledger
+
+INVARIANT PROTECTED: the ledger's open positions equal the venue's open
+positions after every cycle. Brakes that read the ledger (open position
+count, loss streak, daily loss) read something true.
+
+Finding (audit S5, rated HIGH, certainty 100% on the first live exit):
+after entry nothing in the runtime loop looked at a position again.
+Stops and take-profits were venue-side orders and their fills were
+observed by nothing: record_exit_fill()/close_position() were called
+only by backtest.py. So positions rows lived forever, trades was never
+written by a live run, MAX_CONSECUTIVE_LOSSES could never trip, and after
+MAX_OPEN_POSITIONS venue-side exits the shell locked itself out of every
+further entry, permanently and silently.
+
+Thought process: the fix must (a) never place an order, (b) never invent
+a position, (c) prefer venue truth for the exit price, and (d) still
+book the exit when the price is unreadable, because a ledger that
+disagrees with the venue about WHETHER a position exists is worse than
+one with an approximate price. The approximation is labelled
+(VENUE_EXIT_PRICE_UNREAD) so a human can audit it. Linear only: spot
+holdings are balances, not positions, and the two must not share a path.
+
+What changed:
+  bybit_connection.py - get_closed_pnl(symbol, since_ms, limit) over
+        /v5/position/closed-pnl, oldest-first, raises on failure.
+  trading_engine.py   - observe_exits(): per ledger position read the venue
+        size; the shortfall exited; price = qty-weighted avgExitPrice of
+        closed-pnl rows newer than opened_epoch, else last price (flagged);
+        books via record_exit_fill, the ONE place that decrements.
+  main.py             - tick() calls observe_exits() after equity refresh and
+        before should_halt_trading(), wrapped so it never kills the loop.
+  tests/fake_bybit.py - serves /v5/position/closed-pnl from .closed_pnl.
+  tests/test_observe_exits.py - 6 tests: spot no-op; still-open untouched;
+        full stop-out booked at closed-pnl price with negative net_pnl;
+        partial TP reduces qty; closed-pnl 500 still books and labels;
+        no /v5/order/create is ever sent.
+
+What did NOT change: the 5-bar HORIZON time exit of the measured rule is
+still not implemented in the runtime (the runtime does not run the
+measured rule at all - see patch 0002). Fee on venue exits is passed as
+0.0 because closedPnl already nets fees; the ledger's net_pnl therefore
+slightly overstates vs. the venue by the exit fee. Documented, not hidden.
+
+Verification: 6/6 new tests fail on baseline. Affected suites green.
+---
+ bybit_connection.py         |  23 +++++++
+ main.py                     |  10 +++
+ tests/fake_bybit.py         |   7 ++
+ tests/test_observe_exits.py | 133 ++++++++++++++++++++++++++++++++++++
+ trading_engine.py           |  70 +++++++++++++++++++
+ 5 files changed, 243 insertions(+)
+ create mode 100644 tests/test_observe_exits.py
+
+diff --git a/bybit_connection.py b/bybit_connection.py
+index 1e5a2b7..7b34ca9 100644
+--- a/bybit_connection.py
++++ b/bybit_connection.py
+@@ -1332,6 +1332,29 @@ class BybitClient:
+                 return row
+         return None
+ 
++    def get_closed_pnl(self, symbol: str, *, since_ms: int = 0,
++                       limit: int = 50) -> List[Dict[str, Any]]:
++        """Closed-PnL records for ``symbol`` newer than ``since_ms``. Linear only.
++
++        https://bybit-exchange.github.io/docs/v5/position/close-pnl - each row
++        carries ``orderId``, ``side`` (the CLOSING side), ``qty``,
++        ``avgExitPrice``, ``closedPnl`` (fees already netted) and
++        ``updatedTime`` (ms). Oldest first on return. Raises on any failure:
++        an exit the bot cannot read is not an exit it may invent.
++        """
++        if not self.is_linear:
++            raise PermanentAPIError("get_closed_pnl is linear-only")
++        params: Dict[str, Any] = {"category": self.category, "symbol": symbol,
++                                  "limit": int(limit)}
++        if since_ms > 0:
++            params["startTime"] = int(since_ms)
++        payload = self._request("GET", "/v5/position/closed-pnl", params=params,
++                                signed=True)
++        rows = [r for r in (payload.get("result", {}).get("list") or [])
++                if int(r.get("updatedTime", 0) or 0) > since_ms]
++        rows.sort(key=lambda r: int(r.get("updatedTime", 0) or 0))
++        return rows
++
+     def get_book_features(self, symbol: str) -> Optional[Dict[str, Any]]:
+         """Live L2 microstructure for the liquidity gate. ``None`` when unread.
+ 
+diff --git a/main.py b/main.py
+index f1484b0..abff4c0 100644
+--- a/main.py
++++ b/main.py
+@@ -396,6 +396,16 @@ class TradingBot:
+             logger.error("equity unreadable this cycle: %s", exc)
+             return
+ 
++        # Look at what we HOLD before deciding what to do. A stop or take-profit
++        # that filled at the venue since the last cycle must reach the ledger
++        # before any gate reads open_position_count or the loss streak.
++        try:
++            observed = self.engine.observe_exits()
++            if observed.get("closed") or observed.get("reduced"):
++                logger.warning("exits observed this cycle: %s", observed)
++        except Exception as exc:  # noqa: BLE001
++            logger.exception("observe_exits failed; continuing: %s", exc)
++
+         if self.risk.should_halt_trading():
+             logger.warning("trading halted by the risk layer this cycle")
+             return
+diff --git a/tests/fake_bybit.py b/tests/fake_bybit.py
+index 24a49af..f6d618d 100644
+--- a/tests/fake_bybit.py
++++ b/tests/fake_bybit.py
+@@ -61,6 +61,8 @@ class FakeBybit:
+         #: /v5/position/list returns, including the ``stopLoss`` field that
+         #: /v5/position/trading-stop writes. A spot client never touches these.
+         self.positions: Dict[str, Dict[str, Any]] = {}
++        #: Rows served by /v5/position/closed-pnl (linear). Tests append.
++        self.closed_pnl: List[Dict[str, Any]] = []
+         #: Funding rate as a FRACTION per 8h, as the tickers endpoint reports it.
+         self.funding_rate: float = 0.0001
+         #: Set to a retCode to make the next trading-stop call fail.
+@@ -176,6 +178,11 @@ class FakeBybit:
+                              "s": (params or {}).get("symbol", ""),
+                              "ts": int(time.time() * 1000), "u": 1})
+ 
++        if path == "/v5/position/closed-pnl":
++            symbol = (params or {}).get("symbol", "")
++            rows = [r for r in self.closed_pnl if r.get("symbol") == symbol]
++            return self._ok({"list": rows})
++
+         if path == "/v5/position/list":
+             symbol = (params or {}).get("symbol", "")
+             row = self.positions.get(symbol)
+diff --git a/tests/test_observe_exits.py b/tests/test_observe_exits.py
+new file mode 100644
+index 0000000..6cc1b4a
+--- /dev/null
++++ b/tests/test_observe_exits.py
+@@ -0,0 +1,133 @@
++"""Exchange-side exits must reach the ledger.
++
++Invariant protected (audit S5): a stop or take-profit filling at the venue
++was observed by nothing; positions rows lived forever, trades were never
++written by a live run, and MAX_OPEN_POSITIONS eventually locked the shell
++out. observe_exits() books what the venue says happened. It never places an
++order and never invents a position.
++"""
++from __future__ import annotations
++
++import os
++import sys
++import time
++
++import pytest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.dirname(HERE))
++sys.path.insert(0, HERE)
++
++import bybit_connection as bc  # noqa: E402
++import trading_engine as te  # noqa: E402
++from fake_bybit import FakeBybit  # noqa: E402
++from persistence import StateStore  # noqa: E402
++from position_sizing import BillionairePositionSizing  # noqa: E402
++from risk_management import BillionaireRiskManager  # noqa: E402
++from test_orchestrator import Cfg  # noqa: E402
++
++
++class LinearCfg(Cfg):
++    CATEGORY = "linear"
++    ALLOW_SHORTS = True
++
++
++def _engine(tmp_path, cfg, fake):
++    store = StateStore(str(tmp_path / "state.db"))
++    store.claim_writer()
++    store.update_equity(10_000.0)
++    client = bc.BybitClient(config=cfg, store=store, transport=fake)
++    risk = BillionaireRiskManager(config=cfg, store=store)
++    engine = te.TradingEngine(
++        client=client, risk_manager=risk,
++        position_sizer=BillionairePositionSizing(config=cfg, risk_manager=risk),
++        store=store, config=cfg,
++    )
++    return engine, store
++
++
++def _open(store, symbol="BTCUSDT", side="Sell", qty=0.01, entry=60_000.0):
++    store.upsert_position(symbol, side, qty, entry, stop_price=61_000.0)
++
++
++def test_spot_does_nothing(tmp_path):
++    fake = FakeBybit()
++    engine, store = _engine(tmp_path, Cfg(), fake)
++    _open(store)
++    assert engine.observe_exits()["checked"] == 0
++    assert store.open_position_count() == 1
++
++
++def test_position_still_open_at_venue_is_untouched(tmp_path):
++    fake = FakeBybit()
++    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.01",
++                                 "avgPrice": "60000", "stopLoss": "61000"}
++    engine, store = _engine(tmp_path, LinearCfg(), fake)
++    _open(store)
++    s = engine.observe_exits()
++    assert s["checked"] == 1 and s["closed"] == 0 and s["reduced"] == 0
++    assert store.open_position_count() == 1
++
++
++def test_stop_fill_at_venue_is_booked_at_closed_pnl_price(tmp_path):
++    fake = FakeBybit()
++    engine, store = _engine(tmp_path, LinearCfg(), fake)
++    _open(store)  # venue flat: fake.positions has no BTCUSDT
++    fake.closed_pnl.append({
++        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.01",
++        "avgExitPrice": "61000", "closedPnl": "-10.6",
++        "updatedTime": str(int(time.time() * 1000) + 1000),
++    })
++    s = engine.observe_exits()
++    assert s["closed"] == 1 and s["price_approximated"] == 0
++    assert store.open_position_count() == 0
++    trades = store._query("SELECT * FROM trades")
++    assert len(trades) == 1
++    assert float(trades[0]["exit_price"]) == pytest.approx(61_000.0)
++    # a short stopped out above entry is a loss
++    assert float(trades[0]["net_pnl"]) < 0
++
++
++def test_partial_take_profit_reduces_the_ledger(tmp_path):
++    fake = FakeBybit()
++    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.004",
++                                 "avgPrice": "60000", "stopLoss": "61000"}
++    engine, store = _engine(tmp_path, LinearCfg(), fake)
++    _open(store, qty=0.01)
++    fake.closed_pnl.append({
++        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.006",
++        "avgExitPrice": "59000", "closedPnl": "6",
++        "updatedTime": str(int(time.time() * 1000) + 1000),
++    })
++    s = engine.observe_exits()
++    assert s["reduced"] == 1 and s["closed"] == 0
++    row = store.open_positions()[0]
++    assert float(row["qty"]) == pytest.approx(0.004)
++
++
++def test_closed_pnl_unreadable_still_books_the_exit_and_says_so(tmp_path):
++    fake = FakeBybit()
++    engine, store = _engine(tmp_path, LinearCfg(), fake)
++    _open(store)
++    calls = {"n": 0}
++    real = fake.request
++
++    def flaky(method, url, **kw):
++        if "closed-pnl" in url:
++            calls["n"] += 1
++            return 500, "boom"
++        return real(method, url, **kw)
++    fake.request = flaky
++    s = engine.observe_exits()
++    assert s["closed"] == 1 and s["price_approximated"] == 1
++    assert store.open_position_count() == 0
++    trade = store._query("SELECT * FROM trades")[0]
++    assert "PRICE_UNREAD" in str(trade["meta"])
++
++
++def test_never_places_an_order(tmp_path):
++    fake = FakeBybit()
++    engine, store = _engine(tmp_path, LinearCfg(), fake)
++    _open(store)
++    engine.observe_exits()
++    assert not any(r["url"].endswith("/v5/order/create") for r in fake.requests)
+diff --git a/trading_engine.py b/trading_engine.py
+index 8bd773c..da70951 100644
+--- a/trading_engine.py
++++ b/trading_engine.py
+@@ -943,6 +943,76 @@ class TradingEngine:
+         return self._report(ok=True, stage="close", reason="CLOSED", symbol=symbol,
+                             qty=qty, detail={"gross_pnl": gross})
+ 
++    def observe_exits(self) -> Dict[str, Any]:
++        """Notice exchange-side exits (stop / take-profit fills) and book them.
++
++        Before this method, nothing in the runtime loop looked at a position
++        after entry: exits were delegated to venue-side orders and never
++        observed, so ``positions`` rows lived forever, ``open_position_count``
++        never decremented, ``trades`` was never written by a live run and the
++        loss-streak brake was inert. After MAX_OPEN_POSITIONS such exits the
++        shell locked itself out permanently.
++
++        Linear only (spot holdings are balances, not positions). For each
++        position the ledger holds: read the venue position; if the venue holds
++        less than the ledger, the difference has exited. The exit price comes
++        from /v5/position/closed-pnl records newer than the position's open
++        time. If those cannot be read the exit is STILL booked - at the last
++        traded price, with reason ``VENUE_EXIT_PRICE_UNREAD`` - because a
++        ledger that disagrees with the venue about whether a position exists is
++        worse than a ledger with an approximate exit price. Never places an
++        order. Never raises into the loop.
++        """
++        summary: Dict[str, Any] = {"checked": 0, "closed": 0, "reduced": 0,
++                                   "unread": 0, "price_approximated": 0}
++        if not getattr(self.client, "is_linear", False):
++            return summary
++        for row in list(self.store.open_positions()):
++            symbol = str(row["symbol"])
++            summary["checked"] += 1
++            try:
++                remote = self.client.get_position(symbol)
++            except BybitAPIError as exc:
++                logger.error("observe_exits: cannot read %s at the venue: %s",
++                             symbol, exc)
++                summary["unread"] += 1
++                continue
++            held = float(row["qty"])
++            remote_qty = float((remote or {}).get("size", 0) or 0)
++            exited = held - remote_qty
++            if exited <= 0:
++                continue
++            since_ms = int(float(row.get("opened_epoch", 0) or 0) * 1000)
++            price: Optional[float] = None
++            reason = "VENUE_EXIT"
++            try:
++                pnl_rows = self.client.get_closed_pnl(symbol, since_ms=since_ms)
++                qty_sum = sum(float(r.get("qty", 0) or 0) for r in pnl_rows)
++                if qty_sum > 0:
++                    price = sum(float(r.get("avgExitPrice", 0) or 0)
++                                * float(r.get("qty", 0) or 0)
++                                for r in pnl_rows) / qty_sum
++            except BybitAPIError as exc:
++                logger.error("observe_exits: closed-pnl unreadable for %s: %s",
++                             symbol, exc)
++            if price is None or price <= 0:
++                try:
++                    price = float(self.client.get_last_price(symbol))
++                except BybitAPIError as exc:
++                    logger.critical("observe_exits: %s exited at the venue but no "
++                                    "price can be read (%s); will retry next cycle",
++                                    symbol, exc)
++                    summary["unread"] += 1
++                    continue
++                reason = "VENUE_EXIT_PRICE_UNREAD"
++                summary["price_approximated"] += 1
++            fully = self.record_exit_fill(symbol=symbol, qty=exited, price=price,
++                                          fee=0.0, reason=reason)
++            summary["closed" if fully else "reduced"] += 1
++            logger.warning("observe_exits: %s exited %.8g @ %.8g (%s) fully=%s",
++                           symbol, exited, price, reason, fully)
++        return summary
++
+     def record_exit_fill(
+         self,
+         *,
+-- 
+2.43.0
+

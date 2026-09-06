@@ -1,0 +1,90 @@
+{
+  "symbol": "BTCUSDT",
+  "bars": 1461,
+  "signal": "funding_carry_fade_btc_v1",
+  "instrument": {
+    "null": "rotation",
+    "lockup": 1,
+    "runs": 1500,
+    "horizon": 5,
+    "atr_period": 14,
+    "round_trip_bps": 25.0,
+    "take_profit_atr": 1.5,
+    "stop_atr": 1.5,
+    "seed": 20250730
+  },
+  "observed": {
+    "n_trades": 85,
+    "mean_r": 0.09637759630974421
+  },
+  "flag_runs": 85,
+  "m1": {
+    "percentile": 97.0,
+    "bar": 95.0,
+    "passed": true,
+    "replicates": 1500,
+    "null_mean": -0.06727391727402864,
+    "null_sd": 0.08522638953808825
+  },
+  "m2": {
+    "percentile": 97.5,
+    "bar": 95.0,
+    "passed": true,
+    "delta": 0.1603291609343535,
+    "ci_low": 0.14872662054042696,
+    "ci_high": 0.17190386212197506,
+    "schedules": 200,
+    "null_mean": -0.0639515646246093,
+    "null_sd": 0.08312977928586149
+  },
+  "m3": {
+    "folds": [
+      {
+        "fold": 1,
+        "start": 200,
+        "end": 515,
+        "trades": 28,
+        "mean_r": 0.2271642133932945,
+        "percentile": 99.2,
+        "note": ""
+      },
+      {
+        "fold": 2,
+        "start": 515,
+        "end": 830,
+        "trades": 21,
+        "mean_r": -0.2123913710047057,
+        "percentile": 31.2,
+        "note": ""
+      },
+      {
+        "fold": 3,
+        "start": 830,
+        "end": 1145,
+        "trades": 22,
+        "mean_r": 0.2290238134291907,
+        "percentile": 95.39999999999999,
+        "note": ""
+      },
+      {
+        "fold": 4,
+        "start": 1145,
+        "end": 1461,
+        "trades": 14,
+        "mean_r": 0.08951375764090244,
+        "percentile": 62.0,
+        "note": ""
+      }
+    ],
+    "positive": 3,
+    "soft_gate": 3,
+    "soft_gate_met": true
+  },
+  "verdict": "EDGE_EVIDENCE_POSITIVE",
+  "control_validated": false,
+  "control_attestation": null,
+  "registration_eligible": false,
+  "registration_eligible_reason": "FULL-SAMPLE DIAGNOSTIC. The human intake's principle table says a full-sample replay on all history may NOT set cleared_edge_signal for funding_carry_fade_btc_v1 — only the OOS late-50% window may. This run covers all 1,461 bars, roughly half of which the fold calendar demotes to burn-in, and it is here to show the product reproduces the frozen family's BTC arithmetic exactly, not to support a claim.",
+  "window": "full_sample",
+  "oos_folds_sha256": null
+}

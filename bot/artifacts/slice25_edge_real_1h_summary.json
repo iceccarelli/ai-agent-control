@@ -1,0 +1,83 @@
+{
+  "symbol": "BTCUSD",
+  "bars": 61513,
+  "instrument": {
+    "null": "rotation",
+    "lockup": 1,
+    "runs": 1500,
+    "horizon": 24,
+    "atr_period": 14,
+    "round_trip_bps": 25.0,
+    "take_profit_atr": 4.0,
+    "stop_atr": 2.0,
+    "seed": 20250730
+  },
+  "observed": {
+    "n_trades": 2039,
+    "mean_r": -0.1430796891557133
+  },
+  "flag_runs": 2039,
+  "m1": {
+    "percentile": 72.2,
+    "bar": 95.0,
+    "passed": false,
+    "replicates": 1500,
+    "null_mean": -0.1586641196023927,
+    "null_sd": 0.028450971784984156
+  },
+  "m2": {
+    "percentile": 76.0,
+    "bar": 95.0,
+    "passed": false,
+    "delta": 0.016468599648321786,
+    "ci_low": 0.012790522939640444,
+    "ci_high": 0.020236340930125114,
+    "schedules": 200,
+    "null_mean": -0.1595482888040351,
+    "null_sd": 0.026704740970689367
+  },
+  "m3": {
+    "folds": [
+      {
+        "fold": 1,
+        "start": 200,
+        "end": 15528,
+        "trades": 471,
+        "mean_r": -0.1893064910332722,
+        "percentile": 33.800000000000004,
+        "note": ""
+      },
+      {
+        "fold": 2,
+        "start": 15528,
+        "end": 30856,
+        "trades": 478,
+        "mean_r": 0.053450343891529764,
+        "percentile": 100.0,
+        "note": ""
+      },
+      {
+        "fold": 3,
+        "start": 30856,
+        "end": 46184,
+        "trades": 490,
+        "mean_r": -0.26742309396829955,
+        "percentile": 8.799999999999999,
+        "note": ""
+      },
+      {
+        "fold": 4,
+        "start": 46184,
+        "end": 61513,
+        "trades": 600,
+        "mean_r": -0.1618134620791878,
+        "percentile": 48.6,
+        "note": ""
+      }
+    ],
+    "positive": 1,
+    "soft_gate": 3,
+    "soft_gate_met": false
+  },
+  "verdict": "EDGE_EVIDENCE_ABSENT"
+}

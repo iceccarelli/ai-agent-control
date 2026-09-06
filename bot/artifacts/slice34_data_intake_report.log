@@ -1,0 +1,53 @@
+==============================================================================
+DATA INTAKE REPORT — which corpora may Stage 1 be run against
+==============================================================================
+  thresholds (frozen in EDGE.md 13b before any scan): daily >= 500 bars, intraday >= 2000
+
+path                      interval   synthetic   bars       eligible 
+------------------------  ---------  ----------  ---------  ---------
+data/real_1d              D          False       2564       True     
+data/real_4h              4H         False       15379      True     
+data/real                 1H         False       61513      True     
+data/ohlcv                1H         True        5000       False    
+data/orderbook            1H         True        None       False    
+data/quotes               1H         True        None       False    
+data/anomalies            1H         True        3          False    
+data/real_multi_1d        D          False       1461       True     
+data/real_multi_1h        1H         False       35063      True     
+
+  data/ohlcv — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+  data/orderbook — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+      - required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)
+      - timestamp gap policy: unknown (need strictly increasing, no duplicates)
+      - bar count unreadable
+  data/quotes — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+      - required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)
+      - timestamp gap policy: unknown (need strictly increasing, no duplicates)
+      - bar count unreadable
+  data/anomalies — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+      - required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)
+      - timestamp gap policy: fail (need strictly increasing, no duplicates)
+      - only 3 bars; Stage 1 needs >= 2000 at 1H
+
+  eligible corpora        : data/real_1d, data/real_4h, data/real, data/real_multi_1d, data/real_multi_1h
+  multi-asset corpus      : True
+
+  REAL non-BTC data (eligible for Stage 1):
+      data/real_multi_1d       ETH_USDT, SOL_USDT
+      data/real_multi_1h       ETH_USDT, SOL_USDT
+
+  SYNTHETIC non-BTC data (NEVER Stage 1 evidence):
+      data/ohlcv               ETH_USDT, SOL_USDT
+
+      NOTE: ETH_USDT, SOL_USDT appear in BOTH lists. The same
+      ticker exists as real exchange data and as generated data.
+      Select a corpus by PATH, never by symbol name.
+
+  Eligibility is NOT edge. Timing-skill research remains CLOSED.
+  No signal has cleared Stage 1. See RESEARCH_CLOSE_STAGE1.md.
+
+  report written to artifacts/slice34_data_intake_report.json

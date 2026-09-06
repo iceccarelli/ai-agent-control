@@ -1,0 +1,82 @@
+{
+  "git_commit": "efe278f8b4bb16aa17a1297cc2f9cd5c7b884fa0-dirty",
+  "schema": "hypothesis_registry/1",
+  "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
+  "seeded": true,
+  "trials": [
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "technical_analysis"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "closed_analyser"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "donchian_breakout_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "btc_alt_spillover_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "post_shock_fade_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "range_location_fade_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "open_gap_fade_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "ts_momentum_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "sign_flip_momentum_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "compression_breakout_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "funding_carry_fade_v1"
+    },
+    {
+      "note": "n=41, M1~95.13, M2=96.0. Forward: n=2, mean net R -0.8358. 98.4% of setups are SHORT; 77.1% sit exactly at the funding threshold; carry over horizon 15bps vs 25bps round trip.",
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status/STAGE1_VERDICT",
+      "status": "cleared_stage1",
+      "trial_id": "funding_carry_fade_btc_v1"
+    }
+  ],
+  "updated_utc": "2026-09-05T00:15:21Z"
+}

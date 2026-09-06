@@ -1,0 +1,5 @@
+fold,start,end,trades,mean_r,percentile,note
+1,200,933,13,-0.4772138055372133,1.0,
+2,933,1666,7,-0.16585432114500098,,7 trades: too few for a stable percentile
+3,1666,2399,15,-0.3163872070294322,10.2,
+4,2399,3135,6,-0.025597967176908893,,6 trades: too few for a stable percentile

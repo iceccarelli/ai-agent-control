@@ -1,0 +1,78 @@
+{
+  "schema": "restored_from_previous_slice/1",
+  "slice": 63,
+  "why_this_file_exists": "The slice-63 pack is the SLICE-61 tree: every artefact slice 62 produced is absent from it, and the baseline suite failed the same eight tests for the same reason. Recorded without accusation — a tree can be assembled from the wrong parent — but the work is not in the pack, so this slice either re-derives it or proceeds without it. This file says exactly what was brought back and pins every byte of it. EDGE.md §46a, §46b.",
+  "source": "the slice-62 deliverable, tradingbot_slice62.zip",
+  "source_sha256": "f0fe9edc17c7ae27041663f9426c0ffb6c6b272fb00798e4573248049ec95fab",
+  "apparatus": {
+    "why": "NOT souvenirs. Without a forward-window restriction there is no forward window to score, and without the prefix invariant the suite is red on a corpus that grew legitimately. These are the apparatus that makes slice 63 computable at all.",
+    "restored_byte_identically": "9 of 9 restored byte-identically; 1 subsequently amended in slice 63 and recorded under amended_in_slice63 with both digests",
+    "reimplemented": false,
+    "note": "Copied, not rewritten. A re-implementation that happened to agree would be a second opinion presented as the original; these digests let a reader confirm they are the same bytes.",
+    "files": {
+      "tools/corpus_prefix.py": "1ac9a37be3f63525ac92c95fb429770b7af505411a0a08a0fe812b9d48b3ec26",
+      "signals/funding_carry_fade_btc_v1.py": "43f2a9130351c495bdc9385243b80b8e364f3e518d32e7d3dc90ab12633da742",
+      "tests/test_funding_carry_fade_btc_v1.py": "2035a0eb521954b7b1ffa3e52130a531a6d9943906eb1bf128903afaba07f75a",
+      "tests/test_slice55_data_eligibility.py": "0d314207dc92ffa871575c555bf5c877f1b3903f5495fadfcb72005b84cb47af",
+      "tests/test_slice61_extension_claim.py": "d3af27fb9ea19d8fcee4522a376a546d9961b19baba9693058966aabdd96e215",
+      "tests/test_slice62_forward_extension.py": "5d0d46233d8448db8b2bcfaf2780b5fadfd8dd1829b210dfac8facd80acdc64f",
+      "tools/slice62_freshness.py": "1c4244b06f752591df5a2eaf348437b9d6eeebdc4ed160fdab9dfa8f990224f1",
+      "tools/slice62_forward_shadow.py": "8856969312213d49e43355c3f87c0d67a7fa99114b4ba9f6966847bd9a8c5b10",
+      "tools/slice62_promotion_gate.py": "5ecdb5fb6d917a7eff4ef6fe07c30c31f362fbc2f012fe36dc2aa0085cddb193"
+    },
+    "amended_in_slice63": {
+      "tests/test_slice62_forward_extension.py": {
+        "sha256_as_restored_from_slice62": "5d0d46233d8448db8b2bcfaf2780b5fadfd8dd1829b210dfac8facd80acdc64f",
+        "sha256_after_slice63_amendment": "8ac78df56c4a76d5ab03dd7ec76e1342b76d3143df69f3c50780480829624126",
+        "test_amended": "TestNothingThatWasFrozenMoved::test_the_new_forward_helpers_are_purely_additive",
+        "why": "As written the test excluded callers named `slice62_*` — a SLICE NUMBER standing in for a ROLE. Slice 63's own forward-shadow tool, whose entire job is to call `restrict_flags_to_forward`, therefore failed it the moment it existed. Adding `slice63_*` to the exclusion would have been the same mistake one slice later.",
+        "what_changed": "The rule now names the role: the helper may be called by the module that defines it and by any `tools/slice<N>_forward_shadow.py`. Anything else still fails, and six named scoring modules are asserted absent by name, so the check cannot pass by sweeping nothing.",
+        "strength": "STRICTLY STRONGER. The old form let ANY file named slice62_* call the helper, including a hypothetical slice62_edge_measurement.py. The new form permits one filename shape in one directory and names the scoring modules that must never appear.",
+        "is_this_a_dated_record": false,
+        "note": "A TEST is a living document; a dated ARTEFACT is not. That distinction is the one slices 54, 57 and 62 each had to unpick. No dated record was touched: artifacts/slice62_*.json and STAGE1_VERDICT_SLICE62.md still carry their as-restored digests, listed under dated_records."
+      }
+    }
+  },
+  "dated_records": {
+    "why": "These describe measurements that were actually taken, on a corpus state that existed. They are copied byte-for-byte with their original git_commit fields intact.",
+    "regenerated_against_todays_corpus": false,
+    "why_not_regenerated": "Re-running the slice-62 tools today would produce files that LOOK like slice-62 records and are not — the precise substitution §45c had to unpick for slice61_data_freshness.json. Doing it deliberately would be worse than doing it by accident.",
+    "now_disagree_with_disk": "slice62_data_freshness.json records after_t1_funding = 5; the disk now holds 6. That is correct dated-artefact behaviour, not drift: the file records what was true when it was written.",
+    "files": {
+      "STAGE1_VERDICT_SLICE62.md": "05fefd67cd68c2f062c5522d2846d4ddc67f5fa2e746b3ba78e0ac4218f09eaf",
+      "artifacts/slice62_baseline_pytest.log": "d2e55a79754a4e671154bfc13f792a5abc9c3a745850d6e7813697fbd34224e4",
+      "artifacts/slice62_data_freshness.json": "e4e1eaad124f43759bc697c77951b2d560b61e9f00e2b68dafcb06790703b6d2",
+      "artifacts/slice62_forward_shadow.json": "c5885fe61b4b8e9b1a27ce3cdba94fed9ee7b18c345e93ab1b99725d85e9ad5e",
+      "artifacts/slice62_forward_shadow.log": "98e6c0c905c6354685843538272abbe6b09c4176f44903a42a01b06031c014b2",
+      "artifacts/slice62_project_status.log": "a29de2c622fe79356fe0716619f929a2173d61a0152822eb475ed9ee8b747b9e",
+      "artifacts/slice62_promotion_gate.json": "0b4beb3f0d9f043ad7f89db8323ff4bbc79432049f303bd28fe7054f23237577",
+      "artifacts/slice62_pytest.log": "5a6ac6fe16cc508810e0a0aab1d13e04c013ce14639519e5784fcd7143ae1f75",
+      "artifacts/slice62_registration_discipline.log": "c29ac7d6341a05ce520d07863288128962757c07dcfb4741b0fc055423ce2bc5",
+      "artifacts/slice62_sha256_manifest.txt": "a43101f19ac1f06bbbdb7c5817971eac9faa48002c37aa8747fe8d45f843af56"
+    }
+  },
+  "evidence_the_pack_is_the_slice61_tree": {
+    "method": "Whole-file digests, not a file listing. Three files that slice 62 modified hash to their SLICE-61 values.",
+    "EDGE.md": {
+      "slice61_and_slice63": "2af620406859e8f8...",
+      "slice62": "2ee9acf46bcb31c1...",
+      "sections_present": "ends at §44g; no §45"
+    },
+    "signals/funding_carry_fade_btc_v1.py": {
+      "slice61_and_slice63": "2668e74bc3e43299...",
+      "slice62": "43f2a9130351c495..."
+    },
+    "tests/test_slice55_data_eligibility.py": {
+      "slice61_and_slice63": "12da76a1392c5e89...",
+      "slice62": "0d314207dc92ffa8..."
+    },
+    "baseline_suite": {
+      "slice62_baseline": "8 failed, 4036 passed, 2 skipped",
+      "slice63_baseline": "8 failed, 4036 passed, 2 skipped",
+      "same_eight_tests": true,
+      "note": "Eight tests failing identically is not a coincidence; it is the same tree meeting a grown corpus for the second time."
+    }
+  },
+  "the_restored_invariant_was_not_refitted": "The restored apparatus passed against the slice-63 corpus WITHOUT modification — 238 passed, 1 skipped across the four affected test files on first run. An invariant that had been quietly fitted to slice 62's numbers would have needed a nudge here. It needed none.",
+  "git_commit": "70a0dc4243ab5662f7ee72c35b57d467c94520d5"
+}

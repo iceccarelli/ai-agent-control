@@ -1,0 +1,165 @@
+{
+  "schema": "stage1_measurement/1",
+  "slice": 52,
+  "signal": "sign_flip_momentum_v1",
+  "intake": "NEW_SIGNAL_INTAKE.md (human-filled)",
+  "design_note": "EDGE.md §33",
+  "design_before_run": true,
+  "constants": {
+    "LOOKBACK": 10,
+    "SKIP": 1,
+    "ATR_PERIOD": 14,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 2.0,
+    "TAKE_PROFIT_ATR": 3.0,
+    "HORIZON": 5,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_changed_after_seeing_numbers": false,
+  "grid_or_sweep_run": false,
+  "scheduler_modified": false,
+  "runs_per_symbol": 1,
+  "count_finding": {
+    "hard_gate_per_symbol": 50,
+    "design_expectation_per_symbol": 100,
+    "log": "artifacts/slice52_count_finding_sign_flip_momentum.log",
+    "sign_flips": {
+      "BTCUSD": 441,
+      "ETHUSDT": 209,
+      "SOLUSDT": 199
+    },
+    "flagged_bars": {
+      "BTCUSD": 419,
+      "ETHUSDT": 180,
+      "SOLUSDT": 160
+    },
+    "flag_runs": {
+      "BTCUSD": 290,
+      "ETHUSDT": 134,
+      "SOLUSDT": 131
+    },
+    "longest_run": {
+      "BTCUSD": 7,
+      "ETHUSDT": 6,
+      "SOLUSDT": 4
+    },
+    "entries": {
+      "BTCUSD": 290,
+      "ETHUSDT": 134,
+      "SOLUSDT": 131
+    },
+    "symbols_meeting_gate": [
+      "BTCUSD",
+      "ETHUSDT",
+      "SOLUSDT"
+    ],
+    "symbols_meeting_design_expectation": [
+      "BTCUSD",
+      "ETHUSDT",
+      "SOLUSDT"
+    ]
+  },
+  "control": {
+    "construction": "same-asset directed, whole-bar shuffle and re-base",
+    "clauses": {
+      "abs_z_max": 1.96,
+      "ks_min_p": 0.05,
+      "max_incomplete_pct": 5.0
+    },
+    "surrogates_requested": 200,
+    "rotations_each": 1000,
+    "BTCUSD": {
+      "verdict": "VALID",
+      "usable_surrogates": 200,
+      "z": 0.937,
+      "ks_p": 0.3336,
+      "incomplete_pct": 0.0
+    },
+    "ETHUSDT": {
+      "verdict": "VALID",
+      "usable_surrogates": 200,
+      "z": -0.76,
+      "ks_p": 0.4502,
+      "incomplete_pct": 0.0
+    },
+    "SOLUSDT": {
+      "verdict": "VALID",
+      "usable_surrogates": 200,
+      "z": -0.766,
+      "ks_p": 0.6325,
+      "incomplete_pct": 0.0
+    },
+    "all_valid": true,
+    "note": "First VALID control since slice 43, and the first ever on a full three-symbol universe at 0% incompletes. All three predictions made before the run held: surrogates found flips, scheduled enough of them, and the control returned a verdict about the instrument rather than the construction.",
+    "supports_bias_hypothesis": "A close-only trigger reads clean (|z| <= 0.94), like slice 43's 49.05 and unlike slice 46's high/low trigger at z = +3.632. This is the third data point for the RESEARCH_HOLD hypothesis that the directed instrument's bias tracks how directly the trigger reads the geometry the barrier prices its stops from — and the first that could have falsified it and did not."
+  },
+  "edge": {
+    "runs_executed": 3,
+    "per_symbol": {
+      "BTCUSD": {
+        "verdict": "EDGE_EVIDENCE_ABSENT",
+        "m1": 45.0,
+        "m2": 46.0,
+        "m2_delta": -0.006984513245933431,
+        "m2_passed": false,
+        "control_validated": true,
+        "summary": "artifacts/slice52_edge_sign_flip_momentum_BTCUSD_summary.json",
+        "log": "artifacts/slice52_edge_sign_flip_momentum_BTCUSD.log",
+        "control_log": "artifacts/slice52_control_sign_flip_momentum_BTCUSD_n1000.log"
+      },
+      "ETHUSDT": {
+        "verdict": "EDGE_EVIDENCE_ABSENT",
+        "m1": 81.39999999999999,
+        "m2": 83.5,
+        "m2_delta": 0.0671258243133457,
+        "m2_passed": false,
+        "control_validated": true,
+        "summary": "artifacts/slice52_edge_sign_flip_momentum_ETHUSDT_summary.json",
+        "log": "artifacts/slice52_edge_sign_flip_momentum_ETHUSDT.log",
+        "control_log": "artifacts/slice52_control_sign_flip_momentum_ETHUSDT_n1000.log"
+      },
+      "SOLUSDT": {
+        "verdict": "EDGE_EVIDENCE_ABSENT",
+        "m1": 22.666666666666664,
+        "m2": 25.0,
+        "m2_delta": -0.05097356321471296,
+        "m2_passed": false,
+        "control_validated": true,
+        "summary": "artifacts/slice52_edge_sign_flip_momentum_SOLUSDT_summary.json",
+        "log": "artifacts/slice52_edge_sign_flip_momentum_SOLUSDT.log",
+        "control_log": "artifacts/slice52_control_sign_flip_momentum_SOLUSDT_n1000.log"
+      }
+    },
+    "trades": {
+      "BTCUSD": 290,
+      "ETHUSDT": 134,
+      "SOLUSDT": 131
+    },
+    "mean_net_r": {
+      "BTCUSD": null,
+      "ETHUSDT": 0.0395,
+      "SOLUSDT": -0.0609
+    },
+    "control_validated": true
+  },
+  "edge_verdict": "ABSENT",
+  "verdict_is_a_successful_measurement": true,
+  "positive_rule_met": false,
+  "positive_rule": "control_validated on every symbol claimed AND at least two of {BTCUSD, ETHUSDT, SOLUSDT} with >= 50 scored trades AND those same symbols each at M1 >= 95 and M2 >= 95",
+  "symbols_clearing_both_bars": [],
+  "cleared_edge_signal": null,
+  "frozen_absent_count": 8,
+  "this_family_frozen": false,
+  "freeze_of_this_family": "NOT PERFORMED — the intake reserves it for a later human decision",
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "models_current_present": false,
+  "live_authorized": false,
+  "execution_mode": "paper",
+  "closer_to_autonomous_profit_agent": false,
+  "git_commit": "d1abbc97cfe2a42cf3f1345410a65ae423a92cbe"
+}

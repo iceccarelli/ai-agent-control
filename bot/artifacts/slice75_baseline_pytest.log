@@ -1,0 +1,230 @@
+........................................................................ [  1%]
+........................................................................ [  3%]
+........................................................................ [  4%]
+........................................................................ [  6%]
+........................................................................ [  7%]
+........................................................................ [  9%]
+........................................................................ [ 10%]
+........................................................................ [ 12%]
+........................................................................ [ 13%]
+........................................................................ [ 15%]
+........................................................................ [ 16%]
+........................................................................ [ 18%]
+...............................................................s........ [ 19%]
+........................................................................ [ 21%]
+......F..F.............................................................. [ 22%]
+........................................................................ [ 24%]
+........................................................................ [ 25%]
+........................................................................ [ 27%]
+........................................................................ [ 28%]
+........................................................................ [ 30%]
+........................................................................ [ 31%]
+........................................................................ [ 33%]
+........................................................................ [ 34%]
+.................................................................s...... [ 36%]
+........................................................................ [ 37%]
+........................................................................ [ 39%]
+........................................................................ [ 40%]
+........................................................................ [ 42%]
+........................................................................ [ 43%]
+........................................................................ [ 45%]
+........................................................................ [ 46%]
+........................................................................ [ 48%]
+........................................................................ [ 49%]
+........................................................................ [ 51%]
+........................................................................ [ 52%]
+........................................................................ [ 54%]
+........................................................................ [ 55%]
+........................................................................ [ 57%]
+........................................................................ [ 58%]
+........................................................................ [ 60%]
+........................................................................ [ 61%]
+........................................................................ [ 63%]
+........................................................................ [ 64%]
+........................................................................ [ 66%]
+........................................................................ [ 67%]
+........................................................................ [ 69%]
+........................................................................ [ 70%]
+........................................................................ [ 72%]
+........................................................................ [ 73%]
+........................................................................ [ 75%]
+........................................................................ [ 76%]
+........................................................................ [ 78%]
+........................................................................ [ 79%]
+........................................................................ [ 81%]
+........................................................................ [ 82%]
+........................................................................ [ 84%]
+........................................................................ [ 85%]
+........................................................FF.............. [ 87%]
+................................F.....F......F..F....................... [ 88%]
+........................................................................ [ 90%]
+........................................................................ [ 91%]
+........................................................................ [ 93%]
+........................................................................ [ 94%]
+........................................................................ [ 96%]
+........................................................................ [ 97%]
+........................................................................ [ 99%]
+.........................                                                [100%]
+=================================== FAILURES ===================================
+_ TestSchedulingAndTheRealCorpora.test_the_real_setup_counts_are_stable[BTCUSDT-418-6] _
+
+self = <test_funding_carry_fade_v1.TestSchedulingAndTheRealCorpora object at 0x7f13b8437ed0>
+symbol = 'BTCUSDT', setups = 418, longs = 6
+
+    @pytest.mark.parametrize("symbol,setups,longs", [("BTCUSDT", 418, 6),
+                                                     ("ETHUSDT", 415, 10),
+                                                     ("SOLUSDT", 534, 98)])
+    def test_the_real_setup_counts_are_stable(self, symbol, setups, longs):
+        """Pinned so a join change fails here with a number, not in a run.
+    
+        The heavy skew toward SHORT is a fact about the sample, not a bug:
+        perpetual funding is positive most of the time because leveraged longs
+        dominate. Recording it stops a future reader treating the imbalance as
+        evidence of a broken direction rule.
+    
+        BTCUSDT MOVED 417 -> 418 IN SLICE 73, and this is the first time this
+        pin has moved since it was written in slice 55. The cause is recorded
+        in `test_the_btc_movement_is_the_08_19_short` below rather than being
+        absorbed by editing the number: `2026-08-19` close-joined at exactly
+        FUND_ABS, and when `2026-08-20` closed it stopped being the corpus's
+        last bar and became a directed signal bar. `long_setups` did not move,
+        so the new one is a SHORT, which is what the forward artefacts say.
+        EDGE.md §56e.
+        """
+        series, f = self._real(symbol)
+        summary = fc.summary(series, f, warmup=200)
+>       assert summary["setups"] == setups
+E       assert 419 == 418
+
+tests/test_funding_carry_fade_v1.py:670: AssertionError
+___ TestSchedulingAndTheRealCorpora.test_the_btc_movement_is_the_08_19_short ___
+
+self = <test_funding_carry_fade_v1.TestSchedulingAndTheRealCorpora object at 0x7f13b8434cd0>
+
+    def test_the_btc_movement_is_the_08_19_short(self):
+        """Why the pin above moved by exactly one, asserted not assumed.
+    
+        This test reads the CORPUS, not any slice artefact, so it is an
+        independent witness: the newest directed signal bar is 2026-08-19, it
+        is a SHORT, and the bar after it exists — which is precisely why the
+        count changed this slice and not last. EDGE.md §56b, §56e.
+        """
+        series, f = self._real("BTCUSDT")
+        directed = fc.directed_signal_bars(series, f, warmup=200)
+        index, direction = directed[-1]
+        stamp = dt.datetime.fromtimestamp(
+            series[index].start_ms / 1000.0,
+            tz=dt.timezone.utc).strftime("%Y-%m-%d")
+>       assert stamp == "2026-08-19"
+E       AssertionError: assert '2026-08-21' == '2026-08-19'
+E         
+E         - 2026-08-19
+E         ?          -
+E         + 2026-08-21
+E         ?         +
+
+tests/test_funding_carry_fade_v1.py:688: AssertionError
+_______________ TestTheSetupPinMoved.test_the_btc_pin_is_now_418 _______________
+
+self = <test_slice73_eleven_day_window.TestTheSetupPinMoved object at 0x7f13b360a1d0>
+
+    def test_the_btc_pin_is_now_418(self):
+        from signals import funding_carry_fade_v1 as fc  # noqa: PLC0415
+        bars, funding, _folds = _corpus()
+        summary = fc.summary(bars, funding, warmup=200)
+>       assert summary["setups"] == 418
+E       assert 419 == 418
+
+tests/test_slice73_eleven_day_window.py:481: AssertionError
+_ TestTheSetupPinMoved.test_it_moved_by_exactly_one_and_the_new_one_is_the_08_19_short _
+
+self = <test_slice73_eleven_day_window.TestTheSetupPinMoved object at 0x7f13b36c1090>
+
+    def test_it_moved_by_exactly_one_and_the_new_one_is_the_08_19_short(self):
+        from signals import funding_carry_fade_v1 as fc  # noqa: PLC0415
+        bars, funding, _folds = _corpus()
+        directed = fc.directed_signal_bars(bars, funding, warmup=200)
+        index, direction = directed[-1]
+>       assert _day(bars, index) == "2026-08-19"
+E       AssertionError: assert '2026-08-21' == '2026-08-19'
+E         
+E         - 2026-08-19
+E         ?          -
+E         + 2026-08-21
+E         ?         +
+
+tests/test_slice73_eleven_day_window.py:490: AssertionError
+____ TestTheWindowReachedTwelve.test_the_counts_came_from_this_slices_files ____
+
+self = <test_slice74_twelve_day_window.TestTheWindowReachedTwelve object at 0x7f13b33000d0>
+
+    def test_the_counts_came_from_this_slices_files(self):
+>       assert cp.check(cp.LINEAR_BTC).rows_on_disk == \
+            load(FRESHNESS)["linear_rows"]
+E       AssertionError: assert 1474 == 1473
+E        +  where 1474 = PrefixCheck(path='data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz', time_column='time_period_start', pinne...-08-21T00:00:00+00:00', '2026-08-22T00:00:00+00:00'), appended_all_strictly_after_t1=True, appended_before_or_at_t1=()).rows_on_disk
+E        +    where PrefixCheck(path='data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz', time_column='time_period_start', pinne...-08-21T00:00:00+00:00', '2026-08-22T00:00:00+00:00'), appended_all_strictly_after_t1=True, appended_before_or_at_t1=()) = <function check at 0x7f13b30d9f80>('data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz')
+E        +      where <function check at 0x7f13b30d9f80> = cp.check
+E        +      and   'data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz' = cp.LINEAR_BTC
+
+tests/test_slice74_twelve_day_window.py:200: AssertionError
+____ TestTheSecondSetup.test_08_21_is_not_a_flag_because_it_is_the_last_bar ____
+
+self = <test_slice74_twelve_day_window.TestTheSecondSetup object at 0x7f13b36a4b50>
+
+    def test_08_21_is_not_a_flag_because_it_is_the_last_bar(self):
+        bars, funding, _folds = _corpus()
+        flags, _directions = fb.flags_and_directions(bars, funding, warmup=200)
+        index = next(i for i in range(len(bars))
+                     if _day(bars, i) == "2026-08-21")
+>       assert index == len(bars) - 1
+E       assert 1472 == (1474 - 1)
+E        +  where 1474 = len([Bar(start_ms=1660089600000, open=23140.1, high=24235.2, low=22608.0, close=23940.9, volume=760738.204), Bar(start_ms=...37314.32), Bar(start_ms=1660521600000, open=24294.1, high=25200.0, low=23762.0, close=24085.2, volume=739390.721), ...])
+
+tests/test_slice74_twelve_day_window.py:266: AssertionError
+____ TestTheFlagIsStillNotScoreable.test_it_needs_the_corpus_to_reach_08_26 ____
+
+self = <test_slice74_twelve_day_window.TestTheFlagIsStillNotScoreable object at 0x7f13b3352a90>
+
+    def test_it_needs_the_corpus_to_reach_08_26(self):
+        """Arithmetic, not forecast — and the arithmetic was done wrong.
+    
+        §57b said "four days short" and the mission said the same. The corpus
+        says FIVE: 08-19 sits at index `last - 2`, needs `last >= flag + 7`,
+        and 08-22 through 08-26 is five bars. The claim that a number came
+        from subtraction rather than forecast is worth nothing if the
+        subtraction is not checked against the file. EDGE.md §57e.
+        """
+        bars, _funding, _folds = _corpus()
+        flag = next(i for i in range(len(bars))
+                    if _day(bars, i) == "2026-08-19")
+        needed_index = flag + 7
+        last = len(bars) - 1
+        assert last < needed_index
+>       assert needed_index - last == 5
+E       assert (1477 - 1473) == 5
+
+tests/test_slice74_twelve_day_window.py:358: AssertionError
+__ TestTheThresholdSitsOnTheBaseRate.test_the_census_is_measured_not_asserted __
+
+self = <test_slice74_twelve_day_window.TestTheThresholdSitsOnTheBaseRate object at 0x7f13b3353d10>
+
+    def test_the_census_is_measured_not_asserted(self):
+        census = load(FRESHNESS)["forward_funding_regime"]["threshold_census"]
+        rows = cp.read_rows(cp.FUNDING_BTC)
+        values = [float(r["funding_rate"]) for r in rows]
+>       assert census["prints"] == len(values)
+E       assert 4422 == 4424
+E        +  where 4424 = len([0.0001, -1.314e-05, 5.81e-06, 9.44e-05, 7.206e-05, 0.0001, ...])
+
+tests/test_slice74_twelve_day_window.py:394: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_funding_carry_fade_v1.py::TestSchedulingAndTheRealCorpora::test_the_real_setup_counts_are_stable[BTCUSDT-418-6]
+FAILED tests/test_funding_carry_fade_v1.py::TestSchedulingAndTheRealCorpora::test_the_btc_movement_is_the_08_19_short
+FAILED tests/test_slice73_eleven_day_window.py::TestTheSetupPinMoved::test_the_btc_pin_is_now_418
+FAILED tests/test_slice73_eleven_day_window.py::TestTheSetupPinMoved::test_it_moved_by_exactly_one_and_the_new_one_is_the_08_19_short
+FAILED tests/test_slice74_twelve_day_window.py::TestTheWindowReachedTwelve::test_the_counts_came_from_this_slices_files
+FAILED tests/test_slice74_twelve_day_window.py::TestTheSecondSetup::test_08_21_is_not_a_flag_because_it_is_the_last_bar
+FAILED tests/test_slice74_twelve_day_window.py::TestTheFlagIsStillNotScoreable::test_it_needs_the_corpus_to_reach_08_26
+FAILED tests/test_slice74_twelve_day_window.py::TestTheThresholdSitsOnTheBaseRate::test_the_census_is_measured_not_asserted
+8 failed, 4767 passed, 2 skipped in 248.19s (0:04:08)

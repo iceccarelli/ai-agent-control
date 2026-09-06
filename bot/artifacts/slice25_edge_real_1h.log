@@ -1,0 +1,57 @@
+==============================================================================
+REAL-SERIES EDGE MEASUREMENT (slice 24)
+==============================================================================
+BTCUSD: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : BTCUSD
+bars              : 61,513
+
+Instrument path = the configuration whose control PASSED at n=200
+(EDGE.md 4u: median 48.0, z = -1.18, KS p = 0.435, 0 incomplete):
+  null rotation | lock-up 1 | one trade per run | 1,500 replicates
+  barrier +4/-2 ATR, 24-bar horizon, 25 bps round trip
+
+Bars pre-declared in EDGE.md 5b, before any number existed:
+  M1  real-series percentile          >= 95.0
+  M2  Delta > 0, 95% CI excludes 0, percentile >= 95.0
+  M3  >= 3 of 4 folds mean net R > 0 (soft, supporting only)
+
+computing the analyser's flags on the REAL series, bar by bar ...
+PRIMARY_TIMEFRAME=60 with a 25 bps round trip: on bars this short the ATR risk unit is of the same order as the cost, so most of every R is spent on execution. Measured on seven years of real BTC data, ZERO of 84 hourly geometries had positive net expectancy and 72 of 84 daily ones did. See GEOMETRY.md.
+
+real-series schedule: 2039 trades from 2039 flag runs
+strategy mean net R : -0.1431
+
+M1: ranking against the validated rotation null ...
+  replicates        : 1,500 of 1,500
+  null mean net R   : -0.1587  (sd 0.0285)
+  null trade counts : median 2039
+  M1 PERCENTILE     : 72.2   bar 95.0   -> FAIL
+
+M2: drift-controlled contrast against shape-matched schedules ...
+  schedules         : 200 of 200
+  Side N mean net R : -0.1595  (sd 0.0267)
+  Side N trades     : median 2038   (Side S: 2039)
+  Delta             : +0.0165   95% CI [+0.0128, +0.0202]
+  M2 PERCENTILE     : 76.0  bar 95.0
+  M2                -> FAIL   (needs Delta>0 AND CI excludes 0 AND percentile>=95.0)
+
+M3: walk-forward, per fold ...
+  fold 1: bars 200-15528  471 trades  mean net R -0.1893  percentile 33.8
+  fold 2: bars 15528-30856  478 trades  mean net R +0.0535  percentile 100.0
+  fold 3: bars 30856-46184  490 trades  mean net R -0.2674  percentile 8.8
+  fold 4: bars 46184-61513  600 trades  mean net R -0.1618  percentile 48.6
+  folds with mean net R > 0 : 1 of 4   soft gate NOT met (supporting only)
+
+==============================================================================
+DECISION
+==============================================================================
+  M1  percentile 72.2 vs bar 95.0  -> FAIL
+  M2  delta +0.0165, CI [+0.0128, +0.0202], percentile 76.0  -> FAIL
+  M3  1/4 folds positive  (soft, supporting only)
+
+  EDGE_EVIDENCE_ABSENT
+
+  The pre-declared bars are not met. No threshold, stop, size or
+  confidence parameter may be retuned to change this reading.
+
+artifacts: artifacts/slice25_edge_real_1h_summary.json / _null_distributions.csv / _folds.csv

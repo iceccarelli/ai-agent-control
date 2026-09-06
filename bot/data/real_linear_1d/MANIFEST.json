@@ -1,0 +1,33 @@
+{
+  "synthetic": false,
+  "asset_class": "ohlcv",
+  "venue": "binance_usdtm",
+  "market": "linear",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "interval": "1d",
+  "source": "public_rest_klines",
+  "endpoint": "GET /fapi/v1/klines",
+  "fetched_utc": "2026-08-09T13:47:45Z",
+  "date_range_utc": {
+    "BTCUSDT": {
+      "start": "2022-08-10",
+      "end": "2026-08-24",
+      "rows": 1476
+    },
+    "ETHUSDT": {
+      "start": "2022-08-10",
+      "end": "2026-08-13",
+      "rows": 1465
+    },
+    "SOLUSDT": {
+      "start": "2022-08-10",
+      "end": "2026-08-13",
+      "rows": 1465
+    }
+  },
+  "notes": "No synthetic bars. Pagination complete. Stage-1 barrier series for funding_carry_fade_v1."
+}

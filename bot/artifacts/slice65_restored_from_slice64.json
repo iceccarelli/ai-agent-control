@@ -1,0 +1,124 @@
+{
+  "schema": "restored_from_previous_slice/3",
+  "slice": 65,
+  "why_this_file_exists": "THIRD CONSECUTIVE PACK REGRESSION, to the same parent. The slice-65 pack is again the SLICE-61 tree: everything from slices 62, 63 AND 64 is absent, the three digest probes all read slice-61, and the baseline suite is identical to slice 64's down to the failing test names. Three occurrences is a PATTERN, not an incident: the pack is being built from a fixed parent rather than from the previous deliverable. EDGE.md §48a.",
+  "source": "the slice-64 deliverable, tradingbot_slice64.zip",
+  "source_sha256": "5dd457e52735967cc67d22029bae4b838737aa532addc10e862c3a8b7cda048c",
+  "restores_slices": [
+    62,
+    63,
+    64
+  ],
+  "apparatus": {
+    "why": "The prefix invariant, the forward-window helpers and the slice 62-64 tools are what make a forward segment computable at all. Restored byte-identically, not re-implemented.",
+    "restored_byte_identically": "17 restored; 2 subsequently amended",
+    "reimplemented": false,
+    "files": {
+      "tools/corpus_prefix.py": "1ac9a37be3f63525ac92c95fb429770b7af505411a0a08a0fe812b9d48b3ec26",
+      "signals/funding_carry_fade_btc_v1.py": "43f2a9130351c495bdc9385243b80b8e364f3e518d32e7d3dc90ab12633da742",
+      "tests/test_funding_carry_fade_btc_v1.py": "2035a0eb521954b7b1ffa3e52130a531a6d9943906eb1bf128903afaba07f75a",
+      "tests/test_slice55_data_eligibility.py": "046f0d4cc39b8946cef242401bed604001890f089defd64328f5f0501476d291",
+      "tests/test_slice61_extension_claim.py": "d3af27fb9ea19d8fcee4522a376a546d9961b19baba9693058966aabdd96e215",
+      "tests/test_slice62_forward_extension.py": "194566e79c41ea7dd8b57aabdc80b67c5c32548a0121166f18d4f5e15a154353",
+      "tests/test_slice63_window_did_not_grow.py": "de3ab589d2bc0d4ae14ffcd6a4be05e7d9fbafe273adbb70943334cd0eae4a50",
+      "tests/test_slice64_window_grew.py": "9fe029a4e0924548d0c2229937c949bac1c3b1d1c5fb1ee6f305c18349a91e64",
+      "tools/slice62_freshness.py": "1c4244b06f752591df5a2eaf348437b9d6eeebdc4ed160fdab9dfa8f990224f1",
+      "tools/slice62_forward_shadow.py": "8856969312213d49e43355c3f87c0d67a7fa99114b4ba9f6966847bd9a8c5b10",
+      "tools/slice62_promotion_gate.py": "5ecdb5fb6d917a7eff4ef6fe07c30c31f362fbc2f012fe36dc2aa0085cddb193",
+      "tools/slice63_freshness.py": "ff1331d719f6e4b251362a59951fd64a8620dede921ae15a18f90b728acae4d3",
+      "tools/slice63_forward_shadow.py": "3e5440aeee80b43d0375aa339f1eacd82c3fb5ae5a09888e5bc2e921033a43e2",
+      "tools/slice63_promotion_gate.py": "42a3e40b5e6fbbece06d14a65351a2515541a94346a171c35c26004b3cc8e8d6",
+      "tools/slice64_freshness.py": "bffaf7bfe89c6b2ac42f1c2c7a31c80796087ec7028bec43d80524188c0942e1",
+      "tools/slice64_forward_shadow.py": "d6423c0e65c9ee2b8a11c4370483bd1d23552ffa525fa69295d1cc2da1228cea",
+      "tools/slice64_promotion_gate.py": "f09faf726b153b2089bccf3bb6ab58087347f3093e4e9d568c02a14ad1cd2257"
+    },
+    "amended_in_slice65": {
+      "tests/test_slice55_data_eligibility.py": {
+        "sha256_as_restored_from_slice64": "046f0d4cc39b8946cef242401bed604001890f089defd64328f5f0501476d291",
+        "sha256_after_slice65_amendment": "aae96ea1ad5943f3233be3e9f86548316c0b8693687139d4720f728cb7a07e65",
+        "why": "The manifest enumeration went red — which is exactly what slice 64 built it to do. The signal read RE-BROADCAST, not repaired: ETH's and SOL's four files are byte-identical to slice 64's and their declared counts moved anyway, tracking BTC's. Re-pinned to the new values. EDGE.md §48a.",
+        "strength": "STRICTLY STRONGER. Two checks were added that assert the SHAPE of the defect rather than its values — all three symbols declaring one count while the files hold three, and the declared counts moving while the files do not — so the next regeneration is caught even before anyone compares numbers, and the 'systematic vs one-off' question is answered by a test.",
+        "is_this_a_dated_record": false
+      },
+      "tests/test_slice64_window_grew.py": {
+        "sha256_as_restored_from_slice64": "9fe029a4e0924548d0c2229937c949bac1c3b1d1c5fb1ee6f305c18349a91e64",
+        "sha256_after_slice65_amendment": "424973cc0c5009aace5a376d0bcc5024bde81e0e048abd035fe500ee0f1799eb",
+        "why": "Four tests asserted LIVE ABSOLUTES — `appended_rows == 2`, a hard-coded 2026-08-12, slice-64 row counts against today's disk — and expired when a third bar arrived. §47f named this exact mistake and the same file then made it, which is worth recording rather than quietly fixing. A fifth amendment followed: `test_every_restored_file_matches_its_recorded_digest` re-verified the restored APPARATUS against live files, which slice 65 legitimately amended — the same amendment slice 64 made to slice 63's file, one level up. Recurrence at two consecutive levels is the sign it should be a RULE rather than a repair, so it is now stated generally in that test: EACH SLICE'S RESTORATION MANIFEST OWNS THE LIVE APPARATUS; EVERY EARLIER ONE OWNS ONLY ITS FROZEN RECORDS.",
+        "strength": "Each dated claim now asserts against slice 64's FROZEN artefact and each live claim asserts direction of travel. `test_no_bar_for_the_current_utc_day_is_present` is the clearest gain: it computes today from the clock instead of hard-coding a date, so it states the real rule — an unclosed bar is never on disk — and cannot expire.",
+        "is_this_a_dated_record": false
+      }
+    },
+    "amendment_rule": "A TEST is a living document; a dated ARTEFACT is not. Every amendment carries both digests, a reason and an argument for why the new form is stronger, and a test refuses any digest change this manifest does not name."
+  },
+  "dated_records": {
+    "why": "Measurements actually taken, on corpus states that existed. Copied byte-for-byte with their original git_commit fields.",
+    "regenerated_against_todays_corpus": false,
+    "why_not_regenerated": "Re-running the slice 62-64 tools today would produce files that LOOK like slice-62, -63 and -64 records and are not.",
+    "now_disagree_with_disk": "slice62 records after_t1_linear 1; slice63 1; slice64 2; the disk now holds 3. Correct dated-artefact behaviour.",
+    "files": {
+      "STAGE1_VERDICT_SLICE62.md": "05fefd67cd68c2f062c5522d2846d4ddc67f5fa2e746b3ba78e0ac4218f09eaf",
+      "STAGE1_VERDICT_SLICE63.md": "3c63ad22f29caf0203ca1b7fbab1d33c7f7d0bde5b2aefea59115c874ba6c40a",
+      "STAGE1_VERDICT_SLICE64.md": "b3bfc7baac69c2445bc2bd98963bde9095db219f5f022069f057b3e4c6521dac",
+      "artifacts/slice62_baseline_pytest.log": "d2e55a79754a4e671154bfc13f792a5abc9c3a745850d6e7813697fbd34224e4",
+      "artifacts/slice62_data_freshness.json": "e4e1eaad124f43759bc697c77951b2d560b61e9f00e2b68dafcb06790703b6d2",
+      "artifacts/slice62_forward_shadow.json": "c5885fe61b4b8e9b1a27ce3cdba94fed9ee7b18c345e93ab1b99725d85e9ad5e",
+      "artifacts/slice62_forward_shadow.log": "98e6c0c905c6354685843538272abbe6b09c4176f44903a42a01b06031c014b2",
+      "artifacts/slice62_project_status.log": "a29de2c622fe79356fe0716619f929a2173d61a0152822eb475ed9ee8b747b9e",
+      "artifacts/slice62_promotion_gate.json": "0b4beb3f0d9f043ad7f89db8323ff4bbc79432049f303bd28fe7054f23237577",
+      "artifacts/slice62_pytest.log": "5a6ac6fe16cc508810e0a0aab1d13e04c013ce14639519e5784fcd7143ae1f75",
+      "artifacts/slice62_registration_discipline.log": "c29ac7d6341a05ce520d07863288128962757c07dcfb4741b0fc055423ce2bc5",
+      "artifacts/slice62_sha256_manifest.txt": "a43101f19ac1f06bbbdb7c5817971eac9faa48002c37aa8747fe8d45f843af56",
+      "artifacts/slice63_baseline_pytest.log": "76f8c08affb6f4df48b235d205c1739ed101b457d60965713a10f6c8214cc436",
+      "artifacts/slice63_data_freshness.json": "0bd3dca1f2217e90079d105d329ba995b39668b71d89dc6b2ee00e9ef3d846e8",
+      "artifacts/slice63_forward_shadow.json": "23fa740d1d77daef6cf294548e30db90e67309f04a1d65d2e382e63b83a18380",
+      "artifacts/slice63_forward_shadow.log": "f4eadcade2b0f46e39b3f6ba75b5e1afde84cf0c5ca5d2ed22a811434aa16038",
+      "artifacts/slice63_paper_cert.log": "a6ff6380a899cc38fa4619ae43833ea3fd95a437900133c71fe9b984b4bbe85b",
+      "artifacts/slice63_project_status.log": "a29de2c622fe79356fe0716619f929a2173d61a0152822eb475ed9ee8b747b9e",
+      "artifacts/slice63_promotion_gate.json": "17f1228f3eafec169864f95120ead3dad8144ddeb6d7c83f171d06ff81bda338",
+      "artifacts/slice63_pytest.log": "813df8264853e04dbf247c0f8a4595ca2233ce8d0386c13a7d52a233cc20df7a",
+      "artifacts/slice63_registration_discipline.log": "c29ac7d6341a05ce520d07863288128962757c07dcfb4741b0fc055423ce2bc5",
+      "artifacts/slice63_restored_from_slice62.json": "40573d51c24b71d07580f411c2ca669016664be97115a481e72070b48969944e",
+      "artifacts/slice63_sha256_manifest.txt": "584745c47f1508e3f3bd7a04465993a278a667bdb77d577f3f1b19b5356e2350",
+      "artifacts/slice64_baseline_pytest.log": "c6ce76aab26f4838cbfa94fb36657fa7173a278fc693a682cde89fbef488d5eb",
+      "artifacts/slice64_data_freshness.json": "ebff07d526317b4292a1e171c89267e3be0e448a55a67cc7196f0cf44b282f93",
+      "artifacts/slice64_forward_shadow.json": "94f0846fe720c26741c4df5fcf0168075ff74727d1f25acc37284a25cae1d49c",
+      "artifacts/slice64_forward_shadow.log": "f31b03ea28732474cf2fe10708ca5ff4fd3564354160d971e5aa203e049363fd",
+      "artifacts/slice64_paper_cert.log": "d88a72e78f8074f6810357a4a5fcc4149f16e5515b1f81e3c89656195ed672c8",
+      "artifacts/slice64_project_status.log": "a29de2c622fe79356fe0716619f929a2173d61a0152822eb475ed9ee8b747b9e",
+      "artifacts/slice64_promotion_gate.json": "efc003878a0aa06241e326e99f156099e0fc2ad677078ad6438731f0878bcdb9",
+      "artifacts/slice64_pytest.log": "62388e8d7edd2e78ff8e500e7138dfba6dcee3a6de4bdcc0cd70b43dc811ee40",
+      "artifacts/slice64_registration_discipline.log": "c29ac7d6341a05ce520d07863288128962757c07dcfb4741b0fc055423ce2bc5",
+      "artifacts/slice64_restored_from_slice63.json": "6063c2ee88e3068f6a43d98b4ff37eae8ad891f108b8d7d58cb6753795c0672e",
+      "artifacts/slice64_sha256_manifest.txt": "a26bf518966b138f43abb93f901d1d382280cdc88e65dbe01fbe880a1fc0512a"
+    }
+  },
+  "evidence_the_pack_is_the_slice61_tree": {
+    "method": "whole-file digests of three files slices 62-64 modified",
+    "EDGE.md": {
+      "slice61_and_slice65": "2af620406859",
+      "slice62": "2ee9acf46bcb",
+      "slice63": "c4deed698ade",
+      "slice64": "675e021daeae"
+    },
+    "signals/funding_carry_fade_btc_v1.py": {
+      "slice61_and_slice65": "2668e74bc3e4",
+      "slice62_to_64": "43f2a9130351"
+    },
+    "tests/test_slice55_data_eligibility.py": {
+      "slice61_and_slice65": "12da76a1392c",
+      "slice62_63": "0d314207dc92",
+      "slice64": "046f0d4cc39b"
+    },
+    "baseline_suite": {
+      "slice62": "8 failed, 4036 passed, 2 skipped",
+      "slice63": "8 failed, 4036 passed, 2 skipped",
+      "slice64": "12 failed, 4032 passed, 2 skipped",
+      "slice65": "12 failed, 4032 passed, 2 skipped",
+      "identical_to_slice64": true,
+      "note": "Identical to slice 64's, down to the failing test names. The same tree meeting a grown corpus for the fourth time."
+    },
+    "occurrences": 3,
+    "assessment": "A one-line change to whatever assembles the zip would end this. Until it is made, every slice spends its first hour restoring work that already exists and its verdict re-explaining why."
+  },
+  "git_commit": "b1b646bfbd742db85892bd9700c8b7edc97d355c"
+}

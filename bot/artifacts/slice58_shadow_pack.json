@@ -1,0 +1,154 @@
+{
+  "schema": "shadow_pack/1",
+  "slice": 58,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "design_note": "EDGE.md §41 (written before shadow.py existed)",
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "cleared_edge_re_scored_this_slice": false,
+  "cleared_edge_evidence": {
+    "artefact": "artifacts/slice57_oos_edge_BTCUSDT_summary.json",
+    "n_trades": 41,
+    "m1": 95.13,
+    "m2": 96.0,
+    "mean_net_r": 0.1735699020942922,
+    "window": "oos_late",
+    "unchanged_since_slice_57": true
+  },
+  "live_authorized": false,
+  "policy_mode": "off",
+  "models_current_present": false,
+  "execution_mode": "paper",
+  "constants_fingerprint": "662de0115880871352d5d623b1020eaa",
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_changed": false,
+  "caps": {
+    "max_concurrent_positions": 1,
+    "max_entries_per_day": 1,
+    "max_notional_usd": 100.0,
+    "symbol": "BTCUSDT",
+    "declared_before_implementation": true,
+    "note": "A FIXED dollar notional, not a fraction of equity: a percentage cap grows with the account and so authorises more risk the better things go, which is backwards for a pilot whose purpose is to find out whether the rule works at all."
+  },
+  "monitors": {
+    "M1_rolling_trades": {
+      "k": 10,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 10
+    },
+    "M2_rolling_days": {
+      "window_days": 90,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 5
+    },
+    "M3_concentration": {
+      "top_n": 3,
+      "warn_above": 0.6,
+      "min_trades": 10
+    },
+    "M4_halves": {
+      "min_trades": 20
+    }
+  },
+  "monitors_declared_before_replay": true,
+  "monitor_derivations": {
+    "alert_below_-0.25": "beyond this rule's own worst full-sample fold (-0.2124): a stretch worse than anything in its history",
+    "concentration_0.60": "half again the OOS sample's own 0.41",
+    "K=10_and_5_trade_floor": "a rule that produced 41 trades in two years"
+  },
+  "monitor_readings_on_the_oos_window": [
+    {
+      "name": "M1_rolling_trades",
+      "state": "OK",
+      "value": 0.029757656465978655,
+      "threshold": -0.25,
+      "n_trades": 10,
+      "detail": "mean net R over the last 10 closed trades"
+    },
+    {
+      "name": "M2_rolling_days",
+      "state": "OK",
+      "value": 0.23990203185971773,
+      "threshold": -0.25,
+      "n_trades": 5,
+      "detail": "mean net R over trades closed in the last 90 days"
+    },
+    {
+      "name": "M3_concentration",
+      "state": "OK",
+      "value": 0.4502541935561254,
+      "threshold": 0.6,
+      "n_trades": 35,
+      "detail": "top-3 share of cumulative net R (the OOS sample itself is 0.41)"
+    },
+    {
+      "name": "M4_halves",
+      "state": "WARN",
+      "value": -0.07982286076591971,
+      "threshold": 0.0,
+      "n_trades": 35,
+      "detail": "earlier half +0.4669 on 17, recent half -0.0798 on 18"
+    }
+  ],
+  "monitor_status_on_the_oos_window": "WARN",
+  "monitor_finding": "M4_halves reads WARN on the first real window: earlier half +0.4669 on 17 trades, recent half -0.0798 on 18. The threshold was declared before shadow.py existed and it fired on the first data it saw. NOTHING was changed in response — a threshold adjusted because it fired is a description of the past, not a monitor.",
+  "revoke_policy": {
+    "mechanism": "shadow.revoke_cleared_edge",
+    "acknowledgement": "HUMAN_REVOKED_CLEARED_EDGE",
+    "record": "artifacts/edge_revocations.json",
+    "auto_revoke": false,
+    "auto_revoke_considered_and_refused": "A monitor that can silently null the research flag is a monitor that can be gamed by a quiet period, and withdrawing a research claim belongs to the human who made it.",
+    "asymmetry": "Registering requires passing a pre-declared gate; revoking requires only a human saying so. It is easy to stop claiming something and hard to start.",
+    "callable_by_trading_or_model_code": false
+  },
+  "wiring": {
+    "module": "shadow_strategy.ShadowStrategy",
+    "interface": "signal_for(symbol) — the same one TradingBot already calls",
+    "why": "A parallel shadow universe drifts from the shell that would eventually trade it. Plugging into the existing interface means every gate, the kill switch, the risk chain and the protective-stop guarantee apply unchanged; the caps are ON TOP.",
+    "one_trade_per_run_enforced": true,
+    "defect_found_by_the_replay": "The first version proposed on EVERY flagged bar rather than at run starts, taking 55 trades on the OOS window with a NEGATIVE mean where the cleared rule scored +0.1736. The pilot would have monitored a rule that loses money while reporting healthy status. Fixed causally: propose only when the previous decision bar was not a setup. See EDGE.md 41i."
+  },
+  "shadow_replay": {
+    "artefact": "artifacts/slice58_shadow_replay.json",
+    "is_stage1_evidence": false,
+    "candidates": 41,
+    "refused_by_caps": 6,
+    "trades": 35,
+    "mean_net_r": 0.18571343161930676,
+    "note": "A wiring proof. No rotation null, no control, no percentile. It cannot register anything: the hook reads only *_summary.json artefacts that pass the slice-57 OOS gate, and this is not one."
+  },
+  "proof_tests": [
+    "tests/test_shadow_pack.py::TestTheShadowedRuleIsTheClearedRule",
+    "tests/test_shadow_pack.py::TestShadowIsPermittedOnlyInScope",
+    "tests/test_shadow_pack.py::TestTheHardCapsAreEnforced",
+    "tests/test_shadow_pack.py::TestTheMonitorsAreThePreDeclaredOnes",
+    "tests/test_shadow_pack.py::TestM1RollingTrades",
+    "tests/test_shadow_pack.py::TestM2RollingDays",
+    "tests/test_shadow_pack.py::TestM3Concentration",
+    "tests/test_shadow_pack.py::TestM4Halves",
+    "tests/test_shadow_pack.py::TestMonitorsDoNotTrade",
+    "tests/test_shadow_pack.py::TestRevokeIsHumanOnly",
+    "tests/test_shadow_pack.py::TestTheShadowStrategy",
+    "tests/test_shadow_pack.py::TestNothingWasArmed",
+    "tests/test_shadow_pack.py::TestTheSessionSurface",
+    "tests/test_shadow_pack.py::TestOneTradePerRun",
+    "tests/test_shadow_pack.py::TestTheShadowReplayArtefact"
+  ],
+  "frozen_absent_count": 11,
+  "eleven_freezes_intact": true,
+  "closer_to_autonomous_profit_agent": false,
+  "closer_note": "NO. Live is blocked, no model exists, nothing is armed and this slice adds no path toward any of them. What it adds is apparatus for watching a thin clear decay.",
+  "git_commit": "94be00c5fb43eda3e1306f410efcf06c670ba21b"
+}

@@ -1,0 +1,91 @@
+{
+  "schema": "stage1_measurement/1",
+  "slice": 49,
+  "signal": "open_gap_fade_v1",
+  "intake": "NEW_SIGNAL_INTAKE.md (human-filled)",
+  "design_note": "EDGE.md §30",
+  "design_before_run": true,
+  "constants": {
+    "GAP_K": 0.75,
+    "ATR_PERIOD": 14,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 4,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_changed_after_seeing_numbers": false,
+  "grid_or_sweep_run": false,
+  "count_finding": {
+    "design_target_per_symbol": 50,
+    "log": "artifacts/slice49_count_finding_open_gap_fade.log",
+    "entries": {
+      "BTCUSD": 1,
+      "ETHUSDT": 0,
+      "SOLUSDT": 0
+    },
+    "symbols_meeting_target": [],
+    "cause": "24/7 spot markets have no overnight session: the daily open is the first print after 00:00 UTC and the prior daily close is the last print before it. open[t] == close[t-1] exactly on 540/3134 (17.2%) of BTCUSD bars, 702/1460 (48.1%) of ETHUSDT and 740/1460 (50.7%) of SOLUSDT; median |gap| is 0.0135% / 0.0002% / 0.0000% of price and 0.0031 / 0.0000 / 0.0000 ATR against a 0.75-ATR threshold. The largest gap anywhere in the BTC corpus is 1.661 ATR, once in 3,134 bars."
+  },
+  "control": {
+    "construction": "same-asset directed, whole-bar shuffle and re-base",
+    "clauses": {
+      "abs_z_max": 1.96,
+      "ks_min_p": 0.05,
+      "max_incomplete_pct": 5.0
+    },
+    "surrogates_requested": 200,
+    "rotations_each": 1000,
+    "BTCUSD": {
+      "verdict": "INVALID",
+      "usable_surrogates": 0,
+      "incomplete_pct": 100.0,
+      "log": "artifacts/slice49_control_open_gap_fade_BTCUSD_n1000.log"
+    },
+    "ETHUSDT": {
+      "verdict": "INVALID",
+      "usable_surrogates": 0,
+      "incomplete_pct": 100.0,
+      "log": "artifacts/slice49_control_open_gap_fade_ETHUSDT_n1000.log"
+    },
+    "SOLUSDT": {
+      "verdict": "INVALID",
+      "usable_surrogates": 0,
+      "incomplete_pct": 100.0,
+      "log": "artifacts/slice49_control_open_gap_fade_SOLUSDT_n1000.log"
+    },
+    "why_invalid": "CONSTRUCTION MISMATCH, NOT INSTRUMENT BIAS. skill_test.surrogate_series re-bases every shuffled bar with scale = price / bar.open where price is the previous surrogate bar's close, so every surrogate bar opens EXACTLY at the prior close and the gap is identically zero. The null does not destroy this trigger's information, it deletes the quantity. No surrogate produced a single scoreable entry, so clause (c) failed at 100% incomplete and clauses (a) and (b) had no sample at all. This says nothing about the ~1.5-point cross-asset bias or the slice-46 z = +3.6 finding.",
+    "predicted_before_the_run": true,
+    "prediction_commit": "6447fe5"
+  },
+  "edge": {
+    "runs_executed": 0,
+    "m1": null,
+    "m2": null,
+    "n_trades": null,
+    "mean_r": null,
+    "control_validated": false,
+    "attestation_log": "artifacts/slice49_no_edge_run_attestation.log",
+    "why_not_run": "Two independent sufficient reasons: every symbol is below the intake's 50-trade design target (1/0/0), and every control is INVALID. NO M1 AND NO M2 EXIST for this family; quoting one would be fabrication, not approximation."
+  },
+  "edge_verdict": "INCONCLUSIVE",
+  "positive_rule_met": false,
+  "positive_rule": "control_validated on every symbol claimed AND at least two of {BTCUSD, ETHUSDT, SOLUSDT} at M1 >= 95 and M2 >= 95 AND each of those with >= 50 scored trades",
+  "cleared_edge_signal": null,
+  "prior_six_still_frozen": true,
+  "frozen_absent_count": 6,
+  "freeze_of_this_family": "PROPOSED — awaiting human decision, per the slice 46 -> 47 precedent",
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "models_current_present": false,
+  "live_authorized": false,
+  "execution_mode": "paper",
+  "closer_to_autonomous_profit_agent": false,
+  "instrument_defect_recorded_not_repaired": "A surrogate that preserved each bar's open-to-prior-close offset would let this family be controlled. It is NOT built here: changing a null after seeing which way its verdict went is a construction chosen to fit a result. docs/RESEARCH_HOLD.md requires a human pre-declaration written before the run it enables.",
+  "standing_obstacle_added": "Open-gap, overnight-inventory and session-discontinuity theses are blocked on data for the entire eligible corpus: these venues never close, so the event does not exist. This is a data fact, not a result.",
+  "git_commit": "6447fe53efca47424d26fb7366a1d91f46b1b20b"
+}

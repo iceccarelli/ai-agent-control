@@ -1,0 +1,500 @@
+{
+  "schema": "forward_shadow_observation/14",
+  "slice": 75,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "observed_at_utc": "2026-08-23T12:32:09Z",
+  "extension_present": true,
+  "is_forward_observation": false,
+  "forward_n_trades": 0,
+  "forward_observations_to_date": 0,
+  "is_stage1_evidence": false,
+  "registration_eligible": false,
+  "cleared_edge_re_scored_this_slice": false,
+  "labelling_rule": "is_forward_observation = forward_n_trades > 0, NOT extension_present. A BAR ARRIVING IS NOT AN OBSERVATION. Declared in EDGE.md §45e before this tool ran.",
+  "ceiling": {
+    "closed_forward_bars": 13,
+    "closed_forward_bars_needed_for_one_trade": 6,
+    "max_possible_forward_closed_trades": 8,
+    "declared_in": "EDGE.md §58a, before this tool ran",
+    "observed_forward_closed_trades": 0,
+    "within_ceiling": true,
+    "note_on_this_milestone": "Ceiling 8 at N=13: not 7 — that was slice 74, at N=12 — and not 9, which would need N=14. Two things moved upstream: 2026-08-21 became a FLAG, the transition 2026-08-19 made in slice 73, and 2026-08-22 is a THIRD setup on the last bar. Nothing is scoreable: eligibility reaches back seven bars, so the highest scoreable bar is 2026-08-15. The gaps are recomputed from the corpus every slice and never carried forward — §57b reused a distance and got it wrong. EDGE.md §58b, §57e, §56d.",
+    "assumption_the_declared_ceiling_rests_on": "every trade holds for the full HORIZON. The code does not assume that: held = side_used.get(index, HORIZON) and the short-side barrier resolves in fewer than HORIZON bars on 52.8% of this corpus, so a decision later than last - HORIZON can also close inside the window.",
+    "unconditional_upper_bound": 12,
+    "contiguous_setup_runs": [
+      [
+        "2026-08-19"
+      ],
+      [
+        "2026-08-21",
+        "2026-08-22"
+      ]
+    ],
+    "max_entries_the_schedule_would_admit": 2,
+    "forward_bars_with_a_barrier_outcome": 6,
+    "what_actually_bound_this_slice": "barrier eligibility, not the horizon and not the schedule. See barrier_eligibility. EDGE.md §56d.",
+    "what_the_unconditional_bound_counts": "forward decision bars that have ANY next bar to enter on, i.e. every bar but the last. A count above THIS is a data or scheduling defect; a count above the declared ceiling may simply be early barrier resolution.",
+    "_prior_milestone_note": "FIRST STRUCTURAL NON-ZERO CEILING in the pilot series. It counts DECISION BARS that could yield a trade closing inside the window — exactly one, the first forward bar — not outcomes: whether such a trade closes also depends on the barrier resolving in the bars that remain, since entry falls on the following bar and the exit index must stay inside the corpus. A true upper bound, not a forecast.",
+    "if_exceeded": "CORRECTED IN SLICE 75 (EDGE.md §55c). Every artefact from slice 62 onward said a count above this ceiling is a DATA DEFECT or a scheduling bug. That was wrong: with early barrier resolution it can be ordinary and correct. The count that genuinely indicates a defect is one above unconditional_upper_bound. The declared ceiling is NOT re-derived — re-deriving a pre-declared bound in the slice where a setup first fired is exactly the move this programme refuses. Observed is 0 and below both."
+  },
+  "forward_window": {
+    "rule": "closed linear daily bars STRICTLY after t1",
+    "t1": "2026-08-09T00:00:00Z",
+    "t1_is_measured_not_forward": "Strict. A bar stamped exactly t1 is the last bar of the cleared run. Counting it as forward would be the slice-59 substitution in its smallest and most plausible form.",
+    "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+    "bars_strictly_after_t1": 13,
+    "of_which_closed": 13,
+    "bar_utcs": [
+      "2026-08-10T00:00:00Z",
+      "2026-08-11T00:00:00Z",
+      "2026-08-12T00:00:00Z",
+      "2026-08-13T00:00:00Z",
+      "2026-08-14T00:00:00Z",
+      "2026-08-15T00:00:00Z",
+      "2026-08-16T00:00:00Z",
+      "2026-08-17T00:00:00Z",
+      "2026-08-18T00:00:00Z",
+      "2026-08-19T00:00:00Z",
+      "2026-08-20T00:00:00Z",
+      "2026-08-21T00:00:00Z",
+      "2026-08-22T00:00:00Z"
+    ],
+    "corpus_last_bar_utc": "2026-08-22T00:00:00Z",
+    "built_by": "restrict_flags_to_forward (flags zeroed)",
+    "bar_array_sliced": false,
+    "why_not_sliced": "A 14-period ATR computed over a one-bar window is not a warm indicator, it is a number invented out of nothing, and every barrier derived from it would be fiction. Warm-up state legitimately flows from history. Decisions do not.",
+    "invented_future_bars": 0
+  },
+  "forward_decisions": {
+    "flagged_bars_in_window": [
+      "2026-08-19T00:00:00Z",
+      "2026-08-21T00:00:00Z"
+    ],
+    "candidates_after_schedule": [],
+    "entries_taken": 0,
+    "entries_refused_by_caps": 0,
+    "why_the_rule_stood_aside": [
+      {
+        "bar_utc": "2026-08-10T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-11T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-12T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-13T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-14T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-15T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-16T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-17T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-18T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-19T00:00:00Z",
+        "funding_setup_present": true,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-20T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-21T00:00:00Z",
+        "funding_setup_present": true,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-22T00:00:00Z",
+        "funding_setup_present": true,
+        "is_last_bar_of_corpus": true,
+        "excluded_as_last_bar": "directed_signal_bars excludes the final bar: the fill happens one bar later and there is no next bar to fill on",
+        "fund_abs_threshold": 0.0001
+      }
+    ],
+    "decisions_with_no_entry_bar_yet": [],
+    "decisions_whose_exit_bar_does_not_exist_yet": [],
+    "exit_clamping_to_corpus_end": false,
+    "why_no_clamping": "A trade that ran out of data has not closed. Clamping the exit index to the last bar that happens to exist would manufacture an exit price and report an unfinished trade as an observation."
+  },
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_fingerprint": "662de0115880871352d5d623b1020eaa",
+  "constants_fingerprint_matches_slice58": true,
+  "schedule_mode": "one_entry_per_contiguous_run",
+  "caps": {
+    "max_concurrent_positions": 1,
+    "max_entries_per_day": 1,
+    "max_notional_usd": 100.0,
+    "symbol": "BTCUSDT"
+  },
+  "caps_changed_this_slice": false,
+  "fund_abs_moved_this_slice": false,
+  "join_changed_this_slice": false,
+  "fund_abs": 0.0001,
+  "join_rule": "last funding print at-or-before the bar's CLOSE — funding.at_or_before(close_time_ms(bar)), reading only backwards in time",
+  "why_neither_moved": "A THRESHOLD WAS REACHED THIS SLICE WITHOUT ANYTHING BEING MOVED. 2026-08-19 close-joined at 0.00010000, equal to FUND_ABS exactly, and stood at the bar's close — the first forward decision ever to qualify (EDGE.md §55b). It counts for something precisely because the three near misses before it were left alone: a threshold reached by a market is evidence, and a threshold reached because it was lowered is not. THE THREE MISSES, UNRESCUED. (1) The 2026-08-12T00:00Z print equalled FUND_ABS exactly and was superseded before that bar's close, so only a change to the JOIN would capture it (EDGE.md §51c). (2) The 2026-08-17T16:00Z print was 0.00009202 and DID stand at its bar's close, so no join change is relevant — only a lower FUND_ABS would capture it, by 8.0e-6 (EDGE.md §53c). (3) The 2026-08-18T16:00Z print was 0.00003650, also standing at its close, and missed by 6.4e-5 — no adjustment short of abandoning the threshold reaches it (EDGE.md §54b). The first two exhaust the two available rescues; the third is the one that makes the case for leaving them alone, because a threshold whose misses are ALL narrow looks like a boundary being crept toward, and one that misses widely the very next day is behaving like a threshold. Adjusting a threshold or a join AFTER seeing which prints missed is fitting the rule to the data, and the rule was cleared under these values. The adjustment that would rescue any of these bars is precisely the one that would void the clear. Nothing moves this slice either: FUND_ABS 0.0001, HORIZON 5, join at bar close, caps unchanged — and neither does barrier_r_for_all_bars, which is again what stopped an entry and is again the most tempting thing in the tree to adjust. 2026-08-20 is still NOT a setup: its close-join is 0.00009422, the 16:00 print, and the 0.00010000 that printed at 08:00 that day is not the decision rate. §58d adds this slice's version: the rate has now printed exactly the base value for six consecutive prints, which is the 89th percentile of 294 such runs in this corpus and therefore unremarkable. §57c adds temptation this slice actually produced: FUND_ABS sits on the venue's BASE funding rate rather than on an extreme, which is a correction to how the rule is DESCRIBED and not a reason to re-derive it. A threshold changed after seeing which prints qualify is fitted to data whether the change is dressed as an optimisation or as a correction.",
+  "thresholds_moved_this_slice": false,
+  "monitor_thresholds": {
+    "M1_rolling_trades": {
+      "k": 10,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 10
+    },
+    "M2_rolling_days": {
+      "window_days": 90,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 5
+    },
+    "M3_concentration": {
+      "top_n": 3,
+      "warn_above": 0.6,
+      "min_trades": 10
+    },
+    "M4_halves": {
+      "min_trades": 20
+    }
+  },
+  "forward_monitor_readings": [
+    {
+      "name": "M1_rolling_trades",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": -0.25,
+      "n_trades": 0,
+      "detail": "needs 10 closed trades, has 0"
+    },
+    {
+      "name": "M2_rolling_days",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": -0.25,
+      "n_trades": 0,
+      "detail": "needs 5 trades closed in the last 90 days, has 0"
+    },
+    {
+      "name": "M3_concentration",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": 0.6,
+      "n_trades": 0,
+      "detail": "needs 10 closed trades, has 0"
+    },
+    {
+      "name": "M4_halves",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": null,
+      "n_trades": 0,
+      "detail": "needs 20 closed trades, has 0"
+    }
+  ],
+  "forward_monitor_status": "INSUFFICIENT_DATA",
+  "entries_blocked_by_monitor": false,
+  "monitor_scope_note": "These readings are over FORWARD trades only, which is why they report insufficient data rather than a state. The M-4 WARN recorded in slices 58-61 is a fact about the HISTORICAL segment and is deliberately NOT recomputed here into something that could be mistaken for a forward reading. It stands, unerased, in artifacts/slice59_forward_shadow.json and in EDGE.md §41j and §42d, and it remains an item a human must explicitly accept at the promotion gate. The only legitimate way it stops warning is new forward data recovering under the threshold AS IT STANDS.",
+  "forward_mean_net_r": null,
+  "forward_mean_note": "If this is ever non-null it is a capped pilot's mean with no rotation null, no drift-controlled contrast and no control behind it. It is NOT Stage-1 evidence, NOT registration-eligible, and NOT comparable with the OOS mean of +0.1736.",
+  "constants_fingerprint_matches_frozen": true,
+  "bars_fabricated": 0,
+  "promotion_gate_allows_live": false,
+  "state_ladder": {
+    "1_setups": 3,
+    "2_flagged": 2,
+    "3_eligible_and_flagged": 0,
+    "4_candidates_after_schedule": 0,
+    "5_entries_taken": 0,
+    "6_closed_trades": 0,
+    "definitions": {
+      "1_setups": "close-join rate reaches FUND_ABS (inclusive)",
+      "2_flagged": "the rule directs a trade there; requires the bar not be the corpus's last, because the fill is at the NEXT bar's open",
+      "3_eligible_and_flagged": "a barrier outcome is computable for that bar — see barrier_eligibility",
+      "4_candidates_after_schedule": "one_entry_per_contiguous_run and the lockup admit it",
+      "5_entries_taken": "a fill was attempted under the caps; counts fills, cap refusals, and decisions whose entry or exit bar does not exist yet",
+      "6_closed_trades": "entered AND exited on closed bars strictly after t1 — the only one the promotion gate counts"
+    },
+    "reading": "A number from a lower rung may never be reported as a higher one. Counting a setup, a flag, or an entry as a closed trade would be the slice-59 substitution."
+  },
+  "barrier_eligibility": {
+    "source": "tools/skill_test.py :: barrier_r_for_all_bars",
+    "rule": "eligible[max(0, n - horizon - entry_offset - 1):] = False",
+    "entry_on": "next_open",
+    "entry_offset": 1,
+    "horizon": 5,
+    "corpus_last_index": 1473,
+    "highest_scoreable_index": 1466,
+    "highest_scoreable_bar_utc": "2026-08-15T00:00:00Z",
+    "reaches_back_from_the_end_by_bars": 7,
+    "forward_bars_that_are_scoreable": [
+      "2026-08-10",
+      "2026-08-11",
+      "2026-08-12",
+      "2026-08-13",
+      "2026-08-14",
+      "2026-08-15"
+    ],
+    "forward_bars_that_are_not_scoreable": [
+      "2026-08-16",
+      "2026-08-17",
+      "2026-08-18",
+      "2026-08-19",
+      "2026-08-20",
+      "2026-08-21",
+      "2026-08-22"
+    ],
+    "closed_days_until_scoreable": {
+      "2026-08-16": 1,
+      "2026-08-17": 2,
+      "2026-08-18": 3,
+      "2026-08-19": 4,
+      "2026-08-20": 5,
+      "2026-08-21": 6,
+      "2026-08-22": 7
+    },
+    "how_that_is_computed": "a bar at index i is scoreable when the last index is at least i + horizon + 2, so the remaining closed days are (i + horizon + 2) - last. Read from the corpus this slice; never carried forward. EDGE.md §56d, §57e, §58b.",
+    "this_is_what_stopped_an_entry_this_slice": "2026-08-19 is a setup and, since 2026-08-20 closed, a FLAG. It is not scoreable: no barrier outcome exists for it, because the corpus ends before its entry bar could resolve. So it never reaches the schedule, and no entry is taken. The gate is arithmetic about available data, not a judgement about the trade.",
+    "not_modified_by_this_slice": true
+  },
+  "edge_state_when_this_ran": {
+    "edge_sha256": "0a6020d412572050d4a415d5da56cb737cb92b9c73b28b2903e75e9ff3e63584",
+    "sections_present": [
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36,
+      37,
+      38,
+      39,
+      40,
+      41,
+      42,
+      43,
+      44,
+      45,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      55,
+      56,
+      57,
+      58
+    ],
+    "self_reported": true
+  },
+  "window_grew_since_slice74": {
+    "comparable": true,
+    "previous_artefact": "artifacts/slice74_forward_shadow.json",
+    "closed_forward_bars_previously": 12,
+    "closed_forward_bars_now": 13,
+    "delta": 1,
+    "grew": true,
+    "setups_in_window": 3,
+    "setup_dates": [
+      "2026-08-19",
+      "2026-08-21",
+      "2026-08-22"
+    ],
+    "note": "THE WINDOW REACHED THIRTEEN BARS AND THE CEILING IS 8 — that many forward decision bars could yield a trade closing inside the window under a full-horizon hold. 3 of 13 decisions reached FUND_ABS: 2026-08-19, 2026-08-21, 2026-08-22. The measurement is 'ceiling 8, setups 3 of 13, fills 0' and no second sentence is entitled to more. A SETUP IS NOT A TRADE: it needs an entry bar and an exit inside the corpus, and a setup on the final bar has neither. It says NOTHING about whether the rule makes money, because no position was opened and only selectivity was exercised, never skill. The cleared run scheduled 41 trades in about two years, roughly one per eighteen days, so 3 of 13 is an entirely ordinary rate for this rule. EDGE.md §55b, §55d."
+  },
+  "funding_setup_table": [
+    {
+      "date": "2026-08-10",
+      "funding_at_decision": 5.057e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 4.9430000000000006e-05
+    },
+    {
+      "date": "2026-08-11",
+      "funding_at_decision": 8.282e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 1.718000000000001e-05
+    },
+    {
+      "date": "2026-08-12",
+      "funding_at_decision": 6.601e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 3.3990000000000005e-05
+    },
+    {
+      "date": "2026-08-13",
+      "funding_at_decision": 7.841e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 2.159e-05
+    },
+    {
+      "date": "2026-08-14",
+      "funding_at_decision": 6.29e-06,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 9.371000000000001e-05
+    },
+    {
+      "date": "2026-08-15",
+      "funding_at_decision": 5.311e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 4.689000000000001e-05
+    },
+    {
+      "date": "2026-08-16",
+      "funding_at_decision": 5e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 5e-05
+    },
+    {
+      "date": "2026-08-17",
+      "funding_at_decision": 9.202e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 7.980000000000002e-06
+    },
+    {
+      "date": "2026-08-18",
+      "funding_at_decision": 3.65e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 6.35e-05
+    },
+    {
+      "date": "2026-08-19",
+      "funding_at_decision": 0.0001,
+      "fund_abs": 0.0001,
+      "funding_setup_present": true,
+      "shortfall_vs_fund_abs": 0.0
+    },
+    {
+      "date": "2026-08-20",
+      "funding_at_decision": 9.422e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 5.780000000000002e-06
+    },
+    {
+      "date": "2026-08-21",
+      "funding_at_decision": 0.0001,
+      "fund_abs": 0.0001,
+      "funding_setup_present": true,
+      "shortfall_vs_fund_abs": 0.0
+    },
+    {
+      "date": "2026-08-22",
+      "funding_at_decision": 0.0001,
+      "fund_abs": 0.0001,
+      "funding_setup_present": true,
+      "shortfall_vs_fund_abs": 0.0
+    }
+  ],
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "live_authorized": false,
+  "policy_mode": "off",
+  "execution_mode": "paper",
+  "models_current_present": false,
+  "frozen_absent_count": 11,
+  "closer_to_autonomous_profit_agent": false,
+  "why_not_closer": "13 post-t1 days is pilot progress, not autonomy — and a longer window is a larger denominator, not a result. The gate counts closed forward trades and it counts 0.",
+  "trades": [],
+  "git_commit": "47dbe22fccc320e9d0f2a09afb7a3c62c3d6c81f"
+}

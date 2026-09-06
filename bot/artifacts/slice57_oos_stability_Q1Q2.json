@@ -1,0 +1,45 @@
+{
+  "schema": "oos_stability/1",
+  "slice": 57,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "is_a_gate_clause": false,
+  "note": "A DIAGNOSTIC. The intake lists five clauses and this is not one of them. It cannot fail the gate and it cannot rescue it. Each half holds roughly 20 trades, so a difference between them is weak evidence on its own — stated here rather than left for a reader to infer.",
+  "method": "oos_window_halved_by_bar_index",
+  "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+  "oos_bar_range": [
+    730,
+    1461
+  ],
+  "q_split_index": 1095,
+  "q1": {
+    "n_trades": 21,
+    "mean_net_r": 0.316373097208067,
+    "sum_net_r": 6.643835041369407,
+    "positive_trades": 13,
+    "best_trade_r": 0.9859282295092152,
+    "worst_trade_r": -1.0495830601015057
+  },
+  "q2": {
+    "n_trades": 20,
+    "mean_net_r": 0.023626547224828764,
+    "sum_net_r": 0.4725309444965753,
+    "positive_trades": 12,
+    "best_trade_r": 0.9703635057834242,
+    "worst_trade_r": -1.0594161079885378
+  },
+  "oos_whole": {
+    "n_trades": 41,
+    "mean_net_r": 0.1735699020942922,
+    "sum_net_r": 7.116365985865981,
+    "positive_trades": 25,
+    "best_trade_r": 0.9859282295092152,
+    "worst_trade_r": -1.0594161079885378
+  },
+  "concentration": {
+    "top_1_trade_share_of_total_r": 0.13854377802763304,
+    "top_3_trades_share_of_total_r": 0.41125467750434497,
+    "note": "Share of the summed net R carried by the best 1 and best 3 trades. A mean of +0.17 over 41 trades reads very differently if one trade carries most of it."
+  },
+  "git_commit": "8991b5e74e28268ca3825f724064c95c0efc9b16"
+}

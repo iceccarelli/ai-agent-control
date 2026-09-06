@@ -1,0 +1,746 @@
+{
+  "artefact_fingerprint": "980e097aced53c4fcef11e0cab3b1764a1ac29b35909663a050250c3a1eea9a6",
+  "artefact_path": "/home/claude/work/repo/models/rejected/d9701527a970",
+  "artefact_schema": "policy-artefact/1",
+  "corpus": {
+    "bars": 61513,
+    "file_sha256": {
+      "ohlcv/BITSTAMP_SPOT_BTC_USD_1H.csv.gz": "c523952e818031a86acbbcabe16261168c72803dda8ed2ffa43e2f0402ae9ad4"
+    },
+    "files_checked": 1,
+    "first_bar": "2018-01-01T00:00:00Z",
+    "last_bar": "2025-01-07T00:00:00Z",
+    "manifest_sha256": "e175f5a71e7f24dd5d069fa9202d8a1c33e0f28099aa6304db02861a8cf2db45",
+    "notes": [
+      "BTCUSD: no order book in the corpus \u2014 the liquidity gate will abstain for this symbol"
+    ],
+    "recompressed": [],
+    "root": "/home/claude/work/repo/data/real",
+    "source": {
+      "exchange": "BITSTAMP",
+      "file": "btcusd_bitstamp_1min_2012-2025.csv.gz",
+      "instrument": "BTC/USD",
+      "licence": "MIT",
+      "native_resolution": "1m",
+      "provenance": "local file /tmp/bts/data/historical/btcusd_bitstamp_1min_2012-2025.csv.gz",
+      "sha256": "46fe0bbe0491b33b8e85dfec079d6b96049705e87892e985a13ef43ff8cafbde"
+    },
+    "symbol": "BTCUSD",
+    "synthetic": false
+  },
+  "dataset": {
+    "always_missing": [
+      "book_spread_bps",
+      "book_imbalance",
+      "book_microprice_dev_bps"
+    ],
+    "bars_seen": 61513,
+    "dropped_cold": 263,
+    "dropped_missing_features": 9,
+    "dropped_unresolved_label": 8,
+    "rows_kept": 61233,
+    "rows_with_book": 0
+  },
+  "determinism": {
+    "hyperparameters": {
+      "early_stopping": false,
+      "l2_regularization": 1.0,
+      "learning_rate": 0.05,
+      "max_bins": 64,
+      "max_depth": 3,
+      "max_iter": 200,
+      "max_leaf_nodes": 8,
+      "min_samples_leaf": 200,
+      "random_state": 7
+    },
+    "note": "artefact_fingerprint is reproducible across runs; policy_content_hash is not, because policy.save records the wall-clock training time inside the hashed document",
+    "seed": 7
+  },
+  "estimator_sha256": "74cb0377ab66d5c8636c039528044c34b3e5ba764d8b1f1b66a9dca707d8530e",
+  "feature_importance": {
+    "base_auc": 0.5379800542911642,
+    "measured_on": "the holdout block (12247 rows) \u2014 genuinely out of sample for this model",
+    "method": "permutation, AUC drop",
+    "ranked": [
+      {
+        "feature": "dist_sma100_atr",
+        "mean_auc_drop": 0.008306897459325335,
+        "repeats": 5,
+        "std_auc_drop": 0.002645063190678877
+      },
+      {
+        "feature": "di_spread",
+        "mean_auc_drop": 0.007271691319737883,
+        "repeats": 5,
+        "std_auc_drop": 0.002110701702197969
+      },
+      {
+        "feature": "dist_sma50_atr",
+        "mean_auc_drop": 0.005010145714015568,
+        "repeats": 5,
+        "std_auc_drop": 0.0012094829578933694
+      },
+      {
+        "feature": "ret_24",
+        "mean_auc_drop": 0.0045327882132642165,
+        "repeats": 5,
+        "std_auc_drop": 0.0008708219623836272
+      },
+      {
+        "feature": "rv_72",
+        "mean_auc_drop": 0.00412094871611095,
+        "repeats": 5,
+        "std_auc_drop": 0.0003865150761327007
+      },
+      {
+        "feature": "macd_hist_z",
+        "mean_auc_drop": 0.003949040749692712,
+        "repeats": 5,
+        "std_auc_drop": 0.0010662427749945442
+      },
+      {
+        "feature": "ret_4",
+        "mean_auc_drop": 0.0036039238526369257,
+        "repeats": 5,
+        "std_auc_drop": 0.0010749591170704912
+      },
+      {
+        "feature": "ret_72",
+        "mean_auc_drop": 0.0025445896451680603,
+        "repeats": 5,
+        "std_auc_drop": 0.0004922106799228136
+      },
+      {
+        "feature": "ret_24_vol_norm",
+        "mean_auc_drop": 0.0023232450384176317,
+        "repeats": 5,
+        "std_auc_drop": 0.0010722429466457413
+      },
+      {
+        "feature": "sma20_slope_atr",
+        "mean_auc_drop": 0.0023102233502599657,
+        "repeats": 5,
+        "std_auc_drop": 0.0004686102656885959
+      },
+      {
+        "feature": "atr_pct",
+        "mean_auc_drop": 0.0020747126886774938,
+        "repeats": 5,
+        "std_auc_drop": 0.0007516311307052794
+      },
+      {
+        "feature": "dow_cos",
+        "mean_auc_drop": 0.0018833806037076516,
+        "repeats": 5,
+        "std_auc_drop": 0.0003408997336826718
+      },
+      {
+        "feature": "dow_sin",
+        "mean_auc_drop": 0.0018471222490780593,
+        "repeats": 5,
+        "std_auc_drop": 0.0006852276223677585
+      },
+      {
+        "feature": "volume_z_50",
+        "mean_auc_drop": 0.0018446588492369242,
+        "repeats": 5,
+        "std_auc_drop": 0.0008075384789870991
+      },
+      {
+        "feature": "volume_trend",
+        "mean_auc_drop": 0.0017302583196963095,
+        "repeats": 5,
+        "std_auc_drop": 0.0008776692306180071
+      },
+      {
+        "feature": "close_location",
+        "mean_auc_drop": 0.001493567153544495,
+        "repeats": 5,
+        "std_auc_drop": 0.00022311188090030258
+      },
+      {
+        "feature": "vol_regime_pct",
+        "mean_auc_drop": 0.00045501825867144685,
+        "repeats": 5,
+        "std_auc_drop": 0.0004712496511810155
+      },
+      {
+        "feature": "lower_wick_fraction",
+        "mean_auc_drop": 0.00037827943868213866,
+        "repeats": 5,
+        "std_auc_drop": 8.48136848696882e-05
+      },
+      {
+        "feature": "bb_position",
+        "mean_auc_drop": 0.0003383470647296383,
+        "repeats": 5,
+        "std_auc_drop": 8.235221434728637e-05
+      },
+      {
+        "feature": "body_fraction",
+        "mean_auc_drop": 0.00023058988488273703,
+        "repeats": 5,
+        "std_auc_drop": 0.0007841718773463211
+      },
+      {
+        "feature": "rv_24",
+        "mean_auc_drop": 0.00012074875309204813,
+        "repeats": 5,
+        "std_auc_drop": 0.0013333661805516228
+      },
+      {
+        "feature": "adx_norm",
+        "mean_auc_drop": 9.103135745378577e-05,
+        "repeats": 5,
+        "std_auc_drop": 0.0016775271519775578
+      },
+      {
+        "feature": "ret_1",
+        "mean_auc_drop": 3.0018544763121822e-05,
+        "repeats": 5,
+        "std_auc_drop": 0.0001208286705621025
+      },
+      {
+        "feature": "ret_12",
+        "mean_auc_drop": 2.2718689977230256e-05,
+        "repeats": 5,
+        "std_auc_drop": 0.00019842502949983854
+      },
+      {
+        "feature": "range_atr",
+        "mean_auc_drop": -5.288178632021356e-05,
+        "repeats": 5,
+        "std_auc_drop": 0.00039801324700571846
+      },
+      {
+        "feature": "upper_wick_fraction",
+        "mean_auc_drop": -7.101698661753364e-05,
+        "repeats": 5,
+        "std_auc_drop": 8.117406011369585e-05
+      },
+      {
+        "feature": "hour_sin",
+        "mean_auc_drop": -8.785122269552303e-05,
+        "repeats": 5,
+        "std_auc_drop": 9.902199475575972e-05
+      },
+      {
+        "feature": "hour_cos",
+        "mean_auc_drop": -0.00023437231789058544,
+        "repeats": 5,
+        "std_auc_drop": 0.0003975186195445015
+      },
+      {
+        "feature": "rsi_norm",
+        "mean_auc_drop": -0.00024456922725735186,
+        "repeats": 5,
+        "std_auc_drop": 0.00020616898126876688
+      },
+      {
+        "feature": "dist_sma20_atr",
+        "mean_auc_drop": -0.0004956432756110685,
+        "repeats": 5,
+        "std_auc_drop": 0.0012064339813834043
+      },
+      {
+        "feature": "bb_width",
+        "mean_auc_drop": -0.0005103032150078013,
+        "repeats": 5,
+        "std_auc_drop": 0.0004111104619199212
+      },
+      {
+        "feature": "vol_ratio_24_72",
+        "mean_auc_drop": -0.0013503406297750598,
+        "repeats": 5,
+        "std_auc_drop": 0.0022341328671965596
+      }
+    ],
+    "repeats": 5
+  },
+  "features": {
+    "declared": [
+      "ret_1",
+      "ret_4",
+      "ret_12",
+      "ret_24",
+      "ret_72",
+      "ret_24_vol_norm",
+      "rv_24",
+      "rv_72",
+      "vol_ratio_24_72",
+      "vol_regime_pct",
+      "atr_pct",
+      "rsi_norm",
+      "macd_hist_z",
+      "adx_norm",
+      "di_spread",
+      "bb_position",
+      "bb_width",
+      "dist_sma20_atr",
+      "dist_sma50_atr",
+      "dist_sma100_atr",
+      "sma20_slope_atr",
+      "volume_z_50",
+      "volume_trend",
+      "body_fraction",
+      "upper_wick_fraction",
+      "lower_wick_fraction",
+      "close_location",
+      "range_atr",
+      "hour_sin",
+      "hour_cos",
+      "dow_sin",
+      "dow_cos",
+      "book_spread_bps",
+      "book_imbalance",
+      "book_microprice_dev_bps"
+    ],
+    "dropped_unmeasurable": [
+      "book_spread_bps",
+      "book_imbalance",
+      "book_microprice_dev_bps"
+    ],
+    "schema_digest": "2283fd5d38f591e9",
+    "schema_version": "1.0.0",
+    "used": [
+      "ret_1",
+      "ret_4",
+      "ret_12",
+      "ret_24",
+      "ret_72",
+      "ret_24_vol_norm",
+      "rv_24",
+      "rv_72",
+      "vol_ratio_24_72",
+      "vol_regime_pct",
+      "atr_pct",
+      "rsi_norm",
+      "macd_hist_z",
+      "adx_norm",
+      "di_spread",
+      "bb_position",
+      "bb_width",
+      "dist_sma20_atr",
+      "dist_sma50_atr",
+      "dist_sma100_atr",
+      "sma20_slope_atr",
+      "volume_z_50",
+      "volume_trend",
+      "body_fraction",
+      "upper_wick_fraction",
+      "lower_wick_fraction",
+      "close_location",
+      "range_atr",
+      "hour_sin",
+      "hour_cos",
+      "dow_sin",
+      "dow_cos"
+    ],
+    "warmup_bars": 264
+  },
+  "git_commit": "50ff4b43db39fb4c2434c642c55008499db5a845",
+  "label": {
+    "barriers": {
+      "atr_period": 14,
+      "direction": 1,
+      "max_horizon": 24,
+      "reward_to_risk": 2.0,
+      "stop_atr": 1.0,
+      "take_profit_atr": 2.0
+    },
+    "binary_base_rate": 0.30130547231002913,
+    "counts_three_way": {
+      "stop": 39950,
+      "take_profit": 18790,
+      "timeout": 2493
+    },
+    "definition": "triple-barrier long: y=1 iff the +2xATR(14) take-profit was touched before the -1xATR stop within 24 bars from this bar's close; the stop and the timeout are BOTH y=0, so P(y=1) is the probability of a completed winning trade, not of a positive return"
+  },
+  "manifest_schema": "policy-training/1",
+  "metrics": {
+    "holdout": {
+      "accuracy": 0.6691434637053972,
+      "auc": 0.5379800542911642,
+      "base_rate": 0.33085653629460277,
+      "baseline_brier": 0.22226375406836135,
+      "brier": 0.22174052181249965,
+      "brier_skill": 0.002354105184873223,
+      "calibration": {
+        "base_rate": 0.33085653629460277,
+        "brier": 0.22174052181249965,
+        "buckets": [
+          {
+            "count": 0,
+            "lower": 0.0,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.1
+          },
+          {
+            "count": 46,
+            "lower": 0.1,
+            "mean_predicted": 0.1836762828681672,
+            "observed_frequency": 0.34782608695652173,
+            "upper": 0.2
+          },
+          {
+            "count": 5887,
+            "lower": 0.2,
+            "mean_predicted": 0.2793135650353288,
+            "observed_frequency": 0.30643791404790216,
+            "upper": 0.30000000000000004
+          },
+          {
+            "count": 6312,
+            "lower": 0.30000000000000004,
+            "mean_predicted": 0.31879824518395417,
+            "observed_frequency": 0.35361216730038025,
+            "upper": 0.4
+          },
+          {
+            "count": 2,
+            "lower": 0.4,
+            "mean_predicted": 0.40985403441358254,
+            "observed_frequency": 0.0,
+            "upper": 0.5
+          },
+          {
+            "count": 0,
+            "lower": 0.5,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.6000000000000001
+          },
+          {
+            "count": 0,
+            "lower": 0.6000000000000001,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.7000000000000001
+          },
+          {
+            "count": 0,
+            "lower": 0.7000000000000001,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.8
+          },
+          {
+            "count": 0,
+            "lower": 0.8,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.9
+          },
+          {
+            "count": 0,
+            "lower": 0.9,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 1.0
+          }
+        ],
+        "expected_calibration_error": 0.03166466221056523,
+        "max_calibration_error": 0.40985403441358254,
+        "n_samples": 12247
+      },
+      "first_bar": "2023-08-15T08:00:00Z",
+      "last_bar": "2025-01-06T16:00:00Z",
+      "log_loss": 0.6357393537578885,
+      "n_samples": 12247,
+      "train_base_rate": 0.30130547231002913
+    },
+    "walk_forward": {
+      "base_rate": 0.30130547231002913,
+      "calibration": {
+        "base_rate": 0.3039640795381655,
+        "brier": 0.21233098874900813,
+        "buckets": [
+          {
+            "count": 0,
+            "lower": 0.0,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.1
+          },
+          {
+            "count": 1242,
+            "lower": 0.1,
+            "mean_predicted": 0.18197482450134533,
+            "observed_frequency": 0.2181964573268921,
+            "upper": 0.2
+          },
+          {
+            "count": 22095,
+            "lower": 0.2,
+            "mean_predicted": 0.2635361262738118,
+            "observed_frequency": 0.30386965376782077,
+            "upper": 0.30000000000000004
+          },
+          {
+            "count": 15485,
+            "lower": 0.30000000000000004,
+            "mean_predicted": 0.32901868421577724,
+            "observed_frequency": 0.30939618986115597,
+            "upper": 0.4
+          },
+          {
+            "count": 153,
+            "lower": 0.4,
+            "mean_predicted": 0.4141217519007989,
+            "observed_frequency": 0.46405228758169936,
+            "upper": 0.5
+          },
+          {
+            "count": 0,
+            "lower": 0.5,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.6000000000000001
+          },
+          {
+            "count": 0,
+            "lower": 0.6000000000000001,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.7000000000000001
+          },
+          {
+            "count": 0,
+            "lower": 0.7000000000000001,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.8
+          },
+          {
+            "count": 0,
+            "lower": 0.8,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 0.9
+          },
+          {
+            "count": 0,
+            "lower": 0.9,
+            "mean_predicted": null,
+            "observed_frequency": null,
+            "upper": 1.0
+          }
+        ],
+        "expected_calibration_error": 0.0320115524051301,
+        "max_calibration_error": 0.049930535680900445,
+        "n_samples": 38975
+      },
+      "calibration_cv": "purged_walk_forward(2)",
+      "calibration_method": "sigmoid",
+      "embargo_bars": 264,
+      "feature_names": [
+        "ret_1",
+        "ret_4",
+        "ret_12",
+        "ret_24",
+        "ret_72",
+        "ret_24_vol_norm",
+        "rv_24",
+        "rv_72",
+        "vol_ratio_24_72",
+        "vol_regime_pct",
+        "atr_pct",
+        "rsi_norm",
+        "macd_hist_z",
+        "adx_norm",
+        "di_spread",
+        "bb_position",
+        "bb_width",
+        "dist_sma20_atr",
+        "dist_sma50_atr",
+        "dist_sma100_atr",
+        "sma20_slope_atr",
+        "volume_z_50",
+        "volume_trend",
+        "body_fraction",
+        "upper_wick_fraction",
+        "lower_wick_fraction",
+        "close_location",
+        "range_atr",
+        "hour_sin",
+        "hour_cos",
+        "dow_sin",
+        "dow_cos"
+      ],
+      "folds": [
+        {
+          "accuracy": 0.700944170771757,
+          "auc": 0.536099895390657,
+          "base_rate": 0.29905582922824303,
+          "baseline_brier": 0.2098104662366158,
+          "brier": 0.21088314565298655,
+          "fold": 0,
+          "log_loss": 0.613509380975994,
+          "n_embargoed": 263,
+          "n_purged": 6,
+          "n_train": 9474,
+          "n_val": 9744,
+          "skipped_reason": null,
+          "val_start": 9743,
+          "val_stop": 19487
+        },
+        {
+          "accuracy": 0.6756645796982449,
+          "auc": 0.5266256150768089,
+          "base_rate": 0.3243354203017551,
+          "baseline_brier": 0.2200615555316815,
+          "brier": 0.2214980128363406,
+          "fold": 1,
+          "log_loss": 0.6360887184385549,
+          "n_embargoed": 269,
+          "n_purged": 1,
+          "n_train": 19217,
+          "n_val": 9743,
+          "skipped_reason": null,
+          "val_start": 19487,
+          "val_stop": 29230
+        },
+        {
+          "accuracy": 0.7142857142857143,
+          "auc": 0.539850097849782,
+          "base_rate": 0.2857142857142857,
+          "baseline_brier": 0.2044381935419366,
+          "brier": 0.2043338494799765,
+          "fold": 2,
+          "log_loss": 0.5986978675528782,
+          "n_embargoed": 273,
+          "n_purged": 4,
+          "n_train": 28953,
+          "n_val": 9744,
+          "skipped_reason": null,
+          "val_start": 29230,
+          "val_stop": 38974
+        },
+        {
+          "accuracy": 0.6932471264367817,
+          "auc": 0.5198878245647315,
+          "base_rate": 0.3067528735632184,
+          "baseline_brier": 0.21269809688312316,
+          "brier": 0.21260988781327325,
+          "fold": 3,
+          "log_loss": 0.6164254175494644,
+          "n_embargoed": 264,
+          "n_purged": 3,
+          "n_train": 38707,
+          "n_val": 9744,
+          "skipped_reason": null,
+          "val_start": 38974,
+          "val_stop": 48718
+        }
+      ],
+      "hyperparameters": {
+        "early_stopping": false,
+        "l2_regularization": 1.0,
+        "learning_rate": 0.05,
+        "max_bins": 64,
+        "max_depth": 3,
+        "max_iter": 200,
+        "max_leaf_nodes": 8,
+        "min_samples_leaf": 200,
+        "random_state": 7
+      },
+      "label_definition": "triple-barrier long: y=1 iff the +2xATR(14) take-profit was touched before the -1xATR stop within 24 bars from this bar's close; the stop and the timeout are BOTH y=0, so P(y=1) is the probability of a completed winning trade, not of a positive return",
+      "n_features": 32,
+      "n_folds": 4,
+      "n_samples": 48718,
+      "oos": {
+        "accuracy_mean": 0.6960353977981244,
+        "auc_mean": 0.5306158582204948,
+        "auc_min": 0.5198878245647315,
+        "auc_std": 0.007847907231863502,
+        "baseline_brier_mean": 0.21175207804833926,
+        "brier_mean": 0.21233122394564422,
+        "brier_skill": -0.0027350187192625164,
+        "log_loss_mean": 0.6161803461292229
+      },
+      "purge_enabled": true,
+      "schema_version": "1.0.0",
+      "threshold": 0.5,
+      "train_end": null,
+      "train_start": null,
+      "trained_at": "2026-07-26T17:02:50.909113Z"
+    }
+  },
+  "policy_content_hash": "6a69b07a987ee9f527ab190553bd00354cd87a552f80aa7554fc198cef16a5a5",
+  "promotion": {
+    "criteria": {
+      "max_base_rate": 0.95,
+      "max_calibration_error": 0.05,
+      "min_auc_mean": 0.55,
+      "min_auc_per_fold": 0.52,
+      "min_base_rate": 0.05,
+      "min_brier_skill": 0.01,
+      "min_samples": 1000,
+      "min_usable_folds": 3
+    },
+    "holdout_ok": false,
+    "holdout_reasons": [
+      "HOLDOUT_AUC_TOO_LOW: 0.5380 < 0.55",
+      "HOLDOUT_BRIER_NO_BETTER_THAN_BASE_RATE: skill=0.0024 < 0.01 (brier=0.2217 vs baseline 0.2223)"
+    ],
+    "min_holdout_samples": 200,
+    "promoted": false,
+    "walk_forward_ok": false,
+    "walk_forward_reasons": [
+      "AUC_MEAN_TOO_LOW: 0.5306 < 0.55",
+      "AUC_INCONSISTENT_ACROSS_FOLDS: fold 3=0.5199 < 0.52",
+      "BRIER_NO_BETTER_THAN_BASE_RATE: skill=-0.0027 < 0.01 (brier=0.2123 vs baseline 0.2118)"
+    ]
+  },
+  "run_id": "d9701527a970",
+  "split": {
+    "boundary_purged": {
+      "n_samples": 268,
+      "why": "rows before the cut whose label window reached into the holdout (plus the embargo); training on them would mean the holdout had already been seen through the label"
+    },
+    "embargo_bars": 264,
+    "fold_validation_ranges": [
+      {
+        "first_bar": "2019-02-21T22:00:00Z",
+        "fold": 0,
+        "last_bar": "2020-04-02T21:00:00Z"
+      },
+      {
+        "first_bar": "2020-04-02T22:00:00Z",
+        "fold": 1,
+        "last_bar": "2021-05-14T00:00:00Z"
+      },
+      {
+        "first_bar": "2021-05-14T01:00:00Z",
+        "fold": 2,
+        "last_bar": "2022-06-24T01:00:00Z"
+      },
+      {
+        "first_bar": "2022-06-24T02:00:00Z",
+        "fold": 3,
+        "last_bar": "2023-08-04T04:00:00Z"
+      }
+    ],
+    "holdout": {
+      "first_bar": "2023-08-15T08:00:00Z",
+      "last_bar": "2025-01-06T16:00:00Z",
+      "n_samples": 12247
+    },
+    "holdout_from": "2023-08-15T07:48:00Z",
+    "holdout_from_source": "default: the last 20% of the 2552-day sample span",
+    "n_folds": 4,
+    "train_validate": {
+      "first_bar": "2018-01-11T23:00:00Z",
+      "last_bar": "2023-08-04T04:00:00Z",
+      "n_samples": 48718
+    }
+  },
+  "started_at": "2026-07-26T17:02:46Z",
+  "tool": "tools/train_policy.py",
+  "tool_version": 1,
+  "warnings": [
+    "This tool reports probability quality, not profit. No return, expectancy or Sharpe figure is produced anywhere in it.",
+    "The holdout is single-use. Any hyper-parameter chosen after looking at the holdout metrics has spent it, and this manifest cannot detect that happening."
+  ]
+}

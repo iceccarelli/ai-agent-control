@@ -1,0 +1,423 @@
+{
+  "schema": "data_freshness/11",
+  "slice": 70,
+  "symbol": "BTCUSDT",
+  "checked_at_utc": "2026-08-18T23:11:57Z",
+  "extension_present": true,
+  "new_bars_available": true,
+  "after_t1_linear": 8,
+  "after_t1_funding": 27,
+  "after_t1_dates": [
+    "2026-08-10",
+    "2026-08-11",
+    "2026-08-12",
+    "2026-08-13",
+    "2026-08-14",
+    "2026-08-15",
+    "2026-08-16",
+    "2026-08-17"
+  ],
+  "delta_since_slice69": {
+    "previous_artefact": "artifacts/slice69_data_freshness.json",
+    "previous_after_t1_linear": 7,
+    "previous_after_t1_funding": 24,
+    "new_linear_bars_since_slice69": 1,
+    "new_funding_prints_since_slice69": 3,
+    "the_window_grew": true,
+    "why_this_field_exists": "t1 does not move, so once one bar lands after it extension_present is permanently true and re-reporting it reads like progress every slice. The informative quantity is the DELTA, and it is written here so a reader does not have to diff two artefacts to learn whether anything happened. EDGE.md §46c.",
+    "finding": "THE WINDOW REACHED EIGHT BARS. 1 new closed daily bar(s) since the previous artefact, taking the ceiling to 3. That many forward decision bars could now yield a trade that closes inside the window. Zero setups fired: every rate at a decision is below FUND_ABS. The measurement is 'ceiling 3, setups 0 of 8, fills 0' and there is no second sentence entitled to more. EDGE.md §53b, §53c, §53d."
+  },
+  "t1": "2026-08-09T00:00:00Z",
+  "t1_ms": 1786233600000,
+  "t1_source": "artifacts/funding_carry_fade_btc_v1_folds.json",
+  "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+  "folds_unmodified": true,
+  "latest_linear_timestamp": "2026-08-17T00:00:00+00:00",
+  "latest_funding_timestamp": "2026-08-18T16:00:00+00:00",
+  "linear_rows": 1469,
+  "funding_rows": 4410,
+  "new_linear_bars_count": 8,
+  "new_funding_prints_count": 27,
+  "digests": {
+    "linear_sha256_uncompressed": "416e4430cd5eb0844bb7a64601fd36855bafa26146570722c7d4424b4b06eea9",
+    "linear_sha256_compressed": "9fdd5842237bb60b0ef9120f028bf10da0267225f18ef77f7e3bcad6afd47f26",
+    "funding_sha256_uncompressed": "fa8b207f79115694ec2908507e830c56a7a2a44c1d4f5bd0355223775450bf73",
+    "funding_sha256_compressed": "b533d2ed721fdd2eb76a343b5f6d6cfa00208d064c3fddb07bba4435082c988d",
+    "which_one_the_repository_pins": "uncompressed",
+    "note_quotes_the_compressed_digest": true,
+    "note_linear_sha256": "9fdd5842237bb60b0ef9120f028bf10da0267225f18ef77f7e3bcad6afd47f26",
+    "note_digest_matches_the_compressed_file": true,
+    "slice69_linear_sha256_uncompressed": "81b8194bd95331cef84fdaec4f1d935fe4d44e272d53ab140a1cd61297bd60ca",
+    "linear_identical_to_slice69_uncompressed": false,
+    "linear_differs_from_slice69_because_a_bar_arrived": true,
+    "the_trap": "The note's digest differs from slice 62's, which read alone says the linear corpus changed. It did not. Both figures are digests of the COMPRESSED file and gzip's header varies between compression runs; the uncompressed streams are byte-identical. TWO DIFFERENT COMPRESSED DIGESTS OVER IDENTICAL CONTENT. Had the check been the one the note quotes, this slice would have opened by reporting a change that did not happen — and a later slice, seeing the same thing in reverse, could have missed one that did."
+  },
+  "prefix_invariant": {
+    "rule": "a pinned digest is asserted against the PREFIX of the file at the pinned row count; growth is permitted only as an append, and every appended row must be strictly after t1",
+    "declared_in": "EDGE.md §45c",
+    "pins_from": "artifacts/slice55_data_eligibility.json",
+    "pinned_digests_agree_across_two_records": {
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz": true,
+      "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz": true
+    },
+    "all_corpora_append_only": true,
+    "history_rewritten": false,
+    "checks": {
+      "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz": {
+        "path": "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz",
+        "pinned_rows": 4383,
+        "pinned_sha256_uncompressed": "9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145",
+        "rows_on_disk": 4410,
+        "whole_file_sha256_uncompressed": "fa8b207f79115694ec2908507e830c56a7a2a44c1d4f5bd0355223775450bf73",
+        "prefix_sha256_uncompressed": "9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 27,
+        "appended_timestamps": [
+          "2026-08-10T00:00:00+00:00",
+          "2026-08-10T08:00:00+00:00",
+          "2026-08-10T16:00:00+00:00",
+          "2026-08-11T00:00:00+00:00",
+          "2026-08-11T08:00:00+00:00",
+          "2026-08-11T16:00:00+00:00",
+          "2026-08-12T00:00:00+00:00",
+          "2026-08-12T08:00:00+00:00",
+          "2026-08-12T16:00:00+00:00",
+          "2026-08-13T00:00:00+00:00",
+          "2026-08-13T08:00:00+00:00",
+          "2026-08-13T16:00:00+00:00",
+          "2026-08-14T00:00:00+00:00",
+          "2026-08-14T08:00:00+00:00",
+          "2026-08-14T16:00:00+00:00",
+          "2026-08-15T00:00:00+00:00",
+          "2026-08-15T08:00:00+00:00",
+          "2026-08-15T16:00:00+00:00",
+          "2026-08-16T00:00:00+00:00",
+          "2026-08-16T08:00:00+00:00",
+          "2026-08-16T16:00:00+00:00",
+          "2026-08-17T00:00:00+00:00",
+          "2026-08-17T08:00:00+00:00",
+          "2026-08-17T16:00:00+00:00",
+          "2026-08-18T00:00:00+00:00",
+          "2026-08-18T08:00:00+00:00",
+          "2026-08-18T16:00:00+00:00"
+        ],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": true,
+        "why_not": ""
+      },
+      "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz": {
+        "path": "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz",
+        "pinned_rows": 4383,
+        "pinned_sha256_uncompressed": "695513e27cda0311fdb2940d8aff8c46d7f2251fccb47ffdcbc71c0bb208bf5d",
+        "rows_on_disk": 4383,
+        "whole_file_sha256_uncompressed": "695513e27cda0311fdb2940d8aff8c46d7f2251fccb47ffdcbc71c0bb208bf5d",
+        "prefix_sha256_uncompressed": "695513e27cda0311fdb2940d8aff8c46d7f2251fccb47ffdcbc71c0bb208bf5d",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      },
+      "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz": {
+        "path": "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz",
+        "pinned_rows": 4458,
+        "pinned_sha256_uncompressed": "892edd2b80a5a2c445809d3ca805c5058dc39b21bb6af19c57d729f1a125853c",
+        "rows_on_disk": 4458,
+        "whole_file_sha256_uncompressed": "892edd2b80a5a2c445809d3ca805c5058dc39b21bb6af19c57d729f1a125853c",
+        "prefix_sha256_uncompressed": "892edd2b80a5a2c445809d3ca805c5058dc39b21bb6af19c57d729f1a125853c",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz": {
+        "path": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
+        "pinned_rows": 1461,
+        "pinned_sha256_uncompressed": "3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55",
+        "rows_on_disk": 1469,
+        "whole_file_sha256_uncompressed": "416e4430cd5eb0844bb7a64601fd36855bafa26146570722c7d4424b4b06eea9",
+        "prefix_sha256_uncompressed": "3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 8,
+        "appended_timestamps": [
+          "2026-08-10T00:00:00+00:00",
+          "2026-08-11T00:00:00+00:00",
+          "2026-08-12T00:00:00+00:00",
+          "2026-08-13T00:00:00+00:00",
+          "2026-08-14T00:00:00+00:00",
+          "2026-08-15T00:00:00+00:00",
+          "2026-08-16T00:00:00+00:00",
+          "2026-08-17T00:00:00+00:00"
+        ],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": true,
+        "why_not": ""
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz": {
+        "path": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz",
+        "pinned_rows": 1461,
+        "pinned_sha256_uncompressed": "086b231cef04ce58bf5ae0d98f02b0a614f102233b20435ee00ab0f83923ed80",
+        "rows_on_disk": 1461,
+        "whole_file_sha256_uncompressed": "086b231cef04ce58bf5ae0d98f02b0a614f102233b20435ee00ab0f83923ed80",
+        "prefix_sha256_uncompressed": "086b231cef04ce58bf5ae0d98f02b0a614f102233b20435ee00ab0f83923ed80",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz": {
+        "path": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz",
+        "pinned_rows": 1461,
+        "pinned_sha256_uncompressed": "35c557d1f073b93bef07bb254e3308c471d2381a15ca6b73dfb0a7481c7f3220",
+        "rows_on_disk": 1461,
+        "whole_file_sha256_uncompressed": "35c557d1f073b93bef07bb254e3308c471d2381a15ca6b73dfb0a7481c7f3220",
+        "prefix_sha256_uncompressed": "35c557d1f073b93bef07bb254e3308c471d2381a15ca6b73dfb0a7481c7f3220",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      }
+    }
+  },
+  "appended_linear_bars": [
+    {
+      "time_period_start": "2026-08-10T00:00:00+00:00",
+      "closes_at_utc": "2026-08-11T00:00:00+00:00",
+      "closed": true
+    },
+    {
+      "time_period_start": "2026-08-11T00:00:00+00:00",
+      "closes_at_utc": "2026-08-12T00:00:00+00:00",
+      "closed": true
+    },
+    {
+      "time_period_start": "2026-08-12T00:00:00+00:00",
+      "closes_at_utc": "2026-08-13T00:00:00+00:00",
+      "closed": true
+    },
+    {
+      "time_period_start": "2026-08-13T00:00:00+00:00",
+      "closes_at_utc": "2026-08-14T00:00:00+00:00",
+      "closed": true
+    },
+    {
+      "time_period_start": "2026-08-14T00:00:00+00:00",
+      "closes_at_utc": "2026-08-15T00:00:00+00:00",
+      "closed": true
+    },
+    {
+      "time_period_start": "2026-08-15T00:00:00+00:00",
+      "closes_at_utc": "2026-08-16T00:00:00+00:00",
+      "closed": true
+    },
+    {
+      "time_period_start": "2026-08-16T00:00:00+00:00",
+      "closes_at_utc": "2026-08-17T00:00:00+00:00",
+      "closed": true
+    },
+    {
+      "time_period_start": "2026-08-17T00:00:00+00:00",
+      "closes_at_utc": "2026-08-18T00:00:00+00:00",
+      "closed": true
+    }
+  ],
+  "open_bar_absent_as_expected": true,
+  "funding_seam": {
+    "missing_prints": [
+      "2026-08-09T16:00:00+00:00"
+    ],
+    "cadence_hours_across_pinned_prefix": {
+      "min": 8.0,
+      "max": 8.0
+    },
+    "unchanged_from_slice69": true,
+    "finding": "Still exactly one hole, at 2026-08-09T16:00Z, in the forward region. This slice's extension did not fill it either. It changes no number in this slice and is carried forward again, now for the ninth slice. EDGE.md §45d."
+  },
+  "human_note_present": true,
+  "human_note_path": "docs/human/HUMAN_DATA_NOTE_SLICE70.md",
+  "human_note_is_evidence": false,
+  "human_note_claims_checked": {
+    "closed bars after t1 = 8": true,
+    "after_t1_dates": true,
+    "linear rows = 1469": true,
+    "linear sha256 (compressed)": true,
+    "append-only; no pre-t1 rewrite": true,
+    "grew vs slice 69 (7 -> 8)": true,
+    "08-18 NOT appended": true,
+    "ceiling: max(0, 8-5) = 3": true,
+    "08-17 16:00 funding print = 0.00009202": true,
+    "synthetic false": true,
+    "pack base: tradingbot_slice69.zip": true
+  },
+  "claim_vs_files_discrepancy": false,
+  "growth_claim_verified": true,
+  "note_claims_all_true": true,
+  "false_note_claims": [],
+  "pack_base_claim": {
+    "claim": "Pack base: tradingbot_slice69.zip",
+    "true": true,
+    "was_false_when_first_made_in_slice67": true,
+    "true_this_slice": true,
+    "why_it_matters": "Across slices 62-66 the notes made claims about DATA — bar counts, dates, digests, append-only, synthetic false — and every one verified. Slice 67's was the first claim about PROCESS and the first to fail. A human can check a bar count by looking at the file they wrote; they cannot check which parent their build script used by looking at anything. It is re-scored every slice since, on the same terms, because a claim that failed once is the one worth checking again. It has now held for three slices running.",
+    "evidence": "git show b678d6e9a056:EDGE.md — sections 45a-52a all present in the tree AS DELIVERED",
+    "recorded_without_accusation": true
+  },
+  "human_note_verdict": "Every claim in the note was scored against the files, not believed. That includes the growth claim, the ceiling arithmetic, the absence of 2026-08-18, and the 0.00009202 print the note quotes from 2026-08-17T16:00Z — which is checked against the funding corpus rather than accepted, because a near-miss quoted in prose is exactly the number a later reader would build an argument on. The note's sha256 is the COMPRESSED digest, which is not the digest any check here uses; §46c records why that distinction earns its keep.",
+  "manifests": {
+    "synthetic_declared_false": true,
+    "entries": {
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz": {
+        "declared_rows": 1469,
+        "rows_on_disk": 1469,
+        "declared_end": "2026-08-17",
+        "end_on_disk": "2026-08-17",
+        "manifest_describes_the_file": true,
+        "understates_the_corpus": false,
+        "declared_rows_previous_slice": 1468,
+        "declared_rows_moved_this_slice": true
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz": {
+        "declared_rows": 1465,
+        "rows_on_disk": 1461,
+        "declared_end": "2026-08-13",
+        "end_on_disk": "2026-08-09",
+        "manifest_describes_the_file": false,
+        "understates_the_corpus": false,
+        "declared_rows_previous_slice": 1465,
+        "declared_rows_moved_this_slice": false
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz": {
+        "declared_rows": 1465,
+        "rows_on_disk": 1461,
+        "declared_end": "2026-08-13",
+        "end_on_disk": "2026-08-09",
+        "manifest_describes_the_file": false,
+        "understates_the_corpus": false,
+        "declared_rows_previous_slice": 1465,
+        "declared_rows_moved_this_slice": false
+      },
+      "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz": {
+        "declared_rows": 4410,
+        "rows_on_disk": 4410,
+        "declared_end": "2026-08-18",
+        "end_on_disk": "2026-08-18",
+        "manifest_describes_the_file": true,
+        "understates_the_corpus": false,
+        "declared_rows_previous_slice": 4407,
+        "declared_rows_moved_this_slice": true
+      },
+      "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz": {
+        "declared_rows": 4397,
+        "rows_on_disk": 4383,
+        "declared_end": "2026-08-14",
+        "end_on_disk": "2026-08-09",
+        "manifest_describes_the_file": false,
+        "understates_the_corpus": false,
+        "declared_rows_previous_slice": 4397,
+        "declared_rows_moved_this_slice": false
+      },
+      "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz": {
+        "declared_rows": 4397,
+        "rows_on_disk": 4458,
+        "declared_end": "2026-08-14",
+        "end_on_disk": "2026-08-09",
+        "manifest_describes_the_file": false,
+        "understates_the_corpus": true,
+        "declared_rows_previous_slice": 4397,
+        "declared_rows_moved_this_slice": false
+      }
+    },
+    "entries_that_disagree_with_their_file": [
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz",
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz",
+      "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz",
+      "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz"
+    ],
+    "count_disagreeing": 4,
+    "measured_product_entries_are_accurate": true,
+    "declared_rows_that_moved_this_slice": [
+      "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz",
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz"
+    ],
+    "broadcast_occurred_this_slice": false,
+    "entries_that_disagree_with_their_file_count": 4,
+    "finding": "4 of 6 manifest entries disagree with the file beside them: BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz, BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz, BINANCE_LINEAR_ETH_USDT_1D.csv.gz, BINANCE_LINEAR_SOL_USDT_1D.csv.gz. Declared row counts that moved this slice: BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz, BINANCE_LINEAR_BTC_USDT_1D.csv.gz. Broadcast to non-BTC symbols this slice: False. The four wrong entries are the frozen residue of slice 64's broadcast, which slice 67 stopped: ETH and SOL were never extended, so their declared counts describe data that does not exist. They are wrong and they are STILL, which is a different and smaller problem than wrong and moving. BTCUSDT's two entries — the only ones any claim in this slice depends on — agree with disk. EDGE.md §47b, §53e.",
+    "not_edited_by_this_slice": true,
+    "enumerated_in": "tests/test_slice55_data_eligibility.py::TestTheManifestsDescribeTheFilesBesideThem"
+  },
+  "forward_funding_regime": {
+    "fund_abs": 0.0001,
+    "comparison_is_inclusive": true,
+    "comparison_source": "signals/funding_carry_fade_btc_v1.py :: funding_setups tests f >= fund_abs",
+    "rate_at_each_forward_decision": {
+      "2026-08-10": 5.057e-05,
+      "2026-08-11": 8.282e-05,
+      "2026-08-12": 6.601e-05,
+      "2026-08-13": 7.841e-05,
+      "2026-08-14": 6.29e-06,
+      "2026-08-15": 5.311e-05,
+      "2026-08-16": 5e-05,
+      "2026-08-17": 9.202e-05
+    },
+    "funding_setups_in_window": 0,
+    "forward_bars": 8,
+    "join_rule": "funding_at_decision reads funding.at_or_before(close_time_ms(bar)) — the rate STANDING AT THE BAR'S CLOSE, reading only backwards in time",
+    "prints_after_t1": 27,
+    "prints_at_or_above_fund_abs": [
+      {
+        "funding_time": "2026-08-12T00:00:00+00:00",
+        "funding_rate": 0.0001,
+        "equals_fund_abs_exactly": true
+      }
+    ],
+    "finding": "No setup fired on any of the 8 forward bars: every rate at a decision is below FUND_ABS = 0.0001. 0 of 8. TWO forward prints have come near the line and both were answered the same way. 2026-08-12T00:00:00Z printed 0.00010000, equal to FUND_ABS exactly, and the comparison is inclusive — but the join reads the rate standing at the bar's CLOSE and two later prints (0.00008568, then 0.00006601) had superseded it by then. 2026-08-17T16:00:00Z printed 0.00009202 and DID stand at its bar's close; it simply missed, by 8e-6. Neither is a missed trade and neither is a defect. The second is the more instructive of the two, because no join rule would have rescued it — only a lower threshold would, which is the change that voids the clear. 'A qualifying rate existed that day' and 'the qualifying rate stood at the decision' remain different claims. EDGE.md §51c, §53c.",
+    "parameters_moved_because_of_this": false,
+    "why_not": "A threshold adjusted after seeing which prints missed it is a threshold fitted to the data, and a narrow miss makes the temptation larger rather than the change more defensible. FUND_ABS stays 0.0001; the horizon stays 5; the join stays close-time."
+  },
+  "manifests_edited_by_this_slice": false,
+  "why_manifests_not_edited": "Rewriting a data-provenance record to state whatever the files say would be asserting a provenance this programme cannot attest: nothing here knows independently that ETH should hold 1461 rows rather than having lost two. A manifest that agrees with disk by construction certifies nothing. The false claims are enumerated by name in tests instead. EDGE.md §47b.",
+  "bars_fabricated": 0,
+  "corpus_appended_to_by_this_tool": false,
+  "fetch_attempted": false,
+  "why_no_fetch": "The human supplies the data on disk, which is the sanctioned path. Slice 60 recorded a ProxyError against the venue from this environment and nothing has changed; a fetch would add a log line and no evidence.",
+  "what_would_count_as_a_forward_observation": {
+    "rule": "a shadow trade that both ENTERS and EXITS on closed bars strictly after t1",
+    "closed_forward_bars_available": 8,
+    "closed_forward_bars_needed": 6,
+    "maximum_possible_forward_trades_today": 3,
+    "ceiling_declared_before_scoring": "EDGE.md §53b"
+  },
+  "pack_regression": {
+    "occurred_this_slice": false,
+    "pack_base": "the slice-69 deliverable, verified by digest",
+    "restore_artefact": null,
+    "summary": "No regression. The pack is the previous deliverable, so nothing was restored and no restore artefact exists — the third consecutive slice with no restoration tax. The five-slice run of slice-61 regressions ended at slice 68.",
+    "design_note": "EDGE.md §51a"
+  },
+  "git_commit": "f1255394990d5b442ba2488f8fcc89e9b3df0f31"
+}

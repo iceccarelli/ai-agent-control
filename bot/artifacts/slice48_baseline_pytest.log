@@ -1,0 +1,12 @@
+slice 48 baseline, taken from a clean unzip of tradingbot_slice47.zip before any mutation
+
+python3 -m pytest -q --tb=no    ->  3112 passed, 1 skipped
+python3 -m pytest tests/test_paper_agent_certification.py -q --tb=no  ->  138 passed
+
+print_project_status: CLOSED / null / paper / live_authorized false / models_current_present false
+ABSENT_SIGNALS: 6  (technical_analysis, closed_analyser, donchian_breakout_v1,
+                    btc_alt_spillover_v1, post_shock_fade_v1, range_location_fade_v1)
+FROZEN_STATUS[range_location_fade_v1] = INCONCLUSIVE
+slice-46 control logs: BTCUSD/ETHUSDT/SOLUSDT all CONTROL: **INVALID
+models/current: absent
+NEW_SIGNAL_INTAKE.md: COMPLETED - CLOSED; next intake WAITING

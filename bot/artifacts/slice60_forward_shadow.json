@@ -1,0 +1,86 @@
+{
+  "schema": "forward_shadow_observation/2",
+  "slice": 60,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "observed_at_utc": "2026-08-10T21:42:34Z",
+  "result": "HOLD",
+  "is_forward_observation": false,
+  "forward_observations_to_date": 0,
+  "reason": "no bars after measure end",
+  "reason_long": "The locked measure end is t1 = 2026-08-09T00:00:00Z. The newest daily bar that could have CLOSED by 2026-08-10T21:42:34Z is 2026-08-09T00:00:00Z, which IS t1 rather than after it. Zero new closed bars exist, so zero forward observations exist. The sanctioned fetch was attempted and failed with ProxyError — recorded verbatim in artifacts/slice60_data_freshness.json. Nothing was fabricated.",
+  "monitors_re_run": false,
+  "monitor_readings": null,
+  "monitor_status": null,
+  "entries_blocked_by_monitor": null,
+  "why_monitors_were_not_re_run": "Deliberate, per EDGE.md §43c. Re-reporting slice 59's historical readings under a slice-60 heading would manufacture the appearance of an updated observation from no new data — the same substitution as calling a replay a forward observation, one level up. The readings that stand are slice 59's, and they are pointed at rather than copied.",
+  "monitor_readings_that_stand": {
+    "source": "artifacts/slice59_forward_shadow.json",
+    "monitor_status": "WARN",
+    "m4_state": "WARN",
+    "m4_detail": "earlier half +0.4669 on 17, recent half -0.0798 on 18",
+    "note": "M-4 still WARNs. It was not re-run, not moved, and not silenced. EDGE.md §41j, §42d and §43f."
+  },
+  "monitor_thresholds": {
+    "M1_rolling_trades": {
+      "k": 10,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 10
+    },
+    "M2_rolling_days": {
+      "window_days": 90,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 5
+    },
+    "M3_concentration": {
+      "top_n": 3,
+      "warn_above": 0.6,
+      "min_trades": 10
+    },
+    "M4_halves": {
+      "min_trades": 20
+    }
+  },
+  "thresholds_moved_this_slice": false,
+  "one_new_funding_print_note": "1 funding print exists after t1 (2026-08-09T08:00:00+00:00), and it produces NOTHING. The decision clock is the daily bar: a funding rate is joined to the last bar whose close it precedes, and no bar after t1 has closed. A print with no bar to decide is not an observation, and reporting the count without this sentence would read as partial progress where there is none.",
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_fingerprint": "662de0115880871352d5d623b1020eaa",
+  "constants_fingerprint_matches_slice58": true,
+  "schedule_mode": "one_entry_per_contiguous_run",
+  "caps": {
+    "max_concurrent_positions": 1,
+    "max_entries_per_day": 1,
+    "max_notional_usd": 100.0,
+    "symbol": "BTCUSDT"
+  },
+  "freshness_artefact": "artifacts/slice60_data_freshness.json",
+  "new_bars_available": false,
+  "new_linear_bars_count": 0,
+  "new_funding_prints_count": 1,
+  "bars_fabricated": 0,
+  "is_stage1_evidence": false,
+  "registration_eligible": false,
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "cleared_edge_re_scored_this_slice": false,
+  "live_authorized": false,
+  "policy_mode": "off",
+  "execution_mode": "paper",
+  "models_current_present": false,
+  "frozen_absent_count": 11,
+  "promotion_gate_allows_live": false,
+  "closer_to_autonomous_profit_agent": false,
+  "hold_is_not_progress": "A HOLD is the correct outcome when the only missing ingredient is time, and it is recorded as a HOLD rather than dressed up. Nothing advanced this slice except the record of having checked. The promotion gate's forward item still reads 0 of 20.",
+  "git_commit": "7c8a2e957116cdad4de0fa3860ff7872be6ab0d5"
+}

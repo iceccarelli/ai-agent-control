@@ -1,0 +1,24 @@
+==============================================================================
+REAL-SERIES EDGE MEASUREMENT (slice 24)
+==============================================================================
+AVAXUSDT: no order book in the corpus — the liquidity gate will abstain for this symbol
+BNBUSDT: no order book in the corpus — the liquidity gate will abstain for this symbol
+ETHUSDT: no order book in the corpus — the liquidity gate will abstain for this symbol
+SOLUSDT: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : SOLUSDT
+bars              : 1,461
+
+Instrument path = the configuration whose control PASSED at n=200
+(EDGE.md 4u: median 48.0, z = -1.18, KS p = 0.435, 0 incomplete):
+  null rotation | lock-up 1 | one trade per run | 1,500 replicates
+  barrier +1.5/-1.5 ATR, 3-bar horizon, 25 bps round trip
+
+Bars pre-declared in EDGE.md 5b, before any number existed:
+  M1  real-series percentile          >= 95.0
+  M2  Delta > 0, 95% CI excludes 0, percentile >= 95.0
+  M3  >= 3 of 4 folds mean net R > 0 (soft, supporting only)
+
+signal            : post_shock_fade_v1  (own shock >= 2 x ATR%, FADED, two-sided, fill at next open)
+setups            : 7  (0 long / 7 short)
+setups scoreable  : 7  (0 long / 7 short)
+INCONCLUSIVE: fewer than 30 scoreable real-series entries.

@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+state/
+*.db
+*.db-wal
+*.db-shm
+
+# Trained model artefacts. The estimators are large binaries and are
+# reproducible from tools/train_policy.py plus the corpus; the MANIFESTs are
+# small, human-readable, and are the record of what was trained and whether it
+# was promoted — so those are kept.
+#
+# Three lines, not one: ignoring `models/` alone would stop git descending into
+# the directory at all, and the negation below would never match.
+models/**
+!models/**/
+!models/**/MANIFEST.json

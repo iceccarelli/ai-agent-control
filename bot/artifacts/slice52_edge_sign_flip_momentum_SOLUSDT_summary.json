@@ -1,0 +1,86 @@
+{
+  "symbol": "SOLUSDT",
+  "bars": 1461,
+  "signal": "sign_flip_momentum_v1",
+  "instrument": {
+    "null": "rotation",
+    "lockup": 1,
+    "runs": 1500,
+    "horizon": 5,
+    "atr_period": 14,
+    "round_trip_bps": 25.0,
+    "take_profit_atr": 3.0,
+    "stop_atr": 1.5,
+    "seed": 20250730
+  },
+  "observed": {
+    "n_trades": 131,
+    "mean_r": -0.06093086085958639
+  },
+  "flag_runs": 131,
+  "m1": {
+    "percentile": 22.666666666666664,
+    "bar": 95.0,
+    "passed": false,
+    "replicates": 1500,
+    "null_mean": -0.0083169112452231,
+    "null_sd": 0.07212713417539297
+  },
+  "m2": {
+    "percentile": 25.0,
+    "bar": 95.0,
+    "passed": false,
+    "delta": -0.05097356321471296,
+    "ci_low": -0.06074960969822902,
+    "ci_high": -0.04120056646149926,
+    "schedules": 200,
+    "null_mean": -0.009957297644873431,
+    "null_sd": 0.07190817470301218
+  },
+  "m3": {
+    "folds": [
+      {
+        "fold": 1,
+        "start": 200,
+        "end": 515,
+        "trades": 26,
+        "mean_r": -0.07678779484586028,
+        "percentile": 28.999999999999996,
+        "note": ""
+      },
+      {
+        "fold": 2,
+        "start": 515,
+        "end": 830,
+        "trades": 33,
+        "mean_r": -0.02498507396553378,
+        "percentile": 56.00000000000001,
+        "note": ""
+      },
+      {
+        "fold": 3,
+        "start": 830,
+        "end": 1145,
+        "trades": 33,
+        "mean_r": -0.22014358188336758,
+        "percentile": 9.2,
+        "note": ""
+      },
+      {
+        "fold": 4,
+        "start": 1145,
+        "end": 1461,
+        "trades": 39,
+        "mean_r": 0.05394321888205877,
+        "percentile": 69.6,
+        "note": ""
+      }
+    ],
+    "positive": 1,
+    "soft_gate": 3,
+    "soft_gate_met": false
+  },
+  "verdict": "EDGE_EVIDENCE_ABSENT",
+  "control_validated": true,
+  "control_attestation": "artifacts/slice52_control_sign_flip_momentum_SOLUSDT_n1000.log"
+}

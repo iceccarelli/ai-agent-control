@@ -1,0 +1,289 @@
+{
+  "schema": "shadow_replay/1",
+  "slice": 58,
+  "kind": "shadow_replay",
+  "is_stage1_evidence": false,
+  "registration_eligible": false,
+  "why_not_evidence": "No rotation null, no drift-controlled contrast, no control validation and no percentile. This replay exercises the caps, the monitors and the artefact schema. It cannot change cleared_edge_signal — the registration hook only accepts _summary.json artefacts that pass the slice-57 OOS gate, and this is not one.",
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "constants_fingerprint": "662de0115880871352d5d623b1020eaa",
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "window": {
+    "t_mid": "2024-08-09T00:00:00Z",
+    "t1": "2026-08-09T00:00:00Z",
+    "bars": 731
+  },
+  "caps": {
+    "max_concurrent_positions": 1,
+    "max_entries_per_day": 1,
+    "max_notional_usd": 100.0
+  },
+  "setups_considered": 41,
+  "entries_refused_by_caps": 6,
+  "shadow_trades": 35,
+  "shadow_mean_net_r": 0.18571343161930676,
+  "capping_note": "Candidates are the CLEARED RULE's own schedule — one entry per contiguous run, from skill_test.simulate_schedule over the same tradable mask the Stage-1 run used. 41 candidates, 6 refused by the caps, 35 taken. A capped pilot is still not the same object as an uncapped backtest and the means are not strictly comparable, but the SCHEDULE is now the same rule rather than a cousin of it. The first version of this tool walked every flagged bar and entered mid-run, taking 55 trades with a negative mean where the rule it was shadowing scored +0.1736 — see EDGE.md 41i.",
+  "monitors": [
+    {
+      "name": "M1_rolling_trades",
+      "state": "OK",
+      "value": 0.029757656465978655,
+      "threshold": -0.25,
+      "n_trades": 10,
+      "detail": "mean net R over the last 10 closed trades"
+    },
+    {
+      "name": "M2_rolling_days",
+      "state": "OK",
+      "value": 0.23990203185971773,
+      "threshold": -0.25,
+      "n_trades": 5,
+      "detail": "mean net R over trades closed in the last 90 days"
+    },
+    {
+      "name": "M3_concentration",
+      "state": "OK",
+      "value": 0.4502541935561254,
+      "threshold": 0.6,
+      "n_trades": 35,
+      "detail": "top-3 share of cumulative net R (the OOS sample itself is 0.41)"
+    },
+    {
+      "name": "M4_halves",
+      "state": "WARN",
+      "value": -0.07982286076591971,
+      "threshold": 0.0,
+      "n_trades": 35,
+      "detail": "earlier half +0.4669 on 17, recent half -0.0798 on 18"
+    }
+  ],
+  "monitor_status": "WARN",
+  "entries_blocked_by_monitor": false,
+  "cleared_edge_signal_after_replay": "funding_carry_fade_btc_v1",
+  "live_authorized": false,
+  "models_current_present": false,
+  "trades": [
+    {
+      "entry_utc": "2024-09-27T00:00:00Z",
+      "exit_utc": "2024-10-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9703470632275664
+    },
+    {
+      "entry_utc": "2024-10-11T00:00:00Z",
+      "exit_utc": "2024-10-11T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0495830601015057
+    },
+    {
+      "entry_utc": "2024-10-15T00:00:00Z",
+      "exit_utc": "2024-10-20T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0151100189373994
+    },
+    {
+      "entry_utc": "2024-10-30T00:00:00Z",
+      "exit_utc": "2024-11-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9639976052087643
+    },
+    {
+      "entry_utc": "2024-12-18T00:00:00Z",
+      "exit_utc": "2024-12-18T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.961026141788135
+    },
+    {
+      "entry_utc": "2024-12-25T00:00:00Z",
+      "exit_utc": "2024-12-30T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9859282295092152
+    },
+    {
+      "entry_utc": "2025-01-07T00:00:00Z",
+      "exit_utc": "2025-01-07T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9568079733174515
+    },
+    {
+      "entry_utc": "2025-01-09T00:00:00Z",
+      "exit_utc": "2025-01-13T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9701550514338524
+    },
+    {
+      "entry_utc": "2025-01-19T00:00:00Z",
+      "exit_utc": "2025-01-24T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.06538052124651365
+    },
+    {
+      "entry_utc": "2025-02-01T00:00:00Z",
+      "exit_utc": "2025-02-02T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9639471212161503
+    },
+    {
+      "entry_utc": "2025-02-19T00:00:00Z",
+      "exit_utc": "2025-02-24T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.7692276086120955
+    },
+    {
+      "entry_utc": "2025-02-27T00:00:00Z",
+      "exit_utc": "2025-02-28T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9676908093120082
+    },
+    {
+      "entry_utc": "2025-03-10T00:00:00Z",
+      "exit_utc": "2025-03-15T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.5129210143556204
+    },
+    {
+      "entry_utc": "2025-05-12T00:00:00Z",
+      "exit_utc": "2025-05-17T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.1990319861566216
+    },
+    {
+      "entry_utc": "2025-05-19T00:00:00Z",
+      "exit_utc": "2025-05-19T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.939162971499171
+    },
+    {
+      "entry_utc": "2025-05-23T00:00:00Z",
+      "exit_utc": "2025-05-23T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.94511249573647
+    },
+    {
+      "entry_utc": "2025-06-30T00:00:00Z",
+      "exit_utc": "2025-07-05T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.0126588419141704
+    },
+    {
+      "entry_utc": "2025-07-12T00:00:00Z",
+      "exit_utc": "2025-07-14T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.043445354509622
+    },
+    {
+      "entry_utc": "2025-08-11T00:00:00Z",
+      "exit_utc": "2025-08-13T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0503135708776261
+    },
+    {
+      "entry_utc": "2025-08-14T00:00:00Z",
+      "exit_utc": "2025-08-14T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9368658981089805
+    },
+    {
+      "entry_utc": "2025-08-25T00:00:00Z",
+      "exit_utc": "2025-08-26T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9520724432351513
+    },
+    {
+      "entry_utc": "2025-08-27T00:00:00Z",
+      "exit_utc": "2025-09-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.47203732279090926
+    },
+    {
+      "entry_utc": "2025-09-10T00:00:00Z",
+      "exit_utc": "2025-09-12T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0538839274394591
+    },
+    {
+      "entry_utc": "2025-10-02T00:00:00Z",
+      "exit_utc": "2025-10-03T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0594161079885378
+    },
+    {
+      "entry_utc": "2025-10-04T00:00:00Z",
+      "exit_utc": "2025-10-09T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.11169523823386268
+    },
+    {
+      "entry_utc": "2025-10-13T00:00:00Z",
+      "exit_utc": "2025-10-16T00:00:00Z",
+      "direction": "LONG_SETUP",
+      "net_r": -1.0400649311563475
+    },
+    {
+      "entry_utc": "2025-11-01T00:00:00Z",
+      "exit_utc": "2025-11-04T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9703635057834242
+    },
+    {
+      "entry_utc": "2025-12-20T00:00:00Z",
+      "exit_utc": "2025-12-25T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.13964035956472992
+    },
+    {
+      "entry_utc": "2025-12-27T00:00:00Z",
+      "exit_utc": "2026-01-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.34766719727431705
+    },
+    {
+      "entry_utc": "2026-02-07T00:00:00Z",
+      "exit_utc": "2026-02-12T00:00:00Z",
+      "direction": "LONG_SETUP",
+      "net_r": -0.6242053315562917
+    },
+    {
+      "entry_utc": "2026-04-18T00:00:00Z",
+      "exit_utc": "2026-04-23T00:00:00Z",
+      "direction": "LONG_SETUP",
+      "net_r": 0.27124368540601934
+    },
+    {
+      "entry_utc": "2026-05-29T00:00:00Z",
+      "exit_utc": "2026-06-02T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9627910089199427
+    },
+    {
+      "entry_utc": "2026-06-04T00:00:00Z",
+      "exit_utc": "2026-06-05T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9537952136771425
+    },
+    {
+      "entry_utc": "2026-07-07T00:00:00Z",
+      "exit_utc": "2026-07-12T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.05466511669926469
+    },
+    {
+      "entry_utc": "2026-07-14T00:00:00Z",
+      "exit_utc": "2026-07-15T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0429848654037808
+    }
+  ],
+  "git_commit": "94be00c5fb43eda3e1306f410efcf06c670ba21b"
+}

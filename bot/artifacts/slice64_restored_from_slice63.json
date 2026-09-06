@@ -1,0 +1,109 @@
+{
+  "schema": "restored_from_previous_slice/2",
+  "slice": 64,
+  "why_this_file_exists": "SECOND CONSECUTIVE PACK REGRESSION, to the same parent. The slice-64 pack is again the SLICE-61 tree: everything from slices 62 AND 63 is absent, and the three digest probes (EDGE.md 2af62040..., signals/funding_carry_fade_btc_v1.py 2668e74b..., tests/test_slice55_data_eligibility.py 12da76a1...) all read slice-61. Recorded without accusation — but the work is not in the pack, so this slice restores it rather than re-implementing it. EDGE.md §46a, §46b.",
+  "source": "the slice-63 deliverable, tradingbot_slice63.zip",
+  "source_sha256": "5d9b405ea68f01f6271fe5312c712a3b0cf01a7f9d50251b20b4dc6db6f30296",
+  "restores_slices": [
+    62,
+    63
+  ],
+  "apparatus": {
+    "why": "The prefix invariant, the forward-window helpers and the slice 62/63 tools are what make a forward segment computable at all. Restored byte-identically, not re-implemented.",
+    "restored_byte_identically": "13 of 13",
+    "reimplemented": false,
+    "files": {
+      "tools/corpus_prefix.py": "1ac9a37be3f63525ac92c95fb429770b7af505411a0a08a0fe812b9d48b3ec26",
+      "signals/funding_carry_fade_btc_v1.py": "43f2a9130351c495bdc9385243b80b8e364f3e518d32e7d3dc90ab12633da742",
+      "tests/test_funding_carry_fade_btc_v1.py": "2035a0eb521954b7b1ffa3e52130a531a6d9943906eb1bf128903afaba07f75a",
+      "tests/test_slice55_data_eligibility.py": "0d314207dc92ffa871575c555bf5c877f1b3903f5495fadfcb72005b84cb47af",
+      "tests/test_slice61_extension_claim.py": "d3af27fb9ea19d8fcee4522a376a546d9961b19baba9693058966aabdd96e215",
+      "tests/test_slice62_forward_extension.py": "8ac78df56c4a76d5ab03dd7ec76e1342b76d3143df69f3c50780480829624126",
+      "tests/test_slice63_window_did_not_grow.py": "f35f7d737a4d3408663f7f8ef0ce760ce8ce1a9856862321f1e31013666743f9",
+      "tools/slice62_freshness.py": "1c4244b06f752591df5a2eaf348437b9d6eeebdc4ed160fdab9dfa8f990224f1",
+      "tools/slice62_forward_shadow.py": "8856969312213d49e43355c3f87c0d67a7fa99114b4ba9f6966847bd9a8c5b10",
+      "tools/slice62_promotion_gate.py": "5ecdb5fb6d917a7eff4ef6fe07c30c31f362fbc2f012fe36dc2aa0085cddb193",
+      "tools/slice63_freshness.py": "ff1331d719f6e4b251362a59951fd64a8620dede921ae15a18f90b728acae4d3",
+      "tools/slice63_forward_shadow.py": "3e5440aeee80b43d0375aa339f1eacd82c3fb5ae5a09888e5bc2e921033a43e2",
+      "tools/slice63_promotion_gate.py": "42a3e40b5e6fbbece06d14a65351a2515541a94346a171c35c26004b3cc8e8d6"
+    },
+    "amended_in_slice64": {
+      "tests/test_slice55_data_eligibility.py": {
+        "sha256_as_restored_from_slice63": "0d314207dc92ffa871575c555bf5c877f1b3903f5495fadfcb72005b84cb47af",
+        "sha256_after_slice64_amendment": "046f0d4cc39b8946cef242401bed604001890f089defd64328f5f0501476d291",
+        "why": "Two tests asserted `pinned_rows == manifest_rows`, treating the MANIFEST as a description of the measured prefix. It was, in slices 62-63, BY ACCIDENT: the manifest was stale at exactly the prefix length. Slice 64's pack updated the manifests, ending the coincidence. Each record is now asserted against what it actually describes — the eligibility artefact pins the prefix, the manifest describes the file — and a new class enumerates the four false manifest claims by name. EDGE.md §47b, §47c.",
+        "strength": "STRICTLY STRONGER. The old form could be satisfied by a manifest and an artefact agreeing with each other while BOTH disagreed with the files. The new form recomputes the prefix digest from disk and separately checks every manifest entry against the file beside it, plus a sweep that would catch a fifth false claim hiding behind the four named.",
+        "is_this_a_dated_record": false
+      },
+      "tests/test_slice62_forward_extension.py": {
+        "sha256_as_restored_from_slice63": "8ac78df56c4a76d5ab03dd7ec76e1342b76d3143df69f3c50780480829624126",
+        "sha256_after_slice64_amendment": "194566e79c41ea7dd8b57aabdc80b67c5c32548a0121166f18d4f5e15a154353",
+        "why": "`test_exactly_one_closed_linear_bar_arrived_after_t1` asserted a LIVE ABSOLUTE (`appended_rows == 1`) that became false the moment the window grew — the event the programme exists to wait for. `test_a_legitimate_further_extension_still_passes` hard-coded `== 2` for the same reason. EDGE.md §47c.",
+        "strength": "Both are now relative: the first post-t1 bar is still 2026-08-10, the corpus only grows, and one more legitimate bar is still accepted whatever the window's current size. Slice 62's own count is asserted against its DATED artefact instead of against today's disk.",
+        "is_this_a_dated_record": false
+      },
+      "tests/test_slice63_window_did_not_grow.py": {
+        "sha256_as_restored_from_slice63": "f35f7d737a4d3408663f7f8ef0ce760ce8ce1a9856862321f1e31013666743f9",
+        "sha256_after_slice64_amendment": "de3ab589d2bc0d4ae14ffcd6a4be05e7d9fbafe273adbb70943334cd0eae4a50",
+        "why": "`test_the_linear_corpus_is_byte_identical_to_slice62` was a DATED finding asserted against live disk; it expired when a bar arrived. `test_the_prior_freshness_artefact_now_disagrees_with_disk` pinned an exact funding count. And `test_every_restored_file_matches_its_recorded_digest` re-verified slice 63's restored apparatus against live files, which a later slice may legitimately amend.",
+        "strength": "The dated claims move to slice 63's frozen artefact and the live claims become direction-of-travel (grew / did not shrink). A restoration manifest now verifies only what is FROZEN; live apparatus is verified by the CURRENT slice's manifest, which is where an amendment can be declared.",
+        "is_this_a_dated_record": false
+      }
+    },
+    "amendment_rule": "A TEST is a living document; a dated ARTEFACT is not. Every amendment below carries both digests and its reason, and a test refuses any digest change this manifest does not name."
+  },
+  "dated_records": {
+    "why": "Measurements actually taken, on corpus states that existed. Copied byte-for-byte with their original git_commit fields intact.",
+    "regenerated_against_todays_corpus": false,
+    "why_not_regenerated": "Re-running the slice 62/63 tools today would produce files that LOOK like slice-62 and slice-63 records and are not.",
+    "now_disagree_with_disk": "slice62_data_freshness.json records after_t1_linear = 1 and after_t1_funding = 5; slice63 records 1 and 6; the disk now holds 2 and 9. That is correct dated-artefact behaviour.",
+    "files": {
+      "STAGE1_VERDICT_SLICE62.md": "05fefd67cd68c2f062c5522d2846d4ddc67f5fa2e746b3ba78e0ac4218f09eaf",
+      "STAGE1_VERDICT_SLICE63.md": "3c63ad22f29caf0203ca1b7fbab1d33c7f7d0bde5b2aefea59115c874ba6c40a",
+      "artifacts/slice62_baseline_pytest.log": "d2e55a79754a4e671154bfc13f792a5abc9c3a745850d6e7813697fbd34224e4",
+      "artifacts/slice62_data_freshness.json": "e4e1eaad124f43759bc697c77951b2d560b61e9f00e2b68dafcb06790703b6d2",
+      "artifacts/slice62_forward_shadow.json": "c5885fe61b4b8e9b1a27ce3cdba94fed9ee7b18c345e93ab1b99725d85e9ad5e",
+      "artifacts/slice62_forward_shadow.log": "98e6c0c905c6354685843538272abbe6b09c4176f44903a42a01b06031c014b2",
+      "artifacts/slice62_project_status.log": "a29de2c622fe79356fe0716619f929a2173d61a0152822eb475ed9ee8b747b9e",
+      "artifacts/slice62_promotion_gate.json": "0b4beb3f0d9f043ad7f89db8323ff4bbc79432049f303bd28fe7054f23237577",
+      "artifacts/slice62_pytest.log": "5a6ac6fe16cc508810e0a0aab1d13e04c013ce14639519e5784fcd7143ae1f75",
+      "artifacts/slice62_registration_discipline.log": "c29ac7d6341a05ce520d07863288128962757c07dcfb4741b0fc055423ce2bc5",
+      "artifacts/slice62_sha256_manifest.txt": "a43101f19ac1f06bbbdb7c5817971eac9faa48002c37aa8747fe8d45f843af56",
+      "artifacts/slice63_baseline_pytest.log": "76f8c08affb6f4df48b235d205c1739ed101b457d60965713a10f6c8214cc436",
+      "artifacts/slice63_data_freshness.json": "0bd3dca1f2217e90079d105d329ba995b39668b71d89dc6b2ee00e9ef3d846e8",
+      "artifacts/slice63_forward_shadow.json": "23fa740d1d77daef6cf294548e30db90e67309f04a1d65d2e382e63b83a18380",
+      "artifacts/slice63_forward_shadow.log": "f4eadcade2b0f46e39b3f6ba75b5e1afde84cf0c5ca5d2ed22a811434aa16038",
+      "artifacts/slice63_paper_cert.log": "a6ff6380a899cc38fa4619ae43833ea3fd95a437900133c71fe9b984b4bbe85b",
+      "artifacts/slice63_project_status.log": "a29de2c622fe79356fe0716619f929a2173d61a0152822eb475ed9ee8b747b9e",
+      "artifacts/slice63_promotion_gate.json": "17f1228f3eafec169864f95120ead3dad8144ddeb6d7c83f171d06ff81bda338",
+      "artifacts/slice63_pytest.log": "813df8264853e04dbf247c0f8a4595ca2233ce8d0386c13a7d52a233cc20df7a",
+      "artifacts/slice63_registration_discipline.log": "c29ac7d6341a05ce520d07863288128962757c07dcfb4741b0fc055423ce2bc5",
+      "artifacts/slice63_restored_from_slice62.json": "40573d51c24b71d07580f411c2ca669016664be97115a481e72070b48969944e",
+      "artifacts/slice63_sha256_manifest.txt": "584745c47f1508e3f3bd7a04465993a278a667bdb77d577f3f1b19b5356e2350"
+    }
+  },
+  "evidence_the_pack_is_the_slice61_tree": {
+    "method": "whole-file digests of three files slices 62-63 modified",
+    "EDGE.md": {
+      "slice61_and_slice64": "2af620406859",
+      "slice62": "2ee9acf46bcb",
+      "slice63": "c4deed698ade",
+      "sections_present": "ends at §44g"
+    },
+    "signals/funding_carry_fade_btc_v1.py": {
+      "slice61_and_slice64": "2668e74bc3e4",
+      "slice62_and_63": "43f2a9130351"
+    },
+    "tests/test_slice55_data_eligibility.py": {
+      "slice61_and_slice64": "12da76a1392c",
+      "slice62_and_63": "0d314207dc92"
+    },
+    "baseline_suite": {
+      "slice62": "8 failed, 4036 passed, 2 skipped",
+      "slice63": "8 failed, 4036 passed, 2 skipped",
+      "slice64": "12 failed, 4032 passed, 2 skipped",
+      "note": "The same eight, plus four NEW failures which are the manifest broadcast defect being caught by guards slice 55 already had. EDGE.md §47b."
+    }
+  },
+  "git_commit": "1be05afa3fd33e2214c662efcf9ba1b329ef22b4"
+}

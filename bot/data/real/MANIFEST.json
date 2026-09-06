@@ -1,0 +1,43 @@
+{
+ "bar_seconds": 3600,
+ "bars_per_symbol": 61513,
+ "coverage": {
+  "bars": 61513,
+  "completeness": 1.0,
+  "expected_bars": 61513,
+  "missing_buckets": 0,
+  "stress_periods": {
+   "2020-03 covid crash": true,
+   "2021 bull": true,
+   "2022 bear (full year)": true
+  },
+  "zero_volume_bars": 9
+ },
+ "files": {
+  "ohlcv/BITSTAMP_SPOT_BTC_USD_1H.csv.gz": {
+   "data_kind": "ohlcv",
+   "interval_seconds": 3600,
+   "kind": "ohlcv",
+   "rows": 61513,
+   "sha256": "c523952e818031a86acbbcabe16261168c72803dda8ed2ffa43e2f0402ae9ad4",
+   "sha256_uncompressed": "e609e82e5c7552f2decd726d1d5c15da3c8a7cd03730a3839f5400b3877d9148",
+   "size_bytes": 1758064
+  }
+ },
+ "first_timestamp": "2018-01-01T00:00:00.0000000Z",
+ "generator": "tools/fetch_real_data.py",
+ "generator_version": 1,
+ "last_timestamp": "2025-01-07T01:00:00.0000000Z",
+ "schema": "coinapi-flat-files/1",
+ "source": {
+  "exchange": "BITSTAMP",
+  "file": "btcusd_bitstamp_1min_2012-2025.csv.gz",
+  "instrument": "BTC/USD",
+  "licence": "MIT",
+  "native_resolution": "1m",
+  "provenance": "local file /tmp/bts/data/historical/btcusd_bitstamp_1min_2012-2025.csv.gz",
+  "sha256": "46fe0bbe0491b33b8e85dfec079d6b96049705e87892e985a13ef43ff8cafbde"
+ },
+ "synthetic": false,
+ "warning": "REAL market data from a third-party archive. It is Bitstamp BTC/USD, NOT Bybit BTCUSDT: the price series is genuine, the execution assumptions in the backtest are Bybit's. There is no order book in this corpus, so the liquidity gate abstains."
+}

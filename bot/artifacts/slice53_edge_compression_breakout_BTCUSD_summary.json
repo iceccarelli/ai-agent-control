@@ -1,0 +1,86 @@
+{
+  "symbol": "BTCUSD",
+  "bars": 3135,
+  "signal": "compression_breakout_v1",
+  "instrument": {
+    "null": "rotation",
+    "lockup": 1,
+    "runs": 1500,
+    "horizon": 5,
+    "atr_period": 14,
+    "round_trip_bps": 25.0,
+    "take_profit_atr": 3.0,
+    "stop_atr": 1.5,
+    "seed": 20250730
+  },
+  "observed": {
+    "n_trades": 76,
+    "mean_r": 0.05896717823344294
+  },
+  "flag_runs": 76,
+  "m1": {
+    "percentile": 69.13333333333334,
+    "bar": 95.0,
+    "passed": false,
+    "replicates": 1500,
+    "null_mean": -0.0004482589382086523,
+    "null_sd": 0.11303481016006045
+  },
+  "m2": {
+    "percentile": 73.5,
+    "bar": 95.0,
+    "passed": false,
+    "delta": 0.060950471175809914,
+    "ci_low": 0.047202712728329085,
+    "ci_high": 0.07475650041180328,
+    "schedules": 200,
+    "null_mean": -0.0019832929423669763,
+    "null_sd": 0.1002264574855458
+  },
+  "m3": {
+    "folds": [
+      {
+        "fold": 1,
+        "start": 200,
+        "end": 933,
+        "trades": 16,
+        "mean_r": 0.19919580051452124,
+        "percentile": 79.2,
+        "note": ""
+      },
+      {
+        "fold": 2,
+        "start": 933,
+        "end": 1666,
+        "trades": 16,
+        "mean_r": 0.27217003366870784,
+        "percentile": 83.2,
+        "note": ""
+      },
+      {
+        "fold": 3,
+        "start": 1666,
+        "end": 2399,
+        "trades": 18,
+        "mean_r": -0.09477651413460556,
+        "percentile": 35.199999999999996,
+        "note": ""
+      },
+      {
+        "fold": 4,
+        "start": 2399,
+        "end": 3135,
+        "trades": 26,
+        "mean_r": -0.05209117487565773,
+        "percentile": 49.2,
+        "note": ""
+      }
+    ],
+    "positive": 2,
+    "soft_gate": 3,
+    "soft_gate_met": false
+  },
+  "verdict": "EDGE_EVIDENCE_ABSENT",
+  "control_validated": true,
+  "control_attestation": "artifacts/slice53_control_compression_breakout_BTCUSD_n1000.log"
+}

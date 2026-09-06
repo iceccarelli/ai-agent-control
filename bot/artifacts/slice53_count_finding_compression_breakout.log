@@ -1,0 +1,45 @@
+==============================================================================
+COUNT FINDING — compression_breakout_v1   (no scores, no percentiles)
+==============================================================================
+  rule             : ATR pctile <= 25 over 50 bars (INCLUDING t)  AND  close beyond the 20-bar channel (EXCLUDING t)   (frozen)
+  direction        : break up -> LONG, break down -> SHORT (continuation)
+  barrier          : +3/-1.5 ATR, horizon 5, 25 bps, entry next_open
+  hard gate        : >= 50 scored trades per symbol
+  design expectation: >= 80 scored trades per symbol
+
+  BTCUSD   3,135 bars   setups   93   scoreable   93   entries   76   -> MEETS the 50-trade target
+  ETHUSDT  1,461 bars   setups   26   scoreable   26   entries   23   -> BELOW the 50-trade target
+  SOLUSDT  1,461 bars   setups   48   scoreable   48   entries   35   -> BELOW the 50-trade target
+
+------------------------------------------------------------------------------
+WHAT THE COMPRESSION FILTER REMOVES — the material-difference claim
+------------------------------------------------------------------------------
+  BTCUSD   310 channel breaks at any volatility; 1,284 of 3,072 bars compressed
+           -> 93 breaks ALSO compressed  (survival 30.0% of breaks)
+           76 contiguous flag runs, longest 3 bars -> 17 merged away
+           -> 76 scheduled entries (one per run, at its first bar)
+  ETHUSDT  116 channel breaks at any volatility; 533 of 1,398 bars compressed
+           -> 26 breaks ALSO compressed  (survival 22.4% of breaks)
+           23 contiguous flag runs, longest 2 bars -> 3 merged away
+           -> 23 scheduled entries (one per run, at its first bar)
+  SOLUSDT  135 channel breaks at any volatility; 563 of 1,398 bars compressed
+           -> 48 breaks ALSO compressed  (survival 35.6% of breaks)
+           35 contiguous flag runs, longest 4 bars -> 13 merged away
+           -> 35 scheduled entries (one per run, at its first bar)
+
+The survival rate is what makes this family distinct from the
+frozen donchian_breakout_v1, whose break half this shares. A rate
+near 100% would mean the precondition is decorative; a rate near 0%
+would mean the sample cannot support a measurement. Compression and
+breakout are in tension by construction: a bar that breaks a channel
+usually expands its range, and its own true range enters the ATR
+whose percentile is being tested.
+
+==============================================================================
+COUNT FINDING: BELOW THE HARD GATE on ETHUSDT, SOLUSDT
+
+Per the intake, COMP_MAX is NOT raised and BREAK_N is NOT cut,
+and no grid is run. A symbol below the gate cannot support a
+POSITIVE claim for this family, and a threshold moved to reach
+a count would be a parameter fitted to an observed shortfall.
+==============================================================================

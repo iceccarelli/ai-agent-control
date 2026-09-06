@@ -1,0 +1,88 @@
+{
+  "schema": "research_hold_and_paper_ops/1",
+  "slice": 48,
+  "research_hold": true,
+  "research_hold_document": "docs/RESEARCH_HOLD.md",
+  "research_program": "FROZEN",
+  "timing_skill_research": "CLOSED",
+  "frozen_absent": [
+    "technical_analysis",
+    "closed_analyser",
+    "donchian_breakout_v1",
+    "btc_alt_spillover_v1",
+    "post_shock_fade_v1",
+    "range_location_fade_v1"
+  ],
+  "frozen_absent_count": 6,
+  "frozen_status": {
+    "technical_analysis": "ABSENT",
+    "closed_analyser": "ABSENT",
+    "donchian_breakout_v1": "ABSENT",
+    "btc_alt_spillover_v1": "ABSENT",
+    "post_shock_fade_v1": "ABSENT",
+    "range_location_fade_v1": "INCONCLUSIVE"
+  },
+  "frozen_status_note": "ABSENT = a trusted instrument measured it and it did not clear the bar (percentiles exist). INCONCLUSIVE = the instrument failed its own pre-declared control, so no reading was taken (NO percentiles exist; quoting one would be fabrication). Both are refused identically by the registration hook.",
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "cleared_edge_signal": null,
+  "measurement_runs_this_slice": 0,
+  "signal_constants_changed": false,
+  "signals_byte_identical_to_slice47": true,
+  "non_goals": [
+    "no edge — no measurement of any kind was run in this slice",
+    "no live — live_authorized stays false and no arming path was opened",
+    "no model — nothing trained, promoted or loaded; models/current absent",
+    "no Signal 7 — no new signal file and NEW_SIGNAL_INTAKE.md not filled",
+    "no null redesign — the slice-46 z-failure hypothesis was not acted on",
+    "no bar change — M1 and M2 stay 95.0, the three control clauses stand",
+    "no weakening of the slice-42 certification or slice-45 operator pack",
+    "no scoreboard — no PnL, equity, win-rate, Sharpe or drawdown field"
+  ],
+  "paper_certified": true,
+  "paper_certification_standard": "docs/PAPER_AGENT_CERTIFICATION.md",
+  "paper_operator_runbook": "docs/PAPER_OPERATOR_RUNBOOK.md",
+  "runbook_sections": [
+    "A. What you are running",
+    "B. Startup checklist",
+    "C. Kill switch",
+    "D. Session / health log contract",
+    "E. Pause, stand-down and revocation",
+    "F. Pointers"
+  ],
+  "runbook_startup_reads": [
+    "timing_skill_research",
+    "cleared_edge_signal",
+    "execution_mode",
+    "live_authorized",
+    "models_current_present"
+  ],
+  "execution_mode": "paper",
+  "live": "blocked",
+  "live_authorized": false,
+  "model": "blocked",
+  "models_current_present": false,
+  "kill_switch": "human_clear_only",
+  "entries_enabled_is_a_risk_gate": false,
+  "closer_to_autonomous_profit_agent": false,
+  "runtime_is_evidence": false,
+  "next_stage1_requires": "new_human_material_intake_with_min_trade_count",
+  "next_stage1_gate": [
+    "a different information set from all six frozen names",
+    "an expected minimum of 50 scored trades per symbol, stated before any code",
+    "every constant frozen in git before any run",
+    "a control for the construction it uses, validated before any percentile is read",
+    "M1 = M2 = 95.0 on the pre-declared conjunction, from one run"
+  ],
+  "standing_obstacles": [
+    "No eligible corpus contains an order book, so every microstructure thesis is blocked on data rather than on ideas.",
+    "The directed instrument carries an unexplained upward bias that appears to track how directly the trigger reads the same bar geometry the barrier prices its stops from: 49.05 on a return-based same-asset trigger, ~1.5 points on the cross-asset return trigger, +3.63 on a high/low-based one. Three data points, a hypothesis."
+  ],
+  "guard_reassertion_log": "artifacts/slice48_guard_reassertion.log",
+  "git_commit": "d888bbf49a5ad30baa686c8262de27a45d48fa15",
+  "suite_passed": 3145,
+  "suite_skipped": 1,
+  "certification_tests_passed": 171
+}

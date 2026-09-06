@@ -1,0 +1,208 @@
+{
+  "schema": "stage1_measurement/2",
+  "slice": 57,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "intake": "NEW_SIGNAL_INTAKE.md (human-filled, PATH B ULTIMATE)",
+  "design_note": "EDGE.md §39",
+  "design_before_run": true,
+  "design_before_run_evidence": {
+    "edge39_commit_lists_only_EDGE_md": true,
+    "folds_commit_precedes_module_commit": true,
+    "check": "git log --diff-filter=A -- <path>; asserted by tests/test_funding_carry_fade_btc_v1.py::test_git_ordering_puts_the_lock_before_the_signal_module"
+  },
+  "derived_from": {
+    "name": "funding_carry_fade_v1",
+    "status": "FROZEN ABSENT (slice 56)",
+    "reopened": false
+  },
+  "folds_path": "artifacts/funding_carry_fade_btc_v1_folds.json",
+  "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+  "folds_locked_before_any_score": true,
+  "folds_lock_log": "artifacts/slice57_folds_lock.log",
+  "t0": "2022-08-10T00:00:00Z",
+  "t_mid": "2024-08-09T00:00:00Z",
+  "t1": "2026-08-09T00:00:00Z",
+  "n_bars_early": 730,
+  "n_bars_late": 731,
+  "t_mid_moved_after_any_number": false,
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_identical_to_frozen_family": true,
+  "constants_changed_after_seeing_numbers": false,
+  "grid_or_sweep_run": false,
+  "runs_executed_on_oos": 1,
+  "eth_or_sol_measured_for_this_name": false,
+  "oos": {
+    "n_trades": 41,
+    "mean_net_r": 0.1735699020942922,
+    "m1": 95.13333333333334,
+    "m2": 96.0,
+    "m2_delta": 0.21398047477692644,
+    "m2_ci": [
+      0.19559005707518676,
+      0.23185031477300921
+    ],
+    "control_validated": true,
+    "control_log": "artifacts/slice57_oos_control_BTCUSDT_n1000.log",
+    "control_z": 1.121,
+    "control_ks_p": 0.1561,
+    "control_incomplete_pct": 0.0,
+    "control_surrogate_mean_percentile": 52.3,
+    "summary": "artifacts/slice57_oos_edge_BTCUSDT_summary.json",
+    "count_log": "artifacts/slice57_oos_count_finding.log"
+  },
+  "gate_clauses": {
+    "1_n_oos_ge_40": {
+      "observed": 41,
+      "bar": 40,
+      "met": true
+    },
+    "2_control_valid": {
+      "observed": true,
+      "bar": true,
+      "met": true
+    },
+    "3_m1_ge_95": {
+      "observed": 95.13333333333334,
+      "bar": 95.0,
+      "met": true
+    },
+    "4_m2_ge_95": {
+      "observed": 96.0,
+      "bar": 95.0,
+      "met": true
+    },
+    "5_mean_net_r_gt_0": {
+      "observed": 0.1735699020942922,
+      "bar": 0.0,
+      "met": true
+    }
+  },
+  "positive_rule": "n_OOS>=40 AND control VALID AND M1>=95.0 AND M2>=95.0 AND mean net R>0",
+  "positive_rule_met": true,
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "diagnostic_fullsample": {
+    "registration_eligible": false,
+    "artefact": "artifacts/slice57_diagnostic_fullsample_BTCUSDT.json",
+    "m1": 97.0,
+    "m2": 97.5,
+    "n_trades": 85,
+    "reproduces_slice55_btc_exactly": true
+  },
+  "slice55_btc_artefact": {
+    "path": "artifacts/slice55_edge_funding_carry_fade_BTCUSDT_summary.json",
+    "unedited": true,
+    "verdict_on_disk": "EDGE_EVIDENCE_POSITIVE",
+    "m1": 97.0,
+    "m2": 97.5,
+    "n_trades": 85,
+    "registered_anything": false,
+    "note": "Belongs to funding_carry_fade_v1, which is FROZEN ABSENT. Refused by the deny-list AND by the multi-symbol rule."
+  },
+  "q1_q2": {
+    "is_a_gate_clause": false,
+    "q1": {
+      "n": 21,
+      "mean_net_r": 0.316373097208067
+    },
+    "q2": {
+      "n": 20,
+      "mean_net_r": 0.023626547224828764
+    },
+    "top_3_trades_share_of_total_r": 0.41125467750434497,
+    "artefact": "artifacts/slice57_oos_stability_Q1Q2.json"
+  },
+  "HOW_FRAGILE_THIS_RESULT_IS": {
+    "read_this_before_acting_on_the_clear": true,
+    "m1_margin": {
+      "m1": 95.13333333333334,
+      "bar": 95.0,
+      "rotation_replicates": 1500,
+      "replicates_above_observed": 73,
+      "replicates_above_that_would_fail_it": 76,
+      "margin_in_replicates": 3,
+      "observed_mean_net_r": 0.1735699020942922,
+      "critical_mean_net_r_at_the_bar": 0.16938794999999998,
+      "headroom_in_r": 0.0041819520942922295,
+      "headroom_as_pct_of_observed": 2.409376305357582,
+      "statement": "M1 cleared its bar by 0.13 percentile points. THREE of 1,500 rotation replicates moving above the observed mean would fail it. The observed mean net R would need to fall by 0.0042 R — 2.4% of itself — to sit exactly at the bar. This is a pass, and it is the thinnest pass the programme could produce."
+    },
+    "n_margin": {
+      "n_oos": 41,
+      "floor": 40,
+      "margin_in_trades": 1,
+      "statement": "The trade count cleared its floor by ONE trade. EDGE.md §39c predicted this before the module existed, which is why the cut was locked and hashed in a separate commit first."
+    },
+    "control_offset": {
+      "surrogate_mean_percentile": 52.3,
+      "z": 1.121,
+      "statement": "The instrument reads 52.30, not 50, on this window when nothing can be timed. The three-clause control rule PASSED and there is no pre-declared adjustment for the residual offset — inventing one now, after seeing 95.13, would be moving the goalposts against a result, which is exactly as dishonest as moving them toward one. It is recorded so a human can weigh it."
+    },
+    "decay_across_time": {
+      "series": [
+        {
+          "window": "full-sample fold 1 (bars 200-515)",
+          "n": 28,
+          "mean_net_r": 0.2272
+        },
+        {
+          "window": "full-sample fold 2 (bars 515-830)",
+          "n": 21,
+          "mean_net_r": -0.2124
+        },
+        {
+          "window": "full-sample fold 3 (bars 830-1145)",
+          "n": 22,
+          "mean_net_r": 0.229
+        },
+        {
+          "window": "full-sample fold 4 (bars 1145-1461)",
+          "n": 14,
+          "mean_net_r": 0.0895
+        },
+        {
+          "window": "OOS Q1",
+          "n": 21,
+          "mean_net_r": 0.316373097208067
+        },
+        {
+          "window": "OOS Q2 (most recent)",
+          "n": 20,
+          "mean_net_r": 0.023626547224828764
+        }
+      ],
+      "statement": "The most recent half of the out-of-sample window reads +0.0236 mean net R on 20 trades — essentially flat — against +0.3164 on the 21 trades before it. The whole OOS pass is carried by its earlier half. This is a DIAGNOSTIC and cannot fail the gate; it is also the single most important thing a human should look at before trading this."
+    },
+    "concentration": {
+      "top_3_trades_share_of_total_r": 0.41125467750434497,
+      "statement": "Three of 41 trades carry 41% of the summed net R."
+    },
+    "THE_LIMITATION_THAT_MATTERS_MOST": "THIS IS A TIME SPLIT OF ALREADY-OBSERVED DATA, NOT HELD-OUT DATA. The late window was part of the full sample that slice 55 measured to 97.0/97.5 on BTCUSDT — the reading that motivated writing this product at all. No human chose these constants without having seen this window; they chose them in slice 55 having seen all of it. A genuine out-of-sample test requires data that did not exist, or was not looked at, when the rule was fixed. The intake defines the gate as the late-50% split and that gate has been followed exactly and honestly, but a bank auditor should read this clear as 'survived a pre-declared time split of the data it was found in', NOT as 'validated on unseen data'. The difference is material and it is the reason a forward paper period is the obvious next step."
+  },
+  "frozen_absent_count": 11,
+  "funding_carry_fade_v1_still_frozen": true,
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "bars_changed_this_slice": false,
+  "models_current_present": false,
+  "model_blocked": true,
+  "live_blocked": true,
+  "execution_mode": "paper",
+  "shell_executes_this_signal": false,
+  "shell_note": "Nothing wires funding_carry_fade_btc_v1 into the trading engine and no trading path consults cleared_edge_signal. The NO EDGE CLAIM line is unchanged and was not weakened: it is a statement about this shell, which still executes no edge.",
+  "closer_to_autonomous_profit_agent": true,
+  "closer_note": "YES in the precise and only sense the intake defines: ProjectStatus.cleared_edge_signal is 'funding_carry_fade_btc_v1' under the OOS gate. That means ONE product passed ONE pre-declared Stage-1 gate, by 0.13 percentile points and one trade, on a time split of data that had already been looked at. It does NOT mean the process is a profit agent, that anything is wired up, that a model exists, or that live is any closer — model and live remain BLOCKED and models/current does not exist.",
+  "git_commit": "8991b5e74e28268ca3825f724064c95c0efc9b16"
+}

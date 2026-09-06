@@ -1,0 +1,41 @@
+SLICE 50 STEP 6 — EDGE MEASUREMENT: NOT RUN, AND WHY
+
+  symbol    scheduled entries   hard gate   control    edge run?
+  BTCUSD             1          >= 50       INVALID    NO
+  ETHUSDT            1          >= 50       INVALID    NO
+  SOLUSDT            3          >= 50       INVALID    NO
+
+Two independent reasons, either one sufficient:
+  1. every symbol is below the intake's >= 50 hard gate (1 / 1 / 3),
+     so none can support a POSITIVE claim;
+  2. every control is INVALID, and a percentile from an instrument
+     that failed its own check is not a weak number, it is not a
+     number.
+
+THE SLICE-49 FAILURE MODE DID NOT RECUR, AND THE LOGS SHOW IT
+--------------------------------------------------------------
+Both predictions in EDGE.md 31c (committed 0ac7674, before any run)
+are confirmed. The decisive line is what each surrogate reported:
+
+  slice 49: surrogate 1: INCOMPLETE (0 scoreable entries, need 20)
+  slice 50: surrogate 1: INCOMPLETE (1 scoreable entries, need 20)
+
+  slice 49 -> ZERO. The null DELETED the trigger's quantity: every
+             surrogate bar opened exactly at the prior close.
+  slice 50 -> ONE. The null PRESERVED the trigger -- surrogates found
+             their own momentum setups -- and the SCHEDULER collapsed
+             them, because a state signal's flags form one run.
+
+Different components, different findings. Neither is evidence about
+the directed instrument's upward bias, which remains a slice-46
+observation from an instrument that actually ran.
+
+Filesystem check — no edge artefact for this family exists:
+    slice50_control_ts_momentum_BTCUSD_n1000.log
+    slice50_control_ts_momentum_ETHUSDT_n1000.log
+    slice50_control_ts_momentum_SOLUSDT_n1000.log
+    slice50_count_finding_ts_momentum.log
+  edge summaries for ts_momentum_v1: 0
+
+NO M1 AND NO M2 EXIST FOR ts_momentum_v1. Quoting one would be
+fabrication, not approximation.

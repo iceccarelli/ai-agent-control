@@ -1,0 +1,91 @@
+{
+  "schema": "forward_shadow_observation/3",
+  "slice": 61,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "observed_at_utc": "2026-08-11T01:35:34Z",
+  "result": "HOLD",
+  "extension_present": false,
+  "is_forward_observation": false,
+  "forward_observations_to_date": 0,
+  "forward_n_trades": 0,
+  "forward_mean_net_r": null,
+  "reason": "no closed linear bars after t1; the human pack contained no data files",
+  "reason_long": "The human note names two extended files. The pack (s61pack.zip, 2474 bytes, sha256 b13a2586510892e4...) contains 2 markdown documents and 0 data files. The corpus on disk hashes IDENTICALLY to the values pinned in the fold calendar in slice 57, which proves both that no history was rewritten and that no extension exists. Zero closed bars after t1 means zero forward observations. Nothing was fabricated. EDGE.md §44.",
+  "monitors_re_run": false,
+  "monitor_readings": null,
+  "monitor_status": null,
+  "entries_blocked_by_monitor": null,
+  "why_monitors_were_not_re_run": "Deliberate, per EDGE.md §43c and §44e. Re-reporting slice 59's readings under a slice-61 heading would manufacture the appearance of a refreshed observation from no new data — the same substitution as calling a replay forward, one level up.",
+  "monitor_readings_that_stand": {
+    "source": "artifacts/slice59_forward_shadow.json",
+    "monitor_status": "WARN",
+    "m4_state": "WARN",
+    "m4_detail": "earlier half +0.4669 on 17, recent half -0.0798 on 18",
+    "note": "M-4 still WARNs. Not re-run, not moved, not silenced."
+  },
+  "monitor_thresholds": {
+    "M1_rolling_trades": {
+      "k": 10,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 10
+    },
+    "M2_rolling_days": {
+      "window_days": 90,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 5
+    },
+    "M3_concentration": {
+      "top_n": 3,
+      "warn_above": 0.6,
+      "min_trades": 10
+    },
+    "M4_halves": {
+      "min_trades": 20
+    }
+  },
+  "thresholds_moved_this_slice": false,
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_fingerprint": "662de0115880871352d5d623b1020eaa",
+  "constants_fingerprint_matches_frozen": true,
+  "schedule_mode": "one_entry_per_contiguous_run",
+  "caps": {
+    "max_concurrent_positions": 1,
+    "max_entries_per_day": 1,
+    "max_notional_usd": 100.0,
+    "symbol": "BTCUSDT"
+  },
+  "freshness_artefact": "artifacts/slice61_data_freshness.json",
+  "human_note": "docs/human/HUMAN_DATA_NOTE_SLICE61.md",
+  "human_pack_supplied_data_files": false,
+  "history_rewritten": false,
+  "new_linear_bars_count": 0,
+  "new_funding_prints_count": 1,
+  "one_new_funding_print_note": "The 1 funding print after t1 produces nothing: the decision clock is the daily bar and no bar after t1 has closed. Unchanged from slice 60.",
+  "bars_fabricated": 0,
+  "is_stage1_evidence": false,
+  "registration_eligible": false,
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "cleared_edge_re_scored_this_slice": false,
+  "live_authorized": false,
+  "policy_mode": "off",
+  "execution_mode": "paper",
+  "models_current_present": false,
+  "frozen_absent_count": 11,
+  "promotion_gate_allows_live": false,
+  "closer_to_autonomous_profit_agent": false,
+  "hold_is_not_progress": "Nothing advanced this slice except the record of having looked, and of having looked at the FILES rather than at the note about them. The gate's forward item still reads 0 of 20.",
+  "git_commit": "4fcc71fa251373f6aed9a94c958f3587e58b6ff4"
+}

@@ -1,0 +1,84 @@
+==============================================================================
+DATA PROVENANCE
+==============================================================================
+BTCUSD: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : BTCUSD
+bars              : 2,564
+
+lock-up            : 1 bars, FIXED (schedule cannot depend on when a barrier resolved)
+
+computing the signal flags with the REAL analyser, bar by bar …
+
+==============================================================================
+SKILL TEST — matched-exposure permutation
+==============================================================================
+replicates         : 500 runs, null = block_resample
+Both sides run the SAME machinery -- same signal rate, same gates,
+same fixed lock-up, same barrier scoring.
+BLOCK RESAMPLE: the observed flag sequence is decomposed into 47 runs
+and their gaps. Every replicate re-tiles the series with the SAME multiset
+of run lengths -- so clustering and trade counts are preserved exactly, not
+imitated -- while each run is placed on a bar drawn from its own geometry
+cell. All three constraints hold at once; none is traded for another.
+stratification     : 5x5 quantile cells, 25 populated
+tolerance          : TV <= 0.2340 (median resample floor; p10 0.1702)
+placements         : 9,493 searched, 400 legal re-tilings (4.2% solve rate)
+geometry acceptance: 4.2% of searches, 100.0% of legal re-tilings; best TV 0.0000, median accepted 0.0000
+entries that are run STARTS: 100.0%  <- must be 100%; TV(all-starts, entries) 0.0000
+Both sides are scored by the SAME triple barrier on the SAME series
+with the SAME costs (+4 / -2 ATR, 24-bar horizon, 25 bps).
+The ONLY difference is which bars were chosen. These are idealised
+single-barrier R values, not the backtest's P&L: the right instrument
+for comparing two sets of entry bars, the wrong one for a forecast.
+
+strategy expectancy: +0.2838 R
+random-entry mean  : +0.1239 R  (sd 0.1528)
+strategy percentile: 85.4
+one-sided p        : 0.1460
+
+trades             : 47  (null median 47)
+median hold        : 14 bars
+time in market     : 26.6% of the sample
+asset over sample  : +675.3%
+
+raw reading        : INCONCLUSIVE — better than the null, not decisively
+
+==============================================================================
+CONTROL — the same test on series with NO temporal structure
+==============================================================================
+A percentile is a claim about timing. On a shuffled-return series
+there is nothing to time, so the same instrument must report ~50.
+If it does not, the reading above is an artefact of the instrument
+and cannot be reported as skill. This control runs unconditionally,
+because a control you have to remember to run is a control that
+gets skipped exactly when the result is exciting.
+
+  surrogate 1: percentile  42.4  (48 trades)
+  surrogate 2: percentile  67.0  (56 trades)
+  surrogate 3: percentile  51.6  (47 trades)
+  surrogate 4: percentile 100.0  (48 trades)
+  surrogate 5: percentile 100.0  (45 trades)
+  surrogate 6: percentile  98.0  (47 trades)
+
+==============================================================================
+VERDICT
+==============================================================================
+surrogate percentiles: median 82.5, mean 76.5, worst 100.0  (must be near 50)
+uniformity check     : mean 76.5 vs 50 expected, z = +2.25 over 6 surrogates
+                       (P(worst<=75) for a PERFECT instrument at n=6 is 0.178)
+real-series percentile: 85.4
+
+incomplete surrogates: 0 of 6   budget 1  -> ok
+note: worst 100.0 exceeds the legacy 75 ceiling. That ceiling is NOT a gate -- a PERFECT instrument
+      clears it with probability 0.178 at n=6. Reported, never gated. See EDGE.md 7b.
+
+CONTROL: **INVALID — the instrument cannot be trusted here.**
+
+  failed: median 82.5 > 50; uniformity rejects
+
+On a series whose time structure has been destroyed the strategy
+CANNOT have timed anything, so a control that does not look
+uniform is measuring a property of the instrument, not of the
+market. The real-series reading of 85.4 above is
+therefore NOT evidence of skill and must not be interpreted.
+EXIT_BR=1

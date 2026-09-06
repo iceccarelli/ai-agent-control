@@ -1,0 +1,56 @@
+==============================================================================
+REAL-SERIES EDGE MEASUREMENT (slice 24)
+==============================================================================
+BTCUSD: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : BTCUSD
+bars              : 2,564
+
+Instrument path = the configuration whose control PASSED at n=200
+(EDGE.md 4u: median 48.0, z = -1.18, KS p = 0.435, 0 incomplete):
+  null rotation | lock-up 1 | one trade per run | 1,500 replicates
+  barrier +4/-2 ATR, 24-bar horizon, 25 bps round trip
+
+Bars pre-declared in EDGE.md 5b, before any number existed:
+  M1  real-series percentile          >= 95.0
+  M2  Delta > 0, 95% CI excludes 0, percentile >= 95.0
+  M3  >= 3 of 4 folds mean net R > 0 (soft, supporting only)
+
+computing the analyser's flags on the REAL series, bar by bar ...
+
+real-series schedule: 47 trades from 47 flag runs
+strategy mean net R : +0.2838
+
+M1: ranking against the validated rotation null ...
+  replicates        : 1,500 of 1,500
+  null mean net R   : +0.1552  (sd 0.1831)
+  null trade counts : median 47
+  M1 PERCENTILE     : 76.1   bar 95.0   -> FAIL
+
+M2: drift-controlled contrast against shape-matched schedules ...
+  schedules         : 200 of 200
+  Side N mean net R : +0.1443  (sd 0.1732)
+  Side N trades     : median 47   (Side S: 47)
+  Delta             : +0.1396   95% CI [+0.1158, +0.1632]
+  M2 PERCENTILE     : 77.5  bar 95.0
+  M2                -> FAIL   (needs Delta>0 AND CI excludes 0 AND percentile>=95.0)
+
+M3: walk-forward, per fold ...
+  fold 1: bars 200-791   12 trades  mean net R -0.1614  percentile 21.8
+  fold 2: bars 791-1382   13 trades  mean net R +1.2690  percentile 100.0
+  fold 3: bars 1382-1973    8 trades  mean net R -0.3281  percentile n/a  [8 trades: too few for a stable percentile]
+  fold 4: bars 1973-2564   14 trades  mean net R +0.1003  percentile 49.6
+  folds with mean net R > 0 : 2 of 4   soft gate NOT met (supporting only)
+
+==============================================================================
+DECISION
+==============================================================================
+  M1  percentile 76.1 vs bar 95.0  -> FAIL
+  M2  delta +0.1396, CI [+0.1158, +0.1632], percentile 77.5  -> FAIL
+  M3  2/4 folds positive  (soft, supporting only)
+
+  EDGE_EVIDENCE_ABSENT
+
+  The pre-declared bars are not met. No threshold, stop, size or
+  confidence parameter may be retuned to change this reading.
+
+artifacts: /home/claude/work/repo/artifacts/slice24_edge_summary.json / _null_distributions.csv / _folds.csv

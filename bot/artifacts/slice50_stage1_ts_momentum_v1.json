@@ -1,0 +1,117 @@
+{
+  "schema": "stage1_measurement/1",
+  "slice": 50,
+  "signal": "ts_momentum_v1",
+  "intake": "NEW_SIGNAL_INTAKE.md (human-filled)",
+  "design_note": "EDGE.md §31",
+  "design_before_run": true,
+  "constants": {
+    "LOOKBACK": 10,
+    "SKIP": 1,
+    "ATR_PERIOD": 14,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 2.0,
+    "TAKE_PROFIT_ATR": 3.0,
+    "HORIZON": 5,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_changed_after_seeing_numbers": false,
+  "grid_or_sweep_run": false,
+  "scheduler_modified_after_seeing_counts": false,
+  "count_finding": {
+    "hard_gate_per_symbol": 50,
+    "design_expectation_per_symbol": 100,
+    "log": "artifacts/slice50_count_finding_ts_momentum.log",
+    "flagged_bars": {
+      "BTCUSD": 2934,
+      "ETHUSDT": 1260,
+      "SOLUSDT": 1258
+    },
+    "flag_runs": {
+      "BTCUSD": 1,
+      "ETHUSDT": 1,
+      "SOLUSDT": 3
+    },
+    "sign_flips": {
+      "BTCUSD": 441,
+      "ETHUSDT": 209,
+      "SOLUSDT": 201
+    },
+    "entries": {
+      "BTCUSD": 1,
+      "ETHUSDT": 1,
+      "SOLUSDT": 3
+    },
+    "symbols_meeting_gate": [],
+    "cause": "A STATE signal against an EVENT-shaped scheduler. The sign of a 10-bar return is defined on nearly every bar, so the flags form 1 / 1 / 3 contiguous runs; skill_test.simulate_schedule takes AT MOST ONE entry per contiguous run, on its first bar (slice 17 — the rule that makes the rotation null valid). The thesis is NOT rare: there are 441 / 209 / 201 sign flips in the three corpora, so a scheduler that broke runs at direction changes would produce a several-hundred-trade sample. That change was NOT made, because making it after seeing this count is a construction chosen to produce a sample."
+  },
+  "control": {
+    "construction": "same-asset directed, whole-bar shuffle and re-base",
+    "clauses": {
+      "abs_z_max": 1.96,
+      "ks_min_p": 0.05,
+      "max_incomplete_pct": 5.0
+    },
+    "surrogates_requested": 200,
+    "rotations_each": 1000,
+    "BTCUSD": {
+      "verdict": "INVALID",
+      "usable_surrogates": 0,
+      "incomplete_pct": 100.0,
+      "typical_surrogate_entries": 1,
+      "log": "artifacts/slice50_control_ts_momentum_BTCUSD_n1000.log"
+    },
+    "ETHUSDT": {
+      "verdict": "INVALID",
+      "usable_surrogates": 0,
+      "incomplete_pct": 100.0,
+      "typical_surrogate_entries": 1,
+      "log": "artifacts/slice50_control_ts_momentum_ETHUSDT_n1000.log"
+    },
+    "SOLUSDT": {
+      "verdict": "INVALID",
+      "usable_surrogates": 0,
+      "incomplete_pct": 100.0,
+      "typical_surrogate_entries": 1,
+      "log": "artifacts/slice50_control_ts_momentum_SOLUSDT_n1000.log"
+    },
+    "why_invalid": "CONSTRUCTION MISMATCH, NOT INSTRUMENT BIAS — and a DIFFERENT mismatch from slice 49's. The null PRESERVED this trigger: every surrogate reported '1 scoreable entries', not 0, so surrogates did find their own momentum setups. What collapsed them is the same scheduler interaction as the real series — one entry per contiguous run — which leaves each surrogate far below the 20-trade floor, so clause (c) failed at 100% incomplete and clauses (a) and (b) had no sample. This says nothing about the ~1.5-point cross-asset bias or the slice-46 z = +3.6 finding, both of which came from an instrument that ran.",
+    "predicted_before_the_run": true,
+    "prediction_commits": [
+      "0ac7674",
+      "773a35f",
+      "f1fa228"
+    ],
+    "slice49_failure_mode_recurred": false
+  },
+  "edge": {
+    "runs_executed": 0,
+    "m1": null,
+    "m2": null,
+    "n_trades": null,
+    "mean_r": null,
+    "control_validated": false,
+    "attestation_log": "artifacts/slice50_no_edge_run_attestation.log",
+    "why_not_run": "Two independent sufficient reasons: every symbol is below the intake's >= 50 hard gate (1 / 1 / 3), and every control is INVALID. NO M1 AND NO M2 EXIST for this family; quoting one would be fabrication, not approximation."
+  },
+  "edge_verdict": "INCONCLUSIVE",
+  "positive_rule_met": false,
+  "positive_rule": "control_validated on every symbol claimed AND at least two of {BTCUSD, ETHUSDT, SOLUSDT} with >= 50 scored trades AND those same symbols each at M1 >= 95 and M2 >= 95",
+  "cleared_edge_signal": null,
+  "frozen_absent_count": 7,
+  "open_gap_fade_v1_frozen": true,
+  "freeze_of_this_family": "NOT PERFORMED — the mission reserves it for a human decision",
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "models_current_present": false,
+  "live_authorized": false,
+  "execution_mode": "paper",
+  "closer_to_autonomous_profit_agent": false,
+  "instrument_defect_recorded_not_repaired": "simulate_schedule's one-entry-per-contiguous-run rule is correct for the EVENT signals it was designed for (slice 17) and collapses any STATE signal to one trade. Repairing it — breaking runs at direction changes, or scheduling one-position-at-a-time — would turn this 1-trade sample into a several-hundred-trade one, which is exactly why it must not be done in the slice that discovered the problem. It is a human pre-declaration, written before the run it enables, per docs/RESEARCH_HOLD.md.",
+  "standing_obstacle_added": "The measurement instrument can only score EVENT-shaped signals. Any thesis expressed as a persistent STATE — a regime, a trend sign, a filter that is on for months — schedules one trade per episode under the current builder, regardless of how often the state changes. Check the flag-run structure before implementing, not after.",
+  "git_commit": "f1fa22832f073221b9ea663e7a9ec73d656ba1a7"
+}

@@ -1,0 +1,280 @@
+==============================================================================
+DATA PROVENANCE
+==============================================================================
+BTCUSD: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : BTCUSD
+bars              : 2,564
+
+lock-up            : 24 bars, FIXED (schedule cannot depend on when a barrier resolved)
+
+computing the signal flags with the REAL analyser, bar by bar …
+
+==============================================================================
+SKILL TEST — matched-exposure permutation
+==============================================================================
+replicates         : 1,500 runs, null = rotation
+Both sides run the SAME machinery -- same signal rate, same gates,
+same fixed lock-up, same barrier scoring.
+ROTATION: the flag sequence is rotated. Preserves every run and
+gap, so clustering and trade counts stay matched; does NOT match
+the barrier geometry. NEITHER null is valid yet -- see EDGE.md.
+Both sides are scored by the SAME triple barrier on the SAME series
+with the SAME costs (+4 / -2 ATR, 24-bar horizon, 25 bps).
+The ONLY difference is which bars were chosen. These are idealised
+single-barrier R values, not the backtest's P&L: the right instrument
+for comparing two sets of entry bars, the wrong one for a forecast.
+
+strategy expectancy: +0.1240 R
+random-entry mean  : +0.1549 R  (sd 0.1693)
+strategy percentile: 43.6
+one-sided p        : 0.5640
+
+trades             : 34  (null median 34)
+median hold        : 13 bars
+time in market     : 18.2% of the sample
+asset over sample  : +675.3%
+
+raw reading        : DRIFT — indistinguishable from random entries
+
+==============================================================================
+CONTROL — the same test on series with NO temporal structure
+==============================================================================
+A percentile is a claim about timing. On a shuffled-return series
+there is nothing to time, so the same instrument must report ~50.
+If it does not, the reading above is an artefact of the instrument
+and cannot be reported as skill. This control runs unconditionally,
+because a control you have to remember to run is a control that
+gets skipped exactly when the result is exciting.
+
+  surrogate 1: percentile  21.8  (38 trades)
+  surrogate 2: percentile  70.6  (40 trades)
+  surrogate 3: percentile  20.6  (35 trades)
+  surrogate 4: percentile  89.4  (34 trades)
+  surrogate 5: percentile  98.8  (35 trades)
+  surrogate 6: percentile  75.0  (38 trades)
+  surrogate 7: percentile  44.4  (33 trades)
+  surrogate 8: percentile  79.2  (37 trades)
+  surrogate 9: percentile  47.4  (35 trades)
+  surrogate 10: percentile  39.2  (35 trades)
+  surrogate 11: percentile  83.4  (36 trades)
+  surrogate 12: percentile  22.6  (32 trades)
+  surrogate 13: percentile  51.0  (36 trades)
+  surrogate 14: percentile  86.8  (31 trades)
+  surrogate 15: percentile  28.6  (36 trades)
+  surrogate 16: percentile  28.2  (37 trades)
+  surrogate 17: percentile  57.4  (41 trades)
+  surrogate 18: percentile  42.2  (37 trades)
+  surrogate 19: percentile  51.6  (32 trades)
+  surrogate 20: percentile  37.8  (37 trades)
+  surrogate 21: percentile  44.0  (36 trades)
+  surrogate 22: percentile  39.6  (37 trades)
+  surrogate 23: percentile   0.0  (42 trades)
+  surrogate 24: percentile  30.4  (34 trades)
+  surrogate 25: percentile  28.6  (36 trades)
+  surrogate 26: percentile  37.8  (40 trades)
+  surrogate 27: percentile   8.4  (34 trades)
+  surrogate 28: percentile   0.8  (41 trades)
+  surrogate 29: percentile   5.8  (36 trades)
+  surrogate 30: percentile  38.6  (36 trades)
+  surrogate 31: percentile  68.6  (34 trades)
+  surrogate 32: percentile  91.2  (35 trades)
+  surrogate 33: percentile  64.0  (36 trades)
+  surrogate 34: percentile  62.6  (36 trades)
+  surrogate 35: percentile  97.2  (33 trades)
+  surrogate 36: percentile  70.6  (35 trades)
+  surrogate 37: percentile  27.2  (36 trades)
+  surrogate 38: percentile  19.4  (39 trades)
+  surrogate 39: percentile   5.6  (42 trades)
+  surrogate 40: percentile   7.4  (36 trades)
+  surrogate 41: percentile  19.6  (36 trades)
+  surrogate 42: percentile  98.6  (32 trades)
+  surrogate 43: percentile  92.4  (38 trades)
+  surrogate 44: percentile   2.2  (40 trades)
+  surrogate 45: percentile  90.6  (35 trades)
+  surrogate 46: percentile  75.2  (36 trades)
+  surrogate 47: percentile  77.4  (34 trades)
+  surrogate 48: percentile   6.2  (38 trades)
+  surrogate 49: percentile   0.8  (42 trades)
+  surrogate 50: percentile  12.0  (37 trades)
+  surrogate 51: percentile  30.8  (34 trades)
+  surrogate 52: percentile  47.8  (33 trades)
+  surrogate 53: percentile  84.2  (33 trades)
+  surrogate 54: percentile   1.8  (38 trades)
+  surrogate 55: percentile  21.2  (36 trades)
+  surrogate 56: percentile  95.6  (34 trades)
+  surrogate 57: percentile  34.6  (36 trades)
+  surrogate 58: percentile  47.2  (36 trades)
+  surrogate 59: percentile  10.0  (36 trades)
+  surrogate 60: percentile  67.4  (35 trades)
+  surrogate 61: percentile  72.2  (33 trades)
+  surrogate 62: percentile  40.0  (36 trades)
+  surrogate 63: percentile  57.2  (35 trades)
+  surrogate 64: percentile  16.2  (35 trades)
+  surrogate 65: percentile  74.8  (34 trades)
+  surrogate 66: percentile  52.6  (36 trades)
+  surrogate 67: percentile  25.8  (30 trades)
+  surrogate 68: percentile  22.0  (38 trades)
+  surrogate 69: percentile   8.8  (36 trades)
+  surrogate 70: percentile  78.4  (36 trades)
+  surrogate 71: percentile  26.2  (38 trades)
+  surrogate 72: percentile  69.0  (31 trades)
+  surrogate 73: percentile  87.6  (36 trades)
+  surrogate 74: percentile  83.6  (39 trades)
+  surrogate 75: percentile  63.6  (35 trades)
+  surrogate 76: percentile  55.8  (46 trades)
+  surrogate 77: percentile  52.0  (36 trades)
+  surrogate 78: percentile  61.4  (37 trades)
+  surrogate 79: percentile  25.6  (39 trades)
+  surrogate 80: percentile  26.6  (30 trades)
+  surrogate 81: percentile  94.0  (34 trades)
+  surrogate 82: percentile   2.6  (37 trades)
+  surrogate 83: percentile  42.0  (37 trades)
+  surrogate 84: percentile  46.2  (39 trades)
+  surrogate 85: percentile  26.6  (39 trades)
+  surrogate 86: percentile  89.2  (34 trades)
+  surrogate 87: percentile   3.0  (34 trades)
+  surrogate 88: percentile  17.0  (35 trades)
+  surrogate 89: percentile  62.2  (38 trades)
+  surrogate 90: percentile  50.6  (40 trades)
+  surrogate 91: percentile  85.2  (37 trades)
+  surrogate 92: percentile  99.4  (34 trades)
+  surrogate 93: percentile  32.2  (37 trades)
+  surrogate 94: percentile  21.2  (36 trades)
+  surrogate 95: percentile  61.8  (32 trades)
+  surrogate 96: percentile  14.8  (34 trades)
+  surrogate 97: percentile  48.4  (33 trades)
+  surrogate 98: percentile  31.6  (40 trades)
+  surrogate 99: percentile  98.8  (37 trades)
+  surrogate 100: percentile  99.8  (35 trades)
+  surrogate 101: percentile  42.4  (35 trades)
+  surrogate 102: percentile   1.6  (39 trades)
+  surrogate 103: percentile  55.0  (31 trades)
+  surrogate 104: percentile  51.8  (35 trades)
+  surrogate 105: percentile  52.0  (39 trades)
+  surrogate 106: percentile  61.8  (37 trades)
+  surrogate 107: percentile  20.8  (35 trades)
+  surrogate 108: percentile  26.6  (35 trades)
+  surrogate 109: percentile  93.2  (35 trades)
+  surrogate 110: percentile  74.4  (33 trades)
+  surrogate 111: percentile   1.2  (41 trades)
+  surrogate 112: percentile   2.2  (34 trades)
+  surrogate 113: percentile  30.6  (32 trades)
+  surrogate 114: percentile  50.8  (39 trades)
+  surrogate 115: percentile  34.2  (42 trades)
+  surrogate 116: percentile  72.0  (35 trades)
+  surrogate 117: percentile  92.0  (36 trades)
+  surrogate 118: percentile   1.8  (36 trades)
+  surrogate 119: percentile  58.6  (34 trades)
+  surrogate 120: percentile   4.4  (34 trades)
+  surrogate 121: percentile  33.8  (34 trades)
+  surrogate 122: percentile  78.6  (35 trades)
+  surrogate 123: percentile  84.2  (37 trades)
+  surrogate 124: percentile  73.2  (34 trades)
+  surrogate 125: percentile  63.4  (37 trades)
+  surrogate 126: percentile   7.2  (34 trades)
+  surrogate 127: percentile  79.0  (36 trades)
+  surrogate 128: percentile  33.8  (36 trades)
+  surrogate 129: percentile  23.8  (35 trades)
+  surrogate 130: percentile  38.2  (36 trades)
+  surrogate 131: percentile  37.0  (38 trades)
+  surrogate 132: percentile  44.6  (35 trades)
+  surrogate 133: percentile  32.8  (36 trades)
+  surrogate 134: percentile   7.4  (37 trades)
+  surrogate 135: percentile  50.6  (34 trades)
+  surrogate 136: percentile  89.8  (42 trades)
+  surrogate 137: percentile  80.0  (37 trades)
+  surrogate 138: percentile  94.0  (34 trades)
+  surrogate 139: percentile  26.8  (36 trades)
+  surrogate 140: percentile  13.8  (36 trades)
+  surrogate 141: percentile   0.6  (41 trades)
+  surrogate 142: percentile  54.8  (36 trades)
+  surrogate 143: percentile  32.6  (38 trades)
+  surrogate 144: percentile  35.4  (38 trades)
+  surrogate 145: percentile  72.6  (36 trades)
+  surrogate 146: too few trades to rank
+  surrogate 147: percentile  83.2  (32 trades)
+  surrogate 148: percentile  64.2  (36 trades)
+  surrogate 149: percentile  75.0  (30 trades)
+  surrogate 150: percentile  96.2  (35 trades)
+  surrogate 151: percentile  67.6  (38 trades)
+  surrogate 152: percentile  96.8  (32 trades)
+  surrogate 153: percentile  49.6  (39 trades)
+  surrogate 154: percentile  29.0  (30 trades)
+  surrogate 155: percentile  60.8  (38 trades)
+  surrogate 156: percentile   3.4  (38 trades)
+  surrogate 157: percentile  71.8  (40 trades)
+  surrogate 158: percentile   7.8  (32 trades)
+  surrogate 159: percentile  49.2  (38 trades)
+  surrogate 160: percentile   1.2  (38 trades)
+  surrogate 161: percentile  90.6  (37 trades)
+  surrogate 162: percentile   1.0  (36 trades)
+  surrogate 163: percentile  41.6  (36 trades)
+  surrogate 164: percentile  22.4  (34 trades)
+  surrogate 165: percentile  33.2  (35 trades)
+  surrogate 166: percentile  52.2  (40 trades)
+  surrogate 167: percentile  64.4  (30 trades)
+  surrogate 168: percentile  96.8  (35 trades)
+  surrogate 169: percentile  95.2  (31 trades)
+  surrogate 170: percentile   8.2  (42 trades)
+  surrogate 171: percentile  81.4  (39 trades)
+  surrogate 172: percentile  58.8  (35 trades)
+  surrogate 173: percentile  83.2  (35 trades)
+  surrogate 174: percentile  87.4  (39 trades)
+  surrogate 175: percentile  53.4  (37 trades)
+  surrogate 176: percentile  51.6  (33 trades)
+  surrogate 177: percentile  74.6  (38 trades)
+  surrogate 178: percentile  65.0  (36 trades)
+  surrogate 179: percentile  37.8  (35 trades)
+  surrogate 180: percentile  13.4  (34 trades)
+  surrogate 181: percentile  95.8  (33 trades)
+  surrogate 182: percentile  41.8  (38 trades)
+  surrogate 183: percentile  60.2  (36 trades)
+  surrogate 184: percentile   2.8  (35 trades)
+  surrogate 185: percentile  97.4  (35 trades)
+  surrogate 186: percentile  23.6  (37 trades)
+  surrogate 187: percentile  69.8  (33 trades)
+  surrogate 188: percentile  19.8  (38 trades)
+  surrogate 189: percentile  30.4  (38 trades)
+  surrogate 190: percentile  15.2  (33 trades)
+  surrogate 191: percentile  71.0  (37 trades)
+  surrogate 192: percentile  68.2  (30 trades)
+  surrogate 193: percentile  30.4  (37 trades)
+  surrogate 194: percentile  18.4  (39 trades)
+  surrogate 195: percentile  12.2  (40 trades)
+  surrogate 196: percentile  65.2  (36 trades)
+  surrogate 197: percentile   9.8  (38 trades)
+  surrogate 198: percentile  93.4  (32 trades)
+  surrogate 199: percentile  64.6  (33 trades)
+  surrogate 200: percentile   2.2  (33 trades)
+
+==============================================================================
+VERDICT
+==============================================================================
+surrogate percentiles: median 47.8, mean 47.9, worst 99.8  (must be near 50)
+uniformity check     : mean 47.9 vs 50 expected, z = -1.00 over 199 surrogates
+                       (P(worst<=75) for a PERFECT instrument at n=199 is 0.000)
+real-series percentile: 43.6
+
+EDGE/SKILL: **RED — and the test itself is INVALID.**
+
+The instrument reported 99.8 on a series whose time
+structure had been destroyed. On that series the strategy CANNOT
+have timed anything, so whatever produced that number is a
+property of the measurement, not of the market.
+
+That means the 43.6 on real data is not evidence of
+skill. It is the same artefact, measured on a different series.
+
+The likely mechanism is selection: the strategy's entry bars are
+not an exchangeable sample of eligible bars. It can only open
+when flat, its stop is CAPPED at STOP_LOSS_PCT*3 so its effective
+barrier differs from the null's on high-volatility bars, and its
+gates reject trades on criteria correlated with the outcome the
+null is scoring. Any of those makes the comparison unfair in the
+strategy's favour without any timing skill being involved.
+
+NEXT CONCRETE ACTION: make the null draw from the SAME
+conditional population the strategy draws from — flat-only bars,
+the strategy's own capped stop widths, and its gate-eligible
+subset — then re-run. Until the control sits near 50, no skill
+claim from this tool means anything.

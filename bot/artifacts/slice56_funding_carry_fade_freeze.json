@@ -1,0 +1,162 @@
+{
+  "schema": "research_freeze/1",
+  "slice": 56,
+  "frozen_name": "funding_carry_fade_v1",
+  "freeze": true,
+  "family_status": "ABSENT",
+  "status": "ABSENT",
+  "freeze_reason": "FAMILY_ABSENT_MULTI_SYMBOL_RULE_FAILED",
+  "frozen_by": "human decision, slice 56",
+  "measured_in_slice": 55,
+  "design_note": "EDGE.md §36 (design), §37 (findings), §38 (freeze)",
+  "conjunction_failed": true,
+  "positive_rule": "control_validated on every symbol claimed AND at least TWO of {BTCUSDT, ETHUSDT, SOLUSDT} with >= 50 scored trades AND those symbols each at M1 >= 95.0 and M2 >= 95.0",
+  "positive_rule_declared_at": "EDGE.md §36e, commit d18a3b8, before any number existed",
+  "positive_rule_symbols_required": 2,
+  "positive_rule_symbols_clearing_both_bars": [
+    "BTCUSDT"
+  ],
+  "positive_rule_met": false,
+  "single_symbol_claim_refused": true,
+  "readings": {
+    "BTCUSDT": {
+      "verdict": "EDGE_EVIDENCE_POSITIVE",
+      "m1": 97.0,
+      "m2": 97.5,
+      "m1_passed": true,
+      "m2_passed": true,
+      "m2_delta": 0.1603291609343535,
+      "m2_ci": [
+        0.14872662054042696,
+        0.17190386212197506
+      ],
+      "n_trades": 85,
+      "mean_net_r": 0.09637759630974421,
+      "control_validated": true,
+      "control_log": "artifacts/slice55_control_funding_carry_fade_BTCUSDT_n1000.log",
+      "summary": "artifacts/slice55_edge_funding_carry_fade_BTCUSDT_summary.json",
+      "clears_both_bars": true
+    },
+    "ETHUSDT": {
+      "verdict": "EDGE_EVIDENCE_ABSENT",
+      "m1": 47.7,
+      "m2": 48.5,
+      "m1_passed": false,
+      "m2_passed": false,
+      "m2_delta": -0.002998089552069483,
+      "m2_ci": [
+        -0.015726302042317425,
+        0.009715093219363783
+      ],
+      "n_trades": 76,
+      "mean_net_r": -0.035829943833568356,
+      "control_validated": true,
+      "control_log": "artifacts/slice55_control_funding_carry_fade_ETHUSDT_n1000.log",
+      "summary": "artifacts/slice55_edge_funding_carry_fade_ETHUSDT_summary.json",
+      "clears_both_bars": false
+    },
+    "SOLUSDT": {
+      "verdict": "EDGE_EVIDENCE_ABSENT",
+      "m1": 2.3,
+      "m2": 1.0,
+      "m1_passed": false,
+      "m2_passed": false,
+      "m2_delta": -0.13148717336268326,
+      "m2_ci": [
+        -0.1401554459747876,
+        -0.12292653955561875
+      ],
+      "n_trades": 162,
+      "mean_net_r": -0.1657996352270143,
+      "control_validated": true,
+      "control_log": "artifacts/slice55_control_funding_carry_fade_SOLUSDT_n1000.log",
+      "summary": "artifacts/slice55_edge_funding_carry_fade_SOLUSDT_summary.json",
+      "clears_both_bars": false
+    }
+  },
+  "readings_summary": "BTC 97.0/97.5 POSITIVE (n=85, control VALID); ETH 47.7/48.5 ABSENT (n=76, control VALID); SOL 2.3/1.0 ABSENT (n=162, control VALID, M2 delta -0.1315 with a CI excluding zero)",
+  "all_symbols_measured": true,
+  "any_symbol_inconclusive": false,
+  "why_absent_not_inconclusive": "Three readings were taken. Every control passed all three pre-declared clauses at 0% incompletes and every symbol cleared the >= 50-trade gate (85/76/162). INCONCLUSIVE means no reading exists; here three do, and the conjunction they were measured against failed.",
+  "why_not_almost_positive": "Best-of-three at a 95th percentile occurs about 14% of the time under a global null; the three readings disagree in SIGN, and the largest sample (SOLUSDT, 162 trades) disagrees hardest with a 95% CI on its M2 delta of [-0.1402, -0.1229], excluding zero on the wrong side.",
+  "btc_artefact_preserved": true,
+  "btc_artefact_path": "artifacts/slice55_edge_funding_carry_fade_BTCUSDT_summary.json",
+  "btc_artefact_verdict_on_disk": "EDGE_EVIDENCE_POSITIVE",
+  "btc_artefact_note": "Retained UNEDITED and still reading EDGE_EVIDENCE_POSITIVE. It is evidence of a true single-symbol reading, not a cleared edge. Deleting it would be the worse of the two available dishonesties: a repository that removes its one inconvenient artefact is one whose remaining artefacts mean less.",
+  "refused_by": [
+    "project_status.MULTI_SYMBOL_MINIMUMS (slice 55)",
+    "project_status.FROZEN_ABSENT (slice 56)"
+  ],
+  "refused_twice_over": true,
+  "forged_positive_satisfying_the_universe_rule_is_refused": true,
+  "constants_unchanged": true,
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "universe_unchanged": true,
+  "universe": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "edge_or_control_rerun_in_this_slice": false,
+  "grid_or_sweep_run": false,
+  "new_signal_implemented": false,
+  "intake_status": "COMPLETED — CLOSED; next slot WAITING — EMPTY",
+  "forbidden_without_a_new_human_intake": [
+    "registering BTCUSDT alone as a cleared edge, by any route",
+    "deleting, editing, weakening or inflating the BTCUSDT POSITIVE artefact",
+    "lowering FUND_ABS or changing the stop, take profit, horizon or cost model",
+    "dropping ETHUSDT or SOLUSDT from the universe post-hoc",
+    "re-scoring under a changed universe without a new pre-declaration",
+    "treating a single-symbol in-sample clear as a licence for a model, shadow trading or live"
+  ],
+  "frozen_absent_count": 11,
+  "frozen_absent": [
+    "technical_analysis",
+    "closed_analyser",
+    "donchian_breakout_v1",
+    "btc_alt_spillover_v1",
+    "post_shock_fade_v1",
+    "range_location_fade_v1",
+    "open_gap_fade_v1",
+    "ts_momentum_v1",
+    "sign_flip_momentum_v1",
+    "compression_breakout_v1",
+    "funding_carry_fade_v1"
+  ],
+  "frozen_status": {
+    "technical_analysis": "ABSENT",
+    "closed_analyser": "ABSENT",
+    "donchian_breakout_v1": "ABSENT",
+    "btc_alt_spillover_v1": "ABSENT",
+    "post_shock_fade_v1": "ABSENT",
+    "range_location_fade_v1": "INCONCLUSIVE",
+    "open_gap_fade_v1": "INCONCLUSIVE",
+    "ts_momentum_v1": "INCONCLUSIVE",
+    "sign_flip_momentum_v1": "ABSENT",
+    "compression_breakout_v1": "INCONCLUSIVE",
+    "funding_carry_fade_v1": "ABSENT"
+  },
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "bars_changed_this_slice": false,
+  "cleared_edge_signal": null,
+  "model_blocked": true,
+  "live_blocked": true,
+  "models_current_present": false,
+  "execution_mode": "paper",
+  "closer_to_autonomous_profit_agent": false,
+  "closer_note": "NO. This slice closes a measured family. Closing one is how a research programme stays honest; it is not progress toward profit. What it adds is narrower and real: the repository can hold a true 97th-percentile reading and still say null, enforced in two independent places in code.",
+  "git_commit": "b75d5681beb09e8f5bd8f2db542a0634c932d022"
+}

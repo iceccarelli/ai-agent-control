@@ -1,0 +1,220 @@
+From 73e2270a1367b622d9cfa1bf69d4247c6049eef8 Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Fri, 4 Sep 2026 22:40:01 +0000
+Subject: [PATCH 06/10] hygiene: loopback health bind, bounded decision
+ journal, pinned dependencies
+
+INVARIANTS PROTECTED: (1) an unauthenticated endpoint that reports
+positions and kill-switch state is not exposed on every interface by
+default; (2) the state DB does not grow without bound under a permanently
+blocking gate; (3) the versions the suite was green against are recorded.
+
+Findings (audit S17, S19; requirements.txt has no lockfile):
+  main.py bound HTTPServer to 0.0.0.0. No secrets leak through it, but
+  position and breaker state do.
+  The decisions journal writes one row per gate block per tick; with one
+  symbol at a 60 s loop and a gate that always blocks, ~1,440 rows/day,
+  unbounded over months. Nothing reads it to decide, so bounding it costs
+  no safety.
+  requirements.txt gives ranges; the versions actually tested were not
+  recorded anywhere, so a rebuild could resolve a different numpy.
+
+What changed:
+  config.py       HEALTHCHECK_HOST (default 127.0.0.1),
+                  DECISIONS_RETENTION_DAYS (default 90, 1..3650)
+  main.py         bind to HEALTHCHECK_HOST; prune once at startup
+  persistence.py  StateStore.prune_decisions(older_than_days) -> count
+  constraints.txt requests==2.33.1 numpy==2.4.4 scipy==1.17.1
+                  scikit-learn==1.8.0 (the set 4,953 tests passed with)
+  Dockerfile      pip install -r requirements.txt -c constraints.txt;
+                  promotion_gate.py added to COPY (patch 0002 introduced
+                  a lazy import of it and tests/test_dockerfile.py from
+                  patch 0001 caught the omission - the test doing its job)
+  tests/test_hygiene_patch.py  3 tests
+
+Note for the Docker HEALTHCHECK: it probes 127.0.0.1, so loopback is
+sufficient inside the container. Set HEALTHCHECK_HOST=0.0.0.0 only if an
+external prober needs it, and put it behind a network policy.
+---
+ Dockerfile                  |  5 +++--
+ config.py                   | 10 ++++++++++
+ constraints.txt             |  8 ++++++++
+ main.py                     | 13 +++++++++++--
+ persistence.py              | 11 +++++++++++
+ tests/test_hygiene_patch.py | 39 +++++++++++++++++++++++++++++++++++++
+ 6 files changed, 82 insertions(+), 4 deletions(-)
+ create mode 100644 constraints.txt
+ create mode 100644 tests/test_hygiene_patch.py
+
+diff --git a/Dockerfile b/Dockerfile
+index ed5ce7b..7fd5b99 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -10,7 +10,8 @@ WORKDIR /app
+ 
+ # Dependencies first so code changes do not invalidate the layer.
+ COPY requirements.txt .
+-RUN pip install --no-cache-dir -r requirements.txt
++COPY constraints.txt .
++RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
+ 
+ # Only the runtime modules. `.dockerignore` excludes tests, tools, docs and —
+ # critically — every .env file. The predecessor of this image shipped live API
+@@ -24,7 +25,7 @@ COPY config.py persistence.py risk_management.py position_sizing.py \
+      bybit_connection.py technical_analysis.py pure_indicators.py \
+      performance_analytics.py trading_engine.py main.py \
+      market_data.py memory.py project_status.py session_log.py \
+-     shadow.py features.py policy.py ml_strategy.py ./
++     shadow.py features.py policy.py ml_strategy.py promotion_gate.py ./
+ COPY signals/ ./signals/
+ 
+ # Run unprivileged. State lives on a mounted volume owned by this user.
+diff --git a/config.py b/config.py
+index 55f21e8..e04d006 100644
+--- a/config.py
++++ b/config.py
+@@ -325,7 +325,9 @@ class Config:
+     # -- runtime ------------------------------------------------------------
+     LOOP_INTERVAL_SECONDS: float
+     ENABLE_HEALTH_SERVER: bool
++    HEALTHCHECK_HOST: str
+     HEALTHCHECK_PORT: int
++    DECISIONS_RETENTION_DAYS: int
+     LOG_LEVEL: str
+     STATE_DB_PATH: str
+ 
+@@ -708,7 +710,15 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
+ 
+         LOOP_INTERVAL_SECONDS=parse_float(env, "LOOP_INTERVAL_SECONDS", 60.0, low=0.01, high=3600.0),
+         ENABLE_HEALTH_SERVER=parse_bool(env.get("ENABLE_HEALTH_SERVER"), False),
++        # Loopback by default. The endpoint is unauthenticated and reports
++        # positions and kill-switch state; exposing it on every interface is
++        # an operator decision, not a default.
++        HEALTHCHECK_HOST=parse_str(env, "HEALTHCHECK_HOST", "127.0.0.1"),
+         HEALTHCHECK_PORT=parse_int(env, "HEALTHCHECK_PORT", 8081, low=1, high=65_535),
++        # The decision journal grows one row per gate block per tick. A gate
++        # that blocks permanently writes ~1,440 rows/day/symbol. Bounded here.
++        DECISIONS_RETENTION_DAYS=parse_int(env, "DECISIONS_RETENTION_DAYS", 90,
++                                           low=1, high=3_650),
+         LOG_LEVEL="WARNING" if log_level == "WARN" else log_level,
+         STATE_DB_PATH=parse_str(env, "STATE_DB_PATH", "state/trading_state.db"),
+         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
+diff --git a/constraints.txt b/constraints.txt
+new file mode 100644
+index 0000000..d2afbc9
+--- /dev/null
++++ b/constraints.txt
+@@ -0,0 +1,8 @@
++# Exact versions against which the 4,953-test suite was last run green
++# (2026-09-05, Python 3.12 sandbox; Dockerfile pins python:3.11-slim).
++# Install with:  pip install -r requirements.txt -c constraints.txt
++# requirements.txt keeps the ranges; this file pins what was actually tested.
++requests==2.33.1
++numpy==2.4.4
++scipy==1.17.1
++scikit-learn==1.8.0
+diff --git a/main.py b/main.py
+index abff4c0..3fd9a6a 100644
+--- a/main.py
++++ b/main.py
+@@ -228,12 +228,13 @@ class TradingBot:
+         if not bool(getattr(self.cfg, "ENABLE_HEALTH_SERVER", False)):
+             return None
+         port = int(getattr(self.cfg, "HEALTHCHECK_PORT", 8081))
++        host = str(getattr(self.cfg, "HEALTHCHECK_HOST", "127.0.0.1") or "127.0.0.1")
+         handler = type("_Bound", (_HealthHandler,), {"bot": self})
+-        self._http = HTTPServer(("0.0.0.0", port), handler)
++        self._http = HTTPServer((host, port), handler)
+         threading.Thread(
+             target=self._http.serve_forever, name="health", daemon=True
+         ).start()
+-        logger.info("health server listening on :%d", port)
++        logger.info("health server listening on %s:%d", host, port)
+         return port
+ 
+     # -- lifecycle ---------------------------------------------------------
+@@ -319,6 +320,14 @@ class TradingBot:
+             )
+             return False
+ 
++        try:
++            days = int(getattr(self.cfg, "DECISIONS_RETENTION_DAYS", 90))
++            pruned = self.store.prune_decisions(older_than_days=days)
++            if pruned:
++                logger.info("pruned %d decision rows older than %d days", pruned, days)
++        except Exception as exc:  # noqa: BLE001
++            logger.warning("decision journal prune skipped: %s", exc)
++
+         self.start_health_server()
+         # State what this process is before it does anything. Research is
+         # closed and nothing has cleared Stage 1; the log must say so rather
+diff --git a/persistence.py b/persistence.py
+index 5878274..2f0481e 100644
+--- a/persistence.py
++++ b/persistence.py
+@@ -1046,6 +1046,17 @@ class StateStore:
+             )
+         ]
+ 
++    def prune_decisions(self, *, older_than_days: int) -> int:
++        """Delete journal rows older than the retention window. Returns count.
++
++        The journal is evidence, not state: nothing reads it to decide. So a
++        bounded window loses nothing a gate depends on, while an unbounded one
++        grows ~1,440 rows/day/symbol under a permanently blocking gate.
++        """
++        cutoff = utc_now_epoch() - float(older_than_days) * 86_400.0
++        cur = self._exec("DELETE FROM decisions WHERE ts_epoch < ?", (cutoff,))
++        return int(cur.rowcount or 0)
++
+     def unresolved_orders(self) -> List[Dict[str, Any]]:
+         """pending_orders() plus rows whose submit outcome is 'unknown'.
+ 
+diff --git a/tests/test_hygiene_patch.py b/tests/test_hygiene_patch.py
+new file mode 100644
+index 0000000..c0b234d
+--- /dev/null
++++ b/tests/test_hygiene_patch.py
+@@ -0,0 +1,39 @@
++"""Health bind address, decision-journal retention, dependency pins."""
++from __future__ import annotations
++
++import os
++import sys
++import time
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++sys.path.insert(0, ROOT)
++
++import config  # noqa: E402
++from persistence import StateStore  # noqa: E402
++
++
++def test_health_binds_loopback_by_default():
++    cfg = config.load({})
++    assert cfg.HEALTHCHECK_HOST == "127.0.0.1"
++    assert config.load({"HEALTHCHECK_HOST": "0.0.0.0"}).HEALTHCHECK_HOST == "0.0.0.0"
++
++
++def test_decisions_retention_is_bounded_and_prunes(tmp_path):
++    cfg = config.load({})
++    assert 1 <= cfg.DECISIONS_RETENTION_DAYS <= 3650
++    store = StateStore(str(tmp_path / "s.db"))
++    store.claim_writer()
++    store.journal("BTCUSDT", "BLOCK", "OLD", {})
++    store._exec("UPDATE decisions SET ts_epoch = ?", (time.time() - 400 * 86400,))
++    store.journal("BTCUSDT", "BLOCK", "NEW", {})
++    assert store.prune_decisions(older_than_days=90) == 1
++    assert len(store._query("SELECT * FROM decisions")) == 1
++
++
++def test_constraints_pin_every_runtime_requirement():
++    req = open(os.path.join(ROOT, "requirements.txt")).read()
++    con = open(os.path.join(ROOT, "constraints.txt")).read()
++    for name in ("requests", "numpy", "scipy", "scikit-learn"):
++        assert name in req and f"{name}==" in con
++    assert "-c constraints.txt" in open(os.path.join(ROOT, "Dockerfile")).read()
+-- 
+2.43.0
+

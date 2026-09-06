@@ -1,0 +1,58 @@
+==============================================================================
+REAL-SERIES EDGE MEASUREMENT (slice 24)
+==============================================================================
+BTCUSD: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : BTCUSD
+bars              : 2,564
+
+Instrument path = the configuration whose control PASSED at n=200
+(EDGE.md 4u: median 48.0, z = -1.18, KS p = 0.435, 0 incomplete):
+  null rotation | lock-up 1 | one trade per run | 1,500 replicates
+  barrier +4/-2 ATR, 24-bar horizon, 25 bps round trip
+
+Bars pre-declared in EDGE.md 5b, before any number existed:
+  M1  real-series percentile          >= 95.0
+  M2  Delta > 0, 95% CI excludes 0, percentile >= 95.0
+  M3  >= 3 of 4 folds mean net R > 0 (soft, supporting only)
+
+signal            : donchian_breakout_v1  (Donchian N=55, long-only, breakout event)
+computing channel breakout flags on the REAL series ...
+
+real-series schedule: 77 trades from 77 flag runs
+strategy mean net R : +0.4274
+
+M1: ranking against the validated rotation null ...
+  replicates        : 1,500 of 1,500
+  null mean net R   : +0.1550  (sd 0.2290)
+  null trade counts : median 77
+  M1 PERCENTILE     : 91.2   bar 95.0   -> FAIL
+
+M2: drift-controlled contrast against shape-matched schedules ...
+  schedules         : 200 of 200
+  Side N mean net R : +0.1585  (sd 0.1991)
+  Side N trades     : median 75   (Side S: 77)
+  Delta             : +0.2690   95% CI [+0.2418, +0.2962]
+  M2 PERCENTILE     : 91.5  bar 95.0
+  M2                -> FAIL   (needs Delta>0 AND CI excludes 0 AND percentile>=95.0)
+
+M3: walk-forward, per fold ...
+  fold 1: bars 200-791   15 trades  mean net R +0.2293  percentile 59.4
+  fold 2: bars 791-1382   29 trades  mean net R +0.4334  percentile 75.2
+  fold 3: bars 1382-1973   10 trades  mean net R -0.0648  percentile 40.2
+  fold 4: bars 1973-2564   23 trades  mean net R +0.7630  percentile 92.2
+  folds with mean net R > 0 : 3 of 4   soft gate met (supporting only)
+
+==============================================================================
+DECISION
+==============================================================================
+  M1  percentile 91.2 vs bar 95.0  -> FAIL
+  M2  delta +0.2690, CI [+0.2418, +0.2962], percentile 91.5  -> FAIL
+  M3  3/4 folds positive  (soft, supporting only)
+
+  EDGE_EVIDENCE_ABSENT
+
+  The pre-declared bars are not met. No threshold, stop, size or
+  confidence parameter may be retuned to change this reading.
+
+artifacts: artifacts/slice29_edge_donchian_regression_summary.json / _null_distributions.csv / _folds.csv
+EXIT=1

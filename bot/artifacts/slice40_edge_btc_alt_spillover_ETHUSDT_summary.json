@@ -1,0 +1,86 @@
+{
+  "symbol": "ETHUSDT",
+  "bars": 1461,
+  "signal": "btc_alt_spillover_v1",
+  "instrument": {
+    "null": "rotation",
+    "lockup": 1,
+    "runs": 1500,
+    "horizon": 5,
+    "atr_period": 14,
+    "round_trip_bps": 25.0,
+    "take_profit_atr": 3.0,
+    "stop_atr": 1.5,
+    "seed": 20250730
+  },
+  "observed": {
+    "n_trades": 124,
+    "mean_r": 0.11554108049759712
+  },
+  "flag_runs": 124,
+  "m1": {
+    "percentile": 94.26666666666667,
+    "bar": 95.0,
+    "passed": false,
+    "replicates": 1500,
+    "null_mean": -0.022565728464254888,
+    "null_sd": 0.08380128696222268
+  },
+  "m2": {
+    "percentile": 92.0,
+    "bar": 95.0,
+    "passed": false,
+    "delta": 0.1382378307495835,
+    "ci_low": 0.1254598983348538,
+    "ci_high": 0.15133186699693432,
+    "schedules": 200,
+    "null_mean": -0.02269675025198639,
+    "null_sd": 0.09351105234061691
+  },
+  "m3": {
+    "folds": [
+      {
+        "fold": 1,
+        "start": 200,
+        "end": 515,
+        "trades": 31,
+        "mean_r": 0.09703845111362056,
+        "percentile": 83.8,
+        "note": ""
+      },
+      {
+        "fold": 2,
+        "start": 515,
+        "end": 830,
+        "trades": 33,
+        "mean_r": 0.41312506661466747,
+        "percentile": 97.8,
+        "note": ""
+      },
+      {
+        "fold": 3,
+        "start": 830,
+        "end": 1145,
+        "trades": 33,
+        "mean_r": -0.07779230051226899,
+        "percentile": 36.0,
+        "note": ""
+      },
+      {
+        "fold": 4,
+        "start": 1145,
+        "end": 1461,
+        "trades": 27,
+        "mean_r": 0.009367433918542889,
+        "percentile": 62.8,
+        "note": ""
+      }
+    ],
+    "positive": 3,
+    "soft_gate": 3,
+    "soft_gate_met": true
+  },
+  "verdict": "EDGE_EVIDENCE_ABSENT",
+  "control_validated": true,
+  "control_attestation": "artifacts/slice40_control_directed_ETHUSDT_n1000.log"
+}

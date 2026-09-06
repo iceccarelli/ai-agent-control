@@ -1,0 +1,102 @@
+{
+  "schema": "research_freeze/1",
+  "slice": 51,
+  "frozen_name": "ts_momentum_v1",
+  "status": "INCONCLUSIVE",
+  "freeze_reason": "INCONCLUSIVE_STATE_VS_EVENT_SCHEDULER",
+  "design_note": "EDGE.md §32",
+  "design_before_code": true,
+  "no_trusted_stage1_number": true,
+  "m1": null,
+  "m2": null,
+  "is_absent_percentile_reading": false,
+  "edge_measurement_runs": 0,
+  "scheduled_entries": {
+    "BTCUSD": 1,
+    "ETHUSDT": 1,
+    "SOLUSDT": 3
+  },
+  "hard_gate_per_symbol": 50,
+  "flagged_bars": {
+    "BTCUSD": 2934,
+    "ETHUSDT": 1260,
+    "SOLUSDT": 1258
+  },
+  "flag_runs": {
+    "BTCUSD": 1,
+    "ETHUSDT": 1,
+    "SOLUSDT": 3
+  },
+  "sign_flips": {
+    "BTCUSD": 441,
+    "ETHUSDT": 209,
+    "SOLUSDT": 201
+  },
+  "thesis_is_rare": false,
+  "controls": {
+    "BTCUSD": "INVALID",
+    "ETHUSDT": "INVALID",
+    "SOLUSDT": "INVALID"
+  },
+  "control_cause": "CONSTRUCTION MISMATCH in the schedule builder — NOT instrument bias",
+  "evidence_logs": [
+    "artifacts/slice50_count_finding_ts_momentum.log",
+    "artifacts/slice50_control_ts_momentum_BTCUSD_n1000.log",
+    "artifacts/slice50_control_ts_momentum_ETHUSDT_n1000.log",
+    "artifacts/slice50_control_ts_momentum_SOLUSDT_n1000.log",
+    "artifacts/slice50_no_edge_run_attestation.log",
+    "artifacts/slice50_stage1_ts_momentum_v1.json"
+  ],
+  "evidence_deleted_or_rewritten": false,
+  "constants_unchanged": {
+    "LOOKBACK": 10,
+    "SKIP": 1,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 2.0,
+    "HORIZON": 5,
+    "ROUND_TRIP_BPS": 25.0
+  },
+  "scheduler_changed": false,
+  "measurement_tools_changed": false,
+  "frozen_absent": [
+    "technical_analysis",
+    "closed_analyser",
+    "donchian_breakout_v1",
+    "btc_alt_spillover_v1",
+    "post_shock_fade_v1",
+    "range_location_fade_v1",
+    "open_gap_fade_v1",
+    "ts_momentum_v1"
+  ],
+  "frozen_absent_count": 8,
+  "frozen_status": {
+    "technical_analysis": "ABSENT",
+    "closed_analyser": "ABSENT",
+    "donchian_breakout_v1": "ABSENT",
+    "btc_alt_spillover_v1": "ABSENT",
+    "post_shock_fade_v1": "ABSENT",
+    "range_location_fade_v1": "INCONCLUSIVE",
+    "open_gap_fade_v1": "INCONCLUSIVE",
+    "ts_momentum_v1": "INCONCLUSIVE"
+  },
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "cleared_edge_signal": null,
+  "forged_positive_refused_for_every_frozen_name": true,
+  "forgery_battery_log": "artifacts/slice51_forgery_battery.log",
+  "intake_slot": "WAITING — EMPTY",
+  "new_signal_implemented": false,
+  "models_current_present": false,
+  "live_authorized": false,
+  "execution_mode": "paper",
+  "paper_certification_intact": true,
+  "closer_to_autonomous_profit_agent": false,
+  "three_invalid_controls_three_causes": {
+    "range_location_fade_v1": "instrument ran 1,000x/symbol at 0% incomplete and came back biased at z = +3.6 — the programme's ONLY instrument-bias evidence",
+    "open_gap_fade_v1": "the null DELETED the trigger's quantity (every surrogate opens at the prior close) — construction mismatch in the NULL",
+    "ts_momentum_v1": "the null PRESERVED the trigger; the SCHEDULER collapsed each surrogate to one trade — construction mismatch in the SCHEDULE BUILDER"
+  },
+  "git_commit": "ffe02a66a6fabee83b68b807c8fc3e847750e78b"
+}

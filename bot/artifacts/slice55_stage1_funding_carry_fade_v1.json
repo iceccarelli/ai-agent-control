@@ -1,0 +1,223 @@
+{
+  "schema": "stage1_measurement/1",
+  "slice": 55,
+  "signal": "funding_carry_fade_v1",
+  "intake": "NEW_SIGNAL_INTAKE.md (human-filled)",
+  "design_note": "EDGE.md §36",
+  "design_before_run": true,
+  "information_set": "FIRST family in the programme whose trigger is not a price. The entry decision is made entirely from the venue's published funding rate — a cash flow between position holders — joined to the linear daily decision clock. The barrier still prices in bars, because a trade has to be scored somehow.",
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_changed_after_seeing_numbers": false,
+  "grid_or_sweep_run": false,
+  "runs_per_symbol": {
+    "BTCUSDT": 1,
+    "ETHUSDT": 1,
+    "SOLUSDT": 1
+  },
+  "data_eligibility": {
+    "artefact": "artifacts/slice55_data_eligibility.json",
+    "bars_corpus": "data/real_linear_1d",
+    "funding_corpus": "data/real_funding",
+    "synthetic": false,
+    "checksums_computed_by_this_slice": true,
+    "note": "sha256 values pin the files as received and are asserted on every test run. They do NOT independently attest the fetch, which happened outside this repository. verify_manifest was NOT weakened to admit this corpus; the measurement path loads it with verify=False and relies on the pins."
+  },
+  "join_policy": {
+    "rule": "f[t] = funding_rate of the LAST print with funding_time <= close_time(t)",
+    "forward_fill": false,
+    "future_funding_readable": false,
+    "missing_f_means_no_setup": true,
+    "bars_joined": {
+      "BTCUSDT": "1461 of 1461",
+      "ETHUSDT": "1461 of 1461",
+      "SOLUSDT": "1461 of 1461"
+    },
+    "near_miss": "The first loader multiplied a microsecond timestamp by 1000 instead of dividing, putting every funding print a million times too far in the future. The join then found nothing and every symbol reported ZERO setups — a unit error that would have read as a market finding. It was caught by cross-checking against the venue's own funding_time_ms column, which the loader now prefers."
+  },
+  "cost_model": {
+    "round_trip_bps": 25.0,
+    "funding_charged_over_hold": true,
+    "mean_adjustment_to_net_r": {
+      "BTCUSDT": {
+        "long": -0.0153,
+        "short": 0.0153
+      },
+      "ETHUSDT": {
+        "long": -0.0115,
+        "short": 0.0115
+      },
+      "SOLUSDT": {
+        "long": -0.0032,
+        "short": 0.0032
+      }
+    },
+    "applied_identically_to_observed_and_replicates": true,
+    "note": "A short RECEIVES positive funding, so the adjustment RAISES its net R; a long pays. The rule shorts exactly when funding is rich and positive, so ignoring funding would have let the fade collect the carry for free. EDGE.md §36d required the adjustment be applied to both sides or the family be INCONCLUSIVE — an asymmetric cost is worse than no cost."
+  },
+  "count_finding": {
+    "hard_gate_per_symbol": 50,
+    "log": "artifacts/slice55_count_finding_funding_carry_fade.log",
+    "setups": {
+      "BTCUSDT": 417,
+      "ETHUSDT": 415,
+      "SOLUSDT": 534
+    },
+    "flag_runs": {
+      "BTCUSDT": 85,
+      "ETHUSDT": 76,
+      "SOLUSDT": 162
+    },
+    "entries": {
+      "BTCUSDT": 85,
+      "ETHUSDT": 76,
+      "SOLUSDT": 162
+    },
+    "longest_run_bars": {
+      "BTCUSDT": 66,
+      "ETHUSDT": 96,
+      "SOLUSDT": 86
+    },
+    "symbols_meeting_gate": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT"
+    ],
+    "positive_already_unreachable_at_count_stage": false,
+    "note": "Rich funding persists for days, so ~80% of setups are absorbed by the one-trade-per-run scheduler (slice 17). That is a property of the pair (persistent signal, event-shaped scheduler) and it was printed BEFORE the control ran so the control would not be asked to explain it later. FUND_ABS was not lowered; it would not have been lowered had the counts come up short."
+  },
+  "control": {
+    "construction": "same-asset directed, whole-bar shuffle and re-base, with the untouched funding series joined at the SAME POSITION in the date sequence",
+    "why_this_construction": "EDGE.md §36f required a null that destroys the relationship between funding and the subsequent price path while preserving both marginals, and said that if it could not be built cleanly the honest outcome was INCONCLUSIVE. skill_test.surrogate_series writes each shuffled bar onto the DESTINATION position's start_ms, so the surrogate keeps the original date sequence and the funding join lands on the same positions. No new null was invented. The control asserts length and every timestamp and ABORTS rather than reporting a percentile from a mis-joined series.",
+    "flags_identical_across_surrogates": true,
+    "flags_identical_note": "The trigger reads no price, so the shuffle cannot change the flags — only the path underneath them. Every surrogate scored 85 / 76 / 162 trades, matching the real series exactly.",
+    "clauses": {
+      "abs_z_max": 1.96,
+      "ks_min_p": 0.05,
+      "max_incomplete_pct": 5.0
+    },
+    "surrogates_requested": 200,
+    "rotations_each": 1000,
+    "BTCUSDT": {
+      "verdict": "VALID",
+      "usable_surrogates": 200,
+      "z": 0.632,
+      "ks_p": 0.5386,
+      "incomplete_pct": 0.0,
+      "surrogate_mean": 51.27,
+      "log": "artifacts/slice55_control_funding_carry_fade_BTCUSDT_n1000.log"
+    },
+    "ETHUSDT": {
+      "verdict": "VALID",
+      "usable_surrogates": 200,
+      "z": 0.168,
+      "ks_p": 0.9242,
+      "incomplete_pct": 0.0,
+      "surrogate_mean": 50.35,
+      "log": "artifacts/slice55_control_funding_carry_fade_ETHUSDT_n1000.log"
+    },
+    "SOLUSDT": {
+      "verdict": "VALID",
+      "usable_surrogates": 200,
+      "z": 1.933,
+      "ks_p": 0.1561,
+      "incomplete_pct": 0.0,
+      "surrogate_mean": 53.97,
+      "log": "artifacts/slice55_control_funding_carry_fade_SOLUSDT_n1000.log"
+    },
+    "prediction_made_before_the_run": "tools/control_funding_carry_fade.py, committed UNEXECUTED at d8311aa, predicted ELEVATED RISK of clause (a) failing in the POSITIVE direction — and explicitly NOT from instrument bias. The observed schedule collects carry on every trade by construction, while a rotated replicate is handed a direction unrelated to the funding at the bar it lands on.",
+    "prediction_outcome": "RIGHT IN SIGN, WRONG IN SIZE",
+    "prediction_note": "All three z are POSITIVE (+0.632 / +0.168 / +1.933), which on a correct instrument is a coin flip three times, so the offset is real. But it is far smaller than the ~0.14-sigma-per-surrogate estimate on BTCUSDT and ETHUSDT. SOLUSDT reached +1.933 against a bar of 1.96 and PASSES: the bar was fixed in slice 37, before this data existed, and is not moved in either direction now that a number is near it. No fourth clause is added. SOLUSDT's margin is recorded as a fact about the CONSTRUCTION for a human to weigh — whether a rotation null is the right null for a carry signal — and it changes nothing in this slice.",
+    "offset_does_not_explain_the_edge_readings": "BTCUSDT's surrogates averaged 51.27 against a real reading of 97.0, and SOLUSDT's averaged 53.97 against a real reading of 2.3. The carry offset explains neither."
+  },
+  "edge": {
+    "runs_executed": 3,
+    "BTCUSDT": {
+      "verdict": "EDGE_EVIDENCE_POSITIVE",
+      "n_trades": 85,
+      "mean_net_r": 0.09637759630974421,
+      "m1": 97.0,
+      "m1_passed": true,
+      "m2": 97.5,
+      "m2_passed": true,
+      "m2_delta": 0.1603291609343535,
+      "m2_ci": [
+        0.14872662054042696,
+        0.17190386212197506
+      ],
+      "m3_folds_positive": 3,
+      "control_validated": true,
+      "summary": "artifacts/slice55_edge_funding_carry_fade_BTCUSDT_summary.json",
+      "note": "Clears both pre-declared bars on 85 trades under a VALID control. NOT registered — see positive_rule."
+    },
+    "ETHUSDT": {
+      "verdict": "EDGE_EVIDENCE_ABSENT",
+      "n_trades": 76,
+      "mean_net_r": -0.035829943833568356,
+      "m1": 47.733333333333334,
+      "m1_passed": false,
+      "m2": 48.5,
+      "m2_passed": false,
+      "m2_delta": -0.002998089552069483,
+      "m2_ci": [
+        -0.015726302042317425,
+        0.009715093219363783
+      ],
+      "m3_folds_positive": 1,
+      "control_validated": true,
+      "summary": "artifacts/slice55_edge_funding_carry_fade_ETHUSDT_summary.json",
+      "note": "A coin flip. 47.7 / 48.5, delta -0.0030 with a CI straddling zero, on 76 trades under a VALID control."
+    },
+    "SOLUSDT": {
+      "verdict": "EDGE_EVIDENCE_ABSENT",
+      "n_trades": 162,
+      "mean_net_r": -0.1657996352270143,
+      "m1": 2.3333333333333335,
+      "m1_passed": false,
+      "m2": 1.0,
+      "m2_passed": false,
+      "m2_delta": -0.13148717336268326,
+      "m2_ci": [
+        -0.1401554459747876,
+        -0.12292653955561875
+      ],
+      "m3_folds_positive": 0,
+      "control_validated": true,
+      "summary": "artifacts/slice55_edge_funding_carry_fade_SOLUSDT_summary.json",
+      "note": "Strongly ANTI-predictive. 2.3 / 1.0, delta -0.1315 with a CI excluding zero, on 162 trades — the largest sample of the three — under a VALID control."
+    }
+  },
+  "edge_verdict": "ABSENT",
+  "edge_verdict_note": "ABSENT for the family under the intake's multi-symbol rule. All three symbols were MEASURED — valid controls, 0% incompletes, every one over the 50-trade gate — and this is the first slice in the programme in which that has been true of all three at once. One symbol clears both bars; the rule requires two. Three things sit beside BTCUSDT's 97.0 / 97.5 and none of them is an explanation of it away: (1) under a global null, one of three independent symbols clearing a 95th percentile happens about 14% of the time; (2) the three readings disagree in SIGN — SOLUSDT is as far below its bar as BTCUSDT is above it, on the symbol with the most trades; (3) the multi-symbol rule was pre-declared precisely so a single flattering symbol could not be promoted afterwards, and this is the first occasion it has ever had to do that job.",
+  "single_symbol_claim_refused": true,
+  "positive_rule_met": false,
+  "positive_rule": "control_validated on each symbol claimed AND at least two of {BTCUSDT, ETHUSDT, SOLUSDT} with >= 50 scored trades AND those symbols each at M1 >= 95 and M2 >= 95",
+  "positive_rule_symbols_clearing_both_bars": [
+    "BTCUSDT"
+  ],
+  "positive_rule_symbols_required": 2,
+  "cleared_edge_signal": null,
+  "frozen_absent_count": 10,
+  "this_family_frozen": false,
+  "freeze_of_this_family": "NOT PERFORMED — the intake reserves it for a later human decision",
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "bars_changed_this_slice": false,
+  "models_current_present": false,
+  "live_authorized": false,
+  "execution_mode": "paper",
+  "closer_to_autonomous_profit_agent": false,
+  "closer_note": "NO. EDGE.md §36g fixed the answer before the run: NO unless this slice produced a genuine multi-symbol POSITIVE under a validated control at the frozen constants. It did not. A single symbol at 97.0 is the exact case the pre-declaration was written to refuse.",
+  "git_commit": "7d35056f5e48dfd0a2a023da6271080ccb082af8"
+}

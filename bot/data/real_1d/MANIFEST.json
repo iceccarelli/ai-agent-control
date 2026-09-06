@@ -1,0 +1,55 @@
+{
+ "bar_seconds": 86400,
+ "bars_per_symbol": {
+  "BITSTAMP_SPOT_BTC_USD_1D": 3135
+ },
+ "coverage": {
+  "bars": 3135,
+  "completeness": 1.0,
+  "expected_bars": 3135,
+  "missing_buckets": 0,
+  "stress_periods": {
+   "2020-03 covid crash": true,
+   "2021 bull": true,
+   "2022 bear (full year)": true,
+   "2025-10-10 liquidation cascade": true,
+   "2026 drawdown": true
+  },
+  "zero_volume_bars": 0
+ },
+ "files": {
+  "ohlcv/BITSTAMP_SPOT_BTC_USD_1D.csv.gz": {
+   "data_kind": "ohlcv",
+   "first": "2018-01-01",
+   "interval_seconds": 86400,
+   "kind": "ohlcv",
+   "last": "2026-08-01",
+   "rows": 3135,
+   "sha256": "7f376934b07833918729472c8129793c09015d37f27786872285032e8b3e02d1",
+   "sha256_gzip_as_supplied": "89dd4abbd1aab3740e9520c0f4b8ebb0de9ead9cbf479e24c2bf88fcfad25603",
+   "sha256_uncompressed": "89dd4abbd1aab3740e9520c0f4b8ebb0de9ead9cbf479e24c2bf88fcfad25603",
+   "size_bytes": 98507
+  }
+ },
+ "first_timestamp": "2018-01-01T00:00:00.0000000Z",
+ "generator": "human_bitstamp_extension_slice38",
+ "last_timestamp": "2026-08-01T23:59:59.0000000+00:00",
+ "provenance_verification_slice38": {
+  "appended_bars": 571,
+  "appended_span": "2025-01-08..2026-08-01",
+  "checks": "OHLC invariants, strict date monotonicity, no gaps, no forward-fill, cross-asset return correlation against untouched real ETH/SOL, fat-tail and volatility-clustering fingerprints, event-level agreement",
+  "note": "the supplied manifest named the uncompressed digest \"sha256_gzip\"; the value verified against the uncompressed bytes and is preserved under sha256_gzip_as_supplied",
+  "prefix_unchanged": "first 2564 data rows byte-identical to the slice-34 file"
+ },
+ "schema": "coinapi_flat/1",
+ "source": {
+  "endpoint": "https://www.bitstamp.net/api/v2/ohlc/btcusd/",
+  "exchange": "BITSTAMP",
+  "fetched_utc": "2026-08-01T15:45:17Z",
+  "market": "SPOT",
+  "note": "Human extended Bitstamp BTC_USD daily so btc_alt_spillover_v1 can be measured on the full alt intersection. Same instrument as original thesis.",
+  "pair": "BTC_USD"
+ },
+ "synthetic": false,
+ "warning": "REAL market data. It is Bitstamp BTC/USD, NOT Bybit BTCUSDT: the price series is genuine, the execution assumptions in the backtest are Bybit's. There is no order book in this corpus, so the liquidity gate abstains. Bars 1-2564 (2018-01-01..2025-01-07) come from the 1-minute Bitstamp archive registered in slice 34 and are byte-identical to it; bars 2565-3135 (2025-01-08..2026-08-01) were supplied by the human in slice 38 from the Bitstamp v2 OHLC endpoint. KNOWN DEFECT: the 2025-01-07 bar is PARTIAL (volume 0.52 against a 90-day median of 1972, range $28) because the 1-minute archive was truncated mid-day; it is left as-is rather than repaired, and slice 38 checks whether any measured setup depends on it."
+}

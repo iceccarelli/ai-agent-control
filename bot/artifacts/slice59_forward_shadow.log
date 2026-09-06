@@ -1,0 +1,53 @@
+==============================================================================
+SLICE 59 — FORWARD-COMPATIBLE SHADOW OBSERVATION
+==============================================================================
+
+  THIS IS NOT A FORWARD OBSERVATION.
+  is_forward_observation       : False
+  forward_observations_to_date : 0
+  corpus last bar              : 2026-08-09
+  bars since the cleared run   : 0
+
+  The record uses the schema, caps, schedule and thresholds a real
+  forward run will use, so its shape is fixed before real
+  observations land in it. It is not experience, and the promotion
+  gate counts it as zero.
+
+------------------------------------------------------------------------------
+  signal            : funding_carry_fade_btc_v1 (BTCUSDT)
+  constants f'print : 662de0115880871352d5d623b1020eaa  (matches slice 58: True)
+  schedule mode     : one_entry_per_contiguous_run
+  caps              : 1 position, 1 entry/day, 100.00 USD
+  window            : 2024-08-09 .. 2026-08-09  (731 bars)
+
+  candidates        : 41
+  refused by caps   : 6
+  entries taken     : 35
+  shadow mean net R : +0.1857
+
+------------------------------------------------------------------------------
+  DECAY LOG — thresholds unchanged from slice 58
+------------------------------------------------------------------------------
+  M1_rolling_trades    OK                  +0.0298   mean net R over the last 10 closed trades
+  M2_rolling_days      OK                  +0.2399   mean net R over trades closed in the last 90 days
+  M3_concentration     OK                  +0.4503   top-3 share of cumulative net R (the OOS sample itself is 0.41)
+  M4_halves            WARN                -0.0798   earlier half +0.4669 on 17, recent half -0.0798 on 18
+
+  monitor status    : WARN
+  entries blocked   : False
+  thresholds moved  : False
+
+  M4_halves reads WARN — earlier half +0.4669 on 17, recent half -0.0798 on 18. This is EXPECTED history, recorded in EDGE.md §41j and §42d and carried into the promotion gate as an item a human must explicitly accept. It is NOT a defect to erase: the only legitimate way it stops warning is new forward data recovering under the threshold AS IT STANDS.
+
+------------------------------------------------------------------------------
+  cleared_edge_signal    : funding_carry_fade_btc_v1  (re-scored this slice: False)
+  live_authorized        : False
+  policy_mode            : off
+  models_current_present : False
+  frozen families        : 11
+  closer to autonomy     : False
+
+  is_stage1_evidence     : False
+  registration_eligible  : False
+
+artefact: artifacts/slice59_forward_shadow.json

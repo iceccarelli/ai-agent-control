@@ -1,0 +1,61 @@
+{
+  "schema": "diagnostic/1",
+  "slice": 57,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "window": "full_sample",
+  "registration_eligible": false,
+  "registration_eligible_reason": "FULL-SAMPLE DIAGNOSTIC. The human intake's principle table says a full-sample replay on all history may NOT set cleared_edge_signal for funding_carry_fade_btc_v1 — only the OOS late-50% window may. This run covers all 1,461 bars, roughly half of which the fold calendar demotes to burn-in, and it is here to show the product reproduces the frozen family's BTC arithmetic exactly, not to support a claim.",
+  "purpose": "An integrity check, not evidence. If this BTC-only product is really the frozen family's rule on a one-symbol universe, its full-sample numbers must reproduce slice 55's BTCUSDT reading EXACTLY. They do, to every digit printed. That is what this run is for.",
+  "reproduces_slice55_btc": true,
+  "comparison_to_slice55_btcusdt": {
+    "slice55": {
+      "m1": 97.0,
+      "m2": 97.5,
+      "n_trades": 85,
+      "mean_net_r": 0.09637759630974421,
+      "source": "artifacts/slice55_edge_funding_carry_fade_BTCUSDT_summary.json"
+    },
+    "slice57_diagnostic": {
+      "m1": 97.0,
+      "m2": 97.5,
+      "n_trades": 85,
+      "mean_net_r": 0.09637759630974421,
+      "source": "artifacts/slice57_diagnostic_fullsample_BTCUSDT_summary.json"
+    }
+  },
+  "verdict_on_disk": "EDGE_EVIDENCE_POSITIVE",
+  "control_validated": false,
+  "m3_folds": [
+    {
+      "fold": 1,
+      "trades": 28,
+      "mean_r": 0.2271642133932945,
+      "percentile": 99.2
+    },
+    {
+      "fold": 2,
+      "trades": 21,
+      "mean_r": -0.2123913710047057,
+      "percentile": 31.2
+    },
+    {
+      "fold": 3,
+      "trades": 22,
+      "mean_r": 0.2290238134291907,
+      "percentile": 95.39999999999999
+    },
+    {
+      "fold": 4,
+      "trades": 14,
+      "mean_r": 0.08951375764090244,
+      "percentile": 62.0
+    }
+  ],
+  "m3_note": "Walk-forward folds from the standard instrument, supporting only. Recorded here BEFORE the OOS run because fold 4 (bars 1145-1461, the most recent quarter) reads mean net R +0.0895 at percentile 62.0 while fold 1 reads +0.2272 at 99.2 — i.e. the full-sample 97.0 is not evenly distributed across time. That is a reason to expect the late window to read lower, and it is written down now rather than offered afterwards as an explanation.",
+  "may_not_register": [
+    "artifacts/slice55_edge_funding_carry_fade_BTCUSDT_summary.json",
+    "artifacts/slice57_diagnostic_fullsample_BTCUSDT_summary.json"
+  ],
+  "git_commit": "e597b8bd4cadd9cf7aee6e4b3bf5f6c88fafd2a5"
+}

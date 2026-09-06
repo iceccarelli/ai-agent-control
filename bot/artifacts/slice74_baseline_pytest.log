@@ -1,0 +1,251 @@
+........................................................................ [  1%]
+........................................................................ [  3%]
+........................................................................ [  4%]
+........................................................................ [  6%]
+........................................................................ [  7%]
+........................................................................ [  9%]
+........................................................................ [ 10%]
+........................................................................ [ 12%]
+........................................................................ [ 13%]
+........................................................................ [ 15%]
+........................................................................ [ 16%]
+........................................................................ [ 18%]
+...............................................................s........ [ 19%]
+........................................................................ [ 21%]
+........................................................................ [ 22%]
+........................................................................ [ 24%]
+........................................................................ [ 26%]
+........................................................................ [ 27%]
+........................................................................ [ 29%]
+........................................................................ [ 30%]
+........................................................................ [ 32%]
+........................................................................ [ 33%]
+........................................................................ [ 35%]
+.................................................................s...... [ 36%]
+........................................................................ [ 38%]
+........................................................................ [ 39%]
+........................................................................ [ 41%]
+........................................................................ [ 42%]
+........................................................................ [ 44%]
+........................................................................ [ 45%]
+........................................................................ [ 47%]
+........................................................................ [ 49%]
+........................................................................ [ 50%]
+........................................................................ [ 52%]
+........................................................................ [ 53%]
+........................................................................ [ 55%]
+........................................................................ [ 56%]
+........................................................................ [ 58%]
+........................................................................ [ 59%]
+........................................................................ [ 61%]
+........................................................................ [ 62%]
+........................................................................ [ 64%]
+........................................................................ [ 65%]
+........................................................................ [ 67%]
+........................................................................ [ 68%]
+........................................................................ [ 70%]
+........................................................................ [ 71%]
+........................................................................ [ 73%]
+........................................................................ [ 75%]
+........................................................................ [ 76%]
+........................................................................ [ 78%]
+........................................................................ [ 79%]
+........................................................................ [ 81%]
+........................................................................ [ 82%]
+........................................................................ [ 84%]
+........................................................................ [ 85%]
+........................................................................ [ 87%]
+.................................F...F....F......................F...F.. [ 88%]
+........................................................................ [ 90%]
+........................................................................ [ 91%]
+........................................................................ [ 93%]
+........................................................................ [ 94%]
+........................................................................ [ 96%]
+........................................................................ [ 98%]
+........................................................................ [ 99%]
+......................                                                   [100%]
+=================================== FAILURES ===================================
+____ TestTheWindowReachedEleven.test_the_counts_came_from_this_slices_files ____
+
+self = <test_slice73_eleven_day_window.TestTheWindowReachedEleven object at 0x7fc0beb9f710>
+
+    def test_the_counts_came_from_this_slices_files(self):
+>       assert cp.check(cp.LINEAR_BTC).rows_on_disk == \
+            load(FRESHNESS)["linear_rows"]
+E       AssertionError: assert 1473 == 1472
+E        +  where 1473 = PrefixCheck(path='data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz', time_column='time_period_start', pinne...-08-20T00:00:00+00:00', '2026-08-21T00:00:00+00:00'), appended_all_strictly_after_t1=True, appended_before_or_at_t1=()).rows_on_disk
+E        +    where PrefixCheck(path='data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz', time_column='time_period_start', pinne...-08-20T00:00:00+00:00', '2026-08-21T00:00:00+00:00'), appended_all_strictly_after_t1=True, appended_before_or_at_t1=()) = <function check at 0x7fc0bf828ea0>('data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz')
+E        +      where <function check at 0x7fc0bf828ea0> = cp.check
+E        +      and   'data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz' = cp.LINEAR_BTC
+
+tests/test_slice73_eleven_day_window.py:210: AssertionError
+_ TestTheFirstForwardFlag.test_the_flag_appeared_because_08_19_stopped_being_the_last_bar _
+
+self = <test_slice73_eleven_day_window.TestTheFirstForwardFlag object at 0x7fc0beb9c990>
+
+    def test_the_flag_appeared_because_08_19_stopped_being_the_last_bar(self):
+        """Slice 72 had the same setup and no flag. The corpus moved, not
+        the rule."""
+        bars, funding, _folds = _corpus()
+        flags, directions = fb.flags_and_directions(bars, funding, warmup=200)
+        index = next(i for i in range(len(bars))
+                     if _day(bars, i) == "2026-08-19")
+        assert bool(flags[index]) is True
+        assert directions[index] == fb.SHORT_SETUP
+        assert index < len(bars) - 1
+>       assert _day(bars, len(bars) - 1) == "2026-08-20"
+E       AssertionError: assert '2026-08-21' == '2026-08-20'
+E         
+E         - 2026-08-20
+E         ?          ^
+E         + 2026-08-21
+E         ?          ^
+
+tests/test_slice73_eleven_day_window.py:259: AssertionError
+_ TestWhatActuallyBound.test_that_is_measured_from_the_frozen_function_not_asserted _
+
+self = <test_slice73_eleven_day_window.TestWhatActuallyBound object at 0x7fc0bebd9a50>
+
+    def test_that_is_measured_from_the_frozen_function_not_asserted(self):
+        bars, _funding, _folds = _corpus()
+        for side in ("short", "long"):
+            idx, _net, _used = sk.barrier_r_for_all_bars(
+                bars, take_profit_atr=fb.TAKE_PROFIT_ATR,
+                stop_atr=fb.STOP_ATR, horizon=fb.HORIZON,
+                atr_period=fb.ATR_PERIOD,
+                round_trip_bps=fb.ROUND_TRIP_BPS, side=side,
+                entry_on=fb.ENTRY_ON)
+            highest = int(max(idx))
+>           assert _day(bars, highest) == "2026-08-13", side
+E           AssertionError: short
+E           assert '2026-08-14' == '2026-08-13'
+E             
+E             - 2026-08-13
+E             ?          ^
+E             + 2026-08-14
+E             ?          ^
+
+tests/test_slice73_eleven_day_window.py:328: AssertionError
+_ TestACitedEdgeSectionMustExistWhenTheArtefactWasWritten.test_the_recorded_digest_matches_the_edge_that_ships_beside_it _
+
+self = <test_slice73_eleven_day_window.TestACitedEdgeSectionMustExistWhenTheArtefactWasWritten object at 0x7fc0bebeef50>
+
+    def test_the_recorded_digest_matches_the_edge_that_ships_beside_it(self):
+        """Stops the record drifting from the file it describes."""
+        digest = sha256("EDGE.md")
+        for path in self.ARTEFACTS:
+>           assert load(path)["edge_state_when_this_ran"]["edge_sha256"] == \
+                digest, path
+E           AssertionError: artifacts/slice73_data_freshness.json
+E           assert '4fa7d6905222...b34564f56acac' == '98b7e143af66...761eb8e90d9b1'
+E             
+E             - 98b7e143af66d8ecb26bd374aef66ef92bd53330b1cca857fd5761eb8e90d9b1
+E             + 4fa7d690522287e9adecd2012ba28642098741262c919962df5b34564f56acac
+
+tests/test_slice73_eleven_day_window.py:626: AssertionError
+_ TestACitedEdgeSectionMustExistWhenTheArtefactWasWritten.test_from_git_when_a_repository_is_present _
+
+self = <test_slice73_eleven_day_window.TestACitedEdgeSectionMustExistWhenTheArtefactWasWritten object at 0x7fc0bebc3490>
+
+    def test_from_git_when_a_repository_is_present(self):
+        """The stronger form. Skipped only when there is no history to read,
+        which is the deliverable's normal state — and the check above is what
+        covers that case, so nothing goes unverified."""
+        if not self._has_git():
+            return
+        for path in self.ARTEFACTS:
+            payload = load(path)
+>           edge = self._edge_at(payload["git_commit"])
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_slice73_eleven_day_window.py:663: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+tests/test_slice73_eleven_day_window.py:607: in _edge_at
+    return subprocess.check_output(
+/usr/lib/python3.11/subprocess.py:466: in check_output
+    return run(*popenargs, stdout=PIPE, timeout=timeout, check=True,
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+input = None, capture_output = False, timeout = None, check = True
+popenargs = (['git', 'show', 'dd41e130645b15bb0853bae5320150d5b4fc9b4a:EDGE.md'],)
+kwargs = {'stdout': -1, 'cwd': '/home/claude/work/repo74'}
+
+    def run(*popenargs,
+            input=None, capture_output=False, timeout=None, check=False, **kwargs):
+        """Run command with arguments and return a CompletedProcess instance.
+    
+        The returned instance will have attributes args, returncode, stdout and
+        stderr. By default, stdout and stderr are not captured, and those attributes
+        will be None. Pass stdout=PIPE and/or stderr=PIPE in order to capture them,
+        or pass capture_output=True to capture both.
+    
+        If check is True and the exit code was non-zero, it raises a
+        CalledProcessError. The CalledProcessError object will have the return code
+        in the returncode attribute, and output & stderr attributes if those streams
+        were captured.
+    
+        If timeout is given, and the process takes too long, a TimeoutExpired
+        exception will be raised.
+    
+        There is an optional argument "input", allowing you to
+        pass bytes or a string to the subprocess's stdin.  If you use this argument
+        you may not also use the Popen constructor's "stdin" argument, as
+        it will be used internally.
+    
+        By default, all communication is in bytes, and therefore any "input" should
+        be bytes, and the stdout and stderr will be bytes. If in text mode, any
+        "input" should be a string, and stdout and stderr will be strings decoded
+        according to locale encoding, or by "encoding" if set. Text mode is
+        triggered by setting any of text, encoding, errors or universal_newlines.
+    
+        The other arguments are the same as for the Popen constructor.
+        """
+        if input is not None:
+            if kwargs.get('stdin') is not None:
+                raise ValueError('stdin and input arguments may not both be used.')
+            kwargs['stdin'] = PIPE
+    
+        if capture_output:
+            if kwargs.get('stdout') is not None or kwargs.get('stderr') is not None:
+                raise ValueError('stdout and stderr arguments may not be used '
+                                 'with capture_output.')
+            kwargs['stdout'] = PIPE
+            kwargs['stderr'] = PIPE
+    
+        with Popen(*popenargs, **kwargs) as process:
+            try:
+                stdout, stderr = process.communicate(input, timeout=timeout)
+            except TimeoutExpired as exc:
+                process.kill()
+                if _mswindows:
+                    # Windows accumulates the output in a single blocking
+                    # read() call run on child threads, with the timeout
+                    # being done in a join() on those threads.  communicate()
+                    # _after_ kill() is required to collect that and add it
+                    # to the exception.
+                    exc.stdout, exc.stderr = process.communicate()
+                else:
+                    # POSIX _communicate already populated the output so
+                    # far into the TimeoutExpired exception.
+                    process.wait()
+                raise
+            except:  # Including KeyboardInterrupt, communicate handled that.
+                process.kill()
+                # We don't call process.wait() as .__exit__ does that for us.
+                raise
+            retcode = process.poll()
+            if check and retcode:
+>               raise CalledProcessError(retcode, process.args,
+                                         output=stdout, stderr=stderr)
+E               subprocess.CalledProcessError: Command '['git', 'show', 'dd41e130645b15bb0853bae5320150d5b4fc9b4a:EDGE.md']' returned non-zero exit status 128.
+
+/usr/lib/python3.11/subprocess.py:571: CalledProcessError
+----------------------------- Captured stderr call -----------------------------
+fatal: path 'EDGE.md' exists on disk, but not in 'dd41e130645b15bb0853bae5320150d5b4fc9b4a'
+=========================== short test summary info ============================
+FAILED tests/test_slice73_eleven_day_window.py::TestTheWindowReachedEleven::test_the_counts_came_from_this_slices_files
+FAILED tests/test_slice73_eleven_day_window.py::TestTheFirstForwardFlag::test_the_flag_appeared_because_08_19_stopped_being_the_last_bar
+FAILED tests/test_slice73_eleven_day_window.py::TestWhatActuallyBound::test_that_is_measured_from_the_frozen_function_not_asserted
+FAILED tests/test_slice73_eleven_day_window.py::TestACitedEdgeSectionMustExistWhenTheArtefactWasWritten::test_the_recorded_digest_matches_the_edge_that_ships_beside_it
+FAILED tests/test_slice73_eleven_day_window.py::TestACitedEdgeSectionMustExistWhenTheArtefactWasWritten::test_from_git_when_a_repository_is_present
+5 failed, 4695 passed, 2 skipped in 273.33s (0:04:33)

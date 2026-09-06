@@ -1,0 +1,120 @@
+{
+  "symbol": "BTCUSDT",
+  "bars": 1461,
+  "signal": "funding_carry_fade_btc_v1",
+  "instrument": {
+    "null": "rotation",
+    "lockup": 1,
+    "runs": 1500,
+    "horizon": 5,
+    "atr_period": 14,
+    "round_trip_bps": 25.0,
+    "take_profit_atr": 1.5,
+    "stop_atr": 1.5,
+    "seed": 20250730
+  },
+  "observed": {
+    "n_trades": 41,
+    "mean_r": 0.1735699020942922
+  },
+  "flag_runs": 41,
+  "m1": {
+    "percentile": 95.13333333333334,
+    "bar": 95.0,
+    "passed": true,
+    "replicates": 1500,
+    "null_mean": -0.03479149109713201,
+    "null_sd": 0.12883954615696136
+  },
+  "m2": {
+    "percentile": 96.0,
+    "bar": 95.0,
+    "passed": true,
+    "delta": 0.21398047477692644,
+    "ci_low": 0.19559005707518676,
+    "ci_high": 0.23185031477300921,
+    "schedules": 200,
+    "null_mean": -0.040410572682634226,
+    "null_sd": 0.13385211285763682
+  },
+  "m3": {
+    "folds": [
+      {
+        "fold": 1,
+        "start": 200,
+        "end": 515,
+        "trades": 0,
+        "mean_r": null,
+        "percentile": null,
+        "note": "no scoreable entries"
+      },
+      {
+        "fold": 2,
+        "start": 515,
+        "end": 830,
+        "trades": 5,
+        "mean_r": 0.16492989669022998,
+        "percentile": null,
+        "note": "5 trades: too few for a stable percentile"
+      },
+      {
+        "fold": 3,
+        "start": 830,
+        "end": 1145,
+        "trades": 22,
+        "mean_r": 0.2290238134291907,
+        "percentile": 96.2,
+        "note": ""
+      },
+      {
+        "fold": 4,
+        "start": 1145,
+        "end": 1461,
+        "trades": 14,
+        "mean_r": 0.08951375764090244,
+        "percentile": 63.0,
+        "note": ""
+      }
+    ],
+    "positive": 3,
+    "soft_gate": 3,
+    "soft_gate_met": true
+  },
+  "verdict": "EDGE_EVIDENCE_POSITIVE",
+  "control_validated": true,
+  "control_attestation": "artifacts/slice57_oos_control_BTCUSDT_n1000.log",
+  "window": "oos_late",
+  "oos_folds_path": "artifacts/funding_carry_fade_btc_v1_folds.json",
+  "oos_folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+  "oos_t_mid": "2024-08-09T00:00:00Z",
+  "oos_bars": 731,
+  "gate_clauses": {
+    "1_n_oos_ge_40": {
+      "observed": 41,
+      "bar": 40,
+      "met": true
+    },
+    "2_control_valid": {
+      "observed": true,
+      "bar": true,
+      "met": true
+    },
+    "3_m1_ge_95": {
+      "observed": 95.13333333333334,
+      "bar": 95.0,
+      "met": true
+    },
+    "4_m2_ge_95": {
+      "observed": 96.0,
+      "bar": 95.0,
+      "met": true
+    },
+    "5_mean_net_r_gt_0": {
+      "observed": 0.1735699020942922,
+      "bar": 0.0,
+      "met": true
+    }
+  },
+  "registration_eligible": true,
+  "registration_eligible_reason": "Scored on the pre-declared out-of-sample window [2024-08-09T00:00:00Z .. 2026-08-09T00:00:00Z] under the fold calendar locked and hashed before this module existed. All five intake clauses hold."
+}
