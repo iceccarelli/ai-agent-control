@@ -32,6 +32,23 @@ import numpy as np
 import backtest as bt
 import market_data as md
 
+# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
+# that every corpus this tool reads is recorded, and a future holdout can be
+# certified untouched by tools/reserved_holdout.py. Reading is reading: a
+# negative result steers the next hypothesis exactly as a positive one does,
+# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
+try:
+    import reserved_holdout as _read_ledger
+    _read_ledger.install()
+except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
+    # NOT a silent pass: the reason is bound and the flag is legible. An
+    # unrecorded read is a real loss (a future holdout cannot be certified),
+    # but it must not take the measurement down with it.
+    _read_ledger = None
+    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
+
+
+
 
 def synthetic_series(n: int = 2000, seed: int = 2024):
     """A series with a 2020-03-style crash and a 2022-style grinding bear leg.

@@ -74,6 +74,23 @@ import skill_test as sk  # noqa: E402
 import edge_measurement as em  # noqa: E402
 from signals import btc_alt_spillover_v1 as spillover  # noqa: E402
 
+# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
+# that every corpus this tool reads is recorded, and a future holdout can be
+# certified untouched by tools/reserved_holdout.py. Reading is reading: a
+# negative result steers the next hypothesis exactly as a positive one does,
+# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
+try:
+    import reserved_holdout as _read_ledger
+    _read_ledger.install()
+except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
+    # NOT a silent pass: the reason is bound and the flag is legible. An
+    # unrecorded read is a real loss (a future holdout cannot be certified),
+    # but it must not take the measurement down with it.
+    _read_ledger = None
+    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
+
+
+
 
 #: The human pre-declaration. Named constants so a change is a visible edit
 #: rather than a number quietly moving inside an expression.

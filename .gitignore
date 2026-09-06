@@ -1,4 +1,3 @@
-bot/state/*.db
 .venv/
 __pycache__/
 *.pyc

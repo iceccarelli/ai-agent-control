@@ -1823,6 +1823,15 @@ def symbol_from_filename(name: str) -> str:
     return (parts[2] + parts[3]).upper()
 
 
+#: Called as ``READ_OBSERVER(symbol, first_start_ms, last_start_ms)`` after every
+#: successful corpus load. Defaults to None so this module keeps zero knowledge
+#: of who is watching. ``reserved_holdout.install()`` sets it; nothing else may.
+#: Loading a symbol counts as reading it even when the signal under test ignores
+#: that symbol — slice 55 read ETH and SOL, and those negative readings are
+#: exactly what steered the next hypothesis toward BTC.
+READ_OBSERVER = None
+
+
 def load_corpus(
     root: str = DATA_ROOT,
     *,
@@ -1929,4 +1938,29 @@ def load_corpus(
 
     if not bars_by_symbol:
         raise MarketDataError(f"no usable OHLCV files under {ohlcv_dir}")
+    # DATA-READ LEDGER (slice 78) — OBSERVER, not an import.
+    #
+    # This is the one place in the tree that sees every read of a price corpus:
+    # every measurement tool routes through load_corpus. Instrumenting HERE
+    # rather than in each tool is the whole point, because the slice-57
+    # contamination happened by relying on a human to notice that a window had
+    # already been looked at, and humans stop noticing.
+    #
+    # But INTEGRATION_MAP §1 says dependencies point downward only, and
+    # test_the_module_imports_only_stdlib_numpy_and_config enforces it. So
+    # market_data does NOT import the ledger. It publishes raw facts to an
+    # observer that defaults to None, and reserved_holdout.install() sets it.
+    # The dependency arrow still points down; the ledger reaches up.
+    #
+    # Raw epoch-ms is passed deliberately: formatting would need `datetime`,
+    # which is not on this module's allowlist either. The observer formats.
+    if READ_OBSERVER is not None:
+        for _symbol, _bars in bars_by_symbol.items():
+            if not _bars:
+                continue
+            try:
+                READ_OBSERVER(_symbol, _bars[0].start_ms, _bars[-1].start_ms)
+            except Exception:  # noqa: BLE001 - bookkeeping never kills a run
+                pass
+
     return bars_by_symbol, books_by_symbol, notes

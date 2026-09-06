@@ -57,6 +57,23 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 import backtest as bt  # noqa: E402
 import market_data as md  # noqa: E402
 
+# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
+# that every corpus this tool reads is recorded, and a future holdout can be
+# certified untouched by tools/reserved_holdout.py. Reading is reading: a
+# negative result steers the next hypothesis exactly as a positive one does,
+# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
+try:
+    import reserved_holdout as _read_ledger
+    _read_ledger.install()
+except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
+    # NOT a silent pass: the reason is bound and the flag is legible. An
+    # unrecorded read is a real loss (a future holdout cannot be certified),
+    # but it must not take the measurement down with it.
+    _read_ledger = None
+    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
+
+
+
 SYMBOL = "BTCUSDT"
 LINEAR = "data/real_linear_1d"
 LINEAR_FILE = "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz"
