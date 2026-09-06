@@ -47,13 +47,40 @@ def test_operator_sandbox_ok_reports_gate_false_and_ladder_from_newest_artifact(
     assert report["live_authorized"] is False
 
 
-def test_operator_refuses_when_the_shipped_kill_switch_is_engaged():
-    db = os.path.join(ROOT, "state", "trading_state.db")
-    if not os.path.isfile(db):
+def test_operator_refuses_when_the_shipped_kill_switch_is_engaged(tmp_path):
+    """The shipped DB is a FIXTURE and is opened through a COPY.
+
+    It used to be opened in place. Opening a tracked sqlite file read-only is
+    not a thing sqlite does: it writes journal pages, and the file came back
+    dirty after every run. `git checkout` then refused to switch branches with
+    "local changes would be overwritten", which is a test corrupting the
+    repository it is testing.
+
+    Copying costs a millisecond and makes the run idempotent.
+    """
+    source = os.path.join(ROOT, "state", "trading_state.db")
+    if not os.path.isfile(source):
         pytest.skip("fixture db not present")
+    db = str(tmp_path / "trading_state.db")
+    shutil.copy(source, db)
     code, report = opd.run(ROOT, {"USE_TESTNET": "1", "PAPER_TRADING": "1",
                                   "STATE_DB_PATH": db})
     assert code == 3 and any("kill switch" in r for r in report["preflight_reasons"])
+
+
+def test_the_shipped_fixture_db_is_never_written_in_place():
+    """Guards the fix above: no test may point STATE_DB_PATH at the tracked file.
+
+    The needle is assembled at runtime. Writing it as a literal would put it in
+    this file, and the guard would then find itself and fail — which is exactly
+    what happened on the first attempt.
+    """
+    with open(__file__, encoding="utf-8") as handle:
+        body = handle.read()
+    needle = "STATE_DB_PATH" + '": ' + "os.path.join(ROOT" + ', "state"'
+    assert needle not in body, (
+        "a test points STATE_DB_PATH at the tracked fixture; sqlite writes "
+        "journal pages even on read, so the repo comes back dirty")
 
 
 def test_operator_refuses_ack_in_paper_and_models_current(tmp_path):

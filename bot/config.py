@@ -351,6 +351,14 @@ class Config:
     #: running ``python3 main.py`` had no way to select.
     ENTRIES_ENABLED: bool
 
+    #: Which book this process runs. "carry" (delta-neutral spot/perp pair,
+    #: collects funding) or "directional" (the legacy technical voter, whose
+    #: Stage-1 verdict is ABSENT). build_bot attaches ONE and returns: they
+    #: share a liquidation price and must never run in the same process.
+    BOOK_MODE: str = "directional"
+    CARRY_SPOT_SYMBOL: str = "BTCUSDT"
+    CARRY_PERP_SYMBOL: str = "BTCUSDT"
+
     # -- derived cost fractions --------------------------------------------
 
     @property
@@ -721,6 +729,15 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
                                            low=1, high=3_650),
         LOG_LEVEL="WARNING" if log_level == "WARN" else log_level,
         STATE_DB_PATH=parse_str(env, "STATE_DB_PATH", "state/trading_state.db"),
+        # Which book this process runs. "carry" = delta-neutral spot/perp pair
+        # collecting funding; "directional" = the legacy technical voter, whose
+        # Stage-1 verdict is ABSENT. They are mutually exclusive: build_bot
+        # attaches one and returns. Default stays "directional" because dozens
+        # of tests predate the carry book, so selecting carry is a deliberate
+        # operator act rather than something that happens by upgrade.
+        BOOK_MODE=parse_str(env, "BOOK_MODE", "directional"),
+        CARRY_SPOT_SYMBOL=parse_str(env, "CARRY_SPOT_SYMBOL", "BTCUSDT"),
+        CARRY_PERP_SYMBOL=parse_str(env, "CARRY_PERP_SYMBOL", "BTCUSDT"),
         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
         # Default True so an existing deployment behaves exactly as before.
         # parse_bool maps every unrecognised value to False, so a typo or a
