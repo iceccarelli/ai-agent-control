@@ -1,0 +1,1088 @@
+From: slice78 <audit@local>
+Subject: [PATCH 0012] slice 78: the read ledger records itself
+
+Slice 77 built reserved_holdout and seeded it BY HAND. That caught the
+slice-57 contamination retroactively, which is worth something, but a ledger
+maintained by hand is a good intention. Good intentions are exactly what
+failed in slice 57: every procedural guard passed, and nobody checked whether
+the bytes had been read before.
+
+market_data.load_corpus is the chokepoint every measurement tool routes
+through. That is where recording belongs.
+
+ ~ market_data.py       READ_OBSERVER = None, called after every successful
+                        corpus load with (symbol, first_ms, last_ms).
+                        NO NEW IMPORTS. INTEGRATION_MAP §1 says dependencies
+                        point downward and test_the_module_imports_only_
+                        stdlib_numpy_and_config enforces it, so market_data
+                        knows nothing about the ledger - it publishes raw
+                        epoch-ms and the ledger reaches UP to observe.
+                        Raw ms because formatting would need datetime, which
+                        is not on this module's allowlist either.
+
+ ~ tools/reserved_holdout.py   + install() sets the observer
+                        + auto_record(): IDEMPOTENT (a re-run is not a second
+                          look) and NEVER FATAL (an unwritable artifacts/ must
+                          not kill a measurement at its last line - slice 77
+                          fixed that failure mode once already)
+                        + LEDGER_DISABLED kill switch
+
+ ~ tools/*.py (28)      every non-archival tool that calls load_corpus now
+                        installs the ledger first. The 16 digest-pinned
+                        historical slice tools are UNTOUCHED: they are
+                        provenance records, and rewriting them would
+                        retroactively falsify how past measurements were made.
+
+ + tests/conftest.py    LEDGER_DISABLED=1 for the session. The suite loads
+                        corpora hundreds of times and none of those looks
+                        informed a hypothesis; left unsuppressed they would
+                        bury the six reads that matter.
+
+ + tests/test_slice78_ledger_is_automatic.py   16 tests. The load-bearing one
+                        scans tools/ and FAILS THE BUILD if a corpus reader
+                        does not install the ledger - the same idiom as the
+                        AST test that forbids assigning live_authorized. It
+                        does not ask anyone to be careful.
+
+TWO GUARDS CAUGHT ME AND BOTH WERE RIGHT:
+  test_the_module_imports_only_stdlib_numpy_and_config rejected importing the
+  ledger into market_data. Rebuilt as an observer; arrow still points down.
+  test_no_handler_silently_passes rejected `except: pass` in the install
+  snippet - "an exception swallowed without a word is a failure nobody will
+  ever see". The reason is now bound and the flag legible.
+
+NOT TOUCHED: FUND_ABS, the join, HORIZON, the barrier, the folds, the caps,
+the schedule, GATE_PATH, live_authorized, Stage-1 artefacts, project_status.
+The slice-77 freeze note remains UNSIGNED.
+
+VERIFIED: 5,066 passed, 2 skipped (was 5,057). Ladder still 5/4/0/0/0/0.
+Ledger unchanged by a full test run.
+
+---
+--- a/market_data.py	2026-08-25 16:28:14.000000000 +0000
++++ b/market_data.py	2026-09-06 09:51:40.091007050 +0000
+@@ -1823,6 +1823,15 @@
+     return (parts[2] + parts[3]).upper()
+ 
+ 
++#: Called as ``READ_OBSERVER(symbol, first_start_ms, last_start_ms)`` after every
++#: successful corpus load. Defaults to None so this module keeps zero knowledge
++#: of who is watching. ``reserved_holdout.install()`` sets it; nothing else may.
++#: Loading a symbol counts as reading it even when the signal under test ignores
++#: that symbol — slice 55 read ETH and SOL, and those negative readings are
++#: exactly what steered the next hypothesis toward BTC.
++READ_OBSERVER = None
++
++
+ def load_corpus(
+     root: str = DATA_ROOT,
+     *,
+@@ -1929,4 +1938,29 @@
+ 
+     if not bars_by_symbol:
+         raise MarketDataError(f"no usable OHLCV files under {ohlcv_dir}")
++    # DATA-READ LEDGER (slice 78) — OBSERVER, not an import.
++    #
++    # This is the one place in the tree that sees every read of a price corpus:
++    # every measurement tool routes through load_corpus. Instrumenting HERE
++    # rather than in each tool is the whole point, because the slice-57
++    # contamination happened by relying on a human to notice that a window had
++    # already been looked at, and humans stop noticing.
++    #
++    # But INTEGRATION_MAP §1 says dependencies point downward only, and
++    # test_the_module_imports_only_stdlib_numpy_and_config enforces it. So
++    # market_data does NOT import the ledger. It publishes raw facts to an
++    # observer that defaults to None, and reserved_holdout.install() sets it.
++    # The dependency arrow still points down; the ledger reaches up.
++    #
++    # Raw epoch-ms is passed deliberately: formatting would need `datetime`,
++    # which is not on this module's allowlist either. The observer formats.
++    if READ_OBSERVER is not None:
++        for _symbol, _bars in bars_by_symbol.items():
++            if not _bars:
++                continue
++            try:
++                READ_OBSERVER(_symbol, _bars[0].start_ms, _bars[-1].start_ms)
++            except Exception:  # noqa: BLE001 - bookkeeping never kills a run
++                pass
++
+     return bars_by_symbol, books_by_symbol, notes
+Binary files s11/state/trading_state.db and t3/state/trading_state.db differ
+--- a/tests/conftest.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/conftest.py	2026-09-06 09:50:53.548095065 +0000
+@@ -0,0 +1,32 @@
++"""Suite-wide fixtures.
++
++The one thing here is the data-read ledger kill switch.
++"""
++from __future__ import annotations
++
++import os
++
++import pytest
++
++
++@pytest.fixture(autouse=True, scope="session")
++def _disable_data_read_ledger():
++    """A test run must not fabricate reads.
++
++    `market_data.load_corpus` records every corpus read into
++    artifacts/data_read_ledger.json so that a future holdout can be certified
++    untouched. The suite loads corpora hundreds of times, and none of those
++    loads informed a hypothesis — they are assertions about code, not looks at
++    data. Left unsuppressed they would bury the six reads that actually matter
++    under noise, and a ledger nobody can read is a ledger nobody uses.
++
++    Set for the session and restored afterwards, so an interactive run in the
++    same shell is still recorded.
++    """
++    previous = os.environ.get("LEDGER_DISABLED")
++    os.environ["LEDGER_DISABLED"] = "1"
++    yield
++    if previous is None:
++        os.environ.pop("LEDGER_DISABLED", None)
++    else:
++        os.environ["LEDGER_DISABLED"] = previous
+--- a/tests/test_slice78_ledger_is_automatic.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_slice78_ledger_is_automatic.py	2026-09-06 09:52:37.728952353 +0000
+@@ -0,0 +1,123 @@
++"""Slice 78 — the read ledger must not depend on anyone remembering.
++
++Slice 77 built `reserved_holdout` and seeded it BY HAND. That caught the
++slice-57 contamination retroactively, which is worth something, but a ledger
++maintained by hand is a good intention, not an invariant. Good intentions are
++exactly what failed in slice 57: every procedural guard passed, and the one
++thing nobody checked was whether the bytes had been read before.
++
++These tests make the recording automatic and keep it that way.
++"""
++from __future__ import annotations
++
++import ast
++import os
++import sys
++
++import pytest
++
++REPO = os.path.join(os.path.dirname(__file__), "..")
++sys.path.insert(0, os.path.join(REPO, "tools"))
++sys.path.insert(0, REPO)
++
++import market_data as md  # noqa: E402
++import reserved_holdout as rh  # noqa: E402
++
++
++class TestTheObserverRespectsIntegrationMap:
++    def test_market_data_does_not_import_the_ledger(self):
++        """§1: dependencies point downward. The ledger reaches UP, never down."""
++        with open(os.path.join(REPO, "market_data.py"), encoding="utf-8") as fh:
++            tree = ast.parse(fh.read())
++        imported = set()
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Import):
++                imported.update(a.name.split(".")[0] for a in node.names)
++            elif isinstance(node, ast.ImportFrom) and node.module:
++                imported.add(node.module.split(".")[0])
++        assert "reserved_holdout" not in imported
++        assert imported <= {
++            "csv", "gzip", "hashlib", "io", "json", "logging", "math", "os",
++            "re", "dataclasses", "typing", "numpy", "config", "__future__",
++        }, f"unexpected imports: {sorted(imported)}"
++
++    def test_the_observer_defaults_to_none(self):
++        """Unwired, market_data records nothing and knows no one."""
++        with open(os.path.join(REPO, "market_data.py"), encoding="utf-8") as fh:
++            body = fh.read()
++        assert "READ_OBSERVER = None" in body
++
++    def test_install_sets_the_observer(self):
++        previous = md.READ_OBSERVER
++        try:
++            md.READ_OBSERVER = None
++            rh.install(md, reader="test", path="/tmp/t78_install.json")
++            assert md.READ_OBSERVER is not None
++        finally:
++            md.READ_OBSERVER = previous
++
++
++class TestRecordingIsSafeUnderFailure:
++    def test_recording_is_idempotent(self, tmp_path, monkeypatch):
++        """Re-running a measurement is not a second look at the data."""
++        monkeypatch.delenv(rh.DISABLE_ENV, raising=False)  # conftest sets it
++        path = str(tmp_path / "L.json")
++        kw = dict(dataset="X", from_utc="2026-01-01T00:00:00Z",
++                  to_utc="2026-02-01T00:00:00Z", read_by="t", path=path)
++        assert rh.auto_record(**kw) is True
++        assert rh.auto_record(**kw) is False
++
++    def test_an_unwritable_ledger_never_raises(self):
++        """A measurement must not die at its last line. Slice 77 fixed that once."""
++        assert rh.auto_record(dataset="X", from_utc="2026-01-01T00:00:00Z",
++                              to_utc="2026-02-01T00:00:00Z", read_by="t",
++                              path="/proc/1/no/L.json") is False
++
++    def test_a_malformed_timestamp_never_raises(self):
++        assert rh.auto_record(dataset="X", from_utc="not-a-time",
++                              to_utc="2026-02-01T00:00:00Z", read_by="t",
++                              path="/tmp/t78_bad.json") is False
++
++    def test_the_kill_switch_suppresses_recording(self, tmp_path, monkeypatch):
++        monkeypatch.setenv(rh.DISABLE_ENV, "1")
++        assert rh.auto_record(dataset="X", from_utc="2026-01-01T00:00:00Z",
++                              to_utc="2026-02-01T00:00:00Z", read_by="t",
++                              path=str(tmp_path / "L.json")) is False
++
++
++class TestEveryCorpusReaderInstallsTheLedger:
++    """The invariant. A tool that reads corpora and does not record is a hole.
++
++    This is the slice-78 equivalent of the AST test that forbids assigning
++    `live_authorized`: it does not ask anyone to be careful, it fails the build.
++    """
++
++    #: Historical slice tools are digest-pinned provenance records (16 of them)
++    #: and MUST stay byte-identical, so they cannot install the hook. They are
++    #: archival, they are not run against new data, and rewriting them to add a
++    #: call would retroactively falsify how past measurements were produced.
++    ARCHIVAL_PREFIXES = ("slice6", "slice7")
++
++    def _tools_that_load_corpora(self):
++        tools_dir = os.path.join(REPO, "tools")
++        for name in sorted(os.listdir(tools_dir)):
++            if not name.endswith(".py"):
++                continue
++            if name.startswith(self.ARCHIVAL_PREFIXES):
++                continue
++            with open(os.path.join(tools_dir, name), encoding="utf-8") as fh:
++                body = fh.read()
++            if "load_corpus" in body:
++                yield name, body
++
++    def test_at_least_one_tool_is_checked(self):
++        assert list(self._tools_that_load_corpora()), "the scan found nothing"
++
++    def test_current_corpus_readers_install_the_ledger(self):
++        missing = [name for name, body in self._tools_that_load_corpora()
++                   if "reserved_holdout" not in body]
++        assert not missing, (
++            "these tools read a corpus without recording the read: "
++            f"{missing}. Add `import reserved_holdout; reserved_holdout.install()` "
++            "before the first load_corpus call, or the next holdout cannot be "
++            "certified untouched.")
+--- a/tools/bisection.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/bisection.py	2026-09-06 09:56:33.303450922 +0000
+@@ -68,6 +68,23 @@
+ import market_data as md
+ import skill_test as sk
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/control_compression_breakout.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_compression_breakout.py	2026-09-06 09:56:33.303687193 +0000
+@@ -75,6 +75,23 @@
+ import control_directed as cd
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/control_directed.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_directed.py	2026-09-06 09:56:33.303795217 +0000
+@@ -74,6 +74,23 @@
+ import edge_measurement as em  # noqa: E402
+ from signals import btc_alt_spillover_v1 as spillover  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ 
+ #: The human pre-declaration. Named constants so a change is a visible edit
+ #: rather than a number quietly moving inside an expression.
+--- a/tools/control_funding_carry_fade.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_funding_carry_fade.py	2026-09-06 09:56:33.303921584 +0000
+@@ -129,6 +129,23 @@
+ import control_directed as cd
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ UNIVERSE = {
+--- a/tools/control_funding_carry_fade_btc_oos.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_funding_carry_fade_btc_oos.py	2026-09-06 09:56:33.304038043 +0000
+@@ -91,6 +91,23 @@
+ import control_directed as cd  # noqa: E402
+ import edge_measurement as em  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ 
+ def positions_preserved(original, shuffled) -> bool:
+     """Did the shuffle keep every bar on its own date?
+--- a/tools/control_open_gap_fade.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_open_gap_fade.py	2026-09-06 09:56:33.304149634 +0000
+@@ -85,6 +85,23 @@
+ import control_directed as cd
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/control_post_shock_fade.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_post_shock_fade.py	2026-09-06 09:56:33.304269725 +0000
+@@ -70,6 +70,23 @@
+ import control_directed as cd
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/control_range_location_fade.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_range_location_fade.py	2026-09-06 09:56:33.304378250 +0000
+@@ -82,6 +82,23 @@
+ import control_directed as cd
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/control_sign_flip_momentum.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_sign_flip_momentum.py	2026-09-06 09:56:33.304538841 +0000
+@@ -77,6 +77,23 @@
+ import control_directed as cd
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/control_ts_momentum.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/control_ts_momentum.py	2026-09-06 09:56:33.304652876 +0000
+@@ -89,6 +89,23 @@
+ import control_directed as cd
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/count_compression_breakout.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/count_compression_breakout.py	2026-09-06 09:56:33.304779788 +0000
+@@ -53,6 +53,23 @@
+ 
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: The intake's HARD GATE for any POSITIVE claim, per symbol. Not a bar this
+--- a/tools/count_funding_carry_fade.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/count_funding_carry_fade.py	2026-09-06 09:56:33.304863181 +0000
+@@ -53,6 +53,23 @@
+ 
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: The intake's hard gate for any POSITIVE claim, per symbol.
+--- a/tools/count_funding_carry_fade_btc_oos.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/count_funding_carry_fade_btc_oos.py	2026-09-06 09:56:33.304943528 +0000
+@@ -46,6 +46,23 @@
+ 
+ import edge_measurement as em  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ #: The intake's clause 1. Not an argument, deliberately — a floor that can be
+ #: passed on the command line is a floor that can be lowered from a shell.
+ HARD_FLOOR = 40
+--- a/tools/count_open_gap_fade.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/count_open_gap_fade.py	2026-09-06 09:56:33.305022466 +0000
+@@ -55,6 +55,23 @@
+ 
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: The intake's design target, per symbol. Not a bar this tool enforces — it
+--- a/tools/count_sign_flip_momentum.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/count_sign_flip_momentum.py	2026-09-06 09:56:33.305102227 +0000
+@@ -49,6 +49,23 @@
+ 
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: The intake's HARD GATE for any POSITIVE claim, per symbol. Not a bar this
+--- a/tools/count_ts_momentum.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/count_ts_momentum.py	2026-09-06 09:56:33.305182743 +0000
+@@ -62,6 +62,23 @@
+ 
+ import edge_measurement as em
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: The intake's HARD GATE for any POSITIVE claim, per symbol. Not a bar this
+--- a/tools/edge_measurement.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/edge_measurement.py	2026-09-06 09:56:33.305574281 +0000
+@@ -72,6 +72,23 @@
+ from signals import funding_carry_fade_v1 as fundfade
+ from signals import funding_carry_fade_btc_v1 as fundbtc
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: Pre-declared in EDGE.md 5b, before any number existed. Not tunable.
+--- a/tools/fetch_real_data.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/fetch_real_data.py	2026-09-06 09:56:33.305854999 +0000
+@@ -75,6 +75,23 @@
+ 
+ import market_data as md  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ DEFAULT_OUT = os.path.join(REPO, "data", "real")
+ 
+--- a/tools/filter_diagnostic.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/filter_diagnostic.py	2026-09-06 09:56:33.305984839 +0000
+@@ -86,6 +86,23 @@
+ import market_data as md
+ import skill_test as sk
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: A side with fewer legal re-tilings than this on a surrogate is reported as
+--- a/tools/forward_shadow_observation.py	2026-09-06 10:00:50.097583534 +0000
++++ b/tools/forward_shadow_observation.py	2026-09-06 09:56:33.306129868 +0000
+@@ -65,6 +65,23 @@
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
+ import provenance as _provenance  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ SCHEMA = "forward_shadow_observation/1"
+ SCHEDULE_MODE = "one_entry_per_contiguous_run"
+ 
+--- a/tools/lock_btc_folds.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/lock_btc_folds.py	2026-09-06 09:56:33.306318522 +0000
+@@ -57,6 +57,23 @@
+ import backtest as bt  # noqa: E402
+ import market_data as md  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ SYMBOL = "BTCUSDT"
+ LINEAR = "data/real_linear_1d"
+ LINEAR_FILE = "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz"
+--- a/tools/oos_stability_q1q2.py	2026-09-06 10:00:50.097624688 +0000
++++ b/tools/oos_stability_q1q2.py	2026-09-06 09:56:33.306586769 +0000
+@@ -48,6 +48,23 @@
+ import edge_measurement as em  # noqa: E402
+ import provenance as _provenance  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ 
+ def main(argv=None) -> int:
+     parser = argparse.ArgumentParser(description=__doc__)
+--- a/tools/reserved_holdout.py	2026-09-06 10:00:50.281879562 +0000
++++ b/tools/reserved_holdout.py	2026-09-06 09:51:53.355274039 +0000
+@@ -170,6 +170,86 @@
+     return entry
+ 
+ 
++#: Set LEDGER_DISABLED=1 to suppress automatic recording. Tests set it so that
++#: a test run does not fabricate thousands of "reads" that never informed a
++#: hypothesis. Nothing else should ever set it, and `--status` reports when it
++#: is on so a suppressed ledger can never look like a clean one.
++DISABLE_ENV = "LEDGER_DISABLED"
++
++
++def auto_record(*, dataset: str, from_utc: str, to_utc: str, read_by: str,
++                purpose: str = "", path: str = DEFAULT_PATH) -> bool:
++    """Record a read from inside a loader. Idempotent, and NEVER fatal.
++
++    Called by `market_data.load_corpus`, the chokepoint every measurement tool
++    in this tree routes through. Instrumenting there rather than in each tool is
++    deliberate: the slice-57 contamination happened because a HUMAN was relied
++    on to notice that a window had been read before, and humans stop noticing.
++    An invariant that depends on anyone remembering is not an invariant.
++
++    Two rules:
++
++    * IDEMPOTENT — an identical (dataset, range, reader) tuple is recorded once.
++      Re-running the same measurement is not a second look at the data.
++    * NEVER FATAL — a read-only artifacts/ or a malformed ledger must not take
++      down a measurement. It logs and returns False. Losing a ledger entry is
++      bad; a measurement that dies at its last line is the bug this programme
++      already fixed once in slice 77.
++    """
++    if os.environ.get(DISABLE_ENV) == "1":
++        return False
++    try:
++        ledger = load(path)
++        key = (dataset, from_utc, to_utc, read_by)
++        for existing in ledger.get("reads", []):
++            if (existing["dataset"], existing["from_utc"],
++                    existing["to_utc"], existing["read_by"]) == key:
++                return False
++        record_read(ledger, dataset=dataset, from_utc=from_utc, to_utc=to_utc,
++                    read_by=read_by, purpose=purpose,
++                    result_seen="(auto-recorded at load; the result this read "
++                                "produced is not known to the loader)")
++        save(ledger, path)
++        return True
++    except Exception:  # noqa: BLE001 - a ledger write must never kill a run
++        return False
++
++
++def install(market_data_module=None, *, reader: str = "",
++            path: str = DEFAULT_PATH) -> bool:
++    """Attach this ledger to `market_data.READ_OBSERVER`. Idempotent.
++
++    The arrow points UP: market_data knows nothing about the ledger, publishes
++    raw epoch-ms facts to an observer that defaults to None, and this function
++    is what sets it. INTEGRATION_MAP §1 stays satisfied and the recording still
++    happens at the single chokepoint every measurement tool routes through.
++
++    Every tool that calls `market_data.load_corpus` must call this first.
++    `tests/test_slice78_ledger_is_automatic.py` fails the build if one does not,
++    which is what turns "remember to record your reads" from a good intention
++    into an invariant.
++    """
++    if market_data_module is None:
++        import market_data as market_data_module  # noqa: PLC0415
++    label = reader or os.path.basename(sys.argv[0] or "") or "unknown-reader"
++
++    def _observe(symbol: str, first_ms: int, last_ms: int) -> None:
++        auto_record(dataset=symbol,
++                    from_utc=_iso_from_ms(first_ms),
++                    to_utc=_iso_from_ms(last_ms),
++                    read_by=label,
++                    purpose="market_data.load_corpus",
++                    path=path)
++
++    market_data_module.READ_OBSERVER = _observe
++    return True
++
++
++def _iso_from_ms(ms: int) -> str:
++    return dt.datetime.fromtimestamp(
++        int(ms) / 1000.0, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
++
++
+ def overlaps(ledger: Dict[str, Any], *, dataset: str, from_utc: str,
+              to_utc: str) -> List[Dict[str, Any]]:
+     start, end = _utc(from_utc), _utc(to_utc)
+--- a/tools/residual_diagnostic.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/residual_diagnostic.py	2026-09-06 09:56:33.306913042 +0000
+@@ -78,6 +78,23 @@
+ import skill_test as sk
+ import sweep_geometry as sweep
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: A cell with fewer than this many unflagged partners is DROPPED for that
+--- a/tools/run_evaluation.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/run_evaluation.py	2026-09-06 09:56:33.307034738 +0000
+@@ -32,6 +32,23 @@
+ import backtest as bt
+ import market_data as md
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ 
+ def synthetic_series(n: int = 2000, seed: int = 2024):
+     """A series with a 2020-03-style crash and a 2022-style grinding bear leg.
+--- a/tools/shadow_replay.py	2026-09-06 10:00:50.097765005 +0000
++++ b/tools/shadow_replay.py	2026-09-06 09:56:33.307152658 +0000
+@@ -57,6 +57,23 @@
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
+ import provenance as _provenance  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ 
+ def iso(ms: int) -> str:
+     return dt.datetime.fromtimestamp(
+--- a/tools/skill_test.py	2026-09-06 10:00:50.095934292 +0000
++++ b/tools/skill_test.py	2026-09-06 09:56:33.307559668 +0000
+@@ -77,6 +77,23 @@
+ import market_data as md
+ import sweep_geometry as sweep
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ 
+--- a/tools/sweep_geometry.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/sweep_geometry.py	2026-09-06 09:56:33.309813548 +0000
+@@ -82,6 +82,23 @@
+ import features as _features
+ import market_data as md
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: Bybit spot taker is 10 bps a side; 5 bps of slippage is the shipped default.
+--- a/tools/train_policy.py	2026-08-25 16:28:14.000000000 +0000
++++ b/tools/train_policy.py	2026-09-06 09:56:33.310184994 +0000
+@@ -85,6 +85,23 @@
+ import market_data as md  # noqa: E402
+ import policy as pol  # noqa: E402
+ 
++# DATA-READ LEDGER (slice 78). Installed BEFORE the first load_corpus call so
++# that every corpus this tool reads is recorded, and a future holdout can be
++# certified untouched by tools/reserved_holdout.py. Reading is reading: a
++# negative result steers the next hypothesis exactly as a positive one does,
++# which is how slice 57 ended up "out of sample" on bytes slice 55 had read.
++try:
++    import reserved_holdout as _read_ledger
++    _read_ledger.install()
++except Exception as _ledger_exc:  # noqa: BLE001 - never blocks a measurement
++    # NOT a silent pass: the reason is bound and the flag is legible. An
++    # unrecorded read is a real loss (a future holdout cannot be certified),
++    # but it must not take the measurement down with it.
++    _read_ledger = None
++    _READ_LEDGER_UNAVAILABLE = repr(_ledger_exc)
++
++
++
+ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ 
+ #: Bumped when the *manifest layout* changes, so a reader can tell whether the
