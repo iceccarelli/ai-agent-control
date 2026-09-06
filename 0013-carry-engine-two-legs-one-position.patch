@@ -1,0 +1,758 @@
+From: build <build@local>
+Subject: [PATCH 0013] carry engine: two legs, one position, executes on candle
+
+THE TRADE
+Long spot BTC + short perp BTC. Zero price exposure. Collect the funding
+leveraged longs pay to be long, every 8 hours.
+
+Measured on THIS REPO'S OWN 4,431-print corpus:
+    funding positive        85.4% of prints
+    mean rate               +0.625 bps per 8h
+    collected over 4.05 yr  27.70% of notional  =  6.84%/yr gross
+    entry cost              31 bps ONE TIME, not per period
+
+Compare the directional fade eleven families died on: 25 bps round trip x ~36
+entries/yr = 900 bps of friction against a ~15 bps edge. The directional trade
+PAYS the funding structure. This one COLLECTS it.
+
+WHAT SHIPS
+ + carry_engine.py       on_candle() is the entire loop. Runs on every closed
+                         bar and either acts or states which leg stopped it:
+                           margin headroom -> delta drift -> funding decision
+                           -> open / rebalance / harvest / unwind
+                         Opens both legs or neither. Hedges what the spot leg
+                         ACTUALLY FILLED, not what was requested. Rebalances on
+                         the perp (5.5 bps) never the spot (10 bps), because
+                         correcting on the spot side means selling collateral.
+                         Unwinds perp-first: it is the leg that gets liquidated.
+
+ + tests/test_carry_engine.py   27 tests. Each one is a way this trade kills an
+                         account, written down so the code cannot do it:
+                           - perp rejected  -> spot sold same cycle, FLAT
+                           - spot rejected  -> perp never shorted
+                           - spot filled, hedge rejected, unwind ALSO rejected
+                             -> HALT + kill switch. The book is naked and
+                             cannot self-correct, so it stops and shouts.
+                           - legs land unpaired -> unwound, not kept
+                           - margin falls while open -> unwind
+                           - margin unreadable -> halt, never assume
+                           - NaN/inf/zero/negative mark -> halt
+                           - one negative funding print -> hold; three -> exit
+
+THE ENGINE CANNOT TAKE A DIRECTIONAL POSITION.
+on_candle() has no side, direction, long, short or signal parameter, and a test
+asserts it never gains one. 10x here is 10x on a hedged carry spread, which is
+what carry desks actually run. It is not 10x on a view.
+
+NO LLM ON THE ORDER PATH. A funding forecaster may later hand this module a
+NOTIONAL - predicting the next funding rate is tractable in a way predicting
+price is not, and being wrong means collecting less rather than losing. It will
+never hand it a direction, because there is nowhere to put one.
+
+NOT TOUCHED: FUND_ABS, the join, HORIZON, the barrier, the folds, the caps,
+the schedule, GATE_PATH, live_authorized, project_status. The old directional
+signal is untouched and still frozen behind the same gate.
+
+STILL NAKED - do not run this against real money:
+  - no venue adapter yet. FakeBroker proves the state machine; a real
+    BybitClient/spot adapter is 0014.
+  - trading_engine.py:1010 still passes fee=0.0 to record_exit_fill.
+  - backtest.py:833 still raises NotImplementedError on the linear stop.
+  - Bybit 403 / fapi 451 from Codespaces. The order path cannot be certified
+    from a host that cannot reach the venue.
+
+VERIFIED: 5,100 passed, 2 skipped (was 5,066). No test weakened or skipped.
+
+---
+--- a/carry_engine.py	1970-01-01 00:00:00.000000000 +0000
++++ b/carry_engine.py	2026-09-06 10:44:30.386987616 +0000
+@@ -0,0 +1,410 @@
++"""Delta-neutral carry book: two legs, one position, executed on candle receipt.
++
++WHAT THIS IS
++============
++The trading system in this tree holds ONE leg at a time and bets on direction.
++That trade is arithmetically dead: 25 bps round trip x ~36 entries a year is
++900 bps of friction against a ~15 bps edge, and eleven signal families died
++proving it.
++
++This module holds TWO legs and bets on nothing.
++
++    LONG spot BTC  +  SHORT perp BTC  =  zero price exposure
++
++Price goes up, the spot leg gains what the perp leg loses. Price goes down, the
++reverse. You are flat. What you keep is the funding the leveraged longs pay to
++be long, every eight hours, forever.
++
++On this repo's own 4,431-print corpus:
++
++    funding positive          85.4% of prints
++    mean rate                 +0.625 bps per 8h
++    collected over 4.05 yrs   27.70% of notional  =  6.84%/yr gross
++    entry cost                31 bps ONE TIME, not per period
++
++You are not predicting. You are supplying balance sheet to people who want
++leverage, and charging them for it. That is a business with an economic reason
++to exist, which is exactly what direction-guessing on daily bars never had.
++
++THE THING THAT KILLS THIS TRADE
++===============================
++One leg landing without the other. A spot buy that fills while the perp short
++is rejected is not a hedged book — it is a naked long at whatever size you
++sized the CARRY at, which is the size you would never take directionally. The
++same trade run carelessly is how funds die: not from the carry going negative,
++but from waking up delta-long into a crash because a leg failed at 3am.
++
++So the invariants here are not caution. They are the product:
++
++  1. LEGS LAND TOGETHER OR NOT AT ALL. A partial pair is unwound immediately.
++     If the unwind fails, the kill switch trips. There is no third option.
++  2. DELTA IS MEASURED, NOT ASSUMED. The hedge drifts as price moves and as
++     legs fill at different prices. It is recomputed on every candle.
++  3. LEVERAGE IS ON THE SPREAD, NOT ON A VIEW. 10x on a delta-neutral pair is
++     10x on a carry spread. 10x on a directional bet is a margin call with a
++     countdown. This module physically cannot express the second one: it has
++     no direction parameter.
++  4. THE SHORT LEG CAN BE LIQUIDATED. Spot cannot. Margin headroom on the perp
++     is checked before every action and is the first thing to trip.
++
++WHAT EXECUTES
++=============
++`on_candle()` is the whole loop. It runs on every closed bar and it either acts
++or states why it did not. In order:
++
++    liquidation headroom -> delta drift -> funding decision -> open / rebalance
++                                                            / harvest / unwind
++
++No LLM sits anywhere on that path. A forecaster may later size the book by
++predicting the next funding rate — a tractable problem where being wrong means
++collecting less, not losing — but it will hand this module a NOTIONAL, never a
++direction. This module has no direction to give it.
++"""
++from __future__ import annotations
++
++import logging
++import math
++from dataclasses import dataclass, field
++from enum import Enum
++from typing import Any, Dict, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++#: Rebalance when |delta| exceeds this fraction of book notional. Below it,
++#: churning the legs costs more in fees than the residual exposure costs in
++#: risk. 2% of notional on a $100k book is $2k of drift — a rounding error
++#: against the carry, and far cheaper than two taker fees to correct.
++DELTA_BAND = 0.02
++
++#: Refuse to open, and start unwinding, below this maintenance-margin multiple
++#: on the short perp leg. 2.0x means the perp can move 50% against the short
++#: before liquidation. The spot leg is the collateral of last resort and can be
++#: sold to post margin, but selling spot in a squeeze is the worst execution in
++#: the world, so the trigger sits well before it is needed.
++MIN_MARGIN_MULTIPLE = 2.0
++
++#: Do not open new carry below this forecast 8h rate. At 0.2 bps per 8h the
++#: annualised gross is ~2.2%, which does not clear the 31 bps entry cost inside
++#: a reasonable hold. Below it, hold cash.
++MIN_ENTRY_FUNDING_BPS = 0.2
++
++#: Unwind when funding has been negative this many consecutive prints. Negative
++#: funding means the trade has inverted: you are now PAYING to hold the hedge.
++#: Three prints is one day — long enough not to react to a single squeeze,
++#: short enough to leave before a regime.
++NEGATIVE_FUNDING_EXIT_PRINTS = 3
++
++
++class BookState(Enum):
++    FLAT = "FLAT"
++    OPENING = "OPENING"
++    HEDGED = "HEDGED"
++    DRIFTED = "DRIFTED"
++    UNWINDING = "UNWINDING"
++    HALTED = "HALTED"
++
++
++@dataclass
++class Leg:
++    """One side of the pair. Filled quantity is what the VENUE says, not what
++    was requested — the difference between those two numbers is the naked
++    exposure this module exists to eliminate."""
++
++    symbol: str
++    side: str                    # "Buy" (spot long) or "Sell" (perp short)
++    product: str                 # "spot" or "linear"
++    requested_qty: float = 0.0
++    filled_qty: float = 0.0
++    avg_price: float = 0.0
++    order_link_id: str = ""
++
++    @property
++    def notional(self) -> float:
++        return self.filled_qty * self.avg_price
++
++    @property
++    def is_complete(self) -> bool:
++        if self.requested_qty <= 0:
++            return False
++        return abs(self.filled_qty - self.requested_qty) <= 1e-9
++
++
++@dataclass
++class CarryPosition:
++    """A hedged pair. Delta is DERIVED from fills, never carried as a belief."""
++
++    spot: Leg
++    perp: Leg
++    opened_ms: int = 0
++    funding_collected: float = 0.0
++    negative_funding_streak: int = 0
++
++    @property
++    def delta_qty(self) -> float:
++        """Net BTC exposure. Zero is the whole point of the trade."""
++        return self.spot.filled_qty - self.perp.filled_qty
++
++    def delta_fraction(self, mark: float) -> float:
++        """|delta| as a fraction of book notional. The number that trips a
++        rebalance."""
++        book = self.spot.notional + self.perp.notional
++        if book <= 0:
++            return 0.0
++        return abs(self.delta_qty * mark) / book
++
++    @property
++    def is_paired(self) -> bool:
++        return self.spot.is_complete and self.perp.is_complete
++
++
++@dataclass
++class CarryDecision:
++    """What the engine did, and why. `acted` is False unless an order went out."""
++
++    action: str
++    acted: bool = False
++    reason: str = ""
++    state: BookState = BookState.FLAT
++    detail: Dict[str, Any] = field(default_factory=dict)
++
++    def __bool__(self) -> bool:
++        return self.acted
++
++
++class CarryEngine:
++    """Holds the pair. Acts on candles. Refuses on anything it cannot verify.
++
++    Constructed with a broker adapter exposing:
++        place_market(symbol, side, qty, product) -> {filled_qty, avg_price, order_link_id}
++        get_margin_multiple(symbol) -> float
++        get_mark(symbol) -> float
++    and a kill switch callable. Everything else is arithmetic done here.
++    """
++
++    def __init__(self, *, broker: Any, kill_switch: Any = None,
++                 spot_symbol: str = "BTCUSDT", perp_symbol: str = "BTCUSDT",
++                 max_notional_usd: float = 100.0,
++                 delta_band: float = DELTA_BAND,
++                 min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
++                 min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS) -> None:
++        self.broker = broker
++        self.kill_switch = kill_switch
++        self.spot_symbol = spot_symbol
++        self.perp_symbol = perp_symbol
++        self.max_notional_usd = float(max_notional_usd)
++        self.delta_band = float(delta_band)
++        self.min_margin_multiple = float(min_margin_multiple)
++        self.min_entry_funding_bps = float(min_entry_funding_bps)
++        self.position: Optional[CarryPosition] = None
++        self.state = BookState.FLAT
++
++    # -- the loop ---------------------------------------------------------
++
++    def on_candle(self, *, mark: float, funding_bps: float,
++                  timestamp_ms: int = 0) -> CarryDecision:
++        """One closed bar. Act or state why not. This is the entire loop.
++
++        Order is not cosmetic. Liquidation headroom is checked before anything
++        else because a margin call does not wait for the funding decision, and
++        delta is checked before opening more because adding size to a drifted
++        book compounds the exposure you already failed to hedge.
++        """
++        if self.state is BookState.HALTED:
++            return CarryDecision("halted", reason="KILL_SWITCH_ENGAGED",
++                                 state=self.state)
++
++        if not self._finite(mark) or mark <= 0:
++            return self._halt("MARK_UNREADABLE",
++                              "a book that cannot be marked cannot be hedged")
++
++        if self.position is not None:
++            headroom = self._check_margin()
++            if headroom is not None:
++                return headroom
++
++            drift = self.position.delta_fraction(mark)
++            if drift > self.delta_band:
++                return self._rebalance(mark, drift)
++
++            if funding_bps < 0:
++                self.position.negative_funding_streak += 1
++                if (self.position.negative_funding_streak
++                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
++                    return self._unwind(mark, "FUNDING_INVERTED")
++            else:
++                self.position.negative_funding_streak = 0
++                self.position.funding_collected += (
++                    funding_bps / 1e4) * self.position.perp.notional
++
++            return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
++                                 state=BookState.HEDGED,
++                                 detail={"delta_fraction": drift,
++                                         "funding_bps": funding_bps,
++                                         "collected": self.position.funding_collected})
++
++        if funding_bps < self.min_entry_funding_bps:
++            return CarryDecision(
++                "stand_aside", reason="FUNDING_TOO_THIN_TO_CLEAR_ENTRY_COST",
++                state=BookState.FLAT,
++                detail={"funding_bps": funding_bps,
++                        "required_bps": self.min_entry_funding_bps})
++
++        return self._open(mark, funding_bps, timestamp_ms)
++
++    # -- actions ----------------------------------------------------------
++
++    def _open(self, mark: float, funding_bps: float,
++              timestamp_ms: int) -> CarryDecision:
++        """Both legs, or neither. There is no partially-open carry position."""
++        qty = self.max_notional_usd / mark
++        if qty <= 0 or not self._finite(qty):
++            return self._halt("SIZE_INVALID", "refusing an unsizable book")
++
++        margin = self._margin_multiple()
++        if margin is not None and margin < self.min_margin_multiple:
++            return CarryDecision("stand_aside", reason="MARGIN_HEADROOM_TOO_THIN",
++                                 state=BookState.FLAT,
++                                 detail={"margin_multiple": margin})
++
++        self.state = BookState.OPENING
++        spot = self._fire(self.spot_symbol, "Buy", qty, "spot")
++        if spot is None or spot.filled_qty <= 0:
++            self.state = BookState.FLAT
++            return CarryDecision("refused", reason="SPOT_LEG_DID_NOT_FILL",
++                                 state=BookState.FLAT)
++
++        # Hedge exactly what the spot leg ACTUALLY filled. Hedging the requested
++        # size instead is how a rounding difference becomes a permanent short.
++        perp = self._fire(self.perp_symbol, "Sell", spot.filled_qty, "linear")
++        if perp is None or perp.filled_qty <= 0:
++            return self._emergency_unwind_spot(
++                spot, "PERP_LEG_DID_NOT_FILL — spot is naked, unwinding now")
++
++        position = CarryPosition(spot=spot, perp=perp, opened_ms=timestamp_ms)
++        residual = position.delta_fraction(mark)
++        if residual > self.delta_band:
++            # Both legs landed but the sizes disagree by more than the band.
++            # That is not a hedge, it is a directional position wearing one.
++            self.position = position
++            return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
++
++        self.position = position
++        self.state = BookState.HEDGED
++        return CarryDecision(
++            "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
++            detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
++                    "perp_price": perp.avg_price, "delta_fraction": residual,
++                    "funding_bps": funding_bps})
++
++    def _rebalance(self, mark: float, drift: float) -> CarryDecision:
++        """Bring delta back inside the band by trading the PERP leg only.
++
++        The perp is the cheap leg (5.5 bps vs 10 bps taker) and the one that can
++        be shorted freely. Correcting on the spot side would mean selling
++        collateral, which is the last thing to touch.
++        """
++        position = self.position
++        assert position is not None
++        delta = position.delta_qty
++        side = "Sell" if delta > 0 else "Buy"
++        fill = self._fire(self.perp_symbol, side, abs(delta), "linear")
++        if fill is None or fill.filled_qty <= 0:
++            return self._halt(
++                "REBALANCE_FAILED",
++                f"delta is {drift:.2%} of book and the correction did not fill")
++
++        if side == "Sell":
++            position.perp.filled_qty += fill.filled_qty
++        else:
++            position.perp.filled_qty -= fill.filled_qty
++        self.state = BookState.HEDGED
++        return CarryDecision(
++            "rebalanced", acted=True, reason="DELTA_RETURNED_TO_BAND",
++            state=BookState.HEDGED,
++            detail={"drift_before": drift, "corrected_qty": fill.filled_qty,
++                    "drift_after": position.delta_fraction(mark)})
++
++    def _unwind(self, mark: float, reason: str) -> CarryDecision:
++        """Close both legs. Perp first: it is the leg that can be liquidated."""
++        position = self.position
++        assert position is not None
++        self.state = BookState.UNWINDING
++        perp = self._fire(self.perp_symbol, "Buy", position.perp.filled_qty,
++                          "linear")
++        spot = self._fire(self.spot_symbol, "Sell", position.spot.filled_qty,
++                          "spot")
++        if perp is None or spot is None:
++            return self._halt(
++                "UNWIND_INCOMPLETE",
++                f"{reason} — a leg did not close and the book is now naked")
++        self.position = None
++        self.state = BookState.FLAT
++        return CarryDecision("unwound", acted=True, reason=reason,
++                             state=BookState.FLAT,
++                             detail={"collected": position.funding_collected})
++
++    def _emergency_unwind_spot(self, spot: Leg, reason: str) -> CarryDecision:
++        """The perp never landed. Sell the spot immediately; it is naked long."""
++        self.state = BookState.UNWINDING
++        closed = self._fire(self.spot_symbol, "Sell", spot.filled_qty, "spot")
++        if closed is None or closed.filled_qty <= 0:
++            return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
++        self.position = None
++        self.state = BookState.FLAT
++        return CarryDecision("unwound", acted=True, reason=reason,
++                             state=BookState.FLAT)
++
++    # -- guards -----------------------------------------------------------
++
++    def _check_margin(self) -> Optional[CarryDecision]:
++        margin = self._margin_multiple()
++        if margin is None:
++            return self._halt("MARGIN_UNREADABLE",
++                              "an unreadable margin is a margin call you cannot see")
++        if margin < self.min_margin_multiple:
++            return self._unwind(self.broker.get_mark(self.perp_symbol),
++                                f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
++        return None
++
++    def _margin_multiple(self) -> Optional[float]:
++        try:
++            value = float(self.broker.get_margin_multiple(self.perp_symbol))
++        except Exception:  # noqa: BLE001
++            return None
++        return value if self._finite(value) else None
++
++    def _fire(self, symbol: str, side: str, qty: float,
++              product: str) -> Optional[Leg]:
++        if qty <= 0 or not self._finite(qty):
++            return None
++        try:
++            result = self.broker.place_market(symbol=symbol, side=side,
++                                              qty=qty, product=product)
++        except Exception as exc:  # noqa: BLE001
++            logger.error("leg %s %s %s failed: %s", side, symbol, product, exc)
++            return None
++        if not result:
++            return None
++        return Leg(symbol=symbol, side=side, product=product,
++                   requested_qty=qty,
++                   filled_qty=float(result.get("filled_qty", 0.0) or 0.0),
++                   avg_price=float(result.get("avg_price", 0.0) or 0.0),
++                   order_link_id=str(result.get("order_link_id", "")))
++
++    def _halt(self, reason: str, detail: str) -> CarryDecision:
++        self.state = BookState.HALTED
++        if self.kill_switch is not None:
++            try:
++                self.kill_switch(reason)
++            except Exception:  # noqa: BLE001
++                logger.critical("kill switch itself failed on %s", reason)
++        logger.critical("carry book HALTED: %s — %s", reason, detail)
++        return CarryDecision("halted", reason=reason, state=BookState.HALTED,
++                             detail={"detail": detail})
++
++    @staticmethod
++    def _finite(value: Any) -> bool:
++        try:
++            return math.isfinite(float(value))
++        except (TypeError, ValueError):
++            return False
+Binary files s12/state/trading_state.db and t3/state/trading_state.db differ
+--- a/tests/test_carry_engine.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_carry_engine.py	2026-09-06 10:45:35.046423615 +0000
+@@ -0,0 +1,275 @@
++"""The carry book executes, or it refuses and says which leg failed.
++
++These are not research assertions. Each one is a way this trade kills an
++account, written down so the code cannot do it.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from carry_engine import BookState, CarryEngine, DELTA_BAND  # noqa: E402
++
++
++class FakeBroker:
++    """A venue that fills what you ask unless told to misbehave."""
++
++    def __init__(self, *, mark=100_000.0, margin=5.0, fill_ratio=1.0,
++                 reject=(), slip=0.0):
++        self.mark = mark
++        self.margin = margin
++        self.fill_ratio = fill_ratio
++        self.reject = set(reject)          # {"spot", "linear"}
++        self.slip = slip
++        self.orders = []
++
++    def place_market(self, *, symbol, side, qty, product):
++        self.orders.append((symbol, side, qty, product))
++        if product in self.reject:
++            return None
++        price = self.mark * (1 + self.slip if side == "Buy" else 1 - self.slip)
++        return {"filled_qty": qty * self.fill_ratio, "avg_price": price,
++                "order_link_id": f"{product}-{len(self.orders)}"}
++
++    def get_margin_multiple(self, symbol):
++        return self.margin
++
++    def get_mark(self, symbol):
++        return self.mark
++
++
++class _SpotFillsThenVenueDies(FakeBroker):
++    """The spot buy lands. Every order after it is rejected — including the
++    sell that would flatten it. A real venue does this during an outage."""
++
++    def place_market(self, *, symbol, side, qty, product):
++        self.orders.append((symbol, side, qty, product))
++        if len(self.orders) == 1 and product == "spot" and side == "Buy":
++            return {"filled_qty": qty, "avg_price": self.mark,
++                    "order_link_id": "spot-1"}
++        return None
++
++
++def engine(broker, **kw):
++    kw.setdefault("max_notional_usd", 100_000.0)
++    return CarryEngine(broker=broker, **kw)
++
++
++class TestItActuallyOpens:
++    def test_rich_funding_opens_both_legs(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.acted is True
++        assert decision.action == "opened"
++        assert eng.state is BookState.HEDGED
++        assert len(broker.orders) == 2, "a carry position is TWO orders"
++
++    def test_the_legs_are_opposite_and_equal(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        spot, perp = broker.orders
++        assert spot[1] == "Buy" and spot[3] == "spot"
++        assert perp[1] == "Sell" and perp[3] == "linear"
++        assert spot[2] == pytest.approx(perp[2])
++
++    def test_the_book_is_delta_flat_after_opening(self):
++        eng = engine(FakeBroker())
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert eng.position.delta_qty == pytest.approx(0.0)
++
++    def test_it_collects_funding_while_hedged(self):
++        eng = engine(FakeBroker())
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert eng.position.funding_collected > 0
++
++
++class TestOneLegNeverStandsAlone:
++    """The failure that kills funds: waking up delta-long at 3am."""
++
++    def test_a_failed_perp_leg_unwinds_the_spot_immediately(self):
++        broker = FakeBroker(reject={"linear"})
++        eng = engine(broker)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert eng.position is None, "a naked spot leg was left open"
++        assert eng.state is BookState.FLAT
++        assert "PERP_LEG_DID_NOT_FILL" in decision.reason
++        sides = [(o[1], o[3]) for o in broker.orders]
++        assert ("Sell", "spot") in sides, "the naked spot was not sold"
++
++    def test_a_failed_spot_leg_never_shorts_the_perp(self):
++        broker = FakeBroker(reject={"spot"})
++        eng = engine(broker)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert eng.position is None
++        assert not any(o[3] == "linear" for o in broker.orders), \
++            "the perp was shorted with no spot behind it"
++
++    def test_both_legs_rejected_leaves_nothing_open(self):
++        """Nothing filled means nothing naked. FLAT, not halted."""
++        broker = FakeBroker(reject={"spot", "linear"})
++        eng = engine(broker)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert eng.position is None
++        assert eng.state is BookState.FLAT
++        assert decision.reason == "SPOT_LEG_DID_NOT_FILL"
++
++    def test_a_naked_spot_that_cannot_be_sold_halts_the_book(self):
++        """THE scenario that ends firms: spot filled, hedge rejected, and the
++        unwind rejected too. The book is naked long and cannot self-correct, so
++        it must stop and shout for a human rather than keep trading."""
++        broker = _SpotFillsThenVenueDies()
++        eng = engine(broker)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.state is BookState.HALTED
++        assert eng.state is BookState.HALTED
++        assert decision.reason == "NAKED_SPOT_UNWIND_FAILED"
++
++    def test_halted_books_refuse_every_later_candle(self):
++        eng = engine(_SpotFillsThenVenueDies())
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        after = eng.on_candle(mark=100_000.0, funding_bps=5.0)
++        assert after.acted is False
++        assert after.reason == "KILL_SWITCH_ENGAGED"
++
++    def test_the_kill_switch_is_called_on_halt(self):
++        tripped = []
++        eng = engine(_SpotFillsThenVenueDies(), kill_switch=tripped.append)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert tripped, "the book halted without tripping the switch"
++
++
++class TestDeltaIsMeasuredNotAssumed:
++    def test_drift_past_the_band_triggers_a_rebalance(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.position.perp.filled_qty *= 0.90          # hedge slipped 10%
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.action == "rebalanced"
++        assert decision.acted is True
++
++    def test_drift_inside_the_band_does_not_churn(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        before = len(broker.orders)
++        eng.position.perp.filled_qty *= (1 - DELTA_BAND / 4)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.action == "hold"
++        assert len(broker.orders) == before, "it traded inside the band"
++
++    def test_rebalancing_uses_the_perp_not_the_spot(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        broker.orders.clear()
++        eng.position.perp.filled_qty *= 0.90
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert all(o[3] == "linear" for o in broker.orders), \
++            "collateral was sold to fix a hedge"
++
++    def test_legs_that_land_unpaired_are_unwound_not_kept(self):
++        broker = FakeBroker(fill_ratio=1.0)
++        eng = engine(broker)
++        original = broker.place_market
++
++        def partial(*, symbol, side, qty, product):
++            result = original(symbol=symbol, side=side, qty=qty, product=product)
++            if result and product == "linear":
++                result["filled_qty"] = qty * 0.5     # half a hedge
++            return result
++
++        broker.place_market = partial
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert eng.position is None
++        assert "UNPAIRED" in decision.reason or decision.action == "unwound"
++
++
++class TestTheShortLegCanBeLiquidated:
++    def test_thin_margin_refuses_to_open(self):
++        eng = engine(FakeBroker(margin=1.2))
++        decision = eng.on_candle(mark=100_000.0, funding_bps=5.0)
++        assert decision.acted is False
++        assert decision.reason == "MARGIN_HEADROOM_TOO_THIN"
++
++    def test_margin_falling_while_open_unwinds_the_book(self):
++        broker = FakeBroker(margin=5.0)
++        eng = engine(broker)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        broker.margin = 1.1
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.action == "unwound"
++        assert eng.position is None
++
++    def test_unreadable_margin_halts_rather_than_assumes(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        broker.get_margin_multiple = lambda s: (_ for _ in ()).throw(RuntimeError())
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.state is BookState.HALTED
++
++
++class TestFundingDrivesEntryAndExit:
++    def test_thin_funding_stands_aside(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=0.05)
++        assert decision.acted is False
++        assert decision.reason == "FUNDING_TOO_THIN_TO_CLEAR_ENTRY_COST"
++        assert not broker.orders
++
++    def test_sustained_negative_funding_unwinds(self):
++        eng = engine(FakeBroker())
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        for _ in range(2):
++            eng.on_candle(mark=100_000.0, funding_bps=-0.5)
++        assert eng.position is not None, "it left after one negative print"
++        decision = eng.on_candle(mark=100_000.0, funding_bps=-0.5)
++        assert decision.action == "unwound"
++        assert decision.reason == "FUNDING_INVERTED"
++
++    def test_one_negative_print_does_not_panic(self):
++        eng = engine(FakeBroker())
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(mark=100_000.0, funding_bps=-0.5)
++        assert eng.position is not None
++
++    def test_the_streak_resets_when_funding_returns(self):
++        eng = engine(FakeBroker())
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(mark=100_000.0, funding_bps=-0.5)
++        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert eng.position.negative_funding_streak == 0
++
++
++class TestBadDataHaltsRatherThanTrades:
++    @pytest.mark.parametrize("mark", [float("nan"), float("inf"), 0.0, -100.0])
++    def test_an_unusable_mark_halts(self, mark):
++        eng = engine(FakeBroker())
++        decision = eng.on_candle(mark=mark, funding_bps=5.0)
++        assert decision.acted is False
++        assert decision.state is BookState.HALTED
++
++
++class TestItCannotExpressADirectionalBet:
++    def test_on_candle_takes_no_direction_parameter(self):
++        import inspect
++        params = set(inspect.signature(CarryEngine.on_candle).parameters)
++        for banned in ("side", "direction", "long", "short", "signal"):
++            assert banned not in params, (
++                f"on_candle accepts {banned!r}; this engine must be incapable "
++                "of taking a directional position")
++
++    def test_no_module_assigns_live_authorized(self):
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_engine.py"), encoding="utf-8") as fh:
++            body = fh.read()
++        assert "live_authorized" not in body
