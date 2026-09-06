@@ -1,82 +1,202 @@
 {
-  "git_commit": "efe278f8b4bb16aa17a1297cc2f9cd5c7b884fa0-dirty",
-  "schema": "hypothesis_registry/1",
-  "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
-  "seeded": true,
-  "trials": [
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "technical_analysis"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "closed_analyser"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "donchian_breakout_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "btc_alt_spillover_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "post_shock_fade_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "range_location_fade_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "open_gap_fade_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "ts_momentum_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "sign_flip_momentum_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "compression_breakout_v1"
-    },
-    {
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status.FROZEN_ABSENT",
-      "status": "frozen_absent",
-      "trial_id": "funding_carry_fade_v1"
-    },
-    {
-      "note": "n=41, M1~95.13, M2=96.0. Forward: n=2, mean net R -0.8358. 98.4% of setups are SHORT; 77.1% sit exactly at the funding threshold; carry over horizon 15bps vs 25bps round trip.",
-      "recorded_utc": "2026-09-05T00:15:21Z",
-      "source": "project_status/STAGE1_VERDICT",
-      "status": "cleared_stage1",
-      "trial_id": "funding_carry_fade_btc_v1"
-    }
-  ],
-  "updated_utc": "2026-09-05T00:15:21Z"
+ "git_commit": "efe278f8b4bb16aa17a1297cc2f9cd5c7b884fa0-dirty",
+ "schema": "hypothesis_registry/1",
+ "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
+ "seeded": true,
+ "trials": [
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "technical_analysis"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "closed_analyser"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "donchian_breakout_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "btc_alt_spillover_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "post_shock_fade_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "range_location_fade_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "open_gap_fade_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "ts_momentum_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "sign_flip_momentum_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "compression_breakout_v1"
+  },
+  {
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status.FROZEN_ABSENT",
+   "status": "frozen_absent",
+   "trial_id": "funding_carry_fade_v1"
+  },
+  {
+   "note": "n=41, M1~95.13, M2=96.0. Forward: n=2, mean net R -0.8358. 98.4% of setups are SHORT; 77.1% sit exactly at the funding threshold; carry over horizon 15bps vs 25bps round trip.",
+   "recorded_utc": "2026-09-05T00:15:21Z",
+   "source": "project_status/STAGE1_VERDICT",
+   "status": "cleared_stage1",
+   "trial_id": "funding_carry_fade_btc_v1"
+  },
+  {
+   "note": "slice55 M1/M2 97.0/97.5 n=85 \u2014 the reading that SELECTED BTC",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "funding_carry_fade_v1@BTCUSDT"
+  },
+  {
+   "note": "slice55 M1/M2 47.7/48.5 n=76",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "funding_carry_fade_v1@ETHUSDT"
+  },
+  {
+   "note": "slice55 M1/M2 2.3/1.0 n=162 \u2014 largest sample, worst reading",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "funding_carry_fade_v1@SOLUSDT"
+  },
+  {
+   "note": "slice35/40",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "btc_alt_spillover_v1@ETHUSDT"
+  },
+  {
+   "note": "slice35/40",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "btc_alt_spillover_v1@SOLUSDT"
+  },
+  {
+   "note": "slice52",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "sign_flip_momentum_v1@BTCUSD"
+  },
+  {
+   "note": "slice52",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "sign_flip_momentum_v1@ETHUSDT"
+  },
+  {
+   "note": "slice52",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "sign_flip_momentum_v1@SOLUSDT"
+  },
+  {
+   "note": "slice53",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "compression_breakout_v1@BTCUSD"
+  },
+  {
+   "note": "slice43",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "post_shock_fade_v1@BTCUSD"
+  },
+  {
+   "note": "slice28",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "donchian_breakout_v1@BTCUSD"
+  },
+  {
+   "note": "slice29",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "donchian_regression@BTCUSD"
+  },
+  {
+   "note": "slice28/29",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "closed_regression@BTCUSD"
+  },
+  {
+   "note": "slice26",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "edge_recheck@BTCUSD"
+  },
+  {
+   "note": "slice25",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "edge_real_1h@BTCUSD"
+  },
+  {
+   "note": "slice25",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "edge_real_4h@BTCUSD"
+  },
+  {
+   "note": "slice57 M1/M2 95.13/96.0 n=41 \u2014 CONTAMINATED HOLDOUT, see docs/human/FREEZE_NOTE_SLICE77",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+   "status": "measured",
+   "trial_id": "funding_carry_fade_btc_v1@BTCUSDT_OOS"
+  }
+ ],
+ "updated_utc": "2026-09-05T00:15:21Z",
+ "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }
