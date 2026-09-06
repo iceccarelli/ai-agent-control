@@ -24,13 +24,22 @@ from carry_engine import BookState  # noqa: E402
 
 
 class _Store:
+    """The stub must carry the REAL StateStore method names.
+
+    An earlier version used next_order_sequence / engage_kill_switch, which do
+    not exist on StateStore. The stub passed, production would have failed at
+    the first order. A test double that is kinder than reality tests nothing.
+    """
+
     def __init__(self):
         self.killed = []
+        self.seq = 0
 
-    def next_order_sequence(self):
-        return 1
+    def next_order_seq(self):
+        self.seq += 1
+        return self.seq
 
-    def engage_kill_switch(self, reason):
+    def trip_kill_switch(self, reason):
         self.killed.append(reason)
 
     def open_positions(self):

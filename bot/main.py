@@ -580,21 +580,60 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
     # It remains the default only because dozens of tests predate the carry
     # book and assert its presence; selecting it in production is a decision an
     # operator has to make on purpose, and it is logged as one.
+    # BOOK_MODE is read with a default and the notional cap is not, which is a
+    # deliberate distinction rather than an inconsistency:
+    #
+    #   a MODE SELECTOR absent from a config object means nobody asked for the
+    #   carry book, and falling back to the legacy path is the conservative
+    #   reading. Test doubles across this suite pass minimal config stubs and
+    #   must keep working.
+    #
+    #   a RISK LIMIT absent from a config object means nobody set the limit, and
+    #   inventing one is how a $100 cap silently becomes whatever the literal in
+    #   the source happens to say. The cap comes from
+    #   shadow.SHADOW_MAX_NOTIONAL_USD, the same constant promotion_gate polices,
+    #   and there is no fallback.
+    #
+    # An unrecognised mode still raises: a typo must not select a strategy.
     book_mode = str(getattr(cfg, "BOOK_MODE", "directional") or "directional").lower()
+    if book_mode not in ("carry", "directional"):
+        raise ValueError(
+            f"BOOK_MODE={cfg.BOOK_MODE!r} is not a book. Refusing rather than "
+            "falling back: a typo must not silently select a strategy.")
     if book_mode == "carry" and attach_strategy and bot.carry is None:
         from carry_broker import CarryBroker
         from carry_engine import CarryEngine
 
+        # The notional cap comes from shadow.SHADOW_MAX_NOTIONAL_USD, which is
+        # the SAME constant promotion_gate re-derives its cap check from. It is
+        # not read from config and there is no default here.
+        #
+        # The first version of this wiring read `getattr(cfg, "MAX_NOTIONAL_USD",
+        # 100.0)` from a key that DOES NOT EXIST in Config. It therefore
+        # silently invented a risk limit that happened to be right, and would
+        # have gone on inventing it if anyone moved the real cap. A risk
+        # parameter with a silent default is not a risk parameter.
+        #
+        # `next_order_seq` and `trip_kill_switch` are called directly and are
+        # NOT guarded by hasattr. The earlier version guarded them, and because
+        # both names were wrong the guard swallowed it: every order would have
+        # received sequence 0, so the same intent on a later candle would build
+        # the SAME orderLinkId, the venue would reject it as a duplicate, and
+        # the adapter would resolve the duplicate by returning the OLD fill. The
+        # book would believe it had re-opened a position it never placed.
+        # An AttributeError at construction is the correct outcome for a
+        # misnamed dependency.
+        import shadow as _shadow
+
         bot.carry = CarryEngine(
             broker=CarryBroker(
                 client=bot.client,
-                sequence_source=lambda product, symbol, purpose: (
-                    bot.store.next_order_sequence()
-                    if hasattr(bot.store, "next_order_sequence") else 0)),
-            kill_switch=lambda reason: bot.store.engage_kill_switch(reason),
-            spot_symbol=str(getattr(cfg, "CARRY_SPOT_SYMBOL", "BTCUSDT")),
-            perp_symbol=str(getattr(cfg, "CARRY_PERP_SYMBOL", "BTCUSDT")),
-            max_notional_usd=float(getattr(cfg, "MAX_NOTIONAL_USD", 100.0)),
+                sequence_source=lambda product, symbol, purpose:
+                    bot.store.next_order_seq()),
+            kill_switch=bot.store.trip_kill_switch,
+            spot_symbol=cfg.CARRY_SPOT_SYMBOL,
+            perp_symbol=cfg.CARRY_PERP_SYMBOL,
+            max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
         )
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f. The "
