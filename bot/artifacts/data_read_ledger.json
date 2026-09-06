@@ -1,0 +1,61 @@
+{
+ "floor_not_census": "Abandoned runs and one-off diagnostics left no artefact and are not recorded. The true contamination is wider than this.",
+ "reads": [
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1D",
+   "from_utc": "2022-08-10T00:00:00Z",
+   "purpose": "full-sample Stage-1 measurement, 1461 bars, n=85",
+   "read_by": "slice55 edge funding_carry_fade_v1 BTCUSDT",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "result_seen": "M1/M2 97.0/97.5, mean net R +0.0964 \u2014 the reading that selected BTC out of three symbols",
+   "to_utc": "2026-08-09T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_ETH_USDT_1D",
+   "from_utc": "2022-08-10T00:00:00Z",
+   "purpose": "full-sample Stage-1 measurement, n=76",
+   "read_by": "slice55 edge funding_carry_fade_v1 ETHUSDT",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "result_seen": "M1/M2 47.7/48.5, mean net R -0.0358",
+   "to_utc": "2026-08-09T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_SOL_USDT_1D",
+   "from_utc": "2022-08-10T00:00:00Z",
+   "purpose": "full-sample Stage-1 measurement, n=162",
+   "read_by": "slice55 edge funding_carry_fade_v1 SOLUSDT",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "result_seen": "M1/M2 2.3/1.0, mean net R -0.1658",
+   "to_utc": "2026-08-09T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1D",
+   "from_utc": "2024-08-09T00:00:00Z",
+   "purpose": "the 'out-of-sample' half, [t_mid, t1], n=41",
+   "read_by": "slice57 OOS funding_carry_fade_btc_v1",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "result_seen": "M1/M2 95.13/96.0 \u2014 CONTAMINATED: this range is a strict subset of the slice55 read above",
+   "to_utc": "2026-08-09T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1D",
+   "from_utc": "2022-08-10T00:00:00Z",
+   "purpose": "diagnostic, refused by project_status for lacking a validated-control attestation",
+   "read_by": "slice57 diagnostic full-sample BTCUSDT",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "result_seen": "EDGE_EVIDENCE_POSITIVE, refused \u2014 but READ nonetheless",
+   "to_utc": "2026-08-09T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1D",
+   "from_utc": "2026-08-09T00:00:00Z",
+   "purpose": "forward observation window after t1",
+   "read_by": "slices 59-76 forward shadow",
+   "recorded_utc": "2026-09-06T00:00:00Z",
+   "result_seen": "2 closed trades, -1.0632 and -0.6084, mean -0.8358",
+   "to_utc": "2026-08-24T00:00:00Z"
+  }
+ ],
+ "schema": "data_read_ledger/1",
+ "seeded": true
+}
