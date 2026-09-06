@@ -1,0 +1,328 @@
+From: build <build@local>
+Subject: [PATCH 0016] no silent defaults on the carry path
+
+Found by running the wiring instead of trusting it:
+
+    python3 -c "print(config.load({}).MAX_NOTIONAL_USD)"
+    AttributeError: 'Config' object has no attribute 'MAX_NOTIONAL_USD'
+
+THREE DEFECTS, ALL IN 0015, ALL INVISIBLE
+
+1. getattr(cfg, "MAX_NOTIONAL_USD", 100.0)
+   The key does not exist in Config. The carry book's risk cap was INVENTED by
+   a default that happened to be right, and was NOT connected to
+   shadow.SHADOW_MAX_NOTIONAL_USD - the constant promotion_gate re-derives its
+   cap check from. Move the real cap and the gate would police a number the
+   book does not use. A risk parameter with a silent default is not a risk
+   parameter.
+
+2. hasattr(store, "next_order_sequence")
+   Wrong name; the real method is next_order_seq. The guard swallowed it and
+   returned 0 forever. Consequence: the same intent on a later candle rebuilds
+   the SAME orderLinkId, the venue rejects it as a duplicate, and CarryBroker
+   correctly resolves duplicates by QUERYING THE ID - returning the OLD fill.
+   The book would believe it had re-opened a position it never placed.
+
+3. store.engage_kill_switch(...)
+   Wrong name; the real method is trip_kill_switch. The lambda raised,
+   CarryEngine caught it and logged "kill switch itself failed", the book
+   halted IN MEMORY, and the PERSISTED switch was never set. A restart would
+   resume trading.
+
+Each was hidden by a default or a guard. All three now call the real names
+directly. An AttributeError at construction is the correct outcome for a
+misnamed dependency.
+
+THE LINE THIS PATCH DRAWS
+BOOK_MODE keeps a default; the cap does not. Deliberate, not inconsistent:
+  a MODE SELECTOR absent means nobody asked for the carry book, and the legacy
+  path is the conservative reading (and dozens of test doubles pass minimal
+  config stubs).
+  a RISK LIMIT absent means nobody set the limit, and inventing one is how a
+  $100 cap silently becomes whatever literal is in the source.
+An unrecognised BOOK_MODE now RAISES: a typo must not select a strategy.
+
+ + tests/test_carry_wiring_authority.py   14 tests, including one that patches
+   shadow.SHADOW_MAX_NOTIONAL_USD to 250 and asserts the book follows - proving
+   the cap and the gate are JOINED, not merely equal today. Others assert the
+   real StateStore actually has next_order_seq and trip_kill_switch, that the
+   sequence advances so link ids differ, that the halt reaches the PERSISTED
+   switch, and that no hasattr guard exists anywhere in the carry wiring.
+
+ ~ tests/test_carry_wiring.py   the stub store used the WRONG method names, so
+   it passed while production would have failed at its first order. A test
+   double kinder than reality tests nothing.
+
+VERIFIED: 5,162 passed, 2 skipped (was 5,148). Fixture md5 stable. No test
+weakened or skipped.
+
+---
+--- a/main.py	2026-09-06 14:03:04.218450337 +0000
++++ b/main.py	2026-09-06 13:58:38.111013563 +0000
+@@ -580,21 +580,60 @@
+     # It remains the default only because dozens of tests predate the carry
+     # book and assert its presence; selecting it in production is a decision an
+     # operator has to make on purpose, and it is logged as one.
++    # BOOK_MODE is read with a default and the notional cap is not, which is a
++    # deliberate distinction rather than an inconsistency:
++    #
++    #   a MODE SELECTOR absent from a config object means nobody asked for the
++    #   carry book, and falling back to the legacy path is the conservative
++    #   reading. Test doubles across this suite pass minimal config stubs and
++    #   must keep working.
++    #
++    #   a RISK LIMIT absent from a config object means nobody set the limit, and
++    #   inventing one is how a $100 cap silently becomes whatever the literal in
++    #   the source happens to say. The cap comes from
++    #   shadow.SHADOW_MAX_NOTIONAL_USD, the same constant promotion_gate polices,
++    #   and there is no fallback.
++    #
++    # An unrecognised mode still raises: a typo must not select a strategy.
+     book_mode = str(getattr(cfg, "BOOK_MODE", "directional") or "directional").lower()
++    if book_mode not in ("carry", "directional"):
++        raise ValueError(
++            f"BOOK_MODE={cfg.BOOK_MODE!r} is not a book. Refusing rather than "
++            "falling back: a typo must not silently select a strategy.")
+     if book_mode == "carry" and attach_strategy and bot.carry is None:
+         from carry_broker import CarryBroker
+         from carry_engine import CarryEngine
+ 
++        # The notional cap comes from shadow.SHADOW_MAX_NOTIONAL_USD, which is
++        # the SAME constant promotion_gate re-derives its cap check from. It is
++        # not read from config and there is no default here.
++        #
++        # The first version of this wiring read `getattr(cfg, "MAX_NOTIONAL_USD",
++        # 100.0)` from a key that DOES NOT EXIST in Config. It therefore
++        # silently invented a risk limit that happened to be right, and would
++        # have gone on inventing it if anyone moved the real cap. A risk
++        # parameter with a silent default is not a risk parameter.
++        #
++        # `next_order_seq` and `trip_kill_switch` are called directly and are
++        # NOT guarded by hasattr. The earlier version guarded them, and because
++        # both names were wrong the guard swallowed it: every order would have
++        # received sequence 0, so the same intent on a later candle would build
++        # the SAME orderLinkId, the venue would reject it as a duplicate, and
++        # the adapter would resolve the duplicate by returning the OLD fill. The
++        # book would believe it had re-opened a position it never placed.
++        # An AttributeError at construction is the correct outcome for a
++        # misnamed dependency.
++        import shadow as _shadow
++
+         bot.carry = CarryEngine(
+             broker=CarryBroker(
+                 client=bot.client,
+-                sequence_source=lambda product, symbol, purpose: (
+-                    bot.store.next_order_sequence()
+-                    if hasattr(bot.store, "next_order_sequence") else 0)),
+-            kill_switch=lambda reason: bot.store.engage_kill_switch(reason),
+-            spot_symbol=str(getattr(cfg, "CARRY_SPOT_SYMBOL", "BTCUSDT")),
+-            perp_symbol=str(getattr(cfg, "CARRY_PERP_SYMBOL", "BTCUSDT")),
+-            max_notional_usd=float(getattr(cfg, "MAX_NOTIONAL_USD", 100.0)),
++                sequence_source=lambda product, symbol, purpose:
++                    bot.store.next_order_seq()),
++            kill_switch=bot.store.trip_kill_switch,
++            spot_symbol=cfg.CARRY_SPOT_SYMBOL,
++            perp_symbol=cfg.CARRY_PERP_SYMBOL,
++            max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
+         )
+         logger.warning(
+             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f. The "
+--- a/tests/test_carry_wiring.py	2026-09-06 14:03:04.224840919 +0000
++++ b/tests/test_carry_wiring.py	2026-09-06 13:58:38.111510788 +0000
+@@ -24,13 +24,22 @@
+ 
+ 
+ class _Store:
++    """The stub must carry the REAL StateStore method names.
++
++    An earlier version used next_order_sequence / engage_kill_switch, which do
++    not exist on StateStore. The stub passed, production would have failed at
++    the first order. A test double that is kinder than reality tests nothing.
++    """
++
+     def __init__(self):
+         self.killed = []
++        self.seq = 0
+ 
+-    def next_order_sequence(self):
+-        return 1
++    def next_order_seq(self):
++        self.seq += 1
++        return self.seq
+ 
+-    def engage_kill_switch(self, reason):
++    def trip_kill_switch(self, reason):
+         self.killed.append(reason)
+ 
+     def open_positions(self):
+--- a/tests/test_carry_wiring_authority.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_carry_wiring_authority.py	2026-09-06 13:50:05.840095584 +0000
+@@ -0,0 +1,168 @@
++"""No silent defaults on the carry path. Every dependency is real or it raises.
++
++The first version of the carry wiring had three of them and all three were
++invisible:
++
++    getattr(cfg, "MAX_NOTIONAL_USD", 100.0)   the key does not exist, so the
++                                              risk cap was INVENTED and was not
++                                              connected to the constant the
++                                              promotion gate polices
++    hasattr(store, "next_order_sequence")     wrong name, so every order got
++                                              sequence 0, so the same intent on
++                                              a later candle would build the
++                                              SAME orderLinkId, the venue would
++                                              reject it as a duplicate, and the
++                                              adapter would resolve that by
++                                              returning the OLD fill. The book
++                                              would believe it re-opened a
++                                              position it never placed.
++    store.engage_kill_switch(...)             wrong name; the lambda raised,
++                                              CarryEngine caught it, the book
++                                              halted in memory and the
++                                              PERSISTED switch was never set —
++                                              a restart would resume trading.
++
++Each was hidden by a default or a guard. These tests remove the hiding places.
++"""
++from __future__ import annotations
++
++import os
++import sys
++from unittest import mock
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import config as _config  # noqa: E402
++import main as _main  # noqa: E402
++import persistence  # noqa: E402
++import shadow  # noqa: E402
++
++
++class _Store:
++    def __init__(self):
++        self.tripped = []
++        self.seq = 0
++
++    def next_order_seq(self):
++        self.seq += 1
++        return self.seq
++
++    def trip_kill_switch(self, reason):
++        self.tripped.append(reason)
++
++    def open_positions(self):
++        return []
++
++
++def _build(mode="carry", store=None):
++    return _main.build_bot(config=_config.load({"BOOK_MODE": mode}),
++                           store=store or _Store(), client=mock.Mock(),
++                           risk_manager=mock.Mock(), engine=mock.Mock())
++
++
++class TestTheCapIsTheGatesCap:
++    def test_the_carry_cap_equals_the_authoritative_constant(self):
++        """One cap, one source. If they can drift, the gate polices a number
++        the book does not use."""
++        assert _build().carry.max_notional_usd == pytest.approx(
++            shadow.SHADOW_MAX_NOTIONAL_USD)
++
++    def test_the_cap_is_not_read_from_config(self):
++        """Config has no MAX_NOTIONAL_USD, and adding one would create a second
++        authority that could silently disagree with the gate."""
++        assert not hasattr(_config.load({}), "MAX_NOTIONAL_USD")
++
++    def test_build_bot_does_not_default_the_cap(self):
++        """AST, not text: the comment explaining this rule quotes the old line,
++        and a substring check would find its own documentation."""
++        import ast
++        with open(os.path.join(os.path.dirname(__file__), "..", "main.py"),
++                  encoding="utf-8") as fh:
++            source = fh.read()
++        for node in ast.walk(ast.parse(source)):
++            if (isinstance(node, ast.Call)
++                    and isinstance(node.func, ast.Name)
++                    and node.func.id == "getattr"
++                    and len(node.args) >= 2
++                    and isinstance(node.args[1], ast.Constant)):
++                assert "NOTIONAL" not in str(node.args[1].value), (
++                    "a risk cap is being read with a default; it must come "
++                    "from shadow.SHADOW_MAX_NOTIONAL_USD")
++        assert "SHADOW_MAX_NOTIONAL_USD" in source
++
++    def test_moving_the_constant_moves_the_book(self):
++        """Proves they are actually joined, not merely equal today."""
++        with mock.patch.object(shadow, "SHADOW_MAX_NOTIONAL_USD", 250.0):
++            assert _build().carry.max_notional_usd == pytest.approx(250.0)
++
++
++class TestTheStoreDependenciesAreReal:
++    @pytest.mark.parametrize("name", ["next_order_seq", "trip_kill_switch"])
++    def test_the_method_the_wiring_calls_exists_on_the_real_store(self, name):
++        assert hasattr(persistence.StateStore, name), (
++            f"build_bot calls store.{name}; the real StateStore has no such "
++            "method, so the carry book would fail at its first order")
++
++    def test_the_sequence_advances_so_link_ids_differ(self):
++        """A frozen sequence means a later candle rebuilds an id the venue has
++        already seen, and the duplicate path returns the OLD fill."""
++        store = _Store()
++        bot = _build(store=store)
++        broker = bot.carry.broker
++        first = store.next_order_seq()
++        second = store.next_order_seq()
++        assert second > first
++        assert broker.sequence_source("linear", "BTCUSDT", "carry") > second
++
++    def test_the_kill_switch_reaches_the_store_not_a_lambda_that_raises(self):
++        store = _Store()
++        bot = _build(store=store)
++        bot.carry.kill_switch("TEST_REASON")
++        assert store.tripped == ["TEST_REASON"], (
++            "the halt never reached the PERSISTED switch; a restart would "
++            "resume trading")
++
++    def test_the_wiring_is_not_guarded_by_hasattr(self):
++        with open(os.path.join(os.path.dirname(__file__), "..", "main.py"),
++                  encoding="utf-8") as fh:
++            block = fh.read().split("BOOK_MODE ---")[1].split("return bot")[0]
++        assert "hasattr(" not in block, (
++            "a hasattr guard here swallows a misnamed dependency; an "
++            "AttributeError at construction is the correct outcome")
++
++
++class TestABadModeRefusesRatherThanFallingBack:
++    def test_an_unknown_book_mode_raises(self):
++        """A typo must not silently select a strategy."""
++        with pytest.raises(ValueError):
++            _main.build_bot(config=_config.load({"BOOK_MODE": "carrry"}),
++                            store=_Store(), client=mock.Mock(),
++                            risk_manager=mock.Mock(), engine=mock.Mock())
++
++    @pytest.mark.parametrize("mode", ["carry", "directional"])
++    def test_both_real_modes_still_build(self, mode):
++        assert _build(mode) is not None
++
++
++class TestSymbolsComeFromConfigNotADefault:
++    def test_the_symbols_are_read_without_a_fallback(self):
++        with open(os.path.join(os.path.dirname(__file__), "..", "main.py"),
++                  encoding="utf-8") as fh:
++            body = fh.read()
++        import ast
++        for node in ast.walk(ast.parse(body)):
++            if (isinstance(node, ast.Call)
++                    and isinstance(node.func, ast.Name)
++                    and node.func.id == "getattr"
++                    and len(node.args) >= 2
++                    and isinstance(node.args[1], ast.Constant)):
++                assert "CARRY_" not in str(node.args[1].value)
++        assert "cfg.CARRY_SPOT_SYMBOL" in body
++
++    def test_a_configured_symbol_reaches_the_book(self):
++        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_PERP_SYMBOL": "ETHUSDT"})
++        bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
++                              risk_manager=mock.Mock(), engine=mock.Mock())
++        assert bot.carry.perp_symbol == "ETHUSDT"
