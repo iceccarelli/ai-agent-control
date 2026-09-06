@@ -1,0 +1,695 @@
+From: build <build@local>
+Subject: [PATCH 0014] carry broker: the venue adapter, and stop the suite dirtying the repo
+
+ + carry_broker.py      Places the pair against a real venue. Two products,
+                        one economic position.
+                          spot   BTCUSDT  long leg, your collateral
+                          linear BTCUSDT  short leg, the one that liquidates
+
+   THE FAILURE IT PREVENTS: a submit times out, the order actually landed, you
+   retry, and now you hold two spot legs against one perp short - long BTC at
+   the size you sized the CARRY at, a size you would never take directionally.
+
+   Defence reuses what bybit_connection already got right: orderLinkId is
+   DETERMINISTIC, derived from a persisted sequence plus the order intent, so
+   the retry carries the SAME id and the venue rejects the duplicate.
+   Bybit answers 110072 (linear) / 170130 (spot). Those codes mean THE ORDER
+   EXISTS: resolved by querying the id, never by recording a rejection and
+   moving on, which would leave a real leg the ledger does not know about.
+
+   get_margin_multiple RAISES when unreadable and catches NOTHING - an AST test
+   asserts it has no exception handler. CarryEngine turns the raise into a
+   halt. A comfortable default here would be the worst line in the file.
+
+   reconcile_pair OBSERVES ONLY. A mismatch beyond dust is an INCIDENT and it
+   names the naked side. It never rewrites the ledger to agree with the venue:
+   a book that edits itself to match whatever it finds cannot detect a bug, a
+   missed fill, or an order somebody placed by hand. A test asserts every call
+   it makes is a GET.
+
+ + tests/test_carry_broker.py   28 tests, including END TO END:
+   CarryEngine + CarryBroker + a venue opens a real pair, two categories, two
+   opposite sides.
+
+ ~ tests/conftest.py + tests/test_operator_tools.py
+   FIXES A DEFECT THIS SERIES INTRODUCED. Tracking state/trading_state.db made
+   the suite write the file git tracks - sqlite writes journal pages even on a
+   read-only open - so the repo came back dirty and `git checkout` refused to
+   switch branches with "local changes would be overwritten by checkout".
+   A suite that dirties the repository it is testing is a bug in the suite.
+
+   Two parts: the operator test now COPIES the fixture instead of opening it in
+   place, and conftest redirects the default STATE_DB_PATH at IMPORT time.
+   Import time is not a style choice - persistence.py binds DEFAULT_DB_PATH at
+   module load, so a session fixture runs after the tracked path is already
+   baked in. That was measured: the fixture md5 still moved with the fixture
+   version and stopped moving with this one.
+
+   VERIFIED: fixture md5 identical before and after a full suite run.
+
+STILL NAKED - do not point this at real money:
+  - no live venue run. FakeClient proves the protocol; Bybit is 403 and
+    fapi.binance.com 451 from Codespaces. Get a host that can reach the venue
+    or the order path cannot be certified at all.
+  - trading_engine.py:1010 still passes fee=0.0 to record_exit_fill.
+  - backtest.py:833 still raises NotImplementedError on the linear stop.
+  - no spot venue chosen yet; the adapter routes by category and assumes one
+    account holds both products.
+
+VERIFIED: 5,136 passed, 2 skipped (was 5,100). No test weakened or skipped.
+
+---
+--- a/carry_broker.py	1970-01-01 00:00:00.000000000 +0000
++++ b/carry_broker.py	2026-09-06 11:07:50.609897925 +0000
+@@ -0,0 +1,300 @@
++"""Venue adapter for the carry book: two products, one atomic intent.
++
++WHAT THIS DOES
++==============
++`CarryEngine` decides. This places. It implements the three calls the engine
++needs — `place_market`, `get_margin_multiple`, `get_mark` — against a real
++venue, for BOTH products the carry trade uses:
++
++    spot   BTCUSDT   the long leg, your collateral
++    linear BTCUSDT   the short leg, the one that can be liquidated
++
++WHY IT IS A SEPARATE MODULE
++===========================
++`BybitClient` is a single-product order path built for the directional shell.
++The carry trade needs a *paired* intent: two orders, two products, one economic
++position, where a leg landing alone is not a partial success but an incident.
++Bolting that onto the existing client would put pair semantics inside a class
++that has no concept of a pair, and the first person to call `place_order`
++directly would bypass it.
++
++THE FAILURE THIS MODULE EXISTS TO PREVENT
++=========================================
++A submit times out. The order actually landed. You retry. Now you hold two
++spot legs against one perp short, and you are long BTC at the size you sized
++the CARRY at — a size you would never take directionally.
++
++Defence, reusing what `bybit_connection` already got right:
++
++    orderLinkId is DETERMINISTIC. `build_order_link_id` derives it from a
++    persisted sequence number plus the order intent, so the retry after a
++    timeout carries the SAME id, and the venue rejects the duplicate rather
++    than opening a second leg. Bybit answers 110072 (linear) or 170130 (spot).
++    Those codes mean THE ORDER EXISTS. They are resolved by querying the id,
++    never by recording a rejection and moving on.
++
++The sequence number is per (product, symbol, purpose) so the spot and perp legs
++of the same pair never collide on an id while still being individually
++replayable.
++
++RECONCILIATION
++==============
++`reconcile_pair()` asks the venue what it actually holds on both products and
++compares against what the ledger believes. Any mismatch beyond dust is an
++INCIDENT, not a discrepancy to be smoothed: it means one leg exists that the
++other does not hedge. It returns the drift and the direction so the engine can
++flatten, and it never silently rewrites the ledger to match the venue — a book
++that edits itself to agree with whatever it finds is a book that cannot detect
++theft, a bug, or a fat finger.
++
++WHAT THIS MODULE MAY NOT DO
++===========================
++Decide. There is no funding logic here, no entry rule, no direction. It takes a
++symbol, a side, a quantity and a product, and it reports what the venue did.
++"""
++from __future__ import annotations
++
++import logging
++import math
++from dataclasses import dataclass, field
++from typing import Any, Dict, Optional, Tuple
++
++logger = logging.getLogger(__name__)
++
++#: Quantity differences below this fraction of the leg are venue rounding, not
++#: exposure. Above it, the pair is unmatched and that is an incident.
++PAIR_DUST_FRACTION = 1e-6
++
++#: Products the carry book touches. Anything else is refused rather than
++#: guessed at: routing a spot order to the linear endpoint is a naked short.
++SPOT = "spot"
++LINEAR = "linear"
++VALID_PRODUCTS = frozenset({SPOT, LINEAR})
++
++
++class PairIncident(RuntimeError):
++    """One leg exists that the other does not hedge. Never caught and ignored."""
++
++
++@dataclass
++class LegFill:
++    filled_qty: float = 0.0
++    avg_price: float = 0.0
++    order_link_id: str = ""
++    was_duplicate: bool = False
++    detail: Dict[str, Any] = field(default_factory=dict)
++
++    def as_engine_result(self) -> Dict[str, Any]:
++        """The shape `CarryEngine._fire` consumes."""
++        return {"filled_qty": self.filled_qty, "avg_price": self.avg_price,
++                "order_link_id": self.order_link_id}
++
++
++class CarryBroker:
++    """Places paired legs. Idempotent. Reports incidents rather than papering.
++
++    `client` is a BybitClient-shaped object exposing `_request`, and
++    `sequence_source` is a callable returning a persisted, monotonic integer.
++    Both are injected so this module can be exercised without a venue.
++    """
++
++    def __init__(self, *, client: Any, sequence_source: Any,
++                 link_id_builder: Any = None,
++                 duplicate_ret_codes: Tuple[int, ...] = (110072, 170130)) -> None:
++        self.client = client
++        self.sequence_source = sequence_source
++        self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
++        if link_id_builder is None:
++            from bybit_connection import build_order_link_id
++            link_id_builder = build_order_link_id
++        self._build_link_id = link_id_builder
++
++    # -- the engine's three calls -----------------------------------------
++
++    def place_market(self, *, symbol: str, side: str, qty: float,
++                     product: str) -> Optional[Dict[str, Any]]:
++        """One leg. Deterministic id, so a retry cannot double it."""
++        if product not in VALID_PRODUCTS:
++            raise ValueError(
++                f"unknown product {product!r}; routing a spot order to the "
++                "linear endpoint is a naked short, so this is refused rather "
++                "than defaulted")
++        if not self._positive_finite(qty):
++            return None
++
++        qty_text = self._format_qty(qty)
++        link_id = self._build_link_id(
++            seq=int(self.sequence_source(product, symbol, "carry")),
++            symbol=symbol, side=side, qty=qty_text,
++            purpose=f"carry-{product}")
++
++        try:
++            response = self.client._request(
++                "POST", "/v5/order/create", signed=True,
++                body={"category": product, "symbol": symbol, "side": side,
++                      "orderType": "Market", "qty": qty_text,
++                      "orderLinkId": link_id})
++        except Exception as exc:  # noqa: BLE001
++            ret_code = getattr(exc, "ret_code", None)
++            if ret_code in self.duplicate_ret_codes:
++                # The id already exists at the venue. That means the FIRST
++                # attempt landed and its response was lost. Resolving by query
++                # is the only correct move: recording a rejection here would
++                # leave a real leg the ledger does not know about.
++                logger.warning(
++                    "duplicate orderLinkId %s (retCode %s) — the first attempt "
++                    "landed; resolving by query", link_id, ret_code)
++                resolved = self._query_by_link_id(symbol, link_id, product)
++                if resolved is not None:
++                    resolved.was_duplicate = True
++                    return resolved.as_engine_result()
++                raise PairIncident(
++                    f"orderLinkId {link_id} exists at the venue but could not "
++                    "be read back; a leg may be live and unhedged") from exc
++            logger.error("leg %s %s %s failed: %s", side, symbol, product, exc)
++            return None
++
++        fill = self._fill_from(response, link_id)
++        if fill.filled_qty <= 0:
++            # Market orders that report nothing filled are queried once rather
++            # than assumed dead: the response and the fill are separate events.
++            resolved = self._query_by_link_id(symbol, link_id, product)
++            if resolved is not None and resolved.filled_qty > 0:
++                return resolved.as_engine_result()
++            return None
++        return fill.as_engine_result()
++
++    def get_margin_multiple(self, symbol: str) -> float:
++        """Maintenance-margin headroom on the SHORT leg. Raises if unreadable.
++
++        Raising is deliberate. `CarryEngine._margin_multiple` turns an exception
++        into a halt, and an unreadable margin is a margin call you cannot see.
++        Returning a comfortable default here would be the single most dangerous
++        line in this file.
++        """
++        result = self.client._request(
++            "GET", "/v5/position/list", signed=True,
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        if not rows:
++            raise PairIncident(
++                f"no linear position row for {symbol}; margin headroom unknown")
++        row = rows[0]
++        margin = float(row.get("positionIM", 0) or 0)
++        maintenance = float(row.get("positionMM", 0) or 0)
++        if maintenance <= 0:
++            raise PairIncident(
++                f"maintenance margin for {symbol} is {maintenance}; refusing to "
++                "compute headroom from a zero denominator")
++        return margin / maintenance
++
++    def get_mark(self, symbol: str) -> float:
++        result = self.client._request(
++            "GET", "/v5/market/tickers",
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        if not rows:
++            raise PairIncident(f"no ticker for {symbol}")
++        mark = float(rows[0].get("markPrice", 0) or 0)
++        if not self._positive_finite(mark):
++            raise PairIncident(f"mark for {symbol} is {mark!r}")
++        return mark
++
++    # -- reconciliation ---------------------------------------------------
++
++    def reconcile_pair(self, *, spot_symbol: str, perp_symbol: str,
++                       expected_qty: float) -> Dict[str, Any]:
++        """What the venue holds vs what the book believes. Mismatch = incident.
++
++        Never rewrites the ledger to match the venue. A book that edits itself
++        to agree with whatever it finds cannot detect a bug, a partial fill or
++        an order somebody placed by hand.
++        """
++        spot_qty = self._holding(spot_symbol, SPOT)
++        perp_qty = self._holding(perp_symbol, LINEAR)
++        pair_drift = abs(spot_qty - perp_qty)
++        scale = max(abs(spot_qty), abs(perp_qty), 1e-12)
++        matched = (pair_drift / scale) <= PAIR_DUST_FRACTION
++
++        expected_drift = max(abs(spot_qty - expected_qty),
++                             abs(perp_qty - expected_qty))
++        agrees_with_book = (expected_drift / max(abs(expected_qty), 1e-12)
++                            ) <= PAIR_DUST_FRACTION
++
++        report = {
++            "spot_qty": spot_qty, "perp_qty": perp_qty,
++            "expected_qty": expected_qty,
++            "legs_match_each_other": matched,
++            "venue_agrees_with_book": agrees_with_book,
++            "pair_drift": pair_drift,
++            "naked_side": ("" if matched
++                           else ("spot" if spot_qty > perp_qty else "perp")),
++            "verdict": ("PAIRED" if matched and agrees_with_book
++                        else "INCIDENT"),
++        }
++        if report["verdict"] == "INCIDENT":
++            logger.critical(
++                "PAIR INCIDENT: spot %.10g vs perp %.10g (book expected %.10g); "
++                "naked on the %s side", spot_qty, perp_qty, expected_qty,
++                report["naked_side"] or "unknown")
++        return report
++
++    # -- internals --------------------------------------------------------
++
++    def _holding(self, symbol: str, product: str) -> float:
++        if product == SPOT:
++            result = self.client._request(
++                "GET", "/v5/account/wallet-balance", signed=True,
++                params={"accountType": "UNIFIED", "coin": symbol[:-4]})
++            rows = (result or {}).get("list") or []
++            if not rows:
++                return 0.0
++            coins = rows[0].get("coin") or []
++            return float(coins[0].get("walletBalance", 0) or 0) if coins else 0.0
++        result = self.client._request(
++            "GET", "/v5/position/list", signed=True,
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        return abs(float(rows[0].get("size", 0) or 0)) if rows else 0.0
++
++    def _query_by_link_id(self, symbol: str, link_id: str,
++                          product: str) -> Optional[LegFill]:
++        try:
++            result = self.client._request(
++                "GET", "/v5/order/realtime", signed=True,
++                params={"category": product, "symbol": symbol,
++                        "orderLinkId": link_id})
++        except Exception as exc:  # noqa: BLE001
++            logger.error("could not read back %s: %s", link_id, exc)
++            return None
++        rows = (result or {}).get("list") or []
++        if not rows:
++            return None
++        row = rows[0]
++        return LegFill(
++            filled_qty=float(row.get("cumExecQty", 0) or 0),
++            avg_price=float(row.get("avgPrice", 0) or 0),
++            order_link_id=link_id, detail=dict(row))
++
++    @staticmethod
++    def _fill_from(response: Optional[Dict[str, Any]],
++                   link_id: str) -> LegFill:
++        row = response or {}
++        return LegFill(
++            filled_qty=float(row.get("cumExecQty", 0) or 0),
++            avg_price=float(row.get("avgPrice", 0) or 0),
++            order_link_id=str(row.get("orderLinkId", link_id) or link_id),
++            detail=dict(row))
++
++    @staticmethod
++    def _format_qty(qty: float) -> str:
++        """Fixed-point, never scientific notation. Bybit rejects `1e-05`."""
++        return f"{qty:.8f}".rstrip("0").rstrip(".") or "0"
++
++    @staticmethod
++    def _positive_finite(value: Any) -> bool:
++        try:
++            number = float(value)
++        except (TypeError, ValueError):
++            return False
++        return math.isfinite(number) and number > 0
+--- a/tests/conftest.py	2026-09-06 11:20:11.760133536 +0000
++++ b/tests/conftest.py	2026-09-06 11:16:32.753812693 +0000
+@@ -5,6 +5,7 @@
+ from __future__ import annotations
+ 
+ import os
++import tempfile
+ 
+ import pytest
+ 
+@@ -30,3 +31,23 @@
+         os.environ.pop("LEDGER_DISABLED", None)
+     else:
+         os.environ["LEDGER_DISABLED"] = previous
++
++
++# --- MODULE SCOPE, deliberately -------------------------------------------
++# persistence.py binds DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH", ...)
++# at IMPORT time, and config.py defaults the same key to the TRACKED fixture
++# state/trading_state.db. A session-scoped fixture runs too late: pytest has
++# already imported the test modules, which imported persistence, which already
++# baked the tracked path in.
++#
++# So this runs when conftest is imported, which is before any test module.
++#
++# Why it matters: sqlite writes journal pages even on a read-only open, so the
++# tracked file came back dirty after every suite run and `git checkout` refused
++# to switch branches with "local changes would be overwritten". A test suite
++# that dirties the repository it is testing is a bug in the suite.
++#
++# A test that deliberately wants the shipped fixture copies it explicitly --
++# see test_operator_refuses_when_the_shipped_kill_switch_is_engaged.
++_TEST_STATE_DIR = tempfile.mkdtemp(prefix="pytest-state-")
++os.environ["STATE_DB_PATH"] = os.path.join(_TEST_STATE_DIR, "trading_state.db")
+--- a/tests/test_carry_broker.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_carry_broker.py	2026-09-06 11:08:44.116996985 +0000
+@@ -0,0 +1,246 @@
++"""The venue adapter places pairs, survives retries, and shouts on mismatch."""
++from __future__ import annotations
++
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from carry_broker import (CarryBroker, LegFill, PairIncident,  # noqa: E402
++                          LINEAR, SPOT)
++
++
++class Boom(Exception):
++    def __init__(self, ret_code):
++        super().__init__(f"retCode {ret_code}")
++        self.ret_code = ret_code
++
++
++class FakeClient:
++    """A venue. Records calls; misbehaves when told."""
++
++    def __init__(self, *, mark=100_000.0, im=5.0, mm=1.0,
++                 spot_qty=1.0, perp_qty=1.0, raise_on_create=None):
++        self.mark = mark
++        self.im = im
++        self.mm = mm
++        self.spot_qty = spot_qty
++        self.perp_qty = perp_qty
++        self.raise_on_create = raise_on_create
++        self.calls = []
++        self.created = []
++
++    def _request(self, method, endpoint, *, params=None, body=None,
++                 signed=False, retries=3):
++        self.calls.append((method, endpoint, params, body))
++        if endpoint == "/v5/order/create":
++            self.created.append(body)
++            if self.raise_on_create is not None:
++                raise Boom(self.raise_on_create)
++            return {"orderLinkId": body["orderLinkId"],
++                    "cumExecQty": body["qty"], "avgPrice": str(self.mark)}
++        if endpoint == "/v5/order/realtime":
++            return {"list": [{"cumExecQty": "0.5", "avgPrice": str(self.mark),
++                              "orderLinkId": params.get("orderLinkId")}]}
++        if endpoint == "/v5/market/tickers":
++            return {"list": [{"markPrice": str(self.mark)}]}
++        if endpoint == "/v5/position/list":
++            return {"list": [{"positionIM": str(self.im),
++                              "positionMM": str(self.mm),
++                              "size": str(self.perp_qty)}]}
++        if endpoint == "/v5/account/wallet-balance":
++            return {"list": [{"coin": [{"walletBalance": str(self.spot_qty)}]}]}
++        return {}
++
++
++def broker(client, **kw):
++    seq = kw.pop("sequence_source", lambda product, symbol, purpose: 7)
++    return CarryBroker(client=client, sequence_source=seq, **kw)
++
++
++class TestItPlacesBothProducts:
++    @pytest.mark.parametrize("product", [SPOT, LINEAR])
++    def test_a_leg_routes_to_its_own_category(self, product):
++        client = FakeClient()
++        result = broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=0.5, product=product)
++        assert result["filled_qty"] == pytest.approx(0.5)
++        assert client.created[0]["category"] == product
++
++    def test_an_unknown_product_is_refused_not_defaulted(self):
++        """Routing spot to the linear endpoint is a naked short."""
++        with pytest.raises(ValueError):
++            broker(FakeClient()).place_market(
++                symbol="BTCUSDT", side="Buy", qty=0.5, product="inverse")
++
++    @pytest.mark.parametrize("qty", [0.0, -1.0, float("nan"), float("inf")])
++    def test_an_unusable_quantity_places_nothing(self, qty):
++        client = FakeClient()
++        assert broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=qty, product=SPOT) is None
++        assert not client.created
++
++    def test_quantity_is_never_scientific_notation(self):
++        """Bybit rejects `1e-05`."""
++        client = FakeClient()
++        broker(client).place_market(symbol="BTCUSDT", side="Buy",
++                                    qty=0.00001, product=SPOT)
++        assert "e" not in client.created[0]["qty"].lower()
++
++
++class TestARetryCannotDoubleALeg:
++    def test_the_link_id_is_deterministic(self):
++        a, b = FakeClient(), FakeClient()
++        for client in (a, b):
++            broker(client).place_market(symbol="BTCUSDT", side="Buy",
++                                        qty=0.5, product=SPOT)
++        assert a.created[0]["orderLinkId"] == b.created[0]["orderLinkId"], (
++            "two processes with the same sequence produced different ids; a "
++            "retry after a timeout would open a SECOND leg")
++
++    def test_the_two_legs_of_a_pair_get_different_ids(self):
++        client = FakeClient()
++        api = broker(client)
++        api.place_market(symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT)
++        api.place_market(symbol="BTCUSDT", side="Sell", qty=0.5, product=LINEAR)
++        assert client.created[0]["orderLinkId"] != client.created[1]["orderLinkId"]
++
++    @pytest.mark.parametrize("ret_code", [110072, 170130])
++    def test_a_duplicate_id_is_resolved_by_query_not_recorded_as_failure(
++            self, ret_code):
++        """The duplicate means THE ORDER EXISTS. Recording a rejection here
++        leaves a real leg the ledger does not know about."""
++        client = FakeClient(raise_on_create=ret_code)
++        result = broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT)
++        assert result is not None, "a landed order was reported as a failure"
++        assert result["filled_qty"] == pytest.approx(0.5)
++        assert any(c[1] == "/v5/order/realtime" for c in client.calls)
++
++    def test_an_unreadable_duplicate_raises_an_incident(self):
++        client = FakeClient(raise_on_create=110072)
++        original = client._request
++
++        def no_readback(method, endpoint, **kw):
++            if endpoint == "/v5/order/realtime":
++                return {"list": []}
++            return original(method, endpoint, **kw)
++
++        client._request = no_readback
++        with pytest.raises(PairIncident):
++            broker(client).place_market(symbol="BTCUSDT", side="Buy",
++                                        qty=0.5, product=SPOT)
++
++    def test_an_ordinary_failure_returns_none_rather_than_raising(self):
++        client = FakeClient(raise_on_create=10001)
++        assert broker(client).place_market(
++            symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT) is None
++
++
++class TestMarginIsNeverAssumed:
++    def test_headroom_is_im_over_mm(self):
++        assert broker(FakeClient(im=5.0, mm=1.0)).get_margin_multiple(
++            "BTCUSDT") == pytest.approx(5.0)
++
++    def test_a_missing_position_row_raises(self):
++        client = FakeClient()
++        client._request = lambda *a, **k: {"list": []}
++        with pytest.raises(PairIncident):
++            broker(client).get_margin_multiple("BTCUSDT")
++
++    def test_zero_maintenance_margin_raises_rather_than_dividing(self):
++        with pytest.raises(PairIncident):
++            broker(FakeClient(mm=0.0)).get_margin_multiple("BTCUSDT")
++
++    def test_there_is_no_comfortable_default(self):
++        """A swallowed exception here would be the worst line in the file.
++
++        Checked by AST so the docstring explaining the rule does not trip it —
++        the same trick market_data uses for its import guard.
++        """
++        import ast
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_broker.py"), encoding="utf-8") as fh:
++            tree = ast.parse(fh.read())
++        target = next(n for n in ast.walk(tree)
++                      if isinstance(n, ast.FunctionDef)
++                      and n.name == "get_margin_multiple")
++        handlers = [n for n in ast.walk(target)
++                    if isinstance(n, ast.ExceptHandler)]
++        assert not handlers, (
++            "get_margin_multiple catches an exception; an unreadable margin "
++            "must propagate so CarryEngine halts on it")
++
++
++class TestMarkMustBeUsable:
++    def test_a_good_mark_comes_back(self):
++        assert broker(FakeClient(mark=99_000.0)).get_mark("BTCUSDT") == \
++            pytest.approx(99_000.0)
++
++    def test_a_zero_mark_raises(self):
++        with pytest.raises(PairIncident):
++            broker(FakeClient(mark=0.0)).get_mark("BTCUSDT")
++
++
++class TestReconciliationTreatsMismatchAsAnIncident:
++    def test_matched_legs_report_paired(self):
++        report = broker(FakeClient(spot_qty=1.0, perp_qty=1.0)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["verdict"] == "PAIRED"
++        assert report["naked_side"] == ""
++
++    def test_a_missing_perp_leg_names_the_naked_side(self):
++        report = broker(FakeClient(spot_qty=1.0, perp_qty=0.5)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["verdict"] == "INCIDENT"
++        assert report["naked_side"] == "spot"
++
++    def test_a_missing_spot_leg_names_the_naked_side(self):
++        report = broker(FakeClient(spot_qty=0.4, perp_qty=1.0)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["naked_side"] == "perp"
++
++    def test_legs_that_match_each_other_but_not_the_book_is_an_incident(self):
++        """Someone traded by hand, or a fill was missed. Both are incidents."""
++        report = broker(FakeClient(spot_qty=2.0, perp_qty=2.0)).reconcile_pair(
++            spot_symbol="BTCUSDT", perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert report["legs_match_each_other"] is True
++        assert report["venue_agrees_with_book"] is False
++        assert report["verdict"] == "INCIDENT"
++
++    def test_reconciliation_never_writes(self):
++        client = FakeClient(spot_qty=2.0, perp_qty=0.5)
++        broker(client).reconcile_pair(spot_symbol="BTCUSDT",
++                                      perp_symbol="BTCUSDT", expected_qty=1.0)
++        assert all(method == "GET" for method, *_ in client.calls), (
++            "reconciliation wrote to the venue; it may only observe")
++
++
++class TestItDecidesNothing:
++    def test_the_module_has_no_funding_or_direction_logic(self):
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_broker.py"), encoding="utf-8") as fh:
++            body = fh.read()
++        for banned in ("FUND_ABS", "def should_", "signal_type"):
++            assert banned not in body
++
++    def test_no_module_assigns_live_authorized(self):
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_broker.py"), encoding="utf-8") as fh:
++            assert "live_authorized" not in fh.read()
++
++
++class TestItDrivesTheEngine:
++    def test_the_engine_opens_a_pair_through_this_adapter(self):
++        """End to end: CarryEngine + CarryBroker + a venue."""
++        from carry_engine import BookState, CarryEngine
++        client = FakeClient(im=5.0, mm=1.0)
++        eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        assert decision.acted is True
++        assert eng.state is BookState.HEDGED
++        assert len(client.created) == 2
++        assert {c["category"] for c in client.created} == {SPOT, LINEAR}
++        assert {c["side"] for c in client.created} == {"Buy", "Sell"}
+--- a/tests/test_operator_tools.py	2026-09-06 11:20:11.759902228 +0000
++++ b/tests/test_operator_tools.py	2026-09-06 11:09:16.572141581 +0000
+@@ -47,15 +47,42 @@
+     assert report["live_authorized"] is False
+ 
+ 
+-def test_operator_refuses_when_the_shipped_kill_switch_is_engaged():
+-    db = os.path.join(ROOT, "state", "trading_state.db")
+-    if not os.path.isfile(db):
++def test_operator_refuses_when_the_shipped_kill_switch_is_engaged(tmp_path):
++    """The shipped DB is a FIXTURE and is opened through a COPY.
++
++    It used to be opened in place. Opening a tracked sqlite file read-only is
++    not a thing sqlite does: it writes journal pages, and the file came back
++    dirty after every run. `git checkout` then refused to switch branches with
++    "local changes would be overwritten", which is a test corrupting the
++    repository it is testing.
++
++    Copying costs a millisecond and makes the run idempotent.
++    """
++    source = os.path.join(ROOT, "state", "trading_state.db")
++    if not os.path.isfile(source):
+         pytest.skip("fixture db not present")
++    db = str(tmp_path / "trading_state.db")
++    shutil.copy(source, db)
+     code, report = opd.run(ROOT, {"USE_TESTNET": "1", "PAPER_TRADING": "1",
+                                   "STATE_DB_PATH": db})
+     assert code == 3 and any("kill switch" in r for r in report["preflight_reasons"])
+ 
+ 
++def test_the_shipped_fixture_db_is_never_written_in_place():
++    """Guards the fix above: no test may point STATE_DB_PATH at the tracked file.
++
++    The needle is assembled at runtime. Writing it as a literal would put it in
++    this file, and the guard would then find itself and fail — which is exactly
++    what happened on the first attempt.
++    """
++    with open(__file__, encoding="utf-8") as handle:
++        body = handle.read()
++    needle = "STATE_DB_PATH" + '": ' + "os.path.join(ROOT" + ', "state"'
++    assert needle not in body, (
++        "a test points STATE_DB_PATH at the tracked fixture; sqlite writes "
++        "journal pages even on read, so the repo comes back dirty")
++
++
+ def test_operator_refuses_ack_in_paper_and_models_current(tmp_path):
+     os.makedirs(tmp_path / "models" / "current")
+     code, report = opd.run(str(tmp_path), {"LIVE_TRADING_ACK": "I_UNDERSTAND"})
