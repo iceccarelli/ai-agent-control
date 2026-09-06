@@ -1,0 +1,149 @@
+From 9cdd9d0dc1afa6ee0baf1ef7273a5ed46cd00da5 Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Fri, 4 Sep 2026 22:24:38 +0000
+Subject: [PATCH 01/10] Dockerfile: COPY the full import closure of main.py;
+ test enforces it
+
+INVARIANT PROTECTED: a deployed image must be able to reach `startup()`.
+
+Finding (audit S9): `python3 main.py` inside the image as shipped raised
+ModuleNotFoundError for market_data (bybit_connection.py:73), memory
+(main.py:49), project_status (main.py:51) and session_log (main.py:52).
+The container therefore died before the health server bound, the
+HEALTHCHECK never went green and any orchestrator restart-looped it.
+Deployability of the tree as uploaded was zero.
+
+Why this is the first patch: every other property of the shell - the
+single-writer ledger, reconcile-before-trade, the kill switch - is worth
+nothing in a process that cannot import itself.
+
+What changed:
+  Dockerfile      - COPY list = static import closure of main.py
+                    (incl. the lazy ml_strategy/policy/features imports
+                    behind POLICY_MODE, and signals/ for shadow.py)
+  tests/test_dockerfile.py - recomputes the closure with `ast` and fails
+                    if the Dockerfile omits any of it; also refuses a
+                    `COPY . /app` regression (that is how the predecessor
+                    baked live keys into layers).
+
+What did NOT change: .dockerignore still excludes .env, state/, data/,
+tests/, tools/. artifacts/ is still not shipped; on this tree that means
+promotion_gate refuses inside the image, which is the correct default.
+
+Verification: new test fails on baseline (missing 8 files), passes after.
+---
+ Dockerfile               | 10 +++++-
+ tests/test_dockerfile.py | 78 ++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 87 insertions(+), 1 deletion(-)
+ create mode 100644 tests/test_dockerfile.py
+
+diff --git a/Dockerfile b/Dockerfile
+index a17a1cd..ed5ce7b 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -15,9 +15,17 @@ RUN pip install --no-cache-dir -r requirements.txt
+ # Only the runtime modules. `.dockerignore` excludes tests, tools, docs and —
+ # critically — every .env file. The predecessor of this image shipped live API
+ # keys inside it.
++# The list is the static import closure of main.py (tests/test_dockerfile.py
++# recomputes it and fails the build if a module is missing). The previous list
++# omitted market_data.py, memory.py, project_status.py and session_log.py, all
++# imported unconditionally, so `python3 main.py` died on ModuleNotFoundError
++# before the health server bound and the container restart-looped.
+ COPY config.py persistence.py risk_management.py position_sizing.py \
+      bybit_connection.py technical_analysis.py pure_indicators.py \
+-     performance_analytics.py trading_engine.py main.py ./
++     performance_analytics.py trading_engine.py main.py \
++     market_data.py memory.py project_status.py session_log.py \
++     shadow.py features.py policy.py ml_strategy.py ./
++COPY signals/ ./signals/
+ 
+ # Run unprivileged. State lives on a mounted volume owned by this user.
+ RUN useradd --create-home --shell /usr/sbin/nologin bot \
+diff --git a/tests/test_dockerfile.py b/tests/test_dockerfile.py
+new file mode 100644
+index 0000000..ef5d5a6
+--- /dev/null
++++ b/tests/test_dockerfile.py
+@@ -0,0 +1,78 @@
++"""The Dockerfile must ship every module `python3 main.py` can import.
++
++Invariant protected: an image that cannot start is a deployment that silently
++never trades AND never reconciles. The COPY list is compared against the
++static import closure of main.py, so adding an import without adding a COPY
++fails here rather than in production.
++"""
++from __future__ import annotations
++
++import ast
++import os
++import re
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++
++def _local_modules():
++    mods = {f[:-3] for f in os.listdir(ROOT) if f.endswith(".py")}
++    mods.add("signals")
++    return mods
++
++
++def _import_closure(entry="main"):
++    local = _local_modules()
++    seen, stack = set(), [entry]
++    while stack:
++        mod = stack.pop()
++        if mod in seen:
++            continue
++        seen.add(mod)
++        path = os.path.join(ROOT, "signals", "__init__.py") if mod == "signals" \
++            else os.path.join(ROOT, mod + ".py")
++        if not os.path.isfile(path):
++            continue
++        tree = ast.parse(open(path, encoding="utf-8").read())
++        for node in ast.walk(tree):
++            names = []
++            if isinstance(node, ast.Import):
++                names = [a.name for a in node.names]
++            elif isinstance(node, ast.ImportFrom) and node.module:
++                names = [node.module]
++            for name in names:
++                root = name.split(".")[0]
++                if root in local:
++                    stack.append(root)
++    return seen
++
++
++def _copied_files():
++    text = open(os.path.join(ROOT, "Dockerfile"), encoding="utf-8").read()
++    # join line continuations, then collect every COPY source token
++    text = re.sub(r"\\\n", " ", text)
++    copied = set()
++    for line in text.splitlines():
++        line = line.strip()
++        if not line.startswith("COPY"):
++            continue
++        parts = line.split()[1:]
++        for tok in parts[:-1]:  # last token is the destination
++            copied.add(tok.rstrip("/"))
++    return copied
++
++
++def test_dockerfile_copies_the_import_closure_of_main():
++    closure = _import_closure("main")
++    copied = _copied_files()
++    missing = []
++    for mod in sorted(closure):
++        want = "signals" if mod == "signals" else mod + ".py"
++        if want not in copied:
++            missing.append(want)
++    assert not missing, f"Dockerfile COPY is missing modules main.py imports: {missing}"
++
++
++def test_dockerfile_does_not_copy_the_whole_tree():
++    # `COPY . /app` is how the predecessor shipped API keys. Keep it explicit.
++    text = open(os.path.join(ROOT, "Dockerfile"), encoding="utf-8").read()
++    assert not re.search(r"^COPY\s+\.\s", text, re.M)
+-- 
+2.43.0
+

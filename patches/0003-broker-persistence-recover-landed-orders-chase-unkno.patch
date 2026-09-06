@@ -1,0 +1,408 @@
+From 77c87c7a874db04ce0048719e2fc4172143f7521 Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Fri, 4 Sep 2026 22:28:49 +0000
+Subject: [PATCH 03/10] broker/persistence: recover landed orders, chase
+ 'unknown' rows, refuse on venue-only positions
+
+INVARIANT PROTECTED: the ledger never knows LESS than the venue about a
+position that can lose money. Where it cannot know, the process refuses
+to trade rather than trading blind.
+
+Findings (audit S2, S3, S7 - all rated HIGH):
+  S2  POST /v5/order/create retried after a transport timeout whose first
+      attempt landed. The retry is rejected as a duplicate orderLinkId
+      (not in TRANSIENT_RET_CODES) -> PermanentAPIError -> _submit wrote
+      the local row 'rejected' although the order EXISTS at the venue.
+      The engine then reported REJECTED, placed no stop, recorded no
+      position. Health stayed green. A naked live position, invisible.
+  S3  An exhausted retry loop wrote status 'unknown' with the comment
+      "leave the intent pending so reconciliation resolves it" - but
+      pending_orders() selects only pending/submitted/partial, so
+      'unknown' rows were never revisited by anything.
+  S7  reconcile_on_startup walked the LEDGER only. It never read
+      /v5/position/list, so a position the ledger never recorded (S2/S3
+      aftermath, a manual trade) was invisible for the life of the
+      process.
+
+Thought process: three separate fixes, each the smallest one that fails
+closed. (1) A duplicate-id rejection is evidence the order exists: ask
+get_order() and record the exchange's answer; never resubmit; if the
+lookup itself fails or returns nothing, leave 'unknown' so (2) picks it
+up. (2) Add unresolved_orders() = pending + 'unknown', used by startup
+reconciliation ONLY - pending_orders() is deliberately untouched because
+shutdown() cancels through it and must never try to cancel an order the
+venue may never have received. (3) For linear, read the venue position
+per configured symbol; any position the ledger does not know is reported
+as orphan_positions and main.startup() refuses to start. The process does
+not try to adopt or close it: that is a human decision at a $100 cap and
+a catastrophic automation at any bigger one.
+
+What changed:
+  bybit_connection.py - DUPLICATE_LINK_ID_RET_CODES {110072 linear, 170130
+        spot}; _looks_like_duplicate_link_id (code OR message);
+        _recover_landed_order; reconcile_on_startup(symbols=) with
+        venue position check on linear; summary gains orphan_positions.
+  persistence.py      - StateStore.unresolved_orders()
+  trading_engine.py   - reconcile() passes cfg.TRADING_SYMBOLS
+  main.py             - startup refuses on orphan_positions
+  tests/test_reconcile_orphans_and_duplicates.py - 6 tests incl. a lossy
+        transport that drops the create reply after the fake accepted it;
+        asserts exactly one venue order and a truthful local row.
+
+CANNOT DETERMINE without a venue: whether 110072 is the exact code every
+Bybit linear account returns today (the message match is the backstop),
+and the /v5/position/list shape for hedge-mode accounts (this client
+sends positionIdx=0 and does not support hedge mode).
+
+Verification: new tests 6/6 fail on baseline, pass after. 299 passed
+across bybit_connection, orchestrator, paper cert and the two new files.
+---
+ bybit_connection.py                           |  87 ++++++++++-
+ main.py                                       |   7 +
+ persistence.py                                |  15 ++
+ .../test_reconcile_orphans_and_duplicates.py  | 140 ++++++++++++++++++
+ trading_engine.py                             |   3 +-
+ 5 files changed, 248 insertions(+), 4 deletions(-)
+ create mode 100644 tests/test_reconcile_orphans_and_duplicates.py
+
+diff --git a/bybit_connection.py b/bybit_connection.py
+index 170846c..1e5a2b7 100644
+--- a/bybit_connection.py
++++ b/bybit_connection.py
+@@ -122,6 +122,16 @@ TRANSIENT_RET_CODES = frozenset({
+ TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
+ 
+ #: Verified against https://bybit-exchange.github.io/docs/v5/enum
++#: retCodes Bybit returns when an orderLinkId was already used. Seen on a
++#: RETRY after a transport timeout whose first attempt actually landed. The
++#: rejection means "the order exists", not "the order failed", and must be
++#: resolved by querying the id, never by recording a rejection.
++#:   110072 - linear/inverse "OrderLinkedID is duplicate"
++#:   170130 - spot "Duplicate orderLinkId" (also what tests/fake_bybit.py emits)
++#: The message is matched as well because the code table is not under our
++#: control; a miss here degrades to the previous behaviour (row 'rejected').
++DUPLICATE_LINK_ID_RET_CODES = frozenset({110072, 170130})
++
+ TERMINAL_ORDER_STATUS = frozenset({
+     "Filled", "Cancelled", "Rejected", "PartiallyFilledCanceled", "Deactivated",
+ })
+@@ -918,6 +928,13 @@ class BybitClient:
+                 "POST", "/v5/order/create", body=body, signed=True
+             )
+         except PermanentAPIError as exc:
++            if self._looks_like_duplicate_link_id(exc):
++                # Attempt N-1 landed and the transport lost the reply. The
++                # exchange is the truth; ask it before writing anything.
++                recovered = self._recover_landed_order(
++                    symbol=str(body.get("symbol", "")), oid=oid, purpose=purpose)
++                if recovered is not None:
++                    return recovered
+             self.store.update_order_status(oid, "rejected")
+             logger.error("order %s rejected (%s): %s", oid, exc.ret_code, exc)
+             # The id is returned even on failure: the caller needs it to look the
+@@ -945,6 +962,47 @@ class BybitClient:
+             reason="SUBMITTED", raw=result,
+         )
+ 
++    @staticmethod
++    def _looks_like_duplicate_link_id(exc: PermanentAPIError) -> bool:
++        if exc.ret_code in DUPLICATE_LINK_ID_RET_CODES:
++            return True
++        msg = str(exc).lower()
++        return "duplicate" in msg and "orderlink" in msg.replace(" ", "")
++
++    def _recover_landed_order(self, *, symbol: str, oid: str,
++                              purpose: str) -> Optional[OrderResult]:
++        """After a duplicate-id rejection, record what the exchange holds.
++
++        Returns an OrderResult mirroring a normal submit when the order is
++        found. Returns ``None`` when it cannot be found or queried, in which
++        case the caller falls back to 'rejected' - the exchange said the id
++        exists, so a lookup miss is itself suspicious and is logged at error.
++        Never resubmits.
++        """
++        try:
++            remote = self.get_order(symbol=symbol, order_link_id=oid)
++        except BybitAPIError as exc:
++            logger.error("order %s: duplicate-id rejection but lookup failed: %s",
++                         oid, exc)
++            self.store.update_order_status(oid, "unknown")
++            return OrderResult(order_link_id=oid, reason="OUTCOME_UNKNOWN",
++                               ret_code=getattr(exc, "ret_code", None))
++        if remote is None:
++            logger.error("order %s: exchange reports duplicate id but returns "
++                         "no order; leaving 'unknown' for reconciliation", oid)
++            self.store.update_order_status(oid, "unknown")
++            return OrderResult(order_link_id=oid, reason="OUTCOME_UNKNOWN")
++        order_id = str(remote.get("orderId", ""))
++        status = str(remote.get("orderStatus", ""))
++        local = "filled" if status == "Filled" else (
++            status.lower() if status in TERMINAL_ORDER_STATUS else "submitted")
++        self.store.update_order_status(oid, local, exchange_id=order_id)
++        logger.warning("order %s had already landed (%s, %s) %s - recorded from "
++                       "the exchange, not resubmitted", oid, order_id, status,
++                       purpose)
++        return OrderResult(ok=True, order_id=order_id, order_link_id=oid,
++                           reason="SUBMITTED", raw=remote)
++
+     def _check_balance(
+         self, *, symbol: str, side: str, qty: Decimal, reference_price: float,
+         reduce_only: bool = False,
+@@ -1424,7 +1482,7 @@ class BybitClient:
+ 
+     # -- reconciliation ----------------------------------------------------
+ 
+-    def reconcile_on_startup(self) -> Dict[str, Any]:
++    def reconcile_on_startup(self, symbols: Sequence[str] = ()) -> Dict[str, Any]:
+         """Resolve persisted intents against the exchange before trading.
+ 
+         Audit C18: the legacy bot had no reconciliation at all. After a restart
+@@ -1436,9 +1494,13 @@ class BybitClient:
+         """
+         summary: Dict[str, Any] = {
+             "checked": 0, "resolved": 0, "still_open": 0, "unknown": 0,
+-            "naked_positions": [],
++            "naked_positions": [], "orphan_positions": [],
+         }
+-        for row in self.store.pending_orders():
++        # Rows left 'unknown' by an exhausted retry loop were previously never
++        # revisited: pending_orders() excludes them by design (shutdown must
++        # not try to cancel an order that may not exist). Reconciliation is
++        # exactly the place they must be chased.
++        for row in self.store.unresolved_orders():
+             summary["checked"] += 1
+             oid = str(row["order_link_id"])
+             try:
+@@ -1471,6 +1533,25 @@ class BybitClient:
+         summary["naked_positions"] = [
+             str(p.get("symbol")) for p in self.store.positions_without_stops()
+         ]
++        if symbols and self.is_linear:
++            # The ledger only knows positions it wrote. A fill confirmed after
++            # _await_fill's deadline, a manual trade, or a lost create reply all
++            # produce a venue position the ledger never saw. Ask the venue.
++            known = {str(p.get("symbol")) for p in self.store.open_positions()}
++            for symbol in symbols:
++                try:
++                    remote = self.get_position(str(symbol))
++                except BybitAPIError as exc:
++                    logger.error("reconcile: cannot read venue position for %s: %s",
++                                 symbol, exc)
++                    summary["unknown"] += 1
++                    continue
++                if remote is not None and str(symbol) not in known:
++                    summary["orphan_positions"].append(str(symbol))
++                    logger.critical(
++                        "reconcile: venue holds a %s position of size %s that the "
++                        "ledger does not know; a human must resolve it",
++                        symbol, remote.get("size"))
+         logger.info("startup reconciliation: %s", summary)
+         return summary
+ 
+diff --git a/main.py b/main.py
+index de1b8ec..f1484b0 100644
+--- a/main.py
++++ b/main.py
+@@ -299,6 +299,13 @@ class TradingBot:
+                     "refusing to start", summary["unknown"]
+                 )
+                 return False
++            if summary.get("orphan_positions"):
++                logger.critical(
++                    "venue holds position(s) the ledger does not know: %s; "
++                    "refusing to start until a human reconciles them",
++                    summary["orphan_positions"],
++                )
++                return False
+         except Exception as exc:  # noqa: BLE001
+             logger.critical("reconciliation failed: %s", exc, exc_info=True)
+             return False
+diff --git a/persistence.py b/persistence.py
+index 07c58ba..5878274 100644
+--- a/persistence.py
++++ b/persistence.py
+@@ -1046,6 +1046,21 @@ class StateStore:
+             )
+         ]
+ 
++    def unresolved_orders(self) -> List[Dict[str, Any]]:
++        """pending_orders() plus rows whose submit outcome is 'unknown'.
++
++        Read by startup reconciliation only. Kept separate from
++        pending_orders() so that shutdown never attempts to cancel an order
++        the exchange may never have received.
++        """
++        return [
++            dict(r)
++            for r in self._query(
++                "SELECT * FROM orders WHERE status IN "
++                "('pending','submitted','partial','unknown')"
++            )
++        ]
++
+     # -- decision journal --------------------------------------------------
+ 
+     def journal(
+diff --git a/tests/test_reconcile_orphans_and_duplicates.py b/tests/test_reconcile_orphans_and_duplicates.py
+new file mode 100644
+index 0000000..9030b01
+--- /dev/null
++++ b/tests/test_reconcile_orphans_and_duplicates.py
+@@ -0,0 +1,140 @@
++"""Lost create-replies and venue-only positions must not become invisible.
++
++Invariants protected (audit S2/S3/S7):
++  * a POST /v5/order/create whose reply is lost and whose retry is rejected as
++    a duplicate orderLinkId is recorded from the exchange's answer, never as
++    'rejected';
++  * rows left 'unknown' by an exhausted retry loop are chased at startup;
++  * a linear position the venue holds but the ledger does not know refuses
++    startup instead of being silently ignored.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++import pytest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.dirname(HERE))
++sys.path.insert(0, HERE)
++
++import bybit_connection as bc  # noqa: E402
++import main as m  # noqa: E402
++import trading_engine as te  # noqa: E402
++from fake_bybit import FakeBybit  # noqa: E402
++from persistence import StateStore  # noqa: E402
++from position_sizing import BillionairePositionSizing  # noqa: E402
++from risk_management import BillionaireRiskManager  # noqa: E402
++from test_orchestrator import Cfg  # noqa: E402
++
++
++class LinearCfg(Cfg):
++    CATEGORY = "linear"
++    ALLOW_SHORTS = True
++
++
++class LossyTransport:
++    """Forwards to FakeBybit but loses the reply of the first order create."""
++
++    def __init__(self, inner):
++        self.inner = inner
++        self.lost = 0
++
++    def request(self, method, url, **kw):
++        status, text = self.inner.request(method, url, **kw)
++        if method == "POST" and url.endswith("/v5/order/create") and self.lost == 0:
++            self.lost += 1
++            raise ConnectionError("reply lost after the exchange accepted")
++        return status, text
++
++
++@pytest.fixture()
++def store(tmp_path):
++    s = StateStore(str(tmp_path / "state.db"))
++    s.claim_writer()
++    s.update_equity(10_000.0)
++    return s
++
++
++def test_duplicate_link_id_after_lost_reply_is_recorded_from_the_exchange(store):
++    fake = FakeBybit()
++    lossy = LossyTransport(fake)
++    client = bc.BybitClient(config=Cfg(), store=store, transport=lossy)
++    result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
++    assert lossy.lost == 1
++    assert result.ok is True, result
++    assert result.reason == "SUBMITTED"
++    row = store.get_order(result.order_link_id)
++    assert row["status"] in {"submitted", "filled"}
++    assert row["exchange_id"]
++    # exactly ONE order exists at the venue - nothing was resubmitted
++    assert len(fake.orders) == 1
++
++
++def test_duplicate_looks_like_helper_matches_code_and_message():
++    assert bc.BybitClient._looks_like_duplicate_link_id(
++        bc.PermanentAPIError("x", ret_code=110072))
++    assert bc.BybitClient._looks_like_duplicate_link_id(
++        bc.PermanentAPIError("Duplicate orderLinkId", ret_code=999))
++    assert not bc.BybitClient._looks_like_duplicate_link_id(
++        bc.PermanentAPIError("insufficient balance", ret_code=110007))
++
++
++def test_unknown_rows_are_chased_at_startup(store):
++    fake = FakeBybit()
++    client = bc.BybitClient(config=Cfg(), store=store, transport=fake)
++    res = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
++    assert res.ok
++    # simulate an exhausted retry loop having left the row 'unknown'
++    store.update_order_status(res.order_link_id, "unknown")
++    assert res.order_link_id not in {r["order_link_id"] for r in store.pending_orders()}
++    assert res.order_link_id in {r["order_link_id"] for r in store.unresolved_orders()}
++    summary = client.reconcile_on_startup()
++    assert summary["checked"] == 1
++    assert summary["unknown"] == 0
++    assert store.get_order(res.order_link_id)["status"] != "unknown"
++
++
++def _bot(tmp_path, cfg, fake):
++    store = StateStore(str(tmp_path / "state.db"))
++    store.update_equity(10_000.0)
++    client = bc.BybitClient(config=cfg, store=store, transport=fake)
++    risk = BillionaireRiskManager(config=cfg, store=store)
++    engine = te.TradingEngine(
++        client=client, risk_manager=risk,
++        position_sizer=BillionairePositionSizing(config=cfg, risk_manager=risk),
++        store=store, config=cfg,
++    )
++    return m.TradingBot(config=cfg, store=store, client=client,
++                        risk_manager=risk, engine=engine, strategy=None), store
++
++
++def test_venue_position_unknown_to_ledger_refuses_startup(tmp_path):
++    fake = FakeBybit()
++    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.01",
++                                 "avgPrice": "60000", "stopLoss": ""}
++    bot, _ = _bot(tmp_path, LinearCfg(), fake)
++    assert bot.startup() is False
++    bot.shutdown()
++
++
++def test_venue_position_known_to_ledger_does_not_refuse(tmp_path):
++    fake = FakeBybit()
++    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.01",
++                                 "avgPrice": "60000", "stopLoss": "61000"}
++    bot, store = _bot(tmp_path, LinearCfg(), fake)
++    store.claim_writer()
++    store.upsert_position("BTCUSDT", "Sell", 0.01, 60000.0, stop_price=61000.0)
++    store.release_writer() if hasattr(store, "release_writer") else None
++    summary = bot.client.reconcile_on_startup(symbols=("BTCUSDT",))
++    assert summary["orphan_positions"] == []
++    bot.shutdown()
++
++
++def test_spot_reconcile_never_queries_position_list(tmp_path):
++    fake = FakeBybit()
++    bot, _ = _bot(tmp_path, Cfg(), fake)
++    bot.client.reconcile_on_startup(symbols=("BTCUSDT",))
++    assert not any(r["url"].endswith("/v5/position/list") for r in fake.requests)
++    bot.shutdown()
+diff --git a/trading_engine.py b/trading_engine.py
+index 67db49c..8bd773c 100644
+--- a/trading_engine.py
++++ b/trading_engine.py
+@@ -1112,7 +1112,8 @@ class TradingEngine:
+         Called before the first trade of a run. A position found without a
+         verified stop is not simply logged: it is protected or closed.
+         """
+-        summary = self.client.reconcile_on_startup()
++        summary = self.client.reconcile_on_startup(
++            symbols=tuple(getattr(self.cfg, "TRADING_SYMBOLS", ()) or ()))
+         for symbol in list(summary.get("naked_positions") or []):
+             row = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
+             if row is None:
+-- 
+2.43.0
+

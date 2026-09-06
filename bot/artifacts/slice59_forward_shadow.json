@@ -1,0 +1,366 @@
+{
+  "schema": "forward_shadow_observation/1",
+  "slice": 59,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "observed_at_utc": "2026-08-10T18:30:05Z",
+  "is_forward_observation": false,
+  "forward_observations_to_date": 0,
+  "is_stage1_evidence": false,
+  "registration_eligible": false,
+  "why_this_is_not_forward_evidence": "The linear corpus ends 2026-08-09, which is the same data the cleared measurement was taken over. ZERO bars have arrived since. This record uses the schema, caps, schedule and monitor thresholds a real forward run will use, over the most recent available window, so the record's SHAPE is fixed before real observations land in it. It is not experience. Relabelling history as experience is the exact substitution the promotion gate exists to prevent, which is why that gate counts 0 forward observations and refuses.",
+  "why_this_cannot_register": "The registration hook reads only *_summary.json artefacts that pass the slice-57 OOS gate: registration_eligible true, window oos_late, a matching fold hash, >= 40 scored trades and a positive mean. This file is not a summary, declares registration_eligible false, and carries none of those fields.",
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_fingerprint": "662de0115880871352d5d623b1020eaa",
+  "constants_fingerprint_matches_slice58": true,
+  "schedule_mode": "one_entry_per_contiguous_run",
+  "schedule_note": "One entry per contiguous setup run, from skill_test.simulate_schedule over the same tradable mask the Stage-1 run used. NOT every flagged bar: slice 58 §41i records that the first shadow wiring did exactly that and took 55 trades at -0.0464 mean net R where the cleared rule schedules 41 at +0.1736 — a pilot monitoring a rule that loses money while reporting healthy status.",
+  "caps": {
+    "max_concurrent_positions": 1,
+    "max_entries_per_day": 1,
+    "max_notional_usd": 100.0,
+    "symbol": "BTCUSDT"
+  },
+  "window": {
+    "source": "artifacts/funding_carry_fade_btc_v1_folds.json",
+    "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+    "t_mid": "2024-08-09T00:00:00Z",
+    "t1": "2026-08-09T00:00:00Z",
+    "bars": 731,
+    "corpus_last_bar_utc": "2026-08-09T00:00:00Z",
+    "bars_after_the_cleared_measurement": 0,
+    "invented_future_bars": 0
+  },
+  "setups_or_candidates": 41,
+  "entries_taken": 35,
+  "entries_refused_by_caps": 6,
+  "shadow_n_trades": 35,
+  "shadow_mean_net_r": 0.18571343161930676,
+  "shadow_mean_note": "A capped pilot's mean, with no rotation null, no drift-controlled contrast and no control behind it. It is not comparable with the Stage-1 mean and it is not evidence.",
+  "monitor_thresholds": {
+    "M1_rolling_trades": {
+      "k": 10,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 10
+    },
+    "M2_rolling_days": {
+      "window_days": 90,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 5
+    },
+    "M3_concentration": {
+      "top_n": 3,
+      "warn_above": 0.6,
+      "min_trades": 10
+    },
+    "M4_halves": {
+      "min_trades": 20
+    }
+  },
+  "monitor_readings": [
+    {
+      "name": "M1_rolling_trades",
+      "state": "OK",
+      "value": 0.029757656465978655,
+      "threshold": -0.25,
+      "n_trades": 10,
+      "detail": "mean net R over the last 10 closed trades"
+    },
+    {
+      "name": "M2_rolling_days",
+      "state": "OK",
+      "value": 0.23990203185971773,
+      "threshold": -0.25,
+      "n_trades": 5,
+      "detail": "mean net R over trades closed in the last 90 days"
+    },
+    {
+      "name": "M3_concentration",
+      "state": "OK",
+      "value": 0.4502541935561254,
+      "threshold": 0.6,
+      "n_trades": 35,
+      "detail": "top-3 share of cumulative net R (the OOS sample itself is 0.41)"
+    },
+    {
+      "name": "M4_halves",
+      "state": "WARN",
+      "value": -0.07982286076591971,
+      "threshold": 0.0,
+      "n_trades": 35,
+      "detail": "earlier half +0.4669 on 17, recent half -0.0798 on 18"
+    }
+  ],
+  "monitor_status": "WARN",
+  "entries_blocked_by_monitor": false,
+  "m4_recent_half_note": "M4_halves reads WARN — earlier half +0.4669 on 17, recent half -0.0798 on 18. This is EXPECTED history, recorded in EDGE.md §41j and §42d and carried into the promotion gate as an item a human must explicitly accept. It is NOT a defect to erase: the only legitimate way it stops warning is new forward data recovering under the threshold AS IT STANDS.",
+  "thresholds_moved_this_slice": false,
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "cleared_edge_re_scored_this_slice": false,
+  "live_authorized": false,
+  "policy_mode": "off",
+  "execution_mode": "paper",
+  "models_current_present": false,
+  "frozen_absent_count": 11,
+  "closer_to_autonomous_profit_agent": false,
+  "trades": [
+    {
+      "entry_utc": "2024-09-27T00:00:00Z",
+      "exit_utc": "2024-10-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9703470632275664,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2024-10-11T00:00:00Z",
+      "exit_utc": "2024-10-11T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0495830601015057,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2024-10-15T00:00:00Z",
+      "exit_utc": "2024-10-20T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0151100189373994,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2024-10-30T00:00:00Z",
+      "exit_utc": "2024-11-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9639976052087643,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2024-12-18T00:00:00Z",
+      "exit_utc": "2024-12-18T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.961026141788135,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2024-12-25T00:00:00Z",
+      "exit_utc": "2024-12-30T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9859282295092152,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-01-07T00:00:00Z",
+      "exit_utc": "2025-01-07T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9568079733174515,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-01-09T00:00:00Z",
+      "exit_utc": "2025-01-13T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9701550514338524,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-01-19T00:00:00Z",
+      "exit_utc": "2025-01-24T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.06538052124651365,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-02-01T00:00:00Z",
+      "exit_utc": "2025-02-02T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9639471212161503,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-02-19T00:00:00Z",
+      "exit_utc": "2025-02-24T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.7692276086120955,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-02-27T00:00:00Z",
+      "exit_utc": "2025-02-28T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9676908093120082,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-03-10T00:00:00Z",
+      "exit_utc": "2025-03-15T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.5129210143556204,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-05-12T00:00:00Z",
+      "exit_utc": "2025-05-17T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.1990319861566216,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-05-19T00:00:00Z",
+      "exit_utc": "2025-05-19T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.939162971499171,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-05-23T00:00:00Z",
+      "exit_utc": "2025-05-23T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.94511249573647,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-06-30T00:00:00Z",
+      "exit_utc": "2025-07-05T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.0126588419141704,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-07-12T00:00:00Z",
+      "exit_utc": "2025-07-14T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.043445354509622,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-08-11T00:00:00Z",
+      "exit_utc": "2025-08-13T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0503135708776261,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-08-14T00:00:00Z",
+      "exit_utc": "2025-08-14T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9368658981089805,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-08-25T00:00:00Z",
+      "exit_utc": "2025-08-26T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9520724432351513,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-08-27T00:00:00Z",
+      "exit_utc": "2025-09-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.47203732279090926,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-09-10T00:00:00Z",
+      "exit_utc": "2025-09-12T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0538839274394591,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-10-02T00:00:00Z",
+      "exit_utc": "2025-10-03T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0594161079885378,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-10-04T00:00:00Z",
+      "exit_utc": "2025-10-09T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.11169523823386268,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-10-13T00:00:00Z",
+      "exit_utc": "2025-10-16T00:00:00Z",
+      "direction": "LONG_SETUP",
+      "net_r": -1.0400649311563475,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-11-01T00:00:00Z",
+      "exit_utc": "2025-11-04T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9703635057834242,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-12-20T00:00:00Z",
+      "exit_utc": "2025-12-25T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.13964035956472992,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2025-12-27T00:00:00Z",
+      "exit_utc": "2026-01-01T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -0.34766719727431705,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2026-02-07T00:00:00Z",
+      "exit_utc": "2026-02-12T00:00:00Z",
+      "direction": "LONG_SETUP",
+      "net_r": -0.6242053315562917,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2026-04-18T00:00:00Z",
+      "exit_utc": "2026-04-23T00:00:00Z",
+      "direction": "LONG_SETUP",
+      "net_r": 0.27124368540601934,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2026-05-29T00:00:00Z",
+      "exit_utc": "2026-06-02T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9627910089199427,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2026-06-04T00:00:00Z",
+      "exit_utc": "2026-06-05T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.9537952136771425,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2026-07-07T00:00:00Z",
+      "exit_utc": "2026-07-12T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": 0.05466511669926469,
+      "notional_usd": 100.0
+    },
+    {
+      "entry_utc": "2026-07-14T00:00:00Z",
+      "exit_utc": "2026-07-15T00:00:00Z",
+      "direction": "SHORT_SETUP",
+      "net_r": -1.0429848654037808,
+      "notional_usd": 100.0
+    }
+  ],
+  "git_commit": "9a3190f9814a1194976a72edd3ed52ff80670468"
+}

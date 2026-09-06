@@ -1,0 +1,1072 @@
+From db4036fa6ec7bc561d295d9796f869ebba4bf3c3 Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Sat, 5 Sep 2026 00:26:11 +0000
+Subject: [PATCH 09/10] tools: guard git provenance so measurement reproduces
+ on a non-git tree
+
+INVARIANT PROTECTED: a measurement that ran must not be thrown away, and
+an outside reviewer must be able to reproduce EDGE.md from the archive as
+distributed.
+
+Finding (reported by a collaborating audit, REPRODUCED here 2026-09-05 on
+a fresh unzip of `tradingbot_slice76 (2) (1).zip` from
+github.com/iceccarelli/ai-agent-control - md5 3f50eea3, byte-identical to
+the zip audited in earlier rounds):
+
+    subprocess.CalledProcessError: Command '['git','rev-parse','HEAD']'
+    returned non-zero exit status 128
+
+The call sits at the LAST line of `build()`, after every number is
+computed. The tool did the entire job and then discarded the result. 51
+tools carried the idiom. Practical effect: nobody outside the original
+machine could reproduce a single figure in EDGE.md.
+
+Fix: tools/provenance.py returns a sentinel instead of raising.
+`UNKNOWN_NOT_A_GIT_REPO` is strictly more informative than a traceback -
+it records that provenance was unavailable rather than pretending it was
+or losing the measurement. A `-dirty` suffix is appended when the tree has
+uncommitted changes, so an artefact cannot claim a clean commit it does
+not match. tools/train_policy.py already used the correct guarded form;
+that pattern is now the shared helper.
+
+VERIFIED END TO END: a fresh unzip + the patched tool now completes,
+exits 0, writes artifacts/slice76_forward_shadow.json with
+git_commit = UNKNOWN_NOT_A_GIT_REPO, and reproduces the documented ladder
+5/4/0/0/0/0 with constants fingerprint 662de011... intact.
+
+WHAT I DID NOT TOUCH, AND WHY: the first pass rewrote 49 tools and broke
+tests/test_slice67_five_day_window.py, which pins the sha256 of the
+slice-62..66 apparatus via artifacts/slice67_restored_from_slice66.json.
+Those 15 files are DATED RECORDS of what was run at the time. Editing
+them - even to fix a real crash - rewrites history, which is the single
+thing this programme exists to prevent, so they are reverted and stay
+broken on purpose: they are never run to produce new numbers. The
+whole-class test exempts exactly those files, and a second test asserts
+the exemption stays bounded to slice6[2-6] and fails if the pin manifest
+disappears. 35 current-generation tools fixed.
+
+Verification: full suite 5,039 passed, 2 skipped. 6 new tests.
+---
+ tests/test_provenance_guard.py      | 120 ++++++++++++++++++++++++++++
+ tools/data_freshness_check.py       |   4 +-
+ tools/forward_shadow_observation.py |   4 +-
+ tools/oos_stability_q1q2.py         |   4 +-
+ tools/provenance.py                 |  77 ++++++++++++++++++
+ tools/shadow_replay.py              |   4 +-
+ tools/slice61_freshness.py          |   4 +-
+ tools/slice67_forward_shadow.py     |   4 +-
+ tools/slice67_freshness.py          |   4 +-
+ tools/slice67_promotion_gate.py     |   4 +-
+ tools/slice68_forward_shadow.py     |   4 +-
+ tools/slice68_freshness.py          |   4 +-
+ tools/slice68_promotion_gate.py     |   4 +-
+ tools/slice69_forward_shadow.py     |   4 +-
+ tools/slice69_freshness.py          |   4 +-
+ tools/slice69_promotion_gate.py     |   4 +-
+ tools/slice70_forward_shadow.py     |   4 +-
+ tools/slice70_freshness.py          |   4 +-
+ tools/slice70_promotion_gate.py     |   4 +-
+ tools/slice71_forward_shadow.py     |   4 +-
+ tools/slice71_freshness.py          |   4 +-
+ tools/slice71_promotion_gate.py     |   4 +-
+ tools/slice72_forward_shadow.py     |   4 +-
+ tools/slice72_freshness.py          |   4 +-
+ tools/slice72_promotion_gate.py     |   4 +-
+ tools/slice73_forward_shadow.py     |   4 +-
+ tools/slice73_freshness.py          |   4 +-
+ tools/slice73_promotion_gate.py     |   4 +-
+ tools/slice74_forward_shadow.py     |   4 +-
+ tools/slice74_freshness.py          |   4 +-
+ tools/slice74_promotion_gate.py     |   4 +-
+ tools/slice75_forward_shadow.py     |   4 +-
+ tools/slice75_freshness.py          |   4 +-
+ tools/slice75_promotion_gate.py     |   4 +-
+ tools/slice76_forward_shadow.py     |   4 +-
+ tools/slice76_freshness.py          |   4 +-
+ tools/slice76_promotion_gate.py     |   4 +-
+ 37 files changed, 267 insertions(+), 70 deletions(-)
+ create mode 100644 tests/test_provenance_guard.py
+ create mode 100644 tools/provenance.py
+
+diff --git a/tests/test_provenance_guard.py b/tests/test_provenance_guard.py
+new file mode 100644
+index 0000000..e497e4b
+--- /dev/null
++++ b/tests/test_provenance_guard.py
+@@ -0,0 +1,120 @@
++"""Measurement tools must survive a tree that is not a git repository.
++
++Finding (reproduced 2026-09-05 on a fresh unzip of the distributed
++archive): `tools/slice76_forward_shadow.py` computed every number, then
++died at the last line of `build()` with
++`CalledProcessError: 'git rev-parse HEAD' returned non-zero exit status
++128`. 51 tools carried the same unguarded idiom. The practical effect is
++that no outside reviewer could reproduce a single figure in EDGE.md from
++the artifact as distributed - the measurement ran and the result was
++thrown away.
++
++Fix: tools/provenance.py returns a sentinel instead of raising.
++`UNKNOWN_NOT_A_GIT_REPO` is strictly more informative than a traceback:
++it records that provenance was unavailable rather than pretending it was.
++"""
++from __future__ import annotations
++
++import glob
++import os
++import re
++import subprocess
++import sys
++
++import pytest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++
++import provenance  # noqa: E402
++
++
++def test_git_commit_in_a_real_repo_is_a_sha_or_an_honest_sentinel():
++    value = provenance.git_commit(ROOT)
++    assert value == provenance.UNKNOWN or provenance.is_real_commit(value) \
++        or value == provenance.UNAVAILABLE
++
++
++def test_git_commit_on_a_non_repo_returns_the_sentinel_and_does_not_raise(tmp_path):
++    assert provenance.git_commit(str(tmp_path)) == provenance.UNKNOWN
++
++
++def test_dirty_tree_is_marked(tmp_path):
++    repo = tmp_path / "r"
++    repo.mkdir()
++    run = lambda *a: subprocess.run(a, cwd=str(repo), capture_output=True)
++    run("git", "init", "-q")
++    run("git", "config", "user.email", "t@t")
++    run("git", "config", "user.name", "t")
++    (repo / "f.txt").write_text("one")
++    run("git", "add", "-A")
++    run("git", "commit", "-qm", "c")
++    clean = provenance.git_commit(str(repo))
++    if not provenance.is_real_commit(clean):
++        pytest.skip("git unavailable in this sandbox")
++    assert not clean.endswith(provenance.DIRTY_SUFFIX)
++    (repo / "f.txt").write_text("two")
++    assert provenance.git_commit(str(repo)).endswith(provenance.DIRTY_SUFFIX)
++
++
++def test_sentinels_are_not_mistaken_for_commits():
++    assert not provenance.is_real_commit(provenance.UNKNOWN)
++    assert not provenance.is_real_commit(provenance.UNAVAILABLE)
++    assert not provenance.is_real_commit("")
++    assert provenance.is_real_commit("a" * 40)
++    assert provenance.is_real_commit("a" * 40 + provenance.DIRTY_SUFFIX)
++
++
++def _digest_pinned_tools():
++    """Historical apparatus whose sha256 is recorded and must not change.
++
++    artifacts/slice67_restored_from_slice66.json pins the bytes of the
++    slice-62..66 tools as a DATED RECORD of what was run at the time.
++    tests/test_slice67_five_day_window.py enforces those digests. Editing
++    them - even to fix a real crash - would rewrite history, which is the
++    one thing this programme is built to prevent. They are exempt here and
++    stay broken ON PURPOSE: they are not run to produce new numbers, and
++    the current-generation tools that ARE run have been fixed.
++    """
++    manifest = os.path.join(ROOT, "artifacts", "slice67_restored_from_slice66.json")
++    if not os.path.isfile(manifest):
++        return set()
++    import json
++    data = json.load(open(manifest, encoding="utf-8"))
++    pinned = set()
++    for entries in data.get("apparatus", {}).values():
++        if isinstance(entries, dict):
++            pinned.update(entries)
++    return pinned
++
++
++def test_current_generation_tools_no_longer_crash_on_a_non_git_tree():
++    """The whole class of defect, excluding immutable historical records."""
++    pinned = _digest_pinned_tools()
++    offenders = []
++    for path in sorted(glob.glob(os.path.join(ROOT, "tools", "*.py"))):
++        rel = os.path.relpath(path, ROOT)
++        if rel in pinned:
++            continue
++        src = open(path, encoding="utf-8").read()
++        if "rev-parse" not in src:
++            continue
++        # check_output raises on non-zero exit; subprocess.run(check=False)
++        # and the provenance helper do not.
++        if re.search(r"check_output\([^)]*rev-parse", src, re.S):
++            offenders.append(rel)
++    assert not offenders, (
++        f"tools still crash on a non-git tree: {sorted(set(offenders))}")
++
++
++def test_the_pinned_exemption_is_real_and_bounded():
++    """If the pin manifest disappears, the exemption must not silently widen."""
++    pinned = _digest_pinned_tools()
++    assert pinned, "digest pin manifest missing; exemption would swallow everything"
++    still_broken = [p for p in pinned if p.startswith("tools/")
++                    and os.path.isfile(os.path.join(ROOT, p))
++                    and "rev-parse" in open(os.path.join(ROOT, p),
++                                            encoding="utf-8").read()]
++    # These are known, dated, and deliberately left alone.
++    assert all(re.search(r"slice6[2-6]", p) for p in still_broken), still_broken
+diff --git a/tools/data_freshness_check.py b/tools/data_freshness_check.py
+index 36adcdb..ec3943f 100644
+--- a/tools/data_freshness_check.py
++++ b/tools/data_freshness_check.py
+@@ -51,6 +51,7 @@ import csv  # noqa: E402
+ 
+ import market_data as md  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/1"
+ LINEAR_FILE = "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz"
+@@ -206,8 +207,7 @@ def main(argv=None) -> int:
+                      f"cannot exist until at least {fb.HORIZON + 1} closed "
+                      f"forward bars do."),
+         },
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+     with open(args.out, "w", encoding="utf-8") as handle:
+         json.dump(payload, handle, indent=2, ensure_ascii=False)
+diff --git a/tools/forward_shadow_observation.py b/tools/forward_shadow_observation.py
+index 15eb1e2..f2a8c6c 100644
+--- a/tools/forward_shadow_observation.py
++++ b/tools/forward_shadow_observation.py
+@@ -63,6 +63,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/1"
+ SCHEDULE_MODE = "one_entry_per_contiguous_run"
+@@ -258,8 +259,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "notional_usd": t.notional_usd}
+             for t in closed
+         ],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/oos_stability_q1q2.py b/tools/oos_stability_q1q2.py
+index 417ea9d..c947418 100644
+--- a/tools/oos_stability_q1q2.py
++++ b/tools/oos_stability_q1q2.py
+@@ -46,6 +46,7 @@ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
+ 
+ import edge_measurement as em  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ 
+ def main(argv=None) -> int:
+@@ -153,8 +154,7 @@ def main(argv=None) -> int:
+                      "3 trades. A mean of +0.17 over 41 trades reads very "
+                      "differently if one trade carries most of it."),
+         },
+-        "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"],
+-                                              text=True).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+     with open(args.out, "w", encoding="utf-8") as handle:
+         json.dump(payload, handle, indent=2, ensure_ascii=False)
+diff --git a/tools/provenance.py b/tools/provenance.py
+new file mode 100644
+index 0000000..d4ede41
+--- /dev/null
++++ b/tools/provenance.py
+@@ -0,0 +1,77 @@
++#!/usr/bin/env python3
++"""Repository provenance for measurement artefacts. Never raises.
++
++Every measurement tool in this tree stamps its artefact with a git commit.
++The original idiom was::
++
++    "git_commit": _provenance.git_commit(REPO)
++
++which raises `CalledProcessError` on a tree that is not a git repository -
++which is exactly what a reviewer has after unzipping the distributed
++archive. The call sits at the LAST line of `build()`, after every number
++has been computed, so the tool did the whole job and then threw the result
++away. Verified 2026-09-05: a fresh unzip of
++`tradingbot_slice76 (2) (1).zip` running
++`tools/slice76_forward_shadow.py` dies with exit status 128 from
++`git rev-parse HEAD`. 51 tools carry the same idiom.
++
++The provenance field exists so a number can be tied to the code that
++produced it. `UNKNOWN_NOT_A_GIT_REPO` says exactly that and is strictly
++more informative than a traceback: it records that provenance was
++unavailable rather than pretending it was or losing the measurement.
++"""
++from __future__ import annotations
++
++import os
++import subprocess
++from typing import Optional
++import provenance as _provenance  # noqa: E402
++
++UNKNOWN = "UNKNOWN_NOT_A_GIT_REPO"
++UNAVAILABLE = "UNKNOWN_GIT_UNAVAILABLE"
++DIRTY_SUFFIX = "-dirty"
++
++
++def git_commit(repo: Optional[str] = None, *, mark_dirty: bool = True) -> str:
++    """Best-effort `HEAD` sha. Returns a sentinel instead of raising.
++
++    `mark_dirty` appends `-dirty` when the working tree has uncommitted
++    changes, so an artefact cannot silently claim to have come from a clean
++    commit it does not match.
++    """
++    repo = repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    try:
++        head = subprocess.run(
++            ["git", "rev-parse", "HEAD"], cwd=repo, text=True,
++            capture_output=True, timeout=10,
++        )
++    except (OSError, subprocess.SubprocessError):
++        return UNAVAILABLE
++    if head.returncode != 0:
++        return UNKNOWN
++    sha = head.stdout.strip()
++    if not sha:
++        return UNKNOWN
++    if not mark_dirty:
++        return sha
++    try:
++        status = subprocess.run(
++            ["git", "status", "--porcelain"], cwd=repo, text=True,
++            capture_output=True, timeout=10,
++        )
++    except (OSError, subprocess.SubprocessError):
++        return sha
++    if status.returncode == 0 and status.stdout.strip():
++        return sha + DIRTY_SUFFIX
++    return sha
++
++
++def is_real_commit(value: str) -> bool:
++    """True only for an actual sha (dirty or not), not a sentinel."""
++    if not value or value in (UNKNOWN, UNAVAILABLE):
++        return False
++    return len(value.replace(DIRTY_SUFFIX, "")) == 40
++
++
++if __name__ == "__main__":
++    print(git_commit())
+diff --git a/tools/shadow_replay.py b/tools/shadow_replay.py
+index 661f647..9dda67c 100644
+--- a/tools/shadow_replay.py
++++ b/tools/shadow_replay.py
+@@ -55,6 +55,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ 
+ def iso(ms: int) -> str:
+@@ -233,8 +234,7 @@ def main(argv=None) -> int:
+              "direction": t.direction, "net_r": t.net_r}
+             for t in closed
+         ],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+     with open(args.out, "w", encoding="utf-8") as handle:
+         json.dump(payload, handle, indent=2, ensure_ascii=False)
+diff --git a/tools/slice61_freshness.py b/tools/slice61_freshness.py
+index 1530bf0..c815cb0 100644
+--- a/tools/slice61_freshness.py
++++ b/tools/slice61_freshness.py
+@@ -58,6 +58,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import market_data as md  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/2"
+ LINEAR = "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz"
+@@ -208,8 +209,7 @@ def main(argv=None) -> int:
+                 f"bars do. A funding print without a bar to decide is not an "
+                 f"observation either — the decision clock is the daily bar."),
+         },
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+     with open(args.out, "w", encoding="utf-8") as handle:
+         json.dump(payload, handle, indent=2, ensure_ascii=False)
+diff --git a/tools/slice67_forward_shadow.py b/tools/slice67_forward_shadow.py
+index 7d80ec7..8abbbfa 100644
+--- a/tools/slice67_forward_shadow.py
++++ b/tools/slice67_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/7"
+ SCHEDULE_MODE = "one_entry_per_contiguous_run"
+@@ -438,8 +439,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice67_freshness.py b/tools/slice67_freshness.py
+index f1e769a..5da66d6 100644
+--- a/tools/slice67_freshness.py
++++ b/tools/slice67_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/8"
+ NOTE_PATH = "docs/human/HUMAN_DATA_NOTE_SLICE64.md"
+@@ -407,8 +408,7 @@ def main(argv=None) -> int:
+             "design_note": "EDGE.md §46a, §46b",
+         },
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice67_promotion_gate.py b/tools/slice67_promotion_gate.py
+index bde76f8..07fb899 100644
+--- a/tools/slice67_promotion_gate.py
++++ b/tools/slice67_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice66_promotion_gate.json"
+@@ -173,8 +174,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice68_forward_shadow.py b/tools/slice68_forward_shadow.py
+index 8b4ec9a..511024e 100644
+--- a/tools/slice68_forward_shadow.py
++++ b/tools/slice68_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/8"
+ SCHEDULE_MODE = "one_entry_per_contiguous_run"
+@@ -447,8 +448,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice68_freshness.py b/tools/slice68_freshness.py
+index 53b02d1..7dbf2d0 100644
+--- a/tools/slice68_freshness.py
++++ b/tools/slice68_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/9"
+ 
+@@ -489,8 +490,7 @@ def main(argv=None) -> int:
+             "design_note": "EDGE.md §46a, §46b",
+         },
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice68_promotion_gate.py b/tools/slice68_promotion_gate.py
+index ab1b185..a470995 100644
+--- a/tools/slice68_promotion_gate.py
++++ b/tools/slice68_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice67_promotion_gate.json"
+@@ -171,8 +172,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice69_forward_shadow.py b/tools/slice69_forward_shadow.py
+index b227a37..3c18002 100644
+--- a/tools/slice69_forward_shadow.py
++++ b/tools/slice69_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/9"
+ SCHEDULE_MODE = "one_entry_per_contiguous_run"
+@@ -459,8 +460,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice69_freshness.py b/tools/slice69_freshness.py
+index 297a7e7..cbb5957 100644
+--- a/tools/slice69_freshness.py
++++ b/tools/slice69_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/10"
+ 
+@@ -508,8 +509,7 @@ def main(argv=None) -> int:
+             "design_note": "EDGE.md §51a",
+         },
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice69_promotion_gate.py b/tools/slice69_promotion_gate.py
+index ec2faff..3ac1c18 100644
+--- a/tools/slice69_promotion_gate.py
++++ b/tools/slice69_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice68_promotion_gate.json"
+@@ -170,8 +171,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice70_forward_shadow.py b/tools/slice70_forward_shadow.py
+index 25fef78..22f83e0 100644
+--- a/tools/slice70_forward_shadow.py
++++ b/tools/slice70_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/9"
+ SCHEDULE_MODE = "one_entry_per_contiguous_run"
+@@ -512,8 +513,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice70_freshness.py b/tools/slice70_freshness.py
+index e74e9cd..50dd389 100644
+--- a/tools/slice70_freshness.py
++++ b/tools/slice70_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/11"
+ 
+@@ -584,8 +585,7 @@ def main(argv=None) -> int:
+             "design_note": "EDGE.md §51a",
+         },
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice70_promotion_gate.py b/tools/slice70_promotion_gate.py
+index 049bf10..6b90316 100644
+--- a/tools/slice70_promotion_gate.py
++++ b/tools/slice70_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice69_promotion_gate.json"
+@@ -176,8 +177,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice71_forward_shadow.py b/tools/slice71_forward_shadow.py
+index 62e76f5..2f375b7 100644
+--- a/tools/slice71_forward_shadow.py
++++ b/tools/slice71_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/10"
+ SLICE = 71
+@@ -523,8 +524,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice71_freshness.py b/tools/slice71_freshness.py
+index 8e2f309..13c0f57 100644
+--- a/tools/slice71_freshness.py
++++ b/tools/slice71_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/12"
+ 
+@@ -688,8 +689,7 @@ def main(argv=None) -> int:
+             "design_note": "EDGE.md §51a",
+         },
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice71_promotion_gate.py b/tools/slice71_promotion_gate.py
+index 9757703..b2c0461 100644
+--- a/tools/slice71_promotion_gate.py
++++ b/tools/slice71_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice70_promotion_gate.json"
+@@ -178,8 +179,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice72_forward_shadow.py b/tools/slice72_forward_shadow.py
+index b296370..d1ae9b9 100644
+--- a/tools/slice72_forward_shadow.py
++++ b/tools/slice72_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/11"
+ SLICE = 72
+@@ -565,8 +566,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice72_freshness.py b/tools/slice72_freshness.py
+index 81d8e6f..c815298 100644
+--- a/tools/slice72_freshness.py
++++ b/tools/slice72_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/13"
+ 
+@@ -761,8 +762,7 @@ def main(argv=None) -> int:
+             "design_note": "EDGE.md §51a",
+         },
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice72_promotion_gate.py b/tools/slice72_promotion_gate.py
+index db97db6..6017a03 100644
+--- a/tools/slice72_promotion_gate.py
++++ b/tools/slice72_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice71_promotion_gate.json"
+@@ -180,8 +181,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice73_forward_shadow.py b/tools/slice73_forward_shadow.py
+index dbc49fc..12080d1 100644
+--- a/tools/slice73_forward_shadow.py
++++ b/tools/slice73_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/12"
+ SLICE = 73
+@@ -694,8 +695,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice73_freshness.py b/tools/slice73_freshness.py
+index 67debfb..da31b43 100644
+--- a/tools/slice73_freshness.py
++++ b/tools/slice73_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/14"
+ 
+@@ -798,8 +799,7 @@ def main(argv=None) -> int:
+ 
+         "edge_state_when_this_ran": edge_state(),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice73_promotion_gate.py b/tools/slice73_promotion_gate.py
+index d7b5ee8..f29265c 100644
+--- a/tools/slice73_promotion_gate.py
++++ b/tools/slice73_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice72_promotion_gate.json"
+@@ -184,8 +185,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice74_forward_shadow.py b/tools/slice74_forward_shadow.py
+index b944a14..f9d7956 100644
+--- a/tools/slice74_forward_shadow.py
++++ b/tools/slice74_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/13"
+ SLICE = 74
+@@ -701,8 +702,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice74_freshness.py b/tools/slice74_freshness.py
+index dd90327..5cc615f 100644
+--- a/tools/slice74_freshness.py
++++ b/tools/slice74_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/15"
+ 
+@@ -855,8 +856,7 @@ def main(argv=None) -> int:
+ 
+         "edge_state_when_this_ran": edge_state(),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice74_promotion_gate.py b/tools/slice74_promotion_gate.py
+index 39d0cc0..0fe0d26 100644
+--- a/tools/slice74_promotion_gate.py
++++ b/tools/slice74_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice73_promotion_gate.json"
+@@ -184,8 +185,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice75_forward_shadow.py b/tools/slice75_forward_shadow.py
+index 20b1cb2..2b97897 100644
+--- a/tools/slice75_forward_shadow.py
++++ b/tools/slice75_forward_shadow.py
+@@ -106,6 +106,7 @@ import project_status as ps  # noqa: E402
+ import shadow  # noqa: E402
+ import skill_test as sk  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "forward_shadow_observation/14"
+ SLICE = 75
+@@ -755,8 +756,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice75_freshness.py b/tools/slice75_freshness.py
+index 95accbc..c8e753f 100644
+--- a/tools/slice75_freshness.py
++++ b/tools/slice75_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/16"
+ 
+@@ -908,8 +909,7 @@ def main(argv=None) -> int:
+ 
+         "edge_state_when_this_ran": edge_state(),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice75_promotion_gate.py b/tools/slice75_promotion_gate.py
+index f984d55..c95e22c 100644
+--- a/tools/slice75_promotion_gate.py
++++ b/tools/slice75_promotion_gate.py
+@@ -45,6 +45,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/3"
+ PREVIOUS = "artifacts/slice74_promotion_gate.json"
+@@ -184,8 +185,7 @@ def main(argv=None) -> int:
+             "no closed trade', which is a better-evidenced zero, not a "
+             "smaller gap."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+diff --git a/tools/slice76_forward_shadow.py b/tools/slice76_forward_shadow.py
+index c80464f..af2a48c 100644
+--- a/tools/slice76_forward_shadow.py
++++ b/tools/slice76_forward_shadow.py
+@@ -118,6 +118,7 @@ import numpy as np  # noqa: E402
+ 
+ import backtest as bt  # noqa: E402
+ import corpus_prefix as cp  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ import edge_measurement as em  # noqa: E402
+ import market_data as md  # noqa: E402
+ import project_status as ps  # noqa: E402
+@@ -800,8 +801,7 @@ def build(*, data_dir: str, funding_path: str, warmup: int,
+              "direction": t.direction, "net_r": t.net_r,
+              "notional_usd": t.notional_usd}
+             for t in closed_trades],
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+ 
+diff --git a/tools/slice76_freshness.py b/tools/slice76_freshness.py
+index 0444db7..4ee41e0 100644
+--- a/tools/slice76_freshness.py
++++ b/tools/slice76_freshness.py
+@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import corpus_prefix as cp  # noqa: E402
+ from signals import funding_carry_fade_btc_v1 as fb  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "data_freshness/17"
+ 
+@@ -1202,8 +1203,7 @@ def main(argv=None) -> int:
+ 
+         "edge_state_when_this_ran": edge_state(),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     with open(args.out, "w", encoding="utf-8") as handle:
+diff --git a/tools/slice76_promotion_gate.py b/tools/slice76_promotion_gate.py
+index 44b6e25..da9bd8c 100644
+--- a/tools/slice76_promotion_gate.py
++++ b/tools/slice76_promotion_gate.py
+@@ -59,6 +59,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
+ 
+ import promotion_gate as pg  # noqa: E402
+ import shadow  # noqa: E402
++import provenance as _provenance  # noqa: E402
+ 
+ SCHEMA = "promotion_gate/4"
+ PREVIOUS = "artifacts/slice75_promotion_gate.json"
+@@ -225,8 +226,7 @@ def main(argv=None) -> int:
+             "record of what was written when — and the residue is named here "
+             "instead. EDGE.md §59d."),
+ 
+-        "git_commit": subprocess.check_output(
+-            ["git", "rev-parse", "HEAD"], text=True, cwd=REPO).strip(),
++        "git_commit": _provenance.git_commit(REPO),
+     }
+ 
+     if payload["promotion_gate_allows_live"] or payload["evaluated"][
+-- 
+2.43.0
+

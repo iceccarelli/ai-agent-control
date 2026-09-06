@@ -1,0 +1,38 @@
+==============================================================================
+COUNT FINDING — funding_carry_fade_v1   (no scores, no percentiles)
+==============================================================================
+  rule             : |f| >= 0.0001 at the LAST funding print on or before the bar close   (frozen)
+  direction        : f >= +0.0001 -> SHORT (fade rich long carry); f <= -0.0001 -> LONG
+  barrier          : +1.5/-1.5 ATR, horizon 5, 25 bps, entry next_open, on the LINEAR daily series
+  costs            : 25 bps round trip PLUS the funding actually paid over each hold
+  hard gate        : >= 50 scored trades per symbol
+
+  BTCUSDT  1,461 bars   setups  417   scoreable  417   entries   85   -> MEETS the 50-trade gate
+  ETHUSDT  1,461 bars   setups  415   scoreable  415   entries   76   -> MEETS the 50-trade gate
+  SOLUSDT  1,461 bars   setups  534   scoreable  531   entries  162   -> MEETS the 50-trade gate
+
+------------------------------------------------------------------------------
+WHERE THE SAMPLE GOES — the join, then the scheduler
+------------------------------------------------------------------------------
+  BTCUSDT  4,383 funding prints; 1,461 of 1,461 bars joined a rate (no forward-fill)
+           417 setups -> 85 contiguous runs (longest 66) -> 85 entries (6 long / 79 short)
+           funding ADJUSTMENT to net R: -0.0153 on longs, +0.0153 on shorts
+           (a short RECEIVES positive funding, so its net R rises; a long pays. Applied to observed AND every replicate.)
+  ETHUSDT  4,383 funding prints; 1,461 of 1,461 bars joined a rate (no forward-fill)
+           415 setups -> 76 contiguous runs (longest 96) -> 76 entries (8 long / 68 short)
+           funding ADJUSTMENT to net R: -0.0115 on longs, +0.0115 on shorts
+           (a short RECEIVES positive funding, so its net R rises; a long pays. Applied to observed AND every replicate.)
+  SOLUSDT  4,458 funding prints; 1,461 of 1,461 bars joined a rate (no forward-fill)
+           534 setups -> 162 contiguous runs (longest 86) -> 162 entries (65 long / 97 short)
+           funding ADJUSTMENT to net R: -0.0032 on longs, +0.0032 on shorts
+           (a short RECEIVES positive funding, so its net R rises; a long pays. Applied to observed AND every replicate.)
+
+Rich funding PERSISTS for days, so the flags form long runs and
+simulate_schedule takes one entry per run (slice 17 — the rule that
+makes the rotation null valid). The gap between setups and entries
+is that persistence, not a defect, and it is printed rather than
+described so the control is not asked to explain it later.
+
+==============================================================================
+COUNT FINDING: every symbol clears the >= 50 hard gate.
+==============================================================================

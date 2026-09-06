@@ -1,0 +1,5 @@
+fold,start,end,trades,mean_r,percentile,note
+1,200,515,0,,,no scoreable entries
+2,515,830,5,0.16492989669022998,,5 trades: too few for a stable percentile
+3,830,1145,22,0.2290238134291907,96.2,
+4,1145,1461,14,0.08951375764090244,63.0,

@@ -1,0 +1,56 @@
+==============================================================================
+PAPER SESSION DEMO — offline stub, no network, no credentials used
+==============================================================================
+  ENTRIES_ENABLED : False
+  ticks           : 10
+
+mode: SANDBOX | testnet=True paper=True | SANDBOX (TESTNET+PAPER) — live trading not armed
+reconciliation: {'checked': 0, 'resolved': 0, 'still_open': 0, 'unknown': 0, 'naked_positions': []}
+artefact slice35_edge_btc_alt_spillover_ETHUSDT_summary.json reports EDGE_EVIDENCE_POSITIVE but carries no validated-control attestation; refusing. A number measured with an unchecked ruler is not a claim.
+funding_carry_fade_v1 cleared on BTCUSDT (1 of the 3 symbols its pre-declaration names: BTCUSDT, ETHUSDT, SOLUSDT), but that pre-declaration requires at least 2. A single symbol clearing while its companions fail is ABSENT, not an almost-POSITIVE. Refusing.
+PROJECT MODE | timing_skill_research=CLOSED | cleared_edge_signal=none | execution_mode=paper | policy_mode=off | entries_enabled=False | live_authorized=False | NO EDGE CLAIM — timing-skill research CLOSED
+artefact slice35_edge_btc_alt_spillover_ETHUSDT_summary.json reports EDGE_EVIDENCE_POSITIVE but carries no validated-control attestation; refusing. A number measured with an unchecked ruler is not a claim.
+funding_carry_fade_v1 cleared on BTCUSDT (1 of the 3 symbols its pre-declaration names: BTCUSDT, ETHUSDT, SOLUSDT), but that pre-declaration requires at least 2. A single symbol clearing while its companions fail is ABSENT, not an almost-POSITIVE. Refusing.
+paper session 0ee84f05a5ad440ab9cb2148b7cc11a4 start | entries_enabled=False paper=True testnet=True live_authorized=False | NO EDGE CLAIM — timing-skill research CLOSED
+artefact slice35_edge_btc_alt_spillover_ETHUSDT_summary.json reports EDGE_EVIDENCE_POSITIVE but carries no validated-control attestation; refusing. A number measured with an unchecked ruler is not a claim.
+funding_carry_fade_v1 cleared on BTCUSDT (1 of the 3 symbols its pre-declaration names: BTCUSDT, ETHUSDT, SOLUSDT), but that pre-declaration requires at least 2. A single symbol clearing while its companions fail is ABSENT, not an almost-POSITIVE. Refusing.
+artefact slice35_edge_btc_alt_spillover_ETHUSDT_summary.json reports EDGE_EVIDENCE_POSITIVE but carries no validated-control attestation; refusing. A number measured with an unchecked ruler is not a claim.
+funding_carry_fade_v1 cleared on BTCUSDT (1 of the 3 symbols its pre-declaration names: BTCUSDT, ETHUSDT, SOLUSDT), but that pre-declaration requires at least 2. A single symbol clearing while its companions fail is ABSENT, not an almost-POSITIVE. Refusing.
+artefact slice35_edge_btc_alt_spillover_ETHUSDT_summary.json reports EDGE_EVIDENCE_POSITIVE but carries no validated-control attestation; refusing. A number measured with an unchecked ruler is not a claim.
+funding_carry_fade_v1 cleared on BTCUSDT (1 of the 3 symbols its pre-declaration names: BTCUSDT, ETHUSDT, SOLUSDT), but that pre-declaration requires at least 2. A single symbol clearing while its companions fail is ABSENT, not an almost-POSITIVE. Refusing.
+paper session 0ee84f05a5ad440ab9cb2148b7cc11a4 end | ticks=10 orders_submitted=0 kill_switch=False | NO EDGE CLAIM — timing-skill research CLOSED
+artefact slice35_edge_btc_alt_spillover_ETHUSDT_summary.json reports EDGE_EVIDENCE_POSITIVE but carries no validated-control attestation; refusing. A number measured with an unchecked ruler is not a claim.
+funding_carry_fade_v1 cleared on BTCUSDT (1 of the 3 symbols its pre-declaration names: BTCUSDT, ETHUSDT, SOLUSDT), but that pre-declaration requires at least 2. A single symbol clearing while its companions fail is ABSENT, not an almost-POSITIVE. Refusing.
+  session record
+  --------------------------------------------------------------------------
+    cleared_edge_signal   : None
+    ended_utc             : 2026-08-09T15:18:13Z
+    entries_enabled       : False
+    kill_switch_engaged   : False
+    kill_switch_reason    : 
+    live_authorized       : False
+    model_loaded          : False
+    no_edge_claim         : NO EDGE CLAIM — timing-skill research CLOSED
+    orders_submitted      : 0
+    paper                 : True
+    policy_mode           : off
+    reconciled            : True
+    schema                : paper_session/1
+    session_id            : 0ee84f05a5ad440ab9cb2148b7cc11a4
+    started_utc           : 2026-08-09T15:18:13Z
+    testnet               : True
+    ticks                 : 10
+    timing_skill_research : CLOSED
+
+  health.healthy        : True
+  exchange order bodies : 0
+  decisions journalled  : 0  (none)
+
+shutting down
+artefact slice35_edge_btc_alt_spillover_ETHUSDT_summary.json reports EDGE_EVIDENCE_POSITIVE but carries no validated-control attestation; refusing. A number measured with an unchecked ruler is not a claim.
+funding_carry_fade_v1 cleared on BTCUSDT (1 of the 3 symbols its pre-declaration names: BTCUSDT, ETHUSDT, SOLUSDT), but that pre-declaration requires at least 2. A single symbol clearing while its companions fail is ABSENT, not an almost-POSITIVE. Refusing.
+  OK — the session behaved as docs/PAPER_RUNBOOK.md describes.
+  NO EDGE CLAIM — timing-skill research CLOSED
+  A clean paper session is evidence the plumbing works. It is NOT
+  evidence of timing skill, which measurement has twice refused to
+  support. See RESEARCH_CLOSE_STAGE1.md.

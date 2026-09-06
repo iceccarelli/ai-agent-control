@@ -1,0 +1,8 @@
+# Exact versions against which the 4,953-test suite was last run green
+# (2026-09-05, Python 3.12 sandbox; Dockerfile pins python:3.11-slim).
+# Install with:  pip install -r requirements.txt -c constraints.txt
+# requirements.txt keeps the ranges; this file pins what was actually tested.
+requests==2.33.1
+numpy==2.4.4
+scipy==1.17.1
+scikit-learn==1.8.0

@@ -1,0 +1,59 @@
+==============================================================================
+REAL-SERIES EDGE MEASUREMENT (slice 24)
+==============================================================================
+BTCUSD: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : BTCUSD
+bars              : 3,135
+
+Instrument path = the configuration whose control PASSED at n=200
+(EDGE.md 4u: median 48.0, z = -1.18, KS p = 0.435, 0 incomplete):
+  null rotation | lock-up 1 | one trade per run | 1,500 replicates
+  barrier +1.5/-1.5 ATR, 3-bar horizon, 25 bps round trip
+
+Bars pre-declared in EDGE.md 5b, before any number existed:
+  M1  real-series percentile          >= 95.0
+  M2  Delta > 0, 95% CI excludes 0, percentile >= 95.0
+  M3  >= 3 of 4 folds mean net R > 0 (soft, supporting only)
+
+signal            : post_shock_fade_v1  (own shock >= 2 x ATR%, FADED, two-sided, fill at next open)
+setups            : 45  (15 long / 30 short)
+setups scoreable  : 45  (15 long / 30 short)
+
+real-series schedule: 41 trades from 41 flag runs
+strategy mean net R : -0.2991
+
+M1: ranking against the validated rotation null ...
+  replicates        : 1,500 of 1,500
+  null mean net R   : -0.0517  (sd 0.1149)
+  null trade counts : median 41
+  M1 PERCENTILE     : 1.6   bar 95.0   -> FAIL
+
+M2: drift-controlled contrast against shape-matched schedules ...
+  schedules         : 200 of 200
+  Side N mean net R : -0.0511  (sd 0.1145)
+  Side N trades     : median 41   (Side S: 41)
+  Delta             : -0.2480   95% CI [-0.2640, -0.2325]
+  M2 PERCENTILE     : 2.0  bar 95.0
+  M2                -> FAIL   (needs Delta>0 AND CI excludes 0 AND percentile>=95.0)
+
+M3: walk-forward, per fold ...
+  fold 1: bars 200-933   13 trades  mean net R -0.4772  percentile 1.0
+  fold 2: bars 933-1666    7 trades  mean net R -0.1659  percentile n/a  [7 trades: too few for a stable percentile]
+  fold 3: bars 1666-2399   15 trades  mean net R -0.3164  percentile 10.2
+  fold 4: bars 2399-3135    6 trades  mean net R -0.0256  percentile n/a  [6 trades: too few for a stable percentile]
+  folds with mean net R > 0 : 0 of 4   soft gate NOT met (supporting only)
+
+==============================================================================
+DECISION
+==============================================================================
+  M1  percentile 1.6 vs bar 95.0  -> FAIL
+  M2  delta -0.2480, CI [-0.2640, -0.2325], percentile 2.0  -> FAIL
+  M3  0/4 folds positive  (soft, supporting only)
+
+  EDGE_EVIDENCE_ABSENT
+
+  The pre-declared bars are not met. No threshold, stop, size or
+  confidence parameter may be retuned to change this reading.
+  control_validated : True
+
+artifacts: artifacts/slice43_edge_post_shock_fade_BTCUSD_summary.json / _null_distributions.csv / _folds.csv

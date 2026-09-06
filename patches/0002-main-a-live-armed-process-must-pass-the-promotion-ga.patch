@@ -1,0 +1,363 @@
+From 6e791e28d5f0668fac662135f5b810f82d4a0da0 Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Fri, 4 Sep 2026 22:26:21 +0000
+Subject: [PATCH 02/10] main: a live-armed process must pass the promotion gate
+ and attach the cleared signal
+
+INVARIANT PROTECTED: no unmeasured strategy can touch real money, and the
+promotion gate is consulted in code, not only in tools.
+
+Finding (audit S20, the CRITICAL item): promotion_gate_allows_live() was
+read only by tools/sliceNN_promotion_gate.py. Setting USE_TESTNET=0,
+PAPER_TRADING=0, LIVE_TRADING_ACK=I_UNDERSTAND plus credentials on this
+tree started the bot on mainnet with MarketStrategy (RSI/MACD/BB/
+Supertrend voter, never scored against a null) at 0.5% risk, 2% notional
+per trade, up to 3 positions, no $100 cap, and no reference to the
+Stage-1 clear. Every documented fail-closed promotion invariant lived in
+prose and in a report generator.
+
+Thought process: config.py must stay the single authority on ARMING the
+process (four-part chain, no FORCE_LIVE, AST-tested). The gate answers a
+different question - has the STRATEGY earned live - so the check belongs
+in the orchestrator, after assert_sandbox and before the first network
+call, and it may only refuse. It is evaluated only when live is armed,
+so paper/testnet behaviour is byte-identical (test pins that the gate is
+never even imported in sandbox).
+
+What changed:
+  main.py            - TradingBot.live_promotion_check(): requires
+                       promotion_gate_allows_live(config=cfg) AND
+                       strategy.signal_name == ProjectStatus.cleared_edge_signal
+                       (or no strategy). Exceptions refuse. startup() calls it
+                       when live_armed and returns False on refusal.
+  shadow_strategy.py - ShadowStrategy.signal_name = shadow.SHADOW_SIGNAL, the
+                       only strategy class that carries the cleared identity.
+  tests/test_live_promotion_check.py - 7 tests: refuses before any transport
+                       request; names the gate; unnamed strategy refused even
+                       with gate True; named+cleared+gate True passes; gate
+                       exception refuses; sandbox never consults the gate.
+
+What did NOT change: GATE_PATH, FUND_ABS, any threshold, config.py.
+On this tree the check always refuses (2/8 items complete) - which is
+the point: live is now impossible from this tree for the right reason.
+
+Verification: 425 passed across orchestrator, paper cert, shadow pack,
+config and the new file.
+
+Revision after the full suite: tests/test_funding_carry_fade_btc_v1.py
+::test_no_trading_path_consults_the_cleared_edge_field pins that main,
+config, risk_management, trading_engine, position_sizing and policy never
+contain the string cleared_edge_signal - "a research record would have
+become a trading permission". The first cut of this patch read the field
+in main.py to REFUSE, which is the opposite of a permission, but the
+string guard is right in spirit and was not weakened. The comparison
+now lives in promotion_gate.strategy_is_the_cleared_signal(): a
+negative-only predicate (None strategy ok; no signal_name -> refuse;
+mismatch -> refuse; a True is one necessary condition, never a grant).
+main.py calls it and contains no reference to the research field. Two
+tests added: main's source is clean of the string; the identity check
+returning True still leaves promotion_gate_allows_live() False on this
+tree. 9 tests in the file.
+---
+ main.py                            |  46 ++++++++
+ promotion_gate.py                  |  32 ++++++
+ shadow_strategy.py                 |   5 +
+ tests/test_live_promotion_check.py | 163 +++++++++++++++++++++++++++++
+ 4 files changed, 246 insertions(+)
+ create mode 100644 tests/test_live_promotion_check.py
+
+diff --git a/main.py b/main.py
+index 6cb0d42..de1b8ec 100644
+--- a/main.py
++++ b/main.py
+@@ -259,6 +259,15 @@ class TradingBot:
+             getattr(self.cfg, "PAPER_TRADING", True),
+             live_why,
+         )
++        if live_armed:
++            # The four-part env chain arms the PROCESS. It says nothing about
++            # whether the STRATEGY has earned live. That second question has
++            # its own authority (promotion_gate) and, until this check, nothing
++            # on the order path asked it. Asked here, before any network call.
++            allowed, why = self.live_promotion_check()
++            if not allowed:
++                logger.critical("startup blocked (live requested): %s", why)
++                return False
+ 
+         try:
+             self.client.sync_time()
+@@ -311,6 +320,43 @@ class TradingBot:
+         self.session.start(reconciled=self._reconciled)
+         return True
+ 
++    def live_promotion_check(self) -> "tuple[bool, str]":
++        """May a LIVE-armed process proceed? ``(allowed, reason)``. Fails closed.
++
++        Two conditions, both required, evaluated only when live is armed:
++
++        1. ``promotion_gate.promotion_gate_allows_live()`` is True - every
++           checklist item complete AND the live chain satisfied. The gate file
++           is read from its canonical path; a missing or unreadable file
++           refuses. The gate is never re-aimed from here.
++        2. ``promotion_gate.strategy_is_the_cleared_signal`` accepts the
++           attached strategy. A strategy without ``signal_name`` (the
++           technical-analysis voter) has never been measured against a null
++           and may not touch real money. No strategy at all is fine: the loop
++           then reconciles and protects only. The research field itself is
++           read by promotion_gate, not here, so it stays inert as a permission.
++
++        This function cannot arm anything. It can only refuse.
++        """
++        try:
++            import promotion_gate as _gate
++            if not _gate.promotion_gate_allows_live(config=self.cfg):
++                verdict = _gate.evaluate_promotion_gate(config=self.cfg)
++                return False, "promotion gate refuses: " + "; ".join(
++                    verdict.reasons[:3] or ["no reason recorded"])
++        except Exception as exc:  # noqa: BLE001
++            return False, f"promotion gate could not be evaluated ({exc}); refusing"
++
++        try:
++            import promotion_gate as _gate
++            ok, why = _gate.strategy_is_the_cleared_signal(self.strategy,
++                                                           config=self.cfg)
++        except Exception as exc:  # noqa: BLE001
++            return False, f"strategy identity could not be checked ({exc}); refusing"
++        if not ok:
++            return False, why
++        return True, "promotion gate allows live and the cleared signal is attached"
++
+     def run(self) -> int:
+         """Blocking main loop. Returns a process exit code."""
+         if not self.startup():
+diff --git a/promotion_gate.py b/promotion_gate.py
+index 79ad7f4..f62f53f 100644
+--- a/promotion_gate.py
++++ b/promotion_gate.py
+@@ -241,6 +241,38 @@ def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None
+                        items=items, reasons=reasons)
+ 
+ 
++def strategy_is_the_cleared_signal(strategy: Any, *, config: Any = None,
++                                   artifact_dir: Optional[str] = None
++                                   ) -> Tuple[bool, str]:
++    """Is ``strategy`` the one the research record cleared? ``(ok, reason)``.
++
++    A NEGATIVE-ONLY check: it can refuse a live-armed process whose attached
++    strategy is not the cleared signal. It can never grant anything - a True
++    here is one necessary condition among several, all evaluated by
++    :func:`promotion_gate_allows_live` and config's arming chain. The
++    research field stays inert as a permission: this function is the only
++    place outside reporting that reads it, and it reads it to say no.
++
++    ``None`` strategy is fine (a loop that only reconciles and protects).
++    A strategy without ``signal_name`` is refused: nothing unmeasured may be
++    attached to a live process.
++    """
++    if strategy is None:
++        return True, "no strategy attached"
++    try:
++        import project_status as _ps
++        cleared = _ps.current(config, artifact_dir=artifact_dir).cleared_edge_signal
++    except Exception as exc:  # noqa: BLE001
++        return False, f"project status unreadable ({exc}); refusing"
++    name = getattr(strategy, "signal_name", None)
++    if not cleared or name != cleared:
++        return False, (
++            f"attached strategy {type(strategy).__name__} (signal_name={name!r}) "
++            f"is not the cleared edge signal {cleared!r}; an unmeasured strategy "
++            f"may not trade live")
++    return True, f"attached strategy is the cleared signal {cleared!r}"
++
++
+ def promotion_gate_allows_live(*, path: str = GATE_PATH,
+                                repo: Optional[str] = None,
+                                config: Any = None) -> bool:
+diff --git a/shadow_strategy.py b/shadow_strategy.py
+index 09b7264..d4ae635 100644
+--- a/shadow_strategy.py
++++ b/shadow_strategy.py
+@@ -58,6 +58,11 @@ class ShadowStrategy:
+     freezing time, and so two runs over the same inputs give the same answer.
+     """
+ 
++    #: The identity the live promotion check compares against
++    #: ``ProjectStatus.cleared_edge_signal``. Only a strategy that declares the
++    #: cleared name may be attached to a live-armed process (main.py).
++    signal_name = shadow.SHADOW_SIGNAL
++
+     def __init__(self, *, status_provider, funding_provider, bar_provider,
+                  caps: Optional[shadow.ShadowCaps] = None,
+                  closed_trades: Optional[List[shadow.ShadowTrade]] = None,
+diff --git a/tests/test_live_promotion_check.py b/tests/test_live_promotion_check.py
+new file mode 100644
+index 0000000..325a392
+--- /dev/null
++++ b/tests/test_live_promotion_check.py
+@@ -0,0 +1,163 @@
++"""A live-armed process must consult the promotion gate before any network call.
++
++Invariant protected: promotion_gate_allows_live() was a report generator that
++nothing on the order path read (audit S20). With the four env flags set, the
++shell went live on mainnet with the unmeasured technical-analysis voter and no
++notional cap. These tests pin the new refusal in main.TradingBot.startup.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++import pytest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, os.path.dirname(HERE))
++sys.path.insert(0, HERE)
++
++import bybit_connection as bc  # noqa: E402
++import main as m  # noqa: E402
++import trading_engine as te  # noqa: E402
++from fake_bybit import API_KEY, API_SECRET, FakeBybit  # noqa: E402
++from persistence import StateStore  # noqa: E402
++from position_sizing import BillionairePositionSizing  # noqa: E402
++from risk_management import BillionaireRiskManager  # noqa: E402
++
++
++from test_orchestrator import Cfg  # noqa: E402
++
++
++class LiveCfg(Cfg):
++    USE_TESTNET = False
++    PAPER_TRADING = False
++    LIVE_TRADING_ACK = "I_UNDERSTAND"
++
++
++class SandboxCfg(LiveCfg):
++    USE_TESTNET = True
++    PAPER_TRADING = True
++
++
++class NamedStrategy:
++    signal_name = "funding_carry_fade_btc_v1"
++
++    def signal_for(self, symbol):
++        return None
++
++
++class UnnamedStrategy:
++    def signal_for(self, symbol):
++        return None
++
++
++def build(tmp_path, cfg, strategy=None):
++    exchange = FakeBybit(balances={"USDT": 1_000.0}, equity=1_000.0)
++    store = StateStore(str(tmp_path / "state.db"))
++    store.update_equity(1_000.0)
++    client = bc.BybitClient(config=cfg, store=store, transport=exchange)
++    risk = BillionaireRiskManager(config=cfg, store=store)
++    engine = te.TradingEngine(
++        client=client, risk_manager=risk,
++        position_sizer=BillionairePositionSizing(config=cfg, risk_manager=risk),
++        store=store, config=cfg,
++    )
++    bot = m.TradingBot(config=cfg, store=store, client=client,
++                       risk_manager=risk, engine=engine, strategy=strategy)
++    return bot, exchange
++
++
++def test_live_armed_with_gate_false_refuses_before_any_network_call(tmp_path):
++    bot, exchange = build(tmp_path, LiveCfg(), strategy=UnnamedStrategy())
++    n_before = len(exchange.requests)
++    assert bot.startup() is False
++    # sync_time is the first network call in startup; it must not have run.
++    assert len(exchange.requests) == n_before
++    bot.shutdown()
++
++
++def test_live_armed_check_names_the_gate_as_the_refuser(tmp_path):
++    bot, _ = build(tmp_path, LiveCfg(), strategy=NamedStrategy())
++    allowed, why = bot.live_promotion_check()
++    assert allowed is False
++    assert "promotion gate" in why
++    bot.shutdown()
++
++
++def test_unnamed_strategy_is_refused_even_if_the_gate_said_yes(tmp_path, monkeypatch):
++    import promotion_gate
++    monkeypatch.setattr(promotion_gate, "promotion_gate_allows_live",
++                        lambda **kw: True)
++    bot, _ = build(tmp_path, LiveCfg(), strategy=UnnamedStrategy())
++    allowed, why = bot.live_promotion_check()
++    assert allowed is False
++    assert "not the cleared edge signal" in why
++    bot.shutdown()
++
++
++def test_named_strategy_matching_cleared_signal_passes_when_gate_says_yes(
++        tmp_path, monkeypatch):
++    import promotion_gate
++    import project_status
++    monkeypatch.setattr(promotion_gate, "promotion_gate_allows_live",
++                        lambda **kw: True)
++
++    class Status:
++        cleared_edge_signal = "funding_carry_fade_btc_v1"
++    monkeypatch.setattr(project_status, "current", lambda cfg=None, **k: Status())
++    bot, _ = build(tmp_path, LiveCfg(), strategy=NamedStrategy())
++    allowed, _ = bot.live_promotion_check()
++    assert allowed is True
++    bot.shutdown()
++
++
++def test_gate_exception_refuses(tmp_path, monkeypatch):
++    import promotion_gate
++
++    def boom(**kw):
++        raise RuntimeError("disk on fire")
++    monkeypatch.setattr(promotion_gate, "promotion_gate_allows_live", boom)
++    bot, _ = build(tmp_path, LiveCfg(), strategy=NamedStrategy())
++    allowed, why = bot.live_promotion_check()
++    assert allowed is False and "could not be evaluated" in why
++    bot.shutdown()
++
++
++def test_sandbox_never_consults_the_gate(tmp_path, monkeypatch):
++    import promotion_gate
++
++    def boom(**kw):
++        raise AssertionError("gate must not be consulted in sandbox")
++    monkeypatch.setattr(promotion_gate, "promotion_gate_allows_live", boom)
++    bot, _ = build(tmp_path, SandboxCfg(), strategy=UnnamedStrategy())
++    assert bot.startup() is True
++    bot.shutdown()
++
++
++def test_shadow_strategy_declares_the_cleared_name():
++    import shadow
++    import shadow_strategy
++    assert shadow_strategy.ShadowStrategy.signal_name == shadow.SHADOW_SIGNAL
++    assert shadow.SHADOW_SIGNAL == "funding_carry_fade_btc_v1"
++
++
++def test_main_does_not_read_the_research_field_itself():
++    """The research record stays inert as a permission: only promotion_gate
++    reads cleared_edge_signal, and only to refuse. Mirrors the guard in
++    tests/test_funding_carry_fade_btc_v1.py."""
++    import inspect
++    assert "cleared_edge_signal" not in inspect.getsource(m)
++
++
++def test_identity_check_is_negative_only(monkeypatch):
++    import promotion_gate
++
++    class Status:
++        cleared_edge_signal = "funding_carry_fade_btc_v1"
++    import project_status
++    monkeypatch.setattr(project_status, "current", lambda cfg=None, **k: Status())
++    assert promotion_gate.strategy_is_the_cleared_signal(None)[0] is True
++    assert promotion_gate.strategy_is_the_cleared_signal(UnnamedStrategy())[0] is False
++    assert promotion_gate.strategy_is_the_cleared_signal(NamedStrategy())[0] is True
++    # a True here is NOT live: the gate's own predicate still refuses on this tree
++    assert promotion_gate.promotion_gate_allows_live() is False
+-- 
+2.43.0
+

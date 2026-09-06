@@ -1,0 +1,32 @@
+==============================================================================
+SLICE 57 — FOLD CALENDAR LOCKED
+==============================================================================
+
+  signal          : funding_carry_fade_btc_v1  (BTCUSDT only)
+  method          : index_midpoint_50pct
+  created_utc     : 2026-08-10T07:44:47Z
+
+  t0              : 2022-08-10T00:00:00Z
+  t_mid           : 2024-08-09T00:00:00Z        <- the cut
+  t1              : 2026-08-09T00:00:00Z
+
+  bars total      : 1,461
+  mid_index       : 730
+  early [t0,t_mid): 730 bars   burn-in, may NOT register
+  late  [t_mid,t1]: 731 bars   OOS, the ONLY registering window
+
+  linear  sha256  : 3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55
+  funding sha256  : 9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145
+
+------------------------------------------------------------------------------
+  FOLDS FILE      : artifacts/funding_carry_fade_btc_v1_folds.json
+  FOLDS SHA256    : ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c
+------------------------------------------------------------------------------
+
+This file was written BEFORE signals/funding_carry_fade_btc_v1.py
+existed, before any count, before any control and before any
+percentile. From this point t_mid may not be moved. If the OOS trade
+count falls below the intake's floor of 40 the verdict is
+INCONCLUSIVE and this calendar is unchanged — a cut adjusted to clear
+a count is a parameter fitted to a result, and it would be nearly
+invisible in a summary.

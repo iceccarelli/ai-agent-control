@@ -1,0 +1,210 @@
+{
+  "schema": "data_intake/2",
+  "min_bars_for_stage1": {
+    "daily": 500,
+    "intraday": 2000
+  },
+  "corpora": [
+    {
+      "path": "data/real_1d",
+      "exists": true,
+      "interval_label": "D",
+      "is_synthetic": false,
+      "is_real_exchange_ohlcv": true,
+      "symbols": [
+        "BTC_USD"
+      ],
+      "bar_count": 2564,
+      "timestamp_policy": "UTC",
+      "required_columns_ok": true,
+      "gap_policy_result": "pass",
+      "min_bars_for_stage1": 500,
+      "eligible_for_stage1": true,
+      "ineligible_reasons": []
+    },
+    {
+      "path": "data/real_4h",
+      "exists": true,
+      "interval_label": "4H",
+      "is_synthetic": false,
+      "is_real_exchange_ohlcv": true,
+      "symbols": [
+        "BTC_USD"
+      ],
+      "bar_count": 15379,
+      "timestamp_policy": "UTC",
+      "required_columns_ok": true,
+      "gap_policy_result": "pass",
+      "min_bars_for_stage1": 2000,
+      "eligible_for_stage1": true,
+      "ineligible_reasons": []
+    },
+    {
+      "path": "data/real",
+      "exists": true,
+      "interval_label": "1H",
+      "is_synthetic": false,
+      "is_real_exchange_ohlcv": true,
+      "symbols": [
+        "BTC_USD"
+      ],
+      "bar_count": 61513,
+      "timestamp_policy": "UTC",
+      "required_columns_ok": true,
+      "gap_policy_result": "pass",
+      "min_bars_for_stage1": 2000,
+      "eligible_for_stage1": true,
+      "ineligible_reasons": []
+    },
+    {
+      "path": "data/ohlcv",
+      "exists": true,
+      "interval_label": "1H",
+      "is_synthetic": true,
+      "is_real_exchange_ohlcv": false,
+      "symbols": [
+        "BTC_USDT",
+        "ETH_USDT",
+        "SOL_USDT"
+      ],
+      "bar_count": 5000,
+      "timestamp_policy": "UTC",
+      "required_columns_ok": true,
+      "gap_policy_result": "pass",
+      "min_bars_for_stage1": 2000,
+      "eligible_for_stage1": false,
+      "ineligible_reasons": [
+        "corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence"
+      ]
+    },
+    {
+      "path": "data/orderbook",
+      "exists": true,
+      "interval_label": "1H",
+      "is_synthetic": true,
+      "is_real_exchange_ohlcv": false,
+      "symbols": [],
+      "bar_count": null,
+      "timestamp_policy": "unknown",
+      "required_columns_ok": false,
+      "gap_policy_result": "unknown",
+      "min_bars_for_stage1": 2000,
+      "eligible_for_stage1": false,
+      "ineligible_reasons": [
+        "corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence",
+        "required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)",
+        "timestamp gap policy: unknown (need strictly increasing, no duplicates)",
+        "bar count unreadable"
+      ]
+    },
+    {
+      "path": "data/quotes",
+      "exists": true,
+      "interval_label": "1H",
+      "is_synthetic": true,
+      "is_real_exchange_ohlcv": false,
+      "symbols": [],
+      "bar_count": null,
+      "timestamp_policy": "unknown",
+      "required_columns_ok": false,
+      "gap_policy_result": "unknown",
+      "min_bars_for_stage1": 2000,
+      "eligible_for_stage1": false,
+      "ineligible_reasons": [
+        "corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence",
+        "required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)",
+        "timestamp gap policy: unknown (need strictly increasing, no duplicates)",
+        "bar count unreadable"
+      ]
+    },
+    {
+      "path": "data/anomalies",
+      "exists": true,
+      "interval_label": "1H",
+      "is_synthetic": true,
+      "is_real_exchange_ohlcv": false,
+      "symbols": [],
+      "bar_count": 3,
+      "timestamp_policy": "unknown",
+      "required_columns_ok": false,
+      "gap_policy_result": "fail",
+      "min_bars_for_stage1": 2000,
+      "eligible_for_stage1": false,
+      "ineligible_reasons": [
+        "corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence",
+        "required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)",
+        "timestamp gap policy: fail (need strictly increasing, no duplicates)",
+        "only 3 bars; Stage 1 needs >= 2000 at 1H"
+      ]
+    },
+    {
+      "path": "data/real_multi_1d",
+      "exists": true,
+      "interval_label": "D",
+      "is_synthetic": false,
+      "is_real_exchange_ohlcv": true,
+      "symbols": [
+        "ETH_USDT",
+        "SOL_USDT"
+      ],
+      "bar_count": 1461,
+      "timestamp_policy": "UTC",
+      "required_columns_ok": true,
+      "gap_policy_result": "pass",
+      "min_bars_for_stage1": 500,
+      "eligible_for_stage1": true,
+      "ineligible_reasons": []
+    },
+    {
+      "path": "data/real_multi_1h",
+      "exists": true,
+      "interval_label": "1H",
+      "is_synthetic": false,
+      "is_real_exchange_ohlcv": true,
+      "symbols": [
+        "ETH_USDT",
+        "SOL_USDT"
+      ],
+      "bar_count": 35063,
+      "timestamp_policy": "UTC",
+      "required_columns_ok": true,
+      "gap_policy_result": "pass",
+      "min_bars_for_stage1": 2000,
+      "eligible_for_stage1": true,
+      "ineligible_reasons": []
+    }
+  ],
+  "stage1_eligible_corpus_paths": [
+    "data/real_1d",
+    "data/real_4h",
+    "data/real",
+    "data/real_multi_1d",
+    "data/real_multi_1h"
+  ],
+  "multi_asset_corpus_present": true,
+  "non_btc_real_symbols": [
+    "ETH_USDT",
+    "SOL_USDT"
+  ],
+  "non_btc_real_symbols_by_corpus": {
+    "data/real_multi_1d": [
+      "ETH_USDT",
+      "SOL_USDT"
+    ],
+    "data/real_multi_1h": [
+      "ETH_USDT",
+      "SOL_USDT"
+    ]
+  },
+  "non_btc_synthetic_symbols_present": [
+    "ETH_USDT",
+    "SOL_USDT"
+  ],
+  "non_btc_synthetic_symbols_by_corpus": {
+    "data/ohlcv": [
+      "ETH_USDT",
+      "SOL_USDT"
+    ]
+  },
+  "note": "Eligibility is NOT edge. An eligible corpus is a set of bars a measurement may legitimately be run against; it says nothing about whether any signal times them. Timing-skill research remains CLOSED — see RESEARCH_CLOSE_STAGE1.md."
+}

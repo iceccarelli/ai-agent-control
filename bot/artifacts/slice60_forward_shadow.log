@@ -1,0 +1,37 @@
+==============================================================================
+SLICE 60 — FORWARD SHADOW: HOLD
+==============================================================================
+
+  result                       : HOLD
+  is_forward_observation       : False
+  forward_observations_to_date : 0
+  reason                       : no bars after measure end
+
+  new linear bars              : 0
+  new funding prints           : 1  (produces nothing — see below)
+  bars fabricated              : 0
+
+------------------------------------------------------------------------------
+  MONITORS WERE NOT RE-RUN
+------------------------------------------------------------------------------
+  Re-reporting slice 59's historical readings under a slice-60 heading
+  would manufacture the appearance of an updated observation from no new
+  data. The readings that stand are slice 59's:
+
+    monitor_status : WARN
+    M4_halves      : WARN — earlier half +0.4669 on 17, recent half -0.0798 on 18
+
+  thresholds moved this slice  : False
+
+------------------------------------------------------------------------------
+  1 funding print exists after t1 (2026-08-09T08:00:00+00:00), and it produces NOTHING. The decision clock is the daily bar: a funding rate is joined to the last bar whose close it precedes, and no bar after t1 has closed. A print with no bar to decide is not an observation, and reporting the count without this sentence would read as partial progress where there is none.
+
+------------------------------------------------------------------------------
+  cleared_edge_signal          : funding_carry_fade_btc_v1  (re-scored: False)
+  promotion_gate_allows_live   : False
+  live_authorized              : False
+  models_current_present       : False
+  frozen families              : 11
+  closer to autonomy           : False
+
+  A HOLD is the correct outcome when the only missing ingredient is time, and it is recorded as a HOLD rather than dressed up. Nothing advanced this slice except the record of having checked. The promotion gate's forward item still reads 0 of 20.

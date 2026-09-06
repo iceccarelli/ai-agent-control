@@ -1,0 +1,39 @@
+==============================================================================
+COUNT FINDING — open_gap_fade_v1   (no scores, no percentiles)
+==============================================================================
+  rule             : |open[t] - close[t-1]| / ATR_prev[t] >= 0.75   (frozen)
+  direction        : up-gap -> SHORT, down-gap -> LONG (fade)
+  barrier          : +1.5/-1.5 ATR, horizon 4, 25 bps, entry next_open (== the gap bar's own open)
+  design target    : >= 50 scored trades per symbol
+
+  BTCUSD   3,135 bars   setups    1   scoreable    1   entries    1   -> BELOW the 50-trade target
+  ETHUSDT  1,461 bars   setups    0   scoreable    0   entries    0   -> BELOW the 50-trade target
+  SOLUSDT  1,461 bars   setups    0   scoreable    0   entries    0   -> BELOW the 50-trade target
+
+------------------------------------------------------------------------------
+WHY — the gap distribution in the corpora themselves
+------------------------------------------------------------------------------
+  BTCUSD   open[t] == close[t-1] exactly on 540 of 3,134 bars (17.2%)
+           |gap| in ATR: median 0.0031, p99 0.030, max 1.661   (threshold 0.75)
+           |gap| as % of price: median 0.0135%
+  ETHUSDT  open[t] == close[t-1] exactly on 702 of 1,460 bars (48.1%)
+           |gap| in ATR: median 0.0000, p99 0.000, max 0.003   (threshold 0.75)
+           |gap| as % of price: median 0.0002%
+  SOLUSDT  open[t] == close[t-1] exactly on 740 of 1,460 bars (50.7%)
+           |gap| in ATR: median 0.0000, p99 0.010, max 0.012   (threshold 0.75)
+           |gap| as % of price: median 0.0000%
+
+These corpora are 24/7 spot markets. There is no overnight session:
+the daily open is the first print after 00:00 UTC and the prior
+daily close is the last print before it. The 'gap' this thesis is
+about is a tick-level move across midnight, not an auction
+discontinuity — so a 0.75-ATR gap is a once-in-a-corpus event.
+
+==============================================================================
+COUNT FINDING: BELOW TARGET on BTCUSD, ETHUSDT, SOLUSDT
+
+Per the intake, GAP_K is NOT lowered and no grid is run. A
+symbol below the target cannot support a POSITIVE claim for
+this family, and a threshold moved to reach a count would be a
+parameter fitted to an observed shortfall.
+==============================================================================

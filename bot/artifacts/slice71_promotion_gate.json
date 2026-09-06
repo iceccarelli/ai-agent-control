@@ -1,0 +1,158 @@
+{
+  "schema": "promotion_gate/3",
+  "slice": 71,
+  "supersedes": "artifacts/slice70_promotion_gate.json",
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "doc": "docs/PROMOTION_GATE_MICRO_LIVE.md",
+  "design_note": "EDGE.md §47d (the forward rule and its ceiling, restated)",
+  "default": "REFUSE",
+  "max_notional_usd": 100.0,
+  "min_forward_trades": 20,
+  "min_forward_days": 180,
+  "minimums_moved_this_slice": false,
+  "checklist": {
+    "human_risk_memo_signed": {
+      "complete": false,
+      "owner": "human",
+      "evidence": "no signed memo. A TEMPLATE now exists at docs/promotion/RISK_MEMO_MICRO_LIVE_TEMPLATE.md with blank signature blocks. A template is a form; a memo is a decision. The template does not advance this item.",
+      "how_to_satisfy": "A human writes and signs a risk memo and records its path here. No process may produce this."
+    },
+    "forward_shadow_clean": {
+      "complete": false,
+      "owner": "observation",
+      "evidence": "0 of 20 forward closed trades; 0 of 180 days. THE WINDOW REACHED 9 BARS AND THE CEILING IS NOW 4 — that many forward decision bars could yield a trade closing inside the window. ZERO SETUPS FIRED on all 9: every funding rate at a decision is below FUND_ABS. 4 POSSIBLE TRADES DO NOT ADVANCE THIS GATE, which asks for 20 completed forward trades and 180 forward days; a larger ceiling changes the denominator of what is possible, never the numerator of what has happened. See artifacts/slice71_data_freshness.json and artifacts/slice71_forward_shadow.json.",
+      "forward_trades_to_date": 0,
+      "forward_days_to_date": 0,
+      "min_forward_trades": 20,
+      "min_forward_days": 180,
+      "declared_before_any_new_reading": true,
+      "how_to_satisfy": "Run the pilot forward on data that did not exist when the rule was measured. A replay over the cleared window does NOT count and is the substitution this item exists to prevent.",
+      "extension_present_this_slice": true,
+      "closed_forward_bars": 9,
+      "why_bars_are_not_trades": "A trade is an observation only when it CLOSES. Counting bars, flags or entries would be the slice-59 substitution — history or activity relabelled as experience — in the smallest form still available to this programme."
+    },
+    "m4_recent_half_accepted_or_recovered": {
+      "complete": false,
+      "owner": "human or observation",
+      "evidence": "M4_halves currently reads WARN — earlier half +0.4669 on 17, recent half -0.0798 on 18. Not accepted in any memo, not recovered.",
+      "how_to_satisfy": "Either a human explicitly accepts this in the signed memo, or new forward data brings the recent half back above zero UNDER THE UNCHANGED THRESHOLD. Moving the threshold is forbidden and would not satisfy this."
+    },
+    "kill_switch_drill_recorded": {
+      "complete": false,
+      "owner": "human",
+      "evidence": "no drill performed. A SCRIPT now exists at docs/promotion/KILL_SWITCH_DRILL_SCRIPT.md. A drill you did not run is worth nothing.",
+      "how_to_satisfy": "Trip the switch, confirm entries are blocked, clear it with the exact human token, and record the transcript."
+    },
+    "linear_protective_stop_verified": {
+      "complete": false,
+      "owner": "human",
+      "evidence": "not verified. A CHECKLIST now exists at docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md. It records the concrete reason this item is not a formality: the linear SIMULATOR raises NotImplementedError, so the protective-stop guarantee this repository asserts everywhere has never been exercised end to end in simulation on the instrument this signal actually trades.",
+      "how_to_satisfy": "Document and demonstrate the verification path."
+    },
+    "notional_cap_within_policy": {
+      "complete": true,
+      "owner": "machine",
+      "evidence": "shadow.SHADOW_MAX_NOTIONAL_USD = 100.00",
+      "note": "Re-derived from the live tree by the gate, never trusted from this file."
+    },
+    "live_trading_ack_present": {
+      "complete": false,
+      "owner": "human",
+      "evidence": "LIVE_TRADING_ACK is not satisfied; live_authorized is false",
+      "how_to_satisfy": "A human sets the exact token AND turns testnet off AND turns paper off AND supplies both credentials. Missing any one degrades to paper and logs the reason."
+    },
+    "models_current_absent_or_contained": {
+      "complete": true,
+      "owner": "machine",
+      "evidence": "models/current absent",
+      "note": "Re-derived from the live tree by the gate."
+    }
+  },
+  "templates_present": true,
+  "templates": [
+    "docs/promotion/RISK_MEMO_MICRO_LIVE_TEMPLATE.md",
+    "docs/promotion/KILL_SWITCH_DRILL_SCRIPT.md",
+    "docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md"
+  ],
+  "templates_are_not_a_checklist_item": "templates_present is a fact about the REPOSITORY, deliberately recorded OUTSIDE the checklist. promotion_gate.CHECKLIST_ITEMS does not contain it and the gate never reads it. Adding a form does not make a decision, and an item marked complete because a template exists would be a placeholder mistaken for the thing it stands in for — the same class of error as calling a replay a forward observation.",
+  "signatures_present": false,
+  "signatures_forged": false,
+  "human_items_completed_in_code": 0,
+  "items_total": 8,
+  "items_complete": 2,
+  "items_complete_unchanged_from_slice_70": true,
+  "items_requiring_a_human": 6,
+  "note_on_ownership": "Six of eight items are things a HUMAN does. A gate a process could satisfy on its own is not a gate. The two machine items are re-derived from the live tree by promotion_gate.evaluate_promotion_gate rather than read from this file, so a hand-edited JSON cannot assert them falsely.",
+  "note_on_fail_closed": "Flipping every bool in this file to true does NOT allow live: the gate requires the checklist AND config.is_live_authorized independently, and the gate can neither write live_authorized nor clear the kill switch. A missing or unreadable file means REFUSE, not 'assume complete'.",
+  "evaluated": {
+    "gate_path_read_by_the_gate": "artifacts/slice59_promotion_gate.json",
+    "gate_path_repointed_this_slice": false,
+    "why_not_repointed": "The canonical declaration stays on the slice-59 file. Re-aiming the live gate at a fresher artefact every slice would make the gate's own wiring a moving part, and a gate whose input can be swapped is a gate that can be swapped for a satisfied one.",
+    "allows_live": false,
+    "items": [
+      {
+        "key": "human_risk_memo_signed",
+        "owner": "human",
+        "complete": false,
+        "evidence": "no memo path recorded"
+      },
+      {
+        "key": "forward_shadow_clean",
+        "owner": "observation",
+        "complete": false,
+        "evidence": "0 of 20 forward closed trades; 0 of 180 days. The corpus ends on the same day the cleared measurement was taken, so ZERO genuinely forward observations exist. artifacts/slice59_forward_shadow.json declares is_forward_observation false and forward_observations_to_date 0."
+      },
+      {
+        "key": "m4_recent_half_accepted_or_recovered",
+        "owner": "human or observation",
+        "complete": false,
+        "evidence": "M4_halves currently reads WARN — earlier half +0.4669 on 17, recent half -0.0798 on 18. Not accepted in any memo, not recovered."
+      },
+      {
+        "key": "kill_switch_drill_recorded",
+        "owner": "human",
+        "complete": false,
+        "evidence": "no drill recorded"
+      },
+      {
+        "key": "linear_protective_stop_verified",
+        "owner": "human",
+        "complete": false,
+        "evidence": "not documented. NOTE: docs/PAPER_OPERATOR_RUNBOOK.md §H records that the linear SIMULATOR raises NotImplementedError — the live linear path is implemented and unit-tested, but the simulated one models spot cash accounting only. A human must document how a protective stop is verified on linear before any micro-live."
+      },
+      {
+        "key": "notional_cap_within_policy",
+        "owner": "machine",
+        "complete": true,
+        "evidence": "shadow.SHADOW_MAX_NOTIONAL_USD = 100.00, declared 100.00"
+      },
+      {
+        "key": "live_trading_ack_present",
+        "owner": "human",
+        "complete": false,
+        "evidence": "LIVE_TRADING_ACK is not satisfied; live_authorized is false"
+      },
+      {
+        "key": "models_current_absent_or_contained",
+        "owner": "machine",
+        "complete": true,
+        "evidence": "models/current present: False"
+      }
+    ]
+  },
+  "promotion_gate_allows_live": false,
+  "forward_evidence_this_slice": {
+    "extension_present": true,
+    "closed_forward_bars": 9,
+    "forward_n_trades": 0,
+    "is_forward_observation": false,
+    "max_possible_forward_trades_today": 4,
+    "is_stage1_evidence": false,
+    "registration_eligible": false,
+    "shadow_mean_treated_as_stage1_evidence": false
+  },
+  "closer_to_autonomous_profit_agent": false,
+  "why_not_closer": "One post-t1 day is pilot progress, not autonomy. Six of the eight items are human acts and none of them happened; the observation item moved from 'no data existed' to 'data existed and produced no closed trade', which is a better-evidenced zero, not a smaller gap.",
+  "git_commit": "46bfddbc9f733c69940bd277b30d72c8bfb3c5bf"
+}

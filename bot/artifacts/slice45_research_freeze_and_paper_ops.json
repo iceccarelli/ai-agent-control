@@ -1,0 +1,80 @@
+{
+  "schema": "research_freeze_and_paper_ops/1",
+  "slice": 45,
+  "research_program": "FROZEN",
+  "frozen_absent": [
+    {
+      "signal": "technical_analysis",
+      "status": "ABSENT",
+      "evidence": "M1/M2 76.1/77.5 (1D), 73.0/74.0 (4H), 72.2/76.0 (1H) vs a bar of 95.0 — slices 24-25, STAGE1_VERDICT.md"
+    },
+    {
+      "signal": "closed_analyser",
+      "status": "ABSENT",
+      "evidence": "same 76.1/77.5 (1D) reading under its other name, against the same bar of 95.0; CLOSED slice 25 (H25_REJECT), see RESEARCH_CLOSE_STAGE1.md"
+    },
+    {
+      "signal": "donchian_breakout_v1",
+      "status": "ABSENT",
+      "evidence": "M1/M2 91.2/91.5 (1D) vs a bar of 95.0 — slice 28, artifacts/slice29_edge_donchian_regression_summary.json"
+    },
+    {
+      "signal": "btc_alt_spillover_v1",
+      "status": "ABSENT",
+      "evidence": "M1/M2 94.3/92.0 (ETHUSDT) and 91.3/90.0 (SOLUSDT) vs 95.0, control VALID — slice 40, frozen 41"
+    },
+    {
+      "signal": "post_shock_fade_v1",
+      "status": "ABSENT",
+      "evidence": "M1/M2 1.6/2.0 (BTCUSD, 41 trades) vs 95.0, control VALID; ETHUSDT/SOLUSDT NOT MEASURABLE (controls INVALID at 75.4%/99.8% incomplete, 10 and 7 setups); family INCONCLUSIVE — slice 43, frozen 44"
+    },
+    {
+      "signal": "range_location_fade_v1",
+      "status": "INCONCLUSIVE",
+      "evidence": "CONTROL INVALID on all three symbols (z +3.632 / +3.996 / +2.975 vs |z| < 1.96; KS p 0.0004 / 0.0003 / 0.0122; 0% incompletes). EDGE NOT MEASURED — no M1 and no M2 exist. INCONCLUSIVE, NOT an ABSENT percentile reading. Design was measurable: 281 / 112 / 117 entries — slice 46, frozen 47"
+    }
+  ],
+  "frozen_absent_count": 6,
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "cleared_edge_signal": null,
+  "timing_skill_research": "CLOSED",
+  "paper_certified": true,
+  "paper_certification_standard": "docs/PAPER_AGENT_CERTIFICATION.md",
+  "paper_operator_runbook": "docs/PAPER_OPERATOR_RUNBOOK.md",
+  "research_freeze_document": "docs/RESEARCH_PROGRAM_FREEZE.md",
+  "live": "blocked",
+  "model": "blocked",
+  "models_current_present": false,
+  "kill_switch": "human_clear_only",
+  "closer_to_autonomous_profit_agent": false,
+  "next_stage1_requires": "new_human_material_intake_with_min_trade_count",
+  "next_stage1_gate": [
+    "a different information set from all five frozen names",
+    "expected minimum 50 scored trades per symbol, stated before implementation",
+    "every constant frozen in git before any run",
+    "a control for the construction it uses, validated before any percentile is read",
+    "M1 = M2 = 95.0 on the pre-declared conjunction, from one run"
+  ],
+  "standing_obstacles": [
+    "no eligible corpus contains an order book — every microstructure thesis is blocked on data, not ideas",
+    "~1.5 percentile points of unexplained upward bias remain in the CROSS-ASSET directed instrument (EDGE.md 22d); narrowed by slice 43 (the same-asset control read 49.05) but unpaid"
+  ],
+  "this_slice_did_not": [
+    "implement any signal",
+    "run any measurement",
+    "change any signal constant",
+    "lower any bar or control clause",
+    "train, promote or load a model",
+    "arm any live path",
+    "fill NEW_SIGNAL_INTAKE with a new thesis"
+  ],
+  "suite_passed": 3112,
+  "suite_skipped": 1,
+  "certification_tests_passed": 138,
+  "git_commit": "ecedbb7345a4cc3f58ec7432f1ec00d22112fccb",
+  "frozen_status_note": "ABSENT = a trusted instrument measured it and it did not clear the bar (percentiles exist). INCONCLUSIVE = the instrument failed its own pre-declared control, so no reading was taken (NO percentiles exist; quoting one would be fabrication). Both are refused identically by the registration hook.",
+  "revalidated_at_slice": 47
+}

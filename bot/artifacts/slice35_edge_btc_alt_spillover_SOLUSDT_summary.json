@@ -1,0 +1,86 @@
+{
+  "symbol": "SOLUSDT",
+  "bars": 1461,
+  "signal": "btc_alt_spillover_v1",
+  "instrument": {
+    "null": "rotation",
+    "lockup": 1,
+    "runs": 1500,
+    "horizon": 5,
+    "atr_period": 14,
+    "round_trip_bps": 25.0,
+    "take_profit_atr": 3.0,
+    "stop_atr": 1.5,
+    "seed": 20250730
+  },
+  "observed": {
+    "n_trades": 72,
+    "mean_r": 0.17573394663337683
+  },
+  "flag_runs": 72,
+  "m1": {
+    "percentile": 85.06666666666666,
+    "bar": 95.0,
+    "passed": false,
+    "replicates": 1500,
+    "null_mean": 0.055766200681740166,
+    "null_sd": 0.12392315067892606
+  },
+  "m2": {
+    "percentile": 81.5,
+    "bar": 95.0,
+    "passed": false,
+    "delta": 0.09752325717494392,
+    "ci_low": 0.0836776995401871,
+    "ci_high": 0.11101864175144656,
+    "schedules": 200,
+    "null_mean": 0.0782106894584329,
+    "null_sd": 0.10006108547558898
+  },
+  "m3": {
+    "folds": [
+      {
+        "fold": 1,
+        "start": 200,
+        "end": 515,
+        "trades": 31,
+        "mean_r": 0.4242828368601503,
+        "percentile": 98.2,
+        "note": ""
+      },
+      {
+        "fold": 2,
+        "start": 515,
+        "end": 830,
+        "trades": 33,
+        "mean_r": 0.0068425403416723166,
+        "percentile": 47.0,
+        "note": ""
+      },
+      {
+        "fold": 3,
+        "start": 830,
+        "end": 1145,
+        "trades": 8,
+        "mean_r": -0.09071595204208932,
+        "percentile": null,
+        "note": "8 trades: too few for a stable percentile"
+      },
+      {
+        "fold": 4,
+        "start": 1145,
+        "end": 1461,
+        "trades": 0,
+        "mean_r": null,
+        "percentile": null,
+        "note": "no scoreable entries"
+      }
+    ],
+    "positive": 2,
+    "soft_gate": 3,
+    "soft_gate_met": false
+  },
+  "verdict": "EDGE_EVIDENCE_ABSENT",
+  "control_validated": false,
+  "control_attestation": null
+}

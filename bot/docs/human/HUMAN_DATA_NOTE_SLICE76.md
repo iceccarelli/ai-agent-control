@@ -1,0 +1,23 @@
+# HUMAN DATA NOTE — Slice 76
+- t1: **2026-08-09T00:00:00Z**
+- Product: `funding_carry_fade_btc_v1` only
+- Catch-up: two CLOSED days (2026-08-23 and 2026-08-24). 2026-08-25 NOT appended.
+- Closed linear bars after t1: **15** → ['2026-08-10', '2026-08-11', '2026-08-12', '2026-08-13', '2026-08-14', '2026-08-15', '2026-08-16', '2026-08-17', '2026-08-18', '2026-08-19', '2026-08-20', '2026-08-21', '2026-08-22', '2026-08-23', '2026-08-24']
+- linear rows: 1476
+- linear sha256 (compressed): `55a151d0466c77e788b9951ac408283a0852d8037339d1a7bf10c548dda03b63`
+- linear sha256 uncompressed: `293774ee35fcac24679bed81356ef081c3787e8acfc3877b2fe12650316d97c9`
+- predecessor linear uncompressed (slice 75 CURRENT): `6e64847c54991ef38c0aaaad3095446ea955c822e07f14938ff6943c8c93b0a7`
+- Do NOT copy slice74_linear_sha256_uncompressed from the slice-75 artefact.
+- funding rows: 4431 last 2026-08-25T16:00:00+00:00
+- funding sha256 uncompressed: `c652c9b0b6332b5b98bc11ec89097abd69cea1d0b6774cf4f79532243ba611f4`
+- predecessor funding uncompressed: `fec0ee8c33b528cb0baeda4de0c3d5b0c3bb15a144bc5537cd379e3bda4219b2`
+- synthetic: false; append-only; no pre-t1 rewrite
+- START_MS used: 1787443200000 (2026-08-23). Also ingested closed 2026-08-24.
+- Ceiling: max(0, 15-5) = **10**
+- 08-23 close-join: 0.00010000 at 2026-08-23T16:00:00+00:00
+- 08-24 close-join: 0.00010000 at 2026-08-24T16:00:00+00:00
+- 08-19 remains NOT scoreable until last bar >= 2026-08-26.
+- A flag is not an entry. An entry is not a closed trade.
+- Live / model / autonomy / Bybit / ETH-SOL: **NO**
+- Pack base: **tradingbot_slice75.zip**
+- Agent verifies FILES + hashes, not this note

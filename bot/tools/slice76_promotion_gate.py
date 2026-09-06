@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Re-evaluate the inert promotion gate against REAL forward data. It refuses.
+
+WHY THIS RUN IS DIFFERENT FROM SLICE 75's
+=========================================
+TWO closed days arrived at once — a catch-up, not an acceleration. The window
+went 13 -> 15, the ceiling 8 -> 10, the flag count 2 -> 4, and
+`forward_shadow_clean` still reads **0 / 20**. The gate's numerator has not
+moved in fifteen closed forward days.
+
+`why_not_closer` is DERIVED from those files this slice. From slice 62 to
+slice 75 it read "One post-t1 day" in every gate artefact, fourteen slices
+after that stopped being true, because it was a hand-typed sentence in a field
+nothing checked. EDGE.md §59d — the class of defect is a constant that no
+instrument reads.
+
+--- the slice-75 header follows ---
+
+
+The window grew, and the answer did not change. That is the finding. Slices 62 and 63 both re-evaluated this gate against a ONE-BAR forward window.
+Slice 64 has two bars — genuine growth, verified from files. `forward_shadow_clean`
+still reads 0 / 20, because six closed forward bars are needed before a single
+trade can close under a five-bar horizon.
+
+**A bigger window is not more evidence until it is big enough to produce any.**
+The item's evidence string now says which of those two states holds, so an
+unchanged number is not mistaken for an unchanged situation.
+
+The gate counts CLOSED FORWARD TRADES — not bars, not flags, not entries, and
+not funding prints. It is built so that wanting any of those to count changes
+nothing.
+
+WHAT THIS TOOL WRITES AND WHAT IT CANNOT
+========================================
+It writes a DATED snapshot, `artifacts/slice62_promotion_gate.json`. It does not
+repoint `promotion_gate.GATE_PATH`, which stays on the canonical slice-59
+declaration: re-aiming the live gate at a fresher file every slice would make
+the gate's own wiring a moving part.
+
+It cannot set `live_authorized`, cannot write config, cannot clear the kill
+switch and cannot mark a human item complete. It reads the two machine items
+back out of `evaluate_promotion_gate`, which re-derives them from the live tree,
+so nothing it writes here can assert them.
+
+**It refuses to write at all if the verdict is not REFUSE.** A tool that would
+happily record a promotion is a tool that could be used to record one.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+sys.path.insert(0, os.path.join(REPO, "tools"))
+
+import promotion_gate as pg  # noqa: E402
+import shadow  # noqa: E402
+import provenance as _provenance  # noqa: E402
+
+SCHEMA = "promotion_gate/4"
+PREVIOUS = "artifacts/slice75_promotion_gate.json"
+SLICE = 76
+FRESHNESS = "artifacts/slice76_data_freshness.json"
+FORWARD = "artifacts/slice76_forward_shadow.json"
+
+
+def load(path: str) -> dict:
+    with open(os.path.join(REPO, path), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", default=os.path.join(
+        REPO, "artifacts", "slice76_promotion_gate.json"))
+    args = parser.parse_args(argv)
+
+    previous = load(PREVIOUS)
+    freshness = load(FRESHNESS)
+    forward = load(FORWARD)
+    verdict = pg.evaluate_promotion_gate()
+
+    forward_trades = int(forward["forward_n_trades"])
+    closed_bars = int(freshness["after_t1_linear"])
+
+    checklist = json.loads(json.dumps(previous["checklist"]))  # deep copy
+
+    # Counted from the checklist itself rather than typed as "six of the
+    # eight". EDGE.md §59d.
+    human_items = sum(1 for item in checklist.values()
+                      if str(item.get("owner", "")).lower() != "machine")
+
+    # The ONLY item whose evidence this slice can legitimately touch. It is
+    # owned by observation. The window it observed is longer than any
+    # previous slice's and the count it reports is the same, which is the
+    # whole point: the evidence string says which of the two possible reasons
+    # for an unchanged count holds.
+    checklist["forward_shadow_clean"].update({
+        "complete": forward_trades >= pg.MIN_FORWARD_TRADES,
+        "forward_trades_to_date": forward_trades,
+        "forward_days_to_date": 0,
+        "evidence": (
+            f"{forward_trades} of {pg.MIN_FORWARD_TRADES} forward closed "
+            f"trades; 0 of {pg.MIN_FORWARD_DAYS} days. THE WINDOW REACHED "
+            f"{closed_bars} BARS AND THE CEILING IS NOW "
+            f"{max(0, closed_bars - 5)} — that many forward decision bars "
+            f"could yield a trade closing inside the window. "
+            f"{forward['state_ladder']['1_setups']} of {closed_bars} "
+            f"decisions reached FUND_ABS and "
+            f"{forward['state_ladder']['2_flagged']} became a FLAG, while "
+            f"entries taken = {forward['state_ladder']['5_entries_taken']} "
+            f"and CLOSED trades = {forward['state_ladder']['6_closed_trades']}. "
+            f"A SETUP IS NOT A FLAG, A FLAG IS NOT AN ENTRY, AND AN ENTRY IS "
+            f"NOT A CLOSED TRADE — this gate counts only the last of those. "
+            f"{max(0, closed_bars - 5)} POSSIBLE "
+            f"TRADES DO NOT ADVANCE THIS GATE, which asks for "
+            f"{pg.MIN_FORWARD_TRADES} completed forward trades and "
+            f"{pg.MIN_FORWARD_DAYS} forward days; a larger ceiling changes the "
+            f"denominator of what is possible, never the numerator of what has "
+            f"happened. See "
+            f"{FRESHNESS} and {FORWARD}."),
+        "extension_present_this_slice": bool(freshness["extension_present"]),
+        "closed_forward_bars": closed_bars,
+        "why_bars_are_not_trades": (
+            "A trade is an observation only when it CLOSES. Counting bars, "
+            "flags or entries would be the slice-59 substitution — history or "
+            "activity relabelled as experience — in the smallest form still "
+            "available to this programme."),
+    })
+
+    payload = {
+        "schema": SCHEMA,
+        # Derived, not typed. EDGE.md §54f.
+        "slice": SLICE,
+        "supersedes": PREVIOUS,
+        "signal": previous["signal"],
+        "symbol": previous["symbol"],
+        "doc": previous["doc"],
+        "design_note": "EDGE.md §47d (the forward rule and its ceiling, restated)",
+        "default": "REFUSE",
+        "max_notional_usd": shadow.SHADOW_MAX_NOTIONAL_USD,
+        "min_forward_trades": pg.MIN_FORWARD_TRADES,
+        "min_forward_days": pg.MIN_FORWARD_DAYS,
+        "minimums_moved_this_slice": False,
+
+        "checklist": checklist,
+
+        "templates_present": previous["templates_present"],
+        "templates": previous["templates"],
+        "templates_are_not_a_checklist_item":
+            previous["templates_are_not_a_checklist_item"],
+        "signatures_present": False,
+        "signatures_forged": False,
+        "human_items_completed_in_code": 0,
+
+        "items_total": len(verdict.items),
+        "items_complete": sum(1 for item in verdict.items if item.complete),
+        # prior-slice: keyed to the predecessor artefact this is compared
+        # against. It advances every slice; slice 69 found it frozen at 63.
+        "items_complete_unchanged_from_the_previous_slice":
+            sum(1 for item in verdict.items if item.complete)
+            == previous["items_complete"],
+        "items_requiring_a_human": previous["items_requiring_a_human"],
+        "note_on_ownership": previous["note_on_ownership"],
+        "note_on_fail_closed": previous["note_on_fail_closed"],
+
+        "evaluated": {
+            "gate_path_read_by_the_gate": os.path.relpath(pg.GATE_PATH, REPO),
+            "gate_path_repointed_this_slice": False,
+            "why_not_repointed": (
+                "The canonical declaration stays on the slice-59 file. "
+                "Re-aiming the live gate at a fresher artefact every slice "
+                "would make the gate's own wiring a moving part, and a gate "
+                "whose input can be swapped is a gate that can be swapped for "
+                "a satisfied one."),
+            "allows_live": bool(verdict.allows_live),
+            "items": [
+                {"key": item.key, "owner": item.owner,
+                 "complete": bool(item.complete), "evidence": item.evidence}
+                for item in verdict.items],
+        },
+        "promotion_gate_allows_live": bool(pg.promotion_gate_allows_live()),
+
+        "forward_evidence_this_slice": {
+            "extension_present": bool(freshness["extension_present"]),
+            "closed_forward_bars": closed_bars,
+            "forward_n_trades": forward_trades,
+            "is_forward_observation": bool(forward["is_forward_observation"]),
+            "max_possible_forward_trades_today":
+                forward["ceiling"]["max_possible_forward_closed_trades"],
+            "is_stage1_evidence": False,
+            "registration_eligible": False,
+            "shadow_mean_treated_as_stage1_evidence": False,
+        },
+        "closer_to_autonomous_profit_agent": False,
+        # EDGE.md §59d. DERIVED from this slice's own artefacts. The string
+        # this field carried from slice 62 to slice 75 opened "One post-t1
+        # day" — true when it was written, false for the following fourteen
+        # slices, and never once checked, because a hand-typed sentence in a
+        # prose field is exactly the kind of constant no instrument reads.
+        # Every number below comes out of FRESHNESS or FORWARD.
+        "why_not_closer": (
+            f"{closed_bars} post-t1 days is pilot progress, not autonomy. "
+            f"{human_items} of the {len(checklist)} items are not "
+            f"machine-derived — human acts, or an observation nobody can "
+            f"perform on demand — and not one of them is complete. The "
+            f"observation item has moved from 'no "
+            f"data existed' to a {closed_bars}-bar window that has produced "
+            f"{forward['state_ladder']['1_setups']} setups, "
+            f"{forward['state_ladder']['2_flagged']} flags and "
+            f"{forward_trades} closed trades — a better-evidenced zero, not a "
+            f"smaller gap. The ceiling rose to "
+            f"{forward['ceiling']['max_possible_forward_closed_trades']} this "
+            f"slice, which enlarges the denominator of what is possible and "
+            f"leaves the numerator of what has happened at "
+            f"{forward_trades}."),
+        "why_not_closer_is_derived_not_typed": True,
+        "the_field_this_replaces": (
+            "Every gate artefact from slice 62 to slice 75 inclusive opened "
+            "this field with 'One post-t1 day', fourteen slices after there "
+            "was one. The earlier artefacts are NOT edited — they are the "
+            "record of what was written when — and the residue is named here "
+            "instead. EDGE.md §59d."),
+
+        "git_commit": _provenance.git_commit(REPO),
+    }
+
+    if payload["promotion_gate_allows_live"] or payload["evaluated"][
+            "allows_live"]:
+        raise SystemExit(
+            "REFUSING TO WRITE: the gate did not refuse. This tool records a "
+            "refusal; it is not a mechanism for recording a promotion, and a "
+            "promotion reached on this tree would be a defect to investigate "
+            "before it is a result to file.")
+
+    with open(args.out, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+    print("=" * 78)
+    print("SLICE 75 — PROMOTION GATE   (re-evaluated against REAL forward data)")
+    print("=" * 78)
+    print(f"  default                      : REFUSE")
+    print(f"  promotion_gate_allows_live() : "
+          f"{payload['promotion_gate_allows_live']}")
+    print(f"  items complete               : {payload['items_complete']} / "
+          f"{payload['items_total']}   (unchanged from the previous slice: "
+          f"{payload['items_complete_unchanged_from_the_previous_slice']})")
+    print(f"  minimums moved               : "
+          f"{payload['minimums_moved_this_slice']}  "
+          f"({pg.MIN_FORWARD_TRADES} trades / {pg.MIN_FORWARD_DAYS} days)")
+    print(f"  human items completed in code: "
+          f"{payload['human_items_completed_in_code']}")
+    print(f"  signatures forged            : {payload['signatures_forged']}")
+    print()
+    for item in verdict.items:
+        mark = "COMPLETE" if item.complete else "incomplete"
+        print(f"    {mark:10s} {item.owner:20s} {item.key}")
+    print()
+    print("  THE ITEM THAT COULD HAVE MOVED, AND DID NOT:")
+    print(f"    extension present          : "
+          f"{payload['forward_evidence_this_slice']['extension_present']}")
+    print(f"    closed forward bars        : {closed_bars}")
+    print(f"    forward closed TRADES      : {forward_trades} / "
+          f"{pg.MIN_FORWARD_TRADES}")
+    print(f"    is_forward_observation     : "
+          f"{payload['forward_evidence_this_slice']['is_forward_observation']}")
+    print()
+    print("    A bar is not a trade. The gate counts closed forward trades.")
+    print()
+    print(f"artefact: {os.path.relpath(args.out, REPO)}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

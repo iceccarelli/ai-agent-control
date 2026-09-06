@@ -1,0 +1,147 @@
+........................................................................ [  2%]
+........................................................................ [  5%]
+........................................................................ [  8%]
+.................................................................F..F... [ 10%]
+..........................F............................................. [ 13%]
+........................................................................ [ 16%]
+........................................................................ [ 19%]
+........................................................................ [ 21%]
+........................................................................ [ 24%]
+........................................................................ [ 27%]
+........................................................................ [ 30%]
+........................................................................ [ 32%]
+.................................................................F...... [ 35%]
+........................................................................ [ 38%]
+........................................................................ [ 41%]
+........................................................................ [ 43%]
+........................................................................ [ 46%]
+........................................................................ [ 49%]
+........................................................s............... [ 52%]
+........................................................................ [ 54%]
+........................................................................ [ 57%]
+........................................................................ [ 60%]
+........................................................................ [ 63%]
+........................................................................ [ 65%]
+........................................................................ [ 68%]
+........................................................................ [ 71%]
+........................................................................ [ 74%]
+........................................................................ [ 76%]
+........................................................................ [ 79%]
+........................................................................ [ 82%]
+........................................................................ [ 84%]
+........................................................................ [ 87%]
+........................................................................ [ 90%]
+........................................................................ [ 93%]
+........................................................................ [ 95%]
+........................................................................ [ 98%]
+...................................                                      [100%]
+=================================== FAILURES ===================================
+_______ TestNoFalseMultiAssetClaim.test_no_multi_asset_corpus_is_present _______
+
+self = <test_data_contract.TestNoFalseMultiAssetClaim object at 0x7fe0a32a4990>
+
+    def test_no_multi_asset_corpus_is_present(self):
+        report = dc.build_report(repo_root=REPO)
+>       assert report["multi_asset_corpus_present"] is False
+E       assert True is False
+
+tests/test_data_contract.py:207: AssertionError
+______ TestNoFalseMultiAssetClaim.test_every_eligible_corpus_today_is_btc ______
+
+self = <test_data_contract.TestNoFalseMultiAssetClaim object at 0x7fe0a32a5e50>
+
+    def test_every_eligible_corpus_today_is_btc(self):
+        report = dc.build_report(repo_root=REPO)
+        for record in report["corpora"]:
+            if record["eligible_for_stage1"]:
+>               assert all("BTC" in s.upper() for s in record["symbols"]), record
+E               AssertionError: {'path': 'data/real_multi_1d', 'exists': True, 'interval_label': 'D', 'is_synthetic': False, ...}
+E               assert False
+E                +  where False = all(<generator object TestNoFalseMultiAssetClaim.test_every_eligible_corpus_today_is_btc.<locals>.<genexpr> at 0x7fe09e706880>)
+
+tests/test_data_contract.py:225: AssertionError
+_________ TestTheOperatorTool.test_it_exits_zero_and_writes_the_report _________
+
+self = <test_data_contract.TestTheOperatorTool object at 0x7fe0a327c610>
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-199/test_it_exits_zero_and_writes_0')
+capsys = <_pytest.capture.CaptureFixture object at 0x7fe09e7e1dd0>
+
+    def test_it_exits_zero_and_writes_the_report(self, tmp_path, capsys):
+        import data_intake_report as tool
+        out = str(tmp_path / "report.json")
+        assert tool.main(["--json-out", out]) == 0
+        with open(out, encoding="utf-8") as handle:
+            report = json.load(handle)
+        assert report["schema"] == "data_intake/1"
+>       assert report["multi_asset_corpus_present"] is False
+E       assert True is False
+
+tests/test_data_contract.py:413: AssertionError
+----------------------------- Captured stdout call -----------------------------
+==============================================================================
+DATA INTAKE REPORT — which corpora may Stage 1 be run against
+==============================================================================
+  thresholds (frozen in EDGE.md 13b before any scan): daily >= 500 bars, intraday >= 2000
+
+path                      interval   synthetic   bars       eligible 
+------------------------  ---------  ----------  ---------  ---------
+data/real_1d              D          False       2564       True     
+data/real_4h              4H         False       15379      True     
+data/real                 1H         False       61513      True     
+data/ohlcv                1H         True        5000       False    
+data/orderbook            1H         True        None       False    
+data/quotes               1H         True        None       False    
+data/anomalies            1H         True        3          False    
+data/real_multi_1d        D          False       1461       True     
+data/real_multi_1h        1H         False       35063      True     
+
+  data/ohlcv — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+  data/orderbook — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+      - required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)
+      - timestamp gap policy: unknown (need strictly increasing, no duplicates)
+      - bar count unreadable
+  data/quotes — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+      - required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)
+      - timestamp gap policy: unknown (need strictly increasing, no duplicates)
+      - bar count unreadable
+  data/anomalies — INELIGIBLE
+      - corpus is SYNTHETIC (MANIFEST.synthetic is true) — generated data is never Stage 1 evidence
+      - required OHLCV columns missing (time_period_start, price_open, price_high, price_low, price_close, volume_traded)
+      - timestamp gap policy: fail (need strictly increasing, no duplicates)
+      - only 3 bars; Stage 1 needs >= 2000 at 1H
+
+  eligible corpora        : data/real_1d, data/real_4h, data/real, data/real_multi_1d, data/real_multi_1h
+  multi-asset corpus      : True
+  real non-BTC symbols    : ETH_USDT, SOL_USDT
+  non-BTC symbols that EXIST but are SYNTHETIC: ETH_USDT, SOL_USDT
+      ^ these are generated by tools/make_dataset.py and are NOT
+        multi-asset coverage. Do not run Stage 1 against them.
+
+  Eligibility is NOT edge. Timing-skill research remains CLOSED.
+  See RESEARCH_CLOSE_STAGE1.md.
+
+  report written to /tmp/pytest-of-root/pytest-199/test_it_exits_zero_and_writes_0/report.json
+___________ TestProvenanceAndStructure.test_the_corpus_fits_in_a_zip ___________
+
+self = <test_market_data.TestProvenanceAndStructure object at 0x7fe0a2a1f590>
+
+    def test_the_corpus_fits_in_a_zip(self):
+        total = sum(
+            os.path.getsize(os.path.join(folder, name))
+            for folder, _dirs, names in os.walk(DATA) for name in names
+        )
+>       assert total < 8 * 1024 * 1024, f"corpus is {total / 1048576:.1f} MiB"
+E       AssertionError: corpus is 8.9 MiB
+E       assert 9310248 < ((8 * 1024) * 1024)
+
+tests/test_market_data.py:1207: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_data_contract.py::TestNoFalseMultiAssetClaim::test_no_multi_asset_corpus_is_present
+FAILED tests/test_data_contract.py::TestNoFalseMultiAssetClaim::test_every_eligible_corpus_today_is_btc
+FAILED tests/test_data_contract.py::TestTheOperatorTool::test_it_exits_zero_and_writes_the_report
+FAILED tests/test_market_data.py::TestProvenanceAndStructure::test_the_corpus_fits_in_a_zip
+4 failed, 2622 passed, 1 skipped in 240.36s (0:04:00)
+EXIT=1

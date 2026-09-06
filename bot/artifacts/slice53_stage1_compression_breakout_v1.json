@@ -1,0 +1,151 @@
+{
+  "schema": "stage1_measurement/1",
+  "slice": 53,
+  "signal": "compression_breakout_v1",
+  "intake": "NEW_SIGNAL_INTAKE.md (human-filled)",
+  "design_note": "EDGE.md §34",
+  "design_before_run": true,
+  "constants": {
+    "COMP_MAX": 25.0,
+    "PCTILE_WINDOW": 50,
+    "BREAK_N": 20,
+    "ATR_PERIOD": 14,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 2.0,
+    "TAKE_PROFIT_ATR": 3.0,
+    "HORIZON": 5,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_changed_after_seeing_numbers": false,
+  "grid_or_sweep_run": false,
+  "runs_per_symbol": {
+    "BTCUSD": 1,
+    "ETHUSDT": 0,
+    "SOLUSDT": 0
+  },
+  "count_finding": {
+    "hard_gate_per_symbol": 50,
+    "design_expectation_per_symbol": 80,
+    "log": "artifacts/slice53_count_finding_compression_breakout.log",
+    "breaks_any_volatility": {
+      "BTCUSD": 310,
+      "ETHUSDT": 116,
+      "SOLUSDT": 135
+    },
+    "compressed_breaks": {
+      "BTCUSD": 93,
+      "ETHUSDT": 26,
+      "SOLUSDT": 48
+    },
+    "filter_survival_pct": {
+      "BTCUSD": 30.0,
+      "ETHUSDT": 22.4,
+      "SOLUSDT": 35.6
+    },
+    "flag_runs": {
+      "BTCUSD": 76,
+      "ETHUSDT": 23,
+      "SOLUSDT": 35
+    },
+    "entries": {
+      "BTCUSD": 76,
+      "ETHUSDT": 23,
+      "SOLUSDT": 35
+    },
+    "symbols_meeting_gate": [
+      "BTCUSD"
+    ],
+    "positive_already_unreachable_at_count_stage": true,
+    "note": "The compression filter removes 64-78% of channel breaks, so the precondition is neither decorative nor fatal and the material-difference claim against the frozen 20-bar-Donchian half is substantive. But the intake needs TWO symbols at >= 50 scored trades and only BTCUSD reaches it, so POSITIVE was out of reach before any control ran and long before any percentile existed."
+  },
+  "control": {
+    "construction": "same-asset directed, whole-bar shuffle and re-base",
+    "clauses": {
+      "abs_z_max": 1.96,
+      "ks_min_p": 0.05,
+      "max_incomplete_pct": 5.0
+    },
+    "surrogates_requested": 200,
+    "rotations_each": 1000,
+    "BTCUSD": {
+      "verdict": "VALID",
+      "usable_surrogates": 200,
+      "z": -1.483,
+      "ks_p": 0.1123,
+      "incomplete_pct": 0.0,
+      "log": "artifacts/slice53_control_compression_breakout_BTCUSD_n1000.log"
+    },
+    "ETHUSDT": {
+      "verdict": "INVALID",
+      "usable_surrogates": 177,
+      "z": -1.158,
+      "ks_p": 0.0137,
+      "incomplete_pct": 11.5,
+      "failed_clauses": [
+        "b",
+        "c"
+      ],
+      "log": "artifacts/slice53_control_compression_breakout_ETHUSDT_n1000.log"
+    },
+    "SOLUSDT": {
+      "verdict": "INVALID",
+      "usable_surrogates": 189,
+      "z": -0.443,
+      "ks_p": 0.4838,
+      "incomplete_pct": 5.5,
+      "failed_clauses": [
+        "c"
+      ],
+      "log": "artifacts/slice53_control_compression_breakout_SOLUSDT_n1000.log"
+    },
+    "prediction_made_before_the_run": "EDGE.md §34d at 0a07162 predicted ELEVATED RISK of clause (a) failing in the POSITIVE direction, because this is the first high/low trigger since slice 46 and it also reads the ATR the barrier uses to size its stop.",
+    "prediction_outcome": "WRONG",
+    "prediction_note": "All three z values came back NEGATIVE (-1.483 / -1.158 / -0.443). There is no upward bias here at all. The standing hypothesis in docs/RESEARCH_HOLD.md — that the directed instrument's bias tracks how directly the trigger reads the geometry the barrier prices its stops from — is MATERIALLY WEAKENED by this. One candidate distinction exists (slice 46's biased trigger was a FADE; this is a CONTINUATION), but it is offered after the fact and is recorded as speculation, not adopted as a refinement.",
+    "invalid_cause": "ETHUSDT and SOLUSDT failed on INCOMPLETES (11.5% and 5.5% against a 5.0% bar), the sparse-sample problem their 23 and 35 real entries predict; ETHUSDT also failed the KS clause at p = 0.0137. SOLUSDT missed by 0.5 percentage points and the bar is the bar. This is NOT the slice-49 or slice-50 construction mismatch: the null found and scheduled setups on both symbols, there were simply too few."
+  },
+  "edge": {
+    "runs_executed": 1,
+    "BTCUSD": {
+      "verdict": "EDGE_EVIDENCE_ABSENT",
+      "m1": 69.13333333333334,
+      "m2": 73.5,
+      "m2_delta": 0.060950471175809914,
+      "n_trades": 76,
+      "mean_net_r": 0.059,
+      "control_validated": true,
+      "summary": "artifacts/slice53_edge_compression_breakout_BTCUSD_summary.json"
+    },
+    "ETHUSDT": {
+      "verdict": "NOT MEASURED",
+      "m1": null,
+      "m2": null,
+      "why": "control INVALID, and 23 entries is below the >= 50 gate"
+    },
+    "SOLUSDT": {
+      "verdict": "NOT MEASURED",
+      "m1": null,
+      "m2": null,
+      "why": "control INVALID, and 35 entries is below the >= 50 gate"
+    }
+  },
+  "edge_verdict": "INCONCLUSIVE",
+  "edge_verdict_note": "INCONCLUSIVE under the intake's multi-symbol rule, which needs two symbols at >= 50 scored trades. BTCUSD alone was measurable and it read ABSENT (69.1 / 73.5 vs 95.0 on 76 trades under a VALID control) — a trustworthy single-symbol refusal that the family rule correctly refuses to generalise. The same shape as post_shock_fade_v1 in slice 43.",
+  "positive_rule_met": false,
+  "positive_rule": "control_validated on each symbol claimed AND at least two of {BTCUSD, ETHUSDT, SOLUSDT} with >= 50 scored trades AND those symbols each at M1 >= 95 and M2 >= 95",
+  "cleared_edge_signal": null,
+  "frozen_absent_count": 9,
+  "sign_flip_momentum_v1_frozen": true,
+  "this_family_frozen": false,
+  "freeze_of_this_family": "NOT PERFORMED — the intake reserves it for a later human decision",
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "models_current_present": false,
+  "live_authorized": false,
+  "execution_mode": "paper",
+  "closer_to_autonomous_profit_agent": false,
+  "git_commit": "906a4d65132d53b9bf9e1bebe17437108c41d057"
+}

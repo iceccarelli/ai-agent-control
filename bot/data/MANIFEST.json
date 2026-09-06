@@ -1,0 +1,353 @@
+{
+  "bar_seconds": 3600,
+  "bars_per_symbol": 5000,
+  "files": {
+    "anomalies/l2_negative_latency.csv": {
+      "data_kind": "book",
+      "defective_rows": 1,
+      "expected_rejection": "NEGATIVE_LATENCY",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "b98930469c5dfe0e11efe50e096e6bc195dcc27c6127642fccba1fc0bd8320fb",
+      "sha256_uncompressed": "b98930469c5dfe0e11efe50e096e6bc195dcc27c6127642fccba1fc0bd8320fb",
+      "size_bytes": 374
+    },
+    "anomalies/l2_unknown_update_type.csv": {
+      "data_kind": "book",
+      "defective_rows": 1,
+      "expected_rejection": "UNKNOWN_UPDATE_TYPE",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "66252bc223c160947321f1ff6828727b8c45307523709959e86ce139ba99b8cc",
+      "sha256_uncompressed": "66252bc223c160947321f1ff6828727b8c45307523709959e86ce139ba99b8cc",
+      "size_bytes": 378
+    },
+    "anomalies/l2_zero_size.csv": {
+      "data_kind": "book",
+      "defective_rows": 1,
+      "expected_rejection": "ZERO_SIZE",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "5ae6c14dfb950d3e45333602a653061b40625f9d8174de587914bd506b639d74",
+      "sha256_uncompressed": "5ae6c14dfb950d3e45333602a653061b40625f9d8174de587914bd506b639d74",
+      "size_bytes": 379
+    },
+    "anomalies/ohlcv_bad_timestamp.csv": {
+      "data_kind": "ohlcv",
+      "defective_rows": 1,
+      "expected_rejection": "BAD_TIMESTAMP",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "172e322e869cbfd545500b5b741680edbcd1744bc152af293c58814ed23d4779",
+      "sha256_uncompressed": "172e322e869cbfd545500b5b741680edbcd1744bc152af293c58814ed23d4779",
+      "size_bytes": 562
+    },
+    "anomalies/ohlcv_duplicate_timestamp.csv": {
+      "data_kind": "ohlcv",
+      "defective_rows": 1,
+      "expected_rejection": "DUPLICATE_TIMESTAMP",
+      "kind": "anomaly",
+      "rows": 4,
+      "sha256": "550c65fbc589a6887fe0c8cce52c6d641ccfdc31304384337f7c6fb54c9a5ad5",
+      "sha256_uncompressed": "550c65fbc589a6887fe0c8cce52c6d641ccfdc31304384337f7c6fb54c9a5ad5",
+      "size_bytes": 722
+    },
+    "anomalies/ohlcv_high_low_not_bracketing.csv": {
+      "data_kind": "ohlcv",
+      "defective_rows": 1,
+      "expected_rejection": "HIGH_LOW_NOT_BRACKETING",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "c8108ad61a59f359d3edd36706202deb49343be3779153888f858d451d8b588f",
+      "sha256_uncompressed": "c8108ad61a59f359d3edd36706202deb49343be3779153888f858d451d8b588f",
+      "size_bytes": 573
+    },
+    "anomalies/ohlcv_malformed_row.csv": {
+      "data_kind": "ohlcv",
+      "defective_rows": 1,
+      "expected_rejection": "MALFORMED_ROW",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "e53901cecf3fd93591aa9ba21ec147e8c98f96e31d166f59c2c3aa288963b654",
+      "sha256_uncompressed": "e53901cecf3fd93591aa9ba21ec147e8c98f96e31d166f59c2c3aa288963b654",
+      "size_bytes": 540
+    },
+    "anomalies/ohlcv_negative_volume.csv": {
+      "data_kind": "ohlcv",
+      "defective_rows": 1,
+      "expected_rejection": "NEGATIVE_VALUE",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "02b3bf5770d72c5b03cc00f2361f99b5ef2f2791603ed0a577bcbb379fa4ae67",
+      "sha256_uncompressed": "02b3bf5770d72c5b03cc00f2361f99b5ef2f2791603ed0a577bcbb379fa4ae67",
+      "size_bytes": 574
+    },
+    "anomalies/ohlcv_non_finite.csv": {
+      "data_kind": "ohlcv",
+      "defective_rows": 1,
+      "expected_rejection": "NON_FINITE_VALUE",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "3200df3a693341d7a66cc30cecd3f5e0dc033b385649596bfe3fab12a9b5217f",
+      "sha256_uncompressed": "3200df3a693341d7a66cc30cecd3f5e0dc033b385649596bfe3fab12a9b5217f",
+      "size_bytes": 571
+    },
+    "anomalies/ohlcv_out_of_order.csv": {
+      "data_kind": "ohlcv",
+      "defective_rows": 1,
+      "expected_rejection": "NON_MONOTONIC_TIMESTAMP",
+      "kind": "anomaly",
+      "rows": 4,
+      "sha256": "417889ce898efdbef7b1f5ef897dcf6facf3b80be641da24e5a761d132d32acd",
+      "sha256_uncompressed": "417889ce898efdbef7b1f5ef897dcf6facf3b80be641da24e5a761d132d32acd",
+      "size_bytes": 722
+    },
+    "anomalies/quotes_absurd_spread.csv": {
+      "data_kind": "quotes",
+      "defective_rows": 1,
+      "expected_rejection": "SPREAD_ANOMALY",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "9338c62a02c8dfce745a626f0cb1724e66543cad2d340a23129fa2df2fcff80e",
+      "sha256_uncompressed": "9338c62a02c8dfce745a626f0cb1724e66543cad2d340a23129fa2df2fcff80e",
+      "size_bytes": 350
+    },
+    "anomalies/quotes_crossed_book.csv": {
+      "data_kind": "quotes",
+      "defective_rows": 1,
+      "expected_rejection": "CROSSED_BOOK",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "6f58c82d825353271b19080a3ecc1c72629e08776d03bdd7c6f41b74c9915e11",
+      "sha256_uncompressed": "6f58c82d825353271b19080a3ecc1c72629e08776d03bdd7c6f41b74c9915e11",
+      "size_bytes": 355
+    },
+    "anomalies/quotes_zero_size.csv": {
+      "data_kind": "quotes",
+      "defective_rows": 1,
+      "expected_rejection": "ZERO_SIZE",
+      "kind": "anomaly",
+      "rows": 3,
+      "sha256": "a2c5bbee3e7f34100f63dd6c35f57a4ed101207a0c6a2cb866245a34e11a125f",
+      "sha256_uncompressed": "a2c5bbee3e7f34100f63dd6c35f57a4ed101207a0c6a2cb866245a34e11a125f",
+      "size_bytes": 355
+    },
+    "ohlcv/BYBIT_SPOT_BTC_USDT_1H.csv.gz": {
+      "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+      "interval_seconds": 3600,
+      "kind": "ohlcv",
+      "last_timestamp": "2024-09-25T08:00:00.0000000Z",
+      "regimes": [
+        {
+          "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+          "last_timestamp": "2024-05-02T12:00:00.0000000Z",
+          "name": "CALM_RANGE",
+          "rows": 1500
+        },
+        {
+          "first_timestamp": "2024-05-02T12:00:00.0000000Z",
+          "last_timestamp": "2024-06-21T12:00:00.0000000Z",
+          "name": "STRONG_TREND",
+          "rows": 1200
+        },
+        {
+          "first_timestamp": "2024-06-21T12:00:00.0000000Z",
+          "last_timestamp": "2024-07-04T00:00:00.0000000Z",
+          "name": "CRASH",
+          "rows": 300
+        },
+        {
+          "first_timestamp": "2024-07-04T00:00:00.0000000Z",
+          "last_timestamp": "2024-09-25T08:00:00.0000000Z",
+          "name": "CHOP",
+          "rows": 2000
+        }
+      ],
+      "rows": 5000,
+      "seed": 5928249633761987444,
+      "sha256": "ea43f7fc0a6b8f75d75f17c3e4ee4ea7cacfc29e6915f53d38dea4b260403512",
+      "sha256_uncompressed": "2378c1f5c45e27b1429cfb1837ad7a4295dba9e0ee97e7fbd1745c0446f5786c",
+      "size_bytes": 199681,
+      "symbol_id": "BYBIT_SPOT_BTC_USDT"
+    },
+    "ohlcv/BYBIT_SPOT_ETH_USDT_1H.csv.gz": {
+      "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+      "interval_seconds": 3600,
+      "kind": "ohlcv",
+      "last_timestamp": "2024-09-25T08:00:00.0000000Z",
+      "regimes": [
+        {
+          "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+          "last_timestamp": "2024-05-02T12:00:00.0000000Z",
+          "name": "CALM_RANGE",
+          "rows": 1500
+        },
+        {
+          "first_timestamp": "2024-05-02T12:00:00.0000000Z",
+          "last_timestamp": "2024-06-21T12:00:00.0000000Z",
+          "name": "STRONG_TREND",
+          "rows": 1200
+        },
+        {
+          "first_timestamp": "2024-06-21T12:00:00.0000000Z",
+          "last_timestamp": "2024-07-04T00:00:00.0000000Z",
+          "name": "CRASH",
+          "rows": 300
+        },
+        {
+          "first_timestamp": "2024-07-04T00:00:00.0000000Z",
+          "last_timestamp": "2024-09-25T08:00:00.0000000Z",
+          "name": "CHOP",
+          "rows": 2000
+        }
+      ],
+      "rows": 5000,
+      "seed": 7003972584521871797,
+      "sha256": "0ea8117ffaa768fb8861167cf9e43e52223a03676a3cd6c8f8c8f3e2a995c933",
+      "sha256_uncompressed": "e863022e5f02b8d61aa1e4a05aaaad6dc84250f3212c9fba26285a0bf88b345d",
+      "size_bytes": 197691,
+      "symbol_id": "BYBIT_SPOT_ETH_USDT"
+    },
+    "ohlcv/BYBIT_SPOT_SOL_USDT_1H.csv.gz": {
+      "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+      "interval_seconds": 3600,
+      "kind": "ohlcv",
+      "last_timestamp": "2024-09-25T08:00:00.0000000Z",
+      "regimes": [
+        {
+          "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+          "last_timestamp": "2024-05-02T12:00:00.0000000Z",
+          "name": "CALM_RANGE",
+          "rows": 1500
+        },
+        {
+          "first_timestamp": "2024-05-02T12:00:00.0000000Z",
+          "last_timestamp": "2024-06-21T12:00:00.0000000Z",
+          "name": "STRONG_TREND",
+          "rows": 1200
+        },
+        {
+          "first_timestamp": "2024-06-21T12:00:00.0000000Z",
+          "last_timestamp": "2024-07-04T00:00:00.0000000Z",
+          "name": "CRASH",
+          "rows": 300
+        },
+        {
+          "first_timestamp": "2024-07-04T00:00:00.0000000Z",
+          "last_timestamp": "2024-09-25T08:00:00.0000000Z",
+          "name": "CHOP",
+          "rows": 2000
+        }
+      ],
+      "rows": 5000,
+      "seed": 3892555548833221147,
+      "sha256": "f71a73a4133cd39e42a2e6108ab747069e1253cb087d242e88d00a5805d6631e",
+      "sha256_uncompressed": "c932c237b47479015852eb43b58bdb6ce88a0809f1a924030374609badaabc16",
+      "size_bytes": 194172,
+      "symbol_id": "BYBIT_SPOT_SOL_USDT"
+    },
+    "orderbook/BYBIT_SPOT_BTC_USDT_L2.csv.gz": {
+      "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+      "kind": "orderbook",
+      "last_timestamp": "2024-09-25T07:30:00.0000000Z",
+      "match_events": 6642,
+      "regimes": [
+        "CALM_RANGE",
+        "STRONG_TREND",
+        "CRASH",
+        "CHOP"
+      ],
+      "rows": 200315,
+      "seed": 8163592246330713245,
+      "sha256": "35dab331f8802d0efcd29fd0749a669d424639a8f4ce6ec8086e3e2dbe6ff0c1",
+      "sha256_uncompressed": "c73833a53c4e3cc65f78f50e4fc5ba914bd6b503257627cda2b8404fd7e52230",
+      "size_bytes": 1878687,
+      "snapshot_events": 160,
+      "snapshot_levels": 20,
+      "symbol_id": "BYBIT_SPOT_BTC_USDT"
+    },
+    "orderbook/BYBIT_SPOT_ETH_USDT_L2.csv.gz": {
+      "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+      "kind": "orderbook",
+      "last_timestamp": "2024-09-25T07:30:00.0000000Z",
+      "match_events": 6494,
+      "regimes": [
+        "CALM_RANGE",
+        "STRONG_TREND",
+        "CRASH",
+        "CHOP"
+      ],
+      "rows": 193613,
+      "seed": 840654947505306378,
+      "sha256": "100bc0793491b015ab28472d74e04ff97f4897076be68e05d2bb06c5bdbc7fc6",
+      "sha256_uncompressed": "c4ecdf6f7726f3d2ea42880b0ac54d59250546529a0fbabc90a805691e31ca43",
+      "size_bytes": 1854913,
+      "snapshot_events": 160,
+      "snapshot_levels": 20,
+      "symbol_id": "BYBIT_SPOT_ETH_USDT"
+    },
+    "quotes/BYBIT_SPOT_BTC_USDT_QUOTES.csv.gz": {
+      "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+      "kind": "quotes",
+      "last_timestamp": "2024-09-25T07:45:00.0000000Z",
+      "regimes": [
+        "CALM_RANGE",
+        "STRONG_TREND",
+        "CRASH",
+        "CHOP"
+      ],
+      "rows": 22400,
+      "seed": 5414252268035059446,
+      "sha256": "0ce9e189fcad91ac682f4f48a639313e3572adf62d59a46c7216da00bf31140b",
+      "sha256_uncompressed": "fb0c0b70dda0e6aa48386ed76bbc60b6d65d23a03e4fbfc6557fd448d587f35f",
+      "size_bytes": 540752,
+      "symbol_id": "BYBIT_SPOT_BTC_USDT"
+    }
+  },
+  "first_timestamp": "2024-03-01T00:00:00.0000000Z",
+  "generator": "tools/make_dataset.py",
+  "generator_version": "1.0.0",
+  "last_timestamp": "2024-09-25T08:00:00.0000000Z",
+  "regimes": [
+    {
+      "bars": 1500,
+      "base_spread_bps": 2.0,
+      "bid_depth_skew": 1.0,
+      "depth_multiplier": 1.0,
+      "drift_per_bar": 0.0,
+      "name": "CALM_RANGE",
+      "vol_per_bar": 0.0032
+    },
+    {
+      "bars": 1200,
+      "base_spread_bps": 3.0,
+      "bid_depth_skew": 1.05,
+      "depth_multiplier": 0.9,
+      "drift_per_bar": 0.00045,
+      "name": "STRONG_TREND",
+      "vol_per_bar": 0.006
+    },
+    {
+      "bars": 300,
+      "base_spread_bps": 45.0,
+      "bid_depth_skew": 0.35,
+      "depth_multiplier": 0.3,
+      "drift_per_bar": -0.0035,
+      "name": "CRASH",
+      "vol_per_bar": 0.015
+    },
+    {
+      "bars": 2000,
+      "base_spread_bps": 5.0,
+      "bid_depth_skew": 1.0,
+      "depth_multiplier": 0.8,
+      "drift_per_bar": 0.0,
+      "name": "CHOP",
+      "vol_per_bar": 0.009
+    }
+  ],
+  "schema": "coinapi-flat-files/v1",
+  "seed": 20240301,
+  "synthetic": true,
+  "warning": "SYNTHETIC data generated by tools/make_dataset.py. This is a model, not a market. It exists to exercise loader, microstructure and no-lookahead code paths. Any P&L measured on it describes the generator, not an edge."
+}

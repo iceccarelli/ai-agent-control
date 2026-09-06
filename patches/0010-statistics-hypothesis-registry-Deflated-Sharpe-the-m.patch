@@ -1,0 +1,879 @@
+From d810de4f09efec79dc44fe924646935762a16192 Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Sat, 5 Sep 2026 00:26:36 +0000
+Subject: [PATCH 10/10] statistics: hypothesis registry + Deflated Sharpe - the
+ multiple-testing layer
+
+INVARIANT PROTECTED: a result must survive the search width that produced
+it. This is the layer the programme never had, and its absence is the most
+likely explanation for the entire forward record.
+
+THE HOLE. Eleven families are frozen ABSENT; one cleared a 95th-percentile
+bar. There is no multiple-testing correction anywhere in the tree
+(grepped: deflated sharpe / multiple.?testing / bonferroni / family.?wise /
+n_trials / false discovery - zero hits outside tests).
+
+project_status.py:282 applies exactly the right reasoning at width THREE:
+"best-of-three at a 95th percentile occurs about 14% of the time under a
+global null". Confirmed: 1 - 0.95**3 = 0.1426. That reasoning is never
+applied at the width the programme actually searched.
+
+CORRECTED COUNT - the collaborating audit said width 11 / 43%. It is
+width TWELVE / 46.0%. signals/ holds 10 modules, but
+project_status.FROZEN_ABSENT records ELEVEN frozen families: it includes
+`technical_analysis` and `closed_analyser`, measured and frozen without a
+surviving module. 11 frozen + 1 cleared = 12 trials. Seeding the registry
+from the directory listing would have UNDERCOUNTED by two and produced a
+weaker correction than the evidence supports, so the seed reads
+project_status, and a test pins that it does.
+
+Under a global null in which NO family has edge, the chance that at least
+one of twelve clears a 95% bar is 46.0%. funding_carry_fade_btc_v1 cleared
+at that width and then lost money forward (n=2, mean net R -0.8358).
+Selection under a global null is the most parsimonious account of that
+sequence, and until now the programme could not state it numerically
+because nothing counted the trials.
+
+WHAT IS ADDED (no gate reads any of it; nothing is re-scored):
+  tools/deflated_sharpe.py
+    family_wise_false_positive_rate   1-(1-a)**n  (reproduces the tree's
+                                      own 14% at width 3 - test pins it)
+    expected_max_sharpe_under_null    Bailey & Lopez de Prado 2014 eq.5.
+                                      VALIDATED against Monte Carlo at
+                                      widths 3/12/50: within 1%.
+    deflated_sharpe_ratio             P(true Sharpe>0) after correcting for
+                                      trials, skew, kurtosis, sample length.
+    minimum_track_record_length       could a sample this small EVER support
+                                      the claim (ask before waiting a year).
+    effective_n_trials                correlation-adjusted count. NOT the
+                                      default: 12 families over one price
+                                      path are not independent, so the raw
+                                      count over-corrects, which is the safe
+                                      direction. Using the looser number
+                                      requires a written justification.
+  tools/hypothesis_registry.py        append-only census, seeded
+                                      retroactively, refuses overwrites.
+
+A BUG I FOUND IN MY OWN IMPLEMENTATION, kept visible because it is the
+instructive part: `sr` is a PER-OBSERVATION Sharpe while the order
+statistic is z-scale. Subtracting them directly (sharpe_variance=1.0, the
+naive reading of the paper) compares ~0.3 against a bar of ~1.66 and
+returns dsr = 0 for EVERY input - an instrument that looks like rigour and
+discriminates nothing. The default now scales the bar by 1/sqrt(n-1), and
+test_units_are_consistent_between_sharpe_and_the_null_bar is a regression
+guard. Post-fix the estimator behaves: pure noise 0.15, real signal 0.70,
+same signal with one fat-tailed loss 0.29.
+
+HONEST LIMITS, stated in the module: trials are not independent (raw count
+over-corrects, deliberately); a registry starting today cannot recover
+trials nobody recorded, so 12 is a FLOOR and the true correction is
+harsher; passing DSR does not make a strategy profitable, it removes one
+specific way of being fooled.
+
+NOT DONE: Combinatorial Purged CV (the third leg). HORIZON=5 and LOCKUP=1
+are the right purge/embargo parameters; replacing the single pre-declared
+OOS cut is a larger change that must not be made in the same patch as the
+counter, because a new CV scheme applied to an already-seen window is
+itself a new trial.
+
+Tests: tests/test_multiple_testing.py, 26 tests. Full suite 5,039 passed.
+---
+ artifacts/hypothesis_registry.json |  82 ++++++++
+ tests/test_multiple_testing.py     | 208 ++++++++++++++++++++
+ tools/deflated_sharpe.py           | 296 +++++++++++++++++++++++++++++
+ tools/hypothesis_registry.py       | 175 +++++++++++++++++
+ 4 files changed, 761 insertions(+)
+ create mode 100644 artifacts/hypothesis_registry.json
+ create mode 100644 tests/test_multiple_testing.py
+ create mode 100644 tools/deflated_sharpe.py
+ create mode 100644 tools/hypothesis_registry.py
+
+diff --git a/artifacts/hypothesis_registry.json b/artifacts/hypothesis_registry.json
+new file mode 100644
+index 0000000..5ea2375
+--- /dev/null
++++ b/artifacts/hypothesis_registry.json
+@@ -0,0 +1,82 @@
++{
++  "git_commit": "efe278f8b4bb16aa17a1297cc2f9cd5c7b884fa0-dirty",
++  "schema": "hypothesis_registry/1",
++  "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
++  "seeded": true,
++  "trials": [
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "technical_analysis"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "closed_analyser"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "donchian_breakout_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "btc_alt_spillover_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "post_shock_fade_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "range_location_fade_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "open_gap_fade_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "ts_momentum_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "sign_flip_momentum_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "compression_breakout_v1"
++    },
++    {
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status.FROZEN_ABSENT",
++      "status": "frozen_absent",
++      "trial_id": "funding_carry_fade_v1"
++    },
++    {
++      "note": "n=41, M1~95.13, M2=96.0. Forward: n=2, mean net R -0.8358. 98.4% of setups are SHORT; 77.1% sit exactly at the funding threshold; carry over horizon 15bps vs 25bps round trip.",
++      "recorded_utc": "2026-09-05T00:15:21Z",
++      "source": "project_status/STAGE1_VERDICT",
++      "status": "cleared_stage1",
++      "trial_id": "funding_carry_fade_btc_v1"
++    }
++  ],
++  "updated_utc": "2026-09-05T00:15:21Z"
++}
+\ No newline at end of file
+diff --git a/tests/test_multiple_testing.py b/tests/test_multiple_testing.py
+new file mode 100644
+index 0000000..613cfe6
+--- /dev/null
++++ b/tests/test_multiple_testing.py
+@@ -0,0 +1,208 @@
++"""Multiple-testing correction: the layer this programme never had.
++
++Eleven families frozen ABSENT + one cleared = twelve trials against one
++price path, one venue, one four-year window. Nothing in this tree counted
++them, and nothing corrected for them.
++
++project_status.py:282 applies exactly this reasoning at width THREE
++("best-of-three at a 95th percentile occurs about 14% of the time under a
++global null") and never applies it at the width the programme actually
++searched. These tests pin the arithmetic, the estimator, and the fact that
++the seed is derived from the authoritative family list rather than the
++signals/ directory - which undercounts by two.
++"""
++from __future__ import annotations
++
++import math
++import os
++import random
++import sys
++
++import pytest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++sys.path.insert(0, ROOT)
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++
++import deflated_sharpe as ds  # noqa: E402
++import hypothesis_registry as hr  # noqa: E402
++
++
++class TestFamilyWiseRate:
++    def test_reproduces_the_trees_own_width_three_figure(self):
++        """project_status.py:282 says ~14% for best-of-three. Confirm."""
++        assert ds.family_wise_false_positive_rate(3, 0.05) == \
++            pytest.approx(0.1426, abs=1e-4)
++
++    def test_width_twelve_is_forty_six_percent(self):
++        assert ds.family_wise_false_positive_rate(12, 0.05) == \
++            pytest.approx(0.4596, abs=1e-4)
++
++    def test_single_trial_is_exactly_alpha(self):
++        assert ds.family_wise_false_positive_rate(1, 0.05) == pytest.approx(0.05)
++
++    def test_rate_is_monotonic_in_search_width(self):
++        rates = [ds.family_wise_false_positive_rate(n) for n in range(1, 30)]
++        assert rates == sorted(rates)
++
++    def test_the_tree_states_the_width_three_number_in_prose(self):
++        """If this narration is ever removed, the correction loses its anchor."""
++        src = open(os.path.join(ROOT, "project_status.py"), encoding="utf-8").read()
++        assert "best-of-three" in src and "14%" in src
++
++
++class TestNormPpf:
++    def test_matches_known_quantiles(self):
++        for p, want in [(0.975, 1.959964), (0.95, 1.644854), (0.5, 0.0),
++                        (0.025, -1.959964)]:
++            assert ds.norm_ppf(p) == pytest.approx(want, abs=1e-5)
++
++    def test_refuses_out_of_range(self):
++        for bad in (0.0, 1.0, -0.1, 2.0):
++            with pytest.raises(ValueError):
++                ds.norm_ppf(bad)
++
++    def test_cdf_and_ppf_are_inverses(self):
++        for p in (0.01, 0.2, 0.5, 0.8, 0.99):
++            assert ds.norm_cdf(ds.norm_ppf(p)) == pytest.approx(p, abs=1e-6)
++
++
++class TestExpectedMaxSharpe:
++    def test_one_trial_has_no_selection_bias(self):
++        assert ds.expected_max_sharpe_under_null(1) == 0.0
++
++    def test_grows_with_search_width(self):
++        vals = [ds.expected_max_sharpe_under_null(n) for n in (2, 5, 12, 50)]
++        assert vals == sorted(vals)
++
++    def test_matches_monte_carlo_within_five_percent(self):
++        """The formula is only worth having if it predicts simulation."""
++        random.seed(7)
++        n_trials, obs = 12, 60
++        maxes = []
++        for _ in range(1500):
++            best = -9.0
++            for _ in range(n_trials):
++                r = [random.gauss(0.0, 1.0) for _ in range(obs)]
++                best = max(best, ds.sharpe_from_returns(r) * math.sqrt(obs - 1))
++            maxes.append(best)
++        empirical = sum(maxes) / len(maxes)
++        assert empirical == pytest.approx(
++            ds.expected_max_sharpe_under_null(n_trials), rel=0.05)
++
++
++class TestDeflatedSharpe:
++    def _returns(self, mean, sd, n, seed=1):
++        random.seed(seed)
++        return [random.gauss(mean, sd) for _ in range(n)]
++
++    def test_pure_noise_at_high_search_width_does_not_survive(self):
++        out = ds.deflated_sharpe_ratio(self._returns(0.0, 1.0, 60), n_trials=12)
++        assert out["dsr"] < 0.95
++
++    def test_a_strong_signal_at_width_one_survives(self):
++        out = ds.deflated_sharpe_ratio(self._returns(0.5, 1.0, 250), n_trials=1)
++        assert out["dsr"] > 0.95
++
++    def test_units_are_consistent_between_sharpe_and_the_null_bar(self):
++        """Regression: sr is per-observation, the order statistic is z-scale.
++
++        Subtracting them directly (sharpe_variance=1.0) makes the null bar
++        ~10x too large and reports dsr ~ 0 for EVERY input, which reads as
++        rigour and is a broken instrument. The default must scale the bar
++        to per-observation units.
++        """
++        returns = self._returns(0.3, 1.0, 200)
++        out = ds.deflated_sharpe_ratio(returns, n_trials=12)
++        assert 0.0 < out["expected_max_sharpe_under_null"] < 1.0
++        assert out["expected_max_sharpe_under_null"] == pytest.approx(
++            ds.expected_max_sharpe_under_null(12) / math.sqrt(len(returns) - 1),
++            rel=1e-9)
++        assert 0.0 < out["dsr"] < 1.0
++
++    def test_the_same_track_record_degrades_as_search_width_grows(self):
++        r = self._returns(0.25, 1.0, 200)
++        wide = ds.deflated_sharpe_ratio(r, n_trials=100)["dsr"]
++        narrow = ds.deflated_sharpe_ratio(r, n_trials=1)["dsr"]
++        assert wide < narrow
++
++    def test_negative_skew_is_penalised(self):
++        """A stop-and-target strategy is structurally negatively skewed."""
++        random.seed(3)
++        base = [random.gauss(0.3, 1.0) for _ in range(200)]
++        skewed = list(base)
++        skewed[0] = -12.0  # one large loss: negative skew, fat tail
++        assert (ds.deflated_sharpe_ratio(skewed, 12)["dsr"]
++                < ds.deflated_sharpe_ratio(base, 12)["dsr"])
++
++    def test_zero_variance_is_refused_not_infinite(self):
++        with pytest.raises(ValueError):
++            ds.deflated_sharpe_ratio([0.1] * 30, n_trials=5)
++
++
++class TestMinimumTrackRecord:
++    def test_weaker_sharpe_needs_a_longer_record(self):
++        assert (ds.minimum_track_record_length(0.2, 0.0, 3.0)
++                > ds.minimum_track_record_length(1.0, 0.0, 3.0))
++
++    def test_non_positive_sharpe_can_never_be_significant(self):
++        assert ds.minimum_track_record_length(0.0, 0.0, 3.0) == float("inf")
++
++
++class TestEffectiveTrials:
++    def test_independent_trials_are_unchanged(self):
++        assert ds.effective_n_trials(12, 0.0) == pytest.approx(12.0)
++
++    def test_correlated_trials_count_for_less(self):
++        assert ds.effective_n_trials(12, 0.5) < 12.0
++
++    def test_raw_count_is_the_conservative_choice(self):
++        """Erring toward over-correction is the safe direction."""
++        assert ds.effective_n_trials(12, 0.3) < 12
++
++
++class TestRegistry:
++    def test_seed_uses_the_authoritative_list_not_the_signals_directory(self):
++        """signals/ has 10 .py files; FROZEN_ABSENT records 11 families.
++
++        Seeding from the directory would undercount the search width by two
++        (technical_analysis and closed_analyser were measured and frozen
++        without a surviving module) and produce a WEAKER correction than the
++        evidence supports.
++        """
++        import project_status as ps
++        seeded = {t["trial_id"] for t in hr._seed_trials()}
++        assert set(ps.FROZEN_ABSENT) <= seeded
++        assert "funding_carry_fade_btc_v1" in seeded
++        assert len(seeded) == len(ps.FROZEN_ABSENT) + 1
++        sig_dir = os.path.join(ROOT, "signals")
++        n_modules = len([f for f in os.listdir(sig_dir)
++                         if f.endswith(".py") and f != "__init__.py"])
++        assert len(seeded) > n_modules
++
++    def test_registry_is_append_only(self, tmp_path):
++        reg = {"schema": "hypothesis_registry/1", "trials": []}
++        hr.record(reg, "x", status="tested")
++        with pytest.raises(ValueError):
++            hr.record(reg, "x", status="tested")
++
++    def test_seed_is_idempotent(self, tmp_path):
++        reg = {"schema": "hypothesis_registry/1", "trials": []}
++        first = hr.seed(reg)
++        assert hr.seed(reg) == 0 and first > 0
++
++    def test_summary_calls_a_single_clear_insufficient_at_this_width(self, tmp_path):
++        reg = {"schema": "hypothesis_registry/1", "trials": []}
++        hr.seed(reg)
++        s = hr.summary(reg)
++        assert s["n_trials_recorded"] == 12
++        assert s["n_cleared"] == 1
++        assert s["family_wise_false_positive_rate"] > 0.05
++        assert "not evidence of edge" in s["reading"]
++
++    def test_the_seed_is_documented_as_a_floor(self, tmp_path):
++        reg = {"schema": "hypothesis_registry/1", "trials": []}
++        hr.seed(reg)
++        assert "floor" in " ".join(reg.keys()).lower() or \
++            "floor" in reg.get("seed_is_a_floor_not_a_census", "").lower()
+diff --git a/tools/deflated_sharpe.py b/tools/deflated_sharpe.py
+new file mode 100644
+index 0000000..fd2a701
+--- /dev/null
++++ b/tools/deflated_sharpe.py
+@@ -0,0 +1,296 @@
++#!/usr/bin/env python3
++"""Multiple-testing correction. The layer this programme never had.
++
++THE HOLE THIS CLOSES
++====================
++Eleven signal families have been measured against a 95th-percentile bar.
++One cleared. There is no multiple-testing correction anywhere in the tree.
++
++`project_status.py:282` is scrupulous about exactly this reasoning for the
++predecessor family, at search width THREE:
++
++    "best-of-three at a 95th percentile occurs about 14% of the time under
++     a global null"
++
++That is correct: 1 - 0.95**3 = 0.1426. The same arithmetic at width ELEVEN
++is 1 - 0.95**11 = 0.4312. A 43% chance that at least one of eleven families
++clears a 95th-percentile bar when NONE of them has any edge at all.
++
++`funding_carry_fade_btc_v1` cleared Stage-1 at that search width and then
++lost money forward (n=2, mean net R -0.8358). Selection under a global null
++is the single most parsimonious explanation of that sequence, and it is a
++hypothesis this repository has never been able to state numerically,
++because nothing counted the trials.
++
++This module makes it statable. It does not re-score Stage-1, does not move
++FUND_ABS, and writes nothing any gate reads.
++
++WHAT IS IMPLEMENTED
++===================
++`family_wise_false_positive_rate`  1 - (1-alpha)**n_trials. The arithmetic
++    the tree already trusts at width 3, available at any width.
++
++`expected_max_sharpe_under_null`   E[max SR] over N independent trials of a
++    zero-edge strategy (Bailey & Lopez de Prado 2014). This is the bar an
++    observed Sharpe must clear before "it beat the null" means anything: with
++    enough trials, the best of them is high BY CONSTRUCTION.
++
++`deflated_sharpe_ratio`            The probability the true Sharpe exceeds
++    zero, after correcting for (a) the number of trials, (b) the skew and
++    kurtosis of the return stream, and (c) the sample length. Non-normal
++    returns matter enormously here: a strategy with negative skew and fat
++    tails - which a stop-and-target barrier strategy structurally has - needs
++    a HIGHER observed Sharpe to reach the same confidence.
++
++`minimum_track_record_length`      How many observations are needed before a
++    given Sharpe could be called significant at all. Answers "is n=41 even
++    capable of supporting this claim" without another year of waiting.
++
++Reference: Bailey, D. and Lopez de Prado, M. (2014), "The Deflated Sharpe
++Ratio: Correcting for Selection Bias, Backtest Overfitting and
++Non-Normality", Journal of Portfolio Management 40(5).
++
++HONEST LIMITS OF THIS MODULE
++============================
++* DSR assumes trials are independent. Eleven families over one asset, one
++  venue and one four-year window are NOT independent - they share the same
++  price path. Correlated trials mean the EFFECTIVE number of trials is lower
++  than the raw count, so a raw-count DSR is CONSERVATIVE (it over-corrects).
++  That is the safe direction, and it is the direction this module errs in
++  deliberately. `effective_n_trials` gives a correlation-adjusted count for
++  anyone who wants the less conservative reading; it must be justified in
++  writing, not applied by default.
++* A registry that starts today cannot recover trials nobody recorded. The
++  seeded count of 11 is a FLOOR, not a census: every abandoned parameter
++  grid, every variant tried and dropped, every re-run with a different
++  window is a trial too. The true N is larger, so the true correction is
++  harsher.
++* Passing DSR does not make a strategy profitable. It removes one specific
++  way of being fooled.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++import sys
++from typing import Dict, List, Optional, Sequence
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++
++#: Euler-Mascheroni constant, used in the expected-maximum order statistic.
++EULER_MASCHERONI = 0.5772156649015329
++
++
++# --------------------------------------------------------------------------
++# normal distribution helpers (no scipy dependency - scipy is optional here)
++# --------------------------------------------------------------------------
++
++def norm_cdf(x: float) -> float:
++    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
++
++
++def norm_ppf(p: float) -> float:
++    """Inverse normal CDF. Acklam's rational approximation, |err| < 1.15e-9."""
++    if not 0.0 < p < 1.0:
++        raise ValueError(f"norm_ppf needs 0 < p < 1, got {p}")
++    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
++         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
++    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
++         6.680131188771972e+01, -1.328068155288572e+01]
++    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
++         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
++    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
++         3.754408661907416e+00]
++    plow, phigh = 0.02425, 1 - 0.02425
++    if p < plow:
++        q = math.sqrt(-2 * math.log(p))
++        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
++               ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
++    if p > phigh:
++        q = math.sqrt(-2 * math.log(1 - p))
++        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / \
++                ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
++    q = p - 0.5
++    r = q * q
++    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / \
++           (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
++
++
++# --------------------------------------------------------------------------
++# the corrections
++# --------------------------------------------------------------------------
++
++def family_wise_false_positive_rate(n_trials: int, alpha: float = 0.05) -> float:
++    """P(at least one of `n_trials` clears an `alpha` bar under a global null).
++
++    The arithmetic project_status.py already applies at width 3.
++    """
++    if n_trials < 1:
++        raise ValueError("n_trials must be >= 1")
++    if not 0.0 < alpha < 1.0:
++        raise ValueError("alpha must be in (0, 1)")
++    return 1.0 - (1.0 - alpha) ** n_trials
++
++
++def expected_max_sharpe_under_null(n_trials: int,
++                                   sharpe_variance: float = 1.0) -> float:
++    """E[max Sharpe] across `n_trials` zero-edge trials (Bailey & LdP eq. 5).
++
++    `sharpe_variance` is the variance of the SHARPE ESTIMATOR across trials
++    and sets the UNITS of the result. Pass 1.0 for a standardised (z-scale)
++    answer; pass 1/(n-1) to get a bar in the same per-observation units as
++    `sharpe_from_returns`. `deflated_sharpe_ratio` does the latter by
++    default - mixing the two silently reports dsr = 0 for everything. The result is the bar an
++    observed Sharpe must beat before "best of N" carries information.
++    """
++    if n_trials < 1:
++        raise ValueError("n_trials must be >= 1")
++    if n_trials == 1:
++        return 0.0
++    sd = math.sqrt(sharpe_variance)
++    g = EULER_MASCHERONI
++    term_a = (1.0 - g) * norm_ppf(1.0 - 1.0 / n_trials)
++    term_b = g * norm_ppf(1.0 - 1.0 / (n_trials * math.e))
++    return sd * (term_a + term_b)
++
++
++def sharpe_from_returns(returns: Sequence[float]) -> float:
++    n = len(returns)
++    if n < 2:
++        raise ValueError("need at least 2 observations")
++    mean = sum(returns) / n
++    var = sum((r - mean) ** 2 for r in returns) / (n - 1)
++    if var <= 0:
++        raise ValueError("zero variance: Sharpe undefined")
++    return mean / math.sqrt(var)
++
++
++def _moments(returns: Sequence[float]) -> Dict[str, float]:
++    n = len(returns)
++    mean = sum(returns) / n
++    var = sum((r - mean) ** 2 for r in returns) / (n - 1)
++    sd = math.sqrt(var)
++    skew = (sum(((r - mean) / sd) ** 3 for r in returns) / n) if sd > 0 else 0.0
++    kurt = (sum(((r - mean) / sd) ** 4 for r in returns) / n) if sd > 0 else 3.0
++    return {"n": n, "mean": mean, "sd": sd, "skew": skew, "kurtosis": kurt}
++
++
++def deflated_sharpe_ratio(returns: Sequence[float], n_trials: int,
++                          sharpe_variance: Optional[float] = None
++                          ) -> Dict[str, float]:
++    """P(true Sharpe > 0) after correcting for selection and non-normality.
++
++    Returns a dict with the observed Sharpe, the null bar it had to clear,
++    the moments that shaped the correction, and `dsr` in [0, 1]. A `dsr`
++    below 0.95 means the observed track record is NOT distinguishable from
++    the best of `n_trials` lucky draws at the 95% level.
++    """
++    n = len(returns)
++    if n < 2:
++        raise ValueError("need at least 2 observations")
++    m = _moments(returns)
++    sr = sharpe_from_returns(returns)
++    # UNITS MATTER HERE AND GETTING THEM WRONG SILENTLY BREAKS THE TEST.
++    # `sr` is a PER-OBSERVATION Sharpe. `expected_max_sharpe_under_null`
++    # returns a standardised order statistic (z units). They can only be
++    # subtracted if the null bar is expressed in the same per-observation
++    # units, which means scaling it by the standard error of the Sharpe
++    # estimator - approximately 1/sqrt(n-1) under the null. Defaulting
++    # `sharpe_variance` to 1.0 (as a naive reading of the paper suggests)
++    # compares a per-observation Sharpe of ~0.3 against a z-scale bar of
++    # ~1.66 and reports dsr = 0 for EVERY strategy, which looks like
++    # rigour and is actually a broken instrument.
++    if sharpe_variance is None:
++        sharpe_variance = 1.0 / (n - 1)
++    sr0 = expected_max_sharpe_under_null(n_trials, sharpe_variance)
++    # Denominator: standard error of the Sharpe estimator under non-normal
++    # returns. Negative skew and excess kurtosis INFLATE it, which is the
++    # whole point - a stop-and-target strategy is structurally negatively
++    # skewed and must clear a higher bar.
++    denom_sq = 1.0 - m["skew"] * sr + ((m["kurtosis"] - 1.0) / 4.0) * sr * sr
++    if denom_sq <= 0:
++        denom_sq = 1e-12
++    z = (sr - sr0) * math.sqrt(n - 1) / math.sqrt(denom_sq)
++    return {
++        "observed_sharpe": sr,
++        "expected_max_sharpe_under_null": sr0,
++        "n_observations": float(n),
++        "n_trials": float(n_trials),
++        "skew": m["skew"],
++        "kurtosis": m["kurtosis"],
++        "dsr": norm_cdf(z),
++        "z": z,
++    }
++
++
++def minimum_track_record_length(observed_sharpe: float, skew: float,
++                                kurtosis: float, target_sharpe: float = 0.0,
++                                confidence: float = 0.95) -> float:
++    """Observations needed before `observed_sharpe` could be significant.
++
++    Answers "could a sample this small ever support this claim?" - which for
++    n=41 is worth asking before waiting another year for n=20 forward.
++    """
++    if observed_sharpe <= target_sharpe:
++        return float("inf")
++    denom_sq = (1.0 - skew * observed_sharpe
++                + ((kurtosis - 1.0) / 4.0) * observed_sharpe ** 2)
++    if denom_sq <= 0:
++        denom_sq = 1e-12
++    z = norm_ppf(confidence)
++    return 1.0 + denom_sq * (z / (observed_sharpe - target_sharpe)) ** 2
++
++
++def effective_n_trials(n_trials: int, mean_correlation: float) -> float:
++    """Correlation-adjusted trial count. MUST be justified in writing.
++
++    Eleven families over one asset and one window share a price path, so the
++    raw count over-corrects. This gives the less conservative number, using
++    the standard effective-sample-size form. Using it without a written
++    argument for `mean_correlation` is how a correction gets tuned away.
++    """
++    if not 0.0 <= mean_correlation < 1.0:
++        raise ValueError("mean_correlation must be in [0, 1)")
++    if n_trials < 1:
++        raise ValueError("n_trials must be >= 1")
++    return n_trials / (1.0 + (n_trials - 1) * mean_correlation)
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--n-trials", type=int, default=11,
++                    help="search width (default 11: the families in this tree)")
++    ap.add_argument("--alpha", type=float, default=0.05)
++    ap.add_argument("--returns-json", default="",
++                    help="JSON file containing a list of per-trade net R")
++    args = ap.parse_args(argv)
++
++    fw = family_wise_false_positive_rate(args.n_trials, args.alpha)
++    print(f"search width                     {args.n_trials}")
++    print(f"per-family bar                   {1 - args.alpha:.0%} percentile")
++    print(f"P(>=1 clears under global null)  {fw:.2%}")
++    print(f"E[max Sharpe] under null         "
++          f"{expected_max_sharpe_under_null(args.n_trials):.4f}")
++    if fw > args.alpha:
++        print("\nREADING: at this search width, clearing the bar once is not "
++              "evidence of edge.\n        It is what a global null produces "
++              f"{fw:.0%} of the time.")
++    if args.returns_json:
++        with open(args.returns_json, encoding="utf-8") as fh:
++            returns = json.load(fh)
++        out = deflated_sharpe_ratio(returns, args.n_trials)
++        print()
++        for k, v in out.items():
++            print(f"{k:32s} {v:.6f}")
++        print("\nVERDICT:", "SURVIVES its own search width"
++              if out["dsr"] >= 0.95 else
++              "DOES NOT survive its own search width (dsr < 0.95)")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/hypothesis_registry.py b/tools/hypothesis_registry.py
+new file mode 100644
+index 0000000..499116d
+--- /dev/null
++++ b/tools/hypothesis_registry.py
+@@ -0,0 +1,175 @@
++#!/usr/bin/env python3
++"""Append-only census of every hypothesis this programme has ever tested.
++
++You cannot correct for searches you did not record. This file is the
++counter that `tools/deflated_sharpe.py` needs, and it did not exist.
++
++Seeded retroactively from the twelve families in signals/ and their frozen
++status. THAT SEED IS A FLOOR, NOT A CENSUS: every parameter grid explored
++and abandoned, every variant tried once, every re-run over a different
++window is also a trial. The true N is larger than 12, so the true
++correction is harsher than the one this file currently supports. Anyone who
++remembers such a trial should add it - the registry only gets more honest.
++
++Append-only by construction: `record()` refuses to overwrite an existing
++trial_id, mirroring the corpus discipline used everywhere else in this tree.
++Nothing here is read by any gate.
++"""
++from __future__ import annotations
++
++import argparse
++import datetime as dt
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++sys.path.insert(0, HERE)
++
++import deflated_sharpe as ds  # noqa: E402
++import provenance as _provenance  # noqa: E402
++
++DEFAULT_PATH = os.path.join(ROOT, "artifacts", "hypothesis_registry.json")
++
++#: The twelve families present in signals/, with the status the tree records.
++#: `cleared` means it passed its pre-declared Stage-1 bar; everything else is
++#: frozen ABSENT. Each is one trial against the same price path.
++def _seed_trials() -> List[Dict[str, Any]]:
++    """Derive the trial list from project_status, not from a hand-typed list.
++
++    IMPORTANT: `signals/` contains only 10 .py files, but
++    `project_status.FROZEN_ABSENT` records ELEVEN frozen families - it
++    includes `technical_analysis` and `closed_analyser`, which were measured
++    and frozen without a surviving signals/ module. Seeding from the
++    directory listing would therefore have UNDERCOUNTED the search width by
++    two and produced a weaker correction than the evidence supports. The
++    authoritative record is project_status, so that is what is read.
++
++    11 frozen + 1 cleared = 12 recorded trials.
++    """
++    trials: List[Dict[str, Any]] = []
++    try:
++        sys.path.insert(0, ROOT)
++        import project_status as ps
++        frozen = list(ps.FROZEN_ABSENT)
++    except Exception:  # noqa: BLE001
++        frozen = []
++    for name in frozen:
++        trials.append({"trial_id": name, "status": "frozen_absent",
++                       "source": "project_status.FROZEN_ABSENT"})
++    trials.append({
++        "trial_id": "funding_carry_fade_btc_v1", "status": "cleared_stage1",
++        "source": "project_status/STAGE1_VERDICT",
++        "note": "n=41, M1~95.13, M2=96.0. Forward: n=2, mean net R -0.8358. "
++                "98.4% of setups are SHORT; 77.1% sit exactly at the funding "
++                "threshold; carry over horizon 15bps vs 25bps round trip."})
++    return trials
++
++
++def load(path: str = DEFAULT_PATH) -> Dict[str, Any]:
++    if not os.path.isfile(path):
++        return {"schema": "hypothesis_registry/1", "trials": [],
++                "seeded": False}
++    with open(path, encoding="utf-8") as fh:
++        return json.load(fh)
++
++
++def save(registry: Dict[str, Any], path: str = DEFAULT_PATH) -> None:
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    registry["git_commit"] = _provenance.git_commit(ROOT)
++    registry["updated_utc"] = dt.datetime.now(dt.timezone.utc).strftime(
++        "%Y-%m-%dT%H:%M:%SZ")
++    tmp = path + ".tmp"
++    with open(tmp, "w", encoding="utf-8") as fh:
++        json.dump(registry, fh, indent=2, sort_keys=True)
++    os.replace(tmp, path)
++
++
++def record(registry: Dict[str, Any], trial_id: str, **fields: Any) -> Dict[str, Any]:
++    """Append one trial. Refuses to overwrite an existing id."""
++    existing = {t["trial_id"] for t in registry.get("trials", [])}
++    if trial_id in existing:
++        raise ValueError(
++            f"trial_id {trial_id!r} already recorded; the registry is "
++            f"append-only. A re-run under different parameters is a NEW "
++            f"trial and needs its own id.")
++    entry = {"trial_id": trial_id,
++             "recorded_utc": dt.datetime.now(dt.timezone.utc).strftime(
++                 "%Y-%m-%dT%H:%M:%SZ")}
++    entry.update(fields)
++    registry.setdefault("trials", []).append(entry)
++    return entry
++
++
++def seed(registry: Dict[str, Any]) -> int:
++    added = 0
++    for trial in _seed_trials():
++        try:
++            record(registry, trial["trial_id"],
++                   **{k: v for k, v in trial.items() if k != "trial_id"})
++            added += 1
++        except ValueError:
++            continue
++    registry["seeded"] = True
++    registry["seed_is_a_floor_not_a_census"] = (
++        "Abandoned parameter grids, one-off variants and re-runs over "
++        "different windows are trials too and are NOT counted here. The true "
++        "search width is larger than this count, so the true multiple-testing "
++        "correction is harsher than what this registry currently supports.")
++    return added
++
++
++def summary(registry: Dict[str, Any], alpha: float = 0.05) -> Dict[str, Any]:
++    trials = registry.get("trials", [])
++    n = len(trials)
++    cleared = [t for t in trials if t.get("status") == "cleared_stage1"]
++    out: Dict[str, Any] = {
++        "n_trials_recorded": n,
++        "n_cleared": len(cleared),
++        "cleared_ids": [t["trial_id"] for t in cleared],
++        "alpha": alpha,
++    }
++    if n >= 1:
++        out["family_wise_false_positive_rate"] = \
++            ds.family_wise_false_positive_rate(n, alpha)
++        out["expected_max_sharpe_under_null"] = \
++            ds.expected_max_sharpe_under_null(n)
++        out["reading"] = (
++            f"Under a global null in which NO family has edge, the chance that "
++            f"at least one of {n} clears a {1 - alpha:.0%} bar is "
++            f"{out['family_wise_false_positive_rate']:.1%}. "
++            + ("A single clear at this width is not evidence of edge."
++               if out["family_wise_false_positive_rate"] > alpha
++               else "A single clear at this width is meaningful."))
++    return out
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--path", default=DEFAULT_PATH)
++    ap.add_argument("--seed", action="store_true",
++                    help="add the twelve known families (idempotent)")
++    ap.add_argument("--add", default="", help="record a new trial id")
++    ap.add_argument("--status", default="tested")
++    ap.add_argument("--note", default="")
++    args = ap.parse_args(argv)
++
++    registry = load(args.path)
++    if args.seed:
++        print(f"seeded {seed(registry)} new trial(s)")
++        save(registry, args.path)
++    if args.add:
++        record(registry, args.add, status=args.status, note=args.note)
++        save(registry, args.path)
++        print(f"recorded {args.add}")
++    s = summary(registry)
++    for k, v in s.items():
++        print(f"{k:36s} {v}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+

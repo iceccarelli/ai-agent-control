@@ -1,0 +1,67 @@
+{
+  "schema": "data_freshness/2",
+  "slice": 61,
+  "symbol": "BTCUSDT",
+  "checked_at_utc": "2026-08-11T01:35:34Z",
+  "t1_previous": "2026-08-09T00:00:00Z",
+  "t1_previous_ms": 1786233600000,
+  "t1_source": "artifacts/funding_carry_fade_btc_v1_folds.json",
+  "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+  "folds_unmodified": true,
+  "human_note_present": true,
+  "human_note_path": "docs/human/HUMAN_DATA_NOTE_SLICE61.md",
+  "human_note_claims_extended_files": [
+    "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
+    "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz"
+  ],
+  "human_pack": {
+    "pack_path": "s61pack.zip",
+    "readable": true,
+    "sha256": "b13a2586510892e483c60c929b33dbcaa24582ba164302bd319790e30e59151d",
+    "bytes": 2474,
+    "members": [
+      {
+        "name": "MISSION_SLICE61.md",
+        "bytes": 4219
+      },
+      {
+        "name": "HUMAN_DATA_NOTE_SLICE61.md",
+        "bytes": 676
+      }
+    ],
+    "member_count": 2,
+    "data_member_count": 0,
+    "contains_the_files_the_note_names": false
+  },
+  "human_pack_supplied_data_files": false,
+  "discrepancy": "The human note describes an extension at two data paths. The pack contains 2 markdown documents and 0 data files, and no repository tree. Recorded without accusation — a pack can be assembled and its large members fail to attach — but the artefact that would settle the question is absent, so the question is not settled. EDGE.md §44a.",
+  "latest_linear_timestamp": "2026-08-09T00:00:00+00:00",
+  "latest_funding_timestamp": "2026-08-09T08:00:00+00:00",
+  "linear_rows": 1461,
+  "funding_rows": 4383,
+  "new_linear_bars_count": 0,
+  "new_funding_prints_count": 1,
+  "hash_check": {
+    "linear_sha256": "3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55",
+    "linear_pinned_in_folds": "3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55",
+    "linear_unchanged_since_t1": true,
+    "funding_sha256": "9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145",
+    "funding_pinned_in_folds": "9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145",
+    "funding_unchanged_since_t1": true,
+    "what_this_proves": "Identical hashes prove TWO things at once. (1) NO HISTORY WAS REWRITTEN — the note's more important promise, kept exactly, not one byte of measured history has moved. (2) NO EXTENSION EXISTS — identical files cannot contain new rows. The second follows from the first by arithmetic, which is why the check is a hash and not a reading of the note."
+  },
+  "extension_present": false,
+  "new_bars_available": false,
+  "bars_fabricated": 0,
+  "corpus_appended_to": false,
+  "fetch_attempted": false,
+  "why_no_fetch": "Slice 60 attempted the sanctioned in-repo fetcher and recorded a ProxyError against fapi.binance.com; this environment has no egress to the venue and nothing about that has changed. Repeating a call that failed yesterday in order to produce a fresh-looking log line is activity, not evidence. See artifacts/slice60_data_freshness.json.",
+  "what_would_count": {
+    "rule": "a CLOSED linear daily bar with start strictly after t1",
+    "closed_only": true,
+    "synthetic_must_be_false": true,
+    "first_forward_observation_needs_closed_bars": 6,
+    "note": "A trade is an observation only when it CLOSES. With a 5-bar horizon the first forward observation cannot exist until at least 6 closed forward bars do. A funding print without a bar to decide is not an observation either — the decision clock is the daily bar."
+  },
+  "git_commit": "3f9e86ebfdc4e28c2fa8e094eaee2b3bd0263d9e"
+}

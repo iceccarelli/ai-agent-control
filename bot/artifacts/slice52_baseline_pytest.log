@@ -1,0 +1,3 @@
+FAILED tests/test_project_status.py::TestTheLedgerDocumentsAgreeWithTheDenyList::test_the_intake_slot_is_waiting_and_empty
+FAILED tests/test_project_status.py::TestTheLedgerDocumentsAgreeWithTheDenyList::test_the_closed_intake_is_not_presented_as_an_open_thesis
+2 failed, 3335 passed, 1 skipped in 201.87s (0:03:21)

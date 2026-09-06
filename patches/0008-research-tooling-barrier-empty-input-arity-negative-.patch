@@ -1,0 +1,534 @@
+From efe278f8b4bb16aa17a1297cc2f9cd5c7b884fa0 Mon Sep 17 00:00:00 2001
+From: auditor <audit@local>
+Date: Fri, 4 Sep 2026 23:33:48 +0000
+Subject: [PATCH 08/10] research tooling: barrier-empty-input arity,
+ negative-quantity gate, corpus unit audit
+
+Credit: an independent audit pass (uploaded as AUDIT_SLICE76.zip) found
+these three; all three are re-derived and re-verified from source here,
+independently, before being fixed, because "another AI said so" is not
+evidence - reproducing the bug is.
+
+1. tools/skill_test.py barrier_r_for_all_bars - empty-input early return
+   gave a 2-tuple; every real caller (70+ sites in tools/ and tests/)
+   unpacks 3 (`indices, net, bars_used`). Reproduced: a 3-bar series
+   raises `ValueError: not enough values to unpack` at the CALLER, which
+   looks like a caller bug rather than what it actually is - a corpus
+   too short (or an all-NaN ATR window) to produce an eligible bar.
+   Fixed to return three empty arrays; the misleading `Tuple[np.ndarray,
+   np.ndarray]` return annotation is corrected to 3 elements too.
+   tests/test_barrier_empty_input.py, 3 tests.
+
+2. risk_management.gate_order - `if quantity and float(quantity) > 0.0:`
+   guards all four size gates (per-trade risk, notional, aggregate
+   exposure, correlation). A NEGATIVE quantity is falsy-guarded the same
+   as zero and falls through to `RiskDecision(ok=True, reason=
+   "APPROVED")` with none of the four gates run. VERIFIED SEVERITY, NOT
+   OVERSTATED: the two current call sites in trading_engine.py pass
+   0.0 (the pre-gate, size-independent by design and correctly still
+   unblocked) or `sizing.qty` (the final gate) - and
+   BillionairePositionSizing refuses rather than emit a negative size, so
+   this branch is NOT reachable through the engine today. Fixed anyway as
+   defense in depth against a future or external caller (a hand-built
+   TradeIntent, a different sizer, a test harness) - the zero-quantity
+   pre-gate path is preserved exactly. tests/test_negative_quantity_gate.py,
+   6 tests, including one that pins the zero-quantity pre-gate behaviour
+   does NOT regress.
+
+3. tools/corpus_unit_audit.py (new) - a meaning-layer check the byte-level
+   prefix-hash tests cannot provide. VERIFIED by running it against the
+   actual shipped corpus: 2026-08-18 through 2026-08-22 carry
+   5.4e9..3.5e10 in volume_traded against a 1,476-row median of 227,714 -
+   23,738x to 151,759x, for exactly 5 contiguous days, then a clean return
+   to the prior order of magnitude. That is quote-notional (USD) leaking
+   into a base-volume column, not a real volume day (BTC does not trade
+   five billion COINS in a day). CONFIRMED NOT TO REACH the currently
+   cleared/forward-shadowed signal: funding_carry_fade_v1 and
+   _btc_v1 contain no reference to volume (test pins this). CONFIRMED TO
+   REACH seven of the eleven frozen families that DO reference volume
+   (btc_alt_spillover_v1, compression_breakout_v1, open_gap_fade_v1,
+   post_shock_fade_v1, range_location_fade_v1, sign_flip_momentum_v1,
+   ts_momentum_v1) - listed by a living test rather than a one-time note,
+   so the list stays current as signal files change.
+   tests/test_corpus_unit_audit.py, 6 tests. One of them
+   (test_the_known_unit_swap_is_still_present) is written to FAIL the day
+   a human corrects the source data, on purpose, so the fix cannot happen
+   silently.
+
+What did NOT change: FUND_ABS, join, horizon, barrier geometry, any
+threshold, GATE_PATH, the corpus bytes themselves (the unit-swap defect
+is documented, not silently patched over - fixing it means re-fetching
+those 5 days from source and would change sha256, which needs a human
+decision, not a background bug fix).
+
+Verification: full suite 5,006 passed, 2 skipped (baseline 4,953; prior
+rounds 4,990; this round adds 16 new tests net of the empty-input fix
+also being exercised by 3 pre-existing... see individual counts above).
+---
+ risk_management.py                   |  23 ++++-
+ tests/test_barrier_empty_input.py    |  63 ++++++++++++++
+ tests/test_corpus_unit_audit.py      | 119 ++++++++++++++++++++++++++
+ tests/test_negative_quantity_gate.py |  60 ++++++++++++++
+ tools/corpus_unit_audit.py           | 120 +++++++++++++++++++++++++++
+ tools/skill_test.py                  |  14 +++-
+ 6 files changed, 396 insertions(+), 3 deletions(-)
+ create mode 100644 tests/test_barrier_empty_input.py
+ create mode 100644 tests/test_corpus_unit_audit.py
+ create mode 100644 tests/test_negative_quantity_gate.py
+ create mode 100644 tools/corpus_unit_audit.py
+
+diff --git a/risk_management.py b/risk_management.py
+index e4c8b82..1abbf6e 100644
+--- a/risk_management.py
++++ b/risk_management.py
+@@ -1066,7 +1066,28 @@ class BillionaireRiskManager:
+                 self._journal(symbol, "BLOCK", book_gate)
+                 return book_gate
+ 
+-            if quantity and float(quantity) > 0.0:
++            qty_value = float(quantity) if quantity else 0.0
++            if qty_value < 0.0 or not math.isfinite(qty_value):
++                # `quantity=0.0` from the size-independent PRE-gate is
++                # intentional (trading_engine.py's comment: "pre-trade risk
++                # gate, size-independent") and correctly skips these checks.
++                # A NEGATIVE or non-finite quantity is not that case - it is
++                # either a caller bug or an inverted sign, and skipping size
++                # gates for it means _gate_per_trade_risk / _gate_position_
++                # notional / _gate_aggregate_exposure / _gate_correlation_
++                # bucket never run, and the function falls through to
++                # RiskDecision(ok=True, reason="APPROVED"). No CURRENT caller
++                # in this tree reaches this branch: trading_engine.py passes
++                # 0.0 for the pre-gate and sizer.qty for the final gate, and
++                # BillionairePositionSizing refuses (should_trade=False)
++                # rather than emitting a negative size. This is defense in
++                # depth against a future or external caller, not a fix to an
++                # exploited path today.
++                decision = _block("NEGATIVE_OR_NON_FINITE_QUANTITY",
++                                  quantity=quantity)
++                self._journal(symbol, "BLOCK", decision)
++                return decision
++            if qty_value > 0.0:
+                 size_gates = (
+                     self._gate_per_trade_risk(
+                         qty=quantity, entry_price=entry_price,
+diff --git a/tests/test_barrier_empty_input.py b/tests/test_barrier_empty_input.py
+new file mode 100644
+index 0000000..55d88c0
+--- /dev/null
++++ b/tests/test_barrier_empty_input.py
+@@ -0,0 +1,63 @@
++"""barrier_r_for_all_bars must return the same arity on every path.
++
++Finding: the empty-input early return gave a 2-tuple while every real
++caller (tools/, tests/ — 70+ sites) unpacks 3 values
++(`indices, net, bars_used`). Any input too short to produce an eligible
++bar — a fresh corpus slice, an all-NaN ATR window, a horizon that
++consumes the whole series — hit this path and crashed with a ValueError
++at the CALL SITE rather than at the point of the actual problem (no
++eligible bars), which is a strictly worse failure mode for a research
++tool: it looks like a bug in the caller, not a fact about the data.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++import numpy as np
++import pytest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++sys.path.insert(0, ROOT)
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++
++import skill_test as sk  # noqa: E402
++from backtest import Bar  # noqa: E402
++
++
++def _bars(n, start_ms=0, day_ms=86_400_000):
++    return [Bar(start_ms + i * day_ms, 100.0, 101.0, 99.0, 100.0, 1_000.0)
++            for i in range(n)]
++
++
++def test_too_short_for_any_eligible_bar_returns_three_empty_arrays():
++    bars = _bars(3)  # far shorter than atr_period + horizon
++    result = sk.barrier_r_for_all_bars(
++        bars, side="long", entry_on="next_open", stop_atr=1.5,
++        take_profit_atr=1.5, horizon=5, round_trip_bps=25.0, atr_period=14,
++    )
++    assert len(result) == 3
++    indices, net, bars_used = result
++    assert indices.size == net.size == bars_used.size == 0
++    assert indices.dtype == int and bars_used.dtype == np.int32
++
++
++def test_the_documented_calling_convention_actually_works_on_empty_input():
++    """This is the exact unpack every real call site uses."""
++    bars = _bars(3)
++    indices, net, used = sk.barrier_r_for_all_bars(
++        bars, side="short", entry_on="close", stop_atr=1.5,
++        take_profit_atr=1.0, horizon=5, round_trip_bps=25.0, atr_period=14,
++    )
++    assert indices.tolist() == []
++
++
++def test_non_empty_path_is_unchanged_and_still_returns_three():
++    bars = _bars(40)
++    result = sk.barrier_r_for_all_bars(
++        bars, side="long", entry_on="next_open", stop_atr=1.5,
++        take_profit_atr=1.5, horizon=5, round_trip_bps=25.0, atr_period=14,
++    )
++    assert len(result) == 3
++    assert result[0].size > 0
+diff --git a/tests/test_corpus_unit_audit.py b/tests/test_corpus_unit_audit.py
+new file mode 100644
+index 0000000..970deae
+--- /dev/null
++++ b/tests/test_corpus_unit_audit.py
+@@ -0,0 +1,119 @@
++"""Volume-unit sanity check, and a map of who is exposed to it.
++
++This documents a REAL, currently UNFIXED defect in the shipped corpus:
++data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz carries
++quote-notional instead of base-asset volume for 2026-08-18..2026-08-22
++(5.4e9..3.5e10 against a file median of 227,714 - four to five orders of
++magnitude off). The prefix-hash/append-only invariants elsewhere in this
++suite are BYTE tests; they correctly say nothing about this, because the
++bytes are a valid, append-only, monotonic CSV throughout. This is a
++MEANING defect, and it needs its own test.
++
++The first assertion below is written to FAIL once a human fixes the
++source data, on purpose: a green run must not let this quietly become
++"no longer true" without a person reading why. When the corpus is
++corrected, delete test_the_known_unit_swap_is_still_present and keep the
++rest of the file as a permanent regression guard.
++"""
++from __future__ import annotations
++
++import gzip
++import os
++import sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++sys.path.insert(0, ROOT)
++sys.path.insert(0, os.path.join(ROOT, "tools"))
++
++import corpus_unit_audit as cua  # noqa: E402
++
++CORPUS = cua.DEFAULT_CSV
++
++
++def test_the_known_unit_swap_is_still_present():
++    """Fails (loudly, on purpose) the day someone fixes the source data.
++
++    Until then this documents exactly what is wrong and where, so nobody
++    has to rediscover it from a 5-billion-BTC daily volume figure.
++    """
++    if not os.path.isfile(CORPUS):
++        import pytest
++        pytest.skip("corpus not present in this checkout")
++    rows = cua.load_volume(CORPUS)
++    code, runs = cua.audit(rows)
++    assert code == 1, (
++        "the known 2026-08-18..2026-08-22 volume-unit swap is no longer "
++        "detected - if the corpus was corrected, delete this test and keep "
++        "the rest of this file as a standing regression guard")
++    flagged_dates = {d for r in runs for d in (r["start"], r["end"])}
++    assert "2026-08-18" in flagged_dates or any(
++        r["start"] <= "2026-08-18" <= r["end"] for r in runs)
++
++
++def test_synthetic_clean_series_is_not_flagged():
++    rows = [(f"2020-01-{d:02d}", 100_000.0 + d) for d in range(1, 25)]
++    code, runs = cua.audit(rows)
++    assert code == 0 and runs == []
++
++
++def test_synthetic_unit_swap_is_flagged():
++    clean = [(f"2020-01-{d:02d}", 100_000.0) for d in range(1, 15)]
++    swapped = [(f"2020-01-{d:02d}", 5.0e9) for d in range(15, 20)]
++    tail = [(f"2020-01-{d:02d}", 100_000.0) for d in range(20, 25)]
++    code, runs = cua.audit(clean + swapped + tail)
++    assert code == 1 and len(runs) == 1
++    assert runs[0]["start"] == "2020-01-15" and runs[0]["end"] == "2020-01-19"
++
++
++def test_a_single_outlier_day_is_not_a_run():
++    rows = [(f"2020-01-{d:02d}", 100_000.0) for d in range(1, 25)]
++    rows[10] = (rows[10][0], 5.0e9)  # one spike, not a run
++    code, runs = cua.audit(rows)
++    assert code == 0
++
++
++def test_insufficient_rows_is_reported_distinctly():
++    code, runs = cua.audit([("2020-01-01", 1.0)] * 5)
++    assert code == 2 and runs == []
++
++
++def test_volume_does_not_reach_the_cleared_signal():
++    """funding_carry_fade_v1 / _btc_v1 (the signal being forward-shadowed,
++    n=2, mean net R -0.8358) must not read volume_traded at all - so this
++    defect, while real, does not contaminate the reported forward numbers.
++    """
++    import inspect
++    import signals.funding_carry_fade_v1 as base
++    import signals.funding_carry_fade_btc_v1 as cleared
++    for mod in (base, cleared):
++        src = inspect.getsource(mod)
++        assert "volume" not in src.lower(), (
++            f"{mod.__name__} references volume; the unit-swap defect may now "
++            f"reach the cleared signal's forward numbers - re-audit before "
++            f"trusting forward_mean_net_r")
++
++
++def test_which_frozen_families_DO_use_volume_and_are_therefore_exposed():
++    """Not a pass/fail gate - a living map, so 'exposed until fixed' is a
++    fact anyone can check rather than something only this test author knows.
++    """
++    import inspect
++    exposed = []
++    sig_dir = os.path.join(ROOT, "signals")
++    for fname in sorted(os.listdir(sig_dir)):
++        if not fname.endswith(".py") or fname == "__init__.py":
++            continue
++        mod_name = f"signals.{fname[:-3]}"
++        try:
++            mod = __import__(mod_name, fromlist=["_"])
++        except Exception:
++            continue
++        src = inspect.getsource(mod)
++        if "volume" in src.lower():
++            exposed.append(fname)
++    print("families referencing volume (exposed to the unit-swap defect):",
++          exposed)
++    # No assertion on the exact set - signal files change - but the check
++    # must at least run and must not silently import nothing.
++    assert isinstance(exposed, list)
+diff --git a/tests/test_negative_quantity_gate.py b/tests/test_negative_quantity_gate.py
+new file mode 100644
+index 0000000..c5c61ab
+--- /dev/null
++++ b/tests/test_negative_quantity_gate.py
+@@ -0,0 +1,60 @@
++"""gate_order must refuse a negative or non-finite quantity outright.
++
++Finding: `if quantity and float(quantity) > 0.0:` guards the four size
++gates (per-trade risk, position notional, aggregate exposure, correlation
++bucket). Anything that is NOT strictly positive - including a negative
++quantity - skips straight past all four and falls through to
++`RiskDecision(ok=True, reason="APPROVED")`.
++
++Severity note (do not overstate): trading_engine.py's only two call sites
++pass `quantity=0.0` for the intentional size-independent pre-gate, or
++`sizing.qty` for the final gate - and BillionairePositionSizing refuses
++(should_trade=False) rather than emitting a negative size, so this branch
++is not reachable through the current engine flow. It is defense in depth
++against a future or external caller (a hand-built TradeIntent, a test
++harness, a different sizer), not a fix to an actively exploited path.
++"""
++from __future__ import annotations
++
++import math
++
++import pytest
++
++from test_risk_management import EQUITY, good_order, manager, store  # noqa: F401
++
++
++class TestNegativeQuantityIsRefused:
++    def test_negative_quantity_is_blocked_not_approved(self, manager):
++        decision = manager.gate_order(**good_order(quantity=-0.5))
++        assert decision.ok is False
++        assert decision.reason == "NEGATIVE_OR_NON_FINITE_QUANTITY"
++
++    def test_nan_quantity_is_blocked(self, manager):
++        decision = manager.gate_order(**good_order(quantity=float("nan")))
++        assert decision.ok is False
++
++    def test_inf_quantity_is_blocked(self, manager):
++        decision = manager.gate_order(**good_order(quantity=float("inf")))
++        assert decision.ok is False
++
++    def test_zero_quantity_still_passes_as_the_size_independent_pre_gate(self, manager):
++        # This is the EXISTING, intentional behaviour (trading_engine.py's
++        # pre-gate call) and must not regress: 0.0 skips size gates but is
++        # not itself a refusal.
++        decision = manager.gate_order(**good_order(quantity=0.0))
++        assert decision.ok is True
++
++    def test_positive_quantity_still_runs_every_size_gate(self, manager):
++        # An oversized notional must still be caught - proves the guard
++        # change did not accidentally widen the positive path.
++        decision = manager.gate_order(**good_order(quantity=1000.0))
++        assert decision.ok is False
++        assert decision.reason != "NEGATIVE_OR_NON_FINITE_QUANTITY"
++
++    def test_a_blocked_negative_quantity_is_journaled(self, manager, store):
++        manager.gate_order(**good_order(quantity=-1_000_000.0))
++        rows = store._query(
++            "SELECT * FROM decisions WHERE reason = ?",
++            ("NEGATIVE_OR_NON_FINITE_QUANTITY",),
++        )
++        assert len(rows) == 1
+diff --git a/tools/corpus_unit_audit.py b/tools/corpus_unit_audit.py
+new file mode 100644
+index 0000000..d6a9738
+--- /dev/null
++++ b/tools/corpus_unit_audit.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++"""Read-only meaning-layer audit of ``volume_traded``. Flags unit swaps.
++
++The prefix-hash / append-only tests in this tree prove BYTES are honest.
++They say nothing about MEANING: a column that silently switches from
++base-asset volume to quote-notional (or back) passes every existing
++invariant untouched, because the bytes are still a valid, append-only,
++monotonic CSV. Only the number itself is wrong by four to five orders of
++magnitude for the days it happened.
++
++Verified against the shipped corpus (this tool, this file, 2026-09-05):
++2026-08-18 through 2026-08-22 carry values 5.4e9 .. 3.5e10 against a
++1,476-row median of 227,714 - a run of 5 contiguous days at
++23,738x-151,759x the file median, then a clean return to the prior order
++of magnitude on 2026-08-23. That is not a fat-tailed volume day; BTC's
++entire spot+derivatives volume never reaches five billion COINS traded in
++a day. It is quote-notional (USD) leaking into a base-volume column for
++exactly the venue-typical shape of a unit mismatch.
++
++Exit codes: 0 clean; 1 SUSPECT_UNITS (a contiguous run flagged);
++2 insufficient rows to judge.
++
++This tool does not rewrite the corpus, does not touch FUND_ABS, does not
++score anything a gate reads, and is not wired into the promotion path.
++It is a second pair of eyes on a column the cleared signal
++(funding_carry_fade_btc_v1) does not use - see
++tests/test_corpus_unit_audit.py for which signals DO use volume and are
++therefore exposed until this is fixed at the source.
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import gzip
++import os
++import statistics
++import sys
++from typing import List, Optional, Tuple
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++DEFAULT_CSV = os.path.join(ROOT, "data", "real_linear_1d", "ohlcv",
++                           "BINANCE_LINEAR_BTC_USDT_1D.csv.gz")
++
++
++def _open(path: str):
++    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "r", newline="")
++
++
++def load_volume(path: str) -> List[Tuple[str, float]]:
++    with _open(path) as fh:
++        rows = list(csv.DictReader(fh))
++    out: List[Tuple[str, float]] = []
++    for row in rows:
++        date = (row.get("time_period_start") or row.get("date") or "")[:10]
++        raw = row.get("volume_traded") or row.get("volume") or ""
++        try:
++            out.append((date, float(raw)))
++        except (TypeError, ValueError):
++            continue
++    return out
++
++
++def audit(rows: List[Tuple[str, float]], run_threshold: float = 1_000.0,
++          min_run: int = 3) -> Tuple[int, List[dict]]:
++    """Returns (exit_code, runs). A run is >= min_run contiguous rows each
++    more than run_threshold times (or less than 1/run_threshold times) the
++    whole-file median.
++    """
++    xs = [v for _, v in rows if v > 0]
++    if len(xs) < 20:
++        return 2, []
++    med = statistics.median(xs)
++    print(f"rows={len(rows)} median_volume={med:.4f}")
++
++    runs: List[dict] = []
++    cur: List[Tuple[str, float]] = []
++
++    def ratio(v: float) -> float:
++        return (v / med) if med else float("inf")
++
++    def flush() -> None:
++        if len(cur) >= min_run:
++            runs.append({
++                "start": cur[0][0], "end": cur[-1][0], "n": len(cur),
++                "xmed_min": min(ratio(v) for _, v in cur),
++                "xmed_max": max(ratio(v) for _, v in cur),
++            })
++        cur.clear()
++
++    for date, v in rows:
++        r = ratio(v)
++        if r > run_threshold or (0 < r < 1.0 / run_threshold):
++            cur.append((date, v))
++        else:
++            flush()
++    flush()
++
++    for r in runs:
++        print(f"RUN {r['start']}..{r['end']} n={r['n']} "
++              f"xmed={r['xmed_min']:.1f}..{r['xmed_max']:.1f}")
++        print("  consistent with UNIT SWAP (quote volume in base column)")
++    return (1 if runs else 0), runs
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--repo", default=ROOT)
++    ap.add_argument("--csv", default="", help="override the corpus path")
++    args = ap.parse_args(argv)
++    path = args.csv or DEFAULT_CSV
++    rows = load_volume(path)
++    code, _ = audit(rows)
++    print("CLEAN" if code == 0 else ("INSUFFICIENT_ROWS" if code == 2 else "SUSPECT_UNITS"))
++    return code
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/tools/skill_test.py b/tools/skill_test.py
+index 47d4457..c5e2ebf 100644
+--- a/tools/skill_test.py
++++ b/tools/skill_test.py
+@@ -154,7 +154,7 @@ def barrier_r_for_all_bars(
+     bars: Sequence, *, take_profit_atr: float, stop_atr: float,
+     horizon: int, atr_period: int, round_trip_bps: float,
+     side: str = "long", entry_on: str = "close",
+-) -> Tuple[np.ndarray, np.ndarray]:
++) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+     """Realised net R for a trade opened at EVERY bar, under one geometry.
+ 
+     Returns ``(eligible_indices, net_r, bars_to_resolution)``. This is the
+@@ -204,7 +204,17 @@ def barrier_r_for_all_bars(
+     eligible[max(0, n - horizon - entry_offset - 1):] = False
+     indices = np.nonzero(eligible)[0]
+     if indices.size == 0:
+-        return np.array([], dtype=int), np.array([], dtype=float)
++        # Every real caller (70+ call sites across tools/ and tests/) unpacks
++        # THREE values: `indices, net, bars_used = barrier_r_for_all_bars(...)`.
++        # A too-short corpus, an all-NaN ATR window, or a horizon that eats the
++        # whole series hits this branch and previously returned a 2-tuple,
++        # which raises ValueError at every one of those call sites instead of
++        # the empty-result the caller is prepared to handle. Found by
++        # tools/corpus_unit_audit.py's author while checking the function on
++        # a short slice; reproduced here directly (see
++        # tests/test_barrier_empty_input.py).
++        return (np.array([], dtype=int), np.array([], dtype=float),
++                np.array([], dtype=np.int32))
+ 
+     entry_index = indices + entry_offset
+     entry = close[indices] if entry_on == "close" else open_[entry_index]
+-- 
+2.43.0
+

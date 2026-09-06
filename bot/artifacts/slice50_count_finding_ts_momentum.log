@@ -1,0 +1,41 @@
+==============================================================================
+COUNT FINDING — ts_momentum_v1   (no scores, no percentiles)
+==============================================================================
+  rule             : sign of close[t-1] / close[t-11] - 1   (LOOKBACK 10, SKIP 1, frozen)
+  direction        : ret > 0 -> LONG, ret < 0 -> SHORT (continuation); ret == 0 -> no setup
+  barrier          : +3/-1.5 ATR, horizon 5, 25 bps, entry next_open
+  hard gate        : >= 50 scored trades per symbol
+  design expectation: >= 100 scored trades per symbol
+
+  BTCUSD   3,135 bars   setups 2934   scoreable 2928   entries    1   -> BELOW the 50-trade target
+  ETHUSDT  1,461 bars   setups 1260   scoreable 1254   entries    1   -> BELOW the 50-trade target
+  SOLUSDT  1,461 bars   setups 1258   scoreable 1252   entries    3   -> BELOW the 50-trade target
+
+------------------------------------------------------------------------------
+WHY — a STATE signal against an EVENT-shaped scheduler
+------------------------------------------------------------------------------
+  BTCUSD   2,934 flagged bars of 3,124 with a defined window (0 exactly-zero returns)
+           1 contiguous flag runs, longest 2,928 bars; 441 sign flips
+           -> 1 scheduled entries (one per run, at its first bar)
+  ETHUSDT  1,260 flagged bars of 1,450 with a defined window (0 exactly-zero returns)
+           1 contiguous flag runs, longest 1,254 bars; 209 sign flips
+           -> 1 scheduled entries (one per run, at its first bar)
+  SOLUSDT  1,258 flagged bars of 1,450 with a defined window (2 exactly-zero returns)
+           3 contiguous flag runs, longest 505 bars; 201 sign flips
+           -> 3 scheduled entries (one per run, at its first bar)
+
+Every prior family here fires on an EVENT and its flags are sparse.
+This one is a STATE: the sign of a 10-bar return is defined on
+nearly every bar, so the flags form few long runs. simulate_schedule
+takes AT MOST ONE entry per contiguous run (slice 17 — the rule that
+makes the rotation null valid), so what governs the sample size is
+how often the sign FLIPS, not how many bars are flagged.
+
+==============================================================================
+COUNT FINDING: BELOW THE HARD GATE on BTCUSD, ETHUSDT, SOLUSDT
+
+Per the intake, LOOKBACK and SKIP are NOT changed and no grid
+is run. A symbol below the gate cannot support a POSITIVE claim
+for this family, and a window moved to reach a count would be a
+parameter fitted to an observed shortfall.
+==============================================================================

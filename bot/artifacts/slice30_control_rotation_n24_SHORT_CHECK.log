@@ -1,0 +1,95 @@
+==============================================================================
+DATA PROVENANCE
+==============================================================================
+BTCUSD: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : BTCUSD
+bars              : 2,564
+
+lock-up            : 1 bars, FIXED (schedule cannot depend on when a barrier resolved)
+
+computing the signal flags with the REAL analyser, bar by bar …
+
+==============================================================================
+SKILL TEST — matched-exposure permutation
+==============================================================================
+replicates         : 1,500 runs, null = rotation
+Both sides run the SAME machinery -- same signal rate, same gates,
+same fixed lock-up, same barrier scoring.
+ROTATION: the flag sequence is rotated. Preserves every run and
+gap, so clustering and trade counts stay matched; does NOT match
+the barrier geometry. NEITHER null is valid yet -- see EDGE.md.
+Both sides are scored by the SAME triple barrier on the SAME series
+with the SAME costs (+4 / -2 ATR, 24-bar horizon, 25 bps).
+The ONLY difference is which bars were chosen. These are idealised
+single-barrier R values, not the backtest's P&L: the right instrument
+for comparing two sets of entry bars, the wrong one for a forecast.
+
+strategy expectancy: +0.2838 R
+random-entry mean  : +0.1552 R  (sd 0.1746)
+strategy percentile: 77.1
+one-sided p        : 0.2287
+
+trades             : 47  (null median 47)
+median hold        : 14 bars
+time in market     : 26.6% of the sample
+asset over sample  : +675.3%
+
+raw reading        : INCONCLUSIVE — better than the null, not decisively
+
+==============================================================================
+CONTROL — the same test on series with NO temporal structure
+==============================================================================
+A percentile is a claim about timing. On a shuffled-return series
+there is nothing to time, so the same instrument must report ~50.
+If it does not, the reading above is an artefact of the instrument
+and cannot be reported as skill. This control runs unconditionally,
+because a control you have to remember to run is a control that
+gets skipped exactly when the result is exciting.
+
+  surrogate 1: percentile  19.4  (48 trades)
+  surrogate 2: percentile  48.2  (56 trades)
+  surrogate 3: percentile  21.4  (47 trades)
+  surrogate 4: percentile  96.8  (48 trades)
+  surrogate 5: percentile  98.8  (45 trades)
+  surrogate 6: percentile  82.4  (47 trades)
+  surrogate 7: percentile  53.8  (48 trades)
+  surrogate 8: percentile  87.4  (59 trades)
+  surrogate 9: percentile  40.2  (39 trades)
+  surrogate 10: percentile  31.0  (42 trades)
+  surrogate 11: percentile  86.0  (52 trades)
+  surrogate 12: percentile  19.2  (41 trades)
+  surrogate 13: percentile  64.8  (49 trades)
+  surrogate 14: percentile  83.2  (40 trades)
+  surrogate 15: percentile  19.0  (52 trades)
+  surrogate 16: percentile  14.6  (56 trades)
+  surrogate 17: percentile  56.2  (58 trades)
+  surrogate 18: percentile  14.2  (51 trades)
+  surrogate 19: percentile  72.2  (49 trades)
+  surrogate 20: percentile   6.8  (49 trades)
+  surrogate 21: percentile  59.0  (49 trades)
+  surrogate 22: percentile  58.2  (46 trades)
+  surrogate 23: percentile   0.0  (54 trades)
+  surrogate 24: percentile  67.6  (43 trades)
+
+==============================================================================
+VERDICT
+==============================================================================
+surrogate percentiles: median 55.0, mean 50.0, worst 98.8  (must be near 50)
+uniformity check     : mean 50.0 vs 50 expected, z = +0.00 over 24 surrogates
+                       (P(worst<=75) for a PERFECT instrument at n=24 is 0.001)
+real-series percentile: 77.1
+
+incomplete surrogates: 0 of 24   budget 1  -> ok
+note: worst 98.8 exceeds the legacy 75 ceiling. That ceiling is NOT a gate -- a PERFECT instrument
+      clears it with probability 0.001 at n=24. Reported, never gated. See EDGE.md 7b.
+
+CONTROL: **INVALID — the instrument cannot be trusted here.**
+
+  failed: median 55.0 > 50
+
+On a series whose time structure has been destroyed the strategy
+CANNOT have timed anything, so a control that does not look
+uniform is measuring a property of the instrument, not of the
+market. The real-series reading of 77.1 above is
+therefore NOT evidence of skill and must not be interpreted.
+EXIT=1

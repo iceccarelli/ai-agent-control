@@ -1,0 +1,10 @@
+{
+  "timing_skill_research": "CLOSED",
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "execution_mode": "paper",
+  "policy_mode": "off",
+  "no_edge_claim": "NO EDGE CLAIM — timing-skill research CLOSED",
+  "entries_enabled": true,
+  "live_authorized": false,
+  "models_current_present": false
+}

@@ -1,0 +1,25 @@
+==============================================================================
+SLICE 55 — DATA ELIGIBILITY
+==============================================================================
+
+data/real_funding
+  synthetic False   venue binance_usdtm   interval 8h
+  contract eligible: True
+  BTCUSDT  rows  4383  2022-08-09 -> 2026-08-09  mono True  dupes 0
+           sha256 9f5ceefce6adcc2c396f7b15c83ae641...
+  ETHUSDT  rows  4383  2022-08-09 -> 2026-08-09  mono True  dupes 0
+           sha256 695513e27cda0311fdb2940d8aff8c46...
+  SOLUSDT  rows  4458  2022-08-09 -> 2026-08-09  mono True  dupes 0
+           sha256 892edd2b80a5a2c445809d3ca805c505...
+
+data/real_linear_1d
+  synthetic False   venue binance_usdtm   interval 1d
+  contract eligible: True
+  BTCUSDT  rows  1461  2022-08-10 -> 2026-08-09  mono True  dupes 0
+           sha256 3c2e8601114c10135efc8f0e6e58e097...
+  ETHUSDT  rows  1461  2022-08-10 -> 2026-08-09  mono True  dupes 0
+           sha256 086b231cef04ce58bf5ae0d98f02b0a6...
+  SOLUSDT  rows  1461  2022-08-10 -> 2026-08-09  mono True  dupes 0
+           sha256 35c557d1f073b93bef07bb254e3308c4...
+
+ALL CHECKS PASSED: True

@@ -1,0 +1,30 @@
+# Secrets must never enter an image. The original Dockerfile did `COPY . /app`
+# with no ignore file, so live API keys were baked into every published layer.
+.env
+.env.*
+*.pem
+*.key
+
+# State is a runtime volume, not an image artifact.
+state/
+*.db
+*.db-wal
+*.db-shm
+
+# Development noise.
+.git/
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+tests/
+tools/
+*.md
+Dockerfile
+.dockerignore
+
+# The evaluation corpus. 4.7 MB of SYNTHETIC data used by tools/run_evaluation.py
+# and the market-data tests; a running bot reads its book from the exchange, not
+# from here. Excluded so the image cannot be mistaken for something that ships
+# with market data baked in.
+data/

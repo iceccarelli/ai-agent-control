@@ -1,0 +1,46 @@
+{
+  "schema": "data_freshness/1",
+  "slice": 60,
+  "symbol": "BTCUSDT",
+  "checked_at_utc": "2026-08-10T21:42:34Z",
+  "t1_previous": "2026-08-09T00:00:00Z",
+  "t1_previous_ms": 1786233600000,
+  "t1_source": "artifacts/funding_carry_fade_btc_v1_folds.json",
+  "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+  "latest_linear_timestamp": "2026-08-09T00:00:00+00:00",
+  "latest_funding_timestamp": "2026-08-09T08:00:00+00:00",
+  "linear_rows": 1461,
+  "funding_rows": 4383,
+  "new_linear_bars_count": 0,
+  "new_funding_prints_count": 1,
+  "new_bars_available": false,
+  "closed_bar_ceiling": {
+    "last_bar_that_could_have_closed_utc": "2026-08-09T00:00:00Z",
+    "max_possible_new_closed_bars": 0,
+    "note": "Computed from the clock and the daily grid, and recorded in EDGE.md §43b BEFORE the fetch ran. A daily bar closes 24h after it opens, so on this date the newest CLOSED bar is t1 itself — not after it. Any count above this ceiling would be a DATA DEFECT to investigate, not progress."
+  },
+  "fetch": {
+    "fetch_attempted": true,
+    "tool": "tools/fetch_linear_klines_1d.py",
+    "fetch_succeeded": false,
+    "rows_returned": 0,
+    "error_class": "ProxyError",
+    "error_message": "HTTPSConnectionPool(host='fapi.binance.com', port=443): Max retries exceeded with url: /fapi/v1/klines?symbol=BTCUSDT&interval=1d&startTime=1786233600001&endTime=1786398154531&limit=1500 (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))",
+    "error_traceback_tail": "ts/adapters.py\", line 672, in send\n    raise ProxyError(e, request=request)\nrequests.exceptions.ProxyError: HTTPSConnectionPool(host='fapi.binance.com', port=443): Max retries exceeded with url: /fapi/v1/klines?symbol=BTCUSDT&interval=1d&startTime=1786233600001&endTime=1786398154531&limit=1500 (Caused by ProxyError('Unable to connect to proxy', OSError('Tunnel connection failed: 403 Forbidden')))\n",
+    "note": "The sanctioned fetch path did not return data in this environment. That is recorded verbatim and treated as 'no new bars', which is the honest answer. Nothing is fabricated and no corpus is appended to."
+  },
+  "synthetic": {
+    "linear_manifest_synthetic": false,
+    "funding_manifest_synthetic": false,
+    "requirement": "any corpus supplying new data must declare synthetic false; no synthetic bar is ever an observation"
+  },
+  "bars_fabricated": 0,
+  "corpus_appended_to": false,
+  "what_would_count": {
+    "rule": "timestamp strictly after t1, AND the bar is CLOSED",
+    "closed_only": true,
+    "first_forward_observation_needs_closed_bars": 6,
+    "note": "A trade is an observation only when it CLOSES. With a 5-bar horizon the first forward observation cannot exist until at least 6 closed forward bars do."
+  },
+  "git_commit": "058a9289db49b1cf0a1e31093fa30bbe8eaa5119"
+}

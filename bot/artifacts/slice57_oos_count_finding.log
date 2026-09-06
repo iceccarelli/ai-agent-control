@@ -1,0 +1,36 @@
+==============================================================================
+SLICE 57 — OOS COUNT FINDING   (no scores, no percentiles)
+==============================================================================
+  signal           : funding_carry_fade_btc_v1   (BTCUSDT only)
+  derived from     : funding_carry_fade_v1  (FROZEN ABSENT — same constants, different universe, different gate)
+  rule             : |f| >= 0.0001 at the last print on or before the bar close   (frozen, not lowered)
+  barrier          : +1.5/-1.5 ATR, horizon 5, 25 bps + funding over the hold, entry next_open
+
+  fold calendar    : artifacts/funding_carry_fade_btc_v1_folds.json
+  folds sha256     : ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c
+                     matches the lock log -> the cut is the one frozen before any score existed
+  t_mid            : 2024-08-09T00:00:00Z
+  early [t0,t_mid) : 730 bars   burn-in, may NOT register
+  late  [t_mid,t1] : 731 bars   OOS, the ONLY registering window
+
+------------------------------------------------------------------------------
+WHERE THE SAMPLE GOES — five places, printed rather than summarised
+------------------------------------------------------------------------------
+  1. the join      : 1,461 of 1,461 bars joined a funding rate (no forward-fill)
+  2. the threshold : 417 setups over the whole series
+  3. the cut       : 417 flagged bars -> 138 in the late window (279 withheld as burn-in)
+  4. the scheduler : 138 late flags -> 41 contiguous runs (one trade each, slice 17)
+  5. the horizon   : 724 late bars can host a barrier that resolves
+
+  FULL SAMPLE      : 85 scored trades   (diagnostic only — may not register)
+  OOS              : 41 scored trades   (4 long / 37 short)
+
+  the OOS window holds 48.2% of the full-sample trades against 50.0% of the bars
+
+==============================================================================
+COUNT FINDING: n_OOS = 41 >= 40. Clause 1 of the intake's gate is MET.
+
+The remaining four clauses are untouched by this: a control
+must be VALID on this window before any percentile is read,
+and M1, M2 and the sign of the mean net R decide the rest.
+==============================================================================

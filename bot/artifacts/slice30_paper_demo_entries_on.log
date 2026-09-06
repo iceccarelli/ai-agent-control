@@ -1,0 +1,40 @@
+==============================================================================
+PAPER SESSION DEMO — offline stub, no network, no credentials used
+==============================================================================
+  ENTRIES_ENABLED : True
+  ticks           : 10
+
+mode: SANDBOX | testnet=True paper=True | SANDBOX (TESTNET+PAPER) — live trading not armed
+reconciliation: {'checked': 0, 'resolved': 0, 'still_open': 0, 'unknown': 0, 'naked_positions': []}
+paper session b6eaf9459cd44d62aa2606b616031a7e start | entries_enabled=True paper=True testnet=True live_authorized=False | NO EDGE CLAIM — timing-skill research CLOSED
+orderbook unavailable for BTCUSDT: no order book (further occurrences at debug level)
+paper session b6eaf9459cd44d62aa2606b616031a7e end | ticks=10 orders_submitted=0 kill_switch=False | NO EDGE CLAIM — timing-skill research CLOSED
+  session record
+  --------------------------------------------------------------------------
+    ended_utc             : 2026-07-31T12:21:18Z
+    entries_enabled       : True
+    kill_switch_engaged   : False
+    kill_switch_reason    : 
+    live_authorized       : False
+    model_loaded          : False
+    no_edge_claim         : NO EDGE CLAIM — timing-skill research CLOSED
+    orders_submitted      : 0
+    paper                 : True
+    policy_mode           : off
+    reconciled            : True
+    schema                : paper_session/1
+    session_id            : b6eaf9459cd44d62aa2606b616031a7e
+    started_utc           : 2026-07-31T12:21:18Z
+    testnet               : True
+    ticks                 : 10
+
+  health.healthy        : True
+  exchange order bodies : 0
+  decisions journalled  : 30  (['ALLOW', 'PAPER'])
+
+shutting down
+  OK — the session behaved as docs/PAPER_RUNBOOK.md describes.
+  NO EDGE CLAIM — timing-skill research CLOSED
+  A clean paper session is evidence the plumbing works. It is NOT
+  evidence of timing skill, which measurement has twice refused to
+  support. See RESEARCH_CLOSE_STAGE1.md.

@@ -1,0 +1,35 @@
+SLICE 49 STEP 5 — EDGE MEASUREMENT: NOT RUN, AND WHY
+
+The gate is the intake's and it is not met on any symbol:
+
+  symbol    control    scoreable entries    edge run?
+  BTCUSD    INVALID         1              NO
+  ETHUSDT   INVALID         0              NO
+  SOLUSDT   INVALID         0              NO
+
+Two independent reasons, either one sufficient:
+  1. the count finding gives 1 / 0 / 0 entries against a design
+     target of >= 50 per symbol, so no symbol can support a claim;
+  2. every control is INVALID, and a percentile from an instrument
+     that failed its own check is not a weak number, it is not a
+     number.
+
+Filesystem check — no edge artefact for this family exists:
+    slice49_control_open_gap_fade_BTCUSD_n1000.log
+    slice49_control_open_gap_fade_ETHUSDT_n1000.log
+    slice49_control_open_gap_fade_SOLUSDT_n1000.log
+    slice49_count_finding_open_gap_fade.log
+  edge summaries for open_gap_fade_v1: 0
+
+Git check — no edge_measurement invocation for this signal:
+  6447fe5 Slice 49 STEPS 2-3: open_gap_fade_v1 implemented; count finding 1/0/0.
+  9f5f71d Slice 49 STEP 1: open_gap_fade_v1 design (EDGE 30) BEFORE any code.
+  2274b2f Slice 48 STEPS 3-4: guards re-asserted, hold artefact written.
+  d888bbf Slice 48 STEP 2: operator runbook A-F, bound by 19 tests.
+  3338509 Slice 48 STEP 1: research HOLD written BEFORE any code mutation.
+  e24fc0a Slice 47: range_location_fade_v1 FROZEN INCONCLUSIVE. Six names, two categories.
+  e8e9bc3 Slice 47 STEP 1: freeze note (EDGE 28) written BEFORE any code change.
+  c9e04a4 Slice 46: range_location_fade_v1 measurable but UNMEASURED -- all three controls INVALID. INCONCLUSIVE.
+
+NO M1 AND NO M2 EXIST FOR open_gap_fade_v1. Quoting one would be
+fabrication, not approximation.

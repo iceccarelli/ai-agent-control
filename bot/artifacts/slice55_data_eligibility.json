@@ -1,0 +1,107 @@
+{
+  "schema": "data_eligibility/1",
+  "slice": 55,
+  "checksum_provenance": "sha256 values were computed BY THIS SLICE from the files as received. They detect later drift, edits or truncation and are asserted by tests/test_slice55_data_eligibility.py on every run. They do NOT independently attest the fetch, which happened outside this repository — unlike data/real_multi_1d, whose MANIFEST carries checksums written by the fetcher itself. The honest claim is: the MANIFEST declares synthetic false and names the venue and REST endpoint, and the files match that MANIFEST's own row counts and date ranges and pass every structural check.",
+  "corpora": {
+    "data/real_funding": {
+      "manifest_synthetic": false,
+      "manifest_venue": "binance_usdtm",
+      "manifest_source": "public_rest_funding_history",
+      "manifest_endpoint": "GET /fapi/v1/fundingRate",
+      "manifest_interval": "8h",
+      "contract_eligible": true,
+      "contract_reasons": [],
+      "symbols": {
+        "BTCUSDT": {
+          "file": "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz",
+          "sha256_uncompressed": "9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145",
+          "rows": 4383,
+          "first_utc": "2022-08-09T16:00:00+00:00",
+          "last_utc": "2026-08-09T08:00:00+00:00",
+          "strictly_increasing": true,
+          "duplicate_timestamps": 0,
+          "all_rates_finite": true,
+          "rate_min": -0.00119172,
+          "rate_max": 0.00088148,
+          "gap_hours_min": 8.0,
+          "gap_hours_max": 8.0,
+          "abs_rate_ge_1e4": 1473
+        },
+        "ETHUSDT": {
+          "file": "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz",
+          "sha256_uncompressed": "695513e27cda0311fdb2940d8aff8c46d7f2251fccb47ffdcbc71c0bb208bf5d",
+          "rows": 4383,
+          "first_utc": "2022-08-09T16:00:00+00:00",
+          "last_utc": "2026-08-09T08:00:00+00:00",
+          "strictly_increasing": true,
+          "duplicate_timestamps": 0,
+          "all_rates_finite": true,
+          "rate_min": -0.00301937,
+          "rate_max": 0.00101724,
+          "gap_hours_min": 8.0,
+          "gap_hours_max": 8.0,
+          "abs_rate_ge_1e4": 1533
+        },
+        "SOLUSDT": {
+          "file": "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz",
+          "sha256_uncompressed": "892edd2b80a5a2c445809d3ca805c5058dc39b21bb6af19c57d729f1a125853c",
+          "rows": 4458,
+          "first_utc": "2022-08-09T16:00:00+00:00",
+          "last_utc": "2026-08-09T08:00:00+00:00",
+          "strictly_increasing": true,
+          "duplicate_timestamps": 0,
+          "all_rates_finite": true,
+          "rate_min": -0.02,
+          "rate_max": 0.00119261,
+          "gap_hours_min": 2.0,
+          "gap_hours_max": 8.0,
+          "abs_rate_ge_1e4": 2132
+        }
+      }
+    },
+    "data/real_linear_1d": {
+      "manifest_synthetic": false,
+      "manifest_venue": "binance_usdtm",
+      "manifest_source": "public_rest_klines",
+      "manifest_endpoint": "GET /fapi/v1/klines",
+      "manifest_interval": "1d",
+      "contract_eligible": true,
+      "contract_reasons": [],
+      "loader_manifest_has_checksums": false,
+      "loader_note": "market_data.verify_manifest requires a per-file checksum block this MANIFEST does not carry, so the measurement path loads this corpus with verify=False and relies on the pinned hashes above instead. verify_manifest itself was NOT weakened.",
+      "symbols": {
+        "BTCUSDT": {
+          "file": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
+          "sha256_uncompressed": "3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55",
+          "rows": 1461,
+          "first_utc": "2022-08-10T00:00:00+00:00",
+          "last_utc": "2026-08-09T00:00:00+00:00",
+          "strictly_increasing": true,
+          "duplicate_timestamps": 0,
+          "ohlc_sane": true
+        },
+        "ETHUSDT": {
+          "file": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz",
+          "sha256_uncompressed": "086b231cef04ce58bf5ae0d98f02b0a614f102233b20435ee00ab0f83923ed80",
+          "rows": 1461,
+          "first_utc": "2022-08-10T00:00:00+00:00",
+          "last_utc": "2026-08-09T00:00:00+00:00",
+          "strictly_increasing": true,
+          "duplicate_timestamps": 0,
+          "ohlc_sane": true
+        },
+        "SOLUSDT": {
+          "file": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz",
+          "sha256_uncompressed": "35c557d1f073b93bef07bb254e3308c471d2381a15ca6b73dfb0a7481c7f3220",
+          "rows": 1461,
+          "first_utc": "2022-08-10T00:00:00+00:00",
+          "last_utc": "2026-08-09T00:00:00+00:00",
+          "strictly_increasing": true,
+          "duplicate_timestamps": 0,
+          "ohlc_sane": true
+        }
+      }
+    }
+  },
+  "all_checks_passed": true
+}

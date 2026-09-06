@@ -1,0 +1,111 @@
+{
+  "schema": "research_freeze/1",
+  "slice": 54,
+  "frozen_name": "compression_breakout_v1",
+  "status": "INCONCLUSIVE",
+  "freeze_reason": "INCONCLUSIVE_BTC_ABSENT_ALTS_NON_MEASURABLE",
+  "design_note": "EDGE.md §35",
+  "design_before_code": true,
+  "family_positive_rule_met": false,
+  "positive_unreachable_at_count_stage": true,
+  "measured": {
+    "BTCUSD": {
+      "entries": 76,
+      "gate_met": true,
+      "control": "VALID",
+      "m1": 69.1,
+      "m2": 73.5,
+      "verdict": "EDGE_EVIDENCE_ABSENT",
+      "summary": "artifacts/slice53_edge_compression_breakout_BTCUSD_summary.json"
+    }
+  },
+  "not_measured": {
+    "ETHUSDT": {
+      "entries": 23,
+      "gate_met": false,
+      "control": "INVALID",
+      "m1": null,
+      "m2": null,
+      "why": "23 entries below the >= 50 gate; control INVALID on incompletes 11.5% and KS p 0.0137"
+    },
+    "SOLUSDT": {
+      "entries": 35,
+      "gate_met": false,
+      "control": "INVALID",
+      "m1": null,
+      "m2": null,
+      "why": "35 entries below the >= 50 gate; control INVALID on incompletes 5.5%"
+    }
+  },
+  "is_dual_symbol_absent": false,
+  "is_empty_inconclusive": false,
+  "label_note": "Neither clean shape. NOT a dual-symbol ABSENT — that refusal was never performed, because two of three symbols produced no reading. NOT an empty INCONCLUSIVE like range_location_fade_v1, open_gap_fade_v1 or ts_momentum_v1 — one trustworthy reading exists on BTCUSD and is kept. The family verdict is INCONCLUSIVE because the intake's POSITIVE rule needs two symbols at >= 50 scored trades and only one reached it.",
+  "btc_reading_is_not_almost_95": "69.1 and 73.5 are 26 and 22 points short of the 95.0 bar. This programme refused 94.3 in slice 41 and 83.5 in slice 53; 69.1 is not in that conversation. Its M2 delta is positive with a CI excluding zero, which means the entries beat a shape-matched schedule on average, and that is not the test.",
+  "alts_invalid_cause": "SPARSE SAMPLE, not a construction mismatch. The null found compressed breaks and scheduled them; there were simply too few per surrogate. This must not be cited alongside slice 49 (the null deleted the trigger) or slice 50 (the scheduler collapsed every surrogate to one trade).",
+  "compression_filter_survival_pct": {
+    "BTCUSD": 30.0,
+    "ETHUSDT": 22.4,
+    "SOLUSDT": 35.6
+  },
+  "evidence_logs": [
+    "artifacts/slice53_count_finding_compression_breakout.log",
+    "artifacts/slice53_control_compression_breakout_BTCUSD_n1000.log",
+    "artifacts/slice53_control_compression_breakout_ETHUSDT_n1000.log",
+    "artifacts/slice53_control_compression_breakout_SOLUSDT_n1000.log",
+    "artifacts/slice53_edge_compression_breakout_BTCUSD_summary.json",
+    "artifacts/slice53_stage1_compression_breakout_v1.json"
+  ],
+  "evidence_deleted_or_rewritten": false,
+  "fabricated_percentiles": false,
+  "constants_unchanged": {
+    "COMP_MAX": 25.0,
+    "PCTILE_WINDOW": 50,
+    "BREAK_N": 20,
+    "ATR_PERIOD": 14,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 2.0,
+    "HORIZON": 5,
+    "ROUND_TRIP_BPS": 25.0
+  },
+  "edge_or_control_rerun": false,
+  "frozen_absent": [
+    "technical_analysis",
+    "closed_analyser",
+    "donchian_breakout_v1",
+    "btc_alt_spillover_v1",
+    "post_shock_fade_v1",
+    "range_location_fade_v1",
+    "open_gap_fade_v1",
+    "ts_momentum_v1",
+    "sign_flip_momentum_v1",
+    "compression_breakout_v1"
+  ],
+  "frozen_absent_count": 10,
+  "frozen_status": {
+    "technical_analysis": "ABSENT",
+    "closed_analyser": "ABSENT",
+    "donchian_breakout_v1": "ABSENT",
+    "btc_alt_spillover_v1": "ABSENT",
+    "post_shock_fade_v1": "ABSENT",
+    "range_location_fade_v1": "INCONCLUSIVE",
+    "open_gap_fade_v1": "INCONCLUSIVE",
+    "ts_momentum_v1": "INCONCLUSIVE",
+    "sign_flip_momentum_v1": "ABSENT",
+    "compression_breakout_v1": "INCONCLUSIVE"
+  },
+  "bars": {
+    "m1": 95.0,
+    "m2": 95.0
+  },
+  "cleared_edge_signal": null,
+  "forged_positive_refused_for_every_frozen_name": true,
+  "forgery_battery_log": "artifacts/slice54_forgery_battery.log",
+  "intake_slot": "WAITING — EMPTY",
+  "new_signal_implemented": false,
+  "models_current_present": false,
+  "live_authorized": false,
+  "execution_mode": "paper",
+  "paper_certification_intact": true,
+  "closer_to_autonomous_profit_agent": false,
+  "git_commit": "e37322852656b0d2c2d39e1451d8ee3455b38704"
+}

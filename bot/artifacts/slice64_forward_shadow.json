@@ -1,0 +1,172 @@
+{
+  "schema": "forward_shadow_observation/4",
+  "slice": 64,
+  "signal": "funding_carry_fade_btc_v1",
+  "symbol": "BTCUSDT",
+  "observed_at_utc": "2026-08-12T18:24:46Z",
+  "extension_present": true,
+  "is_forward_observation": false,
+  "forward_n_trades": 0,
+  "forward_observations_to_date": 0,
+  "is_stage1_evidence": false,
+  "registration_eligible": false,
+  "cleared_edge_re_scored_this_slice": false,
+  "labelling_rule": "is_forward_observation = forward_n_trades > 0, NOT extension_present. A BAR ARRIVING IS NOT AN OBSERVATION. Declared in EDGE.md §45e before this tool ran.",
+  "ceiling": {
+    "closed_forward_bars": 2,
+    "closed_forward_bars_needed_for_one_trade": 6,
+    "max_possible_forward_closed_trades": 0,
+    "declared_in": "EDGE.md §45e, before this tool ran",
+    "observed_forward_closed_trades": 0,
+    "within_ceiling": true,
+    "if_exceeded": "A forward trade count above this ceiling is a DATA DEFECT or a scheduling bug to be investigated, NOT progress."
+  },
+  "forward_window": {
+    "rule": "closed linear daily bars STRICTLY after t1",
+    "t1": "2026-08-09T00:00:00Z",
+    "t1_is_measured_not_forward": "Strict. A bar stamped exactly t1 is the last bar of the cleared run. Counting it as forward would be the slice-59 substitution in its smallest and most plausible form.",
+    "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+    "bars_strictly_after_t1": 2,
+    "of_which_closed": 2,
+    "bar_utcs": [
+      "2026-08-10T00:00:00Z",
+      "2026-08-11T00:00:00Z"
+    ],
+    "corpus_last_bar_utc": "2026-08-11T00:00:00Z",
+    "built_by": "restrict_flags_to_forward (flags zeroed)",
+    "bar_array_sliced": false,
+    "why_not_sliced": "A 14-period ATR computed over a one-bar window is not a warm indicator, it is a number invented out of nothing, and every barrier derived from it would be fiction. Warm-up state legitimately flows from history. Decisions do not.",
+    "invented_future_bars": 0
+  },
+  "forward_decisions": {
+    "flagged_bars_in_window": [],
+    "candidates_after_schedule": [],
+    "entries_taken": 0,
+    "entries_refused_by_caps": 0,
+    "why_the_rule_stood_aside": [
+      {
+        "bar_utc": "2026-08-10T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-08-11T00:00:00Z",
+        "funding_setup_present": false,
+        "is_last_bar_of_corpus": true,
+        "excluded_as_last_bar": "directed_signal_bars excludes the final bar: the fill happens one bar later and there is no next bar to fill on",
+        "fund_abs_threshold": 0.0001
+      }
+    ],
+    "decisions_with_no_entry_bar_yet": [],
+    "decisions_whose_exit_bar_does_not_exist_yet": [],
+    "exit_clamping_to_corpus_end": false,
+    "why_no_clamping": "A trade that ran out of data has not closed. Clamping the exit index to the last bar that happens to exist would manufacture an exit price and report an unfinished trade as an observation."
+  },
+  "constants": {
+    "FUND_ABS": 0.0001,
+    "STOP_ATR": 1.5,
+    "TAKE_PROFIT_R": 1.0,
+    "TAKE_PROFIT_ATR": 1.5,
+    "HORIZON": 5,
+    "ATR_PERIOD": 14,
+    "LOCKUP": 1,
+    "ROUND_TRIP_BPS": 25.0,
+    "ENTRY_ON": "next_open"
+  },
+  "constants_fingerprint": "662de0115880871352d5d623b1020eaa",
+  "constants_fingerprint_matches_slice58": true,
+  "schedule_mode": "one_entry_per_contiguous_run",
+  "caps": {
+    "max_concurrent_positions": 1,
+    "max_entries_per_day": 1,
+    "max_notional_usd": 100.0,
+    "symbol": "BTCUSDT"
+  },
+  "caps_changed_this_slice": false,
+  "thresholds_moved_this_slice": false,
+  "monitor_thresholds": {
+    "M1_rolling_trades": {
+      "k": 10,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 10
+    },
+    "M2_rolling_days": {
+      "window_days": 90,
+      "warn_below": 0.0,
+      "alert_below": -0.25,
+      "min_trades": 5
+    },
+    "M3_concentration": {
+      "top_n": 3,
+      "warn_above": 0.6,
+      "min_trades": 10
+    },
+    "M4_halves": {
+      "min_trades": 20
+    }
+  },
+  "forward_monitor_readings": [
+    {
+      "name": "M1_rolling_trades",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": -0.25,
+      "n_trades": 0,
+      "detail": "needs 10 closed trades, has 0"
+    },
+    {
+      "name": "M2_rolling_days",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": -0.25,
+      "n_trades": 0,
+      "detail": "needs 5 trades closed in the last 90 days, has 0"
+    },
+    {
+      "name": "M3_concentration",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": 0.6,
+      "n_trades": 0,
+      "detail": "needs 10 closed trades, has 0"
+    },
+    {
+      "name": "M4_halves",
+      "state": "INSUFFICIENT_DATA",
+      "value": null,
+      "threshold": null,
+      "n_trades": 0,
+      "detail": "needs 20 closed trades, has 0"
+    }
+  ],
+  "forward_monitor_status": "INSUFFICIENT_DATA",
+  "entries_blocked_by_monitor": false,
+  "monitor_scope_note": "These readings are over FORWARD trades only, which is why they report insufficient data rather than a state. The M-4 WARN recorded in slices 58-61 is a fact about the HISTORICAL segment and is deliberately NOT recomputed here into something that could be mistaken for a forward reading. It stands, unerased, in artifacts/slice59_forward_shadow.json and in EDGE.md §41j and §42d, and it remains an item a human must explicitly accept at the promotion gate. The only legitimate way it stops warning is new forward data recovering under the threshold AS IT STANDS.",
+  "forward_mean_net_r": null,
+  "forward_mean_note": "If this is ever non-null it is a capped pilot's mean with no rotation null, no drift-controlled contrast and no control behind it. It is NOT Stage-1 evidence, NOT registration-eligible, and NOT comparable with the OOS mean of +0.1736.",
+  "constants_fingerprint_matches_frozen": true,
+  "bars_fabricated": 0,
+  "promotion_gate_allows_live": false,
+  "window_grew_since_slice63": {
+    "comparable": true,
+    "previous_artefact": "artifacts/slice63_forward_shadow.json",
+    "closed_forward_bars_previously": 1,
+    "closed_forward_bars_now": 2,
+    "delta": 1,
+    "grew": true,
+    "note": "THE WINDOW GREW — the first genuine growth since t1 was locked; slices 62 and 63 both scored a one-bar window. The ceiling did not move with it: max(0, N - HORIZON) is still zero at two bars. A larger window that still cannot produce a closed trade is progress in the pilot and no evidence at all, and those are different sentences. EDGE.md §47a, §47d."
+  },
+  "cleared_edge_signal": "funding_carry_fade_btc_v1",
+  "live_authorized": false,
+  "policy_mode": "off",
+  "execution_mode": "paper",
+  "models_current_present": false,
+  "frozen_absent_count": 11,
+  "closer_to_autonomous_profit_agent": false,
+  "why_not_closer": "One post-t1 day is pilot progress, not autonomy. The gate counts closed forward trades and it counts 0.",
+  "trades": [],
+  "git_commit": "1be05afa3fd33e2214c662efcf9ba1b329ef22b4"
+}

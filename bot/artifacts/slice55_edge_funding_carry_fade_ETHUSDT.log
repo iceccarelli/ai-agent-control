@@ -1,0 +1,64 @@
+==============================================================================
+REAL-SERIES EDGE MEASUREMENT (slice 24)
+==============================================================================
+BTCUSDT: no order book in the corpus — the liquidity gate will abstain for this symbol
+ETHUSDT: no order book in the corpus — the liquidity gate will abstain for this symbol
+SOLUSDT: no order book in the corpus — the liquidity gate will abstain for this symbol
+symbol            : ETHUSDT
+bars              : 1,461
+
+Instrument path = the configuration whose control PASSED at n=200
+(EDGE.md 4u: median 48.0, z = -1.18, KS p = 0.435, 0 incomplete):
+  null rotation | lock-up 1 | one trade per run | 1,500 replicates
+  barrier +1.5/-1.5 ATR, 5-bar horizon, 25 bps round trip
+
+Bars pre-declared in EDGE.md 5b, before any number existed:
+  M1  real-series percentile          >= 95.0
+  M2  Delta > 0, 95% CI excludes 0, percentile >= 95.0
+  M3  >= 3 of 4 folds mean net R > 0 (soft, supporting only)
+
+signal            : funding_carry_fade_v1  (|f| >= 0.0001 at the last print on or before the bar close; rich long carry -> SHORT, rich short carry -> LONG; fill at next open)
+funding prints    : 4,383  from BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz
+bars with funding : 1,461 of 1,461  (no forward-fill)
+setups            : 415  (10 long / 405 short)
+funding adjustment: mean net R shifts -0.0115 on longs, +0.0115 on shorts (a short RECEIVES positive funding; applied to the observed schedule AND every replicate)
+setups scoreable  : 415  (10 long / 405 short)
+
+real-series schedule: 76 trades from 76 flag runs
+strategy mean net R : -0.0358
+
+M1: ranking against the validated rotation null ...
+  replicates        : 1,500 of 1,500
+  null mean net R   : -0.0323  (sd 0.0950)
+  null trade counts : median 76
+  M1 PERCENTILE     : 47.7   bar 95.0   -> FAIL
+
+M2: drift-controlled contrast against shape-matched schedules ...
+  schedules         : 200 of 200
+  Side N mean net R : -0.0328  (sd 0.0922)
+  Side N trades     : median 76   (Side S: 76)
+  Delta             : -0.0030   95% CI [-0.0157, +0.0097]
+  M2 PERCENTILE     : 48.5  bar 95.0
+  M2                -> FAIL   (needs Delta>0 AND CI excludes 0 AND percentile>=95.0)
+
+M3: walk-forward, per fold ...
+  fold 1: bars 200-515   23 trades  mean net R -0.0275  percentile 64.8
+  fold 2: bars 515-830   20 trades  mean net R -0.0360  percentile 55.4
+  fold 3: bars 830-1145   22 trades  mean net R -0.1311  percentile 30.0
+  fold 4: bars 1145-1461   11 trades  mean net R +0.1376  percentile 67.2
+  folds with mean net R > 0 : 1 of 4   soft gate NOT met (supporting only)
+
+==============================================================================
+DECISION
+==============================================================================
+  M1  percentile 47.7 vs bar 95.0  -> FAIL
+  M2  delta -0.0030, CI [-0.0157, +0.0097], percentile 48.5  -> FAIL
+  M3  1/4 folds positive  (soft, supporting only)
+
+  EDGE_EVIDENCE_ABSENT
+
+  The pre-declared bars are not met. No threshold, stop, size or
+  confidence parameter may be retuned to change this reading.
+  control_validated : True
+
+artifacts: artifacts/slice55_edge_funding_carry_fade_ETHUSDT_summary.json / _null_distributions.csv / _folds.csv

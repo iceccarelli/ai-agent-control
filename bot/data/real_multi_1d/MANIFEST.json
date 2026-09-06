@@ -1,0 +1,57 @@
+{
+  "synthetic": false,
+  "bar_seconds": 86400,
+  "schema": "coinapi_flat/1",
+  "generator": "tools/fetch_binance_klines.py",
+  "source": {
+    "exchange": "BINANCE",
+    "market": "SPOT",
+    "endpoint": "https://api.binance.com/api/v3/klines",
+    "fetched_utc": "2026-08-01T02:41:45Z",
+    "requested_range_utc": [
+      "2022-08-01T02:41:45Z",
+      "2026-08-01T02:41:45Z"
+    ]
+  },
+  "bars_per_symbol": {
+    "BINANCE_SPOT_ETH_USDT_1D": 1461,
+    "BINANCE_SPOT_SOL_USDT_1D": 1461,
+    "BINANCE_SPOT_BNB_USDT_1D": 1461,
+    "BINANCE_SPOT_AVAX_USDT_1D": 1461
+  },
+  "files": {
+    "ohlcv/BINANCE_SPOT_ETH_USDT_1D.csv.gz": {
+      "rows": 1461,
+      "sha256_uncompressed": "be3793ed12da4c8995839b01f3d4a6da9dcd13d1ab1f0fc356e7ab55cde1bc0b",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2022-08-02T00:00:00.0000000Z",
+      "last_timestamp": "2026-08-01T00:00:00.0000000Z"
+    },
+    "ohlcv/BINANCE_SPOT_SOL_USDT_1D.csv.gz": {
+      "rows": 1461,
+      "sha256_uncompressed": "7772ddada54654a5372889de18cba99c365bab8b6610d42887cd30c15dc53f09",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2022-08-02T00:00:00.0000000Z",
+      "last_timestamp": "2026-08-01T00:00:00.0000000Z"
+    },
+    "ohlcv/BINANCE_SPOT_BNB_USDT_1D.csv.gz": {
+      "rows": 1461,
+      "sha256_uncompressed": "c98c113c95e094b39a5ee3c2567f2f012d950804fca4b7ad4ab9b25cec3d8210",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2022-08-02T00:00:00.0000000Z",
+      "last_timestamp": "2026-08-01T00:00:00.0000000Z"
+    },
+    "ohlcv/BINANCE_SPOT_AVAX_USDT_1D.csv.gz": {
+      "rows": 1461,
+      "sha256_uncompressed": "7cf4736703cd9aa4e9a1df2e682f69aeffbc980e306431903be91352a012b43d",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2022-08-02T00:00:00.0000000Z",
+      "last_timestamp": "2026-08-01T00:00:00.0000000Z"
+    }
+  },
+  "warning": "REAL exchange data. Eligibility under data_contract is NOT edge \u2014 see RESEARCH_CLOSE_STAGE1.md. Timing-skill research is CLOSED."
+}
