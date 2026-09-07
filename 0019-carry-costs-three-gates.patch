@@ -1,0 +1,476 @@
+From: build <build@local>
+Subject: [PATCH 0019] carry_costs: three gates the engine does not have
+
+PHASE 1.3. Applies on top of 0018.
+
+CarryEngine opens on ONE condition: the last funding print cleared
+MIN_ENTRY_FUNDING_BPS. That is a reflex, not a decision. It does not know what
+the money costs, what the basis will take back, or whether one print represents
+the next eight hours.
+
+0018 measured what that costs:
+    borrow                    57% of gross income
+    mean entry basis          +6 bps
+    mean exit basis           +29 bps    <- opened narrow, closed wide
+    losing trades             15 of 20
+
+GATE 1 - BASIS
+Short perp + long spot earns the basis it SHEDS between entry and exit. Funding
+is rich PRECISELY when the perp trades above spot, so the signal that says
+"open" and the condition that says "the basis will cost you" are the same
+condition, and nothing in the engine separates them. The gate refuses when entry
+basis exceeds the NET edge over the assumed hold - net, not gross, because
+paying basis out of money already spoken for by borrow and fees is how a
+positive-carry trade closes negative.
+
+GATE 2 - COST OF CAPITAL
+A book that opens on funding alone compares its revenue to zero. Refuses when
+expected carry does not clear borrow plus the amortised round trip.
+
+GATE 3 - EWMA, NOT THE LAST PRINT
+Three-print EWMA, alpha 0.5. Below three prints it returns None and the call
+site REFUSES: too little history to know the rate is not an invitation to
+assume zero or reuse the last print.
+
+THE NUMBER THAT DECIDES THE STRATEGY
+ASSUMED_HOLD_DAYS is derived, not chosen. 0018 ran 20 trades over 1,453 days at
+94.8% exposure = ~69 day mean hold. Set to 30, well under it, because a gate
+that assumes a LONG hold to justify an entry is arguing for its own conclusion.
+
+The sensitivity is not academic:
+    hold  7 days -> round trip 4.43 bps/day vs 1.80 bps/day carry at threshold
+                    THE TRADE CANNOT PAY FOR ITS OWN ENTRY
+    hold 30 days -> round trip 1.03 bps/day
+This one number decides whether this is a carry book or a fee generator. Any
+change must be justified against a MEASURED hold, never tuned until an entry
+passes.
+
+VERIFIED, the case named in the spec:
+    funding +0.6 bps, basis +30 bps -> REFUSED (CARRY_BELOW_COST_OF_CAPITAL)
+      carry/day 1.80  borrow/day 1.37  round-trip/day 1.03  net -0.60
+
+Each gate fires independently:
+    basis   0/20/40/80 bps at 2.0 bps funding -> allowed
+    basis 150 bps                             -> ENTRY_BASIS_EXCEEDS_CARRY_BUDGET
+    1 print                                   -> INSUFFICIENT_FUNDING_HISTORY
+    negative funding                          -> FUNDING_NOT_POSITIVE
+    unreadable spot                           -> BASIS_UNREADABLE
+
+ + bot/carry_costs.py            pure. No orders, no state, no venue. Takes
+                                 numbers, returns a verdict. A risk rule with
+                                 state cannot be trusted, so a test asserts the
+                                 same inputs give the same answer.
+ + tests/test_carry_costs.py     26 tests, including that a refusal names the
+                                 BINDING constraint rather than whichever check
+                                 ran first.
+
+NOT WIRED INTO CarryEngine YET. The gates are pure and independently tested
+first; wiring them into the open path changes live behaviour and is its own
+patch with its own tests. That is Phase 1.3 completion, not this patch.
+
+STILL NOT QUOTABLE: the basis term is measured against BITSTAMP_SPOT_BTC_USD.
+Phase 1.2 (ingest BINANCE_SPOT_BTC_USDT_1D via the EXISTING
+tools/fetch_binance_klines.py, which already targets api.binance.com/api/v3)
+must land before any figure from this path is stated as fact.
+
+NOT TOUCHED: FUND_ABS, the join, HORIZON, the barrier, the folds, the caps,
+GATE_PATH, live_authorized, carry_engine.py, carry_broker.py, main.py.
+
+VERIFIED: 5,216 passed, 2 skipped (was 5,183). Fixture md5 stable.
+
+---
+--- a/carry_costs.py	1970-01-01 00:00:00.000000000 +0000
++++ b/carry_costs.py	2026-09-07 21:47:20.700475875 +0000
+@@ -0,0 +1,214 @@
++"""Whether a carry pair is worth opening. Three gates, no opinions.
++
++WHY THIS EXISTS
++===============
++0018 charged the book for existing and the answer was uncomfortable:
++
++    funding +$42,843 · basis -$4,772 · fees -$6,426 · borrow -$24,624
++    NET +$7,020 = +1.77%/yr at 5% financing, +7.96% unfinanced
++    15 of 20 trades lost money
++
++`CarryEngine` opens on one condition: the last funding print cleared
++MIN_ENTRY_FUNDING_BPS. That is not a decision, it is a reflex. It ignores what
++the money costs, what the basis will take back, and whether the rate that just
++printed is representative of the next eight hours.
++
++Three gates, each answering a question the engine currently does not ask.
++
++GATE 1 — BASIS
++==============
++Measured over the backtest window: mean entry basis +6 bps, mean exit +29 bps.
++The book was systematically SHORTING THE PERP INTO A NARROW BASIS AND CLOSING
++INTO A WIDE ONE, which is the losing direction. Short perp plus long spot earns
++the basis it SHEDS between entry and exit.
++
++This is not bad luck, it is structural: funding is rich precisely when the perp
++trades above spot, so the signal that says "open" and the condition that says
++"the basis will cost you" are the same condition. Nothing in the engine
++separates them.
++
++The gate refuses when entry basis exceeds the carry you expect to collect over
++the hold. Paying 30 bps of basis to collect 9 bps of funding is a decision
++nobody would make explicitly, so it must not be reachable implicitly.
++
++GATE 2 — COST OF CAPITAL
++========================
++Borrow was 57% of gross income. The spot leg is financed and the engine has
++never known that. A book that opens on funding alone is comparing its revenue
++to zero.
++
++The gate refuses when expected carry does not clear borrow plus the amortised
++round trip. At 5% APR that is ~1.4 bps/day of financing against ~1.9 bps/day of
++carry at the threshold rate — the trade is marginal at the threshold and the
++threshold was chosen before anyone computed this.
++
++GATE 3 — EWMA, NOT THE LAST PRINT
++=================================
++The engine opens on the LAST funding print. One print is 8 hours of a rate that
++mean-reverts. A three-print EWMA is one day, weights the most recent print
++highest, and stops the book opening into a rate that has already turned.
++
++WHAT THIS MODULE DOES NOT DO
++============================
++It does not place orders, hold state, or know what a venue is. It takes numbers
++and returns a verdict. `CarryEngine` may consult it; the gates are pure and
++independently testable, which is the only reason a risk rule can be trusted.
++"""
++from __future__ import annotations
++
++import math
++from dataclasses import dataclass, field
++from typing import Any, Dict, List, Optional, Sequence
++
++#: Taker fees, declared here so the amortisation is visible rather than buried.
++TAKER_BPS_SPOT = 10.0
++TAKER_BPS_PERP = 5.5
++ROUND_TRIP_BPS = 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP   # 31.0
++
++#: Financing on the spot leg. 0.0 models a book that ALREADY OWNS the BTC and is
++#: monetising it. The difference between those two worlds is +1.77% and +7.96%,
++#: which is the difference between a business and a hobby, so it is a required
++#: argument at every call site rather than a default anyone can forget.
++DEFAULT_BORROW_APR = 0.05
++
++#: Funding prints per day on Binance USDT-M and Bybit linear.
++FUNDING_PERIODS_PER_DAY = 3
++
++#: How long a pair is expected to be held, in days. Amortises the one-time round
++#: trip and sizes the basis the carry must cover.
++#:
++#: DERIVED, not chosen. The 0018 backtest ran 20 trades across 1,453 days at
++#: 94.8% exposure, so the realised mean hold was ~69 days. This is set to 30 —
++#: well under that — because a gate that assumes a LONG hold to justify an entry
++#: is a gate arguing for its own conclusion, and because a position exited early
++#: on inverted funding pays the full round trip over fewer days.
++#:
++#: The sensitivity is not academic. At a 7-day hold the round trip alone is
++#: 4.43 bps/day against 1.80 bps/day of carry at MIN_ENTRY_FUNDING_BPS: the
++#: trade cannot pay for its own entry. At 30 days it is 1.03. This single number
++#: decides whether the strategy is a carry book or a fee generator, and any
++#: change to it must be justified against a measured hold, never tuned until an
++#: entry passes.
++ASSUMED_HOLD_DAYS = 30.0
++
++#: EWMA smoothing over funding prints. 0.5 puts half the weight on the newest
++#: print, a quarter on the one before, and so on: responsive to a turn without
++#: opening on a single spike.
++EWMA_ALPHA = 0.5
++EWMA_MIN_PRINTS = 3
++
++
++@dataclass(frozen=True)
++class CarryVerdict:
++    """Open or refuse, and the arithmetic behind it."""
++
++    allowed: bool
++    reason: str
++    expected_carry_bps_per_day: float = 0.0
++    borrow_bps_per_day: float = 0.0
++    amortised_round_trip_bps_per_day: float = 0.0
++    net_edge_bps_per_day: float = 0.0
++    entry_basis_bps: float = 0.0
++    basis_budget_bps: float = 0.0
++    smoothed_funding_bps: float = 0.0
++    detail: Dict[str, Any] = field(default_factory=dict)
++
++    def __bool__(self) -> bool:
++        return self.allowed
++
++
++def ewma_funding_bps(prints_bps: Sequence[float], *,
++                     alpha: float = EWMA_ALPHA) -> Optional[float]:
++    """Smoothed funding in bps per 8h print, newest last.
++
++    Returns None below EWMA_MIN_PRINTS. None means REFUSE at the call site, not
++    "assume zero" and not "fall back to the last print": a book with too little
++    history to know the rate should not open on it.
++    """
++    values = [float(p) for p in prints_bps if p is not None and math.isfinite(p)]
++    if len(values) < EWMA_MIN_PRINTS:
++        return None
++    smoothed = values[0]
++    for value in values[1:]:
++        smoothed = alpha * value + (1.0 - alpha) * smoothed
++    return smoothed
++
++
++def basis_bps(perp: float, spot: float) -> float:
++    """(perp - spot) / spot in bps. Positive means the perp trades RICH, which
++    is both why funding is positive and why the basis will cost you."""
++    if not (math.isfinite(perp) and math.isfinite(spot)) or spot <= 0:
++        raise ValueError(f"basis undefined for perp={perp!r} spot={spot!r}")
++    return (perp / spot - 1.0) * 1e4
++
++
++def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
++                   spot: float, borrow_apr: float = DEFAULT_BORROW_APR,
++                   hold_days: float = ASSUMED_HOLD_DAYS) -> CarryVerdict:
++    """May the book open this pair?
++
++    Order matters. Cheapest and most decisive checks first, so a refusal names
++    the binding constraint rather than the first thing that happened to fail.
++    """
++    smoothed = ewma_funding_bps(funding_prints_bps)
++    if smoothed is None:
++        return CarryVerdict(
++            False, "INSUFFICIENT_FUNDING_HISTORY",
++            detail={"prints": len(list(funding_prints_bps)),
++                    "required": EWMA_MIN_PRINTS,
++                    "note": "too little history to know the rate; not an "
++                            "invitation to assume zero or use the last print"})
++
++    if smoothed <= 0:
++        return CarryVerdict(False, "FUNDING_NOT_POSITIVE",
++                            smoothed_funding_bps=smoothed)
++
++    carry_per_day = smoothed * FUNDING_PERIODS_PER_DAY
++    borrow_per_day = (borrow_apr / 365.0) * 1e4
++    round_trip_per_day = ROUND_TRIP_BPS / max(hold_days, 1e-9)
++    net_edge = carry_per_day - borrow_per_day - round_trip_per_day
++
++    try:
++        entry_basis = basis_bps(perp, spot)
++    except ValueError as exc:
++        return CarryVerdict(False, "BASIS_UNREADABLE",
++                            smoothed_funding_bps=smoothed,
++                            detail={"error": str(exc)})
++
++    # GATE 2 — does the carry clear what the money costs?
++    if net_edge <= 0:
++        return CarryVerdict(
++            False, "CARRY_BELOW_COST_OF_CAPITAL",
++            expected_carry_bps_per_day=carry_per_day,
++            borrow_bps_per_day=borrow_per_day,
++            amortised_round_trip_bps_per_day=round_trip_per_day,
++            net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
++            smoothed_funding_bps=smoothed,
++            detail={"note": "borrow was 57% of gross income in the 0018 "
++                            "backtest; a book that opens on funding alone is "
++                            "comparing revenue to zero"})
++
++    # GATE 1 — will the basis take back more than the hold will earn?
++    # Budget is the NET edge over the hold, not the gross carry: paying basis
++    # out of money that is already spoken for by borrow and fees is how a
++    # positive-carry trade closes negative.
++    basis_budget = net_edge * hold_days
++    if entry_basis > basis_budget:
++        return CarryVerdict(
++            False, "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET",
++            expected_carry_bps_per_day=carry_per_day,
++            borrow_bps_per_day=borrow_per_day,
++            amortised_round_trip_bps_per_day=round_trip_per_day,
++            net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
++            basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed,
++            detail={"note": "short perp + long spot earns the basis it SHEDS. "
++                            "Opening into a wide basis is paying up front for "
++                            "carry you have not collected yet."})
++
++    return CarryVerdict(
++        True, "CARRY_CLEARS_COSTS_AND_BASIS",
++        expected_carry_bps_per_day=carry_per_day,
++        borrow_bps_per_day=borrow_per_day,
++        amortised_round_trip_bps_per_day=round_trip_per_day,
++        net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
++        basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed)
+--- a/tests/test_carry_costs.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_carry_costs.py	2026-09-07 21:47:54.499601374 +0000
+@@ -0,0 +1,175 @@
++"""The three gates the engine currently does not have.
++
++CarryEngine opens on one condition: the last funding print cleared a threshold.
++That is a reflex, not a decision. It ignores what the money costs, what the
++basis will take back, and whether one print represents the next eight hours.
++
++0018 showed what that costs: borrow was 57% of gross income, mean entry basis
++was +6 bps against a +29 bps exit, and 15 of 20 trades lost money.
++"""
++from __future__ import annotations
++
++import math
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import carry_costs as cc  # noqa: E402
++
++
++def flat(perp: float = 100_000.0):
++    return {"perp": perp, "spot": 100_000.0}
++
++
++def at_basis(bps: float):
++    return {"perp": 100_000.0 * (1 + bps / 1e4), "spot": 100_000.0}
++
++
++class TestTheCaseThatMustRefuse:
++    def test_thin_funding_into_a_wide_basis_is_refused(self):
++        """+0.6 bps funding, +30 bps basis. Named explicitly in the spec."""
++        v = cc.evaluate_entry(funding_prints_bps=[0.6, 0.6, 0.6],
++                              **at_basis(30.0))
++        assert v.allowed is False
++        assert bool(v) is False
++
++    def test_the_refusal_names_the_binding_constraint(self):
++        v = cc.evaluate_entry(funding_prints_bps=[0.6, 0.6, 0.6],
++                              **at_basis(30.0))
++        assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
++        assert v.net_edge_bps_per_day < 0
++
++
++class TestGateOneBasis:
++    def test_a_basis_beyond_the_budget_is_refused(self):
++        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **at_basis(150.0))
++        assert v.allowed is False
++        assert v.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
++
++    def test_a_basis_inside_the_budget_is_allowed(self):
++        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **at_basis(20.0))
++        assert v.allowed is True
++
++    def test_the_budget_is_net_edge_not_gross_carry(self):
++        """Paying basis out of money already spoken for by borrow and fees is
++        how a positive-carry trade closes negative."""
++        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat())
++        gross = v.expected_carry_bps_per_day * cc.ASSUMED_HOLD_DAYS
++        assert v.basis_budget_bps < gross
++
++    def test_basis_is_perp_over_spot(self):
++        assert cc.basis_bps(101_000.0, 100_000.0) == pytest.approx(100.0)
++        assert cc.basis_bps(99_000.0, 100_000.0) == pytest.approx(-100.0)
++
++    @pytest.mark.parametrize("spot", [0.0, -1.0, float("nan")])
++    def test_an_unusable_spot_raises(self, spot):
++        with pytest.raises(ValueError):
++            cc.basis_bps(100_000.0, spot)
++
++    def test_an_unreadable_basis_refuses_rather_than_assuming(self):
++        v = cc.evaluate_entry(funding_prints_bps=[5.0] * 3, perp=100_000.0,
++                              spot=float("nan"))
++        assert v.allowed is False
++        assert v.reason == "BASIS_UNREADABLE"
++
++
++class TestGateTwoCostOfCapital:
++    def test_carry_below_borrow_plus_fees_is_refused(self):
++        v = cc.evaluate_entry(funding_prints_bps=[0.3] * 3, **flat())
++        assert v.allowed is False
++        assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
++
++    def test_a_higher_borrow_rate_shrinks_the_edge(self):
++        cheap = cc.evaluate_entry(funding_prints_bps=[1.2] * 3, **flat(),
++                                  borrow_apr=0.0)
++        dear = cc.evaluate_entry(funding_prints_bps=[1.2] * 3, **flat(),
++                                 borrow_apr=0.08)
++        assert cheap.net_edge_bps_per_day > dear.net_edge_bps_per_day
++
++    def test_an_absurd_borrow_rate_kills_any_entry(self):
++        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat(),
++                              borrow_apr=1.0)
++        assert v.allowed is False
++
++    def test_the_round_trip_is_amortised_over_the_hold(self):
++        short = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat(),
++                                  hold_days=7.0)
++        long = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat(),
++                                 hold_days=90.0)
++        assert (short.amortised_round_trip_bps_per_day
++                > long.amortised_round_trip_bps_per_day)
++
++    def test_a_seven_day_hold_cannot_pay_for_its_own_entry(self):
++        """At threshold carry the round trip alone exceeds the income. This is
++        why ASSUMED_HOLD_DAYS is load-bearing rather than cosmetic."""
++        v = cc.evaluate_entry(funding_prints_bps=[0.2] * 3, **flat(),
++                              hold_days=7.0)
++        assert v.amortised_round_trip_bps_per_day > \
++            v.expected_carry_bps_per_day
++        assert v.allowed is False
++
++
++class TestGateThreeEwma:
++    def test_too_few_prints_refuses(self):
++        v = cc.evaluate_entry(funding_prints_bps=[5.0], **flat())
++        assert v.allowed is False
++        assert v.reason == "INSUFFICIENT_FUNDING_HISTORY"
++
++    def test_too_few_prints_does_not_fall_back_to_the_last_one(self):
++        """A book with too little history should not open on it."""
++        assert cc.ewma_funding_bps([9.9]) is None
++        assert cc.ewma_funding_bps([9.9, 9.9]) is None
++
++    def test_the_newest_print_carries_the_most_weight(self):
++        rising = cc.ewma_funding_bps([1.0, 1.0, 5.0])
++        falling = cc.ewma_funding_bps([5.0, 1.0, 1.0])
++        assert rising > falling
++
++    def test_a_rate_that_has_already_turned_is_damped(self):
++        """Three rich prints then a collapse must not read as rich."""
++        assert cc.ewma_funding_bps([5.0, 5.0, 5.0, 0.0]) < 5.0
++
++    def test_negative_smoothed_funding_refuses(self):
++        v = cc.evaluate_entry(funding_prints_bps=[-1.0] * 3, **flat())
++        assert v.allowed is False
++        assert v.reason == "FUNDING_NOT_POSITIVE"
++
++    def test_non_finite_prints_are_dropped_not_propagated(self):
++        assert cc.ewma_funding_bps([1.0, float("nan"), 1.0, 1.0]) == \
++            pytest.approx(1.0)
++
++
++class TestTheGatesAreOrderedByBindingConstraint:
++    def test_cost_of_capital_is_reported_before_basis(self):
++        """A refusal must name the binding constraint, not whichever check
++        happened to run first."""
++        v = cc.evaluate_entry(funding_prints_bps=[0.3] * 3, **at_basis(500.0))
++        assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
++
++    def test_basis_is_reported_when_the_economics_are_otherwise_fine(self):
++        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **at_basis(500.0))
++        assert v.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
++
++
++class TestItDecidesNothingElse:
++    def test_the_module_places_no_orders(self):
++        with open(os.path.join(os.path.dirname(__file__), "..",
++                               "carry_costs.py"), encoding="utf-8") as fh:
++            body = fh.read()
++        for banned in ("place_market", "place_order", "live_authorized",
++                       "openai", "anthropic"):
++            assert banned not in body
++
++    def test_the_verdict_is_pure(self):
++        """Same inputs, same answer. A risk rule with state cannot be trusted."""
++        kw = dict(funding_prints_bps=[1.5] * 3, **flat())
++        assert cc.evaluate_entry(**kw) == cc.evaluate_entry(**kw)
++
++    def test_borrow_is_explicit_at_the_declaration(self):
++        """+1.77% financed vs +7.96% unfinanced is the difference between a
++        business and a hobby, so the rate is never silently absent."""
++        assert cc.DEFAULT_BORROW_APR == 0.05
++        assert cc.ASSUMED_HOLD_DAYS == 30.0
