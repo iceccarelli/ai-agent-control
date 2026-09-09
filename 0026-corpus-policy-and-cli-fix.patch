@@ -1,0 +1,306 @@
+From: build <build@local>
+Subject: [PATCH 0026] the corpus decision, and a CLI that was crashing
+
+THE DECISION: FROZEN CORPUS, LIVE VENUE.
+
+Refreshing the committed corpora failed the suite at 5,322 instead of 5,333:
+
+    tests/test_operator_tools.py                  pins linear sha 293774ee
+                                                  pins funding sha c652c9b0
+    tests/test_slice76_fifteen_day_window.py      pins 1,476 rows
+    tests/test_slice77_selection_contamination.py pins 1,476 rows
+
+Those are not brittle tests, they are PROVENANCE. test_slice76 asserts facts
+about the corpus slice 76 measured. Updating them to 1,491 would retroactively
+falsify what slice 76 saw — the same reason sixteen historical tools are
+digest-pinned and allowed to be un-runnable.
+
+Updating the pinned numbers to match a fresh fetch is editing the record to
+agree with whatever was just downloaded. That is exactly what
+tools/reserved_holdout.py exists to detect.
+
+ + docs/human/CORPUS_POLICY.md   the decision, why, and how to refresh in a
+                                 WORKING COPY without committing it. Including
+                                 that `git checkout -- bot/data/` is not enough
+                                 once staged — `git restore --staged --worktree`
+                                 is. That cost two rounds to spot.
+
+I WAS ABOUT TO WIRE THIS INTO main.startup AND THAT WOULD HAVE BEEN WRONG.
+A deliberately frozen corpus is stale forever, so startup would have refused to
+boot permanently. The live book does not read these files at all — it reads the
+venue through MarketSnapshot, which has its own freshness and clock-skew gates.
+The check belongs in the RESEARCH path.
+
+ ~ tools/carry_backtest.py   refuses on STRUCTURAL defects and not on staleness:
+
+     OPEN_BAR_IN_FILE   a day priced as closed that had not finished
+     NOT_MONOTONIC      timestamps out of order
+     DUPLICATE_DAYS     a daily bar repeating a date
+     EMPTY / MISSING
+
+   A number computed over any of those is WRONG, not old. A number over a
+   stale-but-intact corpus is simply a number about that period.
+
+   Every report and every CLI run now publishes the row counts, last days and
+   sha256 of all three series. A figure without its provenance is a rumour, and
+   this programme was already burned once by 6.84%/yr turning out to be an input
+   rather than a result.
+
+A LIVE BUG ON MAIN, FOUND BY RUNNING IT
+    python3 tools/carry_backtest.py --repo .
+    KeyError: 'spot_proxy'
+
+0020 renamed that field to spot_source and missed the CLI print. Only --matrix
+worked. Nothing noticed because every test called simulate() directly and NONE
+called main(). Fixed, and four tests now exercise the CLI itself — default,
+--matrix and --gated all asserted not to crash.
+
+That is the third defect in this series found by RUNNING the code rather than
+reading it, after the getattr risk cap and the silent verify.sh.
+
+VERIFIED: 5,340 passed, 2 skipped (was 5,333). Fixture md5 stable.
+
+---
+--- a/docs/human/CORPUS_POLICY.md	1970-01-01 00:00:00.000000000 +0000
++++ b/docs/human/CORPUS_POLICY.md	2026-09-09 09:46:47.051321344 +0000
+@@ -0,0 +1,94 @@
++# CORPUS POLICY — frozen research record, live venue book
++
++Decided 2026-09-09, after refreshing the committed corpora broke three tests.
++
++---
++
++## The decision
++
++**The corpora committed to this repository are FROZEN. They are not refreshed
++in git.**
++
++## What forced it
++
++Running `append_closed_corpus.py --write` brought all three series current and
++immediately failed the suite at 5,322 instead of 5,333:
++
++```
++tests/test_operator_tools.py                    pins linear sha 293774ee…
++                                                pins funding sha c652c9b0…
++tests/test_slice76_fifteen_day_window.py        pins 1,476 rows
++tests/test_slice77_selection_contamination.py   pins 1,476 rows
++```
++
++Those are not brittle tests. They are **provenance**. `test_slice76` asserts
++facts about the 1,476-bar corpus that slice 76 actually measured. Updating them
++to 1,491 would retroactively falsify what slice 76 saw — the same reason sixteen
++historical tools are digest-pinned and are allowed to be un-runnable.
++
++There were three options and only two were coherent:
++
++| | |
++|---|---|
++| **A** freeze a copy, refresh a live one | correct, costs ~25 MB and a patch |
++| **B** don't refresh in git at all | **chosen** |
++| ~~C~~ update the pinned numbers to match | editing the record to agree with whatever was just fetched — precisely what `tools/reserved_holdout.py` exists to detect |
++
++## Why B
++
++The live book **does not read these files.** It reads the venue through
++`MarketSnapshot`, which has its own freshness gate, its own clock-skew check,
++and refuses rather than trading on a view it cannot vouch for.
++
++The corpus exists to answer one question: *what did the backtest measure?* A
++frozen answer is the only useful kind.
++
++## What this means in practice
++
++**Refreshing is a working-copy act.** Refresh, run the backtest, read the
++number, and `git restore` the data files. Never commit them.
++
++```bash
++python3 tools/append_closed_corpus.py --write
++python3 tools/append_spot_corpus.py --write
++python3 tools/carry_backtest.py --repo . --matrix
++git restore --staged --worktree bot/data/       # note: --staged too
++```
++
++`git checkout -- bot/data/` is **not** enough once the files have been staged.
++That cost two rounds to spot.
++
++**Staleness is not a defect on this corpus.** `corpus_health` still reports it,
++because an operator should see it, but `carry_backtest` runs
++`corpus_verdict(repo)` with `max_stale_days=10_000` and refuses only on
++STRUCTURAL defects:
++
++```
++OPEN_BAR_IN_FILE   a day priced as closed that had not finished
++NOT_MONOTONIC      timestamps out of order
++DUPLICATE_DAYS     a daily bar repeating a date
++EMPTY / MISSING
++```
++
++A number computed over any of those is **wrong**, not old. A number computed
++over a stale-but-intact corpus is simply a number about that period.
++
++**Every backtest now publishes the digests it was computed from.** A figure
++without its provenance is a rumour, and this programme has already been burned
++once by a number (`6.84%/yr`) that turned out to be an input rather than a
++result.
++
++## When this decision should be revisited
++
++If a research question needs current data with the same rigour the slice tests
++have, take option A: copy the frozen corpus to `data/frozen/slice76/`, point the
++provenance tests there, and let `data/real_*` move. That is a deliberate patch
++with its own tests, not something to do by accident while refreshing.
++
++---
++
++```
++signed:
++date:
++git commit at signing:
++```
+--- a/tests/test_carry_backtest.py	2026-09-09 09:51:07.936307199 +0000
++++ b/tests/test_carry_backtest.py	2026-09-09 09:46:21.720192408 +0000
+@@ -225,3 +225,46 @@
+         assert cb.simulate(REPO, borrow_apr=0.08)["net_annualised_pct"] < 0
+         assert cb.simulate(REPO, borrow_apr=0.08,
+                            gated=True)["net_annualised_pct"] >= 0
++
++
++class TestTheCliActuallyRuns:
++    """simulate() was tested; main() was not, so a field renamed in 0020 left
++    `carry_backtest.py --repo .` crashing with KeyError: 'spot_proxy' on main.
++    Only --matrix worked, and nothing noticed."""
++
++    def test_the_default_invocation_does_not_crash(self, capsys):
++        assert cb.main(["--repo", REPO]) == 0
++        assert "CARRY BACKTEST" in capsys.readouterr().out
++
++    def test_the_matrix_invocation_does_not_crash(self, capsys):
++        assert cb.main(["--repo", REPO, "--matrix"]) == 0
++        assert "BORROW x GATE MATRIX" in capsys.readouterr().out
++
++    def test_the_gated_invocation_does_not_crash(self, capsys):
++        assert cb.main(["--repo", REPO, "--gated"]) == 0
++
++    def test_the_cli_publishes_the_corpus_digests(self, capsys):
++        cb.main(["--repo", REPO])
++        out = capsys.readouterr().out
++        assert "CORPUS THIS WAS COMPUTED FROM" in out
++        assert "perp_1d" in out and "sha" in out
++
++
++class TestStructuralDefectsRefuseTheBacktest:
++    def test_staleness_alone_does_not_refuse(self, report):
++        """The committed corpus is FROZEN by design so the slice tests keep
++        recording what past measurements saw. A frozen corpus is stale forever
++        and a backtest on it is still valid."""
++        assert report["corpus_health"]["structural_defects"] == []
++
++    def test_the_report_carries_its_own_provenance(self, report):
++        """A number without the digests it came from is a rumour."""
++        for series in report["corpus_health"]["series"]:
++            assert len(series["sha256"]) == 64
++            assert series["rows"] > 0
++
++    def test_structural_defects_are_named_not_swallowed(self):
++        assert "OPEN_BAR_IN_FILE" in cb.STRUCTURAL_DEFECTS
++        assert "NOT_MONOTONIC" in cb.STRUCTURAL_DEFECTS
++        assert not any("STALE" in d for d in cb.STRUCTURAL_DEFECTS), \
++            "staleness must not refuse a frozen research corpus"
+--- a/tools/carry_backtest.py	2026-09-09 09:51:07.950115039 +0000
++++ b/tools/carry_backtest.py	2026-09-09 09:46:21.720192408 +0000
+@@ -184,6 +184,35 @@
+         "--intervals 1d --years 4 --out data/real_spot_btc")
+ 
+ 
++#: Corpus defects that invalidate a backtest, and the one that does not.
++#:
++#: STALENESS IS NOT A DEFECT HERE. The committed corpus is deliberately FROZEN:
++#: it records what slice 76 measured, and tests/test_slice76_fifteen_day_window
++#: and tests/test_slice77_selection_contamination pin its row count for exactly
++#: that reason. Refreshing it in git would retroactively falsify what those
++#: slices saw. The LIVE book does not read this corpus at all — it reads the
++#: venue through MarketSnapshot, which has its own freshness gate.
++#:
++#: So a frozen corpus is stale by design and a backtest on it is still valid.
++#:
++#: STRUCTURAL defects are different. An interior hole means a day the venue had
++#: and this file does not, so the simulation silently skips it. An open bar
++#: means a day that had not finished, priced as though it had. Neither is a
++#: matter of age, and a number computed over either is wrong rather than old.
++STRUCTURAL_DEFECTS = ("OPEN_BAR_IN_FILE", "NOT_MONOTONIC", "DUPLICATE_DAYS",
++                      "EMPTY", "MISSING")
++
++
++def corpus_verdict(repo: str):
++    """Health of the three series, with staleness excluded. See above."""
++    import corpus_health
++    report = corpus_health.check(repo, max_stale_days=10_000)
++    structural = [p for p in report["problems"]
++                  if any(d in p for d in STRUCTURAL_DEFECTS)]
++    holes = report.get("alignment_gaps", [])
++    return report, structural, holes
++
++
+ def _carry_costs():
+     """Import the gates lazily so the backtester still runs without them."""
+     import sys as _sys
+@@ -281,6 +310,19 @@
+     if not days:
+         raise SystemExit("no overlapping days between spot and perp")
+ 
++    # A number computed over a corpus with an interior hole or an open bar is
++    # WRONG, not old. carry_backtest used to intersect the three series in
++    # silence: a day present in one and missing from another simply vanished
++    # from the simulation, and nothing said so.
++    health, structural, holes = corpus_verdict(repo)
++    if structural:
++        raise SystemExit(
++            "REFUSING TO BACKTEST — structural corpus defects:\n  "
++            + "\n  ".join(structural)
++            + "\nStaleness is fine (the corpus is deliberately frozen). These "
++              "are not staleness: they are days priced as closed that were not, "
++              "or rows the simulation cannot trust.")
++
+     trades: List[Trade] = []
+     live: Optional[Trade] = None
+     negative_streak = 0
+@@ -395,6 +437,16 @@
+         "open_bar_dropped": True,
+         "not_modelled": ["slippage beyond taker fees", "order book depth",
+                          "intraday basis", "liquidation of the short leg"],
++        "corpus_health": {
++            "structural_defects": structural,
++            "interior_holes": holes,
++            "series": [{"name": x["name"], "rows": x.get("rows"),
++                        "last": x.get("last"), "sha256": x.get("sha256")}
++                       for x in health["series"]],
++            "note": ("staleness is deliberately NOT a defect: the committed "
++                     "corpus is frozen so the slice tests keep recording what "
++                     "past measurements saw. The live book reads the venue."),
++        },
+         "gated": gated,
+         "refusals": refusals,
+         "trade_log": [{"opened": str(t.opened), "closed": str(t.closed),
+@@ -479,10 +531,18 @@
+     print()
+     print("  " + "!" * 66)
+     print(f"  QUOTABLE: {r['is_a_quotable_return']}")
+-    print(f"  spot proxy: {r['spot_proxy']}")
+-    for line in r["why_not_quotable"].split(", "):
+-        print(f"    {line}")
++    print(f"  spot source: {r['spot_source']}")
++    for line in (r["why_not_quotable"] or "").split(", "):
++        if line:
++            print(f"    {line}")
+     print("  " + "!" * 66)
++    print("\n  CORPUS THIS WAS COMPUTED FROM")
++    for series in r["corpus_health"]["series"]:
++        print(f"    {series['name']:9s} n={series['rows']:5d}  "
++              f"last {series['last']}  sha {series['sha256'][:16]}…")
++    if r["corpus_health"]["interior_holes"]:
++        print(f"    ! {len(r['corpus_health']['interior_holes'])} interior "
++              "hole(s) — days one series has and another does not")
+     if args.out:
+         with open(args.out, "w", encoding="utf-8") as handle:
+             json.dump(r, handle, indent=2)
