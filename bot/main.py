@@ -439,19 +439,26 @@ class TradingBot:
         # system exists to prevent.
         if self.carry is not None:
             symbol = self.symbols[0] if self.symbols else "BTCUSDT"
+            # ONE observation, not three loose reads. The basis is a DIFFERENCE
+            # between the perp and spot marks, so reading them seconds apart
+            # measures the basis plus the drift between the calls. take_snapshot
+            # stamps all four reads with a single observation time and
+            # assert_fresh refuses a view that is stale or whose clock disagrees
+            # with the venue — a frozen feed is indistinguishable from a quiet
+            # market without that check.
             try:
-                mark = float(self.carry.broker.get_mark(symbol))
-                funding_bps = float(self.carry.broker.get_funding_bps(symbol))
-                # The SPOT mark prices the basis. It is fetched here rather
-                # than defaulted, and a failure lands in the same handler as a
-                # missing perp mark: no order, no state change.
-                spot = float(self.carry.broker.get_spot_mark(
-                    self.carry.spot_symbol))
+                from market_snapshot import take_snapshot
+                view = take_snapshot(self.carry.broker, perp_symbol=symbol,
+                                     spot_symbol=self.carry.spot_symbol)
+                view.assert_fresh()
             except Exception as exc:  # noqa: BLE001
                 logger.error(
-                    "carry inputs unreadable this cycle (%s); the book is NOT "
-                    "touched and no order is sent", exc)
+                    "carry market view unusable this cycle (%s); the book is "
+                    "NOT touched and no order is sent", exc)
                 return
+            mark, spot = view.perp_mark, view.spot_mark
+            funding_bps = view.funding_bps
+            self.carry.snapshot = view
             decision = self.carry.on_candle(
                 mark=mark, funding_bps=funding_bps, spot=spot,
                 timestamp_ms=int(time.time() * 1000))
@@ -642,6 +649,15 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             perp_symbol=cfg.CARRY_PERP_SYMBOL,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
         )
+        # The pair gate. Until now max_notional_usd was the ONLY size control on
+        # the carry book: the legs passed through no RiskManager at all. This is
+        # the pair-shaped equivalent — kill switch, one-pair, cap, margin floor,
+        # entries per day — consulted before both legs, never after one.
+        from carry_risk import CarryRisk
+
+        bot.carry.pair_risk = CarryRisk(
+            store=bot.store,
+            max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f. The "
             "directional strategy is NOT attached and will not be consulted.",
