@@ -22,11 +22,11 @@ RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 # imported unconditionally, so `python3 main.py` died on ModuleNotFoundError
 # before the health server bound and the container restart-looped.
 COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
-     config.py features.py main.py market_data.py memory.py \
-     ml_strategy.py persistence.py policy.py position_sizing.py \
-     project_status.py promotion_gate.py pure_indicators.py \
-     risk_management.py session_log.py shadow.py technical_analysis.py \
-     trading_engine.py ./
+     carry_risk.py config.py features.py main.py market_data.py \
+     market_snapshot.py memory.py ml_strategy.py persistence.py \
+     policy.py position_sizing.py project_status.py promotion_gate.py \
+     pure_indicators.py risk_management.py session_log.py shadow.py \
+     technical_analysis.py trading_engine.py ./
 COPY signals/ ./signals/
 
 # Run unprivileged. State lives on a mounted volume owned by this user.

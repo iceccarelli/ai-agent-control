@@ -211,6 +211,13 @@ class CarryEngine:
         self.position: Optional[CarryPosition] = None
         self.state = BookState.FLAT
         self.borrow_apr = float(borrow_apr)
+        #: Set by build_bot. Consulted in _open BEFORE the first leg goes out,
+        #: because a gate that runs after one leg has landed is not a gate, it
+        #: is a post-mortem.
+        self.pair_risk: Optional[Any] = None
+        #: The market view this cycle acted on, set by main.tick. Kept so the
+        #: pair gate judges the SAME observation the entry decision used.
+        self.snapshot: Optional[Any] = None
         self._funding_history: List[float] = []
 
     # -- the loop ---------------------------------------------------------
@@ -312,6 +319,18 @@ class CarryEngine:
                                  state=BookState.FLAT,
                                  detail={"margin_multiple": margin})
 
+        # THE PAIR GATE, before the first leg. Ordered by damage inside
+        # CarryRisk: a tripped kill switch outranks a stale price, both outrank
+        # a cap. Absent when the engine is constructed bare in a test, and that
+        # is the only case where it may be skipped.
+        if self.pair_risk is not None and self.snapshot is not None:
+            gate = self.pair_risk.gate_open(
+                notional_usd=self.max_notional_usd, snapshot=self.snapshot,
+                has_open_pair=self.position is not None)
+            if not gate:
+                return CarryDecision("stand_aside", reason=gate.reason,
+                                     state=BookState.FLAT, detail=gate.detail)
+
         self.state = BookState.OPENING
         spot = self._fire(self.spot_symbol, "Buy", qty, "spot")
         if spot is None or spot.filled_qty <= 0:
@@ -336,6 +355,10 @@ class CarryEngine:
 
         self.position = position
         self.state = BookState.HEDGED
+        if self.pair_risk is not None:
+            # Only now. A refused or half-filled pair did not consume the day's
+            # entry allowance.
+            self.pair_risk.record_entry()
         return CarryDecision(
             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
