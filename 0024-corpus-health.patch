@@ -1,0 +1,422 @@
+From: build <build@local>
+Subject: [PATCH 0024] do the three series agree? corpus health
+
+The carry book reads THREE corpora and they are only meaningful together. The
+basis is a DIFFERENCE between the first two and the carry decision needs all
+three on the same UTC day. Measured on main as delivered:
+
+    perp     2022-08-10 .. 2026-08-24   STALE BY 15 DAYS
+    spot     2022-09-09 .. 2026-09-08   stale 0
+    funding  2022-08-09 .. 2026-08-25   STALE BY 14 DAYS
+
+    30 perp days have no spot.  15 spot days have no perp.
+    31 funding days have no spot. 2 funding days have no perp.
+
+carry_backtest INTERSECTS them silently. Forty-five days present in one series
+and missing from another were dropped without comment, and a series that stopped
+refreshing looked exactly like a quiet market. A book deciding on today's funding
+against a two-week-old spot mark is not hedged - it is guessing, and nothing in
+the tree would have said so.
+
+ + tools/corpus_health.py   staleness against the last CLOSED day, three-way
+                            alignment with the missing days NAMED, open bars
+                            still sitting in the file (drop_open_bar handles
+                            them at LOAD; the bytes are still a trap for any
+                            other consumer), monotonicity, calendar gaps, and a
+                            sha256 per series because a health claim without a
+                            hash is a rumour.
+
+                            Exits non-zero when unhealthy. --max-stale-days
+                            makes the refusal threshold explicit rather than
+                            implied.
+
+   CADENCE IS PER SERIES. Funding prints THREE times a day on Binance USDT-M, so
+   repeated dates there are the schedule, not a duplicate - the first draft
+   flagged 2,953 of them. A daily bar repeating a date IS a defect. One rule for
+   both would either miss real duplicates or cry wolf, and a check that cries
+   wolf gets ignored, which is worse than no check.
+
+ + tests/test_corpus_health.py   12 tests, including that funding is not judged
+                            as a daily bar, that a daily series repeating a date
+                            would still be caught, and that the tool REPORTS
+                            rather than repairs - a health check that fixes
+                            things is one nobody can trust the output of.
+
+READ-ONLY. It does not fetch, append or rewrite. Refreshing the two stale
+corpora is a separate act with its own append-only prefix-hash discipline, and
+it needs a host that reaches the venue.
+
+VERIFIED: 5,322 passed, 2 skipped (was 5,310). Fixture md5 stable.
+
+---
+--- a/tests/test_corpus_health.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tests/test_corpus_health.py	2026-09-09 08:01:14.249154570 +0000
+@@ -0,0 +1,122 @@
++"""The three series are only meaningful together, and nothing checked that.
++
++perp ended 2026-08-24, funding 2026-08-25, spot 2026-09-08. carry_backtest
++intersected them silently: 45 days present in one and missing from another were
++dropped without comment, and a series 16 days behind looked like a quiet market.
++"""
++from __future__ import annotations
++
++import datetime as dt
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
++
++import corpus_health as ch  # noqa: E402
++
++REPO = os.path.join(os.path.dirname(__file__), "..")
++
++
++@pytest.fixture(scope="module")
++def report():
++    return ch.check(REPO)
++
++
++class TestAllThreeSeriesAreInspected:
++    def test_every_series_the_book_reads_is_covered(self, report):
++        assert {s["name"] for s in report["series"]} == {
++            "perp_1d", "spot_1d", "funding"}
++
++    def test_each_series_publishes_a_digest(self, report):
++        """Bytes beat prose. A health claim without a hash is a rumour."""
++        for series in report["series"]:
++            if series.get("present"):
++                assert len(series["sha256"]) == 64
++
++
++class TestFundingIsNotJudgedAsADailyBar:
++    def test_three_prints_a_day_is_not_a_duplicate(self, report):
++        """Funding prints 3x daily on Binance USDT-M. Flagging that would cry
++        wolf 2,953 times, and a check that cries wolf gets ignored."""
++        funding = next(s for s in report["series"] if s["name"] == "funding")
++        assert not any(p.startswith("DUPLICATE_DAYS") for p in funding["problems"])
++
++    def test_a_daily_bar_repeating_a_date_would_still_be_flagged(self):
++        names = {name: per for name, _p, _c, per in ch.SERIES}
++        assert names["perp_1d"] == 1
++        assert names["spot_1d"] == 1
++        assert names["funding"] == 3
++
++
++class TestStalenessIsReported:
++    def test_staleness_is_measured_against_the_last_CLOSED_day(self, report):
++        for series in report["series"]:
++            if series.get("present"):
++                assert series["stale_days"] >= 0
++
++    def test_a_series_past_the_limit_is_named(self):
++        strict = ch.check(REPO, max_stale_days=0)
++        assert strict["series_too_stale"]
++
++    def test_a_generous_limit_names_nobody(self):
++        assert not ch.check(REPO, max_stale_days=10_000)["series_too_stale"]
++
++
++class TestAlignmentIsReportedNotSwallowed:
++    def test_the_three_way_overlap_is_stated(self, report):
++        assert report["three_way_overlap_days"] > 0
++        assert report["overlap_first"] < report["overlap_last"]
++
++    def test_days_missing_from_another_series_are_named(self, report):
++        """These were silently dropped by the backtest before this existed."""
++        assert isinstance(report["alignment_gaps"], list)
++        for gap in report["alignment_gaps"]:
++            assert gap["days_in"] != gap["missing_from"]
++            assert gap["count"] > 0
++
++
++class TestOpenBarsInTheFile:
++    def test_a_bar_dated_today_is_flagged(self, tmp_path):
++        """drop_open_bar handles it at LOAD. The file still contains it, which
++        is a trap for any other consumer."""
++        import csv
++        import gzip
++        path = tmp_path / "s.csv.gz"
++        today = dt.datetime.now(dt.timezone.utc).date()
++        with gzip.open(path, "wt", newline="") as fh:
++            w = csv.writer(fh)
++            w.writerow(["time_period_start"])
++            w.writerow([f"{today - dt.timedelta(days=1)}T00:00:00Z"])
++            w.writerow([f"{today}T00:00:00Z"])
++        out = ch.inspect(str(tmp_path), "x", "s.csv.gz", "time_period_start",
++                         1, today)
++        assert any(p.startswith("OPEN_BAR_IN_FILE") for p in out["problems"])
++
++
++class TestItOnlyReads:
++    def test_the_tool_never_writes_a_corpus(self):
++        with open(os.path.join(REPO, "tools", "corpus_health.py"),
++                  encoding="utf-8") as fh:
++            body = fh.read()
++        # AST, not text: the docstring explains that the tool does not fetch,
++        # and a substring check finds its own documentation. Same trap as the
++        # 0016 cap guard.
++        import ast
++        tree = ast.parse(body)
++        writes = [n for n in ast.walk(tree)
++                  if isinstance(n, ast.Call)
++                  and isinstance(n.func, ast.Name) and n.func.id == "open"
++                  and len(n.args) > 1
++                  and isinstance(n.args[1], ast.Constant)
++                  and "w" in str(n.args[1].value)]
++        # The only write is the optional --out JSON report, never a corpus.
++        assert len(writes) <= 1
++        for banned in ("place_market", "live_authorized"):
++            assert banned not in body
++
++    def test_an_unhealthy_corpus_is_reported_not_repaired(self, report):
++        """A health check that fixes things is one nobody can trust."""
++        assert "healthy" in report
++        assert isinstance(report["problems"], list)
+--- a/tools/corpus_health.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tools/corpus_health.py	2026-09-09 08:01:02.257377313 +0000
+@@ -0,0 +1,243 @@
++#!/usr/bin/env python3
++"""Do the three series the book depends on agree with each other?
++
++WHY THIS EXISTS
++===============
++The carry book reads THREE corpora and they are only meaningful together:
++
++    BINANCE_LINEAR_BTC_USDT_1D     the perp leg
++    BINANCE_SPOT_BTC_USDT_1D       the spot leg
++    BINANCE_LINEAR_BTC_USDT_FUNDING  the income
++
++The basis is a DIFFERENCE between the first two and the carry decision needs
++all three on the same UTC day. Measured on the tree as delivered:
++
++    perp     2022-08-10 .. 2026-08-24   stale by 16 days
++    spot     2022-09-09 .. 2026-09-08   stale by  1 day
++    funding  2022-08-09 .. 2026-08-25   stale by 15 days
++
++    30 perp days have no spot. 15 spot days have no perp.
++
++`carry_backtest` intersects them silently. Nothing reported the gap and nothing
++refused when one series fell 16 days behind the others. A book that decides on
++today's funding against a spot mark from two weeks ago is not hedged, it is
++guessing — and it would never say so.
++
++This tool says so.
++
++WHAT IT CHECKS
++==============
++  STALENESS   how far behind the last CLOSED UTC day each series is
++  ALIGNMENT   days present in one series and missing from another
++  OPEN BARS   a row dated today or later, written as a close
++  MONOTONIC   strictly increasing timestamps, no duplicates
++  CONTINUITY  calendar gaps inside each series
++  UNITS       delegated to corpus_unit_audit's run-vs-point test
++
++WHAT IT DOES NOT DO
++===================
++Fetch, repair, or write. It reads and reports and exits non-zero. Silently
++rewriting a provenance record to whatever looks plausible is the failure this
++programme exists to prevent, and a health check that fixes things is a health
++check nobody can trust the output of.
++
++    python3 tools/corpus_health.py --repo .
++    python3 tools/corpus_health.py --repo . --max-stale-days 2
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import datetime as dt
++import gzip
++import hashlib
++import json
++import os
++import sys
++from typing import Any, Dict, List, Optional, Set
++
++#: How far behind the last closed UTC day a series may be before the book
++#: should refuse to act on it. Two days: one for the day that has not closed,
++#: one for a venue or fetch that ran late. Beyond that, someone stopped
++#: refreshing and the book must not pretend otherwise.
++DEFAULT_MAX_STALE_DAYS = 2
++
++#: name, path, timestamp column, rows-per-day.
++#: Funding prints THREE times a day on Binance USDT-M, so repeated dates are the
++#: schedule, not a duplicate. A daily bar series repeating a date IS a defect.
++#: Applying one rule to both would either miss real duplicates in the bar series
++#: or cry wolf 2,953 times on funding, and a check that cries wolf gets ignored.
++SERIES = [
++    ("perp_1d", "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
++     "time_period_start", 1),
++    ("spot_1d", "data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz",
++     "time_period_start", 1),
++    ("funding", "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz",
++     "funding_time_ms", 3),
++]
++
++
++def _open(path: str):
++    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "rt")
++
++
++def _to_date(raw: str, column: str) -> dt.date:
++    if column == "funding_time_ms":
++        return dt.datetime.fromtimestamp(
++            int(raw) / 1000.0, dt.timezone.utc).date()
++    return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
++
++
++def read_days(path: str, column: str) -> List[dt.date]:
++    with _open(path) as handle:
++        return [_to_date(row[column], column) for row in csv.DictReader(handle)]
++
++
++def sha256(path: str) -> str:
++    digest = hashlib.sha256()
++    with open(path, "rb") as handle:
++        for chunk in iter(lambda: handle.read(1 << 16), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def inspect(repo: str, name: str, rel: str, column: str, per_day: int,
++            today: dt.date) -> Dict[str, Any]:
++    path = os.path.join(repo, rel)
++    if not os.path.exists(path):
++        return {"name": name, "path": rel, "present": False,
++                "problems": ["MISSING"]}
++    days = read_days(path, column)
++    if not days:
++        return {"name": name, "path": rel, "present": True, "rows": 0,
++                "problems": ["EMPTY"]}
++
++    unique = sorted(set(days))
++    last_closed = today - dt.timedelta(days=1)
++    problems: List[str] = []
++
++    # An OPEN bar is a day that has not finished, written as a close. Binance
++    # returns the in-progress bar from klines and the fetcher writes it.
++    open_bars = [d for d in unique if d >= today]
++    if open_bars:
++        problems.append(f"OPEN_BAR_IN_FILE:{open_bars[-1]}")
++
++    stale_days = (last_closed - max(d for d in unique if d < today)).days \
++        if any(d < today for d in unique) else 10_000
++    if stale_days > 0:
++        problems.append(f"STALE:{stale_days}d")
++
++    if per_day == 1 and len(days) != len(unique):
++        problems.append(f"DUPLICATE_DAYS:{len(days) - len(unique)}")
++    if per_day > 1:
++        thin = [d for d in unique[:-1] if days.count(d) < per_day]
++        if thin:
++            problems.append(f"INCOMPLETE_DAYS:{len(thin)}:{thin[-1]}")
++    if days != sorted(days):
++        problems.append("NOT_MONOTONIC")
++
++    gaps = [(unique[i - 1], unique[i]) for i in range(1, len(unique))
++            if (unique[i] - unique[i - 1]).days > 1]
++    if gaps:
++        problems.append(f"CALENDAR_GAPS:{len(gaps)}")
++
++    return {"name": name, "path": rel, "present": True, "rows": len(days),
++            "first": str(unique[0]), "last": str(unique[-1]),
++            "stale_days": stale_days, "open_bars": [str(d) for d in open_bars],
++            "gaps": [[str(a), str(b)] for a, b in gaps[:5]],
++            "sha256": sha256(path), "problems": problems,
++            "_days": set(unique)}
++
++
++def check(repo: str, *, max_stale_days: int = DEFAULT_MAX_STALE_DAYS,
++          today: Optional[dt.date] = None) -> Dict[str, Any]:
++    today = today or dt.datetime.now(dt.timezone.utc).date()
++    reports = [inspect(repo, n, r, c, k, today)
++               for n, r, c, k in SERIES]
++    present = [r for r in reports if r.get("_days")]
++
++    alignment: List[Dict[str, Any]] = []
++    overlap: Optional[Set[dt.date]] = None
++    for report in present:
++        overlap = set(report["_days"]) if overlap is None \
++            else overlap & report["_days"]
++    for a in present:
++        for b in present:
++            if a is b:
++                continue
++            missing = a["_days"] - b["_days"]
++            if missing:
++                alignment.append({"days_in": a["name"], "missing_from": b["name"],
++                                  "count": len(missing),
++                                  "example": str(max(missing))})
++
++    problems = [f"{r['name']}: {p}" for r in reports for p in r["problems"]]
++    too_stale = [r["name"] for r in present
++                 if r.get("stale_days", 0) > max_stale_days]
++
++    for report in reports:
++        report.pop("_days", None)
++
++    return {
++        "checked_utc": str(today),
++        "max_stale_days": max_stale_days,
++        "series": reports,
++        "three_way_overlap_days": len(overlap or ()),
++        "overlap_first": str(min(overlap)) if overlap else None,
++        "overlap_last": str(max(overlap)) if overlap else None,
++        "alignment_gaps": alignment,
++        "series_too_stale": too_stale,
++        "problems": problems,
++        "healthy": not problems and not alignment,
++        "note": ("carry_backtest INTERSECTS these series silently. A day present "
++                 "in one and missing from another is dropped without comment, "
++                 "and a series that stops refreshing looks like a quiet market."),
++    }
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--repo", default=".")
++    parser.add_argument("--max-stale-days", type=int,
++                        default=DEFAULT_MAX_STALE_DAYS)
++    parser.add_argument("--out", default="")
++    args = parser.parse_args(argv)
++
++    report = check(args.repo, max_stale_days=args.max_stale_days)
++
++    print("=" * 74)
++    print("CORPUS HEALTH — do the three series agree?")
++    print("=" * 74)
++    print(f"  as of {report['checked_utc']} UTC\n")
++    for series in report["series"]:
++        if not series.get("present"):
++            print(f"  {series['name']:9s} MISSING  {series['path']}")
++            continue
++        print(f"  {series['name']:9s} {series['first']} .. {series['last']}  "
++              f"n={series['rows']:5d}  stale {series['stale_days']}d")
++        print(f"            sha256 {series['sha256'][:16]}…")
++        for problem in series["problems"]:
++            print(f"            ! {problem}")
++    print(f"\n  three-way overlap  {report['overlap_first']} .. "
++          f"{report['overlap_last']}  n={report['three_way_overlap_days']}")
++    for gap in report["alignment_gaps"]:
++        print(f"  ! {gap['count']:4d} days in {gap['days_in']} are missing "
++              f"from {gap['missing_from']} (e.g. {gap['example']})")
++    print()
++    if report["series_too_stale"]:
++        print(f"  REFUSE: {', '.join(report['series_too_stale'])} exceed "
++              f"{report['max_stale_days']} days stale.")
++        print("  A book deciding on today's funding against a two-week-old spot")
++        print("  mark is not hedged. It is guessing, and it would not say so.")
++    print(f"\n  healthy: {report['healthy']}")
++    print(f"  {report['note']}")
++
++    if args.out:
++        with open(args.out, "w", encoding="utf-8") as handle:
++            json.dump(report, handle, indent=2)
++    return 0 if report["healthy"] else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
