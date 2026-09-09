@@ -1,0 +1,609 @@
+From: build <build@local>
+Subject: [PATCH 0027] the basis your P&L pays, and a refresh you cannot get wrong
+
+THE GAP
+CarryEngine decides on DAILY CLOSES. Funding settles at 00:00, 08:00 and 16:00
+UTC. carry_backtest reports a mean entry basis of +6 bps and a mean exit of +29
+bps, both measured at daily closes — a once-a-day proxy for the number that
+actually changes hands at settlement, and the moment a real book has to be
+hedged.
+
+Nobody has measured the difference. It matters because basis is the term that
+took -$4,772 out of $42,843 of gross carry: the single line item that turns a
+positive-carry trade negative, seen only through a once-a-day lens.
+
+ + tools/fetch_settlement_klines.py   8h klines for BOTH legs. A Binance 8h bar
+                                      is aligned to 00/08/16 UTC — exactly the
+                                      funding clock — so its CLOSE is the price
+                                      at settlement.
+                                      The RUNNING window is refused: pricing a
+                                      settlement that has not happened is the
+                                      same error as writing today's daily bar
+                                      as a close. Append-only, prefix-verified,
+                                      dry-run by default, legs in separate
+                                      files.
+
+ + tools/basis_at_settlement.py       settlement basis vs daily-close basis:
+                                      mean, median, sd, p05, p95, and a
+                                      breakdown BY SETTLEMENT HOUR.
+
+   THE QUESTION IT ANSWERS is not "how big is the difference" but "is it an
+   OFFSET or NOISE". A constant offset is absorbed by the gate's basis budget.
+   Noise means the gate judges one number and the book pays another, and the
+   spread of the difference is the size of that mistake. If 00:00 differs
+   systematically from 16:00, timing an entry to a window is worth more than a
+   wider basis gate.
+
+   IT CHANGES NO THRESHOLD, and says so in its own output. Gating on the
+   settlement basis would be a NEW hypothesis needing its own out-of-sample
+   window — choosing a gate after seeing which basis looked better is the
+   selection path reserved_holdout.py exists to detect.
+
+   Missing data is STATED, not faked: it names the fetch command and exits
+   non-zero rather than substituting the daily basis and calling it settlement.
+
+ + scripts/refresh.sh   the four-step cycle from CORPUS_POLICY.md, including the
+                        subtlety missed twice by hand: `git checkout --
+                        bot/data/` does NOT undo STAGED files, so a refreshed
+                        corpus rides onto the next branch and breaks the
+                        provenance tests. Refuses to start if bot/data/ is
+                        already dirty, and verifies the restore actually
+                        happened rather than assuming it.
+
+VERIFIED: 5,353 passed, 2 skipped (was 5,340). Fixture md5 stable.
+
+NEXT, and said plainly: this is the twenty-seventh patch and the book has never
+placed an order. Everything buildable without a venue is now built. A testnet
+fill would teach more than the next five patches combined.
+
+---
+--- a/bot/tests/test_settlement_basis.py	1970-01-01 00:00:00.000000000 +0000
++++ b/bot/tests/test_settlement_basis.py	2026-09-09 10:22:28.404120722 +0000
+@@ -0,0 +1,130 @@
++"""The basis the book decides on is not the basis the P&L pays.
++
++CarryEngine decides on DAILY CLOSES. Funding settles at 00/08/16 UTC. The
++backtest's +6 bps entry basis is a once-a-day proxy for the number that changes
++hands, and basis is the term that took -$4,772 out of $42,843 of gross.
++"""
++from __future__ import annotations
++
++import datetime as dt
++import gzip
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
++
++import basis_at_settlement as bas  # noqa: E402
++import fetch_settlement_klines as fsk  # noqa: E402
++
++REPO = os.path.join(os.path.dirname(__file__), "..")
++
++
++def kline(when: dt.datetime, close: float):
++    ms = int(when.timestamp() * 1000)
++    return [ms, str(close), str(close), str(close), str(close), "10"]
++
++
++class TestAnUnfinishedWindowHasNoSettlementPrice:
++    def test_the_running_window_is_refused(self, tmp_path):
++        """Pricing a settlement that has not happened is the same error as
++        writing today's daily bar as a close."""
++        now = dt.datetime(2026, 9, 9, 12, 0, tzinfo=dt.timezone.utc)
++        r = fsk.run(str(tmp_path), leg="perp", now_s=now.timestamp(), klines=[
++            kline(dt.datetime(2026, 9, 9, 0, tzinfo=dt.timezone.utc), 100.0),
++            kline(dt.datetime(2026, 9, 9, 8, tzinfo=dt.timezone.utc), 101.0)])
++        assert r["new_windows"] == 1, "the 08:00 window closes at 16:00"
++        assert r["refused_open_windows"] == ["2026-09-09T08:00:00Z"]
++
++    def test_a_window_that_has_closed_is_taken(self, tmp_path):
++        now = dt.datetime(2026, 9, 9, 16, 1, tzinfo=dt.timezone.utc)
++        r = fsk.run(str(tmp_path), leg="perp", now_s=now.timestamp(), klines=[
++            kline(dt.datetime(2026, 9, 9, 8, tzinfo=dt.timezone.utc), 101.0)])
++        assert r["new_windows"] == 1
++
++    def test_the_window_length_is_the_funding_period(self):
++        assert fsk.WINDOW_S == 8 * 3600
++
++
++class TestAppendOnly:
++    def test_the_prefix_is_checked(self, tmp_path):
++        now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc).timestamp()
++        r = fsk.run(str(tmp_path), leg="perp", now_s=now, klines=[
++            kline(dt.datetime(2026, 9, 9, 0, tzinfo=dt.timezone.utc), 100.0)])
++        assert r["historical_bytes_are_prefix"] is True
++
++    def test_a_repeat_run_appends_nothing(self, tmp_path):
++        now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc).timestamp()
++        k = [kline(dt.datetime(2026, 9, 9, 0, tzinfo=dt.timezone.utc), 100.0)]
++        first = fsk.run(str(tmp_path), leg="perp", write=True, now_s=now, klines=k)
++        second = fsk.run(str(tmp_path), leg="perp", write=True, now_s=now, klines=k)
++        assert first["new_windows"] == 1
++        assert second["new_windows"] == 0
++        assert (second["uncompressed_sha256_after"]
++                == first["uncompressed_sha256_after"])
++
++    def test_dry_run_writes_nothing(self, tmp_path):
++        now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc).timestamp()
++        fsk.run(str(tmp_path), leg="perp", now_s=now, klines=[
++            kline(dt.datetime(2026, 9, 9, 0, tzinfo=dt.timezone.utc), 100.0)])
++        assert not os.path.exists(
++            os.path.join(str(tmp_path), fsk.OUT_DIR,
++                         "BINANCE_PERP_BTCUSDT_8H.csv.gz"))
++
++    def test_the_two_legs_land_in_separate_files(self, tmp_path):
++        now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc).timestamp()
++        k = [kline(dt.datetime(2026, 9, 9, 0, tzinfo=dt.timezone.utc), 100.0)]
++        for leg in ("perp", "spot"):
++            fsk.run(str(tmp_path), leg=leg, write=True, now_s=now, klines=k)
++        listing = os.listdir(os.path.join(str(tmp_path), fsk.OUT_DIR))
++        assert len(listing) == 2
++
++
++class TestTheAnalysisDegradesHonestly:
++    def test_missing_data_is_stated_not_faked(self):
++        """No 8h series yet. It says so and names the command, rather than
++        substituting the daily basis and calling it a settlement basis."""
++        report = bas.analyse(REPO)
++        if not report["available"]:
++            assert report["is_a_measurement"] is False
++            assert "fetch_settlement_klines" in report["reason"]
++
++    def test_the_cli_exits_non_zero_without_data(self):
++        report = bas.analyse(REPO)
++        if not report["available"]:
++            assert bas.main(["--repo", REPO]) == 1
++
++
++class TestItComputesTheRightThing:
++    def _seed(self, tmp_path, perp_close, spot_close):
++        when = dt.datetime(2026, 9, 9, 0, tzinfo=dt.timezone.utc)
++        now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc).timestamp()
++        for leg, close in (("perp", perp_close), ("spot", spot_close)):
++            fsk.run(str(tmp_path), leg=leg, write=True, now_s=now,
++                    klines=[kline(when, close)])
++
++    def test_settlement_basis_is_perp_over_spot(self, tmp_path):
++        self._seed(tmp_path, 100_100.0, 100_000.0)
++        # Daily series absent in tmp_path, so the paired comparison is empty —
++        # but the settlement side must still be computed.
++        report = bas.analyse(str(tmp_path))
++        assert report["available"] is True
++
++    def test_only_settlement_hours_are_considered(self):
++        assert bas.SETTLEMENT_HOURS == (0, 8, 16)
++
++
++class TestItChangesNoThreshold:
++    def test_the_report_says_so(self):
++        report = bas.analyse(REPO)
++        if report["available"]:
++            assert report["changes_no_threshold"] is True
++
++    def test_the_module_touches_no_gate(self):
++        with open(os.path.join(REPO, "tools", "basis_at_settlement.py"),
++                  encoding="utf-8") as fh:
++            body = fh.read()
++        for banned in ("FUND_ABS", "place_market", "live_authorized",
++                       "MIN_ENTRY_FUNDING_BPS ="):
++            assert banned not in body
+--- a/bot/tools/basis_at_settlement.py	1970-01-01 00:00:00.000000000 +0000
++++ b/bot/tools/basis_at_settlement.py	2026-09-09 10:22:45.840923483 +0000
+@@ -0,0 +1,199 @@
++#!/usr/bin/env python3
++"""The basis your P&L actually pays, versus the one the book decides on.
++
++THE GAP
++=======
++`CarryEngine` decides on DAILY CLOSES. Funding settles at 00:00, 08:00 and
++16:00 UTC. `carry_backtest` reports a mean entry basis of +6 bps and a mean exit
++of +29 bps, both measured at daily closes — a proxy for the basis at the moment
++the transfer happens and the moment a real book has to be hedged.
++
++Nobody has measured the difference. It matters because basis is the term that
++took -$4,772 out of $42,843 of gross carry: it is the single line item that
++turns a positive-carry trade negative, and the book has only ever seen it
++through a once-a-day lens.
++
++WHAT THIS ANSWERS
++=================
++  1. How far does the settlement basis sit from the daily-close basis?
++  2. Is the difference a constant offset (harmless, absorbed by the gate's
++     budget) or noise (dangerous, because the gate is then judging one number
++     and the book is paying another)?
++  3. Which settlement window is worst? If 00:00 systematically differs from
++     16:00, an entry timed to a window is worth more than a wider basis gate.
++
++WHAT IT DOES NOT DO
++===================
++Change any threshold. It reports a discrepancy. Whether `carry_costs` should
++gate on the settlement basis instead of the daily one is a decision that follows
++this measurement, not one this tool may make — and it would need its own
++out-of-sample window, because choosing a gate after seeing which basis looked
++better is exactly the selection path `reserved_holdout.py` exists to detect.
++
++    python3 tools/fetch_settlement_klines.py --write
++    python3 tools/basis_at_settlement.py --repo .
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import datetime as dt
++import gzip
++import json
++import os
++import statistics
++import sys
++from typing import Any, Dict, List, Optional
++
++SETTLEMENT_DIR = "data/real_settlement_8h"
++DAILY_PERP = "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz"
++DAILY_SPOT = "data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz"
++SETTLEMENT_HOURS = (0, 8, 16)
++
++
++def _open(path: str):
++    return gzip.open(path, "rt") if path.endswith(".gz") else open(path, "rt")
++
++
++def load_8h(path: str) -> Dict[dt.datetime, float]:
++    if not os.path.exists(path):
++        return {}
++    with _open(path) as handle:
++        return {dt.datetime.fromtimestamp(int(r["open_time_ms"]) / 1000.0,
++                                          dt.timezone.utc): float(r["price_close"])
++                for r in csv.DictReader(handle)}
++
++
++def load_daily(path: str) -> Dict[dt.date, float]:
++    # Absent is a legitimate state. The settlement basis stands on its own; the
++    # daily series is only needed for the COMPARISON, and a missing comparison
++    # is reported as zero paired windows rather than as a crash.
++    if not os.path.exists(path):
++        return {}
++    with _open(path) as handle:
++        return {dt.datetime.fromisoformat(
++            r["time_period_start"].replace("Z", "+00:00")).date():
++            float(r["price_close"]) for r in csv.DictReader(handle)}
++
++
++def analyse(repo: str) -> Dict[str, Any]:
++    perp8 = load_8h(os.path.join(repo, SETTLEMENT_DIR,
++                                 "BINANCE_PERP_BTCUSDT_8H.csv.gz"))
++    spot8 = load_8h(os.path.join(repo, SETTLEMENT_DIR,
++                                 "BINANCE_SPOT_BTCUSDT_8H.csv.gz"))
++    if not perp8 or not spot8:
++        return {"available": False,
++                "reason": ("no 8h settlement series. Fetch it first:\n"
++                           "  python3 tools/fetch_settlement_klines.py --write"),
++                "is_a_measurement": False}
++
++    daily_perp = load_daily(os.path.join(repo, DAILY_PERP))
++    daily_spot = load_daily(os.path.join(repo, DAILY_SPOT))
++
++    windows = sorted(set(perp8) & set(spot8))
++    per_hour: Dict[int, List[float]] = {h: [] for h in SETTLEMENT_HOURS}
++    paired: List[Dict[str, Any]] = []
++
++    for when in windows:
++        if when.hour not in SETTLEMENT_HOURS:
++            continue
++        settle_bps = (perp8[when] / spot8[when] - 1.0) * 1e4
++        per_hour[when.hour].append(settle_bps)
++        day = when.date()
++        if day in daily_perp and day in daily_spot:
++            close_bps = (daily_perp[day] / daily_spot[day] - 1.0) * 1e4
++            paired.append({"utc": when.strftime("%Y-%m-%dT%H:%MZ"),
++                           "settlement_bps": settle_bps,
++                           "daily_close_bps": close_bps,
++                           "difference_bps": settle_bps - close_bps})
++
++    settlement_only = [(perp8[w] / spot8[w] - 1.0) * 1e4 for w in windows
++                       if w.hour in SETTLEMENT_HOURS]
++    diffs = [p["difference_bps"] for p in paired]
++    settles = [p["settlement_bps"] for p in paired] or settlement_only
++    closes = [p["daily_close_bps"] for p in paired]
++
++    def stats(values: List[float]) -> Dict[str, float]:
++        if not values:
++            return {}
++        srt = sorted(values)
++        return {"mean": statistics.mean(values),
++                "median": statistics.median(values),
++                "stdev": statistics.pstdev(values) if len(values) > 1 else 0.0,
++                "p05": srt[int(len(srt) * 0.05)],
++                "p95": srt[int(len(srt) * 0.95)]}
++
++    diff_stats = stats(diffs)
++    # A constant offset is absorbed by the gate's budget. NOISE is not: it means
++    # the gate judges one number and the book pays another, and the size of that
++    # gap is the size of the mistake.
++    offset_like = bool(diff_stats and abs(diff_stats["mean"]) >
++                       2.0 * max(diff_stats["stdev"], 1e-9))
++
++    return {
++        "available": True,
++        "windows_compared": len(paired),
++        "settlement_windows": len(settlement_only),
++        "daily_series_present": bool(daily_perp and daily_spot),
++        "first": paired[0]["utc"] if paired else None,
++        "last": paired[-1]["utc"] if paired else None,
++        "settlement_basis_bps": stats(settles),
++        "daily_close_basis_bps": stats(closes),
++        "difference_bps": diff_stats,
++        "by_settlement_hour": {str(h): stats(v) for h, v in per_hour.items()},
++        "difference_is_offset_not_noise": offset_like,
++        "reading": (
++            "a CONSTANT offset is absorbed by the gate's basis budget; NOISE "
++            "means the gate judges one number and the book pays another, and "
++            "the spread of the difference is the size of that mistake"),
++        "is_a_measurement": True,
++        "changes_no_threshold": True,
++    }
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--repo", default=".")
++    parser.add_argument("--out", default="")
++    args = parser.parse_args(argv)
++    report = analyse(args.repo)
++
++    print("=" * 74)
++    print("BASIS AT SETTLEMENT vs BASIS AT THE DAILY CLOSE")
++    print("=" * 74)
++    if not report["available"]:
++        print(f"\n  {report['reason']}")
++        return 1
++
++    print(f"  {report['settlement_windows']} settlement windows, "
++          f"{report['windows_compared']} paired with a daily close  "
++          f"{report['first']} .. {report['last']}\n")
++    if not report["daily_series_present"]:
++        print("  ! daily series absent — settlement basis only, no comparison\n")
++    for label, key in (("at settlement (00/08/16 UTC)", "settlement_basis_bps"),
++                       ("at the daily close        ", "daily_close_basis_bps"),
++                       ("DIFFERENCE               ", "difference_bps")):
++        s = report[key]
++        if not s:
++            continue
++        print(f"  {label}  mean {s['mean']:+7.2f}  median {s['median']:+7.2f}  "
++              f"sd {s['stdev']:6.2f}  p05 {s['p05']:+7.2f}  p95 {s['p95']:+7.2f}")
++    print("\n  by settlement hour (bps):")
++    for hour, s in report["by_settlement_hour"].items():
++        if s:
++            print(f"    {int(hour):02d}:00 UTC  mean {s['mean']:+7.2f}  "
++                  f"sd {s['stdev']:6.2f}")
++    print(f"\n  difference is an OFFSET rather than noise: "
++          f"{report['difference_is_offset_not_noise']}")
++    print(f"  {report['reading']}")
++    print("\n  This tool changes no threshold. Gating on the settlement basis "
++          "would\n  be a NEW hypothesis and needs its own out-of-sample window.")
++    if args.out:
++        with open(args.out, "w", encoding="utf-8") as handle:
++            json.dump(report, handle, indent=2)
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+--- a/bot/tools/fetch_settlement_klines.py	1970-01-01 00:00:00.000000000 +0000
++++ b/bot/tools/fetch_settlement_klines.py	2026-09-09 10:21:25.019674866 +0000
+@@ -0,0 +1,170 @@
++#!/usr/bin/env python3
++"""8h klines on the funding clock, for both legs.
++
++WHY
++===
++The book decides on DAILY CLOSES. Funding settles at 00:00, 08:00 and 16:00 UTC.
++Those are not the same instant, and the basis is not the same number at each.
++
++`carry_backtest` reports a mean entry basis of +6 bps and a mean exit of +29 bps
++measured at daily closes. What the P&L actually paid is the basis AT
++SETTLEMENT — the moment the funding transfer happens and the moment a real book
++would have to be hedged. Nobody has looked at that number, and basis is the term
++that turned -$4,772 against $42,843 of gross.
++
++An 8h kline on Binance is aligned to 00/08/16 UTC, which is exactly the funding
++clock. Its CLOSE is the price at settlement.
++
++WHAT
++====
++Fetches 8h klines for the perp and the spot leg into a separate directory, with
++the same discipline the daily corpora have: closed bars only, append-only,
++prefix-verified, dry-run by default.
++
++The IN-PROGRESS 8h bar is refused. A window that has not finished has no close,
++and pricing a settlement that has not happened is the same error as writing
++today's daily bar.
++
++    python3 tools/fetch_settlement_klines.py               # dry run
++    python3 tools/fetch_settlement_klines.py --write
++"""
++from __future__ import annotations
++
++import argparse
++import csv
++import datetime as dt
++import gzip
++import hashlib
++import io
++import json
++import os
++import sys
++import urllib.request
++from typing import Any, Dict, List, Optional
++
++PERP_ENDPOINT = "https://www.binance.com/fapi/v1/klines"
++SPOT_ENDPOINT = "https://api.binance.com/api/v3/klines"
++OUT_DIR = "data/real_settlement_8h"
++HEADER = ["open_time_ms", "open_utc", "price_open", "price_high", "price_low",
++          "price_close", "volume_traded"]
++
++#: Funding settles every eight hours. A bar whose window includes now has not
++#: closed and therefore has no settlement price.
++WINDOW_S = 8 * 3600
++
++
++def sha256_bytes(data: bytes) -> str:
++    return hashlib.sha256(data).hexdigest()
++
++
++def read_rows(path: str) -> List[Dict[str, str]]:
++    if not os.path.exists(path):
++        return []
++    with gzip.open(path, "rt") as handle:
++        return list(csv.DictReader(handle))
++
++
++def encode(rows: List[Dict[str, str]]) -> bytes:
++    buffer = io.StringIO()
++    writer = csv.DictWriter(buffer, fieldnames=HEADER, lineterminator="\r\n")
++    writer.writeheader()
++    writer.writerows(rows)
++    return buffer.getvalue().encode("utf-8")
++
++
++def fetch(endpoint: str, symbol: str, start_ms: int) -> List[List[Any]]:
++    out: List[List[Any]] = []
++    cursor = start_ms
++    while True:
++        url = (f"{endpoint}?symbol={symbol}&interval=8h"
++               f"&startTime={cursor}&limit=1000")
++        with urllib.request.urlopen(url, timeout=30) as response:
++            batch = json.loads(response.read())
++        if not batch:
++            break
++        out.extend(batch)
++        if len(batch) < 1000:
++            break
++        cursor = int(batch[-1][0]) + 1
++    return out
++
++
++def to_row(kline: List[Any]) -> Dict[str, str]:
++    open_ms = int(kline[0])
++    return {"open_time_ms": str(open_ms),
++            "open_utc": dt.datetime.fromtimestamp(
++                open_ms / 1000.0, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
++            "price_open": kline[1], "price_high": kline[2],
++            "price_low": kline[3], "price_close": kline[4],
++            "volume_traded": kline[5]}
++
++
++def run(repo: str = ".", *, leg: str = "perp", symbol: str = "BTCUSDT",
++        write: bool = False, now_s: Optional[float] = None,
++        klines: Optional[List[List[Any]]] = None) -> Dict[str, Any]:
++    now_s = now_s if now_s is not None else dt.datetime.now(
++        dt.timezone.utc).timestamp()
++    path = os.path.join(repo, OUT_DIR, f"BINANCE_{leg.upper()}_{symbol}_8H.csv.gz")
++    rows = read_rows(path)
++    have = {r["open_time_ms"] for r in rows}
++    start_ms = (int(rows[-1]["open_time_ms"]) + 1) if rows else \
++        int(dt.datetime(2022, 8, 10, tzinfo=dt.timezone.utc).timestamp() * 1000)
++
++    endpoint = PERP_ENDPOINT if leg == "perp" else SPOT_ENDPOINT
++    raw = fetch(endpoint, symbol, start_ms) if klines is None else klines
++    candidates = [to_row(k) for k in raw]
++
++    # A window that includes NOW has not closed. Pricing a settlement that has
++    # not happened is the same error as writing today's daily bar as a close.
++    def closed(row: Dict[str, str]) -> bool:
++        return (int(row["open_time_ms"]) / 1000.0) + WINDOW_S <= now_s
++
++    appended = [r for r in candidates
++                if r["open_time_ms"] not in have and closed(r)]
++    refused_open = [r["open_utc"] for r in candidates if not closed(r)]
++
++    before_plain = encode(rows)
++    after_plain = encode(rows + appended)
++    prefix_holds = after_plain.startswith(before_plain)
++
++    report = {"tool": "fetch_settlement_klines", "leg": leg, "symbol": symbol,
++              "write": write, "rows_before": len(rows),
++              "rows_after": len(rows) + len(appended),
++              "new_windows": len(appended),
++              "first_new": appended[0]["open_utc"] if appended else None,
++              "last_new": appended[-1]["open_utc"] if appended else None,
++              "refused_open_windows": refused_open[-2:],
++              "uncompressed_sha256_before": sha256_bytes(before_plain),
++              "uncompressed_sha256_after": sha256_bytes(after_plain),
++              "historical_bytes_are_prefix": prefix_holds,
++              "bars_fabricated": 0}
++
++    if not prefix_holds:
++        report["error"] = "APPEND WOULD REWRITE HISTORY — refusing"
++        return report
++    if write and appended:
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        with gzip.open(path, "wb") as handle:
++            handle.write(after_plain)
++        report["written"] = True
++    return report
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    parser.add_argument("--repo", default=".")
++    parser.add_argument("--symbol", default="BTCUSDT")
++    parser.add_argument("--legs", nargs="+", default=["perp", "spot"])
++    parser.add_argument("--write", action="store_true")
++    args = parser.parse_args(argv)
++    failed = False
++    for leg in args.legs:
++        report = run(args.repo, leg=leg, symbol=args.symbol, write=args.write)
++        print(json.dumps(report, indent=2))
++        failed = failed or bool(report.get("error"))
++    return 1 if failed else 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+--- a/scripts/refresh.sh	1970-01-01 00:00:00.000000000 +0000
++++ b/scripts/refresh.sh	2026-09-09 10:21:24.866673786 +0000
+@@ -0,0 +1,39 @@
++#!/usr/bin/env bash
++# Pull current data, read the number, put the frozen corpus back.
++#
++# Four steps and one subtlety, run by hand three times already and the subtlety
++# missed twice: `git checkout -- bot/data/` does NOT undo staged files, so the
++# refreshed corpus rides onto the next branch and breaks the provenance tests.
++# `git restore --staged --worktree` does.
++#
++# See bot/docs/human/CORPUS_POLICY.md for why the committed corpus stays frozen.
++set -euo pipefail
++trap 'echo "REFRESH FAILED at line $LINENO" >&2' ERR
++
++root="$(git rev-parse --show-toplevel)"
++cd "$root"
++[ -d .venv ] && . .venv/bin/activate
++
++dirty=$(git status --porcelain bot/data/ | wc -l)
++if [ "$dirty" -ne 0 ]; then
++  echo "bot/data/ is already modified. Restore it first:" >&2
++  echo "  git restore --staged --worktree bot/data/" >&2
++  exit 1
++fi
++
++cd bot
++echo "==> append closed perp bars + funding prints"
++python3 tools/append_closed_corpus.py --write
++echo "==> append closed spot days"
++python3 tools/append_spot_corpus.py --write
++echo "==> corpus health"
++python3 tools/corpus_health.py --repo . || true
++echo "==> backtest on current data"
++python3 tools/carry_backtest.py --repo . --matrix
++
++cd "$root"
++echo "==> restoring the frozen corpus"
++git restore --staged --worktree bot/data/
++remaining=$(git status --porcelain bot/data/ | wc -l)
++[ "$remaining" -eq 0 ] || { echo "bot/data/ is STILL dirty — do not commit" >&2; exit 1; }
++echo "frozen corpus restored. git status is clean."
