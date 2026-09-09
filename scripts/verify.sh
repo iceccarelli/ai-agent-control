@@ -5,6 +5,10 @@
 # produced it. The commit-msg hook checks that receipt. A number you remembered,
 # copied from chat, or read off a run against different code cannot pass.
 set -euo pipefail
+# A verification tool that can fail QUIETLY is worse than no tool. set -e killed
+# this script mid-run when the suite failed and no pass count could be grepped,
+# and it printed nothing at all — the one job it has.
+trap 'echo "VERIFY FAILED at line $LINENO — the suite did not pass" >&2' ERR
 root="$(git rev-parse --show-toplevel)"
 cd "$root"
 [ -d .venv ] || { echo "no .venv — python3 -m venv .venv first"; exit 1; }
@@ -18,6 +22,11 @@ echo "$out"
 after=$(md5sum bot/state/trading_state.db | cut -d' ' -f1)
 [ "$before" = "$after" ] || { echo "FIXTURE DB MUTATED — do not commit"; exit 1; }
 
+if echo "$out" | grep -q "failed"; then
+  echo "SUITE HAS FAILURES — no receipt written:" >&2
+  echo "$out" >&2
+  exit 1
+fi
 count=$(echo "$out" | grep -oE '[0-9]+ passed' | head -1 | cut -d' ' -f1)
 [ -n "$count" ] || { echo "no pass count in output — refusing to write a receipt"; exit 1; }
 

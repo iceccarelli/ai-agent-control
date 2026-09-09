@@ -141,6 +141,112 @@ class Trade:
         return (self.closed - self.opened).days if self.closed else 0
 
 
+#: Spot sources in order of preference. The basis term is
+#: (perp - spot) / spot, so a spot leg from a different VENUE or a different
+#: QUOTE CURRENCY injects that venue's spread and that currency's peg directly
+#: into what the tool reports as carry P&L. USDT has traded ~5% off USD before
+#: (March 2023). Every one of those basis points would be booked as strategy
+#: return by a naive proxy.
+#:
+#: Only the first entry produces a quotable number, because only the first
+#: entry is the same venue and the same quote currency as the perp leg.
+SPOT_SOURCES = [
+    ("data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz",
+     "BINANCE_SPOT_BTC_USDT (same venue, same quote currency as the perp)",
+     True),
+    ("data/real_1d/ohlcv/BITSTAMP_SPOT_BTC_USD_1D.csv.gz",
+     "BITSTAMP_SPOT_BTC_USD (DIFFERENT venue, DIFFERENT currency)",
+     False),
+]
+
+#: A daily bar for a day that has not closed is not a close. Binance returns the
+#: in-progress bar from its klines endpoint and tools/fetch_binance_klines.py
+#: writes it, so the last row of a freshly fetched series is routinely a partial
+#: day wearing a close's clothes. Dropping it here rather than trusting the
+#: fetcher is the same rule the linear corpus already enforces: never write the
+#: open UTC daily bar as a close.
+def drop_open_bar(series: Dict[dt.date, float]) -> Dict[dt.date, float]:
+    """Remove any bar for today or later. Today has not finished."""
+    today = dt.datetime.now(dt.timezone.utc).date()
+    return {d: v for d, v in series.items() if d < today}
+
+
+def resolve_spot(repo: str):
+    """The best spot series present, its provenance, and whether it is quotable."""
+    for rel, label, quotable in SPOT_SOURCES:
+        path = os.path.join(repo, rel)
+        if os.path.exists(path):
+            series = drop_open_bar(load_series(path))
+            return series, label, quotable
+    raise SystemExit(
+        "no spot series found. Fetch one:\n"
+        "  python3 tools/fetch_binance_klines.py --symbols BTCUSDT "
+        "--intervals 1d --years 4 --out data/real_spot_btc")
+
+
+def _carry_costs():
+    """Import the gates lazily so the backtester still runs without them."""
+    import sys as _sys
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if here not in _sys.path:
+        _sys.path.insert(0, here)
+    import carry_costs
+    return carry_costs
+
+
+#: Spot sources in order of preference. The basis term is
+#: (perp - spot) / spot, so a spot leg from a different VENUE or a different
+#: QUOTE CURRENCY injects that venue's spread and that currency's peg directly
+#: into what the tool reports as carry P&L. USDT has traded ~5% off USD before
+#: (March 2023). Every one of those basis points would be booked as strategy
+#: return by a naive proxy.
+#:
+#: Only the first entry produces a quotable number, because only the first
+#: entry is the same venue and the same quote currency as the perp leg.
+SPOT_SOURCES = [
+    ("data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz",
+     "BINANCE_SPOT_BTC_USDT (same venue, same quote currency as the perp)",
+     True),
+    ("data/real_1d/ohlcv/BITSTAMP_SPOT_BTC_USD_1D.csv.gz",
+     "BITSTAMP_SPOT_BTC_USD (DIFFERENT venue, DIFFERENT currency)",
+     False),
+]
+
+#: A daily bar for a day that has not closed is not a close. Binance returns the
+#: in-progress bar from its klines endpoint and tools/fetch_binance_klines.py
+#: writes it, so the last row of a freshly fetched series is routinely a partial
+#: day wearing a close's clothes. Dropping it here rather than trusting the
+#: fetcher is the same rule the linear corpus already enforces: never write the
+#: open UTC daily bar as a close.
+def drop_open_bar(series: Dict[dt.date, float]) -> Dict[dt.date, float]:
+    """Remove any bar for today or later. Today has not finished."""
+    today = dt.datetime.now(dt.timezone.utc).date()
+    return {d: v for d, v in series.items() if d < today}
+
+
+def resolve_spot(repo: str):
+    """The best spot series present, its provenance, and whether it is quotable."""
+    for rel, label, quotable in SPOT_SOURCES:
+        path = os.path.join(repo, rel)
+        if os.path.exists(path):
+            series = drop_open_bar(load_series(path))
+            return series, label, quotable
+    raise SystemExit(
+        "no spot series found. Fetch one:\n"
+        "  python3 tools/fetch_binance_klines.py --symbols BTCUSDT "
+        "--intervals 1d --years 4 --out data/real_spot_btc")
+
+
+def _carry_costs():
+    """Import the gates lazily so the backtester still runs without them."""
+    import sys as _sys
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if here not in _sys.path:
+        _sys.path.insert(0, here)
+    import carry_costs
+    return carry_costs
+
+
 def load_series(path: str) -> Dict[dt.date, float]:
     with _open(path) as handle:
         return {_day(r["time_period_start"]): float(r["price_close"])
@@ -156,11 +262,18 @@ def load_funding(path: str):
 
 def simulate(repo: str, *, notional: float = 100_000.0,
              entry_bps: float = ENTRY_FUNDING_BPS,
-             borrow_apr: float = BORROW_APR) -> Dict[str, Any]:
-    perp = load_series(os.path.join(
-        repo, "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz"))
-    spot = load_series(os.path.join(
-        repo, "data/real_1d/ohlcv/BITSTAMP_SPOT_BTC_USD_1D.csv.gz"))
+             borrow_apr: float = BORROW_APR,
+             gated: bool = False) -> Dict[str, Any]:
+    """`gated=True` routes every entry through carry_costs.evaluate_entry.
+
+    Run both. The difference between them is the only evidence that the gates
+    are worth having: a gate that changes no trade is decoration, and a gate
+    that refuses everything is a way of not trading dressed as risk management.
+    """
+    perp_path = os.path.join(
+        repo, "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz")
+    perp = load_series(perp_path)
+    spot, spot_source, quotable = resolve_spot(repo)
     ftimes, frates = load_funding(os.path.join(
         repo, "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz"))
 
@@ -171,10 +284,13 @@ def simulate(repo: str, *, notional: float = 100_000.0,
     trades: List[Trade] = []
     live: Optional[Trade] = None
     negative_streak = 0
+    history: List[float] = []
+    refusals: Dict[str, int] = {}
     round_trip_bps = 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP
 
     for today in days:
-        p, s = perp[today], spot[today]
+        p, s_ = perp[today], spot[today]
+        s = s_
 
         # Funding actually printed on this UTC day, in bps.
         start = int(dt.datetime.combine(
@@ -186,7 +302,11 @@ def simulate(repo: str, *, notional: float = 100_000.0,
         day_bps = sum(prints) * 1e4
         last_bps = (prints[-1] * 1e4) if prints else 0.0
 
+        if gated and live is None:
+            pass  # history is appended at the decision point below
+
         if live is not None:
+            history.append(last_bps)
             # Income and financing accrue whether or not anything is traded.
             live.funding += (day_bps / 1e4) * live.qty * p
             live.borrow += (borrow_apr / 365.0) * live.qty * s
@@ -206,7 +326,18 @@ def simulate(repo: str, *, notional: float = 100_000.0,
                 negative_streak = 0
             continue
 
-        if last_bps >= entry_bps:
+        if gated:
+            history.append(last_bps)
+            verdict = _carry_costs().evaluate_entry(
+                funding_prints_bps=history[-8:], perp=p, spot=s_,
+                borrow_apr=borrow_apr)
+            may_open = bool(verdict)
+            if not may_open:
+                refusals[verdict.reason] = refusals.get(verdict.reason, 0) + 1
+        else:
+            may_open = last_bps >= entry_bps
+
+        if may_open:
             qty = notional / p
             live = Trade(opened=today, qty=qty, entry_spot=s, entry_perp=p)
             live.fees = qty * (s * TAKER_BPS_SPOT + p * TAKER_BPS_PERP) / 1e4
@@ -254,16 +385,18 @@ def simulate(repo: str, *, notional: float = 100_000.0,
         "worst_trade_usd": min((t.net for t in trades), default=0.0),
         "best_trade_usd": max((t.net for t in trades), default=0.0),
         "losing_trades": sum(1 for t in trades if t.net < 0),
-        "spot_proxy": "BITSTAMP_SPOT_BTC_USD (NOT Binance, NOT USDT)",
-        "basis_is_a_proxy": True,
-        "is_a_quotable_return": False,
-        "why_not_quotable": (
+        "spot_source": spot_source,
+        "basis_is_a_proxy": not quotable,
+        "is_a_quotable_return": quotable,
+        "why_not_quotable": ("" if quotable else
             "the spot leg is priced on a DIFFERENT VENUE in a DIFFERENT "
-            "CURRENCY, so the basis term carries Bitstamp-vs-Binance spread "
-            "and USD-vs-USDT depeg. Fetch Binance BTCUSDT spot 1d before "
-            "quoting any figure from this tool."),
+            "CURRENCY, so the basis term carries cross-venue spread and "
+            "USD-vs-USDT depeg. Fetch Binance BTCUSDT spot 1d."),
+        "open_bar_dropped": True,
         "not_modelled": ["slippage beyond taker fees", "order book depth",
                          "intraday basis", "liquidation of the short leg"],
+        "gated": gated,
+        "refusals": refusals,
         "trade_log": [{"opened": str(t.opened), "closed": str(t.closed),
                        "days": t.days, "funding": round(t.funding, 2),
                        "basis": round(t.basis_pnl, 2), "fees": round(t.fees, 2),
@@ -283,11 +416,38 @@ def main(argv=None) -> int:
     parser.add_argument("--borrow-apr", type=float, default=BORROW_APR,
                         help="0.0 models a book that ALREADY OWNS the BTC and "
                              "is monetising it rather than financing it")
+    parser.add_argument("--gated", action="store_true",
+                        help="route entries through carry_costs.evaluate_entry")
+    parser.add_argument("--matrix", action="store_true",
+                        help="borrow x gate sweep — the table PHASE1_DECISION needs")
     parser.add_argument("--out", default="")
     args = parser.parse_args(argv)
 
+    if args.matrix:
+        print("=" * 74)
+        print("BORROW x GATE MATRIX — net %/yr")
+        print("=" * 74)
+        head = simulate(args.repo, notional=args.notional)
+        print(f"  spot source: {head['spot_source']}")
+        print(f"  quotable   : {head['is_a_quotable_return']}")
+        print(f"  window     : {head['window']}\n")
+        print(f"  {'borrow':>8} {'UNGATED':>18} {'GATED':>18}")
+        for apr in (0.0, 0.03, 0.05, 0.08):
+            u = simulate(args.repo, notional=args.notional, borrow_apr=apr)
+            g = simulate(args.repo, notional=args.notional, borrow_apr=apr,
+                         gated=True)
+            print(f"  {apr*100:7.1f}% "
+                  f"{u['net_annualised_pct']:+8.2f}%/yr n={u['trades']:<3d} "
+                  f"{g['net_annualised_pct']:+8.2f}%/yr n={g['trades']:<3d}")
+        print()
+        print("  A gate that changes no trade is decoration. A gate that")
+        print("  refuses everything is not trading, dressed as risk management.")
+        print("  Read BOTH the return and the trade count.")
+        return 0
+
     r = simulate(args.repo, notional=args.notional,
-                 entry_bps=args.entry_bps, borrow_apr=args.borrow_apr)
+                 entry_bps=args.entry_bps, borrow_apr=args.borrow_apr,
+                 gated=args.gated)
 
     print("=" * 74)
     print("CARRY BACKTEST — two legs, every cost")

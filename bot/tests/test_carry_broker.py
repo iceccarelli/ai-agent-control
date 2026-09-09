@@ -45,7 +45,9 @@ class FakeClient:
             return {"list": [{"cumExecQty": "0.5", "avgPrice": str(self.mark),
                               "orderLinkId": params.get("orderLinkId")}]}
         if endpoint == "/v5/market/tickers":
-            return {"list": [{"markPrice": str(self.mark)}]}
+            return {"list": [{"markPrice": str(self.mark),
+                              "lastPrice": str(self.mark),
+                              "fundingRate": "0.0003"}]}
         if endpoint == "/v5/position/list":
             return {"list": [{"positionIM": str(self.im),
                               "positionMM": str(self.mm),
@@ -238,7 +240,11 @@ class TestItDrivesTheEngine:
         from carry_engine import BookState, CarryEngine
         client = FakeClient(im=5.0, mm=1.0)
         eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0)
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        for _ in range(2):   # warm the EWMA
+            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0)
+        client.created.clear()
+        decision = eng.on_candle(mark=100_000.0, funding_bps=3.0,
+                                 spot=100_000.0)
         assert decision.acted is True
         assert eng.state is BookState.HEDGED
         assert len(client.created) == 2

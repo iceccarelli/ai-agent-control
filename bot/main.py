@@ -442,18 +442,25 @@ class TradingBot:
             try:
                 mark = float(self.carry.broker.get_mark(symbol))
                 funding_bps = float(self.carry.broker.get_funding_bps(symbol))
+                # The SPOT mark prices the basis. It is fetched here rather
+                # than defaulted, and a failure lands in the same handler as a
+                # missing perp mark: no order, no state change.
+                spot = float(self.carry.broker.get_spot_mark(
+                    self.carry.spot_symbol))
             except Exception as exc:  # noqa: BLE001
                 logger.error(
                     "carry inputs unreadable this cycle (%s); the book is NOT "
                     "touched and no order is sent", exc)
                 return
             decision = self.carry.on_candle(
-                mark=mark, funding_bps=funding_bps,
+                mark=mark, funding_bps=funding_bps, spot=spot,
                 timestamp_ms=int(time.time() * 1000))
             logger.info(
-                "carry: %s (%s) state=%s mark=%.2f funding=%.3fbps %s",
+                "carry: %s (%s) state=%s perp=%.2f spot=%.2f "
+                "basis=%.1fbps funding=%.3fbps %s",
                 decision.action, decision.reason, decision.state.value,
-                mark, funding_bps, decision.detail or "")
+                mark, spot, (mark / spot - 1.0) * 1e4, funding_bps,
+                decision.detail or "")
             if decision.state.name == "HALTED":
                 logger.critical(
                     "carry book HALTED — a human must clear it: %s",
