@@ -95,6 +95,13 @@ MIN_ENTRY_FUNDING_BPS = 0.2
 NEGATIVE_FUNDING_EXIT_PRINTS = 3
 
 
+def _costs():
+    """Import the gates lazily. carry_costs is pure and imports nothing from
+    here, so the dependency points one way only."""
+    import carry_costs
+    return carry_costs
+
+
 class BookState(Enum):
     FLAT = "FLAT"
     OPENING = "OPENING"
@@ -181,12 +188,18 @@ class CarryEngine:
     and a kill switch callable. Everything else is arithmetic done here.
     """
 
+    #: Funding prints kept for the EWMA. Eight is ~2.7 days: enough for a
+    #: three-print smoother with slack, short enough that a regime change is
+    #: not diluted by last week.
+    FUNDING_HISTORY = 8
+
     def __init__(self, *, broker: Any, kill_switch: Any = None,
                  spot_symbol: str = "BTCUSDT", perp_symbol: str = "BTCUSDT",
                  max_notional_usd: float = 100.0,
                  delta_band: float = DELTA_BAND,
                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
-                 min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS) -> None:
+                 min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
+                 borrow_apr: float = 0.05) -> None:
         self.broker = broker
         self.kill_switch = kill_switch
         self.spot_symbol = spot_symbol
@@ -197,10 +210,13 @@ class CarryEngine:
         self.min_entry_funding_bps = float(min_entry_funding_bps)
         self.position: Optional[CarryPosition] = None
         self.state = BookState.FLAT
+        self.borrow_apr = float(borrow_apr)
+        self._funding_history: List[float] = []
 
     # -- the loop ---------------------------------------------------------
 
     def on_candle(self, *, mark: float, funding_bps: float,
+                  spot: Optional[float] = None,
                   timestamp_ms: int = 0) -> CarryDecision:
         """One closed bar. Act or state why not. This is the entire loop.
 
@@ -216,6 +232,14 @@ class CarryEngine:
         if not self._finite(mark) or mark <= 0:
             return self._halt("MARK_UNREADABLE",
                               "a book that cannot be marked cannot be hedged")
+
+        # Every print is recorded whether or not the book acts on it. The EWMA
+        # is only meaningful if the history is complete, and a gap because
+        # "nothing happened that day" is exactly the kind of missing data that
+        # makes a smoother lie.
+        if self._finite(funding_bps):
+            self._funding_history.append(float(funding_bps))
+            del self._funding_history[:-self.FUNDING_HISTORY]
 
         if self.position is not None:
             headroom = self._check_margin()
@@ -242,12 +266,34 @@ class CarryEngine:
                                          "funding_bps": funding_bps,
                                          "collected": self.position.funding_collected})
 
-        if funding_bps < self.min_entry_funding_bps:
+        # THE GATES (0019/0021). Before this, the engine opened on ONE
+        # condition: the last funding print cleared a threshold. That is a
+        # reflex, not a decision — it does not know what the money costs, what
+        # the basis will take back, or whether one print represents the next
+        # eight hours. 0018 measured the result: borrow was 57% of gross income
+        # and 15 of 20 trades lost money.
+        #
+        # `spot` is REQUIRED to open. Without it the basis is unknown, and an
+        # unknown basis is not a small basis. Refusing is the only honest move:
+        # a default here would be a silent risk parameter, which is the exact
+        # class of bug 0016 removed from the cap.
+        if spot is None:
             return CarryDecision(
-                "stand_aside", reason="FUNDING_TOO_THIN_TO_CLEAR_ENTRY_COST",
+                "stand_aside", reason="SPOT_UNAVAILABLE_BASIS_UNKNOWN",
                 state=BookState.FLAT,
+                detail={"note": "cannot price the basis without a spot mark; "
+                                "an unknown basis is not a small one"})
+
+        verdict = _costs().evaluate_entry(
+            funding_prints_bps=self._funding_history,
+            perp=mark, spot=spot, borrow_apr=self.borrow_apr)
+        if not verdict:
+            return CarryDecision(
+                "stand_aside", reason=verdict.reason, state=BookState.FLAT,
                 detail={"funding_bps": funding_bps,
-                        "required_bps": self.min_entry_funding_bps})
+                        "smoothed_bps": verdict.smoothed_funding_bps,
+                        "entry_basis_bps": verdict.entry_basis_bps,
+                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day})
 
         return self._open(mark, funding_bps, timestamp_ms)
 

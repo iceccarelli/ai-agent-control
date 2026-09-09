@@ -54,16 +54,37 @@ class _SpotFillsThenVenueDies(FakeBroker):
         return None
 
 
-def engine(broker, **kw):
+SPOT = 100_000.0
+
+
+def engine(broker, *, primed=True, **kw):
+    """A CarryEngine ready to open.
+
+    0021 made two things true that these tests must now respect:
+
+      `spot` is REQUIRED to open. Without it the basis is unknown, and an
+      unknown basis is not a small one, so the engine refuses.
+
+      The EWMA needs three funding prints. Below that the engine returns
+      INSUFFICIENT_FUNDING_HISTORY rather than falling back to the last print.
+
+    `primed=True` feeds the two warm-up prints so a test can reach the entry
+    path in one candle, the way a book that has been running does.
+    `primed=False` leaves the history empty to test the warm-up itself.
+    """
     kw.setdefault("max_notional_usd", 100_000.0)
-    return CarryEngine(broker=broker, **kw)
+    eng = CarryEngine(broker=broker, **kw)
+    if primed:
+        for _ in range(2):
+            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=SPOT)
+    return eng
 
 
 class TestItActuallyOpens:
     def test_rich_funding_opens_both_legs(self):
         broker = FakeBroker()
         eng = engine(broker)
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert decision.acted is True
         assert decision.action == "opened"
         assert eng.state is BookState.HEDGED
@@ -72,7 +93,7 @@ class TestItActuallyOpens:
     def test_the_legs_are_opposite_and_equal(self):
         broker = FakeBroker()
         eng = engine(broker)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         spot, perp = broker.orders
         assert spot[1] == "Buy" and spot[3] == "spot"
         assert perp[1] == "Sell" and perp[3] == "linear"
@@ -80,13 +101,13 @@ class TestItActuallyOpens:
 
     def test_the_book_is_delta_flat_after_opening(self):
         eng = engine(FakeBroker())
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert eng.position.delta_qty == pytest.approx(0.0)
 
     def test_it_collects_funding_while_hedged(self):
         eng = engine(FakeBroker())
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert eng.position.funding_collected > 0
 
 
@@ -96,7 +117,7 @@ class TestOneLegNeverStandsAlone:
     def test_a_failed_perp_leg_unwinds_the_spot_immediately(self):
         broker = FakeBroker(reject={"linear"})
         eng = engine(broker)
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert eng.position is None, "a naked spot leg was left open"
         assert eng.state is BookState.FLAT
         assert "PERP_LEG_DID_NOT_FILL" in decision.reason
@@ -106,7 +127,7 @@ class TestOneLegNeverStandsAlone:
     def test_a_failed_spot_leg_never_shorts_the_perp(self):
         broker = FakeBroker(reject={"spot"})
         eng = engine(broker)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert eng.position is None
         assert not any(o[3] == "linear" for o in broker.orders), \
             "the perp was shorted with no spot behind it"
@@ -115,7 +136,7 @@ class TestOneLegNeverStandsAlone:
         """Nothing filled means nothing naked. FLAT, not halted."""
         broker = FakeBroker(reject={"spot", "linear"})
         eng = engine(broker)
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert eng.position is None
         assert eng.state is BookState.FLAT
         assert decision.reason == "SPOT_LEG_DID_NOT_FILL"
@@ -126,22 +147,22 @@ class TestOneLegNeverStandsAlone:
         it must stop and shout for a human rather than keep trading."""
         broker = _SpotFillsThenVenueDies()
         eng = engine(broker)
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert decision.state is BookState.HALTED
         assert eng.state is BookState.HALTED
         assert decision.reason == "NAKED_SPOT_UNWIND_FAILED"
 
     def test_halted_books_refuse_every_later_candle(self):
         eng = engine(_SpotFillsThenVenueDies())
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
-        after = eng.on_candle(mark=100_000.0, funding_bps=5.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+        after = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=5.0)
         assert after.acted is False
         assert after.reason == "KILL_SWITCH_ENGAGED"
 
     def test_the_kill_switch_is_called_on_halt(self):
         tripped = []
         eng = engine(_SpotFillsThenVenueDies(), kill_switch=tripped.append)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert tripped, "the book halted without tripping the switch"
 
 
@@ -149,29 +170,29 @@ class TestDeltaIsMeasuredNotAssumed:
     def test_drift_past_the_band_triggers_a_rebalance(self):
         broker = FakeBroker()
         eng = engine(broker)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         eng.position.perp.filled_qty *= 0.90          # hedge slipped 10%
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert decision.action == "rebalanced"
         assert decision.acted is True
 
     def test_drift_inside_the_band_does_not_churn(self):
         broker = FakeBroker()
         eng = engine(broker)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         before = len(broker.orders)
         eng.position.perp.filled_qty *= (1 - DELTA_BAND / 4)
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert decision.action == "hold"
         assert len(broker.orders) == before, "it traded inside the band"
 
     def test_rebalancing_uses_the_perp_not_the_spot(self):
         broker = FakeBroker()
         eng = engine(broker)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         broker.orders.clear()
         eng.position.perp.filled_qty *= 0.90
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert all(o[3] == "linear" for o in broker.orders), \
             "collateral was sold to fix a hedge"
 
@@ -187,7 +208,7 @@ class TestDeltaIsMeasuredNotAssumed:
             return result
 
         broker.place_market = partial
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert eng.position is None
         assert "UNPAIRED" in decision.reason or decision.action == "unwound"
 
@@ -195,58 +216,97 @@ class TestDeltaIsMeasuredNotAssumed:
 class TestTheShortLegCanBeLiquidated:
     def test_thin_margin_refuses_to_open(self):
         eng = engine(FakeBroker(margin=1.2))
-        decision = eng.on_candle(mark=100_000.0, funding_bps=5.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=5.0)
         assert decision.acted is False
         assert decision.reason == "MARGIN_HEADROOM_TOO_THIN"
 
     def test_margin_falling_while_open_unwinds_the_book(self):
         broker = FakeBroker(margin=5.0)
         eng = engine(broker)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         broker.margin = 1.1
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert decision.action == "unwound"
         assert eng.position is None
 
     def test_unreadable_margin_halts_rather_than_assumes(self):
         broker = FakeBroker()
         eng = engine(broker)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         broker.get_margin_multiple = lambda s: (_ for _ in ()).throw(RuntimeError())
-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert decision.state is BookState.HALTED
 
 
 class TestFundingDrivesEntryAndExit:
     def test_thin_funding_stands_aside(self):
+        """Thin carry cannot clear borrow plus the amortised round trip.
+
+        The book is built from an EWMA, so it is primed with THIN prints here.
+        One thin print after a rich history does not stand the book down, and
+        that is correct: a smoother that collapses on a single observation is
+        just the last print with extra steps.
+        """
+        broker = FakeBroker()
+        eng = engine(broker, primed=False)
+        for _ in range(3):
+            decision = eng.on_candle(spot=SPOT, mark=100_000.0,
+                                     funding_bps=0.05)
+        assert decision.acted is False
+        assert decision.reason == "CARRY_BELOW_COST_OF_CAPITAL"
+        assert not broker.orders
+
+    def test_one_thin_print_does_not_stand_a_rich_book_down(self):
+        """The other half of the same rule, asserted explicitly."""
+        broker = FakeBroker()
+        eng = engine(broker)          # primed with 3.0 bps
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=0.05)
+        assert decision.acted is True
+
+    def test_the_warm_up_is_required_before_any_entry(self):
+        broker = FakeBroker()
+        eng = engine(broker, primed=False)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=5.0)
+        assert decision.acted is False
+        assert decision.reason == "INSUFFICIENT_FUNDING_HISTORY"
+        assert not broker.orders
+
+    def test_opening_without_a_spot_mark_is_refused(self):
         broker = FakeBroker()
         eng = engine(broker)
-        decision = eng.on_candle(mark=100_000.0, funding_bps=0.05)
+        decision = eng.on_candle(mark=100_000.0, funding_bps=5.0)
         assert decision.acted is False
-        assert decision.reason == "FUNDING_TOO_THIN_TO_CLEAR_ENTRY_COST"
+        assert decision.reason == "SPOT_UNAVAILABLE_BASIS_UNKNOWN"
         assert not broker.orders
+
+    def test_a_wide_entry_basis_is_refused(self):
+        broker = FakeBroker()
+        eng = engine(broker)
+        decision = eng.on_candle(spot=SPOT, mark=SPOT * 1.02, funding_bps=3.0)
+        assert decision.acted is False
+        assert decision.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
 
     def test_sustained_negative_funding_unwinds(self):
         eng = engine(FakeBroker())
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         for _ in range(2):
-            eng.on_candle(mark=100_000.0, funding_bps=-0.5)
+            eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
         assert eng.position is not None, "it left after one negative print"
-        decision = eng.on_candle(mark=100_000.0, funding_bps=-0.5)
+        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
         assert decision.action == "unwound"
         assert decision.reason == "FUNDING_INVERTED"
 
     def test_one_negative_print_does_not_panic(self):
         eng = engine(FakeBroker())
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
-        eng.on_candle(mark=100_000.0, funding_bps=-0.5)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
         assert eng.position is not None
 
     def test_the_streak_resets_when_funding_returns(self):
         eng = engine(FakeBroker())
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
-        eng.on_candle(mark=100_000.0, funding_bps=-0.5)
-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
+        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
         assert eng.position.negative_funding_streak == 0
 
 
@@ -254,7 +314,7 @@ class TestBadDataHaltsRatherThanTrades:
     @pytest.mark.parametrize("mark", [float("nan"), float("inf"), 0.0, -100.0])
     def test_an_unusable_mark_halts(self, mark):
         eng = engine(FakeBroker())
-        decision = eng.on_candle(mark=mark, funding_bps=5.0)
+        decision = eng.on_candle(spot=SPOT, mark=mark, funding_bps=5.0)
         assert decision.acted is False
         assert decision.state is BookState.HALTED
 

@@ -1,0 +1,30 @@
+{
+  "synthetic": false,
+  "bar_seconds": 86400,
+  "schema": "coinapi_flat/1",
+  "generator": "tools/fetch_binance_klines.py",
+  "source": {
+    "exchange": "BINANCE",
+    "market": "SPOT",
+    "endpoint": "https://api.binance.com/api/v3/klines",
+    "fetched_utc": "2026-09-08T00:06:45Z",
+    "requested_range_utc": [
+      "2022-09-08T00:06:45Z",
+      "2026-09-08T00:06:45Z"
+    ]
+  },
+  "bars_per_symbol": {
+    "BINANCE_SPOT_BTC_USDT_1D": 1461
+  },
+  "files": {
+    "ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz": {
+      "rows": 1461,
+      "sha256_uncompressed": "622b3375cdf199479dca9e606c088b6780626bbc897f304355ac1c5003941a56",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2022-09-09T00:00:00.0000000Z",
+      "last_timestamp": "2026-09-08T00:00:00.0000000Z"
+    }
+  },
+  "warning": "REAL exchange data. Eligibility under data_contract is NOT edge \u2014 see RESEARCH_CLOSE_STAGE1.md. Timing-skill research is CLOSED."
+}

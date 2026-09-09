@@ -200,6 +200,25 @@ class CarryBroker:
             raise PairIncident(f"mark for {symbol} is {mark!r}")
         return mark
 
+    def get_spot_mark(self, symbol: str) -> float:
+        """Last traded price on the SPOT product. Required to price the basis.
+
+        Raises when unreadable. CarryEngine turns a missing spot into a refusal
+        to open, because an unknown basis is not a small basis — and 0018
+        measured the basis at -$4,772 on a $42,843 gross, which is not a term
+        anyone should be guessing.
+        """
+        result = self.client._request(
+            "GET", "/v5/market/tickers",
+            params={"category": SPOT, "symbol": symbol})
+        rows = (result or {}).get("list") or []
+        if not rows:
+            raise PairIncident(f"no spot ticker for {symbol}")
+        price = float(rows[0].get("lastPrice", 0) or 0)
+        if not self._positive_finite(price):
+            raise PairIncident(f"spot mark for {symbol} is {price!r}")
+        return price
+
     def get_funding_bps(self, symbol: str) -> float:
         """Current 8h funding on the perp, in basis points.
 

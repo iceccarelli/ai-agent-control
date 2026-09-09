@@ -60,6 +60,13 @@ class _Broker:
             raise RuntimeError("venue down")
         return self.mark
 
+    def get_spot_mark(self, symbol):
+        # 0021: the basis needs a spot mark. Flat here so the gates see a
+        # zero basis and judge purely on carry vs cost.
+        if self.raises == "spot":
+            raise RuntimeError("no spot ticker")
+        return self.mark
+
     def get_funding_bps(self, symbol):
         if self.raises == "funding":
             raise RuntimeError("no fundingRate in ticker")
@@ -74,11 +81,16 @@ class _Broker:
                 "order_link_id": f"x{len(self.orders)}"}
 
 
-def _bot_with_carry(broker):
+def _bot_with_carry(broker, *, warm_bps=3.0):
     from carry_engine import CarryEngine
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]
     bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0)
+    # Warm the EWMA: the engine refuses below three prints rather than
+    # falling back to the last one.
+    for _ in range(2):
+        bot.carry.on_candle(mark=broker.mark, funding_bps=warm_bps,
+                            spot=broker.mark)
     bot.strategy = None
     bot.store = _Store()
     bot._stop = mock.Mock(is_set=lambda: False)
@@ -99,8 +111,14 @@ class TestTheCycleRunsTheCarryBook:
         assert bot.carry.state is BookState.HEDGED
 
     def test_thin_funding_places_nothing(self):
+        """Thin carry cannot clear borrow plus the amortised round trip.
+
+        The warm-up in _bot_with_carry primes a RICH history, so the EWMA must
+        be pulled down by thin prints before the gate refuses — one thin print
+        after a rich run is not a regime change.
+        """
         broker = _Broker(funding=0.01)
-        bot = _bot_with_carry(broker)
+        bot = _bot_with_carry(broker, warm_bps=0.01)
         bot.tick()
         assert not broker.orders
 
@@ -114,7 +132,7 @@ class TestTheCycleRunsTheCarryBook:
 
 
 class TestUnreadableInputsTouchNothing:
-    @pytest.mark.parametrize("broken", ["mark", "funding"])
+    @pytest.mark.parametrize("broken", ["mark", "funding", "spot"])
     def test_a_venue_read_that_raises_sends_no_order(self, broken):
         """A book that trades on absent data is the failure this system exists
         to prevent. No order, no state change, no silent zero."""

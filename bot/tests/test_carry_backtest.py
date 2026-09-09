@@ -88,16 +88,32 @@ class TestTheBasisIsRealPnL:
 
 
 class TestItRefusesToBeQuoted:
-    def test_the_report_declares_itself_unquotable(self, report):
-        assert report["is_a_quotable_return"] is False
+    def test_quotability_is_earned_not_assumed(self, report):
+        """0018 hardcoded False because Bitstamp USD was the only spot series.
+        0020 made quotability track provenance: it is True only when the spot
+        leg is the SAME venue and SAME quote currency as the perp. Asserting
+        False forever would have made the tool lie once real data arrived."""
+        _series, _label, quotable = cb.resolve_spot(REPO)
+        assert report["is_a_quotable_return"] is quotable
+        if quotable:
+            assert "BINANCE" in report["spot_source"]
+            assert "USDT" in report["spot_source"]
 
-    def test_the_spot_proxy_is_named(self, report):
-        assert "BITSTAMP" in report["spot_proxy"]
-        assert report["basis_is_a_proxy"] is True
+    def test_the_spot_source_is_named(self, report):
+        """`spot_proxy` became `spot_source` in 0020: once a same-venue series
+        exists the word "proxy" is wrong, but the provenance must still be
+        stated on every report, quotable or not."""
+        assert report["spot_source"]
+        assert ("BINANCE" in report["spot_source"]
+                or "BITSTAMP" in report["spot_source"])
 
-    def test_the_reason_names_venue_and_currency(self, report):
-        why = report["why_not_quotable"].lower()
-        assert "venue" in why and "currency" in why
+    def test_a_proxy_source_explains_itself(self, report):
+        """Only a non-quotable run owes an explanation."""
+        if report["is_a_quotable_return"]:
+            assert report["why_not_quotable"] == ""
+        else:
+            why = report["why_not_quotable"].lower()
+            assert "venue" in why and "currency" in why
 
     def test_what_is_not_modelled_is_listed(self, report):
         joined = " ".join(report["not_modelled"]).lower()
@@ -135,3 +151,77 @@ class TestTheSimulationIsSane:
     def test_the_trade_log_carries_each_cost(self, report):
         for key in ("funding", "basis", "fees", "borrow", "net"):
             assert key in report["trade_log"][0]
+
+
+class TestSpotProvenanceDecidesQuotability:
+    def test_the_source_is_named_in_the_report(self, report):
+        assert "spot_source" in report
+        assert report["spot_source"]
+
+    def test_binance_usdt_is_preferred_over_bitstamp_usd(self):
+        first = cb.SPOT_SOURCES[0]
+        assert "BINANCE" in first[0] and "USDT" in first[0]
+        assert first[2] is True, "the same-venue source must be the quotable one"
+
+    def test_only_the_same_venue_same_currency_source_is_quotable(self):
+        for path, _label, quotable in cb.SPOT_SOURCES:
+            if quotable:
+                assert "BINANCE" in path and "USDT" in path
+            else:
+                assert not ("BINANCE_SPOT_BTC_USDT" in path)
+
+    def test_quotability_tracks_the_source_actually_used(self, report):
+        _series, _label, quotable = cb.resolve_spot(REPO)
+        assert report["is_a_quotable_return"] is quotable
+        assert report["basis_is_a_proxy"] is (not quotable)
+
+
+class TestTheOpenBarIsRefused:
+    def test_today_is_dropped(self):
+        """Binance returns the in-progress bar and the fetcher writes it. A day
+        that has not closed is not a close."""
+        import datetime as _dt
+        today = _dt.datetime.now(_dt.timezone.utc).date()
+        series = {today: 1.0, today - _dt.timedelta(days=1): 2.0}
+        kept = cb.drop_open_bar(series)
+        assert today not in kept
+        assert (today - _dt.timedelta(days=1)) in kept
+
+    def test_the_loaded_spot_series_ends_before_today(self):
+        import datetime as _dt
+        series, _l, _q = cb.resolve_spot(REPO)
+        assert max(series) < _dt.datetime.now(_dt.timezone.utc).date()
+
+    def test_the_report_declares_the_drop(self, report):
+        assert report["open_bar_dropped"] is True
+
+
+class TestTheGatesChangeTheBook:
+    def test_gating_refuses_some_entries(self):
+        ungated = cb.simulate(REPO)
+        gated = cb.simulate(REPO, gated=True)
+        assert gated["trades"] < ungated["trades"], \
+            "a gate that changes no trade is decoration"
+
+    def test_gating_does_not_refuse_everything(self):
+        """Refusing every entry is not trading, dressed as risk management."""
+        assert cb.simulate(REPO, gated=True)["trades"] > 0
+
+    def test_gating_improves_the_hit_rate(self):
+        ungated = cb.simulate(REPO)
+        gated = cb.simulate(REPO, gated=True)
+        u = ungated["losing_trades"] / max(1, ungated["trades"])
+        g = gated["losing_trades"] / max(1, gated["trades"])
+        assert g < u
+
+    def test_the_refusal_reasons_are_counted(self):
+        refusals = cb.simulate(REPO, gated=True)["refusals"]
+        assert refusals
+        assert "CARRY_BELOW_COST_OF_CAPITAL" in refusals
+
+    def test_gating_rescues_the_book_at_expensive_financing(self):
+        """At 8% the ungated book is negative. The gate is what stands between
+        a cost of capital it cannot clear and simply not trading."""
+        assert cb.simulate(REPO, borrow_apr=0.08)["net_annualised_pct"] < 0
+        assert cb.simulate(REPO, borrow_apr=0.08,
+                           gated=True)["net_annualised_pct"] >= 0
