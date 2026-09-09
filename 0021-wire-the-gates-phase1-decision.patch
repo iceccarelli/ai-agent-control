@@ -1,0 +1,731 @@
+From: build <build@local>
+Subject: [PATCH 0021] wire the gates into the live book + PHASE1_DECISION
+
+PHASE 1.3 COMPLETION AND PHASE 1.4. Applies on top of 0020.
+
+Until now the gates existed and the engine ignored them. CarryEngine opened on
+ONE condition - the last funding print cleared a threshold - which is a reflex,
+not a decision. 0018 measured what that costs: borrow 57% of gross, 15 of 20
+trades losing.
+
+WHAT CHANGES AT RUNTIME
+
+ ~ carry_engine.py   on_candle() now takes `spot` and consults
+                     carry_costs.evaluate_entry before opening.
+
+                     `spot` is REQUIRED to open. Missing spot returns
+                     SPOT_UNAVAILABLE_BASIS_UNKNOWN, because an unknown basis is
+                     not a small basis, and a default here would be a silent
+                     risk parameter - the class of bug 0016 removed from the cap.
+
+                     Every funding print is recorded whether or not the book
+                     acts on it. A gap because "nothing happened that day" is
+                     exactly the missing data that makes a smoother lie.
+
+ ~ carry_broker.py   get_spot_mark() reads the SPOT ticker and RAISES when
+                     unreadable, same contract as get_margin_multiple.
+
+ ~ main.py           tick() fetches the spot mark and passes it. A failure lands
+                     in the same handler as a missing perp mark: no order, no
+                     state change. The log line now carries perp, spot and the
+                     live basis in bps.
+
+ ~ Dockerfile        21 modules. carry_costs.py entered main's import closure
+                     and the image would not have started without it. Caught by
+                     the 0001 COPY check - the third time that check has fired.
+
+BEHAVIOUR THE TESTS NOW PIN
+   no spot mark                 -> SPOT_UNAVAILABLE_BASIS_UNKNOWN
+   fewer than three prints      -> INSUFFICIENT_FUNDING_HISTORY
+   thin carry (3 thin prints)   -> CARRY_BELOW_COST_OF_CAPITAL
+   ONE thin print after a rich
+     history                    -> STILL OPENS. A smoother that collapses on a
+                                   single observation is just the last print
+                                   with extra steps.
+   entry basis 200 bps          -> ENTRY_BASIS_EXCEEDS_CARRY_BUDGET
+
+ + docs/human/PHASE1_DECISION.md   OVERLAY. Unsigned.
+
+     borrow          UNGATED              GATED
+       0.0%    +9.49%/yr n=18     +9.66%/yr n=15
+       3.0%    +5.76%/yr n=18     +6.55%/yr n=11
+       5.0%    +3.28%/yr n=18     +3.85%/yr n=9
+       8.0%    -0.44%/yr n=18     +1.84%/yr n=4
+
+   Above ~4% financing the spread stops clearing its cost of capital. This is a
+   yield product for BTC ALREADY HELD, not a fund to raise cash for. Buyers are
+   crypto treasuries, family offices, prop desks.
+
+   THE GATED COLUMN IS IN-SAMPLE and the doc says so: ASSUMED_HOLD_DAYS,
+   EWMA_ALPHA and the basis budget were all chosen AFTER seeing 0018. That is
+   the selection path tools/reserved_holdout.py exists to detect, and it is how
+   funding_carry_fade_btc_v1 was cleared and then lost money forward. The
+   ungated column is clean; the gated column is a hypothesis needing its own
+   untouched window.
+
+   The doc also records a prediction that was WRONG: on the Bitstamp proxy the
+   gates lowered returns at 0% borrow (+7.96 -> +5.94). On real Binance spot
+   they improve at every level. The proxy's fake basis was making the gates
+   refuse the wrong trades - wrong data produced a wrong conclusion about a
+   TOOL, not just a wrong return.
+
+NOT AUTHORISED: live capital. The book has never touched an exchange. Daily
+closes cannot see the wick that liquidates a short leg. promotion_gate_allows_
+live() stays False and every human item stays unsigned.
+
+VERIFIED: 5,233 passed, 2 skipped (was 5,228). Fixture md5 stable.
+
+---
+--- a/Dockerfile	2026-09-09 05:46:44.026059477 +0000
++++ b/Dockerfile	2026-09-09 05:42:11.929311628 +0000
+@@ -21,11 +21,12 @@
+ # omitted market_data.py, memory.py, project_status.py and session_log.py, all
+ # imported unconditionally, so `python3 main.py` died on ModuleNotFoundError
+ # before the health server bound and the container restart-looped.
+-COPY bybit_connection.py carry_broker.py carry_engine.py config.py \
+-     features.py main.py market_data.py memory.py ml_strategy.py \
+-     persistence.py policy.py position_sizing.py project_status.py \
+-     promotion_gate.py pure_indicators.py risk_management.py \
+-     session_log.py shadow.py technical_analysis.py trading_engine.py ./
++COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
++     config.py features.py main.py market_data.py memory.py \
++     ml_strategy.py persistence.py policy.py position_sizing.py \
++     project_status.py promotion_gate.py pure_indicators.py \
++     risk_management.py session_log.py shadow.py technical_analysis.py \
++     trading_engine.py ./
+ COPY signals/ ./signals/
+ 
+ # Run unprivileged. State lives on a mounted volume owned by this user.
+--- a/carry_broker.py	2026-09-09 05:46:44.042261163 +0000
++++ b/carry_broker.py	2026-09-09 05:36:19.992535877 +0000
+@@ -200,6 +200,25 @@
+             raise PairIncident(f"mark for {symbol} is {mark!r}")
+         return mark
+ 
++    def get_spot_mark(self, symbol: str) -> float:
++        """Last traded price on the SPOT product. Required to price the basis.
++
++        Raises when unreadable. CarryEngine turns a missing spot into a refusal
++        to open, because an unknown basis is not a small basis — and 0018
++        measured the basis at -$4,772 on a $42,843 gross, which is not a term
++        anyone should be guessing.
++        """
++        result = self.client._request(
++            "GET", "/v5/market/tickers",
++            params={"category": SPOT, "symbol": symbol})
++        rows = (result or {}).get("list") or []
++        if not rows:
++            raise PairIncident(f"no spot ticker for {symbol}")
++        price = float(rows[0].get("lastPrice", 0) or 0)
++        if not self._positive_finite(price):
++            raise PairIncident(f"spot mark for {symbol} is {price!r}")
++        return price
++
+     def get_funding_bps(self, symbol: str) -> float:
+         """Current 8h funding on the perp, in basis points.
+ 
+--- a/carry_engine.py	2026-09-09 05:46:44.042299579 +0000
++++ b/carry_engine.py	2026-09-09 05:36:03.888487217 +0000
+@@ -95,6 +95,13 @@
+ NEGATIVE_FUNDING_EXIT_PRINTS = 3
+ 
+ 
++def _costs():
++    """Import the gates lazily. carry_costs is pure and imports nothing from
++    here, so the dependency points one way only."""
++    import carry_costs
++    return carry_costs
++
++
+ class BookState(Enum):
+     FLAT = "FLAT"
+     OPENING = "OPENING"
+@@ -181,12 +188,18 @@
+     and a kill switch callable. Everything else is arithmetic done here.
+     """
+ 
++    #: Funding prints kept for the EWMA. Eight is ~2.7 days: enough for a
++    #: three-print smoother with slack, short enough that a regime change is
++    #: not diluted by last week.
++    FUNDING_HISTORY = 8
++
+     def __init__(self, *, broker: Any, kill_switch: Any = None,
+                  spot_symbol: str = "BTCUSDT", perp_symbol: str = "BTCUSDT",
+                  max_notional_usd: float = 100.0,
+                  delta_band: float = DELTA_BAND,
+                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
+-                 min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS) -> None:
++                 min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
++                 borrow_apr: float = 0.05) -> None:
+         self.broker = broker
+         self.kill_switch = kill_switch
+         self.spot_symbol = spot_symbol
+@@ -197,10 +210,13 @@
+         self.min_entry_funding_bps = float(min_entry_funding_bps)
+         self.position: Optional[CarryPosition] = None
+         self.state = BookState.FLAT
++        self.borrow_apr = float(borrow_apr)
++        self._funding_history: List[float] = []
+ 
+     # -- the loop ---------------------------------------------------------
+ 
+     def on_candle(self, *, mark: float, funding_bps: float,
++                  spot: Optional[float] = None,
+                   timestamp_ms: int = 0) -> CarryDecision:
+         """One closed bar. Act or state why not. This is the entire loop.
+ 
+@@ -217,6 +233,14 @@
+             return self._halt("MARK_UNREADABLE",
+                               "a book that cannot be marked cannot be hedged")
+ 
++        # Every print is recorded whether or not the book acts on it. The EWMA
++        # is only meaningful if the history is complete, and a gap because
++        # "nothing happened that day" is exactly the kind of missing data that
++        # makes a smoother lie.
++        if self._finite(funding_bps):
++            self._funding_history.append(float(funding_bps))
++            del self._funding_history[:-self.FUNDING_HISTORY]
++
+         if self.position is not None:
+             headroom = self._check_margin()
+             if headroom is not None:
+@@ -242,12 +266,34 @@
+                                          "funding_bps": funding_bps,
+                                          "collected": self.position.funding_collected})
+ 
+-        if funding_bps < self.min_entry_funding_bps:
++        # THE GATES (0019/0021). Before this, the engine opened on ONE
++        # condition: the last funding print cleared a threshold. That is a
++        # reflex, not a decision — it does not know what the money costs, what
++        # the basis will take back, or whether one print represents the next
++        # eight hours. 0018 measured the result: borrow was 57% of gross income
++        # and 15 of 20 trades lost money.
++        #
++        # `spot` is REQUIRED to open. Without it the basis is unknown, and an
++        # unknown basis is not a small basis. Refusing is the only honest move:
++        # a default here would be a silent risk parameter, which is the exact
++        # class of bug 0016 removed from the cap.
++        if spot is None:
+             return CarryDecision(
+-                "stand_aside", reason="FUNDING_TOO_THIN_TO_CLEAR_ENTRY_COST",
++                "stand_aside", reason="SPOT_UNAVAILABLE_BASIS_UNKNOWN",
+                 state=BookState.FLAT,
++                detail={"note": "cannot price the basis without a spot mark; "
++                                "an unknown basis is not a small one"})
++
++        verdict = _costs().evaluate_entry(
++            funding_prints_bps=self._funding_history,
++            perp=mark, spot=spot, borrow_apr=self.borrow_apr)
++        if not verdict:
++            return CarryDecision(
++                "stand_aside", reason=verdict.reason, state=BookState.FLAT,
+                 detail={"funding_bps": funding_bps,
+-                        "required_bps": self.min_entry_funding_bps})
++                        "smoothed_bps": verdict.smoothed_funding_bps,
++                        "entry_basis_bps": verdict.entry_basis_bps,
++                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day})
+ 
+         return self._open(mark, funding_bps, timestamp_ms)
+ 
+--- a/docs/human/PHASE1_DECISION.md	1970-01-01 00:00:00.000000000 +0000
++++ b/docs/human/PHASE1_DECISION.md	2026-09-09 05:46:37.540291210 +0000
+@@ -0,0 +1,93 @@
++# PHASE 1 DECISION
++
++**OVERLAY**
++
++Written 2026-09-08. Based on the first quotable backtest this programme has
++produced.
++
++---
++
++## The matrix
++
++`tools/carry_backtest.py --matrix`, Binance BTCUSDT spot against Binance
++USDT-M linear, same venue and same quote currency, open bar refused.
++
++```
++spot source : BINANCE_SPOT_BTC_USDT (same venue, same quote currency)
++quotable    : True
++window      : 2022-09-09 .. 2026-08-24
++
++  borrow            UNGATED              GATED
++    0.0%    +9.49%/yr n=18     +9.66%/yr n=15
++    3.0%    +5.76%/yr n=18     +6.55%/yr n=11
++    5.0%    +3.28%/yr n=18     +3.85%/yr n=9
++    8.0%    -0.44%/yr n=18     +1.84%/yr n=4
++```
++
++## The decision
++
++**OVERLAY.** This is a yield product for BTC that is already held. It is not a
++market-neutral fund to raise cash for.
++
++The threshold is the locate. Above roughly **4% financing** the spread stops
++clearing its cost of capital and the product stops being interesting:
++
++| Locate | Net | Reading |
++|---|---|---|
++| 0% — you own the BTC | **+9.66%/yr** | strong return on an otherwise idle asset |
++| 3% | **+6.55%/yr** | a real spread |
++| 5% | **+3.85%/yr** | below T-bills; not a fund |
++| 8% | **+1.84%/yr** | dead |
++
++Borrow was 57% of gross income in the ungated 0018 run and financing is still
++what decides this. No amount of software creates a cheap locate.
++
++The buyers this fits are crypto treasuries, family offices and prop desks
++holding BTC they will not sell. It does not fit an allocator handing over cash
++to be levered.
++
++## Caveat on the gated column — read before quoting it
++
++**The gated column is IN-SAMPLE.** `ASSUMED_HOLD_DAYS = 30`, `EWMA_ALPHA = 0.5`
++and the basis-budget formula were all chosen *after* seeing the 0018 output. The
++person who picked those parameters already knew which trades had lost money.
++
++That is precisely the selection path `tools/reserved_holdout.py` exists to
++detect, and it is how `funding_carry_fade_btc_v1` was cleared and then lost
++money forward. The ungated column is clean. The gated column is a **hypothesis**
++and needs its own untouched window before any figure from it is stated as fact.
++
++Register it in `tools/hypothesis_registry.py` before scoring it again.
++
++## A prediction that was wrong, recorded
++
++Before the Binance data arrived, the expectation on record was that the gates
++would *lower* returns at cheap financing, because refusing entries also refuses
++income. On the Bitstamp proxy that is what happened: 0% went +7.96% → +5.94%.
++
++On real Binance spot the gates improve returns at **every** borrow level. The
++proxy's fake basis — cross-venue spread plus USD-vs-USDT peg — was making the
++gates refuse the wrong trades. Wrong data produced a wrong conclusion about a
++*tool*, not merely a wrong return.
++
++## What this decision authorises
++
++Phase 2 may begin: market contact on testnet, at the `$100` cap.
++
++## What it does not authorise
++
++Live capital. The book has never touched an exchange. Nothing here is evidence
++about partial fills, rate limits, maintenance windows, or how the basis behaves
++intraday — the simulation uses daily closes and cannot see the wick that
++liquidates a short leg.
++
++`promotion_gate_allows_live()` remains `False` and every one of its human items
++remains unsigned.
++
++---
++
++```
++signed:
++date:
++git commit at signing:
++```
+--- a/main.py	2026-09-09 05:46:44.051190221 +0000
++++ b/main.py	2026-09-09 05:36:19.993362474 +0000
+@@ -442,18 +442,25 @@
+             try:
+                 mark = float(self.carry.broker.get_mark(symbol))
+                 funding_bps = float(self.carry.broker.get_funding_bps(symbol))
++                # The SPOT mark prices the basis. It is fetched here rather
++                # than defaulted, and a failure lands in the same handler as a
++                # missing perp mark: no order, no state change.
++                spot = float(self.carry.broker.get_spot_mark(
++                    self.carry.spot_symbol))
+             except Exception as exc:  # noqa: BLE001
+                 logger.error(
+                     "carry inputs unreadable this cycle (%s); the book is NOT "
+                     "touched and no order is sent", exc)
+                 return
+             decision = self.carry.on_candle(
+-                mark=mark, funding_bps=funding_bps,
++                mark=mark, funding_bps=funding_bps, spot=spot,
+                 timestamp_ms=int(time.time() * 1000))
+             logger.info(
+-                "carry: %s (%s) state=%s mark=%.2f funding=%.3fbps %s",
++                "carry: %s (%s) state=%s perp=%.2f spot=%.2f "
++                "basis=%.1fbps funding=%.3fbps %s",
+                 decision.action, decision.reason, decision.state.value,
+-                mark, funding_bps, decision.detail or "")
++                mark, spot, (mark / spot - 1.0) * 1e4, funding_bps,
++                decision.detail or "")
+             if decision.state.name == "HALTED":
+                 logger.critical(
+                     "carry book HALTED — a human must clear it: %s",
+--- a/tests/test_carry_broker.py	2026-09-09 05:46:44.053465801 +0000
++++ b/tests/test_carry_broker.py	2026-09-09 05:37:31.441897970 +0000
+@@ -45,7 +45,9 @@
+             return {"list": [{"cumExecQty": "0.5", "avgPrice": str(self.mark),
+                               "orderLinkId": params.get("orderLinkId")}]}
+         if endpoint == "/v5/market/tickers":
+-            return {"list": [{"markPrice": str(self.mark)}]}
++            return {"list": [{"markPrice": str(self.mark),
++                              "lastPrice": str(self.mark),
++                              "fundingRate": "0.0003"}]}
+         if endpoint == "/v5/position/list":
+             return {"list": [{"positionIM": str(self.im),
+                               "positionMM": str(self.mm),
+@@ -238,7 +240,11 @@
+         from carry_engine import BookState, CarryEngine
+         client = FakeClient(im=5.0, mm=1.0)
+         eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0)
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        for _ in range(2):   # warm the EWMA
++            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0)
++        client.created.clear()
++        decision = eng.on_candle(mark=100_000.0, funding_bps=3.0,
++                                 spot=100_000.0)
+         assert decision.acted is True
+         assert eng.state is BookState.HEDGED
+         assert len(client.created) == 2
+--- a/tests/test_carry_engine.py	2026-09-09 05:46:44.053508330 +0000
++++ b/tests/test_carry_engine.py	2026-09-09 05:37:18.046409856 +0000
+@@ -54,16 +54,37 @@
+         return None
+ 
+ 
+-def engine(broker, **kw):
++SPOT = 100_000.0
++
++
++def engine(broker, *, primed=True, **kw):
++    """A CarryEngine ready to open.
++
++    0021 made two things true that these tests must now respect:
++
++      `spot` is REQUIRED to open. Without it the basis is unknown, and an
++      unknown basis is not a small one, so the engine refuses.
++
++      The EWMA needs three funding prints. Below that the engine returns
++      INSUFFICIENT_FUNDING_HISTORY rather than falling back to the last print.
++
++    `primed=True` feeds the two warm-up prints so a test can reach the entry
++    path in one candle, the way a book that has been running does.
++    `primed=False` leaves the history empty to test the warm-up itself.
++    """
+     kw.setdefault("max_notional_usd", 100_000.0)
+-    return CarryEngine(broker=broker, **kw)
++    eng = CarryEngine(broker=broker, **kw)
++    if primed:
++        for _ in range(2):
++            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=SPOT)
++    return eng
+ 
+ 
+ class TestItActuallyOpens:
+     def test_rich_funding_opens_both_legs(self):
+         broker = FakeBroker()
+         eng = engine(broker)
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert decision.acted is True
+         assert decision.action == "opened"
+         assert eng.state is BookState.HEDGED
+@@ -72,7 +93,7 @@
+     def test_the_legs_are_opposite_and_equal(self):
+         broker = FakeBroker()
+         eng = engine(broker)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         spot, perp = broker.orders
+         assert spot[1] == "Buy" and spot[3] == "spot"
+         assert perp[1] == "Sell" and perp[3] == "linear"
+@@ -80,13 +101,13 @@
+ 
+     def test_the_book_is_delta_flat_after_opening(self):
+         eng = engine(FakeBroker())
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert eng.position.delta_qty == pytest.approx(0.0)
+ 
+     def test_it_collects_funding_while_hedged(self):
+         eng = engine(FakeBroker())
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert eng.position.funding_collected > 0
+ 
+ 
+@@ -96,7 +117,7 @@
+     def test_a_failed_perp_leg_unwinds_the_spot_immediately(self):
+         broker = FakeBroker(reject={"linear"})
+         eng = engine(broker)
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert eng.position is None, "a naked spot leg was left open"
+         assert eng.state is BookState.FLAT
+         assert "PERP_LEG_DID_NOT_FILL" in decision.reason
+@@ -106,7 +127,7 @@
+     def test_a_failed_spot_leg_never_shorts_the_perp(self):
+         broker = FakeBroker(reject={"spot"})
+         eng = engine(broker)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert eng.position is None
+         assert not any(o[3] == "linear" for o in broker.orders), \
+             "the perp was shorted with no spot behind it"
+@@ -115,7 +136,7 @@
+         """Nothing filled means nothing naked. FLAT, not halted."""
+         broker = FakeBroker(reject={"spot", "linear"})
+         eng = engine(broker)
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert eng.position is None
+         assert eng.state is BookState.FLAT
+         assert decision.reason == "SPOT_LEG_DID_NOT_FILL"
+@@ -126,22 +147,22 @@
+         it must stop and shout for a human rather than keep trading."""
+         broker = _SpotFillsThenVenueDies()
+         eng = engine(broker)
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert decision.state is BookState.HALTED
+         assert eng.state is BookState.HALTED
+         assert decision.reason == "NAKED_SPOT_UNWIND_FAILED"
+ 
+     def test_halted_books_refuse_every_later_candle(self):
+         eng = engine(_SpotFillsThenVenueDies())
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+-        after = eng.on_candle(mark=100_000.0, funding_bps=5.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
++        after = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=5.0)
+         assert after.acted is False
+         assert after.reason == "KILL_SWITCH_ENGAGED"
+ 
+     def test_the_kill_switch_is_called_on_halt(self):
+         tripped = []
+         eng = engine(_SpotFillsThenVenueDies(), kill_switch=tripped.append)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert tripped, "the book halted without tripping the switch"
+ 
+ 
+@@ -149,29 +170,29 @@
+     def test_drift_past_the_band_triggers_a_rebalance(self):
+         broker = FakeBroker()
+         eng = engine(broker)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         eng.position.perp.filled_qty *= 0.90          # hedge slipped 10%
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert decision.action == "rebalanced"
+         assert decision.acted is True
+ 
+     def test_drift_inside_the_band_does_not_churn(self):
+         broker = FakeBroker()
+         eng = engine(broker)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         before = len(broker.orders)
+         eng.position.perp.filled_qty *= (1 - DELTA_BAND / 4)
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert decision.action == "hold"
+         assert len(broker.orders) == before, "it traded inside the band"
+ 
+     def test_rebalancing_uses_the_perp_not_the_spot(self):
+         broker = FakeBroker()
+         eng = engine(broker)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         broker.orders.clear()
+         eng.position.perp.filled_qty *= 0.90
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert all(o[3] == "linear" for o in broker.orders), \
+             "collateral was sold to fix a hedge"
+ 
+@@ -187,7 +208,7 @@
+             return result
+ 
+         broker.place_market = partial
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert eng.position is None
+         assert "UNPAIRED" in decision.reason or decision.action == "unwound"
+ 
+@@ -195,58 +216,97 @@
+ class TestTheShortLegCanBeLiquidated:
+     def test_thin_margin_refuses_to_open(self):
+         eng = engine(FakeBroker(margin=1.2))
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=5.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=5.0)
+         assert decision.acted is False
+         assert decision.reason == "MARGIN_HEADROOM_TOO_THIN"
+ 
+     def test_margin_falling_while_open_unwinds_the_book(self):
+         broker = FakeBroker(margin=5.0)
+         eng = engine(broker)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         broker.margin = 1.1
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert decision.action == "unwound"
+         assert eng.position is None
+ 
+     def test_unreadable_margin_halts_rather_than_assumes(self):
+         broker = FakeBroker()
+         eng = engine(broker)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         broker.get_margin_multiple = lambda s: (_ for _ in ()).throw(RuntimeError())
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert decision.state is BookState.HALTED
+ 
+ 
+ class TestFundingDrivesEntryAndExit:
+     def test_thin_funding_stands_aside(self):
++        """Thin carry cannot clear borrow plus the amortised round trip.
++
++        The book is built from an EWMA, so it is primed with THIN prints here.
++        One thin print after a rich history does not stand the book down, and
++        that is correct: a smoother that collapses on a single observation is
++        just the last print with extra steps.
++        """
++        broker = FakeBroker()
++        eng = engine(broker, primed=False)
++        for _ in range(3):
++            decision = eng.on_candle(spot=SPOT, mark=100_000.0,
++                                     funding_bps=0.05)
++        assert decision.acted is False
++        assert decision.reason == "CARRY_BELOW_COST_OF_CAPITAL"
++        assert not broker.orders
++
++    def test_one_thin_print_does_not_stand_a_rich_book_down(self):
++        """The other half of the same rule, asserted explicitly."""
++        broker = FakeBroker()
++        eng = engine(broker)          # primed with 3.0 bps
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=0.05)
++        assert decision.acted is True
++
++    def test_the_warm_up_is_required_before_any_entry(self):
++        broker = FakeBroker()
++        eng = engine(broker, primed=False)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=5.0)
++        assert decision.acted is False
++        assert decision.reason == "INSUFFICIENT_FUNDING_HISTORY"
++        assert not broker.orders
++
++    def test_opening_without_a_spot_mark_is_refused(self):
+         broker = FakeBroker()
+         eng = engine(broker)
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=0.05)
++        decision = eng.on_candle(mark=100_000.0, funding_bps=5.0)
+         assert decision.acted is False
+-        assert decision.reason == "FUNDING_TOO_THIN_TO_CLEAR_ENTRY_COST"
++        assert decision.reason == "SPOT_UNAVAILABLE_BASIS_UNKNOWN"
+         assert not broker.orders
+ 
++    def test_a_wide_entry_basis_is_refused(self):
++        broker = FakeBroker()
++        eng = engine(broker)
++        decision = eng.on_candle(spot=SPOT, mark=SPOT * 1.02, funding_bps=3.0)
++        assert decision.acted is False
++        assert decision.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
++
+     def test_sustained_negative_funding_unwinds(self):
+         eng = engine(FakeBroker())
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         for _ in range(2):
+-            eng.on_candle(mark=100_000.0, funding_bps=-0.5)
++            eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
+         assert eng.position is not None, "it left after one negative print"
+-        decision = eng.on_candle(mark=100_000.0, funding_bps=-0.5)
++        decision = eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
+         assert decision.action == "unwound"
+         assert decision.reason == "FUNDING_INVERTED"
+ 
+     def test_one_negative_print_does_not_panic(self):
+         eng = engine(FakeBroker())
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+-        eng.on_candle(mark=100_000.0, funding_bps=-0.5)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
+         assert eng.position is not None
+ 
+     def test_the_streak_resets_when_funding_returns(self):
+         eng = engine(FakeBroker())
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
+-        eng.on_candle(mark=100_000.0, funding_bps=-0.5)
+-        eng.on_candle(mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=-0.5)
++        eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
+         assert eng.position.negative_funding_streak == 0
+ 
+ 
+@@ -254,7 +314,7 @@
+     @pytest.mark.parametrize("mark", [float("nan"), float("inf"), 0.0, -100.0])
+     def test_an_unusable_mark_halts(self, mark):
+         eng = engine(FakeBroker())
+-        decision = eng.on_candle(mark=mark, funding_bps=5.0)
++        decision = eng.on_candle(spot=SPOT, mark=mark, funding_bps=5.0)
+         assert decision.acted is False
+         assert decision.state is BookState.HALTED
+ 
+--- a/tests/test_carry_wiring.py	2026-09-09 05:46:44.053530368 +0000
++++ b/tests/test_carry_wiring.py	2026-09-09 05:42:11.742058677 +0000
+@@ -60,6 +60,13 @@
+             raise RuntimeError("venue down")
+         return self.mark
+ 
++    def get_spot_mark(self, symbol):
++        # 0021: the basis needs a spot mark. Flat here so the gates see a
++        # zero basis and judge purely on carry vs cost.
++        if self.raises == "spot":
++            raise RuntimeError("no spot ticker")
++        return self.mark
++
+     def get_funding_bps(self, symbol):
+         if self.raises == "funding":
+             raise RuntimeError("no fundingRate in ticker")
+@@ -74,11 +81,16 @@
+                 "order_link_id": f"x{len(self.orders)}"}
+ 
+ 
+-def _bot_with_carry(broker):
++def _bot_with_carry(broker, *, warm_bps=3.0):
+     from carry_engine import CarryEngine
+     bot = _main.TradingBot.__new__(_main.TradingBot)
+     bot.symbols = ["BTCUSDT"]
+     bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0)
++    # Warm the EWMA: the engine refuses below three prints rather than
++    # falling back to the last one.
++    for _ in range(2):
++        bot.carry.on_candle(mark=broker.mark, funding_bps=warm_bps,
++                            spot=broker.mark)
+     bot.strategy = None
+     bot.store = _Store()
+     bot._stop = mock.Mock(is_set=lambda: False)
+@@ -99,8 +111,14 @@
+         assert bot.carry.state is BookState.HEDGED
+ 
+     def test_thin_funding_places_nothing(self):
++        """Thin carry cannot clear borrow plus the amortised round trip.
++
++        The warm-up in _bot_with_carry primes a RICH history, so the EWMA must
++        be pulled down by thin prints before the gate refuses — one thin print
++        after a rich run is not a regime change.
++        """
+         broker = _Broker(funding=0.01)
+-        bot = _bot_with_carry(broker)
++        bot = _bot_with_carry(broker, warm_bps=0.01)
+         bot.tick()
+         assert not broker.orders
+ 
+@@ -114,7 +132,7 @@
+ 
+ 
+ class TestUnreadableInputsTouchNothing:
+-    @pytest.mark.parametrize("broken", ["mark", "funding"])
++    @pytest.mark.parametrize("broken", ["mark", "funding", "spot"])
+     def test_a_venue_read_that_raises_sends_no_order(self, broken):
+         """A book that trades on absent data is the failure this system exists
+         to prevent. No order, no state change, no silent zero."""
