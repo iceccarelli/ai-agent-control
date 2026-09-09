@@ -116,9 +116,16 @@ def inspect(repo: str, name: str, rel: str, column: str, per_day: int,
     last_closed = today - dt.timedelta(days=1)
     problems: List[str] = []
 
-    # An OPEN bar is a day that has not finished, written as a close. Binance
+    # An OPEN bar is a day that has NOT FINISHED, written as a close. Binance
     # returns the in-progress bar from klines and the fetcher writes it.
-    open_bars = [d for d in unique if d >= today]
+    #
+    # This applies to BARS ONLY. A funding print is an INSTANTANEOUS SETTLED
+    # EVENT — the 00:00 print today is as final as the 00:00 print last year,
+    # and it has no open state to be in. The first draft flagged today's
+    # funding as an open bar, which is a category error: it would have taught
+    # an operator that a correctly-refreshed funding series is unhealthy, and
+    # the fastest way to make a check useless is to make it wrong.
+    open_bars = [d for d in unique if d >= today] if per_day == 1 else []
     if open_bars:
         problems.append(f"OPEN_BAR_IN_FILE:{open_bars[-1]}")
 
@@ -130,7 +137,11 @@ def inspect(repo: str, name: str, rel: str, column: str, per_day: int,
     if per_day == 1 and len(days) != len(unique):
         problems.append(f"DUPLICATE_DAYS:{len(days) - len(unique)}")
     if per_day > 1:
-        thin = [d for d in unique[:-1] if days.count(d) < per_day]
+        # Neither edge day is judged. The FIRST is partial because the corpus
+        # begins mid-day, the LAST because the day is still running. Flagging
+        # either would mark every correctly-fetched series unhealthy forever.
+        interior = unique[1:-1] if len(unique) > 2 else []
+        thin = [d for d in interior if days.count(d) < per_day]
         if thin:
             problems.append(f"INCOMPLETE_DAYS:{len(thin)}:{thin[-1]}")
     if days != sorted(days):
@@ -157,19 +168,37 @@ def check(repo: str, *, max_stale_days: int = DEFAULT_MAX_STALE_DAYS,
     present = [r for r in reports if r.get("_days")]
 
     alignment: List[Dict[str, Any]] = []
+    coverage: List[Dict[str, Any]] = []
     overlap: Optional[Set[dt.date]] = None
     for report in present:
         overlap = set(report["_days"]) if overlap is None \
             else overlap & report["_days"]
+    # A day one series covers and another does not is only a DEFECT when it
+    # falls inside the other's range. spot begins 2022-09-10 and perp begins
+    # 2022-08-10: those 31 days are a COVERAGE DIFFERENCE, permanent, and no
+    # refresh will ever close them. Reporting them as gaps forever is how a
+    # health check trains its operator to ignore it.
+    #
+    # A day missing from the MIDDLE of a series is a hole, and a hole is a bug.
     for a in present:
         for b in present:
             if a is b:
                 continue
-            missing = a["_days"] - b["_days"]
-            if missing:
-                alignment.append({"days_in": a["name"], "missing_from": b["name"],
-                                  "count": len(missing),
-                                  "example": str(max(missing))})
+            b_days = b["_days"]
+            lo, hi = min(b_days), max(b_days)
+            missing = a["_days"] - b_days
+            interior = {d for d in missing if lo <= d <= hi}
+            edge = missing - interior
+            if interior:
+                alignment.append({
+                    "days_in": a["name"], "missing_from": b["name"],
+                    "count": len(interior), "example": str(max(interior)),
+                    "kind": "INTERIOR_HOLE"})
+            if edge:
+                coverage.append({
+                    "days_in": a["name"], "beyond_range_of": b["name"],
+                    "count": len(edge), "example": str(max(edge)),
+                    "kind": "COVERAGE_DIFFERENCE"})
 
     problems = [f"{r['name']}: {p}" for r in reports for p in r["problems"]]
     too_stale = [r["name"] for r in present
@@ -186,6 +215,7 @@ def check(repo: str, *, max_stale_days: int = DEFAULT_MAX_STALE_DAYS,
         "overlap_first": str(min(overlap)) if overlap else None,
         "overlap_last": str(max(overlap)) if overlap else None,
         "alignment_gaps": alignment,
+        "coverage_differences": coverage,
         "series_too_stale": too_stale,
         "problems": problems,
         "healthy": not problems and not alignment,
@@ -222,8 +252,11 @@ def main(argv=None) -> int:
     print(f"\n  three-way overlap  {report['overlap_first']} .. "
           f"{report['overlap_last']}  n={report['three_way_overlap_days']}")
     for gap in report["alignment_gaps"]:
-        print(f"  ! {gap['count']:4d} days in {gap['days_in']} are missing "
-              f"from {gap['missing_from']} (e.g. {gap['example']})")
+        print(f"  ! HOLE {gap['count']:4d} days in {gap['days_in']} are missing "
+              f"from the MIDDLE of {gap['missing_from']} (e.g. {gap['example']})")
+    for gap in report["coverage_differences"]:
+        print(f"    cover {gap['count']:4d} days in {gap['days_in']} lie outside "
+              f"{gap['beyond_range_of']}'s range (not a defect)")
     print()
     if report["series_too_stale"]:
         print(f"  REFUSE: {', '.join(report['series_too_stale'])} exceed "
