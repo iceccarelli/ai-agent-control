@@ -225,3 +225,46 @@ class TestTheGatesChangeTheBook:
         assert cb.simulate(REPO, borrow_apr=0.08)["net_annualised_pct"] < 0
         assert cb.simulate(REPO, borrow_apr=0.08,
                            gated=True)["net_annualised_pct"] >= 0
+
+
+class TestTheCliActuallyRuns:
+    """simulate() was tested; main() was not, so a field renamed in 0020 left
+    `carry_backtest.py --repo .` crashing with KeyError: 'spot_proxy' on main.
+    Only --matrix worked, and nothing noticed."""
+
+    def test_the_default_invocation_does_not_crash(self, capsys):
+        assert cb.main(["--repo", REPO]) == 0
+        assert "CARRY BACKTEST" in capsys.readouterr().out
+
+    def test_the_matrix_invocation_does_not_crash(self, capsys):
+        assert cb.main(["--repo", REPO, "--matrix"]) == 0
+        assert "BORROW x GATE MATRIX" in capsys.readouterr().out
+
+    def test_the_gated_invocation_does_not_crash(self, capsys):
+        assert cb.main(["--repo", REPO, "--gated"]) == 0
+
+    def test_the_cli_publishes_the_corpus_digests(self, capsys):
+        cb.main(["--repo", REPO])
+        out = capsys.readouterr().out
+        assert "CORPUS THIS WAS COMPUTED FROM" in out
+        assert "perp_1d" in out and "sha" in out
+
+
+class TestStructuralDefectsRefuseTheBacktest:
+    def test_staleness_alone_does_not_refuse(self, report):
+        """The committed corpus is FROZEN by design so the slice tests keep
+        recording what past measurements saw. A frozen corpus is stale forever
+        and a backtest on it is still valid."""
+        assert report["corpus_health"]["structural_defects"] == []
+
+    def test_the_report_carries_its_own_provenance(self, report):
+        """A number without the digests it came from is a rumour."""
+        for series in report["corpus_health"]["series"]:
+            assert len(series["sha256"]) == 64
+            assert series["rows"] > 0
+
+    def test_structural_defects_are_named_not_swallowed(self):
+        assert "OPEN_BAR_IN_FILE" in cb.STRUCTURAL_DEFECTS
+        assert "NOT_MONOTONIC" in cb.STRUCTURAL_DEFECTS
+        assert not any("STALE" in d for d in cb.STRUCTURAL_DEFECTS), \
+            "staleness must not refuse a frozen research corpus"

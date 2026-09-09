@@ -184,6 +184,35 @@ def resolve_spot(repo: str):
         "--intervals 1d --years 4 --out data/real_spot_btc")
 
 
+#: Corpus defects that invalidate a backtest, and the one that does not.
+#:
+#: STALENESS IS NOT A DEFECT HERE. The committed corpus is deliberately FROZEN:
+#: it records what slice 76 measured, and tests/test_slice76_fifteen_day_window
+#: and tests/test_slice77_selection_contamination pin its row count for exactly
+#: that reason. Refreshing it in git would retroactively falsify what those
+#: slices saw. The LIVE book does not read this corpus at all — it reads the
+#: venue through MarketSnapshot, which has its own freshness gate.
+#:
+#: So a frozen corpus is stale by design and a backtest on it is still valid.
+#:
+#: STRUCTURAL defects are different. An interior hole means a day the venue had
+#: and this file does not, so the simulation silently skips it. An open bar
+#: means a day that had not finished, priced as though it had. Neither is a
+#: matter of age, and a number computed over either is wrong rather than old.
+STRUCTURAL_DEFECTS = ("OPEN_BAR_IN_FILE", "NOT_MONOTONIC", "DUPLICATE_DAYS",
+                      "EMPTY", "MISSING")
+
+
+def corpus_verdict(repo: str):
+    """Health of the three series, with staleness excluded. See above."""
+    import corpus_health
+    report = corpus_health.check(repo, max_stale_days=10_000)
+    structural = [p for p in report["problems"]
+                  if any(d in p for d in STRUCTURAL_DEFECTS)]
+    holes = report.get("alignment_gaps", [])
+    return report, structural, holes
+
+
 def _carry_costs():
     """Import the gates lazily so the backtester still runs without them."""
     import sys as _sys
@@ -280,6 +309,19 @@ def simulate(repo: str, *, notional: float = 100_000.0,
     days = sorted(set(perp) & set(spot))
     if not days:
         raise SystemExit("no overlapping days between spot and perp")
+
+    # A number computed over a corpus with an interior hole or an open bar is
+    # WRONG, not old. carry_backtest used to intersect the three series in
+    # silence: a day present in one and missing from another simply vanished
+    # from the simulation, and nothing said so.
+    health, structural, holes = corpus_verdict(repo)
+    if structural:
+        raise SystemExit(
+            "REFUSING TO BACKTEST — structural corpus defects:\n  "
+            + "\n  ".join(structural)
+            + "\nStaleness is fine (the corpus is deliberately frozen). These "
+              "are not staleness: they are days priced as closed that were not, "
+              "or rows the simulation cannot trust.")
 
     trades: List[Trade] = []
     live: Optional[Trade] = None
@@ -395,6 +437,16 @@ def simulate(repo: str, *, notional: float = 100_000.0,
         "open_bar_dropped": True,
         "not_modelled": ["slippage beyond taker fees", "order book depth",
                          "intraday basis", "liquidation of the short leg"],
+        "corpus_health": {
+            "structural_defects": structural,
+            "interior_holes": holes,
+            "series": [{"name": x["name"], "rows": x.get("rows"),
+                        "last": x.get("last"), "sha256": x.get("sha256")}
+                       for x in health["series"]],
+            "note": ("staleness is deliberately NOT a defect: the committed "
+                     "corpus is frozen so the slice tests keep recording what "
+                     "past measurements saw. The live book reads the venue."),
+        },
         "gated": gated,
         "refusals": refusals,
         "trade_log": [{"opened": str(t.opened), "closed": str(t.closed),
@@ -479,10 +531,18 @@ def main(argv=None) -> int:
     print()
     print("  " + "!" * 66)
     print(f"  QUOTABLE: {r['is_a_quotable_return']}")
-    print(f"  spot proxy: {r['spot_proxy']}")
-    for line in r["why_not_quotable"].split(", "):
-        print(f"    {line}")
+    print(f"  spot source: {r['spot_source']}")
+    for line in (r["why_not_quotable"] or "").split(", "):
+        if line:
+            print(f"    {line}")
     print("  " + "!" * 66)
+    print("\n  CORPUS THIS WAS COMPUTED FROM")
+    for series in r["corpus_health"]["series"]:
+        print(f"    {series['name']:9s} n={series['rows']:5d}  "
+              f"last {series['last']}  sha {series['sha256'][:16]}…")
+    if r["corpus_health"]["interior_holes"]:
+        print(f"    ! {len(r['corpus_health']['interior_holes'])} interior "
+              "hole(s) — days one series has and another does not")
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(r, handle, indent=2)
