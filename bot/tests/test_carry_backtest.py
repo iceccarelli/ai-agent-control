@@ -90,12 +90,16 @@ class TestTheBasisIsRealPnL:
 class TestItRefusesToBeQuoted:
     def test_quotability_is_earned_not_assumed(self, report):
         """0018 hardcoded False because Bitstamp USD was the only spot series.
-        0020 made quotability track provenance: it is True only when the spot
-        leg is the SAME venue and SAME quote currency as the perp. Asserting
-        False forever would have made the tool lie once real data arrived."""
-        _series, _label, quotable = cb.resolve_spot(REPO)
-        assert report["is_a_quotable_return"] is quotable
-        if quotable:
+        0020 made quotability track provenance alone. 0031 makes it STRICTER:
+        same venue and quote currency is still required, and no longer
+        sufficient. Quotable implies every condition in the report; the old
+        provenance condition is one of them."""
+        _series, _label, same_venue = cb.resolve_spot(REPO)
+        conditions = report["quotable_conditions"]
+        assert conditions["same_venue_same_quote_spot"] is same_venue
+        assert report["is_a_quotable_return"] is all(conditions.values())
+        if report["is_a_quotable_return"]:
+            assert same_venue
             assert "BINANCE" in report["spot_source"]
             assert "USDT" in report["spot_source"]
 
@@ -108,12 +112,15 @@ class TestItRefusesToBeQuoted:
                 or "BITSTAMP" in report["spot_source"])
 
     def test_a_proxy_source_explains_itself(self, report):
-        """Only a non-quotable run owes an explanation."""
+        """Only a non-quotable run owes an explanation, and it must name every
+        unmet condition. A proxy spot leg still has to say venue AND currency."""
         if report["is_a_quotable_return"]:
             assert report["why_not_quotable"] == ""
         else:
             why = report["why_not_quotable"].lower()
-            assert "venue" in why and "currency" in why
+            assert why
+            if not report["quotable_conditions"]["same_venue_same_quote_spot"]:
+                assert "venue" in why and "currency" in why
 
     def test_what_is_not_modelled_is_listed(self, report):
         joined = " ".join(report["not_modelled"]).lower()
@@ -171,9 +178,14 @@ class TestSpotProvenanceDecidesQuotability:
                 assert not ("BINANCE_SPOT_BTC_USDT" in path)
 
     def test_quotability_tracks_the_source_actually_used(self, report):
-        _series, _label, quotable = cb.resolve_spot(REPO)
-        assert report["is_a_quotable_return"] is quotable
-        assert report["basis_is_a_proxy"] is (not quotable)
+        """Provenance is still tracked exactly; it is now a necessary
+        condition for quotability rather than the whole of it."""
+        _series, _label, same_venue = cb.resolve_spot(REPO)
+        assert report["quotable_conditions"]["same_venue_same_quote_spot"] \
+            is same_venue
+        assert report["basis_is_a_proxy"] is (not same_venue)
+        if not same_venue:
+            assert report["is_a_quotable_return"] is False
 
 
 class TestTheOpenBarIsRefused:
@@ -268,3 +280,158 @@ class TestStructuralDefectsRefuseTheBacktest:
         assert "NOT_MONOTONIC" in cb.STRUCTURAL_DEFECTS
         assert not any("STALE" in d for d in cb.STRUCTURAL_DEFECTS), \
             "staleness must not refuse a frozen research corpus"
+
+
+# ---------------------------------------------------------------------------
+# 0031 — the attribution identity and the stricter definition of quotable
+# ---------------------------------------------------------------------------
+
+def _synthetic(prices_perp, prices_spot, rate=0.0):
+    """Daily series and one funding print per day at 00:00 UTC."""
+    start = dt.date(2024, 1, 1)
+    days = [start + dt.timedelta(days=i) for i in range(len(prices_perp))]
+    perp = dict(zip(days, prices_perp))
+    spot = dict(zip(days, prices_spot))
+    ftimes = [int(dt.datetime.combine(d, dt.time(),
+                                      dt.timezone.utc).timestamp() * 1000)
+              for d in days]
+    return perp, spot, ftimes, [rate] * len(days)
+
+
+class TestTheAttributionSumsToNet:
+    TERMS = ("funding_usd", "basis_usd", "fees_usd", "borrow_usd",
+             "impact_usd", "other_usd")
+
+    def test_the_report_attribution_sums_to_net(self, report):
+        a = report["attribution"]
+        assert sum(a[t] for t in self.TERMS) == pytest.approx(a["net_usd"],
+                                                              abs=1e-6)
+        assert a["residual_usd"] == pytest.approx(0.0, abs=1e-6)
+        assert a["net_usd"] == pytest.approx(report["net_usd"], abs=1e-6)
+
+    def test_costs_are_signed_as_costs(self, report):
+        a = report["attribution"]
+        assert a["fees_usd"] <= 0 and a["borrow_usd"] <= 0
+        assert a["impact_usd"] <= 0
+
+    def test_every_trade_sums_to_its_net(self, report):
+        for t in report["trade_log"]:
+            parts = (t["funding"] + t["basis"] - t["fees"] - t["borrow"]
+                     - t["impact"] + t["other"])
+            assert parts == pytest.approx(t["net"], abs=0.02)   # rounded to cents
+
+    def test_the_basis_is_the_sum_of_the_two_price_legs(self, report):
+        """Long spot + short perp. The price terms of the two legs are
+        reported separately and must add up to the basis exactly — the price
+        itself cancels, and this is where that is shown rather than asserted."""
+        a = report["attribution"]
+        assert (a["spot_leg_price_usd"] + a["perp_leg_price_usd"]) == \
+            pytest.approx(a["basis_usd"], abs=1e-6)
+
+    def test_the_cli_prints_the_identity(self, capsys):
+        cb.main(["--repo", REPO])
+        out = capsys.readouterr().out
+        assert "ATTRIBUTION" in out
+        assert "= NET" in out
+        assert "residual" in out
+        assert "impact" in out
+
+
+class TestAPurePriceMoveIsFlat:
+    def test_a_random_walk_with_zero_basis_books_no_price_pnl(self):
+        import random
+        rng = random.Random(7)
+        px = [50_000.0]
+        for _ in range(299):
+            px.append(px[-1] * (1 + rng.gauss(0, 0.03)))
+        perp, spot, ft, fr = _synthetic(px, px, rate=0.0)
+        r = cb.simulate_series(perp=perp, spot=spot, ftimes=ft, frates=fr,
+                               notional=100_000.0, borrow_apr=0.0,
+                               entry_bps=-1.0)
+        assert r["trades"] >= 1
+        assert r["attribution"]["basis_usd"] == pytest.approx(0.0, abs=1e-6)
+        assert r["net_usd"] == pytest.approx(-r["fees_usd"], abs=1e-6)
+
+    def test_a_stable_basis_through_a_big_move_is_flat_within_basis_times_move(self):
+        """Price doubles; basis holds at +10 bps. The book may move by the
+        basis times the move (the dollar basis widens with price), never by
+        the move itself."""
+        b = 10.0
+        spot_px = [50_000.0 * (1 + i / 99.0) for i in range(100)]   # 50k -> 100k
+        perp_px = [p * (1 + b / 1e4) for p in spot_px]
+        perp, spot, ft, fr = _synthetic(perp_px, spot_px, rate=0.0)
+        r = cb.simulate_series(perp=perp, spot=spot, ftimes=ft, frates=fr,
+                               notional=100_000.0, borrow_apr=0.0,
+                               entry_bps=-1.0)
+        move = abs(spot_px[-1] / spot_px[0] - 1.0)
+        tolerance = 100_000.0 * (b / 1e4) * move * 1.01
+        assert abs(r["attribution"]["basis_usd"]) <= tolerance
+        assert abs(r["attribution"]["basis_usd"]) < 0.01 * 100_000.0 * move
+
+    def test_constant_funding_is_income_and_nothing_else(self):
+        px = [60_000.0] * 30
+        perp, spot, ft, fr = _synthetic(px, px, rate=0.0001)   # 1 bp per print
+        r = cb.simulate_series(perp=perp, spot=spot, ftimes=ft, frates=fr,
+                               notional=100_000.0, borrow_apr=0.0,
+                               entry_bps=-1.0)
+        a = r["attribution"]
+        assert a["basis_usd"] == pytest.approx(0.0, abs=1e-9)
+        assert a["funding_usd"] > 0
+        assert a["net_usd"] == pytest.approx(a["funding_usd"] + a["fees_usd"],
+                                             abs=1e-6)
+
+
+class TestDailyClosesAreNotQuotable:
+    def test_the_daily_run_is_not_quotable(self, report):
+        """Rule 19: no quotable return while settlement is a daily close."""
+        assert report["is_a_quotable_return"] is False
+        assert report["quotable_conditions"]["settlement_clock_basis"] is False
+        assert report["quotable_conditions"]["impact_haircut_applied"] is False
+
+    def test_the_explanation_names_the_clock_and_the_impact(self, report):
+        why = report["why_not_quotable"].lower()
+        assert "settlement" in why and "impact" in why
+
+    def test_the_gated_run_is_named_in_sample(self):
+        g = cb.simulate(REPO, gated=True)
+        assert g["is_a_quotable_return"] is False
+        assert g["quotable_conditions"]["rule_scored_on_an_untouched_window"] \
+            is False
+        assert "in-sample" in g["why_not_quotable"].lower()
+
+    def test_the_ungated_run_says_the_engine_does_not_run_it(self, report):
+        assert report["quotable_conditions"]["rule_is_what_the_engine_runs"] \
+            is False
+
+    def test_the_cli_prints_every_condition(self, capsys):
+        cb.main(["--repo", REPO])
+        out = capsys.readouterr().out
+        for name in cb.QUOTABLE_CONDITIONS:
+            assert name in out
+
+
+class TestOnlyClosedTradesAreCounted:
+    def test_the_open_trade_is_flagged(self, report):
+        flagged = [t for t in report["trade_log"] if t["open_at_end"]]
+        assert len(flagged) <= 1
+        assert report["closed_trades"] == report["trades"] - len(flagged)
+
+    def test_closed_and_marked_are_reported_separately(self, report):
+        assert report["closed_net_usd"] + report["open_at_end_marked_usd"] == \
+            pytest.approx(report["net_usd"], abs=1e-6)
+
+
+class TestTheProxyIsKilled:
+    def test_bitstamp_is_not_a_spot_source(self):
+        """Kill Bitstamp-USD as the basis proxy for any allocator-facing number."""
+        for path, _label, _q in cb.SPOT_SOURCES:
+            assert "BITSTAMP" not in path.upper()
+
+    def test_each_helper_is_defined_once(self):
+        import ast
+        with open(os.path.join(REPO, "tools", "carry_backtest.py"),
+                  encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        names = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
+        dupes = sorted({n for n in names if names.count(n) > 1})
+        assert dupes == [], f"defined twice: {dupes}"
