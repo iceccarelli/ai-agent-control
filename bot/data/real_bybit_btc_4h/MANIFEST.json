@@ -1,0 +1,76 @@
+{
+ "bar_seconds": 14400,
+ "files": {
+  "funding/BYBIT_LINEAR_BTC_USDT_FUNDING.csv.gz": {
+   "derived_from": "research/exchange_study/bybit/funding_BTCUSDT.json.gz",
+   "first_timestamp": "2022-06-29T08:00:00+00:00",
+   "interval_seconds": 28800,
+   "kind": "funding",
+   "last_timestamp": "2026-09-09T08:00:00+00:00",
+   "rows": 4600,
+   "sha256": "fe3740698b94dcae1fae01656c97c451306d410fee5f4a30c5ab588fad6f5f20",
+   "sha256_uncompressed": "8fbe00f6702de1db03be5ea17375084c383bdc8ce8ddfb38f293f6932d4d9546",
+   "size_bytes": 39700
+  },
+  "ohlcv/BYBIT_LINEAR_BTC_USDT_4H.csv.gz": {
+   "derived_from": "research/exchange_study/bybit/linear_BTCUSDT_240.json.gz",
+   "first_timestamp": "2022-08-01T12:00:00.0000000Z",
+   "interval_seconds": 14400,
+   "kind": "ohlcv",
+   "last_timestamp": "2026-09-09T04:00:00.0000000Z",
+   "open_bars_dropped": [
+    "2026-09-09T08:00:00.0000000Z"
+   ],
+   "rows": 8999,
+   "sha256": "f29d1fed91b55defc07df077cad5f383c917b022a61285b0caff08195bd2e35b",
+   "sha256_uncompressed": "6d8ec4a20f453662455e1a1bb5b58dfb62fc3818a377bf4285b142e3975a6b19",
+   "size_bytes": 250577
+  },
+  "ohlcv/BYBIT_SPOT_BTC_USDT_4H.csv.gz": {
+   "derived_from": "research/exchange_study/bybit/spot_BTCUSDT_240.json.gz",
+   "first_timestamp": "2022-08-01T12:00:00.0000000Z",
+   "interval_seconds": 14400,
+   "kind": "ohlcv",
+   "last_timestamp": "2026-09-09T04:00:00.0000000Z",
+   "open_bars_dropped": [
+    "2026-09-09T08:00:00.0000000Z"
+   ],
+   "rows": 8999,
+   "sha256": "6c8e45a0c29fbfe0ab55c105abf3ff9fce20311a5be818b507b31a692c09d1e1",
+   "sha256_uncompressed": "d8736429ccd140d31a65608d3f9ab04f429d5dc791f09c4b325bac9ecccbc3d5",
+   "size_bytes": 276869
+  }
+ },
+ "generator": "tools/promote_bybit_study_set.py",
+ "price_at_settlement": "the CLOSE of the 4h bar that ENDS at the settlement instant (opens 4h before it) \u2014 the same convention as tools/fetch_settlement_klines.py (0027)",
+ "products": [
+  "spot",
+  "linear"
+ ],
+ "schema": "coinapi_flat/1 (ohlcv); binance_funding/1 (funding)",
+ "source": {
+  "endpoints": [
+   "GET /v5/market/kline category=spot interval=240",
+   "GET /v5/market/kline category=linear interval=240",
+   "GET /v5/market/funding/history category=linear"
+  ],
+  "fetched_by": "0028 venue study (tools/venue_study.py)",
+  "note": "the study set records no per-file fetch time; its ticker snapshot is the latest instant the set can vouch for, and every bar must have closed before it",
+  "observed_by": "research/exchange_study/bybit/tickers_linear.json.gz (result.time)",
+  "observed_utc": "2026-09-09T10:43:53.0000000Z",
+  "sha256_of_source_files": {
+   "funding_BTCUSDT.json.gz": "4faa404c5f2a751cd9fbb5df7fe1f58eb30b3c4bfcc45c97ea3bbb33cb5a12e8",
+   "linear_BTCUSDT_240.json.gz": "ab5ccc96aea6106ca64c3cdf775a58dff773d3334c91d767e29bc3a830460f7d",
+   "spot_BTCUSDT_240.json.gz": "59f9b94269cb716f36ea9aada353aa3c84129a72cfb2f3d504228b774c5e0a01",
+   "tickers_linear.json.gz": "566bfed18302412e70e19d6d5dc612efbf74eae6f6ac703529aabc1d93a3c738"
+  },
+  "study_set": "research/exchange_study/bybit"
+ },
+ "symbols": [
+  "BTCUSDT"
+ ],
+ "synthetic": false,
+ "trades_count": "not published by Bybit klines; left blank",
+ "venue": "bybit",
+ "warning": "REAL exchange data. A frozen record, like every corpus in this tree (docs/human/CORPUS_POLICY.md). Reads are recorded in artifacts/data_read_ledger.json."
+}
