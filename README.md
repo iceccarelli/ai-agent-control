@@ -8,6 +8,11 @@ makes money. Everything in here is subordinate to that.
 
 **Status: the executor is built and tested. It has never touched an exchange.**
 
+> **Bytes beat this README.** `bot/docs/human/INVENTORY.md` lists what `main.py`
+> actually wires, which lines below are stale, and every defect found by
+> running the carry path against a stub venue. Read it before this file.
+> `python3 bot/tools/session_tail.py` prints the four invariants from the tree.
+
 ---
 
 ## Quick start
@@ -18,7 +23,7 @@ cd ai-agent-control
 python3 -m venv .venv && . .venv/bin/activate
 pip install "requests<3" "numpy<3" "pytest>=8" "scipy<2" "scikit-learn<2"
 ./scripts/install-hooks.sh
-./scripts/verify.sh              # must print: 5162 passed, 2 skipped
+./scripts/verify.sh              # prints the count AND writes a receipt; quote only that
 ```
 
 Run the book against no venue:
@@ -27,6 +32,9 @@ Run the book against no venue:
 cd bot
 BOOK_MODE=carry USE_TESTNET=1 PAPER_TRADING=1 python3 main.py
 ```
+
+(INVENTORY §4 D2: `PAPER_TRADING` does not gate the carry broker before
+0033. Without 0033 this line is false.)
 
 Check venue reachability:
 
