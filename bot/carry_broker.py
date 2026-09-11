@@ -275,6 +275,35 @@ class CarryBroker:
             raise PairIncident(f"funding for {symbol} is {raw!r}")
         return rate * 1e4
 
+    def get_funding_print(self, symbol: str) -> Tuple[float, int]:
+        """The last SETTLED funding print: (rate in bps, settlement epoch ms).
+
+        Not the ticker. The ticker's fundingRate is the rate for the NEXT
+        settlement — a forecast (INVENTORY F6). What the short leg was paid or
+        charged is the settled record, and its stamp is what lets the engine
+        tell a new print from the same one read sixty times.
+
+        Raises when unreadable, like every read the book decides on.
+        """
+        result = self.client._request(
+            "GET", "/v5/market/funding/history",
+            params={"category": LINEAR, "symbol": symbol, "limit": 1})
+        rows = (result or {}).get("list") or []
+        if not rows:
+            raise PairIncident(f"no settled funding print for {symbol}")
+        row = rows[0]
+        try:
+            rate = float(row["fundingRate"])
+            stamp = int(row["fundingRateTimestamp"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"settled funding print for {symbol} is malformed: {row!r}"
+            ) from exc
+        if not math.isfinite(rate) or stamp <= 0:
+            raise PairIncident(
+                f"settled funding print for {symbol} is unusable: {row!r}")
+        return rate * 1e4, stamp
+
     # -- reconciliation ---------------------------------------------------
 
     def reconcile_pair(self, *, spot_symbol: str, perp_symbol: str,

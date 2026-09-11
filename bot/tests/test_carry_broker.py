@@ -254,11 +254,13 @@ class TestItDrivesTheEngine:
         eng.snapshot = MarketSnapshot(perp_mark=100_000.0, spot_mark=100_000.0,
                                       funding_bps=3.0, margin_multiple=5.0,
                                       observed_at_s=time.time())
-        for _ in range(2):   # warm the EWMA
-            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0)
+        h8 = 8 * 3600 * 1000     # 0034: each warm-up call is a settled print
+        for k in (1, 2):   # warm the EWMA
+            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0,
+                          funding_print_ms=k * h8)
         client.created.clear()
         decision = eng.on_candle(mark=100_000.0, funding_bps=3.0,
-                                 spot=100_000.0)
+                                 spot=100_000.0, funding_print_ms=3 * h8)
         assert decision.acted is True
         assert eng.state is BookState.HEDGED
         assert len(client.created) == 2

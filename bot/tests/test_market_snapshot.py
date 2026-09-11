@@ -57,6 +57,13 @@ class FakeBroker:
             raise RuntimeError("no position row")
         return self.margin
 
+    def get_funding_print(self, s):
+        # 0034: the settled print and its stamp; the latest settlement.
+        if self.boom == "print":
+            raise RuntimeError("no funding history")
+        h8 = 8 * 3600 * 1000
+        return (self.funding, int(time.time() * 1000) // h8 * h8)
+
     def get_venue_time_s(self):
         if self.venue_time is None:
             raise RuntimeError("no server time")

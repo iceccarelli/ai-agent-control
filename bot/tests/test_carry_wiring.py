@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from unittest import mock
 
 import pytest
@@ -75,6 +76,13 @@ class _Broker:
     def get_margin_multiple(self, symbol):
         return 5.0
 
+    def get_funding_print(self, symbol):
+        # 0034: the latest SETTLED print, stamped at the last settlement.
+        if self.raises == "funding":
+            raise RuntimeError("no funding history")
+        h8 = 8 * 3600 * 1000
+        return (self.funding, int(time.time() * 1000) // h8 * h8)
+
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((symbol, side, qty, product))
         return {"filled_qty": qty, "avg_price": self.mark,
@@ -93,9 +101,12 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
     bot.carry.pair_risk = CarryRisk(max_notional_usd=100_000.0)
     # Warm the EWMA: the engine refuses below three prints rather than
     # falling back to the last one.
-    for _ in range(2):
+    # 0034: two earlier SETTLED prints; the tick reads the latest one.
+    h8 = 8 * 3600 * 1000
+    latest = int(time.time() * 1000) // h8 * h8
+    for k in (2, 1):
         bot.carry.on_candle(mark=broker.mark, funding_bps=warm_bps,
-                            spot=broker.mark)
+                            spot=broker.mark, funding_print_ms=latest - k * h8)
     bot.strategy = None
     bot.store = _Store()
     bot._stop = mock.Mock(is_set=lambda: False)

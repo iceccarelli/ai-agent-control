@@ -70,7 +70,15 @@ class _Wired(CarryEngine):
     build. The refusals themselves are tested in test_carry_fail_closed.py.
     """
 
-    def on_candle(self, *, mark, funding_bps, spot=None, timestamp_ms=0):
+    #: 0034: every candle in THIS file is one settled funding print — that
+    #: is what these tests have always meant by "a print". The engine now
+    #: needs the print's settlement stamp to tell a print from a tick, so the
+    #: fixture supplies one per candle, eight hours apart. What a TICK does
+    #: (the same stamp again) is tested in test_carry_funding_prints.py.
+    _H8 = 8 * 3600 * 1000
+
+    def on_candle(self, *, mark, funding_bps, spot=None, timestamp_ms=0,
+                  funding_print_ms=None):
         import math
         import time
         usable = (spot is not None and isinstance(mark, (int, float))
@@ -79,8 +87,12 @@ class _Wired(CarryEngine):
             perp_mark=mark, spot_mark=spot, funding_bps=funding_bps,
             margin_multiple=float(getattr(self.broker, "margin", 5.0)),
             observed_at_s=time.time()) if usable else None
+        if funding_print_ms is None:
+            self._stamp = getattr(self, "_stamp", 0) + self._H8
+            funding_print_ms = self._stamp
         return super().on_candle(mark=mark, funding_bps=funding_bps,
-                                 spot=spot, timestamp_ms=timestamp_ms)
+                                 spot=spot, timestamp_ms=timestamp_ms,
+                                 funding_print_ms=funding_print_ms)
 
 
 def engine(broker, *, primed=True, **kw):

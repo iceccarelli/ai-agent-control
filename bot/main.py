@@ -457,17 +457,22 @@ class TradingBot:
                     "NOT touched and no order is sent", exc)
                 return
             mark, spot = view.perp_mark, view.spot_mark
-            funding_bps = view.funding_bps
             self.carry.snapshot = view
+            # The SETTLED print and its stamp, not the ticker's forecast
+            # (0034). The loop ticks every LOOP_INTERVAL_SECONDS; a print
+            # happens every eight hours. The stamp is how the engine tells
+            # them apart.
             decision = self.carry.on_candle(
-                mark=mark, funding_bps=funding_bps, spot=spot,
-                timestamp_ms=int(time.time() * 1000))
+                mark=mark, funding_bps=view.funding_print_bps, spot=spot,
+                timestamp_ms=int(time.time() * 1000),
+                funding_print_ms=view.funding_print_ms)
             logger.info(
                 "carry: %s (%s) state=%s perp=%.2f spot=%.2f "
-                "basis=%.1fbps funding=%.3fbps %s",
+                "basis=%.1fbps settled=%.3fbps@%s predicted=%.3fbps %s",
                 decision.action, decision.reason, decision.state.value,
-                mark, spot, (mark / spot - 1.0) * 1e4, funding_bps,
-                decision.detail or "")
+                mark, spot, (mark / spot - 1.0) * 1e4,
+                view.funding_print_bps, view.funding_print_ms,
+                view.funding_bps, decision.detail or "")
             if decision.state.name == "HALTED":
                 logger.critical(
                     "carry book HALTED — a human must clear it: %s",

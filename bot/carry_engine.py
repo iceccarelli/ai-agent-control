@@ -226,6 +226,10 @@ class CarryEngine:
         #: pair gate judges the SAME observation the entry decision used.
         self.snapshot: Optional[Any] = None
         self._funding_history: List[float] = []
+        #: Settlement stamp (epoch ms) of the last funding PRINT recorded. A
+        #: call to on_candle is a TICK; a print is an event with a stamp, and
+        #: only a stamp newer than this one is a new print (0034, INVENTORY D1).
+        self._last_print_ms: Optional[int] = None
         #: The last exception a leg raised, so a refusal can name it. A leg
         #: that fails for a reason nobody can read is a leg that fails again.
         self._last_leg_error: str = ""
@@ -234,8 +238,18 @@ class CarryEngine:
 
     def on_candle(self, *, mark: float, funding_bps: float,
                   spot: Optional[float] = None,
-                  timestamp_ms: int = 0) -> CarryDecision:
-        """One closed bar. Act or state why not. This is the entire loop.
+                  timestamp_ms: int = 0,
+                  funding_print_ms: Optional[int] = None) -> CarryDecision:
+        """One tick. Act or state why not. This is the entire loop.
+
+        `funding_bps` is the rate of the SETTLED print stamped
+        `funding_print_ms`. A tick is not a print: main.tick calls this every
+        LOOP_INTERVAL_SECONDS, and until 0034 every call was booked as a print
+        (60 ticks at 1 bps on $100 booked $0.60; one print is $0.01), counted
+        toward the negative streak, and fed the EWMA. Now only a stamp newer
+        than the last one is a print. No stamp, no print: nothing is booked,
+        and the warm-up cannot complete, so the book cannot open on a rate it
+        cannot place in time.
 
         Order is not cosmetic. Liquidation headroom is checked before anything
         else because a margin call does not wait for the funding decision, and
@@ -250,11 +264,16 @@ class CarryEngine:
             return self._halt("MARK_UNREADABLE",
                               "a book that cannot be marked cannot be hedged")
 
-        # Every print is recorded whether or not the book acts on it. The EWMA
-        # is only meaningful if the history is complete, and a gap because
-        # "nothing happened that day" is exactly the kind of missing data that
-        # makes a smoother lie.
-        if self._finite(funding_bps):
+        # Every PRINT is recorded whether or not the book acts on it — once.
+        # The EWMA is only meaningful if the history is complete, and equally
+        # meaningless if one print is counted sixty times.
+        new_print = (funding_print_ms is not None
+                     and self._finite(funding_bps)
+                     and self._finite(funding_print_ms)
+                     and (self._last_print_ms is None
+                          or int(funding_print_ms) > self._last_print_ms))
+        if new_print:
+            self._last_print_ms = int(funding_print_ms)
             self._funding_history.append(float(funding_bps))
             del self._funding_history[:-self.FUNDING_HISTORY]
 
@@ -267,20 +286,29 @@ class CarryEngine:
             if drift > self.delta_band:
                 return self._rebalance(mark, drift)
 
-            if funding_bps < 0:
-                self.position.negative_funding_streak += 1
-                if (self.position.negative_funding_streak
-                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
-                    return self._unwind(mark, "FUNDING_INVERTED")
-            else:
-                self.position.negative_funding_streak = 0
+            # A print the pair was HELD through: its stamp is after the open.
+            # The print that triggered the entry, or a late record of an
+            # older settlement, was not earned by this position.
+            held = new_print and int(funding_print_ms) > self.position.opened_ms
+            if held:
+                # Booked SIGNED. Until 0034 a negative print was paid and never
+                # booked, so funding_collected overstated what the book earned
+                # (INVENTORY D10).
                 self.position.funding_collected += (
                     funding_bps / 1e4) * self.position.perp.notional
+                if funding_bps < 0:
+                    self.position.negative_funding_streak += 1
+                    if (self.position.negative_funding_streak
+                            >= NEGATIVE_FUNDING_EXIT_PRINTS):
+                        return self._unwind(mark, "FUNDING_INVERTED")
+                else:
+                    self.position.negative_funding_streak = 0
 
             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
                                  state=BookState.HEDGED,
                                  detail={"delta_fraction": drift,
                                          "funding_bps": funding_bps,
+                                         "new_print": bool(held),
                                          "collected": self.position.funding_collected})
 
         # THE GATES (0019/0021). Before this, the engine opened on ONE

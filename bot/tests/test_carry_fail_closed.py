@@ -24,6 +24,14 @@ from market_snapshot import MarketSnapshot  # noqa: E402
 
 REPO = os.path.join(os.path.dirname(__file__), "..")
 MARK = 100_000.0
+H8 = 8 * 3600 * 1000
+_STAMP = [0]
+
+
+def _print_ms():
+    """0034: a new settled-print stamp per candle (8h apart)."""
+    _STAMP[0] += H8
+    return _STAMP[0]
 
 
 class Venue:
@@ -56,7 +64,8 @@ def warmed(engine):
     gate, view = engine.pair_risk, engine.snapshot
     engine.pair_risk, engine.snapshot = None, None
     for _ in range(2):
-        engine.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        engine.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
     engine.pair_risk, engine.snapshot = gate, view
     return engine
 
@@ -73,19 +82,22 @@ def engine(venue, *, gate=True, view=True, **kw):
 class TestNoFirstLegWithoutTheGateAndTheView:
     def test_a_wired_engine_opens(self):
         v = Venue()
-        d = engine(v).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        d = engine(v).on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert d.action == "opened" and len(v.orders) == 2
 
     def test_no_pair_gate_no_leg(self):
         v = Venue()
-        d = engine(v, gate=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        d = engine(v, gate=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert d.acted is False
         assert d.reason == "PAIR_GATE_ABSENT"
         assert v.orders == []
 
     def test_no_snapshot_no_leg(self):
         v = Venue()
-        d = engine(v, view=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        d = engine(v, view=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert d.reason == "SNAPSHOT_ABSENT"
         assert v.orders == []
 
@@ -95,7 +107,8 @@ class TestNoFirstLegWithoutTheGateAndTheView:
         v = Venue()
         e = engine(v)
         e.snapshot = snap(perp=MARK * 1.001)
-        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert d.reason == "SNAPSHOT_MISMATCH"
         assert v.orders == []
 
@@ -233,7 +246,8 @@ class TestPaperMeansNoCarryOrder:
         e = bot.carry
         e.snapshot = snap()
         warmed(e)
-        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert d.acted is False
         assert "PAPER" in str(d.detail.get("error", ""))
 
@@ -274,7 +288,8 @@ class TestAFeeIsKnownOrItIsUnknown:
     def test_the_engine_keeps_unknown_as_unknown(self):
         v = Venue()
         e = engine(v)
-        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert e.position.spot.fee is None
         assert e.position.perp.fee is None
 
@@ -305,7 +320,8 @@ class TestABrokenPairCannotThrash:
         e = engine(v)
         for _ in range(10):
             e.snapshot = snap()
-            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         spot = [o for o in v.orders if o[1] == "spot"]
         assert spot == [("Buy", "spot"), ("Sell", "spot")]
         assert e.state is BookState.FLAT
@@ -313,7 +329,8 @@ class TestABrokenPairCannotThrash:
     def test_a_broken_pair_is_not_recorded_as_an_entry(self):
         v = Venue(reject={"linear"})
         e = engine(v)
-        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert e.pair_risk._entries == []
         assert len(e.pair_risk._broken) == 1
 
@@ -331,5 +348,6 @@ class TestRecordEntryOnlyAfterBothLegs:
     def test_only_a_landed_pair_is_an_entry(self, reject, expected):
         v = Venue(reject=set(reject))
         e = engine(v)
-        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=_print_ms())
         assert len(e.pair_risk._entries) == expected

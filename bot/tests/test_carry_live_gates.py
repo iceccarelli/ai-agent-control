@@ -46,7 +46,8 @@ class Broker:
         self.mark, self.funding, self.margin = mark, funding, margin
         self.spot = mark if spot is None else spot
         self.orders = []
-        self.reads = {"mark": 0, "spot": 0, "funding": 0, "margin": 0}
+        self.reads = {"mark": 0, "spot": 0, "funding": 0, "margin": 0,
+                      "print": 0}
 
     def get_mark(self, s):
         self.reads["mark"] += 1
@@ -64,9 +65,21 @@ class Broker:
         self.reads["margin"] += 1
         return self.margin
 
+    def get_funding_print(self, s):
+        # 0034: the latest settled print, stamped at the last settlement.
+        self.reads["print"] += 1
+        return (self.funding, latest_settlement_ms())
+
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((side, product))
         return {"filled_qty": qty, "avg_price": self.mark, "order_link_id": "x"}
+
+
+H8 = 8 * 3600 * 1000
+
+
+def latest_settlement_ms():
+    return int(time.time() * 1000) // H8 * H8
 
 
 def bot_with(broker, *, store=None, warm=3.0, risk=True):
@@ -85,9 +98,11 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
                             borrow_apr=0.05)
     if risk:
         bot.carry.pair_risk = CarryRisk(store=store, max_notional_usd=100.0)
-    for _ in range(2):
+    # 0034: two earlier SETTLED prints; the tick then reads the latest one.
+    for k in (2, 1):
         bot.carry.on_candle(mark=broker.mark, funding_bps=warm,
-                            spot=broker.spot)
+                            spot=broker.spot,
+                            funding_print_ms=latest_settlement_ms() - k * H8)
     return bot
 
 
