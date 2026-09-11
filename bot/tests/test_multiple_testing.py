@@ -140,6 +140,21 @@ class TestDeflatedSharpe:
         with pytest.raises(ValueError):
             ds.deflated_sharpe_ratio([0.1] * 30, n_trials=5)
 
+    @pytest.mark.parametrize("value,n", [(0.1, 30), (1 / 3, 7), (0.7, 11),
+                                         (1e-9, 100), (-0.3, 13), (2.675, 5)])
+    def test_a_constant_series_is_refused_on_every_interpreter(self, value, n):
+        """The Dockerfile runs python:3.11. `sum()` there is plain left-to-right
+        float addition; 3.12 switched to compensated summation. So the mean of
+        [0.1]*30 is 0.10000000000000005 on 3.11 and exactly 0.1 on 3.12, the
+        "variance" of a constant series is 5e-32 on one and 0.0 on the other,
+        and the zero-variance refusal fired on the developer's box but not in
+        the image that would run it. A refusal that depends on the interpreter
+        is not a refusal."""
+        with pytest.raises(ValueError):
+            ds.sharpe_from_returns([value] * n)
+        with pytest.raises(ValueError):
+            ds.deflated_sharpe_ratio([value] * n, n_trials=5)
+
 
 class TestMinimumTrackRecord:
     def test_weaker_sharpe_needs_a_longer_record(self):

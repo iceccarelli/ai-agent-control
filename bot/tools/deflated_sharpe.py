@@ -161,6 +161,13 @@ def sharpe_from_returns(returns: Sequence[float]) -> float:
     n = len(returns)
     if n < 2:
         raise ValueError("need at least 2 observations")
+    # Decided on the VALUES, not on the arithmetic. `sum()` is plain float
+    # addition on python 3.11 (the Dockerfile's interpreter) and compensated
+    # summation on 3.12+, so a constant series has a variance of ~5e-32 on one
+    # and exactly 0.0 on the other. A refusal that depends on the interpreter
+    # fired on the developer's box and not in the image.
+    if max(returns) == min(returns):
+        raise ValueError("zero variance: Sharpe undefined")
     mean = sum(returns) / n
     var = sum((r - mean) ** 2 for r in returns) / (n - 1)
     if var <= 0:
