@@ -42,6 +42,7 @@ Check venue reachability:
 
 ```bash
 python3 tools/connector_check.py
+python3 tools/connector_check.py --require-bybit-testnet   # exit 2 unless every carry read is 200
 ```
 
 From Codespaces this returns Bybit 403 / Binance fapi 451. That is expected and

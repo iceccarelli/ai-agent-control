@@ -149,3 +149,11 @@ per leg after dropping one open bar; 4,600 prints). Result and sha256s:
 | this session's sandbox | 0 (egress denied) | 0 | 0 | 0 |
 
 `connector_check.py` has never returned `BYBIT_TESTNET_OK` from any host.
+Since 0035 it probes every public read the carry book makes on testnet and
+`--require-bybit-testnet` exits 2 unless all answer 200. From this session's
+sandbox: `CARRY_READS_BLOCKED`, exit 2. The first command inside the intended
+VPC is:
+
+```
+python3 bot/tools/connector_check.py --require-bybit-testnet
+```
