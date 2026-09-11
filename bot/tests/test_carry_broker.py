@@ -59,6 +59,10 @@ class FakeClient:
 
 def broker(client, **kw):
     seq = kw.pop("sequence_source", lambda product, symbol, purpose: 7)
+    # 0033: the order gate is a required argument. These tests exercise the
+    # adapter against a fake venue that is allowed to receive orders; the
+    # gate's refusals are tested in test_carry_fail_closed.py.
+    kw.setdefault("order_gate", lambda: (True, "TEST_VENUE"))
     return CarryBroker(client=client, sequence_source=seq, **kw)
 
 
@@ -237,9 +241,19 @@ class TestItDecidesNothing:
 class TestItDrivesTheEngine:
     def test_the_engine_opens_a_pair_through_this_adapter(self):
         """End to end: CarryEngine + CarryBroker + a venue."""
+        import time
         from carry_engine import BookState, CarryEngine
+        from carry_risk import CarryRisk
+        from market_snapshot import MarketSnapshot
         client = FakeClient(im=5.0, mm=1.0)
-        eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0)
+        # 0033: borrow is required, and no first leg leaves without the pair
+        # gate and one snapshot of the marks the decision is made on.
+        eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0,
+                          borrow_apr=0.05)
+        eng.pair_risk = CarryRisk(max_notional_usd=100_000.0)
+        eng.snapshot = MarketSnapshot(perp_mark=100_000.0, spot_mark=100_000.0,
+                                      funding_bps=3.0, margin_multiple=5.0,
+                                      observed_at_s=time.time())
         for _ in range(2):   # warm the EWMA
             eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0)
         client.created.clear()

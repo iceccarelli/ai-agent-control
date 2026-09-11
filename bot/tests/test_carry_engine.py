@@ -13,6 +13,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from carry_engine import BookState, CarryEngine, DELTA_BAND  # noqa: E402
+from carry_risk import CarryRisk  # noqa: E402
+from market_snapshot import MarketSnapshot  # noqa: E402
 
 
 class FakeBroker:
@@ -57,6 +59,30 @@ class _SpotFillsThenVenueDies(FakeBroker):
 SPOT = 100_000.0
 
 
+class _Wired(CarryEngine):
+    """The engine as main.tick drives it (0033).
+
+    Since 0033 no first leg leaves without the pair gate AND one market
+    snapshot whose marks are the marks the decision used. main.tick takes that
+    snapshot and hands it over before every on_candle; this stamps one from
+    the candle's own arguments, the same way, so these tests exercise the
+    production path instead of a bare engine that production can no longer
+    build. The refusals themselves are tested in test_carry_fail_closed.py.
+    """
+
+    def on_candle(self, *, mark, funding_bps, spot=None, timestamp_ms=0):
+        import math
+        import time
+        usable = (spot is not None and isinstance(mark, (int, float))
+                  and math.isfinite(mark) and mark > 0)
+        self.snapshot = MarketSnapshot(
+            perp_mark=mark, spot_mark=spot, funding_bps=funding_bps,
+            margin_multiple=float(getattr(self.broker, "margin", 5.0)),
+            observed_at_s=time.time()) if usable else None
+        return super().on_candle(mark=mark, funding_bps=funding_bps,
+                                 spot=spot, timestamp_ms=timestamp_ms)
+
+
 def engine(broker, *, primed=True, **kw):
     """A CarryEngine ready to open.
 
@@ -73,7 +99,9 @@ def engine(broker, *, primed=True, **kw):
     `primed=False` leaves the history empty to test the warm-up itself.
     """
     kw.setdefault("max_notional_usd", 100_000.0)
-    eng = CarryEngine(broker=broker, **kw)
+    kw.setdefault("borrow_apr", 0.05)
+    eng = _Wired(broker=broker, **kw)
+    eng.pair_risk = CarryRisk(max_notional_usd=kw["max_notional_usd"])
     if primed:
         for _ in range(2):
             eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=SPOT)

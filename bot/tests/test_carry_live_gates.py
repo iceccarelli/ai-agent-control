@@ -81,7 +81,8 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
     bot.risk = mock.Mock(should_halt_trading=lambda: False,
                          update_equity=lambda e: None)
     bot.engine = mock.Mock(observe_exits=lambda: {})
-    bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0)
+    bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
+                            borrow_apr=0.05)
     if risk:
         bot.carry.pair_risk = CarryRisk(store=store, max_notional_usd=100.0)
     for _ in range(2):
@@ -166,14 +167,19 @@ class TestThePairGateRunsBeforeTheFirstLeg:
         assert not broker.orders, "the engine opened above the gate's cap"
         assert bot.carry.position is None
 
-    def test_the_gate_is_skipped_only_when_absent(self):
-        """A bare engine in a unit test may open. A wired one may not bypass."""
+    def test_an_absent_gate_is_a_refusal_not_a_skip(self):
+        """0033 INVERTED this test, deliberately. It used to assert that an
+        engine WITHOUT a pair gate opens ("a bare engine in a unit test may
+        open"). That was the bypass Phase C exists to remove: an absent gate
+        is not a pass. The assertion is now the stricter one — no gate, no
+        leg — and the refusal names itself."""
         broker = Broker()
         bot = bot_with(broker, risk=False)
         assert bot.carry.pair_risk is None
         broker.orders.clear()
         bot.tick()
-        assert len(broker.orders) == 2
+        assert broker.orders == []
+        assert bot.carry.position is None
 
 
 class TestTheDayAllowanceIsSpentOnlyOnSuccess:
@@ -205,7 +211,7 @@ class TestTheDayAllowanceIsSpentOnlyOnSuccess:
 class TestBuildBotAttachesTheGate:
     def test_carry_mode_gets_a_pair_gate(self):
         import config as _config
-        cfg = _config.load({"BOOK_MODE": "carry"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.pair_risk is not None
@@ -213,7 +219,7 @@ class TestBuildBotAttachesTheGate:
     def test_the_gate_cap_matches_the_engine_cap(self):
         import config as _config
         import shadow
-        cfg = _config.load({"BOOK_MODE": "carry"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.pair_risk.max_notional_usd == pytest.approx(

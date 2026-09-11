@@ -85,6 +85,11 @@ class CarryRisk:
         self.min_margin_multiple = float(min_margin_multiple)
         self.max_entries_per_day = int(max_entries_per_day)
         self._entries: List[dt.date] = []
+        #: Pairs where ONE leg landed and was unwound (0033, INVENTORY D4). Not
+        #: entries — record_entry stays "both legs landed" — but they paid a
+        #: round trip, and a venue that keeps rejecting the perp would
+        #: otherwise make the book buy and sell spot every tick.
+        self._broken: List[dt.date] = []
 
     def gate_open(self, *, notional_usd: float, snapshot: Any,
                   has_open_pair: bool, now: Optional[dt.datetime] = None
@@ -131,9 +136,13 @@ class CarryRisk:
                           cap=self.max_notional_usd)
 
         today = (now or dt.datetime.now(dt.timezone.utc)).date()
-        used = sum(1 for d in self._entries if d == today)
+        landed = sum(1 for d in self._entries if d == today)
+        broken = sum(1 for d in self._broken if d == today)
+        used = landed + broken
         if used >= self.max_entries_per_day:
             return _block("ENTRY_LIMIT_REACHED_TODAY", used=used,
+                          landed_pairs_today=landed,
+                          broken_pairs_today=broken,
                           limit=self.max_entries_per_day,
                           note="the backtest opened 18 pairs in four years; a "
                                "book opening twice in a day is thrashing, and "
@@ -146,8 +155,17 @@ class CarryRisk:
                              "basis_bps": getattr(snapshot, "basis_bps", None)})
 
     def record_entry(self, *, now: Optional[dt.datetime] = None) -> None:
-        """Called only after BOTH legs land. A refused or half-filled pair did
-        not consume the day's entry."""
+        """Called only after BOTH legs land. A REFUSED pair (no leg sent) did
+        not consume the day's entry. A half-filled one is recorded separately,
+        by record_broken_pair."""
         today = (now or dt.datetime.now(dt.timezone.utc)).date()
         self._entries.append(today)
         del self._entries[:-32]
+
+    def record_broken_pair(self, *, now: Optional[dt.datetime] = None) -> None:
+        """One leg landed alone and was unwound. It is not an entry; it did
+        cost a round trip, so it spends the day's allowance exactly as an
+        entry would. No new threshold: the same MAX_ENTRIES_PER_UTC_DAY."""
+        today = (now or dt.datetime.now(dt.timezone.utc)).date()
+        self._broken.append(today)
+        del self._broken[:-32]

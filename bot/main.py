@@ -639,15 +639,51 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         # misnamed dependency.
         import shadow as _shadow
 
+        # FINANCING (0033, INVENTORY D7). Read with no default and refused when
+        # absent: the engine used to fall back to its own constructor default
+        # of 5%, so an overlay on BTC the client already owns was gated as a
+        # financed book, or the reverse, with nothing in the log to say which.
+        borrow_apr = cfg.CARRY_BORROW_APR
+        if borrow_apr is None:
+            raise ValueError(
+                "BOOK_MODE=carry requires CARRY_BORROW_APR (a fraction per "
+                "year: 0.0 = an overlay on BTC already owned, 0.05 = financed "
+                "at 5%). It decides whether the carry clears its cost of "
+                "capital; refusing rather than assuming.")
+
+        # WHO MAY SEND A CARRY ORDER (0033, INVENTORY D2). The carry broker
+        # bypasses TradingEngine, so PAPER_TRADING never reached it: with
+        # USE_TESTNET=0 PAPER_TRADING=1 the process called itself SANDBOX
+        # (PAPER) and the carry broker would still have POSTed to mainnet.
+        # Asked before EVERY order, read fresh each time.
+        def _carry_orders_permitted():
+            if bool(cfg.PAPER_TRADING):
+                return (False, "PAPER_TRADING=1: the carry book has no paper "
+                               "venue")
+            if bool(cfg.USE_TESTNET):
+                return (True, "TESTNET")
+            armed, why = _config.is_live_authorized(cfg)
+            if armed is not True:
+                return (False, f"mainnet URL without live authorisation: {why}")
+            # Defence in depth: start() already refuses a live-armed process
+            # whose promotion gate is unsigned. The broker asks again, per
+            # order, so no path around start() reaches a mainnet carry order.
+            import promotion_gate as _gate
+            if _gate.promotion_gate_allows_live(config=cfg) is not True:
+                return (False, "mainnet URL: the promotion gate is not signed")
+            return (True, "LIVE (authorised, promotion gate signed)")
+
         bot.carry = CarryEngine(
             broker=CarryBroker(
                 client=bot.client,
                 sequence_source=lambda product, symbol, purpose:
-                    bot.store.next_order_seq()),
+                    bot.store.next_order_seq(),
+                order_gate=_carry_orders_permitted),
             kill_switch=bot.store.trip_kill_switch,
             spot_symbol=cfg.CARRY_SPOT_SYMBOL,
             perp_symbol=cfg.CARRY_PERP_SYMBOL,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
+            borrow_apr=float(borrow_apr),
         )
         # The pair gate. Until now max_notional_usd was the ONLY size control on
         # the carry book: the legs passed through no RiskManager at all. This is
@@ -659,9 +695,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             store=bot.store,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
         logger.warning(
-            "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f. The "
-            "directional strategy is NOT attached and will not be consulted.",
-            bot.carry.max_notional_usd)
+            "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
+            "%.4f/yr, orders: %s. The directional strategy is NOT attached "
+            "and will not be consulted.",
+            bot.carry.max_notional_usd, bot.carry.borrow_apr,
+            _carry_orders_permitted()[1])
         return bot
 
     if attach_strategy and bot.strategy is None:

@@ -30,11 +30,13 @@ Run the book against no venue:
 
 ```bash
 cd bot
-BOOK_MODE=carry USE_TESTNET=1 PAPER_TRADING=1 python3 main.py
+BOOK_MODE=carry CARRY_BORROW_APR=0.0 USE_TESTNET=1 PAPER_TRADING=1 python3 main.py
 ```
 
-(INVENTORY §4 D2: `PAPER_TRADING` does not gate the carry broker before
-0033. Without 0033 this line is false.)
+`CARRY_BORROW_APR` is required for a carry book (0.0 = overlay on BTC already
+owned). Since 0033 `PAPER_TRADING=1` refuses every carry order at the broker;
+before 0033 it did not (INVENTORY §4 D2). The testnet drill needs
+`USE_TESTNET=1 PAPER_TRADING=0`.
 
 Check venue reachability:
 
