@@ -1,0 +1,224 @@
+From 39a7be4c307d40eca600a9b120be49a7141b982f Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Fri, 11 Sep 2026 18:56:08 +0000
+Subject: [PATCH] 0035 connector_check can fail: the first command inside the
+ VPC (5508 passed)
+
+connector_check printed a verdict and exited 0 whatever it found. Inside the
+intended VPC the question is binary and a one-off task needs an exit code.
+
+  + probes every PUBLIC read the carry book makes on Bybit testnet: time,
+    linear and spot tickers, settled funding history (0034), instruments
+  + carry_reads_verdict CARRY_READS_OK | CARRY_READS_BLOCKED (+ names)
+  + --require-bybit-testnet exits 2 unless CARRY_READS_OK
+  No keys, no signed endpoints, no order/position/wallet URL (tested).
+  Without the flag it still exits 0, as before.
+
+From this session's sandbox (egress denied): CARRY_READS_BLOCKED, exit 2.
+
+Tests first: tests/test_connector_check_strict.py, 7 new (6 failed before
+the change). Existing connector tests untouched and passing.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ README.md                                |  1 +
+ bot/docs/human/INVENTORY.md              |  8 +++
+ bot/tests/test_connector_check_strict.py | 67 ++++++++++++++++++++++++
+ bot/tools/connector_check.py             | 47 ++++++++++++++---
+ 4 files changed, 117 insertions(+), 6 deletions(-)
+ create mode 100644 bot/tests/test_connector_check_strict.py
+
+diff --git a/README.md b/README.md
+index 4b1c064..b1da8f5 100644
+--- a/README.md
++++ b/README.md
+@@ -42,6 +42,7 @@ Check venue reachability:
+ 
+ ```bash
+ python3 tools/connector_check.py
++python3 tools/connector_check.py --require-bybit-testnet   # exit 2 unless every carry read is 200
+ ```
+ 
+ From Codespaces this returns Bybit 403 / Binance fapi 451. That is expected and
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index cbd25b6..3c461af 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -149,3 +149,11 @@ per leg after dropping one open bar; 4,600 prints). Result and sha256s:
+ | this session's sandbox | 0 (egress denied) | 0 | 0 | 0 |
+ 
+ `connector_check.py` has never returned `BYBIT_TESTNET_OK` from any host.
++Since 0035 it probes every public read the carry book makes on testnet and
++`--require-bybit-testnet` exits 2 unless all answer 200. From this session's
++sandbox: `CARRY_READS_BLOCKED`, exit 2. The first command inside the intended
++VPC is:
++
++```
++python3 bot/tools/connector_check.py --require-bybit-testnet
++```
+diff --git a/bot/tests/test_connector_check_strict.py b/bot/tests/test_connector_check_strict.py
+new file mode 100644
+index 0000000..2173aaa
+--- /dev/null
++++ b/bot/tests/test_connector_check_strict.py
+@@ -0,0 +1,67 @@
++"""0035 — connector_check can FAIL, so it can be the first command in the VPC.
++
++It printed a verdict and exited 0 either way. From inside the intended VPC the
++question is binary — can this host reach every public endpoint the carry book
++reads on Bybit testnet? — and a one-off ECS task needs an exit code to say so.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
++
++import connector_check as cc  # noqa: E402
++
++
++def _fetch(block=()):
++    def fetch(url, timeout):
++        return (403, "blocked") if any(b in url for b in block) else (200, "{}")
++    return fetch
++
++
++class TestTheCarryReadsAreChecked:
++    def test_every_public_read_the_carry_book_makes_is_probed(self):
++        urls = " ".join(u for _n, u in cc.ENDPOINTS)
++        for path in ("/v5/market/time", "category=linear", "category=spot",
++                     "/v5/market/funding/history",
++                     "/v5/market/instruments-info"):
++            assert path in urls, path
++        assert all("api-testnet.bybit.com" in u for n, u in cc.ENDPOINTS
++                   if n.startswith("bybit_testnet_"))
++
++    def test_all_reachable_is_carry_reads_ok(self):
++        r = cc.check(fetch=_fetch())
++        assert r["bybit_testnet_verdict"] == "BYBIT_TESTNET_OK"
++        assert r["carry_reads_verdict"] == "CARRY_READS_OK"
++
++    def test_one_blocked_carry_read_is_a_failure(self):
++        r = cc.check(fetch=_fetch(block=("funding/history",)))
++        assert r["carry_reads_verdict"] == "CARRY_READS_BLOCKED"
++        assert "bybit_testnet_funding_history" in r["carry_reads_blocked"]
++
++
++class TestStrictModeExits:
++    def test_strict_and_reachable_exits_zero(self, tmp_path):
++        out = tmp_path / "cc.json"
++        assert cc.main(["--require-bybit-testnet", "--out", str(out)],
++                       fetch=_fetch()) == 0
++        assert json.loads(out.read_text())["carry_reads_verdict"] == \
++            "CARRY_READS_OK"
++
++    def test_strict_and_blocked_exits_two(self, tmp_path):
++        assert cc.main(["--require-bybit-testnet", "--out",
++                        str(tmp_path / "cc.json")],
++                       fetch=_fetch(block=("bybit",))) == 2
++
++    def test_without_the_flag_it_still_reports_and_exits_zero(self, tmp_path):
++        assert cc.main(["--out", str(tmp_path / "cc.json")],
++                       fetch=_fetch(block=("bybit",))) == 0
++
++    def test_it_still_sends_no_keys_and_places_nothing(self):
++        r = cc.check(fetch=_fetch())
++        assert r["keys_used"] is False and r["orders_placed"] is False
++        for _n, url in cc.ENDPOINTS:
++            assert "order" not in url and "position" not in url
++            assert "wallet" not in url
+diff --git a/bot/tools/connector_check.py b/bot/tools/connector_check.py
+index e429f86..09b0a3a 100644
+--- a/bot/tools/connector_check.py
++++ b/bot/tools/connector_check.py
+@@ -4,6 +4,14 @@
+ Verdicts
+   BYBIT_TESTNET_BLOCKED  api-testnet.bybit.com unreachable or non-200.
+                           Track D (testnet orders) must not run from this host.
++  CARRY_READS_OK          every PUBLIC read the carry book makes on testnet —
++                          time, linear + spot tickers, settled funding history,
++                          instruments — answered 200 (0035).
++  CARRY_READS_BLOCKED     at least one did not; the blocked names are listed.
++
++--require-bybit-testnet exits 2 unless CARRY_READS_OK. That is the first
++command to run inside the intended VPC (a one-off task): an exit code, not a
++line someone has to read.
+   CORPUS_PATH_OK          www.binance.com/fapi/v1/{time,fundingRate} answered 200:
+                           closed-bar refresh is possible from this host.
+   CORPUS_PATH_BLOCKED     it did not. Do NOT substitute another venue.
+@@ -22,8 +30,22 @@ from typing import Callable, Dict, List, Tuple
+ HERE = os.path.dirname(os.path.abspath(__file__))
+ ROOT = os.path.dirname(HERE)
+ 
+-ENDPOINTS: Tuple[Tuple[str, str], ...] = (
+-    ("bybit_testnet_time", "https://api-testnet.bybit.com/v5/market/time"),
++_TN = "https://api-testnet.bybit.com"
++
++#: The public reads CarryBroker and take_snapshot make, on testnet.
++CARRY_READS: Tuple[Tuple[str, str], ...] = (
++    ("bybit_testnet_time", f"{_TN}/v5/market/time"),
++    ("bybit_testnet_ticker_linear",
++     f"{_TN}/v5/market/tickers?category=linear&symbol=BTCUSDT"),
++    ("bybit_testnet_ticker_spot",
++     f"{_TN}/v5/market/tickers?category=spot&symbol=BTCUSDT"),
++    ("bybit_testnet_funding_history",
++     f"{_TN}/v5/market/funding/history?category=linear&symbol=BTCUSDT&limit=1"),
++    ("bybit_testnet_instruments_linear",
++     f"{_TN}/v5/market/instruments-info?category=linear&symbol=BTCUSDT"),
++)
++
++ENDPOINTS: Tuple[Tuple[str, str], ...] = CARRY_READS + (
+     ("bybit_mainnet_time", "https://api.bybit.com/v5/market/time"),
+     ("binance_fapi_time", "https://fapi.binance.com/fapi/v1/time"),
+     ("binance_www_time", "https://www.binance.com/fapi/v1/time"),
+@@ -57,7 +79,11 @@ def check(fetch: Fetcher = default_fetch, timeout: float = 8.0) -> Dict[str, obj
+     bybit_ok = bool(by["bybit_testnet_time"]["ok"])
+     corpus_ok = bool(by["binance_www_time"]["ok"] and by["binance_www_funding"]["ok"])
+     verdict = "BYBIT_TESTNET_OK" if bybit_ok else "BYBIT_TESTNET_BLOCKED"
++    carry_blocked = [name for name, _u in CARRY_READS if not by[name]["ok"]]
+     return {
++        "carry_reads_verdict": ("CARRY_READS_OK" if not carry_blocked
++                                else "CARRY_READS_BLOCKED"),
++        "carry_reads_blocked": carry_blocked,
+         "tool": "connector_check",
+         "checked_at_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+         "keys_used": False, "orders_placed": False,
+@@ -70,19 +96,28 @@ def check(fetch: Fetcher = default_fetch, timeout: float = 8.0) -> Dict[str, obj
+     }
+ 
+ 
+-def main(argv=None) -> int:
+-    ap = argparse.ArgumentParser(description=__doc__)
++def main(argv=None, fetch: Fetcher = default_fetch) -> int:
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--out", default=os.path.join(ROOT, "artifacts",
+                                                   "connector_check.json"))
+     ap.add_argument("--timeout", type=float, default=8.0)
++    ap.add_argument("--require-bybit-testnet", action="store_true",
++                    help="exit 2 unless every carry read on testnet is 200")
+     args = ap.parse_args(argv)
+-    report = check(timeout=args.timeout)
++    report = check(fetch=fetch, timeout=args.timeout)
+     os.makedirs(os.path.dirname(args.out), exist_ok=True)
+     with open(args.out, "w", encoding="utf-8") as fh:
+         json.dump(report, fh, indent=2)
+     for r in report["endpoints"]:
+         print(f"{r['http']:>4}  {r['url']}")
+-    print(report["bybit_testnet_verdict"], "|", report["corpus_path_verdict"])
++    print(report["bybit_testnet_verdict"], "|", report["corpus_path_verdict"],
++          "|", report["carry_reads_verdict"],
++          ("(" + ", ".join(report["carry_reads_blocked"]) + ")")
++          if report["carry_reads_blocked"] else "")
++    if args.require_bybit_testnet and \
++            report["carry_reads_verdict"] != "CARRY_READS_OK":
++        return 2
+     return 0
+ 
+ 
+-- 
+2.43.0
+

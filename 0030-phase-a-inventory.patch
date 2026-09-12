@@ -1,0 +1,479 @@
+From f30804916d44320f5a453f57a3002910bdf244d1 Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Fri, 11 Sep 2026 18:06:51 +0000
+Subject: [PATCH] 0030 Phase A inventory: what is wired vs what is present
+ (5382 passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Facts only. bot/docs/human/INVENTORY.md, written against 0028 + 0029.
+
+Found by RUNNING the carry path against a stub venue, not by reading:
+
+  D1  funding is booked per 60s tick, not per 8h print: 60 ticks at 1 bps
+      on $100 booked $0.60 (one real print is $0.01); three negative
+      MINUTES of the predicted rate unwind the book
+  D2  PAPER_TRADING=1 does not gate CarryBroker: USE_TESTNET=0 + PAPER=1
+      reports SANDBOX (PAPER) and still sends a mainnet order body
+  D3  restart while HEDGED opens a second pair (memory-only position,
+      reconcile_pair has zero call sites, orphan check skipped on spot)
+  D4  a venue that rejects the perp leg drains the book: 8 spot round trips
+      in 10 ticks
+  D5  carry_backtest prints QUOTABLE: True on daily closes, no impact
+  D6  carry_backtest / venue_study reads never reach the data-read ledger
+  D7  borrow_apr silently defaults to 0.05 on the live path
+  D8  the pair gate is skipped when pair_risk or snapshot is None
+  D12 the engine runs the GATED (in-sample) rule; the clean ungated column
+      is not what the book would do
+
+Plus nine FakeClient-only assumptions (spot marketUnit, create response
+shape, BTC-denominated spot fee, IM/MM is not headroom, qtyStep 0.001 at a
+$100 cap, predicted vs settled funding, ...).
+
+Secrets: 56 commits + 3 committed archives scanned; no key material (test
+sentinels only). No REVOKE.md — nothing found. Standing rule written down:
+any pre-repo Bybit key is burned.
+
+New read-only tool: tools/session_tail.py prints the four invariants from
+the tree and exits 1 on any violation (tests first, 10 new).
+README: pointer to INVENTORY; stale test count removed; the false "no venue"
+line flagged.
+
+Files: bot/docs/human/INVENTORY.md, bot/tools/session_tail.py,
+       bot/tests/test_session_tail.py, README.md
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ README.md                      |  10 ++-
+ bot/docs/human/INVENTORY.md    | 148 +++++++++++++++++++++++++++++++++
+ bot/tests/test_session_tail.py |  86 +++++++++++++++++++
+ bot/tools/session_tail.py      | 132 +++++++++++++++++++++++++++++
+ 4 files changed, 375 insertions(+), 1 deletion(-)
+ create mode 100644 bot/docs/human/INVENTORY.md
+ create mode 100644 bot/tests/test_session_tail.py
+ create mode 100644 bot/tools/session_tail.py
+
+diff --git a/README.md b/README.md
+index 7b48265..ce91e48 100644
+--- a/README.md
++++ b/README.md
+@@ -8,6 +8,11 @@ makes money. Everything in here is subordinate to that.
+ 
+ **Status: the executor is built and tested. It has never touched an exchange.**
+ 
++> **Bytes beat this README.** `bot/docs/human/INVENTORY.md` lists what `main.py`
++> actually wires, which lines below are stale, and every defect found by
++> running the carry path against a stub venue. Read it before this file.
++> `python3 bot/tools/session_tail.py` prints the four invariants from the tree.
++
+ ---
+ 
+ ## Quick start
+@@ -18,7 +23,7 @@ cd ai-agent-control
+ python3 -m venv .venv && . .venv/bin/activate
+ pip install "requests<3" "numpy<3" "pytest>=8" "scipy<2" "scikit-learn<2"
+ ./scripts/install-hooks.sh
+-./scripts/verify.sh              # must print: 5162 passed, 2 skipped
++./scripts/verify.sh              # prints the count AND writes a receipt; quote only that
+ ```
+ 
+ Run the book against no venue:
+@@ -28,6 +33,9 @@ cd bot
+ BOOK_MODE=carry USE_TESTNET=1 PAPER_TRADING=1 python3 main.py
+ ```
+ 
++(INVENTORY §4 D2: `PAPER_TRADING` does not gate the carry broker before
++0033. Without 0033 this line is false.)
++
+ Check venue reachability:
+ 
+ ```bash
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+new file mode 100644
+index 0000000..f374d63
+--- /dev/null
++++ b/bot/docs/human/INVENTORY.md
+@@ -0,0 +1,148 @@
++# INVENTORY — what is wired, what is merely present
++
++Facts only. Written 2026-09-11 against `241edc4` (0028) + 0029. Every line is
++either a file:line, or a command whose output was watched in the session that
++wrote it. Where a later patch closes a line, the STATUS column says which one.
++
++Headline, unchanged by anything below:
++
++> **paired executor built, never touched a venue, do not point it at money.**
++
++---
++
++## 1. What `main.py` constructs when `BOOK_MODE=carry`
++
++`build_bot()` (`main.py` ~612–665), in order:
++
++| Object | Arguments actually passed | Not passed |
++|---|---|---|
++| `CarryBroker` | `client=bot.client` (a `BybitClient`), `sequence_source=store.next_order_seq` | — |
++| `CarryEngine` | broker, `kill_switch=store.trip_kill_switch`, `CARRY_SPOT_SYMBOL`, `CARRY_PERP_SYMBOL`, `max_notional_usd=shadow.SHADOW_MAX_NOTIONAL_USD` | **`borrow_apr`** → constructor default `0.05` is used silently |
++| `CarryRisk` | `store`, `max_notional_usd=shadow.SHADOW_MAX_NOTIONAL_USD` | — |
++
++`main.tick()` (~440–478) when `self.carry` is set: `take_snapshot(broker)` →
++`view.assert_fresh()` → `carry.snapshot = view` → `carry.on_candle(mark,
++funding_bps, spot, timestamp_ms)` → log → `return`. The directional voter is
++never consulted. Loop interval: `LOOP_INTERVAL_SECONDS`, default **60 s**.
++
++## 2. The live tick path — on it vs merely present
++
++| Module / function | On the tick path? | Evidence |
++|---|---|---|
++| `market_snapshot.take_snapshot`, `assert_fresh` | **yes** | `main.py` ~450 |
++| `CarryEngine.on_candle` → `_open` / `_rebalance` / `_unwind` | **yes** | `main.py` ~462 |
++| `carry_costs.evaluate_entry` (3 gates) | **yes**, lazy import | `carry_engine.py` ~294 |
++| `CarryRisk.gate_open` / `record_entry` | yes, **but skipped** when `pair_risk` or `snapshot` is `None` | `carry_engine.py` `_open` |
++| `CarryBroker.place_market`, `get_mark`, `get_spot_mark`, `get_funding_bps`, `get_margin_multiple` | **yes** | via engine / snapshot |
++| `CarryBroker.reconcile_pair` | **no — zero call sites outside tests** | `grep -rn reconcile_pair --include=*.py . \| grep -v tests` |
++| `CarryBroker.get_venue_time_s` | **does not exist** → the clock-skew check in `assert_fresh` never runs | `hasattr(bot.carry.broker, "get_venue_time_s") → False` |
++| `tools/carry_backtest.py`, `tools/venue_study.py`, `tools/basis_at_settlement.py`, `tools/corpus_health.py` | no — offline tools | — |
++| persistence of the carry position | **does not exist** — `persistence.py` has no carry table; the pair lives in `CarryEngine.position` (memory) | `grep -in carry persistence.py` |
++
++## 3. README claims vs bytes
++
++| README says | Bytes say | STATUS |
++|---|---|---|
++| `verify.sh` "must print: 5162 passed, 2 skipped" | 0028 = 5366 passed on 3.12; on python 3.11 (the Dockerfile's) 1 failed | 0029 fixed the 3.11 failure |
++| "There is no two-leg carry backtester anywhere in this tree" | `tools/carry_backtest.py` exists since 0018 | stale line |
++| "No borrow / margin cost model" | `carry_costs` gate 2 charges borrow — but `build_bot` never passes `borrow_apr`, so the live engine uses a silent `0.05` | 0033 |
++| "No basis monitoring" | basis is gated at ENTRY (`carry_costs` gate 1); nothing watches it during a hold | open |
++| "No P&L attribution" | backtest decomposes funding/basis/fees/borrow; live path books none of it | backtest: 0031; live: Phase E |
++| "Run the book against no venue: `BOOK_MODE=carry USE_TESTNET=1 PAPER_TRADING=1`" | **false.** `PAPER_TRADING` gates the directional `TradingEngine` only. `CarryBroker` calls `client._request("POST", "/v5/order/create")` directly. With `USE_TESTNET=0 PAPER_TRADING=1` config reports `SANDBOX (PAPER)` and the carry broker still sends a **mainnet** order body (watched, §4 D2) | 0033 |
++| "Three consecutive negative funding prints → exit" | the engine counts **calls to `on_candle`**, one per 60 s tick. Three negative *minutes* of the ticker's predicted rate unwind the book (watched, §4 D1) | 0034 |
++| "get_margin_multiple RAISES when unreadable" | true. It returns `positionIM / positionMM`, which on Bybit is set by leverage and risk tier and does **not** shrink as price squeezes the short (§5 F4) | open, Phase D |
++| "reconcile_pair OBSERVES ONLY and names the naked side" | true, and nothing calls it | open, Phase D |
++| "No cold-start reconciliation" | true. Worse: the directional orphan check (`bybit_connection.py` ~1557) runs only `if self.is_linear`; the default client category is `spot`, so it is skipped | open, Phase D |
++| Roadmap rows 0018–0027 | what landed under those numbers differs (0018 backtest … 0028 venue study) | stale table |
++| `6.84%/yr` | README correctly calls it gross income, not a return | ok |
++
++## 4. Defects found by running, ranked by damage
++
++Reproduced in-session with a stub broker; no venue.
++
++| # | Defect | Reproduction / evidence | STATUS |
++|---|---|---|---|
++| D1 | **Funding is booked per tick, not per print.** `on_candle` adds `funding_bps × notional` on every call. 60 one-minute ticks at 1.0 bps on $100 booked **$0.60**; one real 8h print is **$0.01**. The negative-funding streak and the 8-print EWMA also count ticks. | stub engine, 60 calls | 0034 |
++| D2 | **`PAPER_TRADING=1` does not stop carry orders.** `USE_TESTNET=0 PAPER_TRADING=1 BOOK_MODE=carry` → `assert_sandbox` = `SANDBOX (PAPER)`, and `bot.carry.broker.place_market(...)` sent `POST /v5/order/create` with a spot body. The client's base URL is chosen by `USE_TESTNET` alone. | `build_bot` + mocked `_request` | 0033 |
++| D3 | **Restart while HEDGED opens a second pair.** The position is memory-only, `reconcile_pair` is never called, the orphan check is skipped on a spot-category client, and `CarryRisk.has_open_pair` reads `engine.position` (None after restart). | code path | open — Phase D cold start |
++| D4 | **A venue that rejects the perp leg drains the book.** Spot buys, perp is rejected, spot is sold, state returns to FLAT, and the next tick repeats: **8 spot round trips in 10 ticks**. `record_entry` is (correctly) only called for a landed pair, so a broken pair consumes no allowance. | stub broker rejecting `linear` | 0033 |
++| D5 | **`carry_backtest` prints `QUOTABLE: True`** on daily closes with no impact term. The flag tracks provenance only (same venue + same quote). Rule 19 says daily-close settlement is not quotable. | `python3 tools/carry_backtest.py --repo .` | 0031 |
++| D6 | **carry_backtest / venue_study reads are not in the data-read ledger.** `reserved_holdout.install()` hooks `market_data.load_corpus`; both tools read with their own loaders, so the hook never fires. `artifacts/data_read_ledger.json` has 6 reads, none by either tool. | `data_read_ledger.json` | 0032 |
++| D7 | `borrow_apr` has a default at every level: `CarryEngine(..., borrow_apr=0.05)`, `evaluate_entry(..., borrow_apr=DEFAULT_BORROW_APR)`, `simulate(..., borrow_apr=BORROW_APR)`; `build_bot` passes none. | `bot.carry.borrow_apr → 0.05` | 0033 |
++| D8 | The pair gate is skipped when `pair_risk` **or** `snapshot` is `None`, and `test_carry_live_gates::test_the_gate_is_skipped_only_when_absent` asserts that a bare engine opens. | `carry_engine.py` `_open` | 0033 |
++| D9 | Clock-skew check is dead code on the live path (no `get_venue_time_s`). | §2 | open |
++| D10 | `funding_collected` books only non-negative prints; negative prints are paid and never booked. | `carry_engine.py` on_candle | 0034 |
++| D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | 0033 (fee carried, unknown ≠ 0) |
++| D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | recorded 0032; holdout is forward-only |
++| D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
++
++## 5. FakeClient-only assumptions — venue semantics never exercised
++
++| # | Assumption in code | Venue fact (Bybit V5, from `research/exchange_study/bybit/*` or `bybit_connection.py`) | STATUS |
++|---|---|---|---|
++| F1 | Spot market Buy `qty` is in BTC | Without `marketUnit=baseCoin` a spot market BUY is read as a **quote (USDT)** amount. `BybitClient` sets it (`bybit_connection.py` ~916); `CarryBroker` builds its own body and omits it. | 0033 |
++| F2 | `/v5/order/create` returns `cumExecQty`, `avgPrice` | It returns `orderId`, `orderLinkId`. The broker then queries `/v5/order/realtime` immediately — a race against the fill. | open, testnet |
++| F3 | The spot fill equals the BTC received | Spot taker fee on a BUY is charged in BTC. Wallet = `cumExecQty − fee`; the perp hedges `cumExecQty`; `reconcile_pair` (dust 1e-6) would call every pair an INCIDENT. | open, testnet |
++| F4 | `positionIM / positionMM` measures liquidation headroom | It is a leverage/risk-tier ratio (risk_limit tier 1: IM 0.66%, MM 0.33%). Under UTA cross margin liquidation is account-level (`accountMMRate`). The margin floor would not trip on a squeeze. | open, Phase D |
++| F5 | Any `qty` is accepted | Linear BTCUSDT `qtyStep = minOrderQty = 0.001`. At the $100 cap and BTC ≈ $79k the engine asks for 0.00127 → not a step multiple → perp rejected → D4. At BTC > $100k no valid perp size fits under $100 at all. | open, Phase D |
++| F6 | Ticker `fundingRate` is the funding print | It is the rate for the NEXT settlement (predicted); the settled print is `/v5/market/funding/history`. | 0034 |
++| F7 | 110072 / 170130 mean "the order exists" | Taken from docs; never observed. | open, testnet |
++| F8 | No rate-limit / 10006 / maintenance handling in `CarryBroker` | A transient error on the perp leg returns `None` → emergency spot unwind. | open, testnet |
++| F9 | `symbol[:-4]` is the base coin | True for `BTCUSDT` only. | open |
++
++## 6. Secrets
++
++Scanned on 2026-09-11: all 56 commits (`git log --all -p`) and the three
++committed archives (`files (3).zip`, `tradingbot_slice31 (1) (1).zip`,
++`tradingbot_slice76 (2) (1).zip`, unpacked). Patterns: `API_KEY|API_SECRET`
++followed by ≥16 alphanumerics, `AKIA[0-9A-Z]{16}`, `ghp_`, `github_pat_`,
++`sk-`, `xox?-`, `AIza`, `-----BEGIN … PRIVATE KEY`, and any added file named
++`.env*`, `*secret*`, `*credential*`, `*.pem`, `*.key`.
++
++Result: **no key material.** Hits were test sentinels
++(`bot/tests/test_memory.py`: `"AKIA_NOT_A_REAL_KEY_9times"` and a 26-char
++`s3c…` placeholder used to prove secrets never reach memory) and an
++`.env.example` with empty values. No `REVOKE.md` is written because nothing was
++found to revoke.
++
++Standing rule regardless of this result: the predecessor programme recorded
++that keys were exposed in an earlier history. Any Bybit key created before this
++repository existed is **burned** — revoke it in the Bybit UI. New keys:
++withdrawals disabled, IP-pinned to the NAT EIP, injected at runtime from
++Secrets Manager, never in a file, a log, or this repository.
++
++## 7. Invariants, checked mechanically
++
++```
++python3 tools/session_tail.py
++```
++
++prints and exits non-zero on any violation of: promotion gate `False`,
++`FUND_ABS == 0.0001`, `SHADOW_MAX_NOTIONAL_USD == 100.0`, no module assigns
++`live_authorized`.
++
++## 8. Market data present
++
++| Series | Rows | Range (UTC) | sha256 (uncompressed, 16) | Status |
++|---|---:|---|---|---|
++| `data/real_linear_1d/…/BINANCE_LINEAR_BTC_USDT_1D` | 1,476 | 2022-08-10 → 2026-08-24 | `293774ee35fcac24` | frozen corpus |
++| `data/real_spot_btc/…/BINANCE_SPOT_BTC_USDT_1D` | 1,461 | 2022-09-09 → 2026-09-08 | `622b3375cdf19947` | frozen corpus |
++| `data/real_funding/…/BINANCE_LINEAR_BTC_USDT_FUNDING` | 4,431 | 2022-08-09 → 2026-08-25 | `c652c9b0b6332b5b` | frozen corpus |
++| `data/real_1d/…/BITSTAMP_SPOT_BTC_USD_1D` | 3,135 | 2018-01-01 → 2026-08-01 | `89dd4abbd1aab374` | cross-venue, cross-currency proxy |
++| `research/exchange_study/bybit/spot_BTCUSDT_240` | 9,000 | 2022-08-01 12:00 → 2026-09-09 08:00, 0 gaps | file `59f9b94269cb716f` | study set (0028) |
++| `research/exchange_study/bybit/linear_BTCUSDT_240` | 9,000 | same, 0 gaps | file `ab5ccc96aea6106c` | study set (0028) |
++| `research/exchange_study/bybit/funding_BTCUSDT` | 4,600 | 2022-06-29 08:00 → 2026-09-09 08:00, 0 gaps, all on the 00/08/16 clock | file `4faa404c5f2a751c` | study set (0028) |
++| `research/exchange_study/stress/{spot,perp}_1m_*` | 3 days | 2024-08-05, 2025-02-03, 2026-04-15 | — | study set (0028) |
++
++The Bybit 4h set is the only data in the tree where spot, perp and funding are
++the **same venue the broker trades on**, at a resolution that lands on the
++funding clock. 0032 promotes it to a corpus.
++
++## 9. Network from the hosts used so far
++
++| Host | Bybit testnet | Bybit mainnet | Binance fapi | Binance www/fapi |
++|---|---|---|---|---|
++| Codespaces (README) | 403 | 403 | 451 | — |
++| this session's sandbox | 0 (egress denied) | 0 | 0 | 0 |
++
++`connector_check.py` has never returned `BYBIT_TESTNET_OK` from any host.
+diff --git a/bot/tests/test_session_tail.py b/bot/tests/test_session_tail.py
+new file mode 100644
+index 0000000..a8cbacf
+--- /dev/null
++++ b/bot/tests/test_session_tail.py
+@@ -0,0 +1,86 @@
++"""The four invariants every session ends by quoting, checked by bytes.
++
++The session tail asks: gate still false? FUND_ABS still 0.0001? cap still 100?
++live_authorized unassigned? Answering from memory is how a number nobody
++watched gets into a commit message. The tool answers from the tree.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import session_tail as st  # noqa: E402
++
++REPO = os.path.join(os.path.dirname(__file__), "..")
++
++
++class TestOnThisTree:
++    def test_every_invariant_holds(self):
++        report = st.check(REPO)
++        assert report["gate_still_false"] is True
++        assert report["fund_abs_still_0_0001"] is True
++        assert report["cap_still_100"] is True
++        assert report["live_authorized_unassigned"] is True
++        assert report["ok"] is True
++
++    def test_the_cli_exits_zero_and_prints_the_tail_labels(self, capsys):
++        assert st.main(["--repo", REPO]) == 0
++        out = capsys.readouterr().out
++        for label in ("GATE STILL FALSE?", "FUND_ABS STILL 0.0001?",
++                      "CAP STILL 100?", "LIVE_AUTHORIZED UNASSIGNED?"):
++            assert label in out
++
++
++class TestTheAstScanCatchesAnAssignment:
++    def _tree(self, tmp_path, body):
++        (tmp_path / "mod.py").write_text(body, encoding="utf-8")
++        return str(tmp_path)
++
++    def test_attribute_assignment_is_caught(self, tmp_path):
++        root = self._tree(tmp_path, "cfg.live_authorized = True\n")
++        assert st.live_authorized_assignments(root)
++
++    def test_upper_case_attribute_is_caught(self, tmp_path):
++        root = self._tree(tmp_path, "cfg.LIVE_AUTHORIZED = True\n")
++        assert st.live_authorized_assignments(root)
++
++    def test_setattr_is_caught(self, tmp_path):
++        root = self._tree(tmp_path, "setattr(cfg, 'live_authorized', True)\n")
++        assert st.live_authorized_assignments(root)
++
++    def test_augmented_and_annotated_assignment_are_caught(self, tmp_path):
++        root = self._tree(tmp_path, "cfg.live_authorized: bool = True\n"
++                                    "cfg.live_authorized |= True\n")
++        assert len(st.live_authorized_assignments(root)) == 2
++
++    def test_reading_it_into_a_local_is_not_an_assignment(self, tmp_path):
++        root = self._tree(
++            tmp_path,
++            "live_authorized = bool(getattr(cfg, 'LIVE_AUTHORIZED', False))\n")
++        assert st.live_authorized_assignments(root) == []
++
++    def test_tests_are_not_scanned(self, tmp_path):
++        (tmp_path / "tests").mkdir()
++        (tmp_path / "tests" / "t.py").write_text("c.live_authorized = 1\n",
++                                                 encoding="utf-8")
++        assert st.live_authorized_assignments(str(tmp_path)) == []
++
++
++class TestAViolationFailsTheExit:
++    def test_a_moved_cap_is_reported_and_fails(self, monkeypatch):
++        import shadow
++        monkeypatch.setattr(shadow, "SHADOW_MAX_NOTIONAL_USD", 250.0)
++        report = st.check(REPO)
++        assert report["cap_still_100"] is False
++        assert report["ok"] is False
++        assert st.main(["--repo", REPO]) != 0
++
++    def test_the_tool_arms_nothing(self):
++        with open(os.path.join(REPO, "tools", "session_tail.py"),
++                  encoding="utf-8") as fh:
++            body = fh.read()
++        assert "place_market" not in body
++        assert "place_order" not in body
+diff --git a/bot/tools/session_tail.py b/bot/tools/session_tail.py
+new file mode 100644
+index 0000000..1e35dd8
+--- /dev/null
++++ b/bot/tools/session_tail.py
+@@ -0,0 +1,132 @@
++#!/usr/bin/env python3
++"""The four invariants a session ends by quoting — answered from the tree.
++
++    GATE STILL FALSE?            promotion_gate.promotion_gate_allows_live()
++    FUND_ABS STILL 0.0001?       signals.funding_carry_fade_v1.FUND_ABS (+ btc_v1)
++    CAP STILL 100?               shadow.SHADOW_MAX_NOTIONAL_USD
++    LIVE_AUTHORIZED UNASSIGNED?  no module outside tests/ assigns an attribute
++                                 named live_authorized / LIVE_AUTHORIZED, or
++                                 setattr()s one
++
++Exit 0 when all four hold, 1 otherwise. Read-only: imports, reads, prints.
++Reading the flag into a local (`live_authorized = bool(getattr(...))`) is a
++read, not an assignment, and is not flagged.
++
++    python3 tools/session_tail.py
++"""
++from __future__ import annotations
++
++import argparse
++import ast
++import os
++import sys
++from typing import Any, Dict, List, Optional
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++
++_FIELD = {"live_authorized", "LIVE_AUTHORIZED"}
++
++
++def _attr_targets(node: ast.AST) -> List[ast.AST]:
++    if isinstance(node, ast.Assign):
++        return list(node.targets)
++    if isinstance(node, ast.AugAssign):
++        return [node.target]
++    if isinstance(node, ast.AnnAssign) and node.value is not None:
++        return [node.target]
++    return []
++
++
++def live_authorized_assignments(root: str) -> List[str]:
++    """Every place outside tests/ that WRITES the flag. Empty is the answer."""
++    hits: List[str] = []
++    for folder, dirs, names in os.walk(root):
++        dirs[:] = [d for d in dirs if d not in ("tests", "__pycache__", ".venv")]
++        for name in sorted(names):
++            if not name.endswith(".py"):
++                continue
++            path = os.path.join(folder, name)
++            try:
++                with open(path, encoding="utf-8") as fh:
++                    tree = ast.parse(fh.read())
++            except (SyntaxError, UnicodeDecodeError):
++                continue
++            rel = os.path.relpath(path, root)
++            for node in ast.walk(tree):
++                for target in _attr_targets(node):
++                    if isinstance(target, ast.Attribute) and target.attr in _FIELD:
++                        hits.append(f"{rel}:{node.lineno}")
++                if (isinstance(node, ast.Call)
++                        and isinstance(node.func, ast.Name)
++                        and node.func.id == "setattr"
++                        and len(node.args) >= 2
++                        and isinstance(node.args[1], ast.Constant)
++                        and node.args[1].value in _FIELD):
++                    hits.append(f"{rel}:{node.lineno}")
++    return hits
++
++
++def check(repo: str = ROOT) -> Dict[str, Any]:
++    repo = os.path.abspath(repo)
++    if repo not in sys.path:
++        sys.path.insert(0, repo)
++    report: Dict[str, Any] = {}
++
++    try:
++        import promotion_gate
++        report["gate_value"] = promotion_gate.promotion_gate_allows_live()
++        report["gate_still_false"] = report["gate_value"] is False
++    except Exception as exc:  # noqa: BLE001 - an unreadable gate is a failure
++        report["gate_value"] = f"UNREADABLE: {exc!r}"
++        report["gate_still_false"] = False
++
++    try:
++        from signals import funding_carry_fade_v1 as a
++        from signals import funding_carry_fade_btc_v1 as b
++        report["fund_abs"] = [a.FUND_ABS, b.FUND_ABS]
++        report["fund_abs_still_0_0001"] = (a.FUND_ABS == 0.0001
++                                           and b.FUND_ABS == 0.0001)
++    except Exception as exc:  # noqa: BLE001
++        report["fund_abs"] = f"UNREADABLE: {exc!r}"
++        report["fund_abs_still_0_0001"] = False
++
++    try:
++        import shadow
++        report["cap"] = shadow.SHADOW_MAX_NOTIONAL_USD
++        report["cap_still_100"] = float(shadow.SHADOW_MAX_NOTIONAL_USD) == 100.0
++    except Exception as exc:  # noqa: BLE001
++        report["cap"] = f"UNREADABLE: {exc!r}"
++        report["cap_still_100"] = False
++
++    hits = live_authorized_assignments(repo)
++    report["live_authorized_writes"] = hits
++    report["live_authorized_unassigned"] = not hits
++
++    report["ok"] = all(report[k] is True for k in (
++        "gate_still_false", "fund_abs_still_0_0001", "cap_still_100",
++        "live_authorized_unassigned"))
++    return report
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__,
++                                 formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--repo", default=ROOT)
++    args = ap.parse_args(argv)
++    r = check(args.repo)
++    yn = lambda v: "yes" if v is True else "NO"  # noqa: E731
++    print(f"GATE STILL FALSE?:            {yn(r['gate_still_false'])}"
++          f"   (promotion_gate_allows_live() = {r['gate_value']})")
++    print(f"FUND_ABS STILL 0.0001?:       {yn(r['fund_abs_still_0_0001'])}"
++          f"   ({r['fund_abs']})")
++    print(f"CAP STILL 100?:               {yn(r['cap_still_100'])}"
++          f"   (SHADOW_MAX_NOTIONAL_USD = {r['cap']})")
++    print(f"LIVE_AUTHORIZED UNASSIGNED?:  {yn(r['live_authorized_unassigned'])}"
++          f"   ({len(r['live_authorized_writes'])} write(s)"
++          f"{': ' + ', '.join(r['live_authorized_writes']) if r['live_authorized_writes'] else ''})")
++    return 0 if r["ok"] else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+-- 
+2.43.0
+

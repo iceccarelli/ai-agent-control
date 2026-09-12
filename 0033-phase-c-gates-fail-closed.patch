@@ -1,0 +1,1337 @@
+From 26e6ff4fc7ccf85bff0db61baede31d1034be8db Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Fri, 11 Sep 2026 18:42:01 +0000
+Subject: [PATCH] 0033 Phase C: every carry gate fails closed, proven by
+ running (5481 passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Each item reproduces an INVENTORY finding, then refuses it. Tests first:
+tests/test_carry_fail_closed.py, 36 new.
+
+D8  No first leg without the pair gate AND one snapshot of the SAME marks.
+    _open refuses PAIR_GATE_ABSENT / SNAPSHOT_ABSENT / SNAPSHOT_MISMATCH.
+    Before: the gate ran only "if pair_risk is not None and snapshot is not
+    None" — an engine built without either opened on the cost gates alone.
+
+D7  borrow_apr has no default anywhere on the live path. CarryEngine(...,
+    borrow_apr) and evaluate_entry(..., borrow_apr) require it;
+    DEFAULT_BORROW_APR is deleted; config gains CARRY_BORROW_APR (a fraction
+    in [0,1), None when absent) and build_bot REFUSES a carry book without
+    it. Before: build_bot passed nothing and the engine financed at 5%.
+
+D2  PAPER_TRADING now reaches the carry broker. CarryBroker requires an
+    order_gate, asked before EVERY order: PAPER refuses; TESTNET may send;
+    mainnet needs live authorisation AND promotion_gate_allows_live() — the
+    broker asks again even though start() already refuses. An unreadable
+    gate refuses. Run: USE_TESTNET=0 PAPER_TRADING=1 -> CarryOrderRefused,
+    0 requests sent (was: a mainnet order body).
+
+D4  A broken pair spends the day. CarryRisk.record_broken_pair() — same
+    MAX_ENTRIES_PER_UTC_DAY, no new threshold. record_entry is still "both
+    legs landed" only. Run: 10 ticks against a venue rejecting the perp ->
+    2 spot orders (was 16).
+
+F1  marketUnit=baseCoin on every spot market order. Without it Bybit reads a
+    spot BUY qty as USDT. BybitClient always set it; CarryBroker did not.
+
+D11 cumExecFee is carried per leg (LegFill.fee, Leg.fee). Unknown is None,
+    never 0.0; an AST test forbids a literal zero fee in any carry module.
+    Booking it is Phase E.
+
+The engine still has no direction parameter (existing test, untouched).
+
+TESTS CHANGED — each stricter, none weaker:
+  test_carry_live_gates::test_the_gate_is_skipped_only_when_absent asserted
+    that an engine WITHOUT a pair gate opens. That is the bypass. INVERTED:
+    now test_an_absent_gate_is_a_refusal_not_a_skip — no gate, no leg.
+  test_carry_costs::test_borrow_is_explicit_at_the_declaration pinned
+    DEFAULT_BORROW_APR == 0.05, contradicting its own docstring. It now
+    asserts there is no default at all.
+  Fixtures, not assertions: test_carry_engine builds the engine the way
+    main.tick drives it (pair gate + a snapshot stamped from each candle);
+    16 evaluate_entry calls in test_carry_costs pass the 5% the default used
+    to supply; carry configs pass CARRY_BORROW_APR; the broker helper passes
+    an order gate. Every pre-existing assertion in those files is unchanged.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ README.md                                |   8 +-
+ bot/carry_broker.py                      |  69 ++++-
+ bot/carry_costs.py                       |  10 +-
+ bot/carry_engine.py                      |  88 ++++--
+ bot/carry_risk.py                        |  24 +-
+ bot/config.py                            |  26 ++
+ bot/docs/human/INVENTORY.md              |  12 +-
+ bot/main.py                              |  46 +++-
+ bot/tests/test_carry_broker.py           |  16 +-
+ bot/tests/test_carry_costs.py            |  42 +--
+ bot/tests/test_carry_engine.py           |  30 +-
+ bot/tests/test_carry_fail_closed.py      | 335 +++++++++++++++++++++++
+ bot/tests/test_carry_live_gates.py       |  18 +-
+ bot/tests/test_carry_wiring.py           |  12 +-
+ bot/tests/test_carry_wiring_authority.py |   7 +-
+ 15 files changed, 664 insertions(+), 79 deletions(-)
+ create mode 100644 bot/tests/test_carry_fail_closed.py
+
+diff --git a/README.md b/README.md
+index ce91e48..4b1c064 100644
+--- a/README.md
++++ b/README.md
+@@ -30,11 +30,13 @@ Run the book against no venue:
+ 
+ ```bash
+ cd bot
+-BOOK_MODE=carry USE_TESTNET=1 PAPER_TRADING=1 python3 main.py
++BOOK_MODE=carry CARRY_BORROW_APR=0.0 USE_TESTNET=1 PAPER_TRADING=1 python3 main.py
+ ```
+ 
+-(INVENTORY §4 D2: `PAPER_TRADING` does not gate the carry broker before
+-0033. Without 0033 this line is false.)
++`CARRY_BORROW_APR` is required for a carry book (0.0 = overlay on BTC already
++owned). Since 0033 `PAPER_TRADING=1` refuses every carry order at the broker;
++before 0033 it did not (INVENTORY §4 D2). The testnet drill needs
++`USE_TESTNET=1 PAPER_TRADING=0`.
+ 
+ Check venue reachability:
+ 
+diff --git a/bot/carry_broker.py b/bot/carry_broker.py
+index f96e34b..bb6b40a 100644
+--- a/bot/carry_broker.py
++++ b/bot/carry_broker.py
+@@ -76,18 +76,32 @@ class PairIncident(RuntimeError):
+     """One leg exists that the other does not hedge. Never caught and ignored."""
+ 
+ 
++class CarryOrderRefused(RuntimeError):
++    """The process may not send a carry order to this venue. Nothing was sent.
++
++    Raised by place_market BEFORE any request is built. Until 0033 the carry
++    broker called `/v5/order/create` whatever PAPER_TRADING said, against
++    whichever base URL USE_TESTNET selected (INVENTORY D2).
++    """
++
++
+ @dataclass
+ class LegFill:
+     filled_qty: float = 0.0
+     avg_price: float = 0.0
+     order_link_id: str = ""
+     was_duplicate: bool = False
++    #: `cumExecFee` as the venue reported it, in the fee currency (BTC on a
++    #: spot BUY, USDT on a linear fill). None means the venue did not say. It
++    #: is never 0.0 by default: an unknown fee booked as zero is a cost that
++    #: disappears from the ledger.
++    fee: Optional[float] = None
+     detail: Dict[str, Any] = field(default_factory=dict)
+ 
+     def as_engine_result(self) -> Dict[str, Any]:
+         """The shape `CarryEngine._fire` consumes."""
+         return {"filled_qty": self.filled_qty, "avg_price": self.avg_price,
+-                "order_link_id": self.order_link_id}
++                "order_link_id": self.order_link_id, "fee": self.fee}
+ 
+ 
+ class CarryBroker:
+@@ -96,13 +110,22 @@ class CarryBroker:
+     `client` is a BybitClient-shaped object exposing `_request`, and
+     `sequence_source` is a callable returning a persisted, monotonic integer.
+     Both are injected so this module can be exercised without a venue.
++
++    `order_gate` is REQUIRED: a callable returning `(may_send, reason)`,
++    asked before EVERY order. build_bot derives it from PAPER_TRADING,
++    USE_TESTNET and the live authorisation. There is no default, because the
++    only safe default would be "never", and a broker that can never trade is
++    a misconfiguration that should fail at construction, not at 3am.
+     """
+ 
+-    def __init__(self, *, client: Any, sequence_source: Any,
++    def __init__(self, *, client: Any, sequence_source: Any, order_gate: Any,
+                  link_id_builder: Any = None,
+                  duplicate_ret_codes: Tuple[int, ...] = (110072, 170130)) -> None:
++        if not callable(order_gate):
++            raise TypeError("order_gate must be callable -> (may_send, reason)")
+         self.client = client
+         self.sequence_source = sequence_source
++        self.order_gate = order_gate
+         self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
+         if link_id_builder is None:
+             from bybit_connection import build_order_link_id
+@@ -114,6 +137,7 @@ class CarryBroker:
+     def place_market(self, *, symbol: str, side: str, qty: float,
+                      product: str) -> Optional[Dict[str, Any]]:
+         """One leg. Deterministic id, so a retry cannot double it."""
++        self._assert_orders_permitted()
+         if product not in VALID_PRODUCTS:
+             raise ValueError(
+                 f"unknown product {product!r}; routing a spot order to the "
+@@ -128,12 +152,19 @@ class CarryBroker:
+             symbol=symbol, side=side, qty=qty_text,
+             purpose=f"carry-{product}")
+ 
++        body = {"category": product, "symbol": symbol, "side": side,
++                "orderType": "Market", "qty": qty_text,
++                "orderLinkId": link_id}
++        if product == SPOT:
++            # Without this a spot market BUY is read as a QUOTE (USDT) amount:
++            # 0.00125 would buy 0.00125 USDT of BTC. BybitClient has always set
++            # it; this adapter built its own body and did not (INVENTORY F1).
++            # Stated on sells too, where it is the venue default, so the unit
++            # of every spot qty this module sends is explicit.
++            body["marketUnit"] = "baseCoin"
+         try:
+             response = self.client._request(
+-                "POST", "/v5/order/create", signed=True,
+-                body={"category": product, "symbol": symbol, "side": side,
+-                      "orderType": "Market", "qty": qty_text,
+-                      "orderLinkId": link_id})
++                "POST", "/v5/order/create", signed=True, body=body)
+         except Exception as exc:  # noqa: BLE001
+             ret_code = getattr(exc, "ret_code", None)
+             if ret_code in self.duplicate_ret_codes:
+@@ -318,7 +349,19 @@ class CarryBroker:
+         return LegFill(
+             filled_qty=float(row.get("cumExecQty", 0) or 0),
+             avg_price=float(row.get("avgPrice", 0) or 0),
+-            order_link_id=link_id, detail=dict(row))
++            order_link_id=link_id, fee=CarryBroker._fee(row),
++            detail=dict(row))
++
++    @staticmethod
++    def _fee(row: Dict[str, Any]) -> Optional[float]:
++        raw = row.get("cumExecFee")
++        if raw is None or str(raw).strip() == "":
++            return None
++        try:
++            value = float(raw)
++        except (TypeError, ValueError):
++            return None
++        return value if math.isfinite(value) else None
+ 
+     @staticmethod
+     def _fill_from(response: Optional[Dict[str, Any]],
+@@ -328,7 +371,17 @@ class CarryBroker:
+             filled_qty=float(row.get("cumExecQty", 0) or 0),
+             avg_price=float(row.get("avgPrice", 0) or 0),
+             order_link_id=str(row.get("orderLinkId", link_id) or link_id),
+-            detail=dict(row))
++            fee=CarryBroker._fee(row), detail=dict(row))
++
++    def _assert_orders_permitted(self) -> None:
++        """Ask the gate. Anything but an explicit (True, reason) refuses."""
++        try:
++            allowed, reason = self.order_gate()
++        except Exception as exc:  # noqa: BLE001 - an unreadable gate is closed
++            raise CarryOrderRefused(
++                f"order gate unreadable ({exc!r}); no carry order sent") from exc
++        if allowed is not True:
++            raise CarryOrderRefused(f"{reason}; no carry order sent")
+ 
+     @staticmethod
+     def _format_qty(qty: float) -> str:
+diff --git a/bot/carry_costs.py b/bot/carry_costs.py
+index 796be06..1c1e00e 100644
+--- a/bot/carry_costs.py
++++ b/bot/carry_costs.py
+@@ -66,10 +66,10 @@ TAKER_BPS_PERP = 5.5
+ ROUND_TRIP_BPS = 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP   # 31.0
+ 
+ #: Financing on the spot leg. 0.0 models a book that ALREADY OWNS the BTC and is
+-#: monetising it. The difference between those two worlds is +1.77% and +7.96%,
+-#: which is the difference between a business and a hobby, so it is a required
+-#: argument at every call site rather than a default anyone can forget.
+-DEFAULT_BORROW_APR = 0.05
++#: monetising it. The difference between those two worlds is the difference
++#: between a business and a hobby, so it is a REQUIRED argument at every call
++#: site. Until 0033 this comment said so and the signature defaulted it to
++#: 0.05 anyway (INVENTORY D7); the constant is gone so nothing can reach for it.
+ 
+ #: Funding prints per day on Binance USDT-M and Bybit linear.
+ FUNDING_PERIODS_PER_DAY = 3
+@@ -143,7 +143,7 @@ def basis_bps(perp: float, spot: float) -> float:
+ 
+ 
+ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
+-                   spot: float, borrow_apr: float = DEFAULT_BORROW_APR,
++                   spot: float, borrow_apr: float,
+                    hold_days: float = ASSUMED_HOLD_DAYS) -> CarryVerdict:
+     """May the book open this pair?
+ 
+diff --git a/bot/carry_engine.py b/bot/carry_engine.py
+index 49ef3ca..3ce62f6 100644
+--- a/bot/carry_engine.py
++++ b/bot/carry_engine.py
+@@ -66,7 +66,7 @@ import logging
+ import math
+ from dataclasses import dataclass, field
+ from enum import Enum
+-from typing import Any, Dict, Optional, Tuple
++from typing import Any, Dict, List, Optional, Tuple
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -124,6 +124,10 @@ class Leg:
+     filled_qty: float = 0.0
+     avg_price: float = 0.0
+     order_link_id: str = ""
++    #: The venue's `cumExecFee` for this leg, or None when it did not say.
++    #: Unknown stays unknown: a None the ledger must resolve, never a 0.0 that
++    #: makes a cost vanish.
++    fee: Optional[float] = None
+ 
+     @property
+     def notional(self) -> float:
+@@ -199,7 +203,10 @@ class CarryEngine:
+                  delta_band: float = DELTA_BAND,
+                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
+                  min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
+-                 borrow_apr: float = 0.05) -> None:
++                 borrow_apr: float) -> None:
++        # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
++        # carry clears its cost of capital, and build_bot never passed it, so
++        # the live engine silently financed at 5% whatever the operator meant.
+         self.broker = broker
+         self.kill_switch = kill_switch
+         self.spot_symbol = spot_symbol
+@@ -219,6 +226,9 @@ class CarryEngine:
+         #: pair gate judges the SAME observation the entry decision used.
+         self.snapshot: Optional[Any] = None
+         self._funding_history: List[float] = []
++        #: The last exception a leg raised, so a refusal can name it. A leg
++        #: that fails for a reason nobody can read is a leg that fails again.
++        self._last_leg_error: str = ""
+ 
+     # -- the loop ---------------------------------------------------------
+ 
+@@ -302,13 +312,41 @@ class CarryEngine:
+                         "entry_basis_bps": verdict.entry_basis_bps,
+                         "net_edge_bps_per_day": verdict.net_edge_bps_per_day})
+ 
+-        return self._open(mark, funding_bps, timestamp_ms)
++        return self._open(mark, spot, funding_bps, timestamp_ms)
+ 
+     # -- actions ----------------------------------------------------------
+ 
+-    def _open(self, mark: float, funding_bps: float,
++    def _open(self, mark: float, spot_mark: float, funding_bps: float,
+               timestamp_ms: int) -> CarryDecision:
+         """Both legs, or neither. There is no partially-open carry position."""
++        # THE PRECONDITIONS (0033, INVENTORY D8). Until 0033 the pair gate ran
++        # only "if self.pair_risk is not None and self.snapshot is not None",
++        # so an engine built without either opened on the cost gates alone. No
++        # first leg now leaves without all three: the cost gates (already
++        # passed to reach here), the pair gate, and ONE market snapshot whose
++        # marks are the marks this decision was made on.
++        if self.pair_risk is None:
++            return CarryDecision(
++                "stand_aside", reason="PAIR_GATE_ABSENT", state=BookState.FLAT,
++                detail={"note": "no CarryRisk attached; a pair gate that is "
++                                "absent is not a pass"})
++        if self.snapshot is None:
++            return CarryDecision(
++                "stand_aside", reason="SNAPSHOT_ABSENT", state=BookState.FLAT,
++                detail={"note": "no market snapshot; the pair gate cannot "
++                                "judge freshness, margin or basis"})
++        if (getattr(self.snapshot, "perp_mark", None) != mark
++                or getattr(self.snapshot, "spot_mark", None) != spot_mark):
++            return CarryDecision(
++                "stand_aside", reason="SNAPSHOT_MISMATCH", state=BookState.FLAT,
++                detail={"decided_on": {"perp": mark, "spot": spot_mark},
++                        "snapshot": {"perp": getattr(self.snapshot,
++                                                     "perp_mark", None),
++                                     "spot": getattr(self.snapshot,
++                                                     "spot_mark", None)},
++                        "note": "the gate must judge the observation the "
++                                "entry was decided on, not a different one"})
++
+         qty = self.max_notional_usd / mark
+         if qty <= 0 or not self._finite(qty):
+             return self._halt("SIZE_INVALID", "refusing an unsizable book")
+@@ -321,22 +359,22 @@ class CarryEngine:
+ 
+         # THE PAIR GATE, before the first leg. Ordered by damage inside
+         # CarryRisk: a tripped kill switch outranks a stale price, both outrank
+-        # a cap. Absent when the engine is constructed bare in a test, and that
+-        # is the only case where it may be skipped.
+-        if self.pair_risk is not None and self.snapshot is not None:
+-            gate = self.pair_risk.gate_open(
+-                notional_usd=self.max_notional_usd, snapshot=self.snapshot,
+-                has_open_pair=self.position is not None)
+-            if not gate:
+-                return CarryDecision("stand_aside", reason=gate.reason,
+-                                     state=BookState.FLAT, detail=gate.detail)
++        # a cap. Never skipped: its absence refused above.
++        gate = self.pair_risk.gate_open(
++            notional_usd=self.max_notional_usd, snapshot=self.snapshot,
++            has_open_pair=self.position is not None)
++        if not gate:
++            return CarryDecision("stand_aside", reason=gate.reason,
++                                 state=BookState.FLAT, detail=gate.detail)
+ 
+         self.state = BookState.OPENING
++        self._last_leg_error = ""
+         spot = self._fire(self.spot_symbol, "Buy", qty, "spot")
+         if spot is None or spot.filled_qty <= 0:
+             self.state = BookState.FLAT
+             return CarryDecision("refused", reason="SPOT_LEG_DID_NOT_FILL",
+-                                 state=BookState.FLAT)
++                                 state=BookState.FLAT,
++                                 detail={"error": self._last_leg_error})
+ 
+         # Hedge exactly what the spot leg ACTUALLY filled. Hedging the requested
+         # size instead is how a rounding difference becomes a permanent short.
+@@ -350,15 +388,16 @@ class CarryEngine:
+         if residual > self.delta_band:
+             # Both legs landed but the sizes disagree by more than the band.
+             # That is not a hedge, it is a directional position wearing one.
++            # It paid a round trip, so it spends the day (INVENTORY D4).
+             self.position = position
++            self.pair_risk.record_broken_pair()
+             return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
+ 
+         self.position = position
+         self.state = BookState.HEDGED
+-        if self.pair_risk is not None:
+-            # Only now. A refused or half-filled pair did not consume the day's
+-            # entry allowance.
+-            self.pair_risk.record_entry()
++        # Only now: both legs landed. A refused pair consumed nothing; a
++        # broken one spent the day through record_broken_pair instead.
++        self.pair_risk.record_entry()
+         return CarryDecision(
+             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
+             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
+@@ -420,8 +459,14 @@ class CarryEngine:
+             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
+         self.position = None
+         self.state = BookState.FLAT
++        # A spot round trip was paid for nothing. Without this, a venue that
++        # rejects the perp leg made the book buy and sell spot every tick:
++        # 8 round trips in 10 ticks, measured (INVENTORY D4).
++        if self.pair_risk is not None:
++            self.pair_risk.record_broken_pair()
+         return CarryDecision("unwound", acted=True, reason=reason,
+-                             state=BookState.FLAT)
++                             state=BookState.FLAT,
++                             detail={"error": self._last_leg_error})
+ 
+     # -- guards -----------------------------------------------------------
+ 
+@@ -450,15 +495,18 @@ class CarryEngine:
+             result = self.broker.place_market(symbol=symbol, side=side,
+                                               qty=qty, product=product)
+         except Exception as exc:  # noqa: BLE001
++            self._last_leg_error = f"{type(exc).__name__}: {exc}"
+             logger.error("leg %s %s %s failed: %s", side, symbol, product, exc)
+             return None
+         if not result:
+             return None
++        raw_fee = result.get("fee")
+         return Leg(symbol=symbol, side=side, product=product,
+                    requested_qty=qty,
+                    filled_qty=float(result.get("filled_qty", 0.0) or 0.0),
+                    avg_price=float(result.get("avg_price", 0.0) or 0.0),
+-                   order_link_id=str(result.get("order_link_id", "")))
++                   order_link_id=str(result.get("order_link_id", "")),
++                   fee=None if raw_fee is None else float(raw_fee))
+ 
+     def _halt(self, reason: str, detail: str) -> CarryDecision:
+         self.state = BookState.HALTED
+diff --git a/bot/carry_risk.py b/bot/carry_risk.py
+index 99c8a3b..8f5166f 100644
+--- a/bot/carry_risk.py
++++ b/bot/carry_risk.py
+@@ -85,6 +85,11 @@ class CarryRisk:
+         self.min_margin_multiple = float(min_margin_multiple)
+         self.max_entries_per_day = int(max_entries_per_day)
+         self._entries: List[dt.date] = []
++        #: Pairs where ONE leg landed and was unwound (0033, INVENTORY D4). Not
++        #: entries — record_entry stays "both legs landed" — but they paid a
++        #: round trip, and a venue that keeps rejecting the perp would
++        #: otherwise make the book buy and sell spot every tick.
++        self._broken: List[dt.date] = []
+ 
+     def gate_open(self, *, notional_usd: float, snapshot: Any,
+                   has_open_pair: bool, now: Optional[dt.datetime] = None
+@@ -131,9 +136,13 @@ class CarryRisk:
+                           cap=self.max_notional_usd)
+ 
+         today = (now or dt.datetime.now(dt.timezone.utc)).date()
+-        used = sum(1 for d in self._entries if d == today)
++        landed = sum(1 for d in self._entries if d == today)
++        broken = sum(1 for d in self._broken if d == today)
++        used = landed + broken
+         if used >= self.max_entries_per_day:
+             return _block("ENTRY_LIMIT_REACHED_TODAY", used=used,
++                          landed_pairs_today=landed,
++                          broken_pairs_today=broken,
+                           limit=self.max_entries_per_day,
+                           note="the backtest opened 18 pairs in four years; a "
+                                "book opening twice in a day is thrashing, and "
+@@ -146,8 +155,17 @@ class CarryRisk:
+                              "basis_bps": getattr(snapshot, "basis_bps", None)})
+ 
+     def record_entry(self, *, now: Optional[dt.datetime] = None) -> None:
+-        """Called only after BOTH legs land. A refused or half-filled pair did
+-        not consume the day's entry."""
++        """Called only after BOTH legs land. A REFUSED pair (no leg sent) did
++        not consume the day's entry. A half-filled one is recorded separately,
++        by record_broken_pair."""
+         today = (now or dt.datetime.now(dt.timezone.utc)).date()
+         self._entries.append(today)
+         del self._entries[:-32]
++
++    def record_broken_pair(self, *, now: Optional[dt.datetime] = None) -> None:
++        """One leg landed alone and was unwound. It is not an entry; it did
++        cost a round trip, so it spends the day's allowance exactly as an
++        entry would. No new threshold: the same MAX_ENTRIES_PER_UTC_DAY."""
++        today = (now or dt.datetime.now(dt.timezone.utc)).date()
++        self._broken.append(today)
++        del self._broken[:-32]
+diff --git a/bot/config.py b/bot/config.py
+index c98cdf1..b978df7 100644
+--- a/bot/config.py
++++ b/bot/config.py
+@@ -154,6 +154,25 @@ def parse_float(
+     return value
+ 
+ 
++def parse_optional_fraction(env: Mapping[str, str], name: str) -> Optional[float]:
++    """A fraction in [0, 1), or None when the key is absent. Never a default.
++
++    Used for risk inputs that must be SET by an operator: absence is carried as
++    None to the one place that needs the value, which refuses on it.
++    """
++    raw = env.get(name)
++    if raw is None or str(raw).strip() == "":
++        return None
++    try:
++        value = float(str(raw).strip())
++    except (TypeError, ValueError):
++        raise ConfigError(f"{name}={raw!r} is not a number")
++    if not math.isfinite(value) or not (0.0 <= value < 1.0):
++        raise ConfigError(f"{name}={value} is outside [0, 1) — a fraction "
++                          "per year, e.g. 0.05 for 5%")
++    return value
++
++
+ def parse_int(
+     env: Mapping[str, str], name: str, default: int,
+     *, low: int = -(2**31), high: int = 2**31,
+@@ -358,6 +377,12 @@ class Config:
+     BOOK_MODE: str = "directional"
+     CARRY_SPOT_SYMBOL: str = "BTCUSDT"
+     CARRY_PERP_SYMBOL: str = "BTCUSDT"
++    #: Financing on the spot leg, as a fraction per year. REQUIRED for
++    #: BOOK_MODE=carry and deliberately without a default: 0.0 is an overlay on
++    #: BTC the client already owns, 0.05 is a financed book, and the difference
++    #: decides whether the trade clears its cost of capital (PHASE1_DECISION).
++    #: None here means "not set"; build_bot refuses a carry book on None.
++    CARRY_BORROW_APR: Optional[float] = None
+ 
+     # -- derived cost fractions --------------------------------------------
+ 
+@@ -738,6 +763,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
+         BOOK_MODE=parse_str(env, "BOOK_MODE", "directional"),
+         CARRY_SPOT_SYMBOL=parse_str(env, "CARRY_SPOT_SYMBOL", "BTCUSDT"),
+         CARRY_PERP_SYMBOL=parse_str(env, "CARRY_PERP_SYMBOL", "BTCUSDT"),
++        CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
+         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
+         # Default True so an existing deployment behaves exactly as before.
+         # parse_bool maps every unrecognised value to False, so a typo or a
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index a2aae21..f5472e9 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -63,16 +63,16 @@ Reproduced in-session with a stub broker; no venue.
+ | # | Defect | Reproduction / evidence | STATUS |
+ |---|---|---|---|
+ | D1 | **Funding is booked per tick, not per print.** `on_candle` adds `funding_bps × notional` on every call. 60 one-minute ticks at 1.0 bps on $100 booked **$0.60**; one real 8h print is **$0.01**. The negative-funding streak and the 8-print EWMA also count ticks. | stub engine, 60 calls | 0034 |
+-| D2 | **`PAPER_TRADING=1` does not stop carry orders.** `USE_TESTNET=0 PAPER_TRADING=1 BOOK_MODE=carry` → `assert_sandbox` = `SANDBOX (PAPER)`, and `bot.carry.broker.place_market(...)` sent `POST /v5/order/create` with a spot body. The client's base URL is chosen by `USE_TESTNET` alone. | `build_bot` + mocked `_request` | 0033 |
++| D2 | **`PAPER_TRADING=1` does not stop carry orders.** `USE_TESTNET=0 PAPER_TRADING=1 BOOK_MODE=carry` → `assert_sandbox` = `SANDBOX (PAPER)`, and `bot.carry.broker.place_market(...)` sent `POST /v5/order/create` with a spot body. The client's base URL is chosen by `USE_TESTNET` alone. | `build_bot` + mocked `_request` | **CLOSED 0033** — `CarryBroker(order_gate=...)` required; PAPER refuses; mainnet needs live authorisation AND a signed promotion gate, asked per order |
+ | D3 | **Restart while HEDGED opens a second pair.** The position is memory-only, `reconcile_pair` is never called, the orphan check is skipped on a spot-category client, and `CarryRisk.has_open_pair` reads `engine.position` (None after restart). | code path | open — Phase D cold start |
+-| D4 | **A venue that rejects the perp leg drains the book.** Spot buys, perp is rejected, spot is sold, state returns to FLAT, and the next tick repeats: **8 spot round trips in 10 ticks**. `record_entry` is (correctly) only called for a landed pair, so a broken pair consumes no allowance. | stub broker rejecting `linear` | 0033 |
++| D4 | **A venue that rejects the perp leg drains the book.** Spot buys, perp is rejected, spot is sold, state returns to FLAT, and the next tick repeats: **8 spot round trips in 10 ticks**. `record_entry` is (correctly) only called for a landed pair, so a broken pair consumes no allowance. | stub broker rejecting `linear` | **CLOSED 0033** — a broken pair spends the day (`CarryRisk.record_broken_pair`); 10 ticks → 1 spot round trip |
+ | D5 | **`carry_backtest` prints `QUOTABLE: True`** on daily closes with no impact term. The flag tracks provenance only (same venue + same quote). Rule 19 says daily-close settlement is not quotable. | `python3 tools/carry_backtest.py --repo .` | **CLOSED 0031** — five conditions, printed; attribution identity enforced |
+ | D6 | **carry_backtest / venue_study reads are not in the data-read ledger.** `reserved_holdout.install()` hooks `market_data.load_corpus`; both tools read with their own loaders, so the hook never fires. `artifacts/data_read_ledger.json` has 6 reads, none by either tool. Worse: run as a script, carry_backtest's `install()` raised on `import market_data` and the bare except set the whole ledger to None. | `data_read_ledger.json` | **CLOSED 0032** — explicit `_record()` in both tools; 15 retroactive + 6 new reads |
+-| D7 | `borrow_apr` has a default at every level: `CarryEngine(..., borrow_apr=0.05)`, `evaluate_entry(..., borrow_apr=DEFAULT_BORROW_APR)`, `simulate(..., borrow_apr=BORROW_APR)`; `build_bot` passes none. | `bot.carry.borrow_apr → 0.05` | 0033 |
+-| D8 | The pair gate is skipped when `pair_risk` **or** `snapshot` is `None`, and `test_carry_live_gates::test_the_gate_is_skipped_only_when_absent` asserts that a bare engine opens. | `carry_engine.py` `_open` | 0033 |
++| D7 | `borrow_apr` has a default at every level: `CarryEngine(..., borrow_apr=0.05)`, `evaluate_entry(..., borrow_apr=DEFAULT_BORROW_APR)`, `simulate(..., borrow_apr=BORROW_APR)`; `build_bot` passes none. | `bot.carry.borrow_apr → 0.05` | **CLOSED 0033** — no default in `CarryEngine` or `evaluate_entry`; `CARRY_BORROW_APR` required for carry, refused when absent |
++| D8 | The pair gate is skipped when `pair_risk` **or** `snapshot` is `None`, and `test_carry_live_gates::test_the_gate_is_skipped_only_when_absent` asserts that a bare engine opens. | `carry_engine.py` `_open` | **CLOSED 0033** — `PAIR_GATE_ABSENT` / `SNAPSHOT_ABSENT` / `SNAPSHOT_MISMATCH`; the test asserting the bypass was inverted |
+ | D9 | Clock-skew check is dead code on the live path (no `get_venue_time_s`). | §2 | open |
+ | D10 | `funding_collected` books only non-negative prints; negative prints are paid and never booked. | `carry_engine.py` on_candle | 0034 |
+-| D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | 0033 (fee carried, unknown ≠ 0) |
++| D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
+ | D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | **recorded 0032** (`carry_cost_gates_v1@BTCUSDT`, forward-only holdout); a quotable condition |
+ | D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
+ | D14 | **On the settlement clock the engine's exit rule churns.** Three negative PRINTS (one day) exit; 86 of 87 ungated trades exit that way, median hold 5.3 days vs `ASSUMED_HOLD_DAYS` 30; fees $313 vs funding $27 per median trade. Ungated at 0% borrow: +9.49%/yr (daily) → +2.24%/yr (8h, Bybit, impact). Not retuned (rule 20). | `--clock 8h --matrix` | open — a new exit rule is a new hypothesis, forward-scored only |
+@@ -81,7 +81,7 @@ Reproduced in-session with a stub broker; no venue.
+ 
+ | # | Assumption in code | Venue fact (Bybit V5, from `research/exchange_study/bybit/*` or `bybit_connection.py`) | STATUS |
+ |---|---|---|---|
+-| F1 | Spot market Buy `qty` is in BTC | Without `marketUnit=baseCoin` a spot market BUY is read as a **quote (USDT)** amount. `BybitClient` sets it (`bybit_connection.py` ~916); `CarryBroker` builds its own body and omits it. | 0033 |
++| F1 | Spot market Buy `qty` is in BTC | Without `marketUnit=baseCoin` a spot market BUY is read as a **quote (USDT)** amount. `BybitClient` sets it (`bybit_connection.py` ~916); `CarryBroker` builds its own body and omits it. | **CLOSED 0033** — `marketUnit=baseCoin` on every spot market order |
+ | F2 | `/v5/order/create` returns `cumExecQty`, `avgPrice` | It returns `orderId`, `orderLinkId`. The broker then queries `/v5/order/realtime` immediately — a race against the fill. | open, testnet |
+ | F3 | The spot fill equals the BTC received | Spot taker fee on a BUY is charged in BTC. Wallet = `cumExecQty − fee`; the perp hedges `cumExecQty`; `reconcile_pair` (dust 1e-6) would call every pair an INCIDENT. | open, testnet |
+ | F4 | `positionIM / positionMM` measures liquidation headroom | It is a leverage/risk-tier ratio (risk_limit tier 1: IM 0.66%, MM 0.33%). Under UTA cross margin liquidation is account-level (`accountMMRate`). The margin floor would not trip on a squeeze. | open, Phase D |
+diff --git a/bot/main.py b/bot/main.py
+index 27346fa..6e105ed 100644
+--- a/bot/main.py
++++ b/bot/main.py
+@@ -639,15 +639,51 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
+         # misnamed dependency.
+         import shadow as _shadow
+ 
++        # FINANCING (0033, INVENTORY D7). Read with no default and refused when
++        # absent: the engine used to fall back to its own constructor default
++        # of 5%, so an overlay on BTC the client already owns was gated as a
++        # financed book, or the reverse, with nothing in the log to say which.
++        borrow_apr = cfg.CARRY_BORROW_APR
++        if borrow_apr is None:
++            raise ValueError(
++                "BOOK_MODE=carry requires CARRY_BORROW_APR (a fraction per "
++                "year: 0.0 = an overlay on BTC already owned, 0.05 = financed "
++                "at 5%). It decides whether the carry clears its cost of "
++                "capital; refusing rather than assuming.")
++
++        # WHO MAY SEND A CARRY ORDER (0033, INVENTORY D2). The carry broker
++        # bypasses TradingEngine, so PAPER_TRADING never reached it: with
++        # USE_TESTNET=0 PAPER_TRADING=1 the process called itself SANDBOX
++        # (PAPER) and the carry broker would still have POSTed to mainnet.
++        # Asked before EVERY order, read fresh each time.
++        def _carry_orders_permitted():
++            if bool(cfg.PAPER_TRADING):
++                return (False, "PAPER_TRADING=1: the carry book has no paper "
++                               "venue")
++            if bool(cfg.USE_TESTNET):
++                return (True, "TESTNET")
++            armed, why = _config.is_live_authorized(cfg)
++            if armed is not True:
++                return (False, f"mainnet URL without live authorisation: {why}")
++            # Defence in depth: start() already refuses a live-armed process
++            # whose promotion gate is unsigned. The broker asks again, per
++            # order, so no path around start() reaches a mainnet carry order.
++            import promotion_gate as _gate
++            if _gate.promotion_gate_allows_live(config=cfg) is not True:
++                return (False, "mainnet URL: the promotion gate is not signed")
++            return (True, "LIVE (authorised, promotion gate signed)")
++
+         bot.carry = CarryEngine(
+             broker=CarryBroker(
+                 client=bot.client,
+                 sequence_source=lambda product, symbol, purpose:
+-                    bot.store.next_order_seq()),
++                    bot.store.next_order_seq(),
++                order_gate=_carry_orders_permitted),
+             kill_switch=bot.store.trip_kill_switch,
+             spot_symbol=cfg.CARRY_SPOT_SYMBOL,
+             perp_symbol=cfg.CARRY_PERP_SYMBOL,
+             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
++            borrow_apr=float(borrow_apr),
+         )
+         # The pair gate. Until now max_notional_usd was the ONLY size control on
+         # the carry book: the legs passed through no RiskManager at all. This is
+@@ -659,9 +695,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
+             store=bot.store,
+             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
+         logger.warning(
+-            "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f. The "
+-            "directional strategy is NOT attached and will not be consulted.",
+-            bot.carry.max_notional_usd)
++            "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
++            "%.4f/yr, orders: %s. The directional strategy is NOT attached "
++            "and will not be consulted.",
++            bot.carry.max_notional_usd, bot.carry.borrow_apr,
++            _carry_orders_permitted()[1])
+         return bot
+ 
+     if attach_strategy and bot.strategy is None:
+diff --git a/bot/tests/test_carry_broker.py b/bot/tests/test_carry_broker.py
+index f351dd9..2d9d415 100644
+--- a/bot/tests/test_carry_broker.py
++++ b/bot/tests/test_carry_broker.py
+@@ -59,6 +59,10 @@ class FakeClient:
+ 
+ def broker(client, **kw):
+     seq = kw.pop("sequence_source", lambda product, symbol, purpose: 7)
++    # 0033: the order gate is a required argument. These tests exercise the
++    # adapter against a fake venue that is allowed to receive orders; the
++    # gate's refusals are tested in test_carry_fail_closed.py.
++    kw.setdefault("order_gate", lambda: (True, "TEST_VENUE"))
+     return CarryBroker(client=client, sequence_source=seq, **kw)
+ 
+ 
+@@ -237,9 +241,19 @@ class TestItDecidesNothing:
+ class TestItDrivesTheEngine:
+     def test_the_engine_opens_a_pair_through_this_adapter(self):
+         """End to end: CarryEngine + CarryBroker + a venue."""
++        import time
+         from carry_engine import BookState, CarryEngine
++        from carry_risk import CarryRisk
++        from market_snapshot import MarketSnapshot
+         client = FakeClient(im=5.0, mm=1.0)
+-        eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0)
++        # 0033: borrow is required, and no first leg leaves without the pair
++        # gate and one snapshot of the marks the decision is made on.
++        eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0,
++                          borrow_apr=0.05)
++        eng.pair_risk = CarryRisk(max_notional_usd=100_000.0)
++        eng.snapshot = MarketSnapshot(perp_mark=100_000.0, spot_mark=100_000.0,
++                                      funding_bps=3.0, margin_multiple=5.0,
++                                      observed_at_s=time.time())
+         for _ in range(2):   # warm the EWMA
+             eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0)
+         client.created.clear()
+diff --git a/bot/tests/test_carry_costs.py b/bot/tests/test_carry_costs.py
+index 19b50df..2650e1d 100644
+--- a/bot/tests/test_carry_costs.py
++++ b/bot/tests/test_carry_costs.py
+@@ -31,13 +31,13 @@ def at_basis(bps: float):
+ class TestTheCaseThatMustRefuse:
+     def test_thin_funding_into_a_wide_basis_is_refused(self):
+         """+0.6 bps funding, +30 bps basis. Named explicitly in the spec."""
+-        v = cc.evaluate_entry(funding_prints_bps=[0.6, 0.6, 0.6],
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.6, 0.6, 0.6],
+                               **at_basis(30.0))
+         assert v.allowed is False
+         assert bool(v) is False
+ 
+     def test_the_refusal_names_the_binding_constraint(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[0.6, 0.6, 0.6],
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.6, 0.6, 0.6],
+                               **at_basis(30.0))
+         assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
+         assert v.net_edge_bps_per_day < 0
+@@ -45,18 +45,18 @@ class TestTheCaseThatMustRefuse:
+ 
+ class TestGateOneBasis:
+     def test_a_basis_beyond_the_budget_is_refused(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **at_basis(150.0))
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(150.0))
+         assert v.allowed is False
+         assert v.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
+ 
+     def test_a_basis_inside_the_budget_is_allowed(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **at_basis(20.0))
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(20.0))
+         assert v.allowed is True
+ 
+     def test_the_budget_is_net_edge_not_gross_carry(self):
+         """Paying basis out of money already spoken for by borrow and fees is
+         how a positive-carry trade closes negative."""
+-        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat())
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat())
+         gross = v.expected_carry_bps_per_day * cc.ASSUMED_HOLD_DAYS
+         assert v.basis_budget_bps < gross
+ 
+@@ -70,7 +70,7 @@ class TestGateOneBasis:
+             cc.basis_bps(100_000.0, spot)
+ 
+     def test_an_unreadable_basis_refuses_rather_than_assuming(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[5.0] * 3, perp=100_000.0,
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[5.0] * 3, perp=100_000.0,
+                               spot=float("nan"))
+         assert v.allowed is False
+         assert v.reason == "BASIS_UNREADABLE"
+@@ -78,7 +78,7 @@ class TestGateOneBasis:
+ 
+ class TestGateTwoCostOfCapital:
+     def test_carry_below_borrow_plus_fees_is_refused(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[0.3] * 3, **flat())
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.3] * 3, **flat())
+         assert v.allowed is False
+         assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
+ 
+@@ -95,9 +95,9 @@ class TestGateTwoCostOfCapital:
+         assert v.allowed is False
+ 
+     def test_the_round_trip_is_amortised_over_the_hold(self):
+-        short = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat(),
++        short = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat(),
+                                   hold_days=7.0)
+-        long = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat(),
++        long = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat(),
+                                  hold_days=90.0)
+         assert (short.amortised_round_trip_bps_per_day
+                 > long.amortised_round_trip_bps_per_day)
+@@ -105,7 +105,7 @@ class TestGateTwoCostOfCapital:
+     def test_a_seven_day_hold_cannot_pay_for_its_own_entry(self):
+         """At threshold carry the round trip alone exceeds the income. This is
+         why ASSUMED_HOLD_DAYS is load-bearing rather than cosmetic."""
+-        v = cc.evaluate_entry(funding_prints_bps=[0.2] * 3, **flat(),
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.2] * 3, **flat(),
+                               hold_days=7.0)
+         assert v.amortised_round_trip_bps_per_day > \
+             v.expected_carry_bps_per_day
+@@ -114,7 +114,7 @@ class TestGateTwoCostOfCapital:
+ 
+ class TestGateThreeEwma:
+     def test_too_few_prints_refuses(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[5.0], **flat())
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[5.0], **flat())
+         assert v.allowed is False
+         assert v.reason == "INSUFFICIENT_FUNDING_HISTORY"
+ 
+@@ -133,7 +133,7 @@ class TestGateThreeEwma:
+         assert cc.ewma_funding_bps([5.0, 5.0, 5.0, 0.0]) < 5.0
+ 
+     def test_negative_smoothed_funding_refuses(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[-1.0] * 3, **flat())
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[-1.0] * 3, **flat())
+         assert v.allowed is False
+         assert v.reason == "FUNDING_NOT_POSITIVE"
+ 
+@@ -146,11 +146,11 @@ class TestTheGatesAreOrderedByBindingConstraint:
+     def test_cost_of_capital_is_reported_before_basis(self):
+         """A refusal must name the binding constraint, not whichever check
+         happened to run first."""
+-        v = cc.evaluate_entry(funding_prints_bps=[0.3] * 3, **at_basis(500.0))
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.3] * 3, **at_basis(500.0))
+         assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
+ 
+     def test_basis_is_reported_when_the_economics_are_otherwise_fine(self):
+-        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **at_basis(500.0))
++        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(500.0))
+         assert v.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
+ 
+ 
+@@ -166,10 +166,18 @@ class TestItDecidesNothingElse:
+     def test_the_verdict_is_pure(self):
+         """Same inputs, same answer. A risk rule with state cannot be trusted."""
+         kw = dict(funding_prints_bps=[1.5] * 3, **flat())
+-        assert cc.evaluate_entry(**kw) == cc.evaluate_entry(**kw)
++        assert cc.evaluate_entry(borrow_apr=0.05, **kw) == cc.evaluate_entry(borrow_apr=0.05, **kw)
+ 
+     def test_borrow_is_explicit_at_the_declaration(self):
+         """+1.77% financed vs +7.96% unfinanced is the difference between a
+-        business and a hobby, so the rate is never silently absent."""
+-        assert cc.DEFAULT_BORROW_APR == 0.05
++        business and a hobby, so the rate is never silently absent.
++
++        0033: this test used to pin DEFAULT_BORROW_APR == 0.05 — a default,
++        which is the opposite of what its docstring says. It now asserts the
++        docstring: evaluate_entry has no default for borrow_apr, and no
++        module-level default exists for anyone to reach for."""
++        import inspect
++        param = inspect.signature(cc.evaluate_entry).parameters["borrow_apr"]
++        assert param.default is inspect.Parameter.empty
++        assert not hasattr(cc, "DEFAULT_BORROW_APR")
+         assert cc.ASSUMED_HOLD_DAYS == 30.0
+diff --git a/bot/tests/test_carry_engine.py b/bot/tests/test_carry_engine.py
+index 5a3e7d3..e7c9858 100644
+--- a/bot/tests/test_carry_engine.py
++++ b/bot/tests/test_carry_engine.py
+@@ -13,6 +13,8 @@ import pytest
+ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+ 
+ from carry_engine import BookState, CarryEngine, DELTA_BAND  # noqa: E402
++from carry_risk import CarryRisk  # noqa: E402
++from market_snapshot import MarketSnapshot  # noqa: E402
+ 
+ 
+ class FakeBroker:
+@@ -57,6 +59,30 @@ class _SpotFillsThenVenueDies(FakeBroker):
+ SPOT = 100_000.0
+ 
+ 
++class _Wired(CarryEngine):
++    """The engine as main.tick drives it (0033).
++
++    Since 0033 no first leg leaves without the pair gate AND one market
++    snapshot whose marks are the marks the decision used. main.tick takes that
++    snapshot and hands it over before every on_candle; this stamps one from
++    the candle's own arguments, the same way, so these tests exercise the
++    production path instead of a bare engine that production can no longer
++    build. The refusals themselves are tested in test_carry_fail_closed.py.
++    """
++
++    def on_candle(self, *, mark, funding_bps, spot=None, timestamp_ms=0):
++        import math
++        import time
++        usable = (spot is not None and isinstance(mark, (int, float))
++                  and math.isfinite(mark) and mark > 0)
++        self.snapshot = MarketSnapshot(
++            perp_mark=mark, spot_mark=spot, funding_bps=funding_bps,
++            margin_multiple=float(getattr(self.broker, "margin", 5.0)),
++            observed_at_s=time.time()) if usable else None
++        return super().on_candle(mark=mark, funding_bps=funding_bps,
++                                 spot=spot, timestamp_ms=timestamp_ms)
++
++
+ def engine(broker, *, primed=True, **kw):
+     """A CarryEngine ready to open.
+ 
+@@ -73,7 +99,9 @@ def engine(broker, *, primed=True, **kw):
+     `primed=False` leaves the history empty to test the warm-up itself.
+     """
+     kw.setdefault("max_notional_usd", 100_000.0)
+-    eng = CarryEngine(broker=broker, **kw)
++    kw.setdefault("borrow_apr", 0.05)
++    eng = _Wired(broker=broker, **kw)
++    eng.pair_risk = CarryRisk(max_notional_usd=kw["max_notional_usd"])
+     if primed:
+         for _ in range(2):
+             eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=SPOT)
+diff --git a/bot/tests/test_carry_fail_closed.py b/bot/tests/test_carry_fail_closed.py
+new file mode 100644
+index 0000000..41ee925
+--- /dev/null
++++ b/bot/tests/test_carry_fail_closed.py
+@@ -0,0 +1,335 @@
++"""0033 — Phase C: every gate on the carry path fails closed, proven by running.
++
++INVENTORY.md found each of these by running the carry path against a stub
++venue. Each test below reproduces one finding and asserts the refusal.
++"""
++from __future__ import annotations
++
++import ast
++import os
++import sys
++import time
++from unittest import mock
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import carry_costs as cc  # noqa: E402
++import main as _main  # noqa: E402
++from carry_broker import CarryBroker, CarryOrderRefused, LegFill  # noqa: E402
++from carry_engine import BookState, CarryEngine  # noqa: E402
++from carry_risk import CarryRisk  # noqa: E402
++from market_snapshot import MarketSnapshot  # noqa: E402
++
++REPO = os.path.join(os.path.dirname(__file__), "..")
++MARK = 100_000.0
++
++
++class Venue:
++    """Fills what it is asked unless told to reject a product."""
++
++    def __init__(self, reject=()):
++        self.reject = set(reject)
++        self.orders = []
++
++    def place_market(self, *, symbol, side, qty, product):
++        self.orders.append((side, product))
++        if product in self.reject:
++            return None
++        return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x"}
++
++    def get_margin_multiple(self, symbol):
++        return 5.0
++
++    def get_mark(self, symbol):
++        return MARK
++
++
++def snap(perp=MARK, spot=MARK):
++    return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=3.0,
++                          margin_multiple=5.0, observed_at_s=time.time())
++
++
++def warmed(engine):
++    """Three prints of history, taken with the gate absent so no leg can go."""
++    gate, view = engine.pair_risk, engine.snapshot
++    engine.pair_risk, engine.snapshot = None, None
++    for _ in range(2):
++        engine.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++    engine.pair_risk, engine.snapshot = gate, view
++    return engine
++
++
++def engine(venue, *, gate=True, view=True, **kw):
++    kw.setdefault("borrow_apr", 0.05)
++    kw.setdefault("max_notional_usd", 100.0)
++    e = CarryEngine(broker=venue, **kw)
++    e.pair_risk = CarryRisk(max_notional_usd=100.0) if gate else None
++    e.snapshot = snap() if view else None
++    return warmed(e)
++
++
++class TestNoFirstLegWithoutTheGateAndTheView:
++    def test_a_wired_engine_opens(self):
++        v = Venue()
++        d = engine(v).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert d.action == "opened" and len(v.orders) == 2
++
++    def test_no_pair_gate_no_leg(self):
++        v = Venue()
++        d = engine(v, gate=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert d.acted is False
++        assert d.reason == "PAIR_GATE_ABSENT"
++        assert v.orders == []
++
++    def test_no_snapshot_no_leg(self):
++        v = Venue()
++        d = engine(v, view=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert d.reason == "SNAPSHOT_ABSENT"
++        assert v.orders == []
++
++    def test_a_snapshot_of_a_different_instant_is_refused(self):
++        """One stamp, not three loose reads: the gate must judge the same
++        observation the entry decision used."""
++        v = Venue()
++        e = engine(v)
++        e.snapshot = snap(perp=MARK * 1.001)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert d.reason == "SNAPSHOT_MISMATCH"
++        assert v.orders == []
++
++
++class TestBorrowIsRequiredEverywhere:
++    def test_the_engine_cannot_be_built_without_it(self):
++        with pytest.raises(TypeError):
++            CarryEngine(broker=Venue(), max_notional_usd=100.0)
++
++    def test_the_cost_gate_cannot_be_asked_without_it(self):
++        with pytest.raises(TypeError):
++            cc.evaluate_entry(funding_prints_bps=[3.0] * 3, perp=MARK, spot=MARK)
++
++    def test_no_module_level_borrow_default_is_left_in_the_cost_gate(self):
++        assert not hasattr(cc, "DEFAULT_BORROW_APR")
++
++    def test_build_bot_refuses_a_carry_book_without_a_financing_rate(self):
++        import config as _config
++        cfg = _config.load({"BOOK_MODE": "carry"})
++        assert cfg.CARRY_BORROW_APR is None
++        with pytest.raises(ValueError, match="CARRY_BORROW_APR"):
++            _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
++                            risk_manager=mock.Mock(), engine=mock.Mock())
++
++    @pytest.mark.parametrize("apr", ["0.0", "0.05"])
++    def test_build_bot_passes_the_configured_rate(self, apr):
++        import config as _config
++        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": apr})
++        bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
++                              risk_manager=mock.Mock(), engine=mock.Mock())
++        assert bot.carry.borrow_apr == pytest.approx(float(apr))
++
++    @pytest.mark.parametrize("bad", ["-0.01", "1.5", "five", "nan"])
++    def test_a_nonsense_rate_is_refused_at_load(self, bad):
++        import config as _config
++        with pytest.raises(Exception):
++            _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": bad})
++
++
++class _Store:
++    def __init__(self):
++        self.seq = 0
++
++    def next_order_seq(self):
++        self.seq += 1
++        return self.seq
++
++    def trip_kill_switch(self, reason):
++        pass
++
++    def is_kill_switch_engaged(self):
++        return (False, "")
++
++
++def _carry_bot(**env):
++    import config as _config
++    base = {"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0"}
++    base.update(env)
++    client = mock.Mock()
++    client._request = mock.Mock(return_value={"orderLinkId": "x"})
++    bot = _main.build_bot(config=_config.load(base), store=_Store(),
++                          client=client, risk_manager=mock.Mock(),
++                          engine=mock.Mock())
++    return bot, client
++
++
++def _created(client):
++    return [c for c in client._request.call_args_list
++            if c.args[:2] == ("POST", "/v5/order/create")]
++
++
++class TestPaperMeansNoCarryOrder:
++    """INVENTORY D2: USE_TESTNET=0 PAPER_TRADING=1 reported SANDBOX (PAPER)
++    and the carry broker still sent a mainnet order body."""
++
++    @pytest.mark.parametrize("testnet", ["0", "1"])
++    def test_paper_refuses_every_carry_order(self, testnet):
++        bot, client = _carry_bot(USE_TESTNET=testnet, PAPER_TRADING="1")
++        with pytest.raises(CarryOrderRefused, match="PAPER"):
++            bot.carry.broker.place_market(symbol="BTCUSDT", side="Buy",
++                                          qty=0.001, product="spot")
++        assert _created(client) == []
++
++    def test_mainnet_without_the_ack_degrades_to_paper_and_refuses(self):
++        """config already turns an un-acknowledged mainnet request into PAPER;
++        the broker then refuses on PAPER."""
++        bot, client = _carry_bot(USE_TESTNET="0", PAPER_TRADING="0")
++        with pytest.raises(CarryOrderRefused, match="PAPER"):
++            bot.carry.broker.place_market(symbol="BTCUSDT", side="Buy",
++                                          qty=0.001, product="spot")
++        assert _created(client) == []
++
++    LIVE = {"USE_TESTNET": "0", "PAPER_TRADING": "0",
++            "LIVE_TRADING_ACK": "I_UNDERSTAND", "BYBIT_API_KEY": "k" * 18,
++            "BYBIT_API_SECRET": "s" * 36}
++
++    def test_live_authorised_but_unsigned_gate_is_refused(self):
++        bot, client = _carry_bot(**self.LIVE)
++        with pytest.raises(CarryOrderRefused, match="promotion gate"):
++            bot.carry.broker.place_market(symbol="BTCUSDT", side="Buy",
++                                          qty=0.001, product="spot")
++        assert _created(client) == []
++
++    def test_authorisation_revoked_at_runtime_is_refused(self, monkeypatch):
++        import config as _config
++        bot, client = _carry_bot(**self.LIVE)
++        monkeypatch.setattr(_config, "is_live_authorized",
++                            lambda cfg=None: (False, "revoked"))
++        with pytest.raises(CarryOrderRefused, match="mainnet"):
++            bot.carry.broker.place_market(symbol="BTCUSDT", side="Buy",
++                                          qty=0.001, product="spot")
++        assert _created(client) == []
++
++    def test_testnet_without_paper_may_send(self):
++        bot, client = _carry_bot(USE_TESTNET="1", PAPER_TRADING="0")
++        bot.carry.broker.place_market(symbol="BTCUSDT", side="Buy",
++                                      qty=0.001, product="spot")
++        assert len(_created(client)) == 1
++
++    def test_the_broker_cannot_be_built_without_an_order_gate(self):
++        with pytest.raises(TypeError):
++            CarryBroker(client=mock.Mock(), sequence_source=lambda *a: 1)
++
++    def test_an_unreadable_gate_refuses(self):
++        def broken():
++            raise RuntimeError("config gone")
++        b = CarryBroker(client=mock.Mock(), sequence_source=lambda *a: 1,
++                        order_gate=broken)
++        with pytest.raises(CarryOrderRefused):
++            b.place_market(symbol="BTCUSDT", side="Buy", qty=0.001,
++                           product="spot")
++
++    def test_the_engine_names_the_refusal(self):
++        bot, _client = _carry_bot(USE_TESTNET="1", PAPER_TRADING="1")
++        e = bot.carry
++        e.snapshot = snap()
++        warmed(e)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert d.acted is False
++        assert "PAPER" in str(d.detail.get("error", ""))
++
++
++class TestTheSpotLegIsSizedInBtc:
++    """INVENTORY F1: without marketUnit a spot market BUY is a USDT amount."""
++
++    def _body(self, product, side="Buy"):
++        client = mock.Mock()
++        client._request = mock.Mock(return_value={"orderLinkId": "x",
++                                                  "cumExecQty": "0.001",
++                                                  "avgPrice": "100000"})
++        CarryBroker(client=client, sequence_source=lambda *a: 1,
++                    order_gate=lambda: (True, "TEST")).place_market(
++            symbol="BTCUSDT", side=side, qty=0.001, product=product)
++        return client._request.call_args_list[0].kwargs["body"]
++
++    @pytest.mark.parametrize("side", ["Buy", "Sell"])
++    def test_spot_market_orders_say_base_coin(self, side):
++        assert self._body("spot", side)["marketUnit"] == "baseCoin"
++
++    def test_linear_orders_carry_no_market_unit(self):
++        assert "marketUnit" not in self._body("linear", "Sell")
++
++
++class TestAFeeIsKnownOrItIsUnknown:
++    def test_cum_exec_fee_is_carried(self):
++        fill = CarryBroker._fill_from({"cumExecQty": "0.001", "avgPrice": "1",
++                                       "cumExecFee": "0.000001"}, "x")
++        assert fill.fee == pytest.approx(0.000001)
++        assert fill.as_engine_result()["fee"] == pytest.approx(0.000001)
++
++    def test_an_absent_fee_is_none_not_zero(self):
++        fill = CarryBroker._fill_from({"cumExecQty": "0.001",
++                                       "avgPrice": "1"}, "x")
++        assert fill.fee is None
++
++    def test_the_engine_keeps_unknown_as_unknown(self):
++        v = Venue()
++        e = engine(v)
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert e.position.spot.fee is None
++        assert e.position.perp.fee is None
++
++    def test_no_carry_module_books_a_zero_fee(self):
++        for name in ("carry_engine.py", "carry_broker.py", "carry_costs.py",
++                     "carry_risk.py", "market_snapshot.py",
++                     os.path.join("tools", "carry_backtest.py")):
++            tree = ast.parse(open(os.path.join(REPO, name),
++                                  encoding="utf-8").read())
++            for node in ast.walk(tree):
++                if isinstance(node, ast.keyword) and node.arg == "fee":
++                    assert not (isinstance(node.value, ast.Constant)
++                                and node.value.value == 0), name
++                if isinstance(node, ast.Assign):
++                    for t in node.targets:
++                        tname = getattr(t, "id", getattr(t, "attr", ""))
++                        if tname == "fee":
++                            assert not (isinstance(node.value, ast.Constant)
++                                        and node.value.value == 0), name
++
++
++class TestABrokenPairCannotThrash:
++    """INVENTORY D4: a venue rejecting the perp leg produced 8 spot round
++    trips in 10 ticks. A broken pair costs a round trip; it spends the day."""
++
++    def test_ten_ticks_one_round_trip(self):
++        v = Venue(reject={"linear"})
++        e = engine(v)
++        for _ in range(10):
++            e.snapshot = snap()
++            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        spot = [o for o in v.orders if o[1] == "spot"]
++        assert spot == [("Buy", "spot"), ("Sell", "spot")]
++        assert e.state is BookState.FLAT
++
++    def test_a_broken_pair_is_not_recorded_as_an_entry(self):
++        v = Venue(reject={"linear"})
++        e = engine(v)
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert e.pair_risk._entries == []
++        assert len(e.pair_risk._broken) == 1
++
++    def test_the_gate_reports_why(self):
++        r = CarryRisk(max_notional_usd=100.0)
++        r.record_broken_pair()
++        d = r.gate_open(notional_usd=100.0, snapshot=snap(), has_open_pair=False)
++        assert d.reason == "ENTRY_LIMIT_REACHED_TODAY"
++        assert d.detail["broken_pairs_today"] == 1
++
++
++class TestRecordEntryOnlyAfterBothLegs:
++    @pytest.mark.parametrize("reject,expected", [((), 1), (("spot",), 0),
++                                                 (("linear",), 0)])
++    def test_only_a_landed_pair_is_an_entry(self, reject, expected):
++        v = Venue(reject=set(reject))
++        e = engine(v)
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert len(e.pair_risk._entries) == expected
+diff --git a/bot/tests/test_carry_live_gates.py b/bot/tests/test_carry_live_gates.py
+index 0ccf18e..b234952 100644
+--- a/bot/tests/test_carry_live_gates.py
++++ b/bot/tests/test_carry_live_gates.py
+@@ -81,7 +81,8 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
+     bot.risk = mock.Mock(should_halt_trading=lambda: False,
+                          update_equity=lambda e: None)
+     bot.engine = mock.Mock(observe_exits=lambda: {})
+-    bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0)
++    bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
++                            borrow_apr=0.05)
+     if risk:
+         bot.carry.pair_risk = CarryRisk(store=store, max_notional_usd=100.0)
+     for _ in range(2):
+@@ -166,14 +167,19 @@ class TestThePairGateRunsBeforeTheFirstLeg:
+         assert not broker.orders, "the engine opened above the gate's cap"
+         assert bot.carry.position is None
+ 
+-    def test_the_gate_is_skipped_only_when_absent(self):
+-        """A bare engine in a unit test may open. A wired one may not bypass."""
++    def test_an_absent_gate_is_a_refusal_not_a_skip(self):
++        """0033 INVERTED this test, deliberately. It used to assert that an
++        engine WITHOUT a pair gate opens ("a bare engine in a unit test may
++        open"). That was the bypass Phase C exists to remove: an absent gate
++        is not a pass. The assertion is now the stricter one — no gate, no
++        leg — and the refusal names itself."""
+         broker = Broker()
+         bot = bot_with(broker, risk=False)
+         assert bot.carry.pair_risk is None
+         broker.orders.clear()
+         bot.tick()
+-        assert len(broker.orders) == 2
++        assert broker.orders == []
++        assert bot.carry.position is None
+ 
+ 
+ class TestTheDayAllowanceIsSpentOnlyOnSuccess:
+@@ -205,7 +211,7 @@ class TestTheDayAllowanceIsSpentOnlyOnSuccess:
+ class TestBuildBotAttachesTheGate:
+     def test_carry_mode_gets_a_pair_gate(self):
+         import config as _config
+-        cfg = _config.load({"BOOK_MODE": "carry"})
++        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
+         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
+                               risk_manager=mock.Mock(), engine=mock.Mock())
+         assert bot.carry.pair_risk is not None
+@@ -213,7 +219,7 @@ class TestBuildBotAttachesTheGate:
+     def test_the_gate_cap_matches_the_engine_cap(self):
+         import config as _config
+         import shadow
+-        cfg = _config.load({"BOOK_MODE": "carry"})
++        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
+         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
+                               risk_manager=mock.Mock(), engine=mock.Mock())
+         assert bot.carry.pair_risk.max_notional_usd == pytest.approx(
+diff --git a/bot/tests/test_carry_wiring.py b/bot/tests/test_carry_wiring.py
+index 175bf4c..46be713 100644
+--- a/bot/tests/test_carry_wiring.py
++++ b/bot/tests/test_carry_wiring.py
+@@ -85,7 +85,12 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
+     from carry_engine import CarryEngine
+     bot = _main.TradingBot.__new__(_main.TradingBot)
+     bot.symbols = ["BTCUSDT"]
+-    bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0)
++    bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0,
++                            borrow_apr=0.05)
++    # 0033: no first leg without the pair gate. main.tick supplies the
++    # snapshot; the gate is attached here exactly as build_bot attaches it.
++    from carry_risk import CarryRisk
++    bot.carry.pair_risk = CarryRisk(max_notional_usd=100_000.0)
+     # Warm the EWMA: the engine refuses below three prints rather than
+     # falling back to the last one.
+     for _ in range(2):
+@@ -153,7 +158,7 @@ class TestUnreadableInputsTouchNothing:
+ 
+ class TestTheTwoBooksAreMutuallyExclusive:
+     def test_carry_mode_never_constructs_the_technical_voter(self):
+-        cfg = _config.load({"BOOK_MODE": "carry"})
++        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
+         with mock.patch("technical_analysis.MarketStrategy") as voter:
+             bot = _main.build_bot(config=cfg, store=_Store(),
+                                   client=mock.Mock(), risk_manager=mock.Mock(),
+@@ -172,7 +177,8 @@ class TestTheTwoBooksAreMutuallyExclusive:
+         """They share one liquidation price. Two strategies fighting over it is
+         how a hedged book becomes a directional one without anyone deciding."""
+         for mode in ("carry", "directional"):
+-            cfg = _config.load({"BOOK_MODE": mode})
++            # 0033: a carry book requires a financing rate; directional ignores it.
++            cfg = _config.load({"BOOK_MODE": mode, "CARRY_BORROW_APR": "0.05"})
+             bot = _main.build_bot(config=cfg, store=_Store(),
+                                   client=mock.Mock(), risk_manager=mock.Mock(),
+                                   engine=mock.Mock())
+diff --git a/bot/tests/test_carry_wiring_authority.py b/bot/tests/test_carry_wiring_authority.py
+index cee2b91..f4bbad7 100644
+--- a/bot/tests/test_carry_wiring_authority.py
++++ b/bot/tests/test_carry_wiring_authority.py
+@@ -57,7 +57,9 @@ class _Store:
+ 
+ 
+ def _build(mode="carry", store=None):
+-    return _main.build_bot(config=_config.load({"BOOK_MODE": mode}),
++    # 0033: CARRY_BORROW_APR is required for a carry book (no default).
++    return _main.build_bot(config=_config.load({"BOOK_MODE": mode,
++                                                "CARRY_BORROW_APR": "0.05"}),
+                            store=store or _Store(), client=mock.Mock(),
+                            risk_manager=mock.Mock(), engine=mock.Mock())
+ 
+@@ -162,7 +164,8 @@ class TestSymbolsComeFromConfigNotADefault:
+         assert "cfg.CARRY_SPOT_SYMBOL" in body
+ 
+     def test_a_configured_symbol_reaches_the_book(self):
+-        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_PERP_SYMBOL": "ETHUSDT"})
++        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_PERP_SYMBOL": "ETHUSDT",
++                            "CARRY_BORROW_APR": "0.05"})
+         bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
+                               risk_manager=mock.Mock(), engine=mock.Mock())
+         assert bot.carry.perp_symbol == "ETHUSDT"
+-- 
+2.43.0
+

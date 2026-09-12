@@ -1,0 +1,958 @@
+From 9f4c7c374fbaf68236d05c983ec60069488dc3a5 Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Fri, 11 Sep 2026 18:51:02 +0000
+Subject: [PATCH] 0034 a funding print is a print, not a tick (5501 passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+INVENTORY D1: main.tick calls on_candle every 60 s with the ticker's
+PREDICTED rate, and the engine booked it on every call. 60 ticks at 1 bps on
+$100 booked $0.60; one real 8h print is $0.01. The negative-funding streak
+and the 8-print EWMA counted ticks too: three negative MINUTES unwound the
+book, and the EWMA was eight minutes of one number.
+
+Fix — prints carry their settlement stamp:
+
+  CarryBroker.get_funding_print(symbol) -> (bps, settlement_ms), from
+    /v5/market/funding/history (the settled record), not the ticker (F6).
+    Raises when unreadable.
+  take_snapshot reads it directly (no getattr) and keeps the forecast
+    (funding_bps) and the settled print (funding_print_bps/_ms) apart.
+  assert_fresh refuses a settled print older than one funding interval
+    (Bybit instrument fundingInterval = 480 min — a venue fact, not a tuned
+    threshold) plus the existing snapshot age limit: a missed settlement is a
+    stale view. A print stamped in the future is refused too.
+  CarryEngine.on_candle(..., funding_print_ms): only a stamp newer than the
+    last is a print. It enters the EWMA once, counts toward the streak once,
+    and is booked once — and only if the pair was held through it (stamp
+    after the open). No stamp, no print: nothing booked, the warm-up cannot
+    complete, the book cannot open.
+  D10: every held print is booked SIGNED; negative prints were paid and
+    never booked.
+  main.tick passes the settled print and its stamp; logs settled AND
+    predicted.
+
+The settlement-clock backtest (0032) already counts prints this way, so
+engine and simulation now agree on what "three negative prints" means —
+which is the rule that produced D14's churn. Not retuned.
+
+Tests first: tests/test_carry_funding_prints.py, 20 new (60 ticks of one
+print book it once; entry print not collected; pre-open print not booked;
+negative booked; 3 negative ticks hold, 3 negative prints unwind; EWMA sees
+one observation per stamp; no stamp -> no entry; broker reads funding
+history and raises on 4 malformed shapes; snapshot keeps both rates; missed
+settlement and future stamp are stale; the tick passes the settled rate;
+60 ticks through main.tick book one print).
+
+TESTS CHANGED — fixtures only, no assertion edited: fake brokers in
+test_market_snapshot / test_carry_live_gates / test_carry_wiring gain
+get_funding_print; warm-up calls pass settlement stamps; test_carry_engine's
+wired fixture stamps one print per candle (what those tests always meant by
+"a print"); my own 0033 file stamps its candles.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ bot/carry_broker.py                    |  29 +++
+ bot/carry_engine.py                    |  56 +++--
+ bot/docs/human/INVENTORY.md            |   8 +-
+ bot/main.py                            |  17 +-
+ bot/market_snapshot.py                 |  41 +++-
+ bot/tests/test_carry_broker.py         |   8 +-
+ bot/tests/test_carry_engine.py         |  16 +-
+ bot/tests/test_carry_fail_closed.py    |  38 +++-
+ bot/tests/test_carry_funding_prints.py | 303 +++++++++++++++++++++++++
+ bot/tests/test_carry_live_gates.py     |  21 +-
+ bot/tests/test_carry_wiring.py         |  15 +-
+ bot/tests/test_market_snapshot.py      |   7 +
+ 12 files changed, 514 insertions(+), 45 deletions(-)
+ create mode 100644 bot/tests/test_carry_funding_prints.py
+
+diff --git a/bot/carry_broker.py b/bot/carry_broker.py
+index bb6b40a..e4fd7ae 100644
+--- a/bot/carry_broker.py
++++ b/bot/carry_broker.py
+@@ -275,6 +275,35 @@ class CarryBroker:
+             raise PairIncident(f"funding for {symbol} is {raw!r}")
+         return rate * 1e4
+ 
++    def get_funding_print(self, symbol: str) -> Tuple[float, int]:
++        """The last SETTLED funding print: (rate in bps, settlement epoch ms).
++
++        Not the ticker. The ticker's fundingRate is the rate for the NEXT
++        settlement — a forecast (INVENTORY F6). What the short leg was paid or
++        charged is the settled record, and its stamp is what lets the engine
++        tell a new print from the same one read sixty times.
++
++        Raises when unreadable, like every read the book decides on.
++        """
++        result = self.client._request(
++            "GET", "/v5/market/funding/history",
++            params={"category": LINEAR, "symbol": symbol, "limit": 1})
++        rows = (result or {}).get("list") or []
++        if not rows:
++            raise PairIncident(f"no settled funding print for {symbol}")
++        row = rows[0]
++        try:
++            rate = float(row["fundingRate"])
++            stamp = int(row["fundingRateTimestamp"])
++        except (KeyError, TypeError, ValueError) as exc:
++            raise PairIncident(
++                f"settled funding print for {symbol} is malformed: {row!r}"
++            ) from exc
++        if not math.isfinite(rate) or stamp <= 0:
++            raise PairIncident(
++                f"settled funding print for {symbol} is unusable: {row!r}")
++        return rate * 1e4, stamp
++
+     # -- reconciliation ---------------------------------------------------
+ 
+     def reconcile_pair(self, *, spot_symbol: str, perp_symbol: str,
+diff --git a/bot/carry_engine.py b/bot/carry_engine.py
+index 3ce62f6..d76416b 100644
+--- a/bot/carry_engine.py
++++ b/bot/carry_engine.py
+@@ -226,6 +226,10 @@ class CarryEngine:
+         #: pair gate judges the SAME observation the entry decision used.
+         self.snapshot: Optional[Any] = None
+         self._funding_history: List[float] = []
++        #: Settlement stamp (epoch ms) of the last funding PRINT recorded. A
++        #: call to on_candle is a TICK; a print is an event with a stamp, and
++        #: only a stamp newer than this one is a new print (0034, INVENTORY D1).
++        self._last_print_ms: Optional[int] = None
+         #: The last exception a leg raised, so a refusal can name it. A leg
+         #: that fails for a reason nobody can read is a leg that fails again.
+         self._last_leg_error: str = ""
+@@ -234,8 +238,18 @@ class CarryEngine:
+ 
+     def on_candle(self, *, mark: float, funding_bps: float,
+                   spot: Optional[float] = None,
+-                  timestamp_ms: int = 0) -> CarryDecision:
+-        """One closed bar. Act or state why not. This is the entire loop.
++                  timestamp_ms: int = 0,
++                  funding_print_ms: Optional[int] = None) -> CarryDecision:
++        """One tick. Act or state why not. This is the entire loop.
++
++        `funding_bps` is the rate of the SETTLED print stamped
++        `funding_print_ms`. A tick is not a print: main.tick calls this every
++        LOOP_INTERVAL_SECONDS, and until 0034 every call was booked as a print
++        (60 ticks at 1 bps on $100 booked $0.60; one print is $0.01), counted
++        toward the negative streak, and fed the EWMA. Now only a stamp newer
++        than the last one is a print. No stamp, no print: nothing is booked,
++        and the warm-up cannot complete, so the book cannot open on a rate it
++        cannot place in time.
+ 
+         Order is not cosmetic. Liquidation headroom is checked before anything
+         else because a margin call does not wait for the funding decision, and
+@@ -250,11 +264,16 @@ class CarryEngine:
+             return self._halt("MARK_UNREADABLE",
+                               "a book that cannot be marked cannot be hedged")
+ 
+-        # Every print is recorded whether or not the book acts on it. The EWMA
+-        # is only meaningful if the history is complete, and a gap because
+-        # "nothing happened that day" is exactly the kind of missing data that
+-        # makes a smoother lie.
+-        if self._finite(funding_bps):
++        # Every PRINT is recorded whether or not the book acts on it — once.
++        # The EWMA is only meaningful if the history is complete, and equally
++        # meaningless if one print is counted sixty times.
++        new_print = (funding_print_ms is not None
++                     and self._finite(funding_bps)
++                     and self._finite(funding_print_ms)
++                     and (self._last_print_ms is None
++                          or int(funding_print_ms) > self._last_print_ms))
++        if new_print:
++            self._last_print_ms = int(funding_print_ms)
+             self._funding_history.append(float(funding_bps))
+             del self._funding_history[:-self.FUNDING_HISTORY]
+ 
+@@ -267,20 +286,29 @@ class CarryEngine:
+             if drift > self.delta_band:
+                 return self._rebalance(mark, drift)
+ 
+-            if funding_bps < 0:
+-                self.position.negative_funding_streak += 1
+-                if (self.position.negative_funding_streak
+-                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
+-                    return self._unwind(mark, "FUNDING_INVERTED")
+-            else:
+-                self.position.negative_funding_streak = 0
++            # A print the pair was HELD through: its stamp is after the open.
++            # The print that triggered the entry, or a late record of an
++            # older settlement, was not earned by this position.
++            held = new_print and int(funding_print_ms) > self.position.opened_ms
++            if held:
++                # Booked SIGNED. Until 0034 a negative print was paid and never
++                # booked, so funding_collected overstated what the book earned
++                # (INVENTORY D10).
+                 self.position.funding_collected += (
+                     funding_bps / 1e4) * self.position.perp.notional
++                if funding_bps < 0:
++                    self.position.negative_funding_streak += 1
++                    if (self.position.negative_funding_streak
++                            >= NEGATIVE_FUNDING_EXIT_PRINTS):
++                        return self._unwind(mark, "FUNDING_INVERTED")
++                else:
++                    self.position.negative_funding_streak = 0
+ 
+             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
+                                  state=BookState.HEDGED,
+                                  detail={"delta_fraction": drift,
+                                          "funding_bps": funding_bps,
++                                         "new_print": bool(held),
+                                          "collected": self.position.funding_collected})
+ 
+         # THE GATES (0019/0021). Before this, the engine opened on ONE
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index f5472e9..cbd25b6 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -49,7 +49,7 @@ never consulted. Loop interval: `LOOP_INTERVAL_SECONDS`, default **60 s**.
+ | "No basis monitoring" | basis is gated at ENTRY (`carry_costs` gate 1); nothing watches it during a hold | open |
+ | "No P&L attribution" | backtest decomposes funding/basis/fees/borrow; live path books none of it | backtest: 0031; live: Phase E |
+ | "Run the book against no venue: `BOOK_MODE=carry USE_TESTNET=1 PAPER_TRADING=1`" | **false.** `PAPER_TRADING` gates the directional `TradingEngine` only. `CarryBroker` calls `client._request("POST", "/v5/order/create")` directly. With `USE_TESTNET=0 PAPER_TRADING=1` config reports `SANDBOX (PAPER)` and the carry broker still sends a **mainnet** order body (watched, §4 D2) | 0033 |
+-| "Three consecutive negative funding prints → exit" | the engine counts **calls to `on_candle`**, one per 60 s tick. Three negative *minutes* of the ticker's predicted rate unwind the book (watched, §4 D1) | 0034 |
++| "Three consecutive negative funding prints → exit" | the engine counts **calls to `on_candle`**, one per 60 s tick. Three negative *minutes* of the ticker's predicted rate unwind the book (watched, §4 D1) | **CLOSED 0034** |
+ | "get_margin_multiple RAISES when unreadable" | true. It returns `positionIM / positionMM`, which on Bybit is set by leverage and risk tier and does **not** shrink as price squeezes the short (§5 F4) | open, Phase D |
+ | "reconcile_pair OBSERVES ONLY and names the naked side" | true, and nothing calls it | open, Phase D |
+ | "No cold-start reconciliation" | true. Worse: the directional orphan check (`bybit_connection.py` ~1557) runs only `if self.is_linear`; the default client category is `spot`, so it is skipped | open, Phase D |
+@@ -62,7 +62,7 @@ Reproduced in-session with a stub broker; no venue.
+ 
+ | # | Defect | Reproduction / evidence | STATUS |
+ |---|---|---|---|
+-| D1 | **Funding is booked per tick, not per print.** `on_candle` adds `funding_bps × notional` on every call. 60 one-minute ticks at 1.0 bps on $100 booked **$0.60**; one real 8h print is **$0.01**. The negative-funding streak and the 8-print EWMA also count ticks. | stub engine, 60 calls | 0034 |
++| D1 | **Funding is booked per tick, not per print.** `on_candle` adds `funding_bps × notional` on every call. 60 one-minute ticks at 1.0 bps on $100 booked **$0.60**; one real 8h print is **$0.01**. The negative-funding streak and the 8-print EWMA also count ticks. | stub engine, 60 calls | **CLOSED 0034** — prints carry a settlement stamp; a repeated stamp is a tick, not a print; 60 ticks book one print |
+ | D2 | **`PAPER_TRADING=1` does not stop carry orders.** `USE_TESTNET=0 PAPER_TRADING=1 BOOK_MODE=carry` → `assert_sandbox` = `SANDBOX (PAPER)`, and `bot.carry.broker.place_market(...)` sent `POST /v5/order/create` with a spot body. The client's base URL is chosen by `USE_TESTNET` alone. | `build_bot` + mocked `_request` | **CLOSED 0033** — `CarryBroker(order_gate=...)` required; PAPER refuses; mainnet needs live authorisation AND a signed promotion gate, asked per order |
+ | D3 | **Restart while HEDGED opens a second pair.** The position is memory-only, `reconcile_pair` is never called, the orphan check is skipped on a spot-category client, and `CarryRisk.has_open_pair` reads `engine.position` (None after restart). | code path | open — Phase D cold start |
+ | D4 | **A venue that rejects the perp leg drains the book.** Spot buys, perp is rejected, spot is sold, state returns to FLAT, and the next tick repeats: **8 spot round trips in 10 ticks**. `record_entry` is (correctly) only called for a landed pair, so a broken pair consumes no allowance. | stub broker rejecting `linear` | **CLOSED 0033** — a broken pair spends the day (`CarryRisk.record_broken_pair`); 10 ticks → 1 spot round trip |
+@@ -71,7 +71,7 @@ Reproduced in-session with a stub broker; no venue.
+ | D7 | `borrow_apr` has a default at every level: `CarryEngine(..., borrow_apr=0.05)`, `evaluate_entry(..., borrow_apr=DEFAULT_BORROW_APR)`, `simulate(..., borrow_apr=BORROW_APR)`; `build_bot` passes none. | `bot.carry.borrow_apr → 0.05` | **CLOSED 0033** — no default in `CarryEngine` or `evaluate_entry`; `CARRY_BORROW_APR` required for carry, refused when absent |
+ | D8 | The pair gate is skipped when `pair_risk` **or** `snapshot` is `None`, and `test_carry_live_gates::test_the_gate_is_skipped_only_when_absent` asserts that a bare engine opens. | `carry_engine.py` `_open` | **CLOSED 0033** — `PAIR_GATE_ABSENT` / `SNAPSHOT_ABSENT` / `SNAPSHOT_MISMATCH`; the test asserting the bypass was inverted |
+ | D9 | Clock-skew check is dead code on the live path (no `get_venue_time_s`). | §2 | open |
+-| D10 | `funding_collected` books only non-negative prints; negative prints are paid and never booked. | `carry_engine.py` on_candle | 0034 |
++| D10 | `funding_collected` books only non-negative prints; negative prints are paid and never booked. | `carry_engine.py` on_candle | **CLOSED 0034** — every held print booked signed |
+ | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
+ | D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | **recorded 0032** (`carry_cost_gates_v1@BTCUSDT`, forward-only holdout); a quotable condition |
+ | D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
+@@ -86,7 +86,7 @@ Reproduced in-session with a stub broker; no venue.
+ | F3 | The spot fill equals the BTC received | Spot taker fee on a BUY is charged in BTC. Wallet = `cumExecQty − fee`; the perp hedges `cumExecQty`; `reconcile_pair` (dust 1e-6) would call every pair an INCIDENT. | open, testnet |
+ | F4 | `positionIM / positionMM` measures liquidation headroom | It is a leverage/risk-tier ratio (risk_limit tier 1: IM 0.66%, MM 0.33%). Under UTA cross margin liquidation is account-level (`accountMMRate`). The margin floor would not trip on a squeeze. | open, Phase D |
+ | F5 | Any `qty` is accepted | Linear BTCUSDT `qtyStep = minOrderQty = 0.001`. At the $100 cap and BTC ≈ $79k the engine asks for 0.00127 → not a step multiple → perp rejected → D4. At BTC > $100k no valid perp size fits under $100 at all. | open, Phase D |
+-| F6 | Ticker `fundingRate` is the funding print | It is the rate for the NEXT settlement (predicted); the settled print is `/v5/market/funding/history`. | 0034 |
++| F6 | Ticker `fundingRate` is the funding print | It is the rate for the NEXT settlement (predicted); the settled print is `/v5/market/funding/history`. | **CLOSED 0034** — `get_funding_print` reads `/v5/market/funding/history`; the snapshot keeps forecast and settled apart; a missed settlement is a stale view |
+ | F7 | 110072 / 170130 mean "the order exists" | Taken from docs; never observed. | open, testnet |
+ | F8 | No rate-limit / 10006 / maintenance handling in `CarryBroker` | A transient error on the perp leg returns `None` → emergency spot unwind. | open, testnet |
+ | F9 | `symbol[:-4]` is the base coin | True for `BTCUSDT` only. | open |
+diff --git a/bot/main.py b/bot/main.py
+index 6e105ed..8cfc5d7 100644
+--- a/bot/main.py
++++ b/bot/main.py
+@@ -457,17 +457,22 @@ class TradingBot:
+                     "NOT touched and no order is sent", exc)
+                 return
+             mark, spot = view.perp_mark, view.spot_mark
+-            funding_bps = view.funding_bps
+             self.carry.snapshot = view
++            # The SETTLED print and its stamp, not the ticker's forecast
++            # (0034). The loop ticks every LOOP_INTERVAL_SECONDS; a print
++            # happens every eight hours. The stamp is how the engine tells
++            # them apart.
+             decision = self.carry.on_candle(
+-                mark=mark, funding_bps=funding_bps, spot=spot,
+-                timestamp_ms=int(time.time() * 1000))
++                mark=mark, funding_bps=view.funding_print_bps, spot=spot,
++                timestamp_ms=int(time.time() * 1000),
++                funding_print_ms=view.funding_print_ms)
+             logger.info(
+                 "carry: %s (%s) state=%s perp=%.2f spot=%.2f "
+-                "basis=%.1fbps funding=%.3fbps %s",
++                "basis=%.1fbps settled=%.3fbps@%s predicted=%.3fbps %s",
+                 decision.action, decision.reason, decision.state.value,
+-                mark, spot, (mark / spot - 1.0) * 1e4, funding_bps,
+-                decision.detail or "")
++                mark, spot, (mark / spot - 1.0) * 1e4,
++                view.funding_print_bps, view.funding_print_ms,
++                view.funding_bps, decision.detail or "")
+             if decision.state.name == "HALTED":
+                 logger.critical(
+                     "carry book HALTED — a human must clear it: %s",
+diff --git a/bot/market_snapshot.py b/bot/market_snapshot.py
+index c4c4c2f..558aacc 100644
+--- a/bot/market_snapshot.py
++++ b/bot/market_snapshot.py
+@@ -54,6 +54,14 @@ MAX_SNAPSHOT_AGE_S = 90.0
+ MAX_CLOCK_SKEW_S = 30.0
+ 
+ 
++#: One funding interval on Bybit BTCUSDT linear (instrument `fundingInterval`
++#: = 480 minutes, research/exchange_study/bybit/instrument_linear.json.gz). A
++#: VENUE FACT, not a tuned threshold. If the last settled print is older than
++#: one interval plus MAX_SNAPSHOT_AGE_S, a settlement has been missed and the
++#: engine's funding history describes a market the venue has moved past.
++FUNDING_INTERVAL_MS = 8 * 3600 * 1000
++
++
+ class StaleMarket(RuntimeError):
+     """The view is too old, internally inconsistent, or unreadable."""
+ 
+@@ -75,6 +83,12 @@ class MarketSnapshot:
+     observed_at_s: float
+     venue_time_s: Optional[float] = None
+     detail: Dict[str, Any] = field(default_factory=dict)
++    #: The last SETTLED print and its settlement stamp (0034). `funding_bps`
++    #: above is the ticker's forecast for the next settlement; these are what
++    #: was actually paid. take_snapshot always fills them; a snapshot built
++    #: by hand without them simply carries no print.
++    funding_print_bps: Optional[float] = None
++    funding_print_ms: Optional[int] = None
+ 
+     @property
+     def basis_bps(self) -> float:
+@@ -112,6 +126,23 @@ class MarketSnapshot:
+                 f"snapshot is {age:.1f}s old (limit {max_age_s:.0f}s); a frozen "
+                 "feed looks exactly like a quiet market")
+ 
++        if self.funding_print_ms is not None:
++            if not (isinstance(self.funding_print_bps, (int, float))
++                    and math.isfinite(self.funding_print_bps)):
++                raise StaleMarket(
++                    f"funding_print_bps is {self.funding_print_bps!r}")
++            now_ms = self.observed_at_s * 1000.0
++            behind = now_ms - float(self.funding_print_ms)
++            if behind > FUNDING_INTERVAL_MS + max_age_s * 1000.0:
++                raise StaleMarket(
++                    f"the last settled funding print is {behind / 3.6e6:.1f}h "
++                    "old — at least one settlement has been missed, and the "
++                    "funding history the book decides on is out of date")
++            if behind < -max_skew_s * 1000.0:
++                raise StaleMarket(
++                    f"a funding print is stamped {-behind / 1000.0:.0f}s in "
++                    "the future; the venue and this host disagree about time")
++
+         skew = self.clock_skew_s
+         if skew is not None and skew > max_skew_s:
+             raise StaleMarket(
+@@ -121,7 +152,10 @@ class MarketSnapshot:
+ 
+     def as_dict(self) -> Dict[str, Any]:
+         return {"perp_mark": self.perp_mark, "spot_mark": self.spot_mark,
+-                "funding_bps": self.funding_bps, "basis_bps": self.basis_bps,
++                "funding_bps": self.funding_bps,
++                "funding_print_bps": self.funding_print_bps,
++                "funding_print_ms": self.funding_print_ms,
++                "basis_bps": self.basis_bps,
+                 "margin_multiple": self.margin_multiple, "age_s": self.age_s,
+                 "clock_skew_s": self.clock_skew_s}
+ 
+@@ -139,6 +173,9 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
+     perp = float(broker.get_mark(perp_symbol))
+     spot = float(broker.get_spot_mark(spot_symbol))
+     funding = float(broker.get_funding_bps(perp_symbol))
++    # Called directly, never through getattr: a broker that cannot say what was
++    # actually settled cannot snapshot (0034).
++    print_bps, print_ms = broker.get_funding_print(perp_symbol)
+     margin = float(broker.get_margin_multiple(perp_symbol))
+ 
+     venue_time = None
+@@ -155,6 +192,8 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
+     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=funding,
+                           margin_multiple=margin, observed_at_s=observed,
+                           venue_time_s=venue_time,
++                          funding_print_bps=float(print_bps),
++                          funding_print_ms=int(print_ms),
+                           detail={"perp_symbol": perp_symbol,
+                                   "spot_symbol": spot_symbol,
+                                   "clock_checked": venue_time is not None})
+diff --git a/bot/tests/test_carry_broker.py b/bot/tests/test_carry_broker.py
+index 2d9d415..e841e32 100644
+--- a/bot/tests/test_carry_broker.py
++++ b/bot/tests/test_carry_broker.py
+@@ -254,11 +254,13 @@ class TestItDrivesTheEngine:
+         eng.snapshot = MarketSnapshot(perp_mark=100_000.0, spot_mark=100_000.0,
+                                       funding_bps=3.0, margin_multiple=5.0,
+                                       observed_at_s=time.time())
+-        for _ in range(2):   # warm the EWMA
+-            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0)
++        h8 = 8 * 3600 * 1000     # 0034: each warm-up call is a settled print
++        for k in (1, 2):   # warm the EWMA
++            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0,
++                          funding_print_ms=k * h8)
+         client.created.clear()
+         decision = eng.on_candle(mark=100_000.0, funding_bps=3.0,
+-                                 spot=100_000.0)
++                                 spot=100_000.0, funding_print_ms=3 * h8)
+         assert decision.acted is True
+         assert eng.state is BookState.HEDGED
+         assert len(client.created) == 2
+diff --git a/bot/tests/test_carry_engine.py b/bot/tests/test_carry_engine.py
+index e7c9858..88f37e5 100644
+--- a/bot/tests/test_carry_engine.py
++++ b/bot/tests/test_carry_engine.py
+@@ -70,7 +70,15 @@ class _Wired(CarryEngine):
+     build. The refusals themselves are tested in test_carry_fail_closed.py.
+     """
+ 
+-    def on_candle(self, *, mark, funding_bps, spot=None, timestamp_ms=0):
++    #: 0034: every candle in THIS file is one settled funding print — that
++    #: is what these tests have always meant by "a print". The engine now
++    #: needs the print's settlement stamp to tell a print from a tick, so the
++    #: fixture supplies one per candle, eight hours apart. What a TICK does
++    #: (the same stamp again) is tested in test_carry_funding_prints.py.
++    _H8 = 8 * 3600 * 1000
++
++    def on_candle(self, *, mark, funding_bps, spot=None, timestamp_ms=0,
++                  funding_print_ms=None):
+         import math
+         import time
+         usable = (spot is not None and isinstance(mark, (int, float))
+@@ -79,8 +87,12 @@ class _Wired(CarryEngine):
+             perp_mark=mark, spot_mark=spot, funding_bps=funding_bps,
+             margin_multiple=float(getattr(self.broker, "margin", 5.0)),
+             observed_at_s=time.time()) if usable else None
++        if funding_print_ms is None:
++            self._stamp = getattr(self, "_stamp", 0) + self._H8
++            funding_print_ms = self._stamp
+         return super().on_candle(mark=mark, funding_bps=funding_bps,
+-                                 spot=spot, timestamp_ms=timestamp_ms)
++                                 spot=spot, timestamp_ms=timestamp_ms,
++                                 funding_print_ms=funding_print_ms)
+ 
+ 
+ def engine(broker, *, primed=True, **kw):
+diff --git a/bot/tests/test_carry_fail_closed.py b/bot/tests/test_carry_fail_closed.py
+index 41ee925..1d2adcb 100644
+--- a/bot/tests/test_carry_fail_closed.py
++++ b/bot/tests/test_carry_fail_closed.py
+@@ -24,6 +24,14 @@ from market_snapshot import MarketSnapshot  # noqa: E402
+ 
+ REPO = os.path.join(os.path.dirname(__file__), "..")
+ MARK = 100_000.0
++H8 = 8 * 3600 * 1000
++_STAMP = [0]
++
++
++def _print_ms():
++    """0034: a new settled-print stamp per candle (8h apart)."""
++    _STAMP[0] += H8
++    return _STAMP[0]
+ 
+ 
+ class Venue:
+@@ -56,7 +64,8 @@ def warmed(engine):
+     gate, view = engine.pair_risk, engine.snapshot
+     engine.pair_risk, engine.snapshot = None, None
+     for _ in range(2):
+-        engine.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        engine.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+     engine.pair_risk, engine.snapshot = gate, view
+     return engine
+ 
+@@ -73,19 +82,22 @@ def engine(venue, *, gate=True, view=True, **kw):
+ class TestNoFirstLegWithoutTheGateAndTheView:
+     def test_a_wired_engine_opens(self):
+         v = Venue()
+-        d = engine(v).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        d = engine(v).on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert d.action == "opened" and len(v.orders) == 2
+ 
+     def test_no_pair_gate_no_leg(self):
+         v = Venue()
+-        d = engine(v, gate=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        d = engine(v, gate=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert d.acted is False
+         assert d.reason == "PAIR_GATE_ABSENT"
+         assert v.orders == []
+ 
+     def test_no_snapshot_no_leg(self):
+         v = Venue()
+-        d = engine(v, view=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        d = engine(v, view=False).on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert d.reason == "SNAPSHOT_ABSENT"
+         assert v.orders == []
+ 
+@@ -95,7 +107,8 @@ class TestNoFirstLegWithoutTheGateAndTheView:
+         v = Venue()
+         e = engine(v)
+         e.snapshot = snap(perp=MARK * 1.001)
+-        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert d.reason == "SNAPSHOT_MISMATCH"
+         assert v.orders == []
+ 
+@@ -233,7 +246,8 @@ class TestPaperMeansNoCarryOrder:
+         e = bot.carry
+         e.snapshot = snap()
+         warmed(e)
+-        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert d.acted is False
+         assert "PAPER" in str(d.detail.get("error", ""))
+ 
+@@ -274,7 +288,8 @@ class TestAFeeIsKnownOrItIsUnknown:
+     def test_the_engine_keeps_unknown_as_unknown(self):
+         v = Venue()
+         e = engine(v)
+-        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert e.position.spot.fee is None
+         assert e.position.perp.fee is None
+ 
+@@ -305,7 +320,8 @@ class TestABrokenPairCannotThrash:
+         e = engine(v)
+         for _ in range(10):
+             e.snapshot = snap()
+-            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         spot = [o for o in v.orders if o[1] == "spot"]
+         assert spot == [("Buy", "spot"), ("Sell", "spot")]
+         assert e.state is BookState.FLAT
+@@ -313,7 +329,8 @@ class TestABrokenPairCannotThrash:
+     def test_a_broken_pair_is_not_recorded_as_an_entry(self):
+         v = Venue(reject={"linear"})
+         e = engine(v)
+-        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert e.pair_risk._entries == []
+         assert len(e.pair_risk._broken) == 1
+ 
+@@ -331,5 +348,6 @@ class TestRecordEntryOnlyAfterBothLegs:
+     def test_only_a_landed_pair_is_an_entry(self, reject, expected):
+         v = Venue(reject=set(reject))
+         e = engine(v)
+-        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=_print_ms())
+         assert len(e.pair_risk._entries) == expected
+diff --git a/bot/tests/test_carry_funding_prints.py b/bot/tests/test_carry_funding_prints.py
+new file mode 100644
+index 0000000..c4e5db1
+--- /dev/null
++++ b/bot/tests/test_carry_funding_prints.py
+@@ -0,0 +1,303 @@
++"""0034 — a funding print is a print, not a tick.
++
++INVENTORY D1: main.tick calls on_candle every LOOP_INTERVAL_SECONDS (60 s)
++with the ticker's PREDICTED rate, and the engine booked that rate into
++funding_collected on every call — 60 ticks at 1 bps on $100 booked $0.60,
++where one real 8h print is $0.01. The negative-funding streak and the EWMA
++counted ticks too: three negative MINUTES unwound the book.
++
++INVENTORY D10: negative prints were paid and never booked.
++INVENTORY F6: the ticker's fundingRate is the NEXT settlement's rate; the
++settled print lives at /v5/market/funding/history.
++"""
++from __future__ import annotations
++
++import os
++import sys
++import time
++from unittest import mock
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import main as _main  # noqa: E402
++import market_snapshot as ms  # noqa: E402
++from carry_broker import CarryBroker, PairIncident  # noqa: E402
++from carry_engine import CarryEngine  # noqa: E402
++from carry_risk import CarryRisk  # noqa: E402
++from market_snapshot import MarketSnapshot, StaleMarket  # noqa: E402
++
++MARK = 100_000.0
++H8 = 8 * 3600 * 1000
++
++
++class Venue:
++    def __init__(self):
++        self.orders = []
++
++    def place_market(self, *, symbol, side, qty, product):
++        self.orders.append((side, product))
++        return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x"}
++
++    def get_margin_multiple(self, symbol):
++        return 5.0
++
++    def get_mark(self, symbol):
++        return MARK
++
++
++def opened(bps=3.0):
++    """An engine that has seen prints 1..3 and opened a $100 pair at print 3."""
++    e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05)
++    e.pair_risk = CarryRisk(max_notional_usd=100.0)
++    e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
++                                funding_bps=bps, margin_multiple=5.0,
++                                observed_at_s=time.time())
++    for k in (1, 2):
++        e.on_candle(mark=MARK, funding_bps=bps, spot=MARK,
++                    funding_print_ms=k * H8)
++    d = e.on_candle(mark=MARK, funding_bps=bps, spot=MARK,
++                    funding_print_ms=3 * H8)
++    assert d.action == "opened", d.reason
++    return e
++
++
++class TestOnePrintIsBookedOnce:
++    def test_sixty_ticks_of_one_print_book_it_once(self):
++        e = opened()
++        for _ in range(60):
++            e.on_candle(mark=MARK, funding_bps=1.0, spot=MARK,
++                        funding_print_ms=4 * H8)
++        assert e.position.funding_collected == pytest.approx(
++            1.0 / 1e4 * e.position.perp.notional)
++
++    def test_the_entry_print_is_not_collected(self):
++        """The book was not holding at the settlement that triggered entry."""
++        e = opened()
++        for _ in range(5):
++            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=3 * H8)
++        assert e.position.funding_collected == 0.0
++
++    def test_a_print_stamped_before_the_open_is_not_booked(self):
++        e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05)
++        e.pair_risk = CarryRisk(max_notional_usd=100.0)
++        e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
++                                    funding_bps=3.0, margin_multiple=5.0,
++                                    observed_at_s=time.time())
++        for k in (1, 2, 3):
++            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=k * H8, timestamp_ms=10 * H8)
++        assert e.position is not None
++        # A late-arriving record for an older settlement is history, not income.
++        e._last_print_ms = 0
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                    funding_print_ms=5 * H8, timestamp_ms=10 * H8 + 1)
++        assert e.position.funding_collected == 0.0
++
++    def test_negative_prints_are_booked_as_paid(self):
++        e = opened()
++        e.on_candle(mark=MARK, funding_bps=2.0, spot=MARK, funding_print_ms=4 * H8)
++        e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK, funding_print_ms=5 * H8)
++        n = e.position.perp.notional
++        assert e.position.funding_collected == pytest.approx((2.0 - 0.5) / 1e4 * n)
++
++
++class TestTheStreakCountsPrints:
++    def test_three_negative_ticks_of_one_print_do_not_unwind(self):
++        e = opened()
++        for _ in range(3):
++            d = e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
++                            funding_print_ms=4 * H8)
++        assert e.position is not None
++        assert d.action == "hold"
++
++    def test_three_negative_prints_unwind(self):
++        e = opened()
++        for k in (4, 5, 6):
++            d = e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
++                            funding_print_ms=k * H8)
++        assert d.action == "unwound"
++        assert d.reason == "FUNDING_INVERTED"
++
++
++class TestTheEwmaSeesPrints:
++    def test_ten_ticks_of_one_print_are_one_observation(self):
++        e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05)
++        for _ in range(10):
++            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=H8)
++        assert e._funding_history == [3.0]
++
++    def test_without_a_stamp_nothing_is_a_print(self):
++        """No stamp, no print: nothing booked, and the warm-up never completes,
++        so the book cannot open on data it cannot place in time."""
++        e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05)
++        e.pair_risk = CarryRisk(max_notional_usd=100.0)
++        for _ in range(10):
++            d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
++        assert e._funding_history == []
++        assert d.reason == "INSUFFICIENT_FUNDING_HISTORY"
++        assert e.broker.orders == []
++
++
++class _Client:
++    def __init__(self, rows):
++        self.rows = rows
++        self.calls = []
++
++    def _request(self, method, endpoint, *, params=None, body=None,
++                 signed=False, retries=3):
++        self.calls.append((method, endpoint, params))
++        if endpoint == "/v5/market/funding/history":
++            return {"list": self.rows}
++        return {}
++
++
++def _broker(rows):
++    return CarryBroker(client=_Client(rows), sequence_source=lambda *a: 1,
++                       order_gate=lambda: (True, "TEST"))
++
++
++class TestTheBrokerReadsTheSettledPrint:
++    def test_it_reads_funding_history_not_the_ticker(self):
++        b = _broker([{"symbol": "BTCUSDT", "fundingRate": "-0.00001",
++                      "fundingRateTimestamp": str(5 * H8)}])
++        bps, stamp = b.get_funding_print("BTCUSDT")
++        assert bps == pytest.approx(-0.1)
++        assert stamp == 5 * H8
++        method, endpoint, params = b.client.calls[0]
++        assert endpoint == "/v5/market/funding/history"
++        assert params["category"] == "linear" and params["limit"] == 1
++
++    @pytest.mark.parametrize("rows", [
++        [], [{"fundingRate": "0.0001"}],
++        [{"fundingRate": "nan", "fundingRateTimestamp": str(H8)}],
++        [{"fundingRate": "0.0001", "fundingRateTimestamp": "0"}]])
++    def test_an_unreadable_print_raises(self, rows):
++        with pytest.raises(PairIncident):
++            _broker(rows).get_funding_print("BTCUSDT")
++
++
++class _SnapBroker:
++    def __init__(self, stamp_ms):
++        self.stamp_ms = stamp_ms
++
++    def get_mark(self, s):
++        return MARK
++
++    def get_spot_mark(self, s):
++        return MARK
++
++    def get_funding_bps(self, s):
++        return 5.0            # the PREDICTED rate
++
++    def get_funding_print(self, s):
++        return (-1.0, self.stamp_ms)   # the SETTLED print
++
++    def get_margin_multiple(self, s):
++        return 5.0
++
++
++def _latest_settlement_ms(now_s):
++    return int(now_s * 1000) // H8 * H8
++
++
++class TestTheSnapshotCarriesTheSettledPrint:
++    def test_both_rates_are_kept_and_named(self):
++        now = time.time()
++        s = ms.take_snapshot(_SnapBroker(_latest_settlement_ms(now)),
++                             perp_symbol="BTCUSDT", spot_symbol="BTCUSDT",
++                             now_s=now)
++        assert s.funding_bps == 5.0
++        assert s.funding_print_bps == -1.0
++        assert s.funding_print_ms == _latest_settlement_ms(now)
++        s.assert_fresh()
++
++    def test_a_broker_without_the_print_cannot_snapshot(self):
++        class Old(_SnapBroker):
++            get_funding_print = None
++        with pytest.raises(TypeError):
++            ms.take_snapshot(Old(0), perp_symbol="BTCUSDT",
++                             spot_symbol="BTCUSDT")
++
++    def test_a_missed_settlement_is_a_stale_view(self):
++        """The last settled print is older than one funding interval (plus
++        the snapshot's own age limit): a settlement has been missed and the
++        EWMA is built on history the venue has moved past."""
++        now = time.time()
++        stamp = int(now * 1000) - ms.FUNDING_INTERVAL_MS - 10 * 60 * 1000
++        s = ms.take_snapshot(_SnapBroker(stamp), perp_symbol="BTCUSDT",
++                             spot_symbol="BTCUSDT", now_s=now)
++        with pytest.raises(StaleMarket, match="settlement"):
++            s.assert_fresh()
++
++    def test_a_print_inside_the_interval_is_fresh(self):
++        now = time.time()
++        stamp = int(now * 1000) - ms.FUNDING_INTERVAL_MS + 10 * 60 * 1000
++        ms.take_snapshot(_SnapBroker(stamp), perp_symbol="BTCUSDT",
++                         spot_symbol="BTCUSDT", now_s=now).assert_fresh()
++
++    def test_a_print_stamped_in_the_future_is_refused(self):
++        now = time.time()
++        stamp = int(now * 1000) + 10 * 60 * 1000
++        s = ms.take_snapshot(_SnapBroker(stamp), perp_symbol="BTCUSDT",
++                             spot_symbol="BTCUSDT", now_s=now)
++        with pytest.raises(StaleMarket, match="future"):
++            s.assert_fresh()
++
++
++class _TickBroker(Venue, _SnapBroker):
++    def __init__(self, stamp_ms):
++        Venue.__init__(self)
++        _SnapBroker.__init__(self, stamp_ms)
++
++    def get_funding_print(self, s):
++        return (2.0, self.stamp_ms)
++
++
++def _bot(broker):
++    bot = _main.TradingBot.__new__(_main.TradingBot)
++    bot.symbols = ["BTCUSDT"]
++    bot.store = mock.Mock(is_kill_switch_engaged=lambda: (False, ""))
++    bot.strategy = None
++    bot._stop = mock.Mock(is_set=lambda: False)
++    bot.session = mock.Mock()
++    bot.client = mock.Mock(get_equity=lambda: 1_000_000.0)
++    bot.risk = mock.Mock(should_halt_trading=lambda: False,
++                         update_equity=lambda e: None)
++    bot.engine = mock.Mock(observe_exits=lambda: {})
++    bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
++                            borrow_apr=0.0)
++    bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
++    return bot
++
++
++class TestTheTickPassesTheSettledPrint:
++    def test_the_engine_sees_the_settled_rate_not_the_predicted_one(self):
++        latest = _latest_settlement_ms(time.time())
++        broker = _TickBroker(latest)
++        bot = _bot(broker)
++        bot.tick()
++        assert bot.carry._funding_history == [2.0]      # settled, not 5.0
++
++    def test_sixty_ticks_inside_one_settlement_window_book_one_print(
++            self, monkeypatch):
++        latest = _latest_settlement_ms(time.time())
++        broker = _TickBroker(latest)
++        bot = _bot(broker)
++        for k in (2, 1):                 # two earlier prints, already settled
++            bot.carry.on_candle(mark=MARK, funding_bps=2.0, spot=MARK,
++                                funding_print_ms=latest - k * H8)
++        bot.tick()                       # the third print: the pair opens
++        assert bot.carry.position is not None
++        # Eight hours pass. The next settlement prints; the loop ticks sixty
++        # times inside that window. It is ONE print.
++        later = (latest + H8) / 1000.0 + 60.0
++        monkeypatch.setattr(time, "time", lambda: later)
++        broker.stamp_ms = latest + H8
++        for _ in range(60):
++            bot.tick()
++        assert bot.carry.position.funding_collected == pytest.approx(
++            2.0 / 1e4 * bot.carry.position.perp.notional)
+diff --git a/bot/tests/test_carry_live_gates.py b/bot/tests/test_carry_live_gates.py
+index b234952..4da60fb 100644
+--- a/bot/tests/test_carry_live_gates.py
++++ b/bot/tests/test_carry_live_gates.py
+@@ -46,7 +46,8 @@ class Broker:
+         self.mark, self.funding, self.margin = mark, funding, margin
+         self.spot = mark if spot is None else spot
+         self.orders = []
+-        self.reads = {"mark": 0, "spot": 0, "funding": 0, "margin": 0}
++        self.reads = {"mark": 0, "spot": 0, "funding": 0, "margin": 0,
++                      "print": 0}
+ 
+     def get_mark(self, s):
+         self.reads["mark"] += 1
+@@ -64,11 +65,23 @@ class Broker:
+         self.reads["margin"] += 1
+         return self.margin
+ 
++    def get_funding_print(self, s):
++        # 0034: the latest settled print, stamped at the last settlement.
++        self.reads["print"] += 1
++        return (self.funding, latest_settlement_ms())
++
+     def place_market(self, *, symbol, side, qty, product):
+         self.orders.append((side, product))
+         return {"filled_qty": qty, "avg_price": self.mark, "order_link_id": "x"}
+ 
+ 
++H8 = 8 * 3600 * 1000
++
++
++def latest_settlement_ms():
++    return int(time.time() * 1000) // H8 * H8
++
++
+ def bot_with(broker, *, store=None, warm=3.0, risk=True):
+     store = store or Store()
+     bot = _main.TradingBot.__new__(_main.TradingBot)
+@@ -85,9 +98,11 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
+                             borrow_apr=0.05)
+     if risk:
+         bot.carry.pair_risk = CarryRisk(store=store, max_notional_usd=100.0)
+-    for _ in range(2):
++    # 0034: two earlier SETTLED prints; the tick then reads the latest one.
++    for k in (2, 1):
+         bot.carry.on_candle(mark=broker.mark, funding_bps=warm,
+-                            spot=broker.spot)
++                            spot=broker.spot,
++                            funding_print_ms=latest_settlement_ms() - k * H8)
+     return bot
+ 
+ 
+diff --git a/bot/tests/test_carry_wiring.py b/bot/tests/test_carry_wiring.py
+index 46be713..34371f0 100644
+--- a/bot/tests/test_carry_wiring.py
++++ b/bot/tests/test_carry_wiring.py
+@@ -12,6 +12,7 @@ from __future__ import annotations
+ 
+ import os
+ import sys
++import time
+ from unittest import mock
+ 
+ import pytest
+@@ -75,6 +76,13 @@ class _Broker:
+     def get_margin_multiple(self, symbol):
+         return 5.0
+ 
++    def get_funding_print(self, symbol):
++        # 0034: the latest SETTLED print, stamped at the last settlement.
++        if self.raises == "funding":
++            raise RuntimeError("no funding history")
++        h8 = 8 * 3600 * 1000
++        return (self.funding, int(time.time() * 1000) // h8 * h8)
++
+     def place_market(self, *, symbol, side, qty, product):
+         self.orders.append((symbol, side, qty, product))
+         return {"filled_qty": qty, "avg_price": self.mark,
+@@ -93,9 +101,12 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
+     bot.carry.pair_risk = CarryRisk(max_notional_usd=100_000.0)
+     # Warm the EWMA: the engine refuses below three prints rather than
+     # falling back to the last one.
+-    for _ in range(2):
++    # 0034: two earlier SETTLED prints; the tick reads the latest one.
++    h8 = 8 * 3600 * 1000
++    latest = int(time.time() * 1000) // h8 * h8
++    for k in (2, 1):
+         bot.carry.on_candle(mark=broker.mark, funding_bps=warm_bps,
+-                            spot=broker.mark)
++                            spot=broker.mark, funding_print_ms=latest - k * h8)
+     bot.strategy = None
+     bot.store = _Store()
+     bot._stop = mock.Mock(is_set=lambda: False)
+diff --git a/bot/tests/test_market_snapshot.py b/bot/tests/test_market_snapshot.py
+index 1b2bf72..d6cd5fc 100644
+--- a/bot/tests/test_market_snapshot.py
++++ b/bot/tests/test_market_snapshot.py
+@@ -57,6 +57,13 @@ class FakeBroker:
+             raise RuntimeError("no position row")
+         return self.margin
+ 
++    def get_funding_print(self, s):
++        # 0034: the settled print and its stamp; the latest settlement.
++        if self.boom == "print":
++            raise RuntimeError("no funding history")
++        h8 = 8 * 3600 * 1000
++        return (self.funding, int(time.time() * 1000) // h8 * h8)
++
+     def get_venue_time_s(self):
+         if self.venue_time is None:
+             raise RuntimeError("no server time")
+-- 
+2.43.0
+
