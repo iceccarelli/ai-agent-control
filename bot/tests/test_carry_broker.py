@@ -258,7 +258,8 @@ class TestItDrivesTheEngine:
         # 0033: borrow is required, and no first leg leaves without the pair
         # gate and one snapshot of the marks the decision is made on.
         eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0,
-                          borrow_apr=0.05, execution_mode="acquire")
+                          borrow_apr=0.05, execution_mode="acquire",
+                          persist=lambda s: None)
         eng.pair_risk = CarryRisk(max_notional_usd=100_000.0)
         eng.snapshot = MarketSnapshot(perp_mark=100_000.0, spot_mark=100_000.0,
                                       funding_bps=3.0, margin_multiple=5.0,

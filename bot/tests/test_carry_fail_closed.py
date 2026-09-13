@@ -84,6 +84,7 @@ def engine(venue, *, gate=True, view=True, **kw):
     kw.setdefault("borrow_apr", 0.05)
     kw.setdefault("max_notional_usd", 100.0)
     kw.setdefault("execution_mode", "acquire")
+    kw.setdefault("persist", lambda state: None)
     e = CarryEngine(broker=venue, **kw)
     e.pair_risk = CarryRisk(max_notional_usd=100.0) if gate else None
     e.snapshot = snap() if view else None
@@ -128,7 +129,7 @@ class TestBorrowIsRequiredEverywhere:
     def test_the_engine_cannot_be_built_without_it(self):
         with pytest.raises(TypeError):
             CarryEngine(broker=Venue(), max_notional_usd=100.0,
-                        execution_mode="acquire")
+                        execution_mode="acquire", persist=lambda s: None)
 
     def test_the_cost_gate_cannot_be_asked_without_it(self):
         with pytest.raises(TypeError):
@@ -171,6 +172,16 @@ class _Store:
 
     def trip_kill_switch(self, reason):
         pass
+
+    # 0037: the carry book writes what it holds on every state change, and
+    # reads it back before the first tick. A stub store without these is a
+    # book with amnesia, which is what INVENTORY D3 was.
+    def save_carry_position(self, state):
+        self.carry_states = getattr(self, "carry_states", [])
+        self.carry_states.append(state)
+
+    def load_carry_position(self):
+        return getattr(self, "carry_states", None) and self.carry_states[-1]
 
     def is_kill_switch_engaged(self):
         return (False, "")

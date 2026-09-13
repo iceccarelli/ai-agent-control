@@ -370,6 +370,17 @@ CREATE TABLE IF NOT EXISTS memory_kv (
     PRIMARY KEY (namespace, key)
 );
 
+-- THE CARRY POSITION (0037). One row, overwritten: what THIS process
+-- believed it was holding, written the moment it changed. It is a LEDGER, not
+-- a cache of the venue: cold start compares the two and refuses to trade when
+-- they disagree, and never edits this row to make them agree.
+CREATE TABLE IF NOT EXISTS carry_position (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    book_state    TEXT NOT NULL DEFAULT 'FLAT',
+    payload       TEXT NOT NULL DEFAULT '',
+    updated_epoch REAL NOT NULL DEFAULT 0.0
+);
+
 -- Additive indexes for the memory reads.  Both are over existing tables and
 -- change no existing behaviour; they only stop the health thread's aggregate
 -- reads from turning into full scans as the ledger grows.
@@ -805,6 +816,49 @@ class StateStore:
             "WHERE id = 1",
             (str(reason), utc_now_epoch()),
         )
+
+    # -- the carry book's position ----------------------------------------
+
+    def save_carry_position(self, state: Dict[str, Any]) -> None:
+        """Record what the carry book holds. Called on every state change.
+
+        The whole state goes in as JSON rather than columns: the engine owns
+        the shape, and a schema that has to be migrated in step with it is a
+        schema that will be one field behind on the day it matters.
+        """
+        payload = json.dumps(state, sort_keys=True)
+        self._exec(
+            "INSERT INTO carry_position(id, book_state, payload, updated_epoch) "
+            "VALUES(1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "book_state = excluded.book_state, payload = excluded.payload, "
+            "updated_epoch = excluded.updated_epoch",
+            (str(state.get("book_state", "FLAT")), payload, utc_now_epoch()),
+        )
+
+    def load_carry_position(self) -> Optional[Dict[str, Any]]:
+        """What the last run believed, or None if it never wrote anything.
+
+        None means "no carry book has ever run against this database". It does
+        NOT mean flat: a flat book writes a row saying so, and the difference
+        is what lets cold start tell "nothing to resume" from "the ledger was
+        lost".
+        """
+        rows = self._query("SELECT * FROM carry_position WHERE id = 1")
+        if not rows:
+            return None
+        raw = str(rows[0]["payload"] or "")
+        if not raw:
+            return None
+        try:
+            state = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise PersistenceError(
+                f"carry_position payload is not readable JSON: {exc}") from exc
+        if not isinstance(state, dict):
+            raise PersistenceError(
+                f"carry_position payload is {type(state).__name__}, not an object")
+        state["updated_epoch"] = float(rows[0]["updated_epoch"] or 0.0)
+        return state
 
     def clear_kill_switch_by_human(self, operator_ack: str) -> None:
         """Clear the kill switch.  Requires an explicit operator acknowledgement.

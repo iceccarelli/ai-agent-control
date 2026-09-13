@@ -125,6 +125,7 @@ def engine(broker, *, primed=True, **kw):
     # 0036: these tests are about the ACQUIRE path — the book buying the spot
     # leg. The overlay path has its own file.
     kw.setdefault("execution_mode", "acquire")
+    kw.setdefault("persist", lambda state: None)
     eng = _Wired(broker=broker, **kw)
     eng.pair_risk = CarryRisk(max_notional_usd=kw["max_notional_usd"])
     if primed:

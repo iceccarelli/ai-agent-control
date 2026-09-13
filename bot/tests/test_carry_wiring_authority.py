@@ -52,6 +52,16 @@ class _Store:
     def trip_kill_switch(self, reason):
         self.tripped.append(reason)
 
+    # 0037: the carry book writes what it holds on every state change, and
+    # reads it back before the first tick. A stub store without these is a
+    # book with amnesia, which is what INVENTORY D3 was.
+    def save_carry_position(self, state):
+        self.carry_states = getattr(self, "carry_states", [])
+        self.carry_states.append(state)
+
+    def load_carry_position(self):
+        return getattr(self, "carry_states", None) and self.carry_states[-1]
+
     def open_positions(self):
         return []
 

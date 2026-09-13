@@ -37,7 +37,7 @@ never consulted. Loop interval: `LOOP_INTERVAL_SECONDS`, default **60 s**.
 | `CarryBroker.reconcile_pair` | **no — zero call sites outside tests** | `grep -rn reconcile_pair --include=*.py . \| grep -v tests` |
 | `CarryBroker.get_venue_time_s` | **does not exist** → the clock-skew check in `assert_fresh` never runs | `hasattr(bot.carry.broker, "get_venue_time_s") → False` |
 | `tools/carry_backtest.py`, `tools/venue_study.py`, `tools/basis_at_settlement.py`, `tools/corpus_health.py` | no — offline tools | — |
-| persistence of the carry position | **does not exist** — `persistence.py` has no carry table; the pair lives in `CarryEngine.position` (memory) | `grep -in carry persistence.py` |
+| persistence of the carry position | **0037: yes** — `StateStore.save_carry_position` / `load_carry_position`, one row, written by the engine on every state change and read back by `TradingBot.carry_cold_start` before the first tick | `carry_position` table; `bot/tests/test_carry_cold_start.py` |
 
 ## 3. README claims vs bytes
 
@@ -64,13 +64,14 @@ Reproduced in-session with a stub broker; no venue.
 |---|---|---|---|
 | D1 | **Funding is booked per tick, not per print.** `on_candle` adds `funding_bps × notional` on every call. 60 one-minute ticks at 1.0 bps on $100 booked **$0.60**; one real 8h print is **$0.01**. The negative-funding streak and the 8-print EWMA also count ticks. | stub engine, 60 calls | **CLOSED 0034** — prints carry a settlement stamp; a repeated stamp is a tick, not a print; 60 ticks book one print |
 | D2 | **`PAPER_TRADING=1` does not stop carry orders.** `USE_TESTNET=0 PAPER_TRADING=1 BOOK_MODE=carry` → `assert_sandbox` = `SANDBOX (PAPER)`, and `bot.carry.broker.place_market(...)` sent `POST /v5/order/create` with a spot body. The client's base URL is chosen by `USE_TESTNET` alone. | `build_bot` + mocked `_request` | **CLOSED 0033** — `CarryBroker(order_gate=...)` required; PAPER refuses; mainnet needs live authorisation AND a signed promotion gate, asked per order |
-| D3 | **Restart while HEDGED opens a second pair.** The position is memory-only, `reconcile_pair` is never called, the orphan check is skipped on a spot-category client, and `CarryRisk.has_open_pair` reads `engine.position` (None after restart). | code path | open — Phase D cold start |
+| D3 | **Restart while HEDGED opens a second pair.** The position is memory-only, `reconcile_pair` is never called, the orphan check is skipped on a spot-category client, and `CarryRisk.has_open_pair` reads `engine.position` (None after restart). | code path | **CLOSED 0037** — the position is written to `carry_position` on every change and reconciled against the venue before the first tick; any disagreement halts and refuses to start |
 | D4 | **A venue that rejects the perp leg drains the book.** Spot buys, perp is rejected, spot is sold, state returns to FLAT, and the next tick repeats: **8 spot round trips in 10 ticks**. `record_entry` is (correctly) only called for a landed pair, so a broken pair consumes no allowance. | stub broker rejecting `linear` | **CLOSED 0033** — a broken pair spends the day (`CarryRisk.record_broken_pair`); 10 ticks → 1 spot round trip |
 | D5 | **`carry_backtest` prints `QUOTABLE: True`** on daily closes with no impact term. The flag tracks provenance only (same venue + same quote). Rule 19 says daily-close settlement is not quotable. | `python3 tools/carry_backtest.py --repo .` | **CLOSED 0031** — five conditions, printed; attribution identity enforced |
 | D6 | **carry_backtest / venue_study reads are not in the data-read ledger.** `reserved_holdout.install()` hooks `market_data.load_corpus`; both tools read with their own loaders, so the hook never fires. `artifacts/data_read_ledger.json` has 6 reads, none by either tool. Worse: run as a script, carry_backtest's `install()` raised on `import market_data` and the bare except set the whole ledger to None. | `data_read_ledger.json` | **CLOSED 0032** — explicit `_record()` in both tools; 15 retroactive + 6 new reads |
 | D7 | `borrow_apr` has a default at every level: `CarryEngine(..., borrow_apr=0.05)`, `evaluate_entry(..., borrow_apr=DEFAULT_BORROW_APR)`, `simulate(..., borrow_apr=BORROW_APR)`; `build_bot` passes none. | `bot.carry.borrow_apr → 0.05` | **CLOSED 0033** — no default in `CarryEngine` or `evaluate_entry`; `CARRY_BORROW_APR` required for carry, refused when absent |
 | D8 | The pair gate is skipped when `pair_risk` **or** `snapshot` is `None`, and `test_carry_live_gates::test_the_gate_is_skipped_only_when_absent` asserts that a bare engine opens. | `carry_engine.py` `_open` | **CLOSED 0033** — `PAIR_GATE_ABSENT` / `SNAPSHOT_ABSENT` / `SNAPSHOT_MISMATCH`; the test asserting the bypass was inverted |
 | D9 | Clock-skew check is dead code on the live path (no `get_venue_time_s`). | §2 | open |
+| D16 | **`session_tail` reported UNREADABLE as a violation.** Run with a bare interpreter it printed `GATE STILL FALSE?: NO (UNREADABLE: No module named numpy)` — which reads as "the gate opened". | seen in Codespaces | **CLOSED 0037** — three outcomes and three exit codes |
 | D15 | **The engine bought spot the client already owned.** PHASE1_DECISION chose the overlay on 2026-09-08; the engine went on paying a four-leg round trip and financing for inventory that was already there. | `--clock 8h --mode overlay` | **CLOSED 0036** — `CARRY_EXECUTION_MODE` required; overlay trades the perp only (`docs/human/OVERLAY_0036.md`) |
 | D10 | `funding_collected` books only non-negative prints; negative prints are paid and never booked. | `carry_engine.py` on_candle | **CLOSED 0034** — every held print booked signed |
 | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
@@ -119,9 +120,14 @@ Secrets Manager, never in a file, a log, or this repository.
 python3 tools/session_tail.py
 ```
 
-prints and exits non-zero on any violation of: promotion gate `False`,
-`FUND_ABS == 0.0001`, `SHADOW_MAX_NOTIONAL_USD == 100.0`, no module assigns
-`live_authorized`.
+prints the four invariants and exits **0** when they hold, **1** when one has
+MOVED, **2** when one could not be READ (0037 — run outside the virtualenv it
+used to print "NO" for a gate it had merely failed to import). Run it with the
+interpreter the suite uses:
+
+```
+. .venv/bin/activate && python3 bot/tools/session_tail.py
+```
 
 ## 8. Market data present
 

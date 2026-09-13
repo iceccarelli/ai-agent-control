@@ -423,6 +423,58 @@ class CarryBroker:
                 f"settled funding print for {symbol} is unusable: {row!r}")
         return rate * 1e4, stamp
 
+    def get_perp_position(self, symbol: str) -> float:
+        """Size of the perp position at the venue, in base units. 0 when flat.
+
+        Read at cold start, before the first tick, and compared with the
+        ledger. Raises when unreadable: a restart that cannot see the venue
+        must not assume it is flat.
+        """
+        result = self.client._request(
+            "GET", "/v5/position/list", signed=True,
+            params={"category": LINEAR, "symbol": symbol})
+        rows = (result or {}).get("list")
+        if rows is None:
+            raise PairIncident(
+                f"cannot read the {symbol} position; refusing to assume flat")
+        if not rows:
+            return 0.0
+        try:
+            return abs(float(rows[0].get("size", 0) or 0))
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"position row for {symbol} is malformed: {rows[0]!r}") from exc
+
+    def get_open_carry_orders(self, spot_symbol: str,
+                              perp_symbol: str) -> list:
+        """Orders that could still fill into this book.
+
+        EVERY open order on the perp symbol counts: that instrument is the
+        book's. On spot, only orders this book placed (their link id carries
+        the carry purpose) — an overlay client's own spot orders are their
+        business, and halting the hedge because they placed one would be the
+        book seizing their wallet.
+        """
+        out = []
+        for category, symbol, mine_only in ((LINEAR, perp_symbol, False),
+                                            (SPOT, spot_symbol, True)):
+            result = self.client._request(
+                "GET", "/v5/order/realtime", signed=True,
+                params={"category": category, "symbol": symbol, "openOnly": 0})
+            rows = (result or {}).get("list")
+            if rows is None:
+                raise PairIncident(
+                    f"cannot read open {category} orders for {symbol}; "
+                    "refusing to assume there are none")
+            for row in rows:
+                link = str(row.get("orderLinkId", ""))
+                if mine_only and "carr" not in link:
+                    continue
+                out.append({"orderLinkId": link, "category": category,
+                            "symbol": symbol,
+                            "orderStatus": row.get("orderStatus")})
+        return out
+
     # -- reconciliation ---------------------------------------------------
 
     def reconcile_pair(self, *, spot_symbol: str, perp_symbol: str,

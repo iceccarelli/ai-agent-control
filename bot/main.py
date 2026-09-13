@@ -297,6 +297,13 @@ class TradingBot:
                     )
                     return False
 
+        # THE CARRY BOOK'S COLD START (0037). Before anything else touches
+        # the venue: what did the last run believe, and what is actually
+        # there? A container that died holding a hedge used to come back FLAT
+        # and open a second one against the same liquidation price.
+        if self.carry is not None and not self.carry_cold_start():
+            return False
+
         # Reconcile BEFORE any trading decision.
         try:
             summary = self.engine.reconcile()
@@ -401,6 +408,49 @@ class TradingBot:
 
         self.shutdown()
         return 0
+
+    def carry_cold_start(self) -> bool:
+        """Reconcile the carry ledger against the venue. False = do not start.
+
+        Reads both sides and hands them to `CarryEngine.cold_start`, which is
+        pure and has its own tests. Anything unreadable is a refusal: a
+        restart that cannot see the venue must not assume it is flat.
+        """
+        broker = self.carry.broker
+        try:
+            ledger = self.store.load_carry_position()
+        except Exception as exc:  # noqa: BLE001
+            logger.critical(
+                "carry cold start: the ledger is unreadable (%s); refusing to "
+                "start", exc)
+            return False
+        try:
+            venue_perp = float(broker.get_perp_position(self.carry.perp_symbol))
+            venue_spot = float(
+                broker.get_spot_inventory(self.carry.spot_symbol))
+            open_orders = broker.get_open_carry_orders(
+                self.carry.spot_symbol, self.carry.perp_symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.critical(
+                "carry cold start: the venue is unreadable (%s); refusing to "
+                "start rather than assuming the book is flat", exc)
+            return False
+
+        decision = self.carry.cold_start(
+            ledger=ledger, venue_perp_qty=venue_perp, venue_spot_qty=venue_spot,
+            open_orders=open_orders)
+        logger.warning(
+            "carry cold start: %s — %s (ledger=%s venue_perp=%.10g "
+            "venue_spot=%.10g open_orders=%d)",
+            decision.action.value, decision.reason,
+            (ledger or {}).get("book_state", "NONE"), venue_perp, venue_spot,
+            len(open_orders))
+        if decision.action.value == "HALT":
+            logger.critical(
+                "carry cold start HALTED — a human must reconcile before this "
+                "process trades: %s", decision.reason)
+            return False
+        return True
 
     def tick(self) -> None:
         """One cycle: refresh equity, check the brakes, then consider each symbol."""
@@ -703,6 +753,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
             borrow_apr=float(borrow_apr),
             execution_mode=execution_mode,
+            # THE LEDGER (0037). Called by the engine on every state change,
+            # straight through to the store. Not a hasattr guard and not a
+            # lambda that swallows: a store without this method is a
+            # misconfiguration that must fail at construction.
+            persist=bot.store.save_carry_position,
         )
         # The pair gate. Until now max_notional_usd was the ONLY size control on
         # the carry book: the legs passed through no RiskManager at all. This is

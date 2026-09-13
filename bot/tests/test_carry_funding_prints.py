@@ -60,7 +60,7 @@ class Venue:
 def opened(bps=3.0):
     """An engine that has seen prints 1..3 and opened a $100 pair at print 3."""
     e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
-                    execution_mode="acquire")
+                    execution_mode="acquire", persist=lambda s: None)
     e.pair_risk = CarryRisk(max_notional_usd=100.0)
     e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
                                 funding_bps=bps, margin_multiple=5.0,
@@ -93,7 +93,7 @@ class TestOnePrintIsBookedOnce:
 
     def test_a_print_stamped_before_the_open_is_not_booked(self):
         e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
-                    execution_mode="acquire")
+                    execution_mode="acquire", persist=lambda s: None)
         e.pair_risk = CarryRisk(max_notional_usd=100.0)
         e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
                                     funding_bps=3.0, margin_multiple=5.0,
@@ -137,7 +137,7 @@ class TestTheStreakCountsPrints:
 class TestTheEwmaSeesPrints:
     def test_ten_ticks_of_one_print_are_one_observation(self):
         e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
-                    execution_mode="acquire")
+                    execution_mode="acquire", persist=lambda s: None)
         for _ in range(10):
             e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
                         funding_print_ms=H8)
@@ -147,7 +147,7 @@ class TestTheEwmaSeesPrints:
         """No stamp, no print: nothing booked, and the warm-up never completes,
         so the book cannot open on data it cannot place in time."""
         e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
-                    execution_mode="acquire")
+                    execution_mode="acquire", persist=lambda s: None)
         e.pair_risk = CarryRisk(max_notional_usd=100.0)
         for _ in range(10):
             d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
@@ -290,7 +290,8 @@ def _bot(broker):
                          update_equity=lambda e: None)
     bot.engine = mock.Mock(observe_exits=lambda: {})
     bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
-                            borrow_apr=0.0, execution_mode="acquire")
+                            borrow_apr=0.0, execution_mode="acquire",
+                            persist=lambda s: None)
     bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
     return bot
 

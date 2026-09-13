@@ -84,3 +84,58 @@ class TestAViolationFailsTheExit:
             body = fh.read()
         assert "place_market" not in body
         assert "place_order" not in body
+
+
+class TestUnreadableIsNotViolated:
+    """0037: run without the virtualenv, session_tail printed
+
+        GATE STILL FALSE?:  NO  (UNREADABLE: No module named 'numpy')
+
+    which reads as "the gate opened". It had not: the interpreter could not
+    import the module. A tool that cannot tell "false" from "cannot tell"
+    turns a missing dependency into a fire drill — and would hide a real
+    violation behind the same word."""
+
+    def _blind(self, monkeypatch, name):
+        import sys
+        monkeypatch.setitem(sys.modules, name, None)
+        for mod in [m for m in sys.modules if m.startswith("promotion_gate")]:
+            monkeypatch.delitem(sys.modules, mod, raising=False)
+
+    def test_an_unreadable_check_is_reported_as_unreadable(self, monkeypatch):
+        self._blind(monkeypatch, "shadow")
+        report = st.check(REPO)
+        assert report["cap_readable"] is False
+        assert report["cap_still_100"] is None
+        assert "UNREADABLE" in str(report["cap"])
+
+    def test_unreadable_is_not_ok_and_not_a_violation(self, monkeypatch):
+        self._blind(monkeypatch, "shadow")
+        report = st.check(REPO)
+        assert report["ok"] is False
+        assert report["violations"] == []
+        assert "cap_still_100" in report["unreadable"]
+
+    def test_a_real_violation_is_still_a_violation(self, monkeypatch):
+        import shadow
+        monkeypatch.setattr(shadow, "SHADOW_MAX_NOTIONAL_USD", 250.0)
+        report = st.check(REPO)
+        assert report["cap_readable"] is True
+        assert report["cap_still_100"] is False
+        assert "cap_still_100" in report["violations"]
+
+    def test_the_exit_code_separates_them(self, monkeypatch):
+        assert st.main(["--repo", REPO]) == 0
+        self._blind(monkeypatch, "shadow")
+        assert st.main(["--repo", REPO]) == 2        # cannot tell
+        monkeypatch.undo()
+        import shadow
+        monkeypatch.setattr(shadow, "SHADOW_MAX_NOTIONAL_USD", 250.0)
+        assert st.main(["--repo", REPO]) == 1        # moved
+
+    def test_it_says_which_interpreter_to_use(self, monkeypatch, capsys):
+        self._blind(monkeypatch, "shadow")
+        st.main(["--repo", REPO])
+        out = capsys.readouterr().out
+        assert "UNREADABLE" in out
+        assert ".venv" in out

@@ -43,6 +43,17 @@ class _Store:
     def trip_kill_switch(self, reason):
         self.killed.append(reason)
 
+    # 0037: the carry book writes what it holds on every state change, and
+    # reads it back before the first tick. A stub store without these is a
+    # book with amnesia, which is what INVENTORY D3 was.
+    def save_carry_position(self, state):
+        self.carry_states = getattr(self, "carry_states", [])
+        self.carry_states.append(state)
+
+    def load_carry_position(self):
+        return getattr(self, "carry_states", [None])[-1] if \
+            getattr(self, "carry_states", None) else None
+
     def open_positions(self):
         return []
 
@@ -104,7 +115,8 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]
     bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0,
-                            borrow_apr=0.05, execution_mode="acquire")
+                            borrow_apr=0.05, execution_mode="acquire",
+                            persist=lambda s: None)
     # 0033: no first leg without the pair gate. main.tick supplies the
     # snapshot; the gate is attached here exactly as build_bot attaches it.
     from carry_risk import CarryRisk

@@ -96,6 +96,7 @@ def snap(perp=MARK, spot=MARK):
 
 def engine(venue, *, mode=OVERLAY, cap=100.0, **kw):
     kw.setdefault("borrow_apr", 0.0)
+    kw.setdefault("persist", lambda state: None)
     e = CarryEngine(broker=venue, max_notional_usd=cap, execution_mode=mode,
                     **kw)
     e.pair_risk = CarryRisk(max_notional_usd=cap)
@@ -318,12 +319,13 @@ class TestTheCostGateTakesTheRoundTripAsAnInput:
 class TestModeIsAnExplicitDecision:
     def test_the_engine_cannot_be_built_without_a_mode(self):
         with pytest.raises(TypeError):
-            CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.0)
+            CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.0,
+                        persist=lambda s: None)
 
     def test_an_unknown_mode_raises_at_construction(self):
         with pytest.raises(ValueError, match="execution mode"):
             CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.0,
-                        execution_mode="hedge_maybe")
+                        execution_mode="hedge_maybe", persist=lambda s: None)
 
     def test_build_bot_refuses_without_the_config_key(self):
         import config as _config
@@ -359,6 +361,16 @@ class _Store:
 
     def trip_kill_switch(self, reason):
         pass
+
+    # 0037: the carry book writes what it holds on every state change, and
+    # reads it back before the first tick. A stub store without these is a
+    # book with amnesia, which is what INVENTORY D3 was.
+    def save_carry_position(self, state):
+        self.carry_states = getattr(self, "carry_states", [])
+        self.carry_states.append(state)
+
+    def load_carry_position(self):
+        return getattr(self, "carry_states", None) and self.carry_states[-1]
 
     def is_kill_switch_engaged(self):
         return (False, "")

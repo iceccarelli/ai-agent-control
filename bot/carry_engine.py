@@ -65,7 +65,7 @@ from __future__ import annotations
 import logging
 import math
 from decimal import Decimal, InvalidOperation
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -138,6 +138,105 @@ def _costs():
     here, so the dependency points one way only."""
     import carry_costs
     return carry_costs
+
+
+class ColdStart(Enum):
+    """What a restart may do, decided before the first tick."""
+
+    CLEAN = "CLEAN"       # nothing in the ledger, nothing at the venue
+    RESUME = "RESUME"     # they agree; the book picks the same pair back up
+    HALT = "HALT"         # they do not agree; a human looks before anything trades
+
+
+@dataclass(frozen=True)
+class ColdStartDecision:
+    action: "ColdStart"
+    reason: str
+    naked_side: str = ""
+    detail: Dict[str, Any] = field(default_factory=dict)
+
+
+def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
+                    venue_perp_qty: float, venue_spot_qty: float,
+                    open_orders: Any = (),
+                    dust: float = QTY_DUST) -> ColdStartDecision:
+    """Compare what the last run believed against what the venue holds.
+
+    Pure. It reads both sides and returns a verdict; it never writes to either.
+    A book that edited its ledger to match the venue could not detect a missed
+    fill, a manual order, or a bug — which is the entire reason this function
+    exists rather than "load the position and carry on".
+
+    HALT is the answer to every disagreement, including the ones that look
+    harmless. The failure this prevents is a container that restarts holding a
+    hedge, reads an empty ledger, and opens a SECOND hedge against the same
+    margin and the same liquidation price.
+    """
+    orders = list(open_orders or ())
+    if orders:
+        return ColdStartDecision(
+            ColdStart.HALT,
+            f"{len(orders)} carry order(s) are still open at the venue; one "
+            "could fill into a book that does not know it exists",
+            detail={"open_orders": orders[:8]})
+
+    state = str((ledger or {}).get("book_state", "")) or "FLAT"
+    position = (ledger or {}).get("position")
+    perp = abs(float(venue_perp_qty or 0.0))
+    spot = float(venue_spot_qty or 0.0)
+
+    if state == BookState.HALTED.value:
+        return ColdStartDecision(
+            ColdStart.HALT,
+            "the last run halted and a halt is cleared by a human, never by a "
+            "restart",
+            detail={"venue_perp_qty": perp})
+
+    if not position:
+        if perp > dust:
+            return ColdStartDecision(
+                ColdStart.HALT,
+                f"the venue holds a perp position of {perp:.10g} that the "
+                "ledger never recorded",
+                naked_side="perp", detail={"venue_perp_qty": perp})
+        return ColdStartDecision(ColdStart.CLEAN, "no pair in the ledger, none "
+                                 "at the venue")
+
+    ledger_perp = abs(float((position.get("perp") or {}).get("filled_qty", 0.0)))
+    ledger_spot = abs(float((position.get("spot") or {}).get("filled_qty", 0.0)))
+    mode = str((ledger or {}).get("execution_mode", ACQUIRE))
+
+    if abs(perp - ledger_perp) > dust:
+        return ColdStartDecision(
+            ColdStart.HALT,
+            f"the ledger holds a {ledger_perp:.10g} perp short and the venue "
+            f"holds {perp:.10g}",
+            naked_side="spot" if perp < ledger_perp else "perp",
+            detail={"ledger_perp_qty": ledger_perp, "venue_perp_qty": perp})
+
+    # The long side. In OVERLAY it is the client's inventory and only has to
+    # COVER the hedge; in ACQUIRE the book bought a specific quantity and that
+    # quantity has to be there.
+    if mode == OVERLAY:
+        if spot + dust < ledger_spot:
+            return ColdStartDecision(
+                ColdStart.HALT,
+                f"the hedge covers {ledger_spot:.10g} BTC and the account now "
+                f"holds {spot:.10g}: the inventory this short was written "
+                "against has left",
+                naked_side="perp",
+                detail={"ledger_spot_qty": ledger_spot, "venue_spot_qty": spot})
+    elif abs(spot - ledger_spot) > dust:
+        return ColdStartDecision(
+            ColdStart.HALT,
+            f"the ledger holds {ledger_spot:.10g} of spot and the venue holds "
+            f"{spot:.10g}",
+            naked_side="spot" if spot < ledger_spot else "perp",
+            detail={"ledger_spot_qty": ledger_spot, "venue_spot_qty": spot})
+
+    return ColdStartDecision(
+        ColdStart.RESUME, "the ledger and the venue agree on the pair",
+        detail={"perp_qty": perp, "spot_qty": spot, "execution_mode": mode})
 
 
 class BookState(Enum):
@@ -241,7 +340,8 @@ class CarryEngine:
                  delta_band: float = DELTA_BAND,
                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
                  min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
-                 borrow_apr: float, execution_mode: str) -> None:
+                 borrow_apr: float, execution_mode: str,
+                 persist: Any) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -252,6 +352,13 @@ class CarryEngine:
                 "modes send different orders, and guessing means either "
                 "buying spot the client already owns or shorting against "
                 "inventory that is not there.")
+        if not callable(persist):
+            raise TypeError(
+                "persist must be callable: the book writes what it holds to "
+                "the ledger on every state change. A carry engine with "
+                "nowhere to write is a container that restarts flat and opens "
+                "a second hedge (INVENTORY D3).")
+        self.persist = persist
         self.execution_mode = execution_mode
         self.broker = broker
         self.kill_switch = kill_switch
@@ -279,6 +386,105 @@ class CarryEngine:
         #: The last exception a leg raised, so a refusal can name it. A leg
         #: that fails for a reason nobody can read is a leg that fails again.
         self._last_leg_error: str = ""
+
+    # -- the ledger -------------------------------------------------------
+
+    def to_state(self) -> Dict[str, Any]:
+        """Everything a restart needs, as plain JSON-able data."""
+        position = None
+        if self.position is not None:
+            position = {
+                "spot": asdict(self.position.spot),
+                "perp": asdict(self.position.perp),
+                "opened_ms": int(self.position.opened_ms),
+                "funding_collected": float(self.position.funding_collected),
+                "negative_funding_streak":
+                    int(self.position.negative_funding_streak),
+            }
+        return {
+            "book_state": self.state.value,
+            "execution_mode": self.execution_mode,
+            "position": position,
+            "last_print_ms": self._last_print_ms,
+            "funding_history": list(self._funding_history),
+            "max_notional_usd": self.max_notional_usd,
+        }
+
+    def restore(self, state: Dict[str, Any]) -> None:
+        """Take the ledger's word for the position. Called only after
+        `cold_start` has checked it against the venue."""
+        position = state.get("position")
+        if position:
+            self.position = CarryPosition(
+                spot=Leg(**position["spot"]), perp=Leg(**position["perp"]),
+                opened_ms=int(position.get("opened_ms", 0)),
+                funding_collected=float(position.get("funding_collected", 0.0)),
+                negative_funding_streak=int(
+                    position.get("negative_funding_streak", 0)))
+            self.state = BookState.HEDGED
+        else:
+            self.position = None
+            self.state = BookState.FLAT
+        last = state.get("last_print_ms")
+        self._last_print_ms = None if last is None else int(last)
+        self._funding_history = [float(x) for x in
+                                 state.get("funding_history", [])][
+                                     -self.FUNDING_HISTORY:]
+
+    def _record(self) -> Optional[CarryDecision]:
+        """Write the ledger. A failure to write HALTS.
+
+        The alternative is a book that placed an order the next restart cannot
+        see, which is the exact state cold start exists to make impossible.
+        """
+        try:
+            self.persist(self.to_state())
+        except Exception as exc:  # noqa: BLE001
+            return self._halt("LEDGER_WRITE_FAILED",
+                              f"the position could not be written down "
+                              f"({type(exc).__name__}: {exc}); a book whose "
+                              "ledger is behind its orders must stop",
+                              record=False)
+        return None
+
+    def cold_start(self, *, ledger: Optional[Dict[str, Any]],
+                   venue_perp_qty: float, venue_spot_qty: float,
+                   open_orders: Any = ()) -> ColdStartDecision:
+        """Reconcile the ledger against the venue BEFORE the first tick.
+
+        RESUME puts the same pair back in the engine. HALT stops the process
+        and trips the switch; it deliberately does NOT rewrite the ledger,
+        because the disagreement is the evidence a human needs.
+        """
+        if ledger and ledger.get("execution_mode") and \
+                ledger["execution_mode"] != self.execution_mode:
+            decision = ColdStartDecision(
+                ColdStart.HALT,
+                f"the ledger holds a {ledger['execution_mode']!r} position and "
+                f"this process is configured {self.execution_mode!r}; "
+                "unwinding one as the other would trade the wrong leg",
+                detail={"ledger_mode": ledger["execution_mode"],
+                        "process_mode": self.execution_mode})
+        else:
+            decision = plan_cold_start(ledger=ledger,
+                                       venue_perp_qty=venue_perp_qty,
+                                       venue_spot_qty=venue_spot_qty,
+                                       open_orders=open_orders)
+        if decision.action is ColdStart.RESUME:
+            self.restore(ledger or {})
+            logger.warning("carry cold start: RESUMED %s", decision.detail)
+        elif decision.action is ColdStart.HALT:
+            self.state = BookState.HALTED
+            if self.kill_switch is not None:
+                try:
+                    self.kill_switch(f"CARRY_COLD_START: {decision.reason}")
+                except Exception:  # noqa: BLE001
+                    logger.critical("kill switch itself failed on cold start")
+            logger.critical(
+                "carry cold start HALTED: %s (naked side: %s) %s",
+                decision.reason, decision.naked_side or "unknown",
+                decision.detail)
+        return decision
 
     def round_trip_bps(self) -> float:
         """What a full cycle costs THIS account at THIS venue, in bps.
@@ -559,6 +765,9 @@ class CarryEngine:
         # Only now: both legs landed. A refused pair consumed nothing; a
         # broken one spent the day through record_broken_pair instead.
         self.pair_risk.record_entry()
+        failed = self._record()
+        if failed is not None:
+            return failed
         return CarryDecision(
             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
@@ -615,6 +824,9 @@ class CarryEngine:
         self.position = position
         self.state = BookState.HEDGED
         self.pair_risk.record_entry()
+        failed = self._record()
+        if failed is not None:
+            return failed
         return CarryDecision(
             "opened", acted=True, reason="PERP_HEDGE_LANDED",
             state=BookState.HEDGED,
@@ -647,6 +859,9 @@ class CarryEngine:
         else:
             position.perp.filled_qty -= fill.filled_qty
         self.state = BookState.HEDGED
+        failed = self._record()
+        if failed is not None:
+            return failed
         return CarryDecision(
             "rebalanced", acted=True, reason="DELTA_RETURNED_TO_BAND",
             state=BookState.HEDGED,
@@ -671,6 +886,9 @@ class CarryEngine:
                     "client's BTC is now unhedged")
             self.position = None
             self.state = BookState.FLAT
+            failed = self._record()
+            if failed is not None:
+                return failed
             return CarryDecision("unwound", acted=True, reason=reason,
                                  state=BookState.FLAT,
                                  detail={"collected": position.funding_collected,
@@ -683,6 +901,9 @@ class CarryEngine:
                 f"{reason} — a leg did not close and the book is now naked")
         self.position = None
         self.state = BookState.FLAT
+        failed = self._record()
+        if failed is not None:
+            return failed
         return CarryDecision("unwound", acted=True, reason=reason,
                              state=BookState.FLAT,
                              detail={"collected": position.funding_collected})
@@ -695,6 +916,9 @@ class CarryEngine:
             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
         self.position = None
         self.state = BookState.FLAT
+        failed = self._record()
+        if failed is not None:
+            return failed
         # A spot round trip was paid for nothing. Without this, a venue that
         # rejects the perp leg made the book buy and sell spot every tick:
         # 8 round trips in 10 ticks, measured (INVENTORY D4).
@@ -744,7 +968,8 @@ class CarryEngine:
                    order_link_id=str(result.get("order_link_id", "")),
                    fee=None if raw_fee is None else float(raw_fee))
 
-    def _halt(self, reason: str, detail: str) -> CarryDecision:
+    def _halt(self, reason: str, detail: str,
+              record: bool = True) -> CarryDecision:
         self.state = BookState.HALTED
         if self.kill_switch is not None:
             try:
@@ -752,6 +977,11 @@ class CarryEngine:
             except Exception:  # noqa: BLE001
                 logger.critical("kill switch itself failed on %s", reason)
         logger.critical("carry book HALTED: %s — %s", reason, detail)
+        if record:
+            try:
+                self.persist(self.to_state())
+            except Exception:  # noqa: BLE001 - already halting
+                logger.critical("the halt itself could not be written down")
         return CarryDecision("halted", reason=reason, state=BookState.HALTED,
                              detail={"detail": detail})
 
