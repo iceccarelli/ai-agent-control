@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""The runtime, as code: one Fargate task that can reach the venue.
+
+WHY THIS FILE EXISTS
+====================
+The book has never touched an exchange because no host it ran on could reach
+one: Codespaces gets Bybit 403, the sandbox gets nothing at all. This is the
+host, written down rather than clicked, so that every claim about it is a line
+someone can read and a test can check.
+
+THE INVARIANTS, AND WHAT EACH ONE COSTS IF IT SLIPS
+===================================================
+  DesiredCount 1, MaximumPercent 100
+      Two tasks are two engines against one Bybit account and one liquidation
+      price, each unaware of the other's legs. MaximumPercent 200 — the AWS
+      default — puts them side by side for a minute during every deploy, which
+      is long enough to open two hedges.
+  AssignPublicIp DISABLED, no ingress
+      The health endpoint is unauthenticated and reports positions and
+      kill-switch state. Nothing may connect to this task.
+  Egress 443 and NFS only
+      A compromised container cannot exfiltrate to an arbitrary port. Domain
+      allowlisting is a further step and it is NOT free — see EGRESS below.
+  EFS at /app/state
+      Fargate's disk dies with the task. The carry ledger (0037) is what stops
+      a restart opening a second hedge; on ephemeral storage it is a comment.
+  Secrets from Secrets Manager, by ARN
+      This repository exists downstream of an image that shipped live keys.
+  No wildcard IAM
+      The task role may mount its own filesystem and nothing else.
+
+EGRESS, HONESTLY
+================
+"NAT egress allowlist to the venue only" needs AWS Network Firewall with an
+FQDN rule group — roughly $300/month plus data processing, against a book
+whose cap is $100. This template restricts egress to 443 and leaves the
+allowlist as a generated, OPT-IN rule group (`--network-firewall`). The
+controls that actually protect the money at this size are the ones on the key:
+withdrawals disabled, IP-pinned to the NAT's elastic IP, which this stack
+gives you as a stable address.
+
+    python3 tools/aws_stack.py --out stack.json
+    python3 tools/aws_stack.py --check stack.json
+    python3 tools/aws_stack.py --run-task-command
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from typing import Any, Dict, List, Optional
+
+#: Where the container keeps state. Must be inside the EFS mount, or the
+#: ledger dies with the task.
+MOUNT_PATH = "/app/state"
+STATE_DB_PATH = f"{MOUNT_PATH}/trading_state.db"
+
+#: The container runs as uid/gid 1000 (`useradd bot` in the Dockerfile).
+CONTAINER_UID = 1000
+
+VPC_CIDR = "10.20.0.0/16"
+SUBNETS = {"PublicSubnetA": "10.20.0.0/24",
+           "PrivateSubnetA": "10.20.10.0/24",
+           "PrivateSubnetB": "10.20.11.0/24"}
+
+#: Bybit's API hosts, for the optional Network Firewall allowlist.
+VENUE_FQDNS = ("api.bybit.com", "api-testnet.bybit.com",
+               "stream.bybit.com", "stream-testnet.bybit.com")
+
+
+def _tag(name: str) -> List[Dict[str, str]]:
+    return [{"Key": "Name", "Value": name},
+            {"Key": "Project", "Value": "carry-book"}]
+
+
+def template(*, network_firewall: bool = False,
+             log_retention_days: int = 90) -> Dict[str, Any]:
+    """The whole stack as a CloudFormation document."""
+    t: Dict[str, Any] = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Description": ("Carry Book runtime: one Fargate task, private "
+                        "subnets, EFS state, secrets from Secrets Manager. "
+                        "TESTNET by construction."),
+        "Parameters": {
+            "ImageUri": {"Type": "String",
+                         "Description": "ECR image URI for the bot"},
+            "ApiKeySecretArn": {"Type": "String"},
+            "ApiSecretArn": {"Type": "String"},
+            "CarryExecutionMode": {
+                "Type": "String", "Default": "overlay",
+                "AllowedValues": ["overlay", "acquire"]},
+            "CarryBorrowApr": {
+                "Type": "String", "Default": "0.0",
+                "Description": "Fraction per year. 0.0 = an overlay on BTC "
+                               "the client already owns."},
+        },
+        "Resources": {},
+        "Outputs": {},
+    }
+    r = t["Resources"]
+
+    # -- network ----------------------------------------------------------
+    r["Vpc"] = {"Type": "AWS::EC2::VPC", "Properties": {
+        "CidrBlock": VPC_CIDR, "EnableDnsSupport": True,
+        "EnableDnsHostnames": True, "Tags": _tag("carry-book")}}
+    r["InternetGateway"] = {"Type": "AWS::EC2::InternetGateway",
+                            "Properties": {"Tags": _tag("carry-book")}}
+    r["GatewayAttachment"] = {"Type": "AWS::EC2::VPCGatewayAttachment",
+                              "Properties": {"VpcId": {"Ref": "Vpc"},
+                                             "InternetGatewayId": {
+                                                 "Ref": "InternetGateway"}}}
+    for name, cidr in SUBNETS.items():
+        index = 0 if name.endswith("A") else 1
+        r[name] = {"Type": "AWS::EC2::Subnet", "Properties": {
+            "VpcId": {"Ref": "Vpc"}, "CidrBlock": cidr,
+            "AvailabilityZone": {"Fn::Select": [
+                index, {"Fn::GetAZs": ""}]},
+            "MapPublicIpOnLaunch": name.startswith("Public"),
+            "Tags": _tag(name)}}
+
+    r["NatEip"] = {"Type": "AWS::EC2::EIP", "DependsOn": "GatewayAttachment",
+                   "Properties": {"Domain": "vpc", "Tags": _tag("carry-nat")}}
+    r["NatGateway"] = {"Type": "AWS::EC2::NatGateway", "Properties": {
+        "AllocationId": {"Fn::GetAtt": ["NatEip", "AllocationId"]},
+        "SubnetId": {"Ref": "PublicSubnetA"}, "Tags": _tag("carry-nat")}}
+
+    r["PublicRouteTable"] = {"Type": "AWS::EC2::RouteTable", "Properties": {
+        "VpcId": {"Ref": "Vpc"}, "Tags": _tag("carry-public")}}
+    r["PublicRoute"] = {"Type": "AWS::EC2::Route",
+                        "DependsOn": "GatewayAttachment", "Properties": {
+                            "RouteTableId": {"Ref": "PublicRouteTable"},
+                            "DestinationCidrBlock": "0.0.0.0/0",
+                            "GatewayId": {"Ref": "InternetGateway"}}}
+    r["PublicSubnetARoute"] = {
+        "Type": "AWS::EC2::SubnetRouteTableAssociation", "Properties": {
+            "SubnetId": {"Ref": "PublicSubnetA"},
+            "RouteTableId": {"Ref": "PublicRouteTable"}}}
+
+    r["PrivateRouteTable"] = {"Type": "AWS::EC2::RouteTable", "Properties": {
+        "VpcId": {"Ref": "Vpc"}, "Tags": _tag("carry-private")}}
+    r["PrivateRoute"] = {"Type": "AWS::EC2::Route", "Properties": {
+        "RouteTableId": {"Ref": "PrivateRouteTable"},
+        "DestinationCidrBlock": "0.0.0.0/0",
+        "NatGatewayId": {"Ref": "NatGateway"}}}
+    for subnet in ("PrivateSubnetA", "PrivateSubnetB"):
+        r[f"{subnet}Route"] = {
+            "Type": "AWS::EC2::SubnetRouteTableAssociation", "Properties": {
+                "SubnetId": {"Ref": subnet},
+                "RouteTableId": {"Ref": "PrivateRouteTable"}}}
+
+    # -- security groups --------------------------------------------------
+    r["EfsSecurityGroup"] = {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+        "GroupDescription": "EFS for the carry ledger",
+        "VpcId": {"Ref": "Vpc"},
+        "SecurityGroupIngress": [{
+            "IpProtocol": "tcp", "FromPort": 2049, "ToPort": 2049,
+            "SourceSecurityGroupId": {"Ref": "TaskSecurityGroup"},
+            "Description": "NFS from the task only"}],
+        "Tags": _tag("carry-efs")}}
+    r["TaskSecurityGroup"] = {"Type": "AWS::EC2::SecurityGroup", "Properties": {
+        "GroupDescription": ("carry book task: no ingress, HTTPS out, NFS to "
+                             "its own filesystem"),
+        "VpcId": {"Ref": "Vpc"},
+        # NOTHING may connect to the book. The health endpoint is
+        # unauthenticated and reports positions and kill-switch state.
+        "SecurityGroupIngress": [],
+        "SecurityGroupEgress": [
+            {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443,
+             "CidrIp": "0.0.0.0/0",
+             "Description": "venue REST and WebSocket, ECR, Secrets Manager"},
+            {"IpProtocol": "tcp", "FromPort": 2049, "ToPort": 2049,
+             "DestinationSecurityGroupId": {"Fn::GetAtt": [
+                 "EfsSecurityGroup", "GroupId"]},
+             "Description": "the ledger"}],
+        "Tags": _tag("carry-task")}}
+
+    # -- state ------------------------------------------------------------
+    r["Efs"] = {"Type": "AWS::EFS::FileSystem", "DeletionPolicy": "Retain",
+                "UpdateReplacePolicy": "Retain", "Properties": {
+                    "Encrypted": True,
+                    "PerformanceMode": "generalPurpose",
+                    "FileSystemTags": _tag("carry-state")}}
+    for subnet in ("PrivateSubnetA", "PrivateSubnetB"):
+        r[f"MountTarget{subnet[-1]}"] = {
+            "Type": "AWS::EFS::MountTarget", "Properties": {
+                "FileSystemId": {"Ref": "Efs"},
+                "SubnetId": {"Ref": subnet},
+                "SecurityGroups": [{"Ref": "EfsSecurityGroup"}]}}
+    r["EfsAccessPoint"] = {"Type": "AWS::EFS::AccessPoint", "Properties": {
+        "FileSystemId": {"Ref": "Efs"},
+        "PosixUser": {"Uid": CONTAINER_UID, "Gid": CONTAINER_UID},
+        "RootDirectory": {"Path": "/carry-state", "CreationInfo": {
+            "OwnerUid": CONTAINER_UID, "OwnerGid": CONTAINER_UID,
+            "Permissions": "0750"}}}}
+
+    # -- logs and roles ---------------------------------------------------
+    r["LogGroup"] = {"Type": "AWS::Logs::LogGroup",
+                     "DeletionPolicy": "Retain", "Properties": {
+                         "LogGroupName": {"Fn::Sub":
+                                          "/carry-book/${AWS::StackName}"},
+                         "RetentionInDays": int(log_retention_days)}}
+    r["ExecutionRole"] = {"Type": "AWS::IAM::Role", "Properties": {
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+                "Action": "sts:AssumeRole"}]},
+        "ManagedPolicyArns": ["arn:aws:iam::aws:policy/service-role/"
+                              "AmazonECSTaskExecutionRolePolicy"],
+        "Policies": [{
+            "PolicyName": "read-the-two-secrets",
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow",
+                "Action": ["secretsmanager:GetSecretValue"],
+                "Resource": [{"Ref": "ApiKeySecretArn"},
+                             {"Ref": "ApiSecretArn"}]}]}}]}}
+    r["TaskRole"] = {"Type": "AWS::IAM::Role", "Properties": {
+        "AssumeRolePolicyDocument": {
+            "Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Service": "ecs-tasks.amazonaws.com"},
+                "Action": "sts:AssumeRole"}]},
+        # The book's own credentials are the Bybit keys. From AWS it needs
+        # exactly one thing: its filesystem.
+        "Policies": [{
+            "PolicyName": "mount-its-own-ledger",
+            "PolicyDocument": {"Version": "2012-10-17", "Statement": [{
+                "Effect": "Allow",
+                "Action": ["elasticfilesystem:ClientMount",
+                           "elasticfilesystem:ClientWrite"],
+                "Resource": [{"Fn::GetAtt": ["Efs", "Arn"]}]}]}}]}}
+
+    # -- the task ---------------------------------------------------------
+    r["Cluster"] = {"Type": "AWS::ECS::Cluster", "Properties": {
+        "ClusterName": {"Fn::Sub": "${AWS::StackName}-carry"},
+        "ClusterSettings": [{"Name": "containerInsights", "Value": "enabled"}]}}
+    r["TaskDefinition"] = {"Type": "AWS::ECS::TaskDefinition", "Properties": {
+        "Family": {"Fn::Sub": "${AWS::StackName}-carry"},
+        "Cpu": "512", "Memory": "1024",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": ["FARGATE"],
+        "ExecutionRoleArn": {"Fn::GetAtt": ["ExecutionRole", "Arn"]},
+        "TaskRoleArn": {"Fn::GetAtt": ["TaskRole", "Arn"]},
+        "Volumes": [{
+            "Name": "state",
+            "EFSVolumeConfiguration": {
+                "FilesystemId": {"Ref": "Efs"},
+                "TransitEncryption": "ENABLED",
+                "AuthorizationConfig": {
+                    "AccessPointId": {"Ref": "EfsAccessPoint"},
+                    "IAM": "ENABLED"}}}],
+        "ContainerDefinitions": [{
+            "Name": "carry-book",
+            "Image": {"Ref": "ImageUri"},
+            "Essential": True,
+            "StopTimeout": 30,
+            "MountPoints": [{"SourceVolume": "state",
+                             "ContainerPath": MOUNT_PATH,
+                             "ReadOnly": False}],
+            "Environment": [
+                {"Name": "BOOK_MODE", "Value": "carry"},
+                # TESTNET is a LITERAL, not a parameter: pointing this stack at
+                # mainnet is a code change and a review, not a deploy argument.
+                {"Name": "USE_TESTNET", "Value": "1"},
+                # PAPER_TRADING=1 refuses every carry order (0033), so the
+                # drill runs with it off, on testnet.
+                {"Name": "PAPER_TRADING", "Value": "0"},
+                {"Name": "CARRY_EXECUTION_MODE",
+                 "Value": {"Ref": "CarryExecutionMode"}},
+                {"Name": "CARRY_BORROW_APR", "Value": {"Ref": "CarryBorrowApr"}},
+                {"Name": "STATE_DB_PATH", "Value": STATE_DB_PATH},
+                {"Name": "ENABLE_HEALTH_SERVER", "Value": "1"},
+                {"Name": "HEALTHCHECK_HOST", "Value": "127.0.0.1"},
+                {"Name": "LOG_LEVEL", "Value": "INFO"},
+            ],
+            "Secrets": [
+                {"Name": "BYBIT_API_KEY", "ValueFrom": {"Ref": "ApiKeySecretArn"}},
+                {"Name": "BYBIT_API_SECRET", "ValueFrom": {"Ref": "ApiSecretArn"}}],
+            "LogConfiguration": {
+                "LogDriver": "awslogs",
+                "Options": {"awslogs-group": {"Ref": "LogGroup"},
+                            "awslogs-region": {"Ref": "AWS::Region"},
+                            "awslogs-stream-prefix": "carry"}}}]}}
+    r["Service"] = {"Type": "AWS::ECS::Service",
+                    "DependsOn": ["MountTargetA", "MountTargetB"],
+                    "Properties": {
+                        "Cluster": {"Ref": "Cluster"},
+                        "TaskDefinition": {"Ref": "TaskDefinition"},
+                        "LaunchType": "FARGATE",
+                        "DesiredCount": 1,
+                        "DeploymentConfiguration": {
+                            # The old task STOPS before the new one starts.
+                            "MaximumPercent": 100,
+                            "MinimumHealthyPercent": 0,
+                            "DeploymentCircuitBreaker": {"Enable": True,
+                                                         "Rollback": True}},
+                        "EnableExecuteCommand": False,
+                        "NetworkConfiguration": {"AwsvpcConfiguration": {
+                            "AssignPublicIp": "DISABLED",
+                            "Subnets": [{"Ref": "PrivateSubnetA"},
+                                        {"Ref": "PrivateSubnetB"}],
+                            "SecurityGroups": [{"Ref": "TaskSecurityGroup"}]}}}}
+
+    if network_firewall:
+        r["VenueAllowlist"] = {
+            "Type": "AWS::NetworkFirewall::RuleGroup", "Properties": {
+                "RuleGroupName": {"Fn::Sub": "${AWS::StackName}-venue-only"},
+                "Type": "STATEFUL", "Capacity": 100,
+                "RuleGroup": {"RulesSource": {"RulesSourceList": {
+                    "TargetTypes": ["TLS_SNI"], "GeneratedRulesType": "ALLOWLIST",
+                    "Targets": list(VENUE_FQDNS)}}}}}
+
+    t["Outputs"] = {
+        "ClusterName": {"Value": {"Ref": "Cluster"}},
+        "ServiceName": {"Value": {"Fn::GetAtt": ["Service", "Name"]}},
+        "TaskDefinitionArn": {"Value": {"Ref": "TaskDefinition"}},
+        "PrivateSubnets": {"Value": {"Fn::Join": [",", [
+            {"Ref": "PrivateSubnetA"}, {"Ref": "PrivateSubnetB"}]]}},
+        "TaskSecurityGroup": {"Value": {"Ref": "TaskSecurityGroup"}},
+        "NatIpToPinTheKeyTo": {
+            "Value": {"Ref": "NatEip"},
+            "Description": "Pin the Bybit API key to this address"},
+        "LogGroup": {"Value": {"Ref": "LogGroup"}},
+        "StateFilesystem": {"Value": {"Ref": "Efs"}},
+    }
+    return t
+
+
+# ---------------------------------------------------------------------------
+# the checker
+# ---------------------------------------------------------------------------
+
+def check(t: Dict[str, Any]) -> List[str]:
+    """Every invariant, read back off the template. Empty means it holds."""
+    problems: List[str] = []
+    res = t.get("Resources", {})
+
+    def prop(name: str, *path, default=None):
+        node: Any = res.get(name, {}).get("Properties", {})
+        for key in path:
+            if isinstance(node, dict):
+                node = node.get(key, {})
+            elif isinstance(node, list) and isinstance(key, int) and \
+                    len(node) > key:
+                node = node[key]
+            else:
+                return default
+        return node if node != {} else default
+
+    if prop("Service", "DesiredCount") != 1:
+        problems.append(
+            f"Service DesiredCount is {prop('Service', 'DesiredCount')!r}: two "
+            "tasks are two engines against one liquidation price")
+    if prop("Service", "DeploymentConfiguration", "MaximumPercent") != 100:
+        problems.append(
+            "Service MaximumPercent is not 100: a deploy would run the old and "
+            "the new task side by side")
+    net = prop("Service", "NetworkConfiguration", "AwsvpcConfiguration",
+               default={})
+    if net.get("AssignPublicIp") != "DISABLED":
+        problems.append("the task gets a public IP; the health endpoint is "
+                        "unauthenticated")
+    subnets = [s.get("Ref") for s in net.get("Subnets", [])]
+    if any(str(s).startswith("Public") for s in subnets):
+        problems.append(f"the task runs in a public subnet: {subnets}")
+
+    sg = res.get("TaskSecurityGroup", {}).get("Properties", {})
+    if sg.get("SecurityGroupIngress"):
+        problems.append("the task security group accepts ingress")
+    for rule in sg.get("SecurityGroupEgress", []):
+        if rule.get("FromPort") not in (443, 2049) or \
+                rule.get("IpProtocol") != "tcp":
+            problems.append(f"egress rule beyond 443/2049: {rule}")
+
+    container = prop("TaskDefinition", "ContainerDefinitions", 0, default={})
+    env = {e.get("Name"): e.get("Value") for e in container.get("Environment", [])}
+    for name in env:
+        if "SECRET" in str(name).upper() or "API_KEY" in str(name).upper():
+            problems.append(f"{name} is in the environment block: a secret "
+                            "belongs in Secrets Manager")
+    mounts = container.get("MountPoints", [])
+    if not any(m.get("ContainerPath") == MOUNT_PATH for m in mounts):
+        problems.append("the state directory is not mounted: the ledger would "
+                        "die with the task")
+    if not str(env.get("STATE_DB_PATH", "")).startswith(MOUNT_PATH + "/"):
+        problems.append("STATE_DB_PATH is outside the mounted state directory")
+    if env.get("BOOK_MODE") != "carry":
+        problems.append("BOOK_MODE is not carry")
+    if env.get("USE_TESTNET") != "1":
+        problems.append("USE_TESTNET is not 1: this stack is testnet by "
+                        "construction")
+    if env.get("PAPER_TRADING") != "0":
+        problems.append("PAPER_TRADING is not 0: the carry book would refuse "
+                        "every order")
+
+    for role in ("ExecutionRole", "TaskRole"):
+        for policy in res.get(role, {}).get("Properties", {}).get("Policies", []):
+            for statement in policy.get("PolicyDocument", {}).get("Statement", []):
+                if "*" in json.dumps(statement.get("Action", "")):
+                    problems.append(f"{role} has a wildcard action")
+                if role == "TaskRole" and \
+                        "*" in json.dumps(statement.get("Resource", "")):
+                    problems.append(f"{role} has a wildcard resource")
+
+    efs = res.get("Efs", {})
+    if not efs.get("Properties", {}).get("Encrypted"):
+        problems.append("the state filesystem is not encrypted")
+    if efs.get("DeletionPolicy") != "Retain":
+        problems.append("the state filesystem is not retained on stack delete")
+
+    blob = json.dumps(t)
+    for needle in ("BYBIT_API_KEY\": \"", "AKIA", "-----BEGIN"):
+        if needle in blob:
+            problems.append(f"the template contains {needle!r}: a secret "
+                            "never goes in a template")
+    return problems
+
+
+RUN_TASK = """\
+# Does this VPC reach the venue? One task, read-only, no keys used.
+aws ecs run-task \\
+  --cluster "$CLUSTER" \\
+  --task-definition "$TASK_DEF" \\
+  --launch-type FARGATE \\
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],\\
+securityGroups=[$SG],assignPublicIp=DISABLED}" \\
+  --overrides '{"containerOverrides":[{"name":"carry-book",
+    "command":["python3","tools/connector_check.py","--require-bybit-testnet"]}]}'
+
+# Then read the exit code and the output:
+aws logs tail "$LOG_GROUP" --since 5m --follow
+# exit 0  -> CARRY_READS_OK: every public read the book makes answered 200
+# exit 2  -> CARRY_READS_BLOCKED: this VPC cannot run the drill
+"""
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", default="", help="write the template here")
+    ap.add_argument("--check", default="", metavar="TEMPLATE",
+                    help="check a template file instead of generating one")
+    ap.add_argument("--network-firewall", action="store_true",
+                    help="also emit the venue FQDN allowlist rule group "
+                         "(~$300/month; read EGRESS in this file first)")
+    ap.add_argument("--run-task-command", action="store_true",
+                    help="print the one-off connector_check task")
+    args = ap.parse_args(argv)
+
+    if args.run_task_command:
+        print(RUN_TASK)
+        return 0
+
+    if args.check:
+        with open(args.check, encoding="utf-8") as fh:
+            loaded = json.load(fh)
+        problems = check(loaded)
+        for problem in problems:
+            print(f"FAIL  {problem}")
+        print("PASS  every invariant holds" if not problems
+              else f"FAIL  {len(problems)} problem(s)")
+        return 1 if problems else 0
+
+    built = template(network_firewall=args.network_firewall)
+    problems = check(built)
+    for problem in problems:
+        print(f"FAIL  {problem}")
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump(built, fh, indent=2)
+            fh.write("\n")
+        print(f"wrote {args.out} ({len(built['Resources'])} resources)")
+    else:
+        print(json.dumps(built, indent=2))
+    if not problems:
+        print("PASS  every invariant holds")
+    return 1 if problems else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

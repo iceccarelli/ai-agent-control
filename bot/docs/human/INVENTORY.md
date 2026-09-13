@@ -156,6 +156,9 @@ per leg after dropping one open bar; 4,600 prints). Result and sha256s:
 | this session's sandbox | 0 (egress denied) | 0 | 0 | 0 |
 
 `connector_check.py` has never returned `BYBIT_TESTNET_OK` from any host.
+0038 generates the VPC that is meant to change that
+(`tools/aws_stack.py`, runbook in `docs/human/AWS_RUNTIME_0038.md`); it has
+not been deployed, so the table above still has no row that says OK.
 Since 0035 it probes every public read the carry book makes on testnet and
 `--require-bybit-testnet` exits 2 unless all answer 200. From this session's
 sandbox: `CARRY_READS_BLOCKED`, exit 2. The first command inside the intended

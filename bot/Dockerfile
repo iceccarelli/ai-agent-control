@@ -29,6 +29,13 @@ COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
      technical_analysis.py trading_engine.py ./
 COPY signals/ ./signals/
 
+# Two READ-ONLY tools, named one by one — never `COPY tools/`, which would put
+# every operator script and fetcher in the image. 0038 runs the first of these
+# as a one-off Fargate task to answer the only question that matters before a
+# drill: can THIS VPC reach the venue? The second prints the four invariants
+# from inside the running image.
+COPY tools/connector_check.py tools/session_tail.py ./tools/
+
 # Run unprivileged. State lives on a mounted volume owned by this user.
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
     && mkdir -p /app/state && chown -R bot:bot /app
