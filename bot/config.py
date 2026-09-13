@@ -191,6 +191,54 @@ def parse_execution_mode(env: Mapping[str, str]) -> Optional[str]:
     return value
 
 
+#: HOW a carry leg is executed. Spelled here as strings so config keeps
+#: importing nothing from the book; carry_engine owns the behaviour.
+CARRY_EXECUTION_STYLES = ("taker", "maker_first")
+
+
+def parse_execution_style(env: Mapping[str, str]) -> str:
+    """The style, defaulting to "taker" — the path the cost gate prices.
+
+    Unlike the MODE this one HAS a default, and that is deliberate: taker is
+    what `round_trip_bps` charges the entry gate, so a process that never
+    heard of this key behaves exactly as it did before. Selecting
+    "maker_first" can only make a trade cheaper than the gate assumed.
+    """
+    raw = env.get("CARRY_EXECUTION_STYLE")
+    if raw is None or str(raw).strip() == "":
+        return "taker"
+    value = str(raw).strip().lower()
+    if value not in CARRY_EXECUTION_STYLES:
+        raise ConfigError(
+            f"CARRY_EXECUTION_STYLE={raw!r} is not one of "
+            f"{CARRY_EXECUTION_STYLES}.")
+    return value
+
+
+#: Seconds a resting entry order is given before it is cancelled and crossed.
+#: Bounded above because the book decides on one market snapshot, and a quote
+#: still in the market after that snapshot is stale is an order placed on a
+#: price nobody is looking at any more.
+MAX_CARRY_MAKER_WAIT_S = 600.0
+
+
+def parse_maker_wait(env: Mapping[str, str]) -> float:
+    raw = env.get("CARRY_MAKER_WAIT_S")
+    if raw is None or str(raw).strip() == "":
+        return 2.0
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ConfigError(f"CARRY_MAKER_WAIT_S={raw!r} is not a number")
+    if not math.isfinite(value) or value <= 0 or value > MAX_CARRY_MAKER_WAIT_S:
+        raise ConfigError(
+            f"CARRY_MAKER_WAIT_S={value} is outside (0, "
+            f"{MAX_CARRY_MAKER_WAIT_S}] seconds — zero would cancel before "
+            "the order could ever fill, and an unbounded wait leaves a quote "
+            "in the market long after the snapshot it was priced on is stale")
+    return value
+
+
 def parse_int(
     env: Mapping[str, str], name: str, default: int,
     *, low: int = -(2**31), high: int = 2**31,
@@ -406,6 +454,13 @@ class Config:
     #: it again). REQUIRED for BOOK_MODE=carry, with no default, because the
     #: two modes send different orders. None means "not set".
     CARRY_EXECUTION_MODE: Optional[str] = None
+    #: HOW each leg is executed: "taker" crosses the spread on every order,
+    #: "maker_first" rests an ENTRY at the touch for CARRY_MAKER_WAIT_S and
+    #: then crosses whatever did not fill. Exits are taker under both. The
+    #: default is "taker" because that is the round trip the entry gate
+    #: prices; maker is upside, never an assumption.
+    CARRY_EXECUTION_STYLE: str = "taker"
+    CARRY_MAKER_WAIT_S: float = 2.0
 
     # -- derived cost fractions --------------------------------------------
 
@@ -788,6 +843,8 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_PERP_SYMBOL=parse_str(env, "CARRY_PERP_SYMBOL", "BTCUSDT"),
         CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
         CARRY_EXECUTION_MODE=parse_execution_mode(env),
+        CARRY_EXECUTION_STYLE=parse_execution_style(env),
+        CARRY_MAKER_WAIT_S=parse_maker_wait(env),
         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
         # Default True so an existing deployment behaves exactly as before.
         # parse_bool maps every unrecognised value to False, so a typo or a

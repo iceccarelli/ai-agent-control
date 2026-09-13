@@ -201,6 +201,153 @@ class CarryBroker:
             return None
         return fill.as_engine_result()
 
+    # -- resting orders (0040) --------------------------------------------
+
+    def get_book_top(self, symbol: str, product: str) -> Dict[str, float]:
+        """`{bid, ask}` — the touch, as the venue publishes it.
+
+        Raises when the ticker carries no touch. The caller then crosses the
+        spread: quoting into a price nobody quoted is worse than paying 0.013
+        bps of spread.
+        """
+        if product not in VALID_PRODUCTS:
+            raise ValueError(f"unknown product {product!r}")
+        result = self.client._request(
+            "GET", "/v5/market/tickers",
+            params={"category": product, "symbol": symbol})
+        rows = (result or {}).get("list") or []
+        if not rows:
+            raise PairIncident(f"no ticker for {symbol} on {product}")
+        row = rows[0]
+        try:
+            bid = float(row["bid1Price"])
+            ask = float(row["ask1Price"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"ticker for {symbol}/{product} carries no touch: {row!r}"
+            ) from exc
+        if not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 \
+                or ask <= 0:
+            raise PairIncident(
+                f"touch for {symbol}/{product} is unusable: "
+                f"bid {bid!r} ask {ask!r}")
+        return {"bid": bid, "ask": ask}
+
+    def place_post_only(self, *, symbol: str, side: str, qty: float,
+                        price: float,
+                        product: str) -> Optional[Dict[str, Any]]:
+        """One PostOnly limit order. Maker or nothing — it never crosses.
+
+        Returns what the order has done so far plus `resting`, or **None**
+        when the order does not exist: a PostOnly that would have crossed is
+        rejected by the venue, which means the price moved, not that anything
+        is broken. The caller crosses instead.
+
+        Raises `PairIncident` when the order's fate cannot be established.
+        That is the dangerous case and it is deliberately loud: a resting
+        order the book does not know about, plus the market order the caller
+        would send next, is two legs where one was intended.
+        """
+        self._assert_orders_permitted()
+        if product not in VALID_PRODUCTS:
+            raise ValueError(
+                f"unknown product {product!r}; routing a spot order to the "
+                "linear endpoint is a naked short, so this is refused rather "
+                "than defaulted")
+        if not self._positive_finite(qty) or not self._positive_finite(price):
+            return None
+
+        qty_text = self._format_qty(qty)
+        price_text = self._format_qty(price)
+        link_id = self._build_link_id(
+            seq=int(self.sequence_source(product, symbol, "carry")),
+            symbol=symbol, side=side, qty=qty_text, price=price_text,
+            purpose=f"carry-{product}-maker")
+
+        body = {"category": product, "symbol": symbol, "side": side,
+                "orderType": "Limit", "qty": qty_text, "price": price_text,
+                "timeInForce": "PostOnly", "orderLinkId": link_id}
+        if product == SPOT:
+            body["marketUnit"] = "baseCoin"
+        try:
+            self.client._request("POST", "/v5/order/create", signed=True,
+                                 body=body)
+        except Exception as exc:  # noqa: BLE001
+            # Whether this was a PostOnly rejection, a duplicate, or a lost
+            # response, the same question decides what to do: does the order
+            # exist? The venue is asked rather than the error code guessed.
+            state = self._order_state(symbol, link_id, product)
+            if state is None:
+                logger.info(
+                    "post-only %s %s %s not accepted (%s); crossing instead",
+                    side, symbol, product, exc)
+                return None
+            return state
+        state = self._order_state(symbol, link_id, product)
+        if state is None:
+            raise PairIncident(
+                f"post-only {link_id} was accepted and then could not be read "
+                "back; whether it rests is unknown")
+        return state
+
+    def cancel_order(self, *, symbol: str, order_link_id: str,
+                     product: str) -> Dict[str, Any]:
+        """Pull a resting order and report its FINAL total fill.
+
+        A cancel that arrives too late is not an error: it means the order
+        filled. Either way the answer comes from reading the order back, never
+        from the cancel's own response.
+        """
+        if product not in VALID_PRODUCTS:
+            raise ValueError(f"unknown product {product!r}")
+        try:
+            self.client._request(
+                "POST", "/v5/order/cancel", signed=True,
+                body={"category": product, "symbol": symbol,
+                      "orderLinkId": order_link_id})
+        except Exception as exc:  # noqa: BLE001
+            logger.info("cancel of %s did not take (%s); reading it back",
+                        order_link_id, exc)
+        state = self._order_state(symbol, order_link_id, product)
+        if state is None:
+            raise PairIncident(
+                f"{order_link_id} could not be read back after a cancel; what "
+                "it filled is unknown")
+        return state
+
+    #: Order statuses that mean the order can still fill. Anything else is
+    #: terminal: what it filled is what it will ever fill.
+    RESTING_STATUSES = frozenset({"New", "Created", "PartiallyFilled",
+                                  "Untriggered"})
+
+    def _order_state(self, symbol: str, link_id: str,
+                     product: str) -> Optional[Dict[str, Any]]:
+        """What the venue says about one order, or None if it has none.
+
+        None means the venue returned no row for this id. For an id the venue
+        has just been asked to create, that means the order was rejected and
+        does not exist.
+        """
+        result = self.client._request(
+            "GET", "/v5/order/realtime", signed=True,
+            params={"category": product, "symbol": symbol,
+                    "orderLinkId": link_id})
+        rows = (result or {}).get("list") or []
+        if not rows:
+            return None
+        row = rows[0]
+        status = str(row.get("orderStatus", ""))
+        filled = float(row.get("cumExecQty", 0) or 0)
+        resting = status in self.RESTING_STATUSES
+        if filled <= 0 and not resting:
+            # Rejected, or cancelled by the post-only rule. Nothing exists and
+            # nothing filled: the caller is free to cross.
+            return None
+        return {"filled_qty": filled,
+                "avg_price": float(row.get("avgPrice", 0) or 0),
+                "order_link_id": link_id, "fee": self._fee(row),
+                "maker": True, "resting": resting, "status": status}
+
     def get_margin_multiple(self, symbol: str) -> float:
         """Maintenance-margin headroom on the SHORT leg. Raises if unreadable.
 

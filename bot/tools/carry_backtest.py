@@ -794,7 +794,9 @@ def simulate_settlements_series(rows: List[Settlement], *,
                                 borrow_apr: float = BORROW_APR,
                                 gated: bool = False,
                                 impact_bps: float = 0.0,
-                                mode: str = ACQUIRE) -> Dict[str, Any]:
+                                mode: str = ACQUIRE,
+                                exec_fee_bps: Optional[float] = None
+                                ) -> Dict[str, Any]:
     """One step per funding print. The rules are the engine's, in its units:
     a print is a print (not a day, not a tick), three consecutive negative
     PRINTS exit, and the EWMA sees the last eight PRINTS."""
@@ -808,9 +810,24 @@ def simulate_settlements_series(rows: List[Settlement], *,
     #: OVERLAY never trades the client's spot: one leg in, one leg out.
     spot_legs = 0.0 if mode == OVERLAY else 1.0
 
+    # WHAT THE FILLS ACTUALLY COST (0040). None = the declared taker tier,
+    # which is what every run before this one charged and what the entry gate
+    # goes on pricing. A number here is the bps PER LEG actually paid, so a
+    # maker-first book can be scored at its realised tier without the gate
+    # being told to expect it. The two are deliberately separate: a gate that
+    # prices 2.0 and a fill that comes back at 5.5 is a trade admitted on a
+    # cost it did not pay.
+    #
+    # THIS IS NOT A FILL-PROBABILITY MODEL. Charging 2.0 bps a leg asserts
+    # every entry rested and filled. Nothing offline can establish that, so a
+    # run with this flag is an UPPER BOUND on what maker-first is worth, not a
+    # forecast of it.
+    perp_leg_bps = TAKER_BPS_PERP if exec_fee_bps is None else exec_fee_bps
+    spot_leg_bps = TAKER_BPS_SPOT if exec_fee_bps is None else exec_fee_bps
+
     def charge(t: Trade, s: float, p: float) -> None:
-        t.fees += t.qty * (spot_legs * s * TAKER_BPS_SPOT
-                           + p * TAKER_BPS_PERP) / 1e4
+        t.fees += t.qty * (spot_legs * s * spot_leg_bps
+                           + p * perp_leg_bps) / 1e4
         t.impact += t.qty * (spot_legs * s + p) * impact_bps / 1e4
 
     for st in rows:
@@ -886,6 +903,11 @@ def simulate_settlements_series(rows: List[Settlement], *,
         "naive_funding_sum_pct_per_yr": 100.0 * sum(s.rate for s in rows) / years,
         "borrow_apr": borrow_apr, "impact_bps_per_leg": impact_bps,
         "execution_mode": mode, "round_trip_bps": round_trip_bps_for(mode),
+        # What the GATE priced vs what the fills were charged. Equal unless
+        # --exec-fee-bps was given.
+        "charged_round_trip_bps": (spot_legs * 2 * spot_leg_bps
+                                   + 2 * perp_leg_bps),
+        "exec_fee_bps_per_leg": exec_fee_bps,
         "mean_entry_basis_bps": statistics.mean(
             t.entry_basis_bps for t in trades) if trades else 0.0,
         "mean_exit_basis_bps": statistics.mean(
@@ -921,7 +943,9 @@ def simulate_settlement(repo: str, *, venue: str = "bybit",
                         entry_bps: float = ENTRY_FUNDING_BPS,
                         borrow_apr: float = BORROW_APR, gated: bool = False,
                         impact: bool = True,
-                        mode: str = ACQUIRE) -> Dict[str, Any]:
+                        mode: str = ACQUIRE,
+                        exec_fee_bps: Optional[float] = None
+                        ) -> Dict[str, Any]:
     """The settlement-clock run. Same venue; prices at 00/08/16 UTC."""
     if venue == "bybit":
         rows, meta = load_bybit_settlements(repo)
@@ -934,14 +958,17 @@ def simulate_settlement(repo: str, *, venue: str = "bybit",
                    else (0.0, {"note": "impact NOT applied (--no-impact)"}))
     r = simulate_settlements_series(rows, notional=notional,
                                     entry_bps=entry_bps, borrow_apr=borrow_apr,
-                                    gated=gated, impact_bps=bps, mode=mode)
+                                    gated=gated, impact_bps=bps, mode=mode,
+                                    exec_fee_bps=exec_fee_bps)
     r.update(quotability(same_venue=meta["same_venue"], settlement_clock=True,
                          impact_applied=impact, gated=gated))
     r.update({"venue": venue, "spot_source": meta["label"],
               "corpus": meta["corpus"], "basis_is_a_proxy": False,
               "impact_detail": detail,
               "not_modelled": ["tick wicks (4h highs only)",
-                               "maker/taker mix (all taker: conservative)",
+                               ("maker/taker mix: all taker unless "
+                                "--exec-fee-bps says otherwise, and that flag "
+                                "asserts a 100% fill rate it cannot know"),
                                "measured spread (impact is a declared haircut)",
                                "venue funding noise beyond the printed rate",
                                "the fee on a spot BUY charged in BTC",
@@ -1136,6 +1163,11 @@ def main(argv=None) -> int:
                         help="8h clock only: bybit = the venue the broker "
                              "trades on (committed corpus); binance needs "
                              "tools/fetch_settlement_klines.py --write first")
+    parser.add_argument("--exec-fee-bps", type=float, default=None,
+                        help="bps PER LEG actually paid on fills (default: "
+                             "the declared taker tier). The entry gate goes "
+                             "on pricing taker whatever this says. Asserts a "
+                             "100%% maker fill rate, so it is an upper bound.")
     parser.add_argument("--no-impact", action="store_true",
                         help="8h clock only: drop the impact haircut (the "
                              "impact condition then reads unmet)")
@@ -1221,7 +1253,8 @@ def _main_settlement(args) -> int:
         print("=" * 74)
         head = simulate_settlement(args.repo, venue=args.venue,
                                    notional=args.notional, impact=impact,
-                                   mode=args.mode)
+                                   mode=args.mode,
+                                   exec_fee_bps=args.exec_fee_bps)
         print(f"  source     : {head['spot_source']}")
         print(f"  execution  : {head['execution_mode'].upper()}"
               f"   round trip {head['round_trip_bps']:.1f} bps")
@@ -1232,10 +1265,12 @@ def _main_settlement(args) -> int:
         for apr in (0.0, 0.03, 0.05, 0.08):
             u = simulate_settlement(args.repo, venue=args.venue,
                                     notional=args.notional, borrow_apr=apr,
-                                    impact=impact, mode=args.mode)
+                                    impact=impact, mode=args.mode,
+                                    exec_fee_bps=args.exec_fee_bps)
             g = simulate_settlement(args.repo, venue=args.venue,
                                     notional=args.notional, borrow_apr=apr,
-                                    gated=True, impact=impact, mode=args.mode)
+                                    gated=True, impact=impact, mode=args.mode,
+                                    exec_fee_bps=args.exec_fee_bps)
             print(f"  {apr*100:7.1f}% "
                   f"{u['net_annualised_pct']:+8.2f}%/yr n={u['trades']:<3d} "
                   f"{g['net_annualised_pct']:+8.2f}%/yr n={g['trades']:<3d}")
@@ -1246,7 +1281,8 @@ def _main_settlement(args) -> int:
     r = simulate_settlement(args.repo, venue=args.venue,
                             notional=args.notional, entry_bps=args.entry_bps,
                             borrow_apr=args.borrow_apr, gated=args.gated,
-                            impact=impact, mode=args.mode)
+                            impact=impact, mode=args.mode,
+                            exec_fee_bps=args.exec_fee_bps)
     print("=" * 74)
     print("CARRY BACKTEST — two legs, every cost  "
           "(clock: settlement 00/08/16 UTC)")
@@ -1261,6 +1297,12 @@ def _main_settlement(args) -> int:
           f"   round trip {r['round_trip_bps']:.1f} bps"
           + ("   (the client's BTC is never bought or sold)"
              if r["execution_mode"] == OVERLAY else ""))
+    if r.get("exec_fee_bps_per_leg") is not None:
+        print(f"  fills CHARGED at  {r['exec_fee_bps_per_leg']:.2f} bps/leg = "
+              f"{r['charged_round_trip_bps']:.1f} bps round trip, while the "
+              f"gate priced {r['round_trip_bps']:.1f}.")
+        print("                    UPPER BOUND: this asserts every entry "
+              "rested and filled. Fill probability is not modelled.")
     if impact:
         d = r["impact_detail"]
         print(f"  impact haircut    {r['impact_bps_per_leg']:.3f} bps/leg = "

@@ -34,6 +34,7 @@ never consulted. Loop interval: `LOOP_INTERVAL_SECONDS`, default **60 s**.
 | `carry_costs.evaluate_entry` (3 gates) | **yes**, lazy import | `carry_engine.py` ~294 |
 | `CarryRisk.gate_open` / `record_entry` | yes, **but skipped** when `pair_risk` or `snapshot` is `None` | `carry_engine.py` `_open` |
 | `CarryBroker.place_market`, `get_mark`, `get_spot_mark`, `get_funding_bps`, `get_margin_multiple` | **yes** | via engine / snapshot |
+| `CarryBroker.get_book_top`, `place_post_only`, `cancel_order` | **yes when `CARRY_EXECUTION_STYLE=maker_first`**, and only for the overlay's entry leg; every exit and both ACQUIRE entry legs cross (0040) | `carry_engine.py` `_rest`; AST invariant in `tests/test_carry_maker.py` |
 | `CarryBroker.reconcile_pair` | **no — zero call sites outside tests** | `grep -rn reconcile_pair --include=*.py . \| grep -v tests` |
 | `CarryBroker.get_venue_time_s` | **does not exist** → the clock-skew check in `assert_fresh` never runs | `hasattr(bot.carry.broker, "get_venue_time_s") → False` |
 | `tools/carry_backtest.py`, `tools/venue_study.py`, `tools/basis_at_settlement.py`, `tools/corpus_health.py` | no — offline tools | — |
@@ -77,6 +78,7 @@ Reproduced in-session with a stub broker; no venue.
 | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
 | D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | **recorded 0032** (`carry_cost_gates_v1@BTCUSDT`, forward-only holdout); a quotable condition |
 | D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
+| D17 | **Every fill crosses the spread.** The book placed market orders only, so the overlay paid 11.0 bps a round trip when this account's maker tier is 4.0. On the Bybit settlement clock, gated, 0% borrow: $8,780.94 of fees against $39,444 of funding. | `--clock 8h --mode overlay --gated` | **0040** — `CARRY_EXECUTION_STYLE=maker_first` rests the overlay's entry at the touch and crosses what does not fill. Worth **at most +1.36 %/yr** ($8,781 → $3,193 of fees, +7.23 → +8.59 %/yr, 54 → 42 losing trades); the realised value is `fill_rate ×` that and the fill rate is **unmeasured** (`docs/human/MAKER_FIRST_0040.md`). Default stays `taker` |
 | D14 | **On the settlement clock the engine's exit rule churns.** Three negative PRINTS (one day) exit; 86 of 87 ungated trades exit that way, median hold 5.3 days vs `ASSUMED_HOLD_DAYS` 30; fees $313 vs funding $27 per median trade. Ungated at 0% borrow: +9.49%/yr (daily) → +2.24%/yr (8h, Bybit, impact). Not retuned (rule 20). | `--clock 8h --matrix` | **0036 addressed the cost side**: overlay pays 11 bps, not 31 (+2.24 → +6.99%/yr at 0% borrow). The exit rule itself is untouched and still marginal at the median hold — a new rule is a new, forward-scored hypothesis |
 
 ## 5. FakeClient-only assumptions — venue semantics never exercised
@@ -92,6 +94,8 @@ Reproduced in-session with a stub broker; no venue.
 | F7 | 110072 / 170130 mean "the order exists" | Taken from docs; never observed. | open, testnet |
 | F8 | No rate-limit / 10006 / maintenance handling in `CarryBroker` | A transient error on the perp leg returns `None` → emergency spot unwind. | open, testnet |
 | F9 | `symbol[:-4]` is the base coin | True for `BTCUSDT` only. | open |
+| F10 | A post-only order the venue has just been asked to create, and for which `/v5/order/realtime` returns no row, was **rejected** | Assumed, not observed. If Bybit drops a fully-FILLED order from `realtime` instead, `place_post_only` raises `PairIncident` and the book HALTS — fail-closed, but a spurious halt. No error code is interpreted anywhere on this path, deliberately (0040). | open, Phase D drill |
+| F11 | A resting post-only order can be cancelled, and what it filled read back | Neither call has touched a venue. A cancel that arrives late is handled (the fill is read from the order, never from the cancel's response); a `realtime` query that fails after a cancel HALTS. | open, Phase D drill |
 
 ## 6. Secrets
 

@@ -753,6 +753,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
             borrow_apr=float(borrow_apr),
             execution_mode=execution_mode,
+            # HOW each leg is executed (0040). Entries may rest at the touch
+            # under "maker_first"; exits cross under both. Defaulted to
+            # "taker" — the round trip the entry gate prices.
+            execution_style=cfg.CARRY_EXECUTION_STYLE,
+            maker_wait_s=float(cfg.CARRY_MAKER_WAIT_S),
             # THE LEDGER (0037). Called by the engine on every state change,
             # straight through to the store. Not a hasattr guard and not a
             # lambda that swallows: a store without this method is a
@@ -770,10 +775,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
-            "%.4f/yr, execution %s, orders: %s. The directional strategy is "
+            "%.4f/yr, execution %s/%s, orders: %s. The directional strategy is "
             "NOT attached and will not be consulted.",
             bot.carry.max_notional_usd, bot.carry.borrow_apr,
-            bot.carry.execution_mode, _carry_orders_permitted()[1])
+            bot.carry.execution_mode, bot.carry.execution_style,
+            _carry_orders_permitted()[1])
         return bot
 
     if attach_strategy and bot.strategy is None:

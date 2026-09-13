@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from decimal import Decimal, InvalidOperation
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -108,6 +109,34 @@ EXECUTION_MODES = (ACQUIRE, OVERLAY)
 
 #: Quantity differences below this fraction of a leg are venue rounding.
 QTY_DUST = 1e-9
+
+#: HOW a leg is executed, which is a different question from WHICH legs the
+#: book trades (that is EXECUTION_MODES above).
+#:
+#:   TAKER        cross the spread on every order. What the cost gate prices.
+#:   MAKER_FIRST  rest at the touch for a bounded wait, then cross whatever
+#:                did not fill.
+#:
+#: The spread is NOT the argument. Bybit's BTCUSDT touch is 0.1 USDT wide —
+#: 0.013 bps on a $100k mark — and crossing it is free. The argument is the
+#: FEE TIER: this account pays 5.5 bps taker and 2.0 bps maker per perp leg,
+#: so an overlay round trip is 11 bps crossed and 4 bps rested. 0032 measured
+#: $27,232 of fees against $39,411 of funding; that 7 bps is the difference
+#: between a median trade that cannot pay for its own exit and one that can.
+#:
+#: What cannot be known offline is FILL PROBABILITY. So every maker path here
+#: ends in a taker fallback, the cost gate goes on pricing the TAKER round
+#: trip (`round_trip_bps`), and the realised fee of every fill is recorded
+#: rather than modelled. Maker is upside, never an assumption.
+MAKER_FIRST = "maker_first"
+TAKER = "taker"
+EXECUTION_STYLES = (MAKER_FIRST, TAKER)
+
+#: How long a resting entry order is given before it is cancelled and crossed.
+#: Bounded, and bounded small: the book is deciding on a snapshot, and a quote
+#: left in the market after that snapshot is stale is an order placed on a
+#: price nobody is looking at any more.
+DEFAULT_MAKER_WAIT_S = 2.0
 
 
 def snap_to_lot(qty: float, step: float) -> float:
@@ -265,6 +294,12 @@ class Leg:
     #: Unknown stays unknown: a None the ledger must resolve, never a 0.0 that
     #: makes a cost vanish.
     fee: Optional[float] = None
+    #: How this leg was filled. A leg can be both: a post-only order that
+    #: partially fills and is then crossed for the remainder is ONE leg with
+    #: two fee rates. The split is carried so the ledger can reconcile the
+    #: realised fee against the invoice instead of assuming a tier.
+    maker_qty: float = 0.0
+    taker_qty: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -341,7 +376,9 @@ class CarryEngine:
                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
                  min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
                  borrow_apr: float, execution_mode: str,
-                 persist: Any) -> None:
+                 persist: Any,
+                 execution_style: str = TAKER,
+                 maker_wait_s: float = DEFAULT_MAKER_WAIT_S) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -358,6 +395,22 @@ class CarryEngine:
                 "the ledger on every state change. A carry engine with "
                 "nowhere to write is a container that restarts flat and opens "
                 "a second hedge (INVENTORY D3).")
+        # EXECUTION STYLE (0040). Defaulted, and defaulted to TAKER, which is
+        # the only default in this constructor: it is not a risk input but the
+        # already-priced path. `round_trip_bps` prices the taker round trip
+        # whatever this says, so selecting MAKER_FIRST can only make a trade
+        # cheaper than the gate assumed, never more expensive.
+        if execution_style not in EXECUTION_STYLES:
+            raise ValueError(
+                f"{execution_style!r} is not an execution style "
+                f"{EXECUTION_STYLES}")
+        wait = float(maker_wait_s)
+        if not math.isfinite(wait) or wait <= 0:
+            raise ValueError(
+                f"maker_wait_s={maker_wait_s!r}: a resting order needs a "
+                "positive, finite wait before it is cancelled and crossed")
+        self.execution_style = execution_style
+        self.maker_wait_s = wait
         self.persist = persist
         self.execution_mode = execution_mode
         self.broker = broker
@@ -736,12 +789,18 @@ class CarryEngine:
             return self._open_overlay(qty, float(inventory), mark, spot_mark,
                                       funding_bps, timestamp_ms, rules)
 
+        # ACQUIRE NEVER RESTS (0040). Maker-first is worth 7 bps a round trip,
+        # and the measurement that justified it — gated overlay on the Bybit
+        # settlement clock, $8,781 of fees against $3,193, +7.23%/yr against
+        # +8.59%/yr — is an OVERLAY measurement. In this mode the trade is a
+        # PAIR, and every second either entry leg spends resting is a second
+        # the book is long spot with no hedge behind it, or short with no spot
+        # in front. "Both legs land or neither" is the rule this module exists
+        # to enforce; buying a fee tier by widening the window where neither
+        # is true would sell the rule for the discount.
         spot = self._fire(self.spot_symbol, "Buy", qty, "spot")
         if spot is None or spot.filled_qty <= 0:
-            self.state = BookState.FLAT
-            return CarryDecision("refused", reason="SPOT_LEG_DID_NOT_FILL",
-                                 state=BookState.FLAT,
-                                 detail={"error": self._last_leg_error})
+            return self._refused("SPOT_LEG_DID_NOT_FILL")
 
         # Hedge exactly what the spot leg ACTUALLY filled. Hedging the requested
         # size instead is how a rounding difference becomes a permanent short.
@@ -788,14 +847,17 @@ class CarryEngine:
         The one thing that IS naked in this mode is shorting MORE than the
         inventory, and that is bought back immediately or the book halts.
         """
-        perp = self._fire(self.perp_symbol, "Sell", qty, "linear")
+        # The ONE place an order may rest (0040). There is no pair to break
+        # here: the long side was the client's before this book existed, so
+        # until this order fills nothing has changed and nobody is naked. That
+        # is what makes the wait free, and it is why ACQUIRE does not get it.
+        perp = self._fire(self.perp_symbol, "Sell", qty, "linear",
+                          patient=True,
+                          qty_step=float(rules.get("qty_step", 0.0)))
         if perp is None or perp.filled_qty <= 0:
-            self.state = BookState.FLAT
             # Nothing was bought and nothing was sold: no round trip was paid,
             # so the day's allowance is untouched.
-            return CarryDecision("refused", reason="PERP_LEG_DID_NOT_FILL",
-                                 state=BookState.FLAT,
-                                 detail={"error": self._last_leg_error})
+            return self._refused("PERP_LEG_DID_NOT_FILL")
 
         if perp.filled_qty > inventory + QTY_DUST:
             excess = snap_to_lot(perp.filled_qty - inventory,
@@ -947,10 +1009,32 @@ class CarryEngine:
             return None
         return value if self._finite(value) else None
 
-    def _fire(self, symbol: str, side: str, qty: float,
-              product: str) -> Optional[Leg]:
+    # -- execution ---------------------------------------------------------
+    #
+    # GETTING OUT IS NEVER SLOWED FOR A FEE.
+    #
+    # `patient=True` is passed by the two ENTRY paths and by nothing else. An
+    # entry is optional: if the book does not come to us, the correct outcome
+    # is simply not to trade, so waiting in the queue risks nothing but time.
+    # Every other order this engine sends exists to REMOVE an exposure — the
+    # unwind, the margin-driven exit, the emergency sale of a naked spot leg,
+    # the delta rebalance, the buy-back of a short that ran past the
+    # inventory — and against the risk of not filling at all, a cheaper fill
+    # is worth nothing. Those cross the spread immediately, whatever
+    # `execution_style` says. There is no configuration that changes this.
+
+    def _fire(self, symbol: str, side: str, qty: float, product: str,
+              *, patient: bool = False,
+              qty_step: float = 0.0) -> Optional[Leg]:
         if qty <= 0 or not self._finite(qty):
             return None
+        if patient and self.execution_style == MAKER_FIRST:
+            return self._rest_then_take(symbol, side, qty, product, qty_step)
+        return self._take(symbol, side, qty, product)
+
+    def _take(self, symbol: str, side: str, qty: float,
+              product: str) -> Optional[Leg]:
+        """Cross the spread. The path the cost gate priced."""
         try:
             result = self.broker.place_market(symbol=symbol, side=side,
                                               qty=qty, product=product)
@@ -961,12 +1045,153 @@ class CarryEngine:
         if not result:
             return None
         raw_fee = result.get("fee")
+        filled = float(result.get("filled_qty", 0.0) or 0.0)
         return Leg(symbol=symbol, side=side, product=product,
-                   requested_qty=qty,
-                   filled_qty=float(result.get("filled_qty", 0.0) or 0.0),
+                   requested_qty=qty, filled_qty=filled,
                    avg_price=float(result.get("avg_price", 0.0) or 0.0),
                    order_link_id=str(result.get("order_link_id", "")),
-                   fee=None if raw_fee is None else float(raw_fee))
+                   fee=None if raw_fee is None else float(raw_fee),
+                   taker_qty=filled)
+
+    def _rest_then_take(self, symbol: str, side: str, qty: float,
+                        product: str, qty_step: float) -> Optional[Leg]:
+        """Join the queue, wait a bounded time, then cross what is left."""
+        maker = self._rest(symbol, side, qty, product)
+        if self.state is BookState.HALTED:
+            # `_rest` could not tell whether an order rests at the venue.
+            # Crossing on top of it would be the second leg of a position
+            # nobody asked for.
+            return None
+        maker_qty = 0.0 if maker is None else maker.filled_qty
+        remainder = qty - maker_qty
+        if qty_step > 0:
+            # A remainder below one venue lot is not a smaller order, it is a
+            # rejected one. What landed is the leg.
+            remainder = snap_to_lot(remainder, qty_step)
+        if remainder <= QTY_DUST:
+            return self._as_whole_leg(maker)
+        taker = self._take(symbol, side, remainder, product)
+        if maker is None or maker.filled_qty <= 0:
+            return taker
+        if taker is None:
+            # The rested part is a real fill and hedges what it hedges. The
+            # callers pair against filled_qty, never against what was asked
+            # for, so a smaller leg is a correct hedge of less — not a loss.
+            return self._as_whole_leg(maker)
+        return self._merge(maker, taker, qty)
+
+    def _rest(self, symbol: str, side: str, qty: float,
+              product: str) -> Optional[Leg]:
+        """One post-only order at the touch. Returns what it filled, or None.
+
+        Never crosses: a Sell rests at the ask and a Buy at the bid. None
+        means "no maker fill and nothing resting" — the caller crosses. An
+        order whose fate cannot be established HALTS instead, because a
+        resting order the ledger does not know about is the D3 failure with a
+        different name.
+        """
+        try:
+            top = self.broker.get_book_top(symbol, product)
+            bid = float(top["bid"])
+            ask = float(top["ask"])
+        except Exception as exc:  # noqa: BLE001
+            # Nothing was sent, so this is not an incident — it is a reason to
+            # cross rather than to quote a price nobody quoted.
+            logger.warning("book top unreadable for %s/%s (%s); crossing",
+                           symbol, product, exc)
+            return None
+        if not (self._finite(bid) and self._finite(ask)) or bid <= 0 \
+                or ask <= 0 or bid >= ask:
+            logger.warning("book top for %s/%s is crossed or unusable "
+                           "(bid %r ask %r); crossing", symbol, product,
+                           bid, ask)
+            return None
+        price = ask if side == "Sell" else bid
+        try:
+            placed = self.broker.place_post_only(
+                symbol=symbol, side=side, qty=qty, price=price,
+                product=product)
+        except Exception as exc:  # noqa: BLE001
+            self._last_leg_error = f"{type(exc).__name__}: {exc}"
+            self._halt(
+                "MAKER_ORDER_AMBIGUOUS",
+                f"a post-only {side} of {qty} {symbol} may or may not be "
+                f"resting at the venue ({exc}); crossing on top of it would "
+                "open a second leg, so the book stops instead")
+            return None
+        if not placed:
+            return None                      # rejected: the price moved
+        filled = float(placed.get("filled_qty", 0.0) or 0.0)
+        raw_fee = placed.get("fee")
+        link = str(placed.get("order_link_id", ""))
+        leg = Leg(symbol=symbol, side=side, product=product,
+                  requested_qty=qty, filled_qty=filled,
+                  avg_price=float(placed.get("avg_price", 0.0) or 0.0),
+                  order_link_id=link,
+                  fee=None if raw_fee is None else float(raw_fee),
+                  maker_qty=filled)
+        if filled + QTY_DUST >= qty or not placed.get("resting"):
+            return leg
+        time.sleep(self.maker_wait_s)
+        try:
+            final = self.broker.cancel_order(symbol=symbol, order_link_id=link,
+                                             product=product)
+        except Exception as exc:  # noqa: BLE001
+            self._last_leg_error = f"{type(exc).__name__}: {exc}"
+            self._halt(
+                "MAKER_ORDER_UNCANCELLABLE",
+                f"a post-only {side} of {qty} {symbol} could not be cancelled "
+                f"or read back ({exc}); what it has filled is unknown")
+            return None
+        total = float((final or {}).get("filled_qty", 0.0) or 0.0)
+        if total > leg.filled_qty:
+            # The venue's number wins: it is the total on that order, and it
+            # may have grown between placement and cancellation.
+            leg.filled_qty = total
+            leg.maker_qty = total
+            leg.avg_price = float((final or {}).get("avg_price", 0.0)
+                                  or leg.avg_price)
+            fee = (final or {}).get("fee")
+            leg.fee = None if fee is None else float(fee)
+        return leg
+
+    @staticmethod
+    def _as_whole_leg(maker: Optional[Leg]) -> Optional[Leg]:
+        """What rested and filled IS the leg, at the size that landed."""
+        if maker is None or maker.filled_qty <= 0:
+            return None
+        maker.requested_qty = maker.filled_qty
+        return maker
+
+    @staticmethod
+    def _merge(maker: Leg, taker: Leg, requested: float) -> Leg:
+        """One leg, two fee rates."""
+        total = maker.filled_qty + taker.filled_qty
+        price = 0.0
+        if total > 0:
+            price = (maker.filled_qty * maker.avg_price
+                     + taker.filled_qty * taker.avg_price) / total
+        # An unknown half makes the TOTAL unknown. Summing the known half and
+        # calling it the fee would book a cost smaller than the invoice;
+        # maker_qty and taker_qty are carried so the ledger can resolve it.
+        fee = (None if maker.fee is None or taker.fee is None
+               else maker.fee + taker.fee)
+        return Leg(symbol=maker.symbol, side=maker.side, product=maker.product,
+                   requested_qty=requested, filled_qty=total, avg_price=price,
+                   order_link_id=f"{maker.order_link_id}+{taker.order_link_id}",
+                   fee=fee, maker_qty=maker.filled_qty,
+                   taker_qty=taker.filled_qty)
+
+    def _refused(self, reason: str) -> CarryDecision:
+        """A leg did not land. A HALT survives; anything else returns FLAT."""
+        if self.state is BookState.HALTED:
+            return CarryDecision("halted", reason="LEG_OUTCOME_UNKNOWN",
+                                 state=BookState.HALTED,
+                                 detail={"error": self._last_leg_error,
+                                         "refused_as": reason})
+        self.state = BookState.FLAT
+        return CarryDecision("refused", reason=reason, state=BookState.FLAT,
+                             detail={"error": self._last_leg_error})
 
     def _halt(self, reason: str, detail: str,
               record: bool = True) -> CarryDecision:
