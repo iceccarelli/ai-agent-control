@@ -43,6 +43,26 @@ EDGE_BPS_PER_PAIR = 214.0
 LEGS_PER_ROUND_TRIP = 4
 
 
+#: DATA-READ LEDGER (0032). 0028 recorded none of this tool's reads. Recorded
+#: now through reserved_holdout.auto_record — idempotent, never fatal, and off
+#: under LEDGER_DISABLED=1 (the test suite). None = the default ledger path.
+LEDGER_PATH = None
+READER = "tools/venue_study.py"
+
+
+def _record(dataset: str, first_ms: int, last_ms: int, purpose: str) -> None:
+    try:
+        import reserved_holdout as _ledger
+    except Exception:  # noqa: BLE001 - a ledger import never blocks a study
+        return
+    iso = lambda ms: dt.datetime.fromtimestamp(  # noqa: E731
+        int(ms) / 1000.0, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    kwargs = {} if LEDGER_PATH is None else {"path": LEDGER_PATH}
+    _ledger.auto_record(dataset=dataset, from_utc=iso(first_ms),
+                        to_utc=iso(last_ms), read_by=READER, purpose=purpose,
+                        **kwargs)
+
+
 def _load(path: str):
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt") as handle:
@@ -62,6 +82,10 @@ def venue_funding(repo: str) -> Dict[str, Any]:
         binance = {int(r["funding_time_ms"]): float(r["funding_rate"])
                    for r in csv.DictReader(handle)}
 
+    _record("BYBIT_LINEAR_BTC_USDT_FUNDING", min(bybit), max(bybit),
+            "venue study: bybit vs binance funding")
+    _record("BINANCE_LINEAR_BTC_USDT_FUNDING", min(binance), max(binance),
+            "venue study: bybit vs binance funding")
     keys = sorted(binance)
     pairs = []
     for when, rate in bybit.items():
@@ -140,6 +164,12 @@ def stress(repo: str) -> Dict[str, Any]:
             continue
         p = {int(k[0]): float(k[4]) for k in perp}
         s = {int(k[0]): float(k[4]) for k in spot}
+        if p:
+            _record(f"BINANCE_LINEAR_BTC_USDT_1M@{day}", min(p), max(p),
+                    "venue study: stress day (perp; Binance 12-field kline format)")
+        if s:
+            _record(f"BINANCE_SPOT_BTC_USDT_1M@{day}", min(s), max(s),
+                    "venue study: stress day (spot; Binance 12-field kline format)")
         common = sorted(set(p) & set(s))
         if not common:
             continue

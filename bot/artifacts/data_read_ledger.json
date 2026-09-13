@@ -54,6 +54,141 @@
    "recorded_utc": "2026-09-06T00:00:00Z",
    "result_seen": "2 closed trades, -1.0632 and -0.6084, mean -0.8358",
    "to_utc": "2026-08-24T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1D",
+   "from_utc": "2022-08-10T00:00:00Z",
+   "purpose": "daily carry backtest, perp leg",
+   "read_by": "tools/carry_backtest.py 0018-0031 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "0018-0028 matrices incl. PHASE1_DECISION (ungated +9.49/+5.76/+3.28/-0.44 %/yr at 0/3/5/8% borrow)",
+   "to_utc": "2026-08-24T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_SPOT_BTC_USDT_1D",
+   "from_utc": "2022-09-09T00:00:00Z",
+   "purpose": "daily carry backtest, spot leg",
+   "read_by": "tools/carry_backtest.py 0020-0031 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "PHASE1_DECISION matrix; gated column chosen after seeing 0018",
+   "to_utc": "2026-09-08T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_FUNDING",
+   "from_utc": "2022-08-09T16:00:00Z",
+   "purpose": "daily carry backtest, funding",
+   "read_by": "tools/carry_backtest.py 0018-0031 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "as above",
+   "to_utc": "2026-08-25T16:00:00Z"
+  },
+  {
+   "dataset": "BITSTAMP_SPOT_BTC_USD_1D",
+   "from_utc": "2022-08-10T00:00:00Z",
+   "purpose": "daily carry backtest, proxy spot leg",
+   "read_by": "tools/carry_backtest.py 0018-0019 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "0018: +1.77%/yr at 5%, +7.96% unfinanced (proxy basis)",
+   "to_utc": "2026-08-01T00:00:00Z"
+  },
+  {
+   "dataset": "BYBIT_LINEAR_BTC_USDT_FUNDING",
+   "from_utc": "2022-06-29T08:00:00Z",
+   "purpose": "venue study: bybit vs binance funding",
+   "read_by": "tools/venue_study.py 0028 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "bybit funding noisier; annualised difference < 1%/yr",
+   "to_utc": "2026-09-09T08:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_FUNDING",
+   "from_utc": "2022-08-09T16:00:00Z",
+   "purpose": "venue study: bybit vs binance funding",
+   "read_by": "tools/venue_study.py 0028 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "as above",
+   "to_utc": "2026-08-25T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1M@2024-08-05",
+   "from_utc": "2024-08-05T00:00:00Z",
+   "purpose": "venue study: stress day",
+   "read_by": "tools/venue_study.py 0028 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "basis range a small fraction of the price swing",
+   "to_utc": "2024-08-05T23:59:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1M@2025-02-03",
+   "from_utc": "2025-02-03T00:00:00Z",
+   "purpose": "venue study: stress day",
+   "read_by": "tools/venue_study.py 0028 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "basis range a small fraction of the price swing",
+   "to_utc": "2025-02-03T23:59:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1M@2026-04-15",
+   "from_utc": "2026-04-15T00:00:00Z",
+   "purpose": "venue study: stress day",
+   "read_by": "tools/venue_study.py 0028 (unrecorded at the time; recorded retroactively in 0032 \u2014 INVENTORY D6)",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "result_seen": "basis range a small fraction of the price swing",
+   "to_utc": "2026-04-15T23:59:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_1D",
+   "from_utc": "2022-08-10T00:00:00Z",
+   "purpose": "daily carry backtest (perp leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-11T18:24:54Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-08-24T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_SPOT_BTC_USDT_1D",
+   "from_utc": "2022-09-09T00:00:00Z",
+   "purpose": "daily carry backtest (spot leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-11T18:24:54Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-08T00:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_BTC_USDT_FUNDING",
+   "from_utc": "2022-08-09T16:00:00Z",
+   "purpose": "daily carry backtest (funding)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-11T18:24:54Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-08-25T16:00:00Z"
+  },
+  {
+   "dataset": "BYBIT_SPOT_BTC_USDT_4H",
+   "from_utc": "2022-08-01T12:00:00Z",
+   "purpose": "settlement-clock carry backtest (spot leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-11T18:24:56Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-09T04:00:00Z"
+  },
+  {
+   "dataset": "BYBIT_LINEAR_BTC_USDT_4H",
+   "from_utc": "2022-08-01T12:00:00Z",
+   "purpose": "settlement-clock carry backtest (perp leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-11T18:24:56Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-09T04:00:00Z"
+  },
+  {
+   "dataset": "BYBIT_LINEAR_BTC_USDT_FUNDING",
+   "from_utc": "2022-08-01T16:00:00Z",
+   "purpose": "settlement-clock carry backtest (funding)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-11T18:24:56Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-09T08:00:00Z"
   }
  ],
  "schema": "data_read_ledger/1",

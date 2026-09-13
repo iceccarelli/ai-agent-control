@@ -86,6 +86,24 @@ remains unsigned.
 
 ---
 
+## Erratum — 0031, 2026-09-11 (appended; nothing above is edited)
+
+`quotable : True` in the matrix above was true under the definition the tool
+had on 2026-09-08: same venue and same quote currency. 0031 made that
+condition necessary and no longer sufficient. Under the current definition
+the same run prints `QUOTABLE: False`, because:
+
+- prices are daily closes, not the 00/08/16 UTC settlement instants;
+- no impact haircut was applied;
+- the ungated column is not the rule `CarryEngine` runs (it always gates);
+- the gated column is in-sample and no holdout has been certified.
+
+The numbers in the matrix did not change. Their status did. The OVERLAY
+decision stands on the ungated column's shape (financing decides the trade),
+not on any figure in it being quotable.
+
+---
+
 ```
 signed:
 date:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from unittest import mock
 
 import pytest
@@ -75,6 +76,13 @@ class _Broker:
     def get_margin_multiple(self, symbol):
         return 5.0
 
+    def get_funding_print(self, symbol):
+        # 0034: the latest SETTLED print, stamped at the last settlement.
+        if self.raises == "funding":
+            raise RuntimeError("no funding history")
+        h8 = 8 * 3600 * 1000
+        return (self.funding, int(time.time() * 1000) // h8 * h8)
+
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((symbol, side, qty, product))
         return {"filled_qty": qty, "avg_price": self.mark,
@@ -85,12 +93,20 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
     from carry_engine import CarryEngine
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]
-    bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0)
+    bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0,
+                            borrow_apr=0.05)
+    # 0033: no first leg without the pair gate. main.tick supplies the
+    # snapshot; the gate is attached here exactly as build_bot attaches it.
+    from carry_risk import CarryRisk
+    bot.carry.pair_risk = CarryRisk(max_notional_usd=100_000.0)
     # Warm the EWMA: the engine refuses below three prints rather than
     # falling back to the last one.
-    for _ in range(2):
+    # 0034: two earlier SETTLED prints; the tick reads the latest one.
+    h8 = 8 * 3600 * 1000
+    latest = int(time.time() * 1000) // h8 * h8
+    for k in (2, 1):
         bot.carry.on_candle(mark=broker.mark, funding_bps=warm_bps,
-                            spot=broker.mark)
+                            spot=broker.mark, funding_print_ms=latest - k * h8)
     bot.strategy = None
     bot.store = _Store()
     bot._stop = mock.Mock(is_set=lambda: False)
@@ -153,7 +169,7 @@ class TestUnreadableInputsTouchNothing:
 
 class TestTheTwoBooksAreMutuallyExclusive:
     def test_carry_mode_never_constructs_the_technical_voter(self):
-        cfg = _config.load({"BOOK_MODE": "carry"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
         with mock.patch("technical_analysis.MarketStrategy") as voter:
             bot = _main.build_bot(config=cfg, store=_Store(),
                                   client=mock.Mock(), risk_manager=mock.Mock(),
@@ -172,7 +188,8 @@ class TestTheTwoBooksAreMutuallyExclusive:
         """They share one liquidation price. Two strategies fighting over it is
         how a hedged book becomes a directional one without anyone deciding."""
         for mode in ("carry", "directional"):
-            cfg = _config.load({"BOOK_MODE": mode})
+            # 0033: a carry book requires a financing rate; directional ignores it.
+            cfg = _config.load({"BOOK_MODE": mode, "CARRY_BORROW_APR": "0.05"})
             bot = _main.build_bot(config=cfg, store=_Store(),
                                   client=mock.Mock(), risk_manager=mock.Mock(),
                                   engine=mock.Mock())

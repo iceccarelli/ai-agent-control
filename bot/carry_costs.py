@@ -66,10 +66,10 @@ TAKER_BPS_PERP = 5.5
 ROUND_TRIP_BPS = 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP   # 31.0
 
 #: Financing on the spot leg. 0.0 models a book that ALREADY OWNS the BTC and is
-#: monetising it. The difference between those two worlds is +1.77% and +7.96%,
-#: which is the difference between a business and a hobby, so it is a required
-#: argument at every call site rather than a default anyone can forget.
-DEFAULT_BORROW_APR = 0.05
+#: monetising it. The difference between those two worlds is the difference
+#: between a business and a hobby, so it is a REQUIRED argument at every call
+#: site. Until 0033 this comment said so and the signature defaulted it to
+#: 0.05 anyway (INVENTORY D7); the constant is gone so nothing can reach for it.
 
 #: Funding prints per day on Binance USDT-M and Bybit linear.
 FUNDING_PERIODS_PER_DAY = 3
@@ -143,7 +143,7 @@ def basis_bps(perp: float, spot: float) -> float:
 
 
 def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
-                   spot: float, borrow_apr: float = DEFAULT_BORROW_APR,
+                   spot: float, borrow_apr: float,
                    hold_days: float = ASSUMED_HOLD_DAYS) -> CarryVerdict:
     """May the book open this pair?
 

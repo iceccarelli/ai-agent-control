@@ -1,5 +1,5 @@
 {
- "git_commit": "efe278f8b4bb16aa17a1297cc2f9cd5c7b884fa0-dirty",
+ "git_commit": "5bc961b3bd841d70c62af10165585bde265f3f1a-dirty",
  "schema": "hypothesis_registry/1",
  "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
  "seeded": true,
@@ -195,8 +195,22 @@
    "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
    "status": "measured",
    "trial_id": "funding_carry_fade_btc_v1@BTCUSDT_OOS"
+  },
+  {
+   "note": "delta-neutral carry, ungated entry on last print >= 0.2 bps, exit on 3 negative prints. Parameters declared before 0018. NOT the rule CarryEngine runs. Daily-close and settlement-clock runs both recorded in data_read_ledger.json. Recorded in 0032; it was run from 0018 onward without an entry.",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "source": "tools/carry_backtest.py (0018-0032)",
+   "status": "measured",
+   "trial_id": "carry_ungated_v1@BTCUSDT"
+  },
+  {
+   "note": "ASSUMED_HOLD_DAYS=30, EWMA_ALPHA=0.5, EWMA_MIN_PRINTS=3, basis budget = net edge x hold. Chosen AFTER 0018's output (PHASE1_DECISION). This is the rule CarryEngine runs. Every window 2022-06-29..2026-09-09 has been read (data_read_ledger.json), so its only admissible holdout is FORWARD: settlements after 2026-09-09T08:00Z on the venue the book trades. Recorded in 0032 before any claim is made from it; its 8h numbers in 0032 are in-sample diagnostics.",
+   "recorded_utc": "2026-09-11T18:24:13Z",
+   "source": "carry_costs.py (0019/0021), tools/carry_backtest.py --gated",
+   "status": "measured_in_sample",
+   "trial_id": "carry_cost_gates_v1@BTCUSDT"
   }
  ],
- "updated_utc": "2026-09-05T00:15:21Z",
+ "updated_utc": "2026-09-11T18:24:13Z",
  "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }

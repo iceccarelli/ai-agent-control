@@ -154,6 +154,25 @@ def parse_float(
     return value
 
 
+def parse_optional_fraction(env: Mapping[str, str], name: str) -> Optional[float]:
+    """A fraction in [0, 1), or None when the key is absent. Never a default.
+
+    Used for risk inputs that must be SET by an operator: absence is carried as
+    None to the one place that needs the value, which refuses on it.
+    """
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name}={raw!r} is not a number")
+    if not math.isfinite(value) or not (0.0 <= value < 1.0):
+        raise ConfigError(f"{name}={value} is outside [0, 1) — a fraction "
+                          "per year, e.g. 0.05 for 5%")
+    return value
+
+
 def parse_int(
     env: Mapping[str, str], name: str, default: int,
     *, low: int = -(2**31), high: int = 2**31,
@@ -358,6 +377,12 @@ class Config:
     BOOK_MODE: str = "directional"
     CARRY_SPOT_SYMBOL: str = "BTCUSDT"
     CARRY_PERP_SYMBOL: str = "BTCUSDT"
+    #: Financing on the spot leg, as a fraction per year. REQUIRED for
+    #: BOOK_MODE=carry and deliberately without a default: 0.0 is an overlay on
+    #: BTC the client already owns, 0.05 is a financed book, and the difference
+    #: decides whether the trade clears its cost of capital (PHASE1_DECISION).
+    #: None here means "not set"; build_bot refuses a carry book on None.
+    CARRY_BORROW_APR: Optional[float] = None
 
     # -- derived cost fractions --------------------------------------------
 
@@ -738,6 +763,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         BOOK_MODE=parse_str(env, "BOOK_MODE", "directional"),
         CARRY_SPOT_SYMBOL=parse_str(env, "CARRY_SPOT_SYMBOL", "BTCUSDT"),
         CARRY_PERP_SYMBOL=parse_str(env, "CARRY_PERP_SYMBOL", "BTCUSDT"),
+        CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
         # Default True so an existing deployment behaves exactly as before.
         # parse_bool maps every unrecognised value to False, so a typo or a

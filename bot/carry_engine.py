@@ -66,7 +66,7 @@ import logging
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,10 @@ class Leg:
     filled_qty: float = 0.0
     avg_price: float = 0.0
     order_link_id: str = ""
+    #: The venue's `cumExecFee` for this leg, or None when it did not say.
+    #: Unknown stays unknown: a None the ledger must resolve, never a 0.0 that
+    #: makes a cost vanish.
+    fee: Optional[float] = None
 
     @property
     def notional(self) -> float:
@@ -199,7 +203,10 @@ class CarryEngine:
                  delta_band: float = DELTA_BAND,
                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
                  min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
-                 borrow_apr: float = 0.05) -> None:
+                 borrow_apr: float) -> None:
+        # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
+        # carry clears its cost of capital, and build_bot never passed it, so
+        # the live engine silently financed at 5% whatever the operator meant.
         self.broker = broker
         self.kill_switch = kill_switch
         self.spot_symbol = spot_symbol
@@ -219,13 +226,30 @@ class CarryEngine:
         #: pair gate judges the SAME observation the entry decision used.
         self.snapshot: Optional[Any] = None
         self._funding_history: List[float] = []
+        #: Settlement stamp (epoch ms) of the last funding PRINT recorded. A
+        #: call to on_candle is a TICK; a print is an event with a stamp, and
+        #: only a stamp newer than this one is a new print (0034, INVENTORY D1).
+        self._last_print_ms: Optional[int] = None
+        #: The last exception a leg raised, so a refusal can name it. A leg
+        #: that fails for a reason nobody can read is a leg that fails again.
+        self._last_leg_error: str = ""
 
     # -- the loop ---------------------------------------------------------
 
     def on_candle(self, *, mark: float, funding_bps: float,
                   spot: Optional[float] = None,
-                  timestamp_ms: int = 0) -> CarryDecision:
-        """One closed bar. Act or state why not. This is the entire loop.
+                  timestamp_ms: int = 0,
+                  funding_print_ms: Optional[int] = None) -> CarryDecision:
+        """One tick. Act or state why not. This is the entire loop.
+
+        `funding_bps` is the rate of the SETTLED print stamped
+        `funding_print_ms`. A tick is not a print: main.tick calls this every
+        LOOP_INTERVAL_SECONDS, and until 0034 every call was booked as a print
+        (60 ticks at 1 bps on $100 booked $0.60; one print is $0.01), counted
+        toward the negative streak, and fed the EWMA. Now only a stamp newer
+        than the last one is a print. No stamp, no print: nothing is booked,
+        and the warm-up cannot complete, so the book cannot open on a rate it
+        cannot place in time.
 
         Order is not cosmetic. Liquidation headroom is checked before anything
         else because a margin call does not wait for the funding decision, and
@@ -240,11 +264,16 @@ class CarryEngine:
             return self._halt("MARK_UNREADABLE",
                               "a book that cannot be marked cannot be hedged")
 
-        # Every print is recorded whether or not the book acts on it. The EWMA
-        # is only meaningful if the history is complete, and a gap because
-        # "nothing happened that day" is exactly the kind of missing data that
-        # makes a smoother lie.
-        if self._finite(funding_bps):
+        # Every PRINT is recorded whether or not the book acts on it — once.
+        # The EWMA is only meaningful if the history is complete, and equally
+        # meaningless if one print is counted sixty times.
+        new_print = (funding_print_ms is not None
+                     and self._finite(funding_bps)
+                     and self._finite(funding_print_ms)
+                     and (self._last_print_ms is None
+                          or int(funding_print_ms) > self._last_print_ms))
+        if new_print:
+            self._last_print_ms = int(funding_print_ms)
             self._funding_history.append(float(funding_bps))
             del self._funding_history[:-self.FUNDING_HISTORY]
 
@@ -257,20 +286,29 @@ class CarryEngine:
             if drift > self.delta_band:
                 return self._rebalance(mark, drift)
 
-            if funding_bps < 0:
-                self.position.negative_funding_streak += 1
-                if (self.position.negative_funding_streak
-                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
-                    return self._unwind(mark, "FUNDING_INVERTED")
-            else:
-                self.position.negative_funding_streak = 0
+            # A print the pair was HELD through: its stamp is after the open.
+            # The print that triggered the entry, or a late record of an
+            # older settlement, was not earned by this position.
+            held = new_print and int(funding_print_ms) > self.position.opened_ms
+            if held:
+                # Booked SIGNED. Until 0034 a negative print was paid and never
+                # booked, so funding_collected overstated what the book earned
+                # (INVENTORY D10).
                 self.position.funding_collected += (
                     funding_bps / 1e4) * self.position.perp.notional
+                if funding_bps < 0:
+                    self.position.negative_funding_streak += 1
+                    if (self.position.negative_funding_streak
+                            >= NEGATIVE_FUNDING_EXIT_PRINTS):
+                        return self._unwind(mark, "FUNDING_INVERTED")
+                else:
+                    self.position.negative_funding_streak = 0
 
             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
                                  state=BookState.HEDGED,
                                  detail={"delta_fraction": drift,
                                          "funding_bps": funding_bps,
+                                         "new_print": bool(held),
                                          "collected": self.position.funding_collected})
 
         # THE GATES (0019/0021). Before this, the engine opened on ONE
@@ -302,13 +340,41 @@ class CarryEngine:
                         "entry_basis_bps": verdict.entry_basis_bps,
                         "net_edge_bps_per_day": verdict.net_edge_bps_per_day})
 
-        return self._open(mark, funding_bps, timestamp_ms)
+        return self._open(mark, spot, funding_bps, timestamp_ms)
 
     # -- actions ----------------------------------------------------------
 
-    def _open(self, mark: float, funding_bps: float,
+    def _open(self, mark: float, spot_mark: float, funding_bps: float,
               timestamp_ms: int) -> CarryDecision:
         """Both legs, or neither. There is no partially-open carry position."""
+        # THE PRECONDITIONS (0033, INVENTORY D8). Until 0033 the pair gate ran
+        # only "if self.pair_risk is not None and self.snapshot is not None",
+        # so an engine built without either opened on the cost gates alone. No
+        # first leg now leaves without all three: the cost gates (already
+        # passed to reach here), the pair gate, and ONE market snapshot whose
+        # marks are the marks this decision was made on.
+        if self.pair_risk is None:
+            return CarryDecision(
+                "stand_aside", reason="PAIR_GATE_ABSENT", state=BookState.FLAT,
+                detail={"note": "no CarryRisk attached; a pair gate that is "
+                                "absent is not a pass"})
+        if self.snapshot is None:
+            return CarryDecision(
+                "stand_aside", reason="SNAPSHOT_ABSENT", state=BookState.FLAT,
+                detail={"note": "no market snapshot; the pair gate cannot "
+                                "judge freshness, margin or basis"})
+        if (getattr(self.snapshot, "perp_mark", None) != mark
+                or getattr(self.snapshot, "spot_mark", None) != spot_mark):
+            return CarryDecision(
+                "stand_aside", reason="SNAPSHOT_MISMATCH", state=BookState.FLAT,
+                detail={"decided_on": {"perp": mark, "spot": spot_mark},
+                        "snapshot": {"perp": getattr(self.snapshot,
+                                                     "perp_mark", None),
+                                     "spot": getattr(self.snapshot,
+                                                     "spot_mark", None)},
+                        "note": "the gate must judge the observation the "
+                                "entry was decided on, not a different one"})
+
         qty = self.max_notional_usd / mark
         if qty <= 0 or not self._finite(qty):
             return self._halt("SIZE_INVALID", "refusing an unsizable book")
@@ -321,22 +387,22 @@ class CarryEngine:
 
         # THE PAIR GATE, before the first leg. Ordered by damage inside
         # CarryRisk: a tripped kill switch outranks a stale price, both outrank
-        # a cap. Absent when the engine is constructed bare in a test, and that
-        # is the only case where it may be skipped.
-        if self.pair_risk is not None and self.snapshot is not None:
-            gate = self.pair_risk.gate_open(
-                notional_usd=self.max_notional_usd, snapshot=self.snapshot,
-                has_open_pair=self.position is not None)
-            if not gate:
-                return CarryDecision("stand_aside", reason=gate.reason,
-                                     state=BookState.FLAT, detail=gate.detail)
+        # a cap. Never skipped: its absence refused above.
+        gate = self.pair_risk.gate_open(
+            notional_usd=self.max_notional_usd, snapshot=self.snapshot,
+            has_open_pair=self.position is not None)
+        if not gate:
+            return CarryDecision("stand_aside", reason=gate.reason,
+                                 state=BookState.FLAT, detail=gate.detail)
 
         self.state = BookState.OPENING
+        self._last_leg_error = ""
         spot = self._fire(self.spot_symbol, "Buy", qty, "spot")
         if spot is None or spot.filled_qty <= 0:
             self.state = BookState.FLAT
             return CarryDecision("refused", reason="SPOT_LEG_DID_NOT_FILL",
-                                 state=BookState.FLAT)
+                                 state=BookState.FLAT,
+                                 detail={"error": self._last_leg_error})
 
         # Hedge exactly what the spot leg ACTUALLY filled. Hedging the requested
         # size instead is how a rounding difference becomes a permanent short.
@@ -350,15 +416,16 @@ class CarryEngine:
         if residual > self.delta_band:
             # Both legs landed but the sizes disagree by more than the band.
             # That is not a hedge, it is a directional position wearing one.
+            # It paid a round trip, so it spends the day (INVENTORY D4).
             self.position = position
+            self.pair_risk.record_broken_pair()
             return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
 
         self.position = position
         self.state = BookState.HEDGED
-        if self.pair_risk is not None:
-            # Only now. A refused or half-filled pair did not consume the day's
-            # entry allowance.
-            self.pair_risk.record_entry()
+        # Only now: both legs landed. A refused pair consumed nothing; a
+        # broken one spent the day through record_broken_pair instead.
+        self.pair_risk.record_entry()
         return CarryDecision(
             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
@@ -420,8 +487,14 @@ class CarryEngine:
             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
         self.position = None
         self.state = BookState.FLAT
+        # A spot round trip was paid for nothing. Without this, a venue that
+        # rejects the perp leg made the book buy and sell spot every tick:
+        # 8 round trips in 10 ticks, measured (INVENTORY D4).
+        if self.pair_risk is not None:
+            self.pair_risk.record_broken_pair()
         return CarryDecision("unwound", acted=True, reason=reason,
-                             state=BookState.FLAT)
+                             state=BookState.FLAT,
+                             detail={"error": self._last_leg_error})
 
     # -- guards -----------------------------------------------------------
 
@@ -450,15 +523,18 @@ class CarryEngine:
             result = self.broker.place_market(symbol=symbol, side=side,
                                               qty=qty, product=product)
         except Exception as exc:  # noqa: BLE001
+            self._last_leg_error = f"{type(exc).__name__}: {exc}"
             logger.error("leg %s %s %s failed: %s", side, symbol, product, exc)
             return None
         if not result:
             return None
+        raw_fee = result.get("fee")
         return Leg(symbol=symbol, side=side, product=product,
                    requested_qty=qty,
                    filled_qty=float(result.get("filled_qty", 0.0) or 0.0),
                    avg_price=float(result.get("avg_price", 0.0) or 0.0),
-                   order_link_id=str(result.get("order_link_id", "")))
+                   order_link_id=str(result.get("order_link_id", "")),
+                   fee=None if raw_fee is None else float(raw_fee))
 
     def _halt(self, reason: str, detail: str) -> CarryDecision:
         self.state = BookState.HALTED

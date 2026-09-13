@@ -46,7 +46,8 @@ class Broker:
         self.mark, self.funding, self.margin = mark, funding, margin
         self.spot = mark if spot is None else spot
         self.orders = []
-        self.reads = {"mark": 0, "spot": 0, "funding": 0, "margin": 0}
+        self.reads = {"mark": 0, "spot": 0, "funding": 0, "margin": 0,
+                      "print": 0}
 
     def get_mark(self, s):
         self.reads["mark"] += 1
@@ -64,9 +65,21 @@ class Broker:
         self.reads["margin"] += 1
         return self.margin
 
+    def get_funding_print(self, s):
+        # 0034: the latest settled print, stamped at the last settlement.
+        self.reads["print"] += 1
+        return (self.funding, latest_settlement_ms())
+
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((side, product))
         return {"filled_qty": qty, "avg_price": self.mark, "order_link_id": "x"}
+
+
+H8 = 8 * 3600 * 1000
+
+
+def latest_settlement_ms():
+    return int(time.time() * 1000) // H8 * H8
 
 
 def bot_with(broker, *, store=None, warm=3.0, risk=True):
@@ -81,12 +94,15 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
     bot.risk = mock.Mock(should_halt_trading=lambda: False,
                          update_equity=lambda e: None)
     bot.engine = mock.Mock(observe_exits=lambda: {})
-    bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0)
+    bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
+                            borrow_apr=0.05)
     if risk:
         bot.carry.pair_risk = CarryRisk(store=store, max_notional_usd=100.0)
-    for _ in range(2):
+    # 0034: two earlier SETTLED prints; the tick then reads the latest one.
+    for k in (2, 1):
         bot.carry.on_candle(mark=broker.mark, funding_bps=warm,
-                            spot=broker.spot)
+                            spot=broker.spot,
+                            funding_print_ms=latest_settlement_ms() - k * H8)
     return bot
 
 
@@ -166,14 +182,19 @@ class TestThePairGateRunsBeforeTheFirstLeg:
         assert not broker.orders, "the engine opened above the gate's cap"
         assert bot.carry.position is None
 
-    def test_the_gate_is_skipped_only_when_absent(self):
-        """A bare engine in a unit test may open. A wired one may not bypass."""
+    def test_an_absent_gate_is_a_refusal_not_a_skip(self):
+        """0033 INVERTED this test, deliberately. It used to assert that an
+        engine WITHOUT a pair gate opens ("a bare engine in a unit test may
+        open"). That was the bypass Phase C exists to remove: an absent gate
+        is not a pass. The assertion is now the stricter one — no gate, no
+        leg — and the refusal names itself."""
         broker = Broker()
         bot = bot_with(broker, risk=False)
         assert bot.carry.pair_risk is None
         broker.orders.clear()
         bot.tick()
-        assert len(broker.orders) == 2
+        assert broker.orders == []
+        assert bot.carry.position is None
 
 
 class TestTheDayAllowanceIsSpentOnlyOnSuccess:
@@ -205,7 +226,7 @@ class TestTheDayAllowanceIsSpentOnlyOnSuccess:
 class TestBuildBotAttachesTheGate:
     def test_carry_mode_gets_a_pair_gate(self):
         import config as _config
-        cfg = _config.load({"BOOK_MODE": "carry"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.pair_risk is not None
@@ -213,7 +234,7 @@ class TestBuildBotAttachesTheGate:
     def test_the_gate_cap_matches_the_engine_cap(self):
         import config as _config
         import shadow
-        cfg = _config.load({"BOOK_MODE": "carry"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.pair_risk.max_notional_usd == pytest.approx(

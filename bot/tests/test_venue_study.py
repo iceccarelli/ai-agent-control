@@ -90,3 +90,30 @@ class TestItIsAStudyNotACorpus:
     def test_the_cli_runs(self, capsys):
         assert vs.main(["--repo", REPO]) == 0
         assert "VENUE STUDY" in capsys.readouterr().out
+
+
+class TestItsReadsReachTheLedger:
+    """0028 read the Bybit set and the Binance funding corpus and recorded
+    neither (INVENTORY D6). A future holdout cannot be certified untouched if
+    the reads that informed a venue decision are missing."""
+
+    def test_venue_and_stress_reads_are_recorded(self, tmp_path, monkeypatch):
+        import json
+        ledger = tmp_path / "ledger.json"
+        monkeypatch.setattr(vs, "LEDGER_PATH", str(ledger))
+        monkeypatch.delenv("LEDGER_DISABLED", raising=False)
+        vs.venue_funding(REPO)
+        vs.stress(REPO)
+        reads = json.loads(ledger.read_text())["reads"]
+        datasets = {r["dataset"] for r in reads}
+        assert "BYBIT_LINEAR_BTC_USDT_FUNDING" in datasets
+        assert "BINANCE_LINEAR_BTC_USDT_FUNDING" in datasets
+        assert any(d.startswith("BINANCE_LINEAR_BTC_USDT_1M") for d in datasets)
+        assert all(r["read_by"].endswith("venue_study.py") for r in reads)
+
+    def test_a_test_run_records_nothing(self, tmp_path, monkeypatch):
+        ledger = tmp_path / "ledger.json"
+        monkeypatch.setattr(vs, "LEDGER_PATH", str(ledger))
+        monkeypatch.setenv("LEDGER_DISABLED", "1")
+        vs.venue_funding(REPO)
+        assert not ledger.exists()

@@ -54,6 +54,14 @@ MAX_SNAPSHOT_AGE_S = 90.0
 MAX_CLOCK_SKEW_S = 30.0
 
 
+#: One funding interval on Bybit BTCUSDT linear (instrument `fundingInterval`
+#: = 480 minutes, research/exchange_study/bybit/instrument_linear.json.gz). A
+#: VENUE FACT, not a tuned threshold. If the last settled print is older than
+#: one interval plus MAX_SNAPSHOT_AGE_S, a settlement has been missed and the
+#: engine's funding history describes a market the venue has moved past.
+FUNDING_INTERVAL_MS = 8 * 3600 * 1000
+
+
 class StaleMarket(RuntimeError):
     """The view is too old, internally inconsistent, or unreadable."""
 
@@ -75,6 +83,12 @@ class MarketSnapshot:
     observed_at_s: float
     venue_time_s: Optional[float] = None
     detail: Dict[str, Any] = field(default_factory=dict)
+    #: The last SETTLED print and its settlement stamp (0034). `funding_bps`
+    #: above is the ticker's forecast for the next settlement; these are what
+    #: was actually paid. take_snapshot always fills them; a snapshot built
+    #: by hand without them simply carries no print.
+    funding_print_bps: Optional[float] = None
+    funding_print_ms: Optional[int] = None
 
     @property
     def basis_bps(self) -> float:
@@ -112,6 +126,23 @@ class MarketSnapshot:
                 f"snapshot is {age:.1f}s old (limit {max_age_s:.0f}s); a frozen "
                 "feed looks exactly like a quiet market")
 
+        if self.funding_print_ms is not None:
+            if not (isinstance(self.funding_print_bps, (int, float))
+                    and math.isfinite(self.funding_print_bps)):
+                raise StaleMarket(
+                    f"funding_print_bps is {self.funding_print_bps!r}")
+            now_ms = self.observed_at_s * 1000.0
+            behind = now_ms - float(self.funding_print_ms)
+            if behind > FUNDING_INTERVAL_MS + max_age_s * 1000.0:
+                raise StaleMarket(
+                    f"the last settled funding print is {behind / 3.6e6:.1f}h "
+                    "old — at least one settlement has been missed, and the "
+                    "funding history the book decides on is out of date")
+            if behind < -max_skew_s * 1000.0:
+                raise StaleMarket(
+                    f"a funding print is stamped {-behind / 1000.0:.0f}s in "
+                    "the future; the venue and this host disagree about time")
+
         skew = self.clock_skew_s
         if skew is not None and skew > max_skew_s:
             raise StaleMarket(
@@ -121,7 +152,10 @@ class MarketSnapshot:
 
     def as_dict(self) -> Dict[str, Any]:
         return {"perp_mark": self.perp_mark, "spot_mark": self.spot_mark,
-                "funding_bps": self.funding_bps, "basis_bps": self.basis_bps,
+                "funding_bps": self.funding_bps,
+                "funding_print_bps": self.funding_print_bps,
+                "funding_print_ms": self.funding_print_ms,
+                "basis_bps": self.basis_bps,
                 "margin_multiple": self.margin_multiple, "age_s": self.age_s,
                 "clock_skew_s": self.clock_skew_s}
 
@@ -139,6 +173,9 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     perp = float(broker.get_mark(perp_symbol))
     spot = float(broker.get_spot_mark(spot_symbol))
     funding = float(broker.get_funding_bps(perp_symbol))
+    # Called directly, never through getattr: a broker that cannot say what was
+    # actually settled cannot snapshot (0034).
+    print_bps, print_ms = broker.get_funding_print(perp_symbol)
     margin = float(broker.get_margin_multiple(perp_symbol))
 
     venue_time = None
@@ -155,6 +192,8 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=funding,
                           margin_multiple=margin, observed_at_s=observed,
                           venue_time_s=venue_time,
+                          funding_print_bps=float(print_bps),
+                          funding_print_ms=int(print_ms),
                           detail={"perp_symbol": perp_symbol,
                                   "spot_symbol": spot_symbol,
                                   "clock_checked": venue_time is not None})

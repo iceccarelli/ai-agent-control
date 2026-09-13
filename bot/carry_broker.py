@@ -76,18 +76,32 @@ class PairIncident(RuntimeError):
     """One leg exists that the other does not hedge. Never caught and ignored."""
 
 
+class CarryOrderRefused(RuntimeError):
+    """The process may not send a carry order to this venue. Nothing was sent.
+
+    Raised by place_market BEFORE any request is built. Until 0033 the carry
+    broker called `/v5/order/create` whatever PAPER_TRADING said, against
+    whichever base URL USE_TESTNET selected (INVENTORY D2).
+    """
+
+
 @dataclass
 class LegFill:
     filled_qty: float = 0.0
     avg_price: float = 0.0
     order_link_id: str = ""
     was_duplicate: bool = False
+    #: `cumExecFee` as the venue reported it, in the fee currency (BTC on a
+    #: spot BUY, USDT on a linear fill). None means the venue did not say. It
+    #: is never 0.0 by default: an unknown fee booked as zero is a cost that
+    #: disappears from the ledger.
+    fee: Optional[float] = None
     detail: Dict[str, Any] = field(default_factory=dict)
 
     def as_engine_result(self) -> Dict[str, Any]:
         """The shape `CarryEngine._fire` consumes."""
         return {"filled_qty": self.filled_qty, "avg_price": self.avg_price,
-                "order_link_id": self.order_link_id}
+                "order_link_id": self.order_link_id, "fee": self.fee}
 
 
 class CarryBroker:
@@ -96,13 +110,22 @@ class CarryBroker:
     `client` is a BybitClient-shaped object exposing `_request`, and
     `sequence_source` is a callable returning a persisted, monotonic integer.
     Both are injected so this module can be exercised without a venue.
+
+    `order_gate` is REQUIRED: a callable returning `(may_send, reason)`,
+    asked before EVERY order. build_bot derives it from PAPER_TRADING,
+    USE_TESTNET and the live authorisation. There is no default, because the
+    only safe default would be "never", and a broker that can never trade is
+    a misconfiguration that should fail at construction, not at 3am.
     """
 
-    def __init__(self, *, client: Any, sequence_source: Any,
+    def __init__(self, *, client: Any, sequence_source: Any, order_gate: Any,
                  link_id_builder: Any = None,
                  duplicate_ret_codes: Tuple[int, ...] = (110072, 170130)) -> None:
+        if not callable(order_gate):
+            raise TypeError("order_gate must be callable -> (may_send, reason)")
         self.client = client
         self.sequence_source = sequence_source
+        self.order_gate = order_gate
         self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
         if link_id_builder is None:
             from bybit_connection import build_order_link_id
@@ -114,6 +137,7 @@ class CarryBroker:
     def place_market(self, *, symbol: str, side: str, qty: float,
                      product: str) -> Optional[Dict[str, Any]]:
         """One leg. Deterministic id, so a retry cannot double it."""
+        self._assert_orders_permitted()
         if product not in VALID_PRODUCTS:
             raise ValueError(
                 f"unknown product {product!r}; routing a spot order to the "
@@ -128,12 +152,19 @@ class CarryBroker:
             symbol=symbol, side=side, qty=qty_text,
             purpose=f"carry-{product}")
 
+        body = {"category": product, "symbol": symbol, "side": side,
+                "orderType": "Market", "qty": qty_text,
+                "orderLinkId": link_id}
+        if product == SPOT:
+            # Without this a spot market BUY is read as a QUOTE (USDT) amount:
+            # 0.00125 would buy 0.00125 USDT of BTC. BybitClient has always set
+            # it; this adapter built its own body and did not (INVENTORY F1).
+            # Stated on sells too, where it is the venue default, so the unit
+            # of every spot qty this module sends is explicit.
+            body["marketUnit"] = "baseCoin"
         try:
             response = self.client._request(
-                "POST", "/v5/order/create", signed=True,
-                body={"category": product, "symbol": symbol, "side": side,
-                      "orderType": "Market", "qty": qty_text,
-                      "orderLinkId": link_id})
+                "POST", "/v5/order/create", signed=True, body=body)
         except Exception as exc:  # noqa: BLE001
             ret_code = getattr(exc, "ret_code", None)
             if ret_code in self.duplicate_ret_codes:
@@ -244,6 +275,35 @@ class CarryBroker:
             raise PairIncident(f"funding for {symbol} is {raw!r}")
         return rate * 1e4
 
+    def get_funding_print(self, symbol: str) -> Tuple[float, int]:
+        """The last SETTLED funding print: (rate in bps, settlement epoch ms).
+
+        Not the ticker. The ticker's fundingRate is the rate for the NEXT
+        settlement — a forecast (INVENTORY F6). What the short leg was paid or
+        charged is the settled record, and its stamp is what lets the engine
+        tell a new print from the same one read sixty times.
+
+        Raises when unreadable, like every read the book decides on.
+        """
+        result = self.client._request(
+            "GET", "/v5/market/funding/history",
+            params={"category": LINEAR, "symbol": symbol, "limit": 1})
+        rows = (result or {}).get("list") or []
+        if not rows:
+            raise PairIncident(f"no settled funding print for {symbol}")
+        row = rows[0]
+        try:
+            rate = float(row["fundingRate"])
+            stamp = int(row["fundingRateTimestamp"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"settled funding print for {symbol} is malformed: {row!r}"
+            ) from exc
+        if not math.isfinite(rate) or stamp <= 0:
+            raise PairIncident(
+                f"settled funding print for {symbol} is unusable: {row!r}")
+        return rate * 1e4, stamp
+
     # -- reconciliation ---------------------------------------------------
 
     def reconcile_pair(self, *, spot_symbol: str, perp_symbol: str,
@@ -318,7 +378,19 @@ class CarryBroker:
         return LegFill(
             filled_qty=float(row.get("cumExecQty", 0) or 0),
             avg_price=float(row.get("avgPrice", 0) or 0),
-            order_link_id=link_id, detail=dict(row))
+            order_link_id=link_id, fee=CarryBroker._fee(row),
+            detail=dict(row))
+
+    @staticmethod
+    def _fee(row: Dict[str, Any]) -> Optional[float]:
+        raw = row.get("cumExecFee")
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
 
     @staticmethod
     def _fill_from(response: Optional[Dict[str, Any]],
@@ -328,7 +400,17 @@ class CarryBroker:
             filled_qty=float(row.get("cumExecQty", 0) or 0),
             avg_price=float(row.get("avgPrice", 0) or 0),
             order_link_id=str(row.get("orderLinkId", link_id) or link_id),
-            detail=dict(row))
+            fee=CarryBroker._fee(row), detail=dict(row))
+
+    def _assert_orders_permitted(self) -> None:
+        """Ask the gate. Anything but an explicit (True, reason) refuses."""
+        try:
+            allowed, reason = self.order_gate()
+        except Exception as exc:  # noqa: BLE001 - an unreadable gate is closed
+            raise CarryOrderRefused(
+                f"order gate unreadable ({exc!r}); no carry order sent") from exc
+        if allowed is not True:
+            raise CarryOrderRefused(f"{reason}; no carry order sent")
 
     @staticmethod
     def _format_qty(qty: float) -> str:

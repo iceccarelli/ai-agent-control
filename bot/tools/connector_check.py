@@ -4,6 +4,14 @@
 Verdicts
   BYBIT_TESTNET_BLOCKED  api-testnet.bybit.com unreachable or non-200.
                           Track D (testnet orders) must not run from this host.
+  CARRY_READS_OK          every PUBLIC read the carry book makes on testnet —
+                          time, linear + spot tickers, settled funding history,
+                          instruments — answered 200 (0035).
+  CARRY_READS_BLOCKED     at least one did not; the blocked names are listed.
+
+--require-bybit-testnet exits 2 unless CARRY_READS_OK. That is the first
+command to run inside the intended VPC (a one-off task): an exit code, not a
+line someone has to read.
   CORPUS_PATH_OK          www.binance.com/fapi/v1/{time,fundingRate} answered 200:
                           closed-bar refresh is possible from this host.
   CORPUS_PATH_BLOCKED     it did not. Do NOT substitute another venue.
@@ -22,8 +30,22 @@ from typing import Callable, Dict, List, Tuple
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
-ENDPOINTS: Tuple[Tuple[str, str], ...] = (
-    ("bybit_testnet_time", "https://api-testnet.bybit.com/v5/market/time"),
+_TN = "https://api-testnet.bybit.com"
+
+#: The public reads CarryBroker and take_snapshot make, on testnet.
+CARRY_READS: Tuple[Tuple[str, str], ...] = (
+    ("bybit_testnet_time", f"{_TN}/v5/market/time"),
+    ("bybit_testnet_ticker_linear",
+     f"{_TN}/v5/market/tickers?category=linear&symbol=BTCUSDT"),
+    ("bybit_testnet_ticker_spot",
+     f"{_TN}/v5/market/tickers?category=spot&symbol=BTCUSDT"),
+    ("bybit_testnet_funding_history",
+     f"{_TN}/v5/market/funding/history?category=linear&symbol=BTCUSDT&limit=1"),
+    ("bybit_testnet_instruments_linear",
+     f"{_TN}/v5/market/instruments-info?category=linear&symbol=BTCUSDT"),
+)
+
+ENDPOINTS: Tuple[Tuple[str, str], ...] = CARRY_READS + (
     ("bybit_mainnet_time", "https://api.bybit.com/v5/market/time"),
     ("binance_fapi_time", "https://fapi.binance.com/fapi/v1/time"),
     ("binance_www_time", "https://www.binance.com/fapi/v1/time"),
@@ -57,7 +79,11 @@ def check(fetch: Fetcher = default_fetch, timeout: float = 8.0) -> Dict[str, obj
     bybit_ok = bool(by["bybit_testnet_time"]["ok"])
     corpus_ok = bool(by["binance_www_time"]["ok"] and by["binance_www_funding"]["ok"])
     verdict = "BYBIT_TESTNET_OK" if bybit_ok else "BYBIT_TESTNET_BLOCKED"
+    carry_blocked = [name for name, _u in CARRY_READS if not by[name]["ok"]]
     return {
+        "carry_reads_verdict": ("CARRY_READS_OK" if not carry_blocked
+                                else "CARRY_READS_BLOCKED"),
+        "carry_reads_blocked": carry_blocked,
         "tool": "connector_check",
         "checked_at_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "keys_used": False, "orders_placed": False,
@@ -70,19 +96,28 @@ def check(fetch: Fetcher = default_fetch, timeout: float = 8.0) -> Dict[str, obj
     }
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, fetch: Fetcher = default_fetch) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", default=os.path.join(ROOT, "artifacts",
                                                   "connector_check.json"))
     ap.add_argument("--timeout", type=float, default=8.0)
+    ap.add_argument("--require-bybit-testnet", action="store_true",
+                    help="exit 2 unless every carry read on testnet is 200")
     args = ap.parse_args(argv)
-    report = check(timeout=args.timeout)
+    report = check(fetch=fetch, timeout=args.timeout)
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
     for r in report["endpoints"]:
         print(f"{r['http']:>4}  {r['url']}")
-    print(report["bybit_testnet_verdict"], "|", report["corpus_path_verdict"])
+    print(report["bybit_testnet_verdict"], "|", report["corpus_path_verdict"],
+          "|", report["carry_reads_verdict"],
+          ("(" + ", ".join(report["carry_reads_blocked"]) + ")")
+          if report["carry_reads_blocked"] else "")
+    if args.require_bybit_testnet and \
+            report["carry_reads_verdict"] != "CARRY_READS_OK":
+        return 2
     return 0
 
 
