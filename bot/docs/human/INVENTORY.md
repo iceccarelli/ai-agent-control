@@ -148,6 +148,23 @@ funding clock. **0032 promoted it** to `data/real_bybit_btc_4h/` (8,999 bars
 per leg after dropping one open bar; 4,600 prints). Result and sha256s:
 `docs/human/SETTLEMENT_CLOCK_0032.md`.
 
+## 8b. Speed, measured (0039)
+
+Numbers, so "Python is too slow" is never argued from vibes again:
+
+| | |
+|---|---|
+| one `CarryEngine.on_candle` decision | 1.8 µs |
+| decisions the book makes | 3 per day |
+| one 4-year settlement simulation (4,500 prints) | 5 ms in Python |
+| the same simulation in `cpp/carrycore` | 29 µs inside a sweep |
+| 1,440-configuration sweep | 42 ms vs 9 s — **212x** |
+
+The decision path has five orders of magnitude of headroom; the order path is
+bounded by a 50–200 ms venue round trip. The native core exists for SEARCH
+(`docs/human/CPP_CORE_0039.md`), and a differential test holds it to the
+Python's answer to the cent.
+
 ## 9. Network from the hosts used so far
 
 | Host | Bybit testnet | Bybit mainnet | Binance fapi | Binance www/fapi |

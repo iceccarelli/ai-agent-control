@@ -15,6 +15,19 @@ makes money. Everything in here is subordinate to that.
 
 ---
 
+## The native core
+
+`cpp/carrycore.cpp` — one file, no dependencies, a C ABI. It is the settlement
+simulator at 29 µs instead of 5 ms, for parameter search only: the decision
+path is 1.8 µs of Python against an 8-hour funding clock and needs nothing.
+A differential test holds it to the Python's answer to the cent.
+
+```bash
+make -C cpp                      # or: python3 bot/tools/carry_core.py --build
+python3 bot/tools/carry_core.py --bench
+python3 bot/tools/carry_sweep.py --repo bot    # 1,440 configs, names no winner
+```
+
 ## Quick start
 
 ```bash

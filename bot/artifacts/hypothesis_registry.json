@@ -1,223 +1,230 @@
 {
- "git_commit": "39a7be4c307d40eca600a9b120be49a7141b982f-dirty",
- "schema": "hypothesis_registry/1",
- "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
- "seeded": true,
- "trials": [
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "technical_analysis"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "closed_analyser"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "donchian_breakout_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "btc_alt_spillover_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "post_shock_fade_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "range_location_fade_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "open_gap_fade_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "ts_momentum_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "sign_flip_momentum_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "compression_breakout_v1"
-  },
-  {
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status.FROZEN_ABSENT",
-   "status": "frozen_absent",
-   "trial_id": "funding_carry_fade_v1"
-  },
-  {
-   "note": "n=41, M1~95.13, M2=96.0. Forward: n=2, mean net R -0.8358. 98.4% of setups are SHORT; 77.1% sit exactly at the funding threshold; carry over horizon 15bps vs 25bps round trip.",
-   "recorded_utc": "2026-09-05T00:15:21Z",
-   "source": "project_status/STAGE1_VERDICT",
-   "status": "cleared_stage1",
-   "trial_id": "funding_carry_fade_btc_v1"
-  },
-  {
-   "note": "slice55 M1/M2 97.0/97.5 n=85 \u2014 the reading that SELECTED BTC",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "funding_carry_fade_v1@BTCUSDT"
-  },
-  {
-   "note": "slice55 M1/M2 47.7/48.5 n=76",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "funding_carry_fade_v1@ETHUSDT"
-  },
-  {
-   "note": "slice55 M1/M2 2.3/1.0 n=162 \u2014 largest sample, worst reading",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "funding_carry_fade_v1@SOLUSDT"
-  },
-  {
-   "note": "slice35/40",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "btc_alt_spillover_v1@ETHUSDT"
-  },
-  {
-   "note": "slice35/40",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "btc_alt_spillover_v1@SOLUSDT"
-  },
-  {
-   "note": "slice52",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "sign_flip_momentum_v1@BTCUSD"
-  },
-  {
-   "note": "slice52",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "sign_flip_momentum_v1@ETHUSDT"
-  },
-  {
-   "note": "slice52",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "sign_flip_momentum_v1@SOLUSDT"
-  },
-  {
-   "note": "slice53",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "compression_breakout_v1@BTCUSD"
-  },
-  {
-   "note": "slice43",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "post_shock_fade_v1@BTCUSD"
-  },
-  {
-   "note": "slice28",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "donchian_breakout_v1@BTCUSD"
-  },
-  {
-   "note": "slice29",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "donchian_regression@BTCUSD"
-  },
-  {
-   "note": "slice28/29",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "closed_regression@BTCUSD"
-  },
-  {
-   "note": "slice26",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "edge_recheck@BTCUSD"
-  },
-  {
-   "note": "slice25",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "edge_real_1h@BTCUSD"
-  },
-  {
-   "note": "slice25",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "edge_real_4h@BTCUSD"
-  },
-  {
-   "note": "slice57 M1/M2 95.13/96.0 n=41 \u2014 CONTAMINATED HOLDOUT, see docs/human/FREEZE_NOTE_SLICE77",
-   "recorded_utc": "2026-09-06T00:00:00Z",
-   "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
-   "status": "measured",
-   "trial_id": "funding_carry_fade_btc_v1@BTCUSDT_OOS"
-  },
-  {
-   "note": "delta-neutral carry, ungated entry on last print >= 0.2 bps, exit on 3 negative prints. Parameters declared before 0018. NOT the rule CarryEngine runs. Daily-close and settlement-clock runs both recorded in data_read_ledger.json. Recorded in 0032; it was run from 0018 onward without an entry.",
-   "recorded_utc": "2026-09-11T18:24:13Z",
-   "source": "tools/carry_backtest.py (0018-0032)",
-   "status": "measured",
-   "trial_id": "carry_ungated_v1@BTCUSDT"
-  },
-  {
-   "note": "ASSUMED_HOLD_DAYS=30, EWMA_ALPHA=0.5, EWMA_MIN_PRINTS=3, basis budget = net edge x hold. Chosen AFTER 0018's output (PHASE1_DECISION). This is the rule CarryEngine runs. Every window 2022-06-29..2026-09-09 has been read (data_read_ledger.json), so its only admissible holdout is FORWARD: settlements after 2026-09-09T08:00Z on the venue the book trades. Recorded in 0032 before any claim is made from it; its 8h numbers in 0032 are in-sample diagnostics.",
-   "recorded_utc": "2026-09-11T18:24:13Z",
-   "source": "carry_costs.py (0019/0021), tools/carry_backtest.py --gated",
-   "status": "measured_in_sample",
-   "trial_id": "carry_cost_gates_v1@BTCUSDT"
-  },
-  {
-   "note": "Same entry/exit rule as carry_cost_gates_v1, executed against BTC the client already owns: the perp is the only leg traded, so the round trip is 11 bps (2 perp legs at the account's taker rate) instead of 31, and there is no borrow. The gate is the SAME rule with a corrected cost input, not a retuned one \u2014 no gate constant moved. Settlement clock, Bybit same-venue corpus, impact haircut applied, 0% borrow: ungated +6.99%/yr n=87, gated +7.23%/yr n=79. IN-SAMPLE: the window 2022-08-01..2026-09-09 is fully read (data_read_ledger.json). Admissible holdout is FORWARD ONLY, after 2026-09-09T08:00Z.",
-   "recorded_utc": "2026-09-13T18:59:24Z",
-   "source": "carry_engine.py execution_mode=overlay (0036), tools/carry_backtest.py --mode overlay",
-   "status": "measured_in_sample",
-   "trial_id": "carry_overlay_v1@BTCUSDT"
-  }
- ],
- "updated_utc": "2026-09-13T18:59:24Z",
- "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
+  "git_commit": "a49849bc8b5a2b9d3c83d6c1ca895d541430fbc5-dirty",
+  "schema": "hypothesis_registry/1",
+  "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
+  "seeded": true,
+  "trials": [
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "technical_analysis"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "closed_analyser"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "donchian_breakout_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "btc_alt_spillover_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "post_shock_fade_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "range_location_fade_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "open_gap_fade_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "ts_momentum_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "sign_flip_momentum_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "compression_breakout_v1"
+    },
+    {
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status.FROZEN_ABSENT",
+      "status": "frozen_absent",
+      "trial_id": "funding_carry_fade_v1"
+    },
+    {
+      "note": "n=41, M1~95.13, M2=96.0. Forward: n=2, mean net R -0.8358. 98.4% of setups are SHORT; 77.1% sit exactly at the funding threshold; carry over horizon 15bps vs 25bps round trip.",
+      "recorded_utc": "2026-09-05T00:15:21Z",
+      "source": "project_status/STAGE1_VERDICT",
+      "status": "cleared_stage1",
+      "trial_id": "funding_carry_fade_btc_v1"
+    },
+    {
+      "note": "slice55 M1/M2 97.0/97.5 n=85 \u2014 the reading that SELECTED BTC",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "funding_carry_fade_v1@BTCUSDT"
+    },
+    {
+      "note": "slice55 M1/M2 47.7/48.5 n=76",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "funding_carry_fade_v1@ETHUSDT"
+    },
+    {
+      "note": "slice55 M1/M2 2.3/1.0 n=162 \u2014 largest sample, worst reading",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "funding_carry_fade_v1@SOLUSDT"
+    },
+    {
+      "note": "slice35/40",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "btc_alt_spillover_v1@ETHUSDT"
+    },
+    {
+      "note": "slice35/40",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "btc_alt_spillover_v1@SOLUSDT"
+    },
+    {
+      "note": "slice52",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "sign_flip_momentum_v1@BTCUSD"
+    },
+    {
+      "note": "slice52",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "sign_flip_momentum_v1@ETHUSDT"
+    },
+    {
+      "note": "slice52",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "sign_flip_momentum_v1@SOLUSDT"
+    },
+    {
+      "note": "slice53",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "compression_breakout_v1@BTCUSD"
+    },
+    {
+      "note": "slice43",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "post_shock_fade_v1@BTCUSD"
+    },
+    {
+      "note": "slice28",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "donchian_breakout_v1@BTCUSD"
+    },
+    {
+      "note": "slice29",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "donchian_regression@BTCUSD"
+    },
+    {
+      "note": "slice28/29",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "closed_regression@BTCUSD"
+    },
+    {
+      "note": "slice26",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "edge_recheck@BTCUSD"
+    },
+    {
+      "note": "slice25",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "edge_real_1h@BTCUSD"
+    },
+    {
+      "note": "slice25",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "edge_real_4h@BTCUSD"
+    },
+    {
+      "note": "slice57 M1/M2 95.13/96.0 n=41 \u2014 CONTAMINATED HOLDOUT, see docs/human/FREEZE_NOTE_SLICE77",
+      "recorded_utc": "2026-09-06T00:00:00Z",
+      "source": "slice77 audit \u2014 artifacts/*_edge_*_summary.json census",
+      "status": "measured",
+      "trial_id": "funding_carry_fade_btc_v1@BTCUSDT_OOS"
+    },
+    {
+      "note": "delta-neutral carry, ungated entry on last print >= 0.2 bps, exit on 3 negative prints. Parameters declared before 0018. NOT the rule CarryEngine runs. Daily-close and settlement-clock runs both recorded in data_read_ledger.json. Recorded in 0032; it was run from 0018 onward without an entry.",
+      "recorded_utc": "2026-09-11T18:24:13Z",
+      "source": "tools/carry_backtest.py (0018-0032)",
+      "status": "measured",
+      "trial_id": "carry_ungated_v1@BTCUSDT"
+    },
+    {
+      "note": "ASSUMED_HOLD_DAYS=30, EWMA_ALPHA=0.5, EWMA_MIN_PRINTS=3, basis budget = net edge x hold. Chosen AFTER 0018's output (PHASE1_DECISION). This is the rule CarryEngine runs. Every window 2022-06-29..2026-09-09 has been read (data_read_ledger.json), so its only admissible holdout is FORWARD: settlements after 2026-09-09T08:00Z on the venue the book trades. Recorded in 0032 before any claim is made from it; its 8h numbers in 0032 are in-sample diagnostics.",
+      "recorded_utc": "2026-09-11T18:24:13Z",
+      "source": "carry_costs.py (0019/0021), tools/carry_backtest.py --gated",
+      "status": "measured_in_sample",
+      "trial_id": "carry_cost_gates_v1@BTCUSDT"
+    },
+    {
+      "note": "Same entry/exit rule as carry_cost_gates_v1, executed against BTC the client already owns: the perp is the only leg traded, so the round trip is 11 bps (2 perp legs at the account's taker rate) instead of 31, and there is no borrow. The gate is the SAME rule with a corrected cost input, not a retuned one \u2014 no gate constant moved. Settlement clock, Bybit same-venue corpus, impact haircut applied, 0% borrow: ungated +6.99%/yr n=87, gated +7.23%/yr n=79. IN-SAMPLE: the window 2022-08-01..2026-09-09 is fully read (data_read_ledger.json). Admissible holdout is FORWARD ONLY, after 2026-09-09T08:00Z.",
+      "recorded_utc": "2026-09-13T18:59:24Z",
+      "source": "carry_engine.py execution_mode=overlay (0036), tools/carry_backtest.py --mode overlay",
+      "status": "measured_in_sample",
+      "trial_id": "carry_overlay_v1@BTCUSDT"
+    },
+    {
+      "note": "1440 configurations scored over 4500 settlements (2022-08-01T16:00:00Z .. 2026-09-09T08:00:00Z), grid entry=0.1..2.4 bps, hold=5..240 days, exit=[1, 2, 3, 4, 6]. IN-SAMPLE: this window is fully read (data_read_ledger.json), so no cell may be chosen from it. The admissible holdout is forward only.",
+      "recorded_utc": "2026-09-13T22:36:56Z",
+      "source": "tools/carry_sweep.py",
+      "status": "search_width_recorded",
+      "trial_id": "carry_rule_sweep@59feb30d2328"
+    }
+  ],
+  "updated_utc": "2026-09-13T22:36:56Z",
+  "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }
