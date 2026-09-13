@@ -53,6 +53,16 @@ class Venue:
     def get_mark(self, symbol):
         return MARK
 
+    # 0036: the venue's own lot rules and fee tier. A 1e-6 step leaves every
+    # size in this file unchanged; the fee table is what the round trip is
+    # computed from instead of a constant.
+    def get_lot_rules(self, symbol, product):
+        return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 0.0}
+
+    def get_fee_rates(self, symbol, product):
+        return {"maker_bps": 2.0,
+                "taker_bps": 10.0 if product == "spot" else 5.5}
+
 
 def snap(perp=MARK, spot=MARK):
     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=3.0,
@@ -73,6 +83,7 @@ def warmed(engine):
 def engine(venue, *, gate=True, view=True, **kw):
     kw.setdefault("borrow_apr", 0.05)
     kw.setdefault("max_notional_usd", 100.0)
+    kw.setdefault("execution_mode", "acquire")
     e = CarryEngine(broker=venue, **kw)
     e.pair_risk = CarryRisk(max_notional_usd=100.0) if gate else None
     e.snapshot = snap() if view else None
@@ -116,7 +127,8 @@ class TestNoFirstLegWithoutTheGateAndTheView:
 class TestBorrowIsRequiredEverywhere:
     def test_the_engine_cannot_be_built_without_it(self):
         with pytest.raises(TypeError):
-            CarryEngine(broker=Venue(), max_notional_usd=100.0)
+            CarryEngine(broker=Venue(), max_notional_usd=100.0,
+                        execution_mode="acquire")
 
     def test_the_cost_gate_cannot_be_asked_without_it(self):
         with pytest.raises(TypeError):
@@ -136,7 +148,8 @@ class TestBorrowIsRequiredEverywhere:
     @pytest.mark.parametrize("apr", ["0.0", "0.05"])
     def test_build_bot_passes_the_configured_rate(self, apr):
         import config as _config
-        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": apr})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": apr,
+                            "CARRY_EXECUTION_MODE": "acquire"})
         bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.borrow_apr == pytest.approx(float(apr))
@@ -165,10 +178,27 @@ class _Store:
 
 def _carry_bot(**env):
     import config as _config
-    base = {"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0"}
+    base = {"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
+            "CARRY_EXECUTION_MODE": "acquire"}
     base.update(env)
+    def _request(method, endpoint, **kw):
+        # 0036: the engine prices its own exit before it decides, so the fake
+        # venue answers the fee table and the lot rules.
+        if endpoint == "/v5/account/fee-rate":
+            return {"list": [{"makerFeeRate": "0.0002",
+                              "takerFeeRate": "0.00055"}]}
+        if endpoint == "/v5/market/instruments-info":
+            return {"list": [{"lotSizeFilter": {
+                "qtyStep": "0.000001", "minOrderQty": "0.000001",
+                "basePrecision": "0.000001", "minOrderAmt": "5",
+                "minNotionalValue": "5"}}]}
+        if endpoint == "/v5/account/wallet-balance":
+            return {"list": [{"coin": [{"coin": "BTC", "walletBalance": "5",
+                                        "locked": "0"}]}]}
+        return {"orderLinkId": "x"}
+
     client = mock.Mock()
-    client._request = mock.Mock(return_value={"orderLinkId": "x"})
+    client._request = mock.Mock(side_effect=_request)
     bot = _main.build_bot(config=_config.load(base), store=_Store(),
                           client=client, risk_manager=mock.Mock(),
                           engine=mock.Mock())

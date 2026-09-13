@@ -44,6 +44,15 @@ class FakeClient:
         if endpoint == "/v5/order/realtime":
             return {"list": [{"cumExecQty": "0.5", "avgPrice": str(self.mark),
                               "orderLinkId": params.get("orderLinkId")}]}
+        if endpoint == "/v5/account/fee-rate":
+            # 0036: the round trip comes from the account's own fee tier.
+            return {"list": [{"makerFeeRate": "0.0002",
+                              "takerFeeRate": "0.00055"}]}
+        if endpoint == "/v5/market/instruments-info":
+            return {"list": [{"lotSizeFilter": {
+                "qtyStep": "0.000001", "minOrderQty": "0.000001",
+                "basePrecision": "0.000001", "minOrderAmt": "5",
+                "minNotionalValue": "5"}}]}
         if endpoint == "/v5/market/tickers":
             return {"list": [{"markPrice": str(self.mark),
                               "lastPrice": str(self.mark),
@@ -249,7 +258,7 @@ class TestItDrivesTheEngine:
         # 0033: borrow is required, and no first leg leaves without the pair
         # gate and one snapshot of the marks the decision is made on.
         eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0,
-                          borrow_apr=0.05)
+                          borrow_apr=0.05, execution_mode="acquire")
         eng.pair_risk = CarryRisk(max_notional_usd=100_000.0)
         eng.snapshot = MarketSnapshot(perp_mark=100_000.0, spot_mark=100_000.0,
                                       funding_bps=3.0, margin_multiple=5.0,

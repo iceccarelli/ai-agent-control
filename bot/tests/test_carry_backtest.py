@@ -661,3 +661,67 @@ class TestTheLedgerIsReachableFromTheCli:
         out = subprocess.run([sys.executable, "-c", code], cwd=str(tmp_path),
                              capture_output=True, text=True, timeout=60)
         assert out.stdout.strip().endswith("True"), out.stderr
+
+
+# ---------------------------------------------------------------------------
+# 0036 — the overlay never trades the client's spot
+# ---------------------------------------------------------------------------
+
+class TestTheOverlayModeCostsLess:
+    @pytest.fixture(scope="class")
+    def pair(self):
+        common = dict(venue="bybit", notional=100_000.0, borrow_apr=0.0)
+        return (cb.simulate_settlement(REPO, mode=cb.ACQUIRE, **common),
+                cb.simulate_settlement(REPO, mode=cb.OVERLAY, **common))
+
+    def test_the_mode_and_its_round_trip_are_reported(self, pair):
+        acquire, overlay = pair
+        assert acquire["execution_mode"] == "acquire"
+        assert overlay["execution_mode"] == "overlay"
+        assert acquire["round_trip_bps"] == pytest.approx(31.0)
+        assert overlay["round_trip_bps"] == pytest.approx(11.0)
+
+    def test_the_overlay_pays_only_the_perp_legs(self, pair):
+        acquire, overlay = pair
+        ratio = overlay["attribution"]["fees_usd"] / \
+            acquire["attribution"]["fees_usd"]
+        # 11 bps of perp legs out of a 31 bps round trip; the spot and perp
+        # prices differ by the basis, so this is not exact to the last digit.
+        assert ratio == pytest.approx(11.0 / 31.0, rel=1e-3)
+
+    def test_same_funding_same_basis_fewer_fees(self, pair):
+        acquire, overlay = pair
+        for term in ("funding_usd", "basis_usd"):
+            assert overlay["attribution"][term] == pytest.approx(
+                acquire["attribution"][term])
+        assert overlay["net_usd"] > acquire["net_usd"]
+
+    def test_the_attribution_still_sums(self, pair):
+        for r in pair:
+            a = r["attribution"]
+            assert (a["funding_usd"] + a["basis_usd"] + a["fees_usd"]
+                    + a["borrow_usd"] + a["impact_usd"] + a["other_usd"]) == \
+                pytest.approx(a["net_usd"], abs=1e-6)
+
+    def test_it_is_still_not_quotable(self, pair):
+        for r in pair:
+            assert r["is_a_quotable_return"] is False
+
+    def test_the_gate_sees_the_mode_s_round_trip(self):
+        """A gate charging 31 bps to a book that pays 11 refuses entries that
+        pay for themselves. Same data, same constants, different execution."""
+        common = dict(venue="bybit", notional=100_000.0, borrow_apr=0.05,
+                      gated=True)
+        assert cb.simulate_settlement(REPO, mode=cb.OVERLAY, **common)["trades"] \
+            > cb.simulate_settlement(REPO, mode=cb.ACQUIRE, **common)["trades"]
+
+    def test_the_cli_runs_both_modes(self, capsys):
+        assert cb.main(["--repo", REPO, "--clock", "8h", "--mode",
+                        "overlay"]) == 0
+        out = capsys.readouterr().out
+        assert "OVERLAY" in out and "round trip 11.0 bps" in out
+
+    def test_the_daily_clock_takes_the_mode_too(self):
+        r = cb.simulate(REPO, mode=cb.OVERLAY, borrow_apr=0.0)
+        assert r["execution_mode"] == "overlay"
+        assert r["round_trip_bps"] == pytest.approx(11.0)

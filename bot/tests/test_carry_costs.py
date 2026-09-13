@@ -31,13 +31,13 @@ def at_basis(bps: float):
 class TestTheCaseThatMustRefuse:
     def test_thin_funding_into_a_wide_basis_is_refused(self):
         """+0.6 bps funding, +30 bps basis. Named explicitly in the spec."""
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.6, 0.6, 0.6],
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[0.6, 0.6, 0.6],
                               **at_basis(30.0))
         assert v.allowed is False
         assert bool(v) is False
 
     def test_the_refusal_names_the_binding_constraint(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.6, 0.6, 0.6],
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[0.6, 0.6, 0.6],
                               **at_basis(30.0))
         assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
         assert v.net_edge_bps_per_day < 0
@@ -45,18 +45,18 @@ class TestTheCaseThatMustRefuse:
 
 class TestGateOneBasis:
     def test_a_basis_beyond_the_budget_is_refused(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(150.0))
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(150.0))
         assert v.allowed is False
         assert v.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
 
     def test_a_basis_inside_the_budget_is_allowed(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(20.0))
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(20.0))
         assert v.allowed is True
 
     def test_the_budget_is_net_edge_not_gross_carry(self):
         """Paying basis out of money already spoken for by borrow and fees is
         how a positive-carry trade closes negative."""
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat())
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat())
         gross = v.expected_carry_bps_per_day * cc.ASSUMED_HOLD_DAYS
         assert v.basis_budget_bps < gross
 
@@ -70,7 +70,7 @@ class TestGateOneBasis:
             cc.basis_bps(100_000.0, spot)
 
     def test_an_unreadable_basis_refuses_rather_than_assuming(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[5.0] * 3, perp=100_000.0,
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[5.0] * 3, perp=100_000.0,
                               spot=float("nan"))
         assert v.allowed is False
         assert v.reason == "BASIS_UNREADABLE"
@@ -78,26 +78,26 @@ class TestGateOneBasis:
 
 class TestGateTwoCostOfCapital:
     def test_carry_below_borrow_plus_fees_is_refused(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.3] * 3, **flat())
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[0.3] * 3, **flat())
         assert v.allowed is False
         assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
 
     def test_a_higher_borrow_rate_shrinks_the_edge(self):
-        cheap = cc.evaluate_entry(funding_prints_bps=[1.2] * 3, **flat(),
+        cheap = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, funding_prints_bps=[1.2] * 3, **flat(),
                                   borrow_apr=0.0)
-        dear = cc.evaluate_entry(funding_prints_bps=[1.2] * 3, **flat(),
+        dear = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, funding_prints_bps=[1.2] * 3, **flat(),
                                  borrow_apr=0.08)
         assert cheap.net_edge_bps_per_day > dear.net_edge_bps_per_day
 
     def test_an_absurd_borrow_rate_kills_any_entry(self):
-        v = cc.evaluate_entry(funding_prints_bps=[2.0] * 3, **flat(),
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, funding_prints_bps=[2.0] * 3, **flat(),
                               borrow_apr=1.0)
         assert v.allowed is False
 
     def test_the_round_trip_is_amortised_over_the_hold(self):
-        short = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat(),
+        short = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat(),
                                   hold_days=7.0)
-        long = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat(),
+        long = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **flat(),
                                  hold_days=90.0)
         assert (short.amortised_round_trip_bps_per_day
                 > long.amortised_round_trip_bps_per_day)
@@ -105,7 +105,7 @@ class TestGateTwoCostOfCapital:
     def test_a_seven_day_hold_cannot_pay_for_its_own_entry(self):
         """At threshold carry the round trip alone exceeds the income. This is
         why ASSUMED_HOLD_DAYS is load-bearing rather than cosmetic."""
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.2] * 3, **flat(),
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[0.2] * 3, **flat(),
                               hold_days=7.0)
         assert v.amortised_round_trip_bps_per_day > \
             v.expected_carry_bps_per_day
@@ -114,7 +114,7 @@ class TestGateTwoCostOfCapital:
 
 class TestGateThreeEwma:
     def test_too_few_prints_refuses(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[5.0], **flat())
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[5.0], **flat())
         assert v.allowed is False
         assert v.reason == "INSUFFICIENT_FUNDING_HISTORY"
 
@@ -133,7 +133,7 @@ class TestGateThreeEwma:
         assert cc.ewma_funding_bps([5.0, 5.0, 5.0, 0.0]) < 5.0
 
     def test_negative_smoothed_funding_refuses(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[-1.0] * 3, **flat())
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[-1.0] * 3, **flat())
         assert v.allowed is False
         assert v.reason == "FUNDING_NOT_POSITIVE"
 
@@ -146,11 +146,11 @@ class TestTheGatesAreOrderedByBindingConstraint:
     def test_cost_of_capital_is_reported_before_basis(self):
         """A refusal must name the binding constraint, not whichever check
         happened to run first."""
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[0.3] * 3, **at_basis(500.0))
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[0.3] * 3, **at_basis(500.0))
         assert v.reason == "CARRY_BELOW_COST_OF_CAPITAL"
 
     def test_basis_is_reported_when_the_economics_are_otherwise_fine(self):
-        v = cc.evaluate_entry(borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(500.0))
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(500.0))
         assert v.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
 
 
@@ -166,7 +166,7 @@ class TestItDecidesNothingElse:
     def test_the_verdict_is_pure(self):
         """Same inputs, same answer. A risk rule with state cannot be trusted."""
         kw = dict(funding_prints_bps=[1.5] * 3, **flat())
-        assert cc.evaluate_entry(borrow_apr=0.05, **kw) == cc.evaluate_entry(borrow_apr=0.05, **kw)
+        assert cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, **kw) == cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, **kw)
 
     def test_borrow_is_explicit_at_the_declaration(self):
         """+1.77% financed vs +7.96% unfinanced is the difference between a

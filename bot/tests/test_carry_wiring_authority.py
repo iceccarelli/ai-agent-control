@@ -59,7 +59,8 @@ class _Store:
 def _build(mode="carry", store=None):
     # 0033: CARRY_BORROW_APR is required for a carry book (no default).
     return _main.build_bot(config=_config.load({"BOOK_MODE": mode,
-                                                "CARRY_BORROW_APR": "0.05"}),
+                                                "CARRY_BORROW_APR": "0.05",
+                                                "CARRY_EXECUTION_MODE": "acquire"}),
                            store=store or _Store(), client=mock.Mock(),
                            risk_manager=mock.Mock(), engine=mock.Mock())
 
@@ -165,7 +166,8 @@ class TestSymbolsComeFromConfigNotADefault:
 
     def test_a_configured_symbol_reaches_the_book(self):
         cfg = _config.load({"BOOK_MODE": "carry", "CARRY_PERP_SYMBOL": "ETHUSDT",
-                            "CARRY_BORROW_APR": "0.05"})
+                            "CARRY_BORROW_APR": "0.05",
+                            "CARRY_EXECUTION_MODE": "acquire"})
         bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.perp_symbol == "ETHUSDT"

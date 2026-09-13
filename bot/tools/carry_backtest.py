@@ -99,6 +99,20 @@ ENTRY_FUNDING_BPS = 0.2      # do not open below this 8h rate
 NEGATIVE_EXIT_PRINTS = 3     # consecutive negative prints before unwinding
 FUNDING_PERIODS_PER_DAY = 3
 
+#: How the long side is held (0036), mirroring carry_engine.
+#:   acquire  buy the spot leg and sell it again: four legs, plus financing
+#:   overlay  the client already owns the BTC: two legs, no financing
+#: The engine reads its fee tier from the venue; offline, these are the
+#: declared taker constants above.
+ACQUIRE = "acquire"
+OVERLAY = "overlay"
+
+
+def round_trip_bps_for(mode: str) -> float:
+    if mode == OVERLAY:
+        return 2 * TAKER_BPS_PERP
+    return 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP
+
 
 # DATA-READ LEDGER (slice 78). This tool reads price and funding corpora
 # directly rather than through market_data.load_corpus, so the observer hook
@@ -382,7 +396,7 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
                     notional: float = 100_000.0,
                     entry_bps: float = ENTRY_FUNDING_BPS,
                     borrow_apr: float = BORROW_APR,
-                    gated: bool = False) -> Dict[str, Any]:
+                    gated: bool = False, mode: str = ACQUIRE) -> Dict[str, Any]:
     """The daily simulation on in-memory series. `simulate()` loads and calls
     this; tests call it on synthetic series to prove the hedge cancels."""
     days = sorted(set(perp) & set(spot))
@@ -433,7 +447,8 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
             history.append(last_bps)
             verdict = _carry_costs().evaluate_entry(
                 funding_prints_bps=history[-8:], perp=p, spot=s,
-                borrow_apr=borrow_apr)
+                borrow_apr=borrow_apr,
+                round_trip_bps=round_trip_bps_for(mode))
             may_open = bool(verdict)
             if not may_open:
                 refusals[verdict.reason] = refusals.get(verdict.reason, 0) + 1
@@ -485,7 +500,8 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
         "net_return_pct": 100.0 * a["net_usd"] / notional,
         "net_annualised_pct": (100.0 * a["net_usd"] / notional) / years,
         "naive_funding_sum_pct_per_yr": naive / years,
-        "round_trip_bps": 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP,
+        "execution_mode": mode,
+        "round_trip_bps": round_trip_bps_for(mode),
         "borrow_apr": borrow_apr,
         "mean_entry_basis_bps": statistics.mean(
             t.entry_basis_bps for t in trades) if trades else 0.0,
@@ -512,7 +528,7 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
 def simulate(repo: str, *, notional: float = 100_000.0,
              entry_bps: float = ENTRY_FUNDING_BPS,
              borrow_apr: float = BORROW_APR,
-             gated: bool = False) -> Dict[str, Any]:
+             gated: bool = False, mode: str = ACQUIRE) -> Dict[str, Any]:
     """Daily-close simulation over the committed Binance corpora.
 
     `gated=True` routes every entry through carry_costs.evaluate_entry — the
@@ -543,7 +559,7 @@ def simulate(repo: str, *, notional: float = 100_000.0,
 
     r = simulate_series(perp=perp, spot=spot, ftimes=ftimes, frates=frates,
                         notional=notional, entry_bps=entry_bps,
-                        borrow_apr=borrow_apr, gated=gated)
+                        borrow_apr=borrow_apr, gated=gated, mode=mode)
     _record("BINANCE_LINEAR_BTC_USDT_1D", _iso_day(min(perp)),
             _iso_day(max(perp)), "daily carry backtest (perp leg)")
     _record("BINANCE_SPOT_BTC_USDT_1D", _iso_day(min(spot)),
@@ -777,7 +793,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
                                 entry_bps: float = ENTRY_FUNDING_BPS,
                                 borrow_apr: float = BORROW_APR,
                                 gated: bool = False,
-                                impact_bps: float = 0.0) -> Dict[str, Any]:
+                                impact_bps: float = 0.0,
+                                mode: str = ACQUIRE) -> Dict[str, Any]:
     """One step per funding print. The rules are the engine's, in its units:
     a print is a print (not a day, not a tick), three consecutive negative
     PRINTS exit, and the EWMA sees the last eight PRINTS."""
@@ -788,9 +805,13 @@ def simulate_settlements_series(rows: List[Settlement], *,
     refusals: Dict[str, int] = {}
     per_print_borrow = borrow_apr / (365.0 * FUNDING_PERIODS_PER_DAY)
 
+    #: OVERLAY never trades the client's spot: one leg in, one leg out.
+    spot_legs = 0.0 if mode == OVERLAY else 1.0
+
     def charge(t: Trade, s: float, p: float) -> None:
-        t.fees += t.qty * (s * TAKER_BPS_SPOT + p * TAKER_BPS_PERP) / 1e4
-        t.impact += t.qty * (s + p) * impact_bps / 1e4
+        t.fees += t.qty * (spot_legs * s * TAKER_BPS_SPOT
+                           + p * TAKER_BPS_PERP) / 1e4
+        t.impact += t.qty * (spot_legs * s + p) * impact_bps / 1e4
 
     for st in rows:
         r_bps = st.rate * 1e4
@@ -815,7 +836,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
         if gated:
             verdict = _carry_costs().evaluate_entry(
                 funding_prints_bps=history[-8:], perp=st.perp, spot=st.spot,
-                borrow_apr=borrow_apr)
+                borrow_apr=borrow_apr,
+                round_trip_bps=round_trip_bps_for(mode))
             may_open = bool(verdict)
             if not may_open:
                 refusals[verdict.reason] = refusals.get(verdict.reason, 0) + 1
@@ -863,6 +885,7 @@ def simulate_settlements_series(rows: List[Settlement], *,
         "net_annualised_pct": (100.0 * a["net_usd"] / notional) / years,
         "naive_funding_sum_pct_per_yr": 100.0 * sum(s.rate for s in rows) / years,
         "borrow_apr": borrow_apr, "impact_bps_per_leg": impact_bps,
+        "execution_mode": mode, "round_trip_bps": round_trip_bps_for(mode),
         "mean_entry_basis_bps": statistics.mean(
             t.entry_basis_bps for t in trades) if trades else 0.0,
         "mean_exit_basis_bps": statistics.mean(
@@ -897,7 +920,8 @@ def simulate_settlement(repo: str, *, venue: str = "bybit",
                         notional: float = 100_000.0,
                         entry_bps: float = ENTRY_FUNDING_BPS,
                         borrow_apr: float = BORROW_APR, gated: bool = False,
-                        impact: bool = True) -> Dict[str, Any]:
+                        impact: bool = True,
+                        mode: str = ACQUIRE) -> Dict[str, Any]:
     """The settlement-clock run. Same venue; prices at 00/08/16 UTC."""
     if venue == "bybit":
         rows, meta = load_bybit_settlements(repo)
@@ -910,7 +934,7 @@ def simulate_settlement(repo: str, *, venue: str = "bybit",
                    else (0.0, {"note": "impact NOT applied (--no-impact)"}))
     r = simulate_settlements_series(rows, notional=notional,
                                     entry_bps=entry_bps, borrow_apr=borrow_apr,
-                                    gated=gated, impact_bps=bps)
+                                    gated=gated, impact_bps=bps, mode=mode)
     r.update(quotability(same_venue=meta["same_venue"], settlement_clock=True,
                          impact_applied=impact, gated=gated))
     r.update({"venue": venue, "spot_source": meta["label"],
@@ -1117,6 +1141,11 @@ def main(argv=None) -> int:
                              "impact condition then reads unmet)")
     parser.add_argument("--stress", action="store_true",
                         help="8h clock only: print the named stress windows")
+    parser.add_argument("--mode", choices=(ACQUIRE, OVERLAY), default=ACQUIRE,
+                        help="acquire = buy the spot leg and sell it again; "
+                             "overlay = the client already owns the BTC, so "
+                             "only the perp is traded (no spot round trip, no "
+                             "borrow)")
     parser.add_argument("--out", default="")
     args = parser.parse_args(argv)
 
@@ -1191,8 +1220,11 @@ def _main_settlement(args) -> int:
         print("BORROW x GATE MATRIX — net %/yr  (clock: settlement 00/08/16 UTC)")
         print("=" * 74)
         head = simulate_settlement(args.repo, venue=args.venue,
-                                   notional=args.notional, impact=impact)
+                                   notional=args.notional, impact=impact,
+                                   mode=args.mode)
         print(f"  source     : {head['spot_source']}")
+        print(f"  execution  : {head['execution_mode'].upper()}"
+              f"   round trip {head['round_trip_bps']:.1f} bps")
         print(f"  window     : {head['window']}")
         print(f"  impact     : {head['impact_bps_per_leg']:.2f} bps/leg"
               f"   quotable: {head['is_a_quotable_return']}\n")
@@ -1200,10 +1232,10 @@ def _main_settlement(args) -> int:
         for apr in (0.0, 0.03, 0.05, 0.08):
             u = simulate_settlement(args.repo, venue=args.venue,
                                     notional=args.notional, borrow_apr=apr,
-                                    impact=impact)
+                                    impact=impact, mode=args.mode)
             g = simulate_settlement(args.repo, venue=args.venue,
                                     notional=args.notional, borrow_apr=apr,
-                                    gated=True, impact=impact)
+                                    gated=True, impact=impact, mode=args.mode)
             print(f"  {apr*100:7.1f}% "
                   f"{u['net_annualised_pct']:+8.2f}%/yr n={u['trades']:<3d} "
                   f"{g['net_annualised_pct']:+8.2f}%/yr n={g['trades']:<3d}")
@@ -1214,7 +1246,7 @@ def _main_settlement(args) -> int:
     r = simulate_settlement(args.repo, venue=args.venue,
                             notional=args.notional, entry_bps=args.entry_bps,
                             borrow_apr=args.borrow_apr, gated=args.gated,
-                            impact=impact)
+                            impact=impact, mode=args.mode)
     print("=" * 74)
     print("CARRY BACKTEST — two legs, every cost  "
           "(clock: settlement 00/08/16 UTC)")
@@ -1225,6 +1257,10 @@ def _main_settlement(args) -> int:
     print(f"  notional          ${r['notional_usd']:,.0f}   borrow "
           f"{r['borrow_apr']*100:.1f}%/yr   rule "
           f"{'GATED (in-sample)' if r['gated'] else 'UNGATED'}")
+    print(f"  execution         {r['execution_mode'].upper()}"
+          f"   round trip {r['round_trip_bps']:.1f} bps"
+          + ("   (the client's BTC is never bought or sold)"
+             if r["execution_mode"] == OVERLAY else ""))
     if impact:
         d = r["impact_detail"]
         print(f"  impact haircut    {r['impact_bps_per_leg']:.3f} bps/leg = "

@@ -173,6 +173,24 @@ def parse_optional_fraction(env: Mapping[str, str], name: str) -> Optional[float
     return value
 
 
+#: The two execution modes, spelled once. carry_engine owns the behaviour;
+#: this is only the parser, so config keeps importing nothing from the book.
+CARRY_EXECUTION_MODES = ("acquire", "overlay")
+
+
+def parse_execution_mode(env: Mapping[str, str]) -> Optional[str]:
+    raw = env.get("CARRY_EXECUTION_MODE")
+    if raw is None or str(raw).strip() == "":
+        return None
+    value = str(raw).strip().lower()
+    if value not in CARRY_EXECUTION_MODES:
+        raise ConfigError(
+            f"CARRY_EXECUTION_MODE={raw!r} is not one of "
+            f"{CARRY_EXECUTION_MODES}. Refusing rather than guessing: the two "
+            "modes place different orders.")
+    return value
+
+
 def parse_int(
     env: Mapping[str, str], name: str, default: int,
     *, low: int = -(2**31), high: int = 2**31,
@@ -383,6 +401,11 @@ class Config:
     #: decides whether the trade clears its cost of capital (PHASE1_DECISION).
     #: None here means "not set"; build_bot refuses a carry book on None.
     CARRY_BORROW_APR: Optional[float] = None
+    #: How the long side is held: "overlay" (the client's own BTC, never
+    #: bought or sold by the book) or "acquire" (the book buys spot and sells
+    #: it again). REQUIRED for BOOK_MODE=carry, with no default, because the
+    #: two modes send different orders. None means "not set".
+    CARRY_EXECUTION_MODE: Optional[str] = None
 
     # -- derived cost fractions --------------------------------------------
 
@@ -764,6 +787,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_SPOT_SYMBOL=parse_str(env, "CARRY_SPOT_SYMBOL", "BTCUSDT"),
         CARRY_PERP_SYMBOL=parse_str(env, "CARRY_PERP_SYMBOL", "BTCUSDT"),
         CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
+        CARRY_EXECUTION_MODE=parse_execution_mode(env),
         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
         # Default True so an existing deployment behaves exactly as before.
         # parse_bool maps every unrecognised value to False, so a typo or a

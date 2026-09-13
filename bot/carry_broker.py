@@ -126,6 +126,12 @@ class CarryBroker:
         self.client = client
         self.sequence_source = sequence_source
         self.order_gate = order_gate
+        #: Venue rules and the account's own fee tier, fetched once per
+        #: process. They are facts about the venue and the account, not
+        #: decisions, and they change on a timescale of weeks — but they are
+        #: NEVER guessed: an unreadable rule raises and the engine refuses.
+        self._lot_rules: Dict[Tuple[str, str], Dict[str, float]] = {}
+        self._fee_rates: Dict[Tuple[str, str], Dict[str, float]] = {}
         self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
         if link_id_builder is None:
             from bybit_connection import build_order_link_id
@@ -274,6 +280,119 @@ class CarryBroker:
         if not math.isfinite(rate):
             raise PairIncident(f"funding for {symbol} is {raw!r}")
         return rate * 1e4
+
+    def get_lot_rules(self, symbol: str, product: str) -> Dict[str, float]:
+        """`{qty_step, min_qty, min_notional}` — what the VENUE will accept.
+
+        Linear BTCUSDT has qtyStep 0.001 and minOrderQty 0.001. The engine
+        sized a $100 book at `cap / mark` — 0.00127 BTC at $79k — which is not
+        a multiple of the step, so the perp leg would have been REJECTED on the
+        first live order and the book would have bought and sold spot for
+        nothing (INVENTORY F5). Spot publishes the same three numbers under
+        different names, so both are normalised here.
+
+        Raises rather than guessing: a size the venue will not accept is not a
+        smaller size, it is a rejected order.
+        """
+        key = (symbol, product)
+        if key in self._lot_rules:
+            return dict(self._lot_rules[key])
+        result = self.client._request(
+            "GET", "/v5/market/instruments-info",
+            params={"category": product, "symbol": symbol})
+        rows = (result or {}).get("list") or []
+        if not rows:
+            raise PairIncident(
+                f"no instrument rules for {symbol} on {product}")
+        lot = (rows[0] or {}).get("lotSizeFilter") or {}
+        try:
+            if product == SPOT:
+                rules = {"qty_step": float(lot["basePrecision"]),
+                         "min_qty": float(lot["minOrderQty"]),
+                         "min_notional": float(lot["minOrderAmt"])}
+            else:
+                rules = {"qty_step": float(lot["qtyStep"]),
+                         "min_qty": float(lot["minOrderQty"]),
+                         "min_notional": float(lot.get("minNotionalValue", 0)
+                                                or 0)}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"instrument rules for {symbol}/{product} are malformed: "
+                f"{lot!r}") from exc
+        if rules["qty_step"] <= 0 or rules["min_qty"] <= 0:
+            raise PairIncident(
+                f"instrument rules for {symbol}/{product} are unusable: {rules}")
+        self._lot_rules[key] = dict(rules)
+        return dict(rules)
+
+    def get_fee_rates(self, symbol: str, product: str) -> Dict[str, float]:
+        """`{maker_bps, taker_bps}` for THIS account, from the venue.
+
+        The round trip is the single biggest cost in this book — 0032 measured
+        $27,232 of fees against $39,411 of funding — and it is account
+        specific: a VIP tier, a referral, a maker rebate all move it. A
+        constant in the source would be a cost model that quietly disagrees
+        with the invoice. Raises when unreadable; the engine refuses to open
+        on a cost it cannot price.
+        """
+        key = (symbol, product)
+        if key in self._fee_rates:
+            return dict(self._fee_rates[key])
+        result = self.client._request(
+            "GET", "/v5/account/fee-rate", signed=True,
+            params={"category": product, "symbol": symbol})
+        rows = (result or {}).get("list") or []
+        if not rows:
+            raise PairIncident(f"no fee rate for {symbol} on {product}")
+        row = rows[0]
+        try:
+            rates = {"maker_bps": float(row["makerFeeRate"]) * 1e4,
+                     "taker_bps": float(row["takerFeeRate"]) * 1e4}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"fee rate for {symbol}/{product} is malformed: {row!r}"
+            ) from exc
+        if not all(math.isfinite(v) and v >= 0 for v in rates.values()):
+            raise PairIncident(
+                f"fee rate for {symbol}/{product} is unusable: {rates}")
+        self._fee_rates[key] = dict(rates)
+        return dict(rates)
+
+    def get_spot_inventory(self, symbol: str) -> float:
+        """Base coin the account holds and can hedge, in base units.
+
+        `walletBalance - locked`: the locked part is already committed to open
+        spot orders and is not yours to hedge. Deliberately NOT
+        availableToWithdraw — under a unified account that field goes to zero
+        when the coin is posted as collateral, which is exactly the state an
+        overlay client is in.
+
+        Raises when the wallet cannot be read. Reporting zero would look
+        identical to "the client holds nothing", and the book would stand
+        aside forever without saying why.
+        """
+        coin = symbol[:-4] if symbol.upper().endswith("USDT") else symbol
+        result = self.client._request(
+            "GET", "/v5/account/wallet-balance", signed=True,
+            params={"accountType": "UNIFIED", "coin": coin})
+        rows = (result or {}).get("list") or []
+        coins = (rows[0].get("coin") if rows else None) or []
+        for entry in coins:
+            if str(entry.get("coin", "")).upper() != coin.upper():
+                continue
+            try:
+                balance = float(entry.get("walletBalance", 0) or 0)
+                locked = float(entry.get("locked", 0) or 0)
+            except (TypeError, ValueError) as exc:
+                raise PairIncident(
+                    f"wallet row for {coin} is malformed: {entry!r}") from exc
+            free = balance - locked
+            if not math.isfinite(free):
+                raise PairIncident(f"inventory for {coin} is {free!r}")
+            return max(0.0, free)
+        raise PairIncident(
+            f"no wallet row for {coin}; inventory unknown (an unreadable "
+            "inventory is not an empty one)")
 
     def get_funding_print(self, symbol: str) -> Tuple[float, int]:
         """The last SETTLED funding print: (rate in bps, settlement epoch ms).

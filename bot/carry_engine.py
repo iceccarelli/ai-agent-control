@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import logging
 import math
+from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
@@ -87,6 +88,43 @@ MIN_MARGIN_MULTIPLE = 2.0
 #: annualised gross is ~2.2%, which does not clear the 31 bps entry cost inside
 #: a reasonable hold. Below it, hold cash.
 MIN_ENTRY_FUNDING_BPS = 0.2
+
+#: The two ways this book can hold the long side (0036).
+#:
+#: ACQUIRE  the book BUYS the spot leg and sells it again on exit. Two extra
+#:          legs per round trip, plus financing on the borrowed dollars.
+#: OVERLAY  the client already owns the BTC. The book shorts the perp against
+#:          inventory it never buys and never sells. Same funding, same basis,
+#:          none of the spot round trip and none of the borrow.
+#:
+#: PHASE1_DECISION chose OVERLAY as the product on 2026-09-08. The engine went
+#: on buying spot anyway, and 0032 measured what that costs on the settlement
+#: clock: $27,232 of fees against $39,411 of funding, -2.99%/yr at 5%
+#: financing. The mode is now an explicit, required decision — there is no
+#: default, because the two modes send different orders.
+ACQUIRE = "acquire"
+OVERLAY = "overlay"
+EXECUTION_MODES = (ACQUIRE, OVERLAY)
+
+#: Quantity differences below this fraction of a leg are venue rounding.
+QTY_DUST = 1e-9
+
+
+def snap_to_lot(qty: float, step: float) -> float:
+    """Round DOWN to the venue's quantity step. Exact, not floating point.
+
+    Bybit linear BTCUSDT has qtyStep 0.001: 0.00127 is not an order, it is a
+    rejection. Rounding UP would breach the cap, so it rounds down and the
+    caller refuses when what is left is below the minimum.
+    """
+    if step <= 0:
+        return float(qty)
+    try:
+        lots = Decimal(str(qty)) // Decimal(str(step))
+        return float(lots * Decimal(str(step)))
+    except (InvalidOperation, ValueError):
+        return 0.0
+
 
 #: Unwind when funding has been negative this many consecutive prints. Negative
 #: funding means the trade has inverted: you are now PAYING to hold the hedge.
@@ -203,10 +241,18 @@ class CarryEngine:
                  delta_band: float = DELTA_BAND,
                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
                  min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
-                 borrow_apr: float) -> None:
+                 borrow_apr: float, execution_mode: str) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
+        if execution_mode not in EXECUTION_MODES:
+            raise ValueError(
+                f"{execution_mode!r} is not an execution mode "
+                f"{EXECUTION_MODES}. Refusing rather than defaulting: the two "
+                "modes send different orders, and guessing means either "
+                "buying spot the client already owns or shorting against "
+                "inventory that is not there.")
+        self.execution_mode = execution_mode
         self.broker = broker
         self.kill_switch = kill_switch
         self.spot_symbol = spot_symbol
@@ -233,6 +279,25 @@ class CarryEngine:
         #: The last exception a leg raised, so a refusal can name it. A leg
         #: that fails for a reason nobody can read is a leg that fails again.
         self._last_leg_error: str = ""
+
+    def round_trip_bps(self) -> float:
+        """What a full cycle costs THIS account at THIS venue, in bps.
+
+        Read from the venue's fee table, never from a constant: the number is
+        account specific and it is the largest cost in the book. OVERLAY pays
+        two perp legs; ACQUIRE pays those plus the spot round trip.
+
+        Raises when the venue will not say. The cost gate then refuses, which
+        is the only honest move — a book that cannot price its own exit has no
+        business opening.
+        """
+        perp = float(self.broker.get_fee_rates(self.perp_symbol,
+                                               "linear")["taker_bps"])
+        if self.execution_mode == OVERLAY:
+            return 2.0 * perp
+        spot = float(self.broker.get_fee_rates(self.spot_symbol,
+                                               "spot")["taker_bps"])
+        return 2.0 * (spot + perp)
 
     # -- the loop ---------------------------------------------------------
 
@@ -329,9 +394,21 @@ class CarryEngine:
                 detail={"note": "cannot price the basis without a spot mark; "
                                 "an unknown basis is not a small one"})
 
+        try:
+            round_trip = self.round_trip_bps()
+        except Exception as exc:  # noqa: BLE001 - an unpriced exit is a refusal
+            return CarryDecision(
+                "stand_aside", reason="FEE_RATES_UNREADABLE",
+                state=BookState.FLAT,
+                detail={"error": f"{type(exc).__name__}: {exc}",
+                        "note": "the venue would not say what this account "
+                                "pays; the round trip is the biggest cost in "
+                                "the book and is never assumed"})
+
         verdict = _costs().evaluate_entry(
             funding_prints_bps=self._funding_history,
-            perp=mark, spot=spot, borrow_apr=self.borrow_apr)
+            perp=mark, spot=spot, borrow_apr=self.borrow_apr,
+            round_trip_bps=round_trip)
         if not verdict:
             return CarryDecision(
                 "stand_aside", reason=verdict.reason, state=BookState.FLAT,
@@ -375,9 +452,61 @@ class CarryEngine:
                         "note": "the gate must judge the observation the "
                                 "entry was decided on, not a different one"})
 
-        qty = self.max_notional_usd / mark
-        if qty <= 0 or not self._finite(qty):
+        # THE VENUE'S RULES (0036, INVENTORY F5). `cap / mark` is 0.00127 BTC
+        # at $79k and Bybit's linear step is 0.001: that order is a rejection,
+        # not a small position. Rules are read from the venue and never
+        # assumed.
+        try:
+            rules = self.broker.get_lot_rules(self.perp_symbol, "linear")
+        except Exception as exc:  # noqa: BLE001
+            return CarryDecision(
+                "stand_aside", reason="VENUE_RULES_UNREADABLE",
+                state=BookState.FLAT,
+                detail={"error": f"{type(exc).__name__}: {exc}"})
+
+        wanted = self.max_notional_usd / mark
+        if wanted <= 0 or not self._finite(wanted):
             return self._halt("SIZE_INVALID", "refusing an unsizable book")
+
+        inventory = None
+        if self.execution_mode == OVERLAY:
+            # THE CLIENT'S BTC. The book hedges a SLICE of it and never buys
+            # or sells any. The rest of the stack is the client's exposure,
+            # not the book's, and is deliberately not hedged here.
+            try:
+                inventory = float(
+                    self.broker.get_spot_inventory(self.spot_symbol))
+            except Exception as exc:  # noqa: BLE001
+                return CarryDecision(
+                    "stand_aside", reason="INVENTORY_UNREADABLE",
+                    state=BookState.FLAT,
+                    detail={"error": f"{type(exc).__name__}: {exc}",
+                            "note": "an unreadable inventory is not an empty "
+                                    "one; refusing rather than shorting "
+                                    "against BTC that may not be there"})
+            if not self._finite(inventory) or inventory <= 0:
+                return CarryDecision(
+                    "stand_aside", reason="NO_SPOT_INVENTORY",
+                    state=BookState.FLAT,
+                    detail={"inventory": inventory,
+                            "note": "the overlay hedges BTC the client already "
+                                    "owns; with none there is nothing to hedge"})
+            wanted = min(wanted, inventory)
+
+        qty = snap_to_lot(wanted, float(rules.get("qty_step", 0.0)))
+        min_qty = float(rules.get("min_qty", 0.0))
+        min_notional = float(rules.get("min_notional", 0.0))
+        if qty < min_qty or qty <= 0 or qty * mark < min_notional:
+            return CarryDecision(
+                "stand_aside", reason="SIZE_BELOW_VENUE_MINIMUM",
+                state=BookState.FLAT,
+                detail={"wanted_qty": wanted, "snapped_qty": qty,
+                        "min_qty": min_qty, "min_notional_usd": min_notional,
+                        "cap_usd": self.max_notional_usd,
+                        "inventory": inventory,
+                        "note": "the cap (or the inventory) does not reach one "
+                                "venue lot; a size the venue will not accept "
+                                "is a rejected order, not a smaller book"})
 
         margin = self._margin_multiple()
         if margin is not None and margin < self.min_margin_multiple:
@@ -397,6 +526,10 @@ class CarryEngine:
 
         self.state = BookState.OPENING
         self._last_leg_error = ""
+        if self.execution_mode == OVERLAY:
+            return self._open_overlay(qty, float(inventory), mark, spot_mark,
+                                      funding_bps, timestamp_ms, rules)
+
         spot = self._fire(self.spot_symbol, "Buy", qty, "spot")
         if spot is None or spot.filled_qty <= 0:
             self.state = BookState.FLAT
@@ -431,6 +564,66 @@ class CarryEngine:
             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
                     "perp_price": perp.avg_price, "delta_fraction": residual,
                     "funding_bps": funding_bps})
+
+    def _open_overlay(self, qty: float, inventory: float, mark: float,
+                      spot_mark: float, funding_bps: float, timestamp_ms: int,
+                      rules: Dict[str, Any]) -> CarryDecision:
+        """Short the perp against BTC the client already holds. One order.
+
+        "Both legs land or neither" is about never being naked. Here the long
+        side was the client's before this book existed, so there is no naked
+        spot to create: a perp that does not fill leaves the client exactly as
+        they were, and a perp that PARTIALLY fills is a smaller hedged slice,
+        which is a correct hedge of less inventory rather than an incident.
+
+        The one thing that IS naked in this mode is shorting MORE than the
+        inventory, and that is bought back immediately or the book halts.
+        """
+        perp = self._fire(self.perp_symbol, "Sell", qty, "linear")
+        if perp is None or perp.filled_qty <= 0:
+            self.state = BookState.FLAT
+            # Nothing was bought and nothing was sold: no round trip was paid,
+            # so the day's allowance is untouched.
+            return CarryDecision("refused", reason="PERP_LEG_DID_NOT_FILL",
+                                 state=BookState.FLAT,
+                                 detail={"error": self._last_leg_error})
+
+        if perp.filled_qty > inventory + QTY_DUST:
+            excess = snap_to_lot(perp.filled_qty - inventory,
+                                 float(rules.get("qty_step", 0.0)))
+            closed = (self._fire(self.perp_symbol, "Buy", excess, "linear")
+                      if excess > 0 else None)
+            if closed is None or closed.filled_qty <= 0:
+                return self._halt(
+                    "OVERSOLD_BEYOND_INVENTORY",
+                    f"short {perp.filled_qty} against {inventory} of "
+                    "inventory and the excess did not close; the book is "
+                    "naked SHORT")
+            perp.filled_qty -= closed.filled_qty
+            perp.requested_qty = perp.filled_qty
+
+        hedged = perp.filled_qty
+        # The inventory slice this hedge covers. No order was placed for it and
+        # none ever will be: order_link_id says INVENTORY so no reader mistakes
+        # it for a fill, and the fee is None rather than 0.0 because there is
+        # no fee to know.
+        spot_leg = Leg(symbol=self.spot_symbol, side="Hold", product="spot",
+                       requested_qty=hedged, filled_qty=hedged,
+                       avg_price=spot_mark, order_link_id="INVENTORY")
+        position = CarryPosition(spot=spot_leg, perp=perp,
+                                 opened_ms=timestamp_ms)
+        self.position = position
+        self.state = BookState.HEDGED
+        self.pair_risk.record_entry()
+        return CarryDecision(
+            "opened", acted=True, reason="PERP_HEDGE_LANDED",
+            state=BookState.HEDGED,
+            detail={"qty": hedged, "inventory": inventory,
+                    "unhedged_inventory": max(0.0, inventory - hedged),
+                    "perp_price": perp.avg_price, "spot_mark": spot_mark,
+                    "delta_fraction": position.delta_fraction(mark),
+                    "funding_bps": funding_bps,
+                    "execution_mode": OVERLAY})
 
     def _rebalance(self, mark: float, drift: float) -> CarryDecision:
         """Bring delta back inside the band by trading the PERP leg only.
@@ -467,6 +660,21 @@ class CarryEngine:
         self.state = BookState.UNWINDING
         perp = self._fire(self.perp_symbol, "Buy", position.perp.filled_qty,
                           "linear")
+        if self.execution_mode == OVERLAY:
+            # The long side is the client's inventory. Closing the hedge means
+            # buying the perp back and nothing else: selling their BTC would
+            # be a liquidation nobody asked for.
+            if perp is None or perp.filled_qty <= 0:
+                return self._halt(
+                    "UNWIND_INCOMPLETE",
+                    f"{reason} — the perp hedge did not close and the "
+                    "client's BTC is now unhedged")
+            self.position = None
+            self.state = BookState.FLAT
+            return CarryDecision("unwound", acted=True, reason=reason,
+                                 state=BookState.FLAT,
+                                 detail={"collected": position.funding_collected,
+                                         "execution_mode": OVERLAY})
         spot = self._fire(self.spot_symbol, "Sell", position.spot.filled_qty,
                           "spot")
         if perp is None or spot is None:

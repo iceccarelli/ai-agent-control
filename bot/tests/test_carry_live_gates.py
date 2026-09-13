@@ -65,6 +65,16 @@ class Broker:
         self.reads["margin"] += 1
         return self.margin
 
+    # 0036: the venue's own lot rules and fee tier. A 1e-6 step leaves every
+    # size in this file unchanged; the fee table is what the round trip is
+    # computed from instead of a constant.
+    def get_lot_rules(self, symbol, product):
+        return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 0.0}
+
+    def get_fee_rates(self, symbol, product):
+        return {"maker_bps": 2.0,
+                "taker_bps": 10.0 if product == "spot" else 5.5}
+
     def get_funding_print(self, s):
         # 0034: the latest settled print, stamped at the last settlement.
         self.reads["print"] += 1
@@ -95,7 +105,7 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
                          update_equity=lambda e: None)
     bot.engine = mock.Mock(observe_exits=lambda: {})
     bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
-                            borrow_apr=0.05)
+                            borrow_apr=0.05, execution_mode="acquire")
     if risk:
         bot.carry.pair_risk = CarryRisk(store=store, max_notional_usd=100.0)
     # 0034: two earlier SETTLED prints; the tick then reads the latest one.
@@ -226,7 +236,8 @@ class TestTheDayAllowanceIsSpentOnlyOnSuccess:
 class TestBuildBotAttachesTheGate:
     def test_carry_mode_gets_a_pair_gate(self):
         import config as _config
-        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05",
+                            "CARRY_EXECUTION_MODE": "acquire"})
         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.pair_risk is not None
@@ -234,7 +245,8 @@ class TestBuildBotAttachesTheGate:
     def test_the_gate_cap_matches_the_engine_cap(self):
         import config as _config
         import shadow
-        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05",
+                            "CARRY_EXECUTION_MODE": "acquire"})
         bot = _main.build_bot(config=cfg, store=Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.pair_risk.max_notional_usd == pytest.approx(

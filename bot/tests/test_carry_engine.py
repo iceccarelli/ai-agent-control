@@ -43,6 +43,16 @@ class FakeBroker:
     def get_mark(self, symbol):
         return self.mark
 
+    # 0036: the venue's own lot rules and fee tier. A 1e-6 step leaves every
+    # size in this file unchanged; the fee table is what the round trip is
+    # computed from instead of a constant.
+    def get_lot_rules(self, symbol, product):
+        return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 0.0}
+
+    def get_fee_rates(self, symbol, product):
+        return {"maker_bps": 2.0,
+                "taker_bps": 10.0 if product == "spot" else 5.5}
+
 
 class _SpotFillsThenVenueDies(FakeBroker):
     """The spot buy lands. Every order after it is rejected — including the
@@ -112,6 +122,9 @@ def engine(broker, *, primed=True, **kw):
     """
     kw.setdefault("max_notional_usd", 100_000.0)
     kw.setdefault("borrow_apr", 0.05)
+    # 0036: these tests are about the ACQUIRE path — the book buying the spot
+    # leg. The overlay path has its own file.
+    kw.setdefault("execution_mode", "acquire")
     eng = _Wired(broker=broker, **kw)
     eng.pair_risk = CarryRisk(max_notional_usd=kw["max_notional_usd"])
     if primed:

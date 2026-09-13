@@ -1,5 +1,5 @@
 {
- "git_commit": "5bc961b3bd841d70c62af10165585bde265f3f1a-dirty",
+ "git_commit": "39a7be4c307d40eca600a9b120be49a7141b982f-dirty",
  "schema": "hypothesis_registry/1",
  "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
  "seeded": true,
@@ -209,8 +209,15 @@
    "source": "carry_costs.py (0019/0021), tools/carry_backtest.py --gated",
    "status": "measured_in_sample",
    "trial_id": "carry_cost_gates_v1@BTCUSDT"
+  },
+  {
+   "note": "Same entry/exit rule as carry_cost_gates_v1, executed against BTC the client already owns: the perp is the only leg traded, so the round trip is 11 bps (2 perp legs at the account's taker rate) instead of 31, and there is no borrow. The gate is the SAME rule with a corrected cost input, not a retuned one \u2014 no gate constant moved. Settlement clock, Bybit same-venue corpus, impact haircut applied, 0% borrow: ungated +6.99%/yr n=87, gated +7.23%/yr n=79. IN-SAMPLE: the window 2022-08-01..2026-09-09 is fully read (data_read_ledger.json). Admissible holdout is FORWARD ONLY, after 2026-09-09T08:00Z.",
+   "recorded_utc": "2026-09-13T18:59:24Z",
+   "source": "carry_engine.py execution_mode=overlay (0036), tools/carry_backtest.py --mode overlay",
+   "status": "measured_in_sample",
+   "trial_id": "carry_overlay_v1@BTCUSDT"
   }
  ],
- "updated_utc": "2026-09-11T18:24:13Z",
+ "updated_utc": "2026-09-13T18:59:24Z",
  "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }

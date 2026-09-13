@@ -61,9 +61,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 #: Taker fees, declared here so the amortisation is visible rather than buried.
+#: These are the ACQUIRE-mode figures (buy spot, short perp, reverse both) and
+#: they are what the 0018-0032 backtests charged.
 TAKER_BPS_SPOT = 10.0
 TAKER_BPS_PERP = 5.5
 ROUND_TRIP_BPS = 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP   # 31.0
+
+#: 0036: `evaluate_entry` takes the round trip as a REQUIRED argument instead
+#: of reading the constant above. An overlay on BTC the client already owns
+#: never trades the spot leg, so its round trip is two perp legs — 11 bps at
+#: taker, and less with a maker fill. Charging it 31 refuses entries that pay
+#: for themselves three times over; charging a spot-buying book 11 would let
+#: through entries that cannot. The number belongs to the CALLER's execution
+#: mode and fee tier, and the live engine reads it from the venue.
 
 #: Financing on the spot leg. 0.0 models a book that ALREADY OWNS the BTC and is
 #: monetising it. The difference between those two worlds is the difference
@@ -143,7 +153,7 @@ def basis_bps(perp: float, spot: float) -> float:
 
 
 def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
-                   spot: float, borrow_apr: float,
+                   spot: float, borrow_apr: float, round_trip_bps: float,
                    hold_days: float = ASSUMED_HOLD_DAYS) -> CarryVerdict:
     """May the book open this pair?
 
@@ -165,7 +175,7 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
 
     carry_per_day = smoothed * FUNDING_PERIODS_PER_DAY
     borrow_per_day = (borrow_apr / 365.0) * 1e4
-    round_trip_per_day = ROUND_TRIP_BPS / max(hold_days, 1e-9)
+    round_trip_per_day = float(round_trip_bps) / max(hold_days, 1e-9)
     net_edge = carry_per_day - borrow_per_day - round_trip_per_day
 
     try:

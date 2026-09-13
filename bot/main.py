@@ -678,6 +678,19 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                 return (False, "mainnet URL: the promotion gate is not signed")
             return (True, "LIVE (authorised, promotion gate signed)")
 
+        # HOW THE LONG SIDE IS HELD (0036). No default: "overlay" shorts the
+        # perp against BTC the client already owns and never touches their
+        # spot; "acquire" buys the spot leg and sells it again. PHASE1_DECISION
+        # chose the overlay as the product, and the engine went on buying spot
+        # because nothing made the choice explicit.
+        execution_mode = cfg.CARRY_EXECUTION_MODE
+        if execution_mode is None:
+            raise ValueError(
+                "BOOK_MODE=carry requires CARRY_EXECUTION_MODE (\"overlay\" = "
+                "hedge BTC the client already owns, never trading their spot; "
+                "\"acquire\" = buy the spot leg and sell it again). The two "
+                "place different orders; refusing rather than assuming.")
+
         bot.carry = CarryEngine(
             broker=CarryBroker(
                 client=bot.client,
@@ -689,6 +702,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             perp_symbol=cfg.CARRY_PERP_SYMBOL,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
             borrow_apr=float(borrow_apr),
+            execution_mode=execution_mode,
         )
         # The pair gate. Until now max_notional_usd was the ONLY size control on
         # the carry book: the legs passed through no RiskManager at all. This is
@@ -701,10 +715,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
-            "%.4f/yr, orders: %s. The directional strategy is NOT attached "
-            "and will not be consulted.",
+            "%.4f/yr, execution %s, orders: %s. The directional strategy is "
+            "NOT attached and will not be consulted.",
             bot.carry.max_notional_usd, bot.carry.borrow_apr,
-            _carry_orders_permitted()[1])
+            bot.carry.execution_mode, _carry_orders_permitted()[1])
         return bot
 
     if attach_strategy and bot.strategy is None:

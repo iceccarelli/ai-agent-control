@@ -59,6 +59,17 @@ history were a stale local checkout wearing different clothes.
 LONG spot BTC  +  SHORT perp BTC  =  zero price exposure
 ```
 
+Two ways to hold the long side, and the choice is required
+(`CARRY_EXECUTION_MODE`, no default):
+
+```
+overlay   the client already owns the BTC. The book shorts the perp against
+          it and never buys or sells their spot. Round trip 11 bps, no borrow.
+acquire   the book buys the spot leg and sells it again. Round trip 31 bps,
+          plus financing. This is what the engine did until 0036, and 0032
+          measured it losing 2.99%/yr at 5% financing on the settlement clock.
+```
+
 Price rises: the spot leg gains what the perp leg loses. Price falls: the
 reverse. You are flat. What you keep is the funding rate, paid every eight
 hours by leveraged longs to whoever holds the other side.

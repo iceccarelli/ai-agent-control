@@ -76,6 +76,16 @@ class _Broker:
     def get_margin_multiple(self, symbol):
         return 5.0
 
+    # 0036: the venue's own lot rules and fee tier. A 1e-6 step leaves every
+    # size in this file unchanged; the fee table is what the round trip is
+    # computed from instead of a constant.
+    def get_lot_rules(self, symbol, product):
+        return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 0.0}
+
+    def get_fee_rates(self, symbol, product):
+        return {"maker_bps": 2.0,
+                "taker_bps": 10.0 if product == "spot" else 5.5}
+
     def get_funding_print(self, symbol):
         # 0034: the latest SETTLED print, stamped at the last settlement.
         if self.raises == "funding":
@@ -94,7 +104,7 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]
     bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0,
-                            borrow_apr=0.05)
+                            borrow_apr=0.05, execution_mode="acquire")
     # 0033: no first leg without the pair gate. main.tick supplies the
     # snapshot; the gate is attached here exactly as build_bot attaches it.
     from carry_risk import CarryRisk
@@ -169,7 +179,8 @@ class TestUnreadableInputsTouchNothing:
 
 class TestTheTwoBooksAreMutuallyExclusive:
     def test_carry_mode_never_constructs_the_technical_voter(self):
-        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05"})
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.05",
+                            "CARRY_EXECUTION_MODE": "acquire"})
         with mock.patch("technical_analysis.MarketStrategy") as voter:
             bot = _main.build_bot(config=cfg, store=_Store(),
                                   client=mock.Mock(), risk_manager=mock.Mock(),
@@ -189,7 +200,8 @@ class TestTheTwoBooksAreMutuallyExclusive:
         how a hedged book becomes a directional one without anyone deciding."""
         for mode in ("carry", "directional"):
             # 0033: a carry book requires a financing rate; directional ignores it.
-            cfg = _config.load({"BOOK_MODE": mode, "CARRY_BORROW_APR": "0.05"})
+            cfg = _config.load({"BOOK_MODE": mode, "CARRY_BORROW_APR": "0.05",
+                                "CARRY_EXECUTION_MODE": "acquire"})
             bot = _main.build_bot(config=cfg, store=_Store(),
                                   client=mock.Mock(), risk_manager=mock.Mock(),
                                   engine=mock.Mock())
