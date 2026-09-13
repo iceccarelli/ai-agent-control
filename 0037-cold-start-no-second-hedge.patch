@@ -1,0 +1,1483 @@
+From f6ff266d7b9ee5abbda9ef495bfee7a308e7d57d Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Sun, 13 Sep 2026 20:45:35 +0000
+Subject: [PATCH] 0037 a restart cannot open a second hedge (5590 passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+INVENTORY D3: CarryEngine.position lived in memory. A container that died
+holding a hedge came back FLAT, CarryRisk.has_open_pair read the empty engine,
+and the book opened a SECOND hedge against the same margin and the same
+liquidation price. reconcile_pair existed with zero call sites; the
+directional orphan check only runs for a linear-category client and the carry
+client is spot. Drill step 5 could not pass.
+
+Two halves, neither optional.
+
+THE LEDGER. persistence gains one row (`carry_position`): the whole engine
+state as JSON, written on EVERY state change — open, rebalance, unwind,
+emergency unwind, halt. The engine takes `persist` as a REQUIRED argument; a
+write that fails HALTS the book (LEDGER_WRITE_FAILED), because a book whose
+ledger is behind its orders is exactly the state this patch exists to prevent.
+`load_carry_position()` returns None only when no carry book ever ran: a flat
+book writes a row saying flat, and that difference is what separates "nothing
+to resume" from "the ledger was lost".
+
+THE VENUE. CarryBroker.get_perp_position and get_open_carry_orders, both
+raising rather than reporting zero. Open-order policy: EVERY open order on the
+perp symbol counts (that instrument is the book's), but on spot only orders
+this book placed — an overlay client's own spot orders are their business, and
+halting the hedge because they placed one would be the book seizing their
+wallet.
+
+THE COMPARISON. plan_cold_start() is pure and has its own tests: CLEAN,
+RESUME, or HALT. It halts on a venue position the ledger never saw, a ledger
+pair the venue does not have, a size mismatch beyond dust, an overlay whose
+inventory has left, an execution mode that changed between runs, a ledger that
+was already HALTED, and any open order. It NEVER edits the ledger — the
+disagreement is the evidence a human needs. TradingBot.carry_cold_start runs
+it in startup() BEFORE engine.reconcile, trips the kill switch on HALT and
+refuses to start; an unreadable ledger or venue is also a refusal, never an
+assumption of flat.
+
+Also 0037 (D16): session_tail told the truth about itself. Run outside the
+virtualenv it printed `GATE STILL FALSE?: NO (UNREADABLE: No module named
+numpy)` — which reads as "the gate opened". It now has three outcomes and
+three exit codes: 0 holds, 1 MOVED, 2 could not be read, plus the line telling
+you which interpreter to use. A tool that cannot tell False from cannot-tell
+would hide a real violation behind the same word.
+
+Tests first: bot/tests/test_carry_cold_start.py, 30 new; 5 more in
+test_session_tail.py. No existing assertion changed; stub stores gained the
+two ledger methods and engines gained `persist`, both of which production
+requires.
+
+Files: bot/carry_engine.py carry_broker.py persistence.py main.py,
+bot/tools/session_tail.py, bot/docs/human/INVENTORY.md, 9 test files.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ bot/carry_broker.py                      |  52 ++++
+ bot/carry_engine.py                      | 236 +++++++++++++++-
+ bot/docs/human/INVENTORY.md              |  16 +-
+ bot/main.py                              |  55 ++++
+ bot/persistence.py                       |  54 ++++
+ bot/tests/test_carry_broker.py           |   3 +-
+ bot/tests/test_carry_cold_start.py       | 338 +++++++++++++++++++++++
+ bot/tests/test_carry_engine.py           |   1 +
+ bot/tests/test_carry_fail_closed.py      |  13 +-
+ bot/tests/test_carry_funding_prints.py   |  11 +-
+ bot/tests/test_carry_live_gates.py       |  13 +-
+ bot/tests/test_carry_overlay.py          |  16 +-
+ bot/tests/test_carry_wiring.py           |  14 +-
+ bot/tests/test_carry_wiring_authority.py |  10 +
+ bot/tests/test_session_tail.py           |  55 ++++
+ bot/tools/session_tail.py                | 131 ++++++---
+ 16 files changed, 956 insertions(+), 62 deletions(-)
+ create mode 100644 bot/tests/test_carry_cold_start.py
+
+diff --git a/bot/carry_broker.py b/bot/carry_broker.py
+index 2be07b5..df30c39 100644
+--- a/bot/carry_broker.py
++++ b/bot/carry_broker.py
+@@ -423,6 +423,58 @@ class CarryBroker:
+                 f"settled funding print for {symbol} is unusable: {row!r}")
+         return rate * 1e4, stamp
+ 
++    def get_perp_position(self, symbol: str) -> float:
++        """Size of the perp position at the venue, in base units. 0 when flat.
++
++        Read at cold start, before the first tick, and compared with the
++        ledger. Raises when unreadable: a restart that cannot see the venue
++        must not assume it is flat.
++        """
++        result = self.client._request(
++            "GET", "/v5/position/list", signed=True,
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list")
++        if rows is None:
++            raise PairIncident(
++                f"cannot read the {symbol} position; refusing to assume flat")
++        if not rows:
++            return 0.0
++        try:
++            return abs(float(rows[0].get("size", 0) or 0))
++        except (TypeError, ValueError) as exc:
++            raise PairIncident(
++                f"position row for {symbol} is malformed: {rows[0]!r}") from exc
++
++    def get_open_carry_orders(self, spot_symbol: str,
++                              perp_symbol: str) -> list:
++        """Orders that could still fill into this book.
++
++        EVERY open order on the perp symbol counts: that instrument is the
++        book's. On spot, only orders this book placed (their link id carries
++        the carry purpose) — an overlay client's own spot orders are their
++        business, and halting the hedge because they placed one would be the
++        book seizing their wallet.
++        """
++        out = []
++        for category, symbol, mine_only in ((LINEAR, perp_symbol, False),
++                                            (SPOT, spot_symbol, True)):
++            result = self.client._request(
++                "GET", "/v5/order/realtime", signed=True,
++                params={"category": category, "symbol": symbol, "openOnly": 0})
++            rows = (result or {}).get("list")
++            if rows is None:
++                raise PairIncident(
++                    f"cannot read open {category} orders for {symbol}; "
++                    "refusing to assume there are none")
++            for row in rows:
++                link = str(row.get("orderLinkId", ""))
++                if mine_only and "carr" not in link:
++                    continue
++                out.append({"orderLinkId": link, "category": category,
++                            "symbol": symbol,
++                            "orderStatus": row.get("orderStatus")})
++        return out
++
+     # -- reconciliation ---------------------------------------------------
+ 
+     def reconcile_pair(self, *, spot_symbol: str, perp_symbol: str,
+diff --git a/bot/carry_engine.py b/bot/carry_engine.py
+index 7870f43..5676532 100644
+--- a/bot/carry_engine.py
++++ b/bot/carry_engine.py
+@@ -65,7 +65,7 @@ from __future__ import annotations
+ import logging
+ import math
+ from decimal import Decimal, InvalidOperation
+-from dataclasses import dataclass, field
++from dataclasses import asdict, dataclass, field
+ from enum import Enum
+ from typing import Any, Dict, List, Optional, Tuple
+ 
+@@ -140,6 +140,105 @@ def _costs():
+     return carry_costs
+ 
+ 
++class ColdStart(Enum):
++    """What a restart may do, decided before the first tick."""
++
++    CLEAN = "CLEAN"       # nothing in the ledger, nothing at the venue
++    RESUME = "RESUME"     # they agree; the book picks the same pair back up
++    HALT = "HALT"         # they do not agree; a human looks before anything trades
++
++
++@dataclass(frozen=True)
++class ColdStartDecision:
++    action: "ColdStart"
++    reason: str
++    naked_side: str = ""
++    detail: Dict[str, Any] = field(default_factory=dict)
++
++
++def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
++                    venue_perp_qty: float, venue_spot_qty: float,
++                    open_orders: Any = (),
++                    dust: float = QTY_DUST) -> ColdStartDecision:
++    """Compare what the last run believed against what the venue holds.
++
++    Pure. It reads both sides and returns a verdict; it never writes to either.
++    A book that edited its ledger to match the venue could not detect a missed
++    fill, a manual order, or a bug — which is the entire reason this function
++    exists rather than "load the position and carry on".
++
++    HALT is the answer to every disagreement, including the ones that look
++    harmless. The failure this prevents is a container that restarts holding a
++    hedge, reads an empty ledger, and opens a SECOND hedge against the same
++    margin and the same liquidation price.
++    """
++    orders = list(open_orders or ())
++    if orders:
++        return ColdStartDecision(
++            ColdStart.HALT,
++            f"{len(orders)} carry order(s) are still open at the venue; one "
++            "could fill into a book that does not know it exists",
++            detail={"open_orders": orders[:8]})
++
++    state = str((ledger or {}).get("book_state", "")) or "FLAT"
++    position = (ledger or {}).get("position")
++    perp = abs(float(venue_perp_qty or 0.0))
++    spot = float(venue_spot_qty or 0.0)
++
++    if state == BookState.HALTED.value:
++        return ColdStartDecision(
++            ColdStart.HALT,
++            "the last run halted and a halt is cleared by a human, never by a "
++            "restart",
++            detail={"venue_perp_qty": perp})
++
++    if not position:
++        if perp > dust:
++            return ColdStartDecision(
++                ColdStart.HALT,
++                f"the venue holds a perp position of {perp:.10g} that the "
++                "ledger never recorded",
++                naked_side="perp", detail={"venue_perp_qty": perp})
++        return ColdStartDecision(ColdStart.CLEAN, "no pair in the ledger, none "
++                                 "at the venue")
++
++    ledger_perp = abs(float((position.get("perp") or {}).get("filled_qty", 0.0)))
++    ledger_spot = abs(float((position.get("spot") or {}).get("filled_qty", 0.0)))
++    mode = str((ledger or {}).get("execution_mode", ACQUIRE))
++
++    if abs(perp - ledger_perp) > dust:
++        return ColdStartDecision(
++            ColdStart.HALT,
++            f"the ledger holds a {ledger_perp:.10g} perp short and the venue "
++            f"holds {perp:.10g}",
++            naked_side="spot" if perp < ledger_perp else "perp",
++            detail={"ledger_perp_qty": ledger_perp, "venue_perp_qty": perp})
++
++    # The long side. In OVERLAY it is the client's inventory and only has to
++    # COVER the hedge; in ACQUIRE the book bought a specific quantity and that
++    # quantity has to be there.
++    if mode == OVERLAY:
++        if spot + dust < ledger_spot:
++            return ColdStartDecision(
++                ColdStart.HALT,
++                f"the hedge covers {ledger_spot:.10g} BTC and the account now "
++                f"holds {spot:.10g}: the inventory this short was written "
++                "against has left",
++                naked_side="perp",
++                detail={"ledger_spot_qty": ledger_spot, "venue_spot_qty": spot})
++    elif abs(spot - ledger_spot) > dust:
++        return ColdStartDecision(
++            ColdStart.HALT,
++            f"the ledger holds {ledger_spot:.10g} of spot and the venue holds "
++            f"{spot:.10g}",
++            naked_side="spot" if spot < ledger_spot else "perp",
++            detail={"ledger_spot_qty": ledger_spot, "venue_spot_qty": spot})
++
++    return ColdStartDecision(
++        ColdStart.RESUME, "the ledger and the venue agree on the pair",
++        detail={"perp_qty": perp, "spot_qty": spot, "execution_mode": mode})
++
++
+ class BookState(Enum):
+     FLAT = "FLAT"
+     OPENING = "OPENING"
+@@ -241,7 +340,8 @@ class CarryEngine:
+                  delta_band: float = DELTA_BAND,
+                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
+                  min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
+-                 borrow_apr: float, execution_mode: str) -> None:
++                 borrow_apr: float, execution_mode: str,
++                 persist: Any) -> None:
+         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
+         # carry clears its cost of capital, and build_bot never passed it, so
+         # the live engine silently financed at 5% whatever the operator meant.
+@@ -252,6 +352,13 @@ class CarryEngine:
+                 "modes send different orders, and guessing means either "
+                 "buying spot the client already owns or shorting against "
+                 "inventory that is not there.")
++        if not callable(persist):
++            raise TypeError(
++                "persist must be callable: the book writes what it holds to "
++                "the ledger on every state change. A carry engine with "
++                "nowhere to write is a container that restarts flat and opens "
++                "a second hedge (INVENTORY D3).")
++        self.persist = persist
+         self.execution_mode = execution_mode
+         self.broker = broker
+         self.kill_switch = kill_switch
+@@ -280,6 +387,105 @@ class CarryEngine:
+         #: that fails for a reason nobody can read is a leg that fails again.
+         self._last_leg_error: str = ""
+ 
++    # -- the ledger -------------------------------------------------------
++
++    def to_state(self) -> Dict[str, Any]:
++        """Everything a restart needs, as plain JSON-able data."""
++        position = None
++        if self.position is not None:
++            position = {
++                "spot": asdict(self.position.spot),
++                "perp": asdict(self.position.perp),
++                "opened_ms": int(self.position.opened_ms),
++                "funding_collected": float(self.position.funding_collected),
++                "negative_funding_streak":
++                    int(self.position.negative_funding_streak),
++            }
++        return {
++            "book_state": self.state.value,
++            "execution_mode": self.execution_mode,
++            "position": position,
++            "last_print_ms": self._last_print_ms,
++            "funding_history": list(self._funding_history),
++            "max_notional_usd": self.max_notional_usd,
++        }
++
++    def restore(self, state: Dict[str, Any]) -> None:
++        """Take the ledger's word for the position. Called only after
++        `cold_start` has checked it against the venue."""
++        position = state.get("position")
++        if position:
++            self.position = CarryPosition(
++                spot=Leg(**position["spot"]), perp=Leg(**position["perp"]),
++                opened_ms=int(position.get("opened_ms", 0)),
++                funding_collected=float(position.get("funding_collected", 0.0)),
++                negative_funding_streak=int(
++                    position.get("negative_funding_streak", 0)))
++            self.state = BookState.HEDGED
++        else:
++            self.position = None
++            self.state = BookState.FLAT
++        last = state.get("last_print_ms")
++        self._last_print_ms = None if last is None else int(last)
++        self._funding_history = [float(x) for x in
++                                 state.get("funding_history", [])][
++                                     -self.FUNDING_HISTORY:]
++
++    def _record(self) -> Optional[CarryDecision]:
++        """Write the ledger. A failure to write HALTS.
++
++        The alternative is a book that placed an order the next restart cannot
++        see, which is the exact state cold start exists to make impossible.
++        """
++        try:
++            self.persist(self.to_state())
++        except Exception as exc:  # noqa: BLE001
++            return self._halt("LEDGER_WRITE_FAILED",
++                              f"the position could not be written down "
++                              f"({type(exc).__name__}: {exc}); a book whose "
++                              "ledger is behind its orders must stop",
++                              record=False)
++        return None
++
++    def cold_start(self, *, ledger: Optional[Dict[str, Any]],
++                   venue_perp_qty: float, venue_spot_qty: float,
++                   open_orders: Any = ()) -> ColdStartDecision:
++        """Reconcile the ledger against the venue BEFORE the first tick.
++
++        RESUME puts the same pair back in the engine. HALT stops the process
++        and trips the switch; it deliberately does NOT rewrite the ledger,
++        because the disagreement is the evidence a human needs.
++        """
++        if ledger and ledger.get("execution_mode") and \
++                ledger["execution_mode"] != self.execution_mode:
++            decision = ColdStartDecision(
++                ColdStart.HALT,
++                f"the ledger holds a {ledger['execution_mode']!r} position and "
++                f"this process is configured {self.execution_mode!r}; "
++                "unwinding one as the other would trade the wrong leg",
++                detail={"ledger_mode": ledger["execution_mode"],
++                        "process_mode": self.execution_mode})
++        else:
++            decision = plan_cold_start(ledger=ledger,
++                                       venue_perp_qty=venue_perp_qty,
++                                       venue_spot_qty=venue_spot_qty,
++                                       open_orders=open_orders)
++        if decision.action is ColdStart.RESUME:
++            self.restore(ledger or {})
++            logger.warning("carry cold start: RESUMED %s", decision.detail)
++        elif decision.action is ColdStart.HALT:
++            self.state = BookState.HALTED
++            if self.kill_switch is not None:
++                try:
++                    self.kill_switch(f"CARRY_COLD_START: {decision.reason}")
++                except Exception:  # noqa: BLE001
++                    logger.critical("kill switch itself failed on cold start")
++            logger.critical(
++                "carry cold start HALTED: %s (naked side: %s) %s",
++                decision.reason, decision.naked_side or "unknown",
++                decision.detail)
++        return decision
++
+     def round_trip_bps(self) -> float:
+         """What a full cycle costs THIS account at THIS venue, in bps.
+ 
+@@ -559,6 +765,9 @@ class CarryEngine:
+         # Only now: both legs landed. A refused pair consumed nothing; a
+         # broken one spent the day through record_broken_pair instead.
+         self.pair_risk.record_entry()
++        failed = self._record()
++        if failed is not None:
++            return failed
+         return CarryDecision(
+             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
+             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
+@@ -615,6 +824,9 @@ class CarryEngine:
+         self.position = position
+         self.state = BookState.HEDGED
+         self.pair_risk.record_entry()
++        failed = self._record()
++        if failed is not None:
++            return failed
+         return CarryDecision(
+             "opened", acted=True, reason="PERP_HEDGE_LANDED",
+             state=BookState.HEDGED,
+@@ -647,6 +859,9 @@ class CarryEngine:
+         else:
+             position.perp.filled_qty -= fill.filled_qty
+         self.state = BookState.HEDGED
++        failed = self._record()
++        if failed is not None:
++            return failed
+         return CarryDecision(
+             "rebalanced", acted=True, reason="DELTA_RETURNED_TO_BAND",
+             state=BookState.HEDGED,
+@@ -671,6 +886,9 @@ class CarryEngine:
+                     "client's BTC is now unhedged")
+             self.position = None
+             self.state = BookState.FLAT
++            failed = self._record()
++            if failed is not None:
++                return failed
+             return CarryDecision("unwound", acted=True, reason=reason,
+                                  state=BookState.FLAT,
+                                  detail={"collected": position.funding_collected,
+@@ -683,6 +901,9 @@ class CarryEngine:
+                 f"{reason} — a leg did not close and the book is now naked")
+         self.position = None
+         self.state = BookState.FLAT
++        failed = self._record()
++        if failed is not None:
++            return failed
+         return CarryDecision("unwound", acted=True, reason=reason,
+                              state=BookState.FLAT,
+                              detail={"collected": position.funding_collected})
+@@ -695,6 +916,9 @@ class CarryEngine:
+             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
+         self.position = None
+         self.state = BookState.FLAT
++        failed = self._record()
++        if failed is not None:
++            return failed
+         # A spot round trip was paid for nothing. Without this, a venue that
+         # rejects the perp leg made the book buy and sell spot every tick:
+         # 8 round trips in 10 ticks, measured (INVENTORY D4).
+@@ -744,7 +968,8 @@ class CarryEngine:
+                    order_link_id=str(result.get("order_link_id", "")),
+                    fee=None if raw_fee is None else float(raw_fee))
+ 
+-    def _halt(self, reason: str, detail: str) -> CarryDecision:
++    def _halt(self, reason: str, detail: str,
++              record: bool = True) -> CarryDecision:
+         self.state = BookState.HALTED
+         if self.kill_switch is not None:
+             try:
+@@ -752,6 +977,11 @@ class CarryEngine:
+             except Exception:  # noqa: BLE001
+                 logger.critical("kill switch itself failed on %s", reason)
+         logger.critical("carry book HALTED: %s — %s", reason, detail)
++        if record:
++            try:
++                self.persist(self.to_state())
++            except Exception:  # noqa: BLE001 - already halting
++                logger.critical("the halt itself could not be written down")
+         return CarryDecision("halted", reason=reason, state=BookState.HALTED,
+                              detail={"detail": detail})
+ 
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index 554a64a..3fd03ac 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -37,7 +37,7 @@ never consulted. Loop interval: `LOOP_INTERVAL_SECONDS`, default **60 s**.
+ | `CarryBroker.reconcile_pair` | **no — zero call sites outside tests** | `grep -rn reconcile_pair --include=*.py . \| grep -v tests` |
+ | `CarryBroker.get_venue_time_s` | **does not exist** → the clock-skew check in `assert_fresh` never runs | `hasattr(bot.carry.broker, "get_venue_time_s") → False` |
+ | `tools/carry_backtest.py`, `tools/venue_study.py`, `tools/basis_at_settlement.py`, `tools/corpus_health.py` | no — offline tools | — |
+-| persistence of the carry position | **does not exist** — `persistence.py` has no carry table; the pair lives in `CarryEngine.position` (memory) | `grep -in carry persistence.py` |
++| persistence of the carry position | **0037: yes** — `StateStore.save_carry_position` / `load_carry_position`, one row, written by the engine on every state change and read back by `TradingBot.carry_cold_start` before the first tick | `carry_position` table; `bot/tests/test_carry_cold_start.py` |
+ 
+ ## 3. README claims vs bytes
+ 
+@@ -64,13 +64,14 @@ Reproduced in-session with a stub broker; no venue.
+ |---|---|---|---|
+ | D1 | **Funding is booked per tick, not per print.** `on_candle` adds `funding_bps × notional` on every call. 60 one-minute ticks at 1.0 bps on $100 booked **$0.60**; one real 8h print is **$0.01**. The negative-funding streak and the 8-print EWMA also count ticks. | stub engine, 60 calls | **CLOSED 0034** — prints carry a settlement stamp; a repeated stamp is a tick, not a print; 60 ticks book one print |
+ | D2 | **`PAPER_TRADING=1` does not stop carry orders.** `USE_TESTNET=0 PAPER_TRADING=1 BOOK_MODE=carry` → `assert_sandbox` = `SANDBOX (PAPER)`, and `bot.carry.broker.place_market(...)` sent `POST /v5/order/create` with a spot body. The client's base URL is chosen by `USE_TESTNET` alone. | `build_bot` + mocked `_request` | **CLOSED 0033** — `CarryBroker(order_gate=...)` required; PAPER refuses; mainnet needs live authorisation AND a signed promotion gate, asked per order |
+-| D3 | **Restart while HEDGED opens a second pair.** The position is memory-only, `reconcile_pair` is never called, the orphan check is skipped on a spot-category client, and `CarryRisk.has_open_pair` reads `engine.position` (None after restart). | code path | open — Phase D cold start |
++| D3 | **Restart while HEDGED opens a second pair.** The position is memory-only, `reconcile_pair` is never called, the orphan check is skipped on a spot-category client, and `CarryRisk.has_open_pair` reads `engine.position` (None after restart). | code path | **CLOSED 0037** — the position is written to `carry_position` on every change and reconciled against the venue before the first tick; any disagreement halts and refuses to start |
+ | D4 | **A venue that rejects the perp leg drains the book.** Spot buys, perp is rejected, spot is sold, state returns to FLAT, and the next tick repeats: **8 spot round trips in 10 ticks**. `record_entry` is (correctly) only called for a landed pair, so a broken pair consumes no allowance. | stub broker rejecting `linear` | **CLOSED 0033** — a broken pair spends the day (`CarryRisk.record_broken_pair`); 10 ticks → 1 spot round trip |
+ | D5 | **`carry_backtest` prints `QUOTABLE: True`** on daily closes with no impact term. The flag tracks provenance only (same venue + same quote). Rule 19 says daily-close settlement is not quotable. | `python3 tools/carry_backtest.py --repo .` | **CLOSED 0031** — five conditions, printed; attribution identity enforced |
+ | D6 | **carry_backtest / venue_study reads are not in the data-read ledger.** `reserved_holdout.install()` hooks `market_data.load_corpus`; both tools read with their own loaders, so the hook never fires. `artifacts/data_read_ledger.json` has 6 reads, none by either tool. Worse: run as a script, carry_backtest's `install()` raised on `import market_data` and the bare except set the whole ledger to None. | `data_read_ledger.json` | **CLOSED 0032** — explicit `_record()` in both tools; 15 retroactive + 6 new reads |
+ | D7 | `borrow_apr` has a default at every level: `CarryEngine(..., borrow_apr=0.05)`, `evaluate_entry(..., borrow_apr=DEFAULT_BORROW_APR)`, `simulate(..., borrow_apr=BORROW_APR)`; `build_bot` passes none. | `bot.carry.borrow_apr → 0.05` | **CLOSED 0033** — no default in `CarryEngine` or `evaluate_entry`; `CARRY_BORROW_APR` required for carry, refused when absent |
+ | D8 | The pair gate is skipped when `pair_risk` **or** `snapshot` is `None`, and `test_carry_live_gates::test_the_gate_is_skipped_only_when_absent` asserts that a bare engine opens. | `carry_engine.py` `_open` | **CLOSED 0033** — `PAIR_GATE_ABSENT` / `SNAPSHOT_ABSENT` / `SNAPSHOT_MISMATCH`; the test asserting the bypass was inverted |
+ | D9 | Clock-skew check is dead code on the live path (no `get_venue_time_s`). | §2 | open |
++| D16 | **`session_tail` reported UNREADABLE as a violation.** Run with a bare interpreter it printed `GATE STILL FALSE?: NO (UNREADABLE: No module named numpy)` — which reads as "the gate opened". | seen in Codespaces | **CLOSED 0037** — three outcomes and three exit codes |
+ | D15 | **The engine bought spot the client already owned.** PHASE1_DECISION chose the overlay on 2026-09-08; the engine went on paying a four-leg round trip and financing for inventory that was already there. | `--clock 8h --mode overlay` | **CLOSED 0036** — `CARRY_EXECUTION_MODE` required; overlay trades the perp only (`docs/human/OVERLAY_0036.md`) |
+ | D10 | `funding_collected` books only non-negative prints; negative prints are paid and never booked. | `carry_engine.py` on_candle | **CLOSED 0034** — every held print booked signed |
+ | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
+@@ -119,9 +120,14 @@ Secrets Manager, never in a file, a log, or this repository.
+ python3 tools/session_tail.py
+ ```
+ 
+-prints and exits non-zero on any violation of: promotion gate `False`,
+-`FUND_ABS == 0.0001`, `SHADOW_MAX_NOTIONAL_USD == 100.0`, no module assigns
+-`live_authorized`.
++prints the four invariants and exits **0** when they hold, **1** when one has
++MOVED, **2** when one could not be READ (0037 — run outside the virtualenv it
++used to print "NO" for a gate it had merely failed to import). Run it with the
++interpreter the suite uses:
++
++```
++. .venv/bin/activate && python3 bot/tools/session_tail.py
++```
+ 
+ ## 8. Market data present
+ 
+diff --git a/bot/main.py b/bot/main.py
+index a825521..6bceb2e 100644
+--- a/bot/main.py
++++ b/bot/main.py
+@@ -297,6 +297,13 @@ class TradingBot:
+                     )
+                     return False
+ 
++        # THE CARRY BOOK'S COLD START (0037). Before anything else touches
++        # the venue: what did the last run believe, and what is actually
++        # there? A container that died holding a hedge used to come back FLAT
++        # and open a second one against the same liquidation price.
++        if self.carry is not None and not self.carry_cold_start():
++            return False
++
+         # Reconcile BEFORE any trading decision.
+         try:
+             summary = self.engine.reconcile()
+@@ -402,6 +409,49 @@ class TradingBot:
+         self.shutdown()
+         return 0
+ 
++    def carry_cold_start(self) -> bool:
++        """Reconcile the carry ledger against the venue. False = do not start.
++
++        Reads both sides and hands them to `CarryEngine.cold_start`, which is
++        pure and has its own tests. Anything unreadable is a refusal: a
++        restart that cannot see the venue must not assume it is flat.
++        """
++        broker = self.carry.broker
++        try:
++            ledger = self.store.load_carry_position()
++        except Exception as exc:  # noqa: BLE001
++            logger.critical(
++                "carry cold start: the ledger is unreadable (%s); refusing to "
++                "start", exc)
++            return False
++        try:
++            venue_perp = float(broker.get_perp_position(self.carry.perp_symbol))
++            venue_spot = float(
++                broker.get_spot_inventory(self.carry.spot_symbol))
++            open_orders = broker.get_open_carry_orders(
++                self.carry.spot_symbol, self.carry.perp_symbol)
++        except Exception as exc:  # noqa: BLE001
++            logger.critical(
++                "carry cold start: the venue is unreadable (%s); refusing to "
++                "start rather than assuming the book is flat", exc)
++            return False
++
++        decision = self.carry.cold_start(
++            ledger=ledger, venue_perp_qty=venue_perp, venue_spot_qty=venue_spot,
++            open_orders=open_orders)
++        logger.warning(
++            "carry cold start: %s — %s (ledger=%s venue_perp=%.10g "
++            "venue_spot=%.10g open_orders=%d)",
++            decision.action.value, decision.reason,
++            (ledger or {}).get("book_state", "NONE"), venue_perp, venue_spot,
++            len(open_orders))
++        if decision.action.value == "HALT":
++            logger.critical(
++                "carry cold start HALTED — a human must reconcile before this "
++                "process trades: %s", decision.reason)
++            return False
++        return True
++
+     def tick(self) -> None:
+         """One cycle: refresh equity, check the brakes, then consider each symbol."""
+         self.session.tick()
+@@ -703,6 +753,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
+             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD),
+             borrow_apr=float(borrow_apr),
+             execution_mode=execution_mode,
++            # THE LEDGER (0037). Called by the engine on every state change,
++            # straight through to the store. Not a hasattr guard and not a
++            # lambda that swallows: a store without this method is a
++            # misconfiguration that must fail at construction.
++            persist=bot.store.save_carry_position,
+         )
+         # The pair gate. Until now max_notional_usd was the ONLY size control on
+         # the carry book: the legs passed through no RiskManager at all. This is
+diff --git a/bot/persistence.py b/bot/persistence.py
+index 2f0481e..1ff4aa4 100644
+--- a/bot/persistence.py
++++ b/bot/persistence.py
+@@ -370,6 +370,17 @@ CREATE TABLE IF NOT EXISTS memory_kv (
+     PRIMARY KEY (namespace, key)
+ );
+ 
++-- THE CARRY POSITION (0037). One row, overwritten: what THIS process
++-- believed it was holding, written the moment it changed. It is a LEDGER, not
++-- a cache of the venue: cold start compares the two and refuses to trade when
++-- they disagree, and never edits this row to make them agree.
++CREATE TABLE IF NOT EXISTS carry_position (
++    id            INTEGER PRIMARY KEY CHECK (id = 1),
++    book_state    TEXT NOT NULL DEFAULT 'FLAT',
++    payload       TEXT NOT NULL DEFAULT '',
++    updated_epoch REAL NOT NULL DEFAULT 0.0
++);
++
+ -- Additive indexes for the memory reads.  Both are over existing tables and
+ -- change no existing behaviour; they only stop the health thread's aggregate
+ -- reads from turning into full scans as the ledger grows.
+@@ -806,6 +817,49 @@ class StateStore:
+             (str(reason), utc_now_epoch()),
+         )
+ 
++    # -- the carry book's position ----------------------------------------
++
++    def save_carry_position(self, state: Dict[str, Any]) -> None:
++        """Record what the carry book holds. Called on every state change.
++
++        The whole state goes in as JSON rather than columns: the engine owns
++        the shape, and a schema that has to be migrated in step with it is a
++        schema that will be one field behind on the day it matters.
++        """
++        payload = json.dumps(state, sort_keys=True)
++        self._exec(
++            "INSERT INTO carry_position(id, book_state, payload, updated_epoch) "
++            "VALUES(1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
++            "book_state = excluded.book_state, payload = excluded.payload, "
++            "updated_epoch = excluded.updated_epoch",
++            (str(state.get("book_state", "FLAT")), payload, utc_now_epoch()),
++        )
++
++    def load_carry_position(self) -> Optional[Dict[str, Any]]:
++        """What the last run believed, or None if it never wrote anything.
++
++        None means "no carry book has ever run against this database". It does
++        NOT mean flat: a flat book writes a row saying so, and the difference
++        is what lets cold start tell "nothing to resume" from "the ledger was
++        lost".
++        """
++        rows = self._query("SELECT * FROM carry_position WHERE id = 1")
++        if not rows:
++            return None
++        raw = str(rows[0]["payload"] or "")
++        if not raw:
++            return None
++        try:
++            state = json.loads(raw)
++        except json.JSONDecodeError as exc:
++            raise PersistenceError(
++                f"carry_position payload is not readable JSON: {exc}") from exc
++        if not isinstance(state, dict):
++            raise PersistenceError(
++                f"carry_position payload is {type(state).__name__}, not an object")
++        state["updated_epoch"] = float(rows[0]["updated_epoch"] or 0.0)
++        return state
++
+     def clear_kill_switch_by_human(self, operator_ack: str) -> None:
+         """Clear the kill switch.  Requires an explicit operator acknowledgement.
+ 
+diff --git a/bot/tests/test_carry_broker.py b/bot/tests/test_carry_broker.py
+index 84b9fe1..fc5f318 100644
+--- a/bot/tests/test_carry_broker.py
++++ b/bot/tests/test_carry_broker.py
+@@ -258,7 +258,8 @@ class TestItDrivesTheEngine:
+         # 0033: borrow is required, and no first leg leaves without the pair
+         # gate and one snapshot of the marks the decision is made on.
+         eng = CarryEngine(broker=broker(client), max_notional_usd=100_000.0,
+-                          borrow_apr=0.05, execution_mode="acquire")
++                          borrow_apr=0.05, execution_mode="acquire",
++                          persist=lambda s: None)
+         eng.pair_risk = CarryRisk(max_notional_usd=100_000.0)
+         eng.snapshot = MarketSnapshot(perp_mark=100_000.0, spot_mark=100_000.0,
+                                       funding_bps=3.0, margin_multiple=5.0,
+diff --git a/bot/tests/test_carry_cold_start.py b/bot/tests/test_carry_cold_start.py
+new file mode 100644
+index 0000000..a8efcc4
+--- /dev/null
++++ b/bot/tests/test_carry_cold_start.py
+@@ -0,0 +1,338 @@
++"""0037 — a restart must not open a second hedge.
++
++INVENTORY D3: `CarryEngine.position` lived in memory. A container that died
++holding a hedged pair came back FLAT, `CarryRisk.has_open_pair` read the empty
++engine and said no pair was open, and the book opened a second one against the
++same margin and the same liquidation price. `reconcile_pair` existed and had
++zero call sites; the directional orphan check runs only for a linear-category
++client and the carry client is spot.
++
++Two halves, and neither is optional:
++
++  the LEDGER   what this process believed, written the moment it changed
++  the VENUE    what is actually there, read before the first tick
++
++They agree, or the book does not start. The ledger is never edited to make
++them agree — that is the one thing reconciliation may not do.
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++import time
++from unittest import mock
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++import main as _main  # noqa: E402
++from carry_engine import (ACQUIRE, OVERLAY, BookState, CarryEngine,  # noqa: E402
++                          ColdStart, plan_cold_start)
++from carry_risk import CarryRisk  # noqa: E402
++from market_snapshot import MarketSnapshot  # noqa: E402
++from persistence import StateStore  # noqa: E402
++
++MARK = 100_000.0
++H8 = 8 * 3600 * 1000
++
++
++class Venue:
++    def __init__(self, *, inventory=5.0, perp=0.0, open_orders=()):
++        self.inventory = inventory
++        self.perp = perp
++        self.open_orders = list(open_orders)
++        self.orders = []
++
++    def place_market(self, *, symbol, side, qty, product):
++        self.orders.append((side, product, qty))
++        return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x"}
++
++    def get_margin_multiple(self, symbol):
++        return 5.0
++
++    def get_mark(self, symbol):
++        return MARK
++
++    def get_lot_rules(self, symbol, product):
++        return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 0.0}
++
++    def get_fee_rates(self, symbol, product):
++        return {"maker_bps": 2.0,
++                "taker_bps": 10.0 if product == "spot" else 5.5}
++
++    def get_spot_inventory(self, symbol):
++        return self.inventory
++
++    def get_perp_position(self, symbol):
++        return self.perp
++
++    def get_open_carry_orders(self, spot_symbol, perp_symbol):
++        return list(self.open_orders)
++
++
++def engine(venue, *, mode=OVERLAY, persist=None, cap=100.0):
++    e = CarryEngine(broker=venue, max_notional_usd=cap, borrow_apr=0.0,
++                    execution_mode=mode, persist=persist or (lambda s: None))
++    e.pair_risk = CarryRisk(max_notional_usd=cap)
++    e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
++                                funding_bps=3.0, margin_multiple=5.0,
++                                observed_at_s=time.time())
++    for k in (1, 2):
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                    funding_print_ms=k * H8)
++    return e
++
++
++def opened(venue, **kw):
++    e = engine(venue, **kw)
++    d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                    funding_print_ms=3 * H8, timestamp_ms=3 * H8)
++    assert d.action == "opened", d.reason
++    return e
++
++
++class TestTheLedgerIsWrittenTheMomentItChanges:
++    def test_opening_persists_the_position(self):
++        written = []
++        e = opened(Venue(), persist=written.append)
++        assert written, "the book opened and wrote nothing down"
++        state = written[-1]
++        assert state["book_state"] == "HEDGED"
++        assert state["position"]["perp"]["filled_qty"] == pytest.approx(0.001)
++        assert state["position"]["spot"]["order_link_id"] == "INVENTORY"
++        assert state["execution_mode"] == OVERLAY
++
++    def test_unwinding_persists_the_flat_book(self):
++        written = []
++        e = opened(Venue(), persist=written.append)
++        for k in (4, 5, 6):
++            e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
++                        funding_print_ms=k * H8)
++        assert written[-1]["book_state"] == "FLAT"
++        assert written[-1]["position"] is None
++
++    def test_halting_persists_the_halt(self):
++        written = []
++        e = opened(Venue(), persist=written.append)
++        e.broker.get_margin_multiple = lambda s: (_ for _ in ()).throw(
++            RuntimeError("no position row"))
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                    funding_print_ms=7 * H8)
++        assert written[-1]["book_state"] == "HALTED"
++
++    def test_a_persist_that_fails_halts_the_book(self):
++        """A book that cannot record what it just did must not keep trading:
++        the next restart would read a ledger that never saw the order."""
++        def broken(_state):
++            raise RuntimeError("disk full")
++        v = Venue()
++        e = engine(v, persist=broken)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=3 * H8)
++        assert d.state is BookState.HALTED
++        assert d.reason == "LEDGER_WRITE_FAILED"
++
++    def test_the_engine_cannot_be_built_without_a_ledger(self):
++        with pytest.raises(TypeError):
++            CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.0,
++                        execution_mode=OVERLAY)
++
++    def test_the_state_round_trips(self):
++        e = opened(Venue())
++        state = e.to_state()
++        clone = engine(Venue(), persist=lambda s: None)
++        clone.restore(state)
++        assert clone.state is BookState.HEDGED
++        assert clone.position.perp.filled_qty == pytest.approx(
++            e.position.perp.filled_qty)
++        assert clone.position.opened_ms == e.position.opened_ms
++        assert clone._last_print_ms == e._last_print_ms
++
++    def test_the_state_is_json(self):
++        json.dumps(opened(Venue()).to_state())
++
++
++class TestTheStoreKeepsIt:
++    @pytest.fixture()
++    def store(self, tmp_path):
++        s = StateStore(str(tmp_path / "s.db"))
++        yield s
++        s.close()
++
++    def test_an_empty_store_has_no_carry_position(self, store):
++        assert store.load_carry_position() is None
++
++    def test_it_saves_and_loads(self, store):
++        state = {"book_state": "HEDGED", "position": {"perp": {"x": 1}},
++                 "execution_mode": OVERLAY}
++        store.save_carry_position(state)
++        back = store.load_carry_position()
++        assert back["book_state"] == "HEDGED"
++        assert back["position"] == {"perp": {"x": 1}}
++        assert back["updated_epoch"] > 0
++
++    def test_saving_none_records_a_flat_book_not_an_absent_one(self, store):
++        store.save_carry_position({"book_state": "FLAT", "position": None})
++        back = store.load_carry_position()
++        assert back is not None and back["position"] is None
++
++    def test_the_latest_write_wins_and_there_is_only_one_row(self, store):
++        for i in range(3):
++            store.save_carry_position({"book_state": "HEDGED",
++                                       "position": {"n": i}})
++        assert store.load_carry_position()["position"] == {"n": 2}
++
++
++class TestTheColdStartPlan:
++    LEDGER = {"book_state": "HEDGED", "execution_mode": OVERLAY,
++              "position": {"perp": {"filled_qty": 0.001},
++                           "spot": {"filled_qty": 0.001}}}
++
++    def plan(self, **kw):
++        base = dict(ledger=None, venue_perp_qty=0.0, venue_spot_qty=5.0,
++                    open_orders=())
++        base.update(kw)
++        return plan_cold_start(**base)
++
++    def test_nothing_anywhere_is_a_clean_start(self):
++        assert self.plan().action is ColdStart.CLEAN
++
++    def test_a_venue_short_the_ledger_never_saw_halts(self):
++        d = self.plan(venue_perp_qty=0.004)
++        assert d.action is ColdStart.HALT
++        assert "perp" in d.naked_side
++        assert "0.004" in d.reason
++
++    def test_a_matching_pair_resumes(self):
++        d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.001)
++        assert d.action is ColdStart.RESUME
++
++    def test_a_ledger_pair_the_venue_does_not_have_halts(self):
++        d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.0)
++        assert d.action is ColdStart.HALT
++        assert d.naked_side == "spot"
++
++    def test_a_size_mismatch_halts(self):
++        d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.002)
++        assert d.action is ColdStart.HALT
++
++    def test_dust_is_not_a_mismatch(self):
++        d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.001 + 1e-9)
++        assert d.action is ColdStart.RESUME
++
++    def test_an_overlay_whose_btc_left_halts(self):
++        d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.001,
++                      venue_spot_qty=0.0)
++        assert d.action is ColdStart.HALT
++        assert d.naked_side == "perp"
++
++    def test_an_open_order_halts_whatever_else_agrees(self):
++        d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.001,
++                      open_orders=({"orderLinkId": "BB-carr-9"},))
++        assert d.action is ColdStart.HALT
++        assert "order" in d.reason.lower()
++
++    def test_a_halted_ledger_stays_halted(self):
++        d = self.plan(ledger={"book_state": "HALTED", "position": None},
++                      venue_perp_qty=0.0)
++        assert d.action is ColdStart.HALT
++        assert "halt" in d.reason.lower()
++
++    def test_an_acquire_book_checks_its_spot_leg_too(self):
++        ledger = dict(self.LEDGER, execution_mode=ACQUIRE)
++        assert self.plan(ledger=ledger, venue_perp_qty=0.001,
++                         venue_spot_qty=0.001).action is ColdStart.RESUME
++        assert self.plan(ledger=ledger, venue_perp_qty=0.001,
++                         venue_spot_qty=0.0).action is ColdStart.HALT
++
++    def test_it_never_edits_the_ledger(self):
++        ledger = json.loads(json.dumps(self.LEDGER))
++        self.plan(ledger=ledger, venue_perp_qty=0.002)
++        assert ledger == self.LEDGER
++
++
++class TestTheEngineResumesOrRefuses:
++    def test_a_resumed_book_holds_the_same_pair(self):
++        v = Venue()
++        e = opened(v, persist=lambda s: None)
++        state = e.to_state()
++        fresh = engine(Venue(perp=0.001), persist=lambda s: None)
++        d = fresh.cold_start(ledger=state, venue_perp_qty=0.001,
++                             venue_spot_qty=5.0, open_orders=())
++        assert d.action is ColdStart.RESUME
++        assert fresh.state is BookState.HEDGED
++        assert fresh.position.perp.filled_qty == pytest.approx(0.001)
++
++    def test_a_resumed_book_does_not_open_a_second_hedge(self):
++        v = Venue(perp=0.001)
++        e = engine(v, persist=lambda s: None)
++        e.cold_start(ledger=opened(Venue()).to_state(), venue_perp_qty=0.001,
++                     venue_spot_qty=5.0, open_orders=())
++        v.orders.clear()
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=9 * H8)
++        assert v.orders == []
++        assert d.action == "hold"
++
++    def test_a_mismatch_halts_the_engine_and_trips_the_switch(self):
++        tripped = []
++        v = Venue(perp=0.004)
++        e = CarryEngine(broker=v, max_notional_usd=100.0, borrow_apr=0.0,
++                        execution_mode=OVERLAY, persist=lambda s: None,
++                        kill_switch=tripped.append)
++        d = e.cold_start(ledger=None, venue_perp_qty=0.004,
++                         venue_spot_qty=5.0, open_orders=())
++        assert d.action is ColdStart.HALT
++        assert e.state is BookState.HALTED
++        assert tripped
++
++    def test_a_halted_engine_places_nothing_afterwards(self):
++        v = Venue(perp=0.004)
++        e = engine(v, persist=lambda s: None)
++        e.cold_start(ledger=None, venue_perp_qty=0.004, venue_spot_qty=5.0,
++                     open_orders=())
++        v.orders.clear()
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                    funding_print_ms=9 * H8)
++        assert v.orders == []
++
++
++class TestTheProcessRefusesToStartOnAMismatch:
++    def _bot(self, venue, ledger):
++        bot = _main.TradingBot.__new__(_main.TradingBot)
++        store = mock.Mock()
++        store.load_carry_position.return_value = ledger
++        store.is_kill_switch_engaged.return_value = (False, "")
++        bot.store = store
++        bot.symbols = ["BTCUSDT"]
++        bot.carry = CarryEngine(broker=venue, max_notional_usd=100.0,
++                                borrow_apr=0.0, execution_mode=OVERLAY,
++                                persist=lambda s: None,
++                                kill_switch=store.trip_kill_switch)
++        bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
++        return bot, store
++
++    def test_a_clean_venue_starts(self):
++        bot, _store = self._bot(Venue(), None)
++        assert bot.carry_cold_start() is True
++
++    def test_an_unknown_venue_position_refuses_to_start(self):
++        bot, store = self._bot(Venue(perp=0.004), None)
++        assert bot.carry_cold_start() is False
++        assert store.trip_kill_switch.called
++
++    def test_an_unreadable_venue_refuses_to_start(self):
++        v = Venue()
++        v.get_perp_position = lambda s: (_ for _ in ()).throw(
++            RuntimeError("venue down"))
++        bot, _store = self._bot(v, None)
++        assert bot.carry_cold_start() is False
++
++    def test_startup_calls_it_before_it_reconciles_anything_else(self):
++        """A cold start that has to be remembered is not an invariant."""
++        import inspect
++        body = inspect.getsource(_main.TradingBot.startup)
++        assert "carry_cold_start" in body
++        assert body.index("carry_cold_start") < body.index("self.engine.reconcile")
+diff --git a/bot/tests/test_carry_engine.py b/bot/tests/test_carry_engine.py
+index 0de17ce..aa9d98d 100644
+--- a/bot/tests/test_carry_engine.py
++++ b/bot/tests/test_carry_engine.py
+@@ -125,6 +125,7 @@ def engine(broker, *, primed=True, **kw):
+     # 0036: these tests are about the ACQUIRE path — the book buying the spot
+     # leg. The overlay path has its own file.
+     kw.setdefault("execution_mode", "acquire")
++    kw.setdefault("persist", lambda state: None)
+     eng = _Wired(broker=broker, **kw)
+     eng.pair_risk = CarryRisk(max_notional_usd=kw["max_notional_usd"])
+     if primed:
+diff --git a/bot/tests/test_carry_fail_closed.py b/bot/tests/test_carry_fail_closed.py
+index c16c779..0afc011 100644
+--- a/bot/tests/test_carry_fail_closed.py
++++ b/bot/tests/test_carry_fail_closed.py
+@@ -84,6 +84,7 @@ def engine(venue, *, gate=True, view=True, **kw):
+     kw.setdefault("borrow_apr", 0.05)
+     kw.setdefault("max_notional_usd", 100.0)
+     kw.setdefault("execution_mode", "acquire")
++    kw.setdefault("persist", lambda state: None)
+     e = CarryEngine(broker=venue, **kw)
+     e.pair_risk = CarryRisk(max_notional_usd=100.0) if gate else None
+     e.snapshot = snap() if view else None
+@@ -128,7 +129,7 @@ class TestBorrowIsRequiredEverywhere:
+     def test_the_engine_cannot_be_built_without_it(self):
+         with pytest.raises(TypeError):
+             CarryEngine(broker=Venue(), max_notional_usd=100.0,
+-                        execution_mode="acquire")
++                        execution_mode="acquire", persist=lambda s: None)
+ 
+     def test_the_cost_gate_cannot_be_asked_without_it(self):
+         with pytest.raises(TypeError):
+@@ -172,6 +173,16 @@ class _Store:
+     def trip_kill_switch(self, reason):
+         pass
+ 
++    # 0037: the carry book writes what it holds on every state change, and
++    # reads it back before the first tick. A stub store without these is a
++    # book with amnesia, which is what INVENTORY D3 was.
++    def save_carry_position(self, state):
++        self.carry_states = getattr(self, "carry_states", [])
++        self.carry_states.append(state)
++
++    def load_carry_position(self):
++        return getattr(self, "carry_states", None) and self.carry_states[-1]
++
+     def is_kill_switch_engaged(self):
+         return (False, "")
+ 
+diff --git a/bot/tests/test_carry_funding_prints.py b/bot/tests/test_carry_funding_prints.py
+index 7ab4b94..bff9a27 100644
+--- a/bot/tests/test_carry_funding_prints.py
++++ b/bot/tests/test_carry_funding_prints.py
+@@ -60,7 +60,7 @@ class Venue:
+ def opened(bps=3.0):
+     """An engine that has seen prints 1..3 and opened a $100 pair at print 3."""
+     e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+-                    execution_mode="acquire")
++                    execution_mode="acquire", persist=lambda s: None)
+     e.pair_risk = CarryRisk(max_notional_usd=100.0)
+     e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
+                                 funding_bps=bps, margin_multiple=5.0,
+@@ -93,7 +93,7 @@ class TestOnePrintIsBookedOnce:
+ 
+     def test_a_print_stamped_before_the_open_is_not_booked(self):
+         e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+-                    execution_mode="acquire")
++                    execution_mode="acquire", persist=lambda s: None)
+         e.pair_risk = CarryRisk(max_notional_usd=100.0)
+         e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
+                                     funding_bps=3.0, margin_multiple=5.0,
+@@ -137,7 +137,7 @@ class TestTheStreakCountsPrints:
+ class TestTheEwmaSeesPrints:
+     def test_ten_ticks_of_one_print_are_one_observation(self):
+         e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+-                    execution_mode="acquire")
++                    execution_mode="acquire", persist=lambda s: None)
+         for _ in range(10):
+             e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                         funding_print_ms=H8)
+@@ -147,7 +147,7 @@ class TestTheEwmaSeesPrints:
+         """No stamp, no print: nothing booked, and the warm-up never completes,
+         so the book cannot open on data it cannot place in time."""
+         e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+-                    execution_mode="acquire")
++                    execution_mode="acquire", persist=lambda s: None)
+         e.pair_risk = CarryRisk(max_notional_usd=100.0)
+         for _ in range(10):
+             d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK)
+@@ -290,7 +290,8 @@ def _bot(broker):
+                          update_equity=lambda e: None)
+     bot.engine = mock.Mock(observe_exits=lambda: {})
+     bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
+-                            borrow_apr=0.0, execution_mode="acquire")
++                            borrow_apr=0.0, execution_mode="acquire",
++                            persist=lambda s: None)
+     bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
+     return bot
+ 
+diff --git a/bot/tests/test_carry_live_gates.py b/bot/tests/test_carry_live_gates.py
+index de6f858..03ffd70 100644
+--- a/bot/tests/test_carry_live_gates.py
++++ b/bot/tests/test_carry_live_gates.py
+@@ -35,6 +35,16 @@ class Store:
+     def trip_kill_switch(self, reason):
+         pass
+ 
++    # 0037: the carry book writes what it holds on every state change, and
++    # reads it back before the first tick. A stub store without these is a
++    # book with amnesia, which is what INVENTORY D3 was.
++    def save_carry_position(self, state):
++        self.carry_states = getattr(self, "carry_states", [])
++        self.carry_states.append(state)
++
++    def load_carry_position(self):
++        return getattr(self, "carry_states", None) and self.carry_states[-1]
++
+     def open_positions(self):
+         return []
+ 
+@@ -105,7 +115,8 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
+                          update_equity=lambda e: None)
+     bot.engine = mock.Mock(observe_exits=lambda: {})
+     bot.carry = CarryEngine(broker=broker, max_notional_usd=100.0,
+-                            borrow_apr=0.05, execution_mode="acquire")
++                            borrow_apr=0.05, execution_mode="acquire",
++                            persist=lambda s: None)
+     if risk:
+         bot.carry.pair_risk = CarryRisk(store=store, max_notional_usd=100.0)
+     # 0034: two earlier SETTLED prints; the tick then reads the latest one.
+diff --git a/bot/tests/test_carry_overlay.py b/bot/tests/test_carry_overlay.py
+index 1a088fb..09b201a 100644
+--- a/bot/tests/test_carry_overlay.py
++++ b/bot/tests/test_carry_overlay.py
+@@ -96,6 +96,7 @@ def snap(perp=MARK, spot=MARK):
+ 
+ def engine(venue, *, mode=OVERLAY, cap=100.0, **kw):
+     kw.setdefault("borrow_apr", 0.0)
++    kw.setdefault("persist", lambda state: None)
+     e = CarryEngine(broker=venue, max_notional_usd=cap, execution_mode=mode,
+                     **kw)
+     e.pair_risk = CarryRisk(max_notional_usd=cap)
+@@ -318,12 +319,13 @@ class TestTheCostGateTakesTheRoundTripAsAnInput:
+ class TestModeIsAnExplicitDecision:
+     def test_the_engine_cannot_be_built_without_a_mode(self):
+         with pytest.raises(TypeError):
+-            CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.0)
++            CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.0,
++                        persist=lambda s: None)
+ 
+     def test_an_unknown_mode_raises_at_construction(self):
+         with pytest.raises(ValueError, match="execution mode"):
+             CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.0,
+-                        execution_mode="hedge_maybe")
++                        execution_mode="hedge_maybe", persist=lambda s: None)
+ 
+     def test_build_bot_refuses_without_the_config_key(self):
+         import config as _config
+@@ -360,6 +362,16 @@ class _Store:
+     def trip_kill_switch(self, reason):
+         pass
+ 
++    # 0037: the carry book writes what it holds on every state change, and
++    # reads it back before the first tick. A stub store without these is a
++    # book with amnesia, which is what INVENTORY D3 was.
++    def save_carry_position(self, state):
++        self.carry_states = getattr(self, "carry_states", [])
++        self.carry_states.append(state)
++
++    def load_carry_position(self):
++        return getattr(self, "carry_states", None) and self.carry_states[-1]
++
+     def is_kill_switch_engaged(self):
+         return (False, "")
+ 
+diff --git a/bot/tests/test_carry_wiring.py b/bot/tests/test_carry_wiring.py
+index a5a04ce..f415210 100644
+--- a/bot/tests/test_carry_wiring.py
++++ b/bot/tests/test_carry_wiring.py
+@@ -43,6 +43,17 @@ class _Store:
+     def trip_kill_switch(self, reason):
+         self.killed.append(reason)
+ 
++    # 0037: the carry book writes what it holds on every state change, and
++    # reads it back before the first tick. A stub store without these is a
++    # book with amnesia, which is what INVENTORY D3 was.
++    def save_carry_position(self, state):
++        self.carry_states = getattr(self, "carry_states", [])
++        self.carry_states.append(state)
++
++    def load_carry_position(self):
++        return getattr(self, "carry_states", [None])[-1] if \
++            getattr(self, "carry_states", None) else None
++
+     def open_positions(self):
+         return []
+ 
+@@ -104,7 +115,8 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
+     bot = _main.TradingBot.__new__(_main.TradingBot)
+     bot.symbols = ["BTCUSDT"]
+     bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0,
+-                            borrow_apr=0.05, execution_mode="acquire")
++                            borrow_apr=0.05, execution_mode="acquire",
++                            persist=lambda s: None)
+     # 0033: no first leg without the pair gate. main.tick supplies the
+     # snapshot; the gate is attached here exactly as build_bot attaches it.
+     from carry_risk import CarryRisk
+diff --git a/bot/tests/test_carry_wiring_authority.py b/bot/tests/test_carry_wiring_authority.py
+index 0c9c805..7efec7c 100644
+--- a/bot/tests/test_carry_wiring_authority.py
++++ b/bot/tests/test_carry_wiring_authority.py
+@@ -52,6 +52,16 @@ class _Store:
+     def trip_kill_switch(self, reason):
+         self.tripped.append(reason)
+ 
++    # 0037: the carry book writes what it holds on every state change, and
++    # reads it back before the first tick. A stub store without these is a
++    # book with amnesia, which is what INVENTORY D3 was.
++    def save_carry_position(self, state):
++        self.carry_states = getattr(self, "carry_states", [])
++        self.carry_states.append(state)
++
++    def load_carry_position(self):
++        return getattr(self, "carry_states", None) and self.carry_states[-1]
++
+     def open_positions(self):
+         return []
+ 
+diff --git a/bot/tests/test_session_tail.py b/bot/tests/test_session_tail.py
+index a8cbacf..f3a70d6 100644
+--- a/bot/tests/test_session_tail.py
++++ b/bot/tests/test_session_tail.py
+@@ -84,3 +84,58 @@ class TestAViolationFailsTheExit:
+             body = fh.read()
+         assert "place_market" not in body
+         assert "place_order" not in body
++
++
++class TestUnreadableIsNotViolated:
++    """0037: run without the virtualenv, session_tail printed
++
++        GATE STILL FALSE?:  NO  (UNREADABLE: No module named 'numpy')
++
++    which reads as "the gate opened". It had not: the interpreter could not
++    import the module. A tool that cannot tell "false" from "cannot tell"
++    turns a missing dependency into a fire drill — and would hide a real
++    violation behind the same word."""
++
++    def _blind(self, monkeypatch, name):
++        import sys
++        monkeypatch.setitem(sys.modules, name, None)
++        for mod in [m for m in sys.modules if m.startswith("promotion_gate")]:
++            monkeypatch.delitem(sys.modules, mod, raising=False)
++
++    def test_an_unreadable_check_is_reported_as_unreadable(self, monkeypatch):
++        self._blind(monkeypatch, "shadow")
++        report = st.check(REPO)
++        assert report["cap_readable"] is False
++        assert report["cap_still_100"] is None
++        assert "UNREADABLE" in str(report["cap"])
++
++    def test_unreadable_is_not_ok_and_not_a_violation(self, monkeypatch):
++        self._blind(monkeypatch, "shadow")
++        report = st.check(REPO)
++        assert report["ok"] is False
++        assert report["violations"] == []
++        assert "cap_still_100" in report["unreadable"]
++
++    def test_a_real_violation_is_still_a_violation(self, monkeypatch):
++        import shadow
++        monkeypatch.setattr(shadow, "SHADOW_MAX_NOTIONAL_USD", 250.0)
++        report = st.check(REPO)
++        assert report["cap_readable"] is True
++        assert report["cap_still_100"] is False
++        assert "cap_still_100" in report["violations"]
++
++    def test_the_exit_code_separates_them(self, monkeypatch):
++        assert st.main(["--repo", REPO]) == 0
++        self._blind(monkeypatch, "shadow")
++        assert st.main(["--repo", REPO]) == 2        # cannot tell
++        monkeypatch.undo()
++        import shadow
++        monkeypatch.setattr(shadow, "SHADOW_MAX_NOTIONAL_USD", 250.0)
++        assert st.main(["--repo", REPO]) == 1        # moved
++
++    def test_it_says_which_interpreter_to_use(self, monkeypatch, capsys):
++        self._blind(monkeypatch, "shadow")
++        st.main(["--repo", REPO])
++        out = capsys.readouterr().out
++        assert "UNREADABLE" in out
++        assert ".venv" in out
+diff --git a/bot/tools/session_tail.py b/bot/tools/session_tail.py
+index 1e35dd8..ecdc7b4 100644
+--- a/bot/tools/session_tail.py
++++ b/bot/tools/session_tail.py
+@@ -68,64 +68,109 @@ def live_authorized_assignments(root: str) -> List[str]:
+ 
+ 
+ def check(repo: str = ROOT) -> Dict[str, Any]:
++    """Every invariant, with three outcomes: holds, VIOLATED, or UNREADABLE.
++
++    0037: the third one is the point. Run outside the virtualenv this printed
++    "NO" for a gate it had simply failed to import, which reads as "the gate
++    opened". A tool that cannot tell `False` from `cannot tell` is worse than
++    no tool: it cries wolf on a missing dependency and it would hide a real
++    violation behind the same word.
++    """
+     repo = os.path.abspath(repo)
+     if repo not in sys.path:
+         sys.path.insert(0, repo)
+     report: Dict[str, Any] = {}
+ 
+-    try:
+-        import promotion_gate
+-        report["gate_value"] = promotion_gate.promotion_gate_allows_live()
+-        report["gate_still_false"] = report["gate_value"] is False
+-    except Exception as exc:  # noqa: BLE001 - an unreadable gate is a failure
+-        report["gate_value"] = f"UNREADABLE: {exc!r}"
+-        report["gate_still_false"] = False
+-
+-    try:
+-        from signals import funding_carry_fade_v1 as a
+-        from signals import funding_carry_fade_btc_v1 as b
+-        report["fund_abs"] = [a.FUND_ABS, b.FUND_ABS]
+-        report["fund_abs_still_0_0001"] = (a.FUND_ABS == 0.0001
+-                                           and b.FUND_ABS == 0.0001)
+-    except Exception as exc:  # noqa: BLE001
+-        report["fund_abs"] = f"UNREADABLE: {exc!r}"
+-        report["fund_abs_still_0_0001"] = False
+-
+-    try:
+-        import shadow
+-        report["cap"] = shadow.SHADOW_MAX_NOTIONAL_USD
+-        report["cap_still_100"] = float(shadow.SHADOW_MAX_NOTIONAL_USD) == 100.0
+-    except Exception as exc:  # noqa: BLE001
+-        report["cap"] = f"UNREADABLE: {exc!r}"
+-        report["cap_still_100"] = False
++    def record(key: str, value_key: str, fn) -> None:
++        try:
++            value, holds = fn()
++        except Exception as exc:  # noqa: BLE001 - unreadable, not violated
++            report[value_key] = f"UNREADABLE: {exc}"
++            report[key] = None
++            report[_readable_key(key)] = False
++            return
++        report[value_key] = value
++        report[key] = holds
++        report[_readable_key(key)] = True
++
++    record("gate_still_false", "gate_value", _gate)
++    record("fund_abs_still_0_0001", "fund_abs", _fund_abs)
++    record("cap_still_100", "cap", _cap)
++    record("live_authorized_unassigned", "live_authorized_writes",
++           lambda: _live_authorized(repo))
++
++    checks = ("gate_still_false", "fund_abs_still_0_0001", "cap_still_100",
++              "live_authorized_unassigned")
++    report["violations"] = [k for k in checks if report[k] is False]
++    report["unreadable"] = [k for k in checks if report[k] is None]
++    report["ok"] = not report["violations"] and not report["unreadable"]
++    return report
+ 
+-    hits = live_authorized_assignments(repo)
+-    report["live_authorized_writes"] = hits
+-    report["live_authorized_unassigned"] = not hits
+ 
+-    report["ok"] = all(report[k] is True for k in (
+-        "gate_still_false", "fund_abs_still_0_0001", "cap_still_100",
+-        "live_authorized_unassigned"))
+-    return report
++def _readable_key(key: str) -> str:
++    return {"gate_still_false": "gate_readable",
++            "fund_abs_still_0_0001": "fund_abs_readable",
++            "cap_still_100": "cap_readable",
++            "live_authorized_unassigned": "live_authorized_readable"}[key]
++
++
++def _gate():
++    import promotion_gate
++    value = promotion_gate.promotion_gate_allows_live()
++    return value, value is False
++
++
++def _fund_abs():
++    from signals import funding_carry_fade_v1 as a
++    from signals import funding_carry_fade_btc_v1 as b
++    return [a.FUND_ABS, b.FUND_ABS], (a.FUND_ABS == 0.0001
++                                      and b.FUND_ABS == 0.0001)
++
++
++def _cap():
++    import shadow
++    value = shadow.SHADOW_MAX_NOTIONAL_USD
++    return value, float(value) == 100.0
++
++
++def _live_authorized(repo: str):
++    hits = live_authorized_assignments(repo)
++    return hits, not hits
+ 
+ 
+ def main(argv: Optional[List[str]] = None) -> int:
++    """0 = every invariant holds, 1 = one MOVED, 2 = one could not be read."""
+     ap = argparse.ArgumentParser(description=__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+     ap.add_argument("--repo", default=ROOT)
+     args = ap.parse_args(argv)
+     r = check(args.repo)
+-    yn = lambda v: "yes" if v is True else "NO"  # noqa: E731
+-    print(f"GATE STILL FALSE?:            {yn(r['gate_still_false'])}"
+-          f"   (promotion_gate_allows_live() = {r['gate_value']})")
+-    print(f"FUND_ABS STILL 0.0001?:       {yn(r['fund_abs_still_0_0001'])}"
+-          f"   ({r['fund_abs']})")
+-    print(f"CAP STILL 100?:               {yn(r['cap_still_100'])}"
+-          f"   (SHADOW_MAX_NOTIONAL_USD = {r['cap']})")
+-    print(f"LIVE_AUTHORIZED UNASSIGNED?:  {yn(r['live_authorized_unassigned'])}"
+-          f"   ({len(r['live_authorized_writes'])} write(s)"
+-          f"{': ' + ', '.join(r['live_authorized_writes']) if r['live_authorized_writes'] else ''})")
+-    return 0 if r["ok"] else 1
++
++    def mark(key: str) -> str:
++        return {True: "yes", False: "NO", None: "UNREADABLE"}[r[key]]
++
++    print(f"GATE STILL FALSE?:            {mark('gate_still_false'):<11s}"
++          f"(promotion_gate_allows_live() = {r['gate_value']})")
++    print(f"FUND_ABS STILL 0.0001?:       {mark('fund_abs_still_0_0001'):<11s}"
++          f"({r['fund_abs']})")
++    print(f"CAP STILL 100?:               {mark('cap_still_100'):<11s}"
++          f"(SHADOW_MAX_NOTIONAL_USD = {r['cap']})")
++    writes = r["live_authorized_writes"]
++    print(f"LIVE_AUTHORIZED UNASSIGNED?:  "
++          f"{mark('live_authorized_unassigned'):<11s}"
++          + (f"({len(writes)} write(s)"
++             + (": " + ", ".join(writes) if writes else "") + ")"
++             if isinstance(writes, list) else f"({writes})"))
++
++    if r["unreadable"]:
++        print()
++        print("UNREADABLE is not a violation: this interpreter could not "
++              "import what the check reads.")
++        print("Run it with the virtualenv the suite uses:")
++        print("    . .venv/bin/activate && python3 bot/tools/session_tail.py")
++        print("    (or: .venv/bin/python bot/tools/session_tail.py)")
++        return 2
++    return 1 if r["violations"] else 0
+ 
+ 
+ if __name__ == "__main__":
+-- 
+2.43.0
+
