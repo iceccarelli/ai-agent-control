@@ -570,6 +570,87 @@ class CarryBroker:
                 f"settled funding print for {symbol} is unusable: {row!r}")
         return rate * 1e4, stamp
 
+    def get_liquidation_view(self, symbol: str) -> Dict[str, Any]:
+        """How far the price can move before this position is liquidated.
+
+        INVENTORY F4: `positionIM / positionMM` is a leverage / risk-tier
+        ratio, not headroom. What the venue actually publishes is `liqPrice`
+        on the position and `accountMMRate` on the account, and under UTA
+        cross margin liquidation is ACCOUNT level, so both are read.
+
+        `liqPrice` is `""` when it lies outside the venue's price bounds.
+        That means there is no REACHABLE liquidation price — the safest state
+        there is — and it comes back as `None` with a reason rather than as a
+        zero, which would read as "liquidation is at zero" or, worse, get
+        arithmetic done to it.
+
+        Raises when the position cannot be read at all.
+        """
+        result = self.client._request(
+            "GET", "/v5/position/list", signed=True,
+            params={"category": LINEAR, "symbol": symbol})
+        rows = (result or {}).get("list")
+        if rows is None:
+            raise PairIncident(
+                f"cannot read the {symbol} position; liquidation distance "
+                "unknown, and an unreadable one is a margin call you cannot "
+                "see")
+
+        account_mm = None
+        try:
+            wallet = self.client._request(
+                "GET", "/v5/account/wallet-balance", signed=True,
+                params={"accountType": "UNIFIED"})
+            wrows = (wallet or {}).get("list") or []
+            raw = wrows[0].get("accountMMRate") if wrows else None
+            if raw is not None and str(raw).strip() != "":
+                value = float(raw)
+                account_mm = value if math.isfinite(value) else None
+        except Exception:  # noqa: BLE001
+            # The per-position number is the primary measure; the account rate
+            # is the cross-check. Losing the cross-check is recorded as None,
+            # not as zero, and never as "fine".
+            account_mm = None
+
+        if not rows:
+            return {"size": 0.0, "side": "", "mark": 0.0, "liq_price": None,
+                    "distance_pct": None, "account_mm_rate": account_mm,
+                    "reason": "NO_POSITION"}
+
+        row = rows[0]
+        try:
+            size = abs(float(row.get("size", 0) or 0))
+            mark = float(row.get("markPrice", 0) or 0)
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"position row for {symbol} is malformed: {row!r}") from exc
+        side = str(row.get("side", ""))
+
+        raw_liq = row.get("liqPrice")
+        if raw_liq is None or str(raw_liq).strip() == "":
+            return {"size": size, "side": side, "mark": mark,
+                    "liq_price": None, "distance_pct": None,
+                    "account_mm_rate": account_mm,
+                    "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
+        try:
+            liq = float(raw_liq)
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"liqPrice for {symbol} is {raw_liq!r}") from exc
+        if not (math.isfinite(liq) and liq > 0 and mark > 0):
+            return {"size": size, "side": side, "mark": mark,
+                    "liq_price": None, "distance_pct": None,
+                    "account_mm_rate": account_mm,
+                    "reason": "LIQ_PRICE_UNUSABLE"}
+
+        # A short is liquidated ABOVE the mark, a long below. Either way the
+        # answer is a positive distance to the bad side.
+        distance = (100.0 * (liq - mark) / mark if side == "Sell"
+                    else 100.0 * (mark - liq) / mark)
+        return {"size": size, "side": side, "mark": mark, "liq_price": liq,
+                "distance_pct": distance, "account_mm_rate": account_mm,
+                "reason": ""}
+
     def get_funding_history(self, symbol: str,
                             limit: int = 8) -> List[Tuple[float, int]]:
         """The last `limit` SETTLED prints, oldest first, as `(bps, ms)`.

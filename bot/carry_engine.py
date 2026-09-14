@@ -156,6 +156,33 @@ def snap_to_lot(qty: float, step: float) -> float:
         return 0.0
 
 
+#: HOW FAR THE PRICE MUST BE ABLE TO MOVE before the short is liquidated,
+#: as a percentage of the mark. INVENTORY F4: the book guarded itself with
+#: `positionIM / positionMM` and a floor of 2.0, and that ratio is a LEVERAGE
+#: / RISK-TIER quantity — Bybit tier 1 is 0.66% over 0.33%, so it sits near
+#: 2.0 by construction and barely moves as the price does. It is not headroom,
+#: and a short being squeezed would not have tripped it.
+#:
+#: MEASURED, not chosen. Over the 4,500-settlement Bybit corpus, the worst
+#: moves against a short were:
+#:
+#:     8h close to close      8.00%
+#:     intra-settlement high 11.52%   (what a liquidation engine actually sees)
+#:     24h                   17.93%
+#:
+#: 15.0 clears the first two. It is not tuned to make anything pass: a
+#: correctly collateralised overlay — one BTC short against one BTC held —
+#: has no reachable liquidation price at all, so this gate should never bind,
+#: and when it binds something has gone wrong that a human needs to see.
+MIN_LIQUIDATION_DISTANCE_PCT = 15.0
+
+#: Account maintenance-margin ratio at which the book leaves. Under UTA cross
+#: margin liquidation is ACCOUNT level, so a comfortable per-position
+#: liqPrice is not the whole answer. Bybit liquidates as this approaches 1.0;
+#: 0.50 is half that distance and the book does not wait to find out whether
+#: the documentation is precise.
+MAX_ACCOUNT_MM_RATE = 0.50
+
 #: Unwind when funding has been negative this many consecutive prints. Negative
 #: funding means the trade has inverted: you are now PAYING to hold the hedge.
 #: Three prints is one day — long enough not to react to a single squeeze,
@@ -379,7 +406,8 @@ class CarryEngine:
                  borrow_apr: float, execution_mode: str,
                  persist: Any,
                  execution_style: str = TAKER,
-                 maker_wait_s: float = DEFAULT_MAKER_WAIT_S) -> None:
+                 maker_wait_s: float = DEFAULT_MAKER_WAIT_S,
+                 require_liquidation_check: bool = False) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -412,6 +440,11 @@ class CarryEngine:
                 "positive, finite wait before it is cancelled and crossed")
         self.execution_style = execution_style
         self.maker_wait_s = wait
+        # F4 (0048). OFF by default so no existing caller changes behaviour,
+        # and turned ON by build_bot, which is disclosed and asserted by a
+        # test. A live book that cannot read its own liquidation price halts;
+        # a test double that was never asked to model one does not.
+        self.require_liquidation_check = bool(require_liquidation_check)
         self.persist = persist
         self.execution_mode = execution_mode
         self.broker = broker
@@ -1070,6 +1103,50 @@ class CarryEngine:
         if margin < self.min_margin_multiple:
             return self._unwind(self.broker.get_mark(self.perp_symbol),
                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
+        return self._check_liquidation_distance()
+
+    def _check_liquidation_distance(self) -> Optional[CarryDecision]:
+        """How far the price can move before the short is gone (F4, 0048).
+
+        This is a HOLD-time check and cannot be anything else: before the book
+        opens there is no position, so the venue has no liquidation price to
+        report. The exposure F4 describes is exactly the held one.
+
+        The IM/MM floor above is untouched and still runs. This is an
+        additional gate; a position must satisfy both.
+        """
+        if not self.require_liquidation_check:
+            return None
+        try:
+            view = self.broker.get_liquidation_view(self.perp_symbol)
+        except Exception as exc:  # noqa: BLE001
+            return self._halt(
+                "LIQUIDATION_PRICE_UNREADABLE",
+                f"the venue would not say how close this position is to "
+                f"liquidation ({type(exc).__name__}: {exc}); an unreadable "
+                "liquidation price is a margin call you cannot see")
+
+        rate = view.get("account_mm_rate")
+        if rate is not None and self._finite(rate) \
+                and float(rate) >= MAX_ACCOUNT_MM_RATE:
+            return self._unwind(
+                self.broker.get_mark(self.perp_symbol),
+                f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
+
+        distance = view.get("distance_pct")
+        if distance is None:
+            # Bybit returns "" for liqPrice when it lies outside the venue's
+            # price bounds: there is no reachable liquidation price, which is
+            # the safest state there is. Not missing data.
+            return None
+        if not self._finite(distance):
+            return self._halt(
+                "LIQUIDATION_DISTANCE_UNUSABLE",
+                f"the venue reported a liquidation distance of {distance!r}")
+        if float(distance) < MIN_LIQUIDATION_DISTANCE_PCT:
+            return self._unwind(
+                self.broker.get_mark(self.perp_symbol),
+                f"LIQUIDATION_{float(distance):.1f}PCT_AWAY_BELOW_FLOOR")
         return None
 
     def _margin_multiple(self) -> Optional[float]:

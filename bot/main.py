@@ -838,6 +838,12 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # "taker" — the round trip the entry gate prices.
             execution_style=cfg.CARRY_EXECUTION_STYLE,
             maker_wait_s=float(cfg.CARRY_MAKER_WAIT_S),
+            # F4 (0048). The live book measures how far the price can move
+            # before the short is liquidated, and halts if the venue will not
+            # say. Off by default in the constructor so test doubles that were
+            # never asked to model a liquidation price are unaffected; ON
+            # here, because this is the one that loses the position.
+            require_liquidation_check=True,
             # THE LEDGER (0037). Called by the engine on every state change,
             # straight through to the store. Not a hasattr guard and not a
             # lambda that swallows: a store without this method is a
