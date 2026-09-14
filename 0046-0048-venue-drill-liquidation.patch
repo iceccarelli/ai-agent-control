@@ -1,0 +1,2181 @@
+From b943f414b19b354d71df96b896d513a37f56e48a Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Mon, 14 Sep 2026 19:00:52 +0000
+Subject: [PATCH 1/3] 0046 a venue the book can reach today (5855 passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Phase D needed an API key and a wallet with BTC in it, and one of them had a
+24-hour clock on it: testnet coins come from a web faucet — 1 BTC, once per
+day, PC browser only, no API.
+
+Bybit DEMO TRADING is a different module. api-demo.bybit.com, funded by
+POST /v5/account/demo-apply-money (up to 15 BTC), running against REAL
+mainnet market data with simulated matching. The marks, the basis and the
+funding prints are the real ones; the fills are not and no real money moves.
+So the wallet stops being a blocker and the market data gets BETTER than
+testnet's, which has its own thin book and its own funding.
+
+THE DANGER THAT CREATES. USE_TESTNET is a boolean that picks a base URL, and
+adding a third destination to a boolean is how a testnet key authenticates
+against mainnet.
+
+  BYBIT_VENUE in {mainnet, testnet, demo} is the authority
+  USE_TESTNET is DERIVED from it, so every existing gate keeps working and
+    none of them has to learn a new word
+  a config that states both and contradicts itself is REFUSED, not resolved
+
+Two sources of truth about which exchange you are pointed at is precisely
+the bug. Tests assert demo is a sandbox at every gate: is_live_authorized
+False, assert_sandbox True, and the carry order gate returns (True, "DEMO")
+— permitted for the same reason testnet is, and NAMED, so no log line and no
+transcript can be read as mainnet evidence. One table maps venue to URL, so
+there is exactly one answer to which exchange am I pointed at.
+
+tools/fund_demo.py sends the funding request and checks the URL the client
+is ACTUALLY pointed at rather than a config flag — that URL decides where
+the request lands, and a funding call is a WRITE. Anything but the demo base
+raises NotDemo and nothing is sent. It also refuses an amount above the
+venue's own maximum and a coin it does not fund, so a typo is a message
+rather than a rejected signed request nobody reads.
+
+The drill now records the venue and what that venue's evidence is worth, and
+defaults to "unknown" rather than to mainnet: a transcript that does not
+know where it ran must not read as the strongest possible claim.
+
+D30 — the drill died with `ModuleNotFoundError: No module named 'numpy'`
+from four imports deep under a bare interpreter. D16 again. The import moved
+into _load_bot(); a failure names the virtualenv and exits 2, the same code
+session_tail uses for "could not read" as distinct from "this is wrong".
+
+scripts/deploy.sh is one command from a checkout to a running book:
+flyctl, fly_stack --check BEFORE creating anything, app, volume, egress IP,
+secrets, deploy --strategy immediate. Idempotent at every step. It REFUSES
+MAINNET BY NAME — that needs a signed memo and a recorded drill first, and
+then it is a deliberate act, not a script — and it ARMS NOTHING: a test
+asserts every arming string appears only in the instructions it prints and
+never in the part it executes, and that test was checked by breaking the
+script on purpose and watching it fail.
+
+What demo still does not give: F4 liquidation, F8 rate limits under load,
+F10/F11 post-only fills, and nothing about slippage on a real book. It is
+the fastest way to find out whether the SOFTWARE is right, which is a
+different question from whether the trade is.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ bot/bybit_connection.py           |  25 ++-
+ bot/config.py                     |  46 +++++-
+ bot/docs/human/INVENTORY.md       |   3 +
+ bot/docs/human/VENUE_0046.md      | 116 ++++++++++++++
+ bot/main.py                       |   6 +-
+ bot/tests/test_drill.py           |  10 +-
+ bot/tests/test_fly_runtime.py     |  40 +++++
+ bot/tests/test_venue_selection.py | 246 ++++++++++++++++++++++++++++++
+ bot/tools/drill.py                |  49 +++++-
+ bot/tools/fund_demo.py            | 129 ++++++++++++++++
+ scripts/deploy.sh                 | 115 ++++++++++++++
+ 11 files changed, 773 insertions(+), 12 deletions(-)
+ create mode 100644 bot/docs/human/VENUE_0046.md
+ create mode 100644 bot/tests/test_venue_selection.py
+ create mode 100644 bot/tools/fund_demo.py
+ create mode 100755 scripts/deploy.sh
+
+diff --git a/bot/bybit_connection.py b/bot/bybit_connection.py
+index 7b34ca9..c9db53e 100644
+--- a/bot/bybit_connection.py
++++ b/bot/bybit_connection.py
+@@ -93,12 +93,24 @@ __all__ = [
+     "OPEN_ORDER_STATUS",
+     "MAINNET_REST",
+     "TESTNET_REST",
++    "DEMO_REST",
++    "VENUE_REST",
+     "MAINNET_WS_PRIVATE",
+     "TESTNET_WS_PRIVATE",
+ ]
+ 
+ MAINNET_REST = "https://api.bybit.com"
+ TESTNET_REST = "https://api-testnet.bybit.com"
++#: Bybit DEMO TRADING (0046). A separate module from testnet: it runs against
++#: REAL mainnet market data with simulated matching, and its wallet is funded
++#: by `POST /v5/account/demo-apply-money` rather than a 24-hour web faucet.
++#: Real marks, real basis, real funding prints, no real money.
++DEMO_REST = "https://api-demo.bybit.com"
++
++#: The only mapping from a venue name to a URL. One table, so there is exactly
++#: one answer to "which exchange am I pointed at".
++VENUE_REST = {"mainnet": MAINNET_REST, "testnet": TESTNET_REST,
++              "demo": DEMO_REST}
+ MAINNET_WS_PRIVATE = "wss://stream.bybit.com/v5/private"
+ TESTNET_WS_PRIVATE = "wss://stream-testnet.bybit.com/v5/private"
+ 
+@@ -334,7 +346,18 @@ class BybitClient:
+         self.orders_submitted = 0
+ 
+         self.testnet = bool(self.cfg.USE_TESTNET)
+-        self.base_url = TESTNET_REST if self.testnet else MAINNET_REST
++        # The venue name is the authority; USE_TESTNET is the DERIVED sandbox
++        # flag every safety gate already reads (0046). A config that states
++        # both and contradicts itself never gets here: config.load refuses it.
++        venue = str(getattr(self.cfg, "BYBIT_VENUE", "") or
++                    ("testnet" if self.testnet else "mainnet"))
++        if venue not in VENUE_REST:
++            raise ValueError(
++                f"BYBIT_VENUE={venue!r} is not one of {sorted(VENUE_REST)}; "
++                "refusing rather than guessing which exchange to authenticate "
++                "against")
++        self.venue = venue
++        self.base_url = VENUE_REST[venue]
+         self.ws_private_url = (
+             TESTNET_WS_PRIVATE if self.testnet else MAINNET_WS_PRIVATE
+         )
+diff --git a/bot/config.py b/bot/config.py
+index 4d49e3b..c27ba74 100644
+--- a/bot/config.py
++++ b/bot/config.py
+@@ -239,6 +239,45 @@ def parse_maker_wait(env: Mapping[str, str]) -> float:
+     return value
+ 
+ 
++#: The three places this software can point. `mainnet` is the only one where
++#: money is real; the other two are sandboxes and every safety gate treats
++#: them identically, because USE_TESTNET is DERIVED from this rather than
++#: competing with it (0046).
++BYBIT_VENUES = ("mainnet", "testnet", "demo")
++
++
++def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
++    """`(venue, is_sandbox)`. Refuses a configuration that contradicts itself.
++
++    `USE_TESTNET` is a boolean and there are three destinations, so the boolean
++    cannot be the authority any more. It stays as the derived sandbox flag —
++    every existing gate reads it and none of them has to learn a new word — and
++    when BOTH keys are set and disagree, that is REFUSED rather than resolved.
++    Two sources of truth about which exchange you are authenticating against is
++    precisely how a testnet key reaches mainnet.
++    """
++    raw = env.get("BYBIT_VENUE")
++    stated = env.get("USE_TESTNET")
++    if raw is None or str(raw).strip() == "":
++        sandbox = parse_bool(stated, True)
++        return ("testnet" if sandbox else "mainnet"), sandbox
++    venue = str(raw).strip().lower()
++    if venue not in BYBIT_VENUES:
++        raise ConfigError(
++            f"BYBIT_VENUE={raw!r} is not one of {BYBIT_VENUES}. Refusing "
++            "rather than defaulting: this decides which exchange the keys "
++            "authenticate against.")
++    sandbox = venue != "mainnet"
++    if stated is not None and str(stated).strip() != "":
++        if parse_bool(stated, True) != sandbox:
++            raise ConfigError(
++                f"BYBIT_VENUE={venue!r} and USE_TESTNET={stated!r} disagree "
++                "about whether this is a sandbox. Set one of them, not both: "
++                "two sources of truth about which exchange you are pointed at "
++                "is how a testnet key ends up on mainnet.")
++    return venue, sandbox
++
++
+ def parse_int(
+     env: Mapping[str, str], name: str, default: int,
+     *, low: int = -(2**31), high: int = 2**31,
+@@ -315,6 +354,10 @@ class Config:
+ 
+     # -- mode ---------------------------------------------------------------
+     USE_TESTNET: bool
++    #: Which exchange (0046): "mainnet", "testnet" or "demo". USE_TESTNET is
++    #: DERIVED from this, so every existing safety gate keeps working without
++    #: learning a new word.
++    BYBIT_VENUE: str
+     PAPER_TRADING: bool
+     LIVE_TRADING_ACK: str
+     LIVE_AUTHORIZED: bool
+@@ -649,7 +692,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
+     """
+     env = os.environ if env is None else env
+ 
+-    use_testnet = parse_bool(env.get("USE_TESTNET"), True)
++    venue, use_testnet = parse_venue(env)
+     paper_trading = parse_bool(env.get("PAPER_TRADING"), True)
+     ack = parse_str(env, "LIVE_TRADING_ACK")
+     api_key = parse_str(env, "BYBIT_API_KEY")
+@@ -709,6 +752,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
+ 
+     cfg = Config(
+         USE_TESTNET=use_testnet,
++        BYBIT_VENUE=venue,
+         PAPER_TRADING=paper_trading,
+         LIVE_TRADING_ACK=ack,
+         LIVE_AUTHORIZED=authorized,
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index 671f902..98c77e5 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -37,6 +37,7 @@ never consulted. Loop interval: `LOOP_INTERVAL_SECONDS`, default **60 s**.
+ | `CarryBroker.get_book_top`, `place_post_only`, `cancel_order` | **yes when `CARRY_EXECUTION_STYLE=maker_first`**, and only for the overlay's entry leg; every exit and both ACQUIRE entry legs cross (0040) | `carry_engine.py` `_rest`; AST invariant in `tests/test_carry_maker.py` |
+ | `CarryBroker.reconcile_pair` | **no — zero call sites outside tests** | `grep -rn reconcile_pair --include=*.py . \| grep -v tests` |
+ | `CarryBroker.get_venue_time_s` | **does not exist** → the clock-skew check in `assert_fresh` never runs | `hasattr(bot.carry.broker, "get_venue_time_s") → False` |
++| `tools/fund_demo.py` | no — funds a DEMO wallet; refuses on any other base URL, checked against the URL the client is pointed at rather than a config flag | `docs/human/VENUE_0046.md` |
+ | `tools/drill.py` | no — the Phase D drill; reads only without `--arm`, and with it goes through the engine and the broker `build_bot` made | `docs/human/DRILL_0045.md` |
+ | `ledger.py` | **yes** — `build_bot` wraps `CarryBroker` in `LedgerBroker`, the journal loads from `carry_ledger` at startup and `tick()` posts funding and writes it back | `docs/human/LEDGER_0044.md` |
+ | `tools/carry_replay.py` | no — offline, but it drives the REAL `CarryEngine` through `main.tick`'s sequence, so it is the only tool whose numbers are the trading class's own | `docs/human/REPLAY_0043.md` |
+@@ -83,6 +84,8 @@ Reproduced in-session with a stub broker; no venue.
+ | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
+ | D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | **recorded 0032** (`carry_cost_gates_v1@BTCUSDT`, forward-only holdout); a quotable condition |
+ | D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
++| D29 | **`USE_TESTNET` is a boolean and there are three venues.** Bybit demo trading (`api-demo.bybit.com`) funds itself by API and runs on REAL mainnet market data, which removes the testnet-faucet blocker — but adding a third destination to a boolean is how a testnet key authenticates against mainnet. | 0046 design | **CLOSED 0046** — `BYBIT_VENUE` is the three-way authority, `USE_TESTNET` is DERIVED from it so every existing gate keeps working, and a config that states both and contradicts itself is refused. Demo is a sandbox at `is_live_authorized`, `assert_sandbox` and the carry order gate, which names it so a transcript cannot be read as mainnet evidence |
++| D30 | **The drill died with a numpy traceback under a bare interpreter.** `ModuleNotFoundError` from four imports deep — D16 again: a tool whose first failure is a traceback about a transitive dependency is a tool that gets run wrong at 2am. | `python3 tools/drill.py` in Codespaces | **CLOSED 0046** — the import moved into `_load_bot()`; a failure names the virtualenv and exits 2, the same code `session_tail` uses for "could not read" as distinct from "this is wrong" |
+ | D27 | **There was no drill.** Phase D says "recorded drill"; what existed was a list of steps in prose, with nothing checking they happened or happened in order. | there was nothing to run | **CLOSED 0045** — `tools/drill.py`: twelve stages, each producing a venue-returned NUMBER rather than a checkmark, refusing to advance on failure and writing a transcript. Safe without `--arm`; no order path of its own (tests assert it builds no client and never touches `_request`). Every failure mode exercised against a venue that misbehaves on command |
+ | D28 | **A freshly started book is blind for 24 hours.** `evaluate_entry` refuses below EWMA_MIN_PRINTS settled prints, prints come every 8h, so a new deploy — new volume, first run, a machine the host moved — stood aside with `INSUFFICIENT_FUNDING_HISTORY` for a day while `/v5/market/funding/history` was returning the last 200 prints on request. | the armed drill could not open on its first run | **CLOSED 0045** — `warm_funding_history()` seeds the EWMA from SETTLED prints and `carry_cold_start` reads them before the first tick. No look-ahead: already settled, already paid. Refuses to overwrite a restored history; the newest stamp becomes the watermark |
+ | D26 | **No fee was ever booked and there was no ledger.** The engine knew `funding_collected`; nothing recorded a cost, reconciled a balance, or produced a statement. D11 had said so since 0033. It is why 0043's funding defect ran for four years unnoticed: nothing added the books up. | there was no statement to run | **CLOSED 0044** — `bot/ledger.py`, a double-entry journal where every entry balances to zero or is refused, append-only with reversing entries, wrapped around the BROKER so a fill cannot escape it. Over the Bybit corpus it reproduces the replay's four-year P&L **to the cent** in three cost configurations (`docs/human/LEDGER_0044.md`) |
+diff --git a/bot/docs/human/VENUE_0046.md b/bot/docs/human/VENUE_0046.md
+new file mode 100644
+index 0000000..00cd731
+--- /dev/null
++++ b/bot/docs/human/VENUE_0046.md
+@@ -0,0 +1,116 @@
++# 0046 — a venue the book can reach today
++
++## The two blockers, and which one just went away
++
++Phase D needed an API key and a wallet with BTC in it. Both were a person's
++job, and one of them had a 24-hour clock on it.
++
++**Testnet** test coins come from a web faucet: 1 BTC and 10,000 USDT, *once per
++24 hours*, PC browser only. No API. That wallet stays a person's job.
++
++**Demo trading** is a different module: `api-demo.bybit.com`, funded by
++`POST /v5/account/demo-apply-money` — up to 15 BTC — and running against **real
++mainnet market data** with simulated matching. The marks, the basis and the
++funding prints are the real ones. The fills are not, and no real money moves.
++
++So the wallet stops being a blocker, and the market data gets *better* than
++testnet's, which has its own thin order book and its own funding.
++
++## The danger this creates, and what stops it
++
++`USE_TESTNET` is a boolean that picks a base URL. **Adding a third destination
++to a boolean is how a testnet key ends up authenticating against mainnet.**
++
++So:
++
++- `BYBIT_VENUE` ∈ `{mainnet, testnet, demo}` is the authority;
++- `USE_TESTNET` becomes the **derived** sandbox flag — every existing safety
++  gate already reads it, and none of them has to learn a new word;
++- a configuration that states both and contradicts itself is **refused**, not
++  resolved. Two sources of truth about which exchange you are pointed at is
++  precisely the bug.
++
++| set | result |
++|---|---|
++| nothing | `testnet`, `USE_TESTNET=True` — unchanged |
++| `USE_TESTNET=0` | `mainnet` — unchanged |
++| `BYBIT_VENUE=demo` | demo, and `USE_TESTNET` derives to `True` |
++| `BYBIT_VENUE=demo` + `USE_TESTNET=0` | **ConfigError** |
++| `BYBIT_VENUE=prod` | **ConfigError** — refused, not defaulted |
++
++Tests assert demo is a sandbox at every gate it passes: `is_live_authorized` is
++False, `assert_sandbox` is True, and `_carry_orders_permitted` returns
++`(True, "DEMO")` — permitted for the same reason testnet is, and **named**, so
++no log line and no drill transcript can be read as mainnet evidence.
++
++There is one table from venue name to URL, so there is exactly one answer to
++*which exchange am I pointed at*.
++
++## Funding, and what it refuses
++
++`tools/fund_demo.py` sends the one request. It checks the **URL the client is
++actually pointed at**, not a config flag — that URL is the thing that decides
++where the request lands, and a funding call is a **write**. Anything but the
++demo base URL raises `NotDemo` and nothing is sent.
++
++It also refuses an amount above the venue's own maximum and a coin the venue
++does not fund, so a typo is a message rather than a rejected signed request
++nobody reads.
++
++```bash
++python3 tools/fund_demo.py --btc 1 --usdt 10000
++```
++
++## The drill now records where it ran
++
++Every transcript carries `venue` and a `venue_note` spelling out what that
++venue's evidence is worth:
++
++- **demo** — real market data, simulated matching, no real money;
++- **testnet** — a separate exchange whose prices and funding are *not* the real
++  ones;
++- **unknown** — the default, deliberately, because a transcript that does not
++  know where it ran must not be readable as the strongest possible claim.
++
++## A missing dependency is a sentence now
++
++Run with a bare `python3`, the drill died with `ModuleNotFoundError: No module
++named 'numpy'` from four imports deep. That is INVENTORY **D16** again, which
++is why `session_tail` reports `UNREADABLE` instead of `NO`.
++
++The import moved into `_load_bot()`, and a failure prints which interpreter to
++use and exits **2** — the same code `session_tail` uses for *I could not read
++this*, distinct from *this is wrong*.
++
++## One command from a checkout to a running book
++
++```bash
++./scripts/deploy.sh                    # testnet
++BYBIT_VENUE=demo ./scripts/deploy.sh   # demo
++```
++
++Installs flyctl if missing, checks `fly.toml` **before** creating anything,
++then app → volume → egress IP → secrets → deploy. Idempotent: every step checks
++whether it already happened, so re-running after a failure costs nothing and
++never duplicates an app, a volume or an IP.
++
++It **refuses mainnet by name**. Mainnet needs a signed risk memo and a recorded
++drill first, and then it is a deliberate act, not a script.
++
++It **arms nothing**. What it leaves you with is a machine that can reach the
++venue running a book that refuses every order, because `PAPER_TRADING=1` and
++the promotion gate is unsigned. A test asserts every arming string appears only
++in the instructions the script *prints*, never in the part it executes — and
++that test was checked by breaking the script on purpose and watching it fail.
++
++## What this still does not give you
++
++Demo matching is simulated. It will answer F1 (`marketUnit`), F5 (lot rules),
++F6 (funding history) and the shape of every response. It will **not** settle F4
++(liquidation), F8 (rate limits under load), or whether a real book fills a
++post-only order (F10/F11) — and its fills are not evidence about slippage on a
++real order book at all.
++
++Testnet answers the matching questions with a fake book. Mainnet at $100
++answers them with a real one. Demo is the fastest way to find out whether the
++software is right, which is a different question from whether the trade is.
+diff --git a/bot/main.py b/bot/main.py
+index ddd1314..f9719f4 100644
+--- a/bot/main.py
++++ b/bot/main.py
+@@ -770,7 +770,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
+                 return (False, "PAPER_TRADING=1: the carry book has no paper "
+                                "venue")
+             if bool(cfg.USE_TESTNET):
+-                return (True, "TESTNET")
++                # Testnet and DEMO are both sandboxes and neither can touch
++                # real money, so both are permitted here — but the reason
++                # NAMES which one, so no log line and no drill transcript can
++                # be read as mainnet evidence (0046).
++                return (True, str(getattr(cfg, "BYBIT_VENUE", "testnet")).upper())
+             armed, why = _config.is_live_authorized(cfg)
+             if armed is not True:
+                 return (False, f"mainnet URL without live authorisation: {why}")
+diff --git a/bot/tests/test_drill.py b/bot/tests/test_drill.py
+index 5b779cc..8268b19 100644
+--- a/bot/tests/test_drill.py
++++ b/bot/tests/test_drill.py
+@@ -269,12 +269,12 @@ class TestTheDrillIsNotAWayAroundTheGates:
+             assert forbidden not in built, forbidden
+ 
+     def test_the_cli_takes_the_brokers_build_bot_made(self):
+-        import ast
++        """0046 moved the import into `_load_bot` so a missing dependency is
++        a sentence rather than a traceback. The invariant is unchanged: the
++        CLI's broker is whatever build_bot decided, gate and all."""
+         import inspect
+-        src = inspect.getsource(D.main)
+-        assert "build_bot" in src
+-        assert "bot.carry.broker" in src
+-        ast.parse(src.lstrip())
++        assert "build_bot" in inspect.getsource(D._load_bot)
++        assert "bot.carry.broker" in inspect.getsource(D.main)
+ 
+     def test_it_never_raises_the_cap(self):
+         """$100 is the cap and the drill does not get an exemption."""
+diff --git a/bot/tests/test_fly_runtime.py b/bot/tests/test_fly_runtime.py
+index a856ff7..ac21235 100644
+--- a/bot/tests/test_fly_runtime.py
++++ b/bot/tests/test_fly_runtime.py
+@@ -91,6 +91,46 @@ class TestTheBuildContextCanDeliverEveryCopy:
+             assert fly_stack.excluded_by(patterns, path), path
+ 
+ 
++class TestTheDeployScriptCannotReachMainnet:
++    """0046 — `scripts/deploy.sh` is the one command from a checkout to a
++    running book. The one thing it must never do is deploy one that can spend
++    real money, and that refusal has to be in the script rather than in the
++    head of whoever runs it."""
++
++    def script(self):
++        path = os.path.join(ROOT, "..", "scripts", "deploy.sh")
++        assert os.path.exists(path), "scripts/deploy.sh is missing"
++        return open(path, encoding="utf-8").read()
++
++    def test_mainnet_is_refused_by_name(self):
++        text = self.script()
++        assert "mainnet)" in text
++        assert "REFUSED: this script does not deploy to mainnet" in text
++
++    def test_it_deploys_immediate(self):
++        assert "--strategy immediate" in self.script()
++
++    def test_it_arms_nothing(self):
++        """It may PRINT the arming commands. It may not run them.
++
++        Every occurrence of an arming string must fall after the point where
++        the script has stopped executing and started printing instructions.
++        """
++        body = self.script()
++        instructions_begin = body.index("ARMING, when the preflight is clean")
++        for armed in ("PAPER_TRADING=0", "LIVE_TRADING_ACK", "drill.py --arm"):
++            first = body.find(armed)
++            if first == -1:
++                continue
++            assert first > instructions_begin, (
++                f"{armed!r} appears in the executed part of deploy.sh, not "
++                "only in the instructions it prints")
++
++    def test_it_checks_the_config_before_creating_anything(self):
++        text = self.script()
++        assert text.index("fly_stack.py --check") < text.index("fly launch")
++
++
+ class TestTwoMachinesIsTwoBooks:
+     def test_the_default_strategy_is_refused(self):
+         for strategy in ("rolling", "bluegreen", "canary"):
+diff --git a/bot/tests/test_venue_selection.py b/bot/tests/test_venue_selection.py
+new file mode 100644
+index 0000000..83a87a4
+--- /dev/null
++++ b/bot/tests/test_venue_selection.py
+@@ -0,0 +1,246 @@
++"""0046 — three venues, one truth about which one you are pointed at.
++
++WHY
++===
++Phase D needs a venue the book can actually reach and actually trade on, and
++the two human blockers were a testnet API key and testnet BTC. Testnet coins
++come from a web faucet — 1 BTC, once per 24 hours, PC browser only — so the
++wallet is a person's job.
++
++Bybit's DEMO TRADING service is a different thing: `api-demo.bybit.com`, funded
++by `POST /v5/account/demo-apply-money` (up to 15 BTC), and running against REAL
++mainnet market data with simulated matching. So the marks, the basis and the
++funding prints are the real ones, and the wallet is one API call.
++
++That is worth having. What it is NOT is a second way to reach mainnet.
++
++THE DANGER
++==========
++`USE_TESTNET` is a boolean that picks a base URL. Adding a third destination
++to a boolean is how a testnet key ends up authenticating against mainnet.
++
++So `BYBIT_VENUE` is explicit and three-way, `USE_TESTNET` becomes the DERIVED
++sandbox flag every existing gate already reads, and a configuration that states
++both and contradicts itself is REFUSED rather than resolved. Two sources of
++truth about which exchange you are pointed at is exactly the bug this file
++exists to make impossible.
++"""
++from __future__ import annotations
++
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
++
++import config as _config  # noqa: E402
++from bybit_connection import DEMO_REST, MAINNET_REST, TESTNET_REST  # noqa: E402
++
++BASE = {"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
++        "CARRY_EXECUTION_MODE": "overlay"}
++
++
++def load(**env):
++    return _config.load({**BASE, **env})
++
++
++class TestTheDefaultDoesNotMove:
++    def test_nothing_set_is_still_testnet(self):
++        cfg = load()
++        assert cfg.BYBIT_VENUE == "testnet"
++        assert cfg.USE_TESTNET is True
++
++    def test_use_testnet_0_is_still_mainnet(self):
++        cfg = load(USE_TESTNET="0")
++        assert cfg.BYBIT_VENUE == "mainnet"
++        assert cfg.USE_TESTNET is False
++
++    def test_use_testnet_1_is_still_testnet(self):
++        cfg = load(USE_TESTNET="1")
++        assert cfg.BYBIT_VENUE == "testnet"
++
++
++class TestDemoIsASandboxEverywhere:
++    def test_demo_derives_the_sandbox_flag(self):
++        """Every existing gate reads USE_TESTNET. Demo must set it, or demo
++        becomes a hole straight through the arming chain."""
++        cfg = load(BYBIT_VENUE="demo")
++        assert cfg.BYBIT_VENUE == "demo"
++        assert cfg.USE_TESTNET is True
++
++    def test_demo_is_not_live_authorised(self):
++        armed, _why = _config.is_live_authorized(
++            load(BYBIT_VENUE="demo", PAPER_TRADING="0",
++                 LIVE_TRADING_ACK="I_UNDERSTAND", BYBIT_API_KEY="k",
++                 BYBIT_API_SECRET="s"))
++        assert armed is False
++
++    def test_demo_may_start(self):
++        may, _why = _config.assert_sandbox(load(BYBIT_VENUE="demo"))
++        assert may is True
++
++    def test_the_carry_gate_permits_demo_and_names_it(self):
++        """A demo order is permitted for the same reason a testnet one is —
++        it cannot touch real money — and the reason string must SAY demo, so
++        no log or transcript can be mistaken for mainnet evidence."""
++        import main as _main
++        from unittest import mock
++        cfg = load(BYBIT_VENUE="demo", PAPER_TRADING="0")
++        bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
++                              risk_manager=mock.Mock(), engine=mock.Mock())
++        allowed, why = bot.carry.broker.inner.order_gate()
++        assert allowed is True
++        assert "DEMO" in why.upper()
++
++
++class TestAContradictionIsRefused:
++    @pytest.mark.parametrize("venue,testnet", [
++        ("mainnet", "1"), ("testnet", "0"), ("demo", "0")])
++    def test_two_sources_of_truth_are_refused(self, venue, testnet):
++        with pytest.raises(_config.ConfigError) as err:
++            load(BYBIT_VENUE=venue, USE_TESTNET=testnet)
++        assert "USE_TESTNET" in str(err.value)
++
++    @pytest.mark.parametrize("venue,testnet", [
++        ("mainnet", "0"), ("testnet", "1"), ("demo", "1")])
++    def test_agreement_is_accepted(self, venue, testnet):
++        assert load(BYBIT_VENUE=venue, USE_TESTNET=testnet).BYBIT_VENUE == venue
++
++    def test_an_unknown_venue_is_refused_not_defaulted(self):
++        with pytest.raises(_config.ConfigError):
++            load(BYBIT_VENUE="prod")
++
++
++class TestTheUrlFollowsTheVenue:
++    @pytest.mark.parametrize("venue,url", [
++        ("mainnet", MAINNET_REST), ("testnet", TESTNET_REST),
++        ("demo", DEMO_REST)])
++    def test_the_client_points_where_the_config_says(self, venue, url):
++        from bybit_connection import BybitClient
++        cfg = load(BYBIT_VENUE=venue,
++                   USE_TESTNET="0" if venue == "mainnet" else "1")
++        client = BybitClient(config=cfg)
++        assert client.base_url == url
++
++    def test_the_three_urls_are_different(self):
++        assert len({MAINNET_REST, TESTNET_REST, DEMO_REST}) == 3
++
++
++class TestDemoFundingCannotTouchAnythingReal:
++    class Client:
++        def __init__(self, base):
++            self.base_url = base
++            self.sent = []
++
++        def _request(self, method, endpoint, *, params=None, body=None,
++                     signed=False, retries=3):
++            self.sent.append((endpoint, body))
++            return {"result": "ok"}
++
++    def test_it_funds_a_demo_account(self):
++        import fund_demo
++        client = self.Client(DEMO_REST)
++        fund_demo.apply(client, [("BTC", "1")])
++        endpoint, body = client.sent[0]
++        assert endpoint == "/v5/account/demo-apply-money"
++        assert body["adjustType"] == 0
++        assert body["utaDemoApplyMoney"] == [{"coin": "BTC",
++                                              "amountStr": "1"}]
++
++    @pytest.mark.parametrize("base", [MAINNET_REST, TESTNET_REST])
++    def test_it_refuses_any_other_venue(self, base):
++        import fund_demo
++        client = self.Client(base)
++        with pytest.raises(fund_demo.NotDemo):
++            fund_demo.apply(client, [("BTC", "1")])
++        assert client.sent == []
++
++    def test_it_refuses_an_amount_above_the_venue_maximum(self):
++        import fund_demo
++        client = self.Client(DEMO_REST)
++        with pytest.raises(ValueError):
++            fund_demo.apply(client, [("BTC", "99")])
++        assert client.sent == []
++
++    def test_it_refuses_a_coin_the_venue_does_not_fund(self):
++        import fund_demo
++        client = self.Client(DEMO_REST)
++        with pytest.raises(ValueError):
++            fund_demo.apply(client, [("DOGE", "1")])
++
++
++class TestTheDrillSaysWhereItRan:
++    def test_a_transcript_names_the_venue(self):
++        import sys as _sys
++        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
++                                         "tools"))
++        import drill as D
++        from test_drill import Venue
++        report = D.run_drill(broker=Venue(), notional=100.0, arm=False,
++                             venue="demo")
++        assert report["venue"] == "demo"
++        assert "demo" in report["venue_note"].lower()
++
++    def test_an_unnamed_venue_is_recorded_as_unknown_not_mainnet(self):
++        import sys as _sys
++        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
++                                         "tools"))
++        import drill as D
++        from test_drill import Venue
++        report = D.run_drill(broker=Venue(), notional=100.0, arm=False)
++        assert report["venue"] == "unknown"
++
++
++class TestAMissingDependencyIsAMessageNotATraceback:
++    def test_the_drill_says_which_interpreter_to_use(self, capsys):
++        """Run with a bare python3 the drill died with `ModuleNotFoundError:
++        No module named 'numpy'` from four imports deep. That is D16 again: a
++        tool whose first failure is a traceback about a transitive dependency
++        is a tool that gets run wrong at 2am."""
++        import sys as _sys
++        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..",
++                                         "tools"))
++        import drill as D
++        from unittest import mock
++
++        def boom():
++            raise ModuleNotFoundError("No module named 'numpy'")
++
++        with mock.patch.object(D, "_load_bot", boom):
++            code = D.main([])
++        assert code == 2
++        out = capsys.readouterr()
++        assert ".venv" in (out.out + out.err)
++        assert "numpy" in (out.out + out.err)
++
++
++class _Store:
++    def __init__(self):
++        self.seq = 0
++
++    def next_order_seq(self):
++        self.seq += 1
++        return self.seq
++
++    def trip_kill_switch(self, reason):
++        pass
++
++    def is_kill_switch_engaged(self):
++        return (False, "")
++
++    def save_carry_position(self, state):
++        pass
++
++    def load_carry_position(self):
++        return None
++
++    def save_ledger(self, rows):
++        self.ledger_rows = list(rows)
++
++    def load_ledger(self):
++        return getattr(self, "ledger_rows", None)
++
++    def open_positions(self):
++        return []
+diff --git a/bot/tools/drill.py b/bot/tools/drill.py
+index daf4dbb..22f9d43 100644
+--- a/bot/tools/drill.py
++++ b/bot/tools/drill.py
+@@ -121,6 +121,10 @@ class Drill:
+         self.orders_sent = 0
+         self.failed_stage: Optional[str] = None
+         self.still_open = False
++        #: WHICH EXCHANGE this ran against (0046). Defaults to "unknown"
++        #: rather than to mainnet: a transcript that does not know where it
++        #: ran must not be readable as the strongest possible claim.
++        self.venue = "unknown"
+ 
+     def stage(self, name: str) -> Stage:
+         s = Stage(name)
+@@ -141,7 +145,7 @@ class Drill:
+ 
+ 
+ def run_drill(*, broker: Any, notional: Optional[float] = None,
+-              arm: bool = False, out: str = "",
++              arm: bool = False, out: str = "", venue: str = "unknown",
+               engine_factory: Any = None) -> Dict[str, Any]:
+     """The whole sequence. Returns the transcript whatever happens."""
+     import shadow
+@@ -149,6 +153,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
+     cap = float(shadow.SHADOW_MAX_NOTIONAL_USD)
+     asked = cap if notional is None else float(notional)
+     d = Drill(broker=broker, notional=asked, arm=arm)
++    d.venue = str(venue or "unknown")
+     state: Dict[str, Any] = {}
+ 
+     def reachability(s: Stage) -> None:
+@@ -372,8 +377,21 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
+     else:
+         action = ("PASSED. The transcript is the Phase D evidence. Read "
+                   "`not_proven` before treating it as more than it is.")
++    venue_note = {
++        "mainnet": "MAINNET — real money moved.",
++        "testnet": "testnet — a separate exchange with its own order book; "
++                   "its prices and funding are NOT the real ones.",
++        "demo": "demo trading — REAL mainnet market data with SIMULATED "
++                "matching. The marks, basis and funding prints are real; the "
++                "fills are not, and no real money moved.",
++        "unknown": "UNKNOWN venue: this transcript does not record which "
++                   "exchange it ran against and must not be read as evidence "
++                   "about any particular one.",
++    }.get(d.venue, f"unrecognised venue {d.venue!r}")
+     report = {
+         "verdict": verdict,
++        "venue": d.venue,
++        "venue_note": venue_note,
+         "armed": bool(d.arm),
+         "failed_stage": d.failed_stage,
+         "still_open": d.still_open,
+@@ -394,6 +412,15 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
+     return report
+ 
+ 
++def _load_bot():
++    """Import and build the stack. Separated so a missing dependency is a
++    sentence rather than a traceback four imports deep (0046) — the same
++    lesson as INVENTORY D16, which is why `session_tail` reports UNREADABLE
++    instead of NO."""
++    import main as _main
++    return _main.build_bot(attach_strategy=False)
++
++
+ def main(argv: Optional[List[str]] = None) -> int:
+     ap = argparse.ArgumentParser(
+         description=__doc__,
+@@ -404,20 +431,34 @@ def main(argv: Optional[List[str]] = None) -> int:
+     ap.add_argument("--out", default="")
+     args = ap.parse_args(argv)
+ 
+-    import main as _main
+-    bot = _main.build_bot(attach_strategy=False)
++    try:
++        bot = _load_bot()
++    except Exception as exc:                                   # noqa: BLE001
++        print(f"the trading stack could not be imported: "
++              f"{type(exc).__name__}: {exc}\n\n"
++              "This is almost always the wrong interpreter. The drill imports "
++              "the whole book,\nwhich needs numpy and requests. Run it with "
++              "the virtualenv the suite uses:\n\n"
++              "    . .venv/bin/activate && python3 tools/drill.py\n"
++              "    (or: ../.venv/bin/python tools/drill.py)\n",
++              file=sys.stderr)
++        return 2
+     if bot.carry is None:
+         print("BOOK_MODE is not carry; there is no book to drill.",
+               file=sys.stderr)
+         return 2
+ 
+     report = run_drill(broker=bot.carry.broker, notional=args.notional,
+-                       arm=args.arm, out=args.out)
++                       arm=args.arm, out=args.out,
++                       venue=str(getattr(bot.cfg, "BYBIT_VENUE", "unknown")
++                                 if hasattr(bot, "cfg") else "unknown"))
+ 
+     print("=" * 74)
+     print(f"PHASE D DRILL — {report['verdict']}"
+           f"   ({'ARMED' if report['armed'] else 'preflight only'})")
+     print("=" * 74)
++    print(f"  venue: {report['venue']} — {report['venue_note']}")
++    print()
+     for stage in report["stages"]:
+         mark = "ok  " if stage["ok"] else "STOP"
+         print(f"  [{mark}] {stage['stage']}")
+diff --git a/bot/tools/fund_demo.py b/bot/tools/fund_demo.py
+new file mode 100644
+index 0000000..7f77988
+--- /dev/null
++++ b/bot/tools/fund_demo.py
+@@ -0,0 +1,129 @@
++#!/usr/bin/env python3
++"""Fund a Bybit DEMO account. Refuses to run anywhere else.
++
++WHY THIS EXISTS
++===============
++The two things standing between this repository and venue truth were an API
++key and a wallet with BTC in it. Testnet coins come from a web faucet — 1 BTC,
++once per 24 hours, PC browser only — so that wallet is a person's job and a
++person's wait.
++
++Bybit's demo trading service is a different module: real mainnet market data,
++simulated matching, and a wallet funded by one signed request. Real marks, real
++basis, real funding prints, no real money. `CARRY_EXECUTION_MODE=overlay`
++hedges BTC the client already owns, so a wallet with BTC in it is the whole
++precondition, and this is how it gets there without waiting a day.
++
++WHAT IT REFUSES
++===============
++Anything that is not the demo base URL. Not by reading a config flag — by
++looking at the URL the client is actually pointed at, because that is the thing
++that decides where the request lands. A funding call is a WRITE, and a write
++aimed at the wrong exchange is the failure this repository is organised around.
++
++    python3 tools/fund_demo.py --btc 1 --usdt 10000
++"""
++from __future__ import annotations
++
++import argparse
++import os
++import sys
++from typing import Any, Iterable, List, Optional, Sequence, Tuple
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(HERE)
++sys.path.insert(0, HERE)
++sys.path.insert(0, ROOT)
++
++ENDPOINT = "/v5/account/demo-apply-money"
++
++#: What the venue will grant, per the demo trading documentation. Asking for
++#: more is refused HERE rather than by the venue, so a typo is a message
++#: instead of a rejected signed request nobody reads.
++MAX = {"BTC": 15.0, "ETH": 200.0, "USDT": 100_000.0, "USDC": 100_000.0}
++
++
++class NotDemo(RuntimeError):
++    """The client is not pointed at the demo venue. Nothing was sent."""
++
++
++def apply(client: Any, amounts: Sequence[Tuple[str, str]],
++          *, reduce: bool = False) -> Any:
++    """One funding request. `amounts` is `(coin, amount_as_string)`."""
++    from bybit_connection import DEMO_REST
++
++    base = str(getattr(client, "base_url", ""))
++    if base.rstrip("/") != DEMO_REST:
++        raise NotDemo(
++            f"the client is pointed at {base!r}, not {DEMO_REST}. This is a "
++            "WRITE, and a write aimed at the wrong exchange is the failure "
++            "this repository is organised around. Nothing was sent.")
++    if not amounts:
++        raise ValueError("nothing to apply for")
++    rows = []
++    for coin, amount in amounts:
++        coin = str(coin).upper()
++        if coin not in MAX:
++            raise ValueError(
++                f"{coin!r} is not fundable on demo; the venue grants "
++                f"{sorted(MAX)}")
++        try:
++            value = float(amount)
++        except (TypeError, ValueError):
++            raise ValueError(f"{amount!r} is not a number")
++        if not (0 < value <= MAX[coin]):
++            raise ValueError(
++                f"{coin} {value} is outside (0, {MAX[coin]}] — the venue's "
++                "own maximum for one request")
++        rows.append({"coin": coin, "amountStr": str(amount)})
++    return client._request(
++        "POST", ENDPOINT, signed=True,
++        body={"adjustType": 1 if reduce else 0, "utaDemoApplyMoney": rows})
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    ap = argparse.ArgumentParser(
++        description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--btc", default="")
++    ap.add_argument("--usdt", default="")
++    ap.add_argument("--reduce", action="store_true")
++    args = ap.parse_args(argv)
++
++    wanted: List[Tuple[str, str]] = []
++    if args.btc:
++        wanted.append(("BTC", args.btc))
++    if args.usdt:
++        wanted.append(("USDT", args.usdt))
++    if not wanted:
++        print("nothing asked for; --btc and/or --usdt", file=sys.stderr)
++        return 2
++
++    try:
++        import config as _config
++        from bybit_connection import BybitClient
++    except Exception as exc:                                   # noqa: BLE001
++        print(f"cannot import the stack ({exc}).\n"
++              "Run it with the virtualenv the suite uses:\n"
++              "    . .venv/bin/activate && python3 tools/fund_demo.py ...",
++              file=sys.stderr)
++        return 2
++
++    cfg = _config.get_config_object()
++    if getattr(cfg, "BYBIT_VENUE", "") != "demo":
++        print(f"BYBIT_VENUE is {getattr(cfg, 'BYBIT_VENUE', None)!r}, not "
++              "'demo'. Nothing was sent.", file=sys.stderr)
++        return 1
++    try:
++        result = apply(BybitClient(config=cfg), wanted, reduce=args.reduce)
++    except NotDemo as exc:
++        print(f"REFUSED: {exc}", file=sys.stderr)
++        return 1
++    print(f"{'reduced' if args.reduce else 'applied'}: "
++          + ", ".join(f"{c} {a}" for c, a in wanted))
++    print(f"venue answered: {result}")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/scripts/deploy.sh b/scripts/deploy.sh
+new file mode 100755
+index 0000000..2f6a82d
+--- /dev/null
++++ b/scripts/deploy.sh
+@@ -0,0 +1,115 @@
++#!/usr/bin/env bash
++# deploy.sh — from a clean checkout to a book running on Fly, in one command.
++#
++# Idempotent and step-wise: every step checks whether it already happened and
++# skips it, so re-running after a failure costs nothing and never duplicates an
++# app, a volume or an IP. It REFUSES rather than guessing at every point where
++# guessing could point the book at the wrong exchange.
++#
++# It does not arm anything. What it leaves you with is a machine that can reach
++# the venue, with a book that refuses every order because PAPER_TRADING=1.
++# Arming is two deliberate commands, printed at the end.
++#
++#   ./scripts/deploy.sh                 # testnet (default)
++#   BYBIT_VENUE=demo ./scripts/deploy.sh
++set -euo pipefail
++trap 'echo; echo "STOPPED at line $LINENO. Nothing was left half-done that a re-run will not fix." >&2' ERR
++
++VENUE="${BYBIT_VENUE:-testnet}"
++APP="${FLY_APP:-carry-book}"
++REGION="${FLY_REGION:-fra}"
++VOLUME="${FLY_VOLUME:-carry_state}"
++
++case "$VENUE" in
++  testnet|demo) ;;
++  mainnet)
++    echo "REFUSED: this script does not deploy to mainnet." >&2
++    echo "         Mainnet needs a signed risk memo and a recorded drill" >&2
++    echo "         first, and then it is a deliberate act, not a script." >&2
++    exit 1 ;;
++  *) echo "REFUSED: BYBIT_VENUE=$VENUE is not testnet or demo." >&2; exit 1 ;;
++esac
++
++root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
++cd "$root/bot"
++say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
++
++say "1/7  flyctl"
++if ! command -v fly >/dev/null 2>&1; then
++  echo "installing flyctl..."
++  curl -L https://fly.io/install.sh | sh
++  export FLYCTL_INSTALL="${FLYCTL_INSTALL:-$HOME/.fly}"
++  export PATH="$FLYCTL_INSTALL/bin:$PATH"
++fi
++fly version
++fly auth whoami >/dev/null 2>&1 || { echo; echo "Not signed in. Run: fly auth login"; exit 1; }
++
++say "2/7  the config, checked before anything is created"
++python3 tools/fly_stack.py --check
++
++say "3/7  the app"
++if fly status --app "$APP" >/dev/null 2>&1; then
++  echo "app $APP already exists"
++else
++  fly launch --no-deploy --name "$APP" --region "$REGION" --copy-config --yes
++fi
++
++say "4/7  the volume (the ledger lives here; losing it means a human looks)"
++if fly volumes list --app "$APP" 2>/dev/null | grep -q "$VOLUME"; then
++  echo "volume $VOLUME already exists"
++else
++  fly volumes create "$VOLUME" --app "$APP" --region "$REGION" --size 1 --yes
++fi
++
++say "5/7  the outbound IP — this is the address you pin the API key to"
++if fly ips list --app "$APP" 2>/dev/null | grep -qi egress; then
++  echo "an egress IP is already allocated"
++else
++  fly ips allocate-egress --app "$APP" --region "$REGION" --yes || \
++    echo "could not allocate an egress IP; pin the key after 'fly ips list'"
++fi
++fly ips list --app "$APP" || true
++
++say "6/7  secrets"
++if fly secrets list --app "$APP" 2>/dev/null | grep -q BYBIT_API_KEY; then
++  echo "BYBIT_API_KEY is already set"
++else
++  echo "Set them now, from the key you pinned to the IPv4 above:"
++  echo "    fly secrets set --app $APP BYBIT_API_KEY=... BYBIT_API_SECRET=..."
++  echo
++  read -r -p "press enter once they are set (or ctrl-c to stop) "
++fi
++fly secrets set --app "$APP" BYBIT_VENUE="$VENUE" --stage >/dev/null
++echo "BYBIT_VENUE staged as $VENUE"
++
++say "7/7  deploy — immediate, because two machines is two hedges"
++fly deploy --app "$APP" --strategy immediate
++
++cat <<NEXT
++
++==============================================================================
++  The book is running and it will not send an order: PAPER_TRADING=1 and the
++  promotion gate is unsigned. Nothing below is armed.
++
++  see it                fly logs --app $APP
++  the four invariants   fly ssh console --app $APP -C "python3 tools/session_tail.py"
++  the preflight drill   fly ssh console --app $APP -C "python3 tools/drill.py"
++NEXT
++
++if [ "$VENUE" = "demo" ]; then cat <<NEXT
++  fund the wallet       fly ssh console --app $APP -C "python3 tools/fund_demo.py --btc 1 --usdt 10000"
++                        (demo funds itself by API; testnet needs the web faucet)
++NEXT
++fi
++
++cat <<NEXT
++
++  ARMING, when the preflight is clean and the wallet has BTC in it. Two
++  deliberate commands, in this order, and neither is mainnet:
++
++      fly secrets set --app $APP PAPER_TRADING=0
++      fly ssh console --app $APP -C "python3 tools/drill.py --arm --out artifacts/drill.json"
++
++  The transcript that writes is the Phase D evidence.
++==============================================================================
++NEXT
+-- 
+2.43.0
+
+
+From 6469958635591c95465c77913ed2813c87cdf8d0 Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Mon, 14 Sep 2026 20:24:16 +0000
+Subject: [PATCH 2/3] 0047 the drill could never attach the book it drills
+ (5863 passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three defects, all found by you running the thing rather than by me
+reading it.
+
+D31 — THE DRILL COULD NEVER GET A CARRY BOOK. _load_bot called
+build_bot(attach_strategy=False) to keep the directional voter out. The
+CARRY book is gated behind the same flag, so it returned a bot with
+`carry is None` and the drill reported "BOOK_MODE is not carry" against a
+config that plainly said carry. It would have failed identically on Fly,
+where the preflight is the entire point. Now build_bot() with no flag, as
+main() does: the config decides, and the carry branch returns before the
+voter is constructed. An AST test refuses any attach_strategy= keyword on
+that call — by AST and not by grep, because the comment explaining the bug
+names the flag and a string search would flag the explanation.
+
+D32 — A READ-ONLY TOOL MODIFIED A TRACKED FILE. STATE_DB_PATH defaults to
+state/trading_state.db, which in a checkout is the committed FIXTURE, so the
+preflight left it dirty and scripts/verify.sh then refused to write a
+receipt ("FIXTURE DB MUTATED"). Run the preflight, then run the suite, and
+the suite refuses. The drill now takes a scratch database outside the
+repository unless STATE_DB_PATH names one — on Fly, fly.toml does, so the
+real one is used there. The test fingerprints every file in state/ by
+content before and after a preflight, WAL and shm included: a journal left
+behind is a modification the next git status shows.
+
+D33 — deploy.sh looked for `fly`; the installer lays down `flyctl`. So it
+reinstalled flyctl on a machine that already had it and then called a
+command that was not there. One resolved $FLY now, flyctl preferred, and a
+test refuses any bare `fly ` call left in the executed part of the script.
+
+And the message. "BOOK_MODE is not carry; there is no book to drill" was
+true and useless. It now prints the three exports that fix it, and says why
+none of them has a default.
+
+Verified by running: the drill reaches `reachability` and stops there with
+the proxy's 403, which is the correct answer from a Codespace and the stop
+the machine on Fly will not have. The fixture database is untouched
+afterwards.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ bot/docs/human/INVENTORY.md            |   3 +
+ bot/tests/test_fly_runtime.py          |   4 +-
+ bot/tests/test_tools_leave_no_trace.py | 163 +++++++++++++++++++++++++
+ bot/tools/drill.py                     |  46 ++++++-
+ scripts/deploy.sh                      |  39 +++---
+ 5 files changed, 236 insertions(+), 19 deletions(-)
+ create mode 100644 bot/tests/test_tools_leave_no_trace.py
+
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index 98c77e5..2b563a9 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -84,6 +84,9 @@ Reproduced in-session with a stub broker; no venue.
+ | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
+ | D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | **recorded 0032** (`carry_cost_gates_v1@BTCUSDT`, forward-only holdout); a quotable condition |
+ | D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
++| D31 | **The drill could never attach the book it drills.** `_load_bot` called `build_bot(attach_strategy=False)` to keep the directional voter out — and the CARRY book is gated behind the same flag, so it returned `carry is None` and the drill reported "BOOK_MODE is not carry" against a config that plainly said carry. It would have failed identically on Fly, where the preflight is the whole point. | `python3 tools/drill.py` with carry env set | **CLOSED 0047** — `build_bot()` with no flag, as `main()` does: the config decides, and the carry branch returns before the voter is constructed. An AST test refuses any `attach_strategy=` keyword on that call |
++| D32 | **A read-only tool modified a tracked file.** `STATE_DB_PATH` defaults to `state/trading_state.db` — the committed FIXTURE — so `tools/drill.py` left it dirty, and `scripts/verify.sh` then refused a receipt ("FIXTURE DB MUTATED"). Run the preflight, then run the suite, and the suite refuses. | `git status` after a preflight | **CLOSED 0047** — the drill takes a scratch database outside the repository unless `STATE_DB_PATH` names one (on Fly, fly.toml does). A test fingerprints every file in `state/` before and after a preflight |
++| D33 | **`deploy.sh` looked for `fly`; the installer lays down `flyctl`.** So it reinstalled flyctl on a machine that already had it, then called a command that was not there. | `bash: fly: command not found` with `which flyctl` succeeding | **CLOSED 0047** — one resolved `$FLY`, `flyctl` preferred; a test refuses any bare `fly ` call left in the script |
+ | D29 | **`USE_TESTNET` is a boolean and there are three venues.** Bybit demo trading (`api-demo.bybit.com`) funds itself by API and runs on REAL mainnet market data, which removes the testnet-faucet blocker — but adding a third destination to a boolean is how a testnet key authenticates against mainnet. | 0046 design | **CLOSED 0046** — `BYBIT_VENUE` is the three-way authority, `USE_TESTNET` is DERIVED from it so every existing gate keeps working, and a config that states both and contradicts itself is refused. Demo is a sandbox at `is_live_authorized`, `assert_sandbox` and the carry order gate, which names it so a transcript cannot be read as mainnet evidence |
+ | D30 | **The drill died with a numpy traceback under a bare interpreter.** `ModuleNotFoundError` from four imports deep — D16 again: a tool whose first failure is a traceback about a transitive dependency is a tool that gets run wrong at 2am. | `python3 tools/drill.py` in Codespaces | **CLOSED 0046** — the import moved into `_load_bot()`; a failure names the virtualenv and exits 2, the same code `session_tail` uses for "could not read" as distinct from "this is wrong" |
+ | D27 | **There was no drill.** Phase D says "recorded drill"; what existed was a list of steps in prose, with nothing checking they happened or happened in order. | there was nothing to run | **CLOSED 0045** — `tools/drill.py`: twelve stages, each producing a venue-returned NUMBER rather than a checkmark, refusing to advance on failure and writing a transcript. Safe without `--arm`; no order path of its own (tests assert it builds no client and never touches `_request`). Every failure mode exercised against a venue that misbehaves on command |
+diff --git a/bot/tests/test_fly_runtime.py b/bot/tests/test_fly_runtime.py
+index ac21235..9afab52 100644
+--- a/bot/tests/test_fly_runtime.py
++++ b/bot/tests/test_fly_runtime.py
+@@ -127,8 +127,10 @@ class TestTheDeployScriptCannotReachMainnet:
+                 "only in the instructions it prints")
+ 
+     def test_it_checks_the_config_before_creating_anything(self):
++        """0047 resolved flyctl to one shell variable, so the call reads
++        `"$FLY" launch`. The invariant is the ORDER, not the spelling."""
+         text = self.script()
+-        assert text.index("fly_stack.py --check") < text.index("fly launch")
++        assert text.index("fly_stack.py --check") < text.index("launch")
+ 
+ 
+ class TestTwoMachinesIsTwoBooks:
+diff --git a/bot/tests/test_tools_leave_no_trace.py b/bot/tests/test_tools_leave_no_trace.py
+new file mode 100644
+index 0000000..73677cf
+--- /dev/null
++++ b/bot/tests/test_tools_leave_no_trace.py
+@@ -0,0 +1,163 @@
++"""0047 — a read-only tool that edits the repository is not read-only.
++
++WHAT HAPPENED
++=============
++`python3 tools/drill.py` in a checkout left `bot/state/trading_state.db`
++MODIFIED. The drill sends no orders without `--arm`; it still dirtied a
++tracked file, because `STATE_DB_PATH` defaults to `state/trading_state.db` —
++which is the committed FIXTURE — and `build_bot` opens a `StateStore` there.
++
++`scripts/verify.sh` already refuses to write a receipt when that file moves
++("FIXTURE DB MUTATED — do not commit"), so the cost was not hypothetical: run
++the preflight, then run the suite, and the suite refuses.
++
++THE RULE
++========
++A tool that reads must not write. Where a tool needs a `StateStore` to exist
++so it can build the stack, it gets a SCRATCH one, and the repository is left
++exactly as it was found.
++"""
++from __future__ import annotations
++
++import hashlib
++import os
++import sys
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++FIXTURE = os.path.join(ROOT, "state", "trading_state.db")
++
++
++def _fingerprint():
++    """Every file the state directory holds, by content. WAL and shm count:
++    a journal left behind is a modification the next `git status` shows."""
++    folder = os.path.dirname(FIXTURE)
++    out = {}
++    for name in sorted(os.listdir(folder)):
++        path = os.path.join(folder, name)
++        if os.path.isfile(path):
++            out[name] = hashlib.sha256(open(path, "rb").read()).hexdigest()
++    return out
++
++
++@pytest.mark.skipif(not os.path.exists(FIXTURE),
++                    reason="no committed fixture database here")
++class TestTheDrillLeavesTheRepositoryAlone:
++    def test_a_preflight_does_not_touch_the_fixture_database(self, monkeypatch):
++        import drill as D
++        before = _fingerprint()
++        monkeypatch.delenv("STATE_DB_PATH", raising=False)
++        monkeypatch.setenv("BOOK_MODE", "carry")
++        monkeypatch.setenv("CARRY_BORROW_APR", "0.0")
++        monkeypatch.setenv("CARRY_EXECUTION_MODE", "overlay")
++        try:
++            D.main([])
++        except SystemExit:
++            pass
++        assert _fingerprint() == before
++
++    def test_it_uses_a_scratch_database_when_none_is_named(self, monkeypatch):
++        import drill as D
++        monkeypatch.delenv("STATE_DB_PATH", raising=False)
++        chosen = D._scratch_state_db()
++        assert chosen
++        assert os.path.abspath(chosen) != os.path.abspath(FIXTURE)
++        assert ROOT not in os.path.abspath(chosen)
++
++    def test_an_explicit_database_is_honoured(self, monkeypatch, tmp_path):
++        """On Fly, fly.toml names the real one and the drill must use it."""
++        import drill as D
++        named = str(tmp_path / "real.db")
++        monkeypatch.setenv("STATE_DB_PATH", named)
++        assert D._scratch_state_db() == named
++
++
++class TestTheDrillActuallyGetsTheBook:
++    def test_carry_config_yields_a_carry_engine(self, monkeypatch, tmp_path):
++        """`attach_strategy=False` reads as "attach no signal source" — and
++        the CARRY book is gated behind the same flag, so the drill got a bot
++        with `carry is None` and reported "BOOK_MODE is not carry" against a
++        config that plainly said carry. It would have failed the same way on
++        Fly, where the preflight is the whole point."""
++        import config as _config
++        import drill as D
++        monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "s.db"))
++        env = {"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
++               "CARRY_EXECUTION_MODE": "overlay",
++               "STATE_DB_PATH": str(tmp_path / "s.db")}
++        for key, value in env.items():
++            monkeypatch.setenv(key, value)
++        # config caches the object it built at import, so without this the
++        # result depends on what ran before — which is not a test.
++        monkeypatch.setattr(_config, "_CFG", _config.load(env))
++        bot = D._load_bot()
++        assert bot.carry is not None
++        assert bot.strategy is None, \
++            "the directional voter must not be constructed for a carry book"
++
++    def test_it_does_not_pass_the_flag_that_suppressed_the_book(self):
++        """By AST, not by grep: the comment explaining the bug names the
++        flag, and a string search would flag the explanation as the bug."""
++        import ast
++        import inspect
++
++        import drill as D
++        tree = ast.parse(inspect.getsource(D).lstrip())
++        for node in ast.walk(tree):
++            if not isinstance(node, ast.Call):
++                continue
++            name = getattr(node.func, "id", None) or \
++                getattr(node.func, "attr", None)
++            if name != "build_bot":
++                continue
++            for kw in node.keywords:
++                assert kw.arg != "attach_strategy", (
++                    "build_bot(attach_strategy=...) suppresses the carry "
++                    "book; let the config decide, as main() does")
++
++
++class TestTheDrillSaysHowToRunIt:
++    def test_a_missing_book_mode_prints_the_exact_exports(self, capsys,
++                                                          monkeypatch):
++        """"BOOK_MODE is not carry; there is no book to drill" is true and
++        useless. The next thing anyone needs is the three lines that fix it."""
++        import config as _config
++        import drill as D
++        monkeypatch.delenv("BOOK_MODE", raising=False)
++        # config caches the object it built at import. Without this the test
++        # passes or fails depending on what ran before it, which is not a
++        # test.
++        monkeypatch.setattr(_config, "_CFG", _config.load({}))
++        code = D.main([])
++        assert code == 2
++        printed = "".join(capsys.readouterr())
++        for needed in ("BOOK_MODE=carry", "CARRY_BORROW_APR",
++                       "CARRY_EXECUTION_MODE"):
++            assert needed in printed, needed
++
++
++class TestTheDeployScriptFindsTheBinaryThatExists:
++    def script(self):
++        return open(os.path.join(ROOT, "..", "scripts", "deploy.sh"),
++                    encoding="utf-8").read()
++
++    def test_it_looks_for_flyctl_not_only_fly(self):
++        """The installer lays down `flyctl`. `fly` is not guaranteed to
++        exist, and the script checked only for `fly` — so it reinstalled
++        flyctl on a machine that already had it, and then called a command
++        that was not there."""
++        text = self.script()
++        assert "command -v flyctl" in text
++
++    def test_every_invocation_goes_through_one_resolved_name(self):
++        """No bare `fly ` calls left: one variable, resolved once."""
++        for line in self.script().splitlines():
++            stripped = line.strip()
++            if stripped.startswith("#") or not stripped:
++                continue
++            assert not stripped.startswith("fly "), (
++                f"bare `fly` call, which may not exist: {stripped}")
+diff --git a/bot/tools/drill.py b/bot/tools/drill.py
+index 22f9d43..9aeebeb 100644
+--- a/bot/tools/drill.py
++++ b/bot/tools/drill.py
+@@ -412,13 +412,42 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
+     return report
+ 
+ 
++def _scratch_state_db() -> str:
++    """Where the stack's `StateStore` should live for a drill.
++
++    An explicit `STATE_DB_PATH` wins — on Fly, fly.toml names the real one and
++    the drill must use it. With none named, the config default is
++    `state/trading_state.db`, which in a checkout is the COMMITTED FIXTURE:
++    running the preflight modified a tracked file, and `scripts/verify.sh`
++    then refused to write a receipt ("FIXTURE DB MUTATED"). A tool that reads
++    must not write, so it gets a scratch database outside the repository.
++    """
++    named = os.environ.get("STATE_DB_PATH", "").strip()
++    if named:
++        return named
++    import tempfile
++    folder = tempfile.mkdtemp(prefix="carry-drill-")
++    return os.path.join(folder, "drill_state.db")
++
++
+ def _load_bot():
+     """Import and build the stack. Separated so a missing dependency is a
+     sentence rather than a traceback four imports deep (0046) — the same
+     lesson as INVENTORY D16, which is why `session_tail` reports UNREADABLE
+     instead of NO."""
++    os.environ["STATE_DB_PATH"] = _scratch_state_db()
+     import main as _main
+-    return _main.build_bot(attach_strategy=False)
++
++    # NOT attach_strategy=False. That flag reads as "attach no signal source",
++    # and it does — but the CARRY book is gated behind the same flag, so
++    # passing False returned a bot with `carry is None` and the drill reported
++    # "BOOK_MODE is not carry" against a config that plainly said carry. It
++    # would have failed the same way on Fly.
++    #
++    # None is what `main()` passes: the config decides, and for BOOK_MODE=carry
++    # build_bot attaches the book and returns before the directional voter is
++    # ever constructed.
++    return _main.build_bot()
+ 
+ 
+ def main(argv: Optional[List[str]] = None) -> int:
+@@ -444,8 +473,19 @@ def main(argv: Optional[List[str]] = None) -> int:
+               file=sys.stderr)
+         return 2
+     if bot.carry is None:
+-        print("BOOK_MODE is not carry; there is no book to drill.",
+-              file=sys.stderr)
++        print(
++            "BOOK_MODE is not carry, so there is no book to drill.\n\n"
++            "The drill needs the same three keys the running book needs, and\n"
++            "none of them has a default — the two modes place different\n"
++            "orders and the financing decides whether the carry clears its\n"
++            "cost of capital. On Fly these come from fly.toml; here, export\n"
++            "them:\n\n"
++            "    export BOOK_MODE=carry\n"
++            "    export CARRY_BORROW_APR=0.0        # 0.0 = an overlay on BTC\n"
++            "                                       # already owned\n"
++            "    export CARRY_EXECUTION_MODE=overlay\n\n"
++            "    . ../.venv/bin/activate && python3 tools/drill.py\n",
++            file=sys.stderr)
+         return 2
+ 
+     report = run_drill(broker=bot.carry.broker, notional=args.notional,
+diff --git a/scripts/deploy.sh b/scripts/deploy.sh
+index 2f6a82d..7f219c1 100755
+--- a/scripts/deploy.sh
++++ b/scripts/deploy.sh
+@@ -35,14 +35,23 @@ cd "$root/bot"
+ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ 
+ say "1/7  flyctl"
+-if ! command -v fly >/dev/null 2>&1; then
++# The installer lays down `flyctl`. A `fly` alias is NOT guaranteed — checking
++# only for it reinstalled flyctl on a machine that already had it and then
++# called a command that was not there. Resolve ONE name, once, and use it.
++export PATH="${FLYCTL_INSTALL:-$HOME/.fly}/bin:$PATH"
++if command -v flyctl >/dev/null 2>&1; then FLY=flyctl
++elif command -v fly >/dev/null 2>&1; then FLY=fly
++else
+   echo "installing flyctl..."
+   curl -L https://fly.io/install.sh | sh
+   export FLYCTL_INSTALL="${FLYCTL_INSTALL:-$HOME/.fly}"
+   export PATH="$FLYCTL_INSTALL/bin:$PATH"
++  command -v flyctl >/dev/null 2>&1 && FLY=flyctl || FLY=fly
+ fi
+-fly version
+-fly auth whoami >/dev/null 2>&1 || { echo; echo "Not signed in. Run: fly auth login"; exit 1; }
++echo "using: $(command -v "$FLY")"
++"$FLY" version
++"$FLY" auth whoami >/dev/null 2>&1 || {
++  echo; echo "Not signed in. Run: $FLY auth login"; exit 1; }
+ 
+ say "2/7  the config, checked before anything is created"
+ python3 tools/fly_stack.py --check
+@@ -51,24 +60,24 @@ say "3/7  the app"
+ if fly status --app "$APP" >/dev/null 2>&1; then
+   echo "app $APP already exists"
+ else
+-  fly launch --no-deploy --name "$APP" --region "$REGION" --copy-config --yes
++  "$FLY" launch --no-deploy --name "$APP" --region "$REGION" --copy-config --yes
+ fi
+ 
+ say "4/7  the volume (the ledger lives here; losing it means a human looks)"
+ if fly volumes list --app "$APP" 2>/dev/null | grep -q "$VOLUME"; then
+   echo "volume $VOLUME already exists"
+ else
+-  fly volumes create "$VOLUME" --app "$APP" --region "$REGION" --size 1 --yes
++  "$FLY" volumes create "$VOLUME" --app "$APP" --region "$REGION" --size 1 --yes
+ fi
+ 
+ say "5/7  the outbound IP — this is the address you pin the API key to"
+ if fly ips list --app "$APP" 2>/dev/null | grep -qi egress; then
+   echo "an egress IP is already allocated"
+ else
+-  fly ips allocate-egress --app "$APP" --region "$REGION" --yes || \
++  "$FLY" ips allocate-egress --app "$APP" --region "$REGION" --yes || \
+     echo "could not allocate an egress IP; pin the key after 'fly ips list'"
+ fi
+-fly ips list --app "$APP" || true
++"$FLY" ips list --app "$APP" || true
+ 
+ say "6/7  secrets"
+ if fly secrets list --app "$APP" 2>/dev/null | grep -q BYBIT_API_KEY; then
+@@ -79,11 +88,11 @@ else
+   echo
+   read -r -p "press enter once they are set (or ctrl-c to stop) "
+ fi
+-fly secrets set --app "$APP" BYBIT_VENUE="$VENUE" --stage >/dev/null
++"$FLY" secrets set --app "$APP" BYBIT_VENUE="$VENUE" --stage >/dev/null
+ echo "BYBIT_VENUE staged as $VENUE"
+ 
+ say "7/7  deploy — immediate, because two machines is two hedges"
+-fly deploy --app "$APP" --strategy immediate
++"$FLY" deploy --app "$APP" --strategy immediate
+ 
+ cat <<NEXT
+ 
+@@ -91,13 +100,13 @@ cat <<NEXT
+   The book is running and it will not send an order: PAPER_TRADING=1 and the
+   promotion gate is unsigned. Nothing below is armed.
+ 
+-  see it                fly logs --app $APP
+-  the four invariants   fly ssh console --app $APP -C "python3 tools/session_tail.py"
+-  the preflight drill   fly ssh console --app $APP -C "python3 tools/drill.py"
++  see it                flyctl logs --app $APP
++  the four invariants   flyctl ssh console --app $APP -C "python3 tools/session_tail.py"
++  the preflight drill   flyctl ssh console --app $APP -C "python3 tools/drill.py"
+ NEXT
+ 
+ if [ "$VENUE" = "demo" ]; then cat <<NEXT
+-  fund the wallet       fly ssh console --app $APP -C "python3 tools/fund_demo.py --btc 1 --usdt 10000"
++  fund the wallet       flyctl ssh console --app $APP -C "python3 tools/fund_demo.py --btc 1 --usdt 10000"
+                         (demo funds itself by API; testnet needs the web faucet)
+ NEXT
+ fi
+@@ -107,8 +116,8 @@ cat <<NEXT
+   ARMING, when the preflight is clean and the wallet has BTC in it. Two
+   deliberate commands, in this order, and neither is mainnet:
+ 
+-      fly secrets set --app $APP PAPER_TRADING=0
+-      fly ssh console --app $APP -C "python3 tools/drill.py --arm --out artifacts/drill.json"
++      "$FLY" secrets set --app $APP PAPER_TRADING=0
++      "$FLY" ssh console --app $APP -C "python3 tools/drill.py --arm --out artifacts/drill.json"
+ 
+   The transcript that writes is the Phase D evidence.
+ ==============================================================================
+-- 
+2.43.0
+
+
+From 0fd3f52b32c8f09740a32fd28516e96f163ac71c Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Mon, 14 Sep 2026 20:42:55 +0000
+Subject: [PATCH 3/3] 0048 the margin gate measured the wrong thing (5881
+ passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+INVENTORY F4, open since 0038, is the only remaining item that loses the
+POSITION rather than costing money slowly. The book guarded its short with
+
+    positionIM / positionMM >= 2.0
+
+and that ratio is a LEVERAGE / RISK-TIER quantity: Bybit tier 1 is 0.66%
+over 0.33%, so it sits near 2.0 by construction and barely moves as the
+price does. It is not headroom. A short being squeezed would not have
+tripped it, and a liquidated perp leg leaves the client naked long in
+exactly the market that just moved against them — the single failure this
+book exists to prevent.
+
+WHAT THE VENUE ACTUALLY PUBLISHES. /v5/position/list returns liqPrice, the
+estimated liquidation price, and /v5/account/wallet-balance returns
+accountMMRate, which is what UTA cross margin liquidates on. Distance from
+mark to liqPrice is a number a human can read: the price can move X% against
+this before it is gone. Both are read, and the book leaves on the worse.
+
+liqPrice is "" when it lies outside the venue's price bounds. That means
+there is no REACHABLE liquidation price — the safest state there is — and it
+comes back as None with a reason rather than as a zero that would read as
+"liquidation is at zero" or get arithmetic done to it.
+
+THE FLOOR IS MEASURED, NOT CHOSEN. Over the 4,500-settlement Bybit corpus,
+the worst moves against a short:
+
+    8h close to close       8.00%
+    intra-settlement high  11.52%   <- what a liquidation engine sees
+    24h                    17.93%
+
+MIN_LIQUIDATION_DISTANCE_PCT = 15.0 clears the first two, and the docstring
+carries the measurement; a test asserts the numbers sit next to the
+constant. It is not tuned to make anything pass: a correctly collateralised
+overlay — one BTC short against one BTC held — has no reachable liquidation
+price at all, so this gate should never bind, and when it binds something
+has gone wrong that a human needs to see.
+
+WHY IT IS A HOLD-TIME CHECK. Before the book opens there is no position, so
+the venue has no liquidation price to report. This cannot be an entry gate,
+and the exposure F4 describes is exactly the held one.
+
+NOTHING IS WEAKENED. The IM/MM floor is untouched and still runs; a position
+must satisfy both. A test asserts the old floor still unwinds on its own.
+
+An unreadable liquidation price HALTS — the same position _margin_multiple
+has taken since 0023: a margin call you cannot see.
+
+require_liquidation_check is OFF in the constructor so no existing caller or
+test double changes behaviour, and ON in build_bot. That default is
+disclosed here and asserted by a test, because the live book is the one that
+must not be allowed to skip it.
+
+STILL OPEN AT THE VENUE: no liqPrice has ever been read from a real
+position, and whether Bybit liquidates precisely at accountMMRate 1.0 is
+documented nowhere exact — 0.50 is half that distance and the book does not
+wait to find out. Phase D.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ bot/carry_broker.py                    |  81 ++++++
+ bot/carry_engine.py                    |  79 +++++-
+ bot/docs/human/INVENTORY.md            |   3 +-
+ bot/ledger.py                          |   3 +
+ bot/main.py                            |   6 +
+ bot/tests/test_liquidation_distance.py | 340 +++++++++++++++++++++++++
+ 6 files changed, 510 insertions(+), 2 deletions(-)
+ create mode 100644 bot/tests/test_liquidation_distance.py
+
+diff --git a/bot/carry_broker.py b/bot/carry_broker.py
+index 1b28c61..6f0af9c 100644
+--- a/bot/carry_broker.py
++++ b/bot/carry_broker.py
+@@ -570,6 +570,87 @@ class CarryBroker:
+                 f"settled funding print for {symbol} is unusable: {row!r}")
+         return rate * 1e4, stamp
+ 
++    def get_liquidation_view(self, symbol: str) -> Dict[str, Any]:
++        """How far the price can move before this position is liquidated.
++
++        INVENTORY F4: `positionIM / positionMM` is a leverage / risk-tier
++        ratio, not headroom. What the venue actually publishes is `liqPrice`
++        on the position and `accountMMRate` on the account, and under UTA
++        cross margin liquidation is ACCOUNT level, so both are read.
++
++        `liqPrice` is `""` when it lies outside the venue's price bounds.
++        That means there is no REACHABLE liquidation price — the safest state
++        there is — and it comes back as `None` with a reason rather than as a
++        zero, which would read as "liquidation is at zero" or, worse, get
++        arithmetic done to it.
++
++        Raises when the position cannot be read at all.
++        """
++        result = self.client._request(
++            "GET", "/v5/position/list", signed=True,
++            params={"category": LINEAR, "symbol": symbol})
++        rows = (result or {}).get("list")
++        if rows is None:
++            raise PairIncident(
++                f"cannot read the {symbol} position; liquidation distance "
++                "unknown, and an unreadable one is a margin call you cannot "
++                "see")
++
++        account_mm = None
++        try:
++            wallet = self.client._request(
++                "GET", "/v5/account/wallet-balance", signed=True,
++                params={"accountType": "UNIFIED"})
++            wrows = (wallet or {}).get("list") or []
++            raw = wrows[0].get("accountMMRate") if wrows else None
++            if raw is not None and str(raw).strip() != "":
++                value = float(raw)
++                account_mm = value if math.isfinite(value) else None
++        except Exception:  # noqa: BLE001
++            # The per-position number is the primary measure; the account rate
++            # is the cross-check. Losing the cross-check is recorded as None,
++            # not as zero, and never as "fine".
++            account_mm = None
++
++        if not rows:
++            return {"size": 0.0, "side": "", "mark": 0.0, "liq_price": None,
++                    "distance_pct": None, "account_mm_rate": account_mm,
++                    "reason": "NO_POSITION"}
++
++        row = rows[0]
++        try:
++            size = abs(float(row.get("size", 0) or 0))
++            mark = float(row.get("markPrice", 0) or 0)
++        except (TypeError, ValueError) as exc:
++            raise PairIncident(
++                f"position row for {symbol} is malformed: {row!r}") from exc
++        side = str(row.get("side", ""))
++
++        raw_liq = row.get("liqPrice")
++        if raw_liq is None or str(raw_liq).strip() == "":
++            return {"size": size, "side": side, "mark": mark,
++                    "liq_price": None, "distance_pct": None,
++                    "account_mm_rate": account_mm,
++                    "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
++        try:
++            liq = float(raw_liq)
++        except (TypeError, ValueError) as exc:
++            raise PairIncident(
++                f"liqPrice for {symbol} is {raw_liq!r}") from exc
++        if not (math.isfinite(liq) and liq > 0 and mark > 0):
++            return {"size": size, "side": side, "mark": mark,
++                    "liq_price": None, "distance_pct": None,
++                    "account_mm_rate": account_mm,
++                    "reason": "LIQ_PRICE_UNUSABLE"}
++
++        # A short is liquidated ABOVE the mark, a long below. Either way the
++        # answer is a positive distance to the bad side.
++        distance = (100.0 * (liq - mark) / mark if side == "Sell"
++                    else 100.0 * (mark - liq) / mark)
++        return {"size": size, "side": side, "mark": mark, "liq_price": liq,
++                "distance_pct": distance, "account_mm_rate": account_mm,
++                "reason": ""}
++
+     def get_funding_history(self, symbol: str,
+                             limit: int = 8) -> List[Tuple[float, int]]:
+         """The last `limit` SETTLED prints, oldest first, as `(bps, ms)`.
+diff --git a/bot/carry_engine.py b/bot/carry_engine.py
+index 9076f69..55207e5 100644
+--- a/bot/carry_engine.py
++++ b/bot/carry_engine.py
+@@ -156,6 +156,33 @@ def snap_to_lot(qty: float, step: float) -> float:
+         return 0.0
+ 
+ 
++#: HOW FAR THE PRICE MUST BE ABLE TO MOVE before the short is liquidated,
++#: as a percentage of the mark. INVENTORY F4: the book guarded itself with
++#: `positionIM / positionMM` and a floor of 2.0, and that ratio is a LEVERAGE
++#: / RISK-TIER quantity — Bybit tier 1 is 0.66% over 0.33%, so it sits near
++#: 2.0 by construction and barely moves as the price does. It is not headroom,
++#: and a short being squeezed would not have tripped it.
++#:
++#: MEASURED, not chosen. Over the 4,500-settlement Bybit corpus, the worst
++#: moves against a short were:
++#:
++#:     8h close to close      8.00%
++#:     intra-settlement high 11.52%   (what a liquidation engine actually sees)
++#:     24h                   17.93%
++#:
++#: 15.0 clears the first two. It is not tuned to make anything pass: a
++#: correctly collateralised overlay — one BTC short against one BTC held —
++#: has no reachable liquidation price at all, so this gate should never bind,
++#: and when it binds something has gone wrong that a human needs to see.
++MIN_LIQUIDATION_DISTANCE_PCT = 15.0
++
++#: Account maintenance-margin ratio at which the book leaves. Under UTA cross
++#: margin liquidation is ACCOUNT level, so a comfortable per-position
++#: liqPrice is not the whole answer. Bybit liquidates as this approaches 1.0;
++#: 0.50 is half that distance and the book does not wait to find out whether
++#: the documentation is precise.
++MAX_ACCOUNT_MM_RATE = 0.50
++
+ #: Unwind when funding has been negative this many consecutive prints. Negative
+ #: funding means the trade has inverted: you are now PAYING to hold the hedge.
+ #: Three prints is one day — long enough not to react to a single squeeze,
+@@ -379,7 +406,8 @@ class CarryEngine:
+                  borrow_apr: float, execution_mode: str,
+                  persist: Any,
+                  execution_style: str = TAKER,
+-                 maker_wait_s: float = DEFAULT_MAKER_WAIT_S) -> None:
++                 maker_wait_s: float = DEFAULT_MAKER_WAIT_S,
++                 require_liquidation_check: bool = False) -> None:
+         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
+         # carry clears its cost of capital, and build_bot never passed it, so
+         # the live engine silently financed at 5% whatever the operator meant.
+@@ -412,6 +440,11 @@ class CarryEngine:
+                 "positive, finite wait before it is cancelled and crossed")
+         self.execution_style = execution_style
+         self.maker_wait_s = wait
++        # F4 (0048). OFF by default so no existing caller changes behaviour,
++        # and turned ON by build_bot, which is disclosed and asserted by a
++        # test. A live book that cannot read its own liquidation price halts;
++        # a test double that was never asked to model one does not.
++        self.require_liquidation_check = bool(require_liquidation_check)
+         self.persist = persist
+         self.execution_mode = execution_mode
+         self.broker = broker
+@@ -1070,6 +1103,50 @@ class CarryEngine:
+         if margin < self.min_margin_multiple:
+             return self._unwind(self.broker.get_mark(self.perp_symbol),
+                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
++        return self._check_liquidation_distance()
++
++    def _check_liquidation_distance(self) -> Optional[CarryDecision]:
++        """How far the price can move before the short is gone (F4, 0048).
++
++        This is a HOLD-time check and cannot be anything else: before the book
++        opens there is no position, so the venue has no liquidation price to
++        report. The exposure F4 describes is exactly the held one.
++
++        The IM/MM floor above is untouched and still runs. This is an
++        additional gate; a position must satisfy both.
++        """
++        if not self.require_liquidation_check:
++            return None
++        try:
++            view = self.broker.get_liquidation_view(self.perp_symbol)
++        except Exception as exc:  # noqa: BLE001
++            return self._halt(
++                "LIQUIDATION_PRICE_UNREADABLE",
++                f"the venue would not say how close this position is to "
++                f"liquidation ({type(exc).__name__}: {exc}); an unreadable "
++                "liquidation price is a margin call you cannot see")
++
++        rate = view.get("account_mm_rate")
++        if rate is not None and self._finite(rate) \
++                and float(rate) >= MAX_ACCOUNT_MM_RATE:
++            return self._unwind(
++                self.broker.get_mark(self.perp_symbol),
++                f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
++
++        distance = view.get("distance_pct")
++        if distance is None:
++            # Bybit returns "" for liqPrice when it lies outside the venue's
++            # price bounds: there is no reachable liquidation price, which is
++            # the safest state there is. Not missing data.
++            return None
++        if not self._finite(distance):
++            return self._halt(
++                "LIQUIDATION_DISTANCE_UNUSABLE",
++                f"the venue reported a liquidation distance of {distance!r}")
++        if float(distance) < MIN_LIQUIDATION_DISTANCE_PCT:
++            return self._unwind(
++                self.broker.get_mark(self.perp_symbol),
++                f"LIQUIDATION_{float(distance):.1f}PCT_AWAY_BELOW_FLOOR")
+         return None
+ 
+     def _margin_multiple(self) -> Optional[float]:
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index 2b563a9..9be88b8 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -84,6 +84,7 @@ Reproduced in-session with a stub broker; no venue.
+ | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
+ | D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | **recorded 0032** (`carry_cost_gates_v1@BTCUSDT`, forward-only holdout); a quotable condition |
+ | D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
++| D34 | **The one open item that loses the position rather than embarrassing us.** The book guarded its short with `positionIM/positionMM >= 2.0`, a leverage/risk-tier ratio that sits near 2.0 by construction and barely moves with price. A squeeze would not have tripped it, and a liquidated perp leg leaves the client naked long in exactly the market that just moved against them. | F4, open since 0038 | **0048** — `get_liquidation_view` reads `liqPrice` and `accountMMRate`; the HELD book (it cannot be an entry gate — there is no position to have a liquidation price yet) unwinds below 15.0% distance or above 0.50 account rate, and HALTS if the venue will not say. `""` from Bybit means no reachable liquidation price and is treated as safe, not as missing. Off by default in the constructor, ON in `build_bot` — disclosed, and asserted by a test |
+ | D31 | **The drill could never attach the book it drills.** `_load_bot` called `build_bot(attach_strategy=False)` to keep the directional voter out — and the CARRY book is gated behind the same flag, so it returned `carry is None` and the drill reported "BOOK_MODE is not carry" against a config that plainly said carry. It would have failed identically on Fly, where the preflight is the whole point. | `python3 tools/drill.py` with carry env set | **CLOSED 0047** — `build_bot()` with no flag, as `main()` does: the config decides, and the carry branch returns before the voter is constructed. An AST test refuses any `attach_strategy=` keyword on that call |
+ | D32 | **A read-only tool modified a tracked file.** `STATE_DB_PATH` defaults to `state/trading_state.db` — the committed FIXTURE — so `tools/drill.py` left it dirty, and `scripts/verify.sh` then refused a receipt ("FIXTURE DB MUTATED"). Run the preflight, then run the suite, and the suite refuses. | `git status` after a preflight | **CLOSED 0047** — the drill takes a scratch database outside the repository unless `STATE_DB_PATH` names one (on Fly, fly.toml does). A test fingerprints every file in `state/` before and after a preflight |
+ | D33 | **`deploy.sh` looked for `fly`; the installer lays down `flyctl`.** So it reinstalled flyctl on a machine that already had it, then called a command that was not there. | `bash: fly: command not found` with `which flyctl` succeeding | **CLOSED 0047** — one resolved `$FLY`, `flyctl` preferred; a test refuses any bare `fly ` call left in the script |
+@@ -110,7 +111,7 @@ Reproduced in-session with a stub broker; no venue.
+ | F1 | Spot market Buy `qty` is in BTC | Without `marketUnit=baseCoin` a spot market BUY is read as a **quote (USDT)** amount. `BybitClient` sets it (`bybit_connection.py` ~916); `CarryBroker` builds its own body and omits it. | **CLOSED 0033** — `marketUnit=baseCoin` on every spot market order |
+ | F2 | `/v5/order/create` returns `cumExecQty`, `avgPrice` | It returns `orderId`, `orderLinkId`. The broker then queries `/v5/order/realtime` immediately — a race against the fill. | open, testnet |
+ | F3 | The spot fill equals the BTC received | Spot taker fee on a BUY is charged in BTC. Wallet = `cumExecQty − fee`; the perp hedges `cumExecQty`; `reconcile_pair` (dust 1e-6) would call every pair an INCIDENT. | **0044 partial** — the ledger books the fee in BTC where the venue takes it and `hedgeable_btc()` returns the wallet, not the fill. Whether Bybit does this is still unobserved: open, Phase D |
+-| F4 | `positionIM / positionMM` measures liquidation headroom | It is a leverage/risk-tier ratio (risk_limit tier 1: IM 0.66%, MM 0.33%). Under UTA cross margin liquidation is account-level (`accountMMRate`). The margin floor would not trip on a squeeze. | open, Phase D |
++| F4 | `positionIM / positionMM` measures liquidation headroom | It is a leverage/risk-tier ratio (risk_limit tier 1: IM 0.66%, MM 0.33%). Under UTA cross margin liquidation is account-level (`accountMMRate`). The margin floor would not trip on a squeeze. | **0048 addressed in code** — the held book now reads `liqPrice` and `accountMMRate` and unwinds below **15.0%** distance or above **0.50** account MM rate. The floor is MEASURED: worst 8h move against a short 8.00%, worst intra-settlement excursion 11.52% over 4,500 settlements. The IM/MM floor is unchanged and still runs; this is an additional gate. **Still open at the venue**: no `liqPrice` has ever been read from a real position, and whether Bybit liquidates at `accountMMRate` 1.0 is documented nowhere precise — Phase D |
+ | F5 | Any `qty` is accepted | Linear BTCUSDT `qtyStep = minOrderQty = 0.001`. At the $100 cap and BTC ≈ $79k the engine asks for 0.00127 → not a step multiple → perp rejected → D4. At BTC > $100k no valid perp size fits under $100 at all. | **CLOSED 0036** — lot rules read from `/v5/market/instruments-info`, size snapped to the step, refused below the minimum |
+ | F6 | Ticker `fundingRate` is the funding print | It is the rate for the NEXT settlement (predicted); the settled print is `/v5/market/funding/history`. | **CLOSED 0034** — `get_funding_print` reads `/v5/market/funding/history`; the snapshot keeps forecast and settled apart; a missed settlement is a stale view |
+ | F7 | 110072 / 170130 mean "the order exists" | Taken from docs; never observed. | open, testnet |
+diff --git a/bot/ledger.py b/bot/ledger.py
+index 7549e8a..bf73907 100644
+--- a/bot/ledger.py
++++ b/bot/ledger.py
+@@ -528,6 +528,9 @@ class LedgerBroker:
+     def get_funding_history(self, symbol, limit=8):
+         return self.inner.get_funding_history(symbol, limit)
+ 
++    def get_liquidation_view(self, symbol):
++        return self.inner.get_liquidation_view(symbol)
++
+     def get_open_carry_orders(self, spot_symbol, perp_symbol):
+         return self.inner.get_open_carry_orders(spot_symbol, perp_symbol)
+ 
+diff --git a/bot/main.py b/bot/main.py
+index f9719f4..bda061f 100644
+--- a/bot/main.py
++++ b/bot/main.py
+@@ -838,6 +838,12 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
+             # "taker" — the round trip the entry gate prices.
+             execution_style=cfg.CARRY_EXECUTION_STYLE,
+             maker_wait_s=float(cfg.CARRY_MAKER_WAIT_S),
++            # F4 (0048). The live book measures how far the price can move
++            # before the short is liquidated, and halts if the venue will not
++            # say. Off by default in the constructor so test doubles that were
++            # never asked to model a liquidation price are unaffected; ON
++            # here, because this is the one that loses the position.
++            require_liquidation_check=True,
+             # THE LEDGER (0037). Called by the engine on every state change,
+             # straight through to the store. Not a hasattr guard and not a
+             # lambda that swallows: a store without this method is a
+diff --git a/bot/tests/test_liquidation_distance.py b/bot/tests/test_liquidation_distance.py
+new file mode 100644
+index 0000000..3de10df
+--- /dev/null
++++ b/bot/tests/test_liquidation_distance.py
+@@ -0,0 +1,340 @@
++"""0048 — F4: the margin gate measured the wrong thing.
++
++WHAT F4 SAYS, AND WHY IT MATTERS MORE THAN THE REST
++===================================================
++`CarryEngine` guards the short with `positionIM / positionMM` and a floor of
++2.0. That ratio is a LEVERAGE / RISK-TIER quantity: at Bybit's tier 1 it is
++0.66% over 0.33%, so it sits near 2.0 by construction and barely moves as the
++price does. It is not headroom. **A short being squeezed would not trip it.**
++
++Every other open item in INVENTORY costs money slowly — a fee booked wrong, a
++number quoted too confidently. This one loses the position: a liquidated perp
++leg leaves the client naked long in exactly the market that just moved against
++them, which is the single failure this book exists to prevent.
++
++WHAT THE VENUE ACTUALLY GIVES YOU
++=================================
++`/v5/position/list` returns `liqPrice` — the estimated liquidation price — and
++`/v5/account/wallet-balance` returns `accountMMRate`, which is what UTA cross
++margin liquidates on. Distance from mark to `liqPrice`, as a percentage, is a
++number a human can read: *the price can move X% against this before it is
++gone.*
++
++`liqPrice` is `""` when it falls outside the venue's price bounds. That is SAFE
++— there is no reachable liquidation price — and it is recorded as that rather
++than converted into a number nobody measured.
++
++THE FLOOR, MEASURED RATHER THAN CHOSEN
++======================================
++Over the 4,500-settlement Bybit corpus:
++
++    worst 8h close-to-close move against a short   8.00%
++    worst intra-settlement high above the close   11.52%
++    worst 24h                                     17.93%
++
++`MIN_LIQUIDATION_DISTANCE_PCT = 15.0` sits above both of the first two. It is
++not a guess and it is not tuned to make anything pass.
++
++WHY IT IS A HOLD-TIME CHECK
++===========================
++Before the book opens there is no position, so the venue has no `liqPrice` to
++report. This cannot be an entry gate. It is checked on every tick while the
++pair is HELD, which is the whole of the exposure F4 describes.
++
++NOTHING IS WEAKENED
++===================
++The IM/MM floor stays exactly as it was and is still checked. This is an
++additional gate, not a replacement, and a position must satisfy both.
++"""
++from __future__ import annotations
++
++import os
++import sys
++import time
++
++import pytest
++
++sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
++
++from carry_engine import (MIN_LIQUIDATION_DISTANCE_PCT, BookState,  # noqa: E402
++                          CarryEngine)
++from carry_risk import CarryRisk  # noqa: E402
++from market_snapshot import MarketSnapshot  # noqa: E402
++
++MARK = 100_000.0
++H8 = 8 * 3600 * 1000
++
++
++class Venue:
++    def __init__(self, *, liq=None, mm_rate=None, raises=False):
++        self.liq = liq
++        self.mm_rate = mm_rate
++        self.raises = raises
++        self.orders = []
++
++    def place_market(self, *, symbol, side, qty, product):
++        self.orders.append((side, product, qty))
++        return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x",
++                "fee": qty * MARK * 5.5 / 1e4}
++
++    def get_margin_multiple(self, symbol):
++        return 5.0
++
++    def get_mark(self, symbol):
++        return MARK
++
++    def get_lot_rules(self, symbol, product):
++        return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 0.0}
++
++    def get_fee_rates(self, symbol, product):
++        return {"maker_bps": 2.0,
++                "taker_bps": 10.0 if product == "spot" else 5.5}
++
++    def get_spot_inventory(self, symbol):
++        return 5.0
++
++    def get_liquidation_view(self, symbol):
++        if self.raises:
++            raise RuntimeError("position list unreadable")
++        return {"size": 0.001, "side": "Sell", "mark": MARK,
++                "liq_price": self.liq,
++                "distance_pct": (None if self.liq is None
++                                 else 100.0 * (self.liq - MARK) / MARK),
++                "account_mm_rate": self.mm_rate,
++                "reason": ("BEYOND_VENUE_PRICE_BOUNDS" if self.liq is None
++                           else "")}
++
++
++def opened(venue, **kw):
++    e = CarryEngine(broker=venue, max_notional_usd=100.0, borrow_apr=0.0,
++                    execution_mode="overlay", persist=lambda s: None, **kw)
++    e.pair_risk = CarryRisk(max_notional_usd=100.0)
++    e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
++                                funding_bps=3.0, margin_multiple=5.0,
++                                observed_at_s=time.time())
++    for k in (1, 2):
++        e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                    funding_print_ms=k * H8, timestamp_ms=k * H8)
++    d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                    funding_print_ms=3 * H8, timestamp_ms=3 * H8)
++    assert d.action == "opened", d.reason
++    return e
++
++
++class TestTheFloorCameFromMeasurement:
++    def test_it_clears_the_worst_move_in_the_corpus(self):
++        """8.00% worst 8h, 11.52% worst intra-settlement excursion."""
++        assert MIN_LIQUIDATION_DISTANCE_PCT >= 11.52
++        assert MIN_LIQUIDATION_DISTANCE_PCT == 15.0
++
++    def test_the_measurement_is_written_down_where_the_number_is(self):
++        import inspect
++
++        import carry_engine
++        source = inspect.getsource(carry_engine)
++        cut = source.index("MIN_LIQUIDATION_DISTANCE_PCT")
++        nearby = source[max(0, cut - 1600):cut + 200]
++        assert "11.52" in nearby and "8.00" in nearby, \
++            "the number must carry the measurement that produced it"
++
++
++class TestAShortBeingSqueezedGetsOut:
++    def test_a_close_liquidation_price_unwinds_the_book(self):
++        venue = Venue(liq=MARK * 1.05)          # 5% away, under the floor
++        e = opened(venue, require_liquidation_check=True)
++        venue.orders.clear()
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
++        assert d.action == "unwound"
++        assert "LIQUIDATION" in d.reason
++        assert venue.orders, "it must actually close the leg"
++
++    def test_a_distant_liquidation_price_is_left_alone(self):
++        venue = Venue(liq=MARK * 1.60)
++        e = opened(venue, require_liquidation_check=True)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
++        assert d.action == "hold"
++
++    def test_beyond_the_venues_bounds_is_safe_not_unknown(self):
++        """Bybit returns "" when liqPrice is outside its price bounds. There
++        is no reachable liquidation price, which is the safest state there
++        is — it must not read as missing data and halt the book."""
++        venue = Venue(liq=None)
++        e = opened(venue, require_liquidation_check=True)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
++        assert d.action == "hold"
++
++    def test_the_exact_floor_is_the_boundary(self):
++        for pct, expect in ((MIN_LIQUIDATION_DISTANCE_PCT - 0.1, "unwound"),
++                            (MIN_LIQUIDATION_DISTANCE_PCT + 0.1, "hold")):
++            venue = Venue(liq=MARK * (1.0 + pct / 100.0))
++            e = opened(venue, require_liquidation_check=True)
++            d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                            funding_print_ms=4 * H8, timestamp_ms=4 * H8)
++            assert d.action == expect, (pct, d.reason)
++
++
++class TestTheAccountRateIsCheckedToo:
++    def test_a_high_account_mm_rate_unwinds(self):
++        """Under UTA cross margin liquidation is ACCOUNT level, so a comfortable
++        per-position liqPrice is not the whole answer."""
++        venue = Venue(liq=MARK * 2.0, mm_rate=0.85)
++        e = opened(venue, require_liquidation_check=True)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
++        assert d.action == "unwound"
++        assert "ACCOUNT" in d.reason
++
++    def test_a_low_account_mm_rate_is_fine(self):
++        venue = Venue(liq=MARK * 2.0, mm_rate=0.05)
++        e = opened(venue, require_liquidation_check=True)
++        assert e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=4 * H8,
++                           timestamp_ms=4 * H8).action == "hold"
++
++
++class TestUnreadableIsNotSafe:
++    def test_a_venue_that_will_not_say_halts(self):
++        """An unreadable liquidation price is a margin call you cannot see —
++        the same position `_margin_multiple` has taken since 0023."""
++        venue = Venue(raises=True)
++        e = opened(venue, require_liquidation_check=True)
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
++        assert d.action == "halted"
++        assert e.state is BookState.HALTED
++
++
++class TestNothingExistingIsWeakened:
++    def test_the_im_mm_floor_is_still_checked(self):
++        import inspect
++
++        import carry_engine
++        body = inspect.getsource(carry_engine.CarryEngine._check_margin)
++        assert "min_margin_multiple" in body
++        assert "MARGIN_UNREADABLE" in body
++
++    def test_the_old_floor_still_unwinds_on_its_own(self):
++        venue = Venue(liq=MARK * 2.0)
++        e = opened(venue, require_liquidation_check=True)
++        venue.get_margin_multiple = lambda s: 1.1   # degrade AFTER opening
++        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
++        assert d.action == "unwound"
++        assert "MARGIN_HEADROOM" in d.reason
++
++    def test_a_book_without_the_check_behaves_exactly_as_before(self):
++        """Default off, so no existing fixture changes behaviour. build_bot
++        turns it on, and a test below asserts that."""
++        venue = Venue(raises=True)
++        e = opened(venue)
++        assert e.require_liquidation_check is False
++        assert e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
++                           funding_print_ms=4 * H8,
++                           timestamp_ms=4 * H8).action == "hold"
++
++
++class TestTheLiveBookTurnsItOn:
++    def test_build_bot_requires_it(self):
++        import config as _config
++        import main as _main
++        from unittest import mock
++        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
++                            "CARRY_EXECUTION_MODE": "overlay"})
++        bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
++                              risk_manager=mock.Mock(), engine=mock.Mock())
++        assert bot.carry.require_liquidation_check is True
++
++
++class TestTheBrokerReadsTheRightFields:
++    class Client:
++        def __init__(self, position=None, wallet=None):
++            self.position = position
++            self.wallet = wallet
++
++        def _request(self, method, endpoint, *, params=None, body=None,
++                     signed=False, retries=3):
++            if endpoint == "/v5/position/list":
++                return self.position
++            if endpoint == "/v5/account/wallet-balance":
++                return self.wallet
++            return {}
++
++    def broker(self, client):
++        from carry_broker import CarryBroker
++        return CarryBroker(client=client, sequence_source=lambda *a: 1,
++                           order_gate=lambda: (True, "TEST"))
++
++    def test_it_reads_liq_price_and_computes_the_distance(self):
++        c = self.Client(
++            position={"list": [{"size": "0.001", "side": "Sell",
++                                "markPrice": "100000", "liqPrice": "115000",
++                                "avgPrice": "100000"}]},
++            wallet={"list": [{"accountMMRate": "0.12"}]})
++        view = self.broker(c).get_liquidation_view("BTCUSDT")
++        assert view["liq_price"] == pytest.approx(115_000.0)
++        assert view["distance_pct"] == pytest.approx(15.0)
++        assert view["account_mm_rate"] == pytest.approx(0.12)
++
++    def test_an_empty_liq_price_is_out_of_bounds_not_zero(self):
++        c = self.Client(
++            position={"list": [{"size": "0.001", "side": "Sell",
++                                "markPrice": "100000", "liqPrice": ""}]},
++            wallet={"list": [{"accountMMRate": "0.1"}]})
++        view = self.broker(c).get_liquidation_view("BTCUSDT")
++        assert view["liq_price"] is None
++        assert view["distance_pct"] is None
++        assert view["reason"] == "BEYOND_VENUE_PRICE_BOUNDS"
++
++    def test_a_long_liquidates_downwards(self):
++        c = self.Client(
++            position={"list": [{"size": "1", "side": "Buy",
++                                "markPrice": "100000", "liqPrice": "80000"}]},
++            wallet={"list": [{"accountMMRate": "0.1"}]})
++        view = self.broker(c).get_liquidation_view("BTCUSDT")
++        assert view["distance_pct"] == pytest.approx(20.0)
++
++    def test_no_position_is_not_an_error(self):
++        c = self.Client(position={"list": []},
++                        wallet={"list": [{"accountMMRate": "0"}]})
++        view = self.broker(c).get_liquidation_view("BTCUSDT")
++        assert view["size"] == 0.0
++        assert view["distance_pct"] is None
++
++    def test_an_unreadable_position_raises(self):
++        from carry_broker import PairIncident
++        c = self.Client(position={}, wallet={"list": []})
++        with pytest.raises(PairIncident):
++            self.broker(c).get_liquidation_view("BTCUSDT")
++
++
++class _Store:
++    def __init__(self):
++        self.seq = 0
++
++    def next_order_seq(self):
++        self.seq += 1
++        return self.seq
++
++    def trip_kill_switch(self, reason):
++        pass
++
++    def is_kill_switch_engaged(self):
++        return (False, "")
++
++    def save_carry_position(self, state):
++        pass
++
++    def load_carry_position(self):
++        return None
++
++    def save_ledger(self, rows):
++        self.ledger_rows = list(rows)
++
++    def load_ledger(self):
++        return getattr(self, "ledger_rows", None)
++
++    def open_positions(self):
++        return []
+-- 
+2.43.0
+
