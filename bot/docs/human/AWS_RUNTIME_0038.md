@@ -1,3 +1,11 @@
+> **SUPERSEDED by 0042 (`FLY_RUNTIME_0042.md`).** The stack below is 27
+> CloudFormation resources for a process that makes three decisions a day and
+> needs one outbound TLS connection. Fly does the five things this book
+> actually needs from a host in forty lines. Worse, everything here pointed at
+> an image that **had never built** (INVENTORY D21). Kept for the VPC/egress
+> reasoning and because its checker and tests still pass; not the deployment
+> path.
+
 # AWS RUNTIME — the host that can reach the venue
 
 Written 2026-09-13 by 0038. `tools/aws_stack.py` generates the whole stack and

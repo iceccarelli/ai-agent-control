@@ -18,7 +18,6 @@ __pycache__/
 *.pyc
 .pytest_cache/
 tests/
-tools/
 *.md
 Dockerfile
 .dockerignore
@@ -28,3 +27,24 @@ Dockerfile
 # from here. Excluded so the image cannot be mistaken for something that ships
 # with market data baked in.
 data/
+
+# tools/ IS DELIBERATELY NOT EXCLUDED (0042).
+#
+# It was, and it is why this image had never built: the Dockerfile says
+#
+#     COPY tools/connector_check.py tools/session_tail.py ./tools/
+#
+# and .dockerignore removes files from the build CONTEXT before the Dockerfile
+# runs, so that COPY failed with "file not found". Every deployment in this
+# repo — 0038's task definition, its one-off connector task, the whole Phase D
+# drill — pointed at an image nobody could produce.
+#
+# The obvious repair is `tools/*` plus `!tools/connector_check.py`. It is not
+# used here, because re-inclusion under an excluded directory is a corner of
+# Docker's matcher that this repo cannot exercise (there is no daemon in the
+# sandbox), and a control whose behaviour cannot be tested is not a control.
+#
+# What replaces it is static and testable: the Dockerfile names every tools
+# file one by one, and tests/test_fly_runtime.py refuses any COPY of a bare
+# directory. No operator script reaches the image because none is named, and
+# that fact is asserted rather than hoped for.
