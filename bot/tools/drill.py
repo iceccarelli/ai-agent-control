@@ -412,13 +412,42 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
     return report
 
 
+def _scratch_state_db() -> str:
+    """Where the stack's `StateStore` should live for a drill.
+
+    An explicit `STATE_DB_PATH` wins — on Fly, fly.toml names the real one and
+    the drill must use it. With none named, the config default is
+    `state/trading_state.db`, which in a checkout is the COMMITTED FIXTURE:
+    running the preflight modified a tracked file, and `scripts/verify.sh`
+    then refused to write a receipt ("FIXTURE DB MUTATED"). A tool that reads
+    must not write, so it gets a scratch database outside the repository.
+    """
+    named = os.environ.get("STATE_DB_PATH", "").strip()
+    if named:
+        return named
+    import tempfile
+    folder = tempfile.mkdtemp(prefix="carry-drill-")
+    return os.path.join(folder, "drill_state.db")
+
+
 def _load_bot():
     """Import and build the stack. Separated so a missing dependency is a
     sentence rather than a traceback four imports deep (0046) — the same
     lesson as INVENTORY D16, which is why `session_tail` reports UNREADABLE
     instead of NO."""
+    os.environ["STATE_DB_PATH"] = _scratch_state_db()
     import main as _main
-    return _main.build_bot(attach_strategy=False)
+
+    # NOT attach_strategy=False. That flag reads as "attach no signal source",
+    # and it does — but the CARRY book is gated behind the same flag, so
+    # passing False returned a bot with `carry is None` and the drill reported
+    # "BOOK_MODE is not carry" against a config that plainly said carry. It
+    # would have failed the same way on Fly.
+    #
+    # None is what `main()` passes: the config decides, and for BOOK_MODE=carry
+    # build_bot attaches the book and returns before the directional voter is
+    # ever constructed.
+    return _main.build_bot()
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -444,8 +473,19 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
     if bot.carry is None:
-        print("BOOK_MODE is not carry; there is no book to drill.",
-              file=sys.stderr)
+        print(
+            "BOOK_MODE is not carry, so there is no book to drill.\n\n"
+            "The drill needs the same three keys the running book needs, and\n"
+            "none of them has a default — the two modes place different\n"
+            "orders and the financing decides whether the carry clears its\n"
+            "cost of capital. On Fly these come from fly.toml; here, export\n"
+            "them:\n\n"
+            "    export BOOK_MODE=carry\n"
+            "    export CARRY_BORROW_APR=0.0        # 0.0 = an overlay on BTC\n"
+            "                                       # already owned\n"
+            "    export CARRY_EXECUTION_MODE=overlay\n\n"
+            "    . ../.venv/bin/activate && python3 tools/drill.py\n",
+            file=sys.stderr)
         return 2
 
     report = run_drill(broker=bot.carry.broker, notional=args.notional,

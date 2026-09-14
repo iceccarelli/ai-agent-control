@@ -127,8 +127,10 @@ class TestTheDeployScriptCannotReachMainnet:
                 "only in the instructions it prints")
 
     def test_it_checks_the_config_before_creating_anything(self):
+        """0047 resolved flyctl to one shell variable, so the call reads
+        `"$FLY" launch`. The invariant is the ORDER, not the spelling."""
         text = self.script()
-        assert text.index("fly_stack.py --check") < text.index("fly launch")
+        assert text.index("fly_stack.py --check") < text.index("launch")
 
 
 class TestTwoMachinesIsTwoBooks:
