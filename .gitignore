@@ -8,3 +8,5 @@ __pycache__/
 # The native core is BUILT, never committed: `make -C cpp` or
 # `python3 bot/tools/carry_core.py --build`.
 bot/lib/*.so
+*.patch
+SHA256SUMS
