@@ -62,6 +62,14 @@ class _Store:
     def load_carry_position(self):
         return getattr(self, "carry_states", None) and self.carry_states[-1]
 
+    # 0044: the double-entry journal. A store without these is a book that
+    # places orders and cannot say what they cost.
+    def save_ledger(self, rows):
+        self.ledger_rows = list(rows)
+
+    def load_ledger(self):
+        return getattr(self, "ledger_rows", None)
+
     def open_positions(self):
         return []
 
@@ -127,7 +135,11 @@ class TestTheStoreDependenciesAreReal:
         first = store.next_order_seq()
         second = store.next_order_seq()
         assert second > first
-        assert broker.sequence_source("linear", "BTCUSDT", "carry") > second
+        # 0044: the engine's broker is a LedgerBroker wrapping the venue
+        # adapter, so every fill is booked. The sequence source belongs to
+        # the adapter underneath.
+        assert broker.inner.sequence_source(
+            "linear", "BTCUSDT", "carry") > second
 
     def test_the_kill_switch_reaches_the_store_not_a_lambda_that_raises(self):
         store = _Store()

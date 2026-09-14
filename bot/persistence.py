@@ -381,6 +381,20 @@ CREATE TABLE IF NOT EXISTS carry_position (
     updated_epoch REAL NOT NULL DEFAULT 0.0
 );
 
+-- 0044: the double-entry journal. One row, holding every entry as JSON, for
+-- the same reason carry_position does: the shape belongs to ledger.py, and a
+-- schema that must be migrated in step with it is a schema that will be one
+-- field behind on the day it matters. The journal is APPEND-ONLY in ledger.py;
+-- this row is rewritten whole because SQLite has no cheaper way to append to
+-- a JSON document, and `Journal.from_rows` re-validates every entry's balance
+-- on load, so a row edited in the file fails there rather than in a statement.
+CREATE TABLE IF NOT EXISTS carry_ledger (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    entries       INTEGER NOT NULL DEFAULT 0,
+    payload       TEXT NOT NULL DEFAULT '',
+    updated_epoch REAL NOT NULL DEFAULT 0.0
+);
+
 -- Additive indexes for the memory reads.  Both are over existing tables and
 -- change no existing behaviour; they only stop the health thread's aggregate
 -- reads from turning into full scans as the ledger grows.
@@ -834,6 +848,37 @@ class StateStore:
             "updated_epoch = excluded.updated_epoch",
             (str(state.get("book_state", "FLAT")), payload, utc_now_epoch()),
         )
+
+    def save_ledger(self, rows: List[Dict[str, Any]]) -> None:
+        """Write the whole journal. Called after any tick that posted.
+
+        Whole, not incremental: the journal is append-only in ledger.py, and a
+        partial write that loses the last entry would be a fee or a funding
+        payment the next restart never hears about.
+        """
+        payload = json.dumps(rows, sort_keys=True)
+        self._exec(
+            "INSERT INTO carry_ledger(id, entries, payload, updated_epoch) "
+            "VALUES(1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "entries = excluded.entries, payload = excluded.payload, "
+            "updated_epoch = excluded.updated_epoch",
+            (len(rows), payload, utc_now_epoch()),
+        )
+
+    def load_ledger(self) -> Optional[List[Dict[str, Any]]]:
+        """Every entry ever posted, or None when no journal has run here.
+
+        None means "no ledger has ever been written against this database". It
+        does NOT mean an empty journal: an empty one writes a row saying so.
+        """
+        rows = self._query("SELECT * FROM carry_ledger WHERE id = 1")
+        if not rows:
+            return None
+        try:
+            return json.loads(rows[0]["payload"] or "[]")
+        except (TypeError, ValueError) as exc:
+            raise PersistenceError(
+                f"carry_ledger payload is not readable JSON: {exc}") from exc
 
     def load_carry_position(self) -> Optional[Dict[str, Any]]:
         """What the last run believed, or None if it never wrote anything.

@@ -304,16 +304,26 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
            risk_class: Any = None,
            halt_after: Optional[int] = None) -> Dict[str, Any]:
     """Drive the real engine through `rows`. One bar, one `main.tick`."""
+    import ledger as L
     from carry_engine import BookState, CarryEngine
     from carry_risk import CarryRisk
     from market_snapshot import take_snapshot
 
-    broker = ReplayBroker(rows=rows, impact_bps=impact_bps,
-                          margin_multiple=margin_multiple)
+    raw_broker = ReplayBroker(rows=rows, impact_bps=impact_bps,
+                              margin_multiple=margin_multiple)
+    broker = raw_broker
     # The overlay hedges BTC the client already owns. Enough of it that the
     # inventory is never the binding constraint, so a divergence from the
     # simulator cannot be blamed on an empty wallet.
-    broker.inventory_btc = 10.0 * max(notional / rows[0].perp, 1.0)
+    raw_broker.inventory_btc = 10.0 * max(notional / rows[0].perp, 1.0)
+
+    # THE LEDGER, wrapped around the venue rather than called by the engine.
+    # Every leg the engine sends is booked because there is nowhere else for
+    # it to go (0044). `_now` follows the bar the replay is on, so entries are
+    # stamped with market time and the statement can be cut into periods.
+    journal = L.Journal()
+    _now = {"ms": int(rows[0].ms)}
+    broker = L.LedgerBroker(raw_broker, journal, ms=lambda: _now["ms"])
 
     store = _Store()
     engine = CarryEngine(
@@ -337,14 +347,15 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
 
     walked = 0
     for index, row in enumerate(rows):
-        broker.i = index
+        raw_broker.i = index
+        _now["ms"] = int(row.ms)
         walked = index + 1
         if halt_after is not None and index == halt_after:
             # A deliberate halt, to prove the replay stops where the process
             # would stop rather than walking past a HALTED book.
             engine._halt("REPLAY_FORCED_HALT", "requested by the harness")
         now_s = row.ms / 1000.0
-        before = len(broker.fills)
+        before = len(raw_broker.fills)
 
         # EXACTLY main.tick: one observation, freshness asserted, then the
         # engine. The clock is patched so `age_s` is measured against replay
@@ -371,7 +382,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         if decision.reason:
             reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
 
-        tick_fills = broker.fills[before:]
+        tick_fills = raw_broker.fills[before:]
         for fill in tick_fills:
             fees_usd += fill.fee
         # THE PRICE THE VENUE ACTUALLY GAVE US, not the bar's close. Taking
@@ -408,6 +419,19 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             # exits), so that miss flattered the replay by $392 over 79 trades.
             collected = float((decision.detail or {}).get("collected",
                                                           last_collected))
+            # The funding the engine booked, into the journal, once per
+            # closed position. Signed. The engine is the source; the ledger
+            # records what it reports rather than recomputing it (0043).
+            if collected:
+                L.funding(journal, ms=int(row.ms), ref=f"fund:{row.ms}",
+                          usd=collected)
+            # And the hedged coin, marked from entry to exit, so the journal
+            # shows BOTH sides of a delta-neutral pair. Without it the short's
+            # loss stands alone and a flat book reads as a disaster.
+            L.revalue_inventory(
+                journal, ms=int(row.ms), ref=f"reval:{row.ms}",
+                qty=open_trade["qty"], from_price=open_trade["entry_spot"],
+                to_price=(exit_spot if exit_spot is not None else row.spot))
             open_trade.update({"closed_ms": int(row.ms),
                                "exit_perp": (exit_perp if exit_perp is not None
                                              else row.perp),
@@ -438,18 +462,39 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             break
 
     if open_trade is not None:
-        last = rows[min(broker.i, len(rows) - 1)]
+        last = rows[min(raw_broker.i, len(rows) - 1)]
         funding_usd += last_collected
+        # FUNDING on the position that never closed IS realised: it was paid
+        # in cash at every settlement it was held through, and the journal
+        # holds cash.
+        #
+        # Its MARK is not. Revaluing the coin without marking the short beside
+        # it books a $21,207 gain on a position that is flat to price — which
+        # this harness did, once. Both legs of an OPEN position are estimates,
+        # they are reported as `unrealised_usd` below, and they never enter
+        # the journal. A ledger holds what is not an estimate.
+        if last_collected:
+            L.funding(journal, ms=int(last.ms), ref=f"fund:{last.ms}",
+                      usd=last_collected)
+        unrealised_usd = (
+            open_trade["qty"] * (open_trade["entry_perp"] - last.perp)
+            + open_trade["qty"] * (last.spot - open_trade["entry_spot"]))
         open_trade.update({"closed_ms": int(last.ms), "exit_perp": last.perp,
                            "exit_spot": last.spot, "reason": "OPEN_AT_END",
                            "open_at_end": True, "funding": last_collected,
-                           "prints_held": broker.i - open_trade["entry_index"]})
+                           "prints_held": raw_broker.i - open_trade["entry_index"]})
         basis_usd += (-open_trade["qty"] * (open_trade["exit_perp"]
                                             - open_trade["entry_perp"])
                       + open_trade["qty"] * (open_trade["exit_spot"]
                                              - open_trade["entry_spot"]))
         trades.append(open_trade)
 
+    unrealised_usd = locals().get("unrealised_usd", 0.0)
+    if borrow_usd:
+        L.borrow(journal, ms=int(rows[min(raw_broker.i, len(rows) - 1)].ms),
+                 ref="borrow:total", usd=borrow_usd)
+
+    statement = journal.statement()
     span_days = max((rows[-1].ms - rows[0].ms) / float(DAY_MS), 1.0)
     years = span_days / 365.25
     net = funding_usd + basis_usd - fees_usd - borrow_usd
@@ -464,14 +509,38 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "impact_bps_per_leg": impact_bps,
         "margin_multiple": margin_multiple,
         "trades": len(trades),
-        "orders": len(broker.fills),
-        "maker_fills": sum(1 for f in broker.fills if f.maker),
+        "orders": len(raw_broker.fills),
+        "maker_fills": sum(1 for f in raw_broker.fills if f.maker),
         "funding_usd": funding_usd, "basis_usd": basis_usd,
         "fees_usd": -fees_usd, "borrow_usd": -borrow_usd,
         "net_usd": net,
         "net_annualised_pct": 100.0 * net / notional / years,
         "market_exposure_pct": 100.0 * held / span_days,
         "actions": actions, "reasons": reasons,
+        # THE JOURNAL'S OWN ANSWER, built from balanced double-entry postings
+        # and never from the running totals above. When the two agree the
+        # P&L is not asserted, it is evidenced.
+        "ledger": statement,
+        # THE TWO LEGS, SEPARATELY. A delta-neutral overlay claims they
+        # cancel; `ledger.hedge_effectiveness` reads them back out and names
+        # what is left, which is the basis.
+        "hedge": {
+            "perp_realised_usd": sum(
+                l.usd for e in journal.entries if e.kind == "perp_close"
+                for l in e.lines if l.account == L.REALISED) * -1.0,
+            "inventory_change_usd": sum(
+                l.usd for e in journal.entries if e.kind == "revalue"
+                for l in e.lines if l.account == L.REALISED) * -1.0,
+        },
+        "ledger_entries": len(journal.entries),
+        "ledger_net_usd": statement["net_usd"],
+        # THE CROSS-CHECK. The journal holds realised money only, so the
+        # replay's net — which marks the position still open at the window
+        # end — must equal the journal's net plus that mark and nothing else.
+        "unrealised_usd": unrealised_usd,
+        "ledger_agrees": abs(
+            statement["net_usd"] + unrealised_usd - net) < max(
+                0.01, 1e-6 * abs(net)),
         "halted_at_ms": halted_at,
         "trade_rows": trades,
         "not_modelled": [
@@ -573,6 +642,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     if r["halted_at_ms"]:
         print(f"  HALTED at {cb._iso_ms(r['halted_at_ms'])} — the replay "
               "stopped there, as the process would")
+    import ledger as _L
+    st = r["ledger"]
+    print("\n  THE LEDGER — built from " f"{r['ledger_entries']:,} "
+          "double-entry postings, each balanced to zero")
+    print(f"    funding          ${st['funding_usd']:>12,.2f}")
+    print(f"    fees             ${-st['fees_usd']:>12,.2f}")
+    print(f"    borrow           ${-st['borrow_usd']:>12,.2f}")
+    print(f"    realised         ${st['realised_usd']:>12,.2f}")
+    print(f"    = NET realised   ${st['net_usd']:>12,.2f}")
+    print(f"    + open position  ${r['unrealised_usd']:>12,.2f}   "
+          "an ESTIMATE; deliberately not in the journal")
+    print(f"    ------------------------------   agrees with the run above: "
+          f"{r['ledger_agrees']}")
+    if st["fees_unknown"]:
+        print(f"    {st['fees_unknown']} fill(s) whose fee the venue never "
+              "stated — counted, never booked as $0.00")
+    eff = _L.hedge_effectiveness(**r["hedge"])
+    print("\n  DID THE HEDGE HEDGE?")
+    print(f"    perp realised    ${eff['perp_realised_usd']:>12,.0f}")
+    print(f"    inventory moved  ${eff['inventory_change_usd']:>12,.0f}")
+    print(f"    residual         ${eff['residual_usd']:>12,.0f}   "
+          f"{eff['residual_fraction_of_leg']:+.3%} of a leg")
+    print("    That residual IS the basis — the only price exposure a "
+          "delta-neutral")
+    print("    overlay runs. Not expected to be zero. Expected to be small, "
+          "and now")
+    print("    measured out of a journal rather than asserted.")
+
     print("\n  WHAT THE ENGINE DID, tick by tick")
     for action, count in sorted(r["actions"].items(), key=lambda kv: -kv[1]):
         print(f"    {action:<14}{count:>7}")

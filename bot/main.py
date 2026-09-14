@@ -115,6 +115,14 @@ class TradingBot:
         #: process running both would hold a hedged pair AND a directional bet
         #: against the same margin.
         self.carry = carry
+        #: The double-entry journal (0044). Attached by build_bot for a carry
+        #: book and None for every other mode. Fills book themselves through
+        #: LedgerBroker; tick() posts funding and writes the journal down.
+        self.carry_journal = None
+        #: Funding already posted for the OPEN position, so a tick books only
+        #: what is new. Reset when the position closes, because the next one
+        #: starts its own accrual at zero.
+        self._carry_booked_funding = 0.0
         self.cfg = config if config is not None else _config.get_config_object()
         self.store = store if store is not None else StateStore()
         self.client = client if client is not None else BybitClient(
@@ -523,6 +531,35 @@ class TradingBot:
                 mark, spot, (mark / spot - 1.0) * 1e4,
                 view.funding_print_bps, view.funding_print_ms,
                 view.funding_bps, decision.detail or "")
+            # THE LEDGER (0044). Fills book themselves through LedgerBroker;
+            # funding does not pass through the broker at all, so it is
+            # posted here from the number the ENGINE reports rather than
+            # recomputed — 0043 is what recomputing it costs.
+            journal = getattr(self, "carry_journal", None)
+            if journal is not None:
+                import ledger as _ledger
+
+                collected = float((decision.detail or {}).get("collected", 0.0))
+                booked = collected - getattr(self, "_carry_booked_funding", 0.0)
+                if decision.action == "unwound":
+                    self._carry_booked_funding = 0.0
+                else:
+                    self._carry_booked_funding = collected
+                if abs(booked) > 1e-12:
+                    try:
+                        _ledger.funding(
+                            journal, ms=int(time.time() * 1000),
+                            ref=f"fund:{view.funding_print_ms}", usd=booked)
+                    except _ledger.LedgerError:
+                        # A duplicate stamp or an out-of-order entry. Loud,
+                        # never silent: an unbookable funding payment is a
+                        # statement that will not add up.
+                        logger.exception("funding could not be booked")
+                try:
+                    self.store.save_ledger(journal.to_rows())
+                except Exception:  # noqa: BLE001
+                    logger.exception("the ledger could not be written down")
+
             if decision.state.name == "HALTED":
                 logger.critical(
                     "carry book HALTED — a human must clear it: %s",
@@ -741,12 +778,34 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                 "\"acquire\" = buy the spot leg and sell it again). The two "
                 "place different orders; refusing rather than assuming.")
 
+        # THE LEDGER (0044). Wrapped around the venue adapter, not called by
+        # the engine: the broker is the engine's ONLY path to an order, so
+        # every leg is booked and no code path anyone adds later can forget
+        # to. The journal is loaded from the store here and written back by
+        # tick(); `Journal.from_rows` re-validates every entry's balance on
+        # load, so a database edited by hand fails at startup rather than in
+        # a statement.
+        import ledger as _ledger
+
+        _rows = bot.store.load_ledger()
+        bot.carry_journal = (_ledger.Journal.from_rows(_rows) if _rows
+                             else _ledger.Journal())
+        if _rows:
+            logger.warning(
+                "carry ledger: resumed %d entries, realised net $%.2f",
+                len(bot.carry_journal.entries),
+                bot.carry_journal.statement()["net_usd"])
+
         bot.carry = CarryEngine(
-            broker=CarryBroker(
-                client=bot.client,
-                sequence_source=lambda product, symbol, purpose:
-                    bot.store.next_order_seq(),
-                order_gate=_carry_orders_permitted),
+            broker=_ledger.LedgerBroker(
+                CarryBroker(
+                    client=bot.client,
+                    sequence_source=lambda product, symbol, purpose:
+                        bot.store.next_order_seq(),
+                    order_gate=_carry_orders_permitted),
+                bot.carry_journal,
+                ms=lambda: int(time.time() * 1000),
+                spot_symbol=cfg.CARRY_SPOT_SYMBOL),
             kill_switch=bot.store.trip_kill_switch,
             spot_symbol=cfg.CARRY_SPOT_SYMBOL,
             perp_symbol=cfg.CARRY_PERP_SYMBOL,

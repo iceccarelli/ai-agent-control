@@ -474,5 +474,13 @@ class _Store:
     def load_carry_position(self):
         return None
 
+    # 0044: the double-entry journal. A store without these is a book that
+    # places orders and cannot say what they cost.
+    def save_ledger(self, rows):
+        self.ledger_rows = list(rows)
+
+    def load_ledger(self):
+        return getattr(self, "ledger_rows", None)
+
     def open_positions(self):
         return []
