@@ -444,6 +444,23 @@ class TradingBot:
                 "start rather than assuming the book is flat", exc)
             return False
 
+        # WARM THE EWMA (0045). The venue has been publishing settled prints
+        # the whole time this process was not running; without them a fresh
+        # deploy stands aside for 24 hours with INSUFFICIENT_FUNDING_HISTORY.
+        # A venue that will not hand them over is not a reason to refuse to
+        # start — it just means the wait — so this logs and carries on.
+        try:
+            warmed = self.carry.warm_funding_history(
+                broker.get_funding_history(self.carry.perp_symbol, limit=8))
+            if warmed:
+                logger.warning("carry: EWMA warmed with %d settled prints",
+                               warmed)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "carry: could not warm the funding history (%s); the book "
+                "will stand aside until it has seen %s prints itself", exc,
+                self.carry.FUNDING_HISTORY)
+
         decision = self.carry.cold_start(
             ledger=ledger, venue_perp_qty=venue_perp, venue_spot_qty=venue_spot,
             open_orders=open_orders)

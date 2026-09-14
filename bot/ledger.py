@@ -525,6 +525,9 @@ class LedgerBroker:
     def get_perp_position(self, symbol):
         return self.inner.get_perp_position(symbol)
 
+    def get_funding_history(self, symbol, limit=8):
+        return self.inner.get_funding_history(symbol, limit)
+
     def get_open_carry_orders(self, spot_symbol, perp_symbol):
         return self.inner.get_open_carry_orders(spot_symbol, perp_symbol)
 

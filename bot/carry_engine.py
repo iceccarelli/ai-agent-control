@@ -69,7 +69,7 @@ import time
 from decimal import Decimal, InvalidOperation
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -544,6 +544,49 @@ class CarryEngine:
                 decision.reason, decision.naked_side or "unknown",
                 decision.detail)
         return decision
+
+    def warm_funding_history(self, prints: Sequence[Tuple[float, int]]) -> int:
+        """Seed the EWMA from SETTLED prints the venue has already published.
+
+        Without this a freshly started book is blind for a full day. The EWMA
+        needs EWMA_MIN_PRINTS settled prints before `evaluate_entry` will look
+        at anything, prints come every eight hours, so a new deploy — a new
+        volume, a first run, a machine moved by the host — stands aside for
+        24 hours with `INSUFFICIENT_FUNDING_HISTORY` while the venue has been
+        publishing the last two hundred prints the whole time.
+
+        There is no look-ahead here: every one of these is a SETTLED print,
+        already paid, exactly the thing `on_candle` would have recorded had
+        the process been running. Reading them is not a shortcut, it is
+        catching up.
+
+        Refuses to touch a history that already has prints in it — a restart
+        that restored its own ledger knows more than the venue's last eight,
+        and overwriting that would lose the stamp that tells a tick from a
+        print.
+
+        `prints` is newest-LAST, as `(bps, settlement_ms)`.
+        """
+        if self._funding_history:
+            return 0
+        clean: List[Tuple[float, int]] = []
+        for rate, stamp in prints:
+            if not (self._finite(rate) and int(stamp) > 0):
+                continue
+            clean.append((float(rate), int(stamp)))
+        clean.sort(key=lambda row: row[1])
+        clean = clean[-self.FUNDING_HISTORY:]
+        if not clean:
+            return 0
+        self._funding_history = [rate for rate, _ms in clean]
+        # The newest stamp becomes the watermark, so the print that is already
+        # settled is not booked again as if the book had held through it.
+        self._last_print_ms = clean[-1][1]
+        logger.warning(
+            "carry: warmed %d settled funding prints from the venue, newest "
+            "%s; the book can decide now instead of in 24 hours",
+            len(clean), clean[-1][1])
+        return len(clean)
 
     def round_trip_bps(self) -> float:
         """What a full cycle costs THIS account at THIS venue, in bps.

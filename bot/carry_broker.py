@@ -570,6 +570,32 @@ class CarryBroker:
                 f"settled funding print for {symbol} is unusable: {row!r}")
         return rate * 1e4, stamp
 
+    def get_funding_history(self, symbol: str,
+                            limit: int = 8) -> List[Tuple[float, int]]:
+        """The last `limit` SETTLED prints, oldest first, as `(bps, ms)`.
+
+        Same endpoint as `get_funding_print`, more of it. Read once at
+        startup so a freshly deployed book is not blind for a day
+        (0045): every row is already settled, so this is catching up
+        rather than looking ahead.
+        """
+        result = self.client._request(
+            "GET", "/v5/market/funding/history",
+            params={"category": LINEAR, "symbol": symbol,
+                    "limit": max(1, min(int(limit), 200))})
+        rows = (result or {}).get("list") or []
+        out: List[Tuple[float, int]] = []
+        for row in rows:
+            try:
+                rate = float(row["fundingRate"])
+                stamp = int(row["fundingRateTimestamp"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(rate) and stamp > 0:
+                out.append((rate * 1e4, stamp))
+        out.sort(key=lambda entry: entry[1])
+        return out
+
     def get_perp_position(self, symbol: str) -> float:
         """Size of the perp position at the venue, in base units. 0 when flat.
 

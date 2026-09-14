@@ -74,6 +74,86 @@ def opened(bps=3.0):
     return e
 
 
+class TestAFreshBookIsNotBlindForADay:
+    """0045 — the EWMA starts empty, and the venue has been publishing the
+    whole time.
+
+    `evaluate_entry` refuses below EWMA_MIN_PRINTS settled prints. Prints come
+    every eight hours. So a new deploy — a new volume, a first run, a machine
+    the host moved — stood aside for 24 hours with
+    INSUFFICIENT_FUNDING_HISTORY while `/v5/market/funding/history` was
+    returning the last two hundred prints on request.
+
+    There is no look-ahead in reading them: every one is SETTLED, already
+    paid, exactly what `on_candle` would have recorded had the process been
+    running. It is catching up, not peeking.
+    """
+
+    def _engine(self):
+        # acquire, matching this file's Venue, which has no wallet read
+        e = CarryEngine(broker=Venue(), max_notional_usd=100.0,
+                        borrow_apr=0.0, execution_mode="acquire",
+                        persist=lambda s: None)
+        e.pair_risk = CarryRisk(max_notional_usd=100.0)
+        e.snapshot = MarketSnapshot(perp_mark=MARK, spot_mark=MARK,
+                                    funding_bps=3.0, margin_multiple=5.0,
+                                    observed_at_s=time.time())
+        return e
+
+    def test_a_cold_engine_stands_aside(self):
+        e = self._engine()
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=9 * H8)
+        assert d.reason == "INSUFFICIENT_FUNDING_HISTORY"
+
+    def test_a_warmed_engine_can_decide_immediately(self):
+        e = self._engine()
+        assert e.warm_funding_history(
+            [(3.0, k * H8) for k in range(1, 9)]) == 8
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=9 * H8, timestamp_ms=9 * H8)
+        assert d.reason != "INSUFFICIENT_FUNDING_HISTORY"
+        assert d.action == "opened", d.reason
+
+    def test_the_newest_warmed_print_is_not_collected_again(self):
+        """Its stamp becomes the watermark. Without that the book books a
+        print it was not holding through."""
+        e = self._engine()
+        e.warm_funding_history([(3.0, k * H8) for k in range(1, 9)])
+        assert e._last_print_ms == 8 * H8
+
+    def test_a_restored_history_is_never_overwritten(self):
+        """A restart that read its own ledger knows more than the venue's last
+        eight, including which prints this book actually held through."""
+        e = self._engine()
+        e.restore({"book_state": "FLAT", "position": None,
+                   "last_print_ms": 5 * H8, "funding_history": [1.0, 2.0]})
+        assert e.warm_funding_history([(9.9, k * H8) for k in range(1, 9)]) == 0
+        assert e._funding_history == [1.0, 2.0]
+        assert e._last_print_ms == 5 * H8
+
+    def test_prints_are_sorted_and_truncated(self):
+        e = self._engine()
+        e.warm_funding_history([(float(k), k * H8) for k in (5, 1, 9, 3, 12,
+                                                             7, 2, 11, 4, 6)])
+        assert len(e._funding_history) == e.FUNDING_HISTORY
+        assert e._funding_history[-1] == 12.0
+        assert e._last_print_ms == 12 * H8
+
+    def test_malformed_rows_are_dropped_not_booked(self):
+        e = self._engine()
+        taken = e.warm_funding_history(
+            [(float("nan"), H8), (3.0, 2 * H8), (1.0, 0), (2.0, 3 * H8)])
+        assert taken == 2
+        assert e._funding_history == [3.0, 2.0]
+
+    def test_nothing_usable_leaves_it_cold_rather_than_guessing(self):
+        e = self._engine()
+        assert e.warm_funding_history([]) == 0
+        assert e._funding_history == []
+        assert e._last_print_ms is None
+
+
 class TestFundingIsPaidOnWhatThePositionIsWorthNow:
     """0043 — the venue pays funding on the position's value at the SETTLEMENT
     mark, not at the price the position was opened at.
