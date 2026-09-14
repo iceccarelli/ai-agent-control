@@ -1,5 +1,5 @@
 {
-  "git_commit": "a49849bc8b5a2b9d3c83d6c1ca895d541430fbc5-dirty",
+  "git_commit": "44e13d5523f94fb3f06946f751af5e13112d7959-dirty",
   "schema": "hypothesis_registry/1",
   "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
   "seeded": true,
@@ -223,8 +223,22 @@
       "source": "tools/carry_sweep.py",
       "status": "search_width_recorded",
       "trial_id": "carry_rule_sweep@59feb30d2328"
+    },
+    {
+      "note": "540 configurations scored over 4500 settlements (2022-08-01T16:00:00Z .. 2026-09-09T08:00:00Z), grid hold=5..240 days, exit=[1, 2, 3, 4, 6], ewma_alpha=0.1..0.9. entry_bps is NOT an axis: the gated rule does not read it (0041). IN-SAMPLE: this window is fully read (data_read_ledger.json), so no cell may be chosen from it. The admissible holdout is forward only.",
+      "recorded_utc": "2026-09-13T23:46:49Z",
+      "source": "tools/carry_sweep.py",
+      "status": "search_width_recorded",
+      "trial_id": "carry_rule_sweep@d7d7d4141a05"
+    },
+    {
+      "note": "20520 distinct gated rules scored (540 per refit x 38 refits) over 4500 settlements (2022-08-01T16:00:00Z .. 2026-09-09T08:00:00Z), burn-in 365d, step 30d. Axes: hold_days, negative_exit_prints, ewma_alpha \u2014 entry_bps is NOT an axis, the gated rule does not read it. WALK-FORWARD IS NOT A HOLDOUT: not quotable, and no cell is adopted.",
+      "recorded_utc": "2026-09-13T23:46:54Z",
+      "source": "tools/carry_walkforward.py",
+      "status": "search_width_recorded",
+      "trial_id": "carry_walkforward@69b08ab2ab84"
     }
   ],
-  "updated_utc": "2026-09-13T22:36:56Z",
+  "updated_utc": "2026-09-13T23:46:54Z",
   "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }

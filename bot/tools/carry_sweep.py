@@ -46,17 +46,31 @@ import carry_backtest as cb          # noqa: E402
 import carry_core as core            # noqa: E402
 
 #: The grid. Declared here, in the source, so a sweep is a reviewable act.
-ENTRY_BPS = [round(0.1 * i, 2) for i in range(1, 25)]        # 0.1 .. 2.4
+#:
+#: 0041: THIS TOOL SCORES THE GATED RULE, AND THE GATED RULE HAS NO ENTRY
+#: THRESHOLD. `may_open_gated` decides on the EWMA of funding, the cost of
+#: capital and the basis budget; `entry_bps` is read only in the UNGATED
+#: branch. Measured on the Bybit settlement corpus, overlay, gated:
+#:
+#:     entry 0.1 bps -> net $29,696.41, 79 trades
+#:     entry 2.4 bps -> net $29,696.41, 79 trades
+#:
+#: So the 24-wide entry axis printed 60 distinct rules 1,440 times, and the
+#: number handed to the multiple-testing correction described the loop rather
+#: than the search. The axis is now one dead value, and the parameters the
+#: gated rule DOES have — `ewma_alpha` above all — are searched instead.
+ENTRY_BPS_GATED = [0.0]
 HOLD_DAYS = [5, 7, 10, 14, 20, 30, 45, 60, 90, 120, 180, 240]
 EXIT_PRINTS = [1, 2, 3, 4, 6]
+EWMA_ALPHA = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 #: The dataset every cell is scored on, for the read ledger and the registry.
 DATASET = "BYBIT_LINEAR_BTC_USDT_FUNDING"
 
 
 def grid_id() -> str:
-    blob = json.dumps({"entry": ENTRY_BPS, "hold": HOLD_DAYS,
-                       "exit": EXIT_PRINTS}, sort_keys=True)
+    blob = json.dumps({"hold": HOLD_DAYS, "exit": EXIT_PRINTS,
+                       "alpha": EWMA_ALPHA}, sort_keys=True)
     return hashlib.sha256(blob.encode()).hexdigest()[:12]
 
 
@@ -72,8 +86,25 @@ def run(repo: str, *, notional: float, borrow_apr: float, overlay: bool,
         gated=True, overlay=overlay,
         taker_spot_bps=cb.TAKER_BPS_SPOT, taker_perp_bps=cb.TAKER_BPS_PERP)
     started = time.perf_counter()
-    cells = core.sweep(rows, base, entry_grid=ENTRY_BPS, hold_grid=HOLD_DAYS,
-                       exit_grid=EXIT_PRINTS)
+    # One native call per alpha: `carry_sweep`'s three axes are fixed at
+    # (entry, hold, exit), and the entry one is dead here, so alpha rides the
+    # outer loop rather than the C ABI growing a fourth grid.
+    cells = []
+    for alpha in EWMA_ALPHA:
+        p = core.params(
+            notional=base.notional, entry_bps=0.0, borrow_apr=base.borrow_apr,
+            impact_bps=base.impact_bps, round_trip_bps=base.round_trip_bps,
+            hold_days=base.hold_days, taker_spot_bps=base.taker_spot_bps,
+            taker_perp_bps=base.taker_perp_bps, ewma_alpha=float(alpha),
+            gated=True, overlay=bool(base.overlay),
+            ewma_min_prints=base.ewma_min_prints,
+            negative_exit_prints=base.negative_exit_prints,
+            funding_history=base.funding_history)
+        for cell in core.sweep(rows, p, entry_grid=ENTRY_BPS_GATED,
+                               hold_grid=HOLD_DAYS, exit_grid=EXIT_PRINTS):
+            cell.pop("entry_bps", None)
+            cell["ewma_alpha"] = float(alpha)
+            cells.append(cell)
     elapsed = time.perf_counter() - started
     years = (rows[-1].ms - rows[0].ms) / (365.25 * 86_400_000)
     for cell in cells:
@@ -94,9 +125,10 @@ def record_width(report: Dict[str, Any], *, path: Optional[str] = None) -> str:
     trial_id = f"carry_rule_sweep@{grid_id()}"
     note = (f"{len(report['cells'])} configurations scored over "
             f"{report['settlements']} settlements ({report['window']}), "
-            f"grid entry={ENTRY_BPS[0]}..{ENTRY_BPS[-1]} bps, "
-            f"hold={HOLD_DAYS[0]}..{HOLD_DAYS[-1]} days, "
-            f"exit={EXIT_PRINTS}. IN-SAMPLE: this window is fully read "
+            f"grid hold={HOLD_DAYS[0]}..{HOLD_DAYS[-1]} days, "
+            f"exit={EXIT_PRINTS}, ewma_alpha={EWMA_ALPHA[0]}.."
+            f"{EWMA_ALPHA[-1]}. entry_bps is NOT an axis: the gated rule does "
+            "not read it (0041). IN-SAMPLE: this window is fully read "
             "(data_read_ledger.json), so no cell may be chosen from it. The "
             "admissible holdout is forward only.")
     try:
@@ -167,17 +199,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     print()
     print(BANNER)
     print()
-    print(f"  {'entry':>6} {'hold':>5} {'exit':>5} {'net %/yr':>10} "
+    print(f"  {'hold':>5} {'exit':>5} {'alpha':>6} {'net %/yr':>10} "
           f"{'trades':>7} {'losing':>7}")
     for cell in cells[:args.top]:
-        print(f"  {cell['entry_bps']:6.2f} {cell['hold_days']:5.0f} "
-              f"{cell['negative_exit_prints']:5d} "
+        print(f"  {cell['hold_days']:5.0f} {cell['negative_exit_prints']:5d} "
+              f"{cell['ewma_alpha']:6.1f} "
               f"{cell['net_annualised_pct']:+9.2f}% {cell['trades']:7d} "
               f"{cell['losing_trades']:7d}")
     worst = cells[-1]
-    print(f"  {'...':>6}")
-    print(f"  {worst['entry_bps']:6.2f} {worst['hold_days']:5.0f} "
-          f"{worst['negative_exit_prints']:5d} "
+    print(f"  {'...':>5}")
+    print(f"  {worst['hold_days']:5.0f} {worst['negative_exit_prints']:5d} "
+          f"{worst['ewma_alpha']:6.1f} "
           f"{worst['net_annualised_pct']:+9.2f}% {worst['trades']:7d} "
           f"{worst['losing_trades']:7d}   <- worst cell")
 
