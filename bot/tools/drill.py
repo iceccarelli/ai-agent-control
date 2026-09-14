@@ -121,6 +121,10 @@ class Drill:
         self.orders_sent = 0
         self.failed_stage: Optional[str] = None
         self.still_open = False
+        #: WHICH EXCHANGE this ran against (0046). Defaults to "unknown"
+        #: rather than to mainnet: a transcript that does not know where it
+        #: ran must not be readable as the strongest possible claim.
+        self.venue = "unknown"
 
     def stage(self, name: str) -> Stage:
         s = Stage(name)
@@ -141,7 +145,7 @@ class Drill:
 
 
 def run_drill(*, broker: Any, notional: Optional[float] = None,
-              arm: bool = False, out: str = "",
+              arm: bool = False, out: str = "", venue: str = "unknown",
               engine_factory: Any = None) -> Dict[str, Any]:
     """The whole sequence. Returns the transcript whatever happens."""
     import shadow
@@ -149,6 +153,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     cap = float(shadow.SHADOW_MAX_NOTIONAL_USD)
     asked = cap if notional is None else float(notional)
     d = Drill(broker=broker, notional=asked, arm=arm)
+    d.venue = str(venue or "unknown")
     state: Dict[str, Any] = {}
 
     def reachability(s: Stage) -> None:
@@ -372,8 +377,21 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
     else:
         action = ("PASSED. The transcript is the Phase D evidence. Read "
                   "`not_proven` before treating it as more than it is.")
+    venue_note = {
+        "mainnet": "MAINNET — real money moved.",
+        "testnet": "testnet — a separate exchange with its own order book; "
+                   "its prices and funding are NOT the real ones.",
+        "demo": "demo trading — REAL mainnet market data with SIMULATED "
+                "matching. The marks, basis and funding prints are real; the "
+                "fills are not, and no real money moved.",
+        "unknown": "UNKNOWN venue: this transcript does not record which "
+                   "exchange it ran against and must not be read as evidence "
+                   "about any particular one.",
+    }.get(d.venue, f"unrecognised venue {d.venue!r}")
     report = {
         "verdict": verdict,
+        "venue": d.venue,
+        "venue_note": venue_note,
         "armed": bool(d.arm),
         "failed_stage": d.failed_stage,
         "still_open": d.still_open,
@@ -394,6 +412,15 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
     return report
 
 
+def _load_bot():
+    """Import and build the stack. Separated so a missing dependency is a
+    sentence rather than a traceback four imports deep (0046) — the same
+    lesson as INVENTORY D16, which is why `session_tail` reports UNREADABLE
+    instead of NO."""
+    import main as _main
+    return _main.build_bot(attach_strategy=False)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -404,20 +431,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
 
-    import main as _main
-    bot = _main.build_bot(attach_strategy=False)
+    try:
+        bot = _load_bot()
+    except Exception as exc:                                   # noqa: BLE001
+        print(f"the trading stack could not be imported: "
+              f"{type(exc).__name__}: {exc}\n\n"
+              "This is almost always the wrong interpreter. The drill imports "
+              "the whole book,\nwhich needs numpy and requests. Run it with "
+              "the virtualenv the suite uses:\n\n"
+              "    . .venv/bin/activate && python3 tools/drill.py\n"
+              "    (or: ../.venv/bin/python tools/drill.py)\n",
+              file=sys.stderr)
+        return 2
     if bot.carry is None:
         print("BOOK_MODE is not carry; there is no book to drill.",
               file=sys.stderr)
         return 2
 
     report = run_drill(broker=bot.carry.broker, notional=args.notional,
-                       arm=args.arm, out=args.out)
+                       arm=args.arm, out=args.out,
+                       venue=str(getattr(bot.cfg, "BYBIT_VENUE", "unknown")
+                                 if hasattr(bot, "cfg") else "unknown"))
 
     print("=" * 74)
     print(f"PHASE D DRILL — {report['verdict']}"
           f"   ({'ARMED' if report['armed'] else 'preflight only'})")
     print("=" * 74)
+    print(f"  venue: {report['venue']} — {report['venue_note']}")
+    print()
     for stage in report["stages"]:
         mark = "ok  " if stage["ok"] else "STOP"
         print(f"  [{mark}] {stage['stage']}")

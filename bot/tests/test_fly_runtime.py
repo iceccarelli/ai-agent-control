@@ -91,6 +91,46 @@ class TestTheBuildContextCanDeliverEveryCopy:
             assert fly_stack.excluded_by(patterns, path), path
 
 
+class TestTheDeployScriptCannotReachMainnet:
+    """0046 — `scripts/deploy.sh` is the one command from a checkout to a
+    running book. The one thing it must never do is deploy one that can spend
+    real money, and that refusal has to be in the script rather than in the
+    head of whoever runs it."""
+
+    def script(self):
+        path = os.path.join(ROOT, "..", "scripts", "deploy.sh")
+        assert os.path.exists(path), "scripts/deploy.sh is missing"
+        return open(path, encoding="utf-8").read()
+
+    def test_mainnet_is_refused_by_name(self):
+        text = self.script()
+        assert "mainnet)" in text
+        assert "REFUSED: this script does not deploy to mainnet" in text
+
+    def test_it_deploys_immediate(self):
+        assert "--strategy immediate" in self.script()
+
+    def test_it_arms_nothing(self):
+        """It may PRINT the arming commands. It may not run them.
+
+        Every occurrence of an arming string must fall after the point where
+        the script has stopped executing and started printing instructions.
+        """
+        body = self.script()
+        instructions_begin = body.index("ARMING, when the preflight is clean")
+        for armed in ("PAPER_TRADING=0", "LIVE_TRADING_ACK", "drill.py --arm"):
+            first = body.find(armed)
+            if first == -1:
+                continue
+            assert first > instructions_begin, (
+                f"{armed!r} appears in the executed part of deploy.sh, not "
+                "only in the instructions it prints")
+
+    def test_it_checks_the_config_before_creating_anything(self):
+        text = self.script()
+        assert text.index("fly_stack.py --check") < text.index("fly launch")
+
+
 class TestTwoMachinesIsTwoBooks:
     def test_the_default_strategy_is_refused(self):
         for strategy in ("rolling", "bluegreen", "canary"):

@@ -239,6 +239,45 @@ def parse_maker_wait(env: Mapping[str, str]) -> float:
     return value
 
 
+#: The three places this software can point. `mainnet` is the only one where
+#: money is real; the other two are sandboxes and every safety gate treats
+#: them identically, because USE_TESTNET is DERIVED from this rather than
+#: competing with it (0046).
+BYBIT_VENUES = ("mainnet", "testnet", "demo")
+
+
+def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
+    """`(venue, is_sandbox)`. Refuses a configuration that contradicts itself.
+
+    `USE_TESTNET` is a boolean and there are three destinations, so the boolean
+    cannot be the authority any more. It stays as the derived sandbox flag —
+    every existing gate reads it and none of them has to learn a new word — and
+    when BOTH keys are set and disagree, that is REFUSED rather than resolved.
+    Two sources of truth about which exchange you are authenticating against is
+    precisely how a testnet key reaches mainnet.
+    """
+    raw = env.get("BYBIT_VENUE")
+    stated = env.get("USE_TESTNET")
+    if raw is None or str(raw).strip() == "":
+        sandbox = parse_bool(stated, True)
+        return ("testnet" if sandbox else "mainnet"), sandbox
+    venue = str(raw).strip().lower()
+    if venue not in BYBIT_VENUES:
+        raise ConfigError(
+            f"BYBIT_VENUE={raw!r} is not one of {BYBIT_VENUES}. Refusing "
+            "rather than defaulting: this decides which exchange the keys "
+            "authenticate against.")
+    sandbox = venue != "mainnet"
+    if stated is not None and str(stated).strip() != "":
+        if parse_bool(stated, True) != sandbox:
+            raise ConfigError(
+                f"BYBIT_VENUE={venue!r} and USE_TESTNET={stated!r} disagree "
+                "about whether this is a sandbox. Set one of them, not both: "
+                "two sources of truth about which exchange you are pointed at "
+                "is how a testnet key ends up on mainnet.")
+    return venue, sandbox
+
+
 def parse_int(
     env: Mapping[str, str], name: str, default: int,
     *, low: int = -(2**31), high: int = 2**31,
@@ -315,6 +354,10 @@ class Config:
 
     # -- mode ---------------------------------------------------------------
     USE_TESTNET: bool
+    #: Which exchange (0046): "mainnet", "testnet" or "demo". USE_TESTNET is
+    #: DERIVED from this, so every existing safety gate keeps working without
+    #: learning a new word.
+    BYBIT_VENUE: str
     PAPER_TRADING: bool
     LIVE_TRADING_ACK: str
     LIVE_AUTHORIZED: bool
@@ -649,7 +692,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
     """
     env = os.environ if env is None else env
 
-    use_testnet = parse_bool(env.get("USE_TESTNET"), True)
+    venue, use_testnet = parse_venue(env)
     paper_trading = parse_bool(env.get("PAPER_TRADING"), True)
     ack = parse_str(env, "LIVE_TRADING_ACK")
     api_key = parse_str(env, "BYBIT_API_KEY")
@@ -709,6 +752,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
 
     cfg = Config(
         USE_TESTNET=use_testnet,
+        BYBIT_VENUE=venue,
         PAPER_TRADING=paper_trading,
         LIVE_TRADING_ACK=ack,
         LIVE_AUTHORIZED=authorized,

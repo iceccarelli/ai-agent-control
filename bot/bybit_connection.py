@@ -93,12 +93,24 @@ __all__ = [
     "OPEN_ORDER_STATUS",
     "MAINNET_REST",
     "TESTNET_REST",
+    "DEMO_REST",
+    "VENUE_REST",
     "MAINNET_WS_PRIVATE",
     "TESTNET_WS_PRIVATE",
 ]
 
 MAINNET_REST = "https://api.bybit.com"
 TESTNET_REST = "https://api-testnet.bybit.com"
+#: Bybit DEMO TRADING (0046). A separate module from testnet: it runs against
+#: REAL mainnet market data with simulated matching, and its wallet is funded
+#: by `POST /v5/account/demo-apply-money` rather than a 24-hour web faucet.
+#: Real marks, real basis, real funding prints, no real money.
+DEMO_REST = "https://api-demo.bybit.com"
+
+#: The only mapping from a venue name to a URL. One table, so there is exactly
+#: one answer to "which exchange am I pointed at".
+VENUE_REST = {"mainnet": MAINNET_REST, "testnet": TESTNET_REST,
+              "demo": DEMO_REST}
 MAINNET_WS_PRIVATE = "wss://stream.bybit.com/v5/private"
 TESTNET_WS_PRIVATE = "wss://stream-testnet.bybit.com/v5/private"
 
@@ -334,7 +346,18 @@ class BybitClient:
         self.orders_submitted = 0
 
         self.testnet = bool(self.cfg.USE_TESTNET)
-        self.base_url = TESTNET_REST if self.testnet else MAINNET_REST
+        # The venue name is the authority; USE_TESTNET is the DERIVED sandbox
+        # flag every safety gate already reads (0046). A config that states
+        # both and contradicts itself never gets here: config.load refuses it.
+        venue = str(getattr(self.cfg, "BYBIT_VENUE", "") or
+                    ("testnet" if self.testnet else "mainnet"))
+        if venue not in VENUE_REST:
+            raise ValueError(
+                f"BYBIT_VENUE={venue!r} is not one of {sorted(VENUE_REST)}; "
+                "refusing rather than guessing which exchange to authenticate "
+                "against")
+        self.venue = venue
+        self.base_url = VENUE_REST[venue]
         self.ws_private_url = (
             TESTNET_WS_PRIVATE if self.testnet else MAINNET_WS_PRIVATE
         )

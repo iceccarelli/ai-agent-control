@@ -269,12 +269,12 @@ class TestTheDrillIsNotAWayAroundTheGates:
             assert forbidden not in built, forbidden
 
     def test_the_cli_takes_the_brokers_build_bot_made(self):
-        import ast
+        """0046 moved the import into `_load_bot` so a missing dependency is
+        a sentence rather than a traceback. The invariant is unchanged: the
+        CLI's broker is whatever build_bot decided, gate and all."""
         import inspect
-        src = inspect.getsource(D.main)
-        assert "build_bot" in src
-        assert "bot.carry.broker" in src
-        ast.parse(src.lstrip())
+        assert "build_bot" in inspect.getsource(D._load_bot)
+        assert "bot.carry.broker" in inspect.getsource(D.main)
 
     def test_it_never_raises_the_cap(self):
         """$100 is the cap and the drill does not get an exemption."""

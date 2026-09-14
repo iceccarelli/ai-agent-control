@@ -770,7 +770,11 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                 return (False, "PAPER_TRADING=1: the carry book has no paper "
                                "venue")
             if bool(cfg.USE_TESTNET):
-                return (True, "TESTNET")
+                # Testnet and DEMO are both sandboxes and neither can touch
+                # real money, so both are permitted here — but the reason
+                # NAMES which one, so no log line and no drill transcript can
+                # be read as mainnet evidence (0046).
+                return (True, str(getattr(cfg, "BYBIT_VENUE", "testnet")).upper())
             armed, why = _config.is_live_authorized(cfg)
             if armed is not True:
                 return (False, f"mainnet URL without live authorisation: {why}")
