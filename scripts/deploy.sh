@@ -63,6 +63,22 @@ else
   "$FLY" launch --no-deploy --name "$APP" --region "$REGION" --copy-config --yes
 fi
 
+# `fly launch` REWRITES fly.toml — it printed "Wrote config file fly.toml" on
+# the run that produced this line. The check in step 2 was therefore a check of
+# a document that no longer exists. If launch dropped `strategy = immediate`,
+# or added an [http_service] with auto_stop, the machine could run two books or
+# be stopped while holding a hedge. So the same check runs again, and this time
+# a failure stops the deploy.
+say "3b/7  the config AGAIN, because fly launch rewrites it"
+if ! python3 tools/fly_stack.py --check; then
+  echo >&2
+  echo "STOP: fly launch rewrote fly.toml into something that fails the" >&2
+  echo "      checks above. Nothing has been deployed. Restore it with" >&2
+  echo "          python3 tools/fly_stack.py --render" >&2
+  echo "      and re-run this script." >&2
+  exit 1
+fi
+
 say "4/7  the volume (the ledger lives here; losing it means a human looks)"
 if fly volumes list --app "$APP" 2>/dev/null | grep -q "$VOLUME"; then
   echo "volume $VOLUME already exists"
@@ -74,8 +90,23 @@ say "5/7  the outbound IP — this is the address you pin the API key to"
 if fly ips list --app "$APP" 2>/dev/null | grep -qi egress; then
   echo "an egress IP is already allocated"
 else
-  "$FLY" ips allocate-egress --app "$APP" --region "$REGION" --yes || \
-    echo "could not allocate an egress IP; pin the key after 'fly ips list'"
+  if ! "$FLY" ips allocate-egress --app "$APP" --region "$REGION" --yes; then
+    cat >&2 <<'PINNING'
+
+  NO STATIC EGRESS IP. Fly disables this for trial organisations until a card
+  is on file. That is a real constraint, not a failure of this script, and it
+  has one consequence: THE API KEY CANNOT BE IP-PINNED.
+
+  For BYBIT_VENUE=demo that is an accepted risk and it is written down in
+  INVENTORY: no real money, no withdrawal rights, simulated matching, and a
+  key that is useless anywhere but the demo venue.
+
+  For MAINNET it is not acceptable and this script refuses mainnet anyway.
+  Before real money: add a card, allocate the egress IP, and pin the key to
+  it — that rule has not moved.
+
+PINNING
+  fi
 fi
 "$FLY" ips list --app "$APP" || true
 
@@ -109,6 +140,16 @@ if [ "$VENUE" = "demo" ]; then cat <<NEXT
   fund the wallet       flyctl ssh console --app $APP -C "python3 tools/fund_demo.py --btc 1 --usdt 10000"
                         (demo funds itself by API; testnet needs the web faucet)
 NEXT
+fi
+
+if ! command -v flyctl >/dev/null 2>&1; then cat <<'PATHNOTE'
+
+  NOTE: flyctl was installed into this script's PATH but not your shell's.
+  Before running anything below:
+
+      export PATH="$HOME/.fly/bin:$PATH"      # or: source ~/.bashrc
+
+PATHNOTE
 fi
 
 cat <<NEXT

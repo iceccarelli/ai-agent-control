@@ -29,12 +29,22 @@ COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
      technical_analysis.py trading_engine.py ./
 COPY signals/ ./signals/
 
-# Two READ-ONLY tools, named one by one — never `COPY tools/`, which would put
-# every operator script and fetcher in the image. 0038 runs the first of these
-# as a one-off Fargate task to answer the only question that matters before a
-# drill: can THIS VPC reach the venue? The second prints the four invariants
-# from inside the running image.
-COPY tools/connector_check.py tools/session_tail.py ./tools/
+# The operator tools, named ONE BY ONE — never `COPY tools/`, which would put
+# every script and fetcher in the image.
+#
+#   connector_check   can THIS host reach the venue? The only question worth
+#                     asking before a drill.
+#   session_tail      the four invariants, printed from inside the image.
+#   drill             Phase D itself (0045). Reads and reports without --arm.
+#   fund_demo         puts BTC in a DEMO wallet (0046), so an overlay has
+#                     something to hedge.
+#
+# 0049: the first two were shipped and the last two were not, while
+# scripts/deploy.sh told the operator to run all four inside the container.
+# The instruction failed at the one moment it mattered.
+# tests/test_image_ships_the_tools.py compares the two lists now.
+COPY tools/connector_check.py tools/session_tail.py \
+     tools/drill.py tools/fund_demo.py ./tools/
 
 # Run unprivileged. State lives on a mounted volume owned by this user.
 RUN useradd --create-home --shell /usr/sbin/nologin bot \

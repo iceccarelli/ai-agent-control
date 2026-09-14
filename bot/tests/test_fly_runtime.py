@@ -126,6 +126,30 @@ class TestTheDeployScriptCannotReachMainnet:
                 f"{armed!r} appears in the executed part of deploy.sh, not "
                 "only in the instructions it prints")
 
+    def test_it_checks_the_config_again_after_launch_rewrites_it(self):
+        """`fly launch` prints "Wrote config file fly.toml" — it REWRITES the
+        document step 2 checked. If it dropped `strategy = immediate` or added
+        an [http_service] with auto_stop, the machine could run two books or
+        be stopped while holding a hedge. So the check runs twice, and the
+        second one stops the deploy."""
+        text = self.script()
+        first = text.index("fly_stack.py --check")
+        launch = text.index("launch")
+        second = text.index("fly_stack.py --check", launch)
+        assert first < launch < second, \
+            "the config is not re-checked after fly launch rewrites it"
+        after = text[second:second + 600]
+        assert "exit 1" in after, \
+            "a failed post-launch check must stop the deploy, not warn"
+
+    def test_a_missing_egress_ip_explains_the_consequence(self):
+        """Fly disables egress IPs for trial organisations. The script must
+        say what that MEANS — the key cannot be IP-pinned — rather than
+        printing a shrug."""
+        text = self.script()
+        assert "CANNOT BE IP-PINNED" in text
+        assert "MAINNET it is not acceptable" in text
+
     def test_it_checks_the_config_before_creating_anything(self):
         """0047 resolved flyctl to one shell variable, so the call reads
         `"$FLY" launch`. The invariant is the ORDER, not the spelling."""
