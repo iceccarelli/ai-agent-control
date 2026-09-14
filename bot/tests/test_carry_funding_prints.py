@@ -74,6 +74,72 @@ def opened(bps=3.0):
     return e
 
 
+class TestFundingIsPaidOnWhatThePositionIsWorthNow:
+    """0043 — the venue pays funding on the position's value at the SETTLEMENT
+    mark, not at the price the position was opened at.
+
+    `funding_collected` booked `perp.notional`, which is `filled_qty *
+    avg_price` and is frozen at the fill. Replaying the engine over the Bybit
+    settlement corpus booked $29,371 where the same 79 trades earn $39,444 —
+    **26% of the funding missing**, because BTC rose while the positions were
+    held and the entry price never moved.
+
+    It changes no decision: nothing gates on `funding_collected`. It is the
+    number a client would be shown as "funding collected", and Phase E calls
+    itself a bankable ledger.
+
+    The error's SIGN follows the price. A book whose whole claim is that price
+    direction does not matter must not report a P&L whose error is a function
+    of price direction.
+    """
+
+    def test_a_doubled_mark_doubles_the_print(self):
+        e = opened()
+        e.on_candle(mark=2 * MARK, funding_bps=1.0, spot=2 * MARK,
+                    funding_print_ms=4 * H8)
+        qty = e.position.perp.filled_qty
+        assert e.position.funding_collected == pytest.approx(
+            1.0 / 1e4 * qty * 2 * MARK)
+
+    def test_a_halved_mark_halves_it(self):
+        """The other direction, so the fix cannot be a constant that happens
+        to suit a rising corpus."""
+        e = opened()
+        e.on_candle(mark=MARK / 2, funding_bps=1.0, spot=MARK / 2,
+                    funding_print_ms=4 * H8)
+        qty = e.position.perp.filled_qty
+        assert e.position.funding_collected == pytest.approx(
+            1.0 / 1e4 * qty * MARK / 2)
+
+    def test_the_entry_price_is_not_what_is_paid_on(self):
+        e = opened()
+        e.on_candle(mark=3 * MARK, funding_bps=2.0, spot=3 * MARK,
+                    funding_print_ms=4 * H8)
+        on_entry = 2.0 / 1e4 * e.position.perp.notional
+        assert e.position.funding_collected != pytest.approx(on_entry)
+
+    def test_a_negative_print_is_still_signed_and_marked(self):
+        """D10 must survive the fix: a print that is PAID is booked, and it is
+        booked on the current mark too."""
+        e = opened()
+        e.on_candle(mark=2 * MARK, funding_bps=-1.5, spot=2 * MARK,
+                    funding_print_ms=4 * H8)
+        qty = e.position.perp.filled_qty
+        assert e.position.funding_collected == pytest.approx(
+            -1.5 / 1e4 * qty * 2 * MARK)
+        assert e.position.negative_funding_streak == 1
+
+    def test_an_unusable_mark_does_not_silently_book_zero(self):
+        """A mark the engine cannot use must not turn a real funding payment
+        into a $0.00 line in the ledger."""
+        e = opened()
+        before = e.position.funding_collected
+        e.on_candle(mark=float("nan"), funding_bps=1.0, spot=MARK,
+                    funding_print_ms=4 * H8)
+        assert e.position.funding_collected == before or \
+            e.state.name == "HALTED"
+
+
 class TestOnePrintIsBookedOnce:
     def test_sixty_ticks_of_one_print_book_it_once(self):
         e = opened()

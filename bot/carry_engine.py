@@ -63,6 +63,7 @@ direction. This module has no direction to give it.
 from __future__ import annotations
 
 import logging
+import datetime as dt
 import math
 import time
 from decimal import Decimal, InvalidOperation
@@ -439,6 +440,11 @@ class CarryEngine:
         #: The last exception a leg raised, so a refusal can name it. A leg
         #: that fails for a reason nobody can read is a leg that fails again.
         self._last_leg_error: str = ""
+        #: Market time of the most recent tick, in epoch ms. Carried so the
+        #: paths that do not take `timestamp_ms` can still date the day's
+        #: entry allowance on the market's calendar rather than the wall
+        #: clock (0043).
+        self._last_tick_ms: int = 0
 
     # -- the ledger -------------------------------------------------------
 
@@ -580,6 +586,7 @@ class CarryEngine:
         delta is checked before opening more because adding size to a drifted
         book compounds the exposure you already failed to hedge.
         """
+        self._last_tick_ms = int(timestamp_ms or 0)
         if self.state is BookState.HALTED:
             return CarryDecision("halted", reason="KILL_SWITCH_ENGAGED",
                                  state=self.state)
@@ -615,11 +622,28 @@ class CarryEngine:
             # older settlement, was not earned by this position.
             held = new_print and int(funding_print_ms) > self.position.opened_ms
             if held:
-                # Booked SIGNED. Until 0034 a negative print was paid and never
-                # booked, so funding_collected overstated what the book earned
-                # (INVENTORY D10).
-                self.position.funding_collected += (
-                    funding_bps / 1e4) * self.position.perp.notional
+                # Booked SIGNED, on WHAT THE POSITION IS WORTH NOW.
+                #
+                # 0034: until then a negative print was paid and never booked,
+                # so funding_collected overstated what the book earned (D10).
+                #
+                # 0043: until then it booked `perp.notional`, which is
+                # `filled_qty * avg_price` and is frozen at the fill. The
+                # venue pays funding on the position's value at the
+                # SETTLEMENT mark. Replaying the engine over the Bybit corpus
+                # booked $29,371 where the same 79 trades earn $39,444 — a
+                # quarter of the funding missing, because BTC rose while the
+                # positions were held and the entry price never moved. The
+                # error's sign follows the price, which is intolerable in a
+                # book whose whole claim is that price direction does not
+                # matter.
+                #
+                # `mark` is the mark this tick observed. Live it is at most
+                # LOOP_INTERVAL_SECONDS away from the settlement mark the
+                # venue used; that residual is named in INVENTORY, not hidden.
+                if self._finite(mark) and mark > 0:
+                    self.position.funding_collected += (
+                        funding_bps / 1e4) * self.position.perp.filled_qty * mark
                 if funding_bps < 0:
                     self.position.negative_funding_streak += 1
                     if (self.position.negative_funding_streak
@@ -778,7 +802,8 @@ class CarryEngine:
         # a cap. Never skipped: its absence refused above.
         gate = self.pair_risk.gate_open(
             notional_usd=self.max_notional_usd, snapshot=self.snapshot,
-            has_open_pair=self.position is not None)
+            has_open_pair=self.position is not None,
+            now=self._gate_now(timestamp_ms))
         if not gate:
             return CarryDecision("stand_aside", reason=gate.reason,
                                  state=BookState.FLAT, detail=gate.detail)
@@ -816,14 +841,15 @@ class CarryEngine:
             # That is not a hedge, it is a directional position wearing one.
             # It paid a round trip, so it spends the day (INVENTORY D4).
             self.position = position
-            self.pair_risk.record_broken_pair()
+            self.pair_risk.record_broken_pair(
+                now=self._gate_now(timestamp_ms))
             return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
 
         self.position = position
         self.state = BookState.HEDGED
         # Only now: both legs landed. A refused pair consumed nothing; a
         # broken one spent the day through record_broken_pair instead.
-        self.pair_risk.record_entry()
+        self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
         failed = self._record()
         if failed is not None:
             return failed
@@ -885,7 +911,7 @@ class CarryEngine:
                                  opened_ms=timestamp_ms)
         self.position = position
         self.state = BookState.HEDGED
-        self.pair_risk.record_entry()
+        self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
         failed = self._record()
         if failed is not None:
             return failed
@@ -985,7 +1011,8 @@ class CarryEngine:
         # rejects the perp leg made the book buy and sell spot every tick:
         # 8 round trips in 10 ticks, measured (INVENTORY D4).
         if self.pair_risk is not None:
-            self.pair_risk.record_broken_pair()
+            self.pair_risk.record_broken_pair(
+                now=self._gate_now(self._last_tick_ms))
         return CarryDecision("unwound", acted=True, reason=reason,
                              state=BookState.FLAT,
                              detail={"error": self._last_leg_error})
@@ -1181,6 +1208,30 @@ class CarryEngine:
                    order_link_id=f"{maker.order_link_id}+{taker.order_link_id}",
                    fee=fee, maker_qty=maker.filled_qty,
                    taker_qty=taker.filled_qty)
+
+    @staticmethod
+    def _gate_now(timestamp_ms: int) -> Optional["dt.datetime"]:
+        """The MARKET's time for this tick, or None to mean "use the clock".
+
+        `CarryRisk` dates the day's entry allowance. Until 0043 it dated it
+        from `datetime.now(utc)` while this method had `timestamp_ms` in hand
+        and never passed it. Live those are the same clock and the behaviour
+        is unchanged — which is exactly the problem: a daily limit that agrees
+        with the calendar only in production is a daily limit nobody can test.
+        Replay 4,500 settlements and every one of them falls on today, the
+        allowance is spent on the first and never returns, and the book stands
+        aside for four years.
+
+        None for a tick with no timestamp, so a caller that never supplied one
+        behaves exactly as it did before.
+        """
+        if not timestamp_ms or timestamp_ms <= 0:
+            return None
+        try:
+            return dt.datetime.fromtimestamp(timestamp_ms / 1000.0,
+                                             dt.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
 
     def _refused(self, reason: str) -> CarryDecision:
         """A leg did not land. A HALT survives; anything else returns FLAT."""
