@@ -56,23 +56,31 @@ echo "using: $(command -v "$FLY")"
 say "2/7  the config, checked before anything is created"
 python3 tools/fly_stack.py --check
 
+# `fly apps create`, NOT `fly launch`. launch rewrites fly.toml: it printed
+# "Wrote config file fly.toml" on the run that first deployed this app, and
+# the rewritten file then failed the checks that had passed minutes earlier
+# against a document which no longer existed. What launch adds is exactly
+# what this book cannot have — it reads the Dockerfile EXPOSE and offers an
+# [http_service], which drags in auto_stop, and a machine stopped while
+# holding a hedge leaves a client unhedged. apps create writes nothing.
 say "3/7  the app"
 if fly status --app "$APP" >/dev/null 2>&1; then
   echo "app $APP already exists"
 else
-  "$FLY" launch --no-deploy --name "$APP" --region "$REGION" --copy-config --yes
+  "$FLY" apps create "$APP" --org "${FLY_ORG:-personal}" --yes
 fi
 
-# `fly launch` REWRITES fly.toml — it printed "Wrote config file fly.toml" on
+# fly.toml is checked AGAIN here, belt and braces. `fly launch` REWRITES it —
 # the run that produced this line. The check in step 2 was therefore a check of
 # a document that no longer exists. If launch dropped `strategy = immediate`,
 # or added an [http_service] with auto_stop, the machine could run two books or
 # be stopped while holding a hedge. So the same check runs again, and this time
 # a failure stops the deploy.
-say "3b/7  the config AGAIN, because fly launch rewrites it"
+say "3b/7  the config again, belt and braces"
 if ! python3 tools/fly_stack.py --check; then
   echo >&2
-  echo "STOP: fly launch rewrote fly.toml into something that fails the" >&2
+  echo "STOP: fly.toml no longer passes the checks above. Something" >&2
+  echo "      rewrote it; fly launch is the usual culprit." >&2
   echo "      checks above. Nothing has been deployed. Restore it with" >&2
   echo "          python3 tools/fly_stack.py --render" >&2
   echo "      and re-run this script." >&2

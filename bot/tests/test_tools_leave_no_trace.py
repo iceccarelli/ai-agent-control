@@ -60,20 +60,38 @@ class TestTheDrillLeavesTheRepositoryAlone:
             pass
         assert _fingerprint() == before
 
-    def test_it_uses_a_scratch_database_when_none_is_named(self, monkeypatch):
+    def test_it_always_uses_a_scratch_database(self, monkeypatch, tmp_path):
+        """ALWAYS scratch, even when STATE_DB_PATH names one.
+
+        The earlier version honoured an explicit path, which on Fly is the
+        RUNNING BOOK's database — and the drill is a separate process, so that
+        would be two writers on one SQLite file. Against the one-writer rule,
+        and against a ledger that is supposed to explain the entire equity
+        change. The drill needs none of it: its own journal, and its position
+        read from the venue.
+        """
         import drill as D
-        monkeypatch.delenv("STATE_DB_PATH", raising=False)
+        monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "the_live_one.db"))
         chosen = D._scratch_state_db()
-        assert chosen
         assert os.path.abspath(chosen) != os.path.abspath(FIXTURE)
+        assert str(tmp_path) not in os.path.abspath(chosen)
         assert ROOT not in os.path.abspath(chosen)
 
-    def test_an_explicit_database_is_honoured(self, monkeypatch, tmp_path):
-        """On Fly, fly.toml names the real one and the drill must use it."""
+    def test_it_reads_no_environment_of_its_own(self):
+        """`config.load()` is the only environment reader in this repo. A tool
+        that writes os.environ to steer another module is a second one wearing
+        a disguise."""
+        import ast
+        import inspect
+
         import drill as D
-        named = str(tmp_path / "real.db")
-        monkeypatch.setenv("STATE_DB_PATH", named)
-        assert D._scratch_state_db() == named
+        tree = ast.parse(inspect.getsource(D).lstrip())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr in (
+                    "environ", "getenv"):
+                raise AssertionError(
+                    "tools/drill.py touches the environment directly; "
+                    "config.load() is the only environment reader")
 
 
 class TestTheDrillActuallyGetsTheBook:

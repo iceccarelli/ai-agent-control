@@ -126,6 +126,25 @@ class TestTheDeployScriptCannotReachMainnet:
                 f"{armed!r} appears in the executed part of deploy.sh, not "
                 "only in the instructions it prints")
 
+    def test_it_never_calls_fly_launch(self):
+        """`fly launch` REWRITES fly.toml. It did, on the run that first
+        deployed this app, and the rewritten file then failed the checks that
+        had passed minutes earlier. What it adds is what this book cannot
+        have: it reads the Dockerfile's EXPOSE and offers an [http_service],
+        which drags in auto_stop — and a machine stopped while holding a hedge
+        leaves a client unhedged.
+
+        `fly apps create` registers the app and writes nothing."""
+        text = self.script()
+        for invocation in ('"$FLY" launch', "fly launch --", "flyctl launch"):
+            for line in text.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#") or stripped.startswith("echo"):
+                    continue          # a mention is not a call
+                assert invocation not in stripped, \
+                    f"fly launch rewrites fly.toml: {stripped}"
+        assert "apps create" in text
+
     def test_it_checks_the_config_again_after_launch_rewrites_it(self):
         """`fly launch` prints "Wrote config file fly.toml" — it REWRITES the
         document step 2 checked. If it dropped `strategy = immediate` or added
@@ -134,7 +153,7 @@ class TestTheDeployScriptCannotReachMainnet:
         second one stops the deploy."""
         text = self.script()
         first = text.index("fly_stack.py --check")
-        launch = text.index("launch")
+        launch = text.index("apps create")
         second = text.index("fly_stack.py --check", launch)
         assert first < launch < second, \
             "the config is not re-checked after fly launch rewrites it"
@@ -154,7 +173,7 @@ class TestTheDeployScriptCannotReachMainnet:
         """0047 resolved flyctl to one shell variable, so the call reads
         `"$FLY" launch`. The invariant is the ORDER, not the spelling."""
         text = self.script()
-        assert text.index("fly_stack.py --check") < text.index("launch")
+        assert text.index("fly_stack.py --check") < text.index("apps create")
 
 
 class TestTwoMachinesIsTwoBooks:

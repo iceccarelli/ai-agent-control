@@ -413,18 +413,24 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
 
 
 def _scratch_state_db() -> str:
-    """Where the stack's `StateStore` should live for a drill.
+    """A throwaway `StateStore` path. ALWAYS throwaway — never the book's.
 
-    An explicit `STATE_DB_PATH` wins — on Fly, fly.toml names the real one and
-    the drill must use it. With none named, the config default is
-    `state/trading_state.db`, which in a checkout is the COMMITTED FIXTURE:
-    running the preflight modified a tracked file, and `scripts/verify.sh`
-    then refused to write a receipt ("FIXTURE DB MUTATED"). A tool that reads
-    must not write, so it gets a scratch database outside the repository.
+    Two reasons, and the second is the important one.
+
+    In a checkout the config default is `state/trading_state.db`, which is the
+    COMMITTED FIXTURE: the preflight modified a tracked file and
+    `scripts/verify.sh` then refused a receipt ("FIXTURE DB MUTATED"). A tool
+    that reads must not write.
+
+    On Fly that path names the RUNNING BOOK's database, and the drill is a
+    separate process. Opening it would be two writers on one SQLite file —
+    against the repo's one-writer rule, and against a ledger that is supposed
+    to explain the entire equity change. The drill needs none of it: it builds
+    its own journal and reads its position from the VENUE.
+
+    Nothing here reads the environment. `config.load()` is the only
+    environment reader, and the path is handed to `StateStore` explicitly.
     """
-    named = os.environ.get("STATE_DB_PATH", "").strip()
-    if named:
-        return named
     import tempfile
     folder = tempfile.mkdtemp(prefix="carry-drill-")
     return os.path.join(folder, "drill_state.db")
@@ -435,8 +441,15 @@ def _load_bot():
     sentence rather than a traceback four imports deep (0046) — the same
     lesson as INVENTORY D16, which is why `session_tail` reports UNREADABLE
     instead of NO."""
-    os.environ["STATE_DB_PATH"] = _scratch_state_db()
+    import persistence
+
     import main as _main
+
+    # The store is CONSTRUCTED and passed, not selected by mutating the
+    # environment: config.load() is the only environment reader in this repo,
+    # and a tool that writes to os.environ to steer another module is a second
+    # one wearing a disguise.
+    store = persistence.StateStore(_scratch_state_db())
 
     # NOT attach_strategy=False. That flag reads as "attach no signal source",
     # and it does — but the CARRY book is gated behind the same flag, so
@@ -447,7 +460,7 @@ def _load_bot():
     # None is what `main()` passes: the config decides, and for BOOK_MODE=carry
     # build_bot attaches the book and returns before the directional voter is
     # ever constructed.
-    return _main.build_bot()
+    return _main.build_bot(store=store)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
