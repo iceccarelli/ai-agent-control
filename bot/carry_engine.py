@@ -689,6 +689,14 @@ class CarryEngine:
             if headroom is not None:
                 return headroom
 
+            # Before anything is rebalanced or collected: in OVERLAY, does the
+            # client still hold the BTC this short is written against? Adding
+            # to, or collecting on, a hedge whose long side has left is
+            # compounding a naked short.
+            cover = self._check_inventory_cover()
+            if cover is not None:
+                return cover
+
             drift = self.position.delta_fraction(mark)
             if drift > self.delta_band:
                 return self._rebalance(mark, drift)
@@ -1037,8 +1045,8 @@ class CarryEngine:
         position = self.position
         assert position is not None
         self.state = BookState.UNWINDING
-        perp = self._fire(self.perp_symbol, "Buy", position.perp.filled_qty,
-                          "linear")
+        wanted_perp = position.perp.filled_qty
+        perp = self._fire(self.perp_symbol, "Buy", wanted_perp, "linear")
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
             # buying the perp back and nothing else: selling their BTC would
@@ -1048,6 +1056,12 @@ class CarryEngine:
                     "UNWIND_INCOMPLETE",
                     f"{reason} — the perp hedge did not close and the "
                     "client's BTC is now unhedged")
+            left = wanted_perp - perp.filled_qty
+            if left > QTY_DUST:
+                # The hedge is SMALLER, not gone. The remainder is still short
+                # at the venue and the slice it covers is still hedged.
+                return self._partial_close(reason, perp_left=left,
+                                           spot_left=left)
             self.position = None
             self.state = BookState.FLAT
             failed = self._record()
@@ -1057,12 +1071,17 @@ class CarryEngine:
                                  state=BookState.FLAT,
                                  detail={"collected": position.funding_collected,
                                          "execution_mode": OVERLAY})
-        spot = self._fire(self.spot_symbol, "Sell", position.spot.filled_qty,
-                          "spot")
+        wanted_spot = position.spot.filled_qty
+        spot = self._fire(self.spot_symbol, "Sell", wanted_spot, "spot")
         if perp is None or spot is None:
             return self._halt(
                 "UNWIND_INCOMPLETE",
                 f"{reason} — a leg did not close and the book is now naked")
+        perp_left = wanted_perp - perp.filled_qty
+        spot_left = wanted_spot - spot.filled_qty
+        if perp_left > QTY_DUST or spot_left > QTY_DUST:
+            return self._partial_close(reason, perp_left=perp_left,
+                                       spot_left=spot_left)
         self.position = None
         self.state = BookState.FLAT
         failed = self._record()
@@ -1072,12 +1091,66 @@ class CarryEngine:
                              state=BookState.FLAT,
                              detail={"collected": position.funding_collected})
 
+    def _partial_close(self, reason: str, *, perp_left: float,
+                       spot_left: float) -> CarryDecision:
+        """A closing order filled LESS than it was asked for.
+
+        The remainder is still at the venue. Recording the position as closed
+        loses it: the book reads FLAT, the next candle may open a SECOND hedge
+        against the same margin and the same liquidation price, and cold
+        start — the one thing that compares the ledger against the venue — does
+        not run again until a restart. That is INVENTORY D3 with a different
+        cause, and `plan_cold_start` cannot see it because the ledger would
+        agree with itself.
+
+        A short fill on the way IN is a smaller hedge and is handled as one
+        (`TestAPartialPerpFillIsASmallerHedgeNotAnIncident`). A short fill on
+        the way OUT is an exposure nobody is managing, so the position is
+        rewritten to what the venue still holds, written down, and a human is
+        called. It deliberately does NOT retry: the orders that fill short are
+        the ones sent into the market that just moved — which is the market
+        that triggered the unwind — and this book has never resolved an
+        ambiguous order by sending another one.
+        """
+        position = self.position
+        assert position is not None
+        position.perp.filled_qty = max(0.0, perp_left)
+        position.perp.requested_qty = position.perp.filled_qty
+        position.spot.filled_qty = max(0.0, spot_left)
+        position.spot.requested_qty = position.spot.filled_qty
+        return self._halt(
+            "UNWIND_PARTIAL",
+            f"{reason} — the close filled short. The venue still holds "
+            f"{position.perp.filled_qty:.10g} perp and "
+            f"{position.spot.filled_qty:.10g} spot; THE BOOK IS NOT FLAT.")
+
     def _emergency_unwind_spot(self, spot: Leg, reason: str) -> CarryDecision:
         """The perp never landed. Sell the spot immediately; it is naked long."""
         self.state = BookState.UNWINDING
-        closed = self._fire(self.spot_symbol, "Sell", spot.filled_qty, "spot")
+        wanted = spot.filled_qty
+        closed = self._fire(self.spot_symbol, "Sell", wanted, "spot")
         if closed is None or closed.filled_qty <= 0:
             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
+        left = wanted - closed.filled_qty
+        if left > QTY_DUST:
+            # Part of the naked long is still held. It is recorded as a
+            # position — with an EMPTY perp leg, because inventing one would
+            # claim a hedge that does not exist — so the ledger and the next
+            # cold start can both see it.
+            spot.filled_qty = left
+            spot.requested_qty = left
+            self.position = CarryPosition(
+                spot=spot,
+                perp=Leg(symbol=self.perp_symbol, side="Sell",
+                         product="linear"),
+                opened_ms=self._last_tick_ms)
+            if self.pair_risk is not None:
+                self.pair_risk.record_broken_pair(
+                    now=self._gate_now(self._last_tick_ms))
+            return self._halt(
+                "NAKED_SPOT_UNWIND_PARTIAL",
+                f"{reason}; the sale filled short and {left:.10g} of spot is "
+                "still held with nothing hedging it")
         self.position = None
         self.state = BookState.FLAT
         failed = self._record()
@@ -1104,6 +1177,107 @@ class CarryEngine:
             return self._unwind(self.broker.get_mark(self.perp_symbol),
                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
         return self._check_liquidation_distance()
+
+    def _check_inventory_cover(self) -> Optional[CarryDecision]:
+        """OVERLAY: is the inventory this short was written against still there?
+
+        The overlay's entire safety argument is that the long side is the
+        CLIENT's own coin, so the short is a hedge rather than a bet. Nothing
+        enforced that after the open. `get_spot_inventory` was read once, in
+        `_open_overlay`, and then only at cold start — so a client who sold,
+        withdrew or re-pledged their BTC left this book short into a market it
+        has no view on, reporting HEDGED_AND_COLLECTING every sixty seconds,
+        until somebody happened to restart the process.
+
+        `plan_cold_start` has always refused exactly this state at startup —
+        "the inventory this short was written against has left". This is that
+        same check, on every candle, where the exposure actually accrues.
+
+        The response is the one `_open_overlay` already uses for a short that
+        runs past the inventory: buy the excess back at once, and halt if it
+        does not close.
+        """
+        if self.execution_mode != OVERLAY or self.position is None:
+            return None
+        try:
+            inventory = float(self.broker.get_spot_inventory(self.spot_symbol))
+        except Exception as exc:  # noqa: BLE001
+            return self._halt(
+                "INVENTORY_UNREADABLE",
+                f"the wallet holding the hedged BTC could not be read "
+                f"({type(exc).__name__}: {exc}); an unreadable inventory is a "
+                "naked short you cannot see")
+        if not self._finite(inventory) or inventory < 0:
+            return self._halt(
+                "INVENTORY_UNREADABLE",
+                f"the venue reported an inventory of {inventory!r}")
+
+        hedged = self.position.perp.filled_qty
+        if inventory + QTY_DUST >= hedged:
+            return None                            # still covered
+
+        excess = hedged - inventory
+        try:
+            step = float(self.broker.get_lot_rules(
+                self.perp_symbol, "linear").get("qty_step", 0.0))
+        except Exception as exc:  # noqa: BLE001
+            return self._halt(
+                "VENUE_RULES_UNREADABLE",
+                f"{excess:.10g} BTC of this short is no longer covered by "
+                f"inventory and the lot rules could not be read "
+                f"({type(exc).__name__}: {exc})")
+        buy = snap_to_lot(excess, step)
+        if buy <= 0:
+            # Smaller than one venue lot, so no order exists that would reduce
+            # it. Said out loud rather than hidden, and NOT halted: halting a
+            # book on dust makes the gate unusable, and the funding path must
+            # go on booking what the position earns.
+            logger.warning(
+                "carry: %.10g BTC of the short is no longer covered by "
+                "inventory (%.10g held against a %.10g short), but the "
+                "shortfall is below one lot (%.10g); nothing can be sent",
+                excess, inventory, hedged, step)
+            return None
+
+        closed = self._fire(self.perp_symbol, "Buy", buy, "linear")
+        if closed is None or closed.filled_qty <= 0:
+            return self._halt(
+                "INVENTORY_LEFT_AND_HEDGE_WOULD_NOT_CLOSE",
+                f"the account holds {inventory:.10g} BTC against a "
+                f"{hedged:.10g} short and the buy-back did not fill; the book "
+                "is naked SHORT")
+
+        remaining = hedged - closed.filled_qty
+        if remaining <= QTY_DUST:
+            self.position = None
+            self.state = BookState.FLAT
+            failed = self._record()
+            if failed is not None:
+                return failed
+            return CarryDecision(
+                "unwound", acted=True, reason="INVENTORY_WITHDRAWN",
+                state=BookState.FLAT,
+                detail={"inventory": inventory,
+                        "closed_qty": closed.filled_qty})
+
+        if remaining > inventory + QTY_DUST:
+            # The buy-back itself filled short, so part of the short is STILL
+            # uncovered. Same rule as any other close that filled short.
+            return self._partial_close("INVENTORY_WITHDRAWN",
+                                       perp_left=remaining,
+                                       spot_left=inventory)
+        self.position.perp.filled_qty = remaining
+        self.position.perp.requested_qty = remaining
+        self.position.spot.filled_qty = remaining
+        self.position.spot.requested_qty = remaining
+        failed = self._record()
+        if failed is not None:
+            return failed
+        return CarryDecision(
+            "rebalanced", acted=True, reason="HEDGE_REDUCED_TO_INVENTORY",
+            state=BookState.HEDGED,
+            detail={"inventory": inventory, "hedged_now": remaining,
+                    "closed_qty": closed.filled_qty})
 
     def _check_liquidation_distance(self) -> Optional[CarryDecision]:
         """How far the price can move before the short is gone (F4, 0048).

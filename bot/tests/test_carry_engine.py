@@ -257,7 +257,15 @@ class TestDeltaIsMeasuredNotAssumed:
 
         def partial(*, symbol, side, qty, product):
             result = original(symbol=symbol, side=side, qty=qty, product=product)
-            if result and product == "linear":
+            # Only the SELL that OPENS the hedge fills short — which is what
+            # "legs that land unpaired" means. A closing buy-back is exact
+            # here, the same convention `test_carry_overlay.Venue` uses, and
+            # for the same reason: a close that fills short is a different
+            # failure, and it now has its own file
+            # (`test_unwind_completeness.py`). Before that distinction existed
+            # this stub halved the buy-back too, so the unwind left 0.25 BTC
+            # short at the venue and the engine still reported FLAT.
+            if result and product == "linear" and side == "Sell":
                 result["filled_qty"] = qty * 0.5     # half a hedge
             return result
 
