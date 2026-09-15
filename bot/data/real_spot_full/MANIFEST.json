@@ -1,0 +1,70 @@
+{
+  "synthetic": false,
+  "bar_seconds": 86400,
+  "schema": "coinapi_flat/1",
+  "generator": "tools/fetch_binance_klines.py",
+  "source": {
+    "exchange": "BINANCE",
+    "market": "SPOT",
+    "endpoint": "https://api.binance.com/api/v3/klines",
+    "fetched_utc": "2026-09-15T23:30:52Z",
+    "requested_range_utc": [
+      "2019-07-05T04:18:52Z",
+      "2026-09-15T23:30:52Z"
+    ]
+  },
+  "bars_per_symbol": {
+    "BINANCE_SPOT_BTC_USDT_1D": 2629,
+    "BINANCE_SPOT_ETH_USDT_1D": 2629,
+    "BINANCE_SPOT_SOL_USDT_1D": 2227
+  },
+  "files": {
+    "ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz": {
+      "rows": 2629,
+      "sha256_uncompressed": "e82f5580b5b804f4e10647437b14b142de686a1f71af4e3889edbda6ec6c3118",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2019-07-06T00:00:00.0000000Z",
+      "last_timestamp": "2026-09-15T00:00:00.0000000Z"
+    },
+    "ohlcv/BINANCE_SPOT_ETH_USDT_1D.csv.gz": {
+      "rows": 2629,
+      "sha256_uncompressed": "5048afee92c5b39c11bcf930b8c2704be14c503c4c4d55e2006b0b2fdb767ffd",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2019-07-06T00:00:00.0000000Z",
+      "last_timestamp": "2026-09-15T00:00:00.0000000Z"
+    },
+    "ohlcv/BINANCE_SPOT_SOL_USDT_1D.csv.gz": {
+      "rows": 2227,
+      "sha256_uncompressed": "15059742c2ee376847ccddf8e6c18e149092a1630ef6a473d573661cb67999b9",
+      "kind": "ohlcv",
+      "interval_seconds": 86400,
+      "first_timestamp": "2020-08-11T00:00:00.0000000Z",
+      "last_timestamp": "2026-09-15T00:00:00.0000000Z"
+    }
+  },
+  "warning": "REAL exchange data. Eligibility under data_contract is NOT edge \u2014 see RESEARCH_CLOSE_STAGE1.md. Timing-skill research is CLOSED.",
+  "open_bar_dropped_utc": "2026-09-15",
+  "open_bar_note": "The fetcher wrote the in-progress UTC day as a close. Those rows were removed after fetch; corpus_health.OPEN_BAR_IN_FILE is what caught it.",
+  "files_after_open_bar_drop": {
+    "BINANCE_SPOT_BTC_USDT_1D.csv.gz": {
+      "rows": 2628,
+      "last": "2026-09-14",
+      "sha256_uncompressed": "cc4b5159ab26bc09a6d7e0c04bf78df20b303a5b6505f1fdd44334bf557b108b",
+      "dropped_open_bars": 1
+    },
+    "BINANCE_SPOT_ETH_USDT_1D.csv.gz": {
+      "rows": 2628,
+      "last": "2026-09-14",
+      "sha256_uncompressed": "960cee75a380792aaf11ace8270eb9861930ce7c28860242fa5b05ff4cf1f630",
+      "dropped_open_bars": 1
+    },
+    "BINANCE_SPOT_SOL_USDT_1D.csv.gz": {
+      "rows": 2226,
+      "last": "2026-09-14",
+      "sha256_uncompressed": "63b94ea843808179d24b6540a81da3b867c549355bc0b7b0d1380bd48ba711f1",
+      "dropped_open_bars": 1
+    }
+  }
+}

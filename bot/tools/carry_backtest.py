@@ -220,12 +220,118 @@ class Trade:
 #:
 #: Only the first entry produces a quotable number, because only the first
 #: entry is the same venue and the same quote currency as the perp leg.
-SPOT_SOURCES = [
-    ("data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz",
-     "BINANCE_SPOT_BTC_USDT (same venue, same quote currency as the perp)",
-     True),
-    # BITSTAMP_SPOT_BTC_USD removed in 0031. See the module docstring.
-]
+#: The three legs, PER ASSET (0052). Every leg is Binance and every leg is
+#: quoted in USDT, so the same-venue/same-quote condition is satisfiable for
+#: all three assets exactly as it is for BTC.
+#:
+#: WHY THIS IS HERE AT ALL: the overlay's entire economic claim rests on 4.0
+#: years of ONE asset, and INVENTORY D20 says that corpus is too short and too
+#: spiky to establish the rule beats zero. ETH and SOL have complete
+#: funding + perp + spot triples already committed to this tree and no tool
+#: could read them, so the cheapest available evidence about whether the BTC
+#: result is a property of carry or a property of BTC had never been taken.
+#:
+#: Selecting by PATH, never by symbol: `ETH_USDT` also names a SYNTHETIC
+#: corpus under data/ohlcv, which is exactly the trap the data contract warns
+#: about.
+ASSET_SOURCES = {
+    "BTC": {
+        "perp": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
+        "funding":
+            "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz",
+        "symbol": "BTCUSDT",
+        "spot": [
+            ("data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz",
+             "BINANCE_SPOT_BTC_USDT (same venue, same quote currency as the perp)",
+             True),
+            # BITSTAMP_SPOT_BTC_USD removed in 0031. See the module docstring.
+        ],
+    },
+    "ETH": {
+        "perp": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz",
+        "funding":
+            "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz",
+        "symbol": "ETHUSDT",
+        "spot": [
+            ("data/real_multi_1d/ohlcv/BINANCE_SPOT_ETH_USDT_1D.csv.gz",
+             "BINANCE_SPOT_ETH_USDT (same venue, same quote currency as the perp)",
+             True),
+        ],
+    },
+    "SOL": {
+        "perp": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz",
+        "funding":
+            "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz",
+        "symbol": "SOLUSDT",
+        "spot": [
+            ("data/real_multi_1d/ohlcv/BINANCE_SPOT_SOL_USDT_1D.csv.gz",
+             "BINANCE_SPOT_SOL_USDT (same venue, same quote currency as the perp)",
+             True),
+        ],
+    },
+}
+
+#: What every existing caller means when it does not say. BTC's behaviour is
+#: unchanged by construction: SPOT_SOURCES below is still exactly the list it
+#: was, and every default argument resolves to these same three files.
+DEFAULT_ASSET = "BTC"
+
+#: THE SAME THREE LEGS, BACK TO INCEPTION (0052).
+#:
+#: The frozen corpora start 2022-08 because that is when a human fetched them.
+#: Binance's BTCUSDT perp has printed funding since 2019-09-10 — 7,688 prints
+#: against the frozen 4,431 — and the missing three years are not filler: they
+#: contain the 2020 covid crash, the 2021 leverage mania (2021H1 ran at 12.9
+#: bps/day against 2026H1's 0.31) and the 2022 bear. INVENTORY D20's finding is
+#: that the corpus is too short and too spiky to establish the rule beats zero,
+#: and a window that covers ONE macro regime is the reason.
+#:
+#: `data/real_*` is FROZEN by CORPUS_POLICY: refreshing it in git would
+#: retroactively falsify what the slice tests pin. So the extension lives in its
+#: own directories, the frozen files are untouched, and `frozen` stays the
+#: default everywhere.
+#:
+#: VERIFIED, NOT TRUSTED: on every timestamp the two overlap, the funding rates
+#: are IDENTICAL — 4,431 / 4,383 / 4,458 rows, zero mismatches.
+ASSET_SOURCES_FULL = {
+    asset: {
+        "perp":
+            f"data/real_linear_1d_full/ohlcv/BINANCE_LINEAR_{asset}_USDT_1D.csv.gz",
+        "funding":
+            f"data/real_funding_full/funding/BINANCE_LINEAR_{asset}_USDT_FUNDING.csv.gz",
+        "symbol": spec["symbol"],
+        "spot": [
+            (f"data/real_spot_full/ohlcv/BINANCE_SPOT_{asset}_USDT_1D.csv.gz",
+             f"BINANCE_SPOT_{asset}_USDT (same venue, same quote currency as "
+             f"the perp; fetched to inception)",
+             True),
+        ],
+    }
+    for asset, spec in ASSET_SOURCES.items()
+}
+
+CORPORA = {"frozen": ASSET_SOURCES, "full": ASSET_SOURCES_FULL}
+DEFAULT_CORPUS = "frozen"
+
+
+def _sources(asset: str = DEFAULT_ASSET,
+             corpus: str = DEFAULT_CORPUS) -> Dict[str, Any]:
+    which = str(corpus).lower()
+    if which not in CORPORA:
+        raise SystemExit(
+            f"{corpus!r} is not a corpus ({', '.join(sorted(CORPORA))})")
+    table = CORPORA[which]
+    key = str(asset).upper()
+    if key not in table:
+        raise SystemExit(
+            f"{asset!r} is not a carry corpus in this tree "
+            f"({', '.join(sorted(table))}). Refusing rather than "
+            "falling back to BTC: a number labelled with the wrong asset is "
+            "worse than no number.")
+    return table[key]
+
+
+SPOT_SOURCES = ASSET_SOURCES[DEFAULT_ASSET]["spot"]
 
 #: A daily bar for a day that has not closed is not a close. Binance returns the
 #: in-progress bar from its klines endpoint and tools/fetch_binance_klines.py
@@ -239,17 +345,19 @@ def drop_open_bar(series: Dict[dt.date, float]) -> Dict[dt.date, float]:
     return {d: v for d, v in series.items() if d < today}
 
 
-def resolve_spot(repo: str):
+def resolve_spot(repo: str, asset: str = DEFAULT_ASSET,
+                 corpus: str = DEFAULT_CORPUS):
     """The best spot series present, its provenance, and whether it is quotable."""
-    for rel, label, quotable in SPOT_SOURCES:
+    source = _sources(asset, corpus)
+    for rel, label, quotable in source["spot"]:
         path = os.path.join(repo, rel)
         if os.path.exists(path):
             series = drop_open_bar(load_series(path))
             return series, label, quotable
     raise SystemExit(
-        "no spot series found. Fetch one:\n"
-        "  python3 tools/fetch_binance_klines.py --symbols BTCUSDT "
-        "--intervals 1d --years 4 --out data/real_spot_btc")
+        f"no spot series found for {str(asset).upper()}. Fetch one:\n"
+        f"  python3 tools/fetch_binance_klines.py --symbols {source['symbol']} "
+        f"--intervals 1d --years 4 --out data/real_spot_btc")
 
 
 #: Corpus defects that invalidate a backtest, and the one that does not.
@@ -271,10 +379,12 @@ STRUCTURAL_DEFECTS = ("OPEN_BAR_IN_FILE", "NOT_MONOTONIC", "DUPLICATE_DAYS",
                       "EMPTY", "MISSING")
 
 
-def corpus_verdict(repo: str):
+def corpus_verdict(repo: str, asset: str = DEFAULT_ASSET,
+                   corpus: str = DEFAULT_CORPUS):
     """Health of the three series, with staleness excluded. See above."""
     import corpus_health
-    report = corpus_health.check(repo, max_stale_days=10_000)
+    report = corpus_health.check(repo, max_stale_days=10_000, asset=asset,
+                                 corpus=corpus)
     structural = [p for p in report["problems"]
                   if any(d in p for d in STRUCTURAL_DEFECTS)]
     holes = report.get("alignment_gaps", [])
@@ -528,7 +638,9 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
 def simulate(repo: str, *, notional: float = 100_000.0,
              entry_bps: float = ENTRY_FUNDING_BPS,
              borrow_apr: float = BORROW_APR,
-             gated: bool = False, mode: str = ACQUIRE) -> Dict[str, Any]:
+             gated: bool = False, mode: str = ACQUIRE,
+             asset: str = DEFAULT_ASSET,
+             corpus: str = DEFAULT_CORPUS) -> Dict[str, Any]:
     """Daily-close simulation over the committed Binance corpora.
 
     `gated=True` routes every entry through carry_costs.evaluate_entry — the
@@ -536,19 +648,23 @@ def simulate(repo: str, *, notional: float = 100_000.0,
     the only evidence that the gates are worth having: a gate that changes no
     trade is decoration, and a gate that refuses everything is a way of not
     trading dressed as risk management.
+
+    `asset` selects which committed triple to read. It defaults to BTC, so
+    every caller that predates 0052 reads exactly the three files it always
+    read and gets exactly the number it always got.
     """
-    perp_path = os.path.join(
-        repo, "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz")
-    perp = load_series(perp_path)
-    spot, spot_source, same_venue = resolve_spot(repo)
-    ftimes, frates = load_funding(os.path.join(
-        repo, "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz"))
+    source = _sources(asset, corpus)
+    key = str(asset).upper()
+    perp_path = os.path.join(repo, source["perp"])
+    perp = drop_open_bar(load_series(perp_path))
+    spot, spot_source, same_venue = resolve_spot(repo, asset, corpus)
+    ftimes, frates = load_funding(os.path.join(repo, source["funding"]))
 
     # A number computed over a corpus with an interior hole or an open bar is
     # WRONG, not old. carry_backtest used to intersect the three series in
     # silence: a day present in one and missing from another simply vanished
     # from the simulation, and nothing said so.
-    health, structural, holes = corpus_verdict(repo)
+    health, structural, holes = corpus_verdict(repo, asset, corpus)
     if structural:
         raise SystemExit(
             "REFUSING TO BACKTEST — structural corpus defects:\n  "
@@ -560,15 +676,17 @@ def simulate(repo: str, *, notional: float = 100_000.0,
     r = simulate_series(perp=perp, spot=spot, ftimes=ftimes, frates=frates,
                         notional=notional, entry_bps=entry_bps,
                         borrow_apr=borrow_apr, gated=gated, mode=mode)
-    _record("BINANCE_LINEAR_BTC_USDT_1D", _iso_day(min(perp)),
+    _record(f"BINANCE_LINEAR_{key}_USDT_1D", _iso_day(min(perp)),
             _iso_day(max(perp)), "daily carry backtest (perp leg)")
-    _record("BINANCE_SPOT_BTC_USDT_1D", _iso_day(min(spot)),
+    _record(f"BINANCE_SPOT_{key}_USDT_1D", _iso_day(min(spot)),
             _iso_day(max(spot)), "daily carry backtest (spot leg)")
-    _record("BINANCE_LINEAR_BTC_USDT_FUNDING", _iso_ms(ftimes[0]),
+    _record(f"BINANCE_LINEAR_{key}_USDT_FUNDING", _iso_ms(ftimes[0]),
             _iso_ms(ftimes[-1]), "daily carry backtest (funding)")
     r.update(quotability(same_venue=same_venue, settlement_clock=False,
                          impact_applied=False, gated=gated))
     r.update({
+        "asset": key,
+        "corpus": str(corpus).lower(),
         "spot_source": spot_source,
         "basis_is_a_proxy": not same_venue,
         "open_bar_dropped": True,
@@ -1178,25 +1296,58 @@ def main(argv=None) -> int:
                              "overlay = the client already owns the BTC, so "
                              "only the perp is traded (no spot round trip, no "
                              "borrow)")
+    parser.add_argument("--asset", default=DEFAULT_ASSET,
+                        choices=sorted(ASSET_SOURCES),
+                        help="which committed triple to read (DAILY clock "
+                             "only). ETH and SOL have complete Binance "
+                             "funding + perp + spot corpora in this tree and "
+                             "no tool could read them before 0052.")
+    parser.add_argument("--corpus", default=DEFAULT_CORPUS,
+                        choices=sorted(CORPORA),
+                        help="frozen = the committed corpora the slice tests "
+                             "pin (2022-08 onward); full = the same legs back "
+                             "to each contract's inception (BTC 2019-09, 7,688 "
+                             "funding prints against the frozen 4,431). DAILY "
+                             "clock only.")
     parser.add_argument("--out", default="")
     args = parser.parse_args(argv)
 
     if args.clock == "8h":
+        if str(args.corpus).lower() != DEFAULT_CORPUS:
+            raise SystemExit(
+                "--clock 8h reads the SETTLEMENT corpora "
+                "(data/real_bybit_btc_4h, data/real_settlement_8h), which are "
+                "a different set of files from --corpus full. There is no 4h "
+                "extended corpus in this tree, so this combination would "
+                "silently give you the frozen settlement numbers under a "
+                "'full' label.")
+        if str(args.asset).upper() != DEFAULT_ASSET:
+            raise SystemExit(
+                f"--clock 8h is BTC-only. The settlement-clock corpora "
+                f"(data/real_bybit_btc_4h, data/real_settlement_8h) exist for "
+                f"BTC alone; {str(args.asset).upper()} has a DAILY triple and "
+                f"no 4h one. Running BTC prices under an "
+                f"{str(args.asset).upper()} label is exactly the silent "
+                f"mislabelling this refuses.")
         return _main_settlement(args)
 
     if args.matrix:
         print("=" * 74)
-        print("BORROW x GATE MATRIX — net %/yr  (daily closes: NOT QUOTABLE)")
+        print(f"BORROW x GATE MATRIX — {str(args.asset).upper()} net %/yr  "
+              "(daily closes: NOT QUOTABLE)")
         print("=" * 74)
-        head = simulate(args.repo, notional=args.notional)
+        head = simulate(args.repo, notional=args.notional, asset=args.asset,
+                        corpus=args.corpus)
+        print(f"  asset      : {head['asset']}   corpus: {head['corpus']}")
         print(f"  spot source: {head['spot_source']}")
         print(f"  quotable   : {head['is_a_quotable_return']}")
         print(f"  window     : {head['window']}\n")
         print(f"  {'borrow':>8} {'UNGATED':>18} {'GATED (in-sample)':>22}")
         for apr in (0.0, 0.03, 0.05, 0.08):
-            u = simulate(args.repo, notional=args.notional, borrow_apr=apr)
+            u = simulate(args.repo, notional=args.notional, borrow_apr=apr,
+                         asset=args.asset, corpus=args.corpus)
             g = simulate(args.repo, notional=args.notional, borrow_apr=apr,
-                         gated=True)
+                         gated=True, asset=args.asset, corpus=args.corpus)
             print(f"  {apr*100:7.1f}% "
                   f"{u['net_annualised_pct']:+8.2f}%/yr n={u['trades']:<3d} "
                   f"{g['net_annualised_pct']:+8.2f}%/yr n={g['trades']:<3d}")
@@ -1208,10 +1359,11 @@ def main(argv=None) -> int:
 
     r = simulate(args.repo, notional=args.notional,
                  entry_bps=args.entry_bps, borrow_apr=args.borrow_apr,
-                 gated=args.gated)
+                 gated=args.gated, asset=args.asset, corpus=args.corpus)
 
     print("=" * 74)
-    print("CARRY BACKTEST — two legs, every cost  (clock: daily close)")
+    print(f"CARRY BACKTEST — {r['asset']} [{r['corpus']}], two legs, every "
+          "cost  (clock: daily close)")
     print("=" * 74)
     print(f"  window            {r['window']}  ({r['years']:.2f} yr)")
     print(f"  notional          ${r['notional_usd']:,.0f}   borrow {r['borrow_apr']*100:.1f}%/yr"

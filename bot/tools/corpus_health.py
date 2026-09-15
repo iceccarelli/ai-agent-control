@@ -62,19 +62,79 @@ from typing import Any, Dict, List, Optional, Set
 #: refreshing and the book must not pretend otherwise.
 DEFAULT_MAX_STALE_DAYS = 2
 
-#: name, path, timestamp column, rows-per-day.
-#: Funding prints THREE times a day on Binance USDT-M, so repeated dates are the
-#: schedule, not a duplicate. A daily bar series repeating a date IS a defect.
-#: Applying one rule to both would either miss real duplicates in the bar series
-#: or cry wolf 2,953 times on funding, and a check that cries wolf gets ignored.
-SERIES = [
-    ("perp_1d", "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
-     "time_period_start", 1),
-    ("spot_1d", "data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz",
-     "time_period_start", 1),
-    ("funding", "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz",
-     "funding_time_ms", 3),
-]
+#: The three series, PER ASSET. Every leg is Binance and every leg is quoted in
+#: USDT, for the same reason the BTC set is: the basis is a DIFFERENCE between
+#: the perp and the spot, so a spot leg from another venue or another quote
+#: currency books that venue's spread and that peg as carry.
+#:
+#: BTC's spot lives under data/real_spot_btc and ETH/SOL's under
+#: data/real_multi_1d because they arrived in different slices. Selecting by
+#: PATH rather than by symbol is deliberate and is the rule the data contract
+#: already states: `ETH_USDT` also names a SYNTHETIC corpus under data/ohlcv.
+ASSET_SERIES = {
+    "BTC": ("data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
+            "data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz",
+            "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz"),
+    "ETH": ("data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz",
+            "data/real_multi_1d/ohlcv/BINANCE_SPOT_ETH_USDT_1D.csv.gz",
+            "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz"),
+    "SOL": ("data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz",
+            "data/real_multi_1d/ohlcv/BINANCE_SPOT_SOL_USDT_1D.csv.gz",
+            "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz"),
+}
+
+#: The SAME three legs, fetched back to each contract's inception (0052).
+#: `data/real_*` is FROZEN by CORPUS_POLICY — refreshing it in git would
+#: retroactively falsify what the slice tests recorded — so the extension lives
+#: in its own directories and the frozen files are not touched.
+#:
+#: Verified rather than trusted: on every timestamp the two overlap, the rates
+#: are IDENTICAL (4,431 / 4,383 / 4,458 rows, zero mismatches).
+ASSET_SERIES_FULL = {
+    asset: (
+        f"data/real_linear_1d_full/ohlcv/BINANCE_LINEAR_{asset}_USDT_1D.csv.gz",
+        f"data/real_spot_full/ohlcv/BINANCE_SPOT_{asset}_USDT_1D.csv.gz",
+        f"data/real_funding_full/funding/BINANCE_LINEAR_{asset}_USDT_FUNDING.csv.gz",
+    )
+    for asset in ASSET_SERIES
+}
+
+CORPORA = {"frozen": ASSET_SERIES, "full": ASSET_SERIES_FULL}
+
+#: The asset every existing caller means when it does not say. BTC's behaviour
+#: is unchanged by construction: `SERIES` below is still exactly the list it was.
+DEFAULT_ASSET = "BTC"
+DEFAULT_CORPUS = "frozen"
+
+
+def series_for(asset: str = DEFAULT_ASSET, corpus: str = DEFAULT_CORPUS):
+    """name, path, timestamp column, rows-per-day — for one asset.
+
+    Funding prints THREE times a day on Binance USDT-M, so repeated dates are
+    the schedule, not a duplicate. A daily bar series repeating a date IS a
+    defect. Applying one rule to both would either miss real duplicates in the
+    bar series or cry wolf 2,953 times on funding, and a check that cries wolf
+    gets ignored.
+    """
+    key = str(asset).upper()
+    which = str(corpus).lower()
+    if which not in CORPORA:
+        raise ValueError(
+            f"{corpus!r} is not a corpus ({', '.join(sorted(CORPORA))})")
+    table = CORPORA[which]
+    if key not in table:
+        raise ValueError(
+            f"{asset!r} is not a corpus in this tree "
+            f"({', '.join(sorted(table))}). Refusing rather than "
+            "falling back to BTC: silently health-checking a different asset "
+            "than the one being backtested is worse than an error.")
+    perp, spot, funding = table[key]
+    return [("perp_1d", perp, "time_period_start", 1),
+            ("spot_1d", spot, "time_period_start", 1),
+            ("funding", funding, "funding_time_ms", 3)]
+
+
+SERIES = series_for(DEFAULT_ASSET)
 
 
 def _open(path: str):
@@ -161,10 +221,12 @@ def inspect(repo: str, name: str, rel: str, column: str, per_day: int,
 
 
 def check(repo: str, *, max_stale_days: int = DEFAULT_MAX_STALE_DAYS,
-          today: Optional[dt.date] = None) -> Dict[str, Any]:
+          today: Optional[dt.date] = None,
+          asset: str = DEFAULT_ASSET,
+          corpus: str = DEFAULT_CORPUS) -> Dict[str, Any]:
     today = today or dt.datetime.now(dt.timezone.utc).date()
     reports = [inspect(repo, n, r, c, k, today)
-               for n, r, c, k in SERIES]
+               for n, r, c, k in series_for(asset, corpus)]
     present = [r for r in reports if r.get("_days")]
 
     alignment: List[Dict[str, Any]] = []
@@ -209,6 +271,8 @@ def check(repo: str, *, max_stale_days: int = DEFAULT_MAX_STALE_DAYS,
 
     return {
         "checked_utc": str(today),
+        "asset": str(asset).upper(),
+        "corpus": str(corpus).lower(),
         "max_stale_days": max_stale_days,
         "series": reports,
         "three_way_overlap_days": len(overlap or ()),
@@ -231,13 +295,21 @@ def main(argv=None) -> int:
     parser.add_argument("--repo", default=".")
     parser.add_argument("--max-stale-days", type=int,
                         default=DEFAULT_MAX_STALE_DAYS)
+    parser.add_argument("--asset", default=DEFAULT_ASSET,
+                        choices=sorted(ASSET_SERIES),
+                        help="which asset's three series to check")
+    parser.add_argument("--corpus", default=DEFAULT_CORPUS,
+                        choices=sorted(CORPORA),
+                        help="frozen = the committed, pinned corpora; "
+                             "full = the same legs back to inception (0052)")
     parser.add_argument("--out", default="")
     args = parser.parse_args(argv)
 
-    report = check(args.repo, max_stale_days=args.max_stale_days)
+    report = check(args.repo, max_stale_days=args.max_stale_days,
+                   asset=args.asset, corpus=args.corpus)
 
     print("=" * 74)
-    print("CORPUS HEALTH — do the three series agree?")
+    print(f"CORPUS HEALTH — do the three {report['asset']} series agree?")
     print("=" * 74)
     print(f"  as of {report['checked_utc']} UTC\n")
     for series in report["series"]:

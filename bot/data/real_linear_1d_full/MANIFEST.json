@@ -1,0 +1,55 @@
+{
+  "synthetic": false,
+  "asset_class": "ohlcv",
+  "venue": "binance_usdtm",
+  "market": "linear",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "interval": "1d",
+  "source": "public_rest_klines",
+  "endpoint": "GET /fapi/v1/klines",
+  "fetched_utc": "2026-09-15T23:30:52Z",
+  "date_range_utc": {
+    "BTCUSDT": {
+      "start": "2019-09-08",
+      "end": "2026-09-15",
+      "rows": 2565
+    },
+    "ETHUSDT": {
+      "start": "2019-11-27",
+      "end": "2026-09-15",
+      "rows": 2485
+    },
+    "SOLUSDT": {
+      "start": "2020-09-14",
+      "end": "2026-09-15",
+      "rows": 2193
+    }
+  },
+  "notes": "No synthetic bars. Pagination complete. Stage-1 barrier series for funding_carry_fade_v1.",
+  "open_bar_dropped_utc": "2026-09-15",
+  "open_bar_note": "The fetcher wrote the in-progress UTC day as a close. Those rows were removed after fetch; corpus_health.OPEN_BAR_IN_FILE is what caught it.",
+  "files_after_open_bar_drop": {
+    "BINANCE_LINEAR_BTC_USDT_1D.csv.gz": {
+      "rows": 2564,
+      "last": "2026-09-14",
+      "sha256_uncompressed": "a2b392c0fc17d7e817c245fe5b54d7a530c59957d6dfa677666f36eb2a803bed",
+      "dropped_open_bars": 1
+    },
+    "BINANCE_LINEAR_ETH_USDT_1D.csv.gz": {
+      "rows": 2484,
+      "last": "2026-09-14",
+      "sha256_uncompressed": "1cfa7e9cae9781d021eab7f4f98907cdeed4aa71e111abdf43a57e47938431ae",
+      "dropped_open_bars": 1
+    },
+    "BINANCE_LINEAR_SOL_USDT_1D.csv.gz": {
+      "rows": 2192,
+      "last": "2026-09-14",
+      "sha256_uncompressed": "f2b1d69fab88e17077ac628428501f55904ebcb5132c39d97b727b4712179a38",
+      "dropped_open_bars": 1
+    }
+  }
+}
