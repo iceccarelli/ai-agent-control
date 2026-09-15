@@ -1,0 +1,271 @@
+From e7624ec228628e1f8edbb087827ec3ce411f9c5e Mon Sep 17 00:00:00 2001
+From: Vincenzo Grimaldi <vince.ceccarelli@gmail.com>
+Date: Tue, 15 Sep 2026 12:41:31 +0000
+Subject: [PATCH] 0050 fly launch rewrote the config it had just been checked
+ against (5888 passed)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Your verify failed, and it failed for the right reason. `git status` showed
+`M bot/fly.toml`: fly launch had rewritten it on the run that first
+deployed, printing "Wrote config file fly.toml", so the check in step 2 of
+deploy.sh had validated a document that no longer existed by step 7. The
+test added in 0042 — which parses the COMMITTED fly.toml and runs
+fly_stack.check() on it — then went red. A true positive.
+
+What launch adds is exactly what this book cannot have: it reads the
+Dockerfile's EXPOSE and offers an [http_service], which drags in auto_stop,
+and a machine stopped while holding a hedge leaves a client unhedged.
+
+`fly apps create` registers the app and writes nothing. fly.toml stays the
+file that was checked and the file that is deployed. A test refuses any
+launch INVOCATION while still allowing the word in a comment or an echo,
+because a mention is not a call.
+
+D38 — and reading this repo's own product law properly caught a second one.
+The drill honoured STATE_DB_PATH, which on Fly names the RUNNING BOOK's
+SQLite. The drill is a separate process, so that is two writers on one file:
+against the one-writer rule, and against a ledger that is supposed to
+explain the entire equity change. It also read AND WROTE os.environ to steer
+persistence, when config.load() is the only environment reader here — a tool
+that mutates the environment to redirect another module is a second reader
+wearing a disguise.
+
+The drill now constructs its own scratch StateStore and passes it to
+build_bot. It needs nothing from the book's database: its own journal, and
+its position read from the VENUE. An AST test refuses any os.environ or
+os.getenv in the module.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01MVNUn9gHXLEqzyyoU2LjND
+---
+ bot/docs/human/INVENTORY.md            |  2 ++
+ bot/tests/test_fly_runtime.py          | 23 +++++++++++++--
+ bot/tests/test_tools_leave_no_trace.py | 34 ++++++++++++++++------
+ bot/tools/drill.py                     | 39 +++++++++++++++++---------
+ scripts/deploy.sh                      | 16 ++++++++---
+ 5 files changed, 87 insertions(+), 27 deletions(-)
+
+diff --git a/bot/docs/human/INVENTORY.md b/bot/docs/human/INVENTORY.md
+index 0b82552..54c50d7 100644
+--- a/bot/docs/human/INVENTORY.md
++++ b/bot/docs/human/INVENTORY.md
+@@ -84,6 +84,8 @@ Reproduced in-session with a stub broker; no venue.
+ | D11 | The carry path records no fees. `Leg` has no fee field; `LegFill` ignores `cumExecFee`. | `carry_engine.py`, `carry_broker.py` | **0033 partial** — `cumExecFee` carried per leg; unknown is `None`, never 0.0. Booking it is Phase E |
+ | D12 | **The engine runs the GATED rule.** `on_candle` always calls `evaluate_entry`. The gated column is in-sample (PHASE1_DECISION). The clean, ungated column is not what the engine does. There is no out-of-sample number for the rule the book would run. | `carry_engine.py` ~294 | **recorded 0032** (`carry_cost_gates_v1@BTCUSDT`, forward-only holdout); a quotable condition |
+ | D13 | `deflated_sharpe` refused zero variance on 3.12, not on 3.11. | suite on 3.11 | **0029** |
++| D37 | **`fly launch` rewrote `fly.toml` and the rewritten file failed its own checks.** It printed "Wrote config file fly.toml" on the run that first deployed, so the pre-launch check had validated a document that no longer existed; the next `./scripts/verify.sh` then failed on `test_the_repo_fly_toml_parses_and_passes`. What launch adds is precisely what this book cannot have — it reads the Dockerfile's `EXPOSE` and offers an `[http_service]`, which drags in `auto_stop`, and a machine stopped while holding a hedge leaves a client unhedged. | `M bot/fly.toml` after the first deploy, then a red suite | **CLOSED 0050** — `fly apps create` registers the app and writes nothing; a test refuses any `launch` invocation in the script, while still allowing the word in a comment or an `echo` |
++| D38 | **The drill opened the running book's database.** It honoured `STATE_DB_PATH`, which on Fly names the live book's SQLite — and the drill is a separate process, so that is two writers on one file: against the one-writer rule, and against a ledger meant to explain the entire equity change. It also read and wrote `os.environ` to steer `persistence`, when `config.load()` is the only environment reader in this repo. | the repo's own product law, read properly | **CLOSED 0050** — the drill always constructs its own scratch `StateStore` and passes it to `build_bot`; it needs nothing from the book's database, building its own journal and reading its position from the VENUE. An AST test refuses any `os.environ` / `os.getenv` in the module |
+ | D35 | **The image did not contain the tools the instructions name.** The Dockerfile copied `connector_check.py` and `session_tail.py`; `scripts/deploy.sh` told the operator to run `drill.py` and `fund_demo.py` inside the container. The first command after a successful deploy would have failed with *no such file*. `test_dockerfile.py` checks `main.py`'s import closure — it guarantees the BOT starts and never asked whether the TOOLS a human is told to run are shipped. | first deploy to Fly, 2026-09-14 | **CLOSED 0049** — all four are COPY'd; `test_image_ships_the_tools.py` parses `deploy.sh` for every `tools/*.py` it names and requires each in the image, plus each shipped tool's own import closure. `COPY tools/` is still refused |
+ | D36 | **`fly launch` rewrites `fly.toml`, after the script had checked it.** The pre-launch check validated a document that no longer existed by deploy time; a launch that dropped `strategy = immediate` or added an `[http_service]` would have given a machine that can run two books or be stopped while holding a hedge. | `Wrote config file fly.toml` in the deploy log | **CLOSED 0049** — the same check runs again after launch and a failure exits 1 rather than warning |
+ | F12 | The venue key is IP-pinned | **It is not, on the deployed demo app.** `fly ips allocate-egress` is disabled for trial organisations until a card is on file, so there is no static egress address to pin to. **Accepted for `BYBIT_VENUE=demo` only**: no real money, no withdrawal rights, simulated matching, and a key that is useless anywhere but the demo venue. **Not accepted for mainnet** — `deploy.sh` refuses mainnet outright and the pinning rule is unchanged. | open by decision, demo only |
+diff --git a/bot/tests/test_fly_runtime.py b/bot/tests/test_fly_runtime.py
+index 19e0200..624988a 100644
+--- a/bot/tests/test_fly_runtime.py
++++ b/bot/tests/test_fly_runtime.py
+@@ -126,6 +126,25 @@ class TestTheDeployScriptCannotReachMainnet:
+                 f"{armed!r} appears in the executed part of deploy.sh, not "
+                 "only in the instructions it prints")
+ 
++    def test_it_never_calls_fly_launch(self):
++        """`fly launch` REWRITES fly.toml. It did, on the run that first
++        deployed this app, and the rewritten file then failed the checks that
++        had passed minutes earlier. What it adds is what this book cannot
++        have: it reads the Dockerfile's EXPOSE and offers an [http_service],
++        which drags in auto_stop — and a machine stopped while holding a hedge
++        leaves a client unhedged.
++
++        `fly apps create` registers the app and writes nothing."""
++        text = self.script()
++        for invocation in ('"$FLY" launch', "fly launch --", "flyctl launch"):
++            for line in text.splitlines():
++                stripped = line.strip()
++                if stripped.startswith("#") or stripped.startswith("echo"):
++                    continue          # a mention is not a call
++                assert invocation not in stripped, \
++                    f"fly launch rewrites fly.toml: {stripped}"
++        assert "apps create" in text
++
+     def test_it_checks_the_config_again_after_launch_rewrites_it(self):
+         """`fly launch` prints "Wrote config file fly.toml" — it REWRITES the
+         document step 2 checked. If it dropped `strategy = immediate` or added
+@@ -134,7 +153,7 @@ class TestTheDeployScriptCannotReachMainnet:
+         second one stops the deploy."""
+         text = self.script()
+         first = text.index("fly_stack.py --check")
+-        launch = text.index("launch")
++        launch = text.index("apps create")
+         second = text.index("fly_stack.py --check", launch)
+         assert first < launch < second, \
+             "the config is not re-checked after fly launch rewrites it"
+@@ -154,7 +173,7 @@ class TestTheDeployScriptCannotReachMainnet:
+         """0047 resolved flyctl to one shell variable, so the call reads
+         `"$FLY" launch`. The invariant is the ORDER, not the spelling."""
+         text = self.script()
+-        assert text.index("fly_stack.py --check") < text.index("launch")
++        assert text.index("fly_stack.py --check") < text.index("apps create")
+ 
+ 
+ class TestTwoMachinesIsTwoBooks:
+diff --git a/bot/tests/test_tools_leave_no_trace.py b/bot/tests/test_tools_leave_no_trace.py
+index 73677cf..7a46245 100644
+--- a/bot/tests/test_tools_leave_no_trace.py
++++ b/bot/tests/test_tools_leave_no_trace.py
+@@ -60,20 +60,38 @@ class TestTheDrillLeavesTheRepositoryAlone:
+             pass
+         assert _fingerprint() == before
+ 
+-    def test_it_uses_a_scratch_database_when_none_is_named(self, monkeypatch):
++    def test_it_always_uses_a_scratch_database(self, monkeypatch, tmp_path):
++        """ALWAYS scratch, even when STATE_DB_PATH names one.
++
++        The earlier version honoured an explicit path, which on Fly is the
++        RUNNING BOOK's database — and the drill is a separate process, so that
++        would be two writers on one SQLite file. Against the one-writer rule,
++        and against a ledger that is supposed to explain the entire equity
++        change. The drill needs none of it: its own journal, and its position
++        read from the venue.
++        """
+         import drill as D
+-        monkeypatch.delenv("STATE_DB_PATH", raising=False)
++        monkeypatch.setenv("STATE_DB_PATH", str(tmp_path / "the_live_one.db"))
+         chosen = D._scratch_state_db()
+-        assert chosen
+         assert os.path.abspath(chosen) != os.path.abspath(FIXTURE)
++        assert str(tmp_path) not in os.path.abspath(chosen)
+         assert ROOT not in os.path.abspath(chosen)
+ 
+-    def test_an_explicit_database_is_honoured(self, monkeypatch, tmp_path):
+-        """On Fly, fly.toml names the real one and the drill must use it."""
++    def test_it_reads_no_environment_of_its_own(self):
++        """`config.load()` is the only environment reader in this repo. A tool
++        that writes os.environ to steer another module is a second one wearing
++        a disguise."""
++        import ast
++        import inspect
++
+         import drill as D
+-        named = str(tmp_path / "real.db")
+-        monkeypatch.setenv("STATE_DB_PATH", named)
+-        assert D._scratch_state_db() == named
++        tree = ast.parse(inspect.getsource(D).lstrip())
++        for node in ast.walk(tree):
++            if isinstance(node, ast.Attribute) and node.attr in (
++                    "environ", "getenv"):
++                raise AssertionError(
++                    "tools/drill.py touches the environment directly; "
++                    "config.load() is the only environment reader")
+ 
+ 
+ class TestTheDrillActuallyGetsTheBook:
+diff --git a/bot/tools/drill.py b/bot/tools/drill.py
+index 9aeebeb..b912f6f 100644
+--- a/bot/tools/drill.py
++++ b/bot/tools/drill.py
+@@ -413,18 +413,24 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
+ 
+ 
+ def _scratch_state_db() -> str:
+-    """Where the stack's `StateStore` should live for a drill.
+-
+-    An explicit `STATE_DB_PATH` wins — on Fly, fly.toml names the real one and
+-    the drill must use it. With none named, the config default is
+-    `state/trading_state.db`, which in a checkout is the COMMITTED FIXTURE:
+-    running the preflight modified a tracked file, and `scripts/verify.sh`
+-    then refused to write a receipt ("FIXTURE DB MUTATED"). A tool that reads
+-    must not write, so it gets a scratch database outside the repository.
++    """A throwaway `StateStore` path. ALWAYS throwaway — never the book's.
++
++    Two reasons, and the second is the important one.
++
++    In a checkout the config default is `state/trading_state.db`, which is the
++    COMMITTED FIXTURE: the preflight modified a tracked file and
++    `scripts/verify.sh` then refused a receipt ("FIXTURE DB MUTATED"). A tool
++    that reads must not write.
++
++    On Fly that path names the RUNNING BOOK's database, and the drill is a
++    separate process. Opening it would be two writers on one SQLite file —
++    against the repo's one-writer rule, and against a ledger that is supposed
++    to explain the entire equity change. The drill needs none of it: it builds
++    its own journal and reads its position from the VENUE.
++
++    Nothing here reads the environment. `config.load()` is the only
++    environment reader, and the path is handed to `StateStore` explicitly.
+     """
+-    named = os.environ.get("STATE_DB_PATH", "").strip()
+-    if named:
+-        return named
+     import tempfile
+     folder = tempfile.mkdtemp(prefix="carry-drill-")
+     return os.path.join(folder, "drill_state.db")
+@@ -435,9 +441,16 @@ def _load_bot():
+     sentence rather than a traceback four imports deep (0046) — the same
+     lesson as INVENTORY D16, which is why `session_tail` reports UNREADABLE
+     instead of NO."""
+-    os.environ["STATE_DB_PATH"] = _scratch_state_db()
++    import persistence
++
+     import main as _main
+ 
++    # The store is CONSTRUCTED and passed, not selected by mutating the
++    # environment: config.load() is the only environment reader in this repo,
++    # and a tool that writes to os.environ to steer another module is a second
++    # one wearing a disguise.
++    store = persistence.StateStore(_scratch_state_db())
++
+     # NOT attach_strategy=False. That flag reads as "attach no signal source",
+     # and it does — but the CARRY book is gated behind the same flag, so
+     # passing False returned a bot with `carry is None` and the drill reported
+@@ -447,7 +460,7 @@ def _load_bot():
+     # None is what `main()` passes: the config decides, and for BOOK_MODE=carry
+     # build_bot attaches the book and returns before the directional voter is
+     # ever constructed.
+-    return _main.build_bot()
++    return _main.build_bot(store=store)
+ 
+ 
+ def main(argv: Optional[List[str]] = None) -> int:
+diff --git a/scripts/deploy.sh b/scripts/deploy.sh
+index a8a6d77..9683a32 100755
+--- a/scripts/deploy.sh
++++ b/scripts/deploy.sh
+@@ -56,23 +56,31 @@ echo "using: $(command -v "$FLY")"
+ say "2/7  the config, checked before anything is created"
+ python3 tools/fly_stack.py --check
+ 
++# `fly apps create`, NOT `fly launch`. launch rewrites fly.toml: it printed
++# "Wrote config file fly.toml" on the run that first deployed this app, and
++# the rewritten file then failed the checks that had passed minutes earlier
++# against a document which no longer existed. What launch adds is exactly
++# what this book cannot have — it reads the Dockerfile EXPOSE and offers an
++# [http_service], which drags in auto_stop, and a machine stopped while
++# holding a hedge leaves a client unhedged. apps create writes nothing.
+ say "3/7  the app"
+ if fly status --app "$APP" >/dev/null 2>&1; then
+   echo "app $APP already exists"
+ else
+-  "$FLY" launch --no-deploy --name "$APP" --region "$REGION" --copy-config --yes
++  "$FLY" apps create "$APP" --org "${FLY_ORG:-personal}" --yes
+ fi
+ 
+-# `fly launch` REWRITES fly.toml — it printed "Wrote config file fly.toml" on
++# fly.toml is checked AGAIN here, belt and braces. `fly launch` REWRITES it —
+ # the run that produced this line. The check in step 2 was therefore a check of
+ # a document that no longer exists. If launch dropped `strategy = immediate`,
+ # or added an [http_service] with auto_stop, the machine could run two books or
+ # be stopped while holding a hedge. So the same check runs again, and this time
+ # a failure stops the deploy.
+-say "3b/7  the config AGAIN, because fly launch rewrites it"
++say "3b/7  the config again, belt and braces"
+ if ! python3 tools/fly_stack.py --check; then
+   echo >&2
+-  echo "STOP: fly launch rewrote fly.toml into something that fails the" >&2
++  echo "STOP: fly.toml no longer passes the checks above. Something" >&2
++  echo "      rewrote it; fly launch is the usual culprit." >&2
+   echo "      checks above. Nothing has been deployed. Restore it with" >&2
+   echo "          python3 tools/fly_stack.py --render" >&2
+   echo "      and re-run this script." >&2
+-- 
+2.43.0
+
