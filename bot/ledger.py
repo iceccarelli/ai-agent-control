@@ -426,6 +426,13 @@ class LedgerBroker:
         #: and the code below realised it against ITSELF.
         self._spot_entry: Optional[float] = None
         self._spot_qty: float = 0.0
+        #: What has already been booked for one resting order, by link id:
+        #: `(side, qty_booked, fee_booked)`. A venue reports a cancel's fill
+        #: as the order's CUMULATIVE total (`cumExecQty`), and the post-only
+        #: call has usually booked part of it already — so the cancel must
+        #: book the INCREMENT or it records more than the venue holds. The
+        #: side lives here because a cancel response does not carry one.
+        self._resting: Dict[str, tuple] = {}
 
     # -- orders: booked ---------------------------------------------------
 
@@ -441,16 +448,63 @@ class LedgerBroker:
         result = self.inner.place_post_only(symbol=symbol, side=side, qty=qty,
                                             price=price, product=product)
         self._book(result, side=side, product=product)
+        if result:
+            link = str(result.get("order_link_id") or "")
+            if link:
+                booked = float(result.get("filled_qty", 0.0) or 0.0)
+                raw = result.get("fee")
+                self._resting[link] = (
+                    side, max(0.0, booked),
+                    None if raw is None else abs(float(raw)))
         return result
 
     def cancel_order(self, *, symbol: str, order_link_id: str, product: str):
-        # A cancel can report a fill it caught on the way out (0040). It is
-        # booked like any other fill; a cancel that filled nothing books
-        # nothing, because `_book` refuses a zero quantity.
+        """Book what the cancel caught, and only what is NEW.
+
+        A cancel can report a fill it caught on the way out (0040). This used
+        to call `_book(side="")`, which returns before booking anything — so
+        the fill reached the ENGINE, which sizes its leg from the cancel's
+        `filled_qty` (`CarryEngine._rest`), and never reached the JOURNAL. The
+        position knew about money the book did not.
+
+        Booking the cancel's number outright would be the opposite error. The
+        venue reports the order's CUMULATIVE fill — `carry_broker._order_state`
+        reads `cumExecQty` — and `place_post_only` has usually booked part of
+        it already. Measured on a stub: post-only books 0.3, the cancel reports
+        0.4, and booking that whole 0.4 would record 0.7 against a venue
+        holding 0.4.
+
+        So it books the INCREMENT, which is what `_rest` does with the same
+        pair of numbers, and it takes the side from what it remembered when the
+        order was placed, because a cancel response does not carry one.
+        """
         result = self.inner.cancel_order(symbol=symbol,
                                          order_link_id=order_link_id,
                                          product=product)
-        self._book(result, side="", product=product, allow_missing_side=True)
+        known = self._resting.pop(str(order_link_id), None)
+        if not result or known is None:
+            # Nothing was remembered for this id, so there is no baseline to
+            # take an increment against. Refusing to guess is the same rule
+            # the rest of this file follows.
+            return result
+        side, booked_qty, booked_fee = known
+        total = float(result.get("filled_qty", 0.0) or 0.0)
+        extra = total - booked_qty
+        if extra <= 0:
+            return result
+
+        raw = result.get("fee")
+        if raw is None or booked_fee is None:
+            # A cumulative fee that is unknown, or a booked one that was, has
+            # no honest difference. Unknown stays unknown: `_book` counts it.
+            fee_extra = None
+        else:
+            fee_extra = max(0.0, abs(float(raw)) - booked_fee)
+        self._book({"filled_qty": extra,
+                    "avg_price": result.get("avg_price", 0.0),
+                    "order_link_id": f"{order_link_id}+cancel",
+                    "fee": fee_extra},
+                   side=side, product=product)
         return result
 
     def _book(self, result, *, side: str, product: str,
