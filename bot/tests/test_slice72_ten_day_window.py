@@ -165,14 +165,28 @@ class TestTheWindowReachedTen:
         assert regime["funding_extends_past_the_newest_decision"] is True
 
     def test_the_old_field_would_have_answered_the_wrong_question(self):
-        """The inversion, demonstrated rather than described."""
+        """The inversion, demonstrated rather than described.
+
+        AMENDED: NOT because waiting ended, but because the REFRESHER WAS
+        FIXED. `append_closed_corpus` bounded funding at `t > now_ms` while
+        bounding daily bars at `close_ms < now_ms`, so funding always ran ahead
+        of the newest closed bar — and this test asserted that overhang as a
+        standing fact. That asymmetry was a defect: it appended prints dated
+        inside the still-open day, which is how `set(frozen) <= set(full)`
+        broke. Funding is now bounded to closed days too, so the two series end
+        together and `last_print <= newest` is True.
+
+        The historical claim is unchanged and is asserted against slice 72's
+        FROZEN artefact below. What is asserted live is the relationship the
+        fixed refresher guarantees: funding never runs PAST the newest closed
+        decision, because a print inside an unclosed bar is not appendable.
+        """
         bars, _f, _folds = _corpus()
         last_print = cp.read_rows(cp.FUNDING_BTC)[-1]["funding_time"]
         newest = dt.datetime.fromtimestamp(
             fb.close_time_ms(bars[-1]) / 1000.0,
             tz=dt.timezone.utc).isoformat()
-        as_slice71_wrote_it = last_print <= newest
-        assert as_slice71_wrote_it is False
+        assert last_print <= newest
         # ...while the question it was named for answers True.
         assert load(FRESHNESS)["forward_funding_regime"][
             "funding_covers_the_newest_decision"] is True
@@ -215,11 +229,19 @@ class TestTheWindowReachedTen:
         clock. The specific date it was written against (08-20) became a
         closed bar in slice 73, which is the thing that expired, not the
         claim. EDGE.md §55f, §56f.
+
+        AMENDED AGAIN: `>` became `>=`. The refresher used to append funding
+        prints dated inside the still-open daily bar, so the funding series
+        always ended a day ahead of the last closed bar. That was the defect
+        that broke `set(frozen) <= set(full)`, and fixing it aligned the two
+        series — both now end 2026-09-15. The claim the test is named for is
+        untouched: a funding print is never a BAR, which is asserted directly
+        below and does not depend on which of the two ends later.
         """
         rows = cp.read_rows(cp.LINEAR_BTC)
         last_bar = rows[-1]["time_period_start"][:10]
         prints = cp.read_rows(cp.FUNDING_BTC)
-        assert prints[-1]["funding_time"][:10] > last_bar
+        assert prints[-1]["funding_time"][:10] >= last_bar
         assert not any(r["time_period_start"][:10] > last_bar for r in rows)
         # What slice 72 recorded, kept against its frozen artefact.
         assert load(FRESHNESS)["after_t1_dates"][-1] == "2026-08-19"

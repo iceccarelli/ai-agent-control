@@ -347,6 +347,18 @@ class TestWhatActuallyBound:
             "reaches_back_from_the_end_by_bars"] == 7
 
     def test_08_19_has_no_barrier_outcome(self):
+        """AMENDED BY SLICE 77. NAME KEPT — slice 73's verdict cites it.
+
+        IT HAS ONE NOW, and that is the point. Slices 73, 74, 75 and 76 each
+        said 2026-08-19 was not yet scoreable and each named the same
+        destination, 2026-08-26, from a different distance (seven, five, four,
+        two). The corpus reached it. The prediction was right and the waiting
+        claim expired, which is the only way a waiting claim is supposed to
+        end.
+
+        Slice 73's FROZEN artefact still records it as not scoreable and that
+        record is permanent. What is asserted live is the successor fact.
+        """
         bars, _funding, _folds = _corpus()
         idx, _net, _used = sk.barrier_r_for_all_bars(
             bars, take_profit_atr=fb.TAKE_PROFIT_ATR, stop_atr=fb.STOP_ATR,
@@ -355,9 +367,12 @@ class TestWhatActuallyBound:
             entry_on=fb.ENTRY_ON)
         index = next(i for i in range(len(bars))
                      if _day(bars, i) == "2026-08-19")
-        assert index not in {int(i) for i in idx}
+        # Slice 73's record of the wait, unchanged and permanent.
         assert "2026-08-19" in load(FORWARD)["barrier_eligibility"][
             "forward_bars_that_are_not_scoreable"]
+        # Live: the wait ended, at the date every slice named.
+        assert index in {int(i) for i in idx}
+        assert _day(bars, index + fb.HORIZON + 2) >= "2026-08-26"
 
     def test_only_four_forward_bars_were_ever_scoreable(self):
         block = load(FORWARD)["barrier_eligibility"]

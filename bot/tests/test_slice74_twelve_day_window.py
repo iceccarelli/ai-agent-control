@@ -339,6 +339,12 @@ class TestTheFlagIsStillNotScoreable:
             assert (len(bars) - 1) - int(max(idx)) == 7, side
 
     def test_08_19_has_no_barrier_outcome(self):
+        """AMENDED BY SLICE 77. NAME KEPT — slice 74's verdict cites it.
+
+        It has one now. Slice 74's FROZEN artefact still records the wait and
+        that record stands; the live assertion is the successor fact, that the
+        wait ended at the destination this slice computed rather than guessed.
+        """
         bars, _funding, _folds = _corpus()
         idx, _net, _used = sk.barrier_r_for_all_bars(
             bars, take_profit_atr=fb.TAKE_PROFIT_ATR, stop_atr=fb.STOP_ATR,
@@ -347,9 +353,9 @@ class TestTheFlagIsStillNotScoreable:
             entry_on=fb.ENTRY_ON)
         index = next(i for i in range(len(bars))
                      if _day(bars, i) == "2026-08-19")
-        assert index not in {int(i) for i in idx}
         assert "2026-08-19" in load(FORWARD)["barrier_eligibility"][
             "forward_bars_that_are_not_scoreable"]
+        assert index in {int(i) for i in idx}
 
     def test_it_needs_the_corpus_to_reach_08_26(self):
         """Arithmetic, not forecast — and the arithmetic was done wrong.
@@ -359,13 +365,19 @@ class TestTheFlagIsStillNotScoreable:
         and 08-22 through 08-26 is five bars. The claim that a number came
         from subtraction rather than forecast is worth nothing if the
         subtraction is not checked against the file. EDGE.md §57e.
+
+        AMENDED BY SLICE 77: the corpus reached it. The subtraction is still
+        checked against the file — that is what the test is for — but the
+        comparison now runs the other way, and the destination it computed is
+        asserted to be the date every later slice independently named.
         """
         bars, _funding, _folds = _corpus()
         flag = next(i for i in range(len(bars))
                     if _day(bars, i) == "2026-08-19")
         needed_index = flag + 7
         last = len(bars) - 1
-        assert last < needed_index
+        assert last >= needed_index
+        assert _day(bars, needed_index) == "2026-08-26"
         # AMENDED BY SLICE 75; on slice 74's list. The DESTINATION is
         # permanent, the DISTANCE is not — it shrinks by one per closed bar,
         # and each slice must recompute it rather than reuse a number. §58b.

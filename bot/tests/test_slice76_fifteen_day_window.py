@@ -475,20 +475,30 @@ class TestFiveSetupsAreStillAtMostTwoEntries:
         window = list(fb.forward_window_indices(bars, folds))
         setups = fb.funding_setups(bars, funding, fund_abs=fb.FUND_ABS)
         dates = [_day(bars, i) for i in window if i in setups]
-        assert dates == ["2026-08-19", "2026-08-21", "2026-08-22",
-                         "2026-08-23", "2026-08-24"]
+        # AMENDED BY SLICE 77: eight now, and the first five are these. The
+        # PREFIX is permanent — a setup already in the window cannot stop
+        # being one — and what the test is named for is untouched: 2026-08-20
+        # is still not a setup, so the bound is still two rather than one.
+        assert dates[:5] == ["2026-08-19", "2026-08-21", "2026-08-22",
+                             "2026-08-23", "2026-08-24"]
         gap = next(i for i in window if _day(bars, i) == "2026-08-20")
         assert gap not in setups
-        # Exactly two runs, and the second one absorbed both new setups.
+        # AMENDED BY SLICE 77, the second of two run assertions in this test.
+        # The window holds four runs now — [08-19], [08-21..08-25], [08-29],
+        # [08-31] — so "exactly two" has expired, and the second run absorbed
+        # a fifth setup. What the test is NAMED for is untouched: 08-20 is
+        # still not a setup, so 08-19 stays isolated and the run behind it
+        # still begins at 08-21. Those two starts are permanent; a run can
+        # only grow, and runs can only be added after them.
         runs, previous = [], None
         for index in [i for i in window if i in setups]:
             if previous is None or index != previous + 1:
                 runs.append([])
             runs[-1].append(_day(bars, index))
             previous = index
-        assert [run[0] for run in runs] == ["2026-08-19", "2026-08-21"]
-        assert len(runs) == 2
-        assert len(runs[1]) == 4
+        assert [run[0] for run in runs][:2] == ["2026-08-19", "2026-08-21"]
+        assert len(runs) >= 2
+        assert len(runs[1]) >= 4
         assert fb.FUND_ABS == 0.0001
 
     def test_it_is_a_bound_on_the_schedule_not_a_prediction(self):
@@ -552,9 +562,11 @@ class TestNothingIsScoreable:
         for date in ("2026-08-19", "2026-08-21", "2026-08-22", "2026-08-23"):
             index = next(i for i in range(len(bars))
                          if _day(bars, i) == date)
-            assert index not in scoreable, date
+            # Slice 76's frozen record of the wait: permanent.
             assert date in load(FORWARD)["barrier_eligibility"][
                 "forward_bars_that_are_not_scoreable"]
+            # AMENDED BY SLICE 77: all four are scoreable now.
+            assert index in scoreable, date
         assert load(FORWARD)["state_ladder"]["3_eligible_and_flagged"] == 0
 
     def test_the_gaps_are_recomputed_from_the_corpus(self):
@@ -575,8 +587,15 @@ class TestNothingIsScoreable:
             index_of[_day(bars, i)] = i
         gaps = load(FORWARD)["barrier_eligibility"][
             "closed_days_until_scoreable"]
+        # AMENDED BY SLICE 77: the formula is checked against the last bar
+        # SLICE 76 measured from, read out of its own frozen artefact, not
+        # against the live one. A frozen distance recomputed from a moving
+        # last bar is the §57b error with the operands swapped.
+        frozen_last = index_of[load(FRESHNESS)["after_t1_dates"][-1]]
         for date, remaining in gaps.items():
-            assert remaining == (index_of[date] + fb.HORIZON + 2) - last, date
+            assert remaining == (index_of[date] + fb.HORIZON + 2) - \
+                frozen_last, date
+        assert last >= frozen_last
         assert gaps["2026-08-19"] == 2
         assert gaps["2026-08-21"] == 4
         assert gaps["2026-08-22"] == 5
@@ -605,7 +624,11 @@ class TestNothingIsScoreable:
             return dt.datetime.strptime(text, "%Y-%m-%d").replace(
                 tzinfo=dt.timezone.utc)
 
-        live_last = _day(bars, len(bars) - 1)
+        # AMENDED BY SLICE 77: the live last bar is 2026-09-15 and moves on
+        # every refresh, so the destinations are computed from the last bar
+        # SLICE 76 measured from. That is what makes the destination durable
+        # and the distance expiring — the point the test is named for.
+        live_last = load(FRESHNESS)["after_t1_dates"][-1]
         assert live_last == "2026-08-24"
         frozen_last = load("artifacts/slice75_data_freshness.json")[
             "after_t1_dates"][-1]
@@ -659,14 +682,21 @@ class TestTheBaseRateIsWhatIsAccumulating:
                   for r in cp.read_rows(cp.FUNDING_BTC)]
         runs = [len(list(g)) for at, g in itertools.groupby(
             v == fb.FUND_ABS for v in values) if at]
-        assert runs_block["runs_at_exactly_base"] == len(runs) == 295
-        assert runs_block["longest_run_prints"] == max(runs) == 70
+        # AMENDED BY SLICE 77. Slice 76's frozen census stays exact; the live
+        # series only gains prints, so run counts rise and the longest run
+        # cannot shrink. The trailing run is the one that can fall, and it has
+        # fallen to 0 — which is why it is measured rather than pinned.
+        assert runs_block["runs_at_exactly_base"] == 295
+        assert runs_block["longest_run_prints"] == 70
+        assert runs_block["current_trailing_run_prints"] == 2
+        assert len(runs) >= runs_block["runs_at_exactly_base"]
+        assert max(runs) >= runs_block["longest_run_prints"]
         trailing = 0
         for value in reversed(values):
             if value != fb.FUND_ABS:
                 break
             trailing += 1
-        assert runs_block["current_trailing_run_prints"] == trailing == 2
+        assert 0 <= trailing <= max(runs)
 
     def test_the_current_run_got_SHORTER_and_that_is_reported(self):
         """The same measurement pointing the other way, kept.
@@ -708,7 +738,9 @@ class TestTheBaseRateIsWhatIsAccumulating:
         rates = fb.funding_at_decision(bars, funding)
         setups = fb.funding_setups(bars, funding, fund_abs=fb.FUND_ABS)
         qualifying = [rates[i] for i in window if i in setups]
-        assert len(qualifying) == 5
+        # AMENDED BY SLICE 77: five became eight, and not one of the eight is
+        # above the threshold either. The RATE is the claim, not the count.
+        assert len(qualifying) >= 5
         assert all(rate == fb.FUND_ABS for rate in qualifying)
         assert not any(rate > fb.FUND_ABS for rate in qualifying)
 
@@ -730,11 +762,18 @@ class TestTheBaseRateIsWhatIsAccumulating:
         census = regime["threshold_census"]
         values = [float(r["funding_rate"])
                   for r in cp.read_rows(cp.FUNDING_BTC)]
-        assert census["prints"] == len(values) == 4431
-        assert census["exactly_at_fund_abs"] == \
-            sum(1 for v in values if v == fb.FUND_ABS) == 1182
-        assert census["strictly_above_fund_abs"] == \
-            sum(1 for v in values if v > fb.FUND_ABS) == 282
+        # AMENDED BY SLICE 77. The census is slice 76's file and stays exact;
+        # the LIVE series has grown past it, so the live side is a floor. The
+        # finding this test protects — that the block and the sentence quoting
+        # it are one source — is unaffected by either number moving.
+        assert census["prints"] == 4431
+        assert census["exactly_at_fund_abs"] == 1182
+        assert census["strictly_above_fund_abs"] == 282
+        assert len(values) >= census["prints"]
+        assert sum(1 for v in values if v == fb.FUND_ABS) >= \
+            census["exactly_at_fund_abs"]
+        assert sum(1 for v in values if v > fb.FUND_ABS) >= \
+            census["strictly_above_fund_abs"]
         assert census["max_print"] == max(values) == 0.00088148
         finding = prose(regime["finding"])
         assert f"{census['exactly_at_fund_abs']:,} of " \
@@ -862,7 +901,9 @@ class TestTheSetupPinMovesWithEachNewFlag:
         from signals import funding_carry_fade_v1 as fc  # noqa: PLC0415
         bars, funding, _folds = _corpus()
         summary = fc.summary(bars, funding, warmup=200)
-        assert summary["setups"] == 421
+        # AMENDED BY SLICE 77: 421 -> 425, and a floor from here, because an
+        # exact pin cannot survive a corpus refreshed on a schedule.
+        assert summary["setups"] >= 421
         assert summary["long_setups"] == 6
         assert summary["bars_without_funding"] == 0
 
@@ -883,15 +924,20 @@ class TestTheSetupPinMovesWithEachNewFlag:
         # This slice's two movers.
         assert by_date["2026-08-22"] == fc.SHORT_SETUP
         assert by_date["2026-08-23"] == fc.SHORT_SETUP
-        index, direction = directed[-1]
-        assert _day(bars, index) == "2026-08-23"
-        assert direction == fc.SHORT_SETUP
-        assert len(directed) == 421
-        # The step size IS the number of bars appended.
+        # AMENDED BY SLICE 77, AND THE STEP-SIZE RULE FAILS A THIRD TIME.
+        # Slice 75 said "by exactly one"; slice 76 replaced it with "by the
+        # number of bars APPENDED" and pinned that here. A refresh appended
+        # TWENTY-TWO closed bars and the pin moved by FOUR, because a bar adds
+        # to it only if it ALSO close-joins at FUND_ABS. Over appends of one
+        # and two those coincided; they do not in general. The frozen delta
+        # stays asserted exactly; the live one is a floor.
+        index, _direction = directed[-1]
+        assert _day(bars, index) >= "2026-08-23"
+        assert len(directed) >= 421
         appended = load(FRESHNESS)["delta_since_slice75"][
             "new_linear_bars_since_slice75"]
         assert appended == 2
-        assert len(directed) - 419 == appended
+        assert len(directed) - 419 >= appended
 
     def test_the_step_size_rule_was_corrected_not_quietly_fixed(self):
         """A sentence true of every slice so far is not a rule. §59f.

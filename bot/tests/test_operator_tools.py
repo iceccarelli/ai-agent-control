@@ -217,7 +217,14 @@ def test_append_against_the_real_corpus_is_a_noop_at_its_own_last_close():
     rep = acc.run(observed_at_utc="2026-08-25T00:00:00Z", fetch=fetch, write=False)
     assert rep["new_closed_bars"] == [] and rep["new_funding_prints"] == 0
     assert rep["linear_sha256_before"] == rep["linear_sha256_after"]
-    assert rep["linear_sha256_before"] == \
-        "293774ee35fcac24679bed81356ef081c3787e8acfc3877b2fe12650316d97c9"
-    assert rep["funding_sha256_before"] == \
-        "c652c9b0b6332b5b98bc11ec89097abd69cea1d0b6774cf4f79532243ba611f4"
+    assert rep["funding_sha256_before"] == rep["funding_sha256_after"]
+    # THE LITERAL DIGESTS ARE GONE, DELIBERATELY. They pinned
+    # 293774ee…/c652c9b0… — the corpus as it stood before Stage B appended to
+    # it — so they went red the first time the forward pilot did its job, and
+    # would go red again on every legitimate append after that. A snapshot
+    # digest is not an invariant of this tool; it is a fact about one moment.
+    #
+    # The property this test is named for survives intact and is asserted
+    # above: at the corpus's own last close, nothing new can be appended, and
+    # the file the tool reports is byte-identical before and after. That holds
+    # whatever the corpus currently contains.
