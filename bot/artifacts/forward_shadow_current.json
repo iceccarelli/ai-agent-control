@@ -1,0 +1,36 @@
+{
+  "tool": "slice76_forward_shadow (scored against the APPEND-ONLY full corpora)",
+  "corpus": {
+    "daily": "data/real_linear_1d_full",
+    "funding": "data/real_funding_full"
+  },
+  "why_full": "frozen is cut at FROZEN_SNAPSHOT_CUT so the PHASE1 figure stays reproducible; the forward counter must track the venue.",
+  "observed_at_utc": "2026-09-16T12:00:00Z",
+  "forward_n_trades": 3,
+  "is_forward_observation": true,
+  "closed_forward_bars": 36,
+  "state_ladder": {
+    "1_setups": 8,
+    "2_flagged": 8,
+    "3_eligible_and_flagged": 8,
+    "4_candidates_after_schedule": 4,
+    "5_entries_taken": 4,
+    "6_closed_trades": 3,
+    "definitions": {
+      "1_setups": "close-join rate reaches FUND_ABS (inclusive)",
+      "2_flagged": "the rule directs a trade there; requires the bar not be the corpus's last, because the fill is at the NEXT bar's open",
+      "3_eligible_and_flagged": "a barrier outcome is computable for that bar — see barrier_eligibility",
+      "4_candidates_after_schedule": "one_entry_per_contiguous_run and the lockup admit it",
+      "5_entries_taken": "a fill was attempted under the caps; counts fills, cap refusals, and decisions whose entry or exit bar does not exist yet",
+      "6_closed_trades": "entered AND exited on closed bars strictly after t1 — the only one the promotion gate counts"
+    },
+    "reading": "A number from a lower rung may never be reported as a higher one. Counting a setup, a flag, or an entry as a closed trade would be the slice-59 substitution."
+  },
+  "gate_requires": {
+    "closed_forward_trades": 20,
+    "forward_days": 180
+  },
+  "is_stage1_evidence": false,
+  "registration_eligible": false,
+  "note": "A counter, not a claim. A shadow fill is not evidence of skill; the pilot exists to detect decay."
+}

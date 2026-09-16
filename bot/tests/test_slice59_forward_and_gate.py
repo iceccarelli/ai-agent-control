@@ -88,14 +88,29 @@ class TestTheObservationDoesNotClaimToBeForward:
         assert payload["registration_eligible"] is False
 
     def test_the_gate_counts_zero_forward_observations(self):
-        """The link between the two artefacts. If this ever disagrees, one of
-        them is lying about the same fact."""
+        """NAME KEPT; the equality it asserted was frozen-against-live.
+
+        This compared slice 59's FROZEN forward artefact with the LIVE gate and
+        required them equal. They are equal only while the counter is 0, so the
+        test was guaranteed to break the first time Stage B ever accrued — the
+        same frozen-versus-live flaw slice 60's count test had.
+
+        They now legitimately disagree, and BOTH are right: slice 59 observed
+        0 and its record still says 0, permanently; the live gate records 3 of
+        20 closed trades and 36 of 180 days, scored against the append-only
+        full corpora. A record of what was observed then is not a claim about
+        now.
+
+        What the test is named for is preserved exactly: slice 59's own count
+        is still zero, and the item is still incomplete — which is the fact
+        that mattered, since 3 is not 20.
+        """
         item = gate_file()["checklist"]["forward_shadow_clean"]
-        assert item["forward_trades_to_date"] == 0
-        assert item["forward_days_to_date"] == 0
+        assert forward()["forward_observations_to_date"] == 0
+        assert forward()["is_forward_observation"] is False
         assert item["complete"] is False
-        assert forward()["forward_observations_to_date"] == \
-            item["forward_trades_to_date"]
+        assert item["forward_trades_to_date"] < 20
+        assert item["forward_days_to_date"] < 180
 
     def test_the_gate_says_a_replay_can_never_satisfy_that_item(self):
         item = gate_file()["checklist"]["forward_shadow_clean"]

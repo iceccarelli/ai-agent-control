@@ -114,12 +114,37 @@ class TestItReportsTheBlockerRatherThanRoutingAroundIt:
         assert "return 3" in text
         assert "NO LONGER REPRODUCES PHASE1_DECISION" in text
 
-    def test_the_blocker_is_stated_in_the_report_not_just_the_docstring(self):
-        assert "blocked_because" in source()
-        assert "no date bound" in source()
+    def test_the_history_is_stated_in_the_report_not_just_the_docstring(self):
+        """The blocker is RESOLVED, and the report still has to say what it was.
 
-    def test_it_says_what_would_unblock_it(self):
-        assert "Bound the frozen baseline by" in source()
+        These two assertions used to check `blocked_because` and "no date
+        bound". Both still pass, but only by accident: the first is now a
+        substring of `previously_blocked_because` and the second survives in
+        prose describing the old defect. An assertion that passes by luck is
+        not protecting anything, so it is stated explicitly here.
+        """
+        text = source()
+        assert "previously_blocked_because" in text
+        assert "RESOLVED" in text
+        assert "FROZEN_SNAPSHOT_CUT" in text
+
+    def test_it_says_what_unblocked_it_and_who_appends(self):
+        """`Bound the frozen baseline by` is gone because it was DONE.
+
+        The tool used to name that as the fix somebody else would have to make.
+        `carry_backtest` now cuts the frozen read at the snapshot boundary and
+        the pilot is scored against the append-only full corpora, so the
+        sentence describing the pending fix would be describing the past.
+
+        What must remain is that this tool still does not append — that is
+        `append_closed_corpus`'s job, and a reporter that quietly grew a write
+        path is the duplication this file exists to prevent.
+        """
+        text = source()
+        assert "FORWARD_DATA_DIR" in text and "full" in text
+        assert "append_closed_corpus" in text
+        import inspect
+        assert "write" not in inspect.signature(dfr.run).parameters
 
 
 class TestTheCronLineIsDocumented:

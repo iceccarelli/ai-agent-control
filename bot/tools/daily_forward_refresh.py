@@ -16,26 +16,33 @@ first the programme has ever had. Measured, then reverted — see below.
 
 AND WHY IT DOES NOT WRITE
 =========================
-`data/real_linear_1d` and `data/real_funding` are read by TWO programmes with
-incompatible requirements, and nothing in the tree says so:
+`data/real_linear_1d` and `data/real_funding` were read by TWO programmes with
+incompatible requirements, and nothing in the tree said so:
 
-* the forward pilot (`corpus_prefix`, the slice-7x tools) needs them to GROW;
-* the carry baseline reads the same files through
-  `carry_backtest.simulate`, which loads them **whole, with no date bound**, and
-  `PHASE1_DECISION.md` quotes the result — **+9.66 %/yr, n=15** — in two places.
+* the forward pilot needs a corpus that GROWS;
+* the carry baseline read the same files through `carry_backtest.simulate`,
+  which loaded them **whole, with no date bound**, and `PHASE1_DECISION.md`
+  quotes the result — **+9.66 %/yr, n=15** — in two places.
 
-Appending 22 bars moves that figure to **9.866**. The test guarding it says
-exactly what that costs: *"If this moves, every document citing it is stale."*
-So a refresh that serves the pilot silently invalidates a shipped decision
-document, and no choice of tool avoids it —
-`tools/append_closed_corpus.py` would do the same, which is very likely why it
-has never been run against the real corpus.
+So every bar the pilot gained silently restated a shipped decision figure, and
+the counter sat at 0 of 20 for sixteen slices while the bars it needed were
+already committed to the tree. That was never patience; it was two questions
+sharing one unbounded read.
 
-THE FIX IS NOT IN THIS TOOL. It is to bound the frozen baseline by DATE rather
-than by the convention that nobody appends, so the two programmes stop sharing
-a mutable definition of "the corpus". Until a human decides that, this reports
-and refuses, because a corpus that silently restates a shipped number is worse
-than one that is three weeks stale.
+RESOLVED, AND THIS IS THE SHAPE OF IT
+=====================================
+* the FROZEN read is cut at `carry_backtest.FROZEN_SNAPSHOT_CUT_*` — daily
+  through 2026-08-24, funding through 2026-08-25 — so a `corpus="frozen"`
+  measurement cannot see an append at all. It reproduces **9.6578 %/yr on 15
+  trades** before and after. Bounding at `t1` was tried first and measured
+  9.5464, outside the pin's tolerance: the quoted figure was always computed
+  over the whole file, 15 post-t1 bars included;
+* the PILOT is scored against the append-only **full** corpora, which track the
+  venue. That is `FORWARD_DATA_DIR` / `FORWARD_FUNDING` below.
+
+Those two corpora are not interchangeable as measurements — `full` starts
+2019-09-08 and spans a different regime. It supplies the forward COUNTER; no
+carry figure may be quoted from it.
 
 WHAT IT DOES
 ============
@@ -76,6 +83,19 @@ import promotion_gate as _gate                      # noqa: E402
 
 FORWARD_TOOL = "slice76_forward_shadow.py"
 
+#: The APPEND-ONLY corpora the Stage B counter is scored against. Not the
+#: frozen pair: those are cut at the snapshot boundary so the carry figure
+#: stays reproducible, and scoring a forward counter against a deliberately
+#: bounded corpus is how it read 0 of 20 while the bars were already in tree.
+FORWARD_DATA_DIR = "data/real_linear_1d_full"
+FORWARD_FUNDING = ("data/real_funding_full/funding/"
+                   "BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz")
+
+#: Rolling evidence, not a slice artefact. `connector_check.json` and
+#: `kill_switch_drill.json` are the precedent: a recurring measurement that
+#: carries no slice number and writes no prose.
+FORWARD_EVIDENCE = os.path.join("artifacts", "forward_shadow_current.json")
+
 #: The figure PHASE1_DECISION.md quotes, and the reason this tool will not
 #: write. Not re-derived here: it is a number in a shipped document.
 PHASE1_ANNUALISED_PCT = 9.66
@@ -105,12 +125,23 @@ def score_forward(scratch: str, observed_utc: str) -> Optional[Dict[str, Any]]:
     it at a later date overwrites that record with different numbers. Three
     committed artefacts were clobbered that way during 0060 and had to be
     restored from git, so the path is always passed explicitly.
+
+    THE PILOT READS `full`, NOT `frozen`. Those are two different questions
+    over the same venue. `frozen` is a SNAPSHOT bounded at
+    `carry_backtest.FROZEN_SNAPSHOT_CUT_*` so the carry figure
+    `PHASE1_DECISION.md` quotes stays reproducible; `full` is append-only and
+    tracks the venue, which is what a forward counter has to do. Scoring the
+    pilot against `frozen` is what kept the counter at 0 while the bars it
+    needed were already on disk.
     """
     out = os.path.join(scratch, "forward.json")
     log = os.path.join(scratch, "forward.log")
     done = subprocess.run(
         [sys.executable, os.path.join(HERE, FORWARD_TOOL),
-         "--observed-at-utc", observed_utc, "--out", out, "--log", log],
+         "--observed-at-utc", observed_utc,
+         "--data-dir", FORWARD_DATA_DIR,
+         "--funding-data", FORWARD_FUNDING,
+         "--out", out, "--log", log],
         cwd=REPO, capture_output=True, text=True, timeout=600)
     if done.returncode != 0 or not os.path.exists(out):
         return None
@@ -161,13 +192,19 @@ def run(*, scratch: Optional[str] = None) -> Dict[str, Any]:
         "closed_forward_trades": _gate.MIN_FORWARD_TRADES,
         "forward_days": _gate.MIN_FORWARD_DAYS,
     }
-    report["blocked_because"] = (
-        "carry_backtest.simulate reads data/real_funding and "
-        "data/real_linear_1d WHOLE, with no date bound, and PHASE1_DECISION.md "
-        "quotes its result as +9.66%/yr n=15. Appending moves it to 9.866, "
-        "which makes a shipped document stale. Bound the frozen baseline by "
-        "DATE and this unblocks; until then an append serves the pilot by "
-        "silently restating a decision figure.")
+    report["previously_blocked_because"] = (
+        "RESOLVED. carry_backtest.simulate used to read data/real_funding and "
+        "data/real_linear_1d WHOLE, with no date bound, so every bar the "
+        "forward pilot gained silently restated the +9.66%/yr n=15 figure "
+        "PHASE1_DECISION.md quotes — which is why the counter sat at 0 while "
+        "the bars it needed were already in tree. The frozen read is now cut "
+        "at carry_backtest.FROZEN_SNAPSHOT_CUT_* and reproduces 9.6578 / 15 "
+        "after the append; the pilot is scored against the append-only full "
+        "corpora instead. The two questions no longer share one unbounded "
+        "read.")
+    report["appending_is_not_this_tools_job"] = (
+        "tools/append_closed_corpus.py — it hash-checks before writing and "
+        "refuses a gap. This tool reads and reports.")
     return report
 
 
