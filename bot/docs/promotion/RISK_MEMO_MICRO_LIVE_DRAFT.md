@@ -136,7 +136,7 @@ the file `promotion_gate.GATE_PATH` resolves to:
 | `notional_cap_within_policy` | — | **complete** |
 | `models_current_absent_or_contained` | — | **complete** |
 | `human_risk_memo_signed` | human | open — *this memo* |
-| `linear_protective_stop_verified` | human | open — see `LINEAR_STOP_VERIFICATION_INVENTORY.md` |
+| `linear_protective_stop_verified` | human | open — see `LINEAR_STOP_OPS_INVENTORY.md` |
 | `live_trading_ack_present` | human | open |
 | `m4_recent_half_accepted_or_recovered` | human or observation | open — §4 above |
 | `forward_shadow_clean` | observation | open — 3/20 trades, 36/180 days |
