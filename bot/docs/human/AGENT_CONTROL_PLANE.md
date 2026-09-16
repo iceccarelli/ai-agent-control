@@ -56,9 +56,18 @@ a key, or a socket.
   "blockers": [],
   "stage_b": {"forward_n_trades": 0, "of_20": 20, "closed_forward_bars": 0},
   "risk": {"allows_live_must_be_false": true},
-  "next_actions": []
+  "next_actions": [],
+  "model": "none (local rules only)",
+  "key_status": "missing",
+  "generated_utc": "1970-01-01T00:00:00Z"
 }
 ```
+
+Implemented by `tools/reviewer_verdict.py`. `allows_progress` and `blockers`
+are computed locally from the artifacts; a model's answer is appended to
+`next_actions` prefixed `ADVISORY` and can never clear a blocker. `key_status`
+is `missing` or `present` — the key itself is never written here, printed, or
+logged.
 
 `risk.allows_live_must_be_false` is always `true`. A verdict is an opinion
 about evidence. It is not an authorisation, and no code may read it as one.

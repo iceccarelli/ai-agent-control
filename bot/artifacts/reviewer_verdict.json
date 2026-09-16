@@ -1,0 +1,24 @@
+{
+  "allows_progress": true,
+  "blockers": [],
+  "stage_b": {
+    "forward_n_trades": 3,
+    "of_20": 20,
+    "closed_forward_bars": 36
+  },
+  "risk": {
+    "allows_live_must_be_false": true
+  },
+  "next_actions": [
+    "accrue closed forward trades: 3 of 20",
+    "accrue forward days: 36 of 180",
+    "gate item open (observation): forward_shadow_clean",
+    "gate item open (human): human_risk_memo_signed",
+    "gate item open (human): linear_protective_stop_verified",
+    "gate item open (human): live_trading_ack_present",
+    "gate item open (human or observation): m4_recent_half_accepted_or_recovered"
+  ],
+  "model": "none (local rules only)",
+  "key_status": "missing",
+  "generated_utc": "2026-09-16T21:48:17Z"
+}

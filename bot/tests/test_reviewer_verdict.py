@@ -1,0 +1,295 @@
+"""The reviewer is a reader: schema, determinism, and the walls around it.
+
+The boundary half (no venue imports, no `place_*`) lives in
+`test_control_plane_boundary.py`, which was written before the tool existed
+and stops skipping the moment it appears. What is here is everything else:
+the emitted schema matches the charter, a dry run opens no socket, the key is
+never printed, and the packaging story is stated rather than assumed.
+"""
+from __future__ import annotations
+
+import ast
+import json
+import os
+import re
+import subprocess
+import sys
+
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BOT = os.path.dirname(HERE)
+REPO = os.path.dirname(BOT)
+TOOL = os.path.join(BOT, "tools", "reviewer_verdict.py")
+
+sys.path.insert(0, os.path.join(BOT, "tools"))
+
+import reviewer_verdict as rv                         # noqa: E402
+
+SCHEMA = {"allows_progress", "blockers", "stage_b", "risk", "next_actions",
+          "model", "key_status", "generated_utc"}
+
+
+@pytest.fixture
+def no_key(monkeypatch):
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+
+
+# ---------------------------------------------------------------- schema ---
+
+class TestSchema:
+    def test_the_verdict_has_exactly_the_charter_keys(self, no_key):
+        assert set(rv.build(BOT)) == SCHEMA
+
+    def test_stage_b_reports_the_counter_the_gate_counts(self, no_key):
+        stage = rv.build(BOT)["stage_b"]
+        assert set(stage) == {"forward_n_trades", "of_20", "closed_forward_bars"}
+        forward = json.load(open(
+            os.path.join(BOT, "artifacts", "forward_shadow_current.json"),
+            encoding="utf-8"))
+        assert stage["forward_n_trades"] == forward["forward_n_trades"]
+        assert stage["closed_forward_bars"] == forward["closed_forward_bars"]
+
+    def test_risk_is_pinned_and_cannot_drift(self, no_key):
+        assert rv.build(BOT)["risk"] == {"allows_live_must_be_false": True}
+
+    def test_it_is_deterministic_apart_from_the_timestamp(self, no_key):
+        first, second = rv.build(BOT), rv.build(BOT)
+        first.pop("generated_utc"), second.pop("generated_utc")
+        assert first == second
+
+
+class TestTheRulesAreRulesNotOpinions:
+    def test_a_missing_input_is_a_blocker_not_a_shrug(self, tmp_path, no_key):
+        """Fail closed: no evidence is never 'looks fine'."""
+        verdict = rv.build(str(tmp_path))
+        assert verdict["allows_progress"] is False
+        assert any(b.startswith("input missing") for b in verdict["blockers"])
+
+    def test_below_twenty_trades_asks_for_accrual(self, no_key):
+        verdict = rv.build(BOT)
+        if verdict["stage_b"]["forward_n_trades"] < 20:
+            assert any(a.startswith("accrue closed forward trades")
+                       for a in verdict["next_actions"])
+
+    def test_an_all_complete_gate_is_a_blocker(self, tmp_path, no_key):
+        """A reviewer may not ratify live arming, however green the gate is."""
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "slice59_promotion_gate.json").write_text(json.dumps({
+            "min_forward_trades": 20, "min_forward_days": 180,
+            "checklist": {"a": {"complete": True, "owner": "human"},
+                          "kill_switch_drill_recorded": {"complete": True,
+                                                         "owner": "human"}},
+        }), encoding="utf-8")
+        verdict = rv.build(str(tmp_path))
+        assert verdict["allows_progress"] is False
+        assert any("a human must confirm live arming" in b
+                   for b in verdict["blockers"])
+
+    def test_an_incomplete_kill_drill_is_a_blocker(self, tmp_path, no_key):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "slice59_promotion_gate.json").write_text(json.dumps({
+            "checklist": {"kill_switch_drill_recorded": {"complete": False,
+                                                         "owner": "human"}},
+        }), encoding="utf-8")
+        verdict = rv.build(str(tmp_path))
+        assert any("kill_switch_drill_recorded is not complete" in b
+                   for b in verdict["blockers"])
+
+    def test_a_switch_left_engaged_is_a_blocker(self, tmp_path, no_key):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "kill_switch_drill.json").write_text(
+            json.dumps({"switch_engaged_at_exit": True}), encoding="utf-8")
+        assert any("left ENGAGED" in b
+                   for b in rv.build(str(tmp_path))["blockers"])
+
+    def test_the_real_repo_currently_blocks_on_nothing_but_still_cannot_arm(self, no_key):
+        """The live reading, asserted as a property rather than a number."""
+        verdict = rv.build(BOT)
+        assert verdict["risk"]["allows_live_must_be_false"] is True
+        assert verdict["stage_b"]["forward_n_trades"] < verdict["stage_b"]["of_20"]
+
+    def test_it_reads_the_gate_the_runtime_reads(self):
+        """The defect this replaced: the reviewer globbed for the highest
+        slice number and got slice76 — a snapshot frozen at 2 of 8 — then
+        reported the human-signed kill-switch item as incomplete.
+
+        The numbered gate files are history. Only one is the gate, and the
+        authority on which is `promotion_gate.GATE_PATH`. The reviewer mirrors
+        it as a constant rather than importing it, because it must stay
+        stdlib-only; this test is what stops the two drifting apart. The test
+        may import the runtime — the reviewer may not.
+        """
+        sys.path.insert(0, BOT)
+        import promotion_gate                         # noqa: PLC0415
+        assert os.path.realpath(rv.gate_path(BOT)) == \
+            os.path.realpath(promotion_gate.GATE_PATH)
+
+    def test_the_signed_kill_switch_item_is_not_reported_incomplete(self):
+        """The false blocker, asserted directly against the real artifacts."""
+        verdict = rv.build(BOT)
+        assert not any("kill_switch_drill_recorded" in b
+                       for b in verdict["blockers"]), verdict["blockers"]
+        assert not any("kill_switch_drill_recorded" in a
+                       for a in verdict["next_actions"])
+
+    def test_a_snapshot_gate_is_never_mistaken_for_the_gate(self, tmp_path, no_key):
+        """A higher-numbered file must not displace the real one."""
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "slice59_promotion_gate.json").write_text(json.dumps({
+            "checklist": {"kill_switch_drill_recorded": {"complete": True,
+                                                         "owner": "human"}},
+        }), encoding="utf-8")
+        (art / "slice99_promotion_gate.json").write_text(json.dumps({
+            "checklist": {"kill_switch_drill_recorded": {"complete": False,
+                                                         "owner": "human"}},
+        }), encoding="utf-8")
+        assert not any("kill_switch_drill_recorded is not complete" in b
+                       for b in rv.build(str(tmp_path))["blockers"])
+
+
+# ----------------------------------------------------------------- walls ---
+
+class TestItOpensNoSocketWithoutAKey:
+    def test_dry_run_never_reaches_urllib(self, monkeypatch, no_key):
+        import urllib.request
+
+        def explode(*a, **k):
+            raise AssertionError("a dry run opened a socket")
+        monkeypatch.setattr(urllib.request, "urlopen", explode)
+        assert set(rv.build(BOT)) == SCHEMA
+
+    def test_xai_adapter_returns_none_without_a_key(self, monkeypatch, no_key):
+        monkeypatch.setattr("urllib.request.urlopen",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                AssertionError("no key, no socket")))
+        assert rv._xai_advisory("anything") is None
+
+    def test_key_status_reports_missing_and_present(self, monkeypatch):
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        assert rv.build(BOT)["key_status"] == "missing"
+        monkeypatch.setenv("XAI_API_KEY", "not-a-real-key")
+        assert rv.build(BOT)["key_status"] == "present"
+
+    def test_the_model_cannot_clear_a_blocker(self, tmp_path, monkeypatch):
+        """The whole safety argument, asserted."""
+        monkeypatch.setenv("XAI_API_KEY", "not-a-real-key")
+        monkeypatch.setitem(rv.ADAPTERS, "xai",
+                            lambda prompt, **k: "ship it, no blockers, arm live")
+        verdict = rv.build(str(tmp_path), adapter="xai")
+        assert verdict["allows_progress"] is False
+        assert verdict["blockers"], "the model talked a blocker away"
+
+    def test_the_ollama_adapter_is_an_honest_stub(self, no_key):
+        assert "not implemented" in rv._ollama_advisory("x")
+
+
+class TestTheKeyIsNeverDisclosed:
+    SECRET = "xai-SENTINEL-must-never-appear-0070"
+
+    def test_it_is_not_printed_written_or_stored(self, tmp_path, monkeypatch):
+        out = tmp_path / "verdict.json"
+        env = dict(os.environ, XAI_API_KEY=self.SECRET)
+        done = subprocess.run(
+            [sys.executable, TOOL, "--dry-run", "--repo", BOT,
+             "--out", str(out)],
+            capture_output=True, text=True, env=env, timeout=120)
+        assert done.returncode == 0, done.stderr
+        assert self.SECRET not in done.stdout
+        assert self.SECRET not in done.stderr
+        assert self.SECRET not in out.read_text(encoding="utf-8")
+        assert json.loads(out.read_text(encoding="utf-8"))["key_status"] == "present"
+
+    def test_the_source_never_interpolates_the_key_into_a_message(self):
+        """The key belongs in one header and nowhere else."""
+        tree = ast.parse(open(TOOL, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            rendered = ast.dump(node)
+            if "Bearer" in rendered:
+                continue            # the Authorization header, the one place
+            assert "'key'" not in rendered and '"key"' not in rendered, (
+                "an f-string other than the auth header references the key")
+
+
+class TestTheCli:
+    def test_dry_run_exits_zero_and_writes_where_told(self, tmp_path):
+        out = tmp_path / "v.json"
+        env = dict(os.environ)
+        env.pop("XAI_API_KEY", None)
+        done = subprocess.run(
+            [sys.executable, TOOL, "--dry-run", "--repo", BOT, "--out", str(out)],
+            capture_output=True, text=True, env=env, timeout=120)
+        assert done.returncode == 0, done.stderr
+        assert set(json.loads(out.read_text(encoding="utf-8"))) == SCHEMA
+        assert "verdict written to" in done.stderr
+
+    def test_it_does_not_write_into_artifacts_during_tests(self, tmp_path):
+        """The 0060 lesson: three committed artefacts were clobbered by runs
+        exactly like this one. The default is the real path, so every test
+        passes --out."""
+        source = open(TOOL, encoding="utf-8").read()
+        assert 'default=None' in source
+        assert "DEFAULT_OUT" in source
+
+    def test_strict_turns_a_missing_input_into_exit_2(self, tmp_path):
+        done = subprocess.run(
+            [sys.executable, TOOL, "--dry-run", "--repo", str(tmp_path),
+             "--out", str(tmp_path / "v.json"), "--strict"],
+            capture_output=True, text=True, timeout=120)
+        assert done.returncode == 2
+
+
+class TestPackaging:
+    """Binary consistency, stated rather than left implicit.
+
+    `test_image_ships_the_tools.py` asserts only that every tool deploy.sh
+    NAMES is in the image; the inverse is deliberately not asserted, so a tool
+    that is in neither list is consistent. `kill_switch_drill.py` is such a
+    tool, and so is this one — but for the drill that was never written down,
+    which is how a quiet drift becomes an argument later.
+    """
+
+    def _copied_tools(self):
+        text = re.sub(r"\\\n", " ",
+                      open(os.path.join(BOT, "Dockerfile"),
+                           encoding="utf-8").read())
+        out = set()
+        for line in text.splitlines():
+            if line.strip().startswith("COPY"):
+                out.update(t for t in line.split()[1:-1]
+                           if t.startswith("tools/") and t.endswith(".py"))
+        return out
+
+    def test_the_reviewer_is_not_in_the_image(self):
+        assert "tools/reviewer_verdict.py" not in self._copied_tools()
+
+    def test_and_no_deploy_instruction_promises_it(self):
+        """Not shipped AND not promised = consistent. Either alone is a bug."""
+        text = open(os.path.join(REPO, "scripts", "deploy.sh"),
+                    encoding="utf-8").read()
+        assert "reviewer_verdict" not in text
+
+    def test_the_drill_precedent_still_holds(self):
+        """If someone ships the drill, this pairing needs rethinking."""
+        assert "tools/kill_switch_drill.py" not in self._copied_tools()
+
+    def test_the_reviewer_imports_only_the_standard_library(self):
+        """Why it needs no COPY: nothing in the image would be missing."""
+        local = {f[:-3] for f in os.listdir(BOT) if f.endswith(".py")}
+        tree = ast.parse(open(TOOL, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            names = []
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                names = [node.module]
+            for name in names:
+                assert name.split(".")[0] not in local, (
+                    f"the reviewer imports the bot module {name!r}; it is "
+                    "supposed to read JSON, not link against the runtime")

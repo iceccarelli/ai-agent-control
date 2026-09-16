@@ -185,7 +185,10 @@ class TestTheCharterSaysWhatItMustSay:
         assert doc["allows_progress"] is False
         assert doc["risk"]["allows_live_must_be_false"] is True
         assert set(doc) == {"allows_progress", "blockers", "stage_b", "risk",
-                            "next_actions"}
+                            "next_actions", "model", "key_status",
+                            "generated_utc"}
+        # The key is a status, never a value.
+        assert doc["key_status"] in ("missing", "present")
 
     def test_openclaw_is_recorded_absent_with_its_hook_points(self):
         """ABSENT is a finding. Inventing an integration would be worse."""
