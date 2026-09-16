@@ -313,6 +313,29 @@ ASSET_SOURCES_FULL = {
 CORPORA = {"frozen": ASSET_SOURCES, "full": ASSET_SOURCES_FULL}
 DEFAULT_CORPUS = "frozen"
 
+#: WHERE THE FROZEN SNAPSHOT ENDS. Everything past this is invisible to a
+#: `corpus="frozen"` measurement.
+#:
+#: The frozen corpus was "frozen" only by the convention that nobody appended
+#: to it, and `simulate` read whatever was on disk. But the FORWARD pilot needs
+#: those same two files to GROW — it is how Stage B accrues — so every bar the
+#: pilot gained silently restated `PHASE1_DECISION.md`'s headline figure of
+#: +9.66 %/yr on 15 trades. Two programmes, one unbounded read, and the carry
+#: number moving as a side effect of the pilot doing its job.
+#:
+#: So the snapshot is cut HERE, at the corpus as it stood when the figure was
+#: quoted: daily through 2026-08-24, funding through 2026-08-25 (the bound is
+#: exclusive at 2026-08-26T00:00:00Z so the last print of the 25th is kept).
+#: 1,476 daily rows and 4,431 funding prints — every row that was on disk —
+#: and the measurement reproduces at 9.6578 %/yr on 15 trades, unchanged.
+#:
+#: NOT `t1`. Bounding at the fold boundary was tried and measured 9.5464 %/yr,
+#: which is outside the pin's tolerance: the quoted figure was always computed
+#: over the whole file, 15 post-t1 bars included. A cut that "looks principled"
+#: and moves the number is a worse defect than the one it replaces.
+FROZEN_SNAPSHOT_CUT_DAILY = "2026-08-24"
+FROZEN_SNAPSHOT_CUT_FUNDING_MS = 1787760000000      # 2026-08-26T00:00:00Z
+
 
 def _sources(asset: str = DEFAULT_ASSET,
              corpus: str = DEFAULT_CORPUS) -> Dict[str, Any]:
@@ -690,6 +713,19 @@ def simulate(repo: str, *, notional: float = 100_000.0,
     perp = drop_open_bar(load_series(perp_path))
     spot, spot_source, same_venue = resolve_spot(repo, asset, corpus)
     ftimes, frates = load_funding(os.path.join(repo, source["funding"]))
+
+    # THE SNAPSHOT CUT. Applied to `frozen` only: the forward pilot appends to
+    # these files and a frozen measurement must not move when it does. `full`
+    # is unbounded on purpose — it is the corpus the pilot reads.
+    if str(corpus).lower() == "frozen":
+        perp = {k: v for k, v in perp.items()
+                if k.isoformat() <= FROZEN_SNAPSHOT_CUT_DAILY}
+        spot = {k: v for k, v in spot.items()
+                if k.isoformat() <= FROZEN_SNAPSHOT_CUT_DAILY}
+        kept = [(t, r) for t, r in zip(ftimes, frates)
+                if t < FROZEN_SNAPSHOT_CUT_FUNDING_MS]
+        ftimes = [t for t, _r in kept]
+        frates = [r for _t, r in kept]
 
     # A number computed over a corpus with an interior hole or an open bar is
     # WRONG, not old. carry_backtest used to intersect the three series in

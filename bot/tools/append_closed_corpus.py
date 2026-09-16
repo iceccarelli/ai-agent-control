@@ -122,10 +122,19 @@ def closed_linear_rows(fetch: Fetcher, *, after_open_ms: int, now_ms: int
 def funding_rows(fetch: Fetcher, *, after_ms: int, now_ms: int) -> List[Tuple[int, str]]:
     raw = fetch("fundingRate", {"symbol": SYMBOL, "startTime": after_ms + 1,
                                 "limit": 1000})
+    # CLOSED DAYS ONLY, matching `closed_linear_rows`. The bound used to be
+    # `t > now_ms`, which admits funding prints belonging to the still-OPEN
+    # daily bar — the same bar this tool refuses on the linear side. That
+    # asymmetry is a real defect: it appended three prints dated today while
+    # the daily series stopped at yesterday, so the frozen corpus reached into
+    # a day no other series had, and `set(frozen) <= set(full)` broke. A
+    # funding print inside an unclosed daily bar has no closed bar to attach
+    # to, so it is not appendable yet.
+    day_start_ms = (now_ms // DAY_MS) * DAY_MS
     out: List[Tuple[int, str]] = []
     for r in raw:
         t = int(r["fundingTime"])
-        if t <= after_ms or t > now_ms or str(r.get("symbol")) != SYMBOL:
+        if t <= after_ms or t >= day_start_ms or str(r.get("symbol")) != SYMBOL:
             continue
         hour_ms = (t // 3_600_000) * 3_600_000
         out.append((t, ",".join([iso(hour_ms), str(t), SYMBOL,
