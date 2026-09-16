@@ -37,11 +37,30 @@ edges at meaningful capacity, and nothing of (c).
    four venue boxes and its signature block are untouched.
    Still outstanding: **no walk-forward has been re-run through it**, so there
    is a linear simulator and still no linear number.
-2. **Run the measured rule in the runtime.** `ShadowStrategy` needs live
-   providers over `BybitClient.get_klines('D')` + funding history; add the
-   5-bar HORIZON time exit the runtime lacks. Then `build_bot` attaches
-   `ShadowStrategy` (never `MarketStrategy`) when `cleared_edge_signal` names
-   it; `MarketStrategy` becomes tools-only or is deleted.
+2. ~~**Run the measured rule in the runtime.**~~ **DONE 0062**, as
+   `BOOK_MODE=shadow`. Live providers over `get_klines('D')` and a new
+   `get_funding_history_fractions`; the 5-bar HORIZON time exit the runtime
+   genuinely lacked (`HORIZON` appeared only in the signal module and in
+   research tools, so a position ran to its stop or target and never timed
+   out — a cousin of the measured rule, not the rule). `shadow_is_permitted`
+   returns True on this tree, so the attach is live rather than decorative,
+   and a real run reads 299 linear daily bars and 200 funding prints.
+
+   **Three deliberate departures from the line above:**
+   * it attaches on `BOOK_MODE=shadow`, NOT automatically when
+     `cleared_edge_signal` names the rule. The repo's own reasoning for carry
+     applies: "selecting carry is a deliberate operator act rather than
+     something that happens by upgrade." An automatic attach would change what
+     a running process trades on the next deploy.
+   * `MarketStrategy` is NOT deleted and is still the `directional` default.
+     Deleting it is a separate change with its own blast radius.
+   * it refuses unless `CATEGORY=linear`. The rule was measured on linear
+     daily bars and the funding endpoint does not exist on spot; BTC spot and
+     perp closes are close enough that substituting one would be invisible.
+
+   **It changes what the shell RUNS, not what it may do.** Paper only, one
+   position, one entry per calendar day, 100.00 USD, every existing gate
+   unchanged, and the promotion gate still reads 2 of 8.
 3. **Testnet from a host that can reach Bybit.** `connector_check` must say
    BYBIT_TESTNET_OK before Track D. Kill-switch drill, recorded. Stop
    verification, recorded. That closes three human gate items.

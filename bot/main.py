@@ -42,6 +42,7 @@ import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+import datetime as dt
 from typing import Any, Dict, List, Optional
 
 import config as _config
@@ -115,6 +116,14 @@ class TradingBot:
         #: process running both would hold a hedged pair AND a directional bet
         #: against the same margin.
         self.carry = carry
+        #: HORIZON for the shadow book, in DAILY BARS. `None` for every other
+        #: mode. ROADMAP Stage A item 2: the cleared rule holds for at most
+        #: HORIZON bars and the runtime had no time exit at all — `HORIZON`
+        #: appeared only in the signal module and in research tools. A pilot
+        #: that holds to its stop or its target and never times out is not the
+        #: rule that was measured, it is a cousin of it, which is the same
+        #: class of error slice 58 found when the shadow entered mid-run.
+        self.shadow_horizon_days: Optional[int] = None
         #: The double-entry journal (0044). Attached by build_bot for a carry
         #: book and None for every other mode. Fills book themselves through
         #: LedgerBroker; tick() posts funding and writes the journal down.
@@ -583,6 +592,11 @@ class TradingBot:
                     decision.reason)
             return
 
+        # The time exit, BEFORE entries. A position at its horizon must leave
+        # this cycle even if the same cycle would open another.
+        if self.shadow_horizon_days:
+            self._expire_at_horizon()
+
         if self.strategy is None:
             # No signal source. Take no trades and say so, rather than inventing
             # one — the legacy fallback fabricated BUYs at confidence 0.66.
@@ -603,6 +617,52 @@ class TradingBot:
                 continue
             report = self.engine.execute(intent)
             logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
+
+    def _expire_at_horizon(self) -> None:
+        """Close any shadow position that has reached HORIZON daily bars.
+
+        The rule holds for at most `HORIZON` bars and then leaves at the close,
+        whatever the price. Nothing in the runtime enforced that: the engine
+        has no time exit at all, only maker timeouts. A position left to run to
+        its stop or its target is a DIFFERENT OBJECT from the one the cleared
+        measurement scored, and a monitor watching the wrong object is worse
+        than no monitor because it looks like diligence.
+
+        Counted in whole UTC days rather than in bars, which is the same thing
+        for a daily rule and needs no bar plumbing: the position's
+        `opened_epoch` is wall-clock, and a daily bar is a UTC day.
+
+        Best effort by design. A close that fails is logged and retried next
+        cycle rather than raising into the loop — the position keeps its
+        protective stop either way, so a failure here costs time, not safety.
+        """
+        horizon = int(self.shadow_horizon_days or 0)
+        if horizon <= 0:
+            return
+        today = dt.datetime.now(dt.timezone.utc).date()
+        try:
+            rows = list(self.store.open_positions())
+        except Exception:  # noqa: BLE001
+            logger.exception("could not read positions for the horizon exit")
+            return
+        for row in rows:
+            try:
+                opened = float(row.get("opened_epoch") or 0.0)
+                if opened <= 0:
+                    continue
+                entry_day = dt.datetime.fromtimestamp(
+                    opened, dt.timezone.utc).date()
+                held = (today - entry_day).days
+                if held < horizon:
+                    continue
+                symbol = str(row["symbol"])
+                report = self.engine.close_position(
+                    symbol=symbol, reason=f"HORIZON_{horizon}_BARS")
+                logger.warning(
+                    "shadow horizon exit: %s held %d days (horizon %d) -> %s",
+                    symbol, held, horizon, report.reason)
+            except Exception:  # noqa: BLE001
+                logger.exception("horizon exit failed for %r", row.get("symbol"))
 
     # -- shutdown ----------------------------------------------------------
 
@@ -719,7 +779,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
     #
     # An unrecognised mode still raises: a typo must not select a strategy.
     book_mode = str(getattr(cfg, "BOOK_MODE", "directional") or "directional").lower()
-    if book_mode not in ("carry", "directional"):
+    if book_mode not in ("carry", "directional", "shadow"):
         raise ValueError(
             f"BOOK_MODE={cfg.BOOK_MODE!r} is not a book. Refusing rather than "
             "falling back: a typo must not silently select a strategy.")
@@ -866,6 +926,66 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             bot.carry.max_notional_usd, bot.carry.borrow_apr,
             bot.carry.execution_mode, bot.carry.execution_style,
             _carry_orders_permitted()[1])
+        return bot
+
+    if book_mode == "shadow" and attach_strategy and bot.strategy is None:
+        # ROADMAP Stage A item 2. Until now `build_bot` attached
+        # `MarketStrategy` unconditionally — the legacy technical voter, whose
+        # Stage-1 verdict is ABSENT. The one rule this programme has ever
+        # cleared was wired into nothing, and `project_status` said so in as
+        # many words: "nothing wires that signal into the engine and no trading
+        # path consults the field. Wiring it up is a human decision that has
+        # not been taken."
+        #
+        # This is that wiring, and it changes what the shell RUNS, not what it
+        # is allowed to do: paper only, BTCUSDT only, one position, one entry
+        # per calendar day, 100.00 USD notional, every existing gate unchanged,
+        # and the promotion gate still 2 of 8.
+        # `import shadow as _shadow` lives inside the CARRY branch above, so
+        # it is not in scope here. Imported again rather than hoisted: the two
+        # branches are mutually exclusive and neither should pay for the
+        # other's imports.
+        # The rule trades a USDT-margined LINEAR perpetual and was measured on
+        # Binance linear daily bars. `get_klines` reads whatever category the
+        # process is configured for, so a spot-configured shell would feed the
+        # cleared rule SPOT bars and call the result the same rule. BTC spot
+        # and perp closes are near enough to make that invisible, which is
+        # exactly why it is refused rather than warned about.
+        # `import shadow as _shadow` lives inside the CARRY branch above, so
+        # it is not in scope here. Imported before the category check because
+        # the refusal names the signal.
+        import shadow as _shadow
+        from shadow_strategy import ShadowStrategy, live_providers
+
+        _category = str(getattr(cfg, "CATEGORY", "spot")).lower()
+        if _category != "linear":
+            raise ValueError(
+                f"BOOK_MODE=shadow requires CATEGORY=linear and this process "
+                f"is {_category!r}. {_shadow.SHADOW_SIGNAL} was measured on "
+                "linear daily bars, and the funding endpoint it reads does not "
+                "exist on spot. Refusing rather than substituting an "
+                "instrument: BTC spot and perp closes are near enough to make "
+                "the substitution invisible.")
+
+        status_provider, bar_provider, funding_provider = live_providers(
+            bot.client, lookback_days=int(getattr(cfg, "KLINE_LOOKBACK", 300)))
+        bot.strategy = ShadowStrategy(
+            status_provider=status_provider,
+            funding_provider=funding_provider,
+            bar_provider=bar_provider,
+        )
+        # The time exit the runtime never had. Read from the frozen module so
+        # it cannot drift from the rule that was measured.
+        from signals import funding_carry_fade_btc_v1 as _fb
+
+        bot.shadow_horizon_days = int(_fb.HORIZON)
+        allowed, why = _shadow.shadow_is_permitted(status_provider())
+        logger.warning(
+            "BOOK_MODE=shadow: %s attached for %s, cap $%.2f, permitted=%s "
+            "(%s). The directional voter is NOT attached. A shadow fill is "
+            "not evidence of skill — it exists to detect DECAY.",
+            _shadow.SHADOW_SIGNAL, _shadow.SHADOW_SYMBOL,
+            _shadow.SHADOW_MAX_NOTIONAL_USD, allowed, why)
         return bot
 
     if attach_strategy and bot.strategy is None:

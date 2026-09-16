@@ -1355,6 +1355,54 @@ class BybitClient:
                 return row
         return None
 
+    def get_funding_history_fractions(
+        self, symbol: str, limit: int = 200
+    ) -> List[Tuple[int, float]]:
+        """Settled funding prints as ``(epoch_ms, FRACTION)``, oldest first.
+
+        THE UNIT IS IN THE NAME ON PURPOSE. `carry_broker.get_funding_history`
+        returns the same endpoint in BASIS POINTS, and the rule this feeds
+        compares against ``FUND_ABS = 0.0001``, a fraction. Mixing the two is a
+        factor of 10,000 that does not raise, does not look wrong, and produces
+        ZERO setups — which reads as a market finding rather than a unit bug.
+        `tests/test_funding_carry_fade_v1.py` opens by recording that exact
+        failure happening once already.
+
+        Settled prints only: this is the same `/v5/market/funding/history` the
+        carry book reads, and every row it returns has already paid.
+        """
+        # LINEAR, not self.category. Funding exists only on perpetuals, and
+        # `/v5/market/funding/history` answers "Illegal category" for spot —
+        # which a caller would experience as an exception, or worse, as the
+        # shadow path standing aside forever because it catches provider
+        # failures and treats them as "no setup". `carry_broker` hardcodes the
+        # same constant for the same reason.
+        payload = self._request(
+            "GET", "/v5/market/funding/history",
+            params={"category": "linear", "symbol": symbol,
+                    "limit": max(1, min(int(limit), 200))},
+        )
+        rows = (payload.get("result", {}) or {}).get("list") or []
+        out: List[Tuple[int, float]] = []
+        for row in rows:
+            try:
+                rate = float(row["fundingRate"])          # already a FRACTION
+                stamp = int(row["fundingRateTimestamp"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if math.isfinite(rate) and stamp > 0:
+                out.append((stamp, rate))
+        out.sort(key=lambda pair: pair[0])
+        # Strictly increasing: FundingSeries does a binary search and refuses a
+        # series that is not, so a duplicated stamp must be dropped here rather
+        # than raising deep inside the rule.
+        deduped: List[Tuple[int, float]] = []
+        for stamp, rate in out:
+            if deduped and stamp <= deduped[-1][0]:
+                continue
+            deduped.append((stamp, rate))
+        return deduped
+
     def get_closed_pnl(self, symbol: str, *, since_ms: int = 0,
                        limit: int = 50) -> List[Dict[str, Any]]:
         """Closed-PnL records for ``symbol`` newer than ``since_ms``. Linear only.

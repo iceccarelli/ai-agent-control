@@ -480,9 +480,14 @@ class Config:
     ENTRIES_ENABLED: bool
 
     #: Which book this process runs. "carry" (delta-neutral spot/perp pair,
-    #: collects funding) or "directional" (the legacy technical voter, whose
-    #: Stage-1 verdict is ABSENT). build_bot attaches ONE and returns: they
-    #: share a liquidation price and must never run in the same process.
+    #: collects funding), "shadow" (the one cleared rule,
+    #: `funding_carry_fade_btc_v1`, paper only and capped at
+    #: SHADOW_MAX_NOTIONAL_USD) or "directional" (the legacy technical voter,
+    #: whose Stage-1 verdict is ABSENT). build_bot attaches ONE and returns:
+    #: they share a liquidation price and must never run in the same process.
+    #: "shadow" is the only one of the three running a rule that has ever
+    #: cleared a gate, and it is still not evidence — it exists to detect
+    #: DECAY, and the promotion gate stays 2 of 8 with it attached.
     BOOK_MODE: str = "directional"
     CARRY_SPOT_SYMBOL: str = "BTCUSDT"
     CARRY_PERP_SYMBOL: str = "BTCUSDT"

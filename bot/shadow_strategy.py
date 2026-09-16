@@ -47,7 +47,7 @@ from trading_engine import TradeIntent
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ShadowStrategy"]
+__all__ = ["ShadowStrategy", "live_providers"]
 
 
 class ShadowStrategy:
@@ -258,3 +258,91 @@ def _wilder_atr_last(bars: Sequence[Any], period: int) -> Optional[float]:
     for value in trs[period:]:
         atr = (atr * (period - 1) + value) / float(period)
     return atr
+
+
+# ---------------------------------------------------------------------------
+# the live wiring (ROADMAP Stage A item 2)
+# ---------------------------------------------------------------------------
+
+
+class _LiveBar:
+    """The minimum a daily bar must be for the frozen rule to read it.
+
+    Deliberately NOT `backtest.Bar`: `backtest.py` is not in the runtime image
+    (the Dockerfile ships a named module list and `tests/test_dockerfile.py`
+    recomputes it), so depending on it here would make the container fail to
+    import at startup. The rule only ever touches `start_ms`, `open`, `high`,
+    `low` and `close`; `close_time_ms` falls back to
+    `start_ms + 86_400_000 - 1` when a bar records no end, which is the same
+    instant for a daily bar.
+    """
+
+    __slots__ = ("start_ms", "open", "high", "low", "close", "volume")
+
+    def __init__(self, start_ms, open_, high, low, close, volume=0.0):
+        self.start_ms = int(start_ms)
+        self.open = float(open_)
+        self.high = float(high)
+        self.low = float(low)
+        self.close = float(close)
+        self.volume = float(volume)
+
+
+def live_providers(client, *, lookback_days: int = 300):
+    """`(status_provider, bar_provider, funding_provider)` reading the VENUE.
+
+    The three callables `ShadowStrategy` is constructed with, wired to the same
+    `BybitClient` the rest of the shell uses, so the pilot decides on the
+    prices the engine would trade at rather than on a corpus.
+
+    THE TWO THINGS THAT WOULD SILENTLY BREAK THIS
+    =============================================
+    * **Units.** `funding_provider` must yield FRACTIONS, because the rule
+      compares its rates against `FUND_ABS`, which is a fraction. The value is
+      deliberately NOT repeated here: `test_the_shadow_declares_no_constants_of
+      _its_own` forbids this module restating any of the rule's numbers, and it
+      is right to — a value copied into a docstring goes stale silently while
+      still reading as authoritative. The other funding reader in this tree,
+      `carry_broker.get_funding_history`, returns BASIS POINTS from the same
+      endpoint. A 10,000x mismatch does not raise and does not look wrong — it
+      produces ZERO setups, which reads as a quiet market rather than as a bug.
+      `get_funding_history_fractions` carries its unit in its name for that
+      reason, and this is the only caller that matters.
+    * **The open bar.** `get_klines` already drops the in-progress candle, so
+      the last element is the newest CLOSED bar. The rule's decision index is
+      `len(bars) - 2` and it fills at `bars[decision + 1].open` — the open of
+      that newest closed bar. Handing it an unclosed candle would fill at a
+      price that has not happened yet.
+
+    A provider raises when the venue cannot be read rather than returning an
+    empty series, and `ShadowStrategy._current_setup` catches it and stands
+    aside. An empty series is indistinguishable from "no setup", which is
+    precisely the confusion this avoids.
+    """
+    import config as _config                        # noqa: PLC0415
+    import project_status as _ps                    # noqa: PLC0415
+
+    cfg = getattr(client, "cfg", None) or _config.get_config_object()
+
+    def status_provider():
+        return _ps.current(cfg)
+
+    def bar_provider(symbol: str):
+        rows = client.get_klines(
+            symbol, interval="D",
+            limit=max(32, min(int(lookback_days), 1000)))
+        bars = []
+        for row in rows:
+            # Bybit V5 kline row: start, open, high, low, close, volume, turnover
+            bars.append(_LiveBar(int(row[0]), row[1], row[2], row[3], row[4],
+                                 row[5] if len(row) > 5 else 0.0))
+        return bars
+
+    def funding_provider(symbol: str):
+        prints = client.get_funding_history_fractions(symbol, limit=200)
+        return signal_module.FundingSeries(
+            [stamp for stamp, _rate in prints],
+            [rate for _stamp, rate in prints],
+            symbol=symbol)
+
+    return status_provider, bar_provider, funding_provider

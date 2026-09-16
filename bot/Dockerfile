@@ -26,7 +26,7 @@ COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
      market_snapshot.py memory.py ml_strategy.py persistence.py \
      policy.py position_sizing.py project_status.py promotion_gate.py \
      pure_indicators.py risk_management.py session_log.py shadow.py \
-     technical_analysis.py trading_engine.py ./
+     shadow_strategy.py technical_analysis.py trading_engine.py ./
 COPY signals/ ./signals/
 
 # The operator tools, named ONE BY ONE — never `COPY tools/`, which would put
