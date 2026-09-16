@@ -595,14 +595,46 @@ class TestTheBacktesterUsesTheCorpus:
         view = bt._backtest_config_view(bt.BacktestConfig(max_position_pct=0.02))
         assert view.MAX_POSITION_SIZE_PCT == pytest.approx(0.02)
 
-    def test_a_linear_backtest_is_refused_rather_than_mis_reported(self):
-        """Cash accounting cannot price a perp. It would not fail — it would
-        succeed and omit funding and liquidation, in the flattering direction."""
+    def test_a_linear_backtest_runs_and_is_not_flattering(self):
+        """This test used to assert the refusal. The refusal is gone, and it is
+        replaced by the property the refusal existed to protect.
+
+        Cash accounting could not price a perp: it would not fail, it would
+        SUCCEED and omit funding and liquidation, in the flattering direction.
+        `LinearSimulatedExchange` prices both (ROADMAP Stage A item 1), so what
+        must now be asserted is that the terms actually COST money — a
+        simulator that models funding nominally and charges nothing would pass
+        a structural test and still report the flattering number.
+        """
+        bars = [bt.Bar(1_600_000_000_000 + i * 3_600_000, 100, 101, 99, 100, 10)
+                for i in range(300)]
+        result = bt.Backtester(
+            {"BTCUSDT": bars},
+            bt.BacktestConfig(category="linear", warmup_bars=120)).run()
+        assert result.bars > 0
+
+        # Funding is charged, and charging it is strictly worse for a long.
+        # These bars are 8h apart on purpose: the hourly ones above contain no
+        # settlement at all, so asserting against them would assert nothing.
+        eight_hourly = [
+            bt.Bar(1_600_000_000_000 + i * 28_800_000, 100, 101, 99, 100, 10)
+            for i in range(4)]
+        venue = bt.LinearSimulatedExchange(
+            {"BTCUSDT": eight_hourly}, starting_cash=1_000.0,
+            funding_rate_per_8h=0.001)
+        venue.positions["BTCUSDT"] = bt._SimPosition(
+            symbol="BTCUSDT", side="Buy", size=1.0, entry_price=100.0)
+        venue._apply_funding("BTCUSDT", eight_hourly[0])
+        assert venue.funding_paid > 0.0
+
+    def test_an_unsupported_category_is_still_refused(self):
+        """Closing the linear gap must not open a door for inverse or option,
+        which have no simulator and would be flattering in the same way."""
         bars = [bt.Bar(1_600_000_000_000 + i * 3_600_000, 100, 101, 99, 100, 10)
                 for i in range(300)]
         with pytest.raises(NotImplementedError) as exc:
             bt.Backtester({"BTCUSDT": bars},
-                          bt.BacktestConfig(category="linear")).run()
+                          bt.BacktestConfig(category="inverse")).run()
         assert "funding" in str(exc.value)
 
 

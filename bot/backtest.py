@@ -34,7 +34,9 @@ Stated plainly, because the gap between these and reality is where over-optimism
 lives:
 
 * partial fills and queue position for limit orders (legs fill fully or not at all)
-* funding, borrow interest, and exchange downtime
+* borrow interest and exchange downtime. **Funding and liquidation ARE modelled
+  on ``category="linear"``** (``LinearSimulatedExchange``) and are absent on
+  spot because a spot account has neither.
 * market impact — size is assumed not to move the book
 * latency between signal and submission
 
@@ -65,6 +67,7 @@ logger = logging.getLogger("backtest")
 __all__ = [
     "Bar",
     "SimulatedExchange",
+    "LinearSimulatedExchange",
     "BacktestConfig",
     "BacktestResult",
     "Backtester",
@@ -580,6 +583,438 @@ class SimulatedExchange(Transport):
 
 
 # ---------------------------------------------------------------------------
+# the perpetual simulator
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _SimPosition:
+    """A USDT-margined perpetual position. No base coin ever changes hands."""
+
+    symbol: str
+    side: str                     # "Buy" == long, "Sell" == short
+    size: float
+    entry_price: float
+    stop_loss: float = 0.0
+    take_profit: float = 0.0
+    leverage: float = 1.0
+    opened_index: int = 0
+
+    @property
+    def direction(self) -> float:
+        return 1.0 if normalize_side(self.side) == "Buy" else -1.0
+
+    def unrealised(self, mark: float) -> float:
+        return self.direction * self.size * (float(mark) - self.entry_price)
+
+
+class LinearSimulatedExchange(SimulatedExchange):
+    """A USDT-margined perpetual venue, for the instrument the rule trades.
+
+    WHY THIS EXISTS
+    ===============
+    ``Backtester.run()`` refused ``category="linear"`` for good reason: the
+    spot simulator keeps **cash accounting** — a Buy debits quote and credits
+    base — and running a perp through it would not fail. It would *succeed*,
+    and report an equity curve with no funding drag and no liquidation. Wrong
+    in the flattering direction.
+
+    `funding_carry_fade_btc_v1` trades a linear perpetual. So the protective
+    stop guarantee this repository asserts everywhere — *a confirmed position
+    always has a verified protective stop* — had **never been exercised end to
+    end on the instrument the signal actually trades**
+    (`docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md`). That is the gap
+    this closes, and it is the reason the class exists at all.
+
+    WHAT IS DIFFERENT FROM SPOT, AND WHY EACH ONE MATTERS
+    ====================================================
+    * **No base balance.** A position is margin-collateralised. ``equity()`` is
+      cash plus unrealised PnL, marked continuously.
+    * **Funding accrues.** Every 8h settlement the position crosses, a long
+      PAYS positive funding and a short receives it. This is the term whose
+      absence made a linear backtest flattering, so it is charged from a real
+      series when one is supplied and from a declared constant otherwise.
+    * **Liquidation exists.** A position can be closed by the venue before its
+      stop is reached, which no amount of stop discipline prevents.
+    * **The stop is a FIELD ON THE POSITION**, not an order. The live path uses
+      ``POST /v5/position/trading-stop`` (`bybit_connection._place_position_stop`)
+      and verifies it by reading ``stopLoss`` back off ``/v5/position/list``.
+      A conditional ``StopOrder`` — the spot mechanism — is not how this
+      instrument is protected, so simulating only that would leave the real
+      mechanism untested.
+
+    THE ORDER OF EVENTS INSIDE ONE BAR
+    ==================================
+    A bar gives range, not path, and the spot simulator's rule — when in doubt,
+    assume the unfavourable resolution — is kept. But between a stop and a
+    liquidation the path is NOT in doubt, and pretending it is would be its own
+    distortion:
+
+        funding  ->  whichever of {stop, liquidation} lies NEARER in the
+                     adverse direction  ->  take-profit
+
+    A protective stop sits between the entry and the liquidation price, so
+    price must cross the stop first and the stop fills. Liquidation wins only
+    when it is genuinely nearer — an under-margined position, which is exactly
+    the case worth simulating. Firing liquidation first unconditionally would
+    be pessimistic rather than conservative, and a simulator that is wrong in
+    the safe direction still cannot be used to size anything.
+
+    WHAT IS APPROXIMATED, SAID PLAINLY
+    ==================================
+    * Liquidation is computed **cross-margin against total account cash**. With
+      one open position that is exact; with several it is optimistic, because
+      the venue would also hold margin against the others. The backtests this
+      serves run one symbol, and a multi-symbol run records the note.
+    * The maintenance-margin rate is a single number, not Bybit's tiered risk
+      ladder. Tier 1 BTCUSDT is 0.33%; the default here is 0.5%, which is
+      stricter, and it is a constructor argument rather than a constant.
+    * Funding is charged at the settlement the bar CONTAINS. Sub-bar timing is
+      not modelled, which matters only for bars longer than 8h.
+    """
+
+    #: Bybit settles funding at 00:00, 08:00 and 16:00 UTC.
+    FUNDING_INTERVAL_MS = 8 * 3_600_000
+
+    def __init__(
+        self,
+        bars_by_symbol: Mapping[str, Sequence[Bar]],
+        *,
+        starting_cash: float = 10_000.0,
+        quote_asset: Optional[str] = None,
+        taker_fee: float = 0.00055,
+        maker_fee: float = 0.0002,
+        slippage: float = 0.0005,
+        instrument_filters: Optional[Mapping[str, Mapping[str, str]]] = None,
+        books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+        funding_rate_per_8h: float = 0.0001,
+        funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
+        maintenance_margin_rate: float = 0.005,
+        leverage: float = 1.0,
+    ) -> None:
+        super().__init__(
+            bars_by_symbol, starting_cash=starting_cash, quote_asset=quote_asset,
+            taker_fee=taker_fee, maker_fee=maker_fee, slippage=slippage,
+            instrument_filters=instrument_filters, books_by_symbol=books_by_symbol,
+        )
+        self.positions: Dict[str, _SimPosition] = {}
+        self.funding_rate_per_8h = float(funding_rate_per_8h)
+        #: ``{symbol: [(settlement_ms, rate), ...]}``, ascending. A REAL series
+        #: when one is supplied; the constant above is the fallback and the
+        #: runs that used it say so.
+        self.funding_by_symbol: Dict[str, List[Tuple[int, float]]] = {
+            s: sorted((int(t), float(r)) for t, r in rows)
+            for s, rows in (funding_by_symbol or {}).items()
+        }
+        self.maintenance_margin_rate = float(maintenance_margin_rate)
+        self.leverage = float(leverage)
+        self.funding_paid = 0.0
+        self.liquidations: List[Dict[str, Any]] = []
+        #: Settlements already charged, so a re-resolved bar cannot double-bill.
+        self._funded: set = set()
+
+    # -- accounting --------------------------------------------------------
+
+    def equity(self) -> float:
+        """Cash plus unrealised PnL at the current mark. No base holdings."""
+        total = self.balances.get(self.quote_asset, 0.0)
+        for symbol, position in self.positions.items():
+            total += position.unrealised(self.bars[symbol][self.index].close)
+        return total
+
+    def _cash(self, delta: float) -> None:
+        self.balances[self.quote_asset] = (
+            self.balances.get(self.quote_asset, 0.0) + float(delta))
+
+    def liquidation_price(self, symbol: str) -> Optional[float]:
+        """Mark at which equity no longer covers maintenance margin.
+
+        Solved from ``cash + dir*S*(p - E) <= mmr*S*p``. ``None`` when the
+        position cannot be liquidated at any positive price — a long backed by
+        cash worth more than the position, which is the collateralised case.
+        """
+        position = self.positions.get(symbol)
+        if position is None or position.size <= 0:
+            return None
+        cash = self.balances.get(self.quote_asset, 0.0)
+        size, entry = position.size, position.entry_price
+        mmr = self.maintenance_margin_rate
+        if normalize_side(position.side) == "Buy":
+            price = (size * entry - cash) / (size * (1.0 - mmr))
+        else:
+            price = (cash + size * entry) / (size * (1.0 + mmr))
+        return price if price > 0 else None
+
+    # -- fills -------------------------------------------------------------
+
+    def _execute(self, order: _SimOrder, price: float, *, taker: bool) -> None:
+        """Open, add to, reduce or flip a position. Nothing credits a base coin."""
+        symbol = order.symbol
+        fee_rate = self.taker_fee if taker else self.maker_fee
+        fill_price = price * (
+            (1 + self.slippage) if (taker and order.side == "Buy")
+            else (1 - self.slippage) if taker else 1.0
+        )
+        qty = float(order.qty)
+        if qty <= 0:
+            order.status = "Rejected"
+            return
+        fee = qty * fill_price * fee_rate
+        position = self.positions.get(symbol)
+        incoming = 1.0 if normalize_side(order.side) == "Buy" else -1.0
+
+        if position is None or position.size <= 1e-12:
+            # Opening. Initial margin must be affordable from cash.
+            margin = qty * fill_price / max(1e-9, self.leverage)
+            if self.balances.get(self.quote_asset, 0.0) < margin + fee:
+                order.status = "Rejected"
+                return
+            self.positions[symbol] = _SimPosition(
+                symbol=symbol, side=order.side, size=qty,
+                entry_price=fill_price, leverage=self.leverage,
+                opened_index=self.index)
+        elif position.direction == incoming:
+            margin = qty * fill_price / max(1e-9, self.leverage)
+            if self.balances.get(self.quote_asset, 0.0) < margin + fee:
+                order.status = "Rejected"
+                return
+            notional = position.size * position.entry_price + qty * fill_price
+            position.size += qty
+            position.entry_price = notional / position.size
+        else:
+            closing = min(qty, position.size)
+            self._cash(position.direction * closing
+                       * (fill_price - position.entry_price))
+            position.size -= closing
+            remainder = qty - closing
+            if position.size <= 1e-12:
+                self.positions.pop(symbol, None)
+                if remainder > 1e-12:
+                    self.positions[symbol] = _SimPosition(
+                        symbol=symbol, side=order.side, size=remainder,
+                        entry_price=fill_price, leverage=self.leverage,
+                        opened_index=self.index)
+
+        self._cash(-fee)
+        self.fees_paid += fee
+        order.status = "Filled"
+        order.avg_price = fill_price
+        order.cum_qty = qty
+        self.fill_log.append({
+            "order_link_id": order.order_link_id, "symbol": symbol,
+            "side": order.side, "qty": qty, "price": fill_price,
+            "fee": fee, "purpose": order.purpose, "bar": self.index,
+        })
+
+    def _close_at(self, symbol: str, price: float, *, purpose: str) -> None:
+        """Close the whole position at ``price`` and log it as an exit fill.
+
+        A position-attached stop has **no order id at the venue** — it is a
+        field, written by ``/v5/position/trading-stop``, and Bybit issues no
+        ``orderLinkId`` for it. So the fill is logged with an empty one rather
+        than an invented one, and ``record_exit_fill`` accepts that: the id is
+        passed through to the trade record, not used to find the position.
+        """
+        position = self.positions.get(symbol)
+        if position is None or position.size <= 0:
+            return
+        exit_side = "Sell" if normalize_side(position.side) == "Buy" else "Buy"
+        qty = position.size
+        fee = qty * price * self.taker_fee
+        self._cash(position.direction * qty * (price - position.entry_price) - fee)
+        self.fees_paid += fee
+        self.positions.pop(symbol, None)
+        self.fill_log.append({
+            "order_link_id": "", "symbol": symbol, "side": exit_side,
+            "qty": qty, "price": price, "fee": fee,
+            "purpose": purpose, "bar": self.index,
+        })
+
+    # -- the bar -----------------------------------------------------------
+
+    def _funding_rate_at(self, symbol: str, stamp_ms: int) -> float:
+        rows = self.funding_by_symbol.get(symbol)
+        if not rows:
+            return self.funding_rate_per_8h
+        best = None
+        for settle_ms, rate in rows:
+            if settle_ms <= stamp_ms:
+                best = rate
+            else:
+                break
+        return self.funding_rate_per_8h if best is None else best
+
+    def _apply_funding(self, symbol: str, bar: Bar) -> None:
+        """Charge every 8h settlement this bar contains. A long pays a positive rate."""
+        position = self.positions.get(symbol)
+        if position is None or position.size <= 0:
+            return
+        span = self.FUNDING_INTERVAL_MS
+        start, end = bar.start_ms, bar.start_ms + self._bar_span_ms(symbol)
+        first = ((start + span - 1) // span) * span
+        for settle in range(first, end, span):
+            key = (symbol, settle)
+            if key in self._funded:
+                continue
+            self._funded.add(key)
+            rate = self._funding_rate_at(symbol, settle)
+            paid = position.direction * rate * position.size * bar.close
+            self._cash(-paid)
+            self.funding_paid += paid
+
+    def _bar_span_ms(self, symbol: str) -> int:
+        series = self.bars[symbol]
+        if len(series) < 2:
+            return self.FUNDING_INTERVAL_MS
+        return max(1, series[1].start_ms - series[0].start_ms)
+
+    def _resolve_bar(self, symbol: str, bar: Bar) -> None:
+        self._apply_funding(symbol, bar)
+        position = self.positions.get(symbol)
+        if position is not None and position.size > 0:
+            long = normalize_side(position.side) == "Buy"
+            adverse = bar.low if long else bar.high
+            stop = position.stop_loss if position.stop_loss > 0 else None
+            liq = self.liquidation_price(symbol)
+
+            hit_stop = stop is not None and (
+                bar.low <= stop if long else bar.high >= stop)
+            hit_liq = liq is not None and (
+                bar.low <= liq if long else bar.high >= liq)
+
+            if hit_stop and hit_liq:
+                # Both levels are inside the range. The NEARER one is crossed
+                # first, and which that is is a fact about the two prices, not
+                # a guess about the path.
+                stop_first = (stop > liq) if long else (stop < liq)
+                if stop_first:
+                    self._close_at(symbol, stop, purpose="stop")
+                else:
+                    self._liquidate(symbol, liq)
+            elif hit_stop:
+                self._close_at(symbol, stop, purpose="stop")
+            elif hit_liq:
+                self._liquidate(symbol, liq)
+            else:
+                position_tp = position.take_profit
+                if position_tp > 0 and (
+                        bar.high >= position_tp if long else bar.low <= position_tp):
+                    self._close_at(symbol, position_tp, purpose="tp")
+            del adverse
+
+        # Resting orders: take-profit legs are ordinary reduce orders on linear.
+        for order in list(self.orders.values()):
+            if order.symbol != symbol or order.status != "New":
+                continue
+            if order.order_type != "Limit":
+                continue
+            filled = (bar.high >= order.price if order.side == "Sell"
+                      else bar.low <= order.price)
+            if filled and symbol in self.positions:
+                self._execute(order, order.price, taker=False)
+
+    def _liquidate(self, symbol: str, price: float) -> None:
+        position = self.positions.get(symbol)
+        if position is None:
+            return
+        self.liquidations.append({
+            "symbol": symbol, "bar": self.index, "price": price,
+            "size": position.size, "side": position.side,
+            "entry_price": position.entry_price,
+        })
+        self._close_at(symbol, price, purpose="liquidation")
+
+    # -- transport ---------------------------------------------------------
+
+    def _position_row(self, symbol: str) -> Optional[Dict[str, Any]]:
+        position = self.positions.get(symbol)
+        if position is None or position.size <= 0:
+            return None
+        mark = self.bars[symbol][self.index].close
+        liq = self.liquidation_price(symbol)
+        return {
+            "symbol": symbol,
+            "side": position.side,
+            "size": str(position.size),
+            "avgPrice": str(position.entry_price),
+            "markPrice": str(mark),
+            "positionValue": str(position.size * mark),
+            "unrealisedPnl": str(position.unrealised(mark)),
+            "leverage": str(position.leverage),
+            "positionIdx": 0,
+            # "" is how Bybit reports a stop that is not set, and how it
+            # reports a liquidation price outside its bounds. Both are read as
+            # absent by the live code, so both are spelled the venue's way.
+            "stopLoss": str(position.stop_loss) if position.stop_loss > 0 else "",
+            "takeProfit": (str(position.take_profit)
+                           if position.take_profit > 0 else ""),
+            "liqPrice": str(liq) if liq else "",
+        }
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        params: Optional[Mapping[str, Any]] = None,
+        body: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Tuple[int, str]:
+        path = url.split("?", 1)[0]
+        for prefix in ("https://api-testnet.bybit.com", "https://api.bybit.com"):
+            path = path.replace(prefix, "")
+        query = url.split("?", 1)[1] if "?" in url else ""
+        query_params = dict(
+            kv.split("=", 1) for kv in query.split("&") if "=" in kv
+        ) if query else {}
+        merged = {**query_params, **dict(params or {})}
+
+        def ok(result: Any) -> Tuple[int, str]:
+            return 200, json.dumps({"retCode": 0, "retMsg": "OK", "result": result})
+
+        def err(code: int, msg: str) -> Tuple[int, str]:
+            return 200, json.dumps({"retCode": code, "retMsg": msg, "result": {}})
+
+        if path == "/v5/position/list":
+            row = self._position_row(str(merged.get("symbol", "")))
+            return ok({"list": [row] if row else []})
+
+        if path == "/v5/position/trading-stop":
+            payload = json.loads(body or "{}")
+            symbol = str(payload.get("symbol", ""))
+            position = self.positions.get(symbol)
+            if position is None or position.size <= 0:
+                return err(110017, "position idx not match position mode")
+            if "stopLoss" in payload:
+                position.stop_loss = float(payload.get("stopLoss") or 0.0)
+            if payload.get("takeProfit"):
+                position.take_profit = float(payload["takeProfit"])
+            return ok({})
+
+        if path == "/v5/position/set-leverage":
+            payload = json.loads(body or "{}")
+            self.leverage = float(payload.get("buyLeverage") or self.leverage)
+            return ok({})
+
+        if path == "/v5/position/closed-pnl":
+            return ok({"list": []})
+
+        if path == "/v5/market/tickers":
+            symbol = str(merged.get("symbol", ""))
+            if symbol not in self.bars:
+                return ok({"list": []})
+            bar = self.bars[symbol][self.index]
+            return ok({"list": [{
+                "symbol": symbol, "lastPrice": str(bar.close),
+                "fundingRate": str(self._funding_rate_at(symbol, bar.start_ms)),
+            }]})
+
+        return super().request(method, url, headers=headers, params=params,
+                               body=body, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
 # the backtester
 # ---------------------------------------------------------------------------
 
@@ -609,6 +1044,10 @@ class BacktestConfig:
     #: honours the difference; it does not pretend a spot account can short.
     category: str = "spot"
     funding_rate_bps_per_8h: float = 1.0
+    #: Maintenance margin, linear only. Bybit's BTCUSDT tier 1 is 0.33%; this
+    #: default is stricter. A single rate rather than the tiered risk ladder,
+    #: which is an approximation the simulator's docstring states.
+    maintenance_margin_rate: float = 0.005
     max_hold_hours: float = 8.0
     #: ``None`` == derive from costs, which is what live does. Set it only to
     #: measure the effect of a different floor, never to get more trades.
@@ -800,6 +1239,7 @@ class Backtester:
         config: Optional[BacktestConfig] = None,
         db_path: str = ":memory:",
         books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+        funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
     ) -> None:
         self.bars = {s: list(b) for s, b in bars_by_symbol.items()}
         self.cfg = config or BacktestConfig()
@@ -807,42 +1247,54 @@ class Backtester:
         #: Per-bar L2 ladders. Optional: without them the liquidity gate has
         #: nothing to evaluate and abstains, which the result notes record.
         self.books = {s: list(b) for s, b in (books_by_symbol or {}).items()}
+        #: ``{symbol: [(settlement_ms, rate), ...]}``. Linear only. Without it
+        #: funding is charged at the CONSTANT declared in the config, and a run
+        #: that used the constant is not a run that priced the real series.
+        self.funding = {s: list(r) for s, r in (funding_by_symbol or {}).items()}
 
     def run(self) -> BacktestResult:
         cfg = self.cfg
-        if cfg.category != "spot":
-            # SimulatedExchange keeps **cash accounting**: a Buy debits quote
-            # and credits base, a Sell does the reverse, and a Sell is rejected
-            # when the base balance is short. That is spot, exactly.
+        if cfg.category not in ("spot", "linear"):
+            # Two categories can be priced: `spot` by SimulatedExchange's cash
+            # accounting, and `linear` by LinearSimulatedExchange's position
+            # accounting, which marks unrealised PnL continuously, accrues
+            # funding every eight hours, and can liquidate a position before
+            # its stop is reached.
             #
-            # A perpetual is a different animal: no base asset changes hands,
-            # the position is margin-collateralised, unrealised PnL marks
-            # against equity continuously, funding accrues every eight hours,
-            # and a losing position can be liquidated before its stop is
-            # reached. Running the linear path through cash accounting would
-            # not fail — it would *succeed*, and produce an equity curve with
-            # no funding drag and no liquidation. The number would be wrong in
-            # the flattering direction, which is the worst kind of wrong.
+            # `inverse` and `option` can be priced by neither. Running either
+            # through the machinery that exists would not fail — it would
+            # *succeed*, and produce an equity curve missing the terms that
+            # cost money. Wrong in the flattering direction, which is the worst
+            # kind of wrong. An inverse contract is coin-margined, so its PnL
+            # is non-linear in the price; an option has a premium and a greeks
+            # surface. Neither is a special case of what is here.
             #
-            # So this refuses. The linear ORDER path is implemented and tested
-            # against a fake exchange (position-attached stops, positionIdx,
-            # margin checks, the funding gate); what does not exist yet is a
-            # simulator that can price it. Until it does, there is no honest
-            # linear backtest to report, and a missing number is better than an
-            # invented one.
+            # So this still refuses, for the same reason it once refused
+            # linear: a missing number is better than an invented one.
             raise NotImplementedError(
-                f"the simulator models spot cash accounting only; a "
-                f"category={cfg.category!r} backtest would omit funding, margin "
-                "and liquidation and report a flattering result. The linear "
-                "live path is implemented and unit-tested; perp simulation is "
-                "not. See MARKET_CATEGORIES.md."
+                f"category={cfg.category!r} has no simulator; the backtest "
+                "would omit funding, margin and liquidation and report a "
+                "flattering result. `spot` and `linear` are priced — see "
+                "LinearSimulatedExchange and MARKET_CATEGORIES.md. An inverse "
+                "contract is coin-margined and an option has a premium, so "
+                "neither is a special case of either."
             )
         view = _backtest_config_view(cfg)
-        exchange = SimulatedExchange(
-            self.bars, starting_cash=cfg.starting_cash,
-            taker_fee=cfg.taker_fee, maker_fee=cfg.maker_fee,
-            slippage=cfg.slippage, books_by_symbol=self.books,
-        )
+        if cfg.category == "linear":
+            exchange: SimulatedExchange = LinearSimulatedExchange(
+                self.bars, starting_cash=cfg.starting_cash,
+                taker_fee=cfg.taker_fee, maker_fee=cfg.maker_fee,
+                slippage=cfg.slippage, books_by_symbol=self.books,
+                funding_rate_per_8h=cfg.funding_rate_bps_per_8h / 10_000.0,
+                funding_by_symbol=self.funding,
+                maintenance_margin_rate=cfg.maintenance_margin_rate,
+            )
+        else:
+            exchange = SimulatedExchange(
+                self.bars, starting_cash=cfg.starting_cash,
+                taker_fee=cfg.taker_fee, maker_fee=cfg.maker_fee,
+                slippage=cfg.slippage, books_by_symbol=self.books,
+            )
         store = StateStore(self.db_path)
         client = BybitClient(config=view, store=store, transport=exchange)
         risk = BillionaireRiskManager(config=view, store=store)
@@ -1183,7 +1635,8 @@ class Backtester:
         open_symbols = {str(p["symbol"]) for p in store.open_positions()}
         unprocessed = [
             f for f in exchange.fill_log
-            if f["purpose"] in ("stop", "tp") and f["symbol"] in open_symbols
+            if f["purpose"] in ("stop", "tp", "liquidation")
+            and f["symbol"] in open_symbols
         ]
         for fill in unprocessed:
             if fill["symbol"] not in {str(p["symbol"]) for p in store.open_positions()}:
@@ -1197,7 +1650,8 @@ class Backtester:
             )
         if unprocessed:
             exchange.fill_log = [
-                f for f in exchange.fill_log if f["purpose"] not in ("stop", "tp")
+                f for f in exchange.fill_log
+                if f["purpose"] not in ("stop", "tp", "liquidation")
             ]
 
     @staticmethod
@@ -1210,7 +1664,14 @@ class Backtester:
             str(p["symbol"]): float(p["qty"]) for p in store.open_positions()
         }
         for symbol in exchange.bars:
-            held = exchange.balances.get(exchange._base(symbol), 0.0)
+            # On linear there is no base coin: inventory IS the position size.
+            # Reading balances here would report every open perp as drift.
+            positions = getattr(exchange, "positions", None)
+            if positions is not None:
+                position = positions.get(symbol)
+                held = float(position.size) if position is not None else 0.0
+            else:
+                held = exchange.balances.get(exchange._base(symbol), 0.0)
             recorded = booked.get(symbol, 0.0)
             difference = held - recorded
             # A difference the exchange would refuse to trade is not a

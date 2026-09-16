@@ -607,19 +607,36 @@ class TestGroupDPaperStaysPaper:
                     offenders.append((name, target))
         assert offenders == [], offenders
 
-    def test_the_perp_simulator_refuses_rather_than_flatters(self):
-        """An honest NotImplementedError, asserted as a certified limitation.
+    def test_the_perp_simulator_prices_funding_and_liquidation(self):
+        """This assertion used to certify a LIMITATION. The limitation is gone.
 
-        The linear LIVE path is implemented and unit-tested; the SIMULATOR
-        models spot cash accounting only. A linear backtest would omit funding,
-        margin and liquidation and report a flattering number, so it raises.
-        A missing number is better than an invented one, and the certification
-        document lists this as a limitation rather than hiding it.
+        The simulator modelled spot cash accounting only, so a linear backtest
+        would omit funding, margin and liquidation and report a flattering
+        number — and it raised rather than report it. ROADMAP Stage A item 1
+        closed that: `LinearSimulatedExchange` keeps position accounting,
+        accrues funding every 8h, and can liquidate a position before its stop
+        is reached.
+
+        What is certified now is that the terms are real rather than nominal,
+        and that categories with still NO simulator are still refused. The
+        refusal is what kept this honest, so it is asserted to survive for
+        every category the tree cannot price.
         """
         import backtest
         source = inspect.getsource(backtest)
-        assert "NotImplementedError" in source
+        assert "NotImplementedError" in source        # inverse/option still refused
         assert "funding" in source and "liquidation" in source
+        assert hasattr(backtest, "LinearSimulatedExchange")
+
+        venue = backtest.LinearSimulatedExchange(
+            {"BTCUSDT": [backtest.Bar(1_600_000_000_000 + i * 28_800_000,
+                                      100, 101, 99, 100, 10)
+                         for i in range(4)]},
+            starting_cash=1_000.0, funding_rate_per_8h=0.001)
+        venue.positions["BTCUSDT"] = backtest._SimPosition(
+            symbol="BTCUSDT", side="Buy", size=1.0, entry_price=100.0)
+        venue._apply_funding("BTCUSDT", venue.bars["BTCUSDT"][0])
+        assert venue.funding_paid > 0.0, "funding is modelled but charges nothing"
 
 
 # ===========================================================================
@@ -1204,9 +1221,17 @@ class TestGroupGResearchFreezeAndOperatorPack:
             assert trigger in text, trigger
 
     def test_it_states_the_perp_simulator_limitation(self):
-        """The runbook must not imply a linear backtest number exists."""
+        """The runbook must not imply a linear RESULT exists.
+
+        The simulator now exists (ROADMAP Stage A item 1), which makes the
+        distinction sharper rather than softer: a simulator is not a
+        measurement, and the runbook has to say that no walk-forward has been
+        re-run through it. `inverse` and `option` still raise, so the literal
+        refusal is still asserted — in both the runbook and the source.
+        """
         text = self._read(self.RUNBOOK)
         assert "NotImplementedError" in text
+        assert "No walk-forward has been re-run through the linear simulator" in text
         import backtest
         assert "NotImplementedError" in inspect.getsource(backtest)
 

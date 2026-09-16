@@ -257,10 +257,27 @@ class TestTemplatesDoNotMoveTheGate:
         text = prose(os.path.join(PROMO_DOCS, self.TEMPLATES[0]))
         assert "Moving the M-4 threshold is not one of the options" in text
 
-    def test_the_stop_checklist_names_the_simulator_gap(self):
+    def test_the_stop_checklist_records_which_half_was_done(self):
+        """This asserted the simulator GAP. ROADMAP Stage A item 1 closed it,
+        so what must be asserted now is the distinction the closure creates:
+        the simulation half is done, the VENUE half is not, and the checklist
+        must not let the first be read as the second."""
         text = prose(os.path.join(PROMO_DOCS, self.TEMPLATES[2]))
-        assert "NotImplementedError" in text
-        assert "never been exercised end to end" in text
+        assert "LinearSimulatedExchange" in text
+        assert "SIMULATION half only" in text
+        assert "They remain" in text and "unverified" in text
+
+    def test_the_stop_checklist_still_leaves_the_venue_items_unchecked(self):
+        """The four items are statements about a venue. No simulator makes them
+        true, and a checked box here would be the forgery the gate exists to
+        prevent."""
+        with open(os.path.join(PROMO_DOCS, self.TEMPLATES[2]),
+                  encoding="utf-8") as handle:
+            text = handle.read()
+        for item in ("1. A protective stop is PLACED", "2. The stop SURVIVES",
+                     "3. A position that somehow ends up NAKED",
+                     "4. Margin and liquidation behaviour"):
+            assert f"[ ] {item}" in text, item
 
     # -- and the gate did not move ----------------------------------------
 

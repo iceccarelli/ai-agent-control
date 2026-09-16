@@ -230,11 +230,22 @@ is.
 
 * **No Stage-1 POSITIVE exists.** The shell executes a strategy-neutral
   configuration; there is no evidence its entries beat their own dates.
-* **Perp (`linear`) simulation raises `NotImplementedError`.** The linear *live*
-  path is implemented and unit-tested; the *simulator* models spot cash
-  accounting only, so a linear backtest would omit funding, margin and
-  liquidation and report a flattering number. A missing number is better than
-  an invented one.
+* **Perp (`linear`) simulation exists now, and what it approximates is stated.**
+  It used to raise `NotImplementedError` because the simulator kept spot cash
+  accounting, and a linear backtest would have omitted funding, margin and
+  liquidation and reported a flattering number. `LinearSimulatedExchange`
+  (ROADMAP Stage A item 1) keeps position accounting, accrues funding every 8h
+  from a real series when one is supplied, and can liquidate a position before
+  its stop is reached. **`inverse` and `option` still raise
+  `NotImplementedError`** — a missing number is still better than an invented
+  one. Three approximations travel with every linear number: liquidation is
+  computed cross-margin against total account cash (exact for one position,
+  optimistic for several), the maintenance-margin rate is a single figure and
+  not Bybit's tiered risk ladder, and funding is charged at the settlement the
+  bar contains rather than at its exact timestamp.
+* **No walk-forward has been re-run through the linear simulator.** The
+  simulator existing and the rule having been measured through it are different
+  facts, and only the first is true today.
 * **The corpora are Bitstamp BTC/USD and Binance spot, not Bybit.** No order
   book, so the liquidity gate abstains and 3 of 35 features are unavailable.
 * **Certification is of the shell, not of a strategy.** It says the process

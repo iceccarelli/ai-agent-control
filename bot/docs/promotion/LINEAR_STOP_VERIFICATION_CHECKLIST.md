@@ -19,8 +19,19 @@ The consequence for this pilot is specific and uncomfortable:
 
 **`funding_carry_fade_btc_v1` trades a USDT-margined linear perpetual. The
 protective-stop behaviour that every other part of this system takes for granted
-has therefore never been exercised end to end in simulation on the instrument
+had therefore never been exercised end to end in simulation on the instrument
 this signal actually trades.**
+
+**That half is now done, and it is the SIMULATION half only.** ROADMAP Stage A
+item 1 added `LinearSimulatedExchange`, in which the stop is written by
+`/v5/position/trading-stop`, read back off `/v5/position/list` through the real
+`BybitClient.verify_stop`, and triggered against the bar — including the case
+where liquidation is nearer than the stop and fills first. See
+`bot/tests/test_linear_simulator.py::TestTheProtectiveStopEndToEnd`.
+
+**It changes nothing about items 1–4 below.** Those are statements about a
+VENUE, not about a simulator, and no simulator can make them true. They remain
+unverified.
 
 Every standing safety claim in this repository — *"a confirmed position always
 has a verified protective stop"* — is asserted and tested on the spot path. This
@@ -55,9 +66,13 @@ recorded:
 ## The simulator gap — say which of the two was done
 
 ```
-[ ] the linear simulator was extended to model margin/funding/liquidation,
+[x] the linear simulator was extended to model margin/funding/liquidation,
     and the extension is tested
-        path to the work: ______________________
+        path to the work: backtest.LinearSimulatedExchange
+                          bot/tests/test_linear_simulator.py (25 tests)
+    NOTE: this box is an ENGINEERING fact and it does not sign anything off.
+    The four venue items above are untouched by it and the signature block
+    below is still blank.
 
 [ ] OR micro-live proceeds on TESTNET only, with the simulator gap accepted
     in writing, and the memo says so explicitly

@@ -273,11 +273,13 @@ tuning parameter. Read `MARKET_CATEGORIES.md` in full before changing it.
 | Shorts | none | native |
 | Funding | none | every 8 hours |
 | Liquidation | none | yes, and it can precede your stop |
-| Backtest available | **yes** | **no** — `Backtester.run()` raises |
+| Backtest available | **yes** | **yes** — funding, margin and liquidation modelled |
 | Protective stop | conditional `StopOrder` | attached to the position |
 
-Ship on `spot`. It is the only category with a working simulator, and every
-number in `TEST_REPORT.md` comes from it.
+Ship on `spot`. Every number in `TEST_REPORT.md` comes from it. `linear` now has
+a simulator too (`LinearSimulatedExchange`), but a simulator existing is not a
+measurement: **no walk-forward has been re-run through it**, so there is still
+no linear performance number in this tree.
 
 Move to `linear` only after all four of:
 
@@ -285,7 +287,9 @@ Move to `linear` only after all four of:
    material share of your edge (on the shipped corpus it is 95%, but that corpus
    is synthetic and proves nothing about a real market);
 2. a perpetual simulator exists — funding accrual, continuous mark-to-market,
-   and a liquidation price — and walk-forward has been re-run through it;
+   and a liquidation price — **and walk-forward has been re-run through it**.
+   The simulator half is done (ROADMAP Stage A item 1); the walk-forward half
+   is NOT, and this item is not satisfied until both are;
 3. `MAX_HOLD_HOURS` reflects how long the strategy actually holds, because it is
    what converts a funding rate into a cost the edge gate must clear;
 4. the whole gate ladder in §1 has been repeated from the start. A linear

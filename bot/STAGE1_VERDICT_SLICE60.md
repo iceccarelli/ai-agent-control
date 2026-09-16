@@ -47,7 +47,7 @@ Closer to autonomous profit agent?: NO
 | **three templates exist, unsigned** | signature lines still underscore runs | `test_the_memo_signature_blocks_are_empty` |
 | the memo states the thinness | "three rotation replicates", "NOT held-out data" | `test_the_memo_states_the_thinness_rather_than_selling_it` |
 | the memo forbids moving M-4 | "not one of the options" | `test_the_memo_forbids_moving_the_m4_threshold` |
-| the stop checklist names the real gap | `NotImplementedError`, "never been exercised end to end" | `test_the_stop_checklist_names_the_simulator_gap` |
+| the stop checklist names the real gap | `NotImplementedError`, "never been exercised end to end" | `test_the_stop_checklist_names_the_simulator_gap` — **SUPERSEDED 0059.** The gap this row records was closed by ROADMAP Stage A item 1 (`LinearSimulatedExchange`), so the assertion became `test_the_stop_checklist_records_which_half_was_done`. The row is left as written: it is what was true at slice 60, and the four VENUE items on that checklist are still unverified |
 | **templates are not a checklist item** | absent from `CHECKLIST_ITEMS`; gate never reads `docs/promotion` | `test_templates_are_not_a_checklist_item` |
 | the completed count did not change | 2/8, equal to slice 59 | `test_the_completed_count_did_not_change` |
 | no signature forged | `signatures_present: false`, `signatures_forged: false` | `test_no_signature_was_forged` |

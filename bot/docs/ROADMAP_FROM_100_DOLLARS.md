@@ -11,7 +11,7 @@ what is missing, and the order in which the missing things must be proven.
 |---|---|---|
 | Plumbing works | Mostly. Now deployable (0001), gate-enforced in code (0002), reconciles against the venue (0003), sees exits (0004). | 4,953 baseline tests + 39 new |
 | Timing works | **One historical pass, two forward losses.** Stage-1 OOS n=41, M1≈95.1/M2=96 against pre-declared bars; forward n=2, mean net R −0.836; monitors INSUFFICIENT_DATA. | artifacts/slice5x–7x, SLICE78_CERTIFICATION |
-| Live works | **No.** Gate 2/8. Bybit testnet unreachable from every host used so far. Linear simulator raises NotImplementedError (backtest.py:833). | slice77_promotion_gate.json |
+| Live works | **No. Gate still 2/8.** Both blockers this row named are retired and the gate did not move by one item: the linear simulator exists (`LinearSimulatedExchange`, 0059) and `connector_check` prints `BYBIT_TESTNET_OK` from this host. Neither is a gate item. `linear_protective_stop_verified` needs four observations of a VENUE that no simulator can supply, and six of the eight items are human acts by design. | slice77_promotion_gate.json, artifacts/connector_check.json |
 | Capacity | **Unmeasured.** The rule fades daily-bar funding extremes on one symbol. Its capacity is bounded by how much BTC-perp notional can enter at the next daily open without moving the funding print it keys on. $100 tells you nothing about $100k; $100k tells you nothing about $100M. | none — this is the biggest unknown |
 
 A "billion-dollar" trading asset is not a bot. It is (a) a set of edges with
@@ -24,10 +24,19 @@ edges at meaningful capacity, and nothing of (c).
 ## 1. Sequence (each stage gates the next; none can be skipped)
 
 ### Stage A — finish the shell (weeks, engineering only)
-1. **Linear simulator** with funding accrual, margin, liquidation price, and a
-   protective stop that is exercised end-to-end (unblocks gate item
-   `linear_protective_stop_verified`). Until this exists the instrument the
-   rule trades has never been simulated.
+1. ~~**Linear simulator**~~ **DONE 0059.** `LinearSimulatedExchange`: position
+   accounting, 8-hourly funding accrual from a real series when supplied,
+   continuous mark-to-market, a liquidation that can precede the stop, and the
+   position-attached stop written by `/v5/position/trading-stop` and read back
+   through the real `BybitClient.verify_stop`. 25 tests.
+   **It does NOT complete the gate item `linear_protective_stop_verified`.**
+   That item's four conditions are statements about a VENUE — a stop placed and
+   read back from Bybit, surviving a process restart, a naked position detected,
+   margin behaviour documented at the proposed notional — and no simulator can
+   make any of them true. The checklist's simulator-gap box is filled in; its
+   four venue boxes and its signature block are untouched.
+   Still outstanding: **no walk-forward has been re-run through it**, so there
+   is a linear simulator and still no linear number.
 2. **Run the measured rule in the runtime.** `ShadowStrategy` needs live
    providers over `BybitClient.get_klines('D')` + funding history; add the
    5-bar HORIZON time exit the runtime lacks. Then `build_bot` attaches
@@ -36,6 +45,14 @@ edges at meaningful capacity, and nothing of (c).
 3. **Testnet from a host that can reach Bybit.** `connector_check` must say
    BYBIT_TESTNET_OK before Track D. Kill-switch drill, recorded. Stop
    verification, recorded. That closes three human gate items.
+   **The verdict is BYBIT_TESTNET_OK from this host (0059).** Not an inference
+   from a reachability probe of my own — `tools/connector_check.py` run
+   unmodified prints `BYBIT_TESTNET_OK | CORPUS_PATH_OK | CARRY_READS_OK`, over
+   public endpoints, with no credentials. That retires "unreachable from every
+   host used so far", which was the stated blocker on this item.
+   **It closes none of the three human gate items.** The drill and the stop
+   verification are acts a person performs and records; this only removes the
+   environmental excuse for not performing them.
 4. Websocket private stream for fills (the auth frame already exists at
    bybit_connection.py `ws_auth_message`; nothing consumes it). Polling
    `observe_exits` is correct but slow.

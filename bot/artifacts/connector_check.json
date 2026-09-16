@@ -1,0 +1,78 @@
+{
+  "carry_reads_verdict": "CARRY_READS_OK",
+  "carry_reads_blocked": [],
+  "tool": "connector_check",
+  "checked_at_utc": "2026-09-16T07:31:53Z",
+  "keys_used": false,
+  "orders_placed": false,
+  "endpoints": [
+    {
+      "name": "bybit_testnet_time",
+      "url": "https://api-testnet.bybit.com/v5/market/time",
+      "http": 200,
+      "ok": true,
+      "note": "{\"retCode\":0,\"retMsg\":\"OK\",\"result\":{\"timeSecond\":\"1789543911\",\"timeNano\":\"1789543911717321032\"},\"retExtInfo\":{},\"time\":"
+    },
+    {
+      "name": "bybit_testnet_ticker_linear",
+      "url": "https://api-testnet.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT",
+      "http": 200,
+      "ok": true,
+      "note": "{\"retCode\":0,\"retMsg\":\"OK\",\"result\":{\"category\":\"linear\",\"list\":[{\"symbol\":\"BTCUSDT\",\"lastPrice\":\"75676.50\",\"indexPrice\""
+    },
+    {
+      "name": "bybit_testnet_ticker_spot",
+      "url": "https://api-testnet.bybit.com/v5/market/tickers?category=spot&symbol=BTCUSDT",
+      "http": 200,
+      "ok": true,
+      "note": "{\"retCode\":0,\"retMsg\":\"OK\",\"result\":{\"category\":\"spot\",\"list\":[{\"symbol\":\"BTCUSDT\",\"bid1Price\":\"75398.2\",\"bid1Size\":\"0.3"
+    },
+    {
+      "name": "bybit_testnet_funding_history",
+      "url": "https://api-testnet.bybit.com/v5/market/funding/history?category=linear&symbol=BTCUSDT&limit=1",
+      "http": 200,
+      "ok": true,
+      "note": "{\"retCode\":0,\"retMsg\":\"OK\",\"result\":{\"category\":\"linear\",\"list\":[{\"symbol\":\"BTCUSDT\",\"fundingRate\":\"0.00076399\",\"funding"
+    },
+    {
+      "name": "bybit_testnet_instruments_linear",
+      "url": "https://api-testnet.bybit.com/v5/market/instruments-info?category=linear&symbol=BTCUSDT",
+      "http": 200,
+      "ok": true,
+      "note": "{\"retCode\":0,\"retMsg\":\"OK\",\"result\":{\"category\":\"linear\",\"list\":[{\"symbol\":\"BTCUSDT\",\"contractType\":\"LinearPerpetual\",\"s"
+    },
+    {
+      "name": "bybit_mainnet_time",
+      "url": "https://api.bybit.com/v5/market/time",
+      "http": 200,
+      "ok": true,
+      "note": "{\"retCode\":0,\"retMsg\":\"OK\",\"result\":{\"timeSecond\":\"1789543912\",\"timeNano\":\"1789543912668959540\"},\"retExtInfo\":{},\"time\":"
+    },
+    {
+      "name": "binance_fapi_time",
+      "url": "https://fapi.binance.com/fapi/v1/time",
+      "http": 200,
+      "ok": true,
+      "note": "{\"serverTime\":1789543912897}"
+    },
+    {
+      "name": "binance_www_time",
+      "url": "https://www.binance.com/fapi/v1/time",
+      "http": 200,
+      "ok": true,
+      "note": "{\"serverTime\":1789543913167}"
+    },
+    {
+      "name": "binance_www_funding",
+      "url": "https://www.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1",
+      "http": 200,
+      "ok": true,
+      "note": "[{\"symbol\":\"BTCUSDT\",\"fundingTime\":1789516800001,\"fundingRate\":\"0.00003951\",\"markPrice\":\"75600.00000000\",\"rateType\":\"Reg"
+    }
+  ],
+  "bybit_testnet_verdict": "BYBIT_TESTNET_OK",
+  "corpus_path_verdict": "CORPUS_PATH_OK",
+  "track_d_permitted_from_this_host": true,
+  "venue_changed": false,
+  "note": "A 403/451 is a network refuse, not a licence to change venue."
+}

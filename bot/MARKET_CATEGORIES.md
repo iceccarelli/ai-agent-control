@@ -94,8 +94,11 @@ exists specifically to catch that failure shape.
 
 ## 3. What is deliberately NOT delivered
 
-**There is no linear backtest.** `Backtester.run()` raises `NotImplementedError`
-for any category other than spot.
+**There is a linear backtest now, and there is no linear RESULT.**
+`Backtester.run()` accepts `spot` and `linear`; `inverse` and `option` still
+raise `NotImplementedError`. What does not exist is a walk-forward re-run
+through the linear path, so no linear performance number should be quoted from
+this tree.
 
 The simulator keeps cash accounting: a Buy debits quote and credits base, a Sell
 does the reverse, a Sell is rejected when the base balance is short. That is
@@ -112,9 +115,12 @@ So the state of play is stated plainly:
 - the linear **order path** is implemented and unit-tested against a strict fake
   exchange: position-attached stops, `positionIdx`, margin-based balance checks,
   leverage setup, the funding gate, and stop verification;
-- the linear **simulation** does not exist, so there is no honest linear
-  backtest to report;
-- a missing number is better than an invented one.
+- the linear **simulation** now exists (`LinearSimulatedExchange`): position
+  accounting, 8-hourly funding accrual, continuous mark-to-market, and a
+  liquidation that can precede the stop. Its approximations are named in its
+  docstring rather than left for a reader to discover;
+- no **walk-forward** has been re-run through it, so there is still no linear
+  performance number, and a missing number is better than an invented one.
 
 **Spot margin borrow is not implemented either.** It is the other way to short a
 spot venue, and it brings borrow interest, a separate liability balance, and
@@ -157,7 +163,8 @@ not a feature flag to flip on the way to production.
 
 1. **Stay on spot** if you are long-only, want no funding, no liquidation, and
    the simplest possible failure modes. This is the shipped default, and it is
-   the only category with a working backtest.
+   the shipped default and the only category with a measured RESULT. `linear`
+   has a simulator now, but no walk-forward has been re-run through it.
 2. **Move to linear** if the suppressed-short count says you are discarding most
    of your edge. Before you do: write the perp simulator (funding accrual,
    mark-to-market, liquidation price), re-run walk-forward, and only then run
