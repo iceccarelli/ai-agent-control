@@ -100,8 +100,13 @@ class Venue:
             self.perp_short += filled if side == "Sell" else -filled
         else:
             self.spot_long += filled if side == "Buy" else -filled
+        # The venue reports a spot BUY fee in the COIN and everything else in
+        # the quote currency (INVENTORY F3). These tests assert no fee
+        # amounts, but a stub that states the wrong unit is how the replay
+        # came to book $388m of fees, so it states the right one.
+        fee = 0.5 / MARK if (product == "spot" and side == "Buy") else 0.5
         return {"filled_qty": filled, "avg_price": MARK,
-                "order_link_id": f"o{len(self.orders)}", "fee": 0.5}
+                "order_link_id": f"o{len(self.orders)}", "fee": fee}
 
     def get_margin_multiple(self, symbol):
         return self.margin

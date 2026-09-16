@@ -169,6 +169,33 @@ class ReplayBroker:
         drag = self.impact_bps / 1e4
         return base * (1.0 + drag) if side == "Buy" else base * (1.0 - drag)
 
+    @staticmethod
+    def _as_venue_fee(fee_usd: float, price: float, side: str,
+                      product: str) -> float:
+        """The fee in the unit THE VENUE reports it in, for the caller.
+
+        Bybit takes a spot BUY fee in the COIN and everything else in the
+        quote currency — INVENTORY F3, and `CarryBroker.LegFill.fee` says so
+        in as many words. `ledger.spot_buy` therefore MULTIPLIES the field it
+        is handed by the price.
+
+        This broker computes its fees in USD for its own accounting, and
+        handed that same number straight back. So every spot buy fee reaching
+        the journal was inflated by the BTC price: a four-year `--mode
+        acquire` replay booked **$388,719,591** of fees against the $20,542
+        this file's own totals report, and the journal's "agrees with the run
+        above" line read False. Nothing caught it because no test runs the
+        replay in acquire, and LEDGER_0044's "agrees to the cent" was measured
+        in overlay, which never buys spot.
+
+        `Fill.fee` deliberately stays in USD: it is what `fees_usd`
+        accumulates a few lines down, and that total was never wrong. Only
+        what crosses the broker boundary is converted.
+        """
+        if product == "spot" and side == "Buy" and price > 0:
+            return fee_usd / price
+        return fee_usd
+
     def place_market(self, *, symbol, side, qty, product):
         if qty <= 0 or not math.isfinite(qty):
             return None
@@ -182,7 +209,8 @@ class ReplayBroker:
         if product == "linear":
             self.perp_qty += qty if side == "Sell" else -qty
         return {"filled_qty": qty, "avg_price": price,
-                "order_link_id": f"r{len(self.fills)}", "fee": fee}
+                "order_link_id": f"r{len(self.fills)}",
+                "fee": self._as_venue_fee(fee, price, side, product)}
 
     def place_post_only(self, *, symbol, side, qty, price, product):
         """Every resting order fills, at the touch, at the maker rate.
@@ -197,7 +225,8 @@ class ReplayBroker:
         if product == "linear":
             self.perp_qty += qty if side == "Sell" else -qty
         return {"filled_qty": qty, "avg_price": price,
-                "order_link_id": f"m{len(self.fills)}", "fee": fee,
+                "order_link_id": f"m{len(self.fills)}",
+                "fee": self._as_venue_fee(fee, price, side, product),
                 "maker": True, "resting": False}
 
     def cancel_order(self, *, symbol, order_link_id, product):
@@ -428,10 +457,26 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             # And the hedged coin, marked from entry to exit, so the journal
             # shows BOTH sides of a delta-neutral pair. Without it the short's
             # loss stands alone and a flat book reads as a disaster.
-            L.revalue_inventory(
-                journal, ms=int(row.ms), ref=f"reval:{row.ms}",
-                qty=open_trade["qty"], from_price=open_trade["entry_spot"],
-                to_price=(exit_spot if exit_spot is not None else row.spot))
+            #
+            # OVERLAY ONLY, and the guard is the whole point. `revalue_inventory`
+            # is overlay-scoped by its own docstring: it exists because the book
+            # never TRADES the client's coin, so nothing else books that leg's
+            # move. In ACQUIRE the book buys the spot and sells it again, and
+            # `spot_sell` realises the move against what it cost — so posting a
+            # revaluation as well counts the same dollars twice.
+            #
+            # This was invisible because it was a COMPENSATING PAIR. While
+            # `LedgerBroker` realised every spot sale against its own sale price
+            # (D44a), spot realisation was identically zero and the revaluation
+            # was the only thing booking that leg at all — so revaluing in both
+            # modes was, by accident, right. Fixing the cost basis turned the
+            # cancellation into a visible double-count: exactly $151,904.02 of
+            # it, which is the acquire revaluation total to the cent.
+            if execution_mode == cb.OVERLAY:
+                L.revalue_inventory(
+                    journal, ms=int(row.ms), ref=f"reval:{row.ms}",
+                    qty=open_trade["qty"], from_price=open_trade["entry_spot"],
+                    to_price=(exit_spot if exit_spot is not None else row.spot))
             open_trade.update({"closed_ms": int(row.ms),
                                "exit_perp": (exit_perp if exit_perp is not None
                                              else row.perp),

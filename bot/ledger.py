@@ -421,6 +421,11 @@ class LedgerBroker:
         #: Entry price per open short, so a close can realise against it.
         self._perp_entry: Optional[float] = None
         self._perp_qty: float = 0.0
+        #: The same thing for the SPOT leg, which did not have it. Without a
+        #: remembered purchase price a sale has nothing to realise against,
+        #: and the code below realised it against ITSELF.
+        self._spot_entry: Optional[float] = None
+        self._spot_qty: float = 0.0
 
     # -- orders: booked ---------------------------------------------------
 
@@ -478,9 +483,39 @@ class LedgerBroker:
                 # balance equal to what the wallet will show.
                 spot_buy(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                          fee_btc=fee)
+                filled = self._spot_qty + qty
+                self._spot_entry = (
+                    price if self._spot_entry is None else
+                    (self._spot_entry * self._spot_qty + price * qty) / filled)
+                self._spot_qty = filled
             else:
+                # WHAT IT COST, not what it just sold for.
+                #
+                # This passed `cost_basis=price` — the SALE price — so `cost`
+                # equalled `proceeds` and EQUITY:REALISED was booked as
+                # EXACTLY ZERO on every spot sale the book ever made. The
+                # money was not lost: the entry still balances, so the gain
+                # landed in ASSET:BTC, which then held value at zero quantity.
+                # Nothing could see it — `reconcile` compares QUANTITIES,
+                # which were right, and returned RECONCILED.
+                #
+                # The perp leg has tracked its weighted entry since 0044.
+                # `spot_sell` itself was correct and is tested directly with a
+                # distinct basis; it was the WIRING that realised a sale
+                # against itself, and no test drove a spot sell through this
+                # wrapper.
+                #
+                # Falls back to the sale price when nothing was bought through
+                # this broker — an OVERLAY never buys the client's coin, so a
+                # sale with no recorded purchase has no basis to use and a
+                # zero realisation is the honest answer rather than a guess.
+                entry = (self._spot_entry if self._spot_entry is not None
+                         else price)
                 spot_sell(self.journal, ms=ms, ref=ref, qty=qty, price=price,
-                          cost_basis=price, fee_usd=fee)
+                          cost_basis=entry, fee_usd=fee)
+                self._spot_qty = max(0.0, self._spot_qty - qty)
+                if self._spot_qty <= 0:
+                    self._spot_entry = None
             return
 
         if side == "Sell":
