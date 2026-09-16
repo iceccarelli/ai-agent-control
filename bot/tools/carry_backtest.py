@@ -506,9 +506,23 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
                     notional: float = 100_000.0,
                     entry_bps: float = ENTRY_FUNDING_BPS,
                     borrow_apr: float = BORROW_APR,
-                    gated: bool = False, mode: str = ACQUIRE) -> Dict[str, Any]:
+                    gated: bool = False, mode: str = ACQUIRE,
+                    borrow_curve: Any = None) -> Dict[str, Any]:
     """The daily simulation on in-memory series. `simulate()` loads and calls
-    this; tests call it on synthetic series to prove the hedge cancels."""
+    this; tests call it on synthetic series to prove the hedge cancels.
+
+    `borrow_curve` is OPTIONAL and charges financing as a SERIES rather than a
+    constant (INVENTORY D43: the real USDT rate moved 1.00% to 104.00%/yr).
+    With none passed the expression below is the one this file has always
+    evaluated — not a flat-curve equivalent of it — so every number already
+    committed rests on untouched arithmetic.
+
+    A day the curve cannot price falls back to `borrow_apr` and is COUNTED in
+    `borrow_periods_unpriced`. Counting rather than silently substituting is
+    the `unknown_fees` convention: a cost that quietly becomes something else
+    is a cost that has left the books.
+    """
+    unpriced = 0
     days = sorted(set(perp) & set(spot))
     if not days:
         raise SystemExit("no overlapping days between spot and perp")
@@ -536,7 +550,15 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
             history.append(last_bps)
             # Income and financing accrue whether or not anything is traded.
             live.funding += (day_bps / 1e4) * live.qty * p
-            live.borrow += (borrow_apr / 365.0) * live.qty * s
+            if borrow_curve is None:
+                live.borrow += (borrow_apr / 365.0) * live.qty * s
+            else:
+                try:
+                    per_day = borrow_curve.per_day(start)
+                except Exception:               # noqa: BLE001 - counted below
+                    per_day = borrow_apr / 365.0
+                    unpriced += 1
+                live.borrow += per_day * live.qty * s
 
             if last_bps < 0:
                 negative_streak += 1
@@ -591,6 +613,15 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
 
     return {
         "clock": "daily_close",
+        # D43, and the same pair the settlement sim reports. `borrow_source`
+        # says WHICH financing was charged; `borrow_periods_unpriced` how many
+        # days the curve could not cover and therefore fell back to the
+        # scalar. The first version of this incremented the counter and never
+        # returned it — a counter nobody can read is the silent substitution
+        # it was written to prevent.
+        "borrow_source": ("scalar" if borrow_curve is None
+                          else getattr(borrow_curve, "source", "curve")),
+        "borrow_periods_unpriced": unpriced,
         "window": f"{days[0]} .. {days[-1]}",
         "years": years,
         "notional_usd": notional,
@@ -930,7 +961,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
                                 gated: bool = False,
                                 impact_bps: float = 0.0,
                                 mode: str = ACQUIRE,
-                                exec_fee_bps: Optional[float] = None
+                                exec_fee_bps: Optional[float] = None,
+                                borrow_curve: Any = None
                                 ) -> Dict[str, Any]:
     """One step per funding print. The rules are the engine's, in its units:
     a print is a print (not a day, not a tick), three consecutive negative
@@ -941,6 +973,10 @@ def simulate_settlements_series(rows: List[Settlement], *,
     history: List[float] = []
     refusals: Dict[str, int] = {}
     per_print_borrow = borrow_apr / (365.0 * FUNDING_PERIODS_PER_DAY)
+    #: Prints the curve could not price, which fell back to the declared
+    #: scalar. A list so the charge closure can increment it. Counted and
+    #: reported, never silently substituted — the `unknown_fees` rule.
+    borrow_unpriced = [0]
 
     #: OVERLAY never trades the client's spot: one leg in, one leg out.
     spot_legs = 0.0 if mode == OVERLAY else 1.0
@@ -971,7 +1007,16 @@ def simulate_settlements_series(rows: List[Settlement], *,
         if live is not None:
             # Held through this settlement: the short receives (pays) it.
             live.funding += st.rate * live.qty * st.perp
-            live.borrow += per_print_borrow * live.qty * st.spot
+            if borrow_curve is None:
+                live.borrow += per_print_borrow * live.qty * st.spot
+            else:
+                try:
+                    rate = borrow_curve.per_print(
+                        st.ms, periods_per_day=FUNDING_PERIODS_PER_DAY)
+                except Exception:               # noqa: BLE001 - counted below
+                    rate = per_print_borrow
+                    borrow_unpriced[0] += 1
+                live.borrow += rate * live.qty * st.spot
             live.max_adverse_short_pct = max(
                 live.max_adverse_short_pct,
                 100.0 * (st.perp_high / live.entry_perp - 1.0))
@@ -1037,6 +1082,13 @@ def simulate_settlements_series(rows: List[Settlement], *,
         "net_annualised_pct": (100.0 * a["net_usd"] / notional) / years,
         "naive_funding_sum_pct_per_yr": 100.0 * sum(s.rate for s in rows) / years,
         "borrow_apr": borrow_apr, "impact_bps_per_leg": impact_bps,
+        # D43. `borrow_source` says WHICH financing was charged, and
+        # `borrow_periods_unpriced` how many prints the curve could not cover
+        # and therefore fell back to the scalar. A run reporting a curve with
+        # a non-zero count is a partly-constant run and must read as one.
+        "borrow_source": ("scalar" if borrow_curve is None
+                          else getattr(borrow_curve, "source", "curve")),
+        "borrow_periods_unpriced": borrow_unpriced[0],
         "execution_mode": mode, "round_trip_bps": round_trip_bps_for(mode),
         # What the GATE priced vs what the fills were charged. Equal unless
         # --exec-fee-bps was given.

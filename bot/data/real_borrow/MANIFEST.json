@@ -1,0 +1,23 @@
+{
+  "asset_class": "borrow_rate",
+  "endpoint": "https://www.okx.com/api/v5/finance/savings/lending-rate-history",
+  "fetched_utc": "2026-09-16T06:47:49Z",
+  "files": {
+    "OKX_LENDING_RATE_USDT_1H.csv.gz": {
+      "first_timestamp": "2021-12-14T09:00:00Z",
+      "interval_seconds": 3600,
+      "kind": "borrow_rate",
+      "last_timestamp": "2026-09-16T06:00:00Z",
+      "rows": 41677,
+      "sha256": "a86c615bc77d95507dbd53e336bcf88ff8b3951dc5f18542b84d364c7fec48ca",
+      "sha256_uncompressed": "962c78e37f8dfa89f4874298c0d3064b4cbdf35250c0a4f5643128673906fb72",
+      "size_bytes": 258421
+    }
+  },
+  "interval": "1h",
+  "notes": "LENDING rate: what a lender earns. A borrower pays more, so these are a FLOOR on the cost of financing. OKX is not the venue this book trades on; it is used because it is the only deep PUBLIC series of its kind (Binance signed-only and undocumented depth, Bybit six months, Deribit no lending product). The venue floor is 2021-12-14, so the 2019-09..2021-12 stretch of the carry corpus has no financing data at any price.",
+  "source": "public_rest_savings_lending_rate_history",
+  "synthetic": false,
+  "venue": "okx",
+  "venue_floor_utc": "2021-12-14"
+}

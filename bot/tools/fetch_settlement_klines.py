@@ -78,7 +78,16 @@ def fetch(endpoint: str, symbol: str, start_ms: int) -> List[List[Any]]:
     while True:
         url = (f"{endpoint}?symbol={symbol}&interval=8h"
                f"&startTime={cursor}&limit=1000")
-        with urllib.request.urlopen(url, timeout=30) as response:
+        # A NAMED AGENT, like the other two urllib fetchers here send
+        # (`fetch_binance_klines`, `append_closed_corpus`). This one called
+        # urlopen bare, which works against Binance today and is one venue
+        # policy change away from a 403 — OKX already refuses the default
+        # `Python-urllib/3.12` agent outright, measured while building the
+        # borrow-rate fetcher. This is the tool that built the 8h corpus, so
+        # the failure would land on the settlement clock.
+        request = urllib.request.Request(
+            url, headers={"User-Agent": "fetch-settlement-klines/1.0"})
+        with urllib.request.urlopen(request, timeout=30) as response:
             batch = json.loads(response.read())
         if not batch:
             break
