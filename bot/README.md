@@ -158,6 +158,22 @@ below cost — that is rejected at load time.
 
 ## Documentation
 
+> **THIS README DESCRIBES SLICE 26. THE TREE IS AT SLICE 56.**
+>
+> Everything below — the geometry gate, the skill test, the null designs — is
+> the **timing-skill programme, which is CLOSED**: eleven signal families
+> measured, none cleared. It is accurate history and is kept for that reason,
+> but it is **not what this repository does now**.
+>
+> What it does now is a **delta-neutral carry book**: long spot BTC (or a
+> client's existing inventory) against a short USDT-perp, collecting funding.
+> `docs/human/PHASE1_DECISION.md` chose the OVERLAY form as the product.
+>
+> Start at **[HANDOFF.md](HANDOFF.md)**, whose status block is current, then
+> **[docs/human/INVENTORY.md](docs/human/INVENTORY.md)** for every defect and
+> what closed it. Profitability is **UNPROVEN** and refused on wider evidence
+> than this README describes — see D20/D42/D47 in INVENTORY.
+
 - **[RESEARCH_STATUS.md](RESEARCH_STATUS.md)** — **read this first.** Research
   is frozen: what is forbidden, what would be required to reopen a skill claim,
   and the recommended control invocation.

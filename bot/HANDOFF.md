@@ -1,6 +1,90 @@
 # HANDOFF — resume here
 
-**Written at the end of slice 47.**
+**Status block written at the end of slice 56. The block below it is the
+slice-47 record of the TIMING-SKILL programme, which is CLOSED and kept
+because it is true history.**
+
+```
+WHAT THIS REPOSITORY IS NOW
+===========================
+A DELTA-NEUTRAL CARRY BOOK. Long spot BTC (or a client's existing inventory)
+against a short USDT-perp, collecting funding. PHASE1_DECISION chose OVERLAY
+as the product on 2026-09-08: a yield product on BTC somebody already holds,
+not a market-neutral fund to raise cash for.
+
+THE TIMING-SKILL PROGRAMME BELOW IS CLOSED. Eleven signal families measured,
+none cleared. Nothing in it is the live work, and its "NEXT HUMAN DECISION"
+options -- write a new intake, fix the directed instrument's bias -- are
+decisions about a programme that stopped. They are not what to do next.
+
+PROFITABILITY: UNPROVEN, and refused on WIDER evidence than before.
+    D20 asked whether the carry rule survives its own search width. It was
+    computed on ONE asset over FOUR years. 0056 re-ran it on THREE assets over
+    SEVEN (74 / 71 / 61 out-of-sample months against 38). Deflated Sharpe,
+    observed against the expected-max of an edgeless search that wide:
+        BTC  wf z -0.434   frozen z +1.708
+        ETH  wf z -3.375   frozen z -0.103
+        SOL  wf z -0.529   frozen z -0.409
+    FIVE OF SIX lines sit at or below what the best of 33,000-40,000 edgeless
+    rules would show. The exception is BTC's frozen line, whose constants were
+    chosen after 0018 with the corpus visible -- the tool charges it a whole
+    540-cell grid for exactly that reason, so its evidence is an UPPER bound,
+    and the same line reads -0.103 and -0.409 on the other two assets. One
+    positive z on the one asset the parameters were fitted to is what
+    SELECTION looks like.
+    D42: 2021 alone carries 58-68% of the seven-year net on 1-3 trades per
+    asset. Concentration did not fall when the sample doubled.
+    QUOTABLE is False on every line. Only a registered FORWARD holdout --
+    settlements that had not printed when the rule was fixed -- can settle it.
+
+THE BOOKS WERE WRONG IN FOUR PLACES, AND ARE NOT NOW (0051, 0053, 0054).
+    Every one was a supported mode nobody had exercised. Overlay was tested
+    and acquire was not; taker was tested and maker_first was not.
+      D39  a partially filled close was recorded as a COMPLETE one, on all
+           three exit paths. A 1.0 BTC hedge unwound against a venue filling
+           half left $50,000 of unhedged short the process did not know about.
+      D40  the overlay never re-read the inventory it hedges. A client who
+           moved their BTC left the book naked short, reporting
+           HEDGED_AND_COLLECTING every sixty seconds until someone restarted.
+      D44  a spot sale realised against ITSELF (realised booked $0.00 on every
+           spot sale, the gain hiding in ASSET:BTC at zero quantity, with
+           reconcile() reading RECONCILED); the fee field had no declared unit
+           ($388,719,591 of fees against a true $20,542); and the journal
+           revaluation was posted in both modes, double-counting $151,904.02
+           once the first two were repaired -- they had been COMPENSATING.
+      D45  a cancel that caught a fill never reached the journal at all.
+    0055 added the standing guard: every supported mode x style reconciles,
+    every run. It found nothing, which is why it exists.
+
+WHAT IS STILL OPEN AND MATTERS
+    F4   no liqPrice has ever been read from a real position.
+    D43  financing is a CONSTANT at every call site and the real one moved
+         10x (1.00% to 10.00%/yr by half-year). The 3/5/8% columns are
+         decoration until a per-period series is charged. At 0% borrow -- the
+         overlay, where the client owns the coin -- none of it applies, which
+         is what EVIDENCES the 0036 product decision rather than assuming it.
+    D46  the settlement loader silently drops 75 real SOL funding prints, all
+         in the FTX week of 2022-11. BTC and ETH drop zero.
+    carry_sweep has NO test on its holdout certification and therefore did NOT
+         get an --asset flag. That is the one site where a mislabelled
+         certification could enter.
+
+NOT READY for live capital. Nothing is armed. The promotion gate refuses.
+
+WHERE TO READ, IN ORDER
+    docs/human/INVENTORY.md      every defect, what closed it, what is open
+    docs/human/PHASE1_DECISION.md  why OVERLAY, and the locate threshold
+    docs/human/WALKFORWARD_0041.md D20, the finding 0056 widened
+    docs/human/LEDGER_0044.md    the double-entry book (note: its "agrees to
+                                 the cent" was measured in OVERLAY only)
+    docs/human/CORPUS_POLICY.md  why the committed corpora are frozen
+    docs/PAPER_RUNBOOK.md        to actually run it
+```
+
+---
+
+**The slice-47 TIMING-SKILL record follows. Closed. Kept because deleting the
+inconvenient half of a research record makes the rest mean less.**
 
 ```
 TIMING_SKILL: no cleared edge. FOUR families measured against pre-declared
@@ -248,7 +332,7 @@ hold charged as a cost on the observed schedule AND every replicate.
     Do not cite the last two alongside the first as bias evidence.
 
 NEXT HUMAN DECISION ONLY:
-    (1) STOP. Ten lines closed, nothing cleared. The best-motivated thesis
+    (1) STOP. Eleven lines closed, nothing cleared. The best-motivated thesis
         got to 94.3 against a bar of 95.0 on an instrument later shown to
         flatter it, and the best-MEASURED one (s52: three symbols, three valid
         controls, 555 trades) returned 45 / 81 / 23. This is a legitimate
@@ -256,7 +340,7 @@ NEXT HUMAN DECISION ONLY:
     (2) WRITE A NEW INTAKE YOURSELF. NEW_SIGNAL_INTAKE.md is marked
         WAITING -- EMPTY and no agent may fill it -- a hypothesis proposed by
         the thing that measures it is not an independent hypothesis. It must
-        have a DIFFERENT INFORMATION SET from all ten frozen names, not
+        have a DIFFERENT INFORMATION SET from all eleven frozen names, not
         different weights, thresholds or lookbacks on the same one. Check two
         things in one line of arithmetic BEFORE implementing: how many events
         the rule produces, and how many contiguous FLAG RUNS they form; or
