@@ -11,7 +11,8 @@ taken."*
 
 This is that wiring. It changes what the shell RUNS, not what it is allowed to
 do: paper only, BTCUSDT only, one position, one entry per calendar day, 100.00
-USD notional, every existing gate unchanged, and the promotion gate still 2 of 8.
+USD notional, every existing gate unchanged, and the promotion gate still
+refusing.
 
 THE THREE THINGS THAT WOULD MAKE IT DECORATIVE, EACH PINNED BELOW
 =================================================================
@@ -222,10 +223,18 @@ class TestTheBookIsSelectedDeliberately:
 
 class TestItChangesWhatRunsNotWhatIsAllowed:
     def test_the_promotion_gate_is_untouched(self):
+        """The durable claim is that the gate REFUSES, not what it counts.
+
+        This pinned `== 2`, which went false when a human signed
+        `kill_switch_drill_recorded`. That is the gate being satisfied one item
+        at a time by the people who own those items — nothing to do with
+        attaching a shadow book. Pinning a count here made a test about the
+        SHADOW WIRING depend on unrelated human progress.
+        """
         import promotion_gate as pg
         verdict = pg.evaluate_promotion_gate()
         assert verdict.allows_live is False
-        assert sum(1 for i in verdict.items if i.complete) == 2
+        assert verdict.incomplete, "the gate cannot be fully complete here"
 
     def test_a_confidence_of_none_is_not_gated(self):
         """ShadowStrategy sets confidence=None on purpose. The ladder runs

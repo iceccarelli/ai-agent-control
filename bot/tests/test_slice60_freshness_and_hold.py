@@ -299,7 +299,21 @@ class TestTemplatesDoNotMoveTheGate:
         assert len(gate["templates"]) == 3
 
     def test_the_completed_count_did_not_change(self):
-        assert load(GATE60)["items_complete"] == load(GATE59)["items_complete"]
+        """A HISTORICAL claim, now pinned to a historical number.
+
+        This compared slice 60's FROZEN snapshot against `GATE59` — which is
+        the LIVE gate file, not a frozen one. So it asserted that a record from
+        slice 60 still matched a file the programme is expected to change, and
+        it would break the first time any item was ever completed. It did: a
+        human signed `kill_switch_drill_recorded`, the live gate moved to 3 of
+        8, and this went red for a reason that has nothing to do with slice 60.
+
+        The claim `STAGE1_VERDICT_SLICE60.md` cites is "2/8, equal to slice 59"
+        AT SLICE 60, and that is still exactly true. It is pinned to 2 here so
+        it stays a statement about slice 60 rather than a hostage to the live
+        file.
+        """
+        assert load(GATE60)["items_complete"] == 2
         assert load(GATE60)["items_complete_unchanged_from_slice_59"] is True
 
     def test_no_signature_was_forged(self):

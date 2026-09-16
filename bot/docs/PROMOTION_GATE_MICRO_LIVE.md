@@ -1,7 +1,13 @@
 # PROMOTION GATE — MICRO-LIVE
 
-**Status: REFUSE. 2 of 8 items complete. `promotion_gate_allows_live()` returns
+**Status: REFUSE. 3 of 8 items complete. `promotion_gate_allows_live()` returns
 `False` and nothing in this repository can make it return `True` today.**
+
+`kill_switch_drill_recorded` moved from incomplete to complete when a human
+witnessed the mechanical drill and signed it (transcript:
+`bot/artifacts/kill_switch_drill.json`). Five items remain open, five of them
+human-owned or observation-owned, so the gate refuses exactly as before. A
+count moving is not the gate softening.
 
 ---
 

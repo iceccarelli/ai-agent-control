@@ -34,10 +34,16 @@
       "how_to_satisfy": "Either a human explicitly accepts this in the signed memo, or new forward data brings the recent half back above zero UNDER THE UNCHANGED THRESHOLD. Moving the threshold is forbidden and would not satisfy this."
     },
     "kill_switch_drill_recorded": {
-      "complete": false,
+      "complete": true,
       "owner": "human",
-      "evidence": "no drill recorded",
-      "how_to_satisfy": "Trip the switch, confirm entries are blocked, clear it with the exact human token, and record the transcript."
+      "evidence": "Drill performed and recorded: bot/artifacts/kill_switch_drill.json — exit 0, 9 of 9 steps as_scripted, trip -> entries blocked (KILL_SWITCH_ENGAGED) + should_halt_trading true + health 503 -> cleared with the exact HUMAN_CLEARED_KILL_SWITCH token -> disengaged. Scratch StateStore only; production database sha256 unchanged (751e248be46e2f1796b08423f9051cd0a029177bcb0910d914beade2b160d8ab). Witnessed by a human after transcript review.",
+      "how_to_satisfy": "Trip the switch, confirm entries are blocked, clear it with the exact human token, and record the transcript.",
+      "signature": {
+        "drill_performed_by": "tools/kill_switch_drill.py",
+        "witnessed_by": "Vincenzo Ceccarelli",
+        "date": "2026-09-16 Europe/Berlin"
+      },
+      "transcript": "bot/artifacts/kill_switch_drill.json"
     },
     "linear_protective_stop_verified": {
       "complete": false,
@@ -65,7 +71,7 @@
     }
   },
   "items_total": 8,
-  "items_complete": 2,
+  "items_complete": 3,
   "items_requiring_a_human": 6,
   "note_on_ownership": "Six of eight items are things a HUMAN does. A gate a process could satisfy on its own is not a gate. The two machine items are re-derived from the live tree by promotion_gate.evaluate_promotion_gate rather than read from this file, so a hand-edited JSON cannot assert them falsely.",
   "note_on_fail_closed": "Flipping every bool in this file to true does NOT allow live: the gate requires the checklist AND config.is_live_authorized independently, and the gate can neither write live_authorized nor clear the kill switch. A missing or unreadable file means REFUSE, not 'assume complete'.",

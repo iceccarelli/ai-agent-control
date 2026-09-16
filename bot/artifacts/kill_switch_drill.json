@@ -1,6 +1,6 @@
 {
   "tool": "kill_switch_drill",
-  "performed_utc": "2026-09-16T15:57:56Z",
+  "performed_utc": "2026-09-16T16:41:09Z",
   "database": "throwaway (temporary)",
   "disposable_database": true,
   "apis_exercised": [
@@ -23,7 +23,7 @@
         "live_authorized": false,
         "models_current_present": false,
         "kill_switch_engaged_before": false,
-        "database": "/var/folders/1b/n9t4hmlx275cpnkvrl41m9fw0000gn/T/tmpxk4vdpmq/drill_state.db",
+        "database": "/var/folders/1b/n9t4hmlx275cpnkvrl41m9fw0000gn/T/tmpo_5ccg6u/drill_state.db",
         "disposable_database": true
       },
       "as_scripted": true

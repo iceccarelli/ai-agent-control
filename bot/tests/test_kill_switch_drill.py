@@ -165,12 +165,27 @@ class TestItCannotCompleteTheGateItem:
         assert os.path.basename(pg.GATE_PATH) not in source()
 
     def test_running_it_does_not_move_the_gate(self, report):
-        """The load-bearing assertion of this file."""
-        verdict = pg.evaluate_promotion_gate()
-        assert verdict.allows_live is False
-        complete = {i.key for i in verdict.items if i.complete}
-        assert "kill_switch_drill_recorded" not in complete
-        assert len(complete) == 2
+        """The load-bearing assertion of this file, stated as the real property.
+
+        It used to assert a COUNT (`len(complete) == 2`) and that the drill's
+        own item was absent. Both became false the moment a human witnessed the
+        drill and signed the item — which is the gate working, not the drill
+        forging anything. A count pinned here made a test about the TOOL depend
+        on a human's decision.
+
+        The property is that RUNNING the drill changes nothing: the gate is
+        snapshotted before and after a run and must be identical. That holds
+        whether the item is signed or not.
+        """
+        def snapshot():
+            verdict = pg.evaluate_promotion_gate()
+            return (verdict.allows_live,
+                    tuple(sorted(i.key for i in verdict.items if i.complete)))
+
+        before = snapshot()
+        ksd.run()
+        assert snapshot() == before, "a drill run changed the promotion gate"
+        assert before[0] is False
 
     def test_it_says_why_a_program_cannot_answer_the_question(self, report):
         why = report["why_this_does_not_complete_the_item"]

@@ -333,9 +333,23 @@ class TestThePromotionGateRefuses:
         assert pg.promotion_gate_allows_live() is False
 
     def test_six_of_eight_items_are_incomplete(self):
+        """NAME KEPT, COUNT AMENDED: six became five.
+
+        `kill_switch_drill_recorded` was completed by a human who witnessed the
+        mechanical drill and signed it — the first checklist item this
+        programme has ever closed. The name is left alone because the slice-59
+        record cites it and a shipped verdict must not be made false by a
+        rename; the number is amended here with its cause.
+
+        What this test exists to protect is NOT the number. It is that the gate
+        still refuses while anything is open, which is asserted directly below
+        and does not depend on how many items have closed.
+        """
         verdict = pg.evaluate_promotion_gate()
         assert len(verdict.items) == 8
-        assert len(verdict.incomplete) == 6
+        assert len(verdict.incomplete) == 5
+        assert verdict.allows_live is False
+        assert "kill_switch_drill_recorded" not in verdict.incomplete
 
     def test_every_reason_is_stated(self):
         verdict = pg.evaluate_promotion_gate()
