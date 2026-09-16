@@ -324,6 +324,69 @@
    "recorded_utc": "2026-09-15T23:42:01Z",
    "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
    "to_utc": "2026-09-15T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_PERP_BTCUSDT_8H",
+   "from_utc": "2019-09-10T08:00:00Z",
+   "purpose": "settlement-clock carry backtest (perp leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-16T00:36:54Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-15T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_SPOT_BTCUSDT_8H",
+   "from_utc": "2019-09-10T08:00:00Z",
+   "purpose": "settlement-clock carry backtest (spot leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-16T00:36:54Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-15T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_PERP_ETHUSDT_8H",
+   "from_utc": "2019-11-27T08:00:00Z",
+   "purpose": "settlement-clock carry backtest (perp leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-16T00:37:01Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-15T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_SPOT_ETHUSDT_8H",
+   "from_utc": "2019-11-27T08:00:00Z",
+   "purpose": "settlement-clock carry backtest (spot leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-16T00:37:01Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-15T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_PERP_SOLUSDT_8H",
+   "from_utc": "2020-09-14T08:00:00Z",
+   "purpose": "settlement-clock carry backtest (perp leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-16T00:37:06Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-15T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_SPOT_SOLUSDT_8H",
+   "from_utc": "2020-09-14T08:00:00Z",
+   "purpose": "settlement-clock carry backtest (spot leg)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-16T00:37:06Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-15T16:00:00Z"
+  },
+  {
+   "dataset": "BINANCE_LINEAR_SOL_USDT_FUNDING",
+   "from_utc": "2020-09-14T08:00:00Z",
+   "purpose": "settlement-clock carry backtest (funding)",
+   "read_by": "tools/carry_backtest.py",
+   "recorded_utc": "2026-09-16T00:37:06Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-15T16:00:00Z"
   }
  ],
  "schema": "data_read_ledger/1",

@@ -73,12 +73,26 @@ class TestAppendOnly:
                          "BINANCE_PERP_BTCUSDT_8H.csv.gz"))
 
     def test_the_two_legs_land_in_separate_files(self, tmp_path):
+        """One leg must not overwrite the other.
+
+        This counted directory entries and expected 2. The count was a PROXY
+        for separateness, and 0056 added a MANIFEST.json alongside the legs —
+        no corpus without provenance — so the proxy broke while the property it
+        stands for did not. Naming the two files asserts the property directly,
+        and is strictly stronger than a count: `len(listing) == 2` would also
+        pass if a leg were written under the wrong name.
+        """
         now = dt.datetime(2026, 9, 10, tzinfo=dt.timezone.utc).timestamp()
         k = [kline(dt.datetime(2026, 9, 9, 0, tzinfo=dt.timezone.utc), 100.0)]
         for leg in ("perp", "spot"):
             fsk.run(str(tmp_path), leg=leg, write=True, now_s=now, klines=k)
-        listing = os.listdir(os.path.join(str(tmp_path), fsk.OUT_DIR))
-        assert len(listing) == 2
+        folder = os.path.join(str(tmp_path), fsk.OUT_DIR)
+        perp = os.path.join(folder, "BINANCE_PERP_BTCUSDT_8H.csv.gz")
+        spot = os.path.join(folder, "BINANCE_SPOT_BTCUSDT_8H.csv.gz")
+        assert os.path.exists(perp) and os.path.exists(spot)
+        assert perp != spot
+        legs = [n for n in os.listdir(folder) if n.endswith(".csv.gz")]
+        assert len(legs) == 2, legs
 
 
 class TestTheAnalysisDegradesHonestly:

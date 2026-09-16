@@ -843,16 +843,31 @@ def load_bybit_settlements(repo: str):
     return rows, meta
 
 
-def load_binance_settlements(repo: str):
-    """Binance 8h klines (0027's fetcher) + the Binance funding corpus."""
+def load_binance_settlements(repo: str, asset: str = DEFAULT_ASSET,
+                             corpus: str = DEFAULT_CORPUS):
+    """Binance 8h klines (0027's fetcher) + the Binance funding corpus.
+
+    `asset` and `corpus` default to BTC/frozen, so every caller that predates
+    0056 reads exactly the three files it always read.
+
+    NOTE ON SOL (INVENTORY D46). The pairing below rounds a funding stamp to
+    the 8h grid and silently `continue`s when it lands more than 60s off.
+    Measured over the 7-year corpora that is lossless for BTC (7,688 of 7,688)
+    and ETH (7,454 of 7,454) — and drops 75 SOL prints, every one of them in
+    the FTX week of 2022-11, when Binance shortened SOL's funding interval.
+    Those are real settlements the book would have been paid at. A SOL number
+    from this loader understates that week; BTC and ETH are unaffected.
+    """
+    key = str(asset).upper()
     folder = os.path.join(repo, BINANCE_8H_DIR)
-    perp_p = os.path.join(folder, "BINANCE_PERP_BTCUSDT_8H.csv.gz")
-    spot_p = os.path.join(folder, "BINANCE_SPOT_BTCUSDT_8H.csv.gz")
+    perp_p = os.path.join(folder, f"BINANCE_PERP_{key}USDT_8H.csv.gz")
+    spot_p = os.path.join(folder, f"BINANCE_SPOT_{key}USDT_8H.csv.gz")
     if not (os.path.exists(perp_p) and os.path.exists(spot_p)):
         raise SystemExit(
-            "no Binance 8h settlement klines in this checkout. Fetch them "
-            "(both legs), from a host that can reach Binance:\n"
-            "  python3 tools/fetch_settlement_klines.py --write\n"
+            f"no Binance 8h settlement klines for {key} in this checkout. "
+            "Fetch them (both legs), from a host that can reach Binance:\n"
+            f"  python3 tools/fetch_settlement_klines.py --symbol {key}USDT "
+            "--since 2019-08-01 --write\n"
             "or run the same-venue Bybit clock:  --clock 8h --venue bybit")
 
     def load(path):
@@ -864,7 +879,7 @@ def load_binance_settlements(repo: str):
 
     perp, spot = load(perp_p), load(spot_p)
     ftimes, frates = load_funding(os.path.join(
-        repo, "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz"))
+        repo, _sources(asset, corpus)["funding"]))
     rows: List[Settlement] = []
     for ms, rate in zip(ftimes, frates):
         stamp = int(round(ms / SETTLEMENT_MS)) * SETTLEMENT_MS
@@ -876,13 +891,15 @@ def load_binance_settlements(repo: str):
                                perp_low=perp[stamp][1]))
     if not rows:
         raise SystemExit("no Binance settlements overlap the funding corpus")
-    _record("BINANCE_PERP_BTCUSDT_8H", _iso_ms(rows[0].ms), _iso_ms(rows[-1].ms),
-            "settlement-clock carry backtest (perp leg)")
-    _record("BINANCE_SPOT_BTCUSDT_8H", _iso_ms(rows[0].ms), _iso_ms(rows[-1].ms),
-            "settlement-clock carry backtest (spot leg)")
-    _record("BINANCE_LINEAR_BTC_USDT_FUNDING", _iso_ms(rows[0].ms),
+    _record(f"BINANCE_PERP_{key}USDT_8H", _iso_ms(rows[0].ms),
+            _iso_ms(rows[-1].ms), "settlement-clock carry backtest (perp leg)")
+    _record(f"BINANCE_SPOT_{key}USDT_8H", _iso_ms(rows[0].ms),
+            _iso_ms(rows[-1].ms), "settlement-clock carry backtest (spot leg)")
+    _record(f"BINANCE_LINEAR_{key}_USDT_FUNDING", _iso_ms(rows[0].ms),
             _iso_ms(rows[-1].ms), "settlement-clock carry backtest (funding)")
     return rows, {"same_venue": True, "corpus": BINANCE_8H_DIR,
+                  "asset": key, "funding_dataset":
+                      f"BINANCE_LINEAR_{key}_USDT_FUNDING",
                   "label": ("BINANCE spot 8h + BINANCE USDT-M 8h + BINANCE "
                             "funding — same venue and quote currency; NOT the "
                             "venue CarryBroker trades on")}

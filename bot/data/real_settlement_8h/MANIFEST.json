@@ -1,0 +1,75 @@
+{
+  "asset_class": "ohlcv",
+  "endpoints": {
+    "perp": "https://www.binance.com/fapi/v1/klines",
+    "spot": "https://api.binance.com/api/v3/klines"
+  },
+  "fetched_utc": "2026-09-16T00:46:25Z",
+  "files": {
+    "BINANCE_PERP_BTCUSDT_8H.csv.gz": {
+      "first_timestamp": "2019-09-08T16:00:00Z",
+      "interval_seconds": 28800,
+      "kind": "ohlcv",
+      "last_timestamp": "2026-09-15T16:00:00Z",
+      "rows": 7693,
+      "sha256": "724d7440d27ce8f64b592adbc917dddfce51bc972d885de0f4ed9e09ee4aabad",
+      "sha256_uncompressed": "5ff4b356930b6b16a6d6afaf48533dab7b03b30f263eff9e575060c764575c2d",
+      "size_bytes": 205074
+    },
+    "BINANCE_PERP_ETHUSDT_8H.csv.gz": {
+      "first_timestamp": "2019-11-27T00:00:00Z",
+      "interval_seconds": 28800,
+      "kind": "ohlcv",
+      "last_timestamp": "2026-09-15T16:00:00Z",
+      "rows": 7455,
+      "sha256": "74b2153a7b2b00d07ae27893459987b85cc3dcb6106902723c4225cb6dda2643",
+      "sha256_uncompressed": "c7a9624a8458b1ee3111c439af375707066c78a66faf107f1d4a995abaeae718",
+      "size_bytes": 195875
+    },
+    "BINANCE_PERP_SOLUSDT_8H.csv.gz": {
+      "first_timestamp": "2020-09-14T00:00:00Z",
+      "interval_seconds": 28800,
+      "kind": "ohlcv",
+      "last_timestamp": "2026-09-15T16:00:00Z",
+      "rows": 6579,
+      "sha256": "e8ab23cbb98921bbf2e191522e348f2228b2b6f6d1a76b786efc81ce7cf46e08",
+      "sha256_uncompressed": "f79daec4c48b9a89804e11444e366e6e8f192b89ed87b34b5e95a57ee7dfb968",
+      "size_bytes": 156893
+    },
+    "BINANCE_SPOT_BTCUSDT_8H.csv.gz": {
+      "first_timestamp": "2019-08-01T00:00:00Z",
+      "interval_seconds": 28800,
+      "kind": "ohlcv",
+      "last_timestamp": "2026-09-15T16:00:00Z",
+      "rows": 7809,
+      "sha256": "cc0d52ca312b714e5d5e6251402b28b2741cbd85249670dc27d1796522ce368d",
+      "sha256_uncompressed": "4598976560581cc975de42d25604042776bc5a4952a9050754b22f6f183e7fea",
+      "size_bytes": 231228
+    },
+    "BINANCE_SPOT_ETHUSDT_8H.csv.gz": {
+      "first_timestamp": "2019-08-01T00:00:00Z",
+      "interval_seconds": 28800,
+      "kind": "ohlcv",
+      "last_timestamp": "2026-09-15T16:00:00Z",
+      "rows": 7809,
+      "sha256": "f1e966878c4f52610e30863c17fc2cf81214caa75f24a026c5175ce76bdb0fa8",
+      "sha256_uncompressed": "4a748fff95febd195b0dbada6aba4f0a1f1c9291de10013f073d8fed8fdf7ae7",
+      "size_bytes": 213762
+    },
+    "BINANCE_SPOT_SOLUSDT_8H.csv.gz": {
+      "first_timestamp": "2020-08-11T00:00:00Z",
+      "interval_seconds": 28800,
+      "kind": "ohlcv",
+      "last_timestamp": "2026-09-15T16:00:00Z",
+      "rows": 6681,
+      "sha256": "c756aab9cad0d579743c6cd87486a2d28bd8492bd61f00af863e472783ef88c1",
+      "sha256_uncompressed": "d2be59bacf14c3ce13055affa7fe4308f40d6eade447d437a9082cf6acc04449",
+      "size_bytes": 163417
+    }
+  },
+  "interval": "8h",
+  "notes": "8h klines on the funding settlement grid (00/08/16 UTC). Append-only: every write asserts the existing bytes are a prefix of the new ones. No bar is fabricated and a window that has not closed is refused.",
+  "source": "public_rest_klines",
+  "synthetic": false,
+  "venue": "binance"
+}

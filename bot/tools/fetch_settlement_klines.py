@@ -99,8 +99,23 @@ def to_row(kline: List[Any]) -> Dict[str, str]:
             "volume_traded": kline[5]}
 
 
+#: Where a FRESH file starts. 2022-08-10 is where the frozen daily corpus
+#: begins (`data/real_linear_1d`), and this literal was matched to it — it is
+#: NOT a provenance rule and never was. Binance serves 8h klines from each
+#: contract's inception: BTC perp 2019-09-08, ETH perp 2019-11-27, SOL perp
+#: 2020-09-14, all grid-aligned to 00/08/16 UTC with zero offset, 7,694 BTC
+#: bars against 7,688 funding prints (probed, not assumed).
+#:
+#: It stays the default so every existing caller writes exactly what it wrote
+#: before. A file that ALREADY has rows resumes from its last row regardless,
+#: so this governs a first write only — which also means an existing file
+#: cannot be back-filled by passing an earlier date. Replace it instead.
+DEFAULT_SINCE = "2022-08-10"
+
+
 def run(repo: str = ".", *, leg: str = "perp", symbol: str = "BTCUSDT",
         write: bool = False, now_s: Optional[float] = None,
+        since: str = DEFAULT_SINCE,
         klines: Optional[List[List[Any]]] = None) -> Dict[str, Any]:
     now_s = now_s if now_s is not None else dt.datetime.now(
         dt.timezone.utc).timestamp()
@@ -108,7 +123,8 @@ def run(repo: str = ".", *, leg: str = "perp", symbol: str = "BTCUSDT",
     rows = read_rows(path)
     have = {r["open_time_ms"] for r in rows}
     start_ms = (int(rows[-1]["open_time_ms"]) + 1) if rows else \
-        int(dt.datetime(2022, 8, 10, tzinfo=dt.timezone.utc).timestamp() * 1000)
+        int(dt.datetime.fromisoformat(since).replace(
+            tzinfo=dt.timezone.utc).timestamp() * 1000)
 
     endpoint = PERP_ENDPOINT if leg == "perp" else SPOT_ENDPOINT
     raw = fetch(endpoint, symbol, start_ms) if klines is None else klines
@@ -147,7 +163,65 @@ def run(repo: str = ".", *, leg: str = "perp", symbol: str = "BTCUSDT",
         with gzip.open(path, "wb") as handle:
             handle.write(after_plain)
         report["written"] = True
+        report["manifest"] = write_manifest(os.path.join(repo, OUT_DIR))
     return report
+
+
+def write_manifest(folder: str) -> str:
+    """NO CORPUS WITHOUT PROVENANCE — which this tool did not honour.
+
+    `fetch_binance_klines` has written a MANIFEST.json since it was built, and
+    says so in its own docstring as a rule. This fetcher wrote none, and the
+    gap went unseen for one reason: `data/real_settlement_8h` had never existed
+    in a checkout. The moment it did, `test_every_corpus_file_is_listed` failed
+    — six real Binance files sitting under the SYNTHETIC root manifest, which
+    is the "a real file checked against a synthetic hash" case that test's own
+    docstring warns about.
+
+    Writing it into the corpus folder, rather than adding the files to
+    `data/MANIFEST.json`, is what makes the directory self-describing: the walk
+    skips any subdirectory carrying its own manifest, and `verify_manifest`
+    then checks these files against THEIR provenance and reports
+    `synthetic: false` for them.
+    """
+    files: Dict[str, Any] = {}
+    for name in sorted(os.listdir(folder)):
+        if not name.endswith(".csv.gz"):
+            continue
+        full = os.path.join(folder, name)
+        with open(full, "rb") as blob:
+            raw = blob.read()
+        plain = gzip.decompress(raw)
+        rows = list(csv.DictReader(io.StringIO(plain.decode("utf-8"))))
+        files[name] = {
+            "kind": "ohlcv",
+            "interval_seconds": WINDOW_S,
+            "rows": len(rows),
+            "size_bytes": len(raw),
+            "sha256": sha256_bytes(raw),
+            "sha256_uncompressed": sha256_bytes(plain),
+            "first_timestamp": rows[0]["open_utc"] if rows else None,
+            "last_timestamp": rows[-1]["open_utc"] if rows else None,
+        }
+    manifest = {
+        "synthetic": False,
+        "asset_class": "ohlcv",
+        "venue": "binance",
+        "interval": "8h",
+        "source": "public_rest_klines",
+        "endpoints": {"perp": PERP_ENDPOINT, "spot": SPOT_ENDPOINT},
+        "fetched_utc": dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "files": files,
+        "notes": ("8h klines on the funding settlement grid (00/08/16 UTC). "
+                  "Append-only: every write asserts the existing bytes are a "
+                  "prefix of the new ones. No bar is fabricated and a window "
+                  "that has not closed is refused."),
+    }
+    path = os.path.join(folder, "MANIFEST.json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(manifest, handle, indent=2, sort_keys=True)
+    return path
 
 
 def main(argv=None) -> int:
@@ -156,11 +230,18 @@ def main(argv=None) -> int:
     parser.add_argument("--repo", default=".")
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--legs", nargs="+", default=["perp", "spot"])
+    parser.add_argument("--since", default=DEFAULT_SINCE,
+                        help="where a FRESH file starts (YYYY-MM-DD). Governs "
+                             "a first write only: a file that already has rows "
+                             "resumes from its last row, so an existing corpus "
+                             "cannot be back-filled by passing an earlier "
+                             "date. Default is unchanged.")
     parser.add_argument("--write", action="store_true")
     args = parser.parse_args(argv)
     failed = False
     for leg in args.legs:
-        report = run(args.repo, leg=leg, symbol=args.symbol, write=args.write)
+        report = run(args.repo, leg=leg, symbol=args.symbol, write=args.write,
+                     since=args.since)
         print(json.dumps(report, indent=2))
         failed = failed or bool(report.get("error"))
     return 1 if failed else 0

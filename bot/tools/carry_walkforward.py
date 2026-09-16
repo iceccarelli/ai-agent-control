@@ -80,7 +80,13 @@ EXIT_PRINTS = [1, 2, 3, 4, 6]
 EWMA_ALPHA = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 AXES = ("hold_days", "negative_exit_prints", "ewma_alpha")
 
-DATASET = "BYBIT_LINEAR_BTC_USDT_FUNDING"
+#: DEAD, and left named so the next reader does not have to find that out the
+#: hard way. It occurs exactly once — here — and is read by nothing. This tool
+#: performs NO holdout certification: it records its search width to the
+#: hypothesis registry and says in its own banner that a walk-forward is not a
+#: holdout. `carry_sweep` is the tool that certifies, and it takes its dataset
+#: name from the series it actually read (0056).
+DATASET = "BYBIT_LINEAR_BTC_USDT_FUNDING"   # unused; see above
 
 
 def _frozen() -> Dict[str, Any]:
@@ -445,8 +451,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--burn-in-days", type=float, default=365.0)
     ap.add_argument("--step-days", type=float, default=30.0)
     ap.add_argument("--no-impact", action="store_true")
+    ap.add_argument("--venue", choices=("bybit", "binance"), default="bybit",
+                    help="bybit = the committed 4h corpus this tool has always "
+                         "read (BTC only, 2022-08 on); binance = the 8h "
+                         "settlement corpus, which reaches each contract's "
+                         "inception and carries ETH and SOL")
+    ap.add_argument("--asset", choices=sorted(cb.ASSET_SOURCES), default="BTC",
+                    help="binance venue only; the bybit corpus is BTC alone")
+    ap.add_argument("--corpus", choices=sorted(cb.CORPORA), default="full",
+                    help="which funding series pairs with the 8h klines. "
+                         "`full` reaches inception and is the point of using "
+                         "the binance venue at all")
     ap.add_argument("--json", default="")
     args = ap.parse_args(argv)
+
+    if args.venue == "bybit" and args.asset != "BTC":
+        print("the committed Bybit 4h corpus is BTC only; --asset needs "
+              "--venue binance", file=sys.stderr)
+        return 2
 
     if not core.available() and not core.build():
         print("libcarrycore.so is not built and there is no compiler here.\n"
@@ -455,7 +477,10 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
-    rows, meta = cb.load_bybit_settlements(args.repo)
+    rows, meta = (cb.load_bybit_settlements(args.repo)
+                  if args.venue == "bybit"
+                  else cb.load_binance_settlements(args.repo, args.asset,
+                                                   args.corpus))
     impact_bps = (0.0 if args.no_impact
                   else cb.impact_bps_per_leg(args.repo, args.notional)[0])
     r = run_rows(rows, notional=args.notional, borrow_apr=args.borrow_apr,
