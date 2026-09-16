@@ -4,7 +4,7 @@
 WHAT THIS IS FOR
 ================
 `docs/promotion/KILL_SWITCH_DRILL_SCRIPT.md` is a six-step script with blank
-`observed: ______` lines, and it has never been run. It is one of the eight
+`observed: ______` lines, and it had never been run. It is one of the eight
 promotion-gate items and one of the six a human owns.
 
 The point of a drill is not to prove the switch exists — `_gate_kill_switch`
@@ -14,49 +14,66 @@ matters. `tools/drill.py` makes the same argument for the Phase D venue drill:
 "a drill that lives in prose gets half-run at 2am by somebody tired, and its
 evidence is a terminal scrollback nobody kept."
 
-So this performs the mechanical steps and records what the system ACTUALLY
-returned at each one. Every field is a value read back from the store, the risk
-chain or the health payload — never a boolean someone typed.
+EVERY STEP HITS THE LIVE PATH. THAT IS THE DELIVERABLE.
+=======================================================
+A drill that asserts against its own re-implementation of the rules proves
+nothing about the bot. So nothing here is re-derived:
 
-WHAT IT DOES NOT DO, AND CANNOT
-===============================
-**It does not complete the gate item.** `kill_switch_drill_recorded` is owned by
-a human, and a drill a process ran for itself is not evidence that a person can
-stop it. This writes no gate file, contains no path to one, and its report
-carries `gate_item_completed: false` with the signature block left blank. A test
-asserts all of that, because this is exactly the file where forging it would be
-easiest and most damaging.
+    entries blocked   `BillionaireRiskManager.gate_order`, the same call
+                      `trading_engine` makes before every entry, asserted to
+                      return the real `KILL_SWITCH_ENGAGED`
+    halt              `BillionaireRiskManager.should_halt_trading`
+    per-symbol        `BillionaireRiskManager.can_trade`
+    health            `TradingBot.health()` — the REAL method on a REAL
+                      TradingBot, not a dict assembled here
+    503               a REAL `HTTPServer` started by the bot's own
+                      `start_health_server()`, fetched over a real socket.
+                      The `200 if healthy else 503` mapping is never recomputed
 
-SAFETY: IT DOES NOT TOUCH YOUR STATE BY DEFAULT
-===============================================
-The switch it trips is real, and a drill that left it engaged would be an
-outage. So:
+An earlier version of this file built its own health dict. That was decorative
+and is recorded here because it is exactly the failure this docstring warns
+about.
 
-* with no `--state`, it runs against a THROWAWAY database in a temporary
-  directory. That proves the mechanism end to end and is safe to run anywhere,
-  including on a timer;
-* `--state PATH` runs against a real database, which is the drill a human
-  actually performs, and is a deliberate act;
-* either way it records the switch's state BEFORE it starts and restores it at
-  the end. If the restore fails it says so at CRITICAL and exits non-zero,
-  because a drill that leaves the switch engaged has caused the incident it was
-  rehearsing for.
+HEALTH DEPENDS ON THREE THINGS, SO THE OTHER TWO ARE PINNED
+===========================================================
+`health()` is unhealthy when the switch is engaged OR a position is unprotected
+OR the bot has not reconciled. To make the switch the ATTRIBUTABLE cause, the
+drill records health BEFORE the trip as well as after, on a store with no
+positions and with `_reconciled` set true. Healthy true -> false with nothing
+else changed is the observation; a single unhealthy reading would not be.
 
-    python3 tools/kill_switch_drill.py                    # throwaway db
-    python3 tools/kill_switch_drill.py --state state/trading_state.db \\
-            --out artifacts/kill_switch_drill.json
+SAFETY: IT DOES NOT TOUCH YOUR STATE
+====================================
+The switch it trips is real, and a drill that left it engaged would be the
+outage it was rehearsing for. So:
+
+* with no `--state` it runs against a THROWAWAY database in a temporary
+  directory, and the production database is hashed before and after to prove
+  it was never opened;
+* `--state PATH` runs against a real database and is a deliberate human act;
+* the switch's state is recorded BEFORE the drill and restored in a `finally`,
+  including when a step raised. A switch engaged before the drill is LEFT
+  engaged — a drill run during a real incident must not resume trading.
+
+    python3 tools/kill_switch_drill.py
+    python3 tools/kill_switch_drill.py --out artifacts/kill_switch_drill.json
 
 Exit codes: 0 every step behaved as scripted; 1 a step did NOT (read the
-report); 2 the switch could not be restored — look now.
+report); 2 the switch could not be restored — a P0, look now.
 """
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import datetime as dt
+import hashlib
 import json
 import os
+import socket
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from typing import Any, Dict, List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -69,16 +86,52 @@ import persistence                                  # noqa: E402
 import project_status as _ps                        # noqa: E402
 import risk_management                              # noqa: E402
 
-#: The token `clear_kill_switch_by_human` demands. Quoted from persistence
-#: rather than restated: a copy of it here that drifted would make the drill
-#: pass against a door that no longer opens.
+#: The token `clear_kill_switch_by_human` demands. A copy that drifted would
+#: make the drill pass against a door that no longer opens, so a test asserts
+#: this string appears in that method's own source.
 HUMAN_TOKEN = "HUMAN_CLEARED_KILL_SWITCH"
 
 DRILL_REASON = "kill-switch drill (tools/kill_switch_drill.py)"
 
+DEFAULT_EVIDENCE = os.path.join("artifacts", "kill_switch_drill.json")
 
-class DrillFailed(RuntimeError):
-    """A step did not behave as the script says it must."""
+
+class _StubClient:
+    """Enough venue for `TradingBot.__init__`. Sends nothing, reads nothing.
+
+    The drill is about the risk chain and the health endpoint, neither of which
+    touches the exchange. A real client here would make the drill require
+    network and credentials to answer a question that involves neither.
+    """
+
+    category = "linear"
+    is_linear = True
+    is_spot = False
+
+    def __init__(self) -> None:
+        self.cfg = None
+
+    def sync_time(self) -> int:
+        return 0
+
+    def get_wallet(self, *_a: Any, **_k: Any) -> Dict[str, Any]:
+        return {}
+
+    def get_equity(self, *_a: Any, **_k: Any) -> float:
+        return 1000.0
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
 
 
 def _observation(step: str, expected: str, observed: Any,
@@ -87,10 +140,36 @@ def _observation(step: str, expected: str, observed: Any,
             "as_scripted": bool(ok)}
 
 
+def _health_over_http(bot: Any, port: int) -> Dict[str, Any]:
+    """Fetch /health over a real socket. Returns the status the SERVER sent.
+
+    The `200 if healthy else 503` mapping lives in `_HealthHandler.do_GET` and
+    is deliberately not recomputed here — recomputing it would test this file
+    rather than the endpoint an orchestrator actually polls.
+    """
+    url = f"http://127.0.0.1:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            return {"status": int(response.status),
+                    "payload": json.loads(response.read())}
+    except urllib.error.HTTPError as exc:          # 503 arrives here
+        body = exc.read()
+        try:
+            payload = json.loads(body)
+        except Exception:                           # noqa: BLE001
+            payload = {"unparseable": body[:200].decode("utf-8", "replace")}
+        return {"status": int(exc.code), "payload": payload}
+
+
 def run(*, state_path: Optional[str] = None,
         config: Any = None) -> Dict[str, Any]:
-    """Perform the six steps and return the evidence."""
+    """Perform the drill and return the evidence."""
     cfg = config if config is not None else _config.get_config_object()
+
+    production_db = os.path.join(
+        REPO, str(getattr(cfg, "STATE_DB_PATH", "state/trading_state.db")))
+    production_sha_before = _sha256_file(production_db)
+
     temp_dir: Optional[tempfile.TemporaryDirectory] = None
     if state_path is None:
         temp_dir = tempfile.TemporaryDirectory()
@@ -102,84 +181,131 @@ def run(*, state_path: Optional[str] = None,
     steps: List[Dict[str, Any]] = []
     store = persistence.StateStore(state_path)
     was_engaged, was_reason = store.is_kill_switch_engaged()
+    bot = None
+    port = _free_port()
 
     try:
+        import main                                 # noqa: PLC0415
+
         # -- 1. baseline ------------------------------------------------
         status = _ps.current(cfg)
         steps.append(_observation(
             "1_baseline",
-            "live_authorized false and models_current absent before a drill",
+            "not live-armed, no promoted model, and a scratch database",
             {"cleared_edge_signal": status.cleared_edge_signal,
              "execution_mode": status.execution_mode,
              "live_authorized": status.live_authorized,
              "models_current_present": status.models_current_present,
-             "kill_switch_engaged_before": was_engaged},
+             "kill_switch_engaged_before": was_engaged,
+             "database": state_path,
+             "disposable_database": disposable},
             not status.live_authorized and not status.models_current_present))
 
-        # -- 2. trip ----------------------------------------------------
+        # The bot under test: REAL TradingBot, real risk manager, real health.
+        drill_cfg = dataclasses.replace(
+            cfg, ENABLE_HEALTH_SERVER=True, HEALTHCHECK_PORT=port)
+        bot = main.TradingBot(config=drill_cfg, store=store,
+                              client=_StubClient())
+        # `health()` is unhealthy when the switch is engaged OR a position is
+        # naked OR the bot has not reconciled. The other two are pinned so the
+        # switch is the attributable cause of the flip below.
+        bot._reconciled = True
+        bot.start_health_server()
+
+        # -- 2. health BEFORE the trip ----------------------------------
+        before = bot.health()
+        before_http = _health_over_http(bot, port)
+        steps.append(_observation(
+            "2_health_before_trip",
+            "healthy, HTTP 200, with no naked positions and reconciled true",
+            {"healthy": before["healthy"], "http_status": before_http["status"],
+             "naked_positions": before["naked_positions"],
+             "reconciled": before["reconciled"]},
+            before["healthy"] is True and before_http["status"] == 200
+            and not before["naked_positions"]))
+
+        # -- 3. trip ----------------------------------------------------
         store.trip_kill_switch(DRILL_REASON)
         engaged, reason = store.is_kill_switch_engaged()
         steps.append(_observation(
-            "2_trip", "the switch reads engaged, with the drill's reason",
+            "3_trip", "the switch reads engaged, carrying the drill's reason",
             {"engaged": engaged, "reason": reason},
             engaged and reason == DRILL_REASON))
 
-        # -- 3. it actually blocks --------------------------------------
-        risk = risk_management.BillionaireRiskManager(config=cfg, store=store)
+        # -- 4. entries are blocked, on the LIVE gate path --------------
+        risk = risk_management.BillionaireRiskManager(config=drill_cfg,
+                                                     store=store)
         halt = risk.should_halt_trading()
         gate = risk.gate_order(
             symbol="BTCUSDT", side="Buy", entry_price=100.0, stop_loss=99.0,
             quantity=0.0, account_equity=1_000.0)
         can = risk.can_trade("BTCUSDT")
         steps.append(_observation(
-            "3_blocks",
-            "should_halt_trading true, the gate chain blocks with "
-            "KILL_SWITCH_ENGAGED, can_trade false",
-            {"should_halt_trading": halt, "gate_reason": gate.reason,
-             "gate_ok": gate.ok, "can_trade": can},
-            halt and not gate.ok and gate.reason == "KILL_SWITCH_ENGAGED"
-            and not can))
+            "4_entries_blocked",
+            "gate_order returns KILL_SWITCH_ENGAGED, should_halt_trading true, "
+            "can_trade false",
+            {"gate_reason": gate.reason, "gate_ok": gate.ok,
+             "should_halt_trading": halt, "can_trade": can},
+            (not gate.ok) and gate.reason == "KILL_SWITCH_ENGAGED"
+            and halt and not can))
 
-        # -- 3b. health says so -----------------------------------------
-        health = {"healthy": not engaged, "kill_switch": engaged,
-                  "kill_reason": reason}
+        # -- 5. health AFTER the trip, and the real 503 -----------------
+        after = bot.health()
+        after_http = _health_over_http(bot, port)
         steps.append(_observation(
-            "3b_health", "the health payload reports unhealthy",
-            health, health["healthy"] is False))
+            "5_health_unhealthy_503",
+            "the same endpoint now reports unhealthy and the server sends 503",
+            {"healthy": after["healthy"], "http_status": after_http["status"],
+             "kill_switch": after["kill_switch"],
+             "kill_reason": after["kill_reason"],
+             "healthy_before": before["healthy"],
+             "http_status_before": before_http["status"]},
+            after["healthy"] is False and after_http["status"] == 503
+            and after["kill_switch"] is True
+            and before_http["status"] == 200))
 
-        # -- 4. it survives a restart -----------------------------------
-        store.close()
+        # -- 6. it survives a restart -----------------------------------
         reopened = persistence.StateStore(state_path)
         still, still_reason = reopened.is_kill_switch_engaged()
         steps.append(_observation(
-            "4_survives_restart",
-            "a new process over the same database still sees it engaged",
+            "6_survives_restart",
+            "a new StateStore over the same file still sees it engaged",
             {"engaged": still, "reason": still_reason}, still))
-        store = reopened
+        reopened.close()
 
-        # -- 5. only the exact token clears it --------------------------
-        wrong_refused = False
+        # -- 7. only the exact token clears it --------------------------
         wrong_error = ""
         try:
             store.clear_kill_switch_by_human("please")
-        except Exception as exc:  # noqa: BLE001
-            wrong_refused = True
+        except Exception as exc:                    # noqa: BLE001
             wrong_error = f"{type(exc).__name__}: {exc}"
         after_wrong, _ = store.is_kill_switch_engaged()
         steps.append(_observation(
-            "5a_wrong_token_refused",
+            "7a_wrong_token_refused",
             "a wrong token raises AND leaves the switch engaged",
             {"raised": wrong_error, "still_engaged": after_wrong},
-            wrong_refused and after_wrong))
+            bool(wrong_error) and after_wrong))
 
         store.clear_kill_switch_by_human(HUMAN_TOKEN)
         cleared, _ = store.is_kill_switch_engaged()
+        recovered = bot.health()
+        recovered_http = _health_over_http(bot, port)
         steps.append(_observation(
-            "5b_exact_token_clears",
-            "the exact operator token clears it",
-            {"engaged_after_clear": cleared}, not cleared))
+            "7b_exact_token_clears",
+            "the exact operator token clears it and health returns to 200",
+            {"engaged_after_clear": cleared,
+             "healthy": recovered["healthy"],
+             "http_status": recovered_http["status"]},
+            (not cleared) and recovered["healthy"] is True
+            and recovered_http["status"] == 200))
 
     finally:
+        if bot is not None and getattr(bot, "_http", None) is not None:
+            try:
+                bot._http.shutdown()
+                bot._http.server_close()
+            except Exception:                       # noqa: BLE001
+                pass
         # Restore whatever was true before the drill. This runs even when a
         # step raised, because the alternative is leaving the switch engaged.
         restored = True
@@ -190,13 +316,29 @@ def run(*, state_path: Optional[str] = None,
                 store.trip_kill_switch(was_reason or "restored after drill")
             elif not was_engaged and engaged_now:
                 store.clear_kill_switch_by_human(HUMAN_TOKEN)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:                    # noqa: BLE001
             restored = False
             restore_error = f"{type(exc).__name__}: {exc}"
         try:
+            final_engaged, _ = store.is_kill_switch_engaged()
+        except Exception:                           # noqa: BLE001
+            final_engaged = None
+        try:
             store.close()
-        except Exception:  # noqa: BLE001
+        except Exception:                           # noqa: BLE001
             pass
+
+    production_sha_after = _sha256_file(production_db)
+    steps.append(_observation(
+        "8_disengaged_and_production_untouched",
+        "the switch is disengaged and the production database is byte-identical",
+        {"switch_engaged_at_exit": final_engaged,
+         "production_db": os.path.relpath(production_db, REPO),
+         "production_sha256_before": production_sha_before,
+         "production_sha256_after": production_sha_after,
+         "production_untouched": production_sha_before == production_sha_after},
+        (final_engaged is False or (was_engaged and final_engaged is True))
+        and production_sha_before == production_sha_after))
 
     report: Dict[str, Any] = {
         "tool": "kill_switch_drill",
@@ -204,11 +346,23 @@ def run(*, state_path: Optional[str] = None,
             "%Y-%m-%dT%H:%M:%SZ"),
         "database": "throwaway (temporary)" if disposable else state_path,
         "disposable_database": disposable,
+        "apis_exercised": [
+            "StateStore.trip_kill_switch",
+            "StateStore.is_kill_switch_engaged",
+            "StateStore.clear_kill_switch_by_human",
+            "BillionaireRiskManager.gate_order -> _gate_kill_switch",
+            "BillionaireRiskManager.should_halt_trading",
+            "BillionaireRiskManager.can_trade",
+            "TradingBot.health",
+            "TradingBot.start_health_server -> _HealthHandler.do_GET",
+        ],
         "steps": steps,
         "all_steps_as_scripted": all(s["as_scripted"] for s in steps),
         "switch_restored": restored,
         "switch_restore_error": restore_error,
         "switch_engaged_before": was_engaged,
+        "switch_engaged_at_exit": final_engaged,
+        "production_db_untouched": production_sha_before == production_sha_after,
         # -- the part a process may not produce ------------------------
         "gate_item": "kill_switch_drill_recorded",
         "gate_item_completed": False,
@@ -218,9 +372,9 @@ def run(*, state_path: Optional[str] = None,
             "The item is owned by a HUMAN. What it asks is whether a person "
             "can stop this process under time pressure; a drill the process "
             "ran for itself cannot answer that. This records that the "
-            "MECHANISM behaves as scripted, which is the half a program can "
-            "establish. A human performs the steps, witnesses them, and signs "
-            "— and only then does the item move."),
+            "MECHANISM behaves as scripted on the live code path, which is the "
+            "half a program can establish. A human performs the steps, "
+            "witnesses them, and signs — and only then does the item move."),
     }
     if temp_dir is not None:
         temp_dir.cleanup()
@@ -234,21 +388,26 @@ def main(argv=None) -> int:
     parser.add_argument("--state", default=None,
                         help="a REAL state database (default: a throwaway one "
                              "in a temporary directory)")
-    parser.add_argument("--out", default="",
-                        help="write the evidence here as JSON")
+    parser.add_argument("--out", default=DEFAULT_EVIDENCE,
+                        help=f"where to write the transcript "
+                             f"(default {DEFAULT_EVIDENCE}); '' to skip")
     args = parser.parse_args(argv)
 
     report = run(state_path=args.state)
     text = json.dumps(report, indent=2)
     print(text)
+
     if args.out:
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-        with open(args.out, "w", encoding="utf-8") as handle:
+        path = args.out if os.path.isabs(args.out) else os.path.join(
+            REPO, args.out)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
             handle.write(text + "\n")
-        print(f"\nevidence written to {args.out}", file=sys.stderr)
+        print(f"\nevidence written to {os.path.relpath(path, REPO)}",
+              file=sys.stderr)
 
     if not report["switch_restored"]:
-        print("THE KILL SWITCH COULD NOT BE RESTORED — look now: "
+        print("P0: THE KILL SWITCH COULD NOT BE RESTORED — look now: "
               f"{report['switch_restore_error']}", file=sys.stderr)
         return 2
     if not report["all_steps_as_scripted"]:
@@ -256,8 +415,9 @@ def main(argv=None) -> int:
         print(f"steps that did NOT behave as scripted: {failed}",
               file=sys.stderr)
         return 1
-    print("\nevery step behaved as scripted. THE GATE ITEM IS STILL OPEN: a "
-          "human performs, witnesses and signs it.", file=sys.stderr)
+    print("\nevery step behaved as scripted on the live path. THE GATE ITEM IS "
+          "STILL OPEN: a human performs, witnesses and signs it.",
+          file=sys.stderr)
     return 0
 
 

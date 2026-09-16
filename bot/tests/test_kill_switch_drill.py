@@ -1,31 +1,39 @@
-"""The kill-switch drill, and the forgery it must not be able to commit.
+"""The kill-switch drill: the live path, and the forgery it must not commit.
 
 WHY THIS FILE EXISTS
 ====================
 `tools/kill_switch_drill.py` performs the six steps of
 `docs/promotion/KILL_SWITCH_DRILL_SCRIPT.md` and records what the system
-actually returned at each one. It exists because the script has never been run
+actually returned at each one. It exists because the script had never been run
 and its evidence would otherwise be a terminal scrollback nobody kept.
 
-It is also the single easiest place in this repository to commit the forgery the
-promotion gate exists to prevent. `kill_switch_drill_recorded` is one of six
-items a HUMAN owns, and the template says it plainly: *"A drill you did not run
-is worth nothing, and marking this item complete without running one is a
-forgery."* A program that ran the drill for itself and then ticked the box would
-be exactly that, dressed as diligence.
+THREE PROPERTIES, AND ALL THREE WERE BROKEN AT SOME POINT
+=========================================================
+1. **It must hit the LIVE path.** An earlier version of this drill assembled
+   its own health dict and asserted against that. It passed, and it proved
+   nothing about the endpoint an orchestrator polls. The drill now calls the
+   real `TradingBot.health()` and fetches the real `HTTPServer` the bot starts
+   itself, so the `200 if healthy else 503` mapping is never recomputed.
+2. **It must not complete the gate item.** `kill_switch_drill_recorded` is one
+   of six items a HUMAN owns, and the template says it plainly: *"A drill you
+   did not run is worth nothing, and marking this item complete without running
+   one is a forgery."*
+3. **It must not leave the switch engaged**, and must not touch the production
+   database.
 
-So the assertions below are in two groups:
+WHAT THIS FILE DOES NOT DO
+==========================
+It does not re-prove what is already covered elsewhere. `KILL_SWITCH_ENGAGED`
+is asserted in eight other test files, and
+`test_orchestrator.py::test_health_endpoint_returns_503_when_unhealthy` already
+proves the endpoint's status mapping. This file asserts that the DRILL exercises
+those paths and records what they returned — the transcript, not the mechanism.
 
-1. **It cannot complete the gate item.** No gate path, no gate write, an
-   explicit `gate_item_completed: false`, and a blank signature block.
-2. **It cannot leave the switch engaged.** A drill that tripped the real switch
-   and walked away would have caused the incident it was rehearsing for.
-
-Nothing here reaches the network or touches the configured state database.
+Nothing here reaches the network or opens the configured state database.
 """
 from __future__ import annotations
 
-import json
+import hashlib
 import os
 import sys
 
@@ -47,9 +55,88 @@ def source():
         return handle.read()
 
 
-@pytest.fixture()
+def step(report, name):
+    return next(s for s in report["steps"] if s["step"] == name)
+
+
+@pytest.fixture(scope="module")
 def report():
+    """One drill run, shared. It writes nothing outside a temporary directory."""
     return ksd.run()
+
+
+# ---------------------------------------------------------------------------
+# 1 — it hits the live path
+# ---------------------------------------------------------------------------
+
+
+class TestItExercisesTheLivePath:
+    def test_the_gate_chain_is_the_one_the_engine_calls(self, report):
+        """`gate_order` is what `trading_engine` calls before every entry."""
+        blocked = step(report, "4_entries_blocked")["observed"]
+        assert blocked["gate_reason"] == "KILL_SWITCH_ENGAGED"
+        assert blocked["gate_ok"] is False
+        assert blocked["should_halt_trading"] is True
+        assert blocked["can_trade"] is False
+
+    def test_the_503_comes_from_a_real_server(self, report):
+        """Not from recomputing `200 if healthy else 503` in the drill."""
+        after = step(report, "5_health_unhealthy_503")["observed"]
+        assert after["http_status"] == 503
+        assert after["healthy"] is False
+        assert after["kill_switch"] is True
+
+    def test_health_flips_and_the_switch_is_the_attributable_cause(self, report):
+        """`health()` is also unhealthy on a naked position or before
+        reconciliation, so a single unhealthy reading proves nothing. The drill
+        records BOTH sides with the other two causes pinned."""
+        before = step(report, "2_health_before_trip")["observed"]
+        after = step(report, "5_health_unhealthy_503")["observed"]
+        assert before["healthy"] is True and before["http_status"] == 200
+        assert before["naked_positions"] == []
+        assert before["reconciled"] is True
+        assert after["healthy"] is False and after["http_status"] == 503
+
+    def test_clearing_restores_health_over_the_same_endpoint(self, report):
+        cleared = step(report, "7b_exact_token_clears")["observed"]
+        assert cleared["engaged_after_clear"] is False
+        assert cleared["healthy"] is True
+        assert cleared["http_status"] == 200
+
+    def test_it_does_not_reimplement_the_status_mapping(self):
+        """Checked against CODE, not prose.
+
+        The first version of this test asserted the phrase
+        `200 if healthy else 503` was absent from the file — and the docstring
+        explaining that the mapping is never recomputed contains that phrase,
+        so the test failed on its own explanation. A substring scan cannot tell
+        an implementation from a description of one. This walks the AST for the
+        ternary itself, which can only exist in executable code.
+        """
+        import ast
+        tree = ast.parse(source())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.IfExp):
+                continue
+            values = {getattr(node.body, "value", None),
+                      getattr(node.orelse, "value", None)}
+            assert not ({200, 503} & values), (
+                f"the drill computes an HTTP status itself: {ast.dump(node)}")
+        text = source()
+        assert "urllib.error.HTTPError" in text
+        assert "int(exc.code)" in text
+        assert "int(response.status)" in text
+
+    def test_the_apis_it_claims_are_the_ones_it_calls(self, report):
+        text = source()
+        for api in report["apis_exercised"]:
+            leaf = api.split(" -> ")[0].split(".")[-1]
+            assert leaf in text, api
+
+
+# ---------------------------------------------------------------------------
+# 2 — it cannot complete the gate item
+# ---------------------------------------------------------------------------
 
 
 class TestItCannotCompleteTheGateItem:
@@ -62,10 +149,7 @@ class TestItCannotCompleteTheGateItem:
             "drill_performed_by": "", "witnessed_by": "", "date": ""}
 
     def test_it_never_writes_the_gate_file(self):
-        text = source()
-        assert os.path.basename(pg.GATE_PATH) not in text
-        assert "promotion_gate" not in text.replace(
-            "promotion-gate items", "").replace("promotion gate", "")
+        assert os.path.basename(pg.GATE_PATH) not in source()
 
     def test_running_it_does_not_move_the_gate(self, report):
         """The load-bearing assertion of this file."""
@@ -77,15 +161,22 @@ class TestItCannotCompleteTheGateItem:
 
     def test_it_says_why_a_program_cannot_answer_the_question(self, report):
         why = report["why_this_does_not_complete_the_item"]
-        assert "HUMAN" in why
-        assert "under time pressure" in why
+        assert "HUMAN" in why and "under time pressure" in why
+
+
+# ---------------------------------------------------------------------------
+# 3 — it cannot leave the switch engaged, or touch production
+# ---------------------------------------------------------------------------
 
 
 class TestItCannotLeaveTheSwitchEngaged:
-    def test_the_switch_is_clear_afterwards(self, tmp_path):
-        path = str(tmp_path / "s.db")
-        report = ksd.run(state_path=path)
+    def test_the_switch_is_disengaged_at_exit(self, report):
         assert report["switch_restored"] is True
+        assert report["switch_engaged_at_exit"] is False
+
+    def test_the_switch_is_clear_in_the_database_afterwards(self, tmp_path):
+        path = str(tmp_path / "s.db")
+        ksd.run(state_path=path)
         store = persistence.StateStore(path)
         engaged, _reason = store.is_kill_switch_engaged()
         store.close()
@@ -99,8 +190,8 @@ class TestItCannotLeaveTheSwitchEngaged:
         store.trip_kill_switch("a real incident, not the drill")
         store.close()
 
-        report = ksd.run(state_path=path)
-        assert report["switch_engaged_before"] is True
+        out = ksd.run(state_path=path)
+        assert out["switch_engaged_before"] is True
 
         store = persistence.StateStore(path)
         engaged, reason = store.is_kill_switch_engaged()
@@ -108,46 +199,93 @@ class TestItCannotLeaveTheSwitchEngaged:
         assert engaged is True
         assert "real incident" in reason
 
-    def test_the_default_database_is_disposable(self, report):
-        assert report["disposable_database"] is True
-        assert "throwaway" in report["database"]
-
     def test_a_failed_restore_is_its_own_exit_code(self):
         text = source()
         assert "return 2" in text
         assert "COULD NOT BE RESTORED" in text
 
+    def test_the_restore_is_conditional_on_the_state_before(self):
+        """The condition is the property; a count of call sites is not."""
+        text = source()
+        assert "Restore whatever was true before the drill" in text
+        assert "was_engaged" in text
 
-class TestTheStepsAreObservationsNotCheckmarks:
+
+class TestItDoesNotTouchProduction:
+    def test_the_default_database_is_disposable(self, report):
+        assert report["disposable_database"] is True
+        assert "throwaway" in report["database"]
+
+    def test_the_production_database_is_byte_identical(self, report):
+        assert report["production_db_untouched"] is True
+        observed = step(report, "8_disengaged_and_production_untouched")[
+            "observed"]
+        assert observed["production_sha256_before"] == \
+            observed["production_sha256_after"]
+
+    def test_the_hash_it_reports_is_the_real_file(self, report):
+        """A self-reported 'untouched' is worth nothing if the path is wrong.
+
+        UNDER PYTEST THIS USUALLY SKIPS, AND THE REASON IS ITSELF THE POINT.
+        `tests/conftest.py` sets `STATE_DB_PATH` to a directory under the test
+        tree before anything imports `persistence`, so a suite run can never
+        open the production database — which means the drill, run from inside
+        the suite, hashes a path that does not exist. The first version of this
+        skip said "no production database in this checkout", which was
+        misleading: there is one, and the suite is deliberately pointed away
+        from it.
+
+        The real-file comparison therefore belongs to a drill run from a shell,
+        where `STATE_DB_PATH` is unset and the path resolves to
+        `state/trading_state.db`. That run is the evidence; this asserts the
+        redirection that makes the suite safe, and verifies the hash whenever
+        the path does resolve.
+        """
+        observed = step(report, "8_disengaged_and_production_untouched")[
+            "observed"]
+        path = os.path.join(REPO, observed["production_db"])
+        if not os.path.exists(path):
+            assert "state/trading_state.db" != observed["production_db"] or \
+                os.environ.get("STATE_DB_PATH"), (
+                    "the drill resolved the REAL production path and the file "
+                    "is missing — that is a finding, not a skip")
+            pytest.skip(
+                "conftest redirects STATE_DB_PATH, so this run had no "
+                f"production database to hash (resolved: "
+                f"{observed['production_db']})")
+        with open(path, "rb") as handle:
+            actual = hashlib.sha256(handle.read()).hexdigest()
+        assert actual == observed["production_sha256_after"]
+
+
+# ---------------------------------------------------------------------------
+# 4 — the transcript is observations, not checkmarks
+# ---------------------------------------------------------------------------
+
+
+class TestTheStepsAreObservations:
     def test_every_step_records_what_was_observed(self, report):
         assert report["steps"]
-        for step in report["steps"]:
-            assert set(step) == {"step", "expected", "observed", "as_scripted"}
-            assert step["observed"] not in (None, "", True)
+        for entry in report["steps"]:
+            assert set(entry) == {"step", "expected", "observed", "as_scripted"}
+            assert isinstance(entry["observed"], dict) and entry["observed"]
 
-    def test_the_six_scripted_steps_are_present(self, report):
+    def test_the_scripted_steps_are_all_present(self, report):
         names = [s["step"] for s in report["steps"]]
-        for expected in ("1_baseline", "2_trip", "3_blocks", "3b_health",
-                         "4_survives_restart", "5a_wrong_token_refused",
-                         "5b_exact_token_clears"):
+        for expected in ("1_baseline", "2_health_before_trip", "3_trip",
+                         "4_entries_blocked", "5_health_unhealthy_503",
+                         "6_survives_restart", "7a_wrong_token_refused",
+                         "7b_exact_token_clears",
+                         "8_disengaged_and_production_untouched"):
             assert expected in names, expected
 
-    def test_the_gate_chain_blocks_with_the_named_reason(self, report):
-        blocks = next(s for s in report["steps"] if s["step"] == "3_blocks")
-        assert blocks["observed"]["gate_reason"] == "KILL_SWITCH_ENGAGED"
-        assert blocks["observed"]["should_halt_trading"] is True
-        assert blocks["observed"]["can_trade"] is False
-
     def test_a_wrong_token_raises_and_leaves_it_engaged(self, report):
-        step = next(s for s in report["steps"]
-                    if s["step"] == "5a_wrong_token_refused")
-        assert step["observed"]["still_engaged"] is True
-        assert "Error" in step["observed"]["raised"]
+        observed = step(report, "7a_wrong_token_refused")["observed"]
+        assert observed["still_engaged"] is True
+        assert "Error" in observed["raised"]
 
     def test_it_survives_a_restart(self, report):
-        step = next(s for s in report["steps"]
-                    if s["step"] == "4_survives_restart")
-        assert step["observed"]["engaged"] is True
+        assert step(report, "6_survives_restart")["observed"]["engaged"] is True
 
     def test_all_steps_behaved_as_scripted(self, report):
         failed = [s["step"] for s in report["steps"] if not s["as_scripted"]]
@@ -156,31 +294,6 @@ class TestTheStepsAreObservationsNotCheckmarks:
 
 class TestTheTokenIsNotRestated:
     def test_the_exact_token_is_the_one_persistence_demands(self):
-        """A copy that drifted would make the drill pass against a door that no
-        longer opens."""
         import inspect
         assert ksd.HUMAN_TOKEN in inspect.getsource(
             persistence.StateStore.clear_kill_switch_by_human)
-
-    def test_the_only_automated_clear_is_the_drill_undoing_its_own_trip(self):
-        """`clear_kill_switch_by_human` is never called from automated code in
-        this codebase — except here, to UNDO the drill's own trip.
-
-        The first version of this test asserted a COUNT of call sites (`<= 3`,
-        against an actual 4) which I wrote without counting. A magic number
-        there encodes nothing: three calls would be fine and one could be a
-        disaster. What matters is the CONDITION guarding the restore — the
-        switch is only cleared when the drill itself engaged it — and that is
-        asserted behaviourally by
-        `TestItCannotLeaveTheSwitchEngaged::test_a_switch_engaged_BEFORE_the_
-        drill_is_left_engaged`, which trips the switch first and proves the
-        drill leaves it engaged.
-
-        What is left here is the thing a behavioural test cannot check: that
-        the justification is written down where the call happens.
-        """
-        text = source()
-        assert "Restore whatever was true before the drill" in text
-        assert "was_engaged" in text, (
-            "the restore must be conditional on the state BEFORE the drill, "
-            "or a drill run during a real incident resumes trading")

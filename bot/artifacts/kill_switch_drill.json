@@ -1,0 +1,130 @@
+{
+  "tool": "kill_switch_drill",
+  "performed_utc": "2026-09-16T15:57:56Z",
+  "database": "throwaway (temporary)",
+  "disposable_database": true,
+  "apis_exercised": [
+    "StateStore.trip_kill_switch",
+    "StateStore.is_kill_switch_engaged",
+    "StateStore.clear_kill_switch_by_human",
+    "BillionaireRiskManager.gate_order -> _gate_kill_switch",
+    "BillionaireRiskManager.should_halt_trading",
+    "BillionaireRiskManager.can_trade",
+    "TradingBot.health",
+    "TradingBot.start_health_server -> _HealthHandler.do_GET"
+  ],
+  "steps": [
+    {
+      "step": "1_baseline",
+      "expected": "not live-armed, no promoted model, and a scratch database",
+      "observed": {
+        "cleared_edge_signal": "funding_carry_fade_btc_v1",
+        "execution_mode": "paper",
+        "live_authorized": false,
+        "models_current_present": false,
+        "kill_switch_engaged_before": false,
+        "database": "/var/folders/1b/n9t4hmlx275cpnkvrl41m9fw0000gn/T/tmpxk4vdpmq/drill_state.db",
+        "disposable_database": true
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "2_health_before_trip",
+      "expected": "healthy, HTTP 200, with no naked positions and reconciled true",
+      "observed": {
+        "healthy": true,
+        "http_status": 200,
+        "naked_positions": [],
+        "reconciled": true
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "3_trip",
+      "expected": "the switch reads engaged, carrying the drill's reason",
+      "observed": {
+        "engaged": true,
+        "reason": "kill-switch drill (tools/kill_switch_drill.py)"
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "4_entries_blocked",
+      "expected": "gate_order returns KILL_SWITCH_ENGAGED, should_halt_trading true, can_trade false",
+      "observed": {
+        "gate_reason": "KILL_SWITCH_ENGAGED",
+        "gate_ok": false,
+        "should_halt_trading": true,
+        "can_trade": false
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "5_health_unhealthy_503",
+      "expected": "the same endpoint now reports unhealthy and the server sends 503",
+      "observed": {
+        "healthy": false,
+        "http_status": 503,
+        "kill_switch": true,
+        "kill_reason": "kill-switch drill (tools/kill_switch_drill.py)",
+        "healthy_before": true,
+        "http_status_before": 200
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "6_survives_restart",
+      "expected": "a new StateStore over the same file still sees it engaged",
+      "observed": {
+        "engaged": true,
+        "reason": "kill-switch drill (tools/kill_switch_drill.py)"
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "7a_wrong_token_refused",
+      "expected": "a wrong token raises AND leaves the switch engaged",
+      "observed": {
+        "raised": "PersistenceError: kill switch clear requires the exact operator acknowledgement; this is a human-only action",
+        "still_engaged": true
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "7b_exact_token_clears",
+      "expected": "the exact operator token clears it and health returns to 200",
+      "observed": {
+        "engaged_after_clear": false,
+        "healthy": true,
+        "http_status": 200
+      },
+      "as_scripted": true
+    },
+    {
+      "step": "8_disengaged_and_production_untouched",
+      "expected": "the switch is disengaged and the production database is byte-identical",
+      "observed": {
+        "switch_engaged_at_exit": false,
+        "production_db": "state/trading_state.db",
+        "production_sha256_before": "751e248be46e2f1796b08423f9051cd0a029177bcb0910d914beade2b160d8ab",
+        "production_sha256_after": "751e248be46e2f1796b08423f9051cd0a029177bcb0910d914beade2b160d8ab",
+        "production_untouched": true
+      },
+      "as_scripted": true
+    }
+  ],
+  "all_steps_as_scripted": true,
+  "switch_restored": true,
+  "switch_restore_error": "",
+  "switch_engaged_before": false,
+  "switch_engaged_at_exit": false,
+  "production_db_untouched": true,
+  "gate_item": "kill_switch_drill_recorded",
+  "gate_item_completed": false,
+  "signature": {
+    "drill_performed_by": "",
+    "witnessed_by": "",
+    "date": ""
+  },
+  "why_this_does_not_complete_the_item": "The item is owned by a HUMAN. What it asks is whether a person can stop this process under time pressure; a drill the process ran for itself cannot answer that. This records that the MECHANISM behaves as scripted on the live code path, which is the half a program can establish. A human performs the steps, witnesses them, and signs \u2014 and only then does the item move."
+}
