@@ -1,0 +1,96 @@
+# AGENT CONTROL PLANE — who may touch the order path
+
+Written 2026-09-16. Law for this repository, not a proposal.
+
+---
+
+## The money objective
+
+Build an **accruing trading asset**: Stage B closed-forward evidence first,
+micro-live under gates afterwards. Revenue comes from venue P&L earned under
+fail-closed risk control.
+
+This is not a chat product, not an "AI agent" product, and not a museum of
+logs. Nothing in this file authorises live trading. `allows_live` is False and
+only a human moves it.
+
+---
+
+## Roles
+
+Separation of roles is the whole point. A role may do exactly what its row
+says and nothing below it.
+
+| Role | Is | May | May never |
+|---|---|---|---|
+| **EXECUTION BOT** | this repo's runtime | Bybit path, risk gates, kill switch, shadow/carry books | import any LLM client on the order path |
+| **BUILDER** | Claude Code | write, test and commit code under human relay | sign a human gate bit; hold venue keys in git |
+| **REVIEWER / DECISION-MAKER** | xAI Grok | read artifacts, gate JSON, forward shadow; emit a verdict file | place orders, clear the kill switch, set `allows_live`, raise caps, write the production state DB |
+| **LOCAL INFERENCE** | Ollama | offline mirror of reviewer prompts, air-gapped checks | same bans as Reviewer — off-path, no order path |
+| **ORCHESTRATOR** | OpenClaw | schedule jobs, route artifacts between Builder / Reviewer / Bot | bypass `promotion_gate`; inject intents into `TradingEngine` |
+
+**ZERO LLM IMPORTS ON THE ORDER PATH.** The existing bans in
+`tests/test_carry_wiring.py` and `tests/test_carry_risk.py` stay, and
+`tests/test_control_plane_boundary.py` extends them to every order-path
+module by AST, so a ban cannot be defeated by a docstring or an alias.
+
+---
+
+## Reviewer I/O contract — OFF-PATH, read-only
+
+The Reviewer is handed files and returns a file. It is never given a client,
+a key, or a socket.
+
+**Inputs (read-only):**
+
+- `artifacts/forward_shadow_current.json`
+- the promotion gate JSON (`artifacts/slice59_promotion_gate.json`)
+- `artifacts/kill_switch_drill.json`
+- the data manifests (`data/*/MANIFEST.json`)
+
+**Output — `artifacts/reviewer_verdict.json`:**
+
+```json
+{
+  "allows_progress": false,
+  "blockers": [],
+  "stage_b": {"forward_n_trades": 0, "of_20": 20, "closed_forward_bars": 0},
+  "risk": {"allows_live_must_be_false": true},
+  "next_actions": []
+}
+```
+
+`risk.allows_live_must_be_false` is always `true`. A verdict is an opinion
+about evidence. It is not an authorisation, and no code may read it as one.
+
+**The Reviewer module, when it exists, MUST NOT import**
+`bybit_connection`, `trading_engine`, `carry_broker`, or call any `place_*`.
+That is asserted mechanically, and asserted *now*, before the module exists —
+see the fail-closed placeholder in `tests/test_control_plane_boundary.py`.
+
+---
+
+## OpenClaw: ABSENT
+
+OpenClaw is **not in this repository or this factory**. Searched
+`/Users/grimaldi/iceccarelli-factory` on 2026-09-16: no match. No integration
+code has been written for it, and none should be invented before it exists.
+
+When it arrives it attaches at exactly these three hook points and nowhere
+else:
+
+1. **Artifact directories** — reads `bot/artifacts/`, writes only
+   `artifacts/reviewer_verdict.json`. It does not write gate JSON.
+2. **Gate JSON schema** — reads `artifacts/slice59_promotion_gate.json` for
+   `checklist`, `items_complete`, `items_total`. Read-only, always. The six
+   human-owned bits are moved by a human, never by a scheduler.
+3. **Refresher schedule** — may own the cron line that runs
+   `tools/daily_forward_refresh.py`. That tool has no `--write`; appending
+   stays with `tools/append_closed_corpus.py`.
+
+---
+
+## Keys
+
+No venue keys in git. No `.env` committed. No key prompts in tooling. The
+Builder never holds them.
