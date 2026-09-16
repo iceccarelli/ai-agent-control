@@ -115,17 +115,30 @@ class TestItExercisesTheLivePath:
         """
         import ast
         tree = ast.parse(source())
+
+        # (a) the drill never CONSTRUCTS a status from a condition.
         for node in ast.walk(tree):
             if not isinstance(node, ast.IfExp):
                 continue
-            values = {getattr(node.body, "value", None),
-                      getattr(node.orelse, "value", None)}
-            assert not ({200, 503} & values), (
+            branches = {getattr(node.body, "value", None),
+                        getattr(node.orelse, "value", None)}
+            assert not ({200, 503} & branches), (
                 f"the drill computes an HTTP status itself: {ast.dump(node)}")
-        text = source()
-        assert "urllib.error.HTTPError" in text
-        assert "int(exc.code)" in text
-        assert "int(response.status)" in text
+
+        # A THIRD CHECK WAS TRIED HERE AND WAS WRONG, which is worth recording
+        # because it is the same mistake as the substring scan above wearing a
+        # different hat. It forbade the integer 503 anywhere in executable
+        # code — and the drill's own step-5 predicate is
+        # `after_http["status"] == 503`, which is the drill CHECKING the status
+        # it read. Banning the literal would have stopped the drill verifying
+        # its own observation. Comparing a value you read against the value you
+        # expect is not reimplementing the mapping; only deriving it is.
+        #
+        # (b) it READS the status off the response and the HTTPError, which is
+        #     the only way it can legitimately obtain one.
+        attrs = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        assert "code" in attrs, "never reads HTTPError.code"
+        assert "status" in attrs, "never reads response.status"
 
     def test_the_apis_it_claims_are_the_ones_it_calls(self, report):
         text = source()
@@ -223,39 +236,67 @@ class TestItDoesNotTouchProduction:
         assert observed["production_sha256_before"] == \
             observed["production_sha256_after"]
 
-    def test_the_hash_it_reports_is_the_real_file(self, report):
-        """A self-reported 'untouched' is worth nothing if the path is wrong.
+    def test_a_run_leaves_the_real_production_database_byte_identical(self):
+        """The invariant, asserted directly. NO SKIP.
 
-        UNDER PYTEST THIS USUALLY SKIPS, AND THE REASON IS ITSELF THE POINT.
-        `tests/conftest.py` sets `STATE_DB_PATH` to a directory under the test
-        tree before anything imports `persistence`, so a suite run can never
-        open the production database — which means the drill, run from inside
-        the suite, hashes a path that does not exist. The first version of this
-        skip said "no production database in this checkout", which was
-        misleading: there is one, and the suite is deliberately pointed away
-        from it.
+        The first version of this test skipped with "no production database in
+        this checkout" while the file plainly existed. That predicate was
+        wrong twice over: it checked the path the DRILL resolved (which
+        `conftest.py` deliberately redirects into the test tree) rather than
+        the real one, and it treated a deliberately hidden path as a missing
+        file. A skip on this surface hides exactly the property the drill
+        exists to establish.
 
-        The real-file comparison therefore belongs to a drill run from a shell,
-        where `STATE_DB_PATH` is unset and the path resolves to
-        `state/trading_state.db`. That run is the evidence; this asserts the
-        redirection that makes the suite safe, and verifies the hash whenever
-        the path does resolve.
+        So this ignores the environment entirely, hashes the REAL production
+        path, runs the drill, and hashes it again. A checkout with no
+        production database yields None on both sides and still asserts
+        equality — there is nothing to skip for.
+        """
+        real = os.path.join(REPO, "state", "trading_state.db")
+
+        def digest():
+            if not os.path.exists(real):
+                return None
+            with open(real, "rb") as handle:
+                return hashlib.sha256(handle.read()).hexdigest()
+
+        before = digest()
+        ksd.run()
+        assert digest() == before, (
+            "a drill run changed the production database")
+
+    def test_the_suite_is_structurally_pointed_away_from_production(self):
+        """Why the drill under pytest never resolves the production path.
+
+        `tests/conftest.py` sets `STATE_DB_PATH` into the test tree before
+        anything imports `persistence`. That is a safety property worth
+        asserting rather than a reason to skip: it is what makes running the
+        drill inside the suite incapable of touching production state.
+        """
+        redirected = os.environ.get("STATE_DB_PATH", "")
+        assert redirected, "conftest did not set STATE_DB_PATH"
+        assert os.path.abspath(redirected) != os.path.abspath(
+            os.path.join(REPO, "state", "trading_state.db")), (
+                "the suite is pointed AT the production database")
+
+    def test_the_reported_hash_matches_whatever_path_it_resolved(self, report):
+        """A self-reported 'untouched' is worth nothing if the hash is fiction.
+
+        Whatever path the drill resolved — scratch under pytest, production
+        from a shell — the digest it published must be that file's real digest,
+        or None when the file is absent. No skip: both branches assert.
         """
         observed = step(report, "8_disengaged_and_production_untouched")[
             "observed"]
         path = os.path.join(REPO, observed["production_db"])
-        if not os.path.exists(path):
-            assert "state/trading_state.db" != observed["production_db"] or \
-                os.environ.get("STATE_DB_PATH"), (
-                    "the drill resolved the REAL production path and the file "
-                    "is missing — that is a finding, not a skip")
-            pytest.skip(
-                "conftest redirects STATE_DB_PATH, so this run had no "
-                f"production database to hash (resolved: "
-                f"{observed['production_db']})")
-        with open(path, "rb") as handle:
-            actual = hashlib.sha256(handle.read()).hexdigest()
+        if os.path.exists(path):
+            with open(path, "rb") as handle:
+                actual = hashlib.sha256(handle.read()).hexdigest()
+        else:
+            actual = None
         assert actual == observed["production_sha256_after"]
+        assert observed["production_sha256_before"] == \
+            observed["production_sha256_after"]
 
 
 # ---------------------------------------------------------------------------
