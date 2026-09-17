@@ -321,6 +321,183 @@ class TestItRegeneratesTheMission:
         assert "SECRETVALUE" not in captured.err
 
 
+# ------------------------------------------------------- the loop wrapper ---
+
+class TestTheLoopWrapperDefaultsToReturning:
+    """`MODE="${1:-loop}"` made the never-ending mode the default one.
+
+    A cron line that forgot the argument would start a fresh daemon on every
+    firing, and the way you would find out is the process table. The default is
+    now `once`: wrong only in the direction where something stops happening.
+    """
+
+    SCRIPT = os.path.join(BOT, "tools", "control_plane_loop.sh")
+
+    @pytest.fixture
+    def sandbox(self, tmp_path):
+        """A throwaway bot/ whose tick just leaves a mark and exits."""
+        tools = tmp_path / "tools"
+        tools.mkdir()
+        (tmp_path / "artifacts").mkdir()
+        marker = tmp_path / "ticks.txt"
+        (tools / "control_plane_tick.py").write_text(
+            "open(%r, 'a').write('tick\\n')\n" % str(marker))
+        script = tools / "control_plane_loop.sh"
+        script.write_bytes(open(self.SCRIPT, "rb").read())
+        script.chmod(0o755)
+
+        def run(*args, timeout=20):
+            return subprocess.run([str(script), *args], capture_output=True,
+                                  text=True, timeout=timeout)
+
+        return types.SimpleNamespace(run=run, marker=marker, root=tmp_path)
+
+    def test_no_arguments_runs_one_tick_and_exits(self, sandbox):
+        done = sandbox.run(timeout=20)
+        assert done.returncode == 0, done.stderr
+        assert sandbox.marker.read_text().count("tick") == 1
+
+    def test_once_is_explicit_and_identical(self, sandbox):
+        assert sandbox.run("once").returncode == 0
+        assert sandbox.marker.read_text().count("tick") == 1
+
+    def test_the_daemon_is_still_one_word_away(self, sandbox):
+        """Making the safe thing default must not remove the useful thing."""
+        with pytest.raises(subprocess.TimeoutExpired):
+            sandbox.run("loop", "1", timeout=4)
+        assert sandbox.marker.read_text().count("tick") >= 1
+
+    def test_a_nonsense_interval_is_refused_rather_than_defaulted(self, sandbox):
+        done = sandbox.run("loop", "0")
+        assert done.returncode == 2
+        done = sandbox.run("loop", "abc")
+        assert done.returncode == 2
+
+    def test_an_unknown_mode_prints_usage(self, sandbox):
+        done = sandbox.run("sometimes")
+        assert done.returncode == 2
+        assert "usage:" in done.stderr
+
+    def test_it_logs_every_run_it_makes(self, sandbox):
+        sandbox.run()
+        log = (sandbox.root / "artifacts" / "control_plane_loop.log").read_text()
+        assert "control_plane_loop start" in log
+        assert "control_plane_loop end" in log
+
+
+# ----------------------------------------------------------------- lock ---
+
+class TestOnlyOneTickRunsAtATime:
+    """The cron fires hourly; the tick has a 600s child and a 180s child.
+
+    Nothing guarantees a tick finishes inside the hour, and two overlapping
+    ticks means two corpus appenders against the same files — real writers,
+    under CONTROL_PLANE_ALLOW_APPEND_WRITE=1.
+    """
+
+    def _lockdir(self, tmp_repo):
+        return os.path.join(tmp_repo, cpt.LOCK_DIR)
+
+    def test_the_lock_lives_on_ignored_ground(self):
+        """A lock directory under artifacts/ would show up as a dirty tree."""
+        assert cpt.LOCK_DIR.split(os.sep)[0] == "state"
+
+    def test_a_tick_takes_the_lock_and_gives_it_back(self, tmp_repo, recorder):
+        seen = {}
+
+        real = cpt.run_tick
+
+        def watching(**kwargs):
+            seen["held"] = os.path.isdir(self._lockdir(tmp_repo))
+            return real(**kwargs)
+
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(cpt, "run_tick", watching)
+        try:
+            assert cpt.main([]) == 0
+        finally:
+            monkey.undo()
+        assert seen["held"] is True, "the tick ran without holding the lock"
+        assert not os.path.isdir(self._lockdir(tmp_repo)), "lock not released"
+
+    def test_a_second_tick_skips_while_the_first_holds_it(self, tmp_repo,
+                                                          recorder, capsys):
+        held, path = cpt._lock()
+        assert held
+        try:
+            mission = os.path.join(tmp_repo, cpt.MISSION_OUT)
+            os.makedirs(os.path.dirname(mission), exist_ok=True)
+            with open(mission, "w", encoding="utf-8") as handle:
+                handle.write("WRITTEN BY THE FIRST TICK\n")
+            assert cpt.main([]) == 0, "an overlap is not a fault"
+            assert "another tick is running" in capsys.readouterr().out
+            assert open(mission, encoding="utf-8").read() == (
+                "WRITTEN BY THE FIRST TICK\n")
+        finally:
+            cpt._unlock(path)
+
+    def test_the_skip_spawns_no_child(self, tmp_repo, recorder):
+        held, path = cpt._lock()
+        try:
+            recorder.calls.clear()
+            assert cpt.main([]) == 0
+            assert recorder.calls == [], (
+                "the skipped tick still ran the corpus tools")
+        finally:
+            cpt._unlock(path)
+
+    def test_a_lock_whose_owner_died_is_taken(self, tmp_repo, recorder):
+        """A tick killed by a reboot must not wedge the control plane."""
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        lock = self._lockdir(tmp_repo)
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w", encoding="utf-8") as handle:
+            handle.write(f"{dead.pid}\n")
+        held, path = cpt._lock()
+        assert held, "a dead owner's lock was treated as held"
+        cpt._unlock(path)
+
+    def test_a_lock_with_an_unreadable_owner_is_never_stolen(self, tmp_repo):
+        """Stealing on a guess is how you get the overlap back."""
+        lock = self._lockdir(tmp_repo)
+        os.makedirs(lock)
+        held, why = cpt._lock()
+        assert held is False
+        assert "held by pid" in why
+        assert os.path.isdir(lock), "the lock was removed anyway"
+
+    def test_a_garbled_pid_is_treated_as_alive(self, tmp_repo):
+        lock = self._lockdir(tmp_repo)
+        os.makedirs(lock)
+        with open(os.path.join(lock, "pid"), "w", encoding="utf-8") as handle:
+            handle.write("not-a-pid\n")
+        held, _ = cpt._lock()
+        assert held is False
+
+    def test_the_lock_is_released_when_the_tick_raises(self, tmp_repo,
+                                                       recorder):
+        """`finally`, not "and then". A crash must not need a human to clear it."""
+        monkey = pytest.MonkeyPatch()
+        monkey.setattr(cpt, "run_tick",
+                       lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+        try:
+            with pytest.raises(RuntimeError):
+                cpt.main([])
+        finally:
+            monkey.undo()
+        assert not os.path.isdir(self._lockdir(tmp_repo))
+
+    def test_the_owner_recorded_is_this_process(self, tmp_repo):
+        held, path = cpt._lock()
+        try:
+            assert held
+            with open(os.path.join(path, "pid"), encoding="utf-8") as handle:
+                assert handle.read().strip() == str(os.getpid())
+        finally:
+            cpt._unlock(path)
+
+
 # ------------------------------------------------- cross-machine bridge ---
 
 class TestTheMissionDeliveryIsRecordedHonestly:

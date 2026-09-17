@@ -29,7 +29,9 @@ WHAT IT MUST NEVER DO
     cd bot && python3 tools/control_plane_tick.py
 
 Exit: 0 tick artefacts written (even if a child tool failed — errors are
-recorded in the tick JSON); 2 if the tick itself could not write outputs.
+recorded in the tick JSON), and also 0 when another tick already holds the
+lock — an overlap is normal operation, not a fault; 2 if the tick itself could
+not write outputs.
 """
 from __future__ import annotations
 
@@ -53,6 +55,9 @@ VERDICT_SCRATCH = os.path.join("state", "control_plane", "reviewer_verdict.json"
 
 #: Opt-in only. Maps 1:1 onto append_closed_corpus.py --write. Absent → dry-run.
 APPEND_WRITE_ENV = "CONTROL_PLANE_ALLOW_APPEND_WRITE"
+
+#: One tick at a time. See _lock().
+LOCK_DIR = os.path.join("state", "control_plane", "tick.lock")
 
 
 def _utc_now() -> str:
@@ -173,6 +178,75 @@ def _promote_verdict() -> Dict[str, Any]:
     return {"promoted": True,
             "reason": "first verdict" if current is None else "finding changed",
             "computed_utc": computed}
+
+
+def _lock() -> Tuple[bool, str]:
+    """Take the single-tick lock, or report who holds it.
+
+    The cron fires hourly. The tick subprocesses daily_forward_refresh with a
+    600-second timeout and append_closed_corpus with 180, and neither is
+    guaranteed to be the slowest thing this ever runs. Two ticks overlapping
+    means two corpus appenders running at once against the same files — and
+    under CONTROL_PLANE_ALLOW_APPEND_WRITE=1 those are real writers.
+
+    mkdir is the lock because it is atomic on every filesystem this will meet,
+    unlike "check then create". A lock whose owner is gone is stale, not held:
+    a tick killed by a reboot must not wedge the control plane until someone
+    notices, so the PID inside is checked and a dead owner's lock is taken.
+    """
+    path = os.path.join(REPO, LOCK_DIR)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    for attempt in (1, 2):
+        try:
+            os.mkdir(path)
+        except FileExistsError:
+            owner = ""
+            try:
+                with open(os.path.join(path, "pid"), encoding="utf-8") as fh:
+                    owner = fh.read().strip()
+            except OSError:
+                pass
+            if attempt == 1 and not _pid_alive(owner):
+                try:
+                    os.remove(os.path.join(path, "pid"))
+                except OSError:
+                    pass
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    return False, f"held by pid {owner or 'unknown'}"
+                continue
+            return False, f"held by pid {owner or 'unknown'}"
+        with open(os.path.join(path, "pid"), "w", encoding="utf-8") as handle:
+            handle.write(f"{os.getpid()}\n")
+        return True, path
+    return False, "lock contended"
+
+
+def _pid_alive(pid: str) -> bool:
+    """A blank or unparseable owner counts as alive — never steal on a guess."""
+    if not pid.isdigit():
+        return True
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def _unlock(path: str) -> None:
+    try:
+        os.remove(os.path.join(path, "pid"))
+    except OSError:
+        pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
 
 
 def _mission_body(verdict: Dict[str, Any], forward: Optional[Dict[str, Any]],
@@ -399,7 +473,18 @@ def main(argv=None) -> int:
     allow_write = bool(args.allow_append_write) or (
         os.environ.get(APPEND_WRITE_ENV, "").strip() == "1")
 
-    tick, verdict, forward, live = run_tick(allow_append_write=allow_write)
+    held, lock = _lock()
+    if not held:
+        # Exit 0: an overlapping tick is normal operation, not a fault. A
+        # nonzero status here would fill the cron log with mail about the
+        # control plane working as designed.
+        print(json.dumps({"skipped": "another tick is running",
+                          "detail": lock}, indent=2))
+        return 0
+    try:
+        tick, verdict, forward, live = run_tick(allow_append_write=allow_write)
+    finally:
+        _unlock(lock)
 
     out_tick = os.path.join(REPO, TICK_OUT)
     out_mission = os.path.join(REPO, MISSION_OUT)

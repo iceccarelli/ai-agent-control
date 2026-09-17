@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # control_plane_loop.sh — cron-friendly wrapper around control_plane_tick.py
 #
-# Default interval: 60 minutes. Logs to artifacts/control_plane_loop.log.
+# Default mode: `once` — one tick, then exit. Default loop interval: 60 minutes.
+# Logs to artifacts/control_plane_loop.log.
 # Never places orders. Never sets allows_live. Never prints secrets.
 #
 # Mac crontab example (every hour):
@@ -17,7 +18,12 @@ BOT="$(cd "$HERE/.." && pwd)"
 TICK="$HERE/control_plane_tick.py"
 LOG="$BOT/artifacts/control_plane_loop.log"
 INTERVAL_MIN="${2:-60}"
-MODE="${1:-loop}"
+# Default `once`, NOT `loop`. The dangerous default is the one that never
+# returns: a cron line that forgets the argument would start a fresh
+# never-ending daemon on every firing, and you would find out from the process
+# table. `once` does one tick and exits, which is wrong only in the harmless
+# direction. The daemon is still one word away.
+MODE="${1:-once}"
 
 mkdir -p "$BOT/artifacts"
 cd "$BOT"
