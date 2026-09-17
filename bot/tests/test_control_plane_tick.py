@@ -24,6 +24,7 @@ import ast
 import inspect
 import json
 import os
+import subprocess
 import sys
 import types
 
@@ -318,6 +319,178 @@ class TestItRegeneratesTheMission:
         captured = capsys.readouterr()
         assert "SECRETVALUE" not in captured.out
         assert "SECRETVALUE" not in captured.err
+
+
+# ------------------------------------------------- cross-machine bridge ---
+
+class TestTheMissionDeliveryIsRecordedHonestly:
+    """FAILS CLOSED, the way TestTheReviewerCannotReachTheVenue does.
+
+    MACHINE A's generated AGENTS.md opens by reading NEXT_MISSION.md "via the
+    clone". MACHINE B writes that file hourly and nothing commits or pushes it,
+    so the clone never receives it. Either a writer exists and the mission is
+    tracked, or the charter says in writing that the bridge is a dead drop.
+    What must not happen is the third case: no writer, and nothing saying so.
+    """
+
+    CHARTER = os.path.join(BOT, "docs", "human", "AGENT_CONTROL_PLANE.md")
+    SEARCH = (os.path.join(BOT, "tools"),
+              os.path.join(os.path.dirname(BOT), "scripts"))
+
+    def _writers(self):
+        """Files with a `git commit` or `git push` in command position."""
+        found = []
+        for root in self.SEARCH:
+            for base, _dirs, files in os.walk(root):
+                for name in files:
+                    if not name.endswith((".py", ".sh")):
+                        continue
+                    path = os.path.join(base, name)
+                    with open(path, encoding="utf-8", errors="replace") as fh:
+                        for lineno, line in enumerate(fh, 1):
+                            body = line.strip().lstrip('"\'(')
+                            if body.startswith(("git commit", "git push")):
+                                found.append(f"{name}:{lineno}")
+        return found
+
+    def _mission_is_tracked(self):
+        done = subprocess.run(
+            ["git", "ls-files", "--error-unmatch",
+             os.path.join("bot", cpt.MISSION_OUT)],
+            cwd=os.path.dirname(BOT), capture_output=True, text=True)
+        return done.returncode == 0
+
+    def test_either_a_writer_exists_or_the_charter_says_it_does_not(self):
+        writers = self._writers()
+        if writers:
+            assert self._mission_is_tracked(), (
+                f"something now pushes ({writers}) but the mission is still "
+                f"untracked, so the clone still gets nothing")
+            return
+        body = open(self.CHARTER, encoding="utf-8").read()
+        assert "NEXT_MISSION has no writer" in body, (
+            "no writer, and the charter does not record the gap")
+        assert "dead drop" in body
+
+    def test_the_gitignore_and_the_charter_agree(self):
+        """Two places can disagree; this is the one that notices."""
+        if self._writers():
+            pytest.skip("a writer appeared; the test above owns that case")
+        ignore = open(os.path.join(BOT, ".gitignore"), encoding="utf-8").read()
+        assert "artifacts/NEXT_MISSION.md" in ignore
+        assert not self._mission_is_tracked(), (
+            "the mission is tracked while the charter says it is not delivered")
+
+    def test_the_charter_does_not_pretend_the_bridge_works(self):
+        body = open(self.CHARTER, encoding="utf-8").read()
+        section = body.split("NEXT_MISSION has no writer", 1)[1]
+        section = section.split("\n---", 1)[0]
+        # Both remedies named, neither claimed as done.
+        assert "Push side" in section and "Pull side" in section
+        assert "neither taken here" in section
+
+
+# ---------------------------------------------------- verdict promotion ---
+
+class TestTheVerdictIsPromotedNotStamped:
+    """The tracked verdict must not change when only the clock did.
+
+    The reviewer recomputes the same finding from the same tracked evidence
+    every hour and stamps a fresh `generated_utc`. Writing that straight into
+    artifacts/ left the working tree dirty on a permanent loop — `git status`
+    never clean, `git checkout` refusing to switch branches, and a genuine move
+    in `blockers` buried in timestamp noise.
+    """
+
+    def _scratch(self, tmp_repo, doc):
+        path = os.path.join(tmp_repo, cpt.VERDICT_SCRATCH)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(doc, handle)
+        return path
+
+    def test_the_reviewer_scores_to_scratch_not_to_artifacts(self, recorder):
+        cpt.run_tick()
+        argv = recorder.argv_for("reviewer_verdict.py")
+        assert cpt.VERDICT_SCRATCH in argv
+        assert cpt.VERDICT_OUT not in argv
+
+    def test_the_scratch_path_is_not_tracked_ground(self):
+        """state/ is gitignored; artifacts/ is not. That is the whole trick."""
+        assert cpt.VERDICT_SCRATCH.split(os.sep)[0] == "state"
+        assert cpt.VERDICT_OUT.split(os.sep)[0] == "artifacts"
+
+    def test_a_new_timestamp_alone_does_not_touch_the_tracked_file(
+            self, tmp_repo, recorder):
+        tracked = os.path.join(tmp_repo, cpt.VERDICT_OUT)
+        before = open(tracked, "rb").read()
+        self._scratch(tmp_repo, dict(VERDICT,
+                                     generated_utc="2099-12-31T23:59:59Z"))
+        assert cpt.main([]) == 0
+        assert open(tracked, "rb").read() == before
+
+    def test_a_changed_finding_is_promoted(self, tmp_repo, recorder):
+        moved = dict(VERDICT, allows_progress=False,
+                     blockers=["forward shadow went stale"],
+                     generated_utc="2099-12-31T23:59:59Z")
+        self._scratch(tmp_repo, moved)
+        assert cpt.main([]) == 0
+        now = json.load(open(os.path.join(tmp_repo, cpt.VERDICT_OUT),
+                             encoding="utf-8"))
+        assert now["blockers"] == ["forward shadow went stale"]
+        assert now["generated_utc"] == "2099-12-31T23:59:59Z"
+
+    def test_a_promoted_blocker_reaches_the_mission(self, tmp_repo, recorder):
+        """Promotion that the Builder never sees is promotion that did nothing."""
+        self._scratch(tmp_repo, dict(VERDICT, allows_progress=False,
+                                     blockers=["forward shadow went stale"]))
+        assert cpt.main([]) == 0
+        body = open(os.path.join(tmp_repo, cpt.MISSION_OUT),
+                    encoding="utf-8").read()
+        assert "forward shadow went stale" in body
+        assert "allows_progress: false" in body
+
+    def test_a_first_run_with_no_tracked_verdict_promotes(self, tmp_repo,
+                                                          recorder):
+        os.remove(os.path.join(tmp_repo, cpt.VERDICT_OUT))
+        self._scratch(tmp_repo, VERDICT)
+        assert cpt.main([]) == 0
+        assert os.path.isfile(os.path.join(tmp_repo, cpt.VERDICT_OUT))
+
+    def test_a_missing_scratch_leaves_the_tracked_verdict_alone(
+            self, tmp_repo, recorder):
+        """The reviewer failing must not blank the last known finding."""
+        tracked = os.path.join(tmp_repo, cpt.VERDICT_OUT)
+        before = open(tracked, "rb").read()
+        assert cpt.main([]) == 0
+        assert open(tracked, "rb").read() == before
+        tick = json.load(open(os.path.join(tmp_repo, cpt.TICK_OUT),
+                              encoding="utf-8"))
+        assert tick["steps"]["reviewer_verdict_promote"]["promoted"] is False
+
+    def test_liveness_is_still_reported_every_tick(self, tmp_repo, recorder):
+        """`generated_utc` now means "when the finding changed". Something must
+        still say "the reviewer ran just now", or a dead cron looks identical
+        to a stable verdict."""
+        self._scratch(tmp_repo, dict(VERDICT,
+                                     generated_utc="2099-12-31T23:59:59Z"))
+        assert cpt.main([]) == 0
+        reviewer = json.load(open(os.path.join(tmp_repo, cpt.TICK_OUT),
+                                  encoding="utf-8"))["reviewer"]
+        assert reviewer["promoted"] is False
+        assert reviewer["computed_utc"] == "2099-12-31T23:59:59Z"
+        assert reviewer["generated_utc"] == VERDICT["generated_utc"]
+
+    def test_substance_ignores_only_the_clock(self):
+        """A comparison that ignored too much would silently drop findings."""
+        base = dict(VERDICT)
+        assert cpt._substance(base) == cpt._substance(
+            dict(base, generated_utc="different"))
+        for key in ("allows_progress", "blockers", "stage_b", "next_actions",
+                    "risk", "model", "key_status"):
+            changed = dict(base)
+            changed[key] = "MOVED"
+            assert cpt._substance(base) != cpt._substance(changed), key
 
 
 # ------------------------------------------------------------- fixtures ---

@@ -13,6 +13,8 @@ WHAT IT MAY DO
   reviewer_verdict)
 * READ artifacts/forward_shadow_current.json
 * WRITE artifacts/control_plane_tick.json and artifacts/NEXT_MISSION.md
+* WRITE artifacts/reviewer_verdict.json, but ONLY when the finding changed —
+  the reviewer scores to state/ first, see _promote_verdict()
 
 WHAT IT MUST NEVER DO
 =====================
@@ -46,6 +48,8 @@ FORWARD = os.path.join("artifacts", "forward_shadow_current.json")
 TICK_OUT = os.path.join("artifacts", "control_plane_tick.json")
 MISSION_OUT = os.path.join("artifacts", "NEXT_MISSION.md")
 VERDICT_OUT = os.path.join("artifacts", "reviewer_verdict.json")
+#: The reviewer writes HERE first. state/ is gitignored; artifacts/ is not.
+VERDICT_SCRATCH = os.path.join("state", "control_plane", "reviewer_verdict.json")
 
 #: Opt-in only. Maps 1:1 onto append_closed_corpus.py --write. Absent → dry-run.
 APPEND_WRITE_ENV = "CONTROL_PLANE_ALLOW_APPEND_WRITE"
@@ -119,6 +123,56 @@ def _allows_live_status() -> Dict[str, Any]:
         "tick_may_set_allows_live": False,
         "probe_error": result.get("error") or f"rc={result.get('returncode')}",
     }
+
+
+def _substance(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The verdict minus the clock. Two verdicts are the same finding if this is."""
+    if doc is None:
+        return None
+    return {k: v for k, v in doc.items() if k != "generated_utc"}
+
+
+def _promote_verdict() -> Dict[str, Any]:
+    """Copy the scratch verdict over the tracked one ONLY if the finding moved.
+
+    Every hour the reviewer recomputes the same verdict from the same tracked
+    evidence and stamps it with a new `generated_utc`. Writing that straight
+    into artifacts/ left the working tree permanently dirty: `git status` was
+    never clean, `git checkout` refused to switch branches, and a real change to
+    `blockers` or `next_actions` was one timestamp line among many — invisible
+    for the same reason a smoke alarm you have muted is.
+
+    So the reviewer scores to state/ (gitignored) and is promoted deliberately.
+    This is the pattern daily_forward_refresh already follows for the forward
+    shadow; it is applied here for the same reason.
+
+    Consequence, stated because it is easy to misread: `generated_utc` in the
+    TRACKED verdict is now the time the finding last CHANGED, not the time the
+    reviewer last ran. Liveness lives in artifacts/control_plane_tick.json,
+    which is regenerated every tick and is not tracked.
+    """
+    fresh, fresh_err = _read_json(VERDICT_SCRATCH)
+    if fresh_err:
+        return {"promoted": False, "reason": fresh_err, "computed_utc": None}
+
+    current, _ = _read_json(VERDICT_OUT)
+    computed = fresh.get("generated_utc")
+    if _substance(current) == _substance(fresh):
+        return {"promoted": False, "reason": "finding unchanged",
+                "computed_utc": computed}
+
+    path = os.path.join(REPO, VERDICT_OUT)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(fresh, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+    except OSError as exc:
+        return {"promoted": False, "reason": f"unwritable: {type(exc).__name__}",
+                "computed_utc": computed}
+    return {"promoted": True,
+            "reason": "first verdict" if current is None else "finding changed",
+            "computed_utc": computed}
 
 
 def _mission_body(verdict: Dict[str, Any], forward: Optional[Dict[str, Any]],
@@ -237,7 +291,7 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
     key_present = bool(os.environ.get("XAI_API_KEY"))
     verdict_argv = [
         sys.executable, os.path.join("tools", "reviewer_verdict.py"),
-        "--dry-run", "--out", VERDICT_OUT,
+        "--dry-run", "--out", VERDICT_SCRATCH,
     ]
     steps["reviewer_verdict_dry_run"] = _run(verdict_argv, timeout=120)
     if steps["reviewer_verdict_dry_run"].get("returncode") not in (0,):
@@ -248,7 +302,7 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
     if key_present:
         xai_argv = [
             sys.executable, os.path.join("tools", "reviewer_verdict.py"),
-            "--xai", "--out", VERDICT_OUT,
+            "--xai", "--out", VERDICT_SCRATCH,
         ]
         steps["reviewer_verdict_xai"] = _run(xai_argv, timeout=120)
         if steps["reviewer_verdict_xai"].get("returncode") not in (0,):
@@ -260,6 +314,8 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
             "skipped": True,
             "reason": "XAI_API_KEY unset; local dry-run verdict retained",
         }
+
+    steps["reviewer_verdict_promote"] = _promote_verdict()
 
     verdict, verdict_err = _read_json(VERDICT_OUT)
     if verdict_err:
@@ -297,7 +353,12 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
         "reviewer": {
             "model": verdict.get("model"),
             "key_status": verdict.get("key_status"),
+            # When the finding last CHANGED ...
             "generated_utc": verdict.get("generated_utc"),
+            # ... versus when it was last COMPUTED. Equal on a tick that moved
+            # the verdict; the second is always this tick.
+            "computed_utc": steps["reviewer_verdict_promote"].get("computed_utc"),
+            "promoted": steps["reviewer_verdict_promote"].get("promoted"),
         },
         "append_write_enabled": bool(allow_append_write),
         "forward_shadow_write": False,

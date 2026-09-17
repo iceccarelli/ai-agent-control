@@ -99,6 +99,40 @@ else:
 
 ---
 
+## The B-to-A delivery of NEXT_MISSION has no writer
+
+`scripts/REWIRE_MACHINE_A_OPENCLAW.sh` writes an `AGENTS.md` whose first
+startup step is *"Read `repos/ai-agent-control/bot/artifacts/NEXT_MISSION.md`
+if present (via the clone)"*, and states that MACHINE A syncs with this repo by
+git. MACHINE B does produce that file: `tools/control_plane_tick.py` rewrites
+it every hour from the cron in `scripts/REWIRE_MACHINE_B_EXECUTION.sh`.
+
+Nothing commits it, and nothing pushes it. Checked 2026-09-17: no `git commit`
+or `git push` in `bot/tools/` or `scripts/` outside the role-doc `git add` in
+the MACHINE B rewire script, which stages two paths and stops. So the file is
+written into a working tree and read from a clone that never receives it. The
+bridge is a dead drop.
+
+`artifacts/NEXT_MISSION.md` is therefore gitignored. That is not the fix — it
+is the honest spelling of the current state. Committing it instead would put a
+derived instruction file under version control, where the failure mode is a
+MACHINE A agent acting on orders that went stale hours ago; that is worse than
+no delivery, because no delivery is visible.
+
+Two ways to close it, both a human's call, neither taken here:
+
+* **Push side.** A step on MACHINE B that commits and pushes the tick output.
+  This makes an unattended hourly cron write to `origin/main`. That is an
+  outward-facing, hard-to-reverse act by a scheduler, and it is the reason this
+  was not simply wired up.
+* **Pull side.** MACHINE A stops expecting the mission over git and reads the
+  reviewer verdict, which IS tracked, as its startup input.
+
+Until one is chosen, MACHINE A's startup step 1 is a no-op and should be read
+as such.
+
+---
+
 ## Keys
 
 No venue keys in git. No `.env` committed. No key prompts in tooling. The
