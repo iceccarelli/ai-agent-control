@@ -58,6 +58,109 @@ class TestTheSlice57WindowWasAlreadyRead:
         assert report["certified_untouched"] is False
 
 
+class TestTheGuardDoesNotDependOnWhereYouAreStanding:
+    """The contamination guard was one `cd` from being off, silently.
+
+    `rh.DEFAULT_PATH` was the relative string "artifacts/data_read_ledger.json"
+    and `rh.load()` returned an EMPTY skeleton for a path that did not resolve.
+    So `tools/carry_sweep.py --best` refused correctly from `bot/` — the window
+    it would pick from is in the ledger — and from the repository root, or a
+    home directory, or anywhere else, the ledger came back empty, nothing
+    overlapped, and it picked a winner out of a window this programme has read
+    end to end.
+
+    Nothing raised. Nothing warned. The only symptom was that
+    `test_carry_core.py::TestTheSweepRefusesToPickAWinner::
+    test_it_refuses_a_window_something_has_read` passed from `bot/` and failed
+    from anywhere else, which is why this is pinned here rather than left to
+    whichever directory the next person happens to run pytest from.
+    """
+
+    def test_the_default_ledger_path_is_absolute(self):
+        assert os.path.isabs(rh.DEFAULT_PATH), rh.DEFAULT_PATH
+
+    def test_it_points_at_the_tracked_ledger(self):
+        assert os.path.isfile(rh.DEFAULT_PATH), rh.DEFAULT_PATH
+        assert rh.DEFAULT_PATH.endswith(
+            os.path.join("artifacts", "data_read_ledger.json"))
+
+    @pytest.mark.parametrize("where", ["repo_root", "tmp", "home"])
+    def test_the_ledger_loads_the_same_from_any_directory(self, tmp_path,
+                                                          monkeypatch, where):
+        here = rh.load()
+        target = {"repo_root": os.path.join(REPO, ".."),
+                  "tmp": str(tmp_path),
+                  "home": os.path.expanduser("~")}[where]
+        monkeypatch.chdir(target)
+        assert rh.load() == here
+
+    @pytest.mark.parametrize("where", ["repo_root", "tmp"])
+    def test_the_sweep_still_refuses_from_another_directory(
+            self, tmp_path, monkeypatch, where):
+        """The behaviour that actually matters, not just the path constant."""
+        import carry_sweep
+        target = os.path.join(REPO, "..") if where == "repo_root" else str(tmp_path)
+        monkeypatch.chdir(target)
+        code = carry_sweep.main([
+            "--repo", os.path.abspath(REPO), "--top", "1", "--best",
+            "--holdout-from", "2025-01-01T00:00:00Z"])
+        assert code == 1, (
+            "the sweep picked a winner from a window the ledger says was read")
+
+    def test_a_read_window_still_overlaps_when_loaded_from_elsewhere(
+            self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        hits = rh.overlaps(rh.load(),
+                           dataset="BINANCE_LINEAR_BTC_USDT_1D",
+                           from_utc="2024-08-09T00:00:00Z",
+                           to_utc="2026-08-09T00:00:00Z")
+        assert hits, "the seeded slice-55 read vanished with the working directory"
+
+
+class TestAnAbsentLedgerIsNotACleanOne:
+    """"No file" used to mean "no reads", which is the most dangerous thing a
+    contamination ledger could claim about itself."""
+
+    def test_a_missing_default_ledger_raises(self, tmp_path, monkeypatch):
+        missing = str(tmp_path / "artifacts" / "data_read_ledger.json")
+        monkeypatch.setattr(rh, "DEFAULT_PATH", missing)
+        with pytest.raises(FileNotFoundError) as caught:
+            rh.load()
+        assert "restore it from git" in str(caught.value).lower()
+
+    def test_an_explicit_missing_path_still_bootstraps_empty(self, tmp_path):
+        """auto_record and install create a ledger this way; so do fixtures."""
+        ledger = rh.load(str(tmp_path / "new.json"))
+        assert ledger["reads"] == []
+        assert ledger["schema"] == rh.SCHEMA
+
+    def test_recording_stays_non_fatal_even_so(self, tmp_path, monkeypatch):
+        """`auto_record` is NEVER FATAL by contract. Raising in load() must not
+        turn a missing ledger into a dead measurement.
+
+        This test lifts conftest's LEDGER_DISABLED kill switch, so it is the one
+        test in the suite that can actually write a ledger. It says where twice
+        — an explicit `path=` AND a redirected DEFAULT_PATH — because relying on
+        the redirect alone is how it wrote to the tracked ledger the first time:
+        `load(path: str = DEFAULT_PATH)` bound its default at import, so
+        monkeypatching the module global did not reach it and the real file took
+        the entry. Belt and braces, on the one test that has scissors.
+        """
+        tracked = os.path.join(REPO, "artifacts", "data_read_ledger.json")
+        before = open(tracked, "rb").read()
+
+        monkeypatch.delenv(rh.DISABLE_ENV, raising=False)
+        missing = str(tmp_path / "gone" / "L.json")
+        monkeypatch.setattr(rh, "DEFAULT_PATH", missing)
+        assert rh.auto_record(
+            dataset="X", from_utc="2026-01-01T00:00:00Z",
+            to_utc="2026-02-01T00:00:00Z", read_by="t",
+            path=missing) in (True, False)
+
+        assert open(tracked, "rb").read() == before, (
+            "the one test allowed to write a ledger wrote to the tracked one")
+
+
 class TestTheLedgerIsAppendOnly:
     def test_seeding_twice_adds_nothing(self):
         ledger = _seeded()

@@ -33,6 +33,50 @@ def _disable_data_read_ledger():
         os.environ["LEDGER_DISABLED"] = previous
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _tracked_read_ledger_is_restored():
+    """The suite must not be able to edit the contamination ledger.
+
+    `_disable_data_read_ledger` above sets LEDGER_DISABLED, which is why this
+    has held so far. But it is a kill switch, and a test that lifts it — there
+    is exactly one, and it is the test that proves recording stays non-fatal —
+    gets a live writer pointed at `artifacts/data_read_ledger.json`. That is a
+    TRACKED file, and it is the record of which windows this programme has
+    already looked at: the thing every holdout claim is checked against. An
+    entry the suite invented is a claim about the data nobody made.
+
+    It has already happened once. `reserved_holdout.load` took its path as a
+    default argument, bound at import, so the test's `monkeypatch.setattr(rh,
+    "DEFAULT_PATH", ...)` did not reach it and a read of dataset "X" landed in
+    the real ledger. `git status` caught it; nothing in the suite did.
+
+    So: snapshot at session start, restore and FAIL at session end. Restoring
+    keeps the working tree clean for the verify receipt; failing is what makes
+    the next occurrence visible instead of merely reverted.
+    """
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+        __file__))), "artifacts", "data_read_ledger.json")
+    before = None
+    if os.path.isfile(path):
+        with open(path, "rb") as handle:
+            before = handle.read()
+
+    yield
+
+    if before is None:
+        return
+    with open(path, "rb") as handle:
+        after = handle.read()
+    if after != before:
+        with open(path, "wb") as handle:
+            handle.write(before)
+        raise AssertionError(
+            f"the suite modified the tracked read ledger ({path}). It has been "
+            f"restored, but a test is writing where it must not: pass an "
+            f"explicit path= to reserved_holdout, and do not rely on "
+            f"monkeypatching DEFAULT_PATH alone.")
+
+
 # --- MODULE SCOPE, deliberately -------------------------------------------
 # persistence.py binds DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH", ...)
 # at IMPORT time, and config.py defaults the same key to the TRACKED fixture

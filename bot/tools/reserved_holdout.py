@@ -60,7 +60,12 @@ import os
 import sys
 from typing import Any, Dict, List, Optional
 
-DEFAULT_PATH = "artifacts/data_read_ledger.json"
+#: ABSOLUTE, anchored to this file. It used to be the relative string
+#: "artifacts/data_read_ledger.json", which made the contamination guard depend
+#: on the caller's working directory — see load().
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+DEFAULT_PATH = os.path.join(_ROOT, "artifacts", "data_read_ledger.json")
 SCHEMA = "data_read_ledger/1"
 
 
@@ -126,8 +131,44 @@ def _seed_reads() -> List[Dict[str, Any]]:
     ]
 
 
-def load(path: str = DEFAULT_PATH) -> Dict[str, Any]:
+def load(path: Optional[str] = None) -> Dict[str, Any]:
+    """Read the ledger. An ABSENT DEFAULT ledger is an error, not an empty one.
+
+    Two bugs lived in the previous three lines, and they compounded.
+
+    `DEFAULT_PATH` was the relative string "artifacts/data_read_ledger.json", so
+    which ledger you got depended on where you were standing. And a missing file
+    returned an empty skeleton — no reads recorded, nothing contaminated.
+
+    Together: run `tools/carry_sweep.py --best` from `bot/` and it refuses,
+    correctly, because the window it would pick from is in the ledger. Run the
+    identical command from the repository root, or from anywhere else, and
+    `artifacts/data_read_ledger.json` does not resolve, the ledger comes back
+    empty, `holdout_is_untouched()` finds no overlap, and the sweep picks a
+    winner out of a window this programme has read end to end. The guard against
+    selection contamination was one `cd` from being off, and it said nothing
+    when it was — `tests/test_carry_core.py::...::test_it_refuses_a_window_
+    something_has_read` passed from bot/ and failed from anywhere else, which is
+    how it was found.
+
+    So the default is absolute now, and a missing default ledger raises. The
+    empty skeleton survives ONLY for an explicitly passed path, which is how
+    `auto_record` and `install` bootstrap a new ledger and how the tests build
+    fixtures. `auto_record` catches everything by contract, so recording stays
+    non-fatal.
+    """
+    # Resolved here, not in the signature: a default argument is bound once at
+    # import, so `DEFAULT_PATH` could not be redirected afterwards — including
+    # by the test that proves a missing ledger raises.
+    explicit = path is not None
+    path = path or DEFAULT_PATH
     if not os.path.exists(path):
+        if not explicit or os.path.abspath(path) == os.path.abspath(DEFAULT_PATH):
+            raise FileNotFoundError(
+                f"the read ledger is missing: {path}. An absent ledger reads as "
+                f"'nothing has been looked at', which is the most dangerous "
+                f"thing this file could claim. Restore it from git rather than "
+                f"letting a holdout check pass on silence.")
         return {"schema": SCHEMA, "seeded": False, "reads": [],
                 "floor_not_census": (
                     "Abandoned runs and one-off diagnostics left no artefact and "
@@ -137,7 +178,8 @@ def load(path: str = DEFAULT_PATH) -> Dict[str, Any]:
         return json.load(handle)
 
 
-def save(ledger: Dict[str, Any], path: str = DEFAULT_PATH) -> None:
+def save(ledger: Dict[str, Any], path: Optional[str] = None) -> None:
+    path = path or DEFAULT_PATH
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(ledger, handle, indent=1, sort_keys=True)
@@ -178,7 +220,7 @@ DISABLE_ENV = "LEDGER_DISABLED"
 
 
 def auto_record(*, dataset: str, from_utc: str, to_utc: str, read_by: str,
-                purpose: str = "", path: str = DEFAULT_PATH) -> bool:
+                purpose: str = "", path: Optional[str] = None) -> bool:
     """Record a read from inside a loader. Idempotent, and NEVER fatal.
 
     Called by `market_data.load_corpus`, the chokepoint every measurement tool
@@ -216,7 +258,7 @@ def auto_record(*, dataset: str, from_utc: str, to_utc: str, read_by: str,
 
 
 def install(market_data_module=None, *, reader: str = "",
-            path: str = DEFAULT_PATH) -> bool:
+            path: Optional[str] = None) -> bool:
     """Attach this ledger to `market_data.READ_OBSERVER`. Idempotent.
 
     The arrow points UP: market_data knows nothing about the ledger, publishes
