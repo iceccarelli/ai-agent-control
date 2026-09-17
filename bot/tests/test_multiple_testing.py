@@ -177,6 +177,57 @@ class TestEffectiveTrials:
         assert ds.effective_n_trials(12, 0.3) < 12
 
 
+class TestTheRegistryPathDoesNotMoveWithTheCaller:
+    """The sibling of the bug fixed in 0085, pinned before it happens here.
+
+    `reserved_holdout.DEFAULT_PATH` was the relative string
+    "artifacts/data_read_ledger.json", so the read ledger — and with it the
+    selection-contamination guard — resolved against whatever directory the
+    caller happened to be in. From anywhere but bot/ it came back empty and
+    `carry_sweep --best` picked a winner out of a fully-read window.
+
+    This registry is the other half of the same honesty machinery: it records
+    how many configurations were actually scored, which is the width every
+    correction in this file divides by. It is already anchored to ROOT, so this
+    is a regression guard rather than a fix — but it is the guard that was
+    missing next door, and the two modules are edited by the same reflex.
+
+    Note for anyone tidying: `borrow_curve.DEFAULT_PATH` is also relative and
+    that is FINE. It is joined with an explicit `repo` and its missing-file
+    branch raises `BorrowCurveError`. A relative path that fails closed is a
+    style question; one that fails open is the bug.
+    """
+
+    def test_the_default_registry_path_is_absolute(self):
+        assert os.path.isabs(hr.DEFAULT_PATH), hr.DEFAULT_PATH
+
+    def test_it_resolves_under_the_repo_not_the_caller(self):
+        assert hr.DEFAULT_PATH.startswith(ROOT + os.sep)
+        assert hr.DEFAULT_PATH.endswith(
+            os.path.join("artifacts", "hypothesis_registry.json"))
+
+    @pytest.mark.parametrize("where", ["repo_root", "tmp", "home"])
+    def test_the_registry_loads_the_same_from_any_directory(
+            self, tmp_path, monkeypatch, where):
+        here = hr.load()
+        target = {"repo_root": os.path.dirname(ROOT),
+                  "tmp": str(tmp_path),
+                  "home": os.path.expanduser("~")}[where]
+        monkeypatch.chdir(target)
+        assert hr.load() == here
+
+    def test_the_recorded_search_width_survives_a_chdir(self, tmp_path,
+                                                        monkeypatch):
+        """Width is what the corrections in this file divide by. A width that
+        silently reads as zero would turn every one of them into a no-op."""
+        before = len(hr.load().get("trials", []))
+        monkeypatch.chdir(tmp_path)
+        assert len(hr.load().get("trials", [])) == before
+        assert before > 0, (
+            "the tracked registry has no trials; a correction for a search "
+            "width of zero corrects for nothing")
+
+
 class TestRegistry:
     def test_seed_uses_the_authoritative_list_not_the_signals_directory(self):
         """signals/ has 10 .py files; FROZEN_ABSENT records 11 families.
