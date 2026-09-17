@@ -17,3 +17,13 @@ state/
 models/**
 !models/**/
 !models/**/MANIFEST.json
+
+# Control-plane tick output. Regenerated every hour by the cron in
+# scripts/REWIRE_MACHINE_B_EXECUTION.sh from evidence that IS tracked, so
+# committing them adds a diff per hour that says only "the clock moved".
+#
+# NEXT_MISSION.md in particular is a derived instruction file, not a record: a
+# committed copy is a copy someone will read after it has gone stale.
+artifacts/NEXT_MISSION.md
+artifacts/control_plane_tick.json
+artifacts/control_plane_loop.log
