@@ -137,7 +137,7 @@ def _substance(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     return {k: v for k, v in doc.items() if k != "generated_utc"}
 
 
-def _promote_verdict() -> Dict[str, Any]:
+def _promote_verdict(*, reviewer_ok: bool) -> Dict[str, Any]:
     """Copy the scratch verdict over the tracked one ONLY if the finding moved.
 
     Every hour the reviewer recomputes the same verdict from the same tracked
@@ -155,7 +155,18 @@ def _promote_verdict() -> Dict[str, Any]:
     TRACKED verdict is now the time the finding last CHANGED, not the time the
     reviewer last ran. Liveness lives in artifacts/control_plane_tick.json,
     which is regenerated every tick and is not tracked.
+
+    `reviewer_ok` is not optional politeness. The scratch file OUTLIVES the run
+    that wrote it: if this tick's reviewer died, yesterday's scratch is still
+    sitting there, and a promote that only checks "is the file readable" would
+    copy a stale finding into artifacts/ and stamp it as the current one. A
+    reviewer that failed produces no verdict, and no verdict must mean the last
+    known one stands.
     """
+    if not reviewer_ok:
+        return {"promoted": False, "reason": "reviewer did not succeed",
+                "computed_utc": None}
+
     fresh, fresh_err = _read_json(VERDICT_SCRATCH)
     if fresh_err:
         return {"promoted": False, "reason": fresh_err, "computed_utc": None}
@@ -389,7 +400,13 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
             "reason": "XAI_API_KEY unset; local dry-run verdict retained",
         }
 
-    steps["reviewer_verdict_promote"] = _promote_verdict()
+    # Whichever reviewer invocation last wrote the scratch is the one that has
+    # to have succeeded. With a key that is the --xai run; without, the dry run.
+    reviewer_step = ("reviewer_verdict_xai" if key_present
+                     else "reviewer_verdict_dry_run")
+    reviewer_ok = steps[reviewer_step].get("returncode") == 0
+    steps["reviewer_verdict_promote"] = _promote_verdict(
+        reviewer_ok=reviewer_ok)
 
     verdict, verdict_err = _read_json(VERDICT_OUT)
     if verdict_err:

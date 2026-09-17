@@ -658,6 +658,64 @@ class TestTheVerdictIsPromotedNotStamped:
         assert reviewer["computed_utc"] == "2099-12-31T23:59:59Z"
         assert reviewer["generated_utc"] == VERDICT["generated_utc"]
 
+    def test_a_failed_reviewer_does_not_promote_yesterdays_scratch(
+            self, tmp_repo, recorder):
+        """The scratch file outlives the run that wrote it.
+
+        If this tick's reviewer died, the previous tick's scratch is still on
+        disk. A promote that only asked "is the file readable" would copy that
+        stale finding into artifacts/ and present it as current.
+        """
+        tracked = os.path.join(tmp_repo, cpt.VERDICT_OUT)
+        before = open(tracked, "rb").read()
+        self._scratch(tmp_repo, dict(VERDICT, allows_progress=False,
+                                     blockers=["stale from yesterday"]))
+        recorder.fail["reviewer_verdict.py"] = 1
+        assert cpt.main([]) == 0
+        assert open(tracked, "rb").read() == before
+        promote = json.load(open(os.path.join(tmp_repo, cpt.TICK_OUT),
+                                 encoding="utf-8"))["steps"][
+                                     "reviewer_verdict_promote"]
+        assert promote["promoted"] is False
+        assert promote["reason"] == "reviewer did not succeed"
+
+    def test_the_failure_is_still_recorded_as_an_error(self, tmp_repo,
+                                                       recorder):
+        """Refusing to promote must not make the failure invisible."""
+        recorder.fail["reviewer_verdict.py"] = 1
+        assert cpt.main([]) == 0
+        tick = json.load(open(os.path.join(tmp_repo, cpt.TICK_OUT),
+                              encoding="utf-8"))
+        assert any("reviewer_verdict" in e for e in tick["errors"]), tick["errors"]
+
+    def test_with_a_key_the_xai_run_is_the_one_that_must_succeed(
+            self, tmp_repo, recorder, monkeypatch):
+        """--xai overwrites the scratch last, so its rc is the one that counts.
+
+        A dry run that succeeded before a failed --xai would otherwise be read
+        as permission to promote whatever the broken run left behind.
+        """
+        monkeypatch.setenv("XAI_API_KEY", "present")
+        tracked = os.path.join(tmp_repo, cpt.VERDICT_OUT)
+        before = open(tracked, "rb").read()
+        self._scratch(tmp_repo, dict(VERDICT, blockers=["half-written"]))
+        recorder.fail["--xai"] = 1
+        assert cpt.main([]) == 0
+        assert open(tracked, "rb").read() == before
+        promote = json.load(open(os.path.join(tmp_repo, cpt.TICK_OUT),
+                                 encoding="utf-8"))["steps"][
+                                     "reviewer_verdict_promote"]
+        assert promote["reason"] == "reviewer did not succeed"
+
+    def test_without_a_key_a_green_dry_run_is_enough(self, tmp_repo, recorder,
+                                                     monkeypatch):
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        self._scratch(tmp_repo, dict(VERDICT, blockers=["a real new blocker"]))
+        assert cpt.main([]) == 0
+        now = json.load(open(os.path.join(tmp_repo, cpt.VERDICT_OUT),
+                             encoding="utf-8"))
+        assert now["blockers"] == ["a real new blocker"]
+
     def test_substance_ignores_only_the_clock(self):
         """A comparison that ignored too much would silently drop findings."""
         base = dict(VERDICT)
@@ -673,18 +731,29 @@ class TestTheVerdictIsPromotedNotStamped:
 # ------------------------------------------------------------- fixtures ---
 
 class _Recorder:
-    """Stands in for subprocess. Records argv, spawns nothing."""
+    """Stands in for subprocess. Records argv, spawns nothing.
+
+    `fail` maps a substring of a child's argv to the returncode it should
+    report, so a test can kill one tool and leave the rest working.
+    """
 
     def __init__(self):
         self.calls = []
+        self.fail = {}
 
     def __call__(self, argv, **kwargs):
         self.calls.append(list(argv))
+        joined = " ".join(argv)
+        rc = 0
+        for needle, code in self.fail.items():
+            if needle in joined:
+                rc = code
+                break
         return {
             "argv": list(argv),
             "started_utc": "2026-01-01T00:00:00Z",
             "ended_utc": "2026-01-01T00:00:00Z",
-            "returncode": 0,
+            "returncode": rc,
             "stdout_tail": "",
             "stderr_tail": "",
             "error": None,
