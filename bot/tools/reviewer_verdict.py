@@ -39,8 +39,13 @@ logged. If it is unset the tool runs the local rules, records
     tools/reviewer_verdict.py --dry-run --out /tmp/verdict.json
     tools/reviewer_verdict.py --xai          # only reaches the network if keyed
 
-Exit codes: 0 verdict written; 2 an input was unreadable AND --strict was
-given. The verdict itself is still written in both cases.
+The output file is left untouched when the finding is identical and only the
+timestamp would have moved — the default path is tracked, and a runbook step
+that dirties git every time you follow it is a runbook step people stop
+following. `--stamp` forces the write.
+
+Exit codes: 0 verdict produced; 2 an input was unreadable AND --strict was
+given. The verdict itself is still emitted in both cases.
 """
 from __future__ import annotations
 
@@ -265,6 +270,42 @@ def build(repo: str, *, adapter: Optional[str] = None) -> Dict[str, Any]:
     return verdict
 
 
+def _write_if_changed(out: str, verdict: dict, *, stamp: bool = False) -> bool:
+    """Write the verdict, unless the only thing that moved was the clock.
+
+    The verdict is a pure function of tracked evidence plus a timestamp, and
+    the default output path is tracked. So every run of the runbook step
+    `tools/reviewer_verdict.py --dry-run` used to leave the working tree dirty
+    with a one-line diff saying the clock advanced — and a human who runs it
+    three times in a shift reverts it three times, or stops looking at
+    `git status`, which is worse.
+
+    Leaving the file alone costs one thing and it is worth naming: on an
+    unchanged run `generated_utc` in the FILE is the time the finding last
+    changed, not the time this ran. The run itself still prints a freshly
+    stamped verdict to stdout, which is where a human looking for liveness is
+    already looking, and `--stamp` forces the write for anyone who wants the
+    file to say it too.
+
+    Returns True if the file was written.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+    if not stamp:
+        try:
+            with open(out, encoding="utf-8") as handle:
+                current = json.load(handle)
+        except (OSError, ValueError):
+            current = None
+        if current is not None and (
+                {k: v for k, v in current.items() if k != "generated_utc"}
+                == {k: v for k, v in verdict.items() if k != "generated_utc"}):
+            return False
+    with open(out, "w", encoding="utf-8") as handle:
+        json.dump(verdict, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    return True
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -281,19 +322,23 @@ def main(argv=None) -> int:
                         help=f"where to write (default: {DEFAULT_OUT})")
     parser.add_argument("--strict", action="store_true",
                         help="exit 2 if any input was missing or unreadable")
+    parser.add_argument("--stamp", action="store_true",
+                        help="rewrite the output even when the finding is "
+                             "identical, moving generated_utc forward")
     args = parser.parse_args(argv)
 
     adapter = "xai" if args.xai else ("ollama" if args.ollama else None)
     verdict = build(args.repo, adapter=adapter)
 
     out = args.out or os.path.join(args.repo, DEFAULT_OUT)
-    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
-    with open(out, "w", encoding="utf-8") as handle:
-        json.dump(verdict, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
+    wrote = _write_if_changed(out, verdict, stamp=args.stamp)
 
     print(json.dumps(verdict, indent=2, ensure_ascii=False))
-    print(f"\nverdict written to {os.path.abspath(out)}", file=sys.stderr)
+    if wrote:
+        print(f"\nverdict written to {os.path.abspath(out)}", file=sys.stderr)
+    else:
+        print(f"\nverdict unchanged; {os.path.abspath(out)} left alone "
+              f"(--stamp to move its timestamp anyway)", file=sys.stderr)
     print(f"key_status={verdict['key_status']} "
           f"allows_progress={verdict['allows_progress']} "
           f"blockers={len(verdict['blockers'])}", file=sys.stderr)

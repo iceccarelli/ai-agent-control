@@ -69,6 +69,18 @@ are computed locally from the artifacts; a model's answer is appended to
 is `missing` or `present` — the key itself is never written here, printed, or
 logged.
 
+`generated_utc` in this FILE is when the finding last changed, not when the
+reviewer last ran. Both `tools/reviewer_verdict.py` and
+`tools/control_plane_tick.py` leave the file untouched when the only difference
+would be the timestamp, because the path is tracked and an hourly cron plus a
+runbook step that each dirty it turn `git status` into noise nobody reads.
+
+Liveness is reported separately and always: `reviewer.computed_utc` in
+`artifacts/control_plane_tick.json`, which is regenerated every tick and is not
+tracked. A run that prints a verdict also prints a freshly stamped one to
+stdout. `--stamp` forces the file write for anyone who wants it recorded there
+too.
+
 `risk.allows_live_must_be_false` is always `true`. A verdict is an opinion
 about evidence. It is not an authorisation, and no code may read it as one.
 

@@ -245,6 +245,94 @@ class TestTheCli:
         assert done.returncode == 2
 
 
+class TestItDoesNotDirtyTheRepoJustByRunning:
+    """`artifacts/reviewer_verdict.json` is TRACKED, and the verdict is a pure
+    function of tracked evidence plus a clock.
+
+    So the runbook step `tools/reviewer_verdict.py --dry-run` used to leave a
+    one-line diff behind every single time it was followed: generated_utc moved,
+    nothing else did. Three runs in a shift is three reverts, or it is a person
+    who has stopped reading `git status` — and `git status` is how the fixture-db
+    guard and the verify receipt both get noticed.
+    """
+
+    def _run(self, out, *extra):
+        env = dict(os.environ)
+        env.pop("XAI_API_KEY", None)
+        return subprocess.run(
+            [sys.executable, TOOL, "--dry-run", "--repo", BOT,
+             "--out", str(out), *extra],
+            capture_output=True, text=True, env=env, timeout=120)
+
+    def test_a_second_identical_run_leaves_the_file_byte_identical(self, tmp_path):
+        out = tmp_path / "v.json"
+        assert self._run(out).returncode == 0
+        first = out.read_bytes()
+        assert self._run(out).returncode == 0
+        assert out.read_bytes() == first
+
+    def test_it_says_so_rather_than_pretending_it_wrote(self, tmp_path):
+        out = tmp_path / "v.json"
+        self._run(out)
+        done = self._run(out)
+        assert "verdict unchanged" in done.stderr
+        assert "left alone" in done.stderr
+
+    def test_the_verdict_it_prints_is_still_freshly_stamped(self, tmp_path):
+        """Liveness has to stay visible somewhere, or a dead reviewer and a
+        stable one look the same."""
+        out = tmp_path / "v.json"
+        self._run(out)
+        onfile = json.loads(out.read_text(encoding="utf-8"))["generated_utc"]
+        printed = json.loads(self._run(out).stdout)["generated_utc"]
+        assert printed >= onfile
+        assert json.loads(out.read_text(encoding="utf-8"))[
+            "generated_utc"] == onfile
+
+    def test_stamp_forces_the_write(self, tmp_path):
+        out = tmp_path / "v.json"
+        self._run(out)
+        before = json.loads(out.read_text(encoding="utf-8"))["generated_utc"]
+        done = self._run(out, "--stamp")
+        assert "verdict written to" in done.stderr
+        after = json.loads(out.read_text(encoding="utf-8"))["generated_utc"]
+        assert after >= before
+
+    def test_a_changed_finding_is_always_written(self, tmp_path):
+        """Skipping the write must never skip a real change."""
+        out = tmp_path / "v.json"
+        self._run(out)
+        doc = json.loads(out.read_text(encoding="utf-8"))
+        doc["blockers"] = ["something a stale file would hide"]
+        out.write_text(json.dumps(doc), encoding="utf-8")
+        assert self._run(out).returncode == 0
+        assert json.loads(out.read_text(encoding="utf-8"))["blockers"] == []
+
+    def test_a_corrupt_existing_file_is_replaced_not_preserved(self, tmp_path):
+        out = tmp_path / "v.json"
+        out.write_text("{ this is not json", encoding="utf-8")
+        assert self._run(out).returncode == 0
+        assert set(json.loads(out.read_text(encoding="utf-8"))) == SCHEMA
+
+    def test_a_first_run_into_a_missing_directory_still_works(self, tmp_path):
+        out = tmp_path / "nested" / "deeper" / "v.json"
+        assert self._run(out).returncode == 0
+        assert out.is_file()
+
+    def test_only_the_clock_is_ignored_in_the_comparison(self, tmp_path):
+        """A comparison that ignored a second field would hide findings."""
+        out = tmp_path / "v.json"
+        self._run(out)
+        baseline = json.loads(out.read_text(encoding="utf-8"))
+        for key in SCHEMA - {"generated_utc"}:
+            doc = dict(baseline)
+            doc[key] = "MOVED"
+            out.write_text(json.dumps(doc), encoding="utf-8")
+            assert self._run(out).returncode == 0
+            assert json.loads(out.read_text(encoding="utf-8"))[key] != "MOVED", (
+                f"a change to {key} was treated as no change")
+
+
 class TestPackaging:
     """Binary consistency, stated rather than left implicit.
 
