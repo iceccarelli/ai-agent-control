@@ -9,6 +9,7 @@ never printed, and the packaging story is stated rather than assumed.
 from __future__ import annotations
 
 import ast
+import datetime as dt
 import json
 import os
 import re
@@ -25,6 +26,9 @@ TOOL = os.path.join(BOT, "tools", "reviewer_verdict.py")
 sys.path.insert(0, os.path.join(BOT, "tools"))
 
 import reviewer_verdict as rv                         # noqa: E402
+
+#: Distinguishes "the key is absent" from "the key is None".
+_ABSENT = object()
 
 SCHEMA = {"allows_progress", "blockers", "stage_b", "risk", "next_actions",
           "model", "key_status", "generated_utc"}
@@ -243,6 +247,142 @@ class TestTheCli:
              "--out", str(tmp_path / "v.json"), "--strict"],
             capture_output=True, text=True, timeout=120)
         assert done.returncode == 2
+
+
+class TestEvidenceThatStoppedMovingIsNotEvidence:
+    """Both Stage B counters come from one file, and nothing asked its age.
+
+    If `daily_forward_refresh` stopped — a broken venv, a cron dropped by an OS
+    upgrade, a host that never came back from a reboot — the counters freeze and
+    the reviewer goes on reporting "accrue closed forward trades: 3 of 20" with
+    no blockers and allows_progress true, indefinitely. Stage B looks slow. It
+    is stopped. Those are not the same finding and the verdict has to be able to
+    tell them apart.
+    """
+
+    BASE = dt.datetime(2026, 9, 17, 0, 0, 0, tzinfo=dt.timezone.utc)
+
+    def _repo(self, tmp_path, observed):
+        art = tmp_path / "artifacts"
+        art.mkdir(exist_ok=True)
+        doc = {"forward_n_trades": 3, "closed_forward_bars": 36}
+        if observed is not _ABSENT:
+            doc["observed_at_utc"] = observed
+        (art / "forward_shadow_current.json").write_text(json.dumps(doc))
+        return str(tmp_path)
+
+    #: The BASE instant, spelled the way the corpus tools write it.
+    STAMP = "2026-09-17T00:00:00Z"
+
+    def _findings(self, tmp_path, observed, hours_later):
+        """Evaluate a repo whose shadow was observed at `observed`, as seen
+        `hours_later` after BASE. The clock is injected so the thresholds can
+        be tested at the boundary instead of waited out."""
+        repo = self._repo(tmp_path, observed)
+        return rv.evaluate(repo, now=self.BASE + dt.timedelta(hours=hours_later))
+
+    def _stale_blockers(self, verdict):
+        return [b for b in verdict["blockers"] if "forward shadow" in b]
+
+    def _stale_actions(self, verdict):
+        return [a for a in verdict["next_actions"] if "forward shadow" in a]
+
+    def test_a_fresh_shadow_says_nothing_about_staleness(self, tmp_path, no_key):
+        verdict = self._findings(tmp_path, self.STAMP, 2)
+        assert self._stale_blockers(verdict) == []
+        assert self._stale_actions(verdict) == []
+
+    def test_a_missed_daily_refresh_is_a_next_action_not_a_blocker(
+            self, tmp_path, no_key):
+        """One missed run is worth saying. It is not worth halting over."""
+        verdict = self._findings(tmp_path, self.STAMP, 30)
+        assert self._stale_blockers(verdict) == []
+        assert len(self._stale_actions(verdict)) == 1
+        assert "30h old" in self._stale_actions(verdict)[0]
+        assert "daily_forward_refresh" in self._stale_actions(verdict)[0]
+
+    def test_two_missed_refreshes_block(self, tmp_path, no_key):
+        verdict = self._findings(tmp_path, self.STAMP, 72)
+        assert len(self._stale_blockers(verdict)) == 1
+        assert "frozen, not slow" in self._stale_blockers(verdict)[0]
+        assert "72h old" in self._stale_blockers(verdict)[0]
+
+    def test_the_counters_are_still_reported_while_stale(self, tmp_path, no_key):
+        """Refusing to trust a number is not a reason to stop showing it."""
+        verdict = self._findings(tmp_path, self.STAMP, 72)
+        assert verdict["stage_b"]["forward_n_trades"] == 3
+        assert verdict["stage_b"]["closed_forward_bars"] == 36
+
+    @pytest.mark.parametrize("hours,expect", [
+        (25.9, "clean"), (26.1, "warn"), (47.9, "warn"), (48.1, "block"),
+    ])
+    def test_the_thresholds_are_where_they_say_they_are(self, tmp_path, no_key,
+                                                        hours, expect):
+        verdict = self._findings(tmp_path, self.STAMP, hours)
+        got = ("block" if self._stale_blockers(verdict)
+               else "warn" if self._stale_actions(verdict) else "clean")
+        assert got == expect, (hours, verdict["blockers"],
+                              verdict["next_actions"])
+
+    def test_a_shadow_with_no_timestamp_is_a_blocker(self, tmp_path, no_key):
+        """Fail closed. A counter you cannot age is a counter you cannot use."""
+        verdict = self._findings(tmp_path, _ABSENT, 0)
+        assert len(self._stale_blockers(verdict)) == 1
+        assert "cannot be aged" in self._stale_blockers(verdict)[0]
+
+    @pytest.mark.parametrize("junk", ["", "   ", "yesterday", "2026-13-45",
+                                      None, 1758067200])
+    def test_an_unparseable_timestamp_is_never_read_as_fresh(self, tmp_path,
+                                                             no_key, junk):
+        verdict = self._findings(tmp_path, junk, 0)
+        assert len(self._stale_blockers(verdict)) == 1, junk
+
+    def test_a_naive_timestamp_is_read_as_utc_not_rejected(self, tmp_path,
+                                                           no_key):
+        """The corpus tools write Z; a hand-edited file might not."""
+        verdict = self._findings(tmp_path, "2026-09-17T00:00:00", 2)
+        assert self._stale_blockers(verdict) == []
+        assert self._stale_actions(verdict) == []
+
+    def test_an_offset_timestamp_is_converted_not_assumed(self, tmp_path,
+                                                          no_key):
+        verdict = self._findings(tmp_path, "2026-09-16T20:00:00-04:00", 2)
+        assert self._stale_blockers(verdict) == []
+
+    def test_a_clock_that_is_behind_does_not_manufacture_staleness(
+            self, tmp_path, no_key):
+        """A shadow stamped in the future is odd, but it is not stale, and a
+        negative age must not wrap into a blocker."""
+        verdict = self._findings(tmp_path, self.STAMP, -5)
+        assert self._stale_blockers(verdict) == []
+        assert self._stale_actions(verdict) == []
+
+    def test_on_the_real_repo_staleness_alone_is_enough_to_halt(self, no_key):
+        """Everywhere else here the tmp repo is missing the drill and the gate,
+        so `allows_progress` is already false and proves nothing. Against the
+        shipped artifacts it is true today — so aging only the clock is the one
+        variable, and it has to be enough on its own."""
+        forward = json.load(open(
+            os.path.join(BOT, "artifacts", "forward_shadow_current.json"),
+            encoding="utf-8"))
+        observed = dt.datetime.fromisoformat(
+            forward["observed_at_utc"].replace("Z", "+00:00"))
+        assert rv.evaluate(BOT, now=observed)["allows_progress"] is True
+        aged = rv.evaluate(BOT, now=observed + dt.timedelta(hours=72))
+        assert aged["allows_progress"] is False
+        assert [b for b in aged["blockers"] if "forward shadow" in b]
+
+    def test_the_shipped_shadow_is_not_stale_against_its_own_stamp(self):
+        """Non-flaky liveness check: the rule must not fire on the real file
+        read at the moment it was observed. Guards against shipping a threshold
+        that blocks the repo the instant it lands."""
+        forward = json.load(open(
+            os.path.join(BOT, "artifacts", "forward_shadow_current.json"),
+            encoding="utf-8"))
+        observed = dt.datetime.fromisoformat(
+            forward["observed_at_utc"].replace("Z", "+00:00"))
+        verdict = rv.evaluate(BOT, now=observed)
+        assert [b for b in verdict["blockers"] if "forward shadow" in b] == []
 
 
 class TestItDoesNotDirtyTheRepoJustByRunning:

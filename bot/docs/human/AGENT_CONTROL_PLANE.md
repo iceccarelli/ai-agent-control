@@ -69,6 +69,18 @@ are computed locally from the artifacts; a model's answer is appended to
 is `missing` or `present` — the key itself is never written here, printed, or
 logged.
 
+Both Stage B counters come from `artifacts/forward_shadow_current.json`, and
+the reviewer ages that file as well as reading it. Past
+`FORWARD_STALE_WARN_HOURS` (26 — a day plus room for cron jitter) it adds a
+`next_action`; past `FORWARD_STALE_BLOCK_HOURS` (48 — two missed daily
+refreshes, which is not jitter) it adds a **blocker**, and a shadow with no
+readable `observed_at_utc` is a blocker outright. The counters are still
+reported either way; refusing to trust a number is not a reason to hide it.
+
+The rule exists because a stopped `daily_forward_refresh` and a slow Stage B are
+indistinguishable from the counters alone: frozen at 3 of 20 reads exactly like
+progressing at 3 of 20, forever.
+
 `generated_utc` in this FILE is when the finding last changed, not when the
 reviewer last ran. Both `tools/reviewer_verdict.py` and
 `tools/control_plane_tick.py` leave the file untouched when the only difference

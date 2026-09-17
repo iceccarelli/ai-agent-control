@@ -75,6 +75,14 @@ CHARTER = os.path.join("docs", "human", "AGENT_CONTROL_PLANE.md")
 #: This mirrors `promotion_gate.GATE_PATH`; the test asserts they agree.
 GATE = os.path.join("artifacts", "slice59_promotion_gate.json")
 
+#: How old the forward shadow may get before the reviewer says so.
+#:
+#: `tools/daily_forward_refresh.py` runs at 01:07 daily, so anything under a day
+#: is normal and 24h exactly would false-positive on ordinary jitter. 26h is a
+#: day plus room; 48h is two missed refreshes, which is not jitter.
+FORWARD_STALE_WARN_HOURS = 26
+FORWARD_STALE_BLOCK_HOURS = 48
+
 #: Overridable because a model id is a fact about a vendor's catalogue, not
 #: about this repository, and hardcoding one makes this file wrong on the day
 #: they rename it.
@@ -110,8 +118,27 @@ def gate_path(repo: str) -> str:
 
 # ----------------------------------------------------------------- rules ---
 
-def evaluate(repo: str) -> Dict[str, Any]:
+def _age_hours(stamp: Any, now: dt.datetime) -> Optional[float]:
+    """Hours between an ISO-8601 Z timestamp and `now`, or None if unusable.
+
+    Returns None rather than guessing. A timestamp nobody can parse is not
+    "probably fine", and the caller treats None as a blocker.
+    """
+    if not isinstance(stamp, str) or not stamp.strip():
+        return None
+    text = stamp.strip().replace("Z", "+00:00")
+    try:
+        when = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=dt.timezone.utc)
+    return (now - when).total_seconds() / 3600.0
+
+
+def evaluate(repo: str, *, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
     """Deterministic from the artifacts. No network, no model, no randomness."""
+    now = now or dt.datetime.now(dt.timezone.utc)
     blockers: List[str] = []
     next_actions: List[str] = []
 
@@ -143,6 +170,35 @@ def evaluate(repo: str) -> Dict[str, Any]:
             f"accrue closed forward trades: {n_trades} of {need_trades}")
     if bars < need_days:
         next_actions.append(f"accrue forward days: {bars} of {need_days}")
+
+    # -- is the evidence still being measured? ------------------------------
+    # Both counters above come from one file, and nothing here used to ask how
+    # old that file was. If daily_forward_refresh stopped — a broken venv, a
+    # cron dropped by an OS upgrade, a host that never came back from a reboot
+    # — the counters would freeze and this reviewer would keep reporting
+    # "accrue closed forward trades: 3 of 20" with no blockers and
+    # allows_progress true, for as long as anyone left it running. Stage B
+    # would look slow. It would in fact be stopped.
+    #
+    # The module docstring already says a reviewer that shrugs because it could
+    # not find the evidence is worse than no reviewer. Evidence that is present
+    # but no longer being updated is the same failure wearing a fresher coat.
+    if forward is not None:
+        age = _age_hours(forward.get("observed_at_utc"), now)
+        if age is None:
+            blockers.append(
+                "forward shadow carries no readable observed_at_utc; its "
+                "counters cannot be aged and must not be trusted")
+        elif age > FORWARD_STALE_BLOCK_HOURS:
+            blockers.append(
+                f"forward shadow is {age:.0f}h old "
+                f"(limit {FORWARD_STALE_BLOCK_HOURS}h): the Stage B counters "
+                f"are frozen, not slow — check daily_forward_refresh")
+        elif age > FORWARD_STALE_WARN_HOURS:
+            next_actions.append(
+                f"forward shadow is {age:.0f}h old; a daily refresh has been "
+                f"missed — check daily_forward_refresh before trusting the "
+                f"counters")
 
     # -- the gate -----------------------------------------------------------
     checklist = (gate or {}).get("checklist") or {}
@@ -244,8 +300,9 @@ def _prompt(verdict: Dict[str, Any]) -> str:
 
 # ------------------------------------------------------------------ main ---
 
-def build(repo: str, *, adapter: Optional[str] = None) -> Dict[str, Any]:
-    verdict = evaluate(repo)
+def build(repo: str, *, adapter: Optional[str] = None,
+          now: Optional[dt.datetime] = None) -> Dict[str, Any]:
+    verdict = evaluate(repo, now=now)
     key_status = "present" if os.environ.get("XAI_API_KEY") else "missing"
     model = "none (local rules only)"
 
