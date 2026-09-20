@@ -1,0 +1,61 @@
+{
+  "tool": "append_closed_corpus.run_all",
+  "observed_at_utc": "2026-09-20T22:43:45Z",
+  "write": true,
+  "trees": {
+    "primary": {
+      "tool": "append_closed_corpus",
+      "symbol": "BTCUSDT",
+      "venue": "binance_usdtm",
+      "observed_at_utc": "2026-09-20T22:43:45Z",
+      "write": true,
+      "linear_last_before": "2026-09-15",
+      "linear_last_after": "2026-09-19",
+      "new_closed_bars": [
+        "2026-09-16",
+        "2026-09-17",
+        "2026-09-18",
+        "2026-09-19"
+      ],
+      "refused_open_bar": "2026-09-20",
+      "new_funding_prints": 12,
+      "bars_fabricated": 0,
+      "linear_sha256_before": "dd37951b8317f3920e73e96ce65c94be7df67d674faa7786004a480f0212eb05",
+      "linear_sha256_after": "b3efc681525f35080d472bf1f023733f8636cb6ba605439a68b766786cd24ef9",
+      "funding_sha256_before": "3d6c9dea0a7e2fcd02931834092a5fda0b2feeb48705bf6641a0c9227db4bac1",
+      "funding_sha256_after": "cb7b5c50b4d26a2dded1f7dfcc022dc586bb9148e51a24512d52e84f1b6fa198",
+      "historical_bytes_are_prefix": true,
+      "eth_sol_touched": false
+    },
+    "full": {
+      "tool": "append_closed_corpus",
+      "symbol": "BTCUSDT",
+      "venue": "binance_usdtm",
+      "observed_at_utc": "2026-09-20T22:43:45Z",
+      "write": true,
+      "linear_last_before": "2026-09-14",
+      "linear_last_after": "2026-09-19",
+      "new_closed_bars": [
+        "2026-09-15",
+        "2026-09-16",
+        "2026-09-17",
+        "2026-09-18",
+        "2026-09-19"
+      ],
+      "refused_open_bar": "2026-09-20",
+      "new_funding_prints": 12,
+      "bars_fabricated": 0,
+      "linear_sha256_before": "a2b392c0fc17d7e817c245fe5b54d7a530c59957d6dfa677666f36eb2a803bed",
+      "linear_sha256_after": "004ee03a72f054de7f668cc9f61e3e6c073b0563806156533a65c44a1d345eed",
+      "funding_sha256_before": "e2b6a4e10690a394305ff4c31d0ece5d3e8441cd8ce561fa2e46652b951bd34b",
+      "funding_sha256_after": "b5948ad841c0d8e41f81c6aab330ae1c4716ccc1f0aca46b1de6f5d801bfa501",
+      "historical_bytes_are_prefix": true,
+      "eth_sol_touched": false
+    }
+  },
+  "linear_tips": {
+    "primary": "2026-09-19",
+    "full": "2026-09-19"
+  },
+  "tips_equal_after": true
+}
