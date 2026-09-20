@@ -382,10 +382,18 @@ def main(argv=None) -> int:
     parser.add_argument("--stamp", action="store_true",
                         help="rewrite the output even when the finding is "
                              "identical, moving generated_utc forward")
+    parser.add_argument("--now", default=None,
+                        help="ISO8601 UTC instant to evaluate against "
+                             "instead of the real clock (tests only; "
+                             "production runs never pass this)")
     args = parser.parse_args(argv)
 
+    now = None
+    if args.now:
+        now = dt.datetime.fromisoformat(args.now.replace("Z", "+00:00"))
+
     adapter = "xai" if args.xai else ("ollama" if args.ollama else None)
-    verdict = build(args.repo, adapter=adapter)
+    verdict = build(args.repo, adapter=adapter, now=now)
 
     out = args.out or os.path.join(args.repo, DEFAULT_OUT)
     wrote = _write_if_changed(out, verdict, stamp=args.stamp)

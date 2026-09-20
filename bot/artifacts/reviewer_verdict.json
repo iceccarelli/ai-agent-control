@@ -1,6 +1,8 @@
 {
-  "allows_progress": true,
-  "blockers": [],
+  "allows_progress": false,
+  "blockers": [
+    "forward shadow is 104h old (limit 48h): the Stage B counters are frozen, not slow — check daily_forward_refresh"
+  ],
   "stage_b": {
     "forward_n_trades": 3,
     "of_20": 20,
@@ -20,5 +22,5 @@
   ],
   "model": "none (local rules only)",
   "key_status": "missing",
-  "generated_utc": "2026-09-16T22:18:54Z"
+  "generated_utc": "2026-09-20T20:00:10Z"
 }
