@@ -397,11 +397,18 @@ class TestItDoesNotDirtyTheRepoJustByRunning:
     """
 
     def _run(self, out, *extra):
+        """Pinned to the shipped shadow's own observed_at_utc, not the real
+        clock: otherwise this whole class goes red the day the checked-in
+        forward_shadow_current.json ages past the staleness threshold,
+        which has nothing to do with what these tests are checking."""
+        forward = json.load(open(
+            os.path.join(BOT, "artifacts", "forward_shadow_current.json"),
+            encoding="utf-8"))
         env = dict(os.environ)
         env.pop("XAI_API_KEY", None)
         return subprocess.run(
             [sys.executable, TOOL, "--dry-run", "--repo", BOT,
-             "--out", str(out), *extra],
+             "--out", str(out), "--now", forward["observed_at_utc"], *extra],
             capture_output=True, text=True, env=env, timeout=120)
 
     def test_a_second_identical_run_leaves_the_file_byte_identical(self, tmp_path):
