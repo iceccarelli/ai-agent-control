@@ -78,6 +78,7 @@ sys.path.insert(0, REPO)
 sys.path.insert(0, HERE)
 
 import append_closed_corpus as acc                  # noqa: E402
+import corpus_health as ch                          # noqa: E402
 import corpus_prefix as cp                          # noqa: E402
 import promotion_gate as _gate                      # noqa: E402
 
@@ -179,6 +180,19 @@ def run(*, scratch: Optional[str] = None) -> Dict[str, Any]:
         }
     report["corpus"] = window
 
+    # append_closed_corpus.py only ever writes data/real_linear_1d and
+    # data/real_funding (the primary, bounded trees). This tool scores the
+    # pilot against the `_full` trees (FORWARD_DATA_DIR / FORWARD_FUNDING
+    # above), and nothing appends to those automatically — so a cron that
+    # faithfully runs append_closed_corpus.py every day can still leave the
+    # `_full` trees frozen indefinitely while Stage B's counter stops moving.
+    # corpus_health.py already detects exactly this (any staleness at all
+    # marks a series unhealthy); it was written but never wired into the
+    # pipeline that reports Stage B's status, so nobody saw it fire. Wiring
+    # it here, read-only, is the fix: the divergence becomes a reported
+    # blocker instead of a silent one.
+    report["full_corpus_health"] = ch.check(REPO, corpus="full", asset="BTC")
+
     report["frozen_baseline"] = frozen_baseline_intact()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -231,6 +245,12 @@ def main(argv=None) -> int:
     trades = report.get("forward_n_trades")
     print(f"\ncorpus is {behind} closed bars behind the venue; forward closed "
           f"trades {trades} of {_gate.MIN_FORWARD_TRADES}", file=sys.stderr)
+    if not report["full_corpus_health"]["healthy"]:
+        print("BLOCKER: the _full corpus this pilot is scored against is "
+              f"unhealthy: {report['full_corpus_health']['problems']} — "
+              "append_closed_corpus.py does not write the _full trees, so "
+              "nothing keeps them in sync. Stage B's counter cannot be "
+              "trusted to move until this is resolved.", file=sys.stderr)
     if not report["frozen_baseline"]["intact"]:
         print("THE FROZEN BASELINE NO LONGER REPRODUCES PHASE1_DECISION — "
               "someone appended to a corpus it is pinned to.", file=sys.stderr)

@@ -34,6 +34,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tools"))
 
+import corpus_health as ch                          # noqa: E402
 import daily_forward_refresh as dfr                 # noqa: E402
 
 TOOL = os.path.join(REPO, "tools", "daily_forward_refresh.py")
@@ -145,6 +146,55 @@ class TestItReportsTheBlockerRatherThanRoutingAroundIt:
         assert "append_closed_corpus" in text
         import inspect
         assert "write" not in inspect.signature(dfr.run).parameters
+
+
+class TestTheFullCorpusHealthIsSurfaced:
+    """`append_closed_corpus.py` only ever writes `data/real_linear_1d` and
+    `data/real_funding` — the primary, bounded trees. This tool scores the
+    pilot against the `_full` trees instead, and nothing appends to those
+    automatically, so a cron that faithfully runs `append_closed_corpus.py`
+    every day can still leave `_full` frozen while Stage B's counter stops
+    moving. `corpus_health.py` already detects exactly this kind of
+    staleness; it just was never called from anything that runs on its own.
+    This wires it in, read-only.
+    """
+
+    def test_the_real_full_corpus_is_unhealthy_today(self):
+        """Ground truth, not a fixture: proves the split exists on disk. If
+        this ever goes green on its own, something now keeps `_full` in sync
+        and this test's premise should be revisited, not deleted."""
+        report = ch.check(REPO, corpus="full", asset="BTC")
+        assert report["healthy"] is False
+        assert any("STALE" in p for p in report["problems"]), report["problems"]
+
+    def _fake_behind(self):
+        return {"new_closed_bars": [], "new_funding_prints": 0,
+                "linear_last_before": "2026-09-15",
+                "linear_last_after": "2026-09-15"}
+
+    def test_run_carries_the_finding_with_no_network(self, monkeypatch):
+        monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
+        monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
+        report = dfr.run()
+        assert report["full_corpus_health"]["corpus"] == "full"
+        assert report["full_corpus_health"]["healthy"] is False
+
+    def test_main_prints_it_as_a_blocker(self, monkeypatch, capsys):
+        monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
+        monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
+        rc = dfr.main([])
+        assert rc == 0, "unhealthy _full is reported, not fatal on its own"
+        err = capsys.readouterr().err
+        assert "BLOCKER" in err and "_full corpus" in err
+
+    def test_a_healthy_full_corpus_prints_no_blocker(self, monkeypatch, capsys):
+        monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
+        monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
+        monkeypatch.setattr(dfr.ch, "check",
+                            lambda *a, **kw: {"healthy": True, "problems": [],
+                                             "corpus": "full"})
+        dfr.main([])
+        assert "BLOCKER" not in capsys.readouterr().err
 
 
 class TestTheCronLineIsDocumented:
