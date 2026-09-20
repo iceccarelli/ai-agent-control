@@ -38,6 +38,23 @@ LINEAR_PATH = os.path.join(ROOT, "data", "real_linear_1d", "ohlcv",
                            "BINANCE_LINEAR_BTC_USDT_1D.csv.gz")
 FUNDING_PATH = os.path.join(ROOT, "data", "real_funding", "funding",
                             "BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz")
+
+#: The tree `daily_forward_refresh` -> `slice76_forward_shadow` actually
+#: scores the pilot against. Its history goes back to 2019 rather than 2022,
+#: so its rows are NOT a 1:1 match with LINEAR_PATH/FUNDING_PATH — but until
+#: `run_all` below, nothing ever appended new closed bars to it, so Stage B's
+#: counter could freeze indefinitely even while this tool "succeeded" daily.
+FULL_LINEAR_PATH = os.path.join(ROOT, "data", "real_linear_1d_full", "ohlcv",
+                                "BINANCE_LINEAR_BTC_USDT_1D.csv.gz")
+FULL_FUNDING_PATH = os.path.join(ROOT, "data", "real_funding_full", "funding",
+                                 "BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz")
+
+#: (label, linear_path, funding_path) for every tree `run_all` keeps moving.
+TREES = (
+    ("primary", LINEAR_PATH, FUNDING_PATH),
+    ("full", FULL_LINEAR_PATH, FULL_FUNDING_PATH),
+)
+
 BASE = "https://www.binance.com/fapi/v1"
 DAY_MS = 86_400_000
 
@@ -205,6 +222,55 @@ def run(*, observed_at_utc: str, fetch: Fetcher = default_fetch,
     return report
 
 
+def run_all(*, observed_at_utc: str, fetch: Fetcher = default_fetch,
+            write: bool = False, trees: Sequence[Tuple[str, str, str]] = TREES,
+            expect_linear_sha256: str = "", expect_funding_sha256: str = ""
+            ) -> Dict[str, Any]:
+    """Keep every corpus tree Stage B depends on moving together.
+
+    Each tree is fetched and appended independently — its own cursor (read
+    off its own last row), its own hash-check, its own prefix guarantee —
+    against the SAME `observed_at_utc` cutoff, so they converge on the same
+    closed-bar frontier without assuming their histories line up row for
+    row (`full` starts in 2019; `primary` in 2022).
+
+    ATOMIC INTENT: every tree is validated with a dry run (`write=False`)
+    BEFORE any tree is written. If any tree would refuse — a gap, a digest
+    mismatch, malformed data — the exception propagates from this dry pass
+    and NOTHING is written to ANY tree. A half-synced pair is worse than an
+    unsynced one: it looks fixed. Only `expect_*_sha256` for the "primary"
+    tree is accepted, matching the existing single-tree CLI contract; `full`
+    is still hash-checked against its own on-disk digest, just not pinned
+    to a caller-supplied expectation.
+    """
+    def _kwargs(name: str, linear_path: str, funding_path: str, do_write: bool
+               ) -> Dict[str, Any]:
+        kw: Dict[str, Any] = dict(
+            observed_at_utc=observed_at_utc, fetch=fetch,
+            linear_path=linear_path, funding_path=funding_path, write=do_write)
+        if name == "primary":
+            kw["expect_linear_sha256"] = expect_linear_sha256
+            kw["expect_funding_sha256"] = expect_funding_sha256
+        return kw
+
+    dry = {name: run(**_kwargs(name, lp, fp, False)) for name, lp, fp in trees}
+
+    if write:
+        for name, lp, fp in trees:
+            if dry[name]["new_closed_bars"] or dry[name]["new_funding_prints"]:
+                dry[name] = run(**_kwargs(name, lp, fp, True))
+
+    linear_tips = {name: rep["linear_last_after"] for name, rep in dry.items()}
+    return {
+        "tool": "append_closed_corpus.run_all",
+        "observed_at_utc": observed_at_utc,
+        "write": write,
+        "trees": dry,
+        "linear_tips": linear_tips,
+        "tips_equal_after": len(set(linear_tips.values())) <= 1,
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -213,13 +279,19 @@ def main(argv=None) -> int:
     ap.add_argument("--expect-linear-sha256", default="")
     ap.add_argument("--expect-funding-sha256", default="")
     ap.add_argument("--write", action="store_true", help="persist (default dry-run)")
+    ap.add_argument("--primary-only", action="store_true",
+                    help="append only data/real_linear_1d + data/real_funding, "
+                         "skipping the _full trees Stage B is scored against "
+                         "(escape hatch for a caller with its own sync plan; "
+                         "the default keeps both moving together)")
     ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
+    trees = (TREES[:1] if args.primary_only else TREES)
     try:
-        report = run(observed_at_utc=args.observed_at_utc,
-                     expect_linear_sha256=args.expect_linear_sha256,
-                     expect_funding_sha256=args.expect_funding_sha256,
-                     write=args.write)
+        report = run_all(observed_at_utc=args.observed_at_utc,
+                         expect_linear_sha256=args.expect_linear_sha256,
+                         expect_funding_sha256=args.expect_funding_sha256,
+                         write=args.write, trees=trees)
     except Refuse as exc:
         print("REFUSED:", exc)
         return 4
