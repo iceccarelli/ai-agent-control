@@ -19,3 +19,18 @@
 11. **`allows_live` / mainnet / kill-switch clear:** human only, always — no exceptions for either class of session above.
 12. **Money sequence:** dual-tree corpus truth → Stage B calendar (20 forward trades / 180 days) → human gates → micro-live → kill-or-keep → only then any productization (control-plane / execution tooling as a sellable surface).
 13. **Green CI proves nothing about edge.** A hygiene PR (tests passing, script refactors, doc edits) is not arming or evidence for the strategy's edge. Edge determination lives in `EDGE.md` / the Stage 1 verdict only — never claim it here.
+
+## Offline-suite reds that are supposed to be red (2026-09-21)
+
+Item 7's coverage/pairing tests are currently red in any checkout without a
+factory-host `--write` run of `fetch_settlement_klines.py` /
+`fetch_borrow_rates.py` past this corpus's frozen window. That is the tests
+doing their job, not a bug:
+
+- `tests/test_borrow_curve.py::TestTheRealSeries::test_it_prices_essentially_all_of_the_frozen_window`
+- `tests/test_settlement_corpus_is_multi_asset.py::TestThePairingIsLosslessWhereItClaimsToBe::test_the_counts_are_what_the_measurement_assumed[BTC]`
+- `tests/test_settlement_corpus_is_multi_asset.py::TestThePairingIsLosslessWhereItClaimsToBe::test_btc_and_eth_drop_nothing_at_all[BTC]`
+- `tests/test_settlement_corpus_is_multi_asset.py::TestThePairingIsLosslessWhereItClaimsToBe::test_there_are_no_interior_holes[BTC]`
+
+Do not fix these by editing the pinned counts, xfailing them, or fabricating
+corpus rows — refetch on a host with venue egress instead.
