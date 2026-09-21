@@ -149,52 +149,82 @@ class TestItReportsTheBlockerRatherThanRoutingAroundIt:
 
 
 class TestTheFullCorpusHealthIsSurfaced:
-    """`append_closed_corpus.py` only ever writes `data/real_linear_1d` and
-    `data/real_funding` — the primary, bounded trees. This tool scores the
-    pilot against the `_full` trees instead, and nothing appends to those
-    automatically, so a cron that faithfully runs `append_closed_corpus.py`
-    every day can still leave `_full` frozen while Stage B's counter stops
-    moving. `corpus_health.py` already detects exactly this kind of
-    staleness; it just was never called from anything that runs on its own.
-    This wires it in, read-only.
+    """`corpus_health.py` reads three legs of `_full` (perp/spot/funding),
+    but the forward pilot only ever reads FORWARD_DATA_DIR / FORWARD_FUNDING
+    — perp and funding. It never reads spot (that feeds the basis leg
+    elsewhere, in carry_backtest). append_closed_corpus.run_all keeps
+    perp+funding's `_full` trees moving (W1b); append_spot_corpus.run_all
+    keeps spot's, run separately.
+
+    So a stale spot_1d is real book-health hygiene, not evidence Stage B is
+    stuck — printing a "Stage B blocked" line for a series the pilot never
+    reads would be exactly the false alarm this field exists to avoid.
+    `stage_b_relevant_problems` is the corpus_health finding list with
+    spot_1d's entries filtered out; only THAT list gates the BLOCKER text.
     """
 
     def test_the_real_full_corpus_is_unhealthy_today(self):
-        """Ground truth, not a fixture: proves the split exists on disk. If
-        this ever goes green on its own, something now keeps `_full` in sync
-        and this test's premise should be revisited, not deleted."""
+        """Ground truth, not a fixture: spot_1d is still stale on disk after
+        the perp/funding catch-up. If this ever goes green on its own,
+        something now keeps spot in sync and this premise should be
+        revisited, not deleted."""
         report = ch.check(REPO, corpus="full", asset="BTC")
         assert report["healthy"] is False
-        assert any("STALE" in p for p in report["problems"]), report["problems"]
+        assert any("spot_1d" in p and "STALE" in p for p in report["problems"]), \
+            report["problems"]
+
+    def test_the_real_stage_b_relevant_problems_are_empty_today(self):
+        """Ground truth: perp/funding are current after W1b's catch-up, so
+        the ONLY unhealthy leg is spot — which the pilot does not read."""
+        health = ch.check(REPO, corpus="full", asset="BTC")
+        relevant = [p for p in health["problems"] if not p.startswith("spot_1d:")]
+        assert relevant == [], relevant
 
     def _fake_behind(self):
         return {"new_closed_bars": [], "new_funding_prints": 0,
                 "linear_last_before": "2026-09-15",
                 "linear_last_after": "2026-09-15"}
 
-    def test_run_carries_the_finding_with_no_network(self, monkeypatch):
+    def test_run_carries_both_fields_with_no_network(self, monkeypatch):
         monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
         monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
         report = dfr.run()
         assert report["full_corpus_health"]["corpus"] == "full"
-        assert report["full_corpus_health"]["healthy"] is False
+        assert report["full_corpus_health"]["healthy"] is False  # spot, today
+        assert report["stage_b_relevant_problems"] == []  # perp+funding, today
 
-    def test_main_prints_it_as_a_blocker(self, monkeypatch, capsys):
+    def _run_main(self, monkeypatch, capsys, health):
+        """Rebinds `dfr.ch` itself, not `corpus_health.check` — that function
+        is shared with `carry_backtest`'s own `import corpus_health` inside
+        `frozen_baseline_intact()`, and mutating the real module's attribute
+        would break that unrelated call with a fixture shaped for this one."""
+        class _FakeCH:
+            def check(self, *a, **kw):
+                return health
         monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
         monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
-        rc = dfr.main([])
-        assert rc == 0, "unhealthy _full is reported, not fatal on its own"
-        err = capsys.readouterr().err
-        assert "BLOCKER" in err and "_full corpus" in err
-
-    def test_a_healthy_full_corpus_prints_no_blocker(self, monkeypatch, capsys):
-        monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
-        monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
-        monkeypatch.setattr(dfr.ch, "check",
-                            lambda *a, **kw: {"healthy": True, "problems": [],
-                                             "corpus": "full"})
+        monkeypatch.setattr(dfr, "ch", _FakeCH())
         dfr.main([])
-        assert "BLOCKER" not in capsys.readouterr().err
+        return capsys.readouterr().err
+
+    def test_a_stage_b_relevant_problem_prints_a_blocker(self, monkeypatch, capsys):
+        err = self._run_main(monkeypatch, capsys, {
+            "healthy": False, "corpus": "full",
+            "problems": ["perp_1d: STALE:3d"]})
+        assert "BLOCKER" in err and "forward pilot" in err
+        assert "NOTE" not in err
+
+    def test_a_spot_only_problem_prints_a_note_not_a_blocker(self, monkeypatch, capsys):
+        err = self._run_main(monkeypatch, capsys, {
+            "healthy": False, "corpus": "full",
+            "problems": ["spot_1d: STALE:5d"]})
+        assert "BLOCKER" not in err
+        assert "NOTE" in err and "not a Stage B blocker" in err
+
+    def test_a_healthy_full_corpus_prints_neither(self, monkeypatch, capsys):
+        err = self._run_main(monkeypatch, capsys, {
+            "healthy": True, "corpus": "full", "problems": []})
+        assert "BLOCKER" not in err and "NOTE" not in err
 
 
 class TestTheCronLineIsDocumented:

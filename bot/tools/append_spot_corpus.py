@@ -50,6 +50,22 @@ import urllib.request
 from typing import Any, Dict, List, Optional
 
 SPOT_PATH = "data/real_spot_btc/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz"
+
+#: `corpus_health.py --corpus full` already reports this tree as the one
+#: series still going stale after the linear/funding dual-tree fix
+#: (append_closed_corpus.run_all): nothing ever kept it moving with the
+#: primary spot tree. The forward pilot itself does not read spot at all
+#: (see test_the_forward_pilot_does_not_read_spot in
+#: tests/test_daily_forward_refresh.py) — this is book-health hygiene for
+#: corpus_health / carry_backtest's basis leg, not a Stage B blocker.
+FULL_SPOT_PATH = "data/real_spot_full/ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz"
+
+#: (label, spot_path) for every tree `run_all` keeps moving.
+TREES = (
+    ("primary", SPOT_PATH),
+    ("full", FULL_SPOT_PATH),
+)
+
 ENDPOINT = "https://api.binance.com/api/v3/klines"
 HEADER = ["time_period_start", "time_period_end", "time_open", "time_close",
           "price_open", "price_high", "price_low", "price_close",
@@ -114,9 +130,10 @@ def encode(rows: List[Dict[str, str]]) -> bytes:
 
 def run(repo: str = ".", *, symbol: str = "BTCUSDT",
         write: bool = False, today: Optional[dt.date] = None,
-        klines: Optional[List[List[Any]]] = None) -> Dict[str, Any]:
+        klines: Optional[List[List[Any]]] = None,
+        rel_path: Optional[str] = None) -> Dict[str, Any]:
     today = today or dt.datetime.now(dt.timezone.utc).date()
-    path = os.path.join(repo, SPOT_PATH)
+    path = os.path.join(repo, rel_path if rel_path is not None else SPOT_PATH)
     rows = read_rows(path)
     have = {r["time_period_start"][:10] for r in rows}
     last = last_day(rows)
@@ -182,6 +199,45 @@ def run(repo: str = ".", *, symbol: str = "BTCUSDT",
     return report
 
 
+def run_all(repo: str = ".", *, symbol: str = "BTCUSDT", write: bool = False,
+            today: Optional[dt.date] = None,
+            klines: Optional[List[List[Any]]] = None,
+            trees=TREES) -> Dict[str, Any]:
+    """Keep every spot tree corpus_health checks moving together.
+
+    Each tree is fetched and appended independently — its own cursor (read
+    off its own last row), its own prefix guarantee — so `primary` and
+    `full` converge on the same closed-day frontier without assuming their
+    (differently-aged) histories line up row for row.
+
+    ATOMIC INTENT: every tree is validated with a dry run before ANY tree is
+    written. If any tree's dry run reports an error (would rewrite history,
+    write verify would fail), NOTHING is written to ANY tree — a
+    half-synced pair looks fixed and is not.
+    """
+    dry = {name: run(repo, symbol=symbol, today=today, klines=klines,
+                     rel_path=rel_path, write=False)
+           for name, rel_path in trees}
+    failed = {name: rep["error"] for name, rep in dry.items() if rep.get("error")}
+    if failed:
+        return {"tool": "append_spot_corpus.run_all", "write": write,
+                "trees": dry, "refused": failed}
+
+    if write:
+        for name, rel_path in trees:
+            if dry[name]["new_closed_days"]:
+                dry[name] = run(repo, symbol=symbol, today=today, klines=klines,
+                                rel_path=rel_path, write=True)
+
+    tips = {name: (rep["new_closed_days"][-1] if rep["new_closed_days"]
+                  else rep["last_before"]) for name, rep in dry.items()}
+    return {
+        "tool": "append_spot_corpus.run_all", "write": write,
+        "trees": dry, "tips": tips,
+        "tips_equal_after": len(set(tips.values())) <= 1,
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -189,10 +245,15 @@ def main(argv=None) -> int:
     parser.add_argument("--symbol", default="BTCUSDT")
     parser.add_argument("--write", action="store_true",
                         help="persist (default: dry run)")
+    parser.add_argument("--primary-only", action="store_true",
+                        help="append only data/real_spot_btc, skipping the "
+                             "_full tree (escape hatch; default keeps both "
+                             "moving together)")
     args = parser.parse_args(argv)
-    report = run(args.repo, symbol=args.symbol, write=args.write)
+    trees = (TREES[:1] if args.primary_only else TREES)
+    report = run_all(args.repo, symbol=args.symbol, write=args.write, trees=trees)
     print(json.dumps(report, indent=2))
-    return 1 if report.get("error") else 0
+    return 1 if report.get("refused") else 0
 
 
 if __name__ == "__main__":

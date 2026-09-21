@@ -180,18 +180,19 @@ def run(*, scratch: Optional[str] = None) -> Dict[str, Any]:
         }
     report["corpus"] = window
 
-    # append_closed_corpus.py only ever writes data/real_linear_1d and
-    # data/real_funding (the primary, bounded trees). This tool scores the
-    # pilot against the `_full` trees (FORWARD_DATA_DIR / FORWARD_FUNDING
-    # above), and nothing appends to those automatically — so a cron that
-    # faithfully runs append_closed_corpus.py every day can still leave the
-    # `_full` trees frozen indefinitely while Stage B's counter stops moving.
-    # corpus_health.py already detects exactly this (any staleness at all
-    # marks a series unhealthy); it was written but never wired into the
-    # pipeline that reports Stage B's status, so nobody saw it fire. Wiring
-    # it here, read-only, is the fix: the divergence becomes a reported
-    # blocker instead of a silent one.
-    report["full_corpus_health"] = ch.check(REPO, corpus="full", asset="BTC")
+    # corpus_health.py already detects any staleness in the three legs
+    # (perp/spot/funding) `_full` carries, but the forward pilot itself only
+    # ever reads FORWARD_DATA_DIR / FORWARD_FUNDING above — perp and funding.
+    # It does not read spot at all (spot feeds the basis leg elsewhere, in
+    # carry_backtest). append_closed_corpus.run_all keeps perp+funding's
+    # `_full` trees moving; spot has its own dual-tree sync in
+    # append_spot_corpus.run_all, run separately. So a stale spot_1d here is
+    # real book-health hygiene, not evidence Stage B's counter is frozen —
+    # conflating the two is exactly the false alarm this field must not raise.
+    health = ch.check(REPO, corpus="full", asset="BTC")
+    report["full_corpus_health"] = health
+    report["stage_b_relevant_problems"] = [
+        p for p in health["problems"] if not p.startswith("spot_1d:")]
 
     report["frozen_baseline"] = frozen_baseline_intact()
 
@@ -245,12 +246,17 @@ def main(argv=None) -> int:
     trades = report.get("forward_n_trades")
     print(f"\ncorpus is {behind} closed bars behind the venue; forward closed "
           f"trades {trades} of {_gate.MIN_FORWARD_TRADES}", file=sys.stderr)
-    if not report["full_corpus_health"]["healthy"]:
-        print("BLOCKER: the _full corpus this pilot is scored against is "
-              f"unhealthy: {report['full_corpus_health']['problems']} — "
-              "append_closed_corpus.py does not write the _full trees, so "
-              "nothing keeps them in sync. Stage B's counter cannot be "
-              "trusted to move until this is resolved.", file=sys.stderr)
+    if report["stage_b_relevant_problems"]:
+        print("BLOCKER: series the forward pilot actually reads are "
+              f"unhealthy: {report['stage_b_relevant_problems']} — "
+              "Stage B's counter cannot be trusted to move until this is "
+              "resolved (append_closed_corpus.py syncs both trees; check "
+              "why it has not run or was refused).", file=sys.stderr)
+    elif not report["full_corpus_health"]["healthy"]:
+        print("NOTE: a series the forward pilot does not read is unhealthy: "
+              f"{report['full_corpus_health']['problems']} — book-health "
+              "hygiene for corpus_health / carry_backtest's basis leg, not "
+              "a Stage B blocker.", file=sys.stderr)
     if not report["frozen_baseline"]["intact"]:
         print("THE FROZEN BASELINE NO LONGER REPRODUCES PHASE1_DECISION — "
               "someone appended to a corpus it is pinned to.", file=sys.stderr)
