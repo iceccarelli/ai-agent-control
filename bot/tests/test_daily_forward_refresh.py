@@ -173,10 +173,18 @@ class TestTheFullCorpusHealthIsSurfaced:
         assert any("spot_1d" in p and "STALE" in p for p in report["problems"]), \
             report["problems"]
 
-    def test_the_real_stage_b_relevant_problems_are_empty_today(self):
-        """Ground truth: perp/funding are current after W1b's catch-up, so
-        the ONLY unhealthy leg is spot — which the pilot does not read."""
-        health = ch.check(REPO, corpus="full", asset="BTC")
+    def test_the_real_stage_b_relevant_problems_are_empty_the_day_after_catchup(self):
+        """Ground truth pinned to the corpus's OWN last bar, not the wall
+        clock: `corpus_health` marks a series stale the instant a calendar
+        day passes with no refresh, so asserting this against real `today`
+        would rot on schedule — the exact bug fixed earlier in
+        tests/test_reviewer_verdict.py, reintroduced here if pinned wrong.
+        Evaluated the morning after perp/funding's own last closed bar
+        (2026-09-19 -> today=2026-09-20), the ONLY unhealthy leg is spot,
+        which the pilot does not read."""
+        import datetime as dt
+        health = ch.check(REPO, corpus="full", asset="BTC",
+                          today=dt.date(2026, 9, 20))
         relevant = [p for p in health["problems"] if not p.startswith("spot_1d:")]
         assert relevant == [], relevant
 
@@ -186,12 +194,21 @@ class TestTheFullCorpusHealthIsSurfaced:
                 "linear_last_after": "2026-09-15"}
 
     def test_run_carries_both_fields_with_no_network(self, monkeypatch):
+        """Proves the field split is wired into dfr.run()'s output — not a
+        claim about today's real corpus state (that's the ground-truth test
+        above, pinned to a fixed `today`), so the health check itself is
+        mocked here rather than left to the wall clock."""
+        class _FakeCH:
+            def check(self, *a, **kw):
+                return {"corpus": "full", "healthy": False,
+                       "problems": ["spot_1d: STALE:5d"]}
         monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
         monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
+        monkeypatch.setattr(dfr, "ch", _FakeCH())
         report = dfr.run()
         assert report["full_corpus_health"]["corpus"] == "full"
-        assert report["full_corpus_health"]["healthy"] is False  # spot, today
-        assert report["stage_b_relevant_problems"] == []  # perp+funding, today
+        assert report["full_corpus_health"]["healthy"] is False
+        assert report["stage_b_relevant_problems"] == []
 
     def _run_main(self, monkeypatch, capsys, health):
         """Rebinds `dfr.ch` itself, not `corpus_health.check` — that function
