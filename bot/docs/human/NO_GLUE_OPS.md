@@ -56,6 +56,15 @@ corpus rows — refetch on a host with venue egress instead.
 6. `git status` on `artifacts/forward_shadow_current.json` after promoting —
    commit and push it only when a human has looked at the diff and intends
    the change. Never auto-commit from the accrual script or the tick.
+7. Crontab, absolute paths:
+   `7 1 * * *  $REPO/bot/scripts/stage_b_forward_accrual.sh >> $REPO/bot/state/forward_refresh.log 2>&1`
+   `0 * * * *  cd $REPO/bot && $REPO/.venv/bin/python tools/control_plane_tick.py >> $REPO/bot/state/control_plane_tick.log 2>&1`
+8. Remove the OLD untracked auto-restamp entry first:
+   `crontab -l | grep -v '<old-script-name>' | crontab -`, then `crontab -l` to confirm it is gone.
+9. One-shot manual run: `cd $REPO/bot && ./scripts/stage_b_forward_accrual.sh`.
+10. Promote by hand: `cd $REPO/bot && .venv/bin/python tools/promote_forward_shadow.py --from state/forward_shadow_scratch/forward.json --i-am-human --write`.
+11. The Mac must not sleep through the nightly window — cron never fires asleep. System Settings → Battery/Energy → prevent sleep on power adapter, or `caffeinate -s` on AC. Do NOT add a LaunchAgent that auto-promotes the shadow file or arms live; promotion stays item 10, by hand.
+12. This Mac is the factory machine only — never cut this cron over onto a non-factory laptop.
 
 ## Product wedge (sellable surface) — only after kill-or-keep
 
