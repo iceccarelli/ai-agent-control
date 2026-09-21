@@ -56,3 +56,31 @@ corpus rows — refetch on a host with venue egress instead.
 6. `git status` on `artifacts/forward_shadow_current.json` after promoting —
    commit and push it only when a human has looked at the diff and intends
    the change. Never auto-commit from the accrual script or the tick.
+
+## Product wedge (sellable surface) — only after kill-or-keep
+
+Money sequence (item 12) still holds: dual-tree corpus truth → Stage B
+calendar → human gates → micro-live → **kill-or-keep**. Nothing below is
+sellable, marketable, or even nameable as a product, before that gate
+resolves. This section states the wedge as law, not as a roadmap to build
+toward now.
+
+**Becomes sellable only after kill-or-keep says "keep" on micro-live:**
+a fail-closed execution / risk / promotion / accounting control plane, as a
+service or API, for operators already running overlay-carry strategies —
+the gates in this repo (frozen-signal registry, promotion refusal, human-only
+kill-switch clear, human-only shadow promotion), packaged for someone else's
+strategy, not this one's alpha.
+
+**Not the wedge, ever:**
+- dashboards or "AI agent" visualization theater
+- new timing/entry signals — this repo freezes signals, it does not sell them
+- "AI trading" marketing of any kind
+- claiming edge from this strategy as part of the pitch
+
+**Stage B gate numbers are calendar proof, not edge claims.** `20` forward
+trades and `180` forward days (item 1) measure how much of the accrual
+calendar has elapsed — they say nothing about whether the strategy is
+profitable. Per item 13, green CI and passing gates are not edge either.
+Any public number about this programme cites `EDGE.md` / the Stage 1
+verdict, never this file.
