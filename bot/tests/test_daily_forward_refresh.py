@@ -25,6 +25,7 @@ Nothing here reaches the network.
 from __future__ import annotations
 
 import ast
+import datetime as dt
 import os
 import sys
 
@@ -202,6 +203,10 @@ class TestTheFullCorpusHealthIsSurfaced:
             def check(self, *a, **kw):
                 return {"corpus": "full", "healthy": False,
                        "problems": ["spot_1d: STALE:5d"]}
+
+            def inspect(self, repo, name, rel, column, per_day, today):
+                return {"name": name, "path": rel, "present": True,
+                       "problems": []}
         monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
         monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
         monkeypatch.setattr(dfr, "ch", _FakeCH())
@@ -210,7 +215,7 @@ class TestTheFullCorpusHealthIsSurfaced:
         assert report["full_corpus_health"]["healthy"] is False
         assert report["stage_b_relevant_problems"] == []
 
-    def _run_main(self, monkeypatch, capsys, health):
+    def _run_main(self, monkeypatch, capsys, health, other_series=None):
         """Rebinds `dfr.ch` itself, not `corpus_health.check` — that function
         is shared with `carry_backtest`'s own `import corpus_health` inside
         `frozen_baseline_intact()`, and mutating the real module's attribute
@@ -218,6 +223,11 @@ class TestTheFullCorpusHealthIsSurfaced:
         class _FakeCH:
             def check(self, *a, **kw):
                 return health
+
+            def inspect(self, repo, name, rel, column, per_day, today):
+                return (other_series or {}).get(
+                    name, {"name": name, "path": rel, "present": True,
+                          "problems": []})
         monkeypatch.setattr(dfr.acc, "run", lambda **kw: self._fake_behind())
         monkeypatch.setattr(dfr, "score_forward", lambda *a, **kw: None)
         monkeypatch.setattr(dfr, "ch", _FakeCH())
@@ -241,6 +251,45 @@ class TestTheFullCorpusHealthIsSurfaced:
     def test_a_healthy_full_corpus_prints_neither(self, monkeypatch, capsys):
         err = self._run_main(monkeypatch, capsys, {
             "healthy": True, "corpus": "full", "problems": []})
+        assert "BLOCKER" not in err and "NOTE" not in err
+
+
+class TestOtherCorporaHealthIsSurfacedReadOnly(TestTheFullCorpusHealthIsSurfaced):
+    """Inherits `_run_main`/`_fake_behind` from the class above — same
+    mocking shape, different fields under test.
+
+    data/real_settlement_8h and data/real_borrow are not Stage B input
+    either (see docs/human/NO_GLUE_OPS.md #7), and both silently fell behind
+    real_funding_full's growth this shift. Surfaced the same way spot is:
+    a NOTE, never a BLOCKER, never a fetch or a promote triggered from here."""
+
+    def test_the_real_corpora_are_behind_today(self):
+        """Ground truth: both fell behind the 2026-09-19 funding catch-up
+        and neither has its own fetcher re-run yet."""
+        health = dfr._other_corpora_health(today=dt.date(2026, 9, 20))
+        assert health["healthy"] is False
+        assert any(p.startswith("settlement_8h_perp_btc: STALE")
+                  for p in health["problems"]), health["problems"]
+        assert any(p.startswith("borrow_usdt: STALE")
+                  for p in health["problems"]), health["problems"]
+
+    def test_a_lag_prints_a_note_not_a_blocker(self, monkeypatch, capsys):
+        err = self._run_main(monkeypatch, capsys, {
+            "healthy": True, "corpus": "full", "problems": []},
+            other_series={"settlement_8h_perp_btc": {
+                "name": "settlement_8h_perp_btc", "present": True,
+                "problems": ["STALE:5d"]}})
+        assert "BLOCKER" not in err
+        assert "NOTE" in err and "settlement_8h_perp_btc: STALE:5d" in err
+
+    def test_no_lag_prints_nothing(self, monkeypatch, capsys):
+        err = self._run_main(monkeypatch, capsys, {
+            "healthy": True, "corpus": "full", "problems": []},
+            other_series={"settlement_8h_perp_btc": {
+                "name": "settlement_8h_perp_btc", "present": True,
+                "problems": []},
+                "borrow_usdt": {"name": "borrow_usdt", "present": True,
+                               "problems": []}})
         assert "BLOCKER" not in err and "NOTE" not in err
 
 

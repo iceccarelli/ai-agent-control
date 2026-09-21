@@ -72,6 +72,38 @@ HEADER = ["time_period_start", "time_period_end", "time_open", "time_close",
           "volume_traded", "trades_count"]
 
 
+def _update_manifest_btc(repo: str, rel_path: str, *, rows: int,
+                         sha256_uncompressed: str, last_timestamp: str) -> None:
+    """Keep the spot MANIFEST.json's own file entry truthful after a write.
+
+    Same intent as append_closed_corpus._update_manifest_btc, different
+    schema: this tree's manifest is `coinapi_flat/1`
+    (bars_per_symbol + files{rows, sha256_uncompressed, last_timestamp}),
+    not linear/funding's `date_range_utc`. There is no ETH/SOL entry here
+    to avoid touching — this manifest describes one symbol, one file.
+    """
+    tree_dir = os.path.dirname(os.path.dirname(os.path.join(repo, rel_path)))
+    manifest_path = os.path.join(tree_dir, "MANIFEST.json")
+    if not os.path.exists(manifest_path):
+        return
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    file_key = os.path.relpath(os.path.join(repo, rel_path), tree_dir)
+    entry = manifest.get("files", {}).get(file_key)
+    if entry is None:
+        return
+    entry["rows"] = rows
+    entry["sha256_uncompressed"] = sha256_uncompressed
+    entry["last_timestamp"] = last_timestamp
+    symbol_key = os.path.splitext(os.path.splitext(
+        os.path.basename(rel_path))[0])[0]
+    if symbol_key in manifest.get("bars_per_symbol", {}):
+        manifest["bars_per_symbol"][symbol_key] = rows
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.write("\n")
+
+
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -196,6 +228,11 @@ def run(repo: str = ".", *, symbol: str = "BTCUSDT",
         if os.path.exists(backup):
             os.remove(backup)
         report["written"] = True
+        _update_manifest_btc(
+            repo, rel_path if rel_path is not None else SPOT_PATH,
+            rows=len(rows) + len(appended),
+            sha256_uncompressed=report["uncompressed_sha256_after"],
+            last_timestamp=appended[-1]["time_period_start"])
     return report
 
 

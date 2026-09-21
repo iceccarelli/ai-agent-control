@@ -119,6 +119,33 @@ def frozen_baseline_intact() -> Dict[str, Any]:
     }
 
 
+#: Two more real corpora that fall behind real_funding_full silently and
+#: are not part of corpus_health's ASSET_SERIES tables: (name, rel path,
+#: time column, prints per day). Neither is Stage B input — see
+#: docs/human/NO_GLUE_OPS.md #7.
+OTHER_CORPORA = (
+    ("settlement_8h_perp_btc",
+     "data/real_settlement_8h/BINANCE_PERP_BTCUSDT_8H.csv.gz", "open_utc", 3),
+    ("borrow_usdt", "data/real_borrow/OKX_LENDING_RATE_USDT_1H.csv.gz",
+     "utc", 24),
+)
+
+
+def _other_corpora_health(today: Optional[dt.date] = None) -> Dict[str, Any]:
+    """Read-only staleness check for OTHER_CORPORA, reusing
+    corpus_health.inspect directly rather than its ASSET_SERIES tables
+    (neither file is a per-asset {perp, spot, funding} triple)."""
+    today = today or dt.datetime.now(dt.timezone.utc).date()
+    series = {name: ch.inspect(REPO, name, rel, column, per_day, today)
+             for name, rel, column, per_day in OTHER_CORPORA}
+    for r in series.values():
+        r.pop("_days", None)
+    problems = [f"{name}: {p}" for name, r in series.items()
+               for p in r.get("problems", [])]
+    return {"series": series, "problems": problems,
+           "healthy": not problems}
+
+
 def score_forward(scratch: str, observed_utc: str) -> Optional[Dict[str, Any]]:
     """Run the forward scorer to a scratch path. NEVER to artifacts/.
 
@@ -194,6 +221,14 @@ def run(*, scratch: Optional[str] = None) -> Dict[str, Any]:
     report["stage_b_relevant_problems"] = [
         p for p in health["problems"] if not p.startswith("spot_1d:")]
 
+    # Two more real corpora the pilot does not read either — the settlement
+    # clock (data/real_settlement_8h) and the financing leg (data/real_borrow)
+    # — but which silently fall behind every time real_funding_full grows and
+    # nobody re-runs their own fetchers (see docs/human/NO_GLUE_OPS.md #7).
+    # Surfaced read-only, same as spot: informational, never a Stage B
+    # blocker, never auto-fetched or auto-promoted from here.
+    report["other_corpora_health"] = _other_corpora_health()
+
     report["frozen_baseline"] = frozen_baseline_intact()
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -257,6 +292,12 @@ def main(argv=None) -> int:
               f"{report['full_corpus_health']['problems']} — book-health "
               "hygiene for corpus_health / carry_backtest's basis leg, not "
               "a Stage B blocker.", file=sys.stderr)
+    if not report["other_corpora_health"]["healthy"]:
+        print("NOTE: settlement/borrow corpora the forward pilot does not "
+              f"read are unhealthy: {report['other_corpora_health']['problems']} "
+              "— run tools/fetch_settlement_klines.py / "
+              "tools/fetch_borrow_rates.py by hand; not a Stage B blocker.",
+              file=sys.stderr)
     if not report["frozen_baseline"]["intact"]:
         print("THE FROZEN BASELINE NO LONGER REPRODUCES PHASE1_DECISION — "
               "someone appended to a corpus it is pinned to.", file=sys.stderr)
