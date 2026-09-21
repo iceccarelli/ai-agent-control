@@ -160,6 +160,22 @@ def encode(rows: List[Dict[str, str]]) -> bytes:
     return buffer.getvalue().encode("utf-8")
 
 
+def _find_gap(last: Optional[dt.date], appended: List[Dict[str, str]]
+             ) -> Optional[str]:
+    """The ISO date of the first appended day that is not exactly one day
+    after its predecessor (the file's own last row, or the previous
+    appended day). A venue that skips a day and a corpus that silently
+    accepts the skip are the same defect as writing the open bar — the
+    series looks continuous and is not."""
+    prev = last
+    for row in appended:
+        day = dt.date.fromisoformat(row["time_period_start"][:10])
+        if prev is not None and (day - prev).days != 1:
+            return row["time_period_start"][:10]
+        prev = day
+    return None
+
+
 def run(repo: str = ".", *, symbol: str = "BTCUSDT",
         write: bool = False, today: Optional[dt.date] = None,
         klines: Optional[List[List[Any]]] = None,
@@ -210,6 +226,14 @@ def run(repo: str = ".", *, symbol: str = "BTCUSDT",
     if not prefix_holds:
         report["error"] = ("APPEND WOULD REWRITE HISTORY — refusing. A corpus "
                            "that updates its own past is a cache, not a record.")
+        return report
+
+    gap_at = _find_gap(last, appended)
+    if gap_at is not None:
+        report["error"] = (
+            f"GAP — refusing: {gap_at} is not the day after the previous "
+            "closed day; a corpus that skips a day looks continuous and is "
+            "not.")
         return report
 
     if write and appended:

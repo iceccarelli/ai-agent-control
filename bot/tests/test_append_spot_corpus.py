@@ -59,6 +59,38 @@ class TestHistoryIsNeverRewritten:
         assert r["refused_already_present"] == 1
         assert not r["new_closed_days"]
 
+
+class TestAGapIsRefused:
+    """The venue skipping a day is a different defect from rewriting one:
+    the corpus would look continuous and is not."""
+
+    def test_a_skipped_day_is_refused(self, repo):
+        # last on disk is 2026-09-05; 09-06 is skipped, 09-07 is offered
+        r = asc.run(repo, today=TODAY, klines=[kline(dt.date(2026, 9, 7))])
+        assert "error" in r
+        assert "GAP" in r["error"]
+        assert not r.get("written")
+
+    def test_a_gap_write_touches_nothing_on_disk(self, repo):
+        before = open(os.path.join(repo, asc.SPOT_PATH), "rb").read()
+        asc.run(repo, today=TODAY, write=True,
+               klines=[kline(dt.date(2026, 9, 7))])
+        assert open(os.path.join(repo, asc.SPOT_PATH), "rb").read() == before
+
+    def test_a_gap_between_two_new_days_is_also_refused(self, repo):
+        # 09-06 is contiguous, but then 09-08 skips 09-07
+        r = asc.run(repo, today=TODAY,
+                    klines=[kline(dt.date(2026, 9, 6)), kline(dt.date(2026, 9, 8))])
+        assert "error" in r
+        assert "GAP" in r["error"]
+
+    def test_no_gap_is_not_refused(self, repo):
+        r = asc.run(repo, today=TODAY, klines=[kline(dt.date(2026, 9, 6)),
+                                               kline(dt.date(2026, 9, 7))])
+        assert "error" not in r
+
+
+class TestHistoryIsCheckedForPrefixAndBarsFabricated:
     def test_the_prefix_is_checked(self, repo):
         r = asc.run(repo, today=TODAY, klines=[kline(dt.date(2026, 9, 6))])
         assert r["historical_bytes_are_prefix"] is True

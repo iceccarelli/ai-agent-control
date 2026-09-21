@@ -122,6 +122,22 @@ def to_row(kline: List[Any]) -> Dict[str, str]:
 DEFAULT_SINCE = "2022-08-10"
 
 
+def _find_gap(rows: List[Dict[str, str]], appended: List[Dict[str, str]]
+             ) -> Optional[str]:
+    """The `open_utc` of the first appended window that is not exactly one
+    WINDOW_S after its predecessor (the file's own last row, or the
+    previous appended window). A venue that drops one 8h window and a
+    corpus that accepts the drop puts a bar on the settlement clock that
+    never happened — the same category of error as pricing an open window."""
+    prev_ms = int(rows[-1]["open_time_ms"]) if rows else None
+    for row in appended:
+        open_ms = int(row["open_time_ms"])
+        if prev_ms is not None and open_ms - prev_ms != WINDOW_S * 1000:
+            return row["open_utc"]
+        prev_ms = open_ms
+    return None
+
+
 def run(repo: str = ".", *, leg: str = "perp", symbol: str = "BTCUSDT",
         write: bool = False, now_s: Optional[float] = None,
         since: str = DEFAULT_SINCE,
@@ -167,6 +183,15 @@ def run(repo: str = ".", *, leg: str = "perp", symbol: str = "BTCUSDT",
     if not prefix_holds:
         report["error"] = "APPEND WOULD REWRITE HISTORY — refusing"
         return report
+
+    gap_at = _find_gap(rows, appended)
+    if gap_at is not None:
+        report["error"] = (
+            f"GAP — refusing: {gap_at} is not one settlement window "
+            "(8h) after the previous row; a corpus that skips a window "
+            "looks continuous on the funding clock and is not.")
+        return report
+
     if write and appended:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with gzip.open(path, "wb") as handle:
