@@ -14,3 +14,18 @@
    If `forward_n_trades` / `closed_forward_bars` moved, a human promotes the scratch score into `artifacts/forward_shadow_current.json` by hand — this is never automated (see `control_plane_tick.py`'s own charter: "must NEVER promote scratch forward scores into `forward_shadow_current.json`").
 7. **Settlement (8h) and borrow corpora:** `data/real_settlement_8h` (`tools/fetch_settlement_klines.py`) and `data/real_borrow` (`tools/fetch_borrow_rates.py`) are NOT wired into the daily path above — they feed `test_settlement_corpus_is_multi_asset.py` / `test_borrow_curve.py`, not Stage B. Both are dry-run-by-default, append/prefix-safe. Run by hand after a funding catch-up moves the tip past their own last window, or their pairing/coverage tests go red on purpose (that is their job).
 8. **Forbidden:** orders, kill-switch clear, key printing, inventing corpus writers, skipping the `allows_live` gate.
+
+## Offline-suite reds that are supposed to be red (2026-09-21)
+
+Item 7's coverage/pairing tests are currently red in any checkout without a
+factory-host `--write` run of `fetch_settlement_klines.py` /
+`fetch_borrow_rates.py` past this corpus's frozen window. That is the tests
+doing their job, not a bug:
+
+- `tests/test_borrow_curve.py::TestTheRealSeries::test_it_prices_essentially_all_of_the_frozen_window`
+- `tests/test_settlement_corpus_is_multi_asset.py::TestThePairingIsLosslessWhereItClaimsToBe::test_the_counts_are_what_the_measurement_assumed[BTC]`
+- `tests/test_settlement_corpus_is_multi_asset.py::TestThePairingIsLosslessWhereItClaimsToBe::test_btc_and_eth_drop_nothing_at_all[BTC]`
+- `tests/test_settlement_corpus_is_multi_asset.py::TestThePairingIsLosslessWhereItClaimsToBe::test_there_are_no_interior_holes[BTC]`
+
+Do not fix these by editing the pinned counts, xfailing them, or fabricating
+corpus rows — refetch on a host with venue egress instead.
