@@ -14,6 +14,11 @@
    If `forward_n_trades` / `closed_forward_bars` moved, a human promotes the scratch score into `artifacts/forward_shadow_current.json` by hand — this is never automated (see `control_plane_tick.py`'s own charter: "must NEVER promote scratch forward scores into `forward_shadow_current.json`").
 7. **Settlement (8h) and borrow corpora:** `data/real_settlement_8h` (`tools/fetch_settlement_klines.py`) and `data/real_borrow` (`tools/fetch_borrow_rates.py`) are NOT wired into the daily path above — they feed `test_settlement_corpus_is_multi_asset.py` / `test_borrow_curve.py`, not Stage B. Both are dry-run-by-default, append/prefix-safe. Run by hand after a funding catch-up moves the tip past their own last window, or their pairing/coverage tests go red on purpose (that is their job).
 8. **Forbidden:** orders, kill-switch clear, key printing, inventing corpus writers, skipping the `allows_live` gate.
+9. **Cursor / cloud coding agents (this class of session):** offline `pytest` only. No venue curls (Binance/OKX/Bybit or any trading venue). No `--write` against real corpora. No network calls to a trading venue, period.
+10. **Factory Mac Terminal + cron:** the only place public corpus catch-up actually runs — `append_closed_corpus.py --write`, `append_spot_corpus.py --write`, and `bot/scripts/stage_b_forward_accrual.sh`. That script only appends corpora and writes a scratch refresh log; it does NOT promote `forward_shadow_current.json` (promotion stays human-by-hand per item 6). Tools live under `bot/tools`, run from `bot/` with `$REPO/.venv/bin/python`.
+11. **`allows_live` / mainnet / kill-switch clear:** human only, always — no exceptions for either class of session above.
+12. **Money sequence:** dual-tree corpus truth → Stage B calendar (20 forward trades / 180 days) → human gates → micro-live → kill-or-keep → only then any productization (control-plane / execution tooling as a sellable surface).
+13. **Green CI proves nothing about edge.** A hygiene PR (tests passing, script refactors, doc edits) is not arming or evidence for the strategy's edge. Edge determination lives in `EDGE.md` / the Stage 1 verdict only — never claim it here.
 
 ## Offline-suite reds that are supposed to be red (2026-09-21)
 
