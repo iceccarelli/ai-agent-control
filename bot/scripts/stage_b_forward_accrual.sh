@@ -13,8 +13,11 @@
 #   1. append_closed_corpus.py --write   (linear + funding, both trees —
 #      dual-tree sync is the tool's own default, no second hand-call needed)
 #   2. append_spot_corpus.py --write     (spot, both trees, same pattern)
-#   3. daily_forward_refresh.py          (READ-ONLY scratch score; never
-#      writes to artifacts/)
+#   3. daily_forward_refresh.py --scratch state/forward_shadow_scratch
+#      (READ-ONLY scratch score; never writes to artifacts/). The scratch
+#      dir is a fixed, persistent path (not a tempfile.TemporaryDirectory
+#      that vanishes when the run ends) so the HUMAN_PROMOTE_HINT below
+#      always names a --from file that is still there when a human reads it.
 #   4. Compares the scratch score's forward counters against the current
 #      artifacts/forward_shadow_current.json, READ-ONLY, and prints a
 #      HUMAN_PROMOTE_HINT line if they differ. It never writes that file.
@@ -60,13 +63,19 @@ cd "$BOT"
 # "$PY" tools/fetch_borrow_rates.py --write
 # -----------------------------------------------------------------------------
 
+# Fixed, persistent scratch dir (never artifacts/, never a tempdir that
+# disappears when this script exits) — the single canonical scratch path
+# every run writes to, so HUMAN_PROMOTE_HINT's --from below is always usable.
+SCRATCH_DIR="state/forward_shadow_scratch"
+SCRATCH_FILE="$SCRATCH_DIR/forward.json"
+mkdir -p "$SCRATCH_DIR"
+
 # 3. Score Stage B to scratch. READ-ONLY: never writes to artifacts/.
-REPORT=$("$PY" tools/daily_forward_refresh.py)
+REPORT=$("$PY" tools/daily_forward_refresh.py --scratch "$SCRATCH_DIR")
 echo "$REPORT"
 
 # Append the same report to the log path daily_forward_refresh.py's own
 # docstring documents (state/forward_refresh.log, relative to bot/).
-mkdir -p state
 {
     printf '\n--- %s ---\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "$REPORT"
@@ -74,12 +83,13 @@ mkdir -p state
 
 # 4. Compare the scratch score against the CURRENT shadow file, read-only.
 #    Never opens forward_shadow_current.json for writing.
-python3 - "$REPORT" <<'PY'
+"$PY" - "$REPORT" "$SCRATCH_FILE" <<'PY'
 import json
 import os
 import sys
 
 report = json.loads(sys.argv[1])
+scratch_file = sys.argv[2]
 shadow_path = os.path.join("artifacts", "forward_shadow_current.json")
 
 old_trades = old_bars = None
@@ -97,7 +107,8 @@ if (new_trades, new_bars) != (old_trades, old_bars):
         "HUMAN_PROMOTE_HINT: forward_n_trades "
         f"{old_trades!r} -> {new_trades!r}, closed_forward_bars "
         f"{old_bars!r} -> {new_bars!r}. Promote by hand with "
-        "tools/promote_forward_shadow.py --i-am-human --write "
+        f"{sys.executable} tools/promote_forward_shadow.py "
+        f"--from {scratch_file} --i-am-human --write "
         "(never automated)."
     )
 PY
