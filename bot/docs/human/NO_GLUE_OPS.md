@@ -34,3 +34,21 @@ doing their job, not a bug:
 
 Do not fix these by editing the pinned counts, xfailing them, or fabricating
 corpus rows — refetch on a host with venue egress instead.
+
+## Factory cutover checklist (git → cron → promote)
+
+1. `git pull` on the factory Mac so `bot/scripts/stage_b_forward_accrual.sh`
+   (item 10) exists in the tree.
+2. Point `crontab` at that TRACKED path, not any prior untracked copy of a
+   similarly named script.
+3. Delete or stop that untracked copy — it auto-restamped
+   `artifacts/forward_shadow_current.json`, which the tracked script and
+   `tools/control_plane_tick.py` both refuse to do.
+4. Confirm the old cron entry is gone (`crontab -l`) before relying on the
+   new one.
+5. When a run prints `HUMAN_PROMOTE_HINT`, run the exact command it names
+   by hand: `tools/promote_forward_shadow.py --from <scratch>/forward.json
+   --i-am-human --write`. Never script or cron this step.
+6. `git status` on `artifacts/forward_shadow_current.json` after promoting —
+   commit and push it only when a human has looked at the diff and intends
+   the change. Never auto-commit from the accrual script or the tick.
