@@ -80,6 +80,37 @@ def sha256_bytes(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
+def _row_count(raw: bytes) -> int:
+    return max(0, len([ln for ln in raw.decode("utf-8").split("\n")
+                       if ln.strip()]) - 1)
+
+
+def _update_manifest_btc(data_path: str, rows: int, end_date: str) -> None:
+    """Keep the LIVING BTCUSDT entry — this tool's only symbol — truthful
+    about the file it just wrote. ETH/SOL entries are dated provenance
+    claims this programme does not touch (see
+    tests/test_slice55_data_eligibility.py); BTCUSDT is different: it is
+    "the measured product", and its manifest entry is meant to describe
+    the file beside it, not a historical snapshot. Missing this step is
+    exactly the defect found on 2026-09-21: a real catch-up grew the file
+    and nothing told the manifest.
+    """
+    manifest_path = os.path.join(
+        os.path.dirname(os.path.dirname(data_path)), "MANIFEST.json")
+    if not os.path.exists(manifest_path):
+        return
+    with open(manifest_path, encoding="utf-8") as fh:
+        manifest = json.load(fh)
+    entry = manifest.get("date_range_utc", {}).get("BTCUSDT")
+    if entry is None:
+        return
+    entry["rows"] = rows
+    entry["end"] = end_date
+    with open(manifest_path, "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh, indent=2)
+        fh.write("\n")
+
+
 def read_gz(path: str) -> bytes:
     with gzip.open(path, "rb") as fh:
         return fh.read()
@@ -202,6 +233,8 @@ def run(*, observed_at_utc: str, fetch: Fetcher = default_fetch,
         "observed_at_utc": observed_at_utc, "write": write,
         "linear_last_before": last_open_iso[:10],
         "linear_last_after": (iso(lin_new[-1][0])[:10] if lin_new else last_open_iso[:10]),
+        "funding_last_after": (iso(fun_new[-1][0])[:10] if fun_new
+                               else iso(last_fund_ms)[:10]),
         "new_closed_bars": [iso(o)[:10] for o, _ in lin_new],
         "refused_open_bar": iso((now_ms // DAY_MS) * DAY_MS)[:10],
         "new_funding_prints": len(fun_new),
@@ -219,6 +252,12 @@ def run(*, observed_at_utc: str, fetch: Fetcher = default_fetch,
             with gzip.open(tmp, "wb") as fh:
                 fh.write(data)
             os.replace(tmp, path)
+        if lin_new:
+            _update_manifest_btc(linear_path, _row_count(lin_after),
+                                 report["linear_last_after"])
+        if fun_new:
+            _update_manifest_btc(funding_path, _row_count(fun_after),
+                                 report["funding_last_after"])
     return report
 
 
