@@ -7,7 +7,9 @@
 # will: promotion of the shadow file stays human-only, via
 # tools/promote_forward_shadow.py --i-am-human --write, run by hand. See
 # docs/human/NO_GLUE_OPS.md items 5-6 and tools/control_plane_tick.py's
-# "WHAT IT MUST NEVER DO" header.
+# "WHAT IT MUST NEVER DO" header. For the copy-paste cutover (crontab lines,
+# removing the old entry, one-shot run, promote command), see the "Factory
+# cutover checklist" in docs/human/NO_GLUE_OPS.md, items 7-12.
 #
 # WHAT THIS SCRIPT DOES
 #   1. append_closed_corpus.py --write   (linear + funding, both trees —
