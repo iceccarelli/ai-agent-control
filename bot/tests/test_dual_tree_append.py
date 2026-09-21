@@ -155,6 +155,29 @@ def test_a_refusal_on_one_tree_writes_neither(tmp_path):
         "half-synced trees are worse than unsynced ones")
 
 
+def test_a_gap_on_a_single_tree_refuses_and_writes_nothing(tmp_path):
+    """A gap need not come from the atomic cross-tree scenario to be
+    refused: a single tree's own fetch skipping a bar must be caught on
+    its own, before `run_all` is ever in the picture."""
+    # far enough behind that the catch-up window has more than one new
+    # bar — a single-bar window can't expose an internal gap at all.
+    lin, fun = _tree(tmp_path, "solo", "2026-09-12")
+    before_lin, before_fun = acc.read_gz(lin), acc.read_gz(fun)
+
+    inner = _fake_fetch(NOW_MS)
+
+    def gappy(path, params):
+        rows = inner(path, params)
+        return rows[::2] if path == "klines" else rows
+
+    with pytest.raises(acc.Refuse):
+        acc.run(observed_at_utc=NOW, fetch=gappy, linear_path=lin,
+               funding_path=fun, write=True)
+
+    assert acc.read_gz(lin) == before_lin
+    assert acc.read_gz(fun) == before_fun
+
+
 def test_dry_run_writes_neither_tree(tmp_path):
     p_lin, p_fun = _tree(tmp_path, "primary", "2026-09-15")
     f_lin, f_fun = _tree(tmp_path, "full", "2026-09-14")

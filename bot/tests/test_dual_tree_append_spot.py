@@ -121,6 +121,26 @@ def test_a_history_rewrite_on_one_tree_writes_neither(repo, monkeypatch):
             "primary was written even though full's dry run refused")
 
 
+def test_a_gap_on_one_tree_refuses_that_tree_and_writes_neither(repo):
+    """A single tree skipping a day is refused on its own — `run_all`'s
+    atomic dry-run-first then keeps the OTHER tree from being written too."""
+    repo_dir, trees = repo
+    primary_path = os.path.join(repo_dir, trees[0][1])
+    full_path = os.path.join(repo_dir, trees[1][1])
+    before_primary = open(primary_path, "rb").read()
+    before_full = open(full_path, "rb").read()
+
+    # primary's own tip is 09-15; offering 09-17 skips 09-16.
+    gappy_days = [kline(dt.date(2026, 9, 17))]
+    rep = asc.run_all(repo_dir, today=TODAY, klines=gappy_days, write=True,
+                      trees=trees)
+
+    assert "refused" in rep and "primary" in rep["refused"]
+    assert "GAP" in rep["refused"]["primary"]
+    assert open(primary_path, "rb").read() == before_primary
+    assert open(full_path, "rb").read() == before_full
+
+
 def test_dry_run_writes_neither_tree(repo):
     repo_dir, trees = repo
     before = {}
