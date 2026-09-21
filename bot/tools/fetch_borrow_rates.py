@@ -184,6 +184,13 @@ def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def read_existing(path: str) -> bytes:
+    if not os.path.exists(path):
+        return b""
+    with gzip.open(path, "rb") as handle:
+        return handle.read()
+
+
 def run(repo: str = ".", *, ccy: str = "USDT", since: str = VENUE_FLOOR_UTC,
         write: bool = False, pager: Any = None,
         max_pages: int = MAX_PAGES) -> Dict[str, Any]:
@@ -195,6 +202,18 @@ def run(repo: str = ".", *, ccy: str = "USDT", since: str = VENUE_FLOOR_UTC,
     name = f"OKX_LENDING_RATE_{ccy}_1H.csv.gz"
     path = os.path.join(repo, OUT_DIR, name)
 
+    # This tool re-walks the WHOLE series from `since` on every run rather
+    # than resuming from the file's last row (unlike append_closed_corpus /
+    # fetch_settlement_klines) — OKX serves complete history cheaply and a
+    # per-run walk is simpler than tracking a cursor. That does not mean
+    # history is unprotected: a correct re-walk must still produce the
+    # existing bytes as its own prefix. A walk that came back SHORTER
+    # (a bad page, a venue hiccup, a botched `since`) would otherwise
+    # silently overwrite good history with less of it.
+    before_plain = read_existing(path)
+    historical_bytes_are_prefix = (
+        True if not before_plain else plain.startswith(before_plain))
+
     report = {
         "tool": "fetch_borrow_rates", "ccy": ccy, "rows": len(rows),
         "first_utc": rows[0]["utc"], "last_utc": rows[-1]["utc"],
@@ -204,6 +223,8 @@ def run(repo: str = ".", *, ccy: str = "USDT", since: str = VENUE_FLOOR_UTC,
         "sha256_uncompressed": sha256_bytes(plain),
         "file": os.path.join(OUT_DIR, name),
         "write": write,
+        "historical_bytes_are_prefix": historical_bytes_are_prefix,
+        "bars_fabricated": 0,
         "what_this_is": ("OKX PUBLIC savings LENDING rate — what a lender "
                          "earns. A borrower pays more, so every value is a "
                          "FLOOR on the true cost of financing."),
@@ -212,6 +233,12 @@ def run(repo: str = ".", *, ccy: str = "USDT", since: str = VENUE_FLOOR_UTC,
         report["warning"] = (
             "the walk stopped at its own page cap, NOT at the end of the data; "
             "the first_utc above is where paging stopped")
+    if not historical_bytes_are_prefix:
+        report["error"] = (
+            "REFRESH WOULD REWRITE HISTORY — refusing to write. The fresh "
+            "walk does not extend the file on disk byte-for-byte; a corpus "
+            "that updates its own past is a cache, not a record.")
+        return report
     if write:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with gzip.open(path, "wb") as handle:

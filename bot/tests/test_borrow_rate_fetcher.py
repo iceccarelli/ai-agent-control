@@ -220,3 +220,42 @@ class TestItSaysWhatTheNumberIs:
         assert list(rows[0]) == list(fbr.COLUMNS)
         stamps = [int(r["ts"]) for r in rows]
         assert stamps == sorted(stamps)
+
+
+class TestARefreshMustExtendNotReplace:
+    """This fetcher re-walks the WHOLE series from `since` every run rather
+    than resuming from the last row (OKX serves complete history cheaply,
+    unlike Binance). That means a bad page, a venue hiccup, or a botched
+    `--since` produces a walk that is SHORTER than what is already on disk
+    — and with no prefix check, `run()` would silently overwrite good
+    history with less of it. This is the same append-only guarantee
+    append_closed_corpus and fetch_settlement_klines already have."""
+
+    def test_a_normal_extension_reports_the_prefix_holds(self, tmp_path):
+        fbr.run(str(tmp_path), ccy="USDT", write=True,
+               pager=pager_over(2_500, NOW))
+        later = NOW + 500 * HOUR_MS
+        report = fbr.run(str(tmp_path), ccy="USDT", write=True,
+                         pager=pager_over(3_000, later))
+        assert report["historical_bytes_are_prefix"] is True
+        assert report["written"] is True
+
+    def test_a_shorter_walk_is_refused_not_written(self, tmp_path):
+        fbr.run(str(tmp_path), ccy="USDT", write=True,
+               pager=pager_over(2_500, NOW))
+        path = os.path.join(str(tmp_path), fbr.OUT_DIR,
+                            "OKX_LENDING_RATE_USDT_1H.csv.gz")
+        before = open(path, "rb").read()
+
+        report = fbr.run(str(tmp_path), ccy="USDT", write=True,
+                         pager=pager_over(1_000, NOW))
+        assert report["historical_bytes_are_prefix"] is False
+        assert "error" in report
+        assert "written" not in report
+        assert open(path, "rb").read() == before, (
+            "a shorter walk must never touch the file already on disk")
+
+    def test_no_existing_file_is_trivially_a_prefix(self, tmp_path):
+        report = fbr.run(str(tmp_path), ccy="USDT",
+                         pager=pager_over(2_500, NOW))
+        assert report["historical_bytes_are_prefix"] is True
