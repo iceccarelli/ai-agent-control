@@ -40,6 +40,8 @@ import os
 import sys
 from typing import Any, Dict
 
+from stage_b_bars import resolve_closed_forward_bars
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 DEFAULT_SHADOW_PATH = os.path.join(BOT, "artifacts", "forward_shadow_current.json")
@@ -47,6 +49,8 @@ DEFAULT_SHADOW_PATH = os.path.join(BOT, "artifacts", "forward_shadow_current.jso
 #: The counters Stage B accrual actually cares about; surfaced first in the
 #: before/after summary. Everything else in the scratch report is copied
 #: through verbatim on promotion (same schema as forward_shadow_current.json).
+#: `closed_forward_bars` is resolved via `resolve_closed_forward_bars` below,
+#: not read directly — the scorer nests it under `ceiling`/`forward_window`.
 COUNTER_KEYS = ("forward_n_trades", "closed_forward_bars")
 
 
@@ -58,8 +62,12 @@ def load_json(path: str) -> Dict[str, Any]:
 def summarize(old: Dict[str, Any], new: Dict[str, Any]) -> str:
     lines = []
     for key in COUNTER_KEYS:
-        before = old.get(key)
-        after = new.get(key)
+        if key == "closed_forward_bars":
+            before: Any = resolve_closed_forward_bars(old)
+            after: Any = resolve_closed_forward_bars(new)
+        else:
+            before = old.get(key)
+            after = new.get(key)
         marker = "  (CHANGED)" if before != after else ""
         lines.append(f"  {key}: {before!r} -> {after!r}{marker}")
     return "\n".join(lines)

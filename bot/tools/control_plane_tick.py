@@ -103,6 +103,29 @@ def _read_json(rel: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
         return None, f"unreadable: {rel} ({type(exc).__name__})"
 
 
+def _resolve_closed_forward_bars(doc: Optional[Dict[str, Any]]) -> int:
+    """Same resolution rule as `tools/stage_b_bars.resolve_closed_forward_bars`,
+    duplicated (not imported) on purpose: this file is stdlib-only so the cron
+    tick keeps running with no venv — see TestTheTickImportsNothingOnTheOrderPath.
+
+    The scorer nests the closed-bar count under `ceiling.closed_forward_bars`
+    / `forward_window.of_which_closed`; a freshly-promoted shadow file has no
+    top-level `closed_forward_bars` key at all, so reading it directly reports
+    0/180 even though the ceiling already says otherwise.
+    """
+    if not doc:
+        return 0
+    ceiling = doc.get("ceiling") or {}
+    value = ceiling.get("closed_forward_bars")
+    if value is not None:
+        return int(value)
+    window = doc.get("forward_window") or {}
+    value = window.get("of_which_closed")
+    if value is not None:
+        return int(value)
+    return int(doc.get("closed_forward_bars") or 0)
+
+
 def _allows_live_status() -> Dict[str, Any]:
     """Report runtime allows_live WITHOUT ever setting it.
 
@@ -269,7 +292,7 @@ def _mission_body(verdict: Dict[str, Any], forward: Optional[Dict[str, Any]],
             or (forward or {}).get("forward_n_trades") or 0)
     of = int(stage.get("of_20") or 20)
     bars = int(stage.get("closed_forward_bars")
-               or (forward or {}).get("closed_forward_bars") or 0)
+               or _resolve_closed_forward_bars(forward))
     actions = list(verdict.get("next_actions") or [])
     blockers = list(verdict.get("blockers") or [])
     human_gates = [a for a in actions
@@ -417,8 +440,7 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
             "stage_b": {
                 "forward_n_trades": int((forward or {}).get("forward_n_trades") or 0),
                 "of_20": 20,
-                "closed_forward_bars": int(
-                    (forward or {}).get("closed_forward_bars") or 0),
+                "closed_forward_bars": _resolve_closed_forward_bars(forward),
             },
             "next_actions": [],
             "risk": {"allows_live_must_be_false": True},
@@ -435,7 +457,7 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
         "forward_n_trades": n_trades,
         "closed_forward_bars": int(
             (verdict.get("stage_b") or {}).get("closed_forward_bars")
-            or (forward or {}).get("closed_forward_bars") or 0),
+            or _resolve_closed_forward_bars(forward)),
         "allows_live": bool(live.get("allows_live")),
         "allows_live_probe": live,
         "allows_progress": bool(verdict.get("allows_progress")),

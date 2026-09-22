@@ -63,6 +63,25 @@ class TestSchema:
         assert first == second
 
 
+class TestStageBBarsResolveThroughTheNestedScorerSchema:
+    """The forward scorer nests the closed-bar count under
+    `ceiling.closed_forward_bars` / `forward_window.of_which_closed`, never at
+    the top level — see tools/stage_b_bars.py. A freshly promoted shadow file
+    carries only the nested form, and the reviewer must still count it."""
+
+    def test_a_nested_only_shadow_reports_the_real_bar_count(
+            self, tmp_path, no_key):
+        art = tmp_path / "artifacts"
+        art.mkdir()
+        (art / "forward_shadow_current.json").write_text(json.dumps({
+            "forward_n_trades": 3,
+            "ceiling": {"closed_forward_bars": 43},
+            "forward_window": {"of_which_closed": 43},
+        }))
+        verdict = rv.evaluate(str(tmp_path))
+        assert verdict["stage_b"]["closed_forward_bars"] == 43
+
+
 class TestTheRulesAreRulesNotOpinions:
     def test_a_missing_input_is_a_blocker_not_a_shrug(self, tmp_path, no_key):
         """Fail closed: no evidence is never 'looks fine'."""
