@@ -56,6 +56,8 @@ import os
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+from stage_b_bars import resolve_closed_forward_bars
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
@@ -158,7 +160,7 @@ def evaluate(repo: str, *, now: Optional[dt.datetime] = None) -> Dict[str, Any]:
 
     # -- Stage B accrual ----------------------------------------------------
     n_trades = int((forward or {}).get("forward_n_trades") or 0)
-    bars = int((forward or {}).get("closed_forward_bars") or 0)
+    bars = resolve_closed_forward_bars(forward)
     need_trades = 20
     need_days = 180
     if gate:

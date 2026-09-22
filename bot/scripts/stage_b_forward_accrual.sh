@@ -90,6 +90,9 @@ import json
 import os
 import sys
 
+sys.path.insert(0, "tools")
+from stage_b_bars import resolve_closed_forward_bars  # noqa: E402
+
 report = json.loads(sys.argv[1])
 scratch_file = sys.argv[2]
 shadow_path = os.path.join("artifacts", "forward_shadow_current.json")
@@ -99,9 +102,12 @@ if os.path.exists(shadow_path):
     with open(shadow_path, "r", encoding="utf-8") as fh:  # read-only, on purpose
         current = json.load(fh)
     old_trades = current.get("forward_n_trades")
-    old_bars = current.get("closed_forward_bars")
+    old_bars = resolve_closed_forward_bars(current)
 
 new_trades = report.get("forward_n_trades")
+# report["forward_bars"] is daily_forward_refresh.py's own resolved reading
+# of the scratch scorer's ceiling.closed_forward_bars (see its run()) — not
+# a raw top-level field, so no resolver needed on this side of the compare.
 new_bars = report.get("forward_bars")
 
 if (new_trades, new_bars) != (old_trades, old_bars):

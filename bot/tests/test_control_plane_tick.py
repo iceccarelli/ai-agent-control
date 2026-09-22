@@ -285,6 +285,31 @@ class TestItRegeneratesTheMission:
         assert "## BLOCKERS" in body
         assert "- (none)" not in body.split("## BLOCKERS", 1)[1]
 
+    def test_a_missing_verdict_resolves_bars_from_a_nested_shadow_file(
+            self, tmp_repo, recorder):
+        """A freshly-promoted shadow file carries `ceiling.closed_forward_bars`,
+        not a top-level `closed_forward_bars` key. When the verdict is also
+        missing, the fallback stage_b block built straight from the shadow
+        file must still resolve the real count (43), not report 0."""
+        os.remove(os.path.join(tmp_repo, cpt.VERDICT_OUT))
+        shadow_path = os.path.join(tmp_repo, "artifacts",
+                                   "forward_shadow_current.json")
+        with open(shadow_path, "w", encoding="utf-8") as handle:
+            json.dump({
+                "forward_n_trades": 3,
+                "ceiling": {"closed_forward_bars": 43},
+            }, handle)
+
+        assert cpt.main([]) == 0
+
+        body = open(os.path.join(tmp_repo, cpt.MISSION_OUT),
+                    encoding="utf-8").read()
+        assert "closed_forward_bars=43/180" in body
+
+        tick = json.load(open(os.path.join(tmp_repo, cpt.TICK_OUT),
+                              encoding="utf-8"))
+        assert tick["closed_forward_bars"] == 43
+
     def test_the_tick_json_pins_the_risk_block(self, tmp_repo, recorder):
         assert cpt.main([]) == 0
         tick = json.load(open(os.path.join(tmp_repo, cpt.TICK_OUT),

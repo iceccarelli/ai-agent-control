@@ -108,6 +108,66 @@ class TestPromotesOnlyWithBothFlags:
         assert written["closed_forward_bars"] == 48
         assert written == NEW_SCRATCH
 
+class TestBarsResolveThroughNestedSchema:
+    """The real scorer nests the closed-bar count under `ceiling` /
+    `forward_window`, never at the top level — see stage_b_bars.py. The
+    before/after summary must not silently report None or 0 for a shadow
+    file or scratch score that only carries the nested form."""
+
+    def test_summary_resolves_nested_ceiling_bars_not_top_level(
+            self, tmp_path, capsys):
+        old_flat = dict(OLD_SHADOW)
+        new_nested = {
+            "tool": "slice76_forward_shadow",
+            "observed_at_utc": "2026-09-21T00:00:00Z",
+            "forward_n_trades": 3,
+            "ceiling": {"closed_forward_bars": 43},
+            "forward_window": {"of_which_closed": 43},
+            "gate_requires": {"closed_forward_trades": 20, "forward_days": 180},
+        }
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, new_nested)
+        _write(shadow_path, old_flat)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+        ])
+        assert rc != 0
+
+        out = capsys.readouterr().out
+        assert "closed_forward_bars: 41 -> 43  (CHANGED)" in out
+
+    def test_promoting_a_nested_only_scratch_still_summarizes_the_real_count(
+            self, tmp_path, capsys):
+        """After promotion the tracked shadow file has no top-level
+        `closed_forward_bars` key at all — the next promote's `old` side must
+        still resolve the nested value rather than treating it as 0/None."""
+        nested = {
+            "tool": "slice76_forward_shadow",
+            "observed_at_utc": "2026-09-21T00:00:00Z",
+            "forward_n_trades": 3,
+            "ceiling": {"closed_forward_bars": 43},
+            "forward_window": {"of_which_closed": 43},
+        }
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, nested)
+        _write(shadow_path, nested)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+        ])
+        assert rc != 0
+
+        out = capsys.readouterr().out
+        assert "closed_forward_bars: 43 -> 43" in out
+        assert "(CHANGED)" not in out
+
+
+class TestPromoteToolIsNeverAutomated:
     def test_it_is_never_invoked_from_the_accrual_script(self):
         """The tool name may appear in a comment or a printed hint pointing a
         human at it, but the script must never actually execute it."""
