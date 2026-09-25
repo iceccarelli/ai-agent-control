@@ -150,7 +150,7 @@ the file `promotion_gate.GATE_PATH` resolves to:
 | `linear_protective_stop_verified` | human | open — see `LINEAR_STOP_OPS_INVENTORY.md` |
 | `live_trading_ack_present` | human | open |
 | `m4_recent_half_accepted_or_recovered` | human or observation | open — §4 above |
-| `forward_shadow_clean` | observation | open — 3/20 trades, 36/180 days |
+| `forward_shadow_clean` | observation | open — 3/20 trades, 46/180 days |
 
 **3 of 8 complete. `promotion_gate_allows_live()` returns False.**
 
