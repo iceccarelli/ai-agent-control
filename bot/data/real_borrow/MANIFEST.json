@@ -1,17 +1,17 @@
 {
   "asset_class": "borrow_rate",
   "endpoint": "https://www.okx.com/api/v5/finance/savings/lending-rate-history",
-  "fetched_utc": "2026-09-16T06:47:49Z",
+  "fetched_utc": "2026-09-21T18:15:55Z",
   "files": {
     "OKX_LENDING_RATE_USDT_1H.csv.gz": {
       "first_timestamp": "2021-12-14T09:00:00Z",
       "interval_seconds": 3600,
       "kind": "borrow_rate",
-      "last_timestamp": "2026-09-16T06:00:00Z",
-      "rows": 41677,
-      "sha256": "a86c615bc77d95507dbd53e336bcf88ff8b3951dc5f18542b84d364c7fec48ca",
-      "sha256_uncompressed": "962c78e37f8dfa89f4874298c0d3064b4cbdf35250c0a4f5643128673906fb72",
-      "size_bytes": 258421
+      "last_timestamp": "2026-09-21T18:00:00Z",
+      "rows": 41809,
+      "sha256": "12a5b543c029a1ac4c6a1e471fa104e5406553aab397975f169242e402794e6f",
+      "sha256_uncompressed": "3ab1c032aae4fc9567f39a0ca59be75ed2f6351dfbd0eda73e7a063574f0fbb8",
+      "size_bytes": 259364
     }
   },
   "interval": "1h",

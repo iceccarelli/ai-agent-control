@@ -14,16 +14,16 @@
     ]
   },
   "bars_per_symbol": {
-    "BINANCE_SPOT_BTC_USDT_1D": 1461
+    "BINANCE_SPOT_BTC_USDT_1D": 1477
   },
   "files": {
     "ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz": {
-      "rows": 1461,
-      "sha256_uncompressed": "622b3375cdf199479dca9e606c088b6780626bbc897f304355ac1c5003941a56",
+      "rows": 1477,
+      "sha256_uncompressed": "b83f35b471a199bd1e0e7d24b9efd4ba538980c24cf8796527b496398f1c6341",
       "kind": "ohlcv",
       "interval_seconds": 86400,
       "first_timestamp": "2022-09-09T00:00:00.0000000Z",
-      "last_timestamp": "2026-09-08T00:00:00.0000000Z"
+      "last_timestamp": "2026-09-24T00:00:00.0000000Z"
     }
   },
   "warning": "REAL exchange data. Eligibility under data_contract is NOT edge \u2014 see RESEARCH_CLOSE_STAGE1.md. Timing-skill research is CLOSED."

@@ -15,8 +15,8 @@
   "date_range_utc": {
     "BTCUSDT": {
       "start": "2022-08-10",
-      "end": "2026-09-19",
-      "rows": 1502
+      "end": "2026-09-24",
+      "rows": 1507
     },
     "ETHUSDT": {
       "start": "2022-08-10",

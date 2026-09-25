@@ -414,6 +414,15 @@
    "recorded_utc": "2026-09-16T18:17:50Z",
    "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
    "to_utc": "2026-09-14T00:00:00Z"
+  },
+  {
+   "dataset": "BTCUSDT",
+   "from_utc": "2019-09-08T00:00:00Z",
+   "purpose": "market_data.load_corpus",
+   "read_by": "slice76_forward_shadow.py",
+   "recorded_utc": "2026-09-18T18:03:40Z",
+   "result_seen": "(auto-recorded at load; the result this read produced is not known to the loader)",
+   "to_utc": "2026-09-17T00:00:00Z"
   }
  ],
  "schema": "data_read_ledger/1",

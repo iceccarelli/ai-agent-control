@@ -4,17 +4,17 @@
     "perp": "https://www.binance.com/fapi/v1/klines",
     "spot": "https://api.binance.com/api/v3/klines"
   },
-  "fetched_utc": "2026-09-16T00:46:25Z",
+  "fetched_utc": "2026-09-21T18:09:41Z",
   "files": {
     "BINANCE_PERP_BTCUSDT_8H.csv.gz": {
       "first_timestamp": "2019-09-08T16:00:00Z",
       "interval_seconds": 28800,
       "kind": "ohlcv",
-      "last_timestamp": "2026-09-15T16:00:00Z",
-      "rows": 7693,
-      "sha256": "724d7440d27ce8f64b592adbc917dddfce51bc972d885de0f4ed9e09ee4aabad",
-      "sha256_uncompressed": "5ff4b356930b6b16a6d6afaf48533dab7b03b30f263eff9e575060c764575c2d",
-      "size_bytes": 205074
+      "last_timestamp": "2026-09-21T08:00:00Z",
+      "rows": 7710,
+      "sha256": "9f48ba36635e1852a1246ba4b6048a4fe27b91f5ae901224ca1532b647ad1c03",
+      "sha256_uncompressed": "d6390de85fca533d16b7512e774e6f377c59cd8f16637890e891bd6f7d6614fd",
+      "size_bytes": 205525
     },
     "BINANCE_PERP_ETHUSDT_8H.csv.gz": {
       "first_timestamp": "2019-11-27T00:00:00Z",
@@ -40,11 +40,11 @@
       "first_timestamp": "2019-08-01T00:00:00Z",
       "interval_seconds": 28800,
       "kind": "ohlcv",
-      "last_timestamp": "2026-09-15T16:00:00Z",
-      "rows": 7809,
-      "sha256": "cc0d52ca312b714e5d5e6251402b28b2741cbd85249670dc27d1796522ce368d",
-      "sha256_uncompressed": "4598976560581cc975de42d25604042776bc5a4952a9050754b22f6f183e7fea",
-      "size_bytes": 231228
+      "last_timestamp": "2026-09-21T08:00:00Z",
+      "rows": 7826,
+      "sha256": "b0286536fbd2967747222f537b4a8fe403596b9d0f47f9d6bc63409e391f2f34",
+      "sha256_uncompressed": "7cdaef12d748e2be63c72ff110db76fd3b8a1e5be7037a036bee8458a0d6fec8",
+      "size_bytes": 231720
     },
     "BINANCE_SPOT_ETHUSDT_8H.csv.gz": {
       "first_timestamp": "2019-08-01T00:00:00Z",
