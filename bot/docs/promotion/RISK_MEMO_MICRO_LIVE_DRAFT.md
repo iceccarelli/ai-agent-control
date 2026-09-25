@@ -51,10 +51,19 @@ the correct number is still small:
 | | |
 |---|---|
 | Closed forward trades | **3 of 20** required |
-| Closed forward bars | **36 of 180** days required |
-| Forward ladder | 8 setups → 8 flagged → 8 eligible → 4 after schedule → 4 entries → **3 closed** |
+| Closed forward bars | **41 of 180** days required |
+| Forward ladder | 9 setups → 8 flagged → 8 eligible → 4 after schedule → 4 entries → **3 closed** |
 | Frozen carry baseline | **9.6578 %/yr on 15 trades**, reproducing the figure `PHASE1_DECISION.md` quotes, under the `FROZEN_SNAPSHOT_CUT_*` bound |
 | Fold-lock | prefix digests match the pinned fold lock on both corpora; history unchanged, never shrank, appends strictly after `t1` |
+
+> **Refreshed 2026-09-25** from this checkout's own
+> `artifacts/forward_shadow_current.json` (`observed_at_utc:
+> 2026-09-20T22:45:00Z`; no `corpus_last_bar_utc` field present in that
+> file). This is the cloud checkout's copy, not the factory Mac's. If the
+> factory copy shows a newer tip (e.g. 46 closed forward bars, a later
+> `corpus_last_bar_utc`), that has not landed in this tree and this table
+> has deliberately not been advanced to match an unverified number —
+> re-run this refresh once the factory-produced artifact is pulled in.
 
 **Three forward trades is not evidence of anything.** It is 15% of the required
 count over 20% of the required window, and no monitor can evaluate it: M1 needs
