@@ -96,10 +96,12 @@ class TestTheObservationDoesNotClaimToBeForward:
         same frozen-versus-live flaw slice 60's count test had.
 
         They now legitimately disagree, and BOTH are right: slice 59 observed
-        0 and its record still says 0, permanently; the live gate records 3 of
-        20 closed trades and 36 of 180 days, scored against the append-only
-        full corpora. A record of what was observed then is not a claim about
-        now.
+        0 and its record still says 0, permanently; the live gate records
+        whatever the installed forward-shadow artefact currently shows (kept
+        in sync by tools/sync_forward_shadow_gate_observation.py), scored
+        against the append-only full corpora. A record of what was observed
+        then is not a claim about now, and this docstring pins no exact day
+        count that the next accrual would make stale.
 
         What the test is named for is preserved exactly: slice 59's own count
         is still zero, and the item is still incomplete — which is the fact

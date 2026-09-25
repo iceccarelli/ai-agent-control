@@ -327,6 +327,12 @@ def _mission_body(verdict: Dict[str, Any], forward: Optional[Dict[str, Any]],
         " (add --xai only if XAI_API_KEY present)")
     lines.append(
         "- After code/evidence change: python3 tools/control_plane_tick.py")
+    lines.append(
+        "- Observation sync: after any shadow install/promote, run "
+        "python3 tools/sync_forward_shadow_gate_observation.py --write")
+    lines.append(
+        "- Factory accrual host offline — do not accrue/append --write/"
+        "promote until a human names a venue-egress host.")
 
     lines.append("")
     lines.append("## HUMAN-ONLY (do not forge signatures)")
