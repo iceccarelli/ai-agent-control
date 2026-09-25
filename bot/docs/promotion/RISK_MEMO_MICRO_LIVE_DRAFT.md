@@ -51,15 +51,26 @@ the correct number is still small:
 | | |
 |---|---|
 | Closed forward trades | **3 of 20** required |
-| Closed forward bars | **36 of 180** days required |
-| Forward ladder | 8 setups → 8 flagged → 8 eligible → 4 after schedule → 4 entries → **3 closed** |
+| Closed forward bars | **46 of 180** days required |
+| Forward ladder | 9 setups → 9 flagged → 8 eligible → 4 after schedule → 4 entries → **3 closed** |
+| Forward mean net R | **−0.8996** (3 trades; NOT comparable to the OOS +0.1736 — no rotation null, no drift control, no monitor can evaluate 3 trades) |
+| M-4 (recent-half decay) | still WARN, still the HISTORICAL fact from slices 58-61 (earlier half +0.4669 / recent half −0.0798). Forward M-4 itself reads `INSUFFICIENT_DATA` — it needs 20 closed trades and has 3. |
+| Concentration (M-3, historical) | 3 of 41 historical trades carry 41% of the net R; forward M-3 reads `INSUFFICIENT_DATA` (needs 10, has 3) |
 | Frozen carry baseline | **9.6578 %/yr on 15 trades**, reproducing the figure `PHASE1_DECISION.md` quotes, under the `FROZEN_SNAPSHOT_CUT_*` bound |
 | Fold-lock | prefix digests match the pinned fold lock on both corpora; history unchanged, never shrank, appends strictly after `t1` |
 
+> **Refreshed 2026-09-25** from the factory-produced
+> `artifacts/forward_shadow_current.json` installed this session
+> (`forward_window.corpus_last_bar_utc: 2026-09-24T00:00:00Z`,
+> `forward_n_trades: 3`, `of_which_closed: 46`) — verified against
+> `state/forward_shadow_scratch/forward.json` byte-for-byte on the fields
+> that matter. See `artifacts/TRADE_SCARCITY_AUTOPSY.md` for the full
+> attrition accounting (VERDICT: DESIGNED_RARITY) behind these counts.
+
 **Three forward trades is not evidence of anything.** It is 15% of the required
-count over 20% of the required window, and no monitor can evaluate it: M1 needs
-10 trades, M2 needs 5, M3 needs 10, M4 needs 20. All four currently read
-`INSUFFICIENT_DATA`. This section exists so the number is not mistaken for
+count over 26% of the required window, and no monitor can evaluate it: M1 needs
+10 trades, M2 needs 5 in 90 days, M3 needs 10, M4 needs 20. All four currently
+read `INSUFFICIENT_DATA`. This section exists so the number is not mistaken for
 progress toward a conclusion — it is progress toward being *able* to conclude.
 
 ## 3. Size and scope being proposed

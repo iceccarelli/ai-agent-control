@@ -26,6 +26,7 @@ TOOL = os.path.join(BOT, "tools", "reviewer_verdict.py")
 sys.path.insert(0, os.path.join(BOT, "tools"))
 
 import reviewer_verdict as rv                         # noqa: E402
+from stage_b_bars import resolve_closed_forward_bars  # noqa: E402
 
 #: Distinguishes "the key is absent" from "the key is None".
 _ABSENT = object()
@@ -52,7 +53,13 @@ class TestSchema:
             os.path.join(BOT, "artifacts", "forward_shadow_current.json"),
             encoding="utf-8"))
         assert stage["forward_n_trades"] == forward["forward_n_trades"]
-        assert stage["closed_forward_bars"] == forward["closed_forward_bars"]
+        # A freshly-promoted shadow file nests the bar count under
+        # `forward_window.of_which_closed` / `ceiling.closed_forward_bars`
+        # and carries no top-level `closed_forward_bars` key at all
+        # (tools/stage_b_bars.py). Resolve through the same single source of
+        # truth `reviewer_verdict.build` itself uses, rather than assuming
+        # the legacy flat key is present.
+        assert stage["closed_forward_bars"] == resolve_closed_forward_bars(forward)
 
     def test_risk_is_pinned_and_cannot_drift(self, no_key):
         assert rv.build(BOT)["risk"] == {"allows_live_must_be_false": True}
