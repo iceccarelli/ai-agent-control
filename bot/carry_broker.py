@@ -215,7 +215,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": product, "symbol": symbol})
-        rows = (result or {}).get("result", {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol} on {product}")
         row = rows[0]
@@ -332,7 +332,7 @@ class CarryBroker:
             "GET", "/v5/order/realtime", signed=True,
             params={"category": product, "symbol": symbol,
                     "orderLinkId": link_id})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             return None
         row = rows[0]
@@ -359,7 +359,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(
                 f"no linear position row for {symbol}; margin headroom unknown")
@@ -376,7 +376,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("result", {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol}")
         mark = float(rows[0].get("markPrice", 0) or 0)
@@ -395,7 +395,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": SPOT, "symbol": symbol})
-        rows = (result or {}).get("result", {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no spot ticker for {symbol}")
         price = float(rows[0].get("lastPrice", 0) or 0)
@@ -417,7 +417,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("result", {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol}; funding unknown")
         raw = rows[0].get("fundingRate")
@@ -447,7 +447,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/instruments-info",
             params={"category": product, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(
                 f"no instrument rules for {symbol} on {product}")
@@ -488,7 +488,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/account/fee-rate", signed=True,
             params={"category": product, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no fee rate for {symbol} on {product}")
         row = rows[0]
@@ -522,7 +522,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/account/wallet-balance", signed=True,
             params={"accountType": "UNIFIED", "coin": coin})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         coins = (rows[0].get("coin") if rows else None) or []
         for entry in coins:
             if str(entry.get("coin", "")).upper() != coin.upper():
@@ -554,7 +554,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/funding/history",
             params={"category": LINEAR, "symbol": symbol, "limit": 1})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no settled funding print for {symbol}")
         row = rows[0]
@@ -589,7 +589,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("list")
+        rows = self._v5_list(result)
         if rows is None:
             raise PairIncident(
                 f"cannot read the {symbol} position; liquidation distance "
@@ -601,7 +601,7 @@ class CarryBroker:
             wallet = self.client._request(
                 "GET", "/v5/account/wallet-balance", signed=True,
                 params={"accountType": "UNIFIED"})
-            wrows = (wallet or {}).get("list") or []
+            wrows = self._v5_list(wallet) or []
             raw = wrows[0].get("accountMMRate") if wrows else None
             if raw is not None and str(raw).strip() != "":
                 value = float(raw)
@@ -664,7 +664,7 @@ class CarryBroker:
             "GET", "/v5/market/funding/history",
             params={"category": LINEAR, "symbol": symbol,
                     "limit": max(1, min(int(limit), 200))})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         out: List[Tuple[float, int]] = []
         for row in rows:
             try:
@@ -687,7 +687,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("list")
+        rows = self._v5_list(result)
         if rows is None:
             raise PairIncident(
                 f"cannot read the {symbol} position; refusing to assume flat")
@@ -715,7 +715,7 @@ class CarryBroker:
             result = self.client._request(
                 "GET", "/v5/order/realtime", signed=True,
                 params={"category": category, "symbol": symbol, "openOnly": 0})
-            rows = (result or {}).get("list")
+            rows = self._v5_list(result)
             if rows is None:
                 raise PairIncident(
                     f"cannot read open {category} orders for {symbol}; "
@@ -775,7 +775,7 @@ class CarryBroker:
             result = self.client._request(
                 "GET", "/v5/account/wallet-balance", signed=True,
                 params={"accountType": "UNIFIED", "coin": symbol[:-4]})
-            rows = (result or {}).get("list") or []
+            rows = self._v5_list(result) or []
             if not rows:
                 return 0.0
             coins = rows[0].get("coin") or []
@@ -783,7 +783,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         return abs(float(rows[0].get("size", 0) or 0)) if rows else 0.0
 
     def _query_by_link_id(self, symbol: str, link_id: str,
@@ -796,7 +796,7 @@ class CarryBroker:
         except Exception as exc:  # noqa: BLE001
             logger.error("could not read back %s: %s", link_id, exc)
             return None
-        rows = (result or {}).get("list") or []
+        rows = self._v5_list(result) or []
         if not rows:
             return None
         row = rows[0]
@@ -805,6 +805,39 @@ class CarryBroker:
             avg_price=float(row.get("avgPrice", 0) or 0),
             order_link_id=link_id, fee=CarryBroker._fee(row),
             detail=dict(row))
+
+    # -- Bybit v5 envelope --------------------------------------------------
+    #
+    # `client._request` returns the WHOLE v5 envelope on retCode 0 -
+    # `{retCode, retMsg, result: {...}, ...}` - never just `result` (see its
+    # own docstring in bybit_connection.py, and how `BybitClient.get_ticker` /
+    # `get_wallet` / `get_open_orders` all unwrap `payload.get("result",
+    # {})`). Every reader in this file goes through `_v5_result` or `_v5_list`
+    # instead of reading a `_request` return value directly, so there is
+    # exactly one unwrap in this module, not a second dialect that quietly
+    # reads the envelope's own top level. `get_mark`/`get_spot_mark`/
+    # `get_book_top`/`get_funding_bps` used a second, ad-hoc
+    # `.get("result", {}).get("list")` before this helper existed (0037);
+    # they now go through the same one.
+
+    @staticmethod
+    def _v5_result(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """The `result` object of a Bybit v5 envelope."""
+        return (payload or {}).get("result") or {}
+
+    @staticmethod
+    def _v5_list(payload: Optional[Dict[str, Any]]) -> Optional[list]:
+        """`result.list`, or `None` when the envelope carries no `list` key.
+
+        `None` and `[]` are different answers. `[]` means the venue read
+        fine and reported nothing - flat, no open orders, no position row.
+        `None` means the response did not carry a `list` at all, which is
+        the unreadable case `get_perp_position` / `get_liquidation_view` /
+        `get_open_carry_orders` refuse on rather than assume flat or empty.
+        `.get("list")` already returns exactly that distinction; nothing
+        here coerces a missing key to `[]`.
+        """
+        return CarryBroker._v5_result(payload).get("list")
 
     @staticmethod
     def _fee(row: Dict[str, Any]) -> Optional[float]:
@@ -820,7 +853,17 @@ class CarryBroker:
     @staticmethod
     def _fill_from(response: Optional[Dict[str, Any]],
                    link_id: str) -> LegFill:
-        row = response or {}
+        """`response` is `/v5/order/create`'s full envelope; unwrap `result`
+        before reading it, same as every other reader in this file.
+
+        Real Bybit create responses carry only `orderId` in `result` - no
+        `cumExecQty`/`avgPrice` - so this legitimately returns a zero fill
+        most of the time even after the correct unwrap; that is what sends
+        `place_market` to `_query_by_link_id` next. FakeClients in the test
+        suite simulate an immediate fill for convenience and now do so
+        inside a real envelope's `result`, not at its top level.
+        """
+        row = CarryBroker._v5_result(response)
         return LegFill(
             filled_qty=float(row.get("cumExecQty", 0) or 0),
             avg_price=float(row.get("avgPrice", 0) or 0),

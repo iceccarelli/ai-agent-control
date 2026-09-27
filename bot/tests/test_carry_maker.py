@@ -311,7 +311,11 @@ class TestTheBrokerSpeaksTheVenuesLanguage:
                                           "ask1Price": "100000.1",
                                           "markPrice": "100000.0",
                                           "lastPrice": "100000.0"}]}}
-            self.create = create or {"orderLinkId": "x"}
+            # Real Bybit create responses carry only orderId/orderLinkId in
+            # `result` (carry_broker.CarryBroker._fill_from's own docstring);
+            # this fixture's default is still inside the real envelope shape.
+            self.create = create or {"retCode": 0, "retMsg": "OK",
+                                     "result": {"orderLinkId": "x"}}
             self.raise_on_create = raise_on_create
             self.bodies = []
 
@@ -325,12 +329,15 @@ class TestTheBrokerSpeaksTheVenuesLanguage:
                     raise self.raise_on_create
                 return self.create
             if endpoint == "/v5/order/realtime":
-                return {"list": [{"cumExecQty": "0.001", "avgPrice": "100000.1",
-                                  "cumExecFee": "0.02", "orderStatus": "Filled",
-                                  "orderLinkId": "x"}]}
+                return {"retCode": 0, "retMsg": "OK",
+                        "result": {"list": [
+                            {"cumExecQty": "0.001", "avgPrice": "100000.1",
+                             "cumExecFee": "0.02", "orderStatus": "Filled",
+                             "orderLinkId": "x"}]}}
             if endpoint == "/v5/order/cancel":
-                return {"orderLinkId": "x"}
-            return {}
+                return {"retCode": 0, "retMsg": "OK",
+                        "result": {"orderLinkId": "x"}}
+            return {"retCode": 0, "retMsg": "OK", "result": {}}
 
     def broker(self, client):
         return CarryBroker(client=client, sequence_source=lambda *a: 1,
@@ -371,7 +378,7 @@ class TestTheBrokerSpeaksTheVenuesLanguage:
         class Rejected(self.Client):
             def _request(self, method, endpoint, **kw):
                 if endpoint == "/v5/order/realtime":
-                    return {"list": []}
+                    return {"retCode": 0, "retMsg": "OK", "result": {"list": []}}
                 return super()._request(method, endpoint, **kw)
         c = Rejected(raise_on_create=BybitAPIError("post only", 30208))
         assert self.broker(c).place_post_only(
@@ -385,9 +392,10 @@ class TestTheBrokerSpeaksTheVenuesLanguage:
         class Resting(self.Client):
             def _request(self, method, endpoint, **kw):
                 if endpoint == "/v5/order/realtime":
-                    return {"list": [{"cumExecQty": "0", "avgPrice": "0",
-                                      "orderStatus": "New",
-                                      "orderLinkId": "x"}]}
+                    return {"retCode": 0, "retMsg": "OK",
+                            "result": {"list": [
+                                {"cumExecQty": "0", "avgPrice": "0",
+                                 "orderStatus": "New", "orderLinkId": "x"}]}}
                 return super()._request(method, endpoint, **kw)
         c = Resting(raise_on_create=RuntimeError("read timeout"))
         state = self.broker(c).place_post_only(

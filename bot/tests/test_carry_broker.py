@@ -18,6 +18,16 @@ class Boom(Exception):
         self.ret_code = ret_code
 
 
+def envelope(result):
+    """The REAL Bybit v5 shape: `client._request` returns the WHOLE thing on
+    retCode 0, never just `result` - see `bybit_connection.BybitClient._request`
+    and `carry_broker.CarryBroker._v5_result`/`_v5_list`, the one unwrap every
+    reader in that file now goes through. Every FakeClient branch below
+    returns this, not the bare `result` object the old fixtures used to ship -
+    that flat shape was the same lie the production bug read past."""
+    return {"retCode": 0, "retMsg": "OK", "result": result}
+
+
 class FakeClient:
     """A venue. Records calls; misbehaves when told."""
 
@@ -39,37 +49,41 @@ class FakeClient:
             self.created.append(body)
             if self.raise_on_create is not None:
                 raise Boom(self.raise_on_create)
-            return {"orderLinkId": body["orderLinkId"],
-                    "cumExecQty": body["qty"], "avgPrice": str(self.mark)}
+            # Real Bybit create responses carry only orderId/orderLinkId in
+            # `result` - no cumExecQty/avgPrice (carry_broker._fill_from's
+            # own docstring). This fixture still simulates an immediate fill
+            # here for tests that want one, inside the real envelope shape.
+            return envelope({"orderLinkId": body["orderLinkId"],
+                             "cumExecQty": body["qty"],
+                             "avgPrice": str(self.mark)})
         if endpoint == "/v5/order/realtime":
-            return {"list": [{"cumExecQty": "0.5", "avgPrice": str(self.mark),
-                              "orderLinkId": params.get("orderLinkId")}]}
+            return envelope({"list": [
+                {"cumExecQty": "0.5", "avgPrice": str(self.mark),
+                 "orderLinkId": params.get("orderLinkId")}]})
         if endpoint == "/v5/account/fee-rate":
             # 0036: the round trip comes from the account's own fee tier.
-            return {"list": [{"makerFeeRate": "0.0002",
-                              "takerFeeRate": "0.00055"}]}
+            return envelope({"list": [{"makerFeeRate": "0.0002",
+                                       "takerFeeRate": "0.00055"}]})
         if endpoint == "/v5/market/instruments-info":
-            return {"list": [{"lotSizeFilter": {
+            return envelope({"list": [{"lotSizeFilter": {
                 "qtyStep": "0.000001", "minOrderQty": "0.000001",
                 "basePrecision": "0.000001", "minOrderAmt": "5",
-                "minNotionalValue": "5"}}]}
+                "minNotionalValue": "5"}}]})
         if endpoint == "/v5/market/tickers":
-            # The REAL envelope, unlike every other branch here (tracked as a
-            # separate, larger finding — see TestTickerUnwrapsTheFullEnvelope
-            # below and the PR description). `BybitClient._request` returns
-            # this whole thing; `carry_broker`'s ticker/mark readers must
-            # unwrap `result.list`, not read `list` off the envelope itself.
-            return {"retCode": 0, "retMsg": "OK",
-                    "result": {"list": [{"markPrice": str(self.mark),
-                                         "lastPrice": str(self.mark),
-                                         "fundingRate": "0.0003"}]}}
+            return envelope({"list": [{"markPrice": str(self.mark),
+                                       "lastPrice": str(self.mark),
+                                       "fundingRate": "0.0003"}]})
         if endpoint == "/v5/position/list":
-            return {"list": [{"positionIM": str(self.im),
-                              "positionMM": str(self.mm),
-                              "size": str(self.perp_qty)}]}
+            return envelope({"list": [{"positionIM": str(self.im),
+                                       "positionMM": str(self.mm),
+                                       "size": str(self.perp_qty)}]})
         if endpoint == "/v5/account/wallet-balance":
-            return {"list": [{"coin": [{"walletBalance": str(self.spot_qty)}]}]}
-        return {}
+            # Unified wallet rows nest per-coin balances under "coin" - see
+            # BybitClient.get_wallet/get_coin_balance in bybit_connection.py,
+            # which this fixture mirrors rather than inventing a shape.
+            return envelope({"list": [
+                {"coin": [{"walletBalance": str(self.spot_qty)}]}]})
+        return envelope({})
 
 
 def broker(client, **kw):
@@ -146,7 +160,7 @@ class TestARetryCannotDoubleALeg:
 
         def no_readback(method, endpoint, **kw):
             if endpoint == "/v5/order/realtime":
-                return {"list": []}
+                return envelope({"list": []})
             return original(method, endpoint, **kw)
 
         client._request = no_readback
@@ -167,7 +181,7 @@ class TestMarginIsNeverAssumed:
 
     def test_a_missing_position_row_raises(self):
         client = FakeClient()
-        client._request = lambda *a, **k: {"list": []}
+        client._request = lambda *a, **k: envelope({"list": []})
         with pytest.raises(PairIncident):
             broker(client).get_margin_multiple("BTCUSDT")
 
@@ -193,6 +207,72 @@ class TestMarginIsNeverAssumed:
         assert not handlers, (
             "get_margin_multiple catches an exception; an unreadable margin "
             "must propagate so CarryEngine halts on it")
+
+
+class TestGetPerpPositionRefusesToAssumeFlat:
+    """The proven live STOP (Codespaces, Bybit testnet):
+    `python3 bot/tools/drill.py` failed reachability's `flat` check with
+    `PairIncident: cannot read the BTCUSDT position; refusing to assume
+    flat` - against a real envelope with retCode 0 and a `result.list` that
+    was simply empty (the account IS flat). The old code read
+    `(result or {}).get("list")` off the whole envelope, which is always
+    `None`, and `None` is exactly the "cannot read" case this function
+    refuses on. `_v5_list` is what makes the three cases below distinguishable
+    again: populated (has a position), empty (flat), missing (unreadable)."""
+
+    def test_a_populated_nested_list_returns_the_size(self):
+        client = FakeClient(perp_qty=0.25)
+        assert broker(client).get_perp_position("BTCUSDT") == pytest.approx(0.25)
+
+    def test_an_empty_nested_list_means_flat_not_unreadable(self):
+        """This is the exact live case: retCode 0, result.list == []."""
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope({"list": []})
+        assert broker(client).get_perp_position("BTCUSDT") == 0.0
+
+    def test_a_missing_list_key_refuses_to_assume_flat(self):
+        """retCode 0, a well-formed envelope, but `result` carries no `list`
+        key at all - the genuinely unreadable case, never to be treated as
+        flat."""
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope({})
+        with pytest.raises(PairIncident):
+            broker(client).get_perp_position("BTCUSDT")
+
+    def test_a_populated_top_level_list_is_not_mistaken_for_the_real_one(self):
+        """Same contract as the ticker tests below: a flat top-level `list`
+        - the shape the bug read - must not be read even when populated;
+        only `result.list` counts."""
+        client = FakeClient()
+        client._request = lambda *a, **k: {
+            "retCode": 0, "retMsg": "OK",
+            "list": [{"size": "99"}],
+            "result": {"list": []},
+        }
+        assert broker(client).get_perp_position("BTCUSDT") == 0.0
+
+
+class TestGetOpenCarryOrdersRefusesToAssumeNone:
+    def test_populated_orders_come_back_for_both_products(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope({"list": [
+            {"orderLinkId": "carry-abc", "orderStatus": "New"}]})
+        orders = broker(client).get_open_carry_orders("BTCUSDT", "BTCUSDT")
+        # LINEAR takes every order; SPOT takes only ones carrying "carr" in
+        # the link id - this fixture's row qualifies for both.
+        assert len(orders) == 2
+        assert {o["category"] for o in orders} == {LINEAR, SPOT}
+
+    def test_an_empty_nested_list_means_no_open_orders(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope({"list": []})
+        assert broker(client).get_open_carry_orders("BTCUSDT", "BTCUSDT") == []
+
+    def test_a_missing_list_key_refuses_to_assume_none(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope({})
+        with pytest.raises(PairIncident):
+            broker(client).get_open_carry_orders("BTCUSDT", "BTCUSDT")
 
 
 class TestMarkMustBeUsable:

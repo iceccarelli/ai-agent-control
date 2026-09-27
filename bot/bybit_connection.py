@@ -472,7 +472,17 @@ class BybitClient:
         signed: bool = False,
         retries: int = 3,
     ) -> Dict[str, Any]:
-        """One transport for every call. Returns the parsed ``result`` envelope.
+        """One transport for every call. Returns the WHOLE parsed v5 envelope
+        on ``retCode == 0`` - ``{"retCode", "retMsg", "result": {...}, ...}`` -
+        never just the ``result`` object. Every caller must unwrap
+        ``payload.get("result", {})`` itself (see ``get_ticker``, ``get_wallet``,
+        ``get_open_orders`` below, and ``carry_broker.CarryBroker._v5_result``/
+        ``_v5_list``, the one unwrap that module's readers share). A prior
+        version of this docstring said "the parsed ``result`` envelope",
+        which read as though this method already unwrapped it; it did not,
+        and that exact mismatch was a live production bug in
+        ``carry_broker.py`` (0037, 0038) before this line was corrected to
+        match the code rather than the code being bent to match the words.
 
         Raises :class:`TransientAPIError` or :class:`PermanentAPIError`; never
         returns a sentinel dict. The legacy transport turned crashes into
