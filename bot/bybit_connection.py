@@ -1310,6 +1310,51 @@ class BybitClient:
             raw={"stopLoss": str(trigger), "mechanism": "position"},
         )
 
+    def clear_position_stop(self, *, symbol: str) -> OrderResult:
+        """Cancel a LINEAR position's protective stop at the venue.
+
+        The mirror of :meth:`_place_position_stop`: same endpoint, same
+        ``tpslMode``, ``stopLoss="0"`` instead of a trigger price. Linear
+        only — spot has no position-attached stop to clear.
+
+        Nothing in the trading engine calls this to manage a live position;
+        clearing a live stop on purpose is not something the safety model
+        ever wants. It exists so an INDUCED-INCIDENT drill (Item 3 of
+        ``linear_protective_stop_verified`` — a stop lost at the venue while
+        a position is open) can simulate that loss through the one real
+        client dialect, instead of a drill hand-rolling its own request.
+        """
+        if not self.is_linear:
+            return OrderResult(reason="SPOT_HAS_NO_POSITION_STOP_TO_CLEAR")
+
+        oid = self._next_order_link_id(
+            symbol=symbol, side="Clear", qty="position",
+            purpose="stop_clear", price="0",
+        )
+        body = {
+            "category": self.category,
+            "symbol": symbol,
+            "stopLoss": "0",
+            "tpslMode": "Full",
+            "positionIdx": 0,
+        }
+        try:
+            self._request("POST", "/v5/position/trading-stop", body=body, signed=True)
+        except PermanentAPIError as exc:
+            logger.error("clear position stop rejected for %s: %s", symbol, exc)
+            return OrderResult(
+                order_link_id=oid, reason=f"REJECTED:{exc.ret_code}",
+                ret_code=exc.ret_code,
+            )
+        except TransientAPIError as exc:
+            logger.error("clear position stop unresolved for %s: %s", symbol, exc)
+            return OrderResult(order_link_id=oid, reason="OUTCOME_UNKNOWN")
+
+        return OrderResult(
+            ok=True, order_link_id=oid, reason="SUBMITTED",
+            raw={"stopLoss": "0", "mechanism": "position"},
+        )
+
     def verify_stop(
         self, *, symbol: str, order_link_id: str
     ) -> Tuple[bool, str]:

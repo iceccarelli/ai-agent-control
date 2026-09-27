@@ -506,6 +506,17 @@ class TradingBot:
         except Exception as exc:  # noqa: BLE001
             logger.exception("observe_exits failed; continuing: %s", exc)
 
+        # A stop that existed and was later cleared AT THE VENUE while the
+        # position stayed open is invisible to reconcile()'s ledger-only
+        # check, which only runs once at startup. This is the live-venue
+        # counterpart, checked every cycle, before any new entry is decided.
+        try:
+            naked = self.engine.check_naked_positions()
+            if naked.get("reprotected") or naked.get("flattened"):
+                logger.warning("naked positions handled this cycle: %s", naked)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("check_naked_positions failed; continuing: %s", exc)
+
         if self.risk.should_halt_trading():
             logger.warning("trading halted by the risk layer this cycle")
             return

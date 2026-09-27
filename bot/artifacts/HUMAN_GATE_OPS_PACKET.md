@@ -65,8 +65,20 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
        observed: ______________________________________________
 
 [ ] 3. NAKED position detected within one cycle
-       # cancel the stop venue-side while the position is open; observe the
-       # next cycle either re-protect or flatten
+       # NOT tools/drill.py (carry drill, no stop mechanism) and NOT
+       # tools/session_tail.py (read-only, never reads a position's stop).
+       python3 tools/linear_stop_venue_drill.py --induce-naked --notional 100 \
+           --out artifacts/linear_stop_naked_induce.json
+       # verdict must be NAKED. Then, a NEW process, same --state-db:
+       python3 tools/linear_stop_venue_drill.py --observe-naked \
+           --from artifacts/linear_stop_naked_induce.json \
+           --out artifacts/linear_stop_naked_observe.json
+       # verdict must be REPROTECTED or FLATTENED (fails closed otherwise) -
+       # this calls the SAME TradingEngine.check_naked_positions() the live
+       # loop's tick() calls every cycle, not a drill-only fork. Required
+       # cleanup if still open:
+       python3 tools/linear_stop_venue_drill.py --flatten \
+           --out artifacts/linear_stop_naked_flatten.json
        observed: ______________________________________________
 
 [ ] 4. Margin/liquidation at 100 USD notional, BTCUSDT linear, documented

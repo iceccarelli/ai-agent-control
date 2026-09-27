@@ -1176,11 +1176,52 @@ class TradingEngine:
 
     # -- startup -----------------------------------------------------------
 
+    def _protect_or_close_naked(
+        self, symbol: str, row: Dict[str, Any], *, reason: str
+    ) -> str:
+        """The one reaction to "naked": re-protect, or flatten if that fails.
+
+        Shared by every caller that can observe a naked position —
+        ``reconcile()`` at startup and ``check_naked_positions()`` mid-cycle —
+        so there is exactly one place this decision is made, not two dialects
+        that could quietly drift apart. Returns ``"REPROTECTED"``,
+        ``"FLATTENED"``, or ``"SKIPPED_FILTERS_UNREADABLE"`` (the position is
+        left naked this cycle; the caller sees it again next cycle).
+        """
+        side = normalize_side(str(row["side"])) or "Buy"
+        exit_side = "Sell" if side == "Buy" else "Buy"
+        entry = float(row["entry_price"])
+        stop_fraction = float(getattr(self.cfg, "STOP_LOSS_PCT", 0.02))
+        stop = entry * (1 - stop_fraction) if side == "Buy" else entry * (1 + stop_fraction)
+        try:
+            filters = self.client.get_instrument_filters(symbol)
+        except BybitAPIError:
+            return "SKIPPED_FILTERS_UNREADABLE"
+        placed = self._protect(
+            symbol=symbol, exit_side=exit_side, qty=float(row["qty"]),
+            stop_price=stop, filters=filters,
+        )
+        if placed:
+            self.store.set_position_stop(symbol, stop)
+            return "REPROTECTED"
+        self._emergency_close(
+            symbol=symbol, exit_side=exit_side, qty=float(row["qty"]),
+            filters=filters, reason=reason,
+        )
+        return "FLATTENED"
+
     def reconcile(self) -> Dict[str, Any]:
         """Resolve state against the exchange, then protect anything naked.
 
         Called before the first trade of a run. A position found without a
         verified stop is not simply logged: it is protected or closed.
+
+        This checks the LOCAL LEDGER's ``stop_price`` column
+        (``StateStore.positions_without_stops()``), not a live venue read —
+        it catches a stop this process itself never recorded (a lost fill, a
+        crash mid-attach), but not a stop that existed and was later cleared
+        AT THE VENUE while the ledger still believes it is live. See
+        ``check_naked_positions()`` for that case, checked every cycle.
         """
         summary = self.client.reconcile_on_startup(
             symbols=tuple(getattr(self.cfg, "TRADING_SYMBOLS", ()) or ()))
@@ -1188,27 +1229,67 @@ class TradingEngine:
             row = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
             if row is None:
                 continue
-            side = normalize_side(str(row["side"])) or "Buy"
-            exit_side = "Sell" if side == "Buy" else "Buy"
-            entry = float(row["entry_price"])
-            stop_fraction = float(getattr(self.cfg, "STOP_LOSS_PCT", 0.02))
-            stop = entry * (1 - stop_fraction) if side == "Buy" else entry * (1 + stop_fraction)
-            try:
-                filters = self.client.get_instrument_filters(symbol)
-            except BybitAPIError:
-                continue
-            placed = self._protect(
-                symbol=symbol, exit_side=exit_side, qty=float(row["qty"]),
-                stop_price=stop, filters=filters,
-            )
-            if placed:
-                self.store.set_position_stop(symbol, stop)
+            outcome = self._protect_or_close_naked(
+                symbol, row, reason="NAKED_ON_STARTUP")
+            if outcome == "REPROTECTED":
                 logger.warning("reconcile: protected naked position %s", symbol)
+        return summary
+
+    def check_naked_positions(self) -> Dict[str, Any]:
+        """Item 3's mid-cycle naked check — the live-venue counterpart to
+        ``reconcile()``'s local-ledger-only check, run every tick.
+
+        ``reconcile()`` trusts the ledger's ``stop_price`` column, which this
+        process itself wrote; it cannot see a stop that was live and was then
+        cleared AT THE VENUE while the position stayed open — the exact
+        incident ``linear_protective_stop_verified`` Item 3 exists to catch.
+        This reads ``verify_stop`` straight from the exchange for every open
+        linear position, every cycle, so that incident is caught inside the
+        cycle it happens in rather than only at the next restart.
+
+        Linear only (spot has no position-attached stop to verify this way).
+        Never places an order for a position already flat — that is
+        ``observe_exits()``'s job, called first each tick; this method only
+        ever sees positions the ledger still believes are open.
+        """
+        summary: Dict[str, Any] = {
+            "checked": 0, "reprotected": [], "flattened": [], "skipped": [],
+            "unread": 0,
+        }
+        if not getattr(self.client, "is_linear", False):
+            return summary
+        for row in list(self.store.open_positions()):
+            symbol = str(row["symbol"])
+            qty = float(row["qty"])
+            if qty <= 0:
+                continue
+            summary["checked"] += 1
+            try:
+                remote = self.client.get_position(symbol)
+            except BybitAPIError as exc:
+                logger.error("check_naked_positions: cannot read %s at the "
+                             "venue: %s", symbol, exc)
+                summary["unread"] += 1
+                continue
+            remote_qty = abs(float((remote or {}).get("size", 0) or 0))
+            if remote_qty <= 0:
+                # Exited at the venue since the ledger last saw it. Booking
+                # the exit is observe_exits()'s job, not this method's.
+                continue
+            live, detail = self.client.verify_stop(symbol=symbol, order_link_id="")
+            if live:
+                continue
+            logger.critical("NAKED position detected mid-cycle: %s (%s)",
+                            symbol, detail)
+            outcome = self._protect_or_close_naked(
+                symbol, row, reason="NAKED_MID_CYCLE")
+            if outcome == "REPROTECTED":
+                summary["reprotected"].append(symbol)
+                logger.warning("check_naked_positions: re-protected %s", symbol)
+            elif outcome == "FLATTENED":
+                summary["flattened"].append(symbol)
             else:
-                self._emergency_close(
-                    symbol=symbol, exit_side=exit_side, qty=float(row["qty"]),
-                    filters=filters, reason="NAKED_ON_STARTUP",
-                )
+                summary["skipped"].append(symbol)
         return summary
 
     def shutdown(self, cancel_protective: bool = False) -> None:

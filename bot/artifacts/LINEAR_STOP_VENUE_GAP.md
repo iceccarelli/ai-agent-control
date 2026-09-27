@@ -31,7 +31,7 @@ Full ops runbook (commands, venue endpoints, evidence paths):
 |---|---|---|
 | 1 | Stop PLACED on the venue and read back from the exchange (not local state) | open — command: `tools/linear_stop_venue_drill.py --arm --notional 100`; evidence `artifacts/linear_protective_stop_venue.json` |
 | 2 | Stop SURVIVES a process restart | open — `tools/linear_stop_venue_drill.py --hold` (opens+attaches, exits leaving the position+stop live), then a NEW process `--verify` (must read `VERIFIED`), then `--flatten` (required cleanup). NOT `tools/session_tail.py` — that tool is read-only and gate-invariant and never calls `verify_stop` |
-| 3 | A NAKED position is detected within one cycle | open — must be induced deliberately (cancel the stop venue-side) |
+| 3 | A NAKED position is detected within one cycle | open — `tools/linear_stop_venue_drill.py --induce-naked` (opens+attaches, records the ledger, then clears the stop AT THE VENUE ONLY), then a NEW process `--observe-naked` (must call the production `TradingEngine.check_naked_positions()` and read `REPROTECTED` or `FLATTENED`), then `--flatten` if needed. NOT `tools/drill.py` (no stop mechanism) or `tools/session_tail.py` (never reads a position's stop) |
 | 4 | Margin/liquidation behaviour at 100 USD notional on BTCUSDT linear, documented | open |
 
 Prerequisite for all four: `python3 tools/connector_check.py` →
