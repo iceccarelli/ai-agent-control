@@ -72,6 +72,30 @@ three phases, run as separate invocations:
         --out bot/artifacts/linear_stop_restart_verify.json
     python3 bot/tools/linear_stop_venue_drill.py --flatten \\
         --out bot/artifacts/linear_stop_restart_flatten.json
+
+ITEM 3 — NAKED DETECTION (--induce-naked / --observe-naked)
+===========================================================
+`reconcile()`'s naked check trusts the LOCAL LEDGER's `stop_price` column; it
+cannot see a stop that was live and was then cleared AT THE VENUE while the
+ledger still believes it is fine. `TradingEngine.check_naked_positions()` is
+the fix: it reads `verify_stop` from the exchange every cycle and reacts
+through the same `_protect`/`_emergency_close` reconcile() already used.
+
+    --induce-naked   open + attach a real stop, record it in the ledger,
+                     then clear the stop AT THE VENUE ONLY. Leaves a naked,
+                     open position. Implies --arm.
+    --observe-naked  a NEW process, same --state-db, calls the PRODUCTION
+                     `TradingEngine.check_naked_positions()` - the one
+                     cycle. Must end REPROTECTED or FLATTENED; fails
+                     closed if still naked.
+
+    python3 bot/tools/linear_stop_venue_drill.py --induce-naked \\
+        --notional 100 --out bot/artifacts/linear_stop_naked_induce.json
+    python3 bot/tools/linear_stop_venue_drill.py --observe-naked \\
+        --from bot/artifacts/linear_stop_naked_induce.json \\
+        --out bot/artifacts/linear_stop_naked_observe.json
+    python3 bot/tools/linear_stop_venue_drill.py --flatten \\
+        --out bot/artifacts/linear_stop_naked_flatten.json
 """
 from __future__ import annotations
 
@@ -705,6 +729,342 @@ def _report_item2(d: Drill, state: Dict[str, Any], out: str, cap: float,
     return report
 
 
+# ---------------------------------------------------------------------------
+# Item 3 - a NAKED position is detected within one cycle and re-protected or
+# flattened. This is the production entrypoint, not a drill-only fork:
+# `run_observe_naked` calls `TradingEngine.check_naked_positions()` directly -
+# the SAME method `main.py`'s `tick()` calls every cycle, which shares its
+# one reaction (`TradingEngine._protect_or_close_naked`) with `reconcile()`'s
+# startup path. Inducing the incident needs a persistent local ledger (a real
+# restart keeps its StateStore file; only the process dies), so `--induce-
+# naked` and `--observe-naked` share an on-disk StateStore path rather than
+# each building a throwaway one - see `--state-db`.
+# ---------------------------------------------------------------------------
+
+
+def _load_engine(state_db: str):
+    """Build a real BybitClient + StateStore + TradingEngine sharing ONE
+    persistent sqlite file. `check_naked_positions()` reads the LOCAL ledger
+    (`store.open_positions()`) to find symbol/side/qty/entry for re-protect
+    sizing, so induce and observe must share this file across the process
+    boundary the same way a real restart would - the sqlite file survives,
+    only the process's memory does not."""
+    import config as _config
+    from bybit_connection import BybitClient
+    from persistence import StateStore
+    from risk_management import BillionaireRiskManager
+    from trading_engine import TradingEngine
+
+    cfg = _config.load()
+    store = StateStore(state_db)
+    client = BybitClient(config=cfg, store=store)
+    risk = BillionaireRiskManager(config=cfg, store=store)
+    engine = TradingEngine(client=client, risk_manager=risk, store=store, config=cfg)
+    return engine, client, cfg, store
+
+
+def run_induce_naked(*, client: Any, store: Any, notional: Optional[float] = None,
+                     out: str = "",
+                     stop_distance_fraction: float = STOP_DISTANCE_FRACTION
+                     ) -> Dict[str, Any]:
+    """Phase INDUCE-NAKED. Opens + attaches a real stop, records the SAME
+    ledger rows `TradingEngine.enter()` would record after a successful
+    protect - then clears the stop AT THE VENUE ONLY, via
+    `BybitClient.clear_position_stop`. The ledger's `stop_price` column is
+    left untouched, exactly as it would be after a real venue-side incident:
+    the local ledger still believes the stop is live, and only a LIVE read
+    (`verify_stop`) can tell otherwise. That gap is Item 3's whole point."""
+    import shadow
+
+    cap = float(shadow.SHADOW_MAX_NOTIONAL_USD)
+    asked = cap if notional is None else float(notional)
+    d = Drill(client=client, notional=min(asked, cap), arm=True)
+    state: Dict[str, Any] = {}
+
+    def reachability(s: Stage) -> None:
+        mark = float(client.get_last_price(SYMBOL))
+        if not mark > 0:
+            s.failed(f"last price unusable: {mark!r}")
+            return
+        state["mark"] = mark
+        s.passed(last_price=mark, venue=d.venue, category=client.category)
+
+    def auth(s: Stage) -> None:
+        wallet = client.get_wallet()
+        s.passed(auth_ok=True, account_type=wallet.get("accountType", ""))
+
+    def flat(s: Stage) -> None:
+        row = client.get_position(SYMBOL)
+        held = abs(float((row or {}).get("size", 0) or 0))
+        state["venue_perp_qty"] = held
+        if held > 0:
+            s.failed(
+                f"the venue already holds {held} on {SYMBOL}. Inducing on "
+                "top of something already there is not a drill, it is an "
+                "incident.", venue_perp_qty=held)
+            return
+        s.passed(venue_perp_qty=held)
+
+    def venue_rules(s: Stage) -> None:
+        filters = client.get_instrument_filters(SYMBOL, force=True)
+        state["filters"] = filters
+        s.passed(qty_step=float(filters.qty_step),
+                 min_qty=float(filters.min_qty),
+                 min_notional=float(filters.min_notional),
+                 from_exchange=filters.from_exchange)
+
+    def arm_gate(s: Stage) -> None:
+        _assert_can_arm(client.cfg)
+        s.passed()
+
+    def open_position(s: Stage) -> None:
+        filters = state["filters"]
+        qty = max(float(filters.min_qty), d.notional / state["mark"])
+        result = client.place_order(
+            symbol=SYMBOL, side="Buy", qty=qty, order_type="Market",
+            purpose="linear_stop_naked_induce", filters=filters)
+        d.orders_sent += 1
+        if not result.ok:
+            s.failed(f"open leg not accepted: {result.reason}",
+                     reason=result.reason, order_link_id=result.order_link_id)
+            return
+        row = client.get_position(SYMBOL)
+        size = abs(float((row or {}).get("size", 0) or 0))
+        if size <= 0:
+            s.failed(
+                "order accepted but the venue reports no position "
+                "afterward; whether it filled is unknown",
+                order_link_id=result.order_link_id)
+            return
+        avg_price = float((row or {}).get("avgPrice") or state["mark"])
+        state["position_size"] = size
+        state["entry_price"] = avg_price
+        state["entry_order_link_id"] = result.order_link_id
+        # The same bookkeeping TradingEngine.enter() does right after a
+        # confirmed fill, before the stop is attached.
+        store.upsert_position(SYMBOL, "Buy", size, avg_price, stop_price=0.0,
+                              order_link_id=result.order_link_id)
+        s.passed(order_link_id=result.order_link_id,
+                 filled_size=size, avg_price=avg_price)
+
+    def attach(s: Stage) -> None:
+        mark = state["mark"]
+        trigger = mark * (1.0 - stop_distance_fraction)
+        result = client.place_stop_order(
+            symbol=SYMBOL, side="Sell", qty=state["position_size"],
+            trigger_price=trigger, filters=state["filters"])
+        if not result.ok:
+            s.failed(f"trading-stop not accepted: {result.reason}",
+                     reason=result.reason, trigger_price=trigger)
+            return
+        state["stop_order_link_id"] = result.order_link_id
+        state["stop_price"] = trigger
+        s.passed(order_link_id=result.order_link_id, trigger_price=trigger,
+                 mechanism=(result.raw or {}).get("mechanism", ""))
+
+    def verify(s: Stage) -> None:
+        live, detail = client.verify_stop(
+            symbol=SYMBOL, order_link_id=state["stop_order_link_id"])
+        if not live:
+            s.failed(f"verify_stop reports live=False: {detail}",
+                     live=live, detail=detail)
+            return
+        # The same bookkeeping TradingEngine.enter() does right after
+        # _protect() confirms live=True.
+        store.set_position_stop(SYMBOL, state["stop_price"])
+        store.upsert_position(SYMBOL, "Buy", state["position_size"],
+                              state["entry_price"], stop_price=state["stop_price"],
+                              order_link_id=state["entry_order_link_id"])
+        s.passed(live=live, detail=detail,
+                 endpoint="GET /v5/position/list (stopLoss field)")
+
+    def clear_stop(s: Stage) -> None:
+        """The induced incident: the venue loses the stop. The LEDGER is
+        deliberately NOT told - `store`'s `stop_price` column stays exactly
+        what `verify` just wrote. A real incident (a manual cancel, a venue
+        bug, a race) would look identical to the ledger: it only finds out
+        by asking the venue again."""
+        result = client.clear_position_stop(symbol=SYMBOL)
+        if not result.ok:
+            s.failed(f"clear_position_stop not accepted: {result.reason}",
+                     reason=result.reason)
+            return
+        s.passed(order_link_id=result.order_link_id,
+                 endpoint="POST /v5/position/trading-stop (stopLoss=0)")
+
+    def confirm_naked(s: Stage) -> None:
+        row = client.get_position(SYMBOL)
+        size = abs(float((row or {}).get("size", 0) or 0))
+        live, detail = client.verify_stop(symbol=SYMBOL, order_link_id="")
+        if size <= 0:
+            s.failed("the position is gone; there is nothing left to be "
+                     "naked - induce failed to leave a naked POSITION",
+                     venue_perp_qty=size, live=live, detail=detail)
+            return
+        if live:
+            s.failed("verify_stop still reports live=True; the venue did "
+                     "not actually lose the stop - induce did not induce "
+                     "anything", venue_perp_qty=size, live=live, detail=detail)
+            return
+        ledger_stop = float(({p["symbol"]: p for p in
+                             store.open_positions()}.get(SYMBOL) or {})
+                            .get("stop_price", 0) or 0)
+        s.passed(venue_perp_qty=size, live=live, detail=detail,
+                 ledger_still_believes_stop_price=ledger_stop)
+
+    for name, fn in (("reachability", reachability), ("auth", auth),
+                     ("flat", flat), ("venue_rules", venue_rules),
+                     ("arm_gate", arm_gate), ("open", open_position),
+                     ("attach", attach), ("verify", verify),
+                     ("clear_stop", clear_stop), ("confirm_naked", confirm_naked)):
+        if not d.run_stage(name, fn):
+            return _report_item3(d, state, out, verdict="FAILED", phase="INDUCE")
+
+    d.still_open = True
+    return _report_item3(d, state, out, verdict="NAKED", phase="INDUCE")
+
+
+def run_observe_naked(*, engine: Any, out: str = "",
+                      induce_finished_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Phase OBSERVE-NAKED. This IS the "one cycle": calls
+    `TradingEngine.check_naked_positions()` - the exact function
+    `main.py`'s `tick()` calls every cycle - from a fresh process reading
+    the persisted local ledger cold, then re-reads the venue independently
+    to confirm the outcome rather than trusting the method's own return
+    value. Fails closed if the position is still naked afterward."""
+    client = engine.client
+    d = Drill(client=client, notional=0.0, arm=False)
+    observe_started_ms = int(time.time() * 1000)
+    state: Dict[str, Any] = {
+        "induce_finished_ms": induce_finished_ms,
+        "observe_started_ms": observe_started_ms,
+    }
+
+    def reachability(s: Stage) -> None:
+        mark = float(client.get_last_price(SYMBOL))
+        if not mark > 0:
+            s.failed(f"last price unusable: {mark!r}")
+            return
+        state["mark"] = mark
+        s.passed(last_price=mark, venue=d.venue, category=client.category)
+
+    def auth(s: Stage) -> None:
+        wallet = client.get_wallet()
+        s.passed(auth_ok=True, account_type=wallet.get("accountType", ""))
+
+    def position_known_to_ledger(s: Stage) -> None:
+        row = {p["symbol"]: p for p in engine.store.open_positions()}.get(SYMBOL)
+        if row is None:
+            s.failed(
+                f"the local ledger has no open position for {SYMBOL}; "
+                "observe-naked cannot exercise the production naked-check "
+                "without the row --induce-naked wrote. Did --state-db match "
+                "the induce run?")
+            return
+        state["ledger_row_before"] = dict(row)
+        s.passed(**{k: row[k] for k in
+                   ("symbol", "side", "qty", "entry_price", "stop_price")
+                   if k in row})
+
+    def detect_and_act(s: Stage) -> None:
+        action_started_ms = int(time.time() * 1000)
+        result = engine.check_naked_positions()
+        state["action_started_ms"] = action_started_ms
+        state["action_finished_ms"] = int(time.time() * 1000)
+        s.passed(production_entrypoint="trading_engine.TradingEngine"
+                                       ".check_naked_positions",
+                 result=result)
+
+    def confirm_outcome(s: Stage) -> None:
+        live, detail = client.verify_stop(symbol=SYMBOL, order_link_id="")
+        row = client.get_position(SYMBOL)
+        size = abs(float((row or {}).get("size", 0) or 0))
+        if size > 0 and not live:
+            s.failed(
+                f"still NAKED after one cycle: size={size} live={live} "
+                f"({detail}). check_naked_positions did not resolve it - "
+                "this is the failure Item 3 exists to catch.",
+                venue_perp_qty=size, live=live, detail=detail)
+            return
+        outcome = "REPROTECTED" if size > 0 else "FLATTENED"
+        state["outcome"] = outcome
+        state["observe_finished_ms"] = int(time.time() * 1000)
+        s.passed(venue_perp_qty=size, live=live, detail=detail, outcome=outcome)
+
+    for name, fn in (("reachability", reachability), ("auth", auth),
+                     ("position_known_to_ledger", position_known_to_ledger),
+                     ("detect_and_act", detect_and_act),
+                     ("confirm_outcome", confirm_outcome)):
+        if not d.run_stage(name, fn):
+            return _report_item3(d, state, out, verdict="FAILED", phase="OBSERVE")
+
+    return _report_item3(d, state, out, verdict=state["outcome"], phase="OBSERVE")
+
+
+def _report_item3(d: Drill, state: Dict[str, Any], out: str,
+                  *, verdict: str, phase: str) -> Dict[str, Any]:
+    evidence = {s.name: s.evidence for s in d.stages}
+    if verdict == "NAKED":
+        action = (
+            "POSITION OPEN AND NAKED — HUMAN MUST ACT. Run --observe-naked "
+            "against the SAME --state-db from a new process now; that call "
+            "IS the one cycle Item 3 measures. Nothing automated will "
+            "protect this position on its own."
+        )
+    elif verdict == "FAILED" and phase == "OBSERVE":
+        action = (f"the drill stopped at {d.failed_stage!r}. If this is "
+                  "confirm_outcome: the position is still naked after one "
+                  "cycle - that is a real Item 3 failure, not a drill bug. "
+                  "Run --flatten by hand now.")
+    elif verdict == "FAILED":
+        action = (f"the drill stopped at {d.failed_stage!r}; nothing is "
+                  "proven. Fix what the stage reports and run it again.")
+    elif verdict == "REPROTECTED":
+        action = ("REPROTECTED: check_naked_positions re-attached a live "
+                  "stop inside one cycle. Position remains open and "
+                  "protected - a human still fills the checklist's "
+                  "observed: line.")
+    else:
+        action = ("FLATTENED: check_naked_positions closed the position "
+                  "inside one cycle rather than leave it naked. Run "
+                  "--flatten if any residual remains (expected ALREADY_FLAT).")
+    timestamps = {k: state[k] for k in
+                 ("induce_finished_ms", "observe_started_ms",
+                  "action_started_ms", "action_finished_ms",
+                  "observe_finished_ms") if k in state}
+    report = {
+        "tool": "linear_stop_venue_drill",
+        "checklist_item": "linear_protective_stop_verified (Item 3 of 4)",
+        "phase": phase,
+        "verdict": verdict,
+        "venue": d.venue,
+        "armed": bool(d.arm),
+        "failed_stage": d.failed_stage,
+        "still_open": d.still_open,
+        "next_action": action,
+        "orders_sent": d.orders_sent,
+        "stages": [s.as_dict() for s in d.stages],
+        "evidence": evidence,
+        "timestamps_ms": timestamps,
+        "production_path": (
+            "trading_engine.TradingEngine.check_naked_positions -> "
+            "trading_engine.TradingEngine._protect_or_close_naked -> "
+            "trading_engine.TradingEngine._protect / _emergency_close - "
+            "the SAME functions main.py's tick() calls every cycle and "
+            "reconcile() calls at startup."
+        ),
+        "clear_stop_method": (
+            "bybit_connection.BybitClient.clear_position_stop -> "
+            "POST /v5/position/trading-stop with stopLoss=\"0\" "
+            "(induce-only; nothing in the live loop calls this)."
+        ),
+        "not_proven": list(NOT_PROVEN),
+        "finished_ms": int(time.time() * 1000),
+    }
+    _dump(report, out)
+    return report
+
+
 def _scratch_state_db() -> str:
     """A throwaway `StateStore` path. Same reasoning as `drill.py`'s own
     helper: never the committed fixture, never the running book's database.
@@ -751,12 +1111,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     phase.add_argument("--flatten", action="store_true",
                        help="Item 2, phase FLATTEN: required cleanup after "
                             "HOLD/VERIFY. Closes the position if one is open.")
+    phase.add_argument("--induce-naked", action="store_true", dest="induce_naked",
+                       help="Item 3, phase INDUCE-NAKED: open + attach a real "
+                            "stop, record it in the ledger, then clear the "
+                            "stop AT THE VENUE ONLY (ledger untouched) - "
+                            "leaves a naked, open position. Implies --arm.")
+    phase.add_argument("--observe-naked", action="store_true", dest="observe_naked",
+                       help="Item 3, phase OBSERVE-NAKED: from a NEW process, "
+                            "calls the production "
+                            "TradingEngine.check_naked_positions() - the one "
+                            "cycle. Must end REPROTECTED or FLATTENED; fails "
+                            "closed if still naked.")
     ap.add_argument("--notional", type=float, default=None)
     ap.add_argument("--out", default="")
+    ap.add_argument("--state-db", dest="state_db",
+                    default=os.path.join(ROOT, "artifacts",
+                                         "linear_stop_naked_state.db"),
+                    help="Shared persistent ledger for --induce-naked / "
+                         "--observe-naked. A real restart keeps this file; "
+                         "only the process's memory is gone.")
+    ap.add_argument("--from", dest="from_report", default="",
+                    help="--observe-naked: prior --induce-naked transcript "
+                         "path, to record its finished_ms as "
+                         "induce_finished_ms.")
     args = ap.parse_args(argv)
 
+    needs_engine = args.induce_naked or args.observe_naked
     try:
-        client, cfg = _load_client()
+        if needs_engine:
+            engine, client, cfg, store = _load_engine(args.state_db)
+        else:
+            client, cfg = _load_client()
     except Exception as exc:                                    # noqa: BLE001
         print(f"the venue client could not be built: {type(exc).__name__}: "
               f"{exc}\n\nRun with the virtualenv the suite uses:\n\n"
@@ -764,7 +1149,7 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
-    arming = args.arm or args.hold or args.flatten
+    arming = args.arm or args.hold or args.flatten or args.induce_naked
     if arming:
         try:
             _assert_can_arm(cfg)
@@ -778,6 +1163,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         report = run_verify(client=client, out=args.out)
     elif args.flatten:
         report = run_flatten(client=client, out=args.out)
+    elif args.induce_naked:
+        report = run_induce_naked(client=client, store=store,
+                                  notional=args.notional, out=args.out)
+    elif args.observe_naked:
+        induce_ms = None
+        if args.from_report:
+            try:
+                with open(args.from_report, encoding="utf-8") as fh:
+                    induce_ms = json.load(fh).get("finished_ms")
+            except (OSError, ValueError):
+                induce_ms = None
+        report = run_observe_naked(engine=engine, out=args.out,
+                                   induce_finished_ms=induce_ms)
     else:
         report = run_drill(client=client, notional=args.notional, arm=args.arm,
                            out=args.out)
@@ -804,6 +1202,11 @@ def main(argv: Optional[List[str]] = None) -> int:
               "<<<")
         print("  >>> A human must now run --verify (new process), then "
               "--flatten. <<<")
+    if report["verdict"] == "NAKED":
+        print(f"\n  >>> POSITION OPEN AND NAKED on the venue "
+              f"(pid={os.getpid()}). <<<")
+        print(f"  >>> A human must now run --observe-naked --state-db "
+              f"{args.state_db} from a NEW process. <<<")
     print("\n  WHAT A PASS STILL DOES NOT ESTABLISH")
     for line in report["not_proven"]:
         print(f"    - {line}")
@@ -811,7 +1214,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n  transcript: {args.out}")
     return 0 if report["verdict"] in (
         "PASSED", "PREFLIGHT_ONLY", "HOLD", "VERIFIED", "FLATTENED",
-        "ALREADY_FLAT") else 1
+        "ALREADY_FLAT", "NAKED", "REPROTECTED") else 1
 
 
 if __name__ == "__main__":

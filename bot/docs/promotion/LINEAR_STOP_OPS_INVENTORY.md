@@ -153,11 +153,53 @@ the checklist.
 
 ### Item 3 — a NAKED position is detected within one cycle
 
-Must be induced deliberately — cancel the stop venue-side while the position is
-open, then observe the next cycle either re-protect or flatten.
+`reconcile()`'s naked check (`StateStore.positions_without_stops()`) trusts the
+LOCAL LEDGER's `stop_price` column — it catches a stop this process itself
+never recorded, but not a stop that was live and was then cleared AT THE
+VENUE while the ledger still believes it is fine. That gap is Item 3. The
+fix is `TradingEngine.check_naked_positions()`, called every cycle from
+`main.py`'s `tick()` (right after `observe_exits()`), which reads `verify_stop`
+straight from the exchange for every open linear position and reacts through
+the SAME functions `reconcile()` already used at startup —
+`TradingEngine._protect_or_close_naked()` → `_protect()` /
+`_emergency_close()`.
 
-Evidence: log excerpt with timestamps showing detection inside one cycle, and
-which of the two actions was taken.
+Induce it deliberately and observe the reaction with
+`bot/tools/linear_stop_venue_drill.py`, from `bot/`:
+
+```bash
+# 1) INDUCE-NAKED — opens + attaches a real stop, records it in the ledger
+#    exactly as TradingEngine.enter() would, then clears the stop AT THE
+#    VENUE ONLY via BybitClient.clear_position_stop. The ledger's stop_price
+#    is left untouched - it still believes the stop is live.
+python3 tools/linear_stop_venue_drill.py --induce-naked --notional 100 \
+    --out artifacts/linear_stop_naked_induce.json
+# verdict must be NAKED (position open, venue verify_stop live=False)
+
+# 2) OBSERVE-NAKED — a NEW process, reading the same --state-db, calls the
+#    production TradingEngine.check_naked_positions() - the one cycle:
+python3 tools/linear_stop_venue_drill.py --observe-naked \
+    --from artifacts/linear_stop_naked_induce.json \
+    --out artifacts/linear_stop_naked_observe.json
+# verdict must be REPROTECTED or FLATTENED - fails closed (FAILED) if the
+# position is still naked after the cycle
+
+# 3) required cleanup if REPROTECTED left the position open:
+python3 tools/linear_stop_venue_drill.py --flatten \
+    --out artifacts/linear_stop_naked_flatten.json
+# (ALREADY_FLAT is fine if OBSERVE-NAKED already flattened it)
+```
+
+**Not `tools/drill.py`** (the carry drill never calls `place_stop_order` /
+`verify_stop` at all) and **not `tools/session_tail.py`** (read-only,
+gate-invariant, never reads a position's stop fields) — neither can be Item 3
+evidence.
+
+Evidence: `artifacts/linear_stop_naked_induce.json` and
+`artifacts/linear_stop_naked_observe.json` — the OBSERVE transcript's
+`timestamps_ms` shows detection and reaction happened inside one cycle, and
+its `verdict` (`REPROTECTED` or `FLATTENED`) names which action was taken.
+`observed:` line in the checklist.
 
 ### Item 4 — margin and liquidation at the proposed notional
 

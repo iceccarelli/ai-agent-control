@@ -23,9 +23,21 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import linear_stop_venue_drill as D  # noqa: E402
-from bybit_connection import BybitClient, OrderResult  # noqa: E402
+from bybit_connection import BybitAPIError, BybitClient, OrderResult  # noqa: E402
 from persistence import StateStore  # noqa: E402
 from position_sizing import InstrumentFilters  # noqa: E402
+from risk_management import BillionaireRiskManager  # noqa: E402
+from test_orchestrator import Cfg as _OrchestratorCfg  # noqa: E402
+from trading_engine import TradingEngine  # noqa: E402
+
+
+class _EngineCfg(_OrchestratorCfg):
+    """A full config, unlike `_cfg()`'s bare namespace - `BillionaireRiskManager`
+    reads MAX_POSITION_SIZE_PCT and friends that the drill's own preflight
+    stages never touch."""
+    BYBIT_VENUE = "testnet"
+    PAPER_TRADING = False
+    CATEGORY = "linear"
 
 SYMBOL = "BTCUSDT"
 MARK = 100_000.0
@@ -42,8 +54,8 @@ class FakeClient:
 
     def __init__(self, *, mark=MARK, venue_perp=0.0, wallet_ok=True,
                  open_ok=True, attach_ok=True, verify_live=True,
-                 flatten_ok=True, category="linear", venue="testnet",
-                 cfg=None):
+                 flatten_ok=True, clear_ok=True, filters_ok=True,
+                 category="linear", venue="testnet", cfg=None):
         self.mark = mark
         self.venue_perp = venue_perp
         self.wallet_ok = wallet_ok
@@ -51,12 +63,18 @@ class FakeClient:
         self.attach_ok = attach_ok
         self.verify_live = verify_live
         self.flatten_ok = flatten_ok
+        self.clear_ok = clear_ok
+        self.filters_ok = filters_ok
         self.category = category
         self.venue = venue
         self.cfg = cfg if cfg is not None else _cfg(CATEGORY=category)
         self.orders = []
         self.position_size = 0.0
         self.stop_loss = 0.0
+
+    @property
+    def is_linear(self):
+        return self.category == "linear"
 
     def get_last_price(self, symbol):
         return self.mark
@@ -76,6 +94,8 @@ class FakeClient:
                 "slOrderType": "Market", "positionIdx": 0}
 
     def get_instrument_filters(self, symbol, force=False):
+        if not self.filters_ok:
+            raise BybitAPIError("filters unreadable")
         return InstrumentFilters(symbol=symbol, tick_size="0.1",
                                  qty_step="0.001", min_qty="0.001",
                                  min_notional="5", from_exchange=True)
@@ -110,6 +130,13 @@ class FakeClient:
         live = self.stop_loss > 0
         return live, (f"stopLoss={self.stop_loss}" if live
                       else "POSITION_HAS_NO_STOP_LOSS")
+
+    def clear_position_stop(self, *, symbol):
+        if not self.clear_ok:
+            return OrderResult(reason="CLEAR_REJECTED")
+        self.stop_loss = 0.0
+        return OrderResult(ok=True, order_link_id="clear-1",
+                           raw={"stopLoss": "0", "mechanism": "position"})
 
 
 def run(client, **kw):
@@ -449,3 +476,200 @@ class TestItem2NeverCitesSessionTailAsEvidence:
                 f"{rel} still points a human at `{self.BANNED}` as if it "
                 "were Item 2 evidence - that tool never calls verify_stop "
                 "or reads a position's stop fields")
+
+
+# ---------------------------------------------------------------------------
+# Item 3 - a NAKED position is detected within one cycle: INDUCE / OBSERVE
+# ---------------------------------------------------------------------------
+
+
+def _engine(client, store):
+    risk = BillionaireRiskManager(config=client.cfg, store=store)
+    return TradingEngine(client=client, risk_manager=risk, store=store,
+                         config=client.cfg)
+
+
+class TestInduceNakedLeavesAnOpenNakedPosition:
+    def test_induce_opens_attaches_clears_and_leaves_the_ledger_believing(self):
+        client = FakeClient()
+        store = StateStore(":memory:")
+        report = D.run_induce_naked(client=client, store=store, notional=100.0)
+        assert report["verdict"] == "NAKED", report.get("failed_stage")
+        assert report["phase"] == "INDUCE"
+        assert report["still_open"] is True
+
+        row = {p["symbol"]: p for p in store.open_positions()}.get(SYMBOL)
+        assert row is not None
+        # The ledger's own stop_price column is untouched by clear_stop -
+        # it still believes the stop it wrote during `verify` is live. That
+        # gap is exactly what Item 3 exists to catch.
+        assert float(row["stop_price"]) > 0
+
+        # The VENUE, independently, shows the stop is gone while the
+        # position is still open.
+        assert client.position_size > 0
+        live, detail = client.verify_stop(symbol=SYMBOL, order_link_id="")
+        assert live is False
+
+    def test_induce_refuses_off_the_one_safe_configuration(self):
+        client = FakeClient(cfg=_cfg(PAPER_TRADING=True))
+        store = StateStore(":memory:")
+        report = D.run_induce_naked(client=client, store=store, notional=100.0)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "arm_gate"
+
+    def test_induce_fails_if_the_venue_never_actually_loses_the_stop(self):
+        client = FakeClient(clear_ok=False)
+        store = StateStore(":memory:")
+        report = D.run_induce_naked(client=client, store=store, notional=100.0)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "clear_stop"
+
+
+class TestObserveNakedCallsTheProductionEntrypoint:
+    """`run_observe_naked` must call the SAME
+    `trading_engine.TradingEngine.check_naked_positions` the live loop's
+    `tick()` calls every cycle - not a copy of the attach logic invented
+    only for this drill."""
+
+    def test_observe_reprotects_when_the_reattach_succeeds(self):
+        client = FakeClient(cfg=_EngineCfg())
+        store = StateStore(":memory:")
+        induced = D.run_induce_naked(client=client, store=store, notional=100.0)
+        assert induced["verdict"] == "NAKED"
+
+        engine = _engine(client, store)
+        report = D.run_observe_naked(engine=engine)
+        assert report["verdict"] == "REPROTECTED", report.get("failed_stage")
+        assert report["phase"] == "OBSERVE"
+        result = report["evidence"]["detect_and_act"]["result"]
+        assert result["reprotected"] == [SYMBOL]
+        live, detail = client.verify_stop(symbol=SYMBOL, order_link_id="")
+        assert live is True
+
+    def test_observe_flattens_when_the_reattach_fails(self):
+        client = FakeClient(cfg=_EngineCfg())
+        store = StateStore(":memory:")
+        induced = D.run_induce_naked(client=client, store=store, notional=100.0)
+        assert induced["verdict"] == "NAKED"
+        # Only NOW does the re-attach start failing - induce's own attach
+        # (proving the stop was live before the incident) must succeed.
+        client.attach_ok = False
+
+        engine = _engine(client, store)
+        report = D.run_observe_naked(engine=engine)
+        assert report["verdict"] == "FLATTENED", report.get("failed_stage")
+        result = report["evidence"]["detect_and_act"]["result"]
+        assert result["flattened"] == [SYMBOL]
+        assert client.position_size == 0.0
+        assert store.open_position_count() == 0
+        # The bracket-failure invariant: emergency close trips the kill
+        # switch, the same as any other _emergency_close caller.
+        engaged, reason = store.is_kill_switch_engaged()
+        assert engaged is True
+
+    def test_observe_fails_closed_if_still_naked_after_the_cycle(self):
+        client = FakeClient(cfg=_EngineCfg())
+        store = StateStore(":memory:")
+        induced = D.run_induce_naked(client=client, store=store, notional=100.0)
+        assert induced["verdict"] == "NAKED"
+        # Only NOW do filters become unreadable - induce's own venue_rules
+        # stage must succeed first.
+        client.filters_ok = False
+
+        engine = _engine(client, store)
+        report = D.run_observe_naked(engine=engine)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "confirm_outcome"
+        # Still naked: never silently reported as resolved.
+        live, detail = client.verify_stop(symbol=SYMBOL, order_link_id="")
+        assert live is False
+        assert client.position_size > 0
+
+    def test_observe_refuses_without_the_ledger_row_induce_wrote(self):
+        client = FakeClient(cfg=_EngineCfg())
+        store = StateStore(":memory:")  # never induced - empty ledger
+        engine = _engine(client, store)
+        report = D.run_observe_naked(engine=engine)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "position_known_to_ledger"
+
+    def test_observe_records_wall_clock_timestamps(self):
+        client = FakeClient(cfg=_EngineCfg())
+        store = StateStore(":memory:")
+        induced = D.run_induce_naked(client=client, store=store, notional=100.0)
+        engine = _engine(client, store)
+        report = D.run_observe_naked(engine=engine,
+                                     induce_finished_ms=induced["finished_ms"])
+        ts = report["timestamps_ms"]
+        assert ts["induce_finished_ms"] == induced["finished_ms"]
+        assert (ts["observe_started_ms"] <= ts["action_started_ms"]
+               <= ts["action_finished_ms"] <= ts["observe_finished_ms"])
+
+
+class TestClearPositionStopOnBybitClient:
+    """The real client method induce-naked uses to lose the stop AT THE
+    VENUE - added once on BybitClient, per the "one dialect" rule, rather
+    than hand-rolled in the drill."""
+
+    def test_spot_refuses_it_has_no_position_stop_to_clear(self):
+        import backtest as bt
+        from persistence import StateStore as RealStateStore
+
+        view = bt._backtest_config_view(bt.BacktestConfig(category="spot"))
+        store = RealStateStore(":memory:")
+        client = BybitClient(config=view, store=store)
+        result = client.clear_position_stop(symbol=SYMBOL)
+        assert not result.ok
+        assert result.reason == "SPOT_HAS_NO_POSITION_STOP_TO_CLEAR"
+        store.close()
+
+    def test_linear_clears_the_stop_against_the_real_simulator(self):
+        import backtest as bt
+
+        view = bt._backtest_config_view(bt.BacktestConfig(category="linear"))
+        store = StateStore(":memory:")
+        ex = bt.LinearSimulatedExchange(
+            {SYMBOL: [bt.Bar(start_ms=1_600_000_000_000, open=100.0,
+                             close=100.0, high=100.5, low=99.5, volume=100.0)]
+             for _ in [0]}, starting_cash=1_000.0)
+        ex.positions[SYMBOL] = bt._SimPosition(
+            symbol=SYMBOL, side="Buy", size=1.0, entry_price=100.0)
+        client = BybitClient(config=view, store=store, transport=ex)
+
+        placed = client.place_stop_order(
+            symbol=SYMBOL, side="Sell", qty=1.0, trigger_price=95.0)
+        assert placed.ok
+        live, _ = client.verify_stop(symbol=SYMBOL, order_link_id="")
+        assert live is True
+
+        result = client.clear_position_stop(symbol=SYMBOL)
+        assert result.ok, result.reason
+        live, detail = client.verify_stop(symbol=SYMBOL, order_link_id="")
+        assert live is False
+        assert detail == "POSITION_HAS_NO_STOP_LOSS"
+        store.close()
+
+
+class TestItem3NeverCitesFalseEvidence:
+    """Item 3's docs must never resurrect either of the false pointers this
+    project already killed: the carry drill (which never calls
+    place_stop_order/verify_stop at all) and session_tail.py (read-only,
+    gate-invariant, never touches a position's stop)."""
+
+    BANNED_SESSION_TAIL = "python3 tools/session_tail.py"
+
+    def test_item_3_docs_do_not_point_at_session_tail(self):
+        repo_root = os.path.join(os.path.dirname(__file__), "..")
+        docs = [
+            "docs/promotion/LINEAR_STOP_OPS_INVENTORY.md",
+            "artifacts/HUMAN_GATE_OPS_PACKET.md",
+            "artifacts/LINEAR_STOP_VENUE_GAP.md",
+        ]
+        for rel in docs:
+            path = os.path.join(repo_root, rel)
+            with open(path, encoding="utf-8") as fh:
+                body = fh.read()
+            assert self.BANNED_SESSION_TAIL not in body, (
+                f"{rel} points Item 3 at session_tail.py - that tool never "
+                "calls verify_stop or reads a position's stop fields")
