@@ -8,19 +8,21 @@ Full checklist: `docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md`
 Full ops runbook (commands, venue endpoints, evidence paths):
 `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md`
 
-## Sim done vs venue done (checklist), gate JSON still lagging
+## Sim done vs venue done (checklist), gate JSON now synced
 
 | half | state | evidence |
 |---|---|---|
 | **Simulator** | **done** | `backtest.LinearSimulatedExchange`; stop written via `/v5/position/trading-stop`, read back via the real `BybitClient.verify_stop`; liquidation-before-stop ordering covered — `bot/tests/test_linear_simulator.py::TestTheProtectiveStopEndToEnd` (25 tests) |
 | **Venue** (items 1–4 of the checklist) | **done on testnet** | all four `observed:` lines filled from real venue runs; `LINEAR_STOP_VERIFICATION_CHECKLIST.md` signed (Verified by Vincenzo Ceccarelli, 2026-09-27) |
 
-**Still open:** `artifacts/slice59_promotion_gate.json`'s own
-`linear_protective_stop_verified.complete` has not been flipped by a human
-yet — it still reads `false` with evidence `"not documented"`. The checklist
-being signed is not the same event as that JSON field being updated; a human
-still needs to do the latter before `promotion_gate.evaluate_promotion_gate()`
-counts this item.
+**Closed:** `artifacts/slice59_promotion_gate.json`'s own
+`linear_protective_stop_verified.complete` now reads `true`, transcribed
+from the signed checklist by `tools/sync_linear_stop_gate_evidence.py
+--write` — the JSON's `signature` block records the checklist path, the
+margin memo path, and the exact `Verified by` / date it read.
+`promotion_gate.evaluate_promotion_gate()` now counts this item; the gate
+still refuses live for the three other open items and the independently
+consulted live-arming chain.
 
 > **WARNING, added after `tools/drill.py --arm` passed (Phase D, carry
 > book):** that transcript — `bot/artifacts/linear_stop_drill.json` — is
@@ -56,18 +58,20 @@ Bybit endpoints involved (from `LINEAR_STOP_OPS_INVENTORY.md` §3): `POST
 read-back a linear stop is verified through — a linear stop is a position
 field, not an order, unlike spot).
 
-## What would close this item
+## What closed this item
 
 All four `observed:` lines in `LINEAR_STOP_VERIFICATION_CHECKLIST.md` filled
 from real venue runs, its sign-off block signed by a human, and the evidence
-path recorded by a human in `artifacts/slice59_promotion_gate.json`
+path recorded in `artifacts/slice59_promotion_gate.json`
 (`linear_protective_stop_verified`).
 
-**The first two are now done.** The four `observed:` lines are filled and
-the checklist's `Verified by` is signed (Vincenzo Ceccarelli, 2026-09-27;
-`Reviewed by` still blank). **The third is not: `slice59_promotion_gate.json`
-itself still reads `linear_protective_stop_verified.complete: false`.** Not
-by this file, and not by any agent — a human still records that evidence
-path in the gate JSON. Until then `promotion_gate_allows_live()` remains
-`False`, as it does regardless (the gate needs `human_risk_memo_signed` and
-`live_trading_ack_present` too, both still open).
+**All three are now done.** The four `observed:` lines are filled, the
+checklist's `Verified by` is signed (Vincenzo Ceccarelli, 2026-09-27;
+`Reviewed by` still blank), and `slice59_promotion_gate.json` now reads
+`linear_protective_stop_verified.complete: true` — transcribed by
+`tools/sync_linear_stop_gate_evidence.py --write`, which refuses to write
+anything unless the checklist is already fully signed; it makes no judgment
+call of its own. `promotion_gate_allows_live()` still remains `False`
+(the gate needs `human_risk_memo_signed`, `live_trading_ack_present`,
+`m4_recent_half_accepted_or_recovered`, and `forward_shadow_clean` too, all
+still open, plus the independently consulted live-arming chain).

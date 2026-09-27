@@ -350,13 +350,18 @@ class TestThePromotionGateRefuses:
         assert pg.promotion_gate_allows_live() is False
 
     def test_six_of_eight_items_are_incomplete(self):
-        """NAME KEPT, COUNT AMENDED: six became five.
+        """NAME KEPT, COUNT AMENDED: six became five, five became four.
 
         `kill_switch_drill_recorded` was completed by a human who witnessed the
         mechanical drill and signed it — the first checklist item this
-        programme has ever closed. The name is left alone because the slice-59
-        record cites it and a shipped verdict must not be made false by a
-        rename; the number is amended here with its cause.
+        programme ever closed. `linear_protective_stop_verified` is the
+        second: `tools/sync_linear_stop_gate_evidence.py` transcribed the
+        signed `LINEAR_STOP_VERIFICATION_CHECKLIST.md` (all four venue items
+        proven on testnet, Verified by Vincenzo Ceccarelli, 2026-09-27) into
+        the gate JSON, and only after confirming that checklist was already
+        fully signed. The name is left alone because the slice-59 record
+        cites it and a shipped verdict must not be made false by a rename;
+        the number is amended here with its cause.
 
         What this test exists to protect is NOT the number. It is that the gate
         still refuses while anything is open, which is asserted directly below
@@ -364,9 +369,10 @@ class TestThePromotionGateRefuses:
         """
         verdict = pg.evaluate_promotion_gate()
         assert len(verdict.items) == 8
-        assert len(verdict.incomplete) == 5
+        assert len(verdict.incomplete) == 4
         assert verdict.allows_live is False
         assert "kill_switch_drill_recorded" not in verdict.incomplete
+        assert "linear_protective_stop_verified" not in verdict.incomplete
 
     def test_every_reason_is_stated(self):
         verdict = pg.evaluate_promotion_gate()

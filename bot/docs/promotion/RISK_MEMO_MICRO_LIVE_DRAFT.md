@@ -162,17 +162,19 @@ the file `promotion_gate.GATE_PATH` resolves to:
 | `kill_switch_drill_recorded` | human | **complete** |
 | `notional_cap_within_policy` | — | **complete** |
 | `models_current_absent_or_contained` | — | **complete** |
-| `human_risk_memo_signed` | human | open — *this memo* |
-| `linear_protective_stop_verified` | human | **checklist evidence complete** (all four venue items `[x]`, `LINEAR_STOP_VERIFICATION_CHECKLIST.md` signed by Vincenzo Ceccarelli, 2026-09-27; `LINEAR_STOP_MARGIN_MEMO.md` filled) — **but `slice59_promotion_gate.json`'s own `linear_protective_stop_verified.complete` still reads `false`, evidence still says "not documented".** That JSON field is human-owned and this memo does not, and cannot, flip it. A human still needs to record the checklist's evidence path there before the gate itself counts this item. |
+| `human_risk_memo_signed` | human | open — *this memo* (§7 signatures blank) |
+| `linear_protective_stop_verified` | human | **complete** — `slice59_promotion_gate.json` now reads `complete: true`, synced from the signed `LINEAR_STOP_VERIFICATION_CHECKLIST.md` (Verified by Vincenzo Ceccarelli, 2026-09-27) via `tools/sync_linear_stop_gate_evidence.py`. Desync closed. |
 | `live_trading_ack_present` | human | open |
-| `m4_recent_half_accepted_or_recovered` | human or observation | open — §4 above |
+| `m4_recent_half_accepted_or_recovered` | human | open — §4 above: **NOT ACCEPTED** is a decision to hold, not a completion. Only ACCEPTED-in-writing or forward recovery under the unchanged threshold satisfies this item. |
 | `forward_shadow_clean` | observation | open — 4/20 trades, 48/180 days |
 
-**3 of 8 complete, read directly from `slice59_promotion_gate.json` as it
-stands.** The linear-stop checklist itself is done, but that completion has
-not yet been recorded in the gate JSON by a human — until it is, the gate
-still counts 3, not 4. `promotion_gate_allows_live()` returns False either
-way.
+**4 of 8 complete, read directly from `slice59_promotion_gate.json` as it
+stands.** `promotion_gate_allows_live()` returns False regardless — three
+human items (`human_risk_memo_signed`, `live_trading_ack_present`,
+`m4_recent_half_accepted_or_recovered`) and one observation item
+(`forward_shadow_clean`) remain open, and the live-arming chain
+(`config.is_live_authorized`) is consulted independently of this checklist
+and is not satisfied either.
 
 It does **not** authorise: raising notional, adding a symbol, loading a model,
 running unattended without monitors, or describing the result as an autonomous
