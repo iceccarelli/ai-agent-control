@@ -96,6 +96,25 @@ through the same `_protect`/`_emergency_close` reconcile() already used.
         --out bot/artifacts/linear_stop_naked_observe.json
     python3 bot/tools/linear_stop_venue_drill.py --flatten \\
         --out bot/artifacts/linear_stop_naked_flatten.json
+
+ITEM 4 — MARGIN & LIQUIDATION AT THE PROPOSED NOTIONAL (--margin-doc)
+======================================================================
+Not a new trading policy and not a simulator essay: venue truth (this dump)
+plus a human-signed memo (`docs/promotion/LINEAR_STOP_MARGIN_MEMO.md`). The
+linear simulator's liquidation formula (`cash + dir*S*(p-E) <= mmr*S*p`,
+`backtest.py`) is CONTEXT ONLY - it is not evidence about what THIS venue's
+own position/wallet fields say, which is what Item 4 actually asks.
+
+    --margin-doc   open + attach a real stop (same stages as --hold), then
+                   DUMP the venue's position/wallet fields verbatim (never
+                   inventing an absent one) and DERIVE stop-vs-liquidation
+                   distance and an at-cap notional readout. Never
+                   auto-flattens - run --flatten next. Implies --arm.
+
+    python3 bot/tools/linear_stop_venue_drill.py --margin-doc \\
+        --notional 100 --out bot/artifacts/linear_stop_margin_doc.json
+    python3 bot/tools/linear_stop_venue_drill.py --flatten \\
+        --out bot/artifacts/linear_stop_margin_doc_flatten.json
 """
 from __future__ import annotations
 
@@ -1065,6 +1084,363 @@ def _report_item3(d: Drill, state: Dict[str, Any], out: str,
     return report
 
 
+# ---------------------------------------------------------------------------
+# Item 4 - margin and liquidation at the proposed notional, documented. Not a
+# new trading policy and not a simulator essay: venue truth (this dump) plus
+# a human-signed memo (LINEAR_STOP_MARGIN_MEMO.md). The simulator's
+# `cash + dir*S*(p-E) <= mmr*S*p` liquidation model is CONTEXT ONLY - it is
+# not evidence about what THIS venue's wallet/position fields say, which is
+# what Item 4 actually asks.
+# ---------------------------------------------------------------------------
+
+#: `liqPrice` is the field Bybit v5 documents; `liquidationPrice` is searched
+#: too in case of a future rename, matching CarryBroker.get_liquidation_view's
+#: proven-live handling of the same field (bot/carry_broker.py). Both are
+#: searched by ONE helper so a rename is fixed in one place.
+LIQ_PRICE_ALIASES = ("liqPrice", "liquidationPrice")
+
+#: Bybit v5 position/list keys this dump records verbatim when present.
+#: `liqPrice` is deliberately absent from this tuple - see `_find_liq_price`.
+POSITION_DUMP_KEYS = (
+    "symbol", "side", "size", "avgPrice", "markPrice",
+    "stopLoss", "takeProfit", "tpslMode", "slTriggerBy", "positionIdx",
+    "positionIM", "positionMM", "positionBalance", "positionValue",
+    "leverage", "unrealisedPnl", "cumRealisedPnl",
+    "riskLimitValue", "mmRate", "imRate",
+)
+
+WALLET_TOP_LEVEL_KEYS = ("totalEquity", "totalAvailableBalance", "accountMMRate")
+WALLET_COIN_KEYS = {
+    "USDT": ("walletBalance", "equity", "availableToWithdraw", "usdValue",
+             "borrowAmount"),
+    "BTC": ("walletBalance", "equity", "usdValue", "collateralSwitch"),
+}
+
+
+def _find_liq_price(row: Dict[str, Any]) -> Dict[str, Any]:
+    """One place a liq-price field rename gets fixed, for the dump AND for
+    any future caller. Bybit returns `""` when the price lies outside the
+    venue's bounds (proven live, testnet - see `get_liquidation_view` in
+    `carry_broker.py`) - that is "no reachable liquidation price", not zero,
+    and it is reported as such rather than coerced into a number."""
+    for key in LIQ_PRICE_ALIASES:
+        if key not in row:
+            continue
+        raw = row.get(key)
+        if raw is None or str(raw).strip() == "":
+            return {"key_found": key, "value": None,
+                    "reason": "BEYOND_VENUE_PRICE_BOUNDS_OR_EMPTY",
+                    "aliases_searched": list(LIQ_PRICE_ALIASES)}
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return {"key_found": key, "value": None,
+                    "reason": f"UNPARSEABLE:{raw!r}",
+                    "aliases_searched": list(LIQ_PRICE_ALIASES)}
+        return {"key_found": key, "value": value, "reason": "OK",
+                "aliases_searched": list(LIQ_PRICE_ALIASES)}
+    return {"key_found": None, "value": None, "reason": "ABSENT",
+            "aliases_searched": list(LIQ_PRICE_ALIASES)}
+
+
+def _dump_position_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    absent: List[str] = []
+    for key in POSITION_DUMP_KEYS:
+        if key in row and row.get(key) not in (None, ""):
+            fields[key] = row.get(key)
+        else:
+            fields[key] = None
+            absent.append(key)
+    fields["liq_price"] = _find_liq_price(row)
+    return {"fields": fields, "absent_keys": absent}
+
+
+def _dump_wallet_fields(wallet: Dict[str, Any]) -> Dict[str, Any]:
+    fields: Dict[str, Any] = {}
+    absent: List[str] = []
+    for key in WALLET_TOP_LEVEL_KEYS:
+        if key in wallet and wallet.get(key) not in (None, ""):
+            fields[key] = wallet.get(key)
+        else:
+            fields[key] = None
+            absent.append(key)
+    coins: Dict[str, Any] = {}
+    coin_rows = {str(c.get("coin", "")).upper(): c
+                for c in (wallet.get("coin") or [])}
+    for coin, keys in WALLET_COIN_KEYS.items():
+        row = coin_rows.get(coin)
+        coin_fields: Dict[str, Any] = {}
+        for key in keys:
+            value = (row or {}).get(key)
+            if row is not None and value not in (None, ""):
+                coin_fields[key] = value
+            else:
+                coin_fields[key] = None
+                absent.append(f"{coin}.{key}")
+        coins[coin] = coin_fields
+    fields["coin"] = coins
+    return {"fields": fields, "absent_keys": absent}
+
+
+def run_margin_doc(*, client: Any, notional: Optional[float] = None,
+                   out: str = "",
+                   stop_distance_fraction: float = STOP_DISTANCE_FRACTION
+                   ) -> Dict[str, Any]:
+    """Phase MARGIN-DOC. Opens + attaches a real stop (same stages as HOLD),
+    then DUMPS the venue's own position and wallet fields verbatim and
+    DERIVES a plain-language risk readout from them. Never auto-flattens -
+    mirrors HOLD's loud exit so a human can copy the numbers into
+    `LINEAR_STOP_MARGIN_MEMO.md` before running `--flatten`.
+
+    Opens its own position rather than attaching to a leftover HOLD - one
+    deterministic path, matching the drill's `flat` refusal already in place
+    for HOLD: if a position is already open (e.g. a HOLD left it there),
+    this phase refuses at `flat`. Flatten it first."""
+    import shadow
+
+    cap = float(shadow.SHADOW_MAX_NOTIONAL_USD)
+    asked = cap if notional is None else float(notional)
+    d = Drill(client=client, notional=min(asked, cap), arm=True)
+    state: Dict[str, Any] = {}
+
+    def reachability(s: Stage) -> None:
+        mark = float(client.get_last_price(SYMBOL))
+        if not mark > 0:
+            s.failed(f"last price unusable: {mark!r}")
+            return
+        state["mark"] = mark
+        s.passed(last_price=mark, venue=d.venue, category=client.category)
+
+    def auth(s: Stage) -> None:
+        wallet = client.get_wallet()
+        s.passed(auth_ok=True, account_type=wallet.get("accountType", ""))
+
+    def flat(s: Stage) -> None:
+        row = client.get_position(SYMBOL)
+        held = abs(float((row or {}).get("size", 0) or 0))
+        state["venue_perp_qty"] = held
+        if held > 0:
+            s.failed(
+                f"the venue already holds {held} on {SYMBOL}. MARGIN-DOC "
+                "opens its own position rather than attach to a leftover "
+                "one - flatten it first.", venue_perp_qty=held)
+            return
+        s.passed(venue_perp_qty=held)
+
+    def venue_rules(s: Stage) -> None:
+        filters = client.get_instrument_filters(SYMBOL, force=True)
+        state["filters"] = filters
+        s.passed(qty_step=float(filters.qty_step),
+                 min_qty=float(filters.min_qty),
+                 min_notional=float(filters.min_notional),
+                 from_exchange=filters.from_exchange)
+
+    def arm_gate(s: Stage) -> None:
+        _assert_can_arm(client.cfg)
+        s.passed()
+
+    def open_position(s: Stage) -> None:
+        filters = state["filters"]
+        qty = max(float(filters.min_qty), d.notional / state["mark"])
+        result = client.place_order(
+            symbol=SYMBOL, side="Buy", qty=qty, order_type="Market",
+            purpose="linear_margin_doc", filters=filters)
+        d.orders_sent += 1
+        if not result.ok:
+            s.failed(f"open leg not accepted: {result.reason}",
+                     reason=result.reason, order_link_id=result.order_link_id)
+            return
+        row = client.get_position(SYMBOL)
+        size = abs(float((row or {}).get("size", 0) or 0))
+        if size <= 0:
+            s.failed(
+                "order accepted but the venue reports no position "
+                "afterward; whether it filled is unknown",
+                order_link_id=result.order_link_id)
+            return
+        state["position_size"] = size
+        state["entry_order_link_id"] = result.order_link_id
+        s.passed(order_link_id=result.order_link_id,
+                 filled_size=size, avg_price=(row or {}).get("avgPrice"))
+
+    def attach(s: Stage) -> None:
+        mark = state["mark"]
+        trigger = mark * (1.0 - stop_distance_fraction)
+        result = client.place_stop_order(
+            symbol=SYMBOL, side="Sell", qty=state["position_size"],
+            trigger_price=trigger, filters=state["filters"])
+        if not result.ok:
+            s.failed(f"trading-stop not accepted: {result.reason}",
+                     reason=result.reason, trigger_price=trigger)
+            return
+        state["stop_order_link_id"] = result.order_link_id
+        state["stop_price"] = trigger
+        s.passed(order_link_id=result.order_link_id, trigger_price=trigger,
+                 mechanism=(result.raw or {}).get("mechanism", ""))
+
+    def verify(s: Stage) -> None:
+        live, detail = client.verify_stop(
+            symbol=SYMBOL, order_link_id=state["stop_order_link_id"])
+        if not live:
+            s.failed(f"verify_stop reports live=False: {detail}",
+                     live=live, detail=detail)
+            return
+        s.passed(live=live, detail=detail,
+                 endpoint="GET /v5/position/list (stopLoss field)")
+
+    def dump(s: Stage) -> None:
+        row = client.get_position(SYMBOL) or {}
+        wallet = client.get_wallet()
+        position_dump = _dump_position_fields(row)
+        wallet_dump = _dump_wallet_fields(wallet)
+        state["position_dump"] = position_dump
+        state["wallet_dump"] = wallet_dump
+        s.passed(position=position_dump["fields"],
+                 position_absent_keys=position_dump["absent_keys"],
+                 wallet=wallet_dump["fields"],
+                 wallet_absent_keys=wallet_dump["absent_keys"])
+
+    def derive(s: Stage) -> None:
+        pos = state["position_dump"]["fields"]
+        entry = float(pos.get("avgPrice") or state.get("entry_avg_price")
+                     or state["mark"])
+        mark = float(pos.get("markPrice") or state["mark"])
+        size = float(pos.get("size") or state["position_size"])
+        stop_price = pos.get("stopLoss")
+        stop_price = float(stop_price) if stop_price not in (None, "") else None
+        liq_info = pos["liq_price"]
+        liq_price = liq_info["value"]
+
+        notional = size * mark
+        stop_distance_abs = (abs(entry - stop_price)
+                            if stop_price is not None else None)
+        stop_distance_pct = (stop_distance_abs / entry * 100.0
+                            if stop_distance_abs is not None and entry > 0
+                            else None)
+        liq_distance_abs = (abs(entry - liq_price)
+                           if liq_price is not None else None)
+        liq_distance_pct = (liq_distance_abs / entry * 100.0
+                           if liq_distance_abs is not None and entry > 0
+                           else None)
+
+        if stop_distance_abs is None or liq_distance_abs is None:
+            nearer = "unknown"
+        elif stop_distance_abs < liq_distance_abs:
+            nearer = "stop"
+        elif liq_distance_abs < stop_distance_abs:
+            nearer = "liq"
+        else:
+            nearer = "tied"
+
+        im_raw = pos.get("positionIM")
+        mm_raw = pos.get("positionMM")
+        im_usd = float(im_raw) if im_raw not in (None, "") else None
+        mm_usd = float(mm_raw) if mm_raw not in (None, "") else None
+
+        min_qty = float(state["filters"].min_qty)
+        min_lot_notional = min_qty * mark
+        at_cap = {
+            "cap_usd": cap,
+            "notional_usd": notional,
+            "notional_at_or_above_cap": notional >= cap,
+            "min_lot_notional_usd": min_lot_notional,
+            "min_lot_at_or_above_cap": min_lot_notional >= cap,
+        }
+
+        if nearer == "stop":
+            risk_line = ("the protective stop is nearer than liquidation - "
+                        "the stop should fire first if the market moves "
+                        "against the position")
+        elif nearer == "liq":
+            risk_line = ("LIQUIDATION IS NEARER THAN THE STOP - the venue "
+                        "would liquidate before the protective stop could "
+                        "fire. This is the finding Item 4 exists to catch.")
+        elif nearer == "tied":
+            risk_line = "stop and liquidation are equidistant from entry"
+        else:
+            risk_line = ("nearer is UNKNOWN - stop and/or liquidation price "
+                        "could not be read; do not assume either is safe")
+
+        derived = {
+            "computed": True,
+            "stop_distance_reference": "avgPrice (entry)",
+            "entry_price": entry,
+            "mark_price": mark,
+            "mark_price_source": ("position.markPrice" if pos.get("markPrice")
+                                  else "get_last_price (markPrice absent)"),
+            "notional_usd": notional,
+            "stop_price": stop_price,
+            "stop_distance_abs": stop_distance_abs,
+            "stop_distance_pct": stop_distance_pct,
+            "liq_price": liq_price,
+            "liq_price_reason": liq_info["reason"],
+            "liq_distance_abs": liq_distance_abs,
+            "liq_distance_pct": liq_distance_pct,
+            "nearer": nearer,
+            "im_usd": im_usd,
+            "mm_usd": mm_usd,
+            "at_cap": at_cap,
+            "risk_line": risk_line,
+        }
+        state["derived"] = derived
+        s.passed(**derived)
+
+    for name, fn in (("reachability", reachability), ("auth", auth),
+                     ("flat", flat), ("venue_rules", venue_rules),
+                     ("arm_gate", arm_gate), ("open", open_position),
+                     ("attach", attach), ("verify", verify),
+                     ("dump", dump), ("derive", derive)):
+        if not d.run_stage(name, fn):
+            return _report_item4(d, state, out, cap, verdict="FAILED")
+
+    d.still_open = True
+    return _report_item4(d, state, out, cap, verdict="DOCUMENTED")
+
+
+def _report_item4(d: Drill, state: Dict[str, Any], out: str, cap: float,
+                  *, verdict: str) -> Dict[str, Any]:
+    evidence = {s.name: s.evidence for s in d.stages}
+    if verdict == "DOCUMENTED":
+        action = (
+            "DOCUMENTED. POSITION STILL OPEN — copy the `dump`/`derive` "
+            "evidence into docs/promotion/LINEAR_STOP_MARGIN_MEMO.md now, "
+            "then RUN --flatten NEXT. Nothing automated will close this "
+            "position. A human still fills the checklist's observed: line "
+            "and the memo's sign-off - this tool signs nothing."
+        )
+    else:
+        action = (f"the drill stopped at {d.failed_stage!r}; nothing is "
+                  "documented. Fix what the stage reports and run it again.")
+    report = {
+        "tool": "linear_stop_venue_drill",
+        "checklist_item": "linear_protective_stop_verified (Item 4 of 4)",
+        "phase": "MARGIN_DOC",
+        "verdict": verdict,
+        "venue": d.venue,
+        "armed": bool(d.arm),
+        "failed_stage": d.failed_stage,
+        "still_open": d.still_open,
+        "next_action": action,
+        "notional_usd": d.notional,
+        "cap_usd": cap,
+        "orders_sent": d.orders_sent,
+        "stages": [s.as_dict() for s in d.stages],
+        "evidence": evidence,
+        "memo_path": "bot/docs/promotion/LINEAR_STOP_MARGIN_MEMO.md",
+        "simulator_disclaimer": (
+            "The linear simulator's liquidation formula "
+            "(cash + dir*S*(p-E) <= mmr*S*p, backtest.py) is CONTEXT ONLY. "
+            "It is not evidence about this venue's own position/wallet "
+            "fields, which is what Item 4 and this transcript answer."
+        ),
+        "not_proven": list(NOT_PROVEN),
+        "finished_ms": int(time.time() * 1000),
+    }
+    _dump(report, out)
+    return report
+
+
 def _scratch_state_db() -> str:
     """A throwaway `StateStore` path. Same reasoning as `drill.py`'s own
     helper: never the committed fixture, never the running book's database.
@@ -1122,6 +1498,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                             "TradingEngine.check_naked_positions() - the one "
                             "cycle. Must end REPROTECTED or FLATTENED; fails "
                             "closed if still naked.")
+    phase.add_argument("--margin-doc", action="store_true", dest="margin_doc",
+                       help="Item 4: open + attach a real stop, then DUMP the "
+                            "venue's own position/wallet fields verbatim and "
+                            "DERIVE stop-vs-liq distance and at-cap notional. "
+                            "Never auto-flattens - run --flatten next. "
+                            "Implies --arm.")
     ap.add_argument("--notional", type=float, default=None)
     ap.add_argument("--out", default="")
     ap.add_argument("--state-db", dest="state_db",
@@ -1149,7 +1531,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               file=sys.stderr)
         return 2
 
-    arming = args.arm or args.hold or args.flatten or args.induce_naked
+    arming = (args.arm or args.hold or args.flatten or args.induce_naked
+             or args.margin_doc)
     if arming:
         try:
             _assert_can_arm(cfg)
@@ -1176,6 +1559,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 induce_ms = None
         report = run_observe_naked(engine=engine, out=args.out,
                                    induce_finished_ms=induce_ms)
+    elif args.margin_doc:
+        report = run_margin_doc(client=client, notional=args.notional,
+                                out=args.out)
     else:
         report = run_drill(client=client, notional=args.notional, arm=args.arm,
                            out=args.out)
@@ -1207,6 +1593,11 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"(pid={os.getpid()}). <<<")
         print(f"  >>> A human must now run --observe-naked --state-db "
               f"{args.state_db} from a NEW process. <<<")
+    if report["verdict"] == "DOCUMENTED":
+        print(f"\n  >>> POSITION STILL OPEN on the venue (pid={os.getpid()}). "
+              "<<<")
+        print(f"  >>> Copy dump/derive into {report['memo_path']}, then "
+              "RUN --flatten NEXT. <<<")
     print("\n  WHAT A PASS STILL DOES NOT ESTABLISH")
     for line in report["not_proven"]:
         print(f"    - {line}")
@@ -1214,7 +1605,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"\n  transcript: {args.out}")
     return 0 if report["verdict"] in (
         "PASSED", "PREFLIGHT_ONLY", "HOLD", "VERIFIED", "FLATTENED",
-        "ALREADY_FLAT", "NAKED", "REPROTECTED") else 1
+        "ALREADY_FLAT", "NAKED", "REPROTECTED", "DOCUMENTED") else 1
 
 
 if __name__ == "__main__":
