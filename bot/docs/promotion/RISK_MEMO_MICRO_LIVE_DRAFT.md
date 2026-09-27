@@ -120,33 +120,35 @@ Choose one, and initial it:
 ```
 
 > **Moving the M-4 threshold is not one of the options and never will be.**
+[ ] ACCEPTED. I have read the decay and consider it tolerable for a
+100 USD pilot, for the following reason:
+____________________________________________________________
+initials: ____
 
-*(Both boxes left unticked by the drafter. This is the decision the memo exists
-to make; an agent ticking either would be the forgery this document warns
-about.)*
+[x] NOT ACCEPTED. Micro-live is not proposed until the recent half
+recovers under the UNCHANGED threshold on forward data.
+Reason: forward M-4 is INSUFFICIENT_DATA at 4/20 closed trades
+(48/180 bars); historical WARN is not a substitute. Keep accruing
+Stage B under unchanged M-4; do not wave through.
+initials: VC
 
-> **Note, factual only — not a decision:** human decision pending. Professional
-> path: leave NOT ACCEPTED until the forward sample supports M-4 under the
-> UNCHANGED threshold; do not accept the historical WARN via a forged agent
-> tick while forward reads 4/20. Forward M-4 itself is still
-> `INSUFFICIENT_DATA` (needs 20 closed trades, has 4) — there is no forward
-> M-4 reading to accept or reject yet, only the historical one above.
+
+> **Recorded 2026-09-27:** NOT ACCEPTED by Vincenzo Ceccarelli. Professional
+> path held: no agent forgery; no threshold move; wait for forward sample ≥20
+> under the unchanged rule before any ACCEPTED reconsideration.
 
 ## 5. Revoke conditions — state them before, not after
 
 The clear is withdrawn by a human calling `shadow.revoke_cleared_edge` with the
 literal `HUMAN_REVOKED_CLEARED_EDGE`. Nothing auto-revokes.
 
-```
-I will revoke if:
-  - rolling mean net R over 10 closed trades falls below : ______  (policy: ALERT at -0.25)
-  - cumulative forward trades reach ______ with mean net R below ______
-  - any of the following qualitative conditions:
-    ____________________________________________________________
-```
 
-*(Left blank. These are thresholds a human commits to in advance; a drafted
-default would become the commitment by accident.)*
+I will revoke if:
+
+rolling mean net R over 10 closed trades falls below : -0.25 (policy: ALERT at -0.25)
+cumulative forward trades reach 20 with mean net R below 0.0
+any of the following qualitative conditions: kill-switch trip; venue stop Item 1–4 evidence invalidated; allows_live forged; unexplained desync between checklist and gate JSON; mainnet without a separate signed memo; USDT margin / liq unknown worse than documented; any order outside testnet $100 shadow cap.
+
 
 ## 6. What signing does and does not authorise
 
