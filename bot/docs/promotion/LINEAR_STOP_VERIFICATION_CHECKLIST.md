@@ -125,32 +125,30 @@ recorded:
          Memo: docs/promotion/LINEAR_STOP_MARGIN_MEMO.md (filled same numbers).
 ```
 
-## The simulator gap — say which of the two was done
+B) In “The simulator gap”, replace the NOTE under the first [x] and tick the second box:
 
-```
 [x] the linear simulator was extended to model margin/funding/liquidation,
     and the extension is tested
         path to the work: backtest.LinearSimulatedExchange
                           bot/tests/test_linear_simulator.py (25 tests)
-    NOTE: this box is an ENGINEERING fact and it does not sign anything off.
-    Venue Item 1 is separately recorded above; Items 2–4 and the signature
-    block below are still open / blank.
+    NOTE: engineering fact only. Venue Items 1–4 are separately recorded above.
 
-[ ] OR micro-live proceeds on TESTNET only, with the simulator gap accepted
+[x] OR micro-live proceeds on TESTNET only, with the simulator gap accepted
     in writing, and the memo says so explicitly
-        memo section: ______________________
-```
+        memo section: docs/promotion/LINEAR_STOP_MARGIN_MEMO.md §5
+                      + this checklist Sign-off (2026-09-27)
 
-> Choosing neither is not an option. An unverified stop path on the instrument
-> the signal trades is the failure mode that turns a 100 USD pilot into an
-> unbounded one. Item 1 closes the “is a stop on the venue and readable?”
-> question only.
+C) Sign-off:
 
-## Sign-off
-
-```
-Verified by         : ______________________  date: __________
+Verified by         : Vincenzo Ceccarelli  date: 2026-09-27
 Reviewed by         : ______________________  date: __________
 Evidence log path   : bot/artifacts/linear_protective_stop_venue.json
-                      (Item 1 only; Items 2–4 not yet evidenced)
+                      bot/artifacts/linear_stop_hold.json
+                      bot/artifacts/linear_stop_verify_after_restart.json
+                      bot/artifacts/linear_stop_flatten.json
+                      bot/artifacts/linear_stop_naked_induce.json
+                      bot/artifacts/linear_stop_naked_observe.json
+                      bot/artifacts/linear_stop_naked_flatten.json
+                      bot/artifacts/linear_stop_margin_doc.json
+                      bot/docs/promotion/LINEAR_STOP_MARGIN_MEMO.md
 ```
