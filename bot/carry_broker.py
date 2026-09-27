@@ -215,7 +215,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": product, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = (result or {}).get("result", {}).get("list") or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol} on {product}")
         row = rows[0]
@@ -376,7 +376,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = (result or {}).get("result", {}).get("list") or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol}")
         mark = float(rows[0].get("markPrice", 0) or 0)
@@ -395,7 +395,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": SPOT, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = (result or {}).get("result", {}).get("list") or []
         if not rows:
             raise PairIncident(f"no spot ticker for {symbol}")
         price = float(rows[0].get("lastPrice", 0) or 0)
@@ -417,7 +417,7 @@ class CarryBroker:
         result = self.client._request(
             "GET", "/v5/market/tickers",
             params={"category": LINEAR, "symbol": symbol})
-        rows = (result or {}).get("list") or []
+        rows = (result or {}).get("result", {}).get("list") or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol}; funding unknown")
         raw = rows[0].get("fundingRate")
