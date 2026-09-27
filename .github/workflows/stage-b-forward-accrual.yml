@@ -1,0 +1,55 @@
+name: stage-b-forward-accrual
+
+on:
+  schedule:
+    # 00:07 UTC — after Binance daily close
+    - cron: "7 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: stage-b-forward-accrual
+  cancel-in-progress: false
+
+jobs:
+  accrue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install -U pip
+          .venv/bin/pip install -r bot/requirements.txt
+
+      - name: Accrue (corpora + scratch only — never promote)
+        working-directory: bot
+        run: bash scripts/stage_b_forward_accrual.sh
+
+      - name: Commit corpus tip if dirty
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            bot/data/real_funding \
+            bot/data/real_funding_full \
+            bot/data/real_linear_1d \
+            bot/data/real_linear_1d_full \
+            bot/data/real_spot_btc \
+            bot/data/real_spot_full \
+            bot/artifacts/data_read_ledger.json 2>/dev/null || true
+          # Never commit scratch state or shadow/gate — human promote only
+          if git diff --cached --quiet; then
+            echo "No corpus tip changes."
+          else
+            git commit -m "ci: Stage B corpus tip accrual (no promote)"
+            git push origin HEAD:main
+          fi
