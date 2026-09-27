@@ -228,6 +228,46 @@ class TestItNeverForgesTheGate:
             assert banned not in body
 
 
+class TestLoadClientReadsTheRealEnvironment:
+    """The live bug: `config.load({})` treats a non-None mapping as the
+    ONLY env source, so `{}` means zero env vars regardless of what the
+    shell actually exports - BYBIT_API_SECRET always empty ("cannot sign:
+    no API secret configured") and CATEGORY always "spot" even with
+    CATEGORY=linear exported. `_load_client` must call `config.load()`
+    with no argument (or `None`), which reads the real `os.environ`."""
+
+    def test_load_client_never_calls_load_with_an_empty_mapping(self):
+        import ast
+        path = os.path.join(os.path.dirname(__file__), "..", "tools",
+                            "linear_stop_venue_drill.py")
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+        target = next(n for n in ast.walk(tree)
+                      if isinstance(n, ast.FunctionDef) and n.name == "_load_client")
+        for node in ast.walk(target):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "load"):
+                assert not node.args, (
+                    "_load_client must call config.load() with no argument, "
+                    "not an empty mapping - {} silently discards os.environ")
+
+    def test_load_client_sees_the_real_environment(self, monkeypatch):
+        monkeypatch.setenv("BYBIT_VENUE", "testnet")
+        monkeypatch.setenv("PAPER_TRADING", "0")
+        monkeypatch.setenv("CATEGORY", "linear")
+        monkeypatch.setenv("BYBIT_API_KEY", "k" * 18)
+        monkeypatch.setenv("BYBIT_API_SECRET", "s" * 36)
+
+        client, cfg = D._load_client()
+
+        assert cfg.BYBIT_API_SECRET == "s" * 36
+        assert cfg.CATEGORY == "linear"
+        assert client.category == "linear"
+        assert client.is_linear is True
+        assert client.api_secret == "s" * 36
+
+
 # ---------------------------------------------------------------------------
 # against the real BybitClient + the real linear simulator - not only a fake
 # ---------------------------------------------------------------------------

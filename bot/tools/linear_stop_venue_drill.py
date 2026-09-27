@@ -360,7 +360,13 @@ def _load_client():
     from bybit_connection import BybitClient
     from persistence import StateStore
 
-    cfg = _config.load({})
+    # `config.load(env)` treats a non-None mapping as the ONLY env source
+    # (`env = os.environ if env is None else env`) - passing `{}` means zero
+    # env vars, silently: BYBIT_API_SECRET always empty ("cannot sign: no API
+    # secret configured") and CATEGORY always defaults to "spot" regardless
+    # of what the shell actually exports. Omitting the argument reads the
+    # real os.environ, same as every other caller of this loader.
+    cfg = _config.load()
     store = StateStore(_scratch_state_db())
     client = BybitClient(config=cfg, store=store)
     return client, cfg
