@@ -60,10 +60,15 @@ class Store:
 class Broker:
     """Counts reads so a test can prove the cycle takes ONE view."""
 
-    def __init__(self, *, mark=100_000.0, funding=3.0, margin=5.0, spot=None):
+    def __init__(self, *, mark=100_000.0, funding=3.0, margin=5.0, spot=None,
+                 held=1.0):
         self.mark, self.funding, self.margin = mark, funding, margin
         self.spot = mark if spot is None else spot
         self.orders = []
+        # Nonzero by default so existing fixtures keep exercising
+        # get_margin_multiple exactly as before (margin is undefined and
+        # skipped only while genuinely flat - see market_snapshot.take_snapshot).
+        self.held = held
         self.reads = {"mark": 0, "spot": 0, "funding": 0, "margin": 0,
                       "print": 0}
 
@@ -78,6 +83,9 @@ class Broker:
     def get_funding_bps(self, s):
         self.reads["funding"] += 1
         return self.funding
+
+    def get_perp_position(self, s):
+        return self.held
 
     def get_margin_multiple(self, s):
         self.reads["margin"] += 1

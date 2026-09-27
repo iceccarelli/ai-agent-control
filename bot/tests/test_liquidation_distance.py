@@ -308,6 +308,22 @@ class TestTheBrokerReadsTheRightFields:
         assert view["size"] == 0.0
         assert view["distance_pct"] is None
 
+    def test_a_present_but_zero_size_row_is_still_no_position(self):
+        """Bybit returns a position/list row even while flat - size "0",
+        liqPrice "" - not only an empty `list` (proven live, Bybit testnet).
+        Without this, the empty liqPrice would read as
+        BEYOND_VENUE_PRICE_BOUNDS, a claim about a position that does not
+        exist."""
+        c = self.Client(
+            position={"list": [{"size": "0", "side": "", "markPrice": "100000",
+                                "liqPrice": ""}]},
+            wallet={"list": [{"accountMMRate": "0"}]})
+        view = self.broker(c).get_liquidation_view("BTCUSDT")
+        assert view["size"] == 0.0
+        assert view["reason"] == "NO_POSITION"
+        assert view["liq_price"] is None
+        assert view["distance_pct"] is None
+
     def test_an_unreadable_position_raises(self):
         from carry_broker import PairIncident
         c = self.Client(position={}, wallet={"list": []})

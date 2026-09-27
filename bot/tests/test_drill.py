@@ -161,11 +161,18 @@ class TestItRefusesBeforeItRisksAnything:
         assert report["verdict"] == "FAILED"
         assert report["failed_stage"] == "inventory"
 
-    def test_thin_margin_stops_before_any_order(self):
-        report = run(Venue(margin=1.1))
-        assert report["verdict"] == "FAILED"
-        assert report["failed_stage"] == "margin"
-        assert report["orders_sent"] == 0
+    def test_a_thin_margin_while_flat_does_not_stop_the_drill(self):
+        """The landmine this fixes: positionIM/positionMM is undefined while
+        flat (INVENTORY F4), not a floor `margin` can fail on. `flat` gates
+        every real preflight run to venue_perp_qty == 0, so a "thin margin"
+        reading at that point is not evidence of anything - the ratio does
+        not exist yet, and the drill must not stop here reporting a number
+        that means nothing."""
+        report = run(Venue(margin=1.1), arm=False)
+        assert report["verdict"] == "PREFLIGHT_ONLY"
+        margin_evidence = report["evidence"]["margin"]
+        assert margin_evidence["margin_multiple"] is None
+        assert margin_evidence["reason"] == "NO_POSITION"
 
     def test_a_position_already_at_the_venue_stops_it(self):
         """A drill that opens on top of something already there is not a
@@ -174,6 +181,66 @@ class TestItRefusesBeforeItRisksAnything:
         assert report["verdict"] == "FAILED"
         assert report["failed_stage"] == "flat"
         assert report["orders_sent"] == 0
+
+
+class TestMarginStageEvidenceBothBranches:
+    """`margin_stage_evidence` directly - the size>0 branch has no way to be
+    exercised through the full drill sequence, because `flat` gates every
+    real run to venue_perp_qty == 0 by design. This is the only place the
+    "a position genuinely exists" contract (INVENTORY F4's fail-closed
+    floor, unchanged) is actually driven."""
+
+    def test_flat_passes_without_ever_calling_the_broker(self):
+        class BoomIfCalled:
+            def get_margin_multiple(self, symbol):
+                raise AssertionError("must not be called while flat")
+
+        ok, evidence, why = D.margin_stage_evidence(
+            broker=BoomIfCalled(), symbol="BTCUSDT", venue_perp_qty=0.0,
+            min_margin_multiple=2.0)
+        assert ok is True
+        assert evidence["margin_multiple"] is None
+        assert evidence["reason"] == "NO_POSITION"
+        assert why == ""
+
+    def test_a_healthy_margin_on_a_held_position_passes(self):
+        class Healthy:
+            def get_margin_multiple(self, symbol):
+                return 5.0
+
+        ok, evidence, why = D.margin_stage_evidence(
+            broker=Healthy(), symbol="BTCUSDT", venue_perp_qty=0.001,
+            min_margin_multiple=2.0)
+        assert ok is True
+        assert evidence["margin_multiple"] == pytest.approx(5.0)
+        assert evidence["floor"] == pytest.approx(2.0)
+
+    def test_a_thin_margin_on_a_held_position_fails(self):
+        class Thin:
+            def get_margin_multiple(self, symbol):
+                return 1.1
+
+        ok, evidence, why = D.margin_stage_evidence(
+            broker=Thin(), symbol="BTCUSDT", venue_perp_qty=0.001,
+            min_margin_multiple=2.0)
+        assert ok is False
+        assert evidence["margin_multiple"] == pytest.approx(1.1)
+        assert "below the 2.0 floor" in why
+
+    def test_an_unreadable_margin_on_a_held_position_still_propagates(self):
+        """MM=0 on a live size is a genuine anomaly (carry_broker.py's own
+        wording) - fail-closed is unchanged the moment a position exists."""
+        class Unreadable:
+            def get_margin_multiple(self, symbol):
+                raise RuntimeError(
+                    "maintenance margin for BTCUSDT is 0.0 (position size "
+                    "0.001); refusing to compute headroom from a zero "
+                    "denominator")
+
+        with pytest.raises(RuntimeError):
+            D.margin_stage_evidence(
+                broker=Unreadable(), symbol="BTCUSDT", venue_perp_qty=0.001,
+                min_margin_multiple=2.0)
 
 
 class TestWithoutArmItSendsNothing:

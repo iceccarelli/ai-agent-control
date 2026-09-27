@@ -86,6 +86,41 @@ NOT_PROVEN = [
 ]
 
 
+def margin_stage_evidence(*, broker: Any, symbol: str, venue_perp_qty: float,
+                          min_margin_multiple: float
+                          ) -> tuple[bool, Dict[str, Any], str]:
+    """The `margin` preflight stage's decision, pulled out to a pure
+    function so both branches are directly testable — the full drill
+    sequence can only ever reach this stage while `flat` (venue_perp_qty ==
+    0, by the preflight's own design), so the size>0 branch below has no
+    other way to be exercised.
+
+    Returns `(ok, evidence, why)`. `why` is only meaningful when `ok` is
+    False. Never catches an exception from `get_margin_multiple` itself:
+    when a position genuinely exists, an unreadable margin must still
+    propagate exactly as it always has (INVENTORY F4's fail-closed contract
+    is unchanged; this function only decides WHETHER to ask).
+    """
+    if venue_perp_qty <= 0:
+        return True, {
+            "margin_multiple": None, "reason": "NO_POSITION",
+            "note": "positionIM/positionMM is undefined while flat "
+                    "(INVENTORY F4); margin/liquidation evidence is "
+                    "gathered AFTER open at ~$100 notional (Part 1 item 4), "
+                    "not required by preflight",
+        }, ""
+    multiple = float(broker.get_margin_multiple(symbol))
+    if multiple < min_margin_multiple:
+        return False, {"margin_multiple": multiple}, (
+            f"margin multiple {multiple} is below the "
+            f"{min_margin_multiple} floor")
+    return True, {
+        "margin_multiple": multiple, "floor": min_margin_multiple,
+        "note": "positionIM/positionMM — a risk-tier ratio, NOT liquidation "
+                "headroom (INVENTORY F4)",
+    }, ""
+
+
 class Stage:
     """One step. Records what the venue said, not that it was asked."""
 
@@ -168,6 +203,9 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
 
     def flat(s: Stage) -> None:
         held = abs(float(broker.get_perp_position(PERP_SYMBOL)))
+        # The one source of truth for "is anything open" - `margin` below
+        # reads this instead of asking the venue a second, contradictory way.
+        state["venue_perp_qty"] = held
         orders = list(broker.get_open_carry_orders(SPOT_SYMBOL, PERP_SYMBOL))
         if held > 0 or orders:
             s.failed(
@@ -231,15 +269,24 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                  oldest_ms=prints[0][1])
 
     def margin(s: Stage) -> None:
+        """positionIM/positionMM is a ratio on an OPEN position (INVENTORY
+        F4) - it does not exist while flat, and Bybit says so by returning a
+        position row with positionIM=0/positionMM=0 (proven live, Bybit
+        testnet), not by omitting the row. That is not a wallet fault or a
+        second envelope bug; it is the venue correctly reporting nothing to
+        compute a ratio about. `flat` already established whether anything
+        is open — reused here rather than asked a second, contradictory way
+        — so this stage only calls the broker at all once a position exists.
+        """
         from carry_engine import MIN_MARGIN_MULTIPLE
-        multiple = float(broker.get_margin_multiple(PERP_SYMBOL))
-        if multiple < MIN_MARGIN_MULTIPLE:
-            s.failed(f"margin multiple {multiple} is below the "
-                     f"{MIN_MARGIN_MULTIPLE} floor", margin_multiple=multiple)
-            return
-        s.passed(margin_multiple=multiple, floor=MIN_MARGIN_MULTIPLE,
-                 note="positionIM/positionMM — a risk-tier ratio, NOT "
-                      "liquidation headroom (INVENTORY F4)")
+        ok, evidence, why = margin_stage_evidence(
+            broker=broker, symbol=PERP_SYMBOL,
+            venue_perp_qty=state["venue_perp_qty"],
+            min_margin_multiple=MIN_MARGIN_MULTIPLE)
+        if ok:
+            s.passed(**evidence)
+        else:
+            s.failed(why, **evidence)
 
     def cap_check(s: Stage) -> None:
         if d.notional > cap:

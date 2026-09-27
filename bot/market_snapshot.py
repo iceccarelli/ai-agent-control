@@ -79,7 +79,12 @@ class MarketSnapshot:
     perp_mark: float
     spot_mark: float
     funding_bps: float
-    margin_multiple: float
+    #: `None` while flat - positionIM/positionMM is a ratio on an OPEN
+    #: position (INVENTORY F4) and is genuinely undefined before the first
+    #: fill, not unreadable. `take_snapshot` checks position size before
+    #: deciding whether to read it at all, the same way
+    #: `CarryEngine._margin_multiple` already tolerates its absence pre-open.
+    margin_multiple: Optional[float]
     observed_at_s: float
     venue_time_s: Optional[float] = None
     detail: Dict[str, Any] = field(default_factory=dict)
@@ -112,11 +117,19 @@ class MarketSnapshot:
         forget to read, and the whole point of this check is that the caller
         must not be able to trade past it.
         """
-        for name in ("perp_mark", "spot_mark", "margin_multiple"):
+        for name in ("perp_mark", "spot_mark"):
             value = getattr(self, name)
             if not (isinstance(value, (int, float)) and math.isfinite(value)
                     and value > 0):
                 raise StaleMarket(f"{name} is {value!r}")
+        # `None` means flat - nothing to check yet (see the field's own
+        # docstring). A position DOES exist the moment this is anything else,
+        # and then it must be a usable positive ratio like every other field.
+        if self.margin_multiple is not None:
+            if not (isinstance(self.margin_multiple, (int, float))
+                    and math.isfinite(self.margin_multiple)
+                    and self.margin_multiple > 0):
+                raise StaleMarket(f"margin_multiple is {self.margin_multiple!r}")
         if not math.isfinite(self.funding_bps):
             raise StaleMarket(f"funding_bps is {self.funding_bps!r}")
 
@@ -176,7 +189,15 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     # Called directly, never through getattr: a broker that cannot say what was
     # actually settled cannot snapshot (0034).
     print_bps, print_ms = broker.get_funding_print(perp_symbol)
-    margin = float(broker.get_margin_multiple(perp_symbol))
+    # Margin headroom is a ratio on an OPEN position (INVENTORY F4) - checking
+    # size first (the same read get_perp_position always is, the single
+    # source of truth for "is anything open") is what tells "nothing to
+    # measure yet" apart from "the venue would not say". Only the second one
+    # still raises: get_margin_multiple below is UNCHANGED and UNWRAPPED when
+    # a position exists, so an unreadable margin on a live position still
+    # propagates exactly as before.
+    held = abs(float(broker.get_perp_position(perp_symbol)))
+    margin = float(broker.get_margin_multiple(perp_symbol)) if held > 0 else None
 
     venue_time = None
     getter = getattr(broker, "get_venue_time_s", None)

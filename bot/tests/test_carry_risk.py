@@ -111,6 +111,19 @@ class TestFreshnessIsDelegated:
                              has_open_pair=False)
         assert d.reason == "MARGIN_HEADROOM_TOO_THIN"
 
+    def test_an_undefined_margin_while_flat_does_not_block_the_first_open(self):
+        """The landmine this fixes: positionIM/positionMM is undefined pre-
+        open (INVENTORY F4), not a floor this gate can check yet.
+        `snapshot.margin_multiple` is `None` for exactly this reason (see
+        `market_snapshot.take_snapshot`), and this gate must agree with
+        `CarryEngine`'s own pre-open check rather than crash on `float(None)`
+        or treat the missing ratio as zero, which would refuse every
+        first-ever open forever."""
+        d = risk().gate_open(notional_usd=100.0, snapshot=snap(margin_multiple=None),
+                             has_open_pair=False)
+        assert d.reason == "PAIR_APPROVED"
+        assert d.detail["margin_multiple"] is None
+
     def test_the_gate_is_not_looser_than_the_engine(self):
         from carry_engine import MIN_MARGIN_MULTIPLE as engine_floor
         import carry_risk

@@ -356,6 +356,9 @@ class _SnapBroker:
     def get_funding_print(self, s):
         return (-1.0, self.stamp_ms)   # the SETTLED print
 
+    def get_perp_position(self, s):
+        return 0.0
+
     def get_margin_multiple(self, s):
         return 5.0
 
