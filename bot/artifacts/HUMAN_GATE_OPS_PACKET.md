@@ -36,7 +36,7 @@ Full detail, evidence paths, and the exact Bybit endpoints for each item are
 in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
 
 ```
-[ ] 1. PLACE and READ BACK
+[x] 1. PLACE and READ BACK
        # NOT tools/drill.py - that drills the CARRY book (paired spot+linear
        # legs) and never calls place_stop_order/verify_stop at all. Its
        # transcript (artifacts/linear_stop_drill.json) is real Phase D carry
@@ -46,9 +46,10 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
            --out artifacts/linear_protective_stop_venue.json
        # verify_stop's call IS the tool's `verify` stage; read the
        # transcript's verdict (must be PASSED), not a grep for "live=True"
-       observed: ______________________________________________
+       observed: 2026-09-27, tip 2c84e89, verdict=PASSED - see
+         LINEAR_STOP_VERIFICATION_CHECKLIST.md item 1 for the full transcript
 
-[ ] 2. SURVIVES a restart
+[x] 2. SURVIVES a restart
        # NOT tools/session_tail.py - that is a read-only gate-invariant
        # checker (allows_live/FUND_ABS/cap/LIVE_AUTHORIZED); it never calls
        # verify_stop or reads a position's stop fields.
@@ -62,9 +63,10 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
        # verdict must be VERIFIED. Then required cleanup:
        python3 tools/linear_stop_venue_drill.py --flatten \
            --out artifacts/linear_stop_restart_flatten.json
-       observed: ______________________________________________
+       observed: 2026-09-27, tip 228fb87, verdict=VERIFIED - see
+         LINEAR_STOP_VERIFICATION_CHECKLIST.md item 2 for the full transcript
 
-[ ] 3. NAKED position detected within one cycle
+[x] 3. NAKED position detected within one cycle
        # NOT tools/drill.py (carry drill, no stop mechanism) and NOT
        # tools/session_tail.py (read-only, never reads a position's stop).
        python3 tools/linear_stop_venue_drill.py --induce-naked --notional 100 \
@@ -79,9 +81,10 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
        # cleanup if still open:
        python3 tools/linear_stop_venue_drill.py --flatten \
            --out artifacts/linear_stop_naked_flatten.json
-       observed: ______________________________________________
+       observed: 2026-09-27, tip b10cfc7, verdict=REPROTECTED - see
+         LINEAR_STOP_VERIFICATION_CHECKLIST.md item 3 for the full transcript
 
-[ ] 4. Margin/liquidation at the proposed notional, BTCUSDT linear, documented
+[x] 4. Margin/liquidation at the proposed notional, BTCUSDT linear, documented
        # NOT tools/drill.py or tools/session_tail.py - neither reads a
        # position's margin/liquidation fields. NOT the simulator formula
        # (cash + dir*S*(p-E) <= mmr*S*p) - context only, not venue truth.
@@ -92,26 +95,43 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
        # docs/promotion/LINEAR_STOP_MARGIN_MEMO.md, THEN:
        python3 tools/linear_stop_venue_drill.py --flatten \
            --out artifacts/linear_stop_margin_doc_flatten.json
-       observed: ______________________________________________
+       observed: 2026-09-27, tip b8dcd84, verdict=DOCUMENTED - filled memo
+         docs/promotion/LINEAR_STOP_MARGIN_MEMO.md; see
+         LINEAR_STOP_VERIFICATION_CHECKLIST.md item 4 for the full transcript
 ```
 
-Then in `LINEAR_STOP_VERIFICATION_CHECKLIST.md`, tick exactly one:
+All four venue items above are ticked from `LINEAR_STOP_VERIFICATION_CHECKLIST.md`'s
+own `[x]` marks and its Sign-off block (Verified by Vincenzo Ceccarelli,
+2026-09-27) — this packet only points at that evidence, it does not restate
+or re-verify it. **The gate JSON itself
+(`artifacts/slice59_promotion_gate.json`'s `linear_protective_stop_verified`)
+still reads `complete: false`** — a human still needs to record the
+checklist's evidence path there; see the note in
+`docs/promotion/RISK_MEMO_MICRO_LIVE_DRAFT.md` §6.
+
+Then in `LINEAR_STOP_VERIFICATION_CHECKLIST.md`, tick exactly one — the
+checklist already has BOTH boxes ticked, since Items 1-4 were satisfied on
+testnet AND the simulator gap was accepted in writing (see its own
+"simulator gap" section):
 
 ```
-[ ] micro-live proceeds on TESTNET only, with the simulator gap accepted
-    in writing, and the memo says so explicitly (memo section: ______)
+[x] micro-live proceeds on TESTNET only, with the simulator gap accepted
+    in writing, and the memo says so explicitly (memo section:
+    LINEAR_STOP_MARGIN_MEMO.md §5 + checklist Sign-off)
 [ ] OR the four items above are all satisfied on mainnet-equivalent venue
     behaviour
 ```
 
-Sign `LINEAR_STOP_VERIFICATION_CHECKLIST.md`'s own sign-off block (`Verified
-by`, `Reviewed by`, `Evidence log path`) — not this packet.
+`LINEAR_STOP_VERIFICATION_CHECKLIST.md`'s own sign-off block is signed
+(`Verified by`) but `Reviewed by` is still blank — that remains a human's to
+fill, not this packet's.
 
 ## Part 2 — what the risk memo needs from you
 
 `docs/promotion/RISK_MEMO_MICRO_LIVE_DRAFT.md` has every fact filled in
-already (3/20 trades, 46/180 days, forward mean net R −0.8996, historical
-M-4 WARN). Three things in it are yours, and only yours:
+already (4/20 trades, 48/180 days, forward mean net R −0.9367, historical
+M-4 WARN — counters synced 2026-09-27). Three things in it are yours, and
+only yours:
 
 1. **§4 — the M-4 decision.** Tick ACCEPTED or NOT ACCEPTED and initial it.
    Moving the M-4 threshold is not, and will never be, a third option.
@@ -124,7 +144,8 @@ M-4 WARN). Three things in it are yours, and only yours:
 
 Nothing else in the memo is a decision for you to make; the facts sections
 are already correct as of `forward_shadow_current.json`'s
-`corpus_last_bar_utc: 2026-09-24T00:00:00Z`.
+`corpus_last_bar_utc: 2026-09-26T00:00:00Z` (re-check before signing — this
+is a snapshot, not a live view).
 
 ## What this packet is not
 
