@@ -55,7 +55,9 @@ class FakeClient:
     def __init__(self, *, mark=MARK, venue_perp=0.0, wallet_ok=True,
                  open_ok=True, attach_ok=True, verify_live=True,
                  flatten_ok=True, clear_ok=True, filters_ok=True,
-                 category="linear", venue="testnet", cfg=None):
+                 category="linear", venue="testnet", cfg=None,
+                 liq_price=None, position_im=None, position_mm=None,
+                 leverage=None, wallet_extra=None):
         self.mark = mark
         self.venue_perp = venue_perp
         self.wallet_ok = wallet_ok
@@ -71,6 +73,12 @@ class FakeClient:
         self.orders = []
         self.position_size = 0.0
         self.stop_loss = 0.0
+        #: Item 4 (--margin-doc) evidence, set only when a test needs it.
+        self.liq_price = liq_price
+        self.position_im = position_im
+        self.position_mm = position_mm
+        self.leverage = leverage
+        self.wallet_extra = wallet_extra or {}
 
     @property
     def is_linear(self):
@@ -82,16 +90,26 @@ class FakeClient:
     def get_wallet(self):
         if not self.wallet_ok:
             raise RuntimeError("wallet unreadable")
-        return {"accountType": "UNIFIED"}
+        return {"accountType": "UNIFIED", **self.wallet_extra}
 
     def get_position(self, symbol):
         size = self.position_size if self.position_size else self.venue_perp
         if size <= 0:
             return None
-        return {"symbol": symbol, "side": "Buy", "size": str(size),
-                "avgPrice": str(self.mark), "stopLoss": str(self.stop_loss),
-                "tpslMode": "Full", "slTriggerBy": "LastPrice",
-                "slOrderType": "Market", "positionIdx": 0}
+        row = {"symbol": symbol, "side": "Buy", "size": str(size),
+              "avgPrice": str(self.mark), "markPrice": str(self.mark),
+              "stopLoss": str(self.stop_loss),
+              "tpslMode": "Full", "slTriggerBy": "LastPrice",
+              "slOrderType": "Market", "positionIdx": 0}
+        if self.liq_price is not None:
+            row["liqPrice"] = str(self.liq_price)
+        if self.position_im is not None:
+            row["positionIM"] = str(self.position_im)
+        if self.position_mm is not None:
+            row["positionMM"] = str(self.position_mm)
+        if self.leverage is not None:
+            row["leverage"] = str(self.leverage)
+        return row
 
     def get_instrument_filters(self, symbol, force=False):
         if not self.filters_ok:
@@ -673,3 +691,220 @@ class TestItem3NeverCitesFalseEvidence:
             assert self.BANNED_SESSION_TAIL not in body, (
                 f"{rel} points Item 3 at session_tail.py - that tool never "
                 "calls verify_stop or reads a position's stop fields")
+
+
+# ---------------------------------------------------------------------------
+# Item 4 - margin and liquidation at the proposed notional, documented.
+# ---------------------------------------------------------------------------
+
+
+class TestMarginDocDumpsVenueTruth:
+    def test_documents_a_full_dump_when_the_venue_has_the_fields(self):
+        client = FakeClient(liq_price=70_000.0, position_im=5.0,
+                           position_mm=1.0, leverage=10,
+                           wallet_extra={"totalEquity": "9999",
+                                        "totalAvailableBalance": "8888",
+                                        "coin": [
+                                            {"coin": "USDT", "walletBalance": "9999",
+                                             "equity": "9999",
+                                             "availableToWithdraw": "8888",
+                                             "usdValue": "9999"},
+                                            {"coin": "BTC", "walletBalance": "0.01",
+                                             "equity": "0.01", "usdValue": "1000",
+                                             "collateralSwitch": "ON"}]})
+        report = D.run_margin_doc(client=client, notional=100.0)
+        assert report["verdict"] == "DOCUMENTED", report.get("failed_stage")
+        assert report["phase"] == "MARGIN_DOC"
+
+        pos = report["evidence"]["dump"]["position"]
+        assert pos["positionIM"] == "5.0"
+        assert pos["positionMM"] == "1.0"
+        assert pos["leverage"] == "10"
+        assert pos["liq_price"]["value"] == 70_000.0
+        assert pos["liq_price"]["key_found"] == "liqPrice"
+
+        wallet = report["evidence"]["dump"]["wallet"]
+        assert wallet["totalEquity"] == "9999"
+        assert wallet["coin"]["USDT"]["walletBalance"] == "9999"
+        assert wallet["coin"]["BTC"]["collateralSwitch"] == "ON"
+
+    def test_absent_fields_are_recorded_explicitly_never_invented(self):
+        client = FakeClient()  # no liq/im/mm/wallet_extra set
+        report = D.run_margin_doc(client=client, notional=100.0)
+        assert report["verdict"] == "DOCUMENTED"
+        pos_evidence = report["evidence"]["dump"]
+        assert "positionIM" in pos_evidence["position_absent_keys"]
+        assert "positionMM" in pos_evidence["position_absent_keys"]
+        assert pos_evidence["position"]["positionIM"] is None
+        assert pos_evidence["position"]["liq_price"]["reason"] == "ABSENT"
+        assert pos_evidence["position"]["liq_price"]["key_found"] is None
+        wallet_evidence = pos_evidence["wallet"]
+        assert wallet_evidence["totalEquity"] is None
+        assert "totalEquity" in pos_evidence["wallet_absent_keys"]
+        assert "USDT.walletBalance" in pos_evidence["wallet_absent_keys"]
+
+
+class TestMarginDocDerivesNearerAndAtCap:
+    def test_stop_nearer_than_liquidation(self):
+        # stop at 5% below mark (~95000); liq far below that.
+        client = FakeClient(liq_price=50_000.0)
+        report = D.run_margin_doc(client=client, notional=100.0)
+        derived = report["evidence"]["derive"]
+        assert derived["nearer"] == "stop"
+        assert "should fire first" in derived["risk_line"]
+
+    def test_liquidation_nearer_than_stop_is_named_loudly(self):
+        # liq just above the stop price (closer to entry than the stop is).
+        client = FakeClient(liq_price=99_000.0)
+        report = D.run_margin_doc(client=client, notional=100.0)
+        derived = report["evidence"]["derive"]
+        assert derived["nearer"] == "liq"
+        assert "LIQUIDATION IS NEARER" in derived["risk_line"]
+
+    def test_nearer_is_unknown_without_a_liq_price(self):
+        client = FakeClient()  # no liq_price
+        report = D.run_margin_doc(client=client, notional=100.0)
+        derived = report["evidence"]["derive"]
+        assert derived["nearer"] == "unknown"
+        assert derived["liq_price"] is None
+        assert "UNKNOWN" in derived["risk_line"]
+
+    def test_at_cap_is_measured_against_the_real_shadow_cap(self):
+        import shadow
+        client = FakeClient()
+        report = D.run_margin_doc(client=client, notional=100.0)
+        at_cap = report["evidence"]["derive"]["at_cap"]
+        assert at_cap["cap_usd"] == float(shadow.SHADOW_MAX_NOTIONAL_USD)
+        assert at_cap["notional_usd"] == pytest.approx(
+            client.position_size * client.mark)
+
+
+class TestMarginDocNeverAutoFlattens:
+    def test_the_position_is_left_open_for_a_human_to_flatten(self):
+        client = FakeClient()
+        report = D.run_margin_doc(client=client, notional=100.0)
+        assert report["still_open"] is True
+        assert client.position_size > 0
+        assert "RUN --flatten NEXT" in report["next_action"]
+        stage_names = [s["stage"] for s in report["stages"]]
+        assert "flatten" not in stage_names
+
+    def test_flatten_afterward_closes_it(self):
+        client = FakeClient()
+        induced = D.run_margin_doc(client=client, notional=100.0)
+        assert induced["verdict"] == "DOCUMENTED"
+        flattened = D.run_flatten(client=client)
+        assert flattened["verdict"] == "FLATTENED", flattened.get("failed_stage")
+
+
+class TestMarginDocRefusesBeforeItRisksAnything:
+    def test_refuses_off_the_one_safe_configuration(self):
+        client = FakeClient(cfg=_cfg(PAPER_TRADING=True))
+        report = D.run_margin_doc(client=client, notional=100.0)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "arm_gate"
+        assert report["orders_sent"] == 0
+
+    def test_refuses_if_the_venue_already_holds_something(self):
+        client = FakeClient(venue_perp=0.5)
+        report = D.run_margin_doc(client=client, notional=100.0)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "flat"
+        assert report["orders_sent"] == 0
+
+
+class TestFindLiqPriceHandlesTheBeyondBoundsCase:
+    """Matches CarryBroker.get_liquidation_view's proven-live handling: an
+    empty string means "beyond the venue's bounds", not zero."""
+
+    def test_empty_string_is_beyond_bounds_not_zero(self):
+        info = D._find_liq_price({"liqPrice": ""})
+        assert info["value"] is None
+        assert info["reason"] == "BEYOND_VENUE_PRICE_BOUNDS_OR_EMPTY"
+
+    def test_a_real_value_is_parsed(self):
+        info = D._find_liq_price({"liqPrice": "70000.5"})
+        assert info["value"] == 70_000.5
+        assert info["key_found"] == "liqPrice"
+
+    def test_the_rename_alias_is_also_searched(self):
+        info = D._find_liq_price({"liquidationPrice": "65000"})
+        assert info["value"] == 65_000.0
+        assert info["key_found"] == "liquidationPrice"
+
+    def test_absent_from_both_aliases_is_reported_as_absent(self):
+        info = D._find_liq_price({})
+        assert info["key_found"] is None
+        assert info["reason"] == "ABSENT"
+        assert info["aliases_searched"] == list(D.LIQ_PRICE_ALIASES)
+
+
+class TestMarginDocAgainstTheRealSimulatedVenue:
+    """The dump helpers, proven against a real BybitClient position row from
+    the linear simulator - not only a hand-rolled fake."""
+
+    def test_dump_reads_real_simulator_fields_and_reports_the_rest_absent(self):
+        import backtest as bt
+
+        view = bt._backtest_config_view(bt.BacktestConfig(category="linear"))
+        store = StateStore(":memory:")
+        ex = bt.LinearSimulatedExchange(
+            {SYMBOL: [bt.Bar(start_ms=1_600_000_000_000, open=100.0,
+                             close=100.0, high=100.5, low=99.5, volume=100.0)]
+             for _ in [0]}, starting_cash=1_000.0)
+        ex.positions[SYMBOL] = bt._SimPosition(
+            symbol=SYMBOL, side="Buy", size=1.0, entry_price=100.0,
+            stop_loss=95.0)
+        client = BybitClient(config=view, store=store, transport=ex)
+
+        row = client.get_position(SYMBOL)
+        assert row is not None
+        dumped = D._dump_position_fields(row)
+        # The simulator DOES model these:
+        assert dumped["fields"]["markPrice"] is not None
+        assert dumped["fields"]["stopLoss"] is not None
+        assert dumped["fields"]["leverage"] is not None
+        # The simulator does NOT model IM/MM - absent, never invented:
+        assert dumped["fields"]["positionIM"] is None
+        assert "positionIM" in dumped["absent_keys"]
+        assert dumped["fields"]["positionMM"] is None
+
+        wallet = client.get_wallet()
+        wallet_dumped = D._dump_wallet_fields(wallet)
+        assert isinstance(wallet_dumped["fields"], dict)
+        store.close()
+
+
+class TestItem4NeverCitesFalseEvidence:
+    """Item 4's docs must give the real --margin-doc command, never point at
+    the carry drill or session_tail.py, and must not claim the simulator's
+    liquidation formula stands in for venue truth."""
+
+    def test_item_4_docs_do_not_point_at_session_tail(self):
+        repo_root = os.path.join(os.path.dirname(__file__), "..")
+        docs = [
+            "docs/promotion/LINEAR_STOP_OPS_INVENTORY.md",
+            "artifacts/HUMAN_GATE_OPS_PACKET.md",
+            "artifacts/LINEAR_STOP_VENUE_GAP.md",
+        ]
+        for rel in docs:
+            path = os.path.join(repo_root, rel)
+            with open(path, encoding="utf-8") as fh:
+                body = fh.read()
+            assert "python3 tools/session_tail.py" not in body
+
+    def test_the_margin_memo_disclaims_the_simulator_formula(self):
+        repo_root = os.path.join(os.path.dirname(__file__), "..")
+        path = os.path.join(repo_root, "docs", "promotion",
+                            "LINEAR_STOP_MARGIN_MEMO.md")
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        assert "NOT a substitute" in body or "NOT evidence" in body
+
+    def test_the_checklist_item_4_observed_line_is_still_blank(self):
+        repo_root = os.path.join(os.path.dirname(__file__), "..")
+        path = os.path.join(repo_root, "docs", "promotion",
+                            "LINEAR_STOP_VERIFICATION_CHECKLIST.md")
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        assert "[ ] 4. Margin and liquidation behaviour" in body

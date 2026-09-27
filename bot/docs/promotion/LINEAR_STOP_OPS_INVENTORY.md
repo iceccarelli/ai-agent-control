@@ -203,13 +203,36 @@ its `verdict` (`REPROTECTED` or `FLATTENED`) names which action was taken.
 
 ### Item 4 — margin and liquidation at the proposed notional
 
-Document, for 100.00 USD on BTCUSDT linear: initial and maintenance margin, the
-liquidation price relative to the stop, and what happens **at the cap**. The
-simulator solves liquidation from `cash + dir*S*(p−E) <= mmr*S*p`; item 4 asks
-what the **venue** does.
+Document, for the proposed notional (`shadow.SHADOW_MAX_NOTIONAL_USD`) on
+BTCUSDT linear: initial and maintenance margin, the liquidation price
+relative to the stop, and what happens **at the cap**. The simulator solves
+liquidation from `cash + dir*S*(p−E) <= mmr*S*p`; that formula is **context
+only** — Item 4 asks what the **venue's own position and wallet fields**
+say, not what a simulator estimates.
 
-Evidence: written section in the memo, plus the venue's own position risk
-readout.
+`bot/tools/linear_stop_venue_drill.py --margin-doc` is the tool: it opens +
+attaches a real stop (same stages as Item 2's `--hold`), then DUMPS the
+venue's position/wallet fields verbatim (never inventing an absent one) and
+DERIVES stop-vs-liquidation distance and an at-cap notional readout. From
+`bot/`:
+
+```bash
+python3 tools/linear_stop_venue_drill.py --margin-doc --notional 100 \
+    --out artifacts/linear_stop_margin_doc.json
+# verdict must be DOCUMENTED. POSITION STAYS OPEN - copy the dump/derive
+# evidence into LINEAR_STOP_MARGIN_MEMO.md, THEN:
+python3 tools/linear_stop_venue_drill.py --flatten \
+    --out artifacts/linear_stop_margin_doc_flatten.json
+```
+
+**Not `tools/drill.py`** (carry drill, no stop or margin readout of its own)
+and **not `tools/session_tail.py`** (read-only, gate-invariant, never reads a
+position's margin or liquidation fields) — neither can be Item 4 evidence.
+
+Evidence: `artifacts/linear_stop_margin_doc.json`, and the filled
+`docs/promotion/LINEAR_STOP_MARGIN_MEMO.md` (ships as a blank template; a
+human fills every number from the artifact, never from the simulator).
+`observed:` line in the checklist.
 
 ## 4. The choice the checklist forces
 

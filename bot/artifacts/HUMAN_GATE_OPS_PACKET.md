@@ -81,7 +81,17 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
            --out artifacts/linear_stop_naked_flatten.json
        observed: ______________________________________________
 
-[ ] 4. Margin/liquidation at 100 USD notional, BTCUSDT linear, documented
+[ ] 4. Margin/liquidation at the proposed notional, BTCUSDT linear, documented
+       # NOT tools/drill.py or tools/session_tail.py - neither reads a
+       # position's margin/liquidation fields. NOT the simulator formula
+       # (cash + dir*S*(p-E) <= mmr*S*p) - context only, not venue truth.
+       python3 tools/linear_stop_venue_drill.py --margin-doc --notional 100 \
+           --out artifacts/linear_stop_margin_doc.json
+       # verdict must be DOCUMENTED. POSITION STAYS OPEN - copy the
+       # dump/derive evidence into
+       # docs/promotion/LINEAR_STOP_MARGIN_MEMO.md, THEN:
+       python3 tools/linear_stop_venue_drill.py --flatten \
+           --out artifacts/linear_stop_margin_doc_flatten.json
        observed: ______________________________________________
 ```
 
