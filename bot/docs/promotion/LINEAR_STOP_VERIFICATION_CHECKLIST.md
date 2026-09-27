@@ -1,10 +1,9 @@
 # LINEAR PROTECTIVE-STOP VERIFICATION
 
-> **Status (2026-09-27):** Venue Item 1 is recorded below from a real Bybit
-> **testnet** armed drill. Items 2–4 are still open. This file does **not**
-> flip `allows_live` and does **not** complete the promotion gate by itself.
-> Sign-off stays blank until Items 2–4 are done (or until a separate written
-> acceptance of remaining gaps is recorded).
+> **Status (2026-09-27):** Venue Items 1–4 are recorded below from real Bybit
+> **testnet** drills (tips through `b8dcd84`). Memo:
+> `docs/promotion/LINEAR_STOP_MARGIN_MEMO.md`. This file does **not** flip
+> `allows_live`. Sign-off and the simulator-gap human choice are below.
 
 ---
 
