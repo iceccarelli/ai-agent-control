@@ -8,12 +8,19 @@ Full checklist: `docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md`
 Full ops runbook (commands, venue endpoints, evidence paths):
 `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md`
 
-## Sim done vs venue unverified
+## Sim done vs venue done (checklist), gate JSON still lagging
 
 | half | state | evidence |
 |---|---|---|
 | **Simulator** | **done** | `backtest.LinearSimulatedExchange`; stop written via `/v5/position/trading-stop`, read back via the real `BybitClient.verify_stop`; liquidation-before-stop ordering covered — `bot/tests/test_linear_simulator.py::TestTheProtectiveStopEndToEnd` (25 tests) |
-| **Venue** (items 1–4 of the checklist) | **not started** | no `observed:` line in the checklist has been filled from a real venue run |
+| **Venue** (items 1–4 of the checklist) | **done on testnet** | all four `observed:` lines filled from real venue runs; `LINEAR_STOP_VERIFICATION_CHECKLIST.md` signed (Verified by Vincenzo Ceccarelli, 2026-09-27) |
+
+**Still open:** `artifacts/slice59_promotion_gate.json`'s own
+`linear_protective_stop_verified.complete` has not been flipped by a human
+yet — it still reads `false` with evidence `"not documented"`. The checklist
+being signed is not the same event as that JSON field being updated; a human
+still needs to do the latter before `promotion_gate.evaluate_promotion_gate()`
+counts this item.
 
 > **WARNING, added after `tools/drill.py --arm` passed (Phase D, carry
 > book):** that transcript — `bot/artifacts/linear_stop_drill.json` — is
@@ -25,14 +32,18 @@ Full ops runbook (commands, venue endpoints, evidence paths):
 > against this item — that is precisely the substitution this file exists
 > to name.
 
-## The four venue items — still open
+## The four venue items — done on testnet
 
 | # | item | state |
 |---|---|---|
-| 1 | Stop PLACED on the venue and read back from the exchange (not local state) | open — command: `tools/linear_stop_venue_drill.py --arm --notional 100`; evidence `artifacts/linear_protective_stop_venue.json` |
-| 2 | Stop SURVIVES a process restart | open — `tools/linear_stop_venue_drill.py --hold` (opens+attaches, exits leaving the position+stop live), then a NEW process `--verify` (must read `VERIFIED`), then `--flatten` (required cleanup). NOT `tools/session_tail.py` — that tool is read-only and gate-invariant and never calls `verify_stop` |
-| 3 | A NAKED position is detected within one cycle | open — `tools/linear_stop_venue_drill.py --induce-naked` (opens+attaches, records the ledger, then clears the stop AT THE VENUE ONLY), then a NEW process `--observe-naked` (must call the production `TradingEngine.check_naked_positions()` and read `REPROTECTED` or `FLATTENED`), then `--flatten` if needed. NOT `tools/drill.py` (no stop mechanism) or `tools/session_tail.py` (never reads a position's stop) |
-| 4 | Margin/liquidation behaviour at the proposed notional on BTCUSDT linear, documented | open — `tools/linear_stop_venue_drill.py --margin-doc --notional 100` (opens+attaches, DUMPS venue position/wallet fields verbatim, DERIVES stop-vs-liq distance and at-cap notional), then a human fills `docs/promotion/LINEAR_STOP_MARGIN_MEMO.md` from the artifact, then `--flatten`. NOT `tools/drill.py` or `tools/session_tail.py`, and NOT the simulator's liquidation formula (context only) |
+| 1 | Stop PLACED on the venue and read back from the exchange (not local state) | **done** — `tools/linear_stop_venue_drill.py --arm --notional 100`; evidence `artifacts/linear_protective_stop_venue.json`, verdict PASSED (tip 2c84e89) |
+| 2 | Stop SURVIVES a process restart | **done** — `tools/linear_stop_venue_drill.py --hold` → new process `--verify` → `--flatten`; verdict VERIFIED (tip 228fb87). NOT `tools/session_tail.py` — that tool is read-only and gate-invariant and never calls `verify_stop` |
+| 3 | A NAKED position is detected within one cycle | **done** — `tools/linear_stop_venue_drill.py --induce-naked` → new process `--observe-naked` → `--flatten`; verdict REPROTECTED via the production `TradingEngine.check_naked_positions()` (tip b10cfc7). NOT `tools/drill.py` (no stop mechanism) or `tools/session_tail.py` (never reads a position's stop) |
+| 4 | Margin/liquidation behaviour at the proposed notional on BTCUSDT linear, documented | **done** — `tools/linear_stop_venue_drill.py --margin-doc --notional 100` → `--flatten`; verdict DOCUMENTED (tip b8dcd84), memo filled at `docs/promotion/LINEAR_STOP_MARGIN_MEMO.md`. NOT `tools/drill.py` or `tools/session_tail.py`, and NOT the simulator's liquidation formula (context only) |
+
+Full transcripts and exact commands for each: see
+`LINEAR_STOP_VERIFICATION_CHECKLIST.md`'s own `observed:` lines and
+`LINEAR_STOP_OPS_INVENTORY.md` §3 — this table only points at them.
 
 Prerequisite for all four: `python3 tools/connector_check.py` →
 `bybit_testnet_verdict: BYBIT_TESTNET_OK` (as of the last committed
@@ -50,6 +61,13 @@ field, not an order, unlike spot).
 All four `observed:` lines in `LINEAR_STOP_VERIFICATION_CHECKLIST.md` filled
 from real venue runs, its sign-off block signed by a human, and the evidence
 path recorded by a human in `artifacts/slice59_promotion_gate.json`
-(`linear_protective_stop_verified`). **Not by this file, and not by any
-agent** — this index changes none of that; `linear_protective_stop_verified`
-remains `complete: false` and `promotion_gate_allows_live()` remains `False`.
+(`linear_protective_stop_verified`).
+
+**The first two are now done.** The four `observed:` lines are filled and
+the checklist's `Verified by` is signed (Vincenzo Ceccarelli, 2026-09-27;
+`Reviewed by` still blank). **The third is not: `slice59_promotion_gate.json`
+itself still reads `linear_protective_stop_verified.complete: false`.** Not
+by this file, and not by any agent — a human still records that evidence
+path in the gate JSON. Until then `promotion_gate_allows_live()` remains
+`False`, as it does regardless (the gate needs `human_risk_memo_signed` and
+`live_trading_ack_present` too, both still open).

@@ -14,6 +14,10 @@
 >
 > Source template: `docs/promotion/RISK_MEMO_MICRO_LIVE_TEMPLATE.md`
 > Drafted: 2026-09-17 · Draft path is NOT the signed-copy path.
+> Counters synced 2026-09-27 against `forward_shadow_current.json` and
+> `slice59_promotion_gate.json` (4/20 trades, 48/180 days) and against the
+> now-signed `LINEAR_STOP_VERIFICATION_CHECKLIST.md`. Still a DRAFT — still
+> UNSIGNED.
 
 ---
 
@@ -50,28 +54,31 @@ the correct number is still small:
 
 | | |
 |---|---|
-| Closed forward trades | **3 of 20** required |
-| Closed forward bars | **46 of 180** days required |
-| Forward ladder | 9 setups → 9 flagged → 8 eligible → 4 after schedule → 4 entries → **3 closed** |
-| Forward mean net R | **−0.8996** (3 trades; NOT comparable to the OOS +0.1736 — no rotation null, no drift control, no monitor can evaluate 3 trades) |
-| M-4 (recent-half decay) | still WARN, still the HISTORICAL fact from slices 58-61 (earlier half +0.4669 / recent half −0.0798). Forward M-4 itself reads `INSUFFICIENT_DATA` — it needs 20 closed trades and has 3. |
-| Concentration (M-3, historical) | 3 of 41 historical trades carry 41% of the net R; forward M-3 reads `INSUFFICIENT_DATA` (needs 10, has 3) |
+| Closed forward trades | **4 of 20** required |
+| Closed forward bars | **48 of 180** days required |
+| Forward ladder | 9 flagged → 9 eligible → 5 after schedule → 5 entries taken → **4 closed** |
+| Forward mean net R | **−0.9367** (4 trades; NOT comparable to the OOS +0.1736 — no rotation null, no drift control, no monitor can evaluate 4 trades) |
+| M-4 (recent-half decay) | still WARN, still the HISTORICAL fact from slices 58-61 (earlier half +0.4669 / recent half −0.0798). Forward M-4 itself reads `INSUFFICIENT_DATA` — it needs 20 closed trades and has 4. |
+| Concentration (M-3, historical) | 3 of 41 historical trades carry 41% of the net R; forward M-3 reads `INSUFFICIENT_DATA` (needs 10, has 4) |
 | Frozen carry baseline | **9.6578 %/yr on 15 trades**, reproducing the figure `PHASE1_DECISION.md` quotes, under the `FROZEN_SNAPSHOT_CUT_*` bound |
 | Fold-lock | prefix digests match the pinned fold lock on both corpora; history unchanged, never shrank, appends strictly after `t1` |
 
-> **Refreshed 2026-09-25** from the factory-produced
-> `artifacts/forward_shadow_current.json` installed this session
-> (`forward_window.corpus_last_bar_utc: 2026-09-24T00:00:00Z`,
-> `forward_n_trades: 3`, `of_which_closed: 46`) — verified against
-> `state/forward_shadow_scratch/forward.json` byte-for-byte on the fields
-> that matter. See `artifacts/TRADE_SCARCITY_AUTOPSY.md` for the full
-> attrition accounting (VERDICT: DESIGNED_RARITY) behind these counts.
+> **Counters synced 2026-09-27** against `artifacts/forward_shadow_current.json`
+> (`slice: 76`, `forward_n_trades: 4`, `ceiling.closed_forward_bars: 48`) and
+> `artifacts/slice59_promotion_gate.json`'s `forward_shadow_clean` entry
+> (`forward_trades_to_date: 4`, `forward_days_to_date: 48`) — both files agree.
+> The previous refresh (2026-09-25, 3/46) is now stale and has been replaced
+> throughout this memo. See `artifacts/TRADE_SCARCITY_AUTOPSY.md` for the
+> attrition accounting (VERDICT: DESIGNED_RARITY) behind these counts, and
+> re-read the current JSON before signing — this memo is a snapshot, not a
+> live view.
 
-**Three forward trades is not evidence of anything.** It is 15% of the required
-count over 26% of the required window, and no monitor can evaluate it: M1 needs
-10 trades, M2 needs 5 in 90 days, M3 needs 10, M4 needs 20. All four currently
-read `INSUFFICIENT_DATA`. This section exists so the number is not mistaken for
-progress toward a conclusion — it is progress toward being *able* to conclude.
+**Four forward trades is not evidence of anything.** It is 20% of the required
+count over 27% of the required window, and no monitor can evaluate it yet: M1
+needs 10 trades, M2 needs 5 in 90 days, M3 needs 10, M4 needs 20. All four
+currently read `INSUFFICIENT_DATA`. This section exists so the number is not
+mistaken for progress toward a conclusion — it is progress toward being *able*
+to conclude.
 
 ## 3. Size and scope being proposed
 
@@ -118,6 +125,13 @@ Choose one, and initial it:
 to make; an agent ticking either would be the forgery this document warns
 about.)*
 
+> **Note, factual only — not a decision:** human decision pending. Professional
+> path: leave NOT ACCEPTED until the forward sample supports M-4 under the
+> UNCHANGED threshold; do not accept the historical WARN via a forged agent
+> tick while forward reads 4/20. Forward M-4 itself is still
+> `INSUFFICIENT_DATA` (needs 20 closed trades, has 4) — there is no forward
+> M-4 reading to accept or reject yet, only the historical one above.
+
 ## 5. Revoke conditions — state them before, not after
 
 The clear is withdrawn by a human calling `shadow.revoke_cleared_edge` with the
@@ -147,12 +161,16 @@ the file `promotion_gate.GATE_PATH` resolves to:
 | `notional_cap_within_policy` | — | **complete** |
 | `models_current_absent_or_contained` | — | **complete** |
 | `human_risk_memo_signed` | human | open — *this memo* |
-| `linear_protective_stop_verified` | human | open — see `LINEAR_STOP_OPS_INVENTORY.md` |
+| `linear_protective_stop_verified` | human | **checklist evidence complete** (all four venue items `[x]`, `LINEAR_STOP_VERIFICATION_CHECKLIST.md` signed by Vincenzo Ceccarelli, 2026-09-27; `LINEAR_STOP_MARGIN_MEMO.md` filled) — **but `slice59_promotion_gate.json`'s own `linear_protective_stop_verified.complete` still reads `false`, evidence still says "not documented".** That JSON field is human-owned and this memo does not, and cannot, flip it. A human still needs to record the checklist's evidence path there before the gate itself counts this item. |
 | `live_trading_ack_present` | human | open |
 | `m4_recent_half_accepted_or_recovered` | human or observation | open — §4 above |
-| `forward_shadow_clean` | observation | open — 3/20 trades, 46/180 days |
+| `forward_shadow_clean` | observation | open — 4/20 trades, 48/180 days |
 
-**3 of 8 complete. `promotion_gate_allows_live()` returns False.**
+**3 of 8 complete, read directly from `slice59_promotion_gate.json` as it
+stands.** The linear-stop checklist itself is done, but that completion has
+not yet been recorded in the gate JSON by a human — until it is, the gate
+still counts 3, not 4. `promotion_gate_allows_live()` returns False either
+way.
 
 It does **not** authorise: raising notional, adding a symbol, loading a model,
 running unattended without monitors, or describing the result as an autonomous

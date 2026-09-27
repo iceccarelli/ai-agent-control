@@ -1,9 +1,11 @@
 # LINEAR PROTECTIVE-STOP — WHAT IS STILL MISSING, AND THE EXACT COMMANDS
 
 > **This inventory verifies nothing and completes nothing.**
-> `linear_protective_stop_verified` is **open**, owner **human**, and this file
-> does not change that. It exists so the human doing the work does not also
-> have to reconstruct *how*.
+> `slice59_promotion_gate.json`'s `linear_protective_stop_verified` is still
+> **`complete: false`, owner human** — the CHECKLIST is now signed (all four
+> venue items `[x]`, Verified by Vincenzo Ceccarelli, 2026-09-27), but that
+> gate JSON field is a separate human act this inventory cannot perform. It
+> exists so the human doing the work does not also have to reconstruct *how*.
 
 **This is not a second checklist.** `docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md`
 is the authority on *what must be true* — its four venue items and its sign-off
@@ -11,7 +13,8 @@ block are unchanged and are not restated here. What was missing was the
 operational layer: which command, on which venue, producing which file. That is
 all this document adds.
 
-Drafted 2026-09-17 by an agent. No box below is ticked.
+Drafted 2026-09-17 by an agent. Updated 2026-09-27: all four venue items are
+now done on testnet (§0, §3). Facts synced, no gate JSON edited.
 
 ---
 
@@ -19,9 +22,9 @@ Drafted 2026-09-17 by an agent. No box below is ticked.
 
 | | |
 |---|---|
-| Gate entry | *"not documented … A human must document how a protective stop is verified on linear before any micro-live."* |
+| Gate entry (`slice59_promotion_gate.json`, still unchanged) | *"not documented … A human must document how a protective stop is verified on linear before any micro-live."* |
 | Simulator half | **done** — `backtest.LinearSimulatedExchange`, `tests/test_linear_simulator.py` (25 tests), stop written via `/v5/position/trading-stop`, read back through the real `BybitClient.verify_stop`, liquidation-before-stop ordering covered |
-| Venue half | **not started.** Items 1–4 of the checklist are statements about a VENUE. No simulator can make them true. |
+| Venue half | **done on testnet.** All four items of the checklist are now `[x]`, each with a real venue transcript — see §3 below and `LINEAR_STOP_VERIFICATION_CHECKLIST.md`. The gate JSON quoted above has simply not been updated by a human yet; that update is the one remaining step. |
 
 The uncomfortable sentence from the checklist, still true: the standing claim
 *"a confirmed position always has a verified protective stop"* is asserted and
@@ -237,15 +240,17 @@ human fills every number from the artifact, never from the simulator).
 ## 4. The choice the checklist forces
 
 The checklist's simulator-gap block has its first box ticked as an engineering
-fact. The second choice is still open and is a **human** decision:
+fact. **The second choice has also now been made, by a human, in the
+checklist itself:**
 
 ```
-[ ] micro-live proceeds on TESTNET only, with the simulator gap accepted
+[x] micro-live proceeds on TESTNET only, with the simulator gap accepted
     in writing, and the memo says so explicitly
-        memo section: ______________________
+        memo section: LINEAR_STOP_MARGIN_MEMO.md §5 + checklist Sign-off
+                       (2026-09-27)
 ```
 
-Choosing neither is not an option.
+This inventory only mirrors that already-made decision; it did not make it.
 
 ## 5. What would complete the gate item
 
@@ -253,6 +258,15 @@ All four `observed:` lines filled from real venue runs, the sign-off block in
 the **checklist** signed, and the evidence path recorded in
 `artifacts/slice59_promotion_gate.json` by a human.
 
-**Not** by this file, and **not** by any agent. Until then the item reads
-`complete: false`, and `promotion_gate_allows_live()` returns False — which is
-the correct answer.
+**The first two are done** (2026-09-27): all four `observed:` lines are
+filled from real testnet drills and the checklist's `Verified by` is signed
+(`Reviewed by` still blank). **The third is not** — `slice59_promotion_gate.json`
+has not been touched; its `linear_protective_stop_verified.complete` still
+reads `false` with evidence `"not documented"`.
+
+**Not by this file, and not by any agent.** Until a human records that
+evidence path in the gate JSON, the item reads `complete: false`, and
+`promotion_gate_allows_live()` returns False — which is the correct answer,
+and would remain the correct answer even if this one item were flipped,
+since `human_risk_memo_signed` and `live_trading_ack_present` are also still
+open.
