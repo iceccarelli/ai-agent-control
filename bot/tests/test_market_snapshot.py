@@ -33,9 +33,13 @@ def snap(**kw):
 
 class FakeBroker:
     def __init__(self, *, perp=100_030.0, spot=100_000.0, funding=1.0,
-                 margin=5.0, venue_time=None, boom=None):
+                 margin=5.0, venue_time=None, boom=None, held=1.0):
         self.perp, self.spot, self.funding = perp, spot, funding
         self.margin, self.venue_time, self.boom = margin, venue_time, boom
+        # Nonzero by default so existing fixtures keep exercising
+        # get_margin_multiple exactly as before; tests for the flat/cold-start
+        # path pass held=0.0 explicitly.
+        self.held = held
 
     def get_mark(self, s):
         if self.boom == "perp":
@@ -51,6 +55,11 @@ class FakeBroker:
         if self.boom == "funding":
             raise RuntimeError("no fundingRate")
         return self.funding
+
+    def get_perp_position(self, s):
+        if self.boom == "position":
+            raise RuntimeError("no position row")
+        return self.held
 
     def get_margin_multiple(self, s):
         if self.boom == "margin":
@@ -143,8 +152,50 @@ class TestAPartialReadIsNotASnapshot:
         """A snapshot missing a field it could not read would be a partial view
         wearing a complete one's clothes. The exception is the information."""
         with pytest.raises(RuntimeError):
-            take_snapshot(FakeBroker(boom=leg), perp_symbol="BTCUSDT",
+            take_snapshot(FakeBroker(boom=leg, held=1.0), perp_symbol="BTCUSDT",
                           spot_symbol="BTCUSDT")
+
+    def test_a_failed_position_read_still_propagates(self):
+        """get_perp_position itself is read directly, same as every other
+        leg - an unreadable position is not "assume flat"."""
+        with pytest.raises(RuntimeError):
+            take_snapshot(FakeBroker(boom="position"), perp_symbol="BTCUSDT",
+                          spot_symbol="BTCUSDT")
+
+
+class TestMarginIsUndefinedNotUnreadableWhileFlat:
+    """The landmine this fixes: `get_margin_multiple` raises PairIncident
+    when the venue is flat (positionIM=0/positionMM=0 is a real Bybit
+    response, not a wallet bug - see carry_broker.CarryBroker.get_margin_multiple
+    and INVENTORY F4). Before this, take_snapshot called it unconditionally
+    and assert_fresh REQUIRED a positive margin_multiple, so the very first
+    --arm from a cold, flat account could never produce a usable snapshot -
+    every tick of main.py's live loop would log "carry market view unusable"
+    and return, forever, because it can never open the position that would
+    make the ratio exist."""
+
+    def test_take_snapshot_never_calls_margin_multiple_while_flat(self):
+        broker = FakeBroker(held=0.0, boom="margin")
+        s = take_snapshot(broker, perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
+        assert s.margin_multiple is None
+
+    def test_a_flat_snapshot_is_fresh(self):
+        """The whole point: this must NOT raise StaleMarket."""
+        s = take_snapshot(FakeBroker(held=0.0), perp_symbol="BTCUSDT",
+                          spot_symbol="BTCUSDT")
+        s.assert_fresh()
+
+    def test_a_held_position_still_reads_and_requires_a_real_margin(self):
+        broker = FakeBroker(held=0.25, margin=3.0)
+        s = take_snapshot(broker, perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
+        assert s.margin_multiple == pytest.approx(3.0)
+        s.assert_fresh()
+
+    def test_a_held_position_with_unreadable_margin_still_propagates(self):
+        """Fail-closed is unchanged the moment a position genuinely exists."""
+        with pytest.raises(RuntimeError):
+            take_snapshot(FakeBroker(held=0.25, boom="margin"),
+                          perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
 
 
 class TestItDecidesNothing:

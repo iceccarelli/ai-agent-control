@@ -92,6 +92,9 @@ class _Broker:
             raise RuntimeError("no fundingRate in ticker")
         return self.funding
 
+    def get_perp_position(self, symbol):
+        return 0.0
+
     def get_margin_multiple(self, symbol):
         return 5.0
 

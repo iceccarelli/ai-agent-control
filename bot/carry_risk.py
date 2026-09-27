@@ -121,8 +121,15 @@ class CarryRisk:
         except Exception as exc:  # noqa: BLE001
             return _block("MARKET_VIEW_STALE", error=str(exc))
 
-        margin = float(getattr(snapshot, "margin_multiple", 0.0))
-        if margin < self.min_margin_multiple:
+        # `None` while flat - a ratio on an OPEN position (INVENTORY F4) is
+        # genuinely undefined before the first fill, not a floor this gate
+        # can check yet. `CarryEngine`'s own pre-open margin check already
+        # tolerates this exact case (`margin is not None and margin < floor`);
+        # this gate must agree, not re-block (or, before this fix, crash on
+        # `float(None)`) the one open that would establish the ratio.
+        raw_margin = getattr(snapshot, "margin_multiple", None)
+        margin = None if raw_margin is None else float(raw_margin)
+        if margin is not None and margin < self.min_margin_multiple:
             return _block("MARGIN_HEADROOM_TOO_THIN",
                           margin_multiple=margin,
                           floor=self.min_margin_multiple)

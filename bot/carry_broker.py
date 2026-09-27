@@ -355,6 +355,19 @@ class CarryBroker:
         into a halt, and an unreadable margin is a margin call you cannot see.
         Returning a comfortable default here would be the single most dangerous
         line in this file.
+
+        This is a ratio on an OPEN position (INVENTORY F4): Bybit returns a
+        position/list row with `positionIM=0`/`positionMM=0` even while FLAT
+        (proven live, Bybit testnet) - that is the venue correctly saying
+        "there is nothing to compute a ratio about", not a wallet fault. This
+        function still raises on it, unchanged and on purpose: it has no way
+        to know from here whether size is 0 or genuinely stuck at 0 on a live
+        position, and guessing "must be flat" would be exactly the comfortable
+        default the docstring above refuses. Callers that know the position
+        size - `tools/drill.py`'s `margin` stage, `market_snapshot.take_snapshot`
+        - check it FIRST and skip calling this at all while flat, so this
+        raise is now reached only when a position genuinely exists (or the
+        read is broken), which is the case the error message below assumes.
         """
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
@@ -367,9 +380,13 @@ class CarryBroker:
         margin = float(row.get("positionIM", 0) or 0)
         maintenance = float(row.get("positionMM", 0) or 0)
         if maintenance <= 0:
+            size = row.get("size", "?")
             raise PairIncident(
-                f"maintenance margin for {symbol} is {maintenance}; refusing to "
-                "compute headroom from a zero denominator")
+                f"maintenance margin for {symbol} is {maintenance} (position "
+                f"size {size}); refusing to compute headroom from a zero "
+                f"denominator. MM=0 at size 0 means flat - callers must check "
+                f"position size before calling this, not treat this raise as "
+                f"that check. MM=0 at a nonzero size is a genuine anomaly.")
         return margin / maintenance
 
     def get_mark(self, symbol: str) -> float:
@@ -625,6 +642,19 @@ class CarryBroker:
             raise PairIncident(
                 f"position row for {symbol} is malformed: {row!r}") from exc
         side = str(row.get("side", ""))
+
+        # Bybit returns a position/list row even while FLAT - size 0,
+        # liqPrice "" (proven live, Bybit testnet) - not only an empty `list`.
+        # Without this, that row's empty liqPrice would fall through to
+        # BEYOND_VENUE_PRICE_BOUNDS below, which means "a position exists and
+        # its liquidation price is unreachable" - a real claim about a
+        # position that does not exist. Same reason, same shape as the
+        # `not rows` branch above; this just catches the other way Bybit
+        # spells "nothing is open".
+        if size <= 0:
+            return {"size": 0.0, "side": "", "mark": mark, "liq_price": None,
+                    "distance_pct": None, "account_mm_rate": account_mm,
+                    "reason": "NO_POSITION"}
 
         raw_liq = row.get("liqPrice")
         if raw_liq is None or str(raw_liq).strip() == "":
