@@ -2,16 +2,16 @@
   "allows_progress": true,
   "blockers": [],
   "stage_b": {
-    "forward_n_trades": 3,
+    "forward_n_trades": 4,
     "of_20": 20,
-    "closed_forward_bars": 46
+    "closed_forward_bars": 48
   },
   "risk": {
     "allows_live_must_be_false": true
   },
   "next_actions": [
-    "accrue closed forward trades: 3 of 20",
-    "accrue forward days: 46 of 180",
+    "accrue closed forward trades: 4 of 20",
+    "accrue forward days: 48 of 180",
     "gate item open (observation): forward_shadow_clean",
     "gate item open (human): human_risk_memo_signed",
     "gate item open (human): linear_protective_stop_verified",
@@ -20,5 +20,5 @@
   ],
   "model": "none (local rules only)",
   "key_status": "missing",
-  "generated_utc": "2026-09-25T00:31:33Z"
+  "generated_utc": "2026-09-27T02:35:19Z"
 }
