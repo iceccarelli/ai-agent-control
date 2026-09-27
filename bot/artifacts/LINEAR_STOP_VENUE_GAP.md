@@ -15,11 +15,21 @@ Full ops runbook (commands, venue endpoints, evidence paths):
 | **Simulator** | **done** | `backtest.LinearSimulatedExchange`; stop written via `/v5/position/trading-stop`, read back via the real `BybitClient.verify_stop`; liquidation-before-stop ordering covered — `bot/tests/test_linear_simulator.py::TestTheProtectiveStopEndToEnd` (25 tests) |
 | **Venue** (items 1–4 of the checklist) | **not started** | no `observed:` line in the checklist has been filled from a real venue run |
 
+> **WARNING, added after `tools/drill.py --arm` passed (Phase D, carry
+> book):** that transcript — `bot/artifacts/linear_stop_drill.json` — is
+> real evidence that `CarryBroker` can pair, reconcile and unwind two legs.
+> It is carry evidence, not linear-stop evidence: `CarryBroker` has no
+> protective-stop mechanism and that transcript contains zero
+> `trading-stop`/`verify_stop` calls. Item 1 below is closed by
+> `tools/linear_stop_venue_drill.py` only. Do not cite the carry transcript
+> against this item — that is precisely the substitution this file exists
+> to name.
+
 ## The four venue items — still open
 
 | # | item | state |
 |---|---|---|
-| 1 | Stop PLACED on the venue and read back from the exchange (not local state) | open — command: `tools/drill.py --arm --notional 100`, then `client.verify_stop(...)` |
+| 1 | Stop PLACED on the venue and read back from the exchange (not local state) | open — command: `tools/linear_stop_venue_drill.py --arm --notional 100`; evidence `artifacts/linear_protective_stop_venue.json` |
 | 2 | Stop SURVIVES a process restart | open — kill the process with a position open, confirm reconciliation sees the venue-side stop on restart |
 | 3 | A NAKED position is detected within one cycle | open — must be induced deliberately (cancel the stop venue-side) |
 | 4 | Margin/liquidation behaviour at 100 USD notional on BTCUSDT linear, documented | open |
