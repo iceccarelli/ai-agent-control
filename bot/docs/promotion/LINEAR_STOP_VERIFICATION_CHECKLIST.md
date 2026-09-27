@@ -94,9 +94,23 @@ recorded:
          FLATTEN: --flatten --out artifacts/linear_stop_flatten.json
            BB-line-1-36e7bad50964a10a825f7a91 → FLAT stop_still_live=False.
 
-[ ] 3. A position that somehow ends up NAKED is detected within one cycle and
+[x] 3. A position that somehow ends up NAKED is detected within one cycle and
        either re-protected or flattened. Induce this deliberately.
-       observed: ______________________________________________
+       observed: 2026-09-27 Codespace tip b10cfc7. induce→observe→flatten via
+         bot/tools/linear_stop_venue_drill.py; production entrypoint
+         trading_engine.TradingEngine.check_naked_positions.
+         INDUCE: --induce-naked --notional 100
+           --out artifacts/linear_stop_naked_induce.json
+           open BB-line-1-d2fc7168d05e30b0f45ce4cb @ 85020.1;
+           attach stopLoss=80769; clear_stop POST trading-stop stopLoss=0
+           (BB-stop-3-ef4b2d0c…); confirm_naked live=False
+           detail=POSITION_HAS_NO_STOP_LOSS size=0.001.
+         OBSERVE: --observe-naked --from induce.json
+           --state-db artifacts/linear_stop_naked_state.db
+           --out artifacts/linear_stop_naked_observe.json
+           verdict=REPROTECTED; reprotected=['BTCUSDT'];
+           confirm live=True stopLoss=83319.6 (one cycle).
+         FLATTEN: artifacts/linear_stop_naked_flatten.json → FLAT.
 
 [ ] 4. Margin and liquidation behaviour on linear is understood and documented
        for the proposed notional, including what happens at the cap.
