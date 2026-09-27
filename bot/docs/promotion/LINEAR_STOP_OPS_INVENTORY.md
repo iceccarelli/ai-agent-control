@@ -75,22 +75,35 @@ commit.
 
 The read-back is the point. Local state agreeing with itself proves nothing.
 
+**Not `bot/tools/drill.py`.** That tool drills the CARRY book (`CarryBroker`
+pairs a spot + linear leg; it has no protective-stop mechanism of its own —
+`get_liquidation_view` is a *read*, never a write). Its transcript,
+`bot/artifacts/linear_stop_drill.json`, is real Phase D evidence for the carry
+book and contains zero `trading-stop` / `verify_stop` calls. Citing it here
+was the exact substitution this document warns against elsewhere — a number
+from one measurement standing in for a different question's answer.
+
+The tool for THIS item is `bot/tools/linear_stop_venue_drill.py`, which drives
+the same `BybitClient.place_stop_order` / `verify_stop` path the directional
+order path and `tests/test_linear_simulator.py::TestTheProtectiveStopEndToEnd`
+already use. From `bot/` (per §1's `cd bot`):
+
 ```bash
-python3 tools/drill.py                                   # read-only first
-python3 tools/drill.py --arm --notional 100 --out artifacts/linear_stop_drill.json
+python3 tools/linear_stop_venue_drill.py                # read-only first
+python3 tools/linear_stop_venue_drill.py --arm --notional 100 \
+    --out artifacts/linear_protective_stop_venue.json
 ```
 
-Then confirm through the exchange, not the log:
+`verify_stop`'s call IS the tool's `verify` stage — there is no separate
+manual `client.verify_stop(...)` step to run. It dispatches by category
+deliberately: a spot conditional stop is an **order**, a linear stop is a
+**field on the position** (`/v5/position/list`). Item 1 is satisfied only by
+the `verify` stage's `live=True`, and only when the transcript's `verdict` is
+`PASSED` — a `FAILED` transcript with a stray `live=True` somewhere in its
+evidence is not a pass; read `verdict`, not a grep.
 
-```python
-live, detail = client.verify_stop(symbol="BTCUSDT", order_link_id="<id>")
-```
-
-`verify_stop` dispatches by category deliberately: a spot conditional stop is an
-**order**, a linear stop is a **field on the position** (`/v5/position/list`).
-Item 1 is satisfied only by the linear branch returning `live=True`.
-
-Evidence: `bot/artifacts/linear_stop_drill.json` · `observed:` line in the checklist
+Evidence: `bot/artifacts/linear_protective_stop_venue.json` · `observed:` line
+in the checklist
 
 ### Item 2 — the stop SURVIVES a process restart
 

@@ -37,10 +37,15 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
 
 ```
 [ ] 1. PLACE and READ BACK
-       python3 tools/drill.py                                   # read-only first
-       python3 tools/drill.py --arm --notional 100 --out artifacts/linear_stop_drill.json
-       # then confirm through the exchange, not the log:
-       #   client.verify_stop(symbol="BTCUSDT", order_link_id="<id>") -> live=True
+       # NOT tools/drill.py - that drills the CARRY book (paired spot+linear
+       # legs) and never calls place_stop_order/verify_stop at all. Its
+       # transcript (artifacts/linear_stop_drill.json) is real Phase D carry
+       # evidence and is NOT stop evidence - do not cite it here.
+       python3 tools/linear_stop_venue_drill.py                 # read-only first
+       python3 tools/linear_stop_venue_drill.py --arm --notional 100 \
+           --out artifacts/linear_protective_stop_venue.json
+       # verify_stop's call IS the tool's `verify` stage; read the
+       # transcript's verdict (must be PASSED), not a grep for "live=True"
        observed: ______________________________________________
 
 [ ] 2. SURVIVES a restart
