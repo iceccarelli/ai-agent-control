@@ -4,6 +4,14 @@ on:
   schedule:
     # 00:07 UTC — after Binance daily close
     - cron: "7 0 * * *"
+  # GitHub-hosted runners can get Binance HTTP 451 geo-blocks that a
+  # Codespaces environment or the factory host would not — Codespaces is the
+  # proven accrual host if this schedule keeps getting geo-blocked.
+  # scripts/stage_b_forward_accrual.sh already fails soft on a spot-corpus
+  # 451/network refusal when spot was already tip-current with linear (not a
+  # Stage B blocker either way — the forward pilot doesn't read spot); a
+  # linear/funding 451, or a real spot gap, still aborts the run. Kept as a
+  # scheduled job for now; workflow_dispatch below is for manual experiments.
   workflow_dispatch:
 
 permissions:

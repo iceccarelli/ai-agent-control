@@ -46,6 +46,7 @@ import json
 import os
 import shutil
 import sys
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -190,7 +191,42 @@ def run(repo: str = ".", *, symbol: str = "BTCUSDT",
         (last + dt.timedelta(days=1)) if last else dt.date(2022, 8, 10),
         dt.time(), dt.timezone.utc).timestamp() * 1000)
 
-    raw = fetch(symbol, start_ms) if klines is None else klines
+    # A network/geo refusal (e.g. Binance HTTP 451 on a blocked runner IP) is
+    # reported structurally here, the same way a prefix break or a gap is
+    # reported below — never an uncaught traceback. `network_error` is the
+    # marker a caller (stage_b_forward_accrual.sh) checks to decide whether
+    # this specific refusal is safe to treat as a no-op (spot tip already
+    # current, nothing missing) rather than a real corpus problem. This
+    # function never makes that call itself: it only reports what happened,
+    # with zero bars fabricated either way.
+    if klines is None:
+        try:
+            raw = fetch(symbol, start_ms)
+        except urllib.error.HTTPError as exc:
+            return {
+                "tool": "append_spot_corpus", "symbol": symbol, "write": write,
+                "last_before": str(last), "new_closed_days": [],
+                "refused_open_day": None, "refused_already_present": 0,
+                "rows_before": len(rows), "rows_after": len(rows),
+                "bars_fabricated": 0,
+                "network_error": {"kind": "HTTPError", "status": exc.code,
+                                  "reason": str(exc.reason)},
+                "error": (f"NETWORK REFUSAL — HTTP {exc.code} {exc.reason}: "
+                          f"fetch aborted, no bars fabricated."),
+            }
+        except urllib.error.URLError as exc:
+            return {
+                "tool": "append_spot_corpus", "symbol": symbol, "write": write,
+                "last_before": str(last), "new_closed_days": [],
+                "refused_open_day": None, "refused_already_present": 0,
+                "rows_before": len(rows), "rows_after": len(rows),
+                "bars_fabricated": 0,
+                "network_error": {"kind": "URLError", "reason": str(exc.reason)},
+                "error": (f"NETWORK REFUSAL — {exc.reason}: fetch aborted, "
+                          f"no bars fabricated."),
+            }
+    else:
+        raw = klines
     candidates = [to_row(k) for k in raw]
 
     # Two refusals, and they are different refusals. TODAY has not closed, so
