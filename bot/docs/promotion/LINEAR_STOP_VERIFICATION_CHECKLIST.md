@@ -78,10 +78,21 @@ recorded:
          NOTE: Phase D carry drill (artifacts/linear_stop_drill.json) is NOT
          this evidence.
 
-[ ] 2. The stop SURVIVES a process restart. Kill the process with a position
+[x] 2. The stop SURVIVES a process restart. Kill the process with a position
        open; confirm on restart that the stop is still on the venue and that
        reconciliation sees it.
-       observed: ______________________________________________
+       observed: 2026-09-27 Codespace tip 228fb87. HOLD→exit→VERIFY→FLATTEN
+         via bot/tools/linear_stop_venue_drill.py (not session_tail).
+         HOLD: --hold --notional 100 --out artifacts/linear_stop_hold.json
+           open BB-line-1-ca5950b3b936bada4a415a02 size 0.001 @ 84704;
+           attach BB-stop-2-25ad10a46cd165956d771743 stopLoss=80468.7
+           live=True; process exited (pid 3097) leaving position+stop.
+         VERIFY (new process pid 3668): --verify
+           --out artifacts/linear_stop_verify_after_restart.json
+           verdict=VERIFIED venue_perp_qty=0.001 live=True
+           detail=stopLoss=80468.7 (GET /v5/position/list).
+         FLATTEN: --flatten --out artifacts/linear_stop_flatten.json
+           BB-line-1-36e7bad50964a10a825f7a91 → FLAT stop_still_live=False.
 
 [ ] 3. A position that somehow ends up NAKED is detected within one cycle and
        either re-protected or flattened. Induce this deliberately.
