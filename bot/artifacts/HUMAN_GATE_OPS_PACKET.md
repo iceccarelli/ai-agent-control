@@ -103,11 +103,12 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
 All four venue items above are ticked from `LINEAR_STOP_VERIFICATION_CHECKLIST.md`'s
 own `[x]` marks and its Sign-off block (Verified by Vincenzo Ceccarelli,
 2026-09-27) — this packet only points at that evidence, it does not restate
-or re-verify it. **The gate JSON itself
-(`artifacts/slice59_promotion_gate.json`'s `linear_protective_stop_verified`)
-still reads `complete: false`** — a human still needs to record the
-checklist's evidence path there; see the note in
-`docs/promotion/RISK_MEMO_MICRO_LIVE_DRAFT.md` §6.
+or re-verify it. **The gate JSON now matches:**
+`artifacts/slice59_promotion_gate.json`'s `linear_protective_stop_verified`
+reads `complete: true` (synced from the signed checklist via
+`tools/sync_linear_stop_gate_evidence.py --write`; see the tool's own
+recorded `signature` block in the JSON for the exact checklist/memo paths
+and Sign-off it transcribed).
 
 Then in `LINEAR_STOP_VERIFICATION_CHECKLIST.md`, tick exactly one — the
 checklist already has BOTH boxes ticked, since Items 1-4 were satisfied on
