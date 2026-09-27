@@ -301,10 +301,16 @@ class TestTheGateStillPricesTheTaker:
 class TestTheBrokerSpeaksTheVenuesLanguage:
     class Client:
         def __init__(self, ticker=None, create=None, raise_on_create=None):
-            self.ticker = ticker or {"list": [{"bid1Price": "99999.9",
-                                               "ask1Price": "100000.1",
-                                               "markPrice": "100000.0",
-                                               "lastPrice": "100000.0"}]}
+            # The REAL envelope: `_request` returns the whole thing
+            # (`{retCode, retMsg, result: {list: [...]}}`), and
+            # `get_book_top` unwraps `result.list` the same way
+            # `BybitClient.get_ticker` does - not a flat top-level `list`.
+            self.ticker = ticker or {"retCode": 0, "retMsg": "OK",
+                                     "result": {"list": [
+                                         {"bid1Price": "99999.9",
+                                          "ask1Price": "100000.1",
+                                          "markPrice": "100000.0",
+                                          "lastPrice": "100000.0"}]}}
             self.create = create or {"orderLinkId": "x"}
             self.raise_on_create = raise_on_create
             self.bodies = []
@@ -336,7 +342,8 @@ class TestTheBrokerSpeaksTheVenuesLanguage:
             "bid": 99999.9, "ask": 100000.1}
 
     def test_a_missing_touch_raises(self):
-        c = self.Client(ticker={"list": [{"markPrice": "1"}]})
+        c = self.Client(ticker={"retCode": 0, "retMsg": "OK",
+                                "result": {"list": [{"markPrice": "1"}]}})
         with pytest.raises(PairIncident):
             self.broker(c).get_book_top("BTCUSDT", "linear")
 

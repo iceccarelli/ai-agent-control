@@ -54,9 +54,15 @@ class FakeClient:
                 "basePrecision": "0.000001", "minOrderAmt": "5",
                 "minNotionalValue": "5"}}]}
         if endpoint == "/v5/market/tickers":
-            return {"list": [{"markPrice": str(self.mark),
-                              "lastPrice": str(self.mark),
-                              "fundingRate": "0.0003"}]}
+            # The REAL envelope, unlike every other branch here (tracked as a
+            # separate, larger finding — see TestTickerUnwrapsTheFullEnvelope
+            # below and the PR description). `BybitClient._request` returns
+            # this whole thing; `carry_broker`'s ticker/mark readers must
+            # unwrap `result.list`, not read `list` off the envelope itself.
+            return {"retCode": 0, "retMsg": "OK",
+                    "result": {"list": [{"markPrice": str(self.mark),
+                                         "lastPrice": str(self.mark),
+                                         "fundingRate": "0.0003"}]}}
         if endpoint == "/v5/position/list":
             return {"list": [{"positionIM": str(self.im),
                               "positionMM": str(self.mm),
@@ -197,6 +203,92 @@ class TestMarkMustBeUsable:
     def test_a_zero_mark_raises(self):
         with pytest.raises(PairIncident):
             broker(FakeClient(mark=0.0)).get_mark("BTCUSDT")
+
+
+class TestTickerUnwrapsTheFullEnvelope:
+    """Proven live on Bybit testnet: `client._request` returns the WHOLE
+    envelope (`{retCode, retMsg, result: {list: [...]}}`), the same object
+    `BybitClient.get_ticker` unwraps via `payload.get("result",
+    {}).get("list")`. `get_mark`/`get_spot_mark`/`get_book_top`/
+    `get_funding_bps` were instead reading `.get("list")` directly off that
+    envelope - always empty, because the real key is nested one level down
+    under "result". `PairIncident("no ticker for ...")` fired every time,
+    with retCode 0 and a populated `result.list` sitting right there.
+
+    Every case here drives `_request` through a full, realistic envelope -
+    never the flattened `{"list": [...]}` shortcut most of this file's
+    FakeClient branches still use for the endpoints this PR does not touch
+    (position/list, order/realtime, wallet-balance, fee-rate,
+    funding/history, instruments-info all share the identical mistake and
+    are OUT of scope here - see the PR description)."""
+
+    @staticmethod
+    def _full_envelope(rows):
+        return {"retCode": 0, "retMsg": "OK", "result": {"list": rows}}
+
+    def test_get_mark_reads_the_nested_result_list(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: TestTickerUnwrapsTheFullEnvelope \
+            ._full_envelope([{"markPrice": "87654.5"}])
+        assert broker(client).get_mark("BTCUSDT") == pytest.approx(87654.5)
+
+    def test_get_spot_mark_reads_the_nested_result_list(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: TestTickerUnwrapsTheFullEnvelope \
+            ._full_envelope([{"lastPrice": "87600.0"}])
+        assert broker(client).get_spot_mark("BTCUSDT") == pytest.approx(87600.0)
+
+    def test_get_book_top_reads_the_nested_result_list(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: TestTickerUnwrapsTheFullEnvelope \
+            ._full_envelope([{"bid1Price": "87500.0", "ask1Price": "87510.0"}])
+        top = broker(client).get_book_top("BTCUSDT", LINEAR)
+        assert top == {"bid": pytest.approx(87500.0), "ask": pytest.approx(87510.0)}
+
+    def test_get_funding_bps_reads_the_nested_result_list(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: TestTickerUnwrapsTheFullEnvelope \
+            ._full_envelope([{"fundingRate": "0.0004"}])
+        assert broker(client).get_funding_bps("BTCUSDT") == pytest.approx(4.0)
+
+    @pytest.mark.parametrize("fn, args", [
+        ("get_mark", ("BTCUSDT",)),
+        ("get_spot_mark", ("BTCUSDT",)),
+        ("get_book_top", ("BTCUSDT", LINEAR)),
+        ("get_funding_bps", ("BTCUSDT",)),
+    ])
+    def test_an_empty_nested_list_still_raises(self, fn, args):
+        """retCode 0, envelope well-formed, `result.list` is simply empty -
+        the venue genuinely has no row. Must still raise, not fabricate."""
+        client = FakeClient()
+        client._request = lambda *a, **k: TestTickerUnwrapsTheFullEnvelope \
+            ._full_envelope([])
+        with pytest.raises(PairIncident):
+            getattr(broker(client), fn)(*args)
+
+    @pytest.mark.parametrize("fn, args", [
+        ("get_mark", ("BTCUSDT",)),
+        ("get_spot_mark", ("BTCUSDT",)),
+        ("get_book_top", ("BTCUSDT", LINEAR)),
+        ("get_funding_bps", ("BTCUSDT",)),
+    ])
+    def test_a_populated_top_level_list_is_not_mistaken_for_the_real_one(
+            self, fn, args):
+        """The bug this PR fixes: a flat top-level `list` (the OLD, wrong
+        shape a mock could return) must NOT be read even if it happens to be
+        populated - only `result.list` is the real answer. This is what
+        actually proves the unwrap changed, rather than merely tolerating
+        both shapes by accident."""
+        client = FakeClient()
+        client._request = lambda *a, **k: {
+            "retCode": 0, "retMsg": "OK",
+            "list": [{"markPrice": "1.0", "lastPrice": "1.0",
+                     "fundingRate": "0.0001", "bid1Price": "1.0",
+                     "ask1Price": "1.0"}],
+            "result": {"list": []},
+        }
+        with pytest.raises(PairIncident):
+            getattr(broker(client), fn)(*args)
 
 
 class TestReconciliationTreatsMismatchAsAnIncident:
