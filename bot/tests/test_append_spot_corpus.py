@@ -10,6 +10,7 @@ import datetime as dt
 import gzip
 import os
 import sys
+import urllib.error
 
 import pytest
 
@@ -58,6 +59,64 @@ class TestHistoryIsNeverRewritten:
                     klines=[kline(dt.date(2026, 9, 3), price=999.0)])
         assert r["refused_already_present"] == 1
         assert not r["new_closed_days"]
+
+
+class TestNetworkRefusalIsReportedNotRaised:
+    """A geo-block (Binance HTTP 451 on a blocked runner IP) or any other
+    network failure must be reported the same way a prefix break or a gap
+    is - structurally, with zero bars fabricated - never an uncaught
+    traceback that crashes the caller before it can decide anything."""
+
+    def test_an_http_451_is_reported_structurally(self, repo, monkeypatch):
+        def _blocked(symbol, start_ms):
+            raise urllib.error.HTTPError(
+                asc.ENDPOINT, 451, "Unavailable For Legal Reasons", {}, None)
+        monkeypatch.setattr(asc, "fetch", _blocked)
+
+        r = asc.run(repo, today=TODAY)
+
+        assert r["network_error"] == {
+            "kind": "HTTPError", "status": 451,
+            "reason": "Unavailable For Legal Reasons"}
+        assert r["new_closed_days"] == []
+        assert r["bars_fabricated"] == 0
+        assert "error" in r
+        assert not r.get("written")
+
+    def test_a_url_error_is_reported_structurally(self, repo, monkeypatch):
+        def _unreachable(symbol, start_ms):
+            raise urllib.error.URLError("geo-blocked")
+        monkeypatch.setattr(asc, "fetch", _unreachable)
+
+        r = asc.run(repo, today=TODAY)
+
+        assert r["network_error"]["kind"] == "URLError"
+        assert r["new_closed_days"] == []
+        assert r["bars_fabricated"] == 0
+
+    def test_run_all_reports_refused_for_both_trees_without_raising(
+            self, repo, monkeypatch):
+        def _blocked(symbol, start_ms):
+            raise urllib.error.HTTPError(asc.ENDPOINT, 451, "blocked", {}, None)
+        monkeypatch.setattr(asc, "fetch", _blocked)
+
+        report = asc.run_all(repo, today=TODAY)
+
+        assert "refused" in report
+        assert all(t["network_error"]["status"] == 451
+                  for t in report["trees"].values())
+
+    def test_explicit_klines_bypasses_the_network_path_entirely(
+            self, repo, monkeypatch):
+        """The existing fixed-klines tests must keep working unchanged - the
+        try/except only wraps the live fetch() call, never a supplied list."""
+        def _should_not_be_called(symbol, start_ms):
+            raise AssertionError("fetch() must not run when klines is given")
+        monkeypatch.setattr(asc, "fetch", _should_not_be_called)
+
+        r = asc.run(repo, today=TODAY, klines=[kline(dt.date(2026, 9, 6))])
+        assert r["new_closed_days"] == ["2026-09-06"]
+        assert "network_error" not in r
 
 
 class TestAGapIsRefused:

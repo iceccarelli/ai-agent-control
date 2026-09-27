@@ -14,7 +14,10 @@
 # WHAT THIS SCRIPT DOES
 #   1. append_closed_corpus.py --write   (linear + funding, both trees —
 #      dual-tree sync is the tool's own default, no second hand-call needed)
-#   2. append_spot_corpus.py --write     (spot, both trees, same pattern)
+#   2. append_spot_corpus.py --write     (spot, both trees, same pattern;
+#      a network/geo refusal — e.g. Binance HTTP 451 on a GitHub-hosted
+#      runner — fails this step SOFTLY (logged, exit 0) only when spot was
+#      already tip-current with linear; a real gap still aborts)
 #   3. daily_forward_refresh.py --scratch state/forward_shadow_scratch
 #      (READ-ONLY scratch score; never writes to artifacts/). The scratch
 #      dir is a fixed, persistent path (not a tempfile.TemporaryDirectory
@@ -51,10 +54,67 @@ PY="$REPO/.venv/bin/python"
 cd "$BOT"
 
 # 1. Linear + funding corpora, both trees (primary + _full), one atomic call.
-"$PY" tools/append_closed_corpus.py --write
+LINEAR_REPORT=$("$PY" tools/append_closed_corpus.py --write)
+echo "$LINEAR_REPORT"
 
 # 2. Spot corpus, both trees, same dual-tree pattern.
-"$PY" tools/append_spot_corpus.py --write
+#
+# Spot is NOT read by the Stage B forward pilot (see append_spot_corpus.py's
+# own docstring and test_the_forward_pilot_does_not_read_spot) - it is
+# book-health hygiene for corpus_health / carry_backtest's basis leg, not a
+# Stage B blocker. Some hosts (GitHub-hosted runners in particular) get
+# Binance HTTP 451 geo-blocks that a factory host or Codespaces would not.
+#
+# So a spot-fetch failure is treated as SOFT (log clearly, exit 0 for this
+# step) only when BOTH of these hold, and is a REAL failure (abort, same as
+# before) otherwise:
+#   (a) the failure is a reported network/geo refusal
+#       (append_spot_corpus.py's own "network_error" field - never a raw
+#       crash, see its run()), not a prefix break, gap, or write-verify
+#       failure, and
+#   (b) both the primary and full spot trees were ALREADY at the same closed
+#       day as linear's own tip before the failed fetch - i.e. there is
+#       nothing this run needed spot to catch up on regardless.
+# This never invents a bar and never promotes anything; it only decides
+# whether an already-harmless network refusal may fail the step softly.
+if SPOT_REPORT=$("$PY" tools/append_spot_corpus.py --write); then
+    SPOT_RC=0
+else
+    SPOT_RC=$?
+fi
+echo "$SPOT_REPORT"
+
+if [ "$SPOT_RC" -ne 0 ]; then
+    SOFT_OK=$("$PY" - "$LINEAR_REPORT" "$SPOT_REPORT" <<'PY'
+import json
+import sys
+
+linear_report = json.loads(sys.argv[1])
+spot_report = json.loads(sys.argv[2])
+
+linear_tips = set((linear_report.get("linear_tips") or {}).values())
+trees = list((spot_report.get("trees") or {}).values())
+
+all_network_refusals = bool(trees) and all(
+    isinstance(t, dict) and t.get("network_error") for t in trees)
+all_already_current = bool(trees) and len(linear_tips) == 1 and all(
+    isinstance(t, dict) and t.get("last_before") in linear_tips for t in trees)
+
+print("yes" if (all_network_refusals and all_already_current) else "no")
+PY
+)
+    if [ "$SOFT_OK" = "yes" ]; then
+        echo "SOFT-FAIL: spot corpus fetch was network-refused (e.g. Binance" \
+             "HTTP 451 geo-block on this runner) and both primary+full spot" \
+             "tips were already at the same closed day as linear before the" \
+             "failed fetch - nothing was missing, no bar was fabricated," \
+             "no promote happened. Not a Stage B blocker; continuing." >&2
+    else
+        echo "spot corpus append failed (exit $SPOT_RC) and is NOT a" \
+             "benign already-tip-current network refusal - aborting." >&2
+        exit "$SPOT_RC"
+    fi
+fi
 
 # --- Settlement / borrow corpora: NOT part of the Stage B daily path. -------
 # Left commented out on purpose (NO_GLUE_OPS.md #7). A human runs these by
