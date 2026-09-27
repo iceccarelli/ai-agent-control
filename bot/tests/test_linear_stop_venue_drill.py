@@ -314,3 +314,138 @@ class TestAgainstTheRealSimulatedVenue:
             symbol=SYMBOL, order_link_id=result.order_link_id)
         assert live is False
         assert detail == "POSITION_HAS_NO_STOP_LOSS"
+
+
+# ---------------------------------------------------------------------------
+# Item 2 - restart survival: HOLD / VERIFY / FLATTEN
+# ---------------------------------------------------------------------------
+
+
+class TestHoldLeavesThePositionOpen:
+    def test_hold_opens_attaches_and_exits_still_open(self):
+        client = FakeClient()
+        report = D.run_hold(client=client, notional=100.0)
+        assert report["verdict"] == "HOLD", report.get("failed_stage")
+        assert report["still_open"] is True
+        assert report["phase"] == "HOLD"
+        assert report["orders_sent"] == 1
+        # No flatten stage exists in HOLD - the position must remain on
+        # the venue.
+        stage_names = [s["stage"] for s in report["stages"]]
+        assert "flatten" not in stage_names
+        assert client.position_size > 0
+        assert client.stop_loss > 0
+        assert "POSITION STILL OPEN" in report["next_action"]
+
+    def test_hold_refuses_off_the_one_safe_configuration(self):
+        client = FakeClient(cfg=_cfg(PAPER_TRADING=True))
+        report = D.run_hold(client=client, notional=100.0)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "arm_gate"
+        assert report["orders_sent"] == 0
+
+    def test_hold_refuses_if_the_venue_already_holds_something(self):
+        client = FakeClient(venue_perp=0.5)
+        report = D.run_hold(client=client, notional=100.0)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "flat"
+        assert report["orders_sent"] == 0
+
+
+class TestVerifyReadsTheVenueColdFromANewProcess:
+    def test_verify_passes_when_the_stop_is_still_live(self):
+        client = FakeClient()
+        hold = D.run_hold(client=client, notional=100.0)
+        assert hold["verdict"] == "HOLD"
+        # A fresh Drill/state - no object shared with run_hold - proves the
+        # read is against the venue (FakeClient), not against any leftover
+        # in-process state.
+        report = D.run_verify(client=client)
+        assert report["verdict"] == "VERIFIED", report.get("failed_stage")
+        assert report["orders_sent"] == 0
+        assert report["evidence"]["verify"]["live"] is True
+
+    def test_verify_fails_closed_if_the_position_is_gone(self):
+        client = FakeClient()
+        report = D.run_verify(client=client)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "position_still_open"
+
+    def test_verify_fails_closed_if_the_stop_is_gone_but_the_position_remains(self):
+        client = FakeClient()
+        client.position_size = 0.001
+        client.stop_loss = 0.0
+        report = D.run_verify(client=client)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "verify"
+        assert report["evidence"]["verify"]["live"] is False
+
+
+class TestFlattenClosesOutAfterHoldOrVerify:
+    def test_flatten_closes_an_open_position(self):
+        client = FakeClient()
+        client.position_size = 0.001
+        client.stop_loss = 84707.0
+        report = D.run_flatten(client=client)
+        assert report["verdict"] == "FLATTENED", report.get("failed_stage")
+        assert report["evidence"]["final_reconcile"]["verdict"] == "FLAT"
+        assert report["evidence"]["final_reconcile"]["stop_still_live"] is False
+
+    def test_flatten_is_a_pass_when_already_flat(self):
+        client = FakeClient()
+        report = D.run_flatten(client=client)
+        assert report["verdict"] == "ALREADY_FLAT"
+        assert report["orders_sent"] == 0
+
+    def test_flatten_refuses_off_the_one_safe_configuration(self):
+        client = FakeClient(cfg=_cfg(BYBIT_VENUE="mainnet"))
+        client.position_size = 0.001
+        report = D.run_flatten(client=client)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "arm_gate"
+        assert report["orders_sent"] == 0
+
+    def test_a_flatten_that_does_not_land_is_loud(self):
+        client = FakeClient(flatten_ok=False)
+        client.position_size = 0.001
+        client.stop_loss = 84707.0
+        report = D.run_flatten(client=client)
+        assert report["verdict"] == "FAILED"
+        assert report["still_open"] is True
+        assert "HUMAN MUST ACT" in report["next_action"]
+
+
+class TestItem2NeverCitesSessionTailAsEvidence:
+    """The ops-lie this mission exists to fix: LINEAR_STOP_OPS_INVENTORY
+    used to point Item 2 at a RUNNABLE `python3 tools/session_tail.py`
+    command, which is gate-invariant read-only and never calls verify_stop
+    or reads a position's stop fields. Item 2 evidence is only ever a
+    HOLD -> VERIFY -> FLATTEN transcript from this tool. Explaining, in
+    prose, that session_tail is NOT the evidence is fine and expected -
+    what must never reappear is the command telling a human to run it as
+    the Item 2 procedure."""
+
+    BANNED = "python3 tools/session_tail.py"
+
+    def test_the_tool_itself_never_shells_out_to_session_tail(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "tools",
+                            "linear_stop_venue_drill.py")
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        assert self.BANNED not in body
+
+    def test_docs_no_longer_point_item_2_at_session_tail(self):
+        repo_root = os.path.join(os.path.dirname(__file__), "..")
+        docs = [
+            "docs/promotion/LINEAR_STOP_OPS_INVENTORY.md",
+            "artifacts/HUMAN_GATE_OPS_PACKET.md",
+            "artifacts/LINEAR_STOP_VENUE_GAP.md",
+        ]
+        for rel in docs:
+            path = os.path.join(repo_root, rel)
+            with open(path, encoding="utf-8") as fh:
+                body = fh.read()
+            assert self.BANNED not in body, (
+                f"{rel} still points a human at `{self.BANNED}` as if it "
+                "were Item 2 evidence - that tool never calls verify_stop "
+                "or reads a position's stop fields")
