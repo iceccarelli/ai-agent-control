@@ -49,9 +49,19 @@ in `docs/promotion/LINEAR_STOP_OPS_INVENTORY.md` §3. Condensed sequence:
        observed: ______________________________________________
 
 [ ] 2. SURVIVES a restart
-       # with a position open: kill <pid>  (not graceful — that is the test)
-       # restart, then:
-       python3 tools/session_tail.py
+       # NOT tools/session_tail.py - that is a read-only gate-invariant
+       # checker (allows_live/FUND_ABS/cap/LIVE_AUTHORIZED); it never calls
+       # verify_stop or reads a position's stop fields.
+       python3 tools/linear_stop_venue_drill.py --hold --notional 100 \
+           --out artifacts/linear_stop_restart_hold.json
+       # HOLD exits leaving the position+stop live on the venue - that
+       # exit is the "process death" under test. If it is somehow still
+       # running, kill -9 <pid> (not graceful). Then, a NEW process:
+       python3 tools/linear_stop_venue_drill.py --verify \
+           --out artifacts/linear_stop_restart_verify.json
+       # verdict must be VERIFIED. Then required cleanup:
+       python3 tools/linear_stop_venue_drill.py --flatten \
+           --out artifacts/linear_stop_restart_flatten.json
        observed: ______________________________________________
 
 [ ] 3. NAKED position detected within one cycle

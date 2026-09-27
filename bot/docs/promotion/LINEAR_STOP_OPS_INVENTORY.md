@@ -107,15 +107,49 @@ in the checklist
 
 ### Item 2 — the stop SURVIVES a process restart
 
+**Not `tools/session_tail.py`.** That tool is a read-only, gate-invariant
+checker (`allows_live` / `FUND_ABS` / cap / `LIVE_AUTHORIZED`) — it never
+calls `verify_stop` and never reads a position's stop fields. Pointing Item 2
+at it would satisfy nothing: it cannot see whether a stop is on the venue at
+all.
+
+This process cannot outlive its own restart to watch itself. What CAN be
+proven is the only boundary a real process death would ever cross: a second,
+independent process reading the venue cold after the first one is gone.
+`bot/tools/linear_stop_venue_drill.py` now has three phases for exactly this,
+from `bot/`:
+
 ```bash
-# with a position open:
-kill <pid>                      # not a graceful shutdown — that is the test
-# restart, then confirm reconciliation sees the venue-side stop
-python3 tools/session_tail.py
+# 1) HOLD — opens + attaches a real stop, then EXITS LEAVING THE POSITION
+#    AND STOP LIVE ON THE VENUE. It never flattens. Note the pid it prints.
+python3 tools/linear_stop_venue_drill.py --hold --notional 100 \
+    --out artifacts/linear_stop_restart_hold.json
+
+# 2) kill the HOLD process if it is somehow still around (normally it has
+#    already exited on its own right after `attach`/`verify` pass — that
+#    exit IS the process death under test):
+kill -9 <pid>          # only if still running; not a graceful shutdown
+
+# 3) VERIFY — a NEW process, no shared state, reads the venue cold:
+python3 tools/linear_stop_venue_drill.py --verify \
+    --out artifacts/linear_stop_restart_verify.json
+# verdict must be VERIFIED (get_position non-empty AND verify_stop live=True)
+
+# 4) FLATTEN — required cleanup, closes the position if VERIFY found one:
+python3 tools/linear_stop_venue_drill.py --flatten \
+    --out artifacts/linear_stop_restart_flatten.json
 ```
 
-Evidence: session log showing reconcile-on-start finding the stop still on the
-venue. Path: `bot/state/` session log + a recorded `verify_stop` read after restart.
+Be precise about the claim: the "restart" being proven is venue-side stop
+survival across process death, evidenced by `verify_stop` reading back
+`live=True` from a *different* process than the one that placed it — not a
+literal `kill -9` of a long-running daemon (there is no long-running daemon
+here to kill; HOLD's own exit after `attach`/`verify` is the death).
+
+Evidence: `artifacts/linear_stop_restart_hold.json`,
+`artifacts/linear_stop_restart_verify.json` (verdict `VERIFIED` is the Item 2
+proof), `artifacts/linear_stop_restart_flatten.json` · `observed:` line in
+the checklist.
 
 ### Item 3 — a NAKED position is detected within one cycle
 
