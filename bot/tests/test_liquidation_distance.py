@@ -256,11 +256,16 @@ class TestTheBrokerReadsTheRightFields:
 
         def _request(self, method, endpoint, *, params=None, body=None,
                      signed=False, retries=3):
+            # `self.position`/`self.wallet` are the v5 `result` object (what
+            # was, until this fix, mistaken for the whole envelope); wrap it
+            # here so every literal value already written below - including
+            # `{}` for "no list key at all, unreadable" - keeps its exact
+            # original meaning through carry_broker's real unwrap.
             if endpoint == "/v5/position/list":
-                return self.position
+                return {"retCode": 0, "retMsg": "OK", "result": self.position}
             if endpoint == "/v5/account/wallet-balance":
-                return self.wallet
-            return {}
+                return {"retCode": 0, "retMsg": "OK", "result": self.wallet}
+            return {"retCode": 0, "retMsg": "OK", "result": {}}
 
     def broker(self, client):
         from carry_broker import CarryBroker

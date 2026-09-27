@@ -204,17 +204,21 @@ def _carry_bot(**env):
         # 0036: the engine prices its own exit before it decides, so the fake
         # venue answers the fee table and the lot rules.
         if endpoint == "/v5/account/fee-rate":
-            return {"list": [{"makerFeeRate": "0.0002",
-                              "takerFeeRate": "0.00055"}]}
+            return {"retCode": 0, "retMsg": "OK",
+                    "result": {"list": [{"makerFeeRate": "0.0002",
+                                        "takerFeeRate": "0.00055"}]}}
         if endpoint == "/v5/market/instruments-info":
-            return {"list": [{"lotSizeFilter": {
-                "qtyStep": "0.000001", "minOrderQty": "0.000001",
-                "basePrecision": "0.000001", "minOrderAmt": "5",
-                "minNotionalValue": "5"}}]}
+            return {"retCode": 0, "retMsg": "OK",
+                    "result": {"list": [{"lotSizeFilter": {
+                        "qtyStep": "0.000001", "minOrderQty": "0.000001",
+                        "basePrecision": "0.000001", "minOrderAmt": "5",
+                        "minNotionalValue": "5"}}]}}
         if endpoint == "/v5/account/wallet-balance":
-            return {"list": [{"coin": [{"coin": "BTC", "walletBalance": "5",
-                                        "locked": "0"}]}]}
-        return {"orderLinkId": "x"}
+            return {"retCode": 0, "retMsg": "OK",
+                    "result": {"list": [
+                        {"coin": [{"coin": "BTC", "walletBalance": "5",
+                                  "locked": "0"}]}]}}
+        return {"retCode": 0, "retMsg": "OK", "result": {"orderLinkId": "x"}}
 
     client = mock.Mock()
     client._request = mock.Mock(side_effect=_request)
@@ -324,8 +328,12 @@ class TestTheSpotLegIsSizedInBtc:
 
 class TestAFeeIsKnownOrItIsUnknown:
     def test_cum_exec_fee_is_carried(self):
-        fill = CarryBroker._fill_from({"cumExecQty": "0.001", "avgPrice": "1",
-                                       "cumExecFee": "0.000001"}, "x")
+        # `_fill_from` unwraps a full v5 envelope's `result`, same as every
+        # other reader in carry_broker.py.
+        fill = CarryBroker._fill_from(
+            {"retCode": 0, "retMsg": "OK",
+             "result": {"cumExecQty": "0.001", "avgPrice": "1",
+                       "cumExecFee": "0.000001"}}, "x")
         assert fill.fee == pytest.approx(0.000001)
         assert fill.as_engine_result()["fee"] == pytest.approx(0.000001)
 

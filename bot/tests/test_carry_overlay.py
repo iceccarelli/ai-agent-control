@@ -281,11 +281,14 @@ class TestTheBookChargesItselfWhatTheVenueCharges:
                          signed=False, retries=3):
                 calls.append(endpoint)
                 if endpoint == "/v5/account/fee-rate":
-                    return {"list": [{"makerFeeRate": "0.0002",
-                                      "takerFeeRate": "0.00055"}]}
-                return {"list": [{"lotSizeFilter": {
-                    "qtyStep": "0.001", "minOrderQty": "0.001",
-                    "minNotionalValue": "5"}}]}
+                    return {"retCode": 0, "retMsg": "OK",
+                            "result": {"list": [
+                                {"makerFeeRate": "0.0002",
+                                 "takerFeeRate": "0.00055"}]}}
+                return {"retCode": 0, "retMsg": "OK",
+                        "result": {"list": [{"lotSizeFilter": {
+                            "qtyStep": "0.001", "minOrderQty": "0.001",
+                            "minNotionalValue": "5"}}]}}
 
         b = CarryBroker(client=Client(), sequence_source=lambda *a: 1,
                         order_gate=lambda: (True, "TEST"))
@@ -410,9 +413,12 @@ class TestTheBrokerReadsTheVenuesRules:
         def _request(self, method, endpoint, *, params=None, body=None,
                      signed=False, retries=3):
             self.calls.append((endpoint, params))
-            if endpoint in self.rows:
-                return self.rows[endpoint]
-            return {}
+            # Each value in self.rows is the v5 `result` object; wrap it in
+            # the real envelope so every literal `{"list": [...]}` below -
+            # and the missing-endpoint `{}` case, "no list key, unreadable" -
+            # keeps its original meaning through carry_broker's real unwrap.
+            result = self.rows.get(endpoint, {})
+            return {"retCode": 0, "retMsg": "OK", "result": result}
 
     def broker(self, client):
         return CarryBroker(client=client, sequence_source=lambda *a: 1,

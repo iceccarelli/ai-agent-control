@@ -311,8 +311,8 @@ class _Client:
                  signed=False, retries=3):
         self.calls.append((method, endpoint, params))
         if endpoint == "/v5/market/funding/history":
-            return {"list": self.rows}
-        return {}
+            return {"retCode": 0, "retMsg": "OK", "result": {"list": self.rows}}
+        return {"retCode": 0, "retMsg": "OK", "result": {}}
 
 
 def _broker(rows):
