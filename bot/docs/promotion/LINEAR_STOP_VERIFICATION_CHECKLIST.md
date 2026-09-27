@@ -141,4 +141,3 @@ bot/artifacts/linear_stop_naked_flatten.json
 bot/artifacts/linear_stop_margin_doc.json
 bot/docs/promotion/LINEAR_STOP_MARGIN_MEMO.md
 
-After commit, send the link. Then we do Part 2: risk memo M-4 (your ACCEPTED / NOT ACCEPTED decision).
