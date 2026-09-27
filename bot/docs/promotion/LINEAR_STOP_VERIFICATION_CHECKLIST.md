@@ -112,9 +112,18 @@ recorded:
            confirm live=True stopLoss=83319.6 (one cycle).
          FLATTEN: artifacts/linear_stop_naked_flatten.json → FLAT.
 
-[ ] 4. Margin and liquidation behaviour on linear is understood and documented
+[x] 4. Margin and liquidation behaviour on linear is understood and documented
        for the proposed notional, including what happens at the cap.
-       observed: ______________________________________________
+       observed: 2026-09-27 Codespace tip b8dcd84.
+         --margin-doc --notional 100
+         --out artifacts/linear_stop_margin_doc.json → DOCUMENTED;
+         --flatten → artifacts/linear_stop_margin_doc_flatten.json FLAT.
+         size 0.001 @ avgPrice 85032.9 mark 84998.83 notional≈84.999 (< cap 100);
+         stopLoss 80781.1 (~5.00% below entry); leverage 10;
+         positionIM 8.54197428 USDT; positionMM 0.32258742 USDT;
+         liqPrice empty (BEYOND_VENUE_PRICE_BOUNDS_OR_EMPTY) → nearer=unknown;
+         USDT walletBalance≈1084.58; totalEquity≈9968.76.
+         Memo: docs/promotion/LINEAR_STOP_MARGIN_MEMO.md (filled same numbers).
 ```
 
 ## The simulator gap — say which of the two was done
