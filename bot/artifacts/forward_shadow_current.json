@@ -3,7 +3,7 @@
   "slice": 76,
   "signal": "funding_carry_fade_btc_v1",
   "symbol": "BTCUSDT",
-  "observed_at_utc": "2026-09-27T02:33:50Z",
+  "observed_at_utc": "2026-09-28T22:24:27Z",
   "extension_present": true,
   "is_forward_observation": true,
   "forward_n_trades": 4,
@@ -13,15 +13,15 @@
   "cleared_edge_re_scored_this_slice": false,
   "labelling_rule": "is_forward_observation = forward_n_trades > 0, NOT extension_present. A BAR ARRIVING IS NOT AN OBSERVATION. Declared in EDGE.md \u00a745e before this tool ran.",
   "ceiling": {
-    "closed_forward_bars": 48,
+    "closed_forward_bars": 49,
     "closed_forward_bars_needed_for_one_trade": 6,
-    "max_possible_forward_closed_trades": 43,
+    "max_possible_forward_closed_trades": 44,
     "declared_in": "EDGE.md \u00a759a, before this tool ran",
     "observed_forward_closed_trades": 4,
     "within_ceiling": true,
     "note_on_this_milestone": "Ceiling 10 at N=15, and it moved by TWO because a CATCH-UP appended two closed days at once \u2014 2026-08-23 and 2026-08-24. Not 9 and not 11: the ceiling counts closed forward decision bars, and there are fifteen. Two things moved upstream and both are arithmetic about which bar is last: 2026-08-22 became a FLAG (the transition 2026-08-21 made in slice 75 and 2026-08-19 in slice 73), and 2026-08-23 made the same transition inside this same catch-up, so the flag count went from two to four. 2026-08-24 is a FIFTH setup standing on the last bar and does not flag. Nothing is scoreable: eligibility reaches back seven bars, so with 2026-08-24 last the highest scoreable bar is 2026-08-17 and all four flags sit in the tail. The gaps are recomputed from the corpus every slice and never carried forward \u2014 \u00a757b reused a distance and got it wrong, and this slice's distance for 2026-08-19 is TWO where slice 75 said four and slice 74 said five. A LARGER CEILING IS A LARGER DENOMINATOR. Ten is permission for a completed trade, not a promise of one, and observed is 0. EDGE.md \u00a759a, \u00a759b, \u00a759c, \u00a757e, \u00a756d.",
     "assumption_the_declared_ceiling_rests_on": "every trade holds for the full HORIZON. The code does not assume that: held = side_used.get(index, HORIZON) and the short-side barrier resolves in fewer than HORIZON bars on 52.8% of this corpus, so a decision later than last - HORIZON can also close inside the window.",
-    "unconditional_upper_bound": 47,
+    "unconditional_upper_bound": 48,
     "contiguous_setup_runs": [
       [
         "2026-08-19"
@@ -44,7 +44,7 @@
       ]
     ],
     "max_entries_the_schedule_would_admit": 5,
-    "forward_bars_with_a_barrier_outcome": 41,
+    "forward_bars_with_a_barrier_outcome": 42,
     "what_actually_bound_this_slice": "barrier eligibility, not the horizon and not the schedule. See barrier_eligibility. EDGE.md \u00a756d.",
     "what_the_unconditional_bound_counts": "forward decision bars that have ANY next bar to enter on, i.e. every bar but the last. A count above THIS is a data or scheduling defect; a count above the declared ceiling may simply be early barrier resolution.",
     "_prior_milestone_note": "FIRST STRUCTURAL NON-ZERO CEILING in the pilot series. It counts DECISION BARS that could yield a trade closing inside the window \u2014 exactly one, the first forward bar \u2014 not outcomes: whether such a trade closes also depends on the barrier resolving in the bars that remain, since entry falls on the following bar and the exit index must stay inside the corpus. A true upper bound, not a forecast.",
@@ -55,8 +55,8 @@
     "t1": "2026-08-09T00:00:00Z",
     "t1_is_measured_not_forward": "Strict. A bar stamped exactly t1 is the last bar of the cleared run. Counting it as forward would be the slice-59 substitution in its smallest and most plausible form.",
     "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
-    "bars_strictly_after_t1": 48,
-    "of_which_closed": 48,
+    "bars_strictly_after_t1": 49,
+    "of_which_closed": 49,
     "bar_utcs": [
       "2026-08-10T00:00:00Z",
       "2026-08-11T00:00:00Z",
@@ -105,9 +105,10 @@
       "2026-09-23T00:00:00Z",
       "2026-09-24T00:00:00Z",
       "2026-09-25T00:00:00Z",
-      "2026-09-26T00:00:00Z"
+      "2026-09-26T00:00:00Z",
+      "2026-09-27T00:00:00Z"
     ],
-    "corpus_last_bar_utc": "2026-09-26T00:00:00Z",
+    "corpus_last_bar_utc": "2026-09-27T00:00:00Z",
     "built_by": "restrict_flags_to_forward (flags zeroed)",
     "bar_array_sliced": false,
     "why_not_sliced": "A 14-period ATR computed over a one-bar window is not a warm indicator, it is a number invented out of nothing, and every barrier derived from it would be fiction. Warm-up state legitimately flows from history. Decisions do not.",
@@ -467,6 +468,13 @@
       {
         "bar_utc": "2026-09-26T00:00:00Z",
         "funding_setup_present": false,
+        "is_last_bar_of_corpus": false,
+        "excluded_as_last_bar": null,
+        "fund_abs_threshold": 0.0001
+      },
+      {
+        "bar_utc": "2026-09-27T00:00:00Z",
+        "funding_setup_present": false,
         "is_last_bar_of_corpus": true,
         "excluded_as_last_bar": "directed_signal_bars excludes the final bar: the fill happens one bar later and there is no next bar to fill on",
         "fund_abs_threshold": 0.0001
@@ -591,9 +599,9 @@
     "entry_on": "next_open",
     "entry_offset": 1,
     "horizon": 5,
-    "corpus_last_index": 2575,
-    "highest_scoreable_index": 2568,
-    "highest_scoreable_bar_utc": "2026-09-19T00:00:00Z",
+    "corpus_last_index": 2576,
+    "highest_scoreable_index": 2569,
+    "highest_scoreable_bar_utc": "2026-09-20T00:00:00Z",
     "reaches_back_from_the_end_by_bars": 7,
     "forward_bars_that_are_scoreable": [
       "2026-08-10",
@@ -636,25 +644,26 @@
       "2026-09-16",
       "2026-09-17",
       "2026-09-18",
-      "2026-09-19"
+      "2026-09-19",
+      "2026-09-20"
     ],
     "forward_bars_that_are_not_scoreable": [
-      "2026-09-20",
       "2026-09-21",
       "2026-09-22",
       "2026-09-23",
       "2026-09-24",
       "2026-09-25",
-      "2026-09-26"
+      "2026-09-26",
+      "2026-09-27"
     ],
     "closed_days_until_scoreable": {
-      "2026-09-20": 1,
-      "2026-09-21": 2,
-      "2026-09-22": 3,
-      "2026-09-23": 4,
-      "2026-09-24": 5,
-      "2026-09-25": 6,
-      "2026-09-26": 7
+      "2026-09-21": 1,
+      "2026-09-22": 2,
+      "2026-09-23": 3,
+      "2026-09-24": 4,
+      "2026-09-25": 5,
+      "2026-09-26": 6,
+      "2026-09-27": 7
     },
     "how_that_is_computed": "a bar at index i is scoreable when the last index is at least i + horizon + 2, so the remaining closed days are (i + horizon + 2) - last. Read from the corpus this slice; never carried forward. EDGE.md \u00a756d, \u00a757e, \u00a758b.",
     "this_is_what_stopped_an_entry_this_slice": "FOUR flags now \u2014 2026-08-19, 2026-08-21, 2026-08-22 and 2026-08-23 \u2014 and not one of them is scoreable. Every one sits inside the seven-bar tail this function blanks, so no barrier outcome exists for any of them, none reaches the schedule, and no entry is taken. The gate is arithmetic about available data, not a judgement about any trade. Catching up two closed days moved the tail forward by exactly two as well, which is why 2026-08-19 went from four closed days away to two rather than becoming scoreable: the window and the tail advance together, and only the passage of time past a FIXED bar closes the gap. EDGE.md \u00a759c.",
@@ -724,8 +733,8 @@
     "comparable": true,
     "previous_artefact": "artifacts/slice75_forward_shadow.json",
     "closed_forward_bars_previously": 13,
-    "closed_forward_bars_now": 48,
-    "delta": 35,
+    "closed_forward_bars_now": 49,
+    "delta": 36,
     "grew": true,
     "setups_in_window": 9,
     "setup_dates": [
@@ -739,7 +748,7 @@
       "2026-08-31",
       "2026-09-19"
     ],
-    "note": "THE WINDOW REACHED 48 BARS AND THE CEILING IS 43 \u2014 that many forward decision bars could yield a trade closing inside the window under a full-horizon hold. 9 of 48 decisions reached FUND_ABS: 2026-08-19, 2026-08-21, 2026-08-22, 2026-08-23, 2026-08-24, 2026-08-25, 2026-08-29, 2026-08-31, 2026-09-19. The measurement is 'ceiling 43, setups 9 of 48, fills 0' and no second sentence is entitled to more. A SETUP IS NOT A TRADE: it needs an entry bar and an exit inside the corpus, and a setup on the final bar has neither. It says NOTHING about whether the rule makes money, because no position was opened and only selectivity was exercised, never skill. The cleared run scheduled 41 trades in about two years, roughly one per eighteen days, so 9 of 48 is an entirely ordinary rate for this rule. EDGE.md \u00a755b, \u00a755d."
+    "note": "THE WINDOW REACHED 49 BARS AND THE CEILING IS 44 \u2014 that many forward decision bars could yield a trade closing inside the window under a full-horizon hold. 9 of 49 decisions reached FUND_ABS: 2026-08-19, 2026-08-21, 2026-08-22, 2026-08-23, 2026-08-24, 2026-08-25, 2026-08-29, 2026-08-31, 2026-09-19. The measurement is 'ceiling 44, setups 9 of 49, fills 0' and no second sentence is entitled to more. A SETUP IS NOT A TRADE: it needs an entry bar and an exit inside the corpus, and a setup on the final bar has neither. It says NOTHING about whether the rule makes money, because no position was opened and only selectivity was exercised, never skill. The cleared run scheduled 41 trades in about two years, roughly one per eighteen days, so 9 of 49 is an entirely ordinary rate for this rule. EDGE.md \u00a755b, \u00a755d."
   },
   "funding_setup_table": [
     {
@@ -1077,6 +1086,13 @@
       "fund_abs": 0.0001,
       "funding_setup_present": false,
       "shortfall_vs_fund_abs": 9.455000000000001e-05
+    },
+    {
+      "date": "2026-09-27",
+      "funding_at_decision": 1.051e-05,
+      "fund_abs": 0.0001,
+      "funding_setup_present": false,
+      "shortfall_vs_fund_abs": 8.949000000000001e-05
     }
   ],
   "cleared_edge_signal": "funding_carry_fade_btc_v1",
@@ -1086,7 +1102,7 @@
   "models_current_present": false,
   "frozen_absent_count": 11,
   "closer_to_autonomous_profit_agent": false,
-  "why_not_closer": "48 post-t1 days is pilot progress, not autonomy \u2014 and a longer window is a larger denominator, not a result. The gate counts closed forward trades and it counts 4.",
+  "why_not_closer": "49 post-t1 days is pilot progress, not autonomy \u2014 and a longer window is a larger denominator, not a result. The gate counts closed forward trades and it counts 4.",
   "trades": [
     {
       "entry_utc": "2026-08-20T00:00:00Z",
@@ -1117,5 +1133,5 @@
       "notional_usd": 100.0
     }
   ],
-  "git_commit": "8aba1b7e5f37034dde634d768abea255fd9ce557-dirty"
+  "git_commit": "13510f965f59ac81ff9f4af43424b110ea2e79fd-dirty"
 }
