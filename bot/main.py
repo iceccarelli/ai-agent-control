@@ -43,7 +43,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import datetime as dt
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import config as _config
 from bybit_connection import BybitAPIError, BybitClient
@@ -109,7 +109,27 @@ class TradingBot:
         engine: Optional[TradingEngine] = None,
         strategy: Optional[Any] = None,
         carry: Optional[Any] = None,
+        ws_transport_factory: Optional[Callable[[], Any]] = None,
     ) -> None:
+        #: Injectable seam for the private-WS transport, exactly like
+        #: `client`/`engine`/`strategy` above — production leaves this
+        #: `None` (a real `ws_transport.PrivateWebSocket` is built from the
+        #: real client's `ws_private_url`), tests inject a scripted fake so
+        #: the REAL `TradingBot`/`TradingEngine`/`BybitClient`/`StateStore`
+        #: can be driven through the actual application lifecycle without a
+        #: socket. See `_start_private_ws`.
+        self._ws_transport_factory = ws_transport_factory
+        self.ws_consumer: Optional[Any] = None
+        self.ws_thread: Optional[threading.Thread] = None
+        self.ws_stop_event = threading.Event()
+        #: "DISABLED" (PRIVATE_WS_ENABLED is false, the default — REST-only
+        #: observation, unchanged from before this attribute existed),
+        #: "STARTING", "HEALTHY" (a WS-flagged gap was cleared by a
+        #: verified REST reconciliation this cycle), or "DEGRADED" (a gap
+        #: exists and has NOT yet been REST-verified, or the WS thread
+        #: died). Never set to "HEALTHY" merely because a tick ran — see
+        #: `_absorb_ws_observations`.
+        self._observation_state = "DISABLED"
         #: The delta-neutral carry book. When present it OWNS the cycle and the
         #: directional strategy is not consulted at all — see `tick`. The two
         #: are mutually exclusive by construction, not by convention, because a
@@ -183,6 +203,31 @@ class TradingBot:
 
     # -- health ------------------------------------------------------------
 
+    @property
+    def observation_status(self) -> str:
+        """"DISABLED" / "STARTING" / "HEALTHY" / "DEGRADED", live-computed
+        rather than a value that only changes inside `tick()`.
+
+        `_observation_state` (set by `_start_private_ws`/
+        `_absorb_ws_observations`) tracks the DISABLED/STARTING/failed-init
+        cases and the "verified HEALTHY as of the last cycle" reading. But
+        `self.ws_consumer.needs_reconciliation` can flip True the instant a
+        WS event arrives, on the WS thread, between ticks — a health check
+        (or a test) reading a stale stored "HEALTHY" in that window would
+        be exactly the false-healthy report Section 5 exists to prevent.
+        So DEGRADED is always computed live from the consumer's own
+        current flag and thread liveness; only the positive (HEALTHY)
+        reading is allowed to come from the last verified cycle.
+        """
+        consumer = self.ws_consumer
+        if consumer is None:
+            return self._observation_state
+        if consumer.needs_reconciliation:
+            return "DEGRADED"
+        if self.ws_thread is not None and not self.ws_thread.is_alive():
+            return "DEGRADED"
+        return self._observation_state
+
     def health(self) -> Dict[str, Any]:
         """Real state, not a hardcoded 200.
 
@@ -208,6 +253,7 @@ class TradingBot:
                 "project": _project_status.current(self.cfg).as_dict(),
                 "memory": self._memory_health(),
                 "policy": self._policy_health(),
+                "observation_status": self.observation_status,
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -360,12 +406,98 @@ class TradingBot:
             logger.warning("decision journal prune skipped: %s", exc)
 
         self.start_health_server()
+        # Private WS starts AFTER reconciliation has already established
+        # ground truth (self._reconciled is True by this point) — a fast
+        # observation path is only worth having once REST has confirmed
+        # there is nothing left to observe cold.
+        self._start_private_ws()
         # State what this process is before it does anything. Research is
         # closed and nothing has cleared Stage 1; the log must say so rather
         # than leave a reader to infer capability from silence.
         logger.warning("%s", _project_status.current(self.cfg).summary_line())
         self.session.start(reconciled=self._reconciled)
         return True
+
+    def _start_private_ws(self) -> None:
+        """Start the private-WS observer thread, only when explicitly
+        enabled (`PRIVATE_WS_ENABLED`, default False — REST-only
+        observation is the unchanged default behaviour). A failed init
+        here must never look healthy: it degrades `observation_status`,
+        never raises out of `startup()`, and REST remains fully able to
+        run this process correctly with WS absent, exactly as it always
+        has (see `tick()`'s unconditional observe_exits/
+        check_naked_positions calls, which do not depend on this at all).
+        """
+        if not bool(getattr(self.cfg, "PRIVATE_WS_ENABLED", False)):
+            self._observation_state = "DISABLED"
+            return
+        try:
+            import private_ws_consumer as _pwc
+
+            transport_factory = self._ws_transport_factory
+            if transport_factory is None:
+                import ws_transport as _wt
+                url = self.client.ws_private_url
+                transport_factory = lambda: _wt.PrivateWebSocket(url)  # noqa: E731
+
+            self.ws_consumer = _pwc.WSPrivateConsumer(
+                client=self.client, transport_factory=transport_factory)
+            self.ws_stop_event = threading.Event()
+            self.ws_thread = threading.Thread(
+                target=self.ws_consumer.run_forever,
+                args=(self.ws_stop_event,),
+                name="private-ws", daemon=True,
+            )
+            self.ws_thread.start()
+            self._observation_state = "STARTING"
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "private-WS observer failed to start; continuing on "
+                "REST-only observation")
+            self.ws_consumer = None
+            self.ws_thread = None
+            self._observation_state = "DEGRADED"
+
+    def _stop_private_ws(self) -> None:
+        """Signal the consumer to stop, wait for its thread to actually
+        exit, and never leave a socket or a daemon thread outliving
+        shutdown. If it does not stop in time, that is reported — not
+        silently accepted as "close enough"."""
+        if self.ws_thread is None:
+            return
+        self.ws_stop_event.set()
+        self.ws_thread.join(timeout=10.0)
+        if self.ws_thread.is_alive():
+            logger.error(
+                "private-WS thread did not stop within the shutdown "
+                "timeout; any observation gap it held is unresolved")
+        self.ws_thread = None
+
+    def _absorb_ws_observations(self, *, rest_ok: bool) -> None:
+        """The WS -> REST-reconciliation bridge.
+
+        `needs_reconciliation`/`dirty_symbols` (set by the WS consumer on
+        disconnect, reconnect, or a position-topic event — see
+        private_ws_consumer.py) are cleared ONLY after THIS cycle's REST
+        calls (`observe_exits`/`check_naked_positions`, already run above,
+        unconditionally, every tick) both completed without raising —
+        never merely because a tick ran. `rest_ok` is computed by the
+        caller from those two calls' own try/except blocks, not inferred
+        here.
+        """
+        consumer = self.ws_consumer
+        if consumer is None:
+            return
+        if consumer.needs_reconciliation:
+            if rest_ok:
+                consumer.needs_reconciliation = False
+                consumer.dirty_symbols.clear()
+                self._observation_state = "HEALTHY"
+            else:
+                self._observation_state = "DEGRADED"
+        elif self.ws_thread is not None:
+            self._observation_state = (
+                "HEALTHY" if self.ws_thread.is_alive() else "DEGRADED")
 
     def live_promotion_check(self) -> "tuple[bool, str]":
         """May a LIVE-armed process proceed? ``(allowed, reason)``. Fails closed.
@@ -496,15 +628,25 @@ class TradingBot:
             logger.error("equity unreadable this cycle: %s", exc)
             return
 
+        # Apply any WS-observed order/execution events FIRST, on this
+        # (the writer) thread — persistence.StateStore enforces a single
+        # writer thread, so the WS consumer's own background thread never
+        # calls a store-mutating method itself; it only queues (see
+        # private_ws_consumer.py's module docstring).
+        if self.ws_consumer is not None:
+            self.ws_consumer.drain_and_apply(self.store)
+
         # Look at what we HOLD before deciding what to do. A stop or take-profit
         # that filled at the venue since the last cycle must reach the ledger
         # before any gate reads open_position_count or the loss streak.
+        rest_observation_ok = True
         try:
             observed = self.engine.observe_exits()
             if observed.get("closed") or observed.get("reduced"):
                 logger.warning("exits observed this cycle: %s", observed)
         except Exception as exc:  # noqa: BLE001
             logger.exception("observe_exits failed; continuing: %s", exc)
+            rest_observation_ok = False
 
         # A stop that existed and was later cleared AT THE VENUE while the
         # position stayed open is invisible to reconcile()'s ledger-only
@@ -516,6 +658,13 @@ class TradingBot:
                 logger.warning("naked positions handled this cycle: %s", naked)
         except Exception as exc:  # noqa: BLE001
             logger.exception("check_naked_positions failed; continuing: %s", exc)
+            rest_observation_ok = False
+
+        # The WS -> REST bridge: a gap the WS consumer flagged (disconnect,
+        # reconnect, a position-topic event) is cleared only now that this
+        # cycle's two REST calls above have both been attempted, and only
+        # if neither raised — never merely because a tick ran.
+        self._absorb_ws_observations(rest_ok=rest_observation_ok)
 
         if self.risk.should_halt_trading():
             logger.warning("trading halted by the risk layer this cycle")
@@ -692,6 +841,9 @@ class TradingBot:
     def shutdown(self) -> None:
         """Graceful stop. Protective stops are deliberately left in place."""
         logger.warning("shutting down")
+        # WS stops FIRST: signal it, wait for the thread to actually exit,
+        # before anything it might still try to touch (the store) closes.
+        self._stop_private_ws()
         # Close the session record BEFORE the store closes, so SESSION_END has
         # somewhere to land. It is best-effort either way.
         try:
