@@ -5,6 +5,8 @@ everything runs against temp-file fixtures.
 """
 from __future__ import annotations
 
+import datetime as dt
+import gzip
 import json
 import os
 import sys
@@ -520,6 +522,178 @@ class TestRejectsRegression:
         ])
 
         assert rc == 0
+
+
+def _write_gz_corpus(path, n_days=10, start="2026-01-01"):
+    """A minimal but structurally real append-only linear corpus: `n_days`
+    strictly consecutive UTC daily bars starting at `start`. Returns the
+    list of (open_iso) strings in order, matching what
+    `pfs.load_full_linear_corpus` should independently recompute."""
+    header = ("time_period_start,time_period_end,time_open,time_close,"
+             "price_open,price_high,price_low,price_close,volume_traded,"
+             "trades_count")
+    start_dt = dt.datetime.strptime(start, "%Y-%m-%d").replace(
+        tzinfo=dt.timezone.utc)
+    lines = [header]
+    opens = []
+    for i in range(n_days):
+        o = start_dt + dt.timedelta(days=i)
+        c = o + dt.timedelta(days=1) - dt.timedelta(seconds=1)
+        lines.append(",".join([
+            o.isoformat(), c.isoformat(), o.isoformat(), c.isoformat(),
+            "100", "101", "99", "100", "1", "1"]))
+        opens.append(o.strftime("%Y-%m-%dT%H:%M:%SZ"))
+    with gzip.open(path, "wt", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return opens
+
+
+class TestValidatesForwardWindowAgainstCorpus:
+    """Mission A: a candidate's `forward_window` (corpus frontier, closed
+    bar count, bar list) must independently check out against the actual
+    append-only corpus file on disk — a candidate cannot claim a later
+    frontier, more bars, or a bar list the corpus does not support."""
+
+    def _corpus(self, tmp_path, monkeypatch, **kw):
+        corpus_path = tmp_path / "corpus.csv.gz"
+        opens = _write_gz_corpus(corpus_path, **kw)
+        monkeypatch.setattr(pfs, "FULL_LINEAR_PATH", str(corpus_path))
+        return opens
+
+    def _candidate(self, opens, *, t1, observed_at_utc):
+        t1_ms = pfs._parse_iso_utc_ms(t1)
+        observed_ms = pfs._parse_iso_utc_ms(observed_at_utc)
+        expected = [
+            o for o in opens
+            if pfs._parse_iso_utc_ms(o) > t1_ms
+            and pfs._parse_iso_utc_ms(o) + pfs.DAY_MS <= observed_ms
+        ]
+        cand = dict(NEW_SCRATCH)
+        cand["observed_at_utc"] = observed_at_utc
+        cand["forward_window"] = {
+            "t1": t1,
+            "bars_strictly_after_t1": len(expected),
+            "of_which_closed": len(expected),
+            "corpus_last_bar_utc": opens[-1],
+            "bar_utcs": expected,
+        }
+        return cand
+
+    def _promote(self, tmp_path, candidate):
+        """No prior shadow file: these tests are about the corpus-frontier
+        checks in isolation, so a first-ever promotion sidesteps the
+        unrelated monotonic-regression checks against some other fixture's
+        counters/timestamps (see TestRejectsRegression for those)."""
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        with open(scratch_path, "w", encoding="utf-8") as h:
+            json.dump(candidate, h)
+        return pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+    def test_consistent_forward_window_is_accepted(self, tmp_path, monkeypatch):
+        opens = self._corpus(tmp_path, monkeypatch, n_days=10)
+        cand = self._candidate(
+            opens, t1="2026-01-01T00:00:00Z",
+            observed_at_utc="2026-01-09T00:00:00Z")
+        assert self._promote(tmp_path, cand) == 0
+
+    def test_candidate_with_no_forward_window_is_unaffected(
+            self, tmp_path, monkeypatch):
+        """Backward compatible: a candidate that never claims a
+        forward_window (older schema) is not checked against the corpus."""
+        self._corpus(tmp_path, monkeypatch, n_days=10)
+        assert self._promote(tmp_path, dict(NEW_SCRATCH)) == 0
+
+    def test_fabricated_corpus_frontier_is_refused(self, tmp_path, monkeypatch):
+        """A candidate claiming the corpus reaches further than it actually
+        does (a future/stale frontier) is refused."""
+        opens = self._corpus(tmp_path, monkeypatch, n_days=10)
+        cand = self._candidate(
+            opens, t1="2026-01-01T00:00:00Z",
+            observed_at_utc="2026-01-09T00:00:00Z")
+        cand["forward_window"]["corpus_last_bar_utc"] = "2026-02-01T00:00:00Z"
+        assert self._promote(tmp_path, cand) != 0
+
+    def test_fabricated_bar_count_is_refused(self, tmp_path, monkeypatch):
+        opens = self._corpus(tmp_path, monkeypatch, n_days=10)
+        cand = self._candidate(
+            opens, t1="2026-01-01T00:00:00Z",
+            observed_at_utc="2026-01-09T00:00:00Z")
+        cand["forward_window"]["bars_strictly_after_t1"] += 5
+        cand["forward_window"]["of_which_closed"] += 5
+        assert self._promote(tmp_path, cand) != 0
+
+    def test_fabricated_bar_in_bar_utcs_is_refused(self, tmp_path, monkeypatch):
+        opens = self._corpus(tmp_path, monkeypatch, n_days=10)
+        cand = self._candidate(
+            opens, t1="2026-01-01T00:00:00Z",
+            observed_at_utc="2026-01-09T00:00:00Z")
+        cand["forward_window"]["bar_utcs"].append("2026-02-01T00:00:00Z")
+        cand["forward_window"]["bars_strictly_after_t1"] += 1
+        cand["forward_window"]["of_which_closed"] += 1
+        assert self._promote(tmp_path, cand) != 0
+
+    def test_stale_scratch_replayed_against_a_grown_corpus_is_refused(
+            self, tmp_path, monkeypatch):
+        """The concrete stale-scratch attack: a scratch score honestly
+        produced against a SHORTER corpus is replayed for promotion after
+        the authoritative corpus has grown further — its bar count and bar
+        list are correct for the corpus at the time it was produced, but
+        stale relative to the corpus it is now being promoted into."""
+        opens = self._corpus(tmp_path, monkeypatch, n_days=10)
+        cand = self._candidate(
+            opens[:7], t1="2026-01-01T00:00:00Z",
+            observed_at_utc="2026-01-07T00:00:00Z")
+        # cand's bar_utcs/corpus_last_bar_utc reflect only the first 7 days,
+        # but the authoritative corpus (patched above) actually has 10.
+        assert self._promote(tmp_path, cand) != 0
+
+    def test_incomplete_forward_window_is_refused(self, tmp_path, monkeypatch):
+        """A partial forward_window claim (missing a required sub-field)
+        cannot be independently checked and is refused rather than
+        silently trusted for the fields that happen to be present."""
+        opens = self._corpus(tmp_path, monkeypatch, n_days=10)
+        cand = self._candidate(
+            opens, t1="2026-01-01T00:00:00Z",
+            observed_at_utc="2026-01-09T00:00:00Z")
+        del cand["forward_window"]["corpus_last_bar_utc"]
+        assert self._promote(tmp_path, cand) != 0
+
+    def test_missing_corpus_file_is_refused(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            pfs, "FULL_LINEAR_PATH", str(tmp_path / "does_not_exist.csv.gz"))
+        cand = dict(NEW_SCRATCH)
+        cand["forward_window"] = {
+            "t1": "2026-01-01T00:00:00Z",
+            "bars_strictly_after_t1": 1,
+            "of_which_closed": 1,
+            "corpus_last_bar_utc": "2026-01-02T00:00:00Z",
+        }
+        assert self._promote(tmp_path, cand) != 0
+
+    def test_gap_in_corpus_is_refused(self, tmp_path, monkeypatch):
+        """A corpus with a missing day cannot be trusted as a frontier
+        authority at all — refuse rather than silently skip the gap."""
+        corpus_path = tmp_path / "corpus.csv.gz"
+        opens = _write_gz_corpus(corpus_path, n_days=10)
+        # Reload, drop day index 5, rewrite — simulating a gapped corpus.
+        with gzip.open(corpus_path, "rt", encoding="utf-8") as h:
+            lines = [ln for ln in h.read().split("\n") if ln.strip()]
+        header, rows = lines[0], lines[1:]
+        del rows[5]
+        with gzip.open(corpus_path, "wt", encoding="utf-8") as h:
+            h.write("\n".join([header] + rows) + "\n")
+        monkeypatch.setattr(pfs, "FULL_LINEAR_PATH", str(corpus_path))
+
+        cand = self._candidate(
+            opens, t1="2026-01-01T00:00:00Z",
+            observed_at_utc="2026-01-09T00:00:00Z")
+        assert self._promote(tmp_path, cand) != 0
 
 
 class TestPromoteToolIsNeverAutomated:
