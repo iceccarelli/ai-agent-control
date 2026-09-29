@@ -167,6 +167,103 @@ class TestBarsResolveThroughNestedSchema:
         assert "(CHANGED)" not in out
 
 
+class TestRejectsRegression:
+    """A promotion that would move a monotonic counter or the observation
+    timestamp backward is evidence corruption, not genuine forward accrual,
+    and must be refused even with both human flags."""
+
+    def test_forward_n_trades_regression_refuses_even_with_both_flags(
+            self, tmp_path):
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        regressed = dict(NEW_SCRATCH)
+        regressed["forward_n_trades"] = 2  # below OLD_SHADOW's 3
+        _write(scratch_path, regressed)
+        _write(shadow_path, OLD_SHADOW)
+        before = shadow_path.read_text(encoding="utf-8")
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc != 0
+        assert shadow_path.read_text(encoding="utf-8") == before
+
+    def test_closed_forward_bars_regression_refuses(self, tmp_path):
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        regressed = dict(NEW_SCRATCH)
+        regressed["closed_forward_bars"] = 10  # below OLD_SHADOW's 41
+        _write(scratch_path, regressed)
+        _write(shadow_path, OLD_SHADOW)
+        before = shadow_path.read_text(encoding="utf-8")
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc != 0
+        assert shadow_path.read_text(encoding="utf-8") == before
+
+    def test_observed_at_utc_regression_refuses(self, tmp_path):
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        regressed = dict(NEW_SCRATCH)
+        regressed["observed_at_utc"] = "2026-08-15T00:00:00Z"  # before OLD's
+        _write(scratch_path, regressed)
+        _write(shadow_path, OLD_SHADOW)
+        before = shadow_path.read_text(encoding="utf-8")
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc != 0
+        assert shadow_path.read_text(encoding="utf-8") == before
+
+    def test_equal_counters_are_not_a_regression(self, tmp_path):
+        """Re-promoting identical evidence (idempotent re-run) must not be
+        rejected as a regression."""
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, OLD_SHADOW)
+        _write(shadow_path, OLD_SHADOW)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc == 0
+
+    def test_no_prior_shadow_file_is_not_a_regression(self, tmp_path):
+        """First-ever promotion: current is {} (no file yet), so there is
+        nothing to regress against."""
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, NEW_SCRATCH)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc == 0
+
+
 class TestPromoteToolIsNeverAutomated:
     def test_it_is_never_invoked_from_the_accrual_script(self):
         """The tool name may appear in a comment or a printed hint pointing a
