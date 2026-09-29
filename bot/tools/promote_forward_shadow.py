@@ -35,6 +35,7 @@ a human has looked at the diff and decided it is correct.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -57,6 +58,19 @@ COUNTER_KEYS = ("forward_n_trades", "closed_forward_bars")
 def load_json(path: str) -> Dict[str, Any]:
     with open(path, encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def content_hash(doc: Dict[str, Any]) -> str:
+    """Canonical sha256 over ``doc``'s logical content.
+
+    ``sort_keys=True`` makes the hash independent of key order, so a
+    reformatted-but-identical scratch file (or a shadow file whose keys were
+    ever emitted in a different order) still hashes equal. This is a content
+    hash for no-op detection, separate from the on-disk byte layout the file
+    is actually written in.
+    """
+    canonical = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def summarize(old: Dict[str, Any], new: Dict[str, Any]) -> str:
@@ -127,8 +141,13 @@ def main(argv=None) -> int:
     current = (load_json(args.shadow_path)
               if os.path.exists(args.shadow_path) else {})
 
+    previous_hash = content_hash(current) if current else None
+    candidate_hash = content_hash(scratch)
+
     print(f"scratch score : {args.from_path}")
     print(f"shadow file   : {args.shadow_path}")
+    print(f"previous_hash : {previous_hash!r}")
+    print(f"candidate_hash: {candidate_hash!r}")
     print("counters:")
     print(summarize(current, scratch))
 
@@ -153,10 +172,35 @@ def main(argv=None) -> int:
             "automated script.", file=sys.stderr)
         return 1
 
-    with open(args.shadow_path, "w", encoding="utf-8") as handle:
+    if previous_hash is not None and candidate_hash == previous_hash:
+        # Identical canonical content: nothing to promote. Do not touch the
+        # file merely to rewrite identical bytes or a fresh mtime — a repeated
+        # valid promotion must be a true no-op, not a divergent artifact.
+        print(
+            f"\nPROMOTION_NOOP: candidate content is identical to the "
+            f"current shadow file (hash {candidate_hash}); zero write")
+        return 0
+
+    tmp_path = f"{args.shadow_path}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
         json.dump(scratch, handle, indent=2)
         handle.write("\n")
-    print(f"\nPROMOTED by a human: wrote {args.shadow_path}")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, args.shadow_path)
+
+    written_hash = content_hash(load_json(args.shadow_path))
+    if written_hash != candidate_hash:
+        print(
+            f"\nPROMOTION FAILED VERIFICATION: wrote {args.shadow_path} but "
+            f"its hash ({written_hash}) does not match the candidate "
+            f"({candidate_hash}); treat the file as untrusted and "
+            f"investigate before relying on it", file=sys.stderr)
+        return 1
+
+    print(
+        f"\nPROMOTION_ACCEPTED by a human: wrote {args.shadow_path} "
+        f"(hash {candidate_hash})")
     return 0
 
 
