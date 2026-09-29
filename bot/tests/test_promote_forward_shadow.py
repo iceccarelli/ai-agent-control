@@ -108,6 +108,110 @@ class TestPromotesOnlyWithBothFlags:
         assert written["closed_forward_bars"] == 48
         assert written == NEW_SCRATCH
 
+    def test_tmp_file_is_gone_after_a_successful_promotion(self, tmp_path):
+        """Promotion writes through a temp file and atomically replaces the
+        target, never leaving a stray .tmp file behind on success."""
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, NEW_SCRATCH)
+        _write(shadow_path, OLD_SHADOW)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc == 0
+        assert not os.path.exists(f"{shadow_path}.tmp")
+
+
+class TestPromotionNoop:
+    """Repeatedly promoting identical canonical content must be a true
+    no-op: zero write, reported explicitly, not a silent re-write of
+    identical bytes with a fresh mtime."""
+
+    def test_identical_content_is_a_noop_and_does_not_touch_the_file(
+            self, tmp_path, capsys):
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, OLD_SHADOW)
+        _write(shadow_path, OLD_SHADOW)
+        mtime_before = os.stat(shadow_path).st_mtime_ns
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc == 0
+        assert os.stat(shadow_path).st_mtime_ns == mtime_before
+        out = capsys.readouterr().out
+        assert "PROMOTION_NOOP" in out
+
+    def test_reordered_but_identical_keys_are_still_a_noop(
+            self, tmp_path, capsys):
+        """Content hashing is key-order independent, so a shadow file whose
+        keys happen to be serialized in a different order than the scratch
+        file is still recognized as identical content."""
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        reordered = dict(reversed(list(OLD_SHADOW.items())))
+        _write(scratch_path, OLD_SHADOW)
+        _write(shadow_path, reordered)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "PROMOTION_NOOP" in out
+
+    def test_changed_content_is_accepted_not_a_noop(self, tmp_path, capsys):
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, NEW_SCRATCH)
+        _write(shadow_path, OLD_SHADOW)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "PROMOTION_ACCEPTED" in out
+        assert "PROMOTION_NOOP" not in out
+
+    def test_first_ever_promotion_is_not_a_noop(self, tmp_path, capsys):
+        """No prior shadow file means nothing to compare against, so the
+        first promotion is always PROMOTION_ACCEPTED even though there is
+        technically no 'change' to point at."""
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, NEW_SCRATCH)
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "PROMOTION_ACCEPTED" in out
+
+
 class TestBarsResolveThroughNestedSchema:
     """The real scorer nests the closed-bar count under `ceiling` /
     `forward_window`, never at the top level — see stage_b_bars.py. The
