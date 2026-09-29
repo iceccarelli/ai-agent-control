@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import sys
+import threading
 import time
 
 import pytest
@@ -91,11 +92,26 @@ def _text_frame(obj):
 
 
 class _ScriptedTransport:
-    def __init__(self, frames):
+    """`block_when_exhausted`: once frames run out, `recv()` blocks for a
+    few seconds (via a real `threading.Event`, never set) instead of
+    raising immediately. Without this, a script that exhausts right after
+    the events a test cares about triggers an IMMEDIATE reconnect on the
+    WS thread — racing, at real millisecond scale, against the main
+    thread's own assertions/`tick()` call on `needs_reconciliation`. That
+    race is real (see private_ws_consumer.py's run_forever docstring for
+    the production-side half of this fix: flag before I/O) but a test
+    should not depend on winning it — blocking keeps the connection
+    "open but idle" for long enough that the test's synchronous assertion
+    window reliably completes first.
+    """
+
+    def __init__(self, frames, *, block_when_exhausted=False):
         self._frames = list(frames)
         self.sent = []
         self.connected = False
         self.closed = False
+        self._block_when_exhausted = block_when_exhausted
+        self._block_event = threading.Event()
 
     def connect(self):
         self.connected = True
@@ -108,11 +124,14 @@ class _ScriptedTransport:
 
     def recv(self, timeout=None):
         if not self._frames:
+            if self._block_when_exhausted:
+                self._block_event.wait(timeout=5.0)
             raise wt.WSClosed("scripted transport exhausted")
         return self._frames.pop(0)
 
     def close(self):
         self.closed = True
+        self._block_event.set()  # unblock a pending recv() immediately
 
 
 class _BlockingFactory:
@@ -147,6 +166,7 @@ def _build_bot(tmp_path, exchange, ws_factory):
     bot = m.TradingBot(
         config=cfg, store=store, client=client, risk_manager=risk,
         engine=engine, strategy=strategy, ws_transport_factory=ws_factory,
+        ws_evidence_path=str(tmp_path / "ws_evidence.jsonl"),
     )
     return bot, store, strategy
 
@@ -249,7 +269,7 @@ class TestFullApplicationLifecycleWithWS:
             _text_frame({"topic": "position", "data": [{
                 "symbol": SYMBOL, "updatedTime": "2",
             }]}),
-        ])
+        ], block_when_exhausted=True)
         ws_factory.provide(events_transport)
 
         assert _wait_until(lambda: bot.ws_consumer.applied_event_count >= 3), (
@@ -295,6 +315,9 @@ class TestFullApplicationLifecycleWithWS:
         # nothing about the WS path touched it:
         assert store.positions_without_stops() == []
 
+        # Unblock the parked recv() immediately rather than waiting out
+        # its 5s timeout, so shutdown() below is fast.
+        events_transport.close()
         bot.shutdown()
 
     def test_reconciliation_failure_leaves_the_gap_unresolved(

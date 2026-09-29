@@ -103,6 +103,16 @@ VENUE_HOSTS = {
     "demo": "api-demo.bybit.com",
 }
 
+#: Inlined from `bybit_connection.MAINNET_WS_PRIVATE`/`TESTNET_WS_PRIVATE`
+#: for the same reason `VENUE_HOSTS` is inlined above. There is no demo
+#: private-WS endpoint in bybit_connection.py today, so there is none
+#: here either — inventing one would be exactly the kind of unverified
+#: claim this module exists to refuse.
+WS_VENUE_HOSTS = {
+    "mainnet": "stream.bybit.com",
+    "testnet": "stream-testnet.bybit.com",
+}
+
 GENESIS_PREV_HASH = "0" * 64
 
 #: Field names (case-insensitive, wherever nested) that hold a secret or a
@@ -120,13 +130,19 @@ class EvidenceRefused(RuntimeError):
 
 
 def infer_environment_from_url(url: str) -> str:
-    """Best-effort environment name from a request URL's host.
+    """Best-effort environment name from a request URL's host — REST or
+    private-WS, checked against the same two independent host tables
+    (`VENUE_HOSTS`, `WS_VENUE_HOSTS`); a URL is only ever one or the
+    other, so checking both is unambiguous.
 
     Returns "unknown" rather than guessing when the host does not match any
     known venue — never defaults to a networked environment.
     """
     text = str(url or "")
     for env, host in VENUE_HOSTS.items():
+        if host in text:
+            return env
+    for env, host in WS_VENUE_HOSTS.items():
         if host in text:
             return env
     return "unknown"
@@ -223,6 +239,16 @@ class EvidenceRecord:
     git_commit: str
     prev_hash: str
     schema: str = SCHEMA
+    #: "rest" (default — every pre-existing caller of `build_record` is a
+    #: REST call, unchanged) or "ws" (a private-WebSocket event; see
+    #: `build_ws_event_record`). Makes the two sources distinguishable in
+    #: a chain without inventing a second evidence format.
+    transport: str = "rest"
+    #: The deterministic, venue-derived event identity (see
+    #: `private_ws_consumer.py`'s canonical-identity rules) for a WS
+    #: record. Empty for a REST record, which is already identified by
+    #: `order_link_id`/`request_url`/`captured_at_utc`.
+    venue_event_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         body = {
@@ -237,6 +263,8 @@ class EvidenceRecord:
             "order_link_id": self.order_link_id,
             "git_commit": self.git_commit,
             "prev_hash": self.prev_hash,
+            "transport": self.transport,
+            "venue_event_id": self.venue_event_id,
         }
         body["record_hash"] = content_hash(body)
         return body
@@ -247,7 +275,9 @@ def build_record(*, venue: str, environment: str, method: str,
                  response: Dict[str, Any], order_link_id: str = "",
                  prev_hash: str = GENESIS_PREV_HASH,
                  captured_at_utc: Optional[str] = None,
-                 repo: Optional[str] = None) -> Dict[str, Any]:
+                 repo: Optional[str] = None,
+                 transport: str = "rest",
+                 venue_event_id: str = "") -> Dict[str, Any]:
     """Build one evidence record as a plain dict, ready for
     `append_evidence`.
 
@@ -271,8 +301,38 @@ def build_record(*, venue: str, environment: str, method: str,
         order_link_id=order_link_id,
         git_commit=prov.git_commit(repo),
         prev_hash=prev_hash,
+        transport=transport,
+        venue_event_id=venue_event_id,
     )
     return record.to_dict()
+
+
+def build_ws_event_record(*, venue: str, environment: str, ws_url: str,
+                          venue_event_id: str, topic: str,
+                          order_link_id: str = "",
+                          payload: Optional[Dict[str, Any]] = None,
+                          duplicate: bool = False,
+                          prev_hash: str = GENESIS_PREV_HASH,
+                          captured_at_utc: Optional[str] = None,
+                          repo: Optional[str] = None) -> Dict[str, Any]:
+    """Build one evidence record for a private-WS event.
+
+    Same guarantees as `build_record` (redaction, environment validation
+    against `ws_url` via `WS_VENUE_HOSTS`, git provenance, hash chaining)
+    — this is the same mechanism, not a parallel one, with a shape suited
+    to a server-pushed event rather than a client request/response pair:
+    `request` records what this connection subscribed to (`topic`),
+    `response` is the redacted raw payload actually observed, and
+    `venue_event_id`/`transport="ws"` carry the deterministic identity
+    and source so a reader can tell a WS record from a REST one without
+    guessing from its shape.
+    """
+    return build_record(
+        venue=venue, environment=environment, method="WS_EVENT",
+        request_url=ws_url, request={"topic": topic, "duplicate": duplicate},
+        response=payload or {}, order_link_id=order_link_id,
+        prev_hash=prev_hash, captured_at_utc=captured_at_utc, repo=repo,
+        transport="ws", venue_event_id=venue_event_id)
 
 
 def build_record_from_order_result(order_result: Any, *, venue: str,

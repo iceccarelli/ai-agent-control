@@ -54,23 +54,57 @@ real network leg is blocked, and only here.
 WHAT ONE RUN DOES (once preflight passes and `--arm --i-am-human` are
 both given)
 =========================================================================
-  1. TradingBot.startup()  — reconcile first, exactly as production does.
+  1. TradingBot.startup() — REST reconciliation, then (this tool forces
+                             `ws_enabled_override=True`) the private-WS
+                             observer connects, authenticates, and
+                             subscribes — the same `_start_private_ws`
+                             production uses, not a separate WS path.
   2. TradingBot.tick()     — one cycle: a bounded one-shot strategy signals
                              BUY once, `engine.execute()` submits the order,
                              observes the fill, places and verifies the
                              protective stop — all synchronous, all real.
-  3. Protection read-back  — `client.get_position()` queried FRESH (not the
+  3. WS observation        — bounded wait (`--ws-observation-timeout`) for
+                             the WS observer to actually capture an order
+                             or execution evidence record for THIS order's
+                             `order_link_id` — proof the private stream
+                             observed the same real order, not merely that
+                             REST did. ASSURANCE mode (this tool always
+                             uses it): missing WS observation is a failed
+                             run, not a soft warning.
+  4. Protection read-back  — `client.get_position()` queried FRESH (not the
                              local ledger) to confirm the stop the venue
                              itself reports, not merely what execute()
                              believed it set.
-  4. Flatten               — `engine.close_position()`, the same method
+  5. Flatten               — `engine.close_position()`, the same method
                              production uses to exit.
-  5. Final reconciliation  — `client.reconcile_on_startup()`.
-  6. Evidence + result     — the evidence log (already being written by
-                             EvidenceCapturingTransport since step 1) is
-                             left in place; a machine-readable summary
-                             (stage-by-stage outcome, latencies, evidence
-                             path) is written to `--out`.
+  6. Final reconciliation  — `client.reconcile_on_startup()`.
+  7. Evidence verification — BOTH evidence chains (REST's, via
+                             EvidenceCapturingTransport; WS's, via
+                             WSPrivateConsumer's assurance-mode capture)
+                             are hash-chain-verified with
+                             `venue_evidence.verify_chain`. A tamper,
+                             gap, or capture failure in EITHER chain fails
+                             the run — see "ASSURANCE MODE" below.
+  8. WS shutdown + result  — `bot.shutdown()` stops the WS thread; a
+                             machine-readable summary (stage-by-stage
+                             outcome, latencies, both evidence paths, both
+                             chain-verification results) is written to
+                             `--out`.
+
+ASSURANCE MODE — NO "BEST EFFORT THEREFORE GREEN"
+====================================================
+This tool always constructs its `WSPrivateConsumer` with
+`assurance_mode=True` (see private_ws_consumer.py's "EVIDENCE FAILURE
+SEMANTICS"). That changes nothing about HOW capture failures are
+handled at capture time — they still never raise mid-receive-loop — but
+it changes what THIS RUNNER does with `evidence_capture_failed`
+afterward: normal trading (main.TradingBot, assurance_mode=False)
+degrades and keeps trading; a conformance run fails closed. `result["ok"]`
+is False if ANY of: a stage failed, the WS observer never captured
+observable evidence for this order, `evidence_capture_failed` is set, or
+either evidence chain fails `verify_chain`. Partial evidence is reported
+as partial (`result["ws_evidence_complete"]`), never silently treated as
+success.
 
 REAL PROCESS RESTART: a separate, deliberate exercise
 ========================================================
@@ -103,11 +137,18 @@ import venue_evidence as ve  # noqa: E402
 
 DEFAULT_EVIDENCE_PATH = os.path.join(
     BOT, "artifacts", "testnet_conformance_evidence.jsonl")
+DEFAULT_WS_EVIDENCE_PATH = os.path.join(
+    BOT, "artifacts", "testnet_conformance_ws_evidence.jsonl")
 DEFAULT_STATE_DB = os.path.join(
     BOT, "artifacts", "testnet_conformance_state.db")
 DEFAULT_RESULT_PATH = os.path.join(
     BOT, "artifacts", "testnet_conformance_result.json")
 SYMBOL = "BTCUSDT"
+#: Bounded wait for the WS observer to capture an order/execution record
+#: for the order this run just submitted. Bounded because a conformance
+#: run must terminate, not hang on a stream that never confirms —
+#: mission requirement "bounded WS observation timeout".
+DEFAULT_WS_OBSERVATION_TIMEOUT_SECONDS = 30.0
 
 
 class ConformanceRefused(RuntimeError):
@@ -235,13 +276,50 @@ class _OneShotBuyStrategy:
         )
 
 
+def _read_evidence_records(path: Optional[str]) -> List[Dict[str, Any]]:
+    if not path or not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as handle:
+        return [json.loads(ln) for ln in handle if ln.strip()]
+
+
+def await_ws_observation(*, bot: Any, order_link_id: str,
+                         timeout_seconds: float,
+                         poll_interval: float = 0.1) -> bool:
+    """Poll the WS evidence log (not an in-memory counter) for a record
+    whose `order_link_id` matches this order and whose topic is `order`
+    or `execution` — proof the private stream itself observed THIS order,
+    not merely that a WS connection exists. Bounded by `timeout_seconds`;
+    returns False (never raises) on timeout, matching `run_conformance`'s
+    "a failed stage is data, not an exception" convention.
+    """
+    consumer = getattr(bot, "ws_consumer", None)
+    if consumer is None:
+        return False
+    evidence_path = getattr(consumer, "evidence_path", None)
+    deadline = time.time() + timeout_seconds
+    while True:
+        for record in _read_evidence_records(evidence_path):
+            if (record.get("order_link_id") == order_link_id
+                    and record.get("request", {}).get("topic") in
+                    ("order", "execution")):
+                return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_interval)
+
+
 def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
-                    symbol: str = SYMBOL) -> Dict[str, Any]:
-    """The bounded lifecycle itself: startup -> one tick -> protection
-    read-back -> flatten -> final reconciliation. Returns a machine-readable
-    stage-by-stage result; never raises for an execution-stage failure (a
-    failed stage is data, not an exception) — only a genuinely unexpected
-    error propagates."""
+                    symbol: str = SYMBOL,
+                    ws_observation_timeout: float =
+                    DEFAULT_WS_OBSERVATION_TIMEOUT_SECONDS) -> Dict[str, Any]:
+    """The bounded lifecycle itself: startup (REST reconciliation + WS
+    connect/auth/subscribe) -> one tick -> WS observation -> protection
+    read-back -> flatten -> final reconciliation -> evidence-chain
+    verification. Returns a machine-readable stage-by-stage result; never
+    raises for an execution-stage failure (a failed stage is data, not an
+    exception) — only a genuinely unexpected error propagates.
+    """
     timestamps: Dict[str, float] = {"run_started": time.time()}
     stages: List[Dict[str, Any]] = []
 
@@ -254,12 +332,26 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     if not started:
         return _finalize(stages, timestamps, ok=False)
 
+    _stage("ws_startup", bot.ws_consumer is not None,
+          observation_status=bot.observation_status)
+    if bot.ws_consumer is None:
+        return _finalize(stages, timestamps, ok=False)
+
     bot.tick()
     positions = {p["symbol"]: p for p in store.open_positions()}
     row = positions.get(symbol)
     _stage("entry", row is not None,
           position=dict(row) if row else None)
     if row is None:
+        return _finalize(stages, timestamps, ok=False)
+
+    order_link_id = str(row.get("order_link_id") or "")
+    ws_observed = await_ws_observation(
+        bot=bot, order_link_id=order_link_id,
+        timeout_seconds=ws_observation_timeout)
+    _stage("ws_observation", ws_observed, order_link_id=order_link_id,
+          timeout_seconds=ws_observation_timeout)
+    if not ws_observed:
         return _finalize(stages, timestamps, ok=False)
 
     naked = store.positions_without_stops()
@@ -289,6 +381,15 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     _stage("final_reconciliation",
           summary.get("unknown", 1) == 0 and not summary.get("naked_positions"),
           summary=summary)
+
+    # ASSURANCE mode fail-closed: a WS evidence-capture failure anywhere
+    # in this run, even one that did not block any stage above, still
+    # fails the conformance result — "partial evidence is reported as
+    # partial", never silently green. See WSPrivateConsumer's
+    # `evidence_capture_failed` / assurance_mode.
+    evidence_complete = not bool(bot.ws_consumer.evidence_capture_failed)
+    _stage("ws_evidence_completeness", evidence_complete,
+          evidence_capture_failed=bool(bot.ws_consumer.evidence_capture_failed))
 
     return _finalize(stages, timestamps, ok=all(s["ok"] for s in stages))
 
@@ -339,6 +440,24 @@ def _build_real_stack(*, state_db: str, evidence_path: str):
     return cfg, store, client, engine, m.TradingBot
 
 
+def verify_evidence_chains(*, rest_evidence_path: str,
+                           ws_evidence_path: str) -> Dict[str, Any]:
+    """Hash-chain-verify BOTH evidence logs — the same
+    `venue_evidence.verify_chain` mechanism for each, never a parallel
+    checker. Returns a dict a caller can fold straight into the result;
+    never raises."""
+    rest_reasons = ve.verify_chain(rest_evidence_path)
+    ws_reasons = ve.verify_chain(ws_evidence_path)
+    return {
+        "rest_evidence_path": rest_evidence_path,
+        "rest_evidence_verified": rest_reasons == [],
+        "rest_evidence_reasons": rest_reasons,
+        "ws_evidence_path": ws_evidence_path,
+        "ws_evidence_verified": ws_reasons == [],
+        "ws_evidence_reasons": ws_reasons,
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -352,7 +471,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--entry-price", type=float, default=None,
                         help="defaults to the live testnet mark")
     parser.add_argument("--state-db", default=DEFAULT_STATE_DB)
-    parser.add_argument("--evidence-path", default=DEFAULT_EVIDENCE_PATH)
+    parser.add_argument("--evidence-path", default=DEFAULT_EVIDENCE_PATH,
+                        help="REST evidence log (EvidenceCapturingTransport)")
+    parser.add_argument("--ws-evidence-path", default=DEFAULT_WS_EVIDENCE_PATH,
+                        help="private-WS evidence log (WSPrivateConsumer, "
+                             "assurance_mode=True)")
+    parser.add_argument("--ws-observation-timeout", type=float,
+                        default=DEFAULT_WS_OBSERVATION_TIMEOUT_SECONDS,
+                        help="bounded wait for the WS observer to capture "
+                             "this order's evidence before failing closed")
     parser.add_argument("--out", default=DEFAULT_RESULT_PATH)
     args = parser.parse_args(argv)
 
@@ -384,13 +511,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     strategy = _OneShotBuyStrategy(
         entry_price=entry_price, stop_price=entry_price * 0.98,
         take_profit=entry_price * 1.05)
+    # ws_enabled_override=True: this bounded run exercises the integrated
+    # WS lifecycle regardless of the general PRIVATE_WS_ENABLED trading
+    # config — see main.TradingBot's own docstring on why that override
+    # exists. ws_assurance_mode=True: an evidence-capture failure here
+    # fails this run closed (never "best effort therefore green") — see
+    # private_ws_consumer.py's "EVIDENCE FAILURE SEMANTICS".
     bot = TradingBot(config=cfg, store=store, client=client, engine=engine,
-                     risk_manager=engine.risk, strategy=strategy)
+                     risk_manager=engine.risk, strategy=strategy,
+                     ws_enabled_override=True, ws_assurance_mode=True,
+                     ws_evidence_path=args.ws_evidence_path)
 
-    result = run_conformance(bot=bot, engine=engine, client=client,
-                             store=store, symbol=args.symbol)
-    result["evidence_path"] = args.evidence_path
-    result["evidence_chain_verified"] = ve.verify_chain(args.evidence_path) == []
+    try:
+        result = run_conformance(
+            bot=bot, engine=engine, client=client, store=store,
+            symbol=args.symbol,
+            ws_observation_timeout=args.ws_observation_timeout)
+    finally:
+        # WS shutdown is part of the bounded lifecycle this tool exercises
+        # — never leave the observer thread/socket running past the run
+        # this process is about to report on.
+        try:
+            bot.shutdown()
+        except Exception:  # noqa: BLE001
+            print("bot.shutdown() raised during cleanup", file=sys.stderr)
+
+    chains = verify_evidence_chains(
+        rest_evidence_path=args.evidence_path,
+        ws_evidence_path=args.ws_evidence_path)
+    result.update(chains)
+    # Fail closed: a stage can all read "ok" while either evidence chain
+    # is broken (e.g. a hand-edited or truncated file) — this must still
+    # fail the CONFORMANCE result, distinct from trading correctness.
+    result["ok"] = bool(
+        result["ok"] and chains["rest_evidence_verified"]
+        and chains["ws_evidence_verified"])
 
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, default=str)

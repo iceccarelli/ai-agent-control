@@ -419,3 +419,64 @@ class TestEvidenceCapturingTransportWiredIntoRealBybitClient:
         order_record = next(r for r in records if "order/create" in r["request_url"])
         assert order_record["request"]["headers"].get("X-BAPI-SIGN") == ve._REDACTED
         assert "BTCUSDT" in (order_record["request"].get("body") or "")
+
+
+class TestBuildWsEventRecord:
+    def _valid(self, **overrides):
+        kw = dict(
+            venue="bybit", environment="testnet",
+            ws_url="wss://stream-testnet.bybit.com/v5/private",
+            venue_event_id="order:abc123", topic="order",
+            order_link_id="BB-entry-1",
+            payload={"orderId": "V-1", "api_key": "shh"},
+        )
+        kw.update(overrides)
+        return ve.build_ws_event_record(**kw)
+
+    def test_record_is_tagged_ws_transport(self):
+        record = self._valid()
+        assert record["transport"] == "ws"
+        assert record["venue_event_id"] == "order:abc123"
+        assert record["method"] == "WS_EVENT"
+        assert record["request_url"] == "wss://stream-testnet.bybit.com/v5/private"
+
+    def test_payload_secrets_are_redacted(self):
+        record = self._valid()
+        assert record["response"]["api_key"] == ve._REDACTED
+
+    def test_duplicate_flag_is_recorded_in_the_request(self):
+        record = self._valid(duplicate=True)
+        assert record["request"]["duplicate"] is True
+        assert record["request"]["topic"] == "order"
+
+    def test_mainnet_claim_against_testnet_ws_url_is_refused(self):
+        with pytest.raises(ve.EvidenceRefused):
+            self._valid(environment="mainnet")
+
+    def test_rest_records_are_unaffected_default_transport(self):
+        """Every pre-existing REST caller of build_record (no `transport`
+        kwarg) still produces transport='rest' and venue_event_id=''."""
+        record = ve.build_record(
+            venue="bybit", environment="testnet",
+            method="POST", request_url="https://api-testnet.bybit.com/v5/order/create",
+            request={}, response={})
+        assert record["transport"] == "rest"
+        assert record["venue_event_id"] == ""
+
+
+class TestWsVenueHosts:
+    def test_testnet_ws_host_recognized(self):
+        assert ve.infer_environment_from_url(
+            "wss://stream-testnet.bybit.com/v5/private") == "testnet"
+
+    def test_mainnet_ws_host_recognized(self):
+        assert ve.infer_environment_from_url(
+            "wss://stream.bybit.com/v5/private") == "mainnet"
+
+    def test_unrecognized_ws_host_is_unknown(self):
+        assert ve.infer_environment_from_url("wss://example.invalid/v5") == "unknown"
+
+    def test_rest_and_ws_hosts_never_collide(self):
+        rest_hosts = set(ve.VENUE_HOSTS.values())
+        ws_hosts = set(ve.WS_VENUE_HOSTS.values())
+        assert rest_hosts.isdisjoint(ws_hosts)

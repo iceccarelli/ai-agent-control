@@ -110,6 +110,9 @@ class TradingBot:
         strategy: Optional[Any] = None,
         carry: Optional[Any] = None,
         ws_transport_factory: Optional[Callable[[], Any]] = None,
+        ws_evidence_path: Optional[str] = None,
+        ws_enabled_override: Optional[bool] = None,
+        ws_assurance_mode: bool = False,
     ) -> None:
         #: Injectable seam for the private-WS transport, exactly like
         #: `client`/`engine`/`strategy` above — production leaves this
@@ -119,6 +122,23 @@ class TradingBot:
         #: can be driven through the actual application lifecycle without a
         #: socket. See `_start_private_ws`.
         self._ws_transport_factory = ws_transport_factory
+        #: Same idea for the WS evidence log path: `None` (production)
+        #: reads `cfg.WS_EVIDENCE_PATH`/falls back to
+        #: `private_ws_consumer.DEFAULT_WS_EVIDENCE_PATH`; tests pass an
+        #: explicit `tmp_path`-based file so they never write into the
+        #: real repository's `artifacts/` directory as a side effect.
+        self._ws_evidence_path = ws_evidence_path
+        #: `None` (production): the config flag `PRIVATE_WS_ENABLED`
+        #: decides, unchanged. `True`/`False`: overrides it explicitly —
+        #: used by tools/testnet_conformance_run.py, which needs WS
+        #: started as part of its bounded run regardless of the general
+        #: trading config, without requiring an extra environment
+        #: variable beyond what the conformance preflight already checks.
+        self._ws_enabled_override = ws_enabled_override
+        #: Passed straight through to WSPrivateConsumer — see
+        #: private_ws_consumer.py's "EVIDENCE FAILURE SEMANTICS". False
+        #: (NORMAL) for real trading; the conformance runner passes True.
+        self._ws_assurance_mode = ws_assurance_mode
         self.ws_consumer: Optional[Any] = None
         self.ws_thread: Optional[threading.Thread] = None
         self.ws_stop_event = threading.Event()
@@ -428,7 +448,10 @@ class TradingBot:
         has (see `tick()`'s unconditional observe_exits/
         check_naked_positions calls, which do not depend on this at all).
         """
-        if not bool(getattr(self.cfg, "PRIVATE_WS_ENABLED", False)):
+        enabled = self._ws_enabled_override
+        if enabled is None:
+            enabled = bool(getattr(self.cfg, "PRIVATE_WS_ENABLED", False))
+        if not enabled:
             self._observation_state = "DISABLED"
             return
         try:
@@ -440,8 +463,12 @@ class TradingBot:
                 url = self.client.ws_private_url
                 transport_factory = lambda: _wt.PrivateWebSocket(url)  # noqa: E731
 
+            evidence_path = self._ws_evidence_path or str(getattr(
+                self.cfg, "WS_EVIDENCE_PATH", "") or _pwc.DEFAULT_WS_EVIDENCE_PATH)
             self.ws_consumer = _pwc.WSPrivateConsumer(
-                client=self.client, transport_factory=transport_factory)
+                client=self.client, transport_factory=transport_factory,
+                evidence_path=evidence_path,
+                assurance_mode=self._ws_assurance_mode)
             self.ws_stop_event = threading.Event()
             self.ws_thread = threading.Thread(
                 target=self.ws_consumer.run_forever,

@@ -191,11 +191,24 @@ class _StubClient:
         return self._reconcile_summary
 
 
+class _StubWSConsumer:
+    def __init__(self, *, evidence_path=None, evidence_capture_failed=False):
+        self.evidence_path = evidence_path
+        self.evidence_capture_failed = evidence_capture_failed
+
+
+_UNSET = object()
+
+
 class _StubBot:
-    def __init__(self, *, startup_ok=True, tick_error=None):
+    def __init__(self, *, startup_ok=True, tick_error=None,
+                ws_consumer=_UNSET, observation_status="HEALTHY"):
         self.startup_ok = startup_ok
         self.tick_error = tick_error
         self.ticked = False
+        self.ws_consumer = (_StubWSConsumer() if ws_consumer is _UNSET
+                           else ws_consumer)
+        self.observation_status = observation_status
 
     def startup(self):
         return self.startup_ok
@@ -205,11 +218,27 @@ class _StubBot:
             raise self.tick_error
         self.ticked = True
 
+    def shutdown(self):
+        pass
+
 
 SYMBOL = "BTCUSDT"
 
 
 class TestRunConformanceStageSequencing:
+    """Tests entry/protection/flatten/reconciliation sequencing — the same
+    thing they tested before WS observation existed. `await_ws_observation`
+    is patched to always succeed HERE ONLY (a class-scoped autouse
+    fixture, not module-scoped) so these tests keep testing exactly that,
+    not WS observation's own behavior — covered separately by
+    TestWsIntegrationStages/TestAwaitWsObservation below, against real
+    evidence files.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _ws_observation_always_succeeds(self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+
     def test_happy_path_runs_every_stage_and_is_ok(self):
         store = _StubStore(positions=[{"symbol": SYMBOL, "qty": 0.01}])
         engine = _StubEngine()
@@ -221,9 +250,10 @@ class TestRunConformanceStageSequencing:
 
         assert result["ok"] is True
         names = [s["stage"] for s in result["stages"]]
-        assert names == ["startup", "entry", "protection_local",
+        assert names == ["startup", "ws_startup", "entry", "ws_observation",
+                        "protection_local",
                         "protection_readback", "flatten",
-                        "final_reconciliation"]
+                        "final_reconciliation", "ws_evidence_completeness"]
         assert all(s["ok"] for s in result["stages"])
         assert engine.closed == [SYMBOL]
         assert result["latencies_ms"], "no latencies computed"
@@ -243,7 +273,8 @@ class TestRunConformanceStageSequencing:
             bot=_StubBot(), engine=_StubEngine(), client=_StubClient(),
             store=_StubStore(positions=[]), symbol=SYMBOL)
         assert result["ok"] is False
-        assert [s["stage"] for s in result["stages"]] == ["startup", "entry"]
+        assert [s["stage"] for s in result["stages"]] == [
+            "startup", "ws_startup", "entry"]
 
     def test_stops_at_protection_local_failure(self):
         store = _StubStore(positions=[{"symbol": SYMBOL}],
@@ -253,7 +284,8 @@ class TestRunConformanceStageSequencing:
             store=store, symbol=SYMBOL)
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
-            "startup", "entry", "protection_local"]
+            "startup", "ws_startup", "entry", "ws_observation",
+            "protection_local"]
 
     def test_stops_when_venue_readback_disagrees_with_local_belief(self):
         """The whole point of protection_readback: the LOCAL ledger says
@@ -267,7 +299,8 @@ class TestRunConformanceStageSequencing:
             store=store, symbol=SYMBOL)
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
-            "startup", "entry", "protection_local", "protection_readback"]
+            "startup", "ws_startup", "entry", "ws_observation",
+            "protection_local", "protection_readback"]
 
     def test_protection_readback_error_is_a_failed_stage_not_an_exception(self):
         store = _StubStore(positions=[{"symbol": SYMBOL}], naked=[])
@@ -291,9 +324,10 @@ class TestRunConformanceStageSequencing:
             store=store, symbol=SYMBOL)
         assert result["ok"] is False
         names = [s["stage"] for s in result["stages"]]
-        assert names == ["startup", "entry", "protection_local",
+        assert names == ["startup", "ws_startup", "entry", "ws_observation",
+                        "protection_local",
                         "protection_readback", "flatten",
-                        "final_reconciliation"]
+                        "final_reconciliation", "ws_evidence_completeness"]
         flatten_stage = next(s for s in result["stages"] if s["stage"] == "flatten")
         assert flatten_stage["ok"] is False
 
@@ -305,7 +339,182 @@ class TestRunConformanceStageSequencing:
             bot=_StubBot(), engine=_StubEngine(), client=client,
             store=store, symbol=SYMBOL)
         assert result["ok"] is False
-        recon_stage = result["stages"][-1]
-        assert recon_stage["stage"] == "final_reconciliation"
+        recon_stage = next(
+            s for s in result["stages"] if s["stage"] == "final_reconciliation")
         assert recon_stage["ok"] is False
         assert recon_stage["summary"]["unknown"] == 1
+
+
+# ---------------------------------------------------------------------------
+# WS integration: ws_startup / ws_observation / ws_evidence_completeness,
+# and evidence-chain verification — the mission this file's later half exists
+# to prove.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+import venue_evidence as ve  # noqa: E402
+
+
+def _write_ws_evidence_record(path, *, order_link_id, topic="order",
+                              prev_hash=None):
+    prev_hash = prev_hash if prev_hash is not None else ve.last_record_hash(path)
+    record = ve.build_ws_event_record(
+        venue="bybit", environment="testnet",
+        ws_url="wss://stream-testnet.bybit.com/v5/private",
+        venue_event_id=f"{topic}:test", topic=topic,
+        order_link_id=order_link_id, payload={"orderId": "V-1"},
+        prev_hash=prev_hash)
+    ve.append_evidence(path, record)
+
+
+class TestAwaitWsObservation:
+    def test_returns_true_when_a_matching_record_already_exists(self, tmp_path):
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(path, order_link_id="BB-1")
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is True
+
+    def test_returns_false_when_no_consumer(self):
+        bot = _StubBot(ws_consumer=None)
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is False
+
+    def test_returns_false_on_timeout_with_no_matching_record(self, tmp_path):
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(path, order_link_id="BB-OTHER")
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is False
+
+    def test_position_topic_does_not_satisfy_observation(self, tmp_path):
+        """Only order/execution evidence counts — a position-topic record
+        for the same symbol is not proof this ORDER was observed."""
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(path, order_link_id="BB-1", topic="position")
+
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is False
+
+    def test_execution_topic_satisfies_observation(self, tmp_path):
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(path, order_link_id="BB-1", topic="execution")
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is True
+
+    def test_appears_within_the_bound_is_observed(self, tmp_path):
+        """A record that lands DURING the wait (not before it) is still
+        found — proves this polls, not just checks once at t=0."""
+        import threading
+        import time
+
+        path = str(tmp_path / "ws_evidence.jsonl")
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        def _write_late():
+            time.sleep(0.2)
+            _write_ws_evidence_record(path, order_link_id="BB-1")
+
+        threading.Thread(target=_write_late).start()
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=2.0,
+            poll_interval=0.05) is True
+
+
+class TestWsIntegrationStages:
+    def test_ws_startup_fails_when_bot_has_no_consumer(self):
+        bot = _StubBot(ws_consumer=None)
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=_StubStore(), symbol=SYMBOL)
+        assert result["ok"] is False
+        assert [s["stage"] for s in result["stages"]] == [
+            "startup", "ws_startup"]
+
+    def test_ws_observation_failure_stops_before_protection(self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: False)
+        store = _StubStore(positions=[{"symbol": SYMBOL,
+                                       "order_link_id": "BB-1"}])
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=_StubEngine(), client=_StubClient(),
+            store=store, symbol=SYMBOL)
+        assert result["ok"] is False
+        assert [s["stage"] for s in result["stages"]] == [
+            "startup", "ws_startup", "entry", "ws_observation"]
+
+    def test_ws_evidence_completeness_fails_the_run_on_capture_failure(
+            self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+        consumer = _StubWSConsumer(evidence_capture_failed=True)
+        result = tcr.run_conformance(
+            bot=_StubBot(ws_consumer=consumer), engine=_StubEngine(),
+            client=_StubClient(), store=_StubStore(
+                positions=[{"symbol": SYMBOL}]),
+            symbol=SYMBOL)
+        assert result["ok"] is False
+        last_stage = result["stages"][-1]
+        assert last_stage["stage"] == "ws_evidence_completeness"
+        assert last_stage["ok"] is False
+
+    def test_ws_evidence_completeness_passes_when_capture_succeeded(
+            self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+        consumer = _StubWSConsumer(evidence_capture_failed=False)
+        result = tcr.run_conformance(
+            bot=_StubBot(ws_consumer=consumer), engine=_StubEngine(),
+            client=_StubClient(), store=_StubStore(
+                positions=[{"symbol": SYMBOL}]),
+            symbol=SYMBOL)
+        assert result["ok"] is True
+
+
+class TestVerifyEvidenceChains:
+    def test_both_chains_clean_is_verified(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        record = ve.build_record(
+            venue="bybit", environment="testnet", method="GET",
+            request_url="https://api-testnet.bybit.com/v5/market/time",
+            request={}, response={})
+        ve.append_evidence(rest_path, record)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1")
+
+        result = tcr.verify_evidence_chains(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path)
+
+        assert result["rest_evidence_verified"] is True
+        assert result["ws_evidence_verified"] is True
+
+    def test_tampered_ws_chain_is_not_verified(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1")
+        with open(ws_path, encoding="utf-8") as h:
+            record = json.loads(h.readline())
+        record["response"] = {"forged": True}
+        with open(ws_path, "w", encoding="utf-8") as h:
+            h.write(json.dumps(record) + "\n")
+
+        result = tcr.verify_evidence_chains(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path)
+
+        assert result["ws_evidence_verified"] is False
+        assert result["ws_evidence_reasons"] != []
+
+    def test_missing_files_are_vacuously_verified(self, tmp_path):
+        """No evidence file yet (e.g. a run that never got far enough to
+        capture anything) is not the same as a TAMPERED chain — verify_chain
+        already treats an absent file as clean (nothing to contradict); the
+        conformance runner's `ws_observation` stage is what actually
+        requires real evidence to exist, not this check."""
+        result = tcr.verify_evidence_chains(
+            rest_evidence_path=str(tmp_path / "nope-rest.jsonl"),
+            ws_evidence_path=str(tmp_path / "nope-ws.jsonl"))
+        assert result["rest_evidence_verified"] is True
+        assert result["ws_evidence_verified"] is True
