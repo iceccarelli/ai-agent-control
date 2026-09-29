@@ -182,40 +182,51 @@ class TestTheTickCannotArmAnything:
 
 # ------------------------------------------------------------- dry run ----
 
-class TestDryRunIsTheDefault:
-    def test_run_tick_defaults_to_no_corpus_write(self):
-        sig = inspect.signature(cpt.run_tick)
-        assert sig.parameters["allow_append_write"].default is False
+class TestTheTickHasNoWriteAuthorityAtAll:
+    """The tick used to carry an opt-in (CONTROL_PLANE_ALLOW_APPEND_WRITE=1 /
+    --allow-append-write) that passed --write through to append_closed_corpus.py.
+    That opt-in has been REMOVED, not merely left at its off default — the
+    tick is orchestrator/observer only; the sanctioned corpus-write path is
+    exclusively bot/scripts/stage_b_forward_accrual.sh on the Factory Mac's
+    cron (docs/human/NO_GLUE_OPS.md item 10). These tests prove there is no
+    way left, including stale environment state from before the removal, to
+    make the tick pass --write to the appender."""
 
-    def test_no_flag_means_no_write_flag_reaches_the_appender(self, recorder):
+    def test_run_tick_takes_no_write_related_parameter(self):
+        """The signature itself must not offer a way to ask for a write —
+        not just default to False, but not exist as a knob at all."""
+        sig = inspect.signature(cpt.run_tick)
+        assert "allow_append_write" not in sig.parameters
+        assert list(sig.parameters) == [], (
+            "run_tick must take no parameters — nothing configures whether "
+            "it writes, because it never does")
+
+    def test_no_write_flag_ever_reaches_the_appender(self, recorder):
         cpt.run_tick()
         argv = recorder.argv_for("append_closed_corpus.py")
-        assert "--write" not in argv, (
-            "the unattended default must be a dry run; --write leaked in")
+        assert "--write" not in argv
 
-    def test_the_flag_is_the_only_way_to_write(self, recorder):
-        cpt.run_tick(allow_append_write=True)
-        assert "--write" in recorder.argv_for("append_closed_corpus.py")
+    def test_main_takes_no_allow_append_write_flag(self):
+        """The CLI surface itself must not offer the flag — argparse must
+        reject it outright, not silently accept and ignore it."""
+        with pytest.raises(SystemExit):
+            cpt.main(["--allow-append-write"])
 
-    def test_the_env_opt_in_requires_exactly_one(self, monkeypatch, recorder,
-                                                 tmp_repo):
-        for value in ("", "0", "true", "yes", "2", " 1 x"):
+    def test_stale_env_var_from_before_the_removal_has_no_effect(
+            self, monkeypatch, recorder, tmp_repo):
+        """A host whose crontab or shell profile still exports
+        CONTROL_PLANE_ALLOW_APPEND_WRITE=1 from before this opt-in was
+        removed must not silently regain write authority."""
+        for value in ("", "0", "1", "true", "yes"):
             monkeypatch.setenv(cpt.APPEND_WRITE_ENV, value)
             recorder.calls.clear()
             assert cpt.main([]) == 0
             assert "--write" not in recorder.argv_for("append_closed_corpus.py"), (
-                f"{value!r} was treated as opt-in")
+                f"stale env value {value!r} leaked --write through")
 
-        monkeypatch.setenv(cpt.APPEND_WRITE_ENV, "1")
-        recorder.calls.clear()
-        assert cpt.main([]) == 0
-        assert "--write" in recorder.argv_for("append_closed_corpus.py")
-
-    def test_the_tick_records_which_mode_it_ran_in(self, recorder):
+    def test_the_tick_records_append_write_as_permanently_false(self, recorder):
         tick, _, _, _ = cpt.run_tick()
         assert tick["append_write_enabled"] is False
-        tick, _, _, _ = cpt.run_tick(allow_append_write=True)
-        assert tick["append_write_enabled"] is True
 
     def test_the_reviewer_is_invoked_dry_run(self, recorder):
         cpt.run_tick()
@@ -416,8 +427,9 @@ class TestOnlyOneTickRunsAtATime:
     """The cron fires hourly; the tick has a 600s child and a 180s child.
 
     Nothing guarantees a tick finishes inside the hour, and two overlapping
-    ticks means two corpus appenders against the same files — real writers,
-    under CONTROL_PLANE_ALLOW_APPEND_WRITE=1.
+    ticks means two dry-run appenders and two reviewer/tick-artefact writers
+    racing against the same files — the tick itself has no corpus-write
+    authority any more, but the artefact writes are still worth serializing.
     """
 
     def _lockdir(self, tmp_repo):
