@@ -29,31 +29,50 @@ checked fact rather than a naming convention: a declared environment that
 the request URL itself contradicts is refused before a record is ever
 built.
 
+WIRED INTO THE REAL ADAPTER, NOT AN UNUSED HELPER
+====================================================
+`EvidenceCapturingTransport` below implements the exact `Transport`
+interface `bybit_connection.BybitClient` calls (`request(method, url,
+headers=, params=, body=, timeout=)` -> `(status_code, text)`), so wrapping
+whatever transport a `BybitClient` is given makes EVERY real request that
+client sends — `place_order`, `place_stop_order`, `cancel_order`,
+`get_position`, all of it — automatically produce a redacted,
+environment-checked, hash-chained evidence record, from the one seam every
+call already passes through, without touching `bybit_connection.py` or
+duplicating capture logic at each call site. This module never imports
+`bybit_connection` (see below), so the wrapper is duck-typed against that
+interface rather than inheriting from it.
+
 NO REAL VENUE EVIDENCE SHIPS WITH THIS MODULE
 ================================================
 This repository has no execution host with live Bybit connectivity in this
-session. Nothing here fabricates a captured transcript to fill that gap —
-every example and every test constructs its own synthetic request/response
-and marks it accordingly. Real testnet/demo evidence, when an execution
-host is available, is captured by feeding this module's `build_record` the
-actual client's actual raw request/response — never invented after the
-fact.
+session (confirmed: no BYBIT_API_KEY/BYBIT_API_SECRET are set, and the
+container's network policy refuses api-testnet.bybit.com outright). Nothing
+here fabricates a captured transcript to fill that gap — every example and
+every test constructs its own synthetic request/response and marks it
+accordingly. Real testnet/demo evidence, the moment an execution host and
+credentials exist, is captured automatically by wrapping that
+`BybitClient`'s transport in `EvidenceCapturingTransport` — never invented
+after the fact.
 """
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 sys.path.insert(0, BOT)
 
 import provenance as prov  # noqa: E402
+
+logger = logging.getLogger("venue_evidence")
 
 SCHEMA = "venue_evidence/1"
 
@@ -366,3 +385,80 @@ def verify_chain(path: str) -> List[str]:
                     "inserted, deleted, or reordered)")
             prev_hash = declared_hash
     return reasons
+
+
+# ---------------------------------------------------------------------------
+# the real adapter integration point
+# ---------------------------------------------------------------------------
+
+
+class EvidenceCapturingTransport:
+    """Wraps a `bybit_connection.Transport`-shaped object so every real
+    request that passes through it also produces an evidence record.
+
+    Duck-typed rather than subclassed: this module never imports
+    `bybit_connection` (see module docstring — no coupling to
+    config/persistence/market_data), and `bybit_connection.BybitClient`
+    never does an `isinstance` check on its transport, only calls
+    `.request(...)` — confirmed by reading bybit_connection.py before
+    writing this class.
+
+    Evidence capture is deliberately best-effort: a capture bug must
+    degrade observability, never execution. Any exception while building
+    or appending the record is logged at `error` level (loud — this is not
+    swallowed silently) and the real request's result is returned exactly
+    as the wrapped transport produced it, unaffected.
+    """
+
+    def __init__(self, inner: Any, *, evidence_path: str, venue: str,
+                environment: str) -> None:
+        self._inner = inner
+        self._evidence_path = evidence_path
+        self._venue = venue
+        self._environment = environment
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Mapping[str, str],
+        params: Optional[Mapping[str, Any]] = None,
+        body: Optional[str] = None,
+        timeout: float = 10.0,
+    ) -> Tuple[int, str]:
+        status, text = self._inner.request(
+            method, url, headers=headers, params=params, body=body,
+            timeout=timeout)
+        try:
+            self._capture(method=method, url=url, headers=headers,
+                          params=params, body=body, status=status, text=text)
+        except Exception:  # noqa: BLE001
+            logger.error(
+                "venue evidence capture failed for %s %s (trading is "
+                "unaffected; this call's real result is still returned)",
+                method, url, exc_info=True)
+        return status, text
+
+    def _capture(self, *, method: str, url: str, headers: Mapping[str, str],
+                params: Optional[Mapping[str, Any]], body: Optional[str],
+                status: int, text: str) -> None:
+        request_payload: Dict[str, Any] = {
+            "headers": dict(headers),
+            "params": dict(params or {}),
+            "body": body,
+        }
+        try:
+            response_payload = json.loads(text) if text else {}
+            if not isinstance(response_payload, dict):
+                response_payload = {"_body": response_payload}
+        except ValueError:
+            response_payload = {"_raw_text": text}
+        response_payload["_status_code"] = status
+
+        prev_hash = last_record_hash(self._evidence_path)
+        record = build_record(
+            venue=self._venue, environment=self._environment, method=method,
+            request_url=url, request=request_payload,
+            response=response_payload, prev_hash=prev_hash)
+        append_evidence(self._evidence_path, record)

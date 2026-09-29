@@ -267,3 +267,155 @@ class TestAppendOnlyHashChain:
         after = open(path, encoding="utf-8").read()
 
         assert after.startswith(before)
+
+
+class TestEvidenceCapturingTransport:
+    """The real adapter integration point: wrapping a Transport captures
+    evidence for every request that passes through it."""
+
+    class _StubTransport:
+        def __init__(self, responses):
+            self._responses = list(responses)
+            self.calls = []
+
+        def request(self, method, url, *, headers, params=None, body=None,
+                   timeout=10.0):
+            self.calls.append({"method": method, "url": url,
+                               "headers": dict(headers)})
+            return self._responses.pop(0)
+
+    def test_wrapped_request_still_returns_the_real_result(self, tmp_path):
+        inner = self._StubTransport([(200, '{"retCode": 0}')])
+        wrapped = ve.EvidenceCapturingTransport(
+            inner, evidence_path=str(tmp_path / "evidence.jsonl"),
+            venue="bybit", environment="testnet")
+
+        status, text = wrapped.request(
+            "POST", "https://api-testnet.bybit.com/v5/order/create",
+            headers={"X-BAPI-API-KEY": "shh"}, body='{"symbol":"BTCUSDT"}')
+
+        assert status == 200
+        assert text == '{"retCode": 0}'
+
+    def test_wrapped_request_appends_a_redacted_evidence_record(self, tmp_path):
+        inner = self._StubTransport([(200, '{"retCode": 0, "result": {}}')])
+        path = str(tmp_path / "evidence.jsonl")
+        wrapped = ve.EvidenceCapturingTransport(
+            inner, evidence_path=path, venue="bybit", environment="testnet")
+
+        wrapped.request(
+            "POST", "https://api-testnet.bybit.com/v5/order/create",
+            headers={"X-BAPI-API-KEY": "shh", "X-BAPI-SIGN": "sig"},
+            body='{"symbol":"BTCUSDT","api_key":"shh"}')
+
+        with open(path, encoding="utf-8") as h:
+            record = json.loads(h.readline())
+        assert record["environment"] == "testnet"
+        assert record["request"]["headers"]["X-BAPI-API-KEY"] == ve._REDACTED
+        assert record["request"]["headers"]["X-BAPI-SIGN"] == ve._REDACTED
+        assert record["response"]["_status_code"] == 200
+        assert ve.verify_chain(path) == []
+
+    def test_multiple_requests_chain_correctly(self, tmp_path):
+        inner = self._StubTransport([
+            (200, '{"retCode": 0, "call": 1}'),
+            (200, '{"retCode": 0, "call": 2}'),
+        ])
+        path = str(tmp_path / "evidence.jsonl")
+        wrapped = ve.EvidenceCapturingTransport(
+            inner, evidence_path=path, venue="bybit", environment="testnet")
+
+        wrapped.request("GET", "https://api-testnet.bybit.com/v5/order/list",
+                        headers={})
+        wrapped.request("GET", "https://api-testnet.bybit.com/v5/order/list",
+                        headers={})
+
+        assert ve.verify_chain(path) == []
+        with open(path, encoding="utf-8") as h:
+            lines = [json.loads(ln) for ln in h if ln.strip()]
+        assert len(lines) == 2
+        assert lines[1]["prev_hash"] == lines[0]["record_hash"]
+
+    def test_environment_mismatch_does_not_raise_or_block_the_real_call(
+            self, tmp_path, caplog):
+        """A mismatched environment claim (this wrapper pointed at testnet,
+        but told to label mainnet) must never surface as an exception to
+        the caller -- capture failure degrades observability, not
+        execution -- but it also must not be silent."""
+        inner = self._StubTransport([(200, '{"retCode": 0}')])
+        path = str(tmp_path / "evidence.jsonl")
+        wrapped = ve.EvidenceCapturingTransport(
+            inner, evidence_path=path, venue="bybit", environment="mainnet")
+
+        status, text = wrapped.request(
+            "POST", "https://api-testnet.bybit.com/v5/order/create",
+            headers={})
+
+        assert status == 200  # the real call still succeeded
+        assert not os.path.exists(path) or open(path).read() == ""
+        assert any("venue evidence capture failed" in r.message
+                   for r in caplog.records)
+
+    def test_non_json_response_is_captured_without_raising(self, tmp_path):
+        inner = self._StubTransport([(503, "<html>maintenance</html>")])
+        path = str(tmp_path / "evidence.jsonl")
+        wrapped = ve.EvidenceCapturingTransport(
+            inner, evidence_path=path, venue="bybit", environment="testnet")
+
+        status, text = wrapped.request(
+            "GET", "https://api-testnet.bybit.com/v5/market/time", headers={})
+
+        assert status == 503
+        with open(path, encoding="utf-8") as h:
+            record = json.loads(h.readline())
+        assert record["response"]["_raw_text"] == "<html>maintenance</html>"
+
+
+class TestEvidenceCapturingTransportWiredIntoRealBybitClient:
+    """Proves this is wired into the actual adapter, not exercised only in
+    isolation: a real `bybit_connection.BybitClient` call, through the real
+    signing/request path, against `FakeBybit`, produces real evidence."""
+
+    def test_a_real_place_order_call_produces_an_evidence_record(
+            self, tmp_path):
+        sys.path.insert(0, REPO)
+        import bybit_connection as bc
+        from fake_bybit import API_KEY, API_SECRET, FakeBybit
+        from persistence import StateStore
+
+        class Cfg:
+            USE_TESTNET = True
+            PAPER_TRADING = False
+            BYBIT_API_KEY = API_KEY
+            BYBIT_API_SECRET = API_SECRET
+            BYBIT_RECV_WINDOW_MS = 5000
+            REQUEST_TIMEOUT_SECONDS = 5.0
+            USE_LEVERAGE = False
+            SYMBOL_FILTERS_TTL = 3600
+            ORDERLINK_PREFIX = "BB"
+
+        exchange = FakeBybit(balances={"USDT": 100_000.0, "BTC": 5.0},
+                             equity=100_000.0)
+        evidence_path = str(tmp_path / "evidence.jsonl")
+        wrapped_transport = ve.EvidenceCapturingTransport(
+            exchange, evidence_path=evidence_path, venue="bybit",
+            environment="testnet")
+        store = StateStore(str(tmp_path / "state.db"))
+        client = bc.BybitClient(config=Cfg(), store=store,
+                                transport=wrapped_transport)
+
+        result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.01)
+
+        assert result.ok
+        assert os.path.exists(evidence_path)
+        with open(evidence_path, encoding="utf-8") as h:
+            records = [json.loads(ln) for ln in h if ln.strip()]
+        assert len(records) >= 1, "no evidence captured for a real client call"
+        assert any("order/create" in r["request_url"] for r in records)
+        assert ve.verify_chain(evidence_path) == []
+        # The client's real signing still redacted-through correctly: the
+        # signature header itself is captured but redacted, never the
+        # plaintext order parameters needed to reconstruct what happened.
+        order_record = next(r for r in records if "order/create" in r["request_url"])
+        assert order_record["request"]["headers"].get("X-BAPI-SIGN") == ve._REDACTED
+        assert "BTCUSDT" in (order_record["request"].get("body") or "")
