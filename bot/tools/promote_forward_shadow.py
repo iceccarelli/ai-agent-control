@@ -73,6 +73,36 @@ def summarize(old: Dict[str, Any], new: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def find_regressions(old: Dict[str, Any], new: Dict[str, Any]) -> list:
+    """Monotonic fields that moved backward. A promotion that regresses one of
+    these is evidence corruption (a rolled-back scratch file, a hand-edited
+    counter, a scorer bug) rather than genuine forward accrual, so promotion
+    must refuse it rather than silently overwrite good evidence with worse.
+
+    Returns a list of human-readable reasons; empty means no regression.
+    """
+    reasons = []
+    for key in COUNTER_KEYS:
+        if key == "closed_forward_bars":
+            before: Any = resolve_closed_forward_bars(old)
+            after: Any = resolve_closed_forward_bars(new)
+        else:
+            before = old.get(key)
+            after = new.get(key)
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)) \
+                and after < before:
+            reasons.append(
+                f"{key} would go backward: {before!r} -> {after!r}")
+
+    old_ts = old.get("observed_at_utc")
+    new_ts = new.get("observed_at_utc")
+    if isinstance(old_ts, str) and isinstance(new_ts, str) and new_ts < old_ts:
+        reasons.append(
+            f"observed_at_utc would go backward: {old_ts!r} -> {new_ts!r}")
+
+    return reasons
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -101,6 +131,17 @@ def main(argv=None) -> int:
     print(f"shadow file   : {args.shadow_path}")
     print("counters:")
     print(summarize(current, scratch))
+
+    regressions = find_regressions(current, scratch)
+    if regressions:
+        print(
+            "\nREFUSED: promotion would move evidence backward, which can "
+            "only mean a rolled-back scratch file, a hand-edited counter, or "
+            "a scorer bug — never genuine forward accrual:",
+            file=sys.stderr)
+        for reason in regressions:
+            print(f"  - {reason}", file=sys.stderr)
+        return 1
 
     if not (args.write and args.i_am_human):
         print(
