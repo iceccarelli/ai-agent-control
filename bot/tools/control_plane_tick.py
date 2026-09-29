@@ -9,8 +9,8 @@ and write a machine-to-machine NEXT_MISSION.md for the Builder (Claude).
 
 WHAT IT MAY DO
 ==============
-* subprocess existing tools under bot/ (append dry-run, daily_forward_refresh,
-  reviewer_verdict)
+* subprocess existing tools under bot/ (append dry-run ONLY,
+  daily_forward_refresh, reviewer_verdict)
 * READ artifacts/forward_shadow_current.json
 * WRITE artifacts/control_plane_tick.json and artifacts/NEXT_MISSION.md
 * WRITE artifacts/reviewer_verdict.json, but ONLY when the finding changed —
@@ -19,8 +19,19 @@ WHAT IT MAY DO
 WHAT IT MUST NEVER DO
 =====================
 * set allows_live / clear the kill switch / place an order
-* write corpus files unless CONTROL_PLANE_ALLOW_APPEND_WRITE=1 (maps to the
-  existing append_closed_corpus.py --write flag — no new writer invented)
+* write corpus files — EVER, unconditionally. `append_closed_corpus.py` is
+  invoked dry-run only, for observability (what WOULD change). The tick used
+  to carry an opt-in (CONTROL_PLANE_ALLOW_APPEND_WRITE=1 / --allow-append-write)
+  that passed --write through to it; that opt-in has been REMOVED, not just
+  left at its off default. The tick is orchestrator/observer, never a writer:
+  docs/human/AGENT_CONTROL_PLANE.md's own OpenClaw hook-point design already
+  drew this line ("appending stays with tools/append_closed_corpus.py"), and
+  the sanctioned corpus-write path is exclusively
+  bot/scripts/stage_b_forward_accrual.sh on the Factory Mac's cron (see
+  docs/human/NO_GLUE_OPS.md item 10). An orchestrator that can also become a
+  writer under an environment variable is exactly the kind of ambiguous,
+  unaudited second writer authority that produces corpus split-brain — no
+  environment variable or flag may re-enable this.
 * promote scratch forward scores into artifacts/forward_shadow_current.json
   (daily_forward_refresh scores to scratch only; that pattern is preserved)
 * print, log, or write any API key / venue secret
@@ -53,7 +64,12 @@ VERDICT_OUT = os.path.join("artifacts", "reviewer_verdict.json")
 #: The reviewer writes HERE first. state/ is gitignored; artifacts/ is not.
 VERDICT_SCRATCH = os.path.join("state", "control_plane", "reviewer_verdict.json")
 
-#: Opt-in only. Maps 1:1 onto append_closed_corpus.py --write. Absent → dry-run.
+#: RETIRED, deliberately kept as a name (not deleted) so that a host whose
+#: crontab or environment still sets this from before the opt-in was removed
+#: does not silently do nothing unnoticed — see test_control_plane_tick.py's
+#: TestAppendWriteAuthorityIsPermanentlyRemoved, which asserts that setting
+#: this to "1" has NO effect on run_tick/main. Nothing in this module reads
+#: it to gate a --write flag any more.
 APPEND_WRITE_ENV = "CONTROL_PLANE_ALLOW_APPEND_WRITE"
 
 #: One tick at a time. See _lock().
@@ -220,8 +236,11 @@ def _lock() -> Tuple[bool, str]:
     The cron fires hourly. The tick subprocesses daily_forward_refresh with a
     600-second timeout and append_closed_corpus with 180, and neither is
     guaranteed to be the slowest thing this ever runs. Two ticks overlapping
-    means two corpus appenders running at once against the same files — and
-    under CONTROL_PLANE_ALLOW_APPEND_WRITE=1 those are real writers.
+    means two dry-run appenders and two reviewer/tick-artefact writers racing
+    against the same files — append_closed_corpus.py is invoked dry-run only
+    (the tick has no write authority at all; see module docstring), but the
+    reviewer_verdict/control_plane_tick/NEXT_MISSION writes are real and
+    still worth serializing.
 
     mkdir is the lock because it is atomic on every filesystem this will meet,
     unlike "check then create". A lock whose owner is gone is stale, not held:
@@ -366,14 +385,16 @@ def _mission_body(verdict: Dict[str, Any], forward: Optional[Dict[str, Any]],
     return "\n".join(lines)
 
 
-def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
+def run_tick() -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]], Dict[str, Any]]:
     errors: List[str] = []
     steps: Dict[str, Any] = {}
 
-    # 1) Corpus append — dry-run unless operator opt-in matches existing --write.
+    # 1) Corpus append — ALWAYS dry-run. The tick has no write authority at
+    # all (see module docstring); this call exists for observability only
+    # (what would change), never with --write. The sanctioned corpus-write
+    # path is bot/scripts/stage_b_forward_accrual.sh on the Factory Mac's
+    # cron (docs/human/NO_GLUE_OPS.md item 10).
     append_argv = [sys.executable, os.path.join("tools", "append_closed_corpus.py")]
-    if allow_append_write:
-        append_argv.append("--write")
     steps["append_closed_corpus"] = _run(append_argv, timeout=180)
     if steps["append_closed_corpus"].get("returncode") not in (0,):
         errors.append(
@@ -479,7 +500,11 @@ def run_tick(*, allow_append_write: bool = False) -> Tuple[Dict[str, Any], Dict[
             "computed_utc": steps["reviewer_verdict_promote"].get("computed_utc"),
             "promoted": steps["reviewer_verdict_promote"].get("promoted"),
         },
-        "append_write_enabled": bool(allow_append_write),
+        # Permanently False: the tick has no write authority at all any more
+        # (see module docstring). Kept in the schema, not removed, so this
+        # artefact itself is auditable evidence of that — a reader does not
+        # need to know the opt-in used to exist to see it is inert now.
+        "append_write_enabled": False,
         "forward_shadow_write": False,
         "steps": {
             k: {sk: sv for sk, sv in v.items()
@@ -509,14 +534,12 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument(
-        "--allow-append-write", action="store_true",
-        help="pass --write to append_closed_corpus.py (also set by "
-             f"{APPEND_WRITE_ENV}=1)")
-    args = parser.parse_args(argv)
-
-    allow_write = bool(args.allow_append_write) or (
-        os.environ.get(APPEND_WRITE_ENV, "").strip() == "1")
+    # No --allow-append-write flag. It existed once and is deliberately not
+    # here any more — see the module docstring's "WHAT IT MUST NEVER DO" and
+    # APPEND_WRITE_ENV's own comment. A host whose environment still sets
+    # CONTROL_PLANE_ALLOW_APPEND_WRITE=1 from before this was removed has no
+    # effect here: nothing below reads that variable to gate a --write flag.
+    parser.parse_args(argv)
 
     held, lock = _lock()
     if not held:
@@ -527,7 +550,7 @@ def main(argv=None) -> int:
                           "detail": lock}, indent=2))
         return 0
     try:
-        tick, verdict, forward, live = run_tick(allow_append_write=allow_write)
+        tick, verdict, forward, live = run_tick()
     finally:
         _unlock(lock)
 
