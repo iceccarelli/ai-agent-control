@@ -9,11 +9,50 @@ import json
 import os
 import sys
 
+import pytest
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tools"))
 
 import promote_forward_shadow as pfs                # noqa: E402
+import shadow as _shadow                             # noqa: E402
+from signals import funding_carry_fade_btc_v1 as _signal  # noqa: E402
+
+#: A syntactically real (40-hex) sha, independent of whatever this checkout's
+#: actual HEAD is. Tests that want a "valid" candidate monkeypatch
+#: `pfs.prov.git_commit` to return exactly this, so the independent git check
+#: in `validate_provenance` passes without depending on the real repo state.
+VALID_GIT_COMMIT = "a" * 40
+
+
+def _valid_provenance():
+    """Fields that pass `validate_provenance` against the real frozen signal
+    module and shadow scope, paired with `_patched_git_identity` below."""
+    return {
+        "signal": _shadow.SHADOW_SIGNAL,
+        "symbol": _shadow.SHADOW_SYMBOL,
+        "constants_fingerprint": _shadow.constants_fingerprint()[:32],
+        "constants": dict(_signal.CONSTANTS),
+        "fund_abs": _signal.FUND_ABS,
+        "caps": {
+            "max_concurrent_positions": _shadow.SHADOW_MAX_CONCURRENT_POSITIONS,
+            "max_entries_per_day": _shadow.SHADOW_MAX_ENTRIES_PER_DAY,
+            "max_notional_usd": _shadow.SHADOW_MAX_NOTIONAL_USD,
+            "symbol": _shadow.SHADOW_SYMBOL,
+        },
+        "git_commit": VALID_GIT_COMMIT,
+    }
+
+
+@pytest.fixture(autouse=True)
+def _patched_git_identity(monkeypatch):
+    """Every test in this file promotes against a fake but internally
+    consistent git identity, never the real checkout's actual HEAD — the
+    real HEAD changes over time and would make these tests depend on the
+    state of the tree they happen to run in."""
+    monkeypatch.setattr(pfs.prov, "git_commit", lambda *a, **kw: VALID_GIT_COMMIT)
+
 
 OLD_SHADOW = {
     "tool": "slice76_forward_shadow (scored against the APPEND-ONLY full corpora)",
@@ -22,6 +61,7 @@ OLD_SHADOW = {
     "closed_forward_bars": 41,
     "state_ladder": {"6_closed_trades": 3},
     "gate_requires": {"closed_forward_trades": 20, "forward_days": 180},
+    **_valid_provenance(),
 }
 
 NEW_SCRATCH = {
@@ -31,6 +71,7 @@ NEW_SCRATCH = {
     "closed_forward_bars": 48,
     "state_ladder": {"6_closed_trades": 5},
     "gate_requires": {"closed_forward_trades": 20, "forward_days": 180},
+    **_valid_provenance(),
 }
 
 
@@ -210,6 +251,119 @@ class TestPromotionNoop:
         assert rc == 0
         out = capsys.readouterr().out
         assert "PROMOTION_ACCEPTED" in out
+
+
+class TestValidatesProvenanceIndependently:
+    """A candidate cannot certify its own provenance. Every field checked
+    here is independently re-derived from the live frozen signal module,
+    the live shadow scope, or the live git tree — none of these mismatches
+    may be waved through even with both human flags."""
+
+    def _promote(self, tmp_path, candidate):
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        _write(scratch_path, candidate)
+        _write(shadow_path, OLD_SHADOW)
+        return pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+    def test_wrong_signal_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        bad["signal"] = "some_other_signal_v2"
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_wrong_symbol_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        bad["symbol"] = "ETHUSDT"
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_missing_signal_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        del bad["signal"]
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_forged_constants_fingerprint_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        bad["constants_fingerprint"] = "0" * 32
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_tampered_constants_with_stale_fingerprint_is_refused(
+            self, tmp_path):
+        """The declared fingerprint alone isn't enough: if a 'constants'
+        payload is present it must itself hash to the live fingerprint, so
+        a candidate can't carry a retuned constants dict alongside an
+        untouched (now-stale) fingerprint string."""
+        bad = dict(NEW_SCRATCH)
+        tampered = dict(bad["constants"])
+        tampered["FUND_ABS"] = 0.0002  # retuned, fingerprint left as-is
+        bad["constants"] = tampered
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_wrong_fund_abs_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        bad["fund_abs"] = 0.0002
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_wrong_caps_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        bad["caps"] = dict(bad["caps"], max_notional_usd=10_000.00)
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_missing_git_commit_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        del bad["git_commit"]
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_malformed_git_commit_is_refused(self, tmp_path):
+        bad = dict(NEW_SCRATCH)
+        bad["git_commit"] = "not-a-real-sha"
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_wrong_git_commit_is_refused(self, tmp_path):
+        """The candidate's git_commit must match THIS tree's actual HEAD
+        (patched to VALID_GIT_COMMIT for this file) — a candidate claiming a
+        different, syntactically valid commit is still refused."""
+        bad = dict(NEW_SCRATCH)
+        bad["git_commit"] = "b" * 40
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_dirty_suffix_mismatch_is_refused(self, tmp_path, monkeypatch):
+        """A candidate claiming a clean tree when the actual tree is dirty
+        (or vice versa) is a provenance mismatch, not a cosmetic detail."""
+        monkeypatch.setattr(pfs.prov, "git_commit",
+                            lambda *a, **kw: VALID_GIT_COMMIT + "-dirty")
+        bad = dict(NEW_SCRATCH)
+        bad["git_commit"] = VALID_GIT_COMMIT  # claims clean
+        assert self._promote(tmp_path, bad) != 0
+
+    def test_valid_provenance_is_accepted(self, tmp_path):
+        """Sanity check: NEW_SCRATCH's provenance, as constructed, actually
+        passes — so the refusals above are testing the specific tampered
+        field, not some unrelated fixture mistake."""
+        assert self._promote(tmp_path, dict(NEW_SCRATCH)) == 0
+
+    def test_refusal_does_not_write(self, tmp_path):
+        scratch_path = tmp_path / "forward.json"
+        shadow_path = tmp_path / "forward_shadow_current.json"
+        bad = dict(NEW_SCRATCH)
+        bad["symbol"] = "ETHUSDT"
+        _write(scratch_path, bad)
+        _write(shadow_path, OLD_SHADOW)
+        before = shadow_path.read_text(encoding="utf-8")
+
+        rc = pfs.main([
+            "--from", str(scratch_path),
+            "--shadow-path", str(shadow_path),
+            "--i-am-human",
+            "--write",
+        ])
+
+        assert rc != 0
+        assert shadow_path.read_text(encoding="utf-8") == before
 
 
 class TestBarsResolveThroughNestedSchema:

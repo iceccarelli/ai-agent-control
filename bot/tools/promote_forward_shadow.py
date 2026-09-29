@@ -39,12 +39,17 @@ import hashlib
 import json
 import os
 import sys
-from typing import Any, Dict
-
-from stage_b_bars import resolve_closed_forward_bars
+from typing import Any, Dict, List
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
+sys.path.insert(0, BOT)
+
+from stage_b_bars import resolve_closed_forward_bars       # noqa: E402
+import provenance as prov                                  # noqa: E402
+import shadow                                               # noqa: E402
+from signals import funding_carry_fade_btc_v1 as _signal    # noqa: E402
+
 DEFAULT_SHADOW_PATH = os.path.join(BOT, "artifacts", "forward_shadow_current.json")
 
 #: The counters Stage B accrual actually cares about; surfaced first in the
@@ -117,6 +122,104 @@ def find_regressions(old: Dict[str, Any], new: Dict[str, Any]) -> list:
     return reasons
 
 
+def validate_provenance(candidate: Dict[str, Any]) -> List[str]:
+    """Independently re-derive every fact the candidate claims about itself.
+
+    A scratch score cannot certify its own provenance — every field checked
+    here is recomputed from the actual frozen signal module, the actual
+    shadow scope (`shadow.py`), or the actual git tree, and the candidate's
+    self-reported value is refused whenever it disagrees. Returns a list of
+    human-readable reasons; empty means the candidate's provenance checks
+    out against the repository it is being promoted into.
+
+    Only the CANDIDATE is checked. The current (already-promoted) shadow
+    file may be historical evidence written before this check existed —
+    that history is not rewritten or re-validated here.
+    """
+    reasons: List[str] = []
+
+    signal = candidate.get("signal")
+    if signal != shadow.SHADOW_SIGNAL:
+        reasons.append(
+            f"signal identity mismatch: candidate declares {signal!r}, the "
+            f"shadow scope is {shadow.SHADOW_SIGNAL!r}")
+
+    symbol = candidate.get("symbol")
+    if symbol != shadow.SHADOW_SYMBOL:
+        reasons.append(
+            f"symbol mismatch: candidate declares {symbol!r}, the shadow "
+            f"scope is {shadow.SHADOW_SYMBOL!r}")
+
+    # Every real producer (slice6x/7x_forward_shadow.py) truncates the full
+    # sha256 to 32 hex chars before writing `constants_fingerprint`, to match
+    # the truncated `shadow.CONSTANTS_FINGERPRINT` pin — see e.g.
+    # tools/slice76_forward_shadow.py's `shadow.constants_fingerprint()[:32]`.
+    live_fingerprint_full = shadow.constants_fingerprint()
+    live_fingerprint = live_fingerprint_full[:32]
+    declared_fingerprint = candidate.get("constants_fingerprint")
+    if declared_fingerprint != live_fingerprint:
+        reasons.append(
+            f"constants_fingerprint mismatch: candidate declares "
+            f"{declared_fingerprint!r}, recomputed live from the frozen "
+            f"signal module it is {live_fingerprint!r}")
+    if live_fingerprint != shadow.CONSTANTS_FINGERPRINT:
+        reasons.append(
+            f"the live constants fingerprint ({live_fingerprint!r}) no "
+            f"longer matches the frozen pin ({shadow.CONSTANTS_FINGERPRINT!r})"
+            f" in this tree; a frozen constant changed and promotion must "
+            f"not proceed from a tree in that state")
+
+    declared_constants = candidate.get("constants")
+    if isinstance(declared_constants, dict):
+        declared_constants_fingerprint = hashlib.sha256(
+            json.dumps(declared_constants, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:32]
+        if declared_constants_fingerprint != live_fingerprint:
+            reasons.append(
+                "candidate's own 'constants' payload does not hash to the "
+                "live frozen fingerprint — its constants dict and its "
+                "declared constants_fingerprint have diverged")
+
+    live_fund_abs = _signal.FUND_ABS
+    declared_fund_abs = candidate.get("fund_abs")
+    if declared_fund_abs != live_fund_abs:
+        reasons.append(
+            f"fund_abs mismatch: candidate declares {declared_fund_abs!r}, "
+            f"the frozen signal constant is {live_fund_abs!r}")
+
+    expected_caps = {
+        "max_concurrent_positions": shadow.SHADOW_MAX_CONCURRENT_POSITIONS,
+        "max_entries_per_day": shadow.SHADOW_MAX_ENTRIES_PER_DAY,
+        "max_notional_usd": shadow.SHADOW_MAX_NOTIONAL_USD,
+        "symbol": shadow.SHADOW_SYMBOL,
+    }
+    declared_caps = candidate.get("caps")
+    if declared_caps != expected_caps:
+        reasons.append(
+            f"caps mismatch: candidate declares {declared_caps!r}, the "
+            f"frozen shadow caps are {expected_caps!r}")
+
+    declared_git = candidate.get("git_commit")
+    actual_git = prov.git_commit()
+    if not prov.is_real_commit(declared_git):
+        reasons.append(
+            f"git_commit is not a real commit sha ({declared_git!r}); "
+            f"refusing rather than trusting an unverifiable claim")
+    elif not prov.is_real_commit(actual_git):
+        reasons.append(
+            f"could not independently verify this tree's git identity "
+            f"({actual_git}); refusing rather than trusting the "
+            f"candidate's self-reported git_commit")
+    elif declared_git != actual_git:
+        reasons.append(
+            f"git_commit mismatch: candidate declares {declared_git!r}, "
+            f"this tree is actually at {actual_git!r} (including dirty "
+            f"state) — promote only from the exact checkout the scratch "
+            f"score was produced from")
+
+    return reasons
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -150,6 +253,18 @@ def main(argv=None) -> int:
     print(f"candidate_hash: {candidate_hash!r}")
     print("counters:")
     print(summarize(current, scratch))
+
+    provenance_problems = validate_provenance(scratch)
+    if provenance_problems:
+        print(
+            "\nREFUSED: the candidate's provenance does not check out "
+            "against this tree's actual frozen signal, shadow scope, and "
+            "git identity. Human flags do not override this — a candidate "
+            "cannot certify itself:",
+            file=sys.stderr)
+        for reason in provenance_problems:
+            print(f"  - {reason}", file=sys.stderr)
+        return 1
 
     regressions = find_regressions(current, scratch)
     if regressions:
