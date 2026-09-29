@@ -19,9 +19,9 @@
     "forward_shadow_clean": {
       "complete": false,
       "owner": "observation",
-      "evidence": "4 of 20 forward closed trades; 49 of 180 forward days, scored against the APPEND-ONLY full corpora (artifacts/forward_shadow_current.json). The counter was 0 for sixteen slices because the pilot was scored against the FROZEN corpus, which is bounded at the snapshot cut; the bars were already in tree. Ladder 8/8/8/4/4/3. NOT complete: 4 < 20 and 49 < 180, and the monitors need 10 and 20 closed trades before they arm.",
+      "evidence": "4 of 20 forward closed trades; 50 of 180 forward days, scored against the APPEND-ONLY full corpora (artifacts/forward_shadow_current.json). The counter was 0 for sixteen slices because the pilot was scored against the FROZEN corpus, which is bounded at the snapshot cut; the bars were already in tree. Ladder 8/8/8/4/4/3. NOT complete: 4 < 20 and 50 < 180, and the monitors need 10 and 20 closed trades before they arm.",
       "forward_trades_to_date": 4,
-      "forward_days_to_date": 49,
+      "forward_days_to_date": 50,
       "min_forward_trades": 20,
       "min_forward_days": 180,
       "declared_before_any_new_reading": true,

@@ -14,18 +14,18 @@
     ]
   },
   "bars_per_symbol": {
-    "BINANCE_SPOT_BTC_USDT_1D": 2641,
+    "BINANCE_SPOT_BTC_USDT_1D": 2642,
     "BINANCE_SPOT_ETH_USDT_1D": 2629,
     "BINANCE_SPOT_SOL_USDT_1D": 2227
   },
   "files": {
     "ohlcv/BINANCE_SPOT_BTC_USDT_1D.csv.gz": {
-      "rows": 2641,
-      "sha256_uncompressed": "7b98fb0c51833b34a7370790b6fd9d7931a1a5e1c14a409dea08e169f32ebd3e",
+      "rows": 2642,
+      "sha256_uncompressed": "6e4606d8dfdf68458d7b8ae400b3ce18332b656ae3acd42b36e0e8ef54ed42ec",
       "kind": "ohlcv",
       "interval_seconds": 86400,
       "first_timestamp": "2019-07-06T00:00:00.0000000Z",
-      "last_timestamp": "2026-09-27T00:00:00.0000000Z"
+      "last_timestamp": "2026-09-28T00:00:00.0000000Z"
     },
     "ohlcv/BINANCE_SPOT_ETH_USDT_1D.csv.gz": {
       "rows": 2629,
