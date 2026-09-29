@@ -314,6 +314,7 @@ def build_ws_event_record(*, venue: str, environment: str, ws_url: str,
                           duplicate: bool = False,
                           prev_hash: str = GENESIS_PREV_HASH,
                           captured_at_utc: Optional[str] = None,
+                          observed_at_utc: Optional[str] = None,
                           repo: Optional[str] = None) -> Dict[str, Any]:
     """Build one evidence record for a private-WS event.
 
@@ -326,10 +327,20 @@ def build_ws_event_record(*, venue: str, environment: str, ws_url: str,
     `venue_event_id`/`transport="ws"` carry the deterministic identity
     and source so a reader can tell a WS record from a REST one without
     guessing from its shape.
+
+    `captured_at_utc` is when this record was durably WRITTEN (normally
+    the writer thread's own time, at drain/apply); `observed_at_utc`, when
+    given, is when the event was first OBSERVED (the WS thread's own
+    time, at enqueue) and is carried in `request` alongside `topic`/
+    `duplicate` — preserving the observed-vs-applied distinction without
+    a new top-level schema field (see private_ws_consumer.py's FIX 1).
     """
+    request: Dict[str, Any] = {"topic": topic, "duplicate": duplicate}
+    if observed_at_utc is not None:
+        request["observed_at_utc"] = observed_at_utc
     return build_record(
         venue=venue, environment=environment, method="WS_EVENT",
-        request_url=ws_url, request={"topic": topic, "duplicate": duplicate},
+        request_url=ws_url, request=request,
         response=payload or {}, order_link_id=order_link_id,
         prev_hash=prev_hash, captured_at_utc=captured_at_utc, repo=repo,
         transport="ws", venue_event_id=venue_event_id)

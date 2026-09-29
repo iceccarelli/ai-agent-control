@@ -64,14 +64,28 @@ unparseable — produces one record via `tools/venue_evidence.py`'s
 existing mechanism (`build_ws_event_record`/`append_evidence`): the same
 redaction, environment validation, hash chaining, and git provenance
 already proven for REST evidence, tagged `transport="ws"` so the two
-sources are distinguishable in a chain reader without guessing. See
-`_write_evidence` below for exactly where this runs and why no lock is
-needed, and "EVIDENCE FAILURE SEMANTICS" there for NORMAL vs ASSURANCE
-mode behaviour on a capture failure.
+sources are distinguishable in a chain reader without guessing.
+
+EVIDENCE OWNERSHIP: THE WS THREAD NEVER WRITES DURABLE EVIDENCE EITHER
+=========================================================================
+Same law as "THIS CONSUMER NEVER WRITES StateStore ITSELF" above, applied
+to the evidence file: the WS (background) thread only OBSERVES an event
+and enqueues a `_PendingEvidence` onto `self._evidence_pending` (a
+`queue.Queue`, fast, no I/O). `drain_evidence()` — called ONLY from the
+writer thread, via `drain_and_apply()` from `TradingBot.tick()` — pops
+everything pending and performs the actual file write
+(`_write_evidence_record`). This means the same "one writer thread"
+invariant now covers both `StateStore` and the WS evidence log, and it
+lets the schema keep "observed" (`observed_at_utc`, stamped when the WS
+thread enqueues) distinct from "applied" (`captured_at_utc`, stamped when
+the writer thread durably writes). See `drain_evidence`'s docstring for
+exactly where the write runs, and "EVIDENCE FAILURE SEMANTICS" further
+down for NORMAL vs ASSURANCE mode behaviour on a capture failure.
 """
 from __future__ import annotations
 
 import collections
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -146,6 +160,23 @@ class NormalizedEvent:
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _PendingEvidence:
+    """One evidence record OBSERVED by the WS thread, not yet durably
+    written. `observed_at_utc` is stamped here, at observation time, and
+    is distinct from `captured_at_utc` on the eventual `EvidenceRecord`,
+    which is stamped by `_write_evidence_record` at APPLY time on the
+    writer thread — see FIX 1, "preserve the distinction between observed
+    and applied"."""
+
+    venue_event_id: str
+    topic: str
+    order_link_id: str
+    payload: Dict[str, Any]
+    duplicate: bool
+    observed_at_utc: str
+
+
 class _Deduplicator:
     """Bounded LRU of event ids. `seen()` both checks and records, so a
     caller cannot check-then-forget-to-record."""
@@ -176,6 +207,16 @@ def _normalize_order_item(item: Dict[str, Any]) -> NormalizedEvent:
     order_link_id = str(item.get("orderLinkId", ""))
     updated = str(item.get("updatedTime", ""))
     status_raw = str(item.get("orderStatus", ""))
+    if not order_id:
+        # No usable venue order identity (`orderId` empty/missing): this
+        # cannot become a legitimate durable "order" event by inventing an
+        # identity out of empty fields — treat it as an invalid/unknown
+        # observation instead (never applied, never a StateStore write),
+        # exactly like an unrecognized topic. See FIX 4.
+        identity = deterministic_id("order-invalid", _canonical_json(item))
+        return NormalizedEvent(
+            event_id=f"unknown:{identity}", kind="unknown", topic="order",
+            raw=item)
     # order_id + status_raw + updated + a hash of the FULL payload: two
     # order-state messages for the same order, at the same status, at the
     # same venue timestamp, but with different content (e.g. a filled
@@ -199,6 +240,15 @@ def _normalize_execution_item(item: Dict[str, Any]) -> NormalizedEvent:
     order_id = str(item.get("orderId", ""))
     order_link_id = str(item.get("orderLinkId", ""))
     exec_type = str(item.get("execType", ""))
+    if not exec_id:
+        # No usable venue execution identity (`execId` empty/missing) —
+        # same treatment as an order with no usable `orderId`: invalid/
+        # unknown observation, never a legitimate "execution" event. See
+        # FIX 4.
+        identity = deterministic_id("execution-invalid", _canonical_json(item))
+        return NormalizedEvent(
+            event_id=f"unknown:{identity}", kind="unknown", topic="execution",
+            raw=item)
     is_maker_or_taker_fill = exec_type in ("Trade", "")
     status = "filled" if is_maker_or_taker_fill else ""
     # execId is already the venue's own durable, unique-per-fill identity
@@ -289,9 +339,12 @@ class WSPrivateConsumer:
         #: what makes handing events from this (background) thread to the
         #: writer thread safe without this module taking a lock itself.
         self._pending: "queue.Queue[NormalizedEvent]" = queue.Queue()
-        #: WS evidence — appended from THIS (the WS) thread only (see
-        #: "WS EVENT EVIDENCE" below); `None` disables capture entirely.
+        #: WS evidence — OBSERVED (enqueued) from THIS (the WS) thread,
+        #: APPLIED (the actual durable file write) only from the writer
+        #: thread via `drain_evidence()`/`drain_and_apply()`. See "WS
+        #: EVENT EVIDENCE" below; `None` disables capture entirely.
         self._evidence_path = evidence_path
+        self._evidence_pending: "queue.Queue[_PendingEvidence]" = queue.Queue()
         #: NORMAL (False, default): a capture failure degrades
         #: (`needs_reconciliation=True`, logged, counted) and trading
         #: continues per the existing safety policy. ASSURANCE/CONFORMANCE
@@ -303,6 +356,15 @@ class WSPrivateConsumer:
         self.evidence_capture_failed = False
         self.evidence_records_written = 0
         self._connection_seq = 0
+        #: Explicit private-stream lifecycle proof (FIX 5): a connected
+        #: transport alone is not sufficient — `auth_ok`/`subscribe_ok`
+        #: are only ever set True by `_handle_control_message` on an
+        #: EXPLICIT `success: true` response to that op, and are reset to
+        #: False at the start of every connection attempt (`run_once`), so
+        #: a stale success from an earlier connection can never be
+        #: mistaken for this one's.
+        self.auth_ok = False
+        self.subscribe_ok = False
 
     @property
     def evidence_path(self) -> Optional[str]:
@@ -335,14 +397,14 @@ class WSPrivateConsumer:
             return []
 
         # Apply BEFORE capturing evidence for each event: `_apply` sets
-        # `needs_reconciliation`/queues an update fast, with no I/O.
-        # `_capture_evidence` writes+fsyncs a file and can be slow. The
-        # writer thread reads `needs_reconciliation` from a different
-        # thread (see `main.TradingBot._absorb_ws_observations`), so
-        # applying first keeps that flag timely regardless of how long
-        # evidence capture takes — the same ordering fix as
-        # `run_forever`'s connection-evidence capture, and for the same
-        # reason.
+        # `needs_reconciliation`/queues an update, and `_capture_evidence`
+        # (since FIX 1) only enqueues a `_PendingEvidence` — both are fast,
+        # no I/O, on this thread. The actual evidence file write happens
+        # later, on the writer thread (`drain_evidence()`), so this
+        # ordering no longer needs to race an fsync; it is kept anyway so
+        # `needs_reconciliation` is set as early as possible regardless of
+        # queueing order — the same ordering discipline as
+        # `run_forever`'s connection-evidence capture.
         events = parse_ws_message(raw_text)
         applied: List[NormalizedEvent] = []
         for event in events:
@@ -367,9 +429,25 @@ class WSPrivateConsumer:
         # reason as handle_raw_message/run_forever above.
         op = str(message.get("op") or "")
         success = message.get("success")
-        if op in ("auth", "subscribe") and success is False:
-            logger.error("private-WS %s failed: %s", op, message)
-            self.needs_reconciliation = True
+        # FIX 5: AUTH_OK/SUBSCRIBE_OK are only ever set True by an EXPLICIT
+        # `success: true` on the matching op — anything else (an explicit
+        # failure, a malformed response, or the key simply missing) leaves
+        # the flag False and fails closed. A connected socket alone must
+        # never be read as authenticated or subscribed.
+        if op == "auth":
+            if success is True:
+                self.auth_ok = True
+            else:
+                self.auth_ok = False
+                self.needs_reconciliation = True
+                logger.error("private-WS auth failed: %s", message)
+        elif op == "subscribe":
+            if success is True:
+                self.subscribe_ok = True
+            else:
+                self.subscribe_ok = False
+                self.needs_reconciliation = True
+                logger.error("private-WS subscribe failed: %s", message)
         elif op == "pong":
             pass
         else:
@@ -392,11 +470,13 @@ class WSPrivateConsumer:
                 self.dirty_symbols.add(event.symbol)
 
     def drain_and_apply(self, store: Any) -> List[NormalizedEvent]:
-        """Apply every currently-queued order/execution event to `store`.
+        """Apply every currently-queued order/execution event to `store`,
+        then durably write every currently-queued evidence record.
 
         MUST be called from the store's writer thread — that is the
-        entire reason this method exists separately from `_apply()` (see
-        module docstring). `main.TradingBot.tick()` calls this once per
+        entire reason this method (and `drain_evidence()`) exists
+        separately from `_apply()`/`_capture_evidence()` (see module
+        docstring and FIX 1). `main.TradingBot.tick()` calls this once per
         cycle, before this cycle's REST calls, so a freshly-applied WS
         status is visible to them.
         """
@@ -416,41 +496,78 @@ class WSPrivateConsumer:
                     "could not apply queued %s event for %s to the store",
                     event.kind, event.order_link_id)
                 self.needs_reconciliation = True
+        self.drain_evidence()
         return applied
+
+    def drain_evidence(self) -> int:
+        """Durably write every currently-queued evidence record.
+
+        MUST be called from the store's writer thread (normally only via
+        `drain_and_apply()` above) — the WS (background) thread only ever
+        OBSERVES an event and enqueues it (`_capture_evidence` and
+        friends, below); it never performs the file I/O itself. This is
+        the same queue-then-drain ownership `persistence.StateStore`
+        already enforces for order/execution updates, extended to durable
+        evidence (FIX 1): the WS thread must never write `StateStore` OR
+        durable evidence.
+
+        Returns the number of records written, for tests/observability.
+        """
+        written = 0
+        while True:
+            try:
+                pending = self._evidence_pending.get_nowait()
+            except queue.Empty:
+                break
+            self._write_evidence_record(pending)
+            written += 1
+        return written
 
     # -- WS event evidence -------------------------------------------------
     #
-    # Appended from THIS thread only — whichever thread calls
-    # handle_raw_message/_handle_control_message/run_once (the WS receive
-    # thread in production, the caller's own thread in tests). That is the
-    # WS evidence file's one-and-only writer, by construction, exactly the
-    # property persistence.StateStore enforces for its own file by a
-    # shared lease — no lease needed here because there is structurally
-    # only ever one writer of `self._evidence_path`. It is a SEPARATE file
-    # from REST's (venue_evidence.EvidenceCapturingTransport's) evidence
-    # log, which is written only from the StateStore writer thread — two
-    # single-writer files, never one file with two writers.
+    # OWNERSHIP (FIX 1): the WS (background) thread only ever OBSERVES —
+    # `_capture_evidence`/`_capture_control_evidence`/
+    # `_capture_connection_evidence` build a `_PendingEvidence` and
+    # `queue.Queue.put()` it (fast, no I/O, thread-safe by construction).
+    # The actual durable write — `_write_evidence_record`, which does the
+    # file I/O — is only ever called from `drain_evidence()`, which MUST
+    # run on the writer thread (see that method's docstring). This is the
+    # exact ownership model `persistence.StateStore` already enforces for
+    # order/execution updates (`self._pending`/`drain_and_apply`),
+    # extended here to durable evidence: the WS thread must never write
+    # `StateStore` OR durable evidence. It remains a SEPARATE file from
+    # REST's (venue_evidence.EvidenceCapturingTransport's) evidence log —
+    # two single-writer-thread files, never one file with two writers.
     #
-    # EVIDENCE FAILURE SEMANTICS: capture is wrapped in `_write_evidence`'s
-    # own try/except, which NEVER raises — a capture bug must not crash
-    # the receive loop or block a real trading decision. In NORMAL mode
-    # (assurance_mode=False, the default, used by main.TradingBot) a
-    # failure only logs, sets `evidence_capture_failed`/
-    # `needs_reconciliation`, and the loop continues — trading proceeds
-    # under the existing safety policy, which never depended on evidence
-    # capture succeeding. In ASSURANCE/CONFORMANCE mode
-    # (assurance_mode=True, used by tools/testnet_conformance_run.py) the
-    # same flag is set, but nothing here decides pass/fail — the CALLER
-    # (the conformance runner) checks `evidence_capture_failed` after the
-    # bounded WS phase and fails the run closed if it is set. That keeps
-    # "what counts as success" a decision the conformance runner owns
-    # explicitly, not a hidden policy buried in this module.
+    # EVIDENCE FAILURE SEMANTICS: `_write_evidence_record` never raises —
+    # a capture bug must not crash the writer thread's tick or block a
+    # real trading decision. In NORMAL mode (assurance_mode=False, the
+    # default, used by main.TradingBot) a failure only logs, sets
+    # `evidence_capture_failed`/`needs_reconciliation`, and the cycle
+    # continues — trading proceeds under the existing safety policy, which
+    # never depended on evidence capture succeeding. In ASSURANCE/
+    # CONFORMANCE mode (assurance_mode=True, used by
+    # tools/testnet_conformance_run.py) the same flag is set, but nothing
+    # here decides pass/fail — the CALLER (the conformance runner) checks
+    # `evidence_capture_failed` after the bounded WS phase and fails the
+    # run closed if it is set. That keeps "what counts as success" a
+    # decision the conformance runner owns explicitly, not a hidden policy
+    # buried in this module.
 
-    def _write_evidence(self, *, venue_event_id: str, topic: str,
-                        order_link_id: str, payload: Dict[str, Any],
-                        duplicate: bool) -> None:
+    def _enqueue_evidence(self, *, venue_event_id: str, topic: str,
+                          order_link_id: str, payload: Dict[str, Any],
+                          duplicate: bool) -> None:
         if self._evidence_path is None:
             return
+        observed_at_utc = dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        self._evidence_pending.put(_PendingEvidence(
+            venue_event_id=venue_event_id, topic=topic,
+            order_link_id=order_link_id, payload=payload,
+            duplicate=duplicate, observed_at_utc=observed_at_utc))
+
+    def _write_evidence_record(self, pending: "_PendingEvidence") -> None:
+        """Runs on the writer thread ONLY — see `drain_evidence()`."""
         try:
             import venue_evidence as ve
 
@@ -459,9 +576,10 @@ class WSPrivateConsumer:
             prev_hash = ve.last_record_hash(self._evidence_path)
             record = ve.build_ws_event_record(
                 venue="bybit", environment=environment, ws_url=ws_url,
-                venue_event_id=venue_event_id, topic=topic,
-                order_link_id=order_link_id, payload=payload,
-                duplicate=duplicate, prev_hash=prev_hash)
+                venue_event_id=pending.venue_event_id, topic=pending.topic,
+                order_link_id=pending.order_link_id, payload=pending.payload,
+                duplicate=pending.duplicate, prev_hash=prev_hash,
+                observed_at_utc=pending.observed_at_utc)
             ve.append_evidence(self._evidence_path, record)
             self.evidence_records_written += 1
         except Exception:  # noqa: BLE001
@@ -469,13 +587,13 @@ class WSPrivateConsumer:
                 "WS evidence capture failed for venue_event_id=%s topic=%s "
                 "(NORMAL mode: degrading, trading continues; ASSURANCE "
                 "mode: the caller must fail this run closed)",
-                venue_event_id, topic, exc_info=True)
+                pending.venue_event_id, pending.topic, exc_info=True)
             self.evidence_capture_failed = True
             self.needs_reconciliation = True
 
     def _capture_evidence(self, event: NormalizedEvent, *,
                           duplicate: bool) -> None:
-        self._write_evidence(
+        self._enqueue_evidence(
             venue_event_id=event.event_id, topic=event.topic or event.kind,
             order_link_id=event.order_link_id, payload=event.raw,
             duplicate=duplicate)
@@ -483,7 +601,7 @@ class WSPrivateConsumer:
     def _capture_control_evidence(self, *, op: str,
                                   payload: Dict[str, Any]) -> None:
         event_id = deterministic_id("control", op, _canonical_json(payload))
-        self._write_evidence(
+        self._enqueue_evidence(
             venue_event_id=f"control:{event_id}", topic=f"control.{op}",
             order_link_id="", payload=payload, duplicate=False)
 
@@ -495,7 +613,7 @@ class WSPrivateConsumer:
         payload: Dict[str, Any] = {"event": connection_event}
         if error:
             payload["error"] = error
-        self._write_evidence(
+        self._enqueue_evidence(
             venue_event_id=f"connection:{event_id}",
             topic=f"connection.{connection_event}", order_link_id="",
             payload=payload, duplicate=False)
@@ -506,13 +624,30 @@ class WSPrivateConsumer:
         """Connect, auth, subscribe, and receive until the transport ends
         the connection (raises) or `max_messages` is reached (test-only
         bound — production calls `run_forever`, which never passes this).
+
+        FIX 5: `auth_ok`/`subscribe_ok` are reset False at the start of
+        every connection attempt, then explicitly required after
+        `_authenticate`/`_subscribe` — a connected transport alone is not
+        sufficient. Either missing raises, which `run_forever` treats
+        exactly like any other connection failure (reconnect-with-backoff,
+        `needs_reconciliation=True`).
         """
+        self.auth_ok = False
+        self.subscribe_ok = False
         transport = self._transport_factory()
         transport.connect()
         self._capture_connection_evidence(connection_event="connected")
         try:
             self._authenticate(transport)
+            if not self.auth_ok:
+                raise RuntimeError(
+                    "private-WS authentication did not succeed "
+                    "(AUTH_OK not established)")
             self._subscribe(transport)
+            if not self.subscribe_ok:
+                raise RuntimeError(
+                    "private-WS subscription did not succeed "
+                    "(SUBSCRIBE_OK not established)")
             count = 0
             last_ping = time.time()
             while max_messages is None or count < max_messages:
@@ -549,14 +684,12 @@ class WSPrivateConsumer:
 
         `needs_reconciliation = True` is set IMMEDIATELY on a connection
         ending, before anything else (including evidence capture, which
-        does file I/O and can be slow) — the writer thread's
-        `_absorb_ws_observations` reads this flag from a different
-        thread, and delaying it behind an fsync would open exactly the
-        race this flag exists to prevent: the writer thread clearing a
-        gap, then this thread re-opening it moments later once its slow
-        I/O finally completes, with no guaranteed ordering between the
-        two. Evidence capture for the disconnect runs AFTER, and does not
-        affect the flag's timeliness.
+        since FIX 1 only enqueues a `_PendingEvidence` on this thread — the
+        actual file write happens later, on the writer thread, via
+        `drain_evidence()`). The writer thread's `_absorb_ws_observations`
+        reads this flag from a different thread, so setting it first keeps
+        it timely regardless of queueing order. Evidence capture for the
+        disconnect runs AFTER, and does not affect the flag's timeliness.
         """
         attempt = 0
         while not stop_event.is_set():

@@ -192,9 +192,12 @@ class _StubClient:
 
 
 class _StubWSConsumer:
-    def __init__(self, *, evidence_path=None, evidence_capture_failed=False):
+    def __init__(self, *, evidence_path=None, evidence_capture_failed=False,
+                auth_ok=True, subscribe_ok=True):
         self.evidence_path = evidence_path
         self.evidence_capture_failed = evidence_capture_failed
+        self.auth_ok = auth_ok
+        self.subscribe_ok = subscribe_ok
 
 
 _UNSET = object()
@@ -357,14 +360,25 @@ import venue_evidence as ve  # noqa: E402
 
 
 def _write_ws_evidence_record(path, *, order_link_id, topic="order",
-                              prev_hash=None):
+                              prev_hash=None, duplicate=False,
+                              captured_at_utc=None):
     prev_hash = prev_hash if prev_hash is not None else ve.last_record_hash(path)
     record = ve.build_ws_event_record(
         venue="bybit", environment="testnet",
         ws_url="wss://stream-testnet.bybit.com/v5/private",
         venue_event_id=f"{topic}:test", topic=topic,
         order_link_id=order_link_id, payload={"orderId": "V-1"},
-        prev_hash=prev_hash)
+        duplicate=duplicate, prev_hash=prev_hash,
+        captured_at_utc=captured_at_utc)
+    ve.append_evidence(path, record)
+
+
+def _write_rest_evidence_record(path, *, prev_hash=None):
+    prev_hash = prev_hash if prev_hash is not None else ve.last_record_hash(path)
+    record = ve.build_record(
+        venue="bybit", environment="testnet", method="GET",
+        request_url="https://api-testnet.bybit.com/v5/market/time",
+        request={}, response={}, prev_hash=prev_hash)
     ve.append_evidence(path, record)
 
 
@@ -426,6 +440,58 @@ class TestAwaitWsObservation:
             bot=bot, order_link_id="BB-1", timeout_seconds=2.0,
             poll_interval=0.05) is True
 
+    def test_wrong_transport_does_not_satisfy_observation(self, tmp_path):
+        """FIX 3: a REST-transport record must never satisfy WS
+        observation, even if it happens to carry a matching order_link_id
+        and an order/execution-shaped `topic` field."""
+        path = str(tmp_path / "ws_evidence.jsonl")
+        record = ve.build_record(
+            venue="bybit", environment="testnet", method="GET",
+            request_url="https://api-testnet.bybit.com/v5/market/time",
+            request={"topic": "order", "duplicate": False},
+            response={}, order_link_id="BB-1")
+        ve.append_evidence(path, record)
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is False
+
+    def test_duplicate_record_does_not_satisfy_observation(self, tmp_path):
+        """FIX 3: a record flagged as a replayed/duplicate delivery is not
+        proof of a fresh observation."""
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(path, order_link_id="BB-1", duplicate=True)
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is False
+
+    def test_stale_record_from_before_run_start_does_not_satisfy_observation(
+            self, tmp_path):
+        """FIX 3: `await_ws_observation` must not accept an arbitrary STALE
+        matching record -- a real record for this exact order_link_id, but
+        captured before THIS run started (e.g. a reused order_link_id from
+        an earlier conformance run against the same testnet account), must
+        not count."""
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(
+            path, order_link_id="BB-1", captured_at_utc="2020-01-01T00:00:00Z")
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0,
+            run_start_utc="2026-01-01T00:00:00Z") is False
+
+    def test_fresh_record_after_run_start_satisfies_observation(self, tmp_path):
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(
+            path, order_link_id="BB-1", captured_at_utc="2026-06-01T00:00:00Z")
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0,
+            run_start_utc="2026-01-01T00:00:00Z") is True
+
 
 class TestWsIntegrationStages:
     def test_ws_startup_fails_when_bot_has_no_consumer(self):
@@ -436,6 +502,42 @@ class TestWsIntegrationStages:
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
             "startup", "ws_startup"]
+
+    def test_ws_startup_fails_when_auth_not_ok(self):
+        """FIX 5: a connected consumer alone is not sufficient -- AUTH_OK
+        must be explicitly established."""
+        consumer = _StubWSConsumer(auth_ok=False, subscribe_ok=True)
+        bot = _StubBot(ws_consumer=consumer)
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=_StubStore(), symbol=SYMBOL)
+        assert result["ok"] is False
+        assert [s["stage"] for s in result["stages"]] == [
+            "startup", "ws_startup"]
+        ws_stage = result["stages"][-1]
+        assert ws_stage["auth_ok"] is False
+
+    def test_ws_startup_fails_when_subscribe_not_ok(self):
+        """FIX 5: SUBSCRIBE_OK must also be explicitly established."""
+        consumer = _StubWSConsumer(auth_ok=True, subscribe_ok=False)
+        bot = _StubBot(ws_consumer=consumer)
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=_StubStore(), symbol=SYMBOL)
+        assert result["ok"] is False
+        assert [s["stage"] for s in result["stages"]] == [
+            "startup", "ws_startup"]
+        ws_stage = result["stages"][-1]
+        assert ws_stage["subscribe_ok"] is False
+
+    def test_ws_startup_passes_when_both_auth_and_subscribe_ok(self):
+        consumer = _StubWSConsumer(auth_ok=True, subscribe_ok=True)
+        bot = _StubBot(ws_consumer=consumer)
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=_StubStore(positions=[]), symbol=SYMBOL)
+        ws_stage = next(s for s in result["stages"] if s["stage"] == "ws_startup")
+        assert ws_stage["ok"] is True
 
     def test_ws_observation_failure_stops_before_protection(self, monkeypatch):
         monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: False)
@@ -518,3 +620,101 @@ class TestVerifyEvidenceChains:
             ws_evidence_path=str(tmp_path / "nope-ws.jsonl"))
         assert result["rest_evidence_verified"] is True
         assert result["ws_evidence_verified"] is True
+
+
+class TestVerifyEvidenceCompleteness:
+    """FIX 2 — ASSURANCE MUST REQUIRE ACTUAL EVIDENCE: a clean (vacuous)
+    chain around missing evidence must not read as verified."""
+
+    def test_missing_both_files_fails_closed(self, tmp_path):
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=str(tmp_path / "nope-rest.jsonl"),
+            ws_evidence_path=str(tmp_path / "nope-ws.jsonl"),
+            order_link_id="BB-1")
+        assert result["ok"] is False
+        assert result["rest_evidence_exists"] is False
+        assert result["ws_evidence_exists"] is False
+
+    def test_missing_rest_evidence_alone_fails(self, tmp_path):
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="order")
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="execution")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=str(tmp_path / "nope-rest.jsonl"),
+            ws_evidence_path=ws_path, order_link_id="BB-1")
+        assert result["ok"] is False
+        assert result["rest_evidence_exists"] is False
+        assert result["ws_evidence_exists"] is True
+
+    def test_missing_ws_evidence_alone_fails(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        _write_rest_evidence_record(rest_path)
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path,
+            ws_evidence_path=str(tmp_path / "nope-ws.jsonl"),
+            order_link_id="BB-1")
+        assert result["ok"] is False
+        assert result["ws_evidence_exists"] is False
+
+    def test_ws_evidence_present_but_missing_order_topic_fails(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_rest_evidence_record(rest_path)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="execution")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-1")
+        assert result["ok"] is False
+        assert result["order_evidence_exists"] is False
+        assert result["execution_evidence_exists"] is True
+
+    def test_ws_evidence_present_but_missing_execution_topic_fails(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_rest_evidence_record(rest_path)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="order")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-1")
+        assert result["ok"] is False
+        assert result["execution_evidence_exists"] is False
+
+    def test_only_duplicate_ws_records_fails(self, tmp_path):
+        """A duplicate-flagged record must not count toward evidence
+        completeness, same as it does not satisfy `await_ws_observation`."""
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_rest_evidence_record(rest_path)
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-1", topic="order", duplicate=True)
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-1", topic="execution", duplicate=True)
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-1")
+        assert result["ok"] is False
+        assert result["order_evidence_exists"] is False
+        assert result["execution_evidence_exists"] is False
+
+    def test_evidence_capture_failed_flag_fails_even_with_full_evidence(
+            self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_rest_evidence_record(rest_path)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="order")
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="execution")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-1", evidence_capture_failed=True)
+        assert result["ok"] is False
+
+    def test_all_present_and_clean_passes(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_rest_evidence_record(rest_path)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="order")
+        _write_ws_evidence_record(ws_path, order_link_id="BB-1", topic="execution")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-1", evidence_capture_failed=False)
+        assert result["ok"] is True

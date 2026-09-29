@@ -121,6 +121,7 @@ way — this tool does not reimplement them.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import sys
@@ -283,15 +284,46 @@ def _read_evidence_records(path: Optional[str]) -> List[Dict[str, Any]]:
         return [json.loads(ln) for ln in handle if ln.strip()]
 
 
+def _is_valid_ws_observation(record: Dict[str, Any], *, order_link_id: str,
+                             run_start_utc: Optional[str]) -> bool:
+    """FIX 3: a matching record must PROVE it is this run's own, not an
+    arbitrary stale record that happens to share an `order_link_id` (e.g.
+    reused across conformance runs against the same testnet account).
+    Requires: `transport == "ws"` (never a REST record shaped to look like
+    one); `duplicate == False` (a replayed delivery is not a fresh
+    observation); a matching `order_link_id`; `topic` is `order` or
+    `execution`; and, when `run_start_utc` is given, a `captured_at_utc`
+    at or after it — comparable as plain strings because both are the
+    same fixed `%Y-%m-%dT%H:%M:%SZ` UTC format, which sorts lexically the
+    same as chronologically.
+    """
+    if record.get("transport") != "ws":
+        return False
+    request = record.get("request") or {}
+    if bool(request.get("duplicate", False)):
+        return False
+    if record.get("order_link_id") != order_link_id:
+        return False
+    if request.get("topic") not in ("order", "execution"):
+        return False
+    if run_start_utc is not None:
+        captured_at_utc = str(record.get("captured_at_utc") or "")
+        if captured_at_utc < run_start_utc:
+            return False
+    return True
+
+
 def await_ws_observation(*, bot: Any, order_link_id: str,
                          timeout_seconds: float,
-                         poll_interval: float = 0.1) -> bool:
+                         poll_interval: float = 0.1,
+                         run_start_utc: Optional[str] = None) -> bool:
     """Poll the WS evidence log (not an in-memory counter) for a record
-    whose `order_link_id` matches this order and whose topic is `order`
-    or `execution` — proof the private stream itself observed THIS order,
-    not merely that a WS connection exists. Bounded by `timeout_seconds`;
-    returns False (never raises) on timeout, matching `run_conformance`'s
-    "a failed stage is data, not an exception" convention.
+    that proves THIS run's own private stream observed THIS order — see
+    `_is_valid_ws_observation` (FIX 3) for exactly what "proves" requires;
+    a reused `order_link_id` alone is never enough. Bounded by
+    `timeout_seconds`; returns False (never raises) on timeout, matching
+    `run_conformance`'s "a failed stage is data, not an exception"
+    convention.
     """
     consumer = getattr(bot, "ws_consumer", None)
     if consumer is None:
@@ -300,9 +332,9 @@ def await_ws_observation(*, bot: Any, order_link_id: str,
     deadline = time.time() + timeout_seconds
     while True:
         for record in _read_evidence_records(evidence_path):
-            if (record.get("order_link_id") == order_link_id
-                    and record.get("request", {}).get("topic") in
-                    ("order", "execution")):
+            if _is_valid_ws_observation(
+                    record, order_link_id=order_link_id,
+                    run_start_utc=run_start_utc):
                 return True
         if time.time() >= deadline:
             return False
@@ -327,14 +359,29 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
         timestamps[f"{name}_at"] = time.time()
         stages.append({"stage": name, "ok": bool(ok), **detail})
 
+    run_start_utc = dt.datetime.fromtimestamp(
+        timestamps["run_started"], dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
     started = bot.startup()
     _stage("startup", started)
     if not started:
         return _finalize(stages, timestamps, ok=False)
 
-    _stage("ws_startup", bot.ws_consumer is not None,
-          observation_status=bot.observation_status)
-    if bot.ws_consumer is None:
+    # FIX 5: a connected WebSocket alone is not sufficient — the
+    # integrated lifecycle must have explicitly established AUTH_OK and
+    # SUBSCRIBE_OK (see private_ws_consumer.WSPrivateConsumer.run_once).
+    # `getattr(..., False)` so a consumer double without these attributes
+    # fails closed rather than raising.
+    consumer = bot.ws_consumer
+    auth_ok = bool(getattr(consumer, "auth_ok", False)) if consumer else False
+    subscribe_ok = (bool(getattr(consumer, "subscribe_ok", False))
+                    if consumer else False)
+    ws_ready = consumer is not None and auth_ok and subscribe_ok
+    _stage("ws_startup", ws_ready,
+          observation_status=bot.observation_status,
+          auth_ok=auth_ok, subscribe_ok=subscribe_ok)
+    if not ws_ready:
         return _finalize(stages, timestamps, ok=False)
 
     bot.tick()
@@ -348,7 +395,8 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     order_link_id = str(row.get("order_link_id") or "")
     ws_observed = await_ws_observation(
         bot=bot, order_link_id=order_link_id,
-        timeout_seconds=ws_observation_timeout)
+        timeout_seconds=ws_observation_timeout,
+        run_start_utc=run_start_utc)
     _stage("ws_observation", ws_observed, order_link_id=order_link_id,
           timeout_seconds=ws_observation_timeout)
     if not ws_observed:
@@ -445,7 +493,15 @@ def verify_evidence_chains(*, rest_evidence_path: str,
     """Hash-chain-verify BOTH evidence logs — the same
     `venue_evidence.verify_chain` mechanism for each, never a parallel
     checker. Returns a dict a caller can fold straight into the result;
-    never raises."""
+    never raises.
+
+    NOTE: a clean chain is NECESSARY but not SUFFICIENT for ASSURANCE
+    acceptance — an absent or empty log has zero structural errors and
+    zero proof (`verify_chain` treats "nothing to contradict" as clean;
+    see its own tests). `verify_evidence_completeness` below is the
+    explicit acceptance check (FIX 2); this function stays a pure
+    chain-integrity check other callers may still want on its own.
+    """
     rest_reasons = ve.verify_chain(rest_evidence_path)
     ws_reasons = ve.verify_chain(ws_evidence_path)
     return {
@@ -456,6 +512,54 @@ def verify_evidence_chains(*, rest_evidence_path: str,
         "ws_evidence_verified": ws_reasons == [],
         "ws_evidence_reasons": ws_reasons,
     }
+
+
+def verify_evidence_completeness(*, rest_evidence_path: str,
+                                 ws_evidence_path: str,
+                                 order_link_id: str = "",
+                                 evidence_capture_failed: bool = False
+                                 ) -> Dict[str, Any]:
+    """FIX 2 — ASSURANCE MUST REQUIRE ACTUAL EVIDENCE.
+
+    `verify_chain()` returning no structural errors must NOT, by itself,
+    count as a conformance run being verified: a missing or empty evidence
+    file has no errors and no content. This explicitly requires: REST
+    evidence exists; WS evidence exists; a real (non-duplicate,
+    `transport="ws"`) `order`-topic record for this run's `order_link_id`
+    exists; likewise for `execution`; both chains verify; and no evidence
+    capture failure was recorded. Missing any of these fails this check —
+    never raises.
+    """
+    chains = verify_evidence_chains(
+        rest_evidence_path=rest_evidence_path,
+        ws_evidence_path=ws_evidence_path)
+    rest_records = _read_evidence_records(rest_evidence_path)
+    ws_records = _read_evidence_records(ws_evidence_path)
+
+    def _has_real_ws_evidence(topic: str) -> bool:
+        return any(
+            _is_valid_ws_observation(
+                record, order_link_id=order_link_id, run_start_utc=None)
+            and record.get("request", {}).get("topic") == topic
+            for record in ws_records)
+
+    checks = {
+        "rest_evidence_exists": len(rest_records) > 0,
+        "ws_evidence_exists": len(ws_records) > 0,
+        "order_evidence_exists": _has_real_ws_evidence("order"),
+        "execution_evidence_exists": _has_real_ws_evidence("execution"),
+        "evidence_capture_failed": bool(evidence_capture_failed),
+    }
+    ok = bool(
+        checks["rest_evidence_exists"] and checks["ws_evidence_exists"]
+        and checks["order_evidence_exists"]
+        and checks["execution_evidence_exists"]
+        and chains["rest_evidence_verified"] and chains["ws_evidence_verified"]
+        and not checks["evidence_capture_failed"])
+    result = dict(chains)
+    result.update(checks)
+    result["ok"] = ok
+    return result
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -527,6 +631,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             bot=bot, engine=engine, client=client, store=store,
             symbol=args.symbol,
             ws_observation_timeout=args.ws_observation_timeout)
+        evidence_capture_failed = bool(
+            bot.ws_consumer.evidence_capture_failed if bot.ws_consumer
+            else True)
     finally:
         # WS shutdown is part of the bounded lifecycle this tool exercises
         # — never leave the observer thread/socket running past the run
@@ -536,16 +643,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         except Exception:  # noqa: BLE001
             print("bot.shutdown() raised during cleanup", file=sys.stderr)
 
-    chains = verify_evidence_chains(
+    order_link_id = ""
+    for stage in result["stages"]:
+        if stage["stage"] == "ws_observation":
+            order_link_id = str(stage.get("order_link_id") or "")
+            break
+
+    # FIX 2: explicit ASSURANCE acceptance — a clean hash chain alone is
+    # not proof; this requires the actual evidence content a real
+    # conformance run must have produced. Missing evidence = failed
+    # conformance, distinct from (and in addition to) trading correctness.
+    completeness = verify_evidence_completeness(
         rest_evidence_path=args.evidence_path,
-        ws_evidence_path=args.ws_evidence_path)
-    result.update(chains)
-    # Fail closed: a stage can all read "ok" while either evidence chain
-    # is broken (e.g. a hand-edited or truncated file) — this must still
-    # fail the CONFORMANCE result, distinct from trading correctness.
-    result["ok"] = bool(
-        result["ok"] and chains["rest_evidence_verified"]
-        and chains["ws_evidence_verified"])
+        ws_evidence_path=args.ws_evidence_path,
+        order_link_id=order_link_id,
+        evidence_capture_failed=evidence_capture_failed)
+    result.update(completeness)
+    result["ok"] = bool(result["ok"] and completeness["ok"])
 
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, default=str)

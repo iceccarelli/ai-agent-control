@@ -410,6 +410,7 @@ class TestWSEvidenceCapture:
     def test_order_event_produces_an_evidence_record(self, tmp_path):
         consumer, path = _consumer_with_evidence(tmp_path)
         consumer.handle_raw_message(ORDER_MSG)
+        consumer.drain_evidence()
 
         records = _read_records(path)
         assert len(records) == 1
@@ -425,6 +426,7 @@ class TestWSEvidenceCapture:
         consumer, path = _consumer_with_evidence(tmp_path)
         consumer.handle_raw_message(EXECUTION_MSG)
         consumer.handle_raw_message(POSITION_MSG)
+        consumer.drain_evidence()
 
         records = _read_records(path)
         assert [r["request"]["topic"] for r in records] == ["execution", "position"]
@@ -435,6 +437,7 @@ class TestWSEvidenceCapture:
         consumer.handle_raw_message(json.dumps({"op": "auth", "success": True}))
         consumer.handle_raw_message(json.dumps({"op": "subscribe", "success": True}))
         consumer.handle_raw_message(json.dumps({"op": "pong"}))
+        consumer.drain_evidence()
 
         records = _read_records(path)
         assert [r["request"]["topic"] for r in records] == [
@@ -445,6 +448,7 @@ class TestWSEvidenceCapture:
         consumer, path = _consumer_with_evidence(tmp_path)
         consumer.handle_raw_message(json.dumps({"topic": "wallet", "data": [{}]}))
         consumer.handle_raw_message("{not json")
+        consumer.drain_evidence()
 
         records = _read_records(path)
         assert len(records) == 2
@@ -461,6 +465,7 @@ class TestWSEvidenceCapture:
             "api_key": "super-secret", "sign": "also-secret",
         }]})
         consumer.handle_raw_message(msg)
+        consumer.drain_evidence()
 
         record = _read_records(path)[0]
         assert record["response"]["api_key"] == ve._REDACTED
@@ -475,6 +480,7 @@ class TestWSEvidenceCapture:
             ws_private_url="wss://stream.bybit.com/v5/private")  # mainnet host
 
         consumer.handle_raw_message(ORDER_MSG)
+        consumer.drain_evidence()
 
         assert not os.path.exists(path) or _read_records(path) == []
         assert consumer.evidence_capture_failed is True
@@ -583,6 +589,7 @@ class TestWSEvidenceDuplicateAndOutOfOrder:
         consumer, path = _consumer_with_evidence(tmp_path)
         consumer.handle_raw_message(ORDER_MSG)
         consumer.handle_raw_message(ORDER_MSG)  # replayed, e.g. post-reconnect
+        consumer.drain_evidence()
 
         records = _read_records(path)
         assert len(records) == 2, "each delivery gets its own evidence record"
@@ -601,6 +608,7 @@ class TestWSEvidenceDuplicateAndOutOfOrder:
         # independent delivery paths/retries at the venue.
         consumer.handle_raw_message(_order("Filled", "3"))
         consumer.handle_raw_message(_order("New", "1"))
+        consumer.drain_evidence()
 
         records = _read_records(path)
         assert len(records) == 2
@@ -640,6 +648,7 @@ class TestWSEvidenceReconnect:
                 return self.calls > 1
 
         consumer.run_forever(_StopAfterOne())
+        consumer.drain_evidence()
 
         records = _read_records(evidence_path)
         topics = [r["request"]["topic"] for r in records]
@@ -655,6 +664,10 @@ class TestWSEvidenceFailureSemantics:
         os.makedirs(path)
 
         applied = consumer.handle_raw_message(ORDER_MSG)  # must not raise
+        assert consumer.evidence_capture_failed is False, (
+            "not yet drained -- the failure only surfaces at drain time, "
+            "on the writer thread, per FIX 1's ownership model")
+        consumer.drain_evidence()  # must not raise either
 
         assert len(applied) == 1, "trading-relevant processing still happened"
         assert consumer.evidence_capture_failed is True
@@ -668,6 +681,7 @@ class TestWSEvidenceFailureSemantics:
         os.makedirs(path)
 
         consumer.handle_raw_message(ORDER_MSG)  # must not raise here either
+        consumer.drain_evidence()  # or here
 
         assert consumer.assurance_mode is True
         assert consumer.evidence_capture_failed is True
@@ -680,3 +694,273 @@ class TestWSEvidenceFailureSemantics:
         consumer.handle_raw_message(ORDER_MSG)
         assert consumer.evidence_capture_failed is False
         assert consumer.evidence_records_written == 0
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 — canonical evidence ownership: the WS thread only enqueues; only
+# drain_evidence()/drain_and_apply() (the writer thread) performs the write.
+# ---------------------------------------------------------------------------
+
+
+class TestEvidenceWriterThreadOwnership:
+    def test_handle_raw_message_never_writes_the_evidence_file(self, tmp_path):
+        """The exact FIX 1 acceptance case: observing an event must not,
+        by itself, produce a durable evidence write — only draining does."""
+        consumer, path = _consumer_with_evidence(tmp_path)
+        consumer.handle_raw_message(ORDER_MSG)
+
+        assert not os.path.exists(path) or _read_records(path) == [], (
+            "the WS thread must never write durable evidence itself")
+        assert consumer.evidence_records_written == 0
+
+    def test_drain_evidence_writes_every_queued_record(self, tmp_path):
+        consumer, path = _consumer_with_evidence(tmp_path)
+        consumer.handle_raw_message(ORDER_MSG)
+        consumer.handle_raw_message(EXECUTION_MSG)
+
+        written = consumer.drain_evidence()
+
+        assert written == 2
+        assert len(_read_records(path)) == 2
+        assert consumer.evidence_records_written == 2
+
+    def test_drain_and_apply_also_drains_evidence(self, tmp_path):
+        """`drain_and_apply` is what `TradingBot.tick()` (the writer
+        thread) actually calls — it must drain BOTH the StateStore queue
+        AND the evidence queue, in one writer-thread pass."""
+        consumer, path = _consumer_with_evidence(tmp_path)
+        store = _StubStore()
+        consumer.handle_raw_message(ORDER_MSG)
+
+        consumer.drain_and_apply(store)
+
+        assert store.updates == [("BB-entry-1", "filled", "V-1")]
+        assert len(_read_records(path)) == 1
+
+    def test_drain_evidence_with_nothing_queued_is_a_noop(self, tmp_path):
+        consumer, path = _consumer_with_evidence(tmp_path)
+        assert consumer.drain_evidence() == 0
+        assert not os.path.exists(path)
+
+    def test_observed_at_is_recorded_distinct_from_captured_at(self, tmp_path):
+        """FIX 1: "preserve the distinction between observed and applied".
+        `observed_at_utc` (stamped when the WS thread enqueued the event)
+        must be present in the durable record, and the record's own
+        `captured_at_utc` (stamped when the writer thread applied/wrote
+        it) must be present too -- proving both moments are recorded, not
+        just one collapsed into the other."""
+        consumer, path = _consumer_with_evidence(tmp_path)
+        consumer.handle_raw_message(ORDER_MSG)
+        consumer.drain_evidence()
+
+        record = _read_records(path)[0]
+        assert record["request"]["observed_at_utc"]
+        assert record["captured_at_utc"]
+
+
+# ---------------------------------------------------------------------------
+# FIX 4 — invalid venue event identity: no usable orderId/execId must never
+# become a legitimate durable "order"/"execution" identity.
+# ---------------------------------------------------------------------------
+
+
+class TestInvalidVenueEventIdentity:
+    def test_order_without_order_id_is_unknown_not_a_legitimate_order(self):
+        msg = json.dumps({"topic": "order", "data": [{
+            "symbol": "BTCUSDT", "orderId": "", "orderLinkId": "BB-1",
+            "orderStatus": "Filled", "updatedTime": "1"}]})
+        events = pwc.parse_ws_message(msg)
+        assert len(events) == 1
+        assert events[0].kind == "unknown"
+
+    def test_execution_without_exec_id_is_unknown_not_a_legitimate_execution(self):
+        msg = json.dumps({"topic": "execution", "data": [{
+            "symbol": "BTCUSDT", "orderId": "V-1", "orderLinkId": "BB-1",
+            "execId": "", "execType": "Trade"}]})
+        events = pwc.parse_ws_message(msg)
+        assert len(events) == 1
+        assert events[0].kind == "unknown"
+
+    def test_invalid_order_identity_is_never_queued_or_applied(self):
+        store = _StubStore()
+        client = _StubClient(store)
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: None)
+        msg = json.dumps({"topic": "order", "data": [{
+            "symbol": "BTCUSDT", "orderId": "", "orderLinkId": "BB-1",
+            "orderStatus": "Filled", "updatedTime": "1"}]})
+
+        applied = consumer.handle_raw_message(msg)
+
+        assert applied == []
+        assert consumer.unknown_message_count == 1
+        assert consumer.drain_and_apply(store) == []
+        assert store.updates == []
+
+    def test_invalid_execution_identity_is_never_queued_or_applied(self):
+        store = _StubStore()
+        client = _StubClient(store)
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: None)
+        msg = json.dumps({"topic": "execution", "data": [{
+            "symbol": "BTCUSDT", "orderId": "V-1", "orderLinkId": "BB-1",
+            "execId": "", "execType": "Trade"}]})
+
+        applied = consumer.handle_raw_message(msg)
+
+        assert applied == []
+        assert consumer.unknown_message_count == 1
+        assert consumer.drain_and_apply(store) == []
+        assert store.updates == []
+
+    def test_invalid_identity_still_produces_evidence_when_assurance_mode(
+            self, tmp_path):
+        """ASSURANCE/CONFORMANCE mode must fail closed on this -- which it
+        does by NEVER producing a legitimate order/execution evidence
+        record for it (see verify_evidence_completeness in
+        testnet_conformance_run.py), not by a special-case flag here."""
+        consumer, path = _consumer_with_evidence(
+            tmp_path, assurance_mode=True)
+        msg = json.dumps({"topic": "order", "data": [{
+            "symbol": "BTCUSDT", "orderId": "", "orderLinkId": "BB-1",
+            "orderStatus": "Filled", "updatedTime": "1"}]})
+
+        consumer.handle_raw_message(msg)
+        consumer.drain_evidence()
+
+        records = _read_records(path)
+        assert len(records) == 1
+        assert records[0]["venue_event_id"].startswith("unknown:")
+        assert records[0]["request"]["topic"] == "order"
+
+
+# ---------------------------------------------------------------------------
+# FIX 5 — explicit AUTH_OK / SUBSCRIBE_OK: a connected transport alone is
+# not sufficient.
+# ---------------------------------------------------------------------------
+
+
+class TestExplicitAuthAndSubscribeSuccess:
+    def test_auth_ok_and_subscribe_ok_start_false(self):
+        client = _StubClient(_StubStore())
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: None)
+        assert consumer.auth_ok is False
+        assert consumer.subscribe_ok is False
+
+    def test_explicit_auth_success_sets_auth_ok(self):
+        client = _StubClient(_StubStore())
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: None)
+        consumer.handle_raw_message(json.dumps({"op": "auth", "success": True}))
+        assert consumer.auth_ok is True
+
+    def test_missing_success_key_never_sets_auth_ok(self):
+        """Fail closed: absence of an explicit `success: true` must never
+        be read as success."""
+        client = _StubClient(_StubStore())
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: None)
+        consumer.handle_raw_message(json.dumps({"op": "auth"}))
+        assert consumer.auth_ok is False
+
+    def test_explicit_subscribe_success_sets_subscribe_ok(self):
+        client = _StubClient(_StubStore())
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: None)
+        consumer.handle_raw_message(
+            json.dumps({"op": "subscribe", "success": True}))
+        assert consumer.subscribe_ok is True
+
+    def test_run_once_raises_when_auth_fails(self):
+        client = _StubClient(_StubStore())
+        transport = _ScriptedTransport([
+            _text_frame({"op": "auth", "success": False, "ret_msg": "bad sig"}),
+        ])
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: transport)
+
+        with pytest.raises(RuntimeError, match="AUTH_OK"):
+            consumer.run_once()
+        assert consumer.auth_ok is False
+        assert transport.closed is True
+
+    def test_run_once_raises_when_subscribe_fails(self):
+        client = _StubClient(_StubStore())
+        transport = _ScriptedTransport([
+            _text_frame({"op": "auth", "success": True}),
+            _text_frame({"op": "subscribe", "success": False}),
+        ])
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: transport)
+
+        with pytest.raises(RuntimeError, match="SUBSCRIBE_OK"):
+            consumer.run_once()
+        assert consumer.auth_ok is True
+        assert consumer.subscribe_ok is False
+        assert transport.closed is True
+
+    def test_auth_failure_triggers_reconnect_with_backoff_in_run_forever(self):
+        """run_forever must treat an AUTH_OK/SUBSCRIBE_OK failure exactly
+        like any other connection failure -- reconnect with backoff, flag
+        needs_reconciliation -- never a silent proceed into the receive
+        loop."""
+        client = _StubClient(_StubStore())
+        attempts = []
+
+        def factory():
+            attempts.append(1)
+            return _ScriptedTransport([
+                _text_frame({"op": "auth", "success": False}),
+            ])
+
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=factory, sleep=lambda s: None)
+
+        class _StopAfterN:
+            def __init__(self, n):
+                self.n = n
+                self.calls = 0
+
+            def is_set(self):
+                self.calls += 1
+                return self.calls > self.n
+
+        consumer.run_forever(_StopAfterN(1))
+
+        assert len(attempts) >= 1
+        assert consumer.needs_reconciliation is True
+
+    def test_auth_ok_resets_false_at_the_start_of_each_connection_attempt(self):
+        """A stale success from a PREVIOUS connection must never be
+        mistaken for this (new) one's -- auth_ok/subscribe_ok must reset
+        at the start of every run_once() call, on the SAME consumer."""
+        client = _StubClient(_StubStore())
+        transports = [
+            _ScriptedTransport([
+                _text_frame({"op": "auth", "success": True}),
+                _text_frame({"op": "subscribe", "success": True}),
+            ]),
+            _ScriptedTransport([
+                _text_frame({"op": "auth", "success": False}),
+            ]),
+        ]
+        calls = []
+
+        def factory():
+            calls.append(1)
+            return transports[len(calls) - 1]
+
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=factory)
+
+        consumer.run_once(max_messages=0)
+        assert consumer.auth_ok is True
+        assert consumer.subscribe_ok is True
+
+        with pytest.raises(RuntimeError):
+            consumer.run_once()
+        assert consumer.auth_ok is False, (
+            "a stale success from the PREVIOUS connection must not carry "
+            "over into this one -- auth_ok must reset at the start of "
+            "every run_once() call")
