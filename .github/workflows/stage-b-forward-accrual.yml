@@ -1,17 +1,23 @@
 name: stage-b-forward-accrual
 
+# NO AUTOMATIC SCHEDULE. docs/human/NO_GLUE_OPS.md item 10 names the Factory
+# Mac cron as the one canonical scheduled corpus writer. A `schedule:`
+# trigger here used to run this same accrual (and commit+push its result to
+# main) on an independent daily cron, ~1 hour before the Factory Mac's own
+# — two unsupervised, uncoordinated writers racing to append the same
+# dual-tree corpus and push to main, with no lease or ownership check
+# between them. It never actually collided (this workflow found nothing to
+# commit in its whole run history), but "never collided yet" is not the
+# same as "cannot collide" on a live daily schedule.
+#
+# This workflow is manual-dispatch-only now: a human (or an explicitly
+# human-triggered failover procedure) runs it on purpose, exactly like the
+# Factory Mac path, never on its own clock. If GitHub-hosted runners keep
+# getting Binance HTTP 451 geo-blocks and a second *scheduled* writer is
+# genuinely needed, that requires a real ownership mechanism between it and
+# the Factory Mac (see NO_GLUE_OPS.md item 10) before a `schedule:` trigger
+# comes back here — not a second independent cron.
 on:
-  schedule:
-    # 00:07 UTC — after Binance daily close
-    - cron: "7 0 * * *"
-  # GitHub-hosted runners can get Binance HTTP 451 geo-blocks that a
-  # Codespaces environment or the factory host would not — Codespaces is the
-  # proven accrual host if this schedule keeps getting geo-blocked.
-  # scripts/stage_b_forward_accrual.sh already fails soft on a spot-corpus
-  # 451/network refusal when spot was already tip-current with linear (not a
-  # Stage B blocker either way — the forward pilot doesn't read spot); a
-  # linear/funding 451, or a real spot gap, still aborts the run. Kept as a
-  # scheduled job for now; workflow_dispatch below is for manual experiments.
   workflow_dispatch:
 
 permissions:
