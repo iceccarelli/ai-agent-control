@@ -134,41 +134,57 @@ class TestHandleRawMessage:
             client=client, transport_factory=lambda: None)
         return consumer, store
 
-    def test_order_event_updates_the_store(self):
+    def test_order_event_is_queued_then_applied_on_drain(self):
+        """`handle_raw_message` (the WS thread) never writes the store
+        itself — see module docstring on the single-writer model. Only
+        `drain_and_apply` (the writer thread) does."""
         consumer, store = self._consumer()
         applied = consumer.handle_raw_message(ORDER_MSG)
         assert len(applied) == 1
+        assert store.updates == [], "handle_raw_message must not write the store"
+
+        drained = consumer.drain_and_apply(store)
+        assert len(drained) == 1
         assert store.updates == [("BB-entry-1", "filled", "V-1")]
 
-    def test_execution_event_updates_the_store(self):
+    def test_execution_event_is_queued_then_applied_on_drain(self):
         consumer, store = self._consumer()
         consumer.handle_raw_message(EXECUTION_MSG)
+        assert store.updates == []
+        consumer.drain_and_apply(store)
         assert store.updates == [("BB-entry-1", "filled", "V-1")]
 
     def test_position_event_never_writes_the_store(self):
         """REST remains the authority for position economics/protection —
         see module docstring. A position message may only flag, never
-        write."""
+        write, and there is nothing to drain either."""
         consumer, store = self._consumer()
         consumer.handle_raw_message(POSITION_MSG)
         assert store.updates == []
         assert consumer.needs_reconciliation is True
         assert "BTCUSDT" in consumer.dirty_symbols
+        assert consumer.drain_and_apply(store) == []
 
-    def test_duplicate_message_is_applied_once(self):
+    def test_duplicate_message_is_queued_and_applied_once(self):
         consumer, store = self._consumer()
         consumer.handle_raw_message(ORDER_MSG)
         consumer.handle_raw_message(ORDER_MSG)
+        consumer.drain_and_apply(store)
         assert len(store.updates) == 1
         assert consumer.duplicate_event_count == 1
         assert consumer.applied_event_count == 1
 
-    def test_unknown_message_is_counted_not_applied_and_does_not_raise(self):
+    def test_drain_with_nothing_queued_is_a_noop(self):
+        consumer, store = self._consumer()
+        assert consumer.drain_and_apply(store) == []
+        assert store.updates == []
+
+    def test_unknown_message_is_counted_not_queued_and_does_not_raise(self):
         consumer, store = self._consumer()
         applied = consumer.handle_raw_message(
             json.dumps({"topic": "wallet", "data": [{}]}))
         assert applied == []
-        assert store.updates == []
+        assert consumer.drain_and_apply(store) == []
         assert consumer.unknown_message_count == 1
 
     def test_failed_auth_control_message_sets_needs_reconciliation(self):
@@ -188,15 +204,19 @@ class TestHandleRawMessage:
         consumer.handle_raw_message(json.dumps({"op": "pong"}))
         assert consumer.needs_reconciliation is False
 
-    def test_store_exception_is_contained_and_flags_reconciliation(self):
+    def test_store_exception_during_drain_is_contained_and_flags_reconciliation(self):
         class ExplodingStore(_StubStore):
             def update_order_status(self, *a, **kw):
                 raise RuntimeError("disk full")
 
-        client = _StubClient(ExplodingStore())
+        client = _StubClient(_StubStore())
         consumer = pwc.WSPrivateConsumer(
             client=client, transport_factory=lambda: None)
-        consumer.handle_raw_message(ORDER_MSG)  # must not raise
+        consumer.handle_raw_message(ORDER_MSG)
+        assert consumer.needs_reconciliation is False  # not yet drained
+
+        drained = consumer.drain_and_apply(ExplodingStore())  # must not raise
+        assert drained == []
         assert consumer.needs_reconciliation is True
 
 
@@ -258,6 +278,8 @@ class TestRunOnce:
         subscribe_sent = json.loads(transport.sent[1])
         assert subscribe_sent["op"] == "subscribe"
         assert set(subscribe_sent["args"]) == set(pwc.WSPrivateConsumer.TOPICS)
+        assert store.updates == [], "the WS thread itself must never write"
+        consumer.drain_and_apply(store)
         assert store.updates == [("BB-entry-1", "filled", "V-1")]
 
     def test_max_messages_bound_stops_cleanly_for_tests(self):
@@ -275,6 +297,8 @@ class TestRunOnce:
         consumer.run_once(max_messages=2)
 
         assert transport.closed is True
+        assert store.updates == []
+        consumer.drain_and_apply(store)
         assert len(store.updates) == 2
 
     def test_ping_from_venue_is_answered_with_pong(self):
@@ -341,4 +365,6 @@ class TestRunForever:
         assert len(attempts) == 2
         assert consumer.needs_reconciliation is True, (
             "a reconnect must always flag that observation may have a gap")
+        assert store.updates == [], "run_forever's own thread must never write"
+        consumer.drain_and_apply(store)
         assert store.updates == [("BB-entry-1", "filled", "V-1")]

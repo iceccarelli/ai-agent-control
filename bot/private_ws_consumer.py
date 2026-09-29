@@ -16,19 +16,31 @@ check_naked_positions()`/`.reconcile()` already do that correctly, from
 REST, and are already tested (tests/test_naked_position_handling.py).
 Duplicating that logic here would be a second writer of the same fact.
 
-What this consumer DOES write, through the SAME `persistence.StateStore`
-methods REST already uses (so it is a second OBSERVER of one authority,
-not a second authority):
-  - `order`/`execution` topic events -> `store.update_order_status()`,
-    exactly like `BybitClient.reconcile_on_startup()` does — an order's
-    lifecycle status is safe to fast-forward from either source, because
-    the update is idempotent and keyed by the durable `order_link_id`.
-  - `position` topic events -> NEVER written directly. A `position`
-    message only sets `needs_reconciliation` and records which symbol
-    changed (`dirty_symbols`), so the next REST-driven cycle
-    (`observe_exits`/`check_naked_positions`) knows to look there sooner.
-    This is "fast observation", not "fast authority" — the distinction
-    the WS/REST split exists to preserve.
+THIS CONSUMER NEVER WRITES `StateStore` ITSELF
+==================================================
+`persistence.StateStore` enforces one writer thread (`claim_writer()`/
+`_assert_writer()` — see persistence.py's own docstring on why: a lock
+alone still lets two threads interleave a read-modify-write). This
+consumer runs on its own background thread, which is NOT the writer
+thread `main.TradingBot.startup()` claims. An earlier version of this
+module called `store.update_order_status()` directly from `_apply()` and
+it raised `PersistenceError` in exactly the orchestrator-level test this
+boundary exists to catch — confirmed while integrating this into
+`TradingBot`, not assumed.
+
+So: `order`/`execution` topic events are normalized, deduplicated, and
+placed on `self._pending` (a `queue.Queue`, thread-safe by construction).
+`drain_and_apply(store)` — called ONLY from the writer thread, i.e. from
+`TradingBot.tick()` — pops everything pending and calls
+`store.update_order_status()` there, exactly like
+`BybitClient.reconcile_on_startup()` does (same idempotent method, same
+authority, a second OBSERVER of it rather than a second writer).
+`position` topic events still never touch the store at all, from any
+thread: a `position` message only sets `needs_reconciliation` and
+records which symbol changed (`dirty_symbols`), so the next REST-driven
+cycle (`observe_exits`/`check_naked_positions`) knows to look there
+sooner. This is "fast observation", not "fast authority" — the
+distinction the WS/REST split exists to preserve.
 
 CORRELATION AND DEDUPLICATION
 ================================
@@ -46,6 +58,7 @@ from __future__ import annotations
 import collections
 import json
 import logging
+import queue
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
@@ -200,6 +213,12 @@ class WSPrivateConsumer:
         self.unknown_message_count = 0
         self.applied_event_count = 0
         self.duplicate_event_count = 0
+        #: order/execution events queued for the writer thread — see
+        #: module docstring, "THIS CONSUMER NEVER WRITES StateStore
+        #: ITSELF". `queue.Queue` is thread-safe by construction, which is
+        #: what makes handing events from this (background) thread to the
+        #: writer thread safe without this module taking a lock itself.
+        self._pending: "queue.Queue[NormalizedEvent]" = queue.Queue()
 
     # -- the part that is fully unit-testable without a socket ----------
 
@@ -242,24 +261,46 @@ class WSPrivateConsumer:
             logger.debug("private-WS control message: %s", message)
 
     def _apply(self, event: NormalizedEvent) -> None:
-        store = self._client.store
+        """Runs on the WS (background) thread — MUST NOT touch
+        `StateStore` (see module docstring). Order/execution events are
+        queued for `drain_and_apply()`; position events only ever set
+        flags, on any thread."""
         if event.kind in ("order", "execution"):
             if event.order_link_id and event.status:
-                try:
-                    store.update_order_status(
-                        event.order_link_id, event.status,
-                        exchange_id=event.venue_order_id)
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "could not apply %s event for %s to the store",
-                        event.kind, event.order_link_id)
-                    self.needs_reconciliation = True
+                self._pending.put(event)
         elif event.kind == "position":
-            # Never written directly here — see module docstring. REST
+            # Never written, from any thread — see module docstring. REST
             # remains the authority for position economics/protection.
             self.needs_reconciliation = True
             if event.symbol:
                 self.dirty_symbols.add(event.symbol)
+
+    def drain_and_apply(self, store: Any) -> List[NormalizedEvent]:
+        """Apply every currently-queued order/execution event to `store`.
+
+        MUST be called from the store's writer thread — that is the
+        entire reason this method exists separately from `_apply()` (see
+        module docstring). `main.TradingBot.tick()` calls this once per
+        cycle, before this cycle's REST calls, so a freshly-applied WS
+        status is visible to them.
+        """
+        applied: List[NormalizedEvent] = []
+        while True:
+            try:
+                event = self._pending.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                store.update_order_status(
+                    event.order_link_id, event.status,
+                    exchange_id=event.venue_order_id)
+                applied.append(event)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "could not apply queued %s event for %s to the store",
+                    event.kind, event.order_link_id)
+                self.needs_reconciliation = True
+        return applied
 
     # -- the part that needs a real (or fake) transport ------------------
 
