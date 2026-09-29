@@ -12,6 +12,9 @@ import re
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT_PATH = os.path.join(REPO, "scripts", "stage_b_forward_accrual.sh")
+REPO_ROOT = os.path.dirname(REPO)
+WORKFLOW_PATH = os.path.join(
+    REPO_ROOT, ".github", "workflows", "stage-b-forward-accrual.yml")
 
 
 def _lines():
@@ -109,3 +112,58 @@ class TestNoSecondDualTreeHandCall:
     def test_append_spot_corpus_is_called_exactly_once(self):
         text = _text()
         assert text.count("tools/append_spot_corpus.py") == 1
+
+
+class TestGithubActionsIsNotACompetingScheduledWriter:
+    """docs/human/NO_GLUE_OPS.md item 10 names the Factory Mac cron as the
+    one canonical SCHEDULED corpus writer. .github/workflows/
+    stage-b-forward-accrual.yml runs this identical script and used to also
+    carry a `schedule:` trigger (~1 hour from the Factory Mac's own cron)
+    plus its own commit+push step — two unsupervised writers racing to
+    append the same dual-tree corpus with no ownership check between them.
+
+    It never actually collided (this workflow's run history commits nothing
+    from github-actions[bot] anywhere in this repo), but "never collided
+    yet" on a live daily schedule is not the same as "cannot collide". The
+    fix was to remove the schedule, not to build a lease: this workflow is
+    now workflow_dispatch-only, an explicit human-triggered failover, never
+    a second automatic writer. These tests keep that invariant from quietly
+    regressing.
+    """
+
+    @staticmethod
+    def _workflow_text() -> str:
+        with open(WORKFLOW_PATH, encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_workflow_file_exists(self):
+        assert os.path.isfile(WORKFLOW_PATH), WORKFLOW_PATH
+
+    def test_no_schedule_trigger(self):
+        """A `schedule:` trigger key (even disabled-looking) must not
+        reappear under `on:` — that key is exactly what made this an
+        unsupervised second writer, regardless of what the cron expression
+        inside it says."""
+        text = self._workflow_text()
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            assert not re.match(r"^schedule\s*:", stripped), (
+                f"a live 'schedule:' trigger reappeared: {line!r} — this "
+                f"workflow must stay manual-dispatch-only unless a real "
+                f"ownership/lease mechanism with the Factory Mac cron is "
+                f"built first (see NO_GLUE_OPS.md item 10)")
+
+    def test_workflow_dispatch_trigger_is_present(self):
+        """The workflow must still be usable as an explicit human failover,
+        not disabled outright."""
+        text = self._workflow_text()
+        assert re.search(r"^\s*workflow_dispatch\s*:", text, re.MULTILINE)
+
+    def test_commit_and_push_still_gated_on_a_real_diff(self):
+        """The commit step must remain conditional on an actual corpus
+        change, not an unconditional commit+push on every manual run."""
+        text = self._workflow_text()
+        assert "git diff --cached --quiet" in text
+        assert "No corpus tip changes." in text
