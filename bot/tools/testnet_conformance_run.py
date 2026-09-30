@@ -421,27 +421,39 @@ def await_ws_observation(*, bot: Any, order_link_id: str,
         time.sleep(poll_interval)
 
 
-def finalize_ws_lifecycle(*, bot: Any, store: Any) -> None:
+def finalize_ws_lifecycle(*, bot: Any, store: Any) -> Dict[str, Any]:
     """FIX 3 — final WS flush, before the store closes and evidence is
     verified.
 
-    Stops the WS observer thread (`bot._stop_private_ws()` — signals it
-    and JOINS it, so it has genuinely stopped touching anything, not just
-    been asked to), then performs ONE LAST writer-thread drain
-    (`drain_and_apply()`, the exact same mechanism `TradingBot.tick()`
-    and `await_ws_observation()` above already use — never a second
-    writer) of whatever the WS thread had already received and queued but
-    that no poll of the bounded observation wait happened to catch before
-    it returned. An event already on the wire, sitting in the queue, must
-    not silently disappear at shutdown.
+    Stops the WS observer thread (`bot._stop_private_ws()`), then, ONLY
+    IF that thread is verifiably no longer alive, performs ONE LAST
+    writer-thread drain (`drain_and_apply()`, the exact same mechanism
+    `TradingBot.tick()` and `await_ws_observation()` above already use —
+    never a second writer) of whatever it had already received and queued
+    but that no poll of the bounded observation wait happened to catch
+    before it returned. An event already on the wire, sitting in the
+    queue, must not silently disappear at shutdown.
+
+    "Stops the thread" is checked here, not assumed: `_stop_private_ws()`
+    joins with a budget sized off `private_ws_consumer.RECV_TIMEOUT_
+    SECONDS` (the receive loop's own maximum blocking `recv()` interval)
+    plus a safety margin — see `main.TradingBot._stop_private_ws()` — but
+    a join timing out with the thread still alive is a real possibility
+    this function must not paper over. If the thread is STILL alive after
+    `_stop_private_ws()` returns, the "final" drain is skipped entirely
+    (draining now would not be final — the still-running thread could
+    enqueue more right after) and `ws_thread_stopped: False` is returned
+    for the caller to fail ASSURANCE/CONFORMANCE closed on — this
+    function never pretends the flush completed when it did not.
 
     Ownership stays exactly as everywhere else in this lifecycle: the WS
-    thread only ever observed/enqueued it; this call is what performs the
-    actual state mutation and durable evidence write, and it runs on the
-    calling (writer) thread. Never raises — a cleanup-path failure here
-    must not prevent evidence verification or shutdown from running; it
-    is exactly the kind of thing `evidence_capture_failed`/the completeness
-    check already exist to catch instead.
+    thread only ever observed/enqueued anything; this call is what
+    performs the actual state mutation and durable evidence write (when
+    it runs at all), on the calling (writer) thread. The `_stop_private_
+    ws()`/`drain_and_apply()` calls themselves are wrapped so a bug in
+    either cannot prevent evidence verification or shutdown from running,
+    but `ws_thread_stopped` is computed directly from the thread's own
+    `is_alive()`, never assumed true just because nothing raised.
     """
     stop = getattr(bot, "_stop_private_ws", None)
     if callable(stop):
@@ -449,12 +461,31 @@ def finalize_ws_lifecycle(*, bot: Any, store: Any) -> None:
             stop()
         except Exception:  # noqa: BLE001
             logger.exception("_stop_private_ws() raised during final WS flush")
+    ws_thread = getattr(bot, "ws_thread", None)
+    ws_thread_stopped = not (ws_thread is not None and ws_thread.is_alive())
     consumer = getattr(bot, "ws_consumer", None)
+    if not ws_thread_stopped:
+        logger.error(
+            "private-WS thread is still alive after _stop_private_ws() "
+            "returned; skipping the final drain (it would not be final) "
+            "-- ASSURANCE/CONFORMANCE must fail closed on this")
+        return {"ws_thread_stopped": False}
     if consumer is not None:
         try:
             consumer.drain_and_apply(store)
         except Exception:  # noqa: BLE001
             logger.exception("final WS drain_and_apply() raised")
+    return {"ws_thread_stopped": True}
+
+
+def _conformance_ok(*, stages_ok: bool, completeness_ok: bool,
+                    ws_thread_stopped: bool) -> bool:
+    """The final accept/reject decision, isolated as a pure function so
+    the invariant "conformance cannot report success while the WS thread
+    remains alive" is directly testable without standing up the whole CLI
+    (`main()` only builds a real venue stack, which this container cannot
+    reach). All three inputs must hold."""
+    return bool(stages_ok and completeness_ok and ws_thread_stopped)
 
 
 def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
@@ -754,16 +785,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             ws_observation_timeout=args.ws_observation_timeout,
             ws_ready_timeout=args.ws_ready_timeout)
     finally:
-        # FIX 3 — final WS flush: stop the WS thread, join it, then run
-        # ONE LAST writer-thread drain of whatever it had queued but that
-        # no poll of the bounded observation wait happened to catch —
-        # BEFORE the store closes and evidence is verified, so a real
-        # observation already received on the wire can never disappear
-        # at shutdown. Runs even when run_conformance stopped early on a
-        # failed stage. `evidence_capture_failed` is read AFTER this, on
-        # purpose: this final drain can itself set it.
+        # FIX 3 — final WS flush: stop the WS thread, join it (a REAL
+        # synchronization boundary — see main.TradingBot._stop_private_ws()
+        # sizing that join off private_ws_consumer.RECV_TIMEOUT_SECONDS,
+        # not a fixed guess), then run ONE LAST writer-thread drain of
+        # whatever it had queued but that no poll of the bounded
+        # observation wait happened to catch — BEFORE the store closes
+        # and evidence is verified, so a real observation already
+        # received on the wire can never disappear at shutdown. Runs even
+        # when run_conformance stopped early on a failed stage.
+        # `evidence_capture_failed` is read AFTER this, on purpose: this
+        # final drain can itself set it.
+        finalize_result = {"ws_thread_stopped": False}
         try:
-            finalize_ws_lifecycle(bot=bot, store=store)
+            finalize_result = finalize_ws_lifecycle(bot=bot, store=store)
         except Exception:  # noqa: BLE001
             print("finalize_ws_lifecycle() raised during cleanup",
                   file=sys.stderr)
@@ -797,7 +832,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         order_link_id=order_link_id,
         evidence_capture_failed=evidence_capture_failed)
     result.update(completeness)
-    result["ok"] = bool(result["ok"] and completeness["ok"])
+    ws_thread_stopped = bool(finalize_result.get("ws_thread_stopped", False))
+    result["ws_thread_stopped"] = ws_thread_stopped
+    if not ws_thread_stopped:
+        print("\nWS thread did not stop within the shutdown boundary; "
+             "the final flush could not run and this result cannot be "
+             "green.", file=sys.stderr)
+    # This run cannot be green unless the WS thread is VERIFIABLY
+    # stopped — see finalize_ws_lifecycle()/_conformance_ok(): a clean
+    # stage sequence and complete evidence are not enough if the final
+    # flush this result depends on never actually happened.
+    result["ok"] = _conformance_ok(
+        stages_ok=result["ok"], completeness_ok=completeness["ok"],
+        ws_thread_stopped=ws_thread_stopped)
 
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(result, handle, indent=2, default=str)

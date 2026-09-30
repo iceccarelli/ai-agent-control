@@ -212,15 +212,34 @@ class _StubWSConsumer:
 _UNSET = object()
 
 
+class _FakeThread:
+    """`threading.Thread`-shaped enough for `finalize_ws_lifecycle()`'s
+    `is_alive()` check -- `alive` is fixed, never flips on its own, so a
+    test controls exactly what "the shutdown join left it alive" looks
+    like without a real thread/timing race."""
+
+    def __init__(self, alive):
+        self._alive = alive
+
+    def is_alive(self):
+        return self._alive
+
+
 class _StubBot:
     def __init__(self, *, startup_ok=True, tick_error=None,
-                ws_consumer=_UNSET, observation_status="HEALTHY"):
+                ws_consumer=_UNSET, observation_status="HEALTHY",
+                ws_thread=None):
         self.startup_ok = startup_ok
         self.tick_error = tick_error
         self.ticked = False
         self.ws_consumer = (_StubWSConsumer() if ws_consumer is _UNSET
                            else ws_consumer)
         self.observation_status = observation_status
+        #: None (default) simulates "already stopped" -- the ordinary
+        #: case. A `_FakeThread(alive=True)` simulates the shutdown
+        #: failure this review round closes: the join budget elapsed
+        #: with the WS thread still genuinely alive.
+        self.ws_thread = ws_thread
 
     def startup(self):
         return self.startup_ok
@@ -235,6 +254,8 @@ class _StubBot:
 
     def _stop_private_ws(self):
         self.ws_stop_calls = getattr(self, "ws_stop_calls", 0) + 1
+        if isinstance(self.ws_thread, _FakeThread) and not self.ws_thread.is_alive():
+            self.ws_thread = None
 
 
 SYMBOL = "BTCUSDT"
@@ -903,6 +924,59 @@ class TestFinalizeWsLifecycle:
         bot = _ExplodingStopBot(ws_consumer=consumer)
         tcr.finalize_ws_lifecycle(bot=bot, store=_StubStore())  # must not raise
         assert consumer.drain_calls == 1
+
+    def test_thread_still_alive_after_stop_skips_the_drain_and_reports_it(self):
+        """The exact race this review round closes: `_stop_private_ws()`
+        can return with the WS thread still genuinely alive (a real
+        shutdown failure). Draining now would not be FINAL -- the still-
+        running thread could enqueue more immediately after -- so the
+        drain must be skipped, not attempted anyway."""
+        consumer = _StubWSConsumer()
+        bot = _StubBot(ws_consumer=consumer, ws_thread=_FakeThread(alive=True))
+
+        result = tcr.finalize_ws_lifecycle(bot=bot, store=_StubStore())
+
+        assert result == {"ws_thread_stopped": False}
+        assert bot.ws_stop_calls == 1
+        assert consumer.drain_calls == 0, (
+            "a drain while the thread is still alive is not the final "
+            "drain the invariant requires")
+
+    def test_thread_genuinely_stopped_reports_it_and_drains(self):
+        consumer = _StubWSConsumer()
+        bot = _StubBot(ws_consumer=consumer, ws_thread=_FakeThread(alive=False))
+
+        result = tcr.finalize_ws_lifecycle(bot=bot, store=_StubStore())
+
+        assert result == {"ws_thread_stopped": True}
+        assert consumer.drain_calls == 1
+
+
+class TestConformanceOk:
+    """FIX (this round): conformance must not report success while the WS
+    thread remains alive, even when every stage and all evidence content
+    checks otherwise pass -- isolated as a pure function so this is
+    directly testable without a real venue stack."""
+
+    def test_all_conditions_true_is_ok(self):
+        assert tcr._conformance_ok(
+            stages_ok=True, completeness_ok=True, ws_thread_stopped=True
+        ) is True
+
+    def test_ws_thread_still_alive_fails_even_with_everything_else_green(self):
+        assert tcr._conformance_ok(
+            stages_ok=True, completeness_ok=True, ws_thread_stopped=False
+        ) is False
+
+    def test_bad_stages_still_fails_regardless_of_ws_thread(self):
+        assert tcr._conformance_ok(
+            stages_ok=False, completeness_ok=True, ws_thread_stopped=True
+        ) is False
+
+    def test_incomplete_evidence_still_fails_regardless_of_ws_thread(self):
+        assert tcr._conformance_ok(
+            stages_ok=True, completeness_ok=False, ws_thread_stopped=True
+        ) is False
 
 
 # ---------------------------------------------------------------------------

@@ -59,6 +59,14 @@ logger = logging.getLogger("main")
 
 __all__ = ["TradingBot", "build_bot", "main"]
 
+#: Safety margin added on top of `private_ws_consumer.RECV_TIMEOUT_SECONDS`
+#: when joining the WS thread at shutdown — see
+#: `TradingBot._stop_private_ws()`. The receive loop's own blocking
+#: `recv()` call is the longest interval between the WS thread checking
+#: `ws_stop_event`; the join budget must exceed that, not guess a fixed
+#: number smaller than it.
+WS_SHUTDOWN_SAFETY_MARGIN_SECONDS = 5.0
+
 
 # ---------------------------------------------------------------------------
 # health server
@@ -142,6 +150,10 @@ class TradingBot:
         self.ws_consumer: Optional[Any] = None
         self.ws_thread: Optional[threading.Thread] = None
         self.ws_stop_event = threading.Event()
+        #: True only if `_stop_private_ws()` ever joined its timeout
+        #: budget with the thread still alive — a real shutdown failure,
+        #: not the ordinary case. See `_stop_private_ws()`.
+        self.ws_shutdown_failed = False
         #: "DISABLED" (PRIVATE_WS_ENABLED is false, the default — REST-only
         #: observation, unchanged from before this attribute existed),
         #: "STARTING", "HEALTHY" (a WS-flagged gap was cleared by a
@@ -486,18 +498,46 @@ class TradingBot:
             self._observation_state = "DEGRADED"
 
     def _stop_private_ws(self) -> None:
-        """Signal the consumer to stop, wait for its thread to actually
-        exit, and never leave a socket or a daemon thread outliving
-        shutdown. If it does not stop in time, that is reported — not
-        silently accepted as "close enough"."""
+        """Signal the consumer to stop and wait for its thread to
+        ACTUALLY exit — not merely for as long as we're willing to wait.
+
+        The receive loop can be blocked inside a single
+        `transport.recv()` for up to `private_ws_consumer.
+        RECV_TIMEOUT_SECONDS` before it next checks `ws_stop_event` (see
+        that module's `run_once`/`run_forever`) — a join() timeout
+        shorter than that is not a real synchronization boundary, it is a
+        coin flip that happens to usually win. This joins for
+        `RECV_TIMEOUT_SECONDS + WS_SHUTDOWN_SAFETY_MARGIN_SECONDS`, so a
+        caller relying on this call meaning "the WS thread is genuinely
+        stopped" (e.g. tools/testnet_conformance_run.py's
+        `finalize_ws_lifecycle`, before it performs what MUST be the
+        final drain) can trust that.
+
+        If the thread is STILL alive after that — a real, unexpected
+        shutdown failure, not the ordinary case — the thread reference is
+        DELIBERATELY NOT discarded (a discarded-but-still-running thread
+        could keep enqueueing observations nobody will ever drain) and
+        `observation_status` is forced to DEGRADED so nothing downstream
+        can read this as a clean shutdown.
+        """
         if self.ws_thread is None:
             return
         self.ws_stop_event.set()
-        self.ws_thread.join(timeout=10.0)
+        import private_ws_consumer as _pwc
+
+        shutdown_timeout = _pwc.RECV_TIMEOUT_SECONDS + WS_SHUTDOWN_SAFETY_MARGIN_SECONDS
+        self.ws_thread.join(timeout=shutdown_timeout)
         if self.ws_thread.is_alive():
             logger.error(
-                "private-WS thread did not stop within the shutdown "
-                "timeout; any observation gap it held is unresolved")
+                "private-WS thread did not stop within %.1fs (RECV_TIMEOUT_"
+                "SECONDS=%.1fs + margin); this is a real shutdown failure, "
+                "not a soft warning -- preserving the thread reference "
+                "(never discarding it while still alive) and forcing "
+                "observation_status to DEGRADED",
+                shutdown_timeout, _pwc.RECV_TIMEOUT_SECONDS)
+            self._observation_state = "DEGRADED"
+            self.ws_shutdown_failed = True
+            return
         self.ws_thread = None
 
     def _absorb_ws_observations(self, *, rest_ok: bool) -> None:
