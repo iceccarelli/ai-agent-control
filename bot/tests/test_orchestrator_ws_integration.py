@@ -401,7 +401,18 @@ class _BlockingRecvTransport:
     `private_ws_consumer.RECV_TIMEOUT_SECONDS` the caller passes in, the
     SAME value `TradingBot._stop_private_ws()`'s fix reads to size its
     join() — so this proves the two are actually tied together, not
-    merely that "the test waited long enough"."""
+    merely that "the test waited long enough".
+
+    `recv_entered`/`recv_returned` are `threading.Event`s set by `recv()`
+    itself, right as it starts blocking and right as it (eventually)
+    returns/raises. A test asserts against THESE — semantic proof that
+    the WS thread was genuinely inside the blocking call and that it
+    genuinely came back out — rather than an exact wall-clock
+    `elapsed >= timeout` comparison, which scheduler/timing overhead can
+    make flaky (an `elapsed` a few milliseconds under `timeout` is not
+    proof of anything wrong; it is measurement noise around a real
+    synchronization boundary that already held).
+    """
 
     def __init__(self, auth_subscribe_frames):
         self._frames = list(auth_subscribe_frames)
@@ -409,6 +420,8 @@ class _BlockingRecvTransport:
         self.connected = False
         self.closed = False
         self._never = threading.Event()
+        self.recv_entered = threading.Event()
+        self.recv_returned = threading.Event()
 
     def connect(self):
         self.connected = True
@@ -422,8 +435,12 @@ class _BlockingRecvTransport:
     def recv(self, timeout=None):
         if self._frames:
             return self._frames.pop(0)
-        self._never.wait(timeout=timeout)
-        raise wt.WSClosed("simulated real-socket recv timeout")
+        self.recv_entered.set()
+        try:
+            self._never.wait(timeout=timeout)
+            raise wt.WSClosed("simulated real-socket recv timeout")
+        finally:
+            self.recv_returned.set()
 
     def close(self):
         self.closed = True
@@ -459,21 +476,25 @@ class TestWsShutdownIsARealSynchronizationBoundary:
         assert _wait_until(
             lambda: bot.ws_consumer is not None and bot.ws_consumer.subscribe_ok)
 
-        # 1. The WS thread is genuinely BLOCKED inside recv() right now —
-        # not merely "started", actually inside the receive loop, exactly
-        # the state that made the old fixed-10s join a coin flip.
+        # 1. recv() was actually ENTERED — the WS thread is genuinely
+        # BLOCKED inside it right now, not merely "started", actually
+        # inside the receive loop, exactly the state that made the old
+        # fixed-10s join a coin flip.
+        assert _wait_until(transport.recv_entered.is_set)
         assert bot.ws_thread.is_alive()
 
-        started = time.time()
-        bot.shutdown()  # calls _stop_private_ws() internally
-        elapsed = time.time() - started
+        bot.shutdown()  # calls _stop_private_ws() internally, synchronously
 
-        # 2. shutdown genuinely WAITED for the blocked recv to time out
-        # (>= the patched RECV_TIMEOUT_SECONDS) rather than giving up
-        # early at some fixed, shorter budget.
-        assert elapsed >= pwc.RECV_TIMEOUT_SECONDS
-        # The thread is verifiably gone -- a real synchronization
-        # boundary, not merely "we stopped waiting for it".
+        # 2. shutdown() WAITED for that exact blocked recv() to complete
+        # — a semantic ordering proof (an Event the recv() call itself
+        # sets), never an exact wall-clock `elapsed >= timeout`
+        # comparison, which scheduler/timing overhead can make flaky.
+        assert transport.recv_returned.is_set() is True
+        # 3. the WS thread is genuinely dead before shutdown() returns —
+        # a real synchronization boundary, not merely "we stopped
+        # waiting for it".
         assert bot.ws_thread is None
-        assert bot.ws_shutdown_failed is False
+        # 4. the final transport cleanup occurred.
         assert transport.closed is True
+        # 5. this was a clean stop, not the shutdown-failure path.
+        assert bot.ws_shutdown_failed is False
