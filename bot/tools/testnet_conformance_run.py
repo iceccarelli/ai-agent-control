@@ -86,14 +86,25 @@ both given)
                              run never takes. ASSURANCE mode (this tool
                              always uses it): missing WS observation is a
                              failed run, not a soft warning.
-  5. Protection read-back  — `client.get_position()` queried FRESH (not the
-                             local ledger) to confirm the stop the venue
-                             itself reports, not merely what execute()
-                             believed it set.
+  5. Protection read-back  — `verify_protection()`, category-dispatched:
+                             LINEAR reads `client.get_position()` FRESH
+                             (not the local ledger) for `stopLoss > 0`;
+                             SPOT (get_position is linear-only) reads the
+                             separate protective stop ORDER back via the
+                             existing `client.verify_stop()`.
   6. Flatten               — `engine.close_position()`, the same method
                              production uses to exit.
-  7. Final reconciliation  — `client.reconcile_on_startup()`.
-  8. Final WS flush        — `finalize_ws_lifecycle()`: stop the WS
+  7. Remote flat verification — `verify_remote_flat()`: a FRESH venue
+                             read proving the account is flat, never
+                             inferred from `close_position()` returning
+                             `ok` or from local `StateStore` having
+                             removed the position. LINEAR re-reads
+                             `get_position()` for `size <= 0`; SPOT checks
+                             no open orders remain and the base-asset
+                             balance is below the instrument's own
+                             minimum tradeable quantity.
+  8. Final reconciliation  — `client.reconcile_on_startup()`.
+  9. Final WS flush        — `finalize_ws_lifecycle()`: stop the WS
                              thread, JOIN it, then one last
                              `drain_and_apply()` of anything it received
                              but that no poll of the bounded observation
@@ -101,7 +112,7 @@ both given)
                              closes or evidence is verified, so a real,
                              already-received observation can never
                              disappear at shutdown.
-  9. Evidence verification — BOTH evidence chains (REST's, via
+  10. Evidence verification — BOTH evidence chains (REST's, via
                              EvidenceCapturingTransport; WS's, via
                              WSPrivateConsumer's assurance-mode capture)
                              are hash-chain-verified, AND their actual
@@ -110,7 +121,7 @@ both given)
                              evidence is not proof. A tamper, gap,
                              missing record, or capture failure fails the
                              run — see "ASSURANCE MODE" below.
-  10. Shutdown + result    — `bot.shutdown()`; a machine-readable summary
+  11. Shutdown + result    — `bot.shutdown()`; a machine-readable summary
                              (stage-by-stage outcome, latencies, both
                              evidence paths, both chain-verification
                              results) is written to `--out`.
@@ -394,6 +405,70 @@ def verify_protection(*, client: Any, store: Any, symbol: str,
             "stop_order_link_id": stop_link_id, "detail": detail}
 
 
+def verify_remote_flat(*, client: Any, symbol: str) -> Dict[str, Any]:
+    """Fresh, venue-derived proof that the account is FLAT after flatten.
+
+    "The conformance runner must not merely call final reconciliation and
+    assume that means the account is flat" — `reconcile_on_startup()`,
+    the way `run_conformance` calls it (no `symbols=` argument), never
+    re-reads this symbol's remote state at all; it only chases locally
+    *unresolved* orders and re-checks the LOCAL ledger's naked-position
+    flag. Neither proves anything about the venue. This function is the
+    explicit, separate remote read that closes that gap. Never relies on:
+    local `StateStore` having removed the position, `close_position()`
+    returning `ok`, a REST acknowledgement alone, or a locally generated
+    trade record — every value here comes from a fresh venue query made
+    right now.
+
+    Dispatches on `client.is_linear`, the same flag used throughout this
+    file and `BybitClient`/`TradingEngine` themselves:
+
+    LINEAR — a position is a first-class venue object: re-reads
+    `client.get_position(symbol)` fresh and requires `size <= 0` (or no
+    row at all, which `get_position` already represents as `None`).
+
+    SPOT — there is no position endpoint (`get_position` is linear-only
+    and raises there — see `BybitClient.get_position`'s own docstring);
+    "flat" on spot means no resting order remains for this symbol AND the
+    base-asset coin balance is below the instrument's own minimum
+    tradeable quantity (an unsellable/dust residual, not a real holding).
+    Reuses the EXISTING `get_open_orders()`, `get_coin_balance()`,
+    `_base_asset()` and `get_instrument_filters()` — every one of them
+    already used elsewhere in `BybitClient` for exactly this purpose
+    (e.g. spot balance sizing) — never a new spot-flatness mechanism.
+
+    Never raises; any failure comes back as `ok: False` with `error`.
+    """
+    category = "linear" if bool(getattr(client, "is_linear", False)) else "spot"
+    if category == "linear":
+        try:
+            remote_position = client.get_position(symbol)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "category": category, "error": str(exc)}
+        remote_size = float((remote_position or {}).get("size", 0) or 0)
+        return {"ok": remote_size <= 0, "category": category,
+                "remote_size": remote_size}
+
+    try:
+        open_orders = client.get_open_orders(symbol)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "category": category, "error": str(exc)}
+    if open_orders:
+        return {"ok": False, "category": category,
+                "open_order_count": len(open_orders),
+                "error": "orders still resting for this symbol"}
+
+    try:
+        base_asset = client._base_asset(symbol)
+        filters = client.get_instrument_filters(symbol)
+        remote_balance = client.get_coin_balance(base_asset)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "category": category, "error": str(exc)}
+    return {"ok": remote_balance < float(filters.min_qty), "category": category,
+            "base_asset": base_asset, "remote_balance": remote_balance,
+            "min_qty": float(filters.min_qty), "open_order_count": 0}
+
+
 def _is_valid_ws_observation(record: Dict[str, Any], *, order_link_id: str,
                              run_start_utc: Optional[str]) -> bool:
     """FIX 3: a matching record must PROVE it is this run's own, not an
@@ -402,10 +477,24 @@ def _is_valid_ws_observation(record: Dict[str, Any], *, order_link_id: str,
     Requires: `transport == "ws"` (never a REST record shaped to look like
     one); `duplicate == False` (a replayed delivery is not a fresh
     observation); a matching `order_link_id`; `topic` is `order` or
-    `execution`; and, when `run_start_utc` is given, a `captured_at_utc`
-    at or after it — comparable as plain strings because both are the
-    same fixed `%Y-%m-%dT%H:%M:%SZ` UTC format, which sorts lexically the
-    same as chronologically.
+    `execution`; a REAL venue identity (see below); and, when
+    `run_start_utc` is given, a `captured_at_utc` at or after it —
+    comparable as plain strings because both are the same fixed
+    `%Y-%m-%dT%H:%M:%SZ` UTC format, which sorts lexically the same as
+    chronologically.
+
+    REAL ORDER ID / REAL EXECUTION ID REQUIRED: `private_ws_consumer.py`'s
+    FIX 4 normalizes an order with no usable `orderId` (or an execution
+    with no usable `execId`) to `kind="unknown"` while LEAVING `topic`
+    set to `"order"`/`"execution"` — so `topic in (order, execution)`
+    alone is not proof of a real identity; an invalid-identity event
+    looks identical on that field. What FIX 4 does NOT leave unchanged is
+    `venue_event_id`: a legitimate event is always stamped
+    `f"{topic}:{identity}"`; an invalid one is stamped `f"unknown:
+    {identity}"` instead. Requiring that prefix match is what actually
+    proves a real venue-derived orderId/execId was present at
+    normalization time, not merely that a message arrived on the right
+    topic.
     """
     if record.get("transport") != "ws":
         return False
@@ -414,7 +503,11 @@ def _is_valid_ws_observation(record: Dict[str, Any], *, order_link_id: str,
         return False
     if record.get("order_link_id") != order_link_id:
         return False
-    if request.get("topic") not in ("order", "execution"):
+    topic = request.get("topic")
+    if topic not in ("order", "execution"):
+        return False
+    venue_event_id = str(record.get("venue_event_id") or "")
+    if not venue_event_id.startswith(f"{topic}:"):
         return False
     if run_start_utc is not None:
         captured_at_utc = str(record.get("captured_at_utc") or "")
@@ -644,6 +737,14 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
 
     close_report = engine.close_position(symbol=symbol, reason="conformance_flatten")
     _stage("flatten", bool(close_report.ok), reason=close_report.reason)
+
+    # Fresh, venue-derived proof of flat — never inferred from
+    # close_position() returning ok or from local StateStore having
+    # removed the position. Runs unconditionally (no early return),
+    # exactly like "flatten" above: a failed flatten should still show
+    # up here as "not flat", not be hidden by stopping early.
+    remote_flat = verify_remote_flat(client=client, symbol=symbol)
+    _stage("remote_flat_verification", remote_flat.pop("ok"), **remote_flat)
 
     try:
         summary = client.reconcile_on_startup()

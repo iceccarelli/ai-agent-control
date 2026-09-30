@@ -175,11 +175,19 @@ class _StubEngine:
         return _StubReport(ok=self.close_ok, reason="CLOSED")
 
 
+class _StubFilters:
+    def __init__(self, min_qty=0.0001):
+        self.min_qty = min_qty
+
+
 class _StubClient:
     def __init__(self, *, remote_stop=100.0, reconcile_summary=None,
                 get_position_error=None, reconcile_error=None,
                 is_linear=True, verify_stop_result=(True, "orderStatus=New"),
-                verify_stop_error=None):
+                verify_stop_error=None, remote_size=0.0,
+                open_orders=(), open_orders_error=None,
+                coin_balance=0.0, coin_balance_error=None,
+                min_qty=0.0001):
         self.remote_stop = remote_stop
         self._reconcile_summary = reconcile_summary or {
             "unknown": 0, "naked_positions": []}
@@ -192,8 +200,19 @@ class _StubClient:
         self.is_linear = is_linear
         self._verify_stop_result = verify_stop_result
         self._verify_stop_error = verify_stop_error
+        #: Defaults to 0.0 -- "already flat" -- so every EXISTING linear
+        #: test (written before verify_remote_flat() existed) keeps
+        #: passing through remote_flat_verification unchanged.
+        self._remote_size = remote_size
+        self._open_orders = list(open_orders)
+        self._open_orders_error = open_orders_error
+        self._coin_balance = coin_balance
+        self._coin_balance_error = coin_balance_error
+        self._min_qty = min_qty
         self.get_position_calls = 0
         self.verify_stop_calls = []
+        self.get_open_orders_calls = 0
+        self.get_coin_balance_calls = 0
 
     def get_position(self, symbol):
         self.get_position_calls += 1
@@ -204,13 +223,33 @@ class _StubClient:
             raise RuntimeError("get_position is linear-only")
         if self._get_position_error:
             raise self._get_position_error
-        return {"symbol": symbol, "stopLoss": str(self.remote_stop)}
+        return {"symbol": symbol, "stopLoss": str(self.remote_stop),
+                "size": self._remote_size}
 
     def verify_stop(self, *, symbol, order_link_id):
         self.verify_stop_calls.append((symbol, order_link_id))
         if self._verify_stop_error:
             raise self._verify_stop_error
         return self._verify_stop_result
+
+    def get_open_orders(self, symbol=None):
+        self.get_open_orders_calls += 1
+        if self._open_orders_error:
+            raise self._open_orders_error
+        return list(self._open_orders)
+
+    def get_coin_balance(self, coin):
+        self.get_coin_balance_calls += 1
+        if self._coin_balance_error:
+            raise self._coin_balance_error
+        return self._coin_balance
+
+    def get_instrument_filters(self, symbol):
+        return _StubFilters(min_qty=self._min_qty)
+
+    @staticmethod
+    def _base_asset(symbol):
+        return symbol.replace("USDT", "")
 
     def reconcile_on_startup(self):
         if self._reconcile_error:
@@ -312,6 +351,7 @@ class TestRunConformanceStageSequencing:
         assert names == ["startup", "ws_startup", "entry", "ws_observation",
                         "protection_local",
                         "protection_readback", "flatten",
+                        "remote_flat_verification",
                         "final_reconciliation", "ws_evidence_completeness"]
         assert all(s["ok"] for s in result["stages"])
         assert engine.closed == [SYMBOL]
@@ -386,6 +426,7 @@ class TestRunConformanceStageSequencing:
         assert names == ["startup", "ws_startup", "entry", "ws_observation",
                         "protection_local",
                         "protection_readback", "flatten",
+                        "remote_flat_verification",
                         "final_reconciliation", "ws_evidence_completeness"]
         flatten_stage = next(s for s in result["stages"] if s["stage"] == "flatten")
         assert flatten_stage["ok"] is False
@@ -506,6 +547,25 @@ class TestAwaitWsObservation:
             request_url="https://api-testnet.bybit.com/v5/market/time",
             request={"topic": "order", "duplicate": False},
             response={}, order_link_id="BB-1")
+        ve.append_evidence(path, record)
+        bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is False
+
+    def test_invalid_identity_record_does_not_satisfy_observation(self, tmp_path):
+        """REAL ORDER ID / REAL EXECUTION ID REQUIRED: private_ws_consumer's
+        FIX 4 normalizes an order with no usable orderId (or an execution
+        with no usable execId) to venue_event_id="unknown:..." while
+        LEAVING topic="order"/"execution" unchanged -- a topic check
+        alone would wrongly accept this as a real observation. It must
+        not: the identity prefix has to match the topic too."""
+        path = str(tmp_path / "ws_evidence.jsonl")
+        record = ve.build_ws_event_record(
+            venue="bybit", environment="testnet",
+            ws_url="wss://stream-testnet.bybit.com/v5/private",
+            venue_event_id="unknown:deadbeef", topic="order",
+            order_link_id="BB-1", payload={"orderId": ""})
         ve.append_evidence(path, record)
         bot = _StubBot(ws_consumer=_StubWSConsumer(evidence_path=path))
 
@@ -748,6 +808,39 @@ class TestVerifyEvidenceCompleteness:
         result = tcr.verify_evidence_completeness(
             rest_evidence_path=rest_path, ws_evidence_path=ws_path,
             order_link_id="BB-1")
+        assert result["ok"] is False
+        assert result["order_evidence_exists"] is False
+        assert result["execution_evidence_exists"] is False
+
+    def test_invalid_identity_ws_records_do_not_count_as_real_evidence(
+            self, tmp_path):
+        """REAL ORDER ID / REAL EXECUTION ID REQUIRED: an order/execution
+        with no usable orderId/execId is normalized to venue_event_id=
+        "unknown:..." (private_ws_consumer's FIX 4) while its `topic`
+        field is left as "order"/"execution" -- completeness must not be
+        satisfied by these, only by records with a real identity prefix."""
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        _write_rest_evidence_record(rest_path)
+        invalid_order = ve.build_ws_event_record(
+            venue="bybit", environment="testnet",
+            ws_url="wss://stream-testnet.bybit.com/v5/private",
+            venue_event_id="unknown:deadbeef", topic="order",
+            order_link_id="BB-1", payload={"orderId": ""},
+            prev_hash=ve.last_record_hash(ws_path))
+        ve.append_evidence(ws_path, invalid_order)
+        invalid_exec = ve.build_ws_event_record(
+            venue="bybit", environment="testnet",
+            ws_url="wss://stream-testnet.bybit.com/v5/private",
+            venue_event_id="unknown:cafef00d", topic="execution",
+            order_link_id="BB-1", payload={"execId": ""},
+            prev_hash=ve.last_record_hash(ws_path))
+        ve.append_evidence(ws_path, invalid_exec)
+
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-1")
+
         assert result["ok"] is False
         assert result["order_evidence_exists"] is False
         assert result["execution_evidence_exists"] is False
@@ -1386,3 +1479,158 @@ class TestEvidenceRequirementsUnchangedByCategoryFix:
         assert params == [
             "rest_evidence_path", "ws_evidence_path", "order_link_id",
             "evidence_capture_failed"]
+
+
+# ---------------------------------------------------------------------------
+# FIX — remote flat verification: run_conformance() called
+# reconcile_on_startup() with no `symbols=` argument, which never re-reads
+# THIS symbol's remote state at all -- neither category proved the account
+# was actually flat after flatten. verify_remote_flat() is the explicit,
+# separate venue read that closes that gap.
+# ---------------------------------------------------------------------------
+
+
+class TestVerifyRemoteFlat:
+    def test_linear_flat_when_remote_size_is_zero(self):
+        client = _StubClient(is_linear=True, remote_size=0.0)
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result == {"ok": True, "category": "linear", "remote_size": 0.0}
+
+    def test_linear_not_flat_when_remote_size_is_nonzero(self):
+        """close_position() returning ok must NOT be trusted -- if the
+        venue still shows a nonzero size, this must fail, regardless of
+        what local state or the close report believed."""
+        client = _StubClient(is_linear=True, remote_size=0.01)
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result["ok"] is False
+        assert result["category"] == "linear"
+        assert result["remote_size"] == 0.01
+
+    def test_linear_readback_error_fails_closed(self):
+        client = _StubClient(is_linear=True,
+                             get_position_error=RuntimeError("venue down"))
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result["ok"] is False
+        assert result["category"] == "linear"
+        assert "error" in result
+
+    def test_spot_flat_when_no_open_orders_and_balance_below_min_qty(self):
+        client = _StubClient(is_linear=False, open_orders=[],
+                             coin_balance=0.0, min_qty=0.0001)
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result == {
+            "ok": True, "category": "spot", "base_asset": "BTC",
+            "remote_balance": 0.0, "min_qty": 0.0001, "open_order_count": 0}
+        assert client.get_position_calls == 0, (
+            "spot must never call the linear-only get_position()")
+
+    def test_spot_not_flat_when_an_order_still_rests(self):
+        """A resting order means the close never actually filled at the
+        venue -- must not be reported flat merely because close_position()
+        returned ok locally."""
+        client = _StubClient(is_linear=False,
+                             open_orders=[{"orderId": "1"}])
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result["ok"] is False
+        assert result["category"] == "spot"
+        assert result["open_order_count"] == 1
+        assert client.get_coin_balance_calls == 0, (
+            "no point reading balance once a resting order alone disproves flat")
+
+    def test_spot_not_flat_when_balance_exceeds_min_qty(self):
+        client = _StubClient(is_linear=False, open_orders=[],
+                             coin_balance=0.05, min_qty=0.0001)
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result["ok"] is False
+        assert result["category"] == "spot"
+        assert result["remote_balance"] == 0.05
+
+    def test_spot_dust_below_min_qty_still_counts_as_flat(self):
+        """A residual below the instrument's own minimum tradeable
+        quantity is unsellable dust, not a real holding."""
+        client = _StubClient(is_linear=False, open_orders=[],
+                             coin_balance=0.000001, min_qty=0.0001)
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result["ok"] is True
+
+    def test_spot_open_orders_error_fails_closed(self):
+        client = _StubClient(is_linear=False,
+                             open_orders_error=RuntimeError("venue down"))
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result["ok"] is False
+        assert result["category"] == "spot"
+        assert "error" in result
+
+    def test_spot_balance_read_error_fails_closed(self):
+        client = _StubClient(is_linear=False, open_orders=[],
+                             coin_balance_error=RuntimeError("venue down"))
+        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        assert result["ok"] is False
+        assert result["category"] == "spot"
+        assert "error" in result
+
+
+class TestRunConformanceRemoteFlatEndToEnd:
+    @pytest.fixture(autouse=True)
+    def _ws_observation_always_succeeds(self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+
+    def test_remote_flat_stage_runs_after_flatten_and_before_reconciliation(self):
+        store = _StubStore(positions=[{"symbol": SYMBOL, "meta": "{}"}])
+        client = _StubClient(is_linear=True, remote_stop=100.0, remote_size=0.0)
+
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=_StubEngine(), client=client,
+            store=store, symbol=SYMBOL)
+
+        names = [s["stage"] for s in result["stages"]]
+        assert names.index("flatten") < names.index("remote_flat_verification")
+        assert names.index("remote_flat_verification") < names.index(
+            "final_reconciliation")
+        flat_stage = next(
+            s for s in result["stages"] if s["stage"] == "remote_flat_verification")
+        assert flat_stage["ok"] is True
+        assert flat_stage["category"] == "linear"
+        assert result["ok"] is True
+
+    def test_venue_still_holding_position_after_flatten_fails_the_run(self):
+        """The exact gap this fix closes: close_position() succeeding
+        locally must not be enough -- if the venue still reports a
+        nonzero position, the run must not be green."""
+        store = _StubStore(positions=[{"symbol": SYMBOL, "meta": "{}"}])
+        client = _StubClient(is_linear=True, remote_stop=100.0, remote_size=0.02)
+        engine = _StubEngine(close_ok=True)
+
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=engine, client=client,
+            store=store, symbol=SYMBOL)
+
+        assert result["ok"] is False
+        flat_stage = next(
+            s for s in result["stages"] if s["stage"] == "remote_flat_verification")
+        assert flat_stage["ok"] is False
+        # flatten itself still ran and is recorded as ok -- the venue
+        # disagreement is what fails the run, not a fabricated flatten
+        # failure.
+        flatten_stage = next(
+            s for s in result["stages"] if s["stage"] == "flatten")
+        assert flatten_stage["ok"] is True
+
+    def test_spot_remote_flat_stage_uses_open_orders_and_balance(self):
+        row = {"symbol": SYMBOL,
+              "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
+        store = _StubStore(positions=[row])
+        client = _StubClient(
+            is_linear=False, verify_stop_result=(True, "orderStatus=New"),
+            open_orders=[], coin_balance=0.0, min_qty=0.0001)
+
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=_StubEngine(), client=client,
+            store=store, symbol=SYMBOL)
+
+        flat_stage = next(
+            s for s in result["stages"] if s["stage"] == "remote_flat_verification")
+        assert flat_stage["ok"] is True
+        assert flat_stage["category"] == "spot"
+        assert client.get_position_calls == 0
+        assert result["ok"] is True
