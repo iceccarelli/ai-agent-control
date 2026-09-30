@@ -1,0 +1,145 @@
+{
+  "ok": true,
+  "stages": [
+    {
+      "stage": "startup",
+      "ok": true
+    },
+    {
+      "stage": "ws_startup",
+      "ok": true,
+      "observation_status": "STARTING",
+      "auth_ok": true,
+      "subscribe_ok": true
+    },
+    {
+      "stage": "spot_baseline_capture",
+      "ok": true,
+      "base_asset": "BTC",
+      "symbol": "BTCUSDT",
+      "starting_balance": 0.10472384,
+      "starting_open_order_count": 0,
+      "captured_at_utc": "2026-09-30T13:55:43Z"
+    },
+    {
+      "stage": "entry",
+      "ok": true,
+      "position": {
+        "symbol": "BTCUSDT",
+        "side": "Buy",
+        "qty": 0.00238,
+        "entry_price": 83484.3,
+        "stop_price": 81814.616,
+        "opened_epoch": 1790776546.4510033,
+        "order_link_id": "BB-entr-9-2c9eeeb96b9459cb9086c7d5",
+        "meta": "{\"stop_order_link_id\": \"BB-stop-10-cc833df3dbb90e18f6ff0b2e\"}"
+      }
+    },
+    {
+      "stage": "ws_observation",
+      "ok": true,
+      "order_link_id": "BB-entr-9-2c9eeeb96b9459cb9086c7d5",
+      "timeout_seconds": 30.0
+    },
+    {
+      "stage": "protection_local",
+      "ok": true
+    },
+    {
+      "stage": "protection_readback",
+      "ok": true,
+      "category": "spot",
+      "stop_order_link_id": "BB-stop-10-cc833df3dbb90e18f6ff0b2e",
+      "detail": "orderStatus=Untriggered"
+    },
+    {
+      "stage": "flatten",
+      "ok": true,
+      "reason": "CLOSED",
+      "exit_order_link_id": "BB-clos-12-e87d1257c8bd367887cc215f",
+      "exit_order_id": "2315595961281636352",
+      "exit_side": "Sell",
+      "requested_exit_qty": 0.00238,
+      "executed_exit_qty": 0.00238,
+      "exit_avg_price": 83483.9,
+      "exit_status": "Filled"
+    },
+    {
+      "stage": "exit_ws_observation",
+      "ok": true,
+      "exit_order_link_id": "BB-clos-12-e87d1257c8bd367887cc215f",
+      "timeout_seconds": 30.0
+    },
+    {
+      "stage": "remote_flat_verification",
+      "ok": true,
+      "category": "spot",
+      "open_order_count": 0,
+      "run_entry_qty": 0.00238,
+      "run_exit_qty": 0.00238,
+      "run_delta": 0.0,
+      "tolerance": 1e-06
+    },
+    {
+      "stage": "final_reconciliation",
+      "ok": true,
+      "summary": {
+        "checked": 0,
+        "resolved": 0,
+        "still_open": 0,
+        "unknown": 0,
+        "naked_positions": [],
+        "orphan_positions": []
+      }
+    },
+    {
+      "stage": "ws_evidence_completeness",
+      "ok": true,
+      "evidence_capture_failed": false
+    }
+  ],
+  "timestamps_epoch": {
+    "run_started": 1790776541.7076404,
+    "startup_at": 1790776542.3723736,
+    "ws_startup_at": 1790776543.2732303,
+    "spot_baseline_capture_at": 1790776543.8997402,
+    "entry_at": 1790776548.2359982,
+    "ws_observation_at": 1790776548.282019,
+    "protection_local_at": 1790776548.2820632,
+    "protection_readback_at": 1790776548.6029043,
+    "flatten_at": 1790776550.8441586,
+    "exit_ws_observation_at": 1790776550.8871534,
+    "remote_flat_verification_at": 1790776551.2008302,
+    "final_reconciliation_at": 1790776551.2009292,
+    "ws_evidence_completeness_at": 1790776551.2009323,
+    "run_finished": 1790776551.20094
+  },
+  "latencies_ms": {
+    "run_started->startup_at": 664.7331714630127,
+    "startup_at->ws_startup_at": 900.8567333221436,
+    "ws_startup_at->spot_baseline_capture_at": 626.5099048614502,
+    "spot_baseline_capture_at->entry_at": 4336.2579345703125,
+    "entry_at->ws_observation_at": 46.0207462310791,
+    "ws_observation_at->protection_local_at": 0.044345855712890625,
+    "protection_local_at->protection_readback_at": 320.84107398986816,
+    "protection_readback_at->flatten_at": 2241.2543296813965,
+    "flatten_at->exit_ws_observation_at": 42.99473762512207,
+    "exit_ws_observation_at->remote_flat_verification_at": 313.6768341064453,
+    "remote_flat_verification_at->final_reconciliation_at": 0.09894371032714844,
+    "final_reconciliation_at->ws_evidence_completeness_at": 0.0030994415283203125
+  },
+  "rest_evidence_path": "/workspaces/ai-agent-control/bot/artifacts/testnet_conformance_evidence.jsonl",
+  "rest_evidence_verified": true,
+  "rest_evidence_reasons": [],
+  "ws_evidence_path": "/workspaces/ai-agent-control/bot/artifacts/testnet_conformance_ws_evidence.jsonl",
+  "ws_evidence_verified": true,
+  "ws_evidence_reasons": [],
+  "rest_evidence_exists": true,
+  "ws_evidence_exists": true,
+  "order_evidence_exists": true,
+  "execution_evidence_exists": true,
+  "evidence_capture_failed": false,
+  "exit_order_evidence_exists": true,
+  "exit_execution_evidence_exists": true,
+  "ws_thread_stopped": true
+}
