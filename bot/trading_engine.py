@@ -1224,6 +1224,30 @@ class TradingEngine:
         entry = float(row["entry_price"])
         stop_fraction = float(getattr(self.cfg, "STOP_LOSS_PCT", 0.02))
         stop = entry * (1 - stop_fraction) if side == "Buy" else entry * (1 + stop_fraction)
+
+        # Crash-boundary invariant: do not mint a SECOND live stop order for
+        # a position that already has one resting at the venue. This is the
+        # gap `place_stop_order` alone cannot close on spot — its
+        # `orderLinkId` is a fresh sequence number every call, so it is
+        # never deduplicated as a retry the way an entry order is. A crash
+        # between the stop being accepted at the venue and this process
+        # durably recording `stop_price` locally (or the earlier "position
+        # found naked" read racing a stop this same process placed moments
+        # before) must re-discover that stop, not double it. See
+        # `BybitClient.find_live_spot_stop`'s docstring and
+        # tests/test_naked_position_handling.py::
+        # TestSpotNakedRecoveryIsIdempotent.
+        existing = self.client.find_live_spot_stop(symbol)
+        if existing is not None:
+            live_trigger = float(existing.get("triggerPrice") or 0.0) or stop
+            self.store.set_position_stop(symbol, live_trigger)
+            self.store.journal(symbol, "REPROTECTED", reason, {
+                "mechanism": "already_live_at_venue",
+                "order_link_id": existing.get("orderLinkId", ""),
+                "stop_price": live_trigger,
+            })
+            return "REPROTECTED"
+
         try:
             filters = self.client.get_instrument_filters(symbol)
         except BybitAPIError:

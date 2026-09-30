@@ -1436,6 +1436,38 @@ class BybitClient:
         except BybitAPIError as exc:
             return False, f"STOP_UNVERIFIABLE: {exc}"
 
+    def find_live_spot_stop(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """The already-live SPOT protective stop order for ``symbol``, if any.
+
+        RECOVERY INVARIANT this exists to hold (crash boundary: after a
+        protective stop is accepted at the venue, before this process
+        durably records that fact): ``place_stop_order`` mints a FRESH
+        ``orderLinkId`` from ``store.next_order_seq()`` on every call, so
+        two calls are never deduplicated as "the same submission" the way
+        ``place_order``'s (or a retried ``record_order``) idempotent-intent
+        insert is for entries. On LINEAR that is harmless — the protective
+        stop is a field on the position (``_place_position_stop``), and
+        re-setting it just overwrites the same field. On SPOT it is a
+        distinct standing conditional order every time, so calling
+        ``place_stop_order`` again for a position that already has one
+        resting at the venue creates a SECOND, independent live stop for
+        the same quantity instead of recognizing the first.
+
+        This is a read-only venue query (``GET /v5/order/realtime`` via
+        ``get_open_orders``, ``orderFilter="StopOrder"``), never a
+        mutation. Returns ``None`` on linear (that path never needs it —
+        see above) and when spot genuinely has no live stop for the
+        symbol, so a caller can tell "already protected, nothing to do"
+        from "actually naked, must protect".
+        """
+        if self.is_linear:
+            return None
+        for row in self.get_open_orders(symbol, order_filter="StopOrder"):
+            status = str(row.get("orderStatus", ""))
+            if status in {"Untriggered", "New", "PartiallyFilled"}:
+                return dict(row)
+        return None
+
     # -- linear-only account surface ---------------------------------------
 
     def get_position(self, symbol: str) -> Optional[Dict[str, Any]]:
