@@ -925,7 +925,15 @@ class BybitClient:
             body["price"] = price_str
         if time_in_force:
             body["timeInForce"] = time_in_force
-        if reduce_only:
+        # `reduceOnly` is a POSITION concept — valid for linear/inverse/
+        # option, where it lets the venue itself refuse an order that
+        # would flip or grow a position instead of shrinking it. Spot has
+        # no position at all (see `get_position`'s own docstring: "a
+        # spot 'position' is a coin balance"), so this field is never
+        # sent there — internal `reduce_only` still selects the intent
+        # (skip the balance check above; the spot-short guard already
+        # ran), it just never becomes a REST body field on spot.
+        if reduce_only and not self.is_spot:
             body["reduceOnly"] = True
 
         return self._submit(body, oid, purpose)

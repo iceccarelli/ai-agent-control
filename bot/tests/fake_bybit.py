@@ -292,6 +292,15 @@ class FakeBybit:
             "orderStatus": status,
             "orderFilter": body.get("orderFilter", "Order"),
             "triggerPrice": body.get("triggerPrice", ""),
+            #: The fake fills immediately and completely -- no partial-fill
+            #: simulation -- so a "Filled" order's executed quantity is
+            #: always its full requested qty. Real Bybit order objects
+            #: carry both fields; a caller (e.g. TradingEngine.
+            #: close_position()) that reads them for real execution
+            #: evidence needs a fake that actually populates them, not
+            #: just an orderStatus.
+            "cumExecQty": body["qty"] if status == "Filled" else "0",
+            "avgPrice": body.get("price", "") if status == "Filled" else "",
             "_purpose": purpose,
             "_body": body,
         }

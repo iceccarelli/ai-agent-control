@@ -435,6 +435,39 @@ class TestClosing:
             trades[0]["gross_pnl"] - 2.0
         )
 
+    def test_close_report_exposes_exit_identity_and_execution_evidence(self, stack):
+        """FIX (exit assurance): close_position()'s report must carry the
+        EXIT's own identity/quantity/price -- extending the existing
+        ExecutionReport.detail path, not a parallel model -- so a caller
+        can require real WS evidence keyed on the exit's own
+        orderLinkId/orderId, exactly like it already can for entry."""
+        engine, client, risk, store, exchange = stack
+        engine.execute(buy_intent())
+
+        close = engine.close_position(symbol="BTCUSDT", reason="manual")
+
+        assert close.ok
+        assert close.detail["exit_order_link_id"], "must be a real venue link id"
+        assert close.detail["exit_order_id"], "must be a real venue order id"
+        assert close.detail["exit_side"] == "Sell"
+        assert close.detail["requested_exit_qty"] == close.qty
+        # The fake fills market orders completely and immediately.
+        assert close.detail["executed_exit_qty"] == pytest.approx(close.qty)
+        assert close.detail["exit_status"] == "Filled"
+        assert close.detail["exit_avg_price"] > 0
+
+    def test_rejected_close_still_reports_whatever_exit_identity_exists(self, stack):
+        engine, client, risk, store, exchange = stack
+        engine.execute(buy_intent())
+        exchange.reject_next_with = (10001, "simulated rejection")
+
+        close = engine.close_position(symbol="BTCUSDT", reason="manual")
+
+        assert close.ok is False
+        assert close.detail["exit_status"] == "REJECTED"
+        assert close.detail["exit_side"] == "Sell"
+        assert "requested_exit_qty" in close.detail
+
     def test_close_cancels_resting_orders_only_after_confirmation(self, stack):
         engine, client, risk, store, exchange = stack
         engine.execute(buy_intent())

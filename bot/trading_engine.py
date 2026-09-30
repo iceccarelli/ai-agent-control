@@ -915,12 +915,27 @@ class TradingEngine:
         )
         if not result.ok:
             logger.error("close failed for %s: %s", symbol, result.reason)
-            return self._report(stage="close", reason=result.reason, symbol=symbol)
+            return self._report(
+                stage="close", reason=result.reason, symbol=symbol,
+                detail={
+                    "exit_order_link_id": result.order_link_id,
+                    "exit_order_id": result.order_id,
+                    "exit_side": exit_side,
+                    "requested_exit_qty": qty,
+                    "exit_status": "REJECTED",
+                })
 
         fill = self._await_fill(symbol, result.order_link_id)
         realised_exit = float(
             (fill or {}).get("avgPrice") or exit_price or entry_price
         )
+        # The ACTUAL venue-confirmed executed quantity, not the requested
+        # one — POST /v5/order/create's acknowledgement is not execution
+        # (Bybit's own docs: order creation is async; confirm status via
+        # WS/order query). 0.0 (never the requested qty) if the fill
+        # never resolved — an unconfirmed exit is not evidence of one.
+        executed_exit_qty = float((fill or {}).get("cumExecQty") or 0.0)
+        exit_status = str((fill or {}).get("orderStatus", "") or "")
 
         self.client.cancel_all(symbol)
 
@@ -940,8 +955,24 @@ class TradingEngine:
             "gross_pnl": gross, "fees": entry_fee + exit_fee,
             "net_pnl": gross - entry_fee - exit_fee,
         })
-        return self._report(ok=True, stage="close", reason="CLOSED", symbol=symbol,
-                            qty=qty, detail={"gross_pnl": gross})
+        # Exit identity/quantity evidence (mission "REAL FINDING #3"):
+        # extends the existing ExecutionReport.detail path -- never a
+        # parallel evidence model -- so a caller (e.g.
+        # tools/testnet_conformance_run.py) can require real exit WS
+        # order/execution evidence keyed on exit_order_link_id/
+        # exit_order_id, exactly like it already does for entry.
+        return self._report(
+            ok=True, stage="close", reason="CLOSED", symbol=symbol,
+            qty=qty, detail={
+                "gross_pnl": gross,
+                "exit_order_link_id": result.order_link_id,
+                "exit_order_id": result.order_id,
+                "exit_side": exit_side,
+                "requested_exit_qty": qty,
+                "executed_exit_qty": executed_exit_qty,
+                "exit_avg_price": realised_exit,
+                "exit_status": exit_status,
+            })
 
     def observe_exits(self) -> Dict[str, Any]:
         """Notice exchange-side exits (stop / take-profit fills) and book them.

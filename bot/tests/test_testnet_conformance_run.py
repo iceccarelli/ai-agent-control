@@ -160,9 +160,15 @@ class _StubStore:
 
 
 class _StubReport:
-    def __init__(self, ok=True, reason="OK"):
+    def __init__(self, ok=True, reason="OK", detail=None):
         self.ok = ok
         self.reason = reason
+        self.detail = detail if detail is not None else {
+            "exit_order_link_id": "BB-exit-1", "exit_order_id": "EX-exit-1",
+            "exit_side": "Sell", "requested_exit_qty": 0.01,
+            "executed_exit_qty": 0.01, "exit_avg_price": 100.0,
+            "exit_status": "Filled",
+        }
 
 
 class _StubEngine:
@@ -351,7 +357,7 @@ class TestRunConformanceStageSequencing:
         assert names == ["startup", "ws_startup", "entry", "ws_observation",
                         "protection_local",
                         "protection_readback", "flatten",
-                        "remote_flat_verification",
+                        "exit_ws_observation", "remote_flat_verification",
                         "final_reconciliation", "ws_evidence_completeness"]
         assert all(s["ok"] for s in result["stages"])
         assert engine.closed == [SYMBOL]
@@ -426,7 +432,7 @@ class TestRunConformanceStageSequencing:
         assert names == ["startup", "ws_startup", "entry", "ws_observation",
                         "protection_local",
                         "protection_readback", "flatten",
-                        "remote_flat_verification",
+                        "exit_ws_observation", "remote_flat_verification",
                         "final_reconciliation", "ws_evidence_completeness"]
         flatten_stage = next(s for s in result["stages"] if s["stage"] == "flatten")
         assert flatten_stage["ok"] is False
@@ -867,6 +873,100 @@ class TestVerifyEvidenceCompleteness:
             rest_evidence_path=rest_path, ws_evidence_path=ws_path,
             order_link_id="BB-1", evidence_capture_failed=False)
         assert result["ok"] is True
+
+
+class TestExitEvidenceCompleteness:
+    """Mission Finding #3: entry-only evidence is not a full lifecycle
+    proof. `exit_order_link_id`, when given, must ALSO be backed by real
+    order and execution WS evidence -- by its OWN link id, not the
+    entry's."""
+
+    def _write_full_entry_evidence(self, rest_path, ws_path):
+        _write_rest_evidence_record(rest_path)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-entry", topic="order")
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-entry", topic="execution")
+
+    def test_entry_only_call_is_unaffected_by_the_exit_extension(self, tmp_path):
+        """Backward compatibility: omitting exit_order_link_id keeps the
+        original FIX 2 entry-only contract exactly as it was."""
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        self._write_full_entry_evidence(rest_path, ws_path)
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-entry")
+        assert result["ok"] is True
+        assert "exit_order_evidence_exists" not in result
+
+    def test_missing_exit_evidence_fails_even_with_complete_entry_evidence(
+            self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        self._write_full_entry_evidence(rest_path, ws_path)
+        # No exit records written at all.
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-entry", exit_order_link_id="BB-exit")
+        assert result["ok"] is False
+        assert result["exit_order_evidence_exists"] is False
+        assert result["exit_execution_evidence_exists"] is False
+
+    def test_mismatched_exit_order_link_id_fails(self, tmp_path):
+        """An exit WS event under the WRONG link id (e.g. a stale/reused
+        one from an earlier run) must not satisfy THIS run's exit proof."""
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        self._write_full_entry_evidence(rest_path, ws_path)
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-some-other-exit", topic="order")
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-some-other-exit", topic="execution")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-entry", exit_order_link_id="BB-exit")
+        assert result["ok"] is False
+        assert result["exit_order_evidence_exists"] is False
+
+    def test_exit_order_evidence_without_exit_execution_evidence_fails(
+            self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        self._write_full_entry_evidence(rest_path, ws_path)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-exit", topic="order")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-entry", exit_order_link_id="BB-exit")
+        assert result["ok"] is False
+        assert result["exit_order_evidence_exists"] is True
+        assert result["exit_execution_evidence_exists"] is False
+
+    def test_entry_and_exit_evidence_both_present_and_clean_passes(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        self._write_full_entry_evidence(rest_path, ws_path)
+        _write_ws_evidence_record(ws_path, order_link_id="BB-exit", topic="order")
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-exit", topic="execution")
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-entry", exit_order_link_id="BB-exit")
+        assert result["ok"] is True
+        assert result["exit_order_evidence_exists"] is True
+        assert result["exit_execution_evidence_exists"] is True
+
+    def test_duplicate_flagged_exit_records_do_not_count(self, tmp_path):
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")
+        self._write_full_entry_evidence(rest_path, ws_path)
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-exit", topic="order", duplicate=True)
+        _write_ws_evidence_record(
+            ws_path, order_link_id="BB-exit", topic="execution", duplicate=True)
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-entry", exit_order_link_id="BB-exit")
+        assert result["ok"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -1402,7 +1502,7 @@ class TestRunConformanceProtectionReadbackEndToEnd:
         assert result["ok"] is True
 
     def test_spot_client_reaches_flatten_via_verify_stop_not_get_position(self):
-        row = {"symbol": SYMBOL,
+        row = {"symbol": SYMBOL, "qty": 0.01,
               "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
         store = _StubStore(positions=[row])
         client = _StubClient(is_linear=False,
@@ -1445,8 +1545,8 @@ class TestRunConformanceProtectionReadbackEndToEnd:
 
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
-            "startup", "ws_startup", "entry", "ws_observation",
-            "protection_local", "protection_readback"]
+            "startup", "ws_startup", "spot_baseline_capture", "entry",
+            "ws_observation", "protection_local", "protection_readback"]
         assert engine.closed == [], "must not flatten past a failed readback"
 
 
@@ -1471,14 +1571,18 @@ class TestEvidenceRequirementsUnchangedByCategoryFix:
         assert result["ok"] is False
         assert result["ws_evidence_exists"] is False
 
-    def test_verify_evidence_completeness_signature_unchanged(self):
-        """Sanity check this fix did not alter FIX 2's function contract
-        while touching the same file."""
+    def test_verify_evidence_completeness_extends_not_replaces_fix_2(self):
+        """FIX 2's original entry-evidence contract must still be
+        reachable unchanged (an omitted `exit_order_link_id` keeps the
+        original entry-only behavior) -- the exit requirement (mission
+        Finding #3) is additive, never a breaking change to FIX 2."""
         import inspect
         params = list(inspect.signature(tcr.verify_evidence_completeness).parameters)
         assert params == [
             "rest_evidence_path", "ws_evidence_path", "order_link_id",
-            "evidence_capture_failed"]
+            "evidence_capture_failed", "exit_order_link_id"]
+        sig = inspect.signature(tcr.verify_evidence_completeness)
+        assert sig.parameters["exit_order_link_id"].default == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1514,15 +1618,24 @@ class TestVerifyRemoteFlat:
         assert result["category"] == "linear"
         assert "error" in result
 
-    def test_spot_flat_when_no_open_orders_and_balance_below_min_qty(self):
-        client = _StubClient(is_linear=False, open_orders=[],
-                             coin_balance=0.0, min_qty=0.0001)
-        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+    def test_spot_flat_when_no_open_orders_and_run_delta_within_tolerance(self):
+        """Mission Finding #1: flat is a RUN-SCOPED accounting check, not
+        an assertion about the account's total balance -- entry qty and
+        exit qty exactly matching is what proves this run left no
+        residue, whatever the account's pre-existing BTC holdings are."""
+        client = _StubClient(is_linear=False, open_orders=[], min_qty=0.0001)
+        result = tcr.verify_remote_flat(
+            client=client, symbol=SYMBOL,
+            run_entry_qty=0.01, run_exit_qty=0.01)
         assert result == {
-            "ok": True, "category": "spot", "base_asset": "BTC",
-            "remote_balance": 0.0, "min_qty": 0.0001, "open_order_count": 0}
+            "ok": True, "category": "spot", "open_order_count": 0,
+            "run_entry_qty": 0.01, "run_exit_qty": 0.01, "run_delta": 0.0,
+            "tolerance": 0.0001}
         assert client.get_position_calls == 0, (
             "spot must never call the linear-only get_position()")
+        assert client.get_coin_balance_calls == 0, (
+            "flat is proven from THIS RUN's own observed quantities, "
+            "never a whole-account balance read")
 
     def test_spot_not_flat_when_an_order_still_rests(self):
         """A resting order means the close never actually filled at the
@@ -1530,28 +1643,45 @@ class TestVerifyRemoteFlat:
         returned ok locally."""
         client = _StubClient(is_linear=False,
                              open_orders=[{"orderId": "1"}])
-        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        result = tcr.verify_remote_flat(
+            client=client, symbol=SYMBOL, run_entry_qty=0.01, run_exit_qty=0.01)
         assert result["ok"] is False
         assert result["category"] == "spot"
         assert result["open_order_count"] == 1
-        assert client.get_coin_balance_calls == 0, (
-            "no point reading balance once a resting order alone disproves flat")
 
-    def test_spot_not_flat_when_balance_exceeds_min_qty(self):
-        client = _StubClient(is_linear=False, open_orders=[],
-                             coin_balance=0.05, min_qty=0.0001)
-        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+    def test_spot_not_flat_when_run_delta_exceeds_tolerance(self):
+        """The exact case Finding #1 exists to catch: a residual order
+        left resting at the venue after flatten means the exit never
+        actually covered the entry quantity."""
+        client = _StubClient(is_linear=False, open_orders=[], min_qty=0.0001)
+        result = tcr.verify_remote_flat(
+            client=client, symbol=SYMBOL,
+            run_entry_qty=0.01, run_exit_qty=0.0)
         assert result["ok"] is False
         assert result["category"] == "spot"
-        assert result["remote_balance"] == 0.05
+        assert result["run_delta"] == pytest.approx(0.01)
 
-    def test_spot_dust_below_min_qty_still_counts_as_flat(self):
+    def test_spot_dust_level_run_delta_still_counts_as_flat(self):
         """A residual below the instrument's own minimum tradeable
         quantity is unsellable dust, not a real holding."""
-        client = _StubClient(is_linear=False, open_orders=[],
-                             coin_balance=0.000001, min_qty=0.0001)
-        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+        client = _StubClient(is_linear=False, open_orders=[], min_qty=0.0001)
+        result = tcr.verify_remote_flat(
+            client=client, symbol=SYMBOL,
+            run_entry_qty=0.01, run_exit_qty=0.01 - 0.000001)
         assert result["ok"] is True
+
+    def test_spot_never_requires_the_whole_account_balance_to_be_zero(self):
+        """Mission: 'Do not require entire account BTC balance == 0
+        unless the conformance run explicitly starts from an account
+        whose baseline BTC balance is zero.' A nonzero pre-existing
+        balance the run never touched must not affect the verdict --
+        this function does not even read the balance any more."""
+        client = _StubClient(is_linear=False, open_orders=[],
+                             coin_balance=5.0, min_qty=0.0001)
+        result = tcr.verify_remote_flat(
+            client=client, symbol=SYMBOL, run_entry_qty=0.01, run_exit_qty=0.01)
+        assert result["ok"] is True
+        assert client.get_coin_balance_calls == 0
 
     def test_spot_open_orders_error_fails_closed(self):
         client = _StubClient(is_linear=False,
@@ -1561,10 +1691,16 @@ class TestVerifyRemoteFlat:
         assert result["category"] == "spot"
         assert "error" in result
 
-    def test_spot_balance_read_error_fails_closed(self):
-        client = _StubClient(is_linear=False, open_orders=[],
-                             coin_balance_error=RuntimeError("venue down"))
-        result = tcr.verify_remote_flat(client=client, symbol=SYMBOL)
+    def test_spot_filters_read_error_fails_closed(self):
+        """`get_instrument_filters` supplies the tolerance -- a failure to
+        read it must fail closed, not fall back to an arbitrary number."""
+        class _FiltersExplode(_StubClient):
+            def get_instrument_filters(self, symbol):
+                raise RuntimeError("venue down")
+
+        client = _FiltersExplode(is_linear=False, open_orders=[])
+        result = tcr.verify_remote_flat(
+            client=client, symbol=SYMBOL, run_entry_qty=0.01, run_exit_qty=0.01)
         assert result["ok"] is False
         assert result["category"] == "spot"
         assert "error" in result
@@ -1616,8 +1752,8 @@ class TestRunConformanceRemoteFlatEndToEnd:
             s for s in result["stages"] if s["stage"] == "flatten")
         assert flatten_stage["ok"] is True
 
-    def test_spot_remote_flat_stage_uses_open_orders_and_balance(self):
-        row = {"symbol": SYMBOL,
+    def test_spot_remote_flat_stage_uses_open_orders_and_run_scoped_qty(self):
+        row = {"symbol": SYMBOL, "qty": 0.01,
               "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
         store = _StubStore(positions=[row])
         client = _StubClient(
@@ -1787,3 +1923,131 @@ class TestRunConformanceEndToEndFailClosedMatrix:
         completeness_stage = next(
             s for s in result["stages"] if s["stage"] == "ws_evidence_completeness")
         assert completeness_stage["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# Mission Finding #1/#3, end to end through run_conformance(): partial exit
+# quantity, and real exit WS evidence against a REAL WSPrivateConsumer
+# (never a pre-populated evidence file).
+# ---------------------------------------------------------------------------
+
+
+class TestPartialExitAndResidualOrderEndToEnd:
+    @pytest.fixture(autouse=True)
+    def _ws_observation_always_succeeds(self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+
+    def test_linear_partial_exit_leaves_a_residual_position_and_fails(self):
+        """A partial exit (venue still reports a nonzero size) must fail
+        remote_flat_verification -- the exact class of failure this
+        mission's real run exposed."""
+        store = _StubStore(positions=[{"symbol": SYMBOL, "meta": "{}"}])
+        client = _StubClient(is_linear=True, remote_stop=100.0, remote_size=0.004)
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=_StubEngine(), client=client,
+            store=store, symbol=SYMBOL)
+        assert result["ok"] is False
+        flat_stage = next(
+            s for s in result["stages"] if s["stage"] == "remote_flat_verification")
+        assert flat_stage["ok"] is False
+        assert flat_stage["remote_size"] == pytest.approx(0.004)
+
+    def test_spot_partial_exit_qty_mismatch_fails_remote_flat(self):
+        """Same failure class on spot: executed_exit_qty short of
+        run_entry_qty must fail, via the run-scoped delta, not a balance
+        assertion."""
+        row = {"symbol": SYMBOL, "qty": 0.02,
+              "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
+        store = _StubStore(positions=[row])
+        engine = _StubEngine()
+        # Exit only fills half.
+        original_close = engine.close_position
+        engine.close_position = lambda *, symbol, reason: _StubReport(
+            ok=True, reason="CLOSED", detail={
+                "exit_order_link_id": "BB-exit-1", "exit_order_id": "EX-1",
+                "exit_side": "Sell", "requested_exit_qty": 0.02,
+                "executed_exit_qty": 0.01,  # only half
+                "exit_avg_price": 100.0, "exit_status": "PartiallyFilled"})
+        client = _StubClient(
+            is_linear=False, verify_stop_result=(True, "orderStatus=New"),
+            open_orders=[], min_qty=0.0001)
+
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=engine, client=client,
+            store=store, symbol=SYMBOL)
+
+        assert result["ok"] is False
+        flat_stage = next(
+            s for s in result["stages"] if s["stage"] == "remote_flat_verification")
+        assert flat_stage["ok"] is False
+        assert flat_stage["run_delta"] == pytest.approx(0.01)
+
+
+class TestRealExitWsEvidenceClosesTheRace:
+    """The critical proof for the EXIT, mirroring the entry-side one
+    proven in an earlier round: a REAL WSPrivateConsumer, never a
+    pre-populated evidence file. Models: flatten -> exit WS event arrives
+    on a background thread -> queue -> exit_ws_observation drains it onto
+    the writer thread -> durable evidence -> success."""
+
+    def test_exit_ws_event_after_flatten_is_queued_then_drained_and_observed(
+            self, tmp_path):
+        import threading
+        import time as time_mod
+
+        ws_evidence_path = str(tmp_path / "ws_evidence.jsonl")
+        entry_link_id = "BB-entry-real-1"
+        exit_link_id = "BB-exit-real-1"
+        consumer = pwc.WSPrivateConsumer(
+            client=_WSEvidenceClient(), transport_factory=lambda: None,
+            evidence_path=ws_evidence_path, assurance_mode=True)
+        consumer.auth_ok = True
+        consumer.subscribe_ok = True
+
+        # Entry evidence exists up front (this test is about the EXIT
+        # race specifically).
+        entry_msg = json.dumps({"topic": "order", "data": [{
+            "symbol": SYMBOL, "orderId": "V-ENTRY-1", "orderLinkId": entry_link_id,
+            "orderStatus": "Filled", "updatedTime": "1"}]})
+        consumer.handle_raw_message(entry_msg)
+        consumer.drain_and_apply(_StubStore())
+
+        exit_msg = json.dumps({"topic": "order", "data": [{
+            "symbol": SYMBOL, "orderId": "V-EXIT-1", "orderLinkId": exit_link_id,
+            "orderStatus": "Filled", "updatedTime": "2"}]})
+
+        def _deliver_exit_event_late():
+            time_mod.sleep(0.3)
+            consumer.handle_raw_message(exit_msg)
+
+        threading.Thread(target=_deliver_exit_event_late).start()
+
+        row = {"symbol": SYMBOL, "qty": 0.01, "order_link_id": entry_link_id,
+              "meta": "{}"}
+        store = _StubStore(positions=[row])
+        engine = _StubEngine()
+        engine.close_position = lambda *, symbol, reason: _StubReport(
+            ok=True, reason="CLOSED", detail={
+                "exit_order_link_id": exit_link_id, "exit_order_id": "V-EXIT-1",
+                "exit_side": "Sell", "requested_exit_qty": 0.01,
+                "executed_exit_qty": 0.01, "exit_avg_price": 100.0,
+                "exit_status": "Filled"})
+        client = _StubClient(is_linear=True, remote_stop=100.0, remote_size=0.0)
+        bot = _StubBot(ws_consumer=consumer)
+
+        result = tcr.run_conformance(
+            bot=bot, engine=engine, client=client, store=store,
+            symbol=SYMBOL, ws_observation_timeout=3.0)
+
+        exit_stage = next(
+            s for s in result["stages"] if s["stage"] == "exit_ws_observation")
+        assert exit_stage["ok"] is True, (
+            "the bounded exit observation wait must drain the queued exit "
+            "WS event onto the writer thread and then see the durable "
+            "record it produces")
+        records = tcr._read_evidence_records(ws_evidence_path)
+        assert any(
+            r.get("order_link_id") == exit_link_id
+            and r.get("transport") == "ws"
+            and r.get("request", {}).get("topic") == "order"
+            for r in records)

@@ -66,11 +66,18 @@ both given)
                              thread necessarily gets there, so "the
                              consumer object exists" is never treated as
                              "ready".
-  3. TradingBot.tick()     — one cycle: a bounded one-shot strategy signals
+  3. Spot baseline (SPOT only) — `capture_spot_baseline()`: the
+                             base-asset balance and open-order count
+                             BEFORE entry, persisted into the result.
+                             Mission Finding #1: a testnet account is not
+                             guaranteed to start from zero BTC, so proving
+                             "flat" later must be run-scoped, never an
+                             assertion about the account's total balance.
+  4. TradingBot.tick()     — one cycle: a bounded one-shot strategy signals
                              BUY once, `engine.execute()` submits the order,
                              observes the fill, places and verifies the
                              protective stop — all synchronous, all real.
-  4. WS observation        — bounded wait (`--ws-observation-timeout`,
+  5. WS observation        — bounded wait (`--ws-observation-timeout`,
                              `await_ws_observation`) for the WS observer
                              to actually capture an order or execution
                              evidence record for THIS order's
@@ -86,25 +93,41 @@ both given)
                              run never takes. ASSURANCE mode (this tool
                              always uses it): missing WS observation is a
                              failed run, not a soft warning.
-  5. Protection read-back  — `verify_protection()`, category-dispatched:
+  6. Protection read-back  — `verify_protection()`, category-dispatched:
                              LINEAR reads `client.get_position()` FRESH
                              (not the local ledger) for `stopLoss > 0`;
                              SPOT (get_position is linear-only) reads the
                              separate protective stop ORDER back via the
                              existing `client.verify_stop()`.
-  6. Flatten               — `engine.close_position()`, the same method
-                             production uses to exit.
-  7. Remote flat verification — `verify_remote_flat()`: a FRESH venue
-                             read proving the account is flat, never
+  7. Flatten               — `engine.close_position()`, the same method
+                             production uses to exit. Its report now also
+                             carries the EXIT's own identity (mission
+                             Finding #3): `exit_order_link_id`,
+                             `exit_order_id`, `exit_side`,
+                             `requested_exit_qty`, `executed_exit_qty`
+                             (the venue-CONFIRMED fill quantity, never the
+                             `/v5/order/create` acknowledgement alone —
+                             Bybit documents order creation as
+                             asynchronous), `exit_avg_price`,
+                             `exit_status`.
+  8. Exit WS observation   — the SAME bounded `await_ws_observation()`
+                             mechanism as step 5, run again for the
+                             EXIT's own `order_link_id` — entry-only
+                             evidence is not a full lifecycle proof.
+  9. Remote flat verification — `verify_remote_flat()`: a FRESH venue
+                             read proving THIS RUN left no residue, never
                              inferred from `close_position()` returning
                              `ok` or from local `StateStore` having
                              removed the position. LINEAR re-reads
-                             `get_position()` for `size <= 0`; SPOT checks
-                             no open orders remain and the base-asset
-                             balance is below the instrument's own
-                             minimum tradeable quantity.
-  8. Final reconciliation  — `client.reconcile_on_startup()`.
-  9. Final WS flush        — `finalize_ws_lifecycle()`: stop the WS
+                             `get_position()` for `size <= 0`. SPOT checks
+                             no open orders remain AND this run's own
+                             observed entry quantity minus its own
+                             observed exit quantity nets to ~0, within the
+                             instrument's own minimum tradeable quantity —
+                             never an assertion that the WHOLE account
+                             balance is zero (see step 3).
+  10. Final reconciliation — `client.reconcile_on_startup()`.
+  11. Final WS flush       — `finalize_ws_lifecycle()`: stop the WS
                              thread, JOIN it, then one last
                              `drain_and_apply()` of anything it received
                              but that no poll of the bounded observation
@@ -112,16 +135,17 @@ both given)
                              closes or evidence is verified, so a real,
                              already-received observation can never
                              disappear at shutdown.
-  10. Evidence verification — BOTH evidence chains (REST's, via
+  12. Evidence verification — BOTH evidence chains (REST's, via
                              EvidenceCapturingTransport; WS's, via
                              WSPrivateConsumer's assurance-mode capture)
                              are hash-chain-verified, AND their actual
                              content is checked (`verify_evidence_
-                             completeness`) — a clean chain around missing
-                             evidence is not proof. A tamper, gap,
-                             missing record, or capture failure fails the
-                             run — see "ASSURANCE MODE" below.
-  11. Shutdown + result    — `bot.shutdown()`; a machine-readable summary
+                             completeness`) for BOTH the entry and the
+                             exit — a clean chain around missing evidence
+                             is not proof. A tamper, gap, missing record,
+                             or capture failure fails the run — see
+                             "ASSURANCE MODE" below.
+  13. Shutdown + result    — `bot.shutdown()`; a machine-readable summary
                              (stage-by-stage outcome, latencies, both
                              evidence paths, both chain-verification
                              results) is written to `--out`.
@@ -405,20 +429,49 @@ def verify_protection(*, client: Any, store: Any, symbol: str,
             "stop_order_link_id": stop_link_id, "detail": detail}
 
 
-def verify_remote_flat(*, client: Any, symbol: str) -> Dict[str, Any]:
-    """Fresh, venue-derived proof that the account is FLAT after flatten.
+def capture_spot_baseline(*, client: Any, symbol: str) -> Dict[str, Any]:
+    """SPOT ONLY — the run-scoped baseline this mission's Finding #1
+    requires, captured BEFORE entry.
 
-    "The conformance runner must not merely call final reconciliation and
-    assume that means the account is flat" — `reconcile_on_startup()`,
-    the way `run_conformance` calls it (no `symbols=` argument), never
-    re-reads this symbol's remote state at all; it only chases locally
-    *unresolved* orders and re-checks the LOCAL ledger's naked-position
-    flag. Neither proves anything about the venue. This function is the
-    explicit, separate remote read that closes that gap. Never relies on:
-    local `StateStore` having removed the position, `close_position()`
-    returning `ok`, a REST acknowledgement alone, or a locally generated
-    trade record — every value here comes from a fresh venue query made
-    right now.
+    A testnet account is not guaranteed to start from zero BTC (a faucet
+    credit, a previous unrelated run, manual testing). Requiring the
+    ENTIRE account balance to be ~zero after flatten is therefore not a
+    valid generic definition of "this run left the account flat" — it
+    conflates pre-existing inventory this run never touched with
+    inventory this run itself created. Recording the starting point here
+    is what lets `verify_remote_flat()` later prove a RUN-SCOPED delta
+    (this run's own entry qty against this run's own exit qty) instead of
+    an absolute balance assertion. Persisted into the run's own result —
+    no new evidence format, just an additional field in the same
+    machine-readable output this tool already writes.
+
+    Never raises; a failed read comes back as `ok: False` with `error`
+    (never a fabricated zero baseline).
+    """
+    try:
+        base_asset = client._base_asset(symbol)
+        starting_balance = client.get_coin_balance(base_asset)
+        starting_open_orders = client.get_open_orders(symbol)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "base_asset": base_asset,
+        "symbol": symbol,
+        "starting_balance": starting_balance,
+        "starting_open_order_count": len(starting_open_orders),
+        "captured_at_utc": dt.datetime.now(dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def verify_remote_flat(*, client: Any, symbol: str,
+                       run_entry_qty: float = 0.0,
+                       run_exit_qty: float = 0.0) -> Dict[str, Any]:
+    """Fresh, venue-derived proof that THIS RUN left no residue — never
+    inferred from local `StateStore` having removed the position,
+    `close_position()` returning `ok`, a REST acknowledgement alone, or a
+    locally generated trade record.
 
     Dispatches on `client.is_linear`, the same flag used throughout this
     file and `BybitClient`/`TradingEngine` themselves:
@@ -428,14 +481,21 @@ def verify_remote_flat(*, client: Any, symbol: str) -> Dict[str, Any]:
     row at all, which `get_position` already represents as `None`).
 
     SPOT — there is no position endpoint (`get_position` is linear-only
-    and raises there — see `BybitClient.get_position`'s own docstring);
-    "flat" on spot means no resting order remains for this symbol AND the
-    base-asset coin balance is below the instrument's own minimum
-    tradeable quantity (an unsellable/dust residual, not a real holding).
-    Reuses the EXISTING `get_open_orders()`, `get_coin_balance()`,
-    `_base_asset()` and `get_instrument_filters()` — every one of them
-    already used elsewhere in `BybitClient` for exactly this purpose
-    (e.g. spot balance sizing) — never a new spot-flatness mechanism.
+    and raises there — see `BybitClient.get_position`'s own docstring).
+    Mission Finding #1: requiring the WHOLE account's base-asset balance
+    to be ~zero is wrong for an account that already holds the asset —
+    that conflates pre-existing inventory with this run's own. Flat here
+    instead means: (a) no resting order remains for this symbol
+    (`get_open_orders`, reused as before), and (b) THIS RUN'S OWN
+    observed entry quantity and exit quantity net to ~0 — `run_entry_qty`
+    (the real executed fill quantity `TradingEngine.execute()` recorded)
+    minus `run_exit_qty` (the real executed fill quantity
+    `TradingEngine.close_position()`'s exit evidence now carries — see
+    `ExecutionReport.detail["executed_exit_qty"]`), within a tolerance of
+    the instrument's own minimum tradeable quantity (its own dust
+    granularity, not an arbitrarily chosen number). This is a run-scoped
+    accounting check, never an assertion about the account's total
+    balance, and never a trigger to sell pre-existing holdings.
 
     Never raises; any failure comes back as `ok: False` with `error`.
     """
@@ -459,14 +519,17 @@ def verify_remote_flat(*, client: Any, symbol: str) -> Dict[str, Any]:
                 "error": "orders still resting for this symbol"}
 
     try:
-        base_asset = client._base_asset(symbol)
         filters = client.get_instrument_filters(symbol)
-        remote_balance = client.get_coin_balance(base_asset)
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "category": category, "error": str(exc)}
-    return {"ok": remote_balance < float(filters.min_qty), "category": category,
-            "base_asset": base_asset, "remote_balance": remote_balance,
-            "min_qty": float(filters.min_qty), "open_order_count": 0}
+    tolerance = float(filters.min_qty)
+    run_delta = float(run_entry_qty) - float(run_exit_qty)
+    return {
+        "ok": abs(run_delta) <= tolerance, "category": category,
+        "open_order_count": 0, "run_entry_qty": float(run_entry_qty),
+        "run_exit_qty": float(run_exit_qty), "run_delta": run_delta,
+        "tolerance": tolerance,
+    }
 
 
 def _is_valid_ws_observation(record: Dict[str, Any], *, order_link_id: str,
@@ -743,6 +806,19 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     if not ws_ready_result["ready"]:
         return _finalize(stages, timestamps, ok=False)
 
+    # Mission Finding #1: the run-scoped baseline, captured BEFORE entry
+    # so a pre-existing BTC balance on this testnet account is never
+    # conflated with what THIS run itself creates/consumes. Spot only —
+    # linear's flatness proof (a position size, not a coin balance) needs
+    # no baseline. A failed capture fails the run closed: without a
+    # baseline, the later run-scoped delta cannot be proven either.
+    is_linear = bool(getattr(client, "is_linear", False))
+    if not is_linear:
+        spot_baseline = capture_spot_baseline(client=client, symbol=symbol)
+        _stage("spot_baseline_capture", spot_baseline.pop("ok"), **spot_baseline)
+        if not stages[-1]["ok"]:
+            return _finalize(stages, timestamps, ok=False)
+
     bot.tick()
     positions = {p["symbol"]: p for p in store.open_positions()}
     row = positions.get(symbol)
@@ -750,6 +826,7 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
           position=dict(row) if row else None)
     if row is None:
         return _finalize(stages, timestamps, ok=False)
+    run_entry_qty = float(row.get("qty") or 0.0)
 
     order_link_id = str(row.get("order_link_id") or "")
     ws_observed = await_ws_observation(
@@ -777,14 +854,42 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
         return _finalize(stages, timestamps, ok=False)
 
     close_report = engine.close_position(symbol=symbol, reason="conformance_flatten")
-    _stage("flatten", bool(close_report.ok), reason=close_report.reason)
+    exit_order_link_id = str(close_report.detail.get("exit_order_link_id") or "")
+    run_exit_qty = float(close_report.detail.get("executed_exit_qty") or 0.0)
+    _stage("flatten", bool(close_report.ok), reason=close_report.reason,
+          exit_order_link_id=exit_order_link_id,
+          exit_order_id=str(close_report.detail.get("exit_order_id") or ""),
+          exit_side=str(close_report.detail.get("exit_side") or ""),
+          requested_exit_qty=float(close_report.detail.get("requested_exit_qty")
+                                   or 0.0),
+          executed_exit_qty=run_exit_qty,
+          exit_avg_price=float(close_report.detail.get("exit_avg_price") or 0.0),
+          exit_status=str(close_report.detail.get("exit_status") or ""))
 
-    # Fresh, venue-derived proof of flat — never inferred from
-    # close_position() returning ok or from local StateStore having
-    # removed the position. Runs unconditionally (no early return),
-    # exactly like "flatten" above: a failed flatten should still show
-    # up here as "not flat", not be hidden by stopping early.
-    remote_flat = verify_remote_flat(client=client, symbol=symbol)
+    # Mission Finding #3: entry-only evidence is not enough — the EXIT
+    # must be independently proven by the same private-WS path, not
+    # inferred from the flatten stage's own local success. Reuses the
+    # EXISTING await_ws_observation()/_is_valid_ws_observation() machinery
+    # verbatim (same real-identity, non-duplicate, this-run-only checks
+    # FIX 3/4 already enforce for entry) — never a parallel evidence path.
+    # Runs unconditionally (no early return), matching "flatten" above.
+    exit_ws_observed = await_ws_observation(
+        bot=bot, order_link_id=exit_order_link_id,
+        timeout_seconds=ws_observation_timeout,
+        run_start_utc=run_start_utc, store=store)
+    _stage("exit_ws_observation", exit_ws_observed,
+          exit_order_link_id=exit_order_link_id,
+          timeout_seconds=ws_observation_timeout)
+
+    # Fresh, venue-derived proof that THIS RUN left no residue — never
+    # inferred from close_position() returning ok or from local
+    # StateStore having removed the position. Runs unconditionally (no
+    # early return), exactly like "flatten" above: a failed flatten
+    # should still show up here as "not flat", not be hidden by stopping
+    # early.
+    remote_flat = verify_remote_flat(
+        client=client, symbol=symbol,
+        run_entry_qty=run_entry_qty, run_exit_qty=run_exit_qty)
     _stage("remote_flat_verification", remote_flat.pop("ok"), **remote_flat)
 
     try:
@@ -883,7 +988,8 @@ def verify_evidence_chains(*, rest_evidence_path: str,
 def verify_evidence_completeness(*, rest_evidence_path: str,
                                  ws_evidence_path: str,
                                  order_link_id: str = "",
-                                 evidence_capture_failed: bool = False
+                                 evidence_capture_failed: bool = False,
+                                 exit_order_link_id: str = ""
                                  ) -> Dict[str, Any]:
     """FIX 2 — ASSURANCE MUST REQUIRE ACTUAL EVIDENCE.
 
@@ -895,6 +1001,14 @@ def verify_evidence_completeness(*, rest_evidence_path: str,
     exists; likewise for `execution`; both chains verify; and no evidence
     capture failure was recorded. Missing any of these fails this check —
     never raises.
+
+    Mission Finding #3: entry-only evidence is entry-centric, not a full
+    lifecycle proof. When `exit_order_link_id` is given (non-empty — every
+    existing caller that omits it keeps the original entry-only
+    contract), this ALSO requires real order and execution WS evidence
+    for the EXIT, by the exit's own order_link_id — the same
+    `_is_valid_ws_observation` real-identity/non-duplicate/this-run checks,
+    never a separate exit-evidence format.
     """
     chains = verify_evidence_chains(
         rest_evidence_path=rest_evidence_path,
@@ -902,24 +1016,34 @@ def verify_evidence_completeness(*, rest_evidence_path: str,
     rest_records = _read_evidence_records(rest_evidence_path)
     ws_records = _read_evidence_records(ws_evidence_path)
 
-    def _has_real_ws_evidence(topic: str) -> bool:
+    def _has_real_ws_evidence(link_id: str, topic: str) -> bool:
         return any(
             _is_valid_ws_observation(
-                record, order_link_id=order_link_id, run_start_utc=None)
+                record, order_link_id=link_id, run_start_utc=None)
             and record.get("request", {}).get("topic") == topic
             for record in ws_records)
 
     checks = {
         "rest_evidence_exists": len(rest_records) > 0,
         "ws_evidence_exists": len(ws_records) > 0,
-        "order_evidence_exists": _has_real_ws_evidence("order"),
-        "execution_evidence_exists": _has_real_ws_evidence("execution"),
+        "order_evidence_exists": _has_real_ws_evidence(order_link_id, "order"),
+        "execution_evidence_exists": _has_real_ws_evidence(
+            order_link_id, "execution"),
         "evidence_capture_failed": bool(evidence_capture_failed),
     }
+    exit_ok = True
+    if exit_order_link_id:
+        checks["exit_order_evidence_exists"] = _has_real_ws_evidence(
+            exit_order_link_id, "order")
+        checks["exit_execution_evidence_exists"] = _has_real_ws_evidence(
+            exit_order_link_id, "execution")
+        exit_ok = bool(checks["exit_order_evidence_exists"]
+                       and checks["exit_execution_evidence_exists"])
     ok = bool(
         checks["rest_evidence_exists"] and checks["ws_evidence_exists"]
         and checks["order_evidence_exists"]
         and checks["execution_evidence_exists"]
+        and exit_ok
         and chains["rest_evidence_verified"] and chains["ws_evidence_verified"]
         and not checks["evidence_capture_failed"])
     result = dict(chains)
@@ -1035,20 +1159,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("bot.shutdown() raised during cleanup", file=sys.stderr)
 
     order_link_id = ""
+    exit_order_link_id = ""
     for stage in result["stages"]:
         if stage["stage"] == "ws_observation":
             order_link_id = str(stage.get("order_link_id") or "")
-            break
+        elif stage["stage"] == "flatten":
+            exit_order_link_id = str(stage.get("exit_order_link_id") or "")
 
-    # FIX 2: explicit ASSURANCE acceptance — a clean hash chain alone is
-    # not proof; this requires the actual evidence content a real
-    # conformance run must have produced. Missing evidence = failed
-    # conformance, distinct from (and in addition to) trading correctness.
+    # FIX 2 + mission Finding #3: explicit ASSURANCE acceptance — a clean
+    # hash chain alone is not proof; this requires the actual evidence
+    # content a real conformance run must have produced, for BOTH the
+    # entry and the exit. Missing evidence = failed conformance, distinct
+    # from (and in addition to) trading correctness.
     completeness = verify_evidence_completeness(
         rest_evidence_path=args.evidence_path,
         ws_evidence_path=args.ws_evidence_path,
         order_link_id=order_link_id,
-        evidence_capture_failed=evidence_capture_failed)
+        evidence_capture_failed=evidence_capture_failed,
+        exit_order_link_id=exit_order_link_id)
     ws_thread_stopped = bool(finalize_result.get("ws_thread_stopped", False))
     if not ws_thread_stopped:
         print("\nWS thread did not stop within the shutdown boundary; "

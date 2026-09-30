@@ -256,6 +256,47 @@ class TestIdempotency:
 
 
 # ---------------------------------------------------------------------------
+# category-correct reduceOnly — reduceOnly is a POSITION concept
+# (linear/inverse/option); spot has no position at all.
+# ---------------------------------------------------------------------------
+
+
+class TestReduceOnlyIsCategoryCorrect:
+    def test_spot_close_order_does_not_contain_reduce_only(self, client, exchange):
+        """`client` fixture defaults to CATEGORY=spot. A close there is an
+        ordinary Sell -- reduceOnly is never a valid field for a category
+        with no position to attach it to."""
+        client.place_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001,
+            order_type="Market", purpose="close", reduce_only=True,
+        )
+        body = json.loads(exchange.requests[-1]["body"])
+        assert "reduceOnly" not in body
+        assert body["category"] == "spot"
+
+    def test_linear_close_order_contains_reduce_only(self, exchange, store):
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+
+        linear_client = bc.BybitClient(
+            config=LinearCfg(), store=store, transport=exchange)
+        linear_client.place_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001,
+            order_type="Market", purpose="close", reduce_only=True,
+        )
+        body = json.loads(exchange.requests[-1]["body"])
+        assert body["reduceOnly"] is True
+        assert body["category"] == "linear"
+
+    def test_spot_non_reduce_only_order_also_never_contains_the_field(
+            self, client, exchange):
+        client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001,
+                           order_type="Market")
+        body = json.loads(exchange.requests[-1]["body"])
+        assert "reduceOnly" not in body
+
+
+# ---------------------------------------------------------------------------
 # spot-correct protective stops  (audit C11)
 # ---------------------------------------------------------------------------
 
