@@ -125,6 +125,10 @@ def _bot_with_carry(broker, *, warm_bps=3.0):
     from carry_engine import CarryEngine
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]
+    # 1fadf8c wired a private-WS drain into tick() gated on this attribute;
+    # a __new__-built stub never runs __init__'s default, so tick() raised
+    # AttributeError before reaching anything this test means to exercise.
+    bot.ws_consumer = None
     bot.carry = CarryEngine(broker=broker, max_notional_usd=100_000.0,
                             borrow_apr=0.05, execution_mode="acquire",
                             persist=lambda s: None)

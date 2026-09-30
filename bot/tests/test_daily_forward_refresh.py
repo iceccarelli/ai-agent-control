@@ -164,6 +164,7 @@ class TestTheFullCorpusHealthIsSurfaced:
     spot_1d's entries filtered out; only THAT list gates the BLOCKER text.
     """
 
+    @pytest.mark.data_freshness
     def test_the_real_full_corpus_is_unhealthy_today(self):
         """Ground truth, not a fixture: spot_1d is still stale on disk after
         the perp/funding catch-up. If this ever goes green on its own,
@@ -174,6 +175,7 @@ class TestTheFullCorpusHealthIsSurfaced:
         assert any("spot_1d" in p and "STALE" in p for p in report["problems"]), \
             report["problems"]
 
+    @pytest.mark.data_freshness
     def test_the_real_stage_b_relevant_problems_are_empty_the_day_after_catchup(self):
         """Ground truth pinned to the corpus's OWN last bar, not the wall
         clock: `corpus_health` marks a series stale the instant a calendar
@@ -263,6 +265,7 @@ class TestOtherCorporaHealthIsSurfacedReadOnly(TestTheFullCorpusHealthIsSurfaced
     real_funding_full's growth this shift. Surfaced the same way spot is:
     a NOTE, never a BLOCKER, never a fetch or a promote triggered from here."""
 
+    @pytest.mark.data_freshness
     def test_the_real_corpora_are_behind_today(self):
         """Ground truth: both fell behind the 2026-09-19 funding catch-up
         and neither has its own fetcher re-run yet."""

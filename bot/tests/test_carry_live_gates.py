@@ -122,6 +122,10 @@ def bot_with(broker, *, store=None, warm=3.0, risk=True):
     store = store or Store()
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]
+    # 1fadf8c wired a private-WS drain into tick() gated on this attribute;
+    # a __new__-built stub never runs __init__'s default, so tick() raised
+    # AttributeError before reaching anything this test means to exercise.
+    bot.ws_consumer = None
     bot.store = store
     bot.strategy = None
     bot._stop = mock.Mock(is_set=lambda: False)

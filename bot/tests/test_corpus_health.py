@@ -56,7 +56,12 @@ class TestStalenessIsReported:
             if series.get("present"):
                 assert series["stale_days"] >= 0
 
+    @pytest.mark.data_freshness
     def test_a_series_past_the_limit_is_named(self):
+        """max_stale_days=0 means ANY staleness against the real, live corpus
+        trips this — which is the point: it is a claim about corpus freshness
+        as of right now, not about the code, and goes red on schedule if the
+        daily accrual stops running. See bot/pytest.ini."""
         strict = ch.check(REPO, max_stale_days=0)
         assert strict["series_too_stale"]
 
