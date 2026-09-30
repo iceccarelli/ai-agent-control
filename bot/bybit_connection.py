@@ -756,7 +756,19 @@ class BybitClient:
                         return float(raw)
         return 0.0
 
-    def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_open_orders(
+        self, symbol: Optional[str] = None, *, order_filter: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Open orders for `symbol` (or the whole category if omitted).
+
+        `order_filter` is optional and defaults to omitted, which is exactly
+        the previous behaviour of this method (every existing caller keeps
+        its original contract). Passing one of `_SPOT_CANCEL_ALL_ORDER_
+        FILTERS` ("Order", "StopOrder", "tpslOrder") narrows the read the
+        same way it narrows `cancel_all` — see that constant's docstring for
+        why a single unfiltered spot read does not already cover all three.
+        This is a read (`GET /v5/order/realtime`), never a mutation.
+        """
         params: Dict[str, Any] = {"category": self.category}
         if symbol:
             params["symbol"] = symbol
@@ -764,6 +776,8 @@ class BybitClient:
             # settleCoin is a linear/inverse filter used to ask for "everything
             # settled in USDT". Spot has no settle currency and rejects it.
             params["settleCoin"] = "USDT"
+        if order_filter:
+            params["orderFilter"] = order_filter
         payload = self._request(
             "GET", "/v5/order/realtime", params=params, signed=True
         )

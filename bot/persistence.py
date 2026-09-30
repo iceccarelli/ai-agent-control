@@ -1145,6 +1145,22 @@ class StateStore:
             )
         ]
 
+    def orders_for_symbol(self, symbol: str) -> List[Dict[str, Any]]:
+        """Every order record this store holds for ``symbol``, any status.
+
+        Read-only, additive (no existing table or method changed): exists so
+        an assurance/reconciliation reader can see the full local order
+        history for a symbol, not just the currently-pending subset
+        `pending_orders()`/`unresolved_orders()` expose.
+        """
+        return [
+            dict(r)
+            for r in self._query(
+                "SELECT * FROM orders WHERE symbol = ? ORDER BY created_epoch",
+                (symbol,),
+            )
+        ]
+
     def prune_decisions(self, *, older_than_days: int) -> int:
         """Delete journal rows older than the retention window. Returns count.
 
