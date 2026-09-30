@@ -941,6 +941,13 @@ class TradingEngine:
 
         direction = 1.0 if normalize_side(side) == "Buy" else -1.0
         gross = (realised_exit - entry_price) * qty * direction
+        # dedupe_key ties this trade to the exit order's own durable id, the
+        # same identity `find_live_spot_stop`/`orders(order_link_id)` already
+        # rely on -- a crash between this `record_trade` and the
+        # `remove_position` below leaves the position row in place, so a
+        # retried/replayed close (or `observe_exits` re-discovering the same
+        # already-closed venue position next cycle) must not book it twice.
+        # See `StateStore.record_trade`'s docstring for the mechanism.
         self.store.record_trade(TradeRecord(
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
             exit_price=realised_exit, gross_pnl=gross,
@@ -949,6 +956,7 @@ class TradingEngine:
             closed_epoch=utc_now_epoch(),
             order_link_id=result.order_link_id,
             meta={"reason": reason},
+            dedupe_key=f"exit:{result.order_link_id}" if result.order_link_id else "",
         ))
         self.store.remove_position(symbol)
         self.store.journal(symbol, "CLOSED", reason, {
@@ -1016,6 +1024,7 @@ class TradingEngine:
             since_ms = int(float(row.get("opened_epoch", 0) or 0) * 1000)
             price: Optional[float] = None
             reason = "VENUE_EXIT"
+            order_ids: List[str] = []
             try:
                 pnl_rows = self.client.get_closed_pnl(symbol, since_ms=since_ms)
                 qty_sum = sum(float(r.get("qty", 0) or 0) for r in pnl_rows)
@@ -1023,6 +1032,10 @@ class TradingEngine:
                     price = sum(float(r.get("avgExitPrice", 0) or 0)
                                 * float(r.get("qty", 0) or 0)
                                 for r in pnl_rows) / qty_sum
+                order_ids = sorted({
+                    str(r.get("orderId") or "") for r in pnl_rows
+                    if r.get("orderId")
+                })
             except BybitAPIError as exc:
                 logger.error("observe_exits: closed-pnl unreadable for %s: %s",
                              symbol, exc)
@@ -1037,8 +1050,26 @@ class TradingEngine:
                     continue
                 reason = "VENUE_EXIT_PRICE_UNREAD"
                 summary["price_approximated"] += 1
+            # Crash-boundary invariant: a process kill between
+            # `record_exit_fill`'s `record_trade` and its `remove_position`
+            # (or `upsert_position` for a partial) leaves this exact position
+            # row in place, so the next cycle's `observe_exits` recomputes
+            # the SAME `exited`/`price` from the SAME closed-pnl window and
+            # would otherwise book the same exit twice. Preferred key: the
+            # venue's own closed-pnl `orderId`s for this window -- a durable
+            # identity, exactly like an order's `orderLinkId`. When the
+            # closed-pnl read itself failed (the `VENUE_EXIT_PRICE_UNREAD`
+            # branch above), no such id exists; the fallback key is still
+            # stable across an identical replay (same symbol/since_ms/
+            # exited qty) though weaker in the general case -- see
+            # `StateStore.record_trade`'s docstring.
+            if order_ids:
+                dedupe_key = f"exit_pnl:{symbol}:{','.join(order_ids)}"
+            else:
+                dedupe_key = f"exit_unread:{symbol}:{since_ms}:{exited:.10f}"
             fully = self.record_exit_fill(symbol=symbol, qty=exited, price=price,
-                                          fee=0.0, reason=reason)
+                                          fee=0.0, reason=reason,
+                                          dedupe_key=dedupe_key)
             summary["closed" if fully else "reduced"] += 1
             logger.warning("observe_exits: %s exited %.8g @ %.8g (%s) fully=%s",
                            symbol, exited, price, reason, fully)
@@ -1053,6 +1084,7 @@ class TradingEngine:
         fee: float,
         reason: str,
         order_link_id: str = "",
+        dedupe_key: str = "",
     ) -> bool:
         """Account for a partial or full exit that an exchange-side order filled.
 
@@ -1064,6 +1096,13 @@ class TradingEngine:
         had closed.
 
         There is exactly one place that decrements a position, and this is it.
+
+        ``dedupe_key`` (typically derived from the venue's own closed-pnl
+        orderId(s), see ``observe_exits``) makes the ``record_trade`` below
+        a no-op on replay: a crash between that call and the
+        ``remove_position``/``upsert_position`` further down leaves this
+        exit re-discoverable next cycle, and it must be booked once, not
+        twice. See ``StateStore.record_trade``'s docstring.
 
         Returns True if the position is now fully closed.
         """
@@ -1089,6 +1128,24 @@ class TradingEngine:
             entry_price * closed_qty * float(getattr(self, "taker_fee_estimate", 0.001))
         )
 
+        # `record_trade` is idempotent on `dedupe_key` (see its docstring):
+        # a crash between it and the position mutations below leaves this
+        # exact exit re-discoverable next cycle, and it must be booked once,
+        # not twice, without double-counting `daily_anchor`. The position
+        # mutations that follow (`remove_position`/`upsert_position`,
+        # `_cancel_protective_orders`, `journal`) are safe to repeat on that
+        # replay regardless of whether the trade row was just inserted or
+        # was a no-op: they are idempotent (DELETE / INSERT-ON-CONFLICT-
+        # UPDATE to the SAME target values, a cancel of already-cancelled
+        # orders, an append-only journal entry), and on the one call path
+        # that reaches this method in production (`observe_exits`, linear
+        # only) so is `move_stop`'s underlying venue call — linear's stop is
+        # a field on the position (`/v5/position/trading-stop`), not a
+        # separate order, so replaying it re-sets the same value rather than
+        # minting a duplicate live order the way a SPOT conditional stop
+        # would (see `move_stop`'s docstring and `_protect_or_close_naked`'s
+        # spot-specific guard for that case, which is why the fix there
+        # needed `find_live_spot_stop` and this one does not).
         self.store.record_trade(TradeRecord(
             symbol=symbol, side=side, qty=closed_qty,
             entry_price=entry_price, exit_price=float(price),
@@ -1096,6 +1153,7 @@ class TradingEngine:
             opened_epoch=float(row.get("opened_epoch") or utc_now_epoch()),
             closed_epoch=utc_now_epoch(),
             order_link_id=order_link_id, meta={"reason": reason, "partial": True},
+            dedupe_key=dedupe_key,
         ))
 
         remaining = held - closed_qty

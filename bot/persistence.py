@@ -193,6 +193,13 @@ class TradeRecord:
     closed_epoch: float
     order_link_id: str = ""
     meta: Dict[str, Any] = field(default_factory=dict)
+    #: A durable, venue-derived identity for the exit this trade books --
+    #: e.g. ``f"exit:{exit_order_link_id}"`` for an engine-initiated close,
+    #: or a key derived from the closed-pnl orderId(s) for an
+    #: exchange-side stop/TP fill observed by `observe_exits`. Empty means
+    #: "no durable identity available" (accepted, not enforced) -- see
+    #: `StateStore.record_trade`.
+    dedupe_key: str = ""
 
     @property
     def total_fees(self) -> float:
@@ -270,7 +277,8 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_epoch   REAL NOT NULL,
     day            TEXT NOT NULL,
     order_link_id  TEXT NOT NULL DEFAULT '',
-    meta           TEXT NOT NULL DEFAULT '{}'
+    meta           TEXT NOT NULL DEFAULT '{}',
+    dedupe_key     TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_trades_day ON trades(day);
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_epoch);
@@ -564,6 +572,7 @@ class StateStore:
         },
         "regime_history": {"detail": "TEXT NOT NULL DEFAULT '{}'"},
         "memory_kv": {"updated_epoch": "REAL NOT NULL DEFAULT 0.0"},
+        "trades": {"dedupe_key": "TEXT NOT NULL DEFAULT ''"},
     }
 
     def _migrate_additive(self) -> None:
@@ -584,6 +593,24 @@ class StateStore:
                 # SQLite cannot add a NOT NULL column without a default; every
                 # declaration above therefore carries one.
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        # Partial unique index, created here (not in _DDL) because it targets
+        # `trades.dedupe_key`, a column that only exists on a fresh database
+        # via the CREATE TABLE above -- on an OLDER database it exists only
+        # after the ALTER TABLE loop just above has run. Partial (`WHERE
+        # dedupe_key <> ''`) so the many legacy/unkeyed trade rows (empty
+        # string, the column's default) never collide with each other; only
+        # rows that carry a real venue-derived identity are deduplicated.
+        # This is the same idempotent-write idiom `orders(order_link_id)`
+        # already uses for entry orders (`record_order`'s `ON CONFLICT
+        # DO NOTHING`), generalised to the exit/trade-booking side. See
+        # `StateStore.record_trade` and `TradingEngine.observe_exits`/
+        # `.close_position` for why a durable exit-side identity is needed:
+        # a process crash between booking a trade and removing the position
+        # row it closed must not re-book the same exit a second time.
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_dedupe_key "
+            "ON trades(dedupe_key) WHERE dedupe_key <> ''"
+        )
 
     def schema_version(self) -> int:
         """The schema version recorded in the database, not the constant."""
@@ -952,18 +979,47 @@ class StateStore:
     # -- trades ------------------------------------------------------------
 
     def record_trade(self, trade: TradeRecord) -> int:
+        """Book one closed trade. Idempotent when ``trade.dedupe_key`` is set.
+
+        CRASH-BOUNDARY INVARIANT: a trade whose ``dedupe_key`` matches one
+        already booked is a no-op -- the INSERT is skipped (via the partial
+        unique index on ``trades.dedupe_key``, the same
+        ``ON CONFLICT ... DO NOTHING`` idiom ``record_order`` already uses
+        for entry orders) and, just as importantly, ``daily_anchor`` is
+        NOT incremented a second time. Booking the row without also gating
+        the anchor update would still corrupt the daily-loss/drawdown gates
+        that read ``daily_anchor.realised_pnl`` even if the visible
+        ``trades`` table looked deduplicated.  Proven by
+        ``tests/test_process_restart_recovery.py::
+        TestExitCrashRecovery`` and ``tests/test_observe_exits.py::
+        test_replaying_the_same_venue_exit_does_not_double_book``.
+
+        Returns the new row's id, or ``0`` when the insert was skipped as a
+        duplicate (mirroring ``record_order``'s bool-via-rowcount pattern,
+        but as an int here since legitimate callers already treat a
+        positive id as "recorded").
+        """
         cur = self._exec(
             "INSERT INTO trades(symbol, side, qty, entry_price, exit_price, gross_pnl,"
             " entry_fee, exit_fee, net_pnl, opened_epoch, closed_epoch, day,"
-            " order_link_id, meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " order_link_id, meta, dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " ON CONFLICT(dedupe_key) WHERE dedupe_key <> '' DO NOTHING",
             (
                 trade.symbol, trade.side, float(trade.qty), float(trade.entry_price),
                 float(trade.exit_price), float(trade.gross_pnl), float(trade.entry_fee),
                 float(trade.exit_fee), trade.net_pnl, float(trade.opened_epoch),
                 float(trade.closed_epoch), utc_day(trade.closed_epoch),
                 trade.order_link_id, json.dumps(trade.meta, default=str),
+                str(trade.dedupe_key or ""),
             ),
         )
+        if cur.rowcount != 1:
+            self.journal(trade.symbol, "DUPLICATE_TRADE_BLOCKED",
+                        "a trade with an already-booked dedupe_key was not "
+                        "re-recorded; daily_anchor was not double-counted",
+                        {"dedupe_key": trade.dedupe_key,
+                         "order_link_id": trade.order_link_id})
+            return 0
         day = utc_day(trade.closed_epoch)
         self._exec(
             "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?, "
