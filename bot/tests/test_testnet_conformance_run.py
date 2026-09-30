@@ -177,17 +177,40 @@ class _StubEngine:
 
 class _StubClient:
     def __init__(self, *, remote_stop=100.0, reconcile_summary=None,
-                get_position_error=None, reconcile_error=None):
+                get_position_error=None, reconcile_error=None,
+                is_linear=True, verify_stop_result=(True, "orderStatus=New"),
+                verify_stop_error=None):
         self.remote_stop = remote_stop
         self._reconcile_summary = reconcile_summary or {
             "unknown": 0, "naked_positions": []}
         self._get_position_error = get_position_error
         self._reconcile_error = reconcile_error
+        #: Defaults True so every EXISTING test (written before category
+        #: dispatch existed, and never setting this) keeps exercising the
+        #: LINEAR path unchanged -- see TestProtectionReadbackCategoryDispatch
+        #: for the SPOT-specific tests, which set this False explicitly.
+        self.is_linear = is_linear
+        self._verify_stop_result = verify_stop_result
+        self._verify_stop_error = verify_stop_error
+        self.get_position_calls = 0
+        self.verify_stop_calls = []
 
     def get_position(self, symbol):
+        self.get_position_calls += 1
+        if not self.is_linear:
+            # Mirrors the real BybitClient.get_position: linear-only,
+            # raises on spot. A caller that reaches here on a spot client
+            # is exactly the mismatch this fix closes.
+            raise RuntimeError("get_position is linear-only")
         if self._get_position_error:
             raise self._get_position_error
         return {"symbol": symbol, "stopLoss": str(self.remote_stop)}
+
+    def verify_stop(self, *, symbol, order_link_id):
+        self.verify_stop_calls.append((symbol, order_link_id))
+        if self._verify_stop_error:
+            raise self._verify_stop_error
+        return self._verify_stop_result
 
     def reconcile_on_startup(self):
         if self._reconcile_error:
@@ -1129,3 +1152,237 @@ class TestRealQueueDrainClosesTheRace:
             for r in records), (
             "an event already received on the wire, sitting in the "
             "queue, must not disappear at shutdown")
+
+
+# ---------------------------------------------------------------------------
+# FIX — category mismatch: run_conformance() unconditionally called the
+# LINEAR-only client.get_position() for protection readback, which raises
+# on spot and reads a field (stopLoss) that does not exist there. Spot's
+# protection is a separate order; the EXISTING client.verify_stop() already
+# dispatches correctly and reads it back via get_order() -- this fix just
+# makes the conformance runner use it instead of reinventing a second
+# mechanism.
+# ---------------------------------------------------------------------------
+
+
+class TestProtectionReadbackCategoryDispatch:
+    def test_linear_category_retains_get_position_stoploss_check(self):
+        client = _StubClient(is_linear=True, remote_stop=100.0)
+        row = {"symbol": SYMBOL, "meta": "{}"}
+        store = _StubStore(positions=[row])
+
+        result = tcr.verify_protection(
+            client=client, store=store, symbol=SYMBOL, entry_row=row)
+
+        assert result == {"ok": True, "category": "linear", "remote_stop": 100.0}
+        assert client.verify_stop_calls == [], (
+            "linear must not go anywhere near the spot order-readback path")
+
+    def test_linear_category_fails_when_stoploss_is_zero(self):
+        client = _StubClient(is_linear=True, remote_stop=0.0)
+        row = {"symbol": SYMBOL, "meta": "{}"}
+        result = tcr.verify_protection(
+            client=client, store=_StubStore(positions=[row]), symbol=SYMBOL,
+            entry_row=row)
+        assert result["ok"] is False
+        assert result["category"] == "linear"
+
+    def test_linear_category_readback_error_fails_closed(self):
+        client = _StubClient(is_linear=True,
+                             get_position_error=RuntimeError("venue down"))
+        row = {"symbol": SYMBOL, "meta": "{}"}
+        result = tcr.verify_protection(
+            client=client, store=_StubStore(positions=[row]), symbol=SYMBOL,
+            entry_row=row)
+        assert result["ok"] is False
+        assert result["category"] == "linear"
+        assert "error" in result
+
+    def test_spot_category_never_calls_linear_only_get_position(self):
+        client = _StubClient(is_linear=False,
+                             verify_stop_result=(True, "orderStatus=New"))
+        row = {"symbol": SYMBOL,
+              "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
+        store = _StubStore(positions=[row])
+
+        result = tcr.verify_protection(
+            client=client, store=store, symbol=SYMBOL, entry_row=row)
+
+        assert client.get_position_calls == 0, (
+            "spot must never call the linear-only get_position() -- this "
+            "is the exact mismatch being fixed")
+        assert result == {
+            "ok": True, "category": "spot",
+            "stop_order_link_id": "BB-stop-1", "detail": "orderStatus=New"}
+        assert client.verify_stop_calls == [(SYMBOL, "BB-stop-1")]
+
+    def test_spot_category_fails_when_stop_order_not_live(self):
+        """The venue itself must report the order live -- a stop order
+        that has already triggered/filled/cancelled is not protection,
+        regardless of what local state believes."""
+        client = _StubClient(
+            is_linear=False,
+            verify_stop_result=(False, "STOP_ORDER_NOT_LIVE:Filled"))
+        row = {"symbol": SYMBOL,
+              "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
+        store = _StubStore(positions=[row])
+
+        result = tcr.verify_protection(
+            client=client, store=store, symbol=SYMBOL, entry_row=row)
+
+        assert result["ok"] is False
+        assert result["category"] == "spot"
+        assert client.get_position_calls == 0
+
+    def test_spot_category_fails_closed_when_no_stop_order_link_id_recorded(self):
+        client = _StubClient(is_linear=False)
+        row = {"symbol": SYMBOL, "meta": "{}"}
+        store = _StubStore(positions=[row])
+
+        result = tcr.verify_protection(
+            client=client, store=store, symbol=SYMBOL, entry_row=row)
+
+        assert result["ok"] is False
+        assert result["category"] == "spot"
+        assert client.verify_stop_calls == [], (
+            "must never call verify_stop with a fabricated/empty id")
+        assert client.get_position_calls == 0
+
+    def test_spot_category_uses_the_freshest_position_row_not_the_stale_entry_row(self):
+        """A partial exit between 'entry' and readback could have re-sized
+        or replaced the stop -- the CURRENT store row's
+        stop_order_link_id must be used, never whatever was captured at
+        entry time."""
+        client = _StubClient(is_linear=False,
+                             verify_stop_result=(True, "orderStatus=New"))
+        stale_row = {"symbol": SYMBOL,
+                    "meta": json.dumps({"stop_order_link_id": "BB-stop-OLD"})}
+        fresh_row = {"symbol": SYMBOL,
+                    "meta": json.dumps({"stop_order_link_id": "BB-stop-NEW"})}
+        store = _StubStore(positions=[fresh_row])
+
+        result = tcr.verify_protection(
+            client=client, store=store, symbol=SYMBOL, entry_row=stale_row)
+
+        assert result["stop_order_link_id"] == "BB-stop-NEW"
+        assert client.verify_stop_calls == [(SYMBOL, "BB-stop-NEW")]
+
+    def test_spot_category_verify_stop_raising_fails_closed(self):
+        client = _StubClient(is_linear=False,
+                             verify_stop_error=RuntimeError("venue down"))
+        row = {"symbol": SYMBOL,
+              "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
+        result = tcr.verify_protection(
+            client=client, store=_StubStore(positions=[row]), symbol=SYMBOL,
+            entry_row=row)
+        assert result["ok"] is False
+        assert result["category"] == "spot"
+        assert "error" in result
+
+
+class TestRunConformanceProtectionReadbackEndToEnd:
+    """The whole pipeline, not just verify_protection() in isolation --
+    proves run_conformance() actually wires category dispatch in, not
+    merely that the helper function does the right thing."""
+
+    @pytest.fixture(autouse=True)
+    def _ws_observation_always_succeeds(self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+
+    def test_default_linear_client_reaches_flatten(self):
+        """No regression: the pre-fix default (is_linear=True) must still
+        run every stage through to a clean flatten, exactly as before."""
+        store = _StubStore(positions=[{"symbol": SYMBOL, "meta": "{}"}])
+        client = _StubClient(is_linear=True, remote_stop=100.0)
+        engine = _StubEngine()
+
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=engine, client=client, store=store,
+            symbol=SYMBOL)
+
+        readback = next(
+            s for s in result["stages"] if s["stage"] == "protection_readback")
+        assert readback["ok"] is True
+        assert readback["category"] == "linear"
+        assert client.get_position_calls >= 1
+        assert engine.closed == [SYMBOL]
+        assert result["ok"] is True
+
+    def test_spot_client_reaches_flatten_via_verify_stop_not_get_position(self):
+        row = {"symbol": SYMBOL,
+              "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
+        store = _StubStore(positions=[row])
+        client = _StubClient(is_linear=False,
+                             verify_stop_result=(True, "orderStatus=New"))
+        engine = _StubEngine()
+
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=engine, client=client, store=store,
+            symbol=SYMBOL)
+
+        readback = next(
+            s for s in result["stages"] if s["stage"] == "protection_readback")
+        assert readback["ok"] is True
+        assert readback["category"] == "spot"
+        assert client.get_position_calls == 0, (
+            "the exact mismatch this fix closes: spot must never reach "
+            "the linear-only get_position()")
+        assert client.verify_stop_calls == [(SYMBOL, "BB-stop-1")]
+        # Flatten follows the EXISTING engine.close_position() path
+        # unconditionally -- category-agnostic already, no second close
+        # implementation introduced by this fix.
+        assert engine.closed == [SYMBOL]
+        assert result["ok"] is True
+
+    def test_spot_client_with_dead_stop_stops_before_flatten(self):
+        """A stop the venue no longer reports as live must stop the run
+        BEFORE flatten -- exactly like the linear stopLoss==0 case did
+        before this fix, now on the spot path too."""
+        row = {"symbol": SYMBOL,
+              "meta": json.dumps({"stop_order_link_id": "BB-stop-1"})}
+        store = _StubStore(positions=[row])
+        client = _StubClient(
+            is_linear=False,
+            verify_stop_result=(False, "STOP_ORDER_NOT_LIVE:Filled"))
+        engine = _StubEngine()
+
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=engine, client=client, store=store,
+            symbol=SYMBOL)
+
+        assert result["ok"] is False
+        assert [s["stage"] for s in result["stages"]] == [
+            "startup", "ws_startup", "entry", "ws_observation",
+            "protection_local", "protection_readback"]
+        assert engine.closed == [], "must not flatten past a failed readback"
+
+
+class TestEvidenceRequirementsUnchangedByCategoryFix:
+    """This fix must not touch FIX 2's evidence-completeness acceptance
+    criteria -- missing evidence still fails, a clean chain around empty
+    evidence is still not proof, regardless of category."""
+
+    def test_verify_evidence_completeness_still_rejects_a_fabricated_empty_pass(
+            self, tmp_path):
+        """No fake/pre-populated evidence is accepted: an empty (never
+        written) WS evidence file must still fail completeness, exactly
+        as FIX 2 established -- this category fix changes nothing here."""
+        rest_path = str(tmp_path / "rest.jsonl")
+        ws_path = str(tmp_path / "ws.jsonl")  # never written to
+        _write_rest_evidence_record(rest_path)
+
+        result = tcr.verify_evidence_completeness(
+            rest_evidence_path=rest_path, ws_evidence_path=ws_path,
+            order_link_id="BB-1", evidence_capture_failed=False)
+
+        assert result["ok"] is False
+        assert result["ws_evidence_exists"] is False
+
+    def test_verify_evidence_completeness_signature_unchanged(self):
+        """Sanity check this fix did not alter FIX 2's function contract
+        while touching the same file."""
+        import inspect
+        params = list(inspect.signature(tcr.verify_evidence_completeness).parameters)
+        assert params == [
+            "rest_evidence_path", "ws_evidence_path", "order_link_id",
+            "evidence_capture_failed"]

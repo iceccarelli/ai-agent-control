@@ -317,6 +317,83 @@ def _read_evidence_records(path: Optional[str]) -> List[Dict[str, Any]]:
         return [json.loads(ln) for ln in handle if ln.strip()]
 
 
+def _stop_order_link_id(row: Dict[str, Any]) -> str:
+    """The protective stop's OWN `order_link_id`, as recorded by
+    `TradingEngine.execute()` into the position row's `meta` JSON
+    (`{"stop_order_link_id": ...}` — see `persistence.StateStore.
+    upsert_position`). Needed for SPOT protection readback: on spot the
+    stop is a separate resting order, identified by its own link id, not
+    a field on a position (see `BybitClient.verify_stop`'s category
+    dispatch). Never raises; a malformed/absent `meta` yields "" rather
+    than fabricating an id.
+    """
+    try:
+        meta = json.loads(row.get("meta") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    return str(meta.get("stop_order_link_id") or "")
+
+
+def verify_protection(*, client: Any, store: Any, symbol: str,
+                      entry_row: Dict[str, Any]) -> Dict[str, Any]:
+    """Category-correct protection readback — the venue itself, not local
+    state, reporting the protection mechanism as live for THIS run's
+    order.
+
+    Dispatches on `client.is_linear` (the same flag `BybitClient` and
+    `TradingEngine` already use everywhere else to pick a mechanism —
+    see `verify_stop`, `check_naked_positions`, `observe_exits`; this is
+    not a new distinction, just this runner finally respecting the one
+    that already exists):
+
+    LINEAR — retains the original mechanism: `client.get_position(symbol)`
+    read back fresh from `/v5/position/list`, `stopLoss > 0`.
+
+    SPOT — `get_position()` is linear-only (raises `PermanentAPIError`
+    if called) and a spot "position" has no `stopLoss` field to read in
+    the first place: the protection is the separate conditional stop
+    ORDER `TradingEngine._protect()` already placed. This calls the
+    EXISTING `client.verify_stop(symbol=symbol, order_link_id=...)` —
+    already written, already used by `check_naked_positions`/
+    `reconcile_on_startup` — which reads that order back via
+    `get_order()` and reports it live only if its `orderStatus` is
+    `Untriggered`/`New`. No second spot-protection implementation is
+    introduced here.
+
+    Never raises; any failure (missing stop id, venue error, not live)
+    comes back as `ok: False` with a `reason`/`detail`, matching this
+    tool's "a failed stage is data, not an exception" convention.
+    """
+    category = "linear" if bool(getattr(client, "is_linear", False)) else "spot"
+    if category == "linear":
+        try:
+            remote_position = client.get_position(symbol)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "category": category, "error": str(exc)}
+        remote_stop = float((remote_position or {}).get("stopLoss", 0) or 0)
+        return {"ok": remote_stop > 0, "category": category,
+                "remote_stop": remote_stop}
+
+    # SPOT: re-read the position fresh (never trust the row captured at
+    # "entry" time — a partial exit could have re-sized/replaced the stop
+    # since) for the CURRENT stop_order_link_id, then ask the venue
+    # whether that exact order is still live.
+    positions_now = {p["symbol"]: p for p in store.open_positions()}
+    current_row = positions_now.get(symbol) or entry_row
+    stop_link_id = _stop_order_link_id(current_row)
+    if not stop_link_id:
+        return {"ok": False, "category": category,
+                "error": "no stop_order_link_id recorded for this position"}
+    try:
+        live, detail = client.verify_stop(
+            symbol=symbol, order_link_id=stop_link_id)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "category": category,
+                "stop_order_link_id": stop_link_id, "error": str(exc)}
+    return {"ok": live, "category": category,
+            "stop_order_link_id": stop_link_id, "detail": detail}
+
+
 def _is_valid_ws_observation(record: Dict[str, Any], *, order_link_id: str,
                              run_start_utc: Optional[str]) -> bool:
     """FIX 3: a matching record must PROVE it is this run's own, not an
@@ -556,14 +633,13 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     if not protected_locally:
         return _finalize(stages, timestamps, ok=False)
 
-    try:
-        remote_position = client.get_position(symbol)
-    except Exception as exc:  # noqa: BLE001
-        _stage("protection_readback", False, error=str(exc))
-        return _finalize(stages, timestamps, ok=False)
-    remote_stop = float((remote_position or {}).get("stopLoss", 0) or 0)
-    _stage("protection_readback", remote_stop > 0, remote_stop=remote_stop)
-    if not (remote_stop > 0):
+    # Category-correct: get_position()/stopLoss is LINEAR-only and raises
+    # on spot, where protection is a separate order, not a position
+    # field — see verify_protection()'s own docstring.
+    protection = verify_protection(
+        client=client, store=store, symbol=symbol, entry_row=row)
+    _stage("protection_readback", protection.pop("ok"), **protection)
+    if not stages[-1]["ok"]:
         return _finalize(stages, timestamps, ok=False)
 
     close_report = engine.close_position(symbol=symbol, reason="conformance_flatten")
