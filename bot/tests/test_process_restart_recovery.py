@@ -68,6 +68,10 @@ import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.dirname(os.path.abspath(__file__))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from persistence import StateStore  # noqa: E402
 
 EQUITY = 100_000.0
 
@@ -302,3 +306,113 @@ class TestRealProcessRestart:
         r3 = _run(_proc3_reread, (db_path,))
         assert r3["unresolved"] == [], (
             "process 2's resolution was not durably visible to process 3")
+
+
+class TestWSStatusMonotonicGuard:
+    """`StateStore.update_order_status(..., source="ws")`'s guard, exercised
+    against the real on-disk store (not a stub) -- this is the property gap
+    a prior audit cycle flagged: a stale/out-of-order WS event, possible on
+    reconnect replay since `private_ws_consumer._Deduplicator` is an
+    in-memory LRU that a restart resets, must not regress a terminal order's
+    status. `source="rest"` (the default, what `BybitClient` uses) must stay
+    completely unaffected, since REST is the venue's own authoritative
+    answer, not a replayed observation.
+    """
+
+    def _store(self, tmp_path) -> StateStore:
+        store = StateStore(str(tmp_path / "state.db"))
+        store.claim_writer()
+        store.record_order("BB-1", "BTCUSDT", "Buy", "Market", 0.01)
+        return store
+
+    def test_stale_ws_new_after_filled_does_not_regress(self, tmp_path):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+
+        # A replayed/out-of-order "New" delivered after the terminal
+        # "Filled" -- e.g. resent by the venue on reconnect, or delivered
+        # out of order across independent delivery paths.
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+
+        assert store.get_order("BB-1")["status"] == "filled", (
+            "a stale WS 'New' regressed a terminal order's status")
+
+    def test_duplicate_terminal_ws_event_is_a_harmless_noop(self, tmp_path):
+        """Re-delivery of the SAME terminal status (a normal duplicate, not
+        an attack) must apply cleanly with no error and no anomaly journal
+        entry."""
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+
+        assert store.get_order("BB-1")["status"] == "filled"
+        anomalies = [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ]
+        assert anomalies == [], "a genuine duplicate must not be journalled"
+
+    def test_legitimate_advancement_still_applies_new_partial_filled(self, tmp_path):
+        """New -> PartiallyFilled -> Filled, delivered in the correct order,
+        must not be blocked by the guard -- it only ever blocks a move OUT
+        OF a terminal status."""
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == "submitted"
+
+        store.update_order_status("BB-1", "partial", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == "partial"
+
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == "filled"
+
+        assert [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ] == []
+
+    def test_stale_partial_after_cancelled_does_not_regress(self, tmp_path):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "cancelled", exchange_id="V-1", source="ws")
+        store.update_order_status("BB-1", "partial", exchange_id="V-1", source="ws")
+
+        assert store.get_order("BB-1")["status"] == "cancelled", (
+            "a stale WS 'PartiallyFilled' regressed a cancelled order")
+
+    def test_blocked_regression_is_journalled_and_inspectable(self, tmp_path):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "rejected", exchange_id="V-1", source="ws")
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+
+        anomalies = [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ]
+        assert len(anomalies) == 1
+        import json as _json
+        detail = _json.loads(anomalies[0]["detail"])
+        assert detail["order_link_id"] == "BB-1"
+        assert detail["from_status"] == "rejected"
+        assert detail["to_status"] == "submitted"
+        assert anomalies[0]["symbol"] == "BTCUSDT"
+
+    def test_rest_reconciliation_is_unaffected_by_the_ws_guard(self, tmp_path):
+        """REST (`source="rest"`, the default) must remain free to correct
+        any status, including what would be a "regression" for a WS-sourced
+        write -- it is the venue's own authoritative answer, e.g.
+        `reconcile_on_startup` discovering the exchange actually cancelled
+        an order the local ledger still shows as filled from a bad fill
+        poll, or any other terminal-to-terminal correction."""
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+
+        store.update_order_status("BB-1", "cancelled", exchange_id="V-1")  # source="rest" default
+        assert store.get_order("BB-1")["status"] == "cancelled"
+
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="rest")
+        assert store.get_order("BB-1")["status"] == "submitted"
+
+        assert [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ] == []

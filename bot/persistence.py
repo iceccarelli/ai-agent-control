@@ -406,6 +406,13 @@ CREATE INDEX IF NOT EXISTS idx_decisions_reason ON decisions(decision, reason);
 #: than stored, because a typo silently becomes a category nobody aggregates.
 EXECUTION_OUTCOMES = ("filled", "partial", "rejected", "cancelled", "unfilled")
 
+#: Local, lowercase ``orders.status`` values that are TERMINAL: an order in
+#: one of these will never legitimately change status again on this venue.
+#: Used only by :meth:`StateStore.update_order_status`'s ``source="ws"``
+#: monotonic guard -- REST (``source="rest"``, the default) is unaffected
+#: and remains free to write any status at any time, terminal or not.
+LOCAL_TERMINAL_ORDER_STATUS = frozenset({"filled", "cancelled", "rejected"})
+
 
 def slippage_bps(side: str, intended_price: float, fill_price: float) -> float:
     """Realised slippage in **basis points, positive == adverse**.
@@ -1122,8 +1129,59 @@ class StateStore:
         return cursor.rowcount == 1
 
     def update_order_status(
-        self, order_link_id: str, status: str, exchange_id: str = ""
+        self, order_link_id: str, status: str, exchange_id: str = "",
+        *, source: str = "rest",
     ) -> None:
+        """Update one order's local status/exchange id.
+
+        INVARIANT (``source="ws"`` only): once an order's persisted status
+        is terminal (one of ``LOCAL_TERMINAL_ORDER_STATUS`` --
+        filled/cancelled/rejected), a WS-sourced status update cannot
+        regress it to a non-terminal status, nor flip it sideways to a
+        *different* terminal status. A stale or replayed WS event is a real
+        possibility on reconnect (`private_ws_consumer._Deduplicator` is an
+        in-memory LRU, reset by a restart, so a "New" delivered after a
+        "Filled" cannot be told apart from a genuine duplicate by identity
+        alone) and must not overwrite a fact already settled here. The
+        write is applied normally when the incoming status is the SAME as
+        the current one (idempotent re-delivery, not an anomaly) or when
+        the current status is not yet terminal (legitimate advancement,
+        e.g. New -> PartiallyFilled -> Filled). Anything else is a blocked
+        regression: the write is skipped and journalled as
+        ``WS_STATUS_REGRESSION_BLOCKED`` (see :meth:`journal`, readable via
+        :meth:`recent_decisions`) rather than silently dropped or silently
+        allowed -- fail closed in the direction that cannot corrupt a
+        settled order.
+
+        ``source="rest"`` (the default -- every call site in
+        ``bybit_connection.BybitClient``: submit, cancel, fill-poll,
+        duplicate-recovery, and ``reconcile_on_startup``) is completely
+        unaffected by this guard. REST is the venue's own answer, not a
+        replayed local observation, and remains fully authoritative: it can
+        correct any locally-recorded status, terminal or not, at any time.
+        """
+        if source == "ws":
+            current = self.get_order(order_link_id)
+            current_status = str(current["status"]) if current else ""
+            if (
+                current is not None
+                and current_status in LOCAL_TERMINAL_ORDER_STATUS
+                and status != current_status
+            ):
+                self.journal(
+                    str(current.get("symbol", "")),
+                    "WS_STATUS_REGRESSION_BLOCKED",
+                    "WS-sourced order event tried to move a terminal order "
+                    f"from '{current_status}' to '{status}'; ignored -- "
+                    "REST reconciliation remains authoritative",
+                    {
+                        "order_link_id": order_link_id,
+                        "from_status": current_status,
+                        "to_status": status,
+                        "exchange_id": exchange_id,
+                    },
+                )
+                return
         self._exec(
             "UPDATE orders SET status = ?, updated_epoch = ?, "
             "exchange_id = COALESCE(NULLIF(?, ''), exchange_id) "
