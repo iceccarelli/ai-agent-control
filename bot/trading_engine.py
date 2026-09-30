@@ -1236,8 +1236,15 @@ class TradingEngine:
         # before) must re-discover that stop, not double it. See
         # `BybitClient.find_live_spot_stop`'s docstring and
         # tests/test_naked_position_handling.py::
-        # TestSpotNakedRecoveryIsIdempotent.
-        existing = self.client.find_live_spot_stop(symbol)
+        # TestSpotNakedRecoveryIsIdempotent. Linear is guarded out here
+        # (rather than relying solely on find_live_spot_stop's own
+        # is_linear check) because it is never naturally duplicated on
+        # linear and some test doubles for TradingEngine.client model
+        # only the linear surface and do not implement this spot-only
+        # method at all.
+        existing = None
+        if not getattr(self.client, "is_linear", False):
+            existing = self.client.find_live_spot_stop(symbol)
         if existing is not None:
             live_trigger = float(existing.get("triggerPrice") or 0.0) or stop
             self.store.set_position_stop(symbol, live_trigger)
