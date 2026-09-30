@@ -220,9 +220,22 @@ class FakeBybit:
             return self._err(110001, "order not exists or too late to cancel")
 
         if path == "/v5/order/cancel-all":
+            payload = json.loads(body or "{}")
+            # Real Bybit V5 behavior on spot: `orderFilter` selects EXACTLY
+            # one of Order/StopOrder/tpslOrder per call, defaulting to
+            # "Order" ALONE when omitted -- verified against
+            # https://bybit-exchange.github.io/docs/api-explorer/v5/trade/cancel-all.
+            # Modeling that default here (not "cancel everything
+            # regardless") is what makes BybitClient.cancel_all()'s own
+            # per-filter looping fix something a test can actually catch a
+            # regression in, instead of a fake that always "succeeds".
+            requested_filter = payload.get("orderFilter") or "Order"
             for row in self.orders.values():
-                if row["orderStatus"] in ("New", "Untriggered"):
-                    row["orderStatus"] = "Cancelled"
+                if row["orderStatus"] not in ("New", "Untriggered"):
+                    continue
+                if row.get("orderFilter", "Order") != requested_filter:
+                    continue
+                row["orderStatus"] = "Cancelled"
             return self._ok({"list": []})
 
         return self._err(10001, f"unknown endpoint {path}")

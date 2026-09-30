@@ -1134,16 +1134,42 @@ class BybitClient:
             self.store.update_order_status(order_link_id, "cancelled")
         return True
 
+    #: On SPOT, `/v5/order/cancel-all`'s `orderFilter` accepts exactly one
+    #: of these per call and DEFAULTS TO "Order" ALONE when omitted —
+    #: verified against
+    #: https://bybit-exchange.github.io/docs/api-explorer/v5/trade/cancel-all.
+    #: A single unfiltered call therefore never touches a resting
+    #: `StopOrder` (the mechanism `place_stop_order` uses for a spot
+    #: protective stop — see that method's own docstring) or a
+    #: `tpslOrder`. Calling it once per filter is the only way to
+    #: actually clear everything; there is no combined/"all filters" value
+    #: to pass instead. Linear/inverse have no such per-filter narrowing
+    #: (a protective stop there is a POSITION field, set by
+    #: `_place_position_stop`, not a separate cancellable order at all),
+    #: so a single unfiltered call already covers everything there.
+    _SPOT_CANCEL_ALL_ORDER_FILTERS = ("Order", "StopOrder", "tpslOrder")
+
     def cancel_all(self, symbol: Optional[str] = None) -> bool:
-        body: Dict[str, Any] = {"category": self.category}
-        if symbol:
-            body["symbol"] = symbol
-        try:
-            self._request("POST", "/v5/order/cancel-all", body=body, signed=True)
-            return True
-        except BybitAPIError as exc:
-            logger.error("cancel-all failed: %s", exc)
-            return False
+        """Cancel every resting order for `symbol` (or the whole category
+        if omitted). See `_SPOT_CANCEL_ALL_ORDER_FILTERS` above for why
+        this is more than one request on spot.
+        """
+        order_filters: Tuple[Optional[str], ...] = (
+            self._SPOT_CANCEL_ALL_ORDER_FILTERS if self.is_spot else (None,))
+        ok = True
+        for order_filter in order_filters:
+            body: Dict[str, Any] = {"category": self.category}
+            if symbol:
+                body["symbol"] = symbol
+            if order_filter:
+                body["orderFilter"] = order_filter
+            try:
+                self._request("POST", "/v5/order/cancel-all", body=body, signed=True)
+            except BybitAPIError as exc:
+                logger.error("cancel-all(orderFilter=%s) failed: %s",
+                            order_filter, exc)
+                ok = False
+        return ok
 
     # -- spot-valid protective stop ---------------------------------------
 

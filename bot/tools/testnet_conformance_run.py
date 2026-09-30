@@ -658,6 +658,47 @@ def _conformance_ok(*, stages_ok: bool, completeness_ok: bool,
     return bool(stages_ok and completeness_ok and ws_thread_stopped)
 
 
+def finalize_conformance_result(*, result: Dict[str, Any],
+                                completeness: Dict[str, Any],
+                                ws_thread_stopped: bool) -> Dict[str, Any]:
+    """Assembles the FINAL result dict `main()` writes to `--out`, from
+    `run_conformance()`'s own stage-sequence result, the evidence-
+    completeness check, and the WS-shutdown proof — without ever letting
+    a dict merge silently discard the stage-sequence's own verdict.
+
+    THE BUG THIS FUNCTION EXISTS TO CLOSE: naively doing
+    `result.update(completeness)` merges `completeness`'s own `"ok"` key
+    OVER `result["ok"]` (`run_conformance()`'s `all(s["ok"] for s in
+    stages)` — covering startup, ws_startup, entry, ws_observation,
+    protection_local, protection_readback, flatten,
+    remote_flat_verification, final_reconciliation,
+    ws_evidence_completeness). If the caller THEN reads `result["ok"]`
+    expecting the stage-sequence verdict and feeds it into
+    `_conformance_ok()` as `stages_ok`, it is actually re-reading
+    `completeness["ok"]` a second time — the true stage-sequence result
+    has already been silently overwritten and discarded. Concretely: a
+    real run where `remote_flat_verification` failed (a residual order
+    left at the venue after flatten) but REST/WS evidence still happened
+    to be complete would report `result["ok"] == True` — exactly the
+    false-green this whole acceptance chain exists to prevent.
+
+    This function captures `stages_ok` from `result["ok"]` BEFORE any
+    merge touches it, then recomputes the real final verdict with the
+    same `_conformance_ok()` every other caller uses. The composition is
+    then provably monotonic: a False in the stage sequence, in evidence
+    completeness, or in WS shutdown can never be turned into a True
+    result, regardless of merge order.
+    """
+    stages_ok = bool(result.get("ok"))
+    merged = dict(result)
+    merged.update(completeness)
+    merged["ws_thread_stopped"] = bool(ws_thread_stopped)
+    merged["ok"] = _conformance_ok(
+        stages_ok=stages_ok, completeness_ok=bool(completeness.get("ok")),
+        ws_thread_stopped=bool(ws_thread_stopped))
+    return merged
+
+
 def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
                     symbol: str = SYMBOL,
                     ws_observation_timeout: float =
@@ -1008,19 +1049,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         ws_evidence_path=args.ws_evidence_path,
         order_link_id=order_link_id,
         evidence_capture_failed=evidence_capture_failed)
-    result.update(completeness)
     ws_thread_stopped = bool(finalize_result.get("ws_thread_stopped", False))
-    result["ws_thread_stopped"] = ws_thread_stopped
     if not ws_thread_stopped:
         print("\nWS thread did not stop within the shutdown boundary; "
              "the final flush could not run and this result cannot be "
              "green.", file=sys.stderr)
-    # This run cannot be green unless the WS thread is VERIFIABLY
-    # stopped — see finalize_ws_lifecycle()/_conformance_ok(): a clean
-    # stage sequence and complete evidence are not enough if the final
-    # flush this result depends on never actually happened.
-    result["ok"] = _conformance_ok(
-        stages_ok=result["ok"], completeness_ok=completeness["ok"],
+    # This run cannot be green unless the stage sequence, evidence
+    # completeness, AND the WS shutdown all hold — see
+    # finalize_conformance_result()'s own docstring for the exact bug
+    # (a plain `result.update(completeness)` silently discarding the
+    # stage-sequence verdict) this composition exists to prevent.
+    result = finalize_conformance_result(
+        result=result, completeness=completeness,
         ws_thread_stopped=ws_thread_stopped)
 
     with open(args.out, "w", encoding="utf-8") as handle:

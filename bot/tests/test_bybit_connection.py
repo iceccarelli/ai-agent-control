@@ -675,6 +675,79 @@ class TestCancel:
         assert client.cancel_all("BTCUSDT") is True
         assert all(o["orderStatus"] == "Cancelled" for o in exchange.orders.values())
 
+    def test_cancel_all_on_spot_also_clears_a_resting_protective_stop(
+            self, client, exchange):
+        """The real gap: /v5/order/cancel-all's `orderFilter` on spot
+        defaults to "Order" ALONE when omitted -- a single unfiltered
+        call never touches a resting StopOrder (the mechanism
+        place_stop_order uses for a spot protective stop). A close that
+        trusted a single cancel_all() call would leave that stop resting
+        at the venue. Verified against
+        https://bybit-exchange.github.io/docs/api-explorer/v5/trade/cancel-all.
+        """
+        client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001,
+                           order_type="Limit", price=40_000.0)
+        stop = client.place_stop_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001, trigger_price=39_000.0)
+        assert stop.ok
+        assert exchange.orders[stop.order_link_id]["orderStatus"] == "Untriggered"
+
+        assert client.cancel_all("BTCUSDT") is True
+
+        assert all(o["orderStatus"] == "Cancelled" for o in exchange.orders.values()), (
+            "the protective StopOrder must not survive cancel_all() -- "
+            "this is exactly the residual-order class of failure")
+
+    def test_cancel_all_on_spot_issues_one_request_per_order_filter(
+            self, client, exchange):
+        client.cancel_all("BTCUSDT")
+        cancel_all_requests = [
+            r for r in exchange.requests if r["url"].endswith("/order/cancel-all")]
+        filters_used = [
+            json.loads(r["body"]).get("orderFilter") for r in cancel_all_requests]
+        assert filters_used == ["Order", "StopOrder", "tpslOrder"]
+
+    def test_cancel_all_on_linear_issues_a_single_unfiltered_request(
+            self, exchange, store):
+        """Linear has no such per-filter narrowing to work around -- its
+        protective stop is a POSITION field (_place_position_stop), never
+        a separate cancellable order -- so a single call is correct and
+        unchanged."""
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+
+        linear_client = bc.BybitClient(
+            config=LinearCfg(), store=store, transport=exchange)
+        assert linear_client.cancel_all("BTCUSDT") is True
+
+        cancel_all_requests = [
+            r for r in exchange.requests if r["url"].endswith("/order/cancel-all")]
+        assert len(cancel_all_requests) == 1
+        assert "orderFilter" not in json.loads(cancel_all_requests[0]["body"])
+
+    def test_a_single_unfiltered_cancel_all_would_have_left_the_stop_resting(
+            self, client, exchange):
+        """Documents the defect directly against the fake's own (now
+        Bybit-accurate) filter model: sending the OLD, single, unfiltered
+        request leaves a resting StopOrder untouched -- proving the
+        multi-filter fix is necessary, not decorative. Bypasses
+        BybitClient.cancel_all() entirely and hits the fake's transport
+        seam directly with exactly the body the old implementation sent
+        (no `headers`, so the fake's signature check -- which only runs
+        when `X-BAPI-SIGN` is present -- is a non-issue here)."""
+        stop = client.place_stop_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001, trigger_price=39_000.0)
+        assert stop.ok
+
+        exchange.request(
+            "POST", "https://api-testnet.bybit.com/v5/order/cancel-all",
+            headers={},
+            body=json.dumps({"category": "spot", "symbol": "BTCUSDT"}))
+
+        assert exchange.orders[stop.order_link_id]["orderStatus"] == "Untriggered", (
+            "an unfiltered spot cancel-all must NOT clear a StopOrder -- "
+            "if this fails, the fake no longer models the real defect")
+
 
 # ---------------------------------------------------------------------------
 # structure

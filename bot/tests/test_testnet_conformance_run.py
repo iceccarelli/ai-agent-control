@@ -1634,3 +1634,156 @@ class TestRunConformanceRemoteFlatEndToEnd:
         assert flat_stage["category"] == "spot"
         assert client.get_position_calls == 0
         assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# FIX — the false-green composition bug: main()'s own
+# `result.update(completeness)` silently discarded run_conformance()'s true
+# stage-sequence verdict before it was read as `stages_ok` for
+# `_conformance_ok()` — so a real stage failure (e.g. remote_flat_verification
+# catching a residual order after flatten) could still end up reported
+# green if evidence happened to be complete and the WS thread stopped
+# cleanly. finalize_conformance_result() is the fix; these tests prove it
+# holds for every required stage named in this mission, individually.
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeConformanceResultIsMonotonicallyFailClosed:
+    def _clean_completeness(self):
+        return {
+            "ok": True, "rest_evidence_exists": True, "ws_evidence_exists": True,
+            "order_evidence_exists": True, "execution_evidence_exists": True,
+            "rest_evidence_verified": True, "ws_evidence_verified": True,
+            "evidence_capture_failed": False,
+        }
+
+    def test_reproduces_the_bug_a_naive_dict_update_would_have(self):
+        """Documents the exact defect this function replaces: a plain
+        `result.update(completeness)` followed by re-reading
+        `result["ok"]` as `stages_ok` silently substitutes
+        completeness["ok"] for the real stage-sequence verdict."""
+        result = {"ok": False, "stages": [{"stage": "flatten", "ok": True},
+                                          {"stage": "remote_flat_verification",
+                                           "ok": False}]}
+        completeness = self._clean_completeness()
+
+        naive = dict(result)
+        naive.update(completeness)
+        buggy_stages_ok_as_read = naive["ok"]  # already corrupted to True
+        assert buggy_stages_ok_as_read is True, (
+            "setup check: proves the naive approach really does lose the "
+            "stage-sequence False")
+
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=completeness, ws_thread_stopped=True)
+        assert fixed["ok"] is False, (
+            "the fix must not reproduce the bug it exists to close")
+
+    def test_remote_flat_false_with_everything_else_true_fails(self):
+        result = {"ok": False, "stages": [
+            {"stage": "flatten", "ok": True},
+            {"stage": "remote_flat_verification", "ok": False,
+             "category": "spot", "open_order_count": 1}]}
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=self._clean_completeness(),
+            ws_thread_stopped=True)
+        assert fixed["ok"] is False
+
+    def test_final_reconciliation_false_with_everything_else_true_fails(self):
+        result = {"ok": False, "stages": [
+            {"stage": "remote_flat_verification", "ok": True},
+            {"stage": "final_reconciliation", "ok": False}]}
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=self._clean_completeness(),
+            ws_thread_stopped=True)
+        assert fixed["ok"] is False
+
+    def test_ws_evidence_completeness_false_with_everything_else_true_fails(self):
+        result = {"ok": False, "stages": [
+            {"stage": "final_reconciliation", "ok": True},
+            {"stage": "ws_evidence_completeness", "ok": False}]}
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=self._clean_completeness(),
+            ws_thread_stopped=True)
+        assert fixed["ok"] is False
+
+    def test_ws_thread_stopped_false_with_everything_else_true_fails(self):
+        result = {"ok": True, "stages": [{"stage": "flatten", "ok": True}]}
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=self._clean_completeness(),
+            ws_thread_stopped=False)
+        assert fixed["ok"] is False
+
+    def test_all_true_passes(self):
+        result = {"ok": True, "stages": [{"stage": "flatten", "ok": True}]}
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=self._clean_completeness(),
+            ws_thread_stopped=True)
+        assert fixed["ok"] is True
+
+    def test_incomplete_evidence_with_everything_else_true_fails(self):
+        result = {"ok": True, "stages": [{"stage": "flatten", "ok": True}]}
+        incomplete = self._clean_completeness()
+        incomplete["ok"] = False
+        incomplete["order_evidence_exists"] = False
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=incomplete, ws_thread_stopped=True)
+        assert fixed["ok"] is False
+
+    def test_merged_result_still_carries_completeness_and_ws_fields(self):
+        """The fix must not lose the diagnostic detail the merge was
+        there to provide in the first place."""
+        result = {"ok": True, "stages": [{"stage": "flatten", "ok": True}]}
+        completeness = self._clean_completeness()
+        fixed = tcr.finalize_conformance_result(
+            result=result, completeness=completeness, ws_thread_stopped=True)
+        assert fixed["rest_evidence_exists"] is True
+        assert fixed["ws_thread_stopped"] is True
+        assert fixed["stages"] == result["stages"]
+
+
+class TestRunConformanceEndToEndFailClosedMatrix:
+    """The same matrix, but through the REAL run_conformance() stage
+    sequence (not a hand-built `result` dict) -- proving `all(s["ok"] for
+    s in stages)` itself is monotonic for each required stage, one at a
+    time, with every other stage genuinely passing."""
+
+    @pytest.fixture(autouse=True)
+    def _ws_observation_always_succeeds(self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+
+    def test_remote_flat_false_fails_the_whole_run(self):
+        store = _StubStore(positions=[{"symbol": SYMBOL, "meta": "{}"}])
+        client = _StubClient(is_linear=True, remote_stop=100.0, remote_size=0.05)
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=_StubEngine(), client=client,
+            store=store, symbol=SYMBOL)
+        assert result["ok"] is False
+        flat_stage = next(
+            s for s in result["stages"] if s["stage"] == "remote_flat_verification")
+        assert flat_stage["ok"] is False
+
+    def test_final_reconciliation_false_fails_the_whole_run(self):
+        store = _StubStore(positions=[{"symbol": SYMBOL, "meta": "{}"}])
+        client = _StubClient(
+            is_linear=True, remote_stop=100.0, remote_size=0.0,
+            reconcile_summary={"unknown": 1, "naked_positions": []})
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=_StubEngine(), client=client,
+            store=store, symbol=SYMBOL)
+        assert result["ok"] is False
+        recon_stage = next(
+            s for s in result["stages"] if s["stage"] == "final_reconciliation")
+        assert recon_stage["ok"] is False
+
+    def test_ws_evidence_completeness_false_fails_the_whole_run(self):
+        store = _StubStore(positions=[{"symbol": SYMBOL, "meta": "{}"}])
+        client = _StubClient(is_linear=True, remote_stop=100.0, remote_size=0.0)
+        consumer = _StubWSConsumer(evidence_capture_failed=True)
+        result = tcr.run_conformance(
+            bot=_StubBot(ws_consumer=consumer), engine=_StubEngine(),
+            client=client, store=store, symbol=SYMBOL)
+        assert result["ok"] is False
+        completeness_stage = next(
+            s for s in result["stages"] if s["stage"] == "ws_evidence_completeness")
+        assert completeness_stage["ok"] is False
