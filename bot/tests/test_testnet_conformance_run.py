@@ -147,12 +147,16 @@ class _StubStore:
     def __init__(self, positions=None, naked=None):
         self._positions = positions or []
         self._naked = naked if naked is not None else []
+        self.order_status_updates = []
 
     def open_positions(self):
         return self._positions
 
     def positions_without_stops(self):
         return self._naked
+
+    def update_order_status(self, order_link_id, status, exchange_id=""):
+        self.order_status_updates.append((order_link_id, status, exchange_id))
 
 
 class _StubReport:
@@ -198,6 +202,11 @@ class _StubWSConsumer:
         self.evidence_capture_failed = evidence_capture_failed
         self.auth_ok = auth_ok
         self.subscribe_ok = subscribe_ok
+        self.drain_calls = 0
+
+    def drain_and_apply(self, store):
+        self.drain_calls += 1
+        return []
 
 
 _UNSET = object()
@@ -223,6 +232,9 @@ class _StubBot:
 
     def shutdown(self):
         pass
+
+    def _stop_private_ws(self):
+        self.ws_stop_calls = getattr(self, "ws_stop_calls", 0) + 1
 
 
 SYMBOL = "BTCUSDT"
@@ -718,3 +730,328 @@ class TestVerifyEvidenceCompleteness:
             rest_evidence_path=rest_path, ws_evidence_path=ws_path,
             order_link_id="BB-1", evidence_capture_failed=False)
         assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# FIX 1 (this review round) — bounded WS readiness wait: startup() starts the
+# WS observer thread asynchronously; auth_ok/subscribe_ok must be POLLED, not
+# read once immediately.
+# ---------------------------------------------------------------------------
+
+
+class TestAwaitWsReady:
+    def test_no_consumer_is_never_ready(self):
+        bot = _StubBot(ws_consumer=None)
+        result = tcr.await_ws_ready(bot=bot, timeout_seconds=0)
+        assert result["ready"] is False
+
+    def test_already_ready_returns_immediately(self):
+        bot = _StubBot(ws_consumer=_StubWSConsumer(auth_ok=True, subscribe_ok=True))
+        result = tcr.await_ws_ready(bot=bot, timeout_seconds=0)
+        assert result == {"ready": True, "auth_ok": True, "subscribe_ok": True}
+
+    def test_times_out_when_never_ready(self):
+        bot = _StubBot(
+            ws_consumer=_StubWSConsumer(auth_ok=False, subscribe_ok=False))
+        result = tcr.await_ws_ready(bot=bot, timeout_seconds=0)
+        assert result["ready"] is False
+
+    def test_waits_for_asynchronous_auth_and_subscribe_readiness(self):
+        """The exact race FIX 1 closes: the observer thread's auth/
+        subscribe sequence completes SHORTLY AFTER `startup()` already
+        returned -- this must WAIT for it, not fail on the first read."""
+        import threading
+        import time as time_mod
+
+        consumer = _StubWSConsumer(auth_ok=False, subscribe_ok=False)
+        bot = _StubBot(ws_consumer=consumer)
+
+        def _become_ready_late():
+            time_mod.sleep(0.15)
+            consumer.auth_ok = True
+            consumer.subscribe_ok = True
+
+        threading.Thread(target=_become_ready_late).start()
+
+        result = tcr.await_ws_ready(
+            bot=bot, timeout_seconds=2.0, poll_interval=0.05)
+        assert result == {"ready": True, "auth_ok": True, "subscribe_ok": True}
+
+    def test_only_auth_ready_is_not_ready(self):
+        bot = _StubBot(
+            ws_consumer=_StubWSConsumer(auth_ok=True, subscribe_ok=False))
+        result = tcr.await_ws_ready(bot=bot, timeout_seconds=0)
+        assert result["ready"] is False
+        assert result["auth_ok"] is True
+        assert result["subscribe_ok"] is False
+
+
+class TestRunConformanceWsReadyWait:
+    def test_ws_startup_waits_rather_than_failing_immediately(self, monkeypatch):
+        """run_conformance's own ws_startup stage must use the bounded
+        wait, not a single immediate read -- proven end to end, not just
+        at the await_ws_ready unit level."""
+        import threading
+        import time as time_mod
+
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: True)
+        consumer = _StubWSConsumer(auth_ok=False, subscribe_ok=False)
+        bot = _StubBot(ws_consumer=consumer)
+
+        def _become_ready_late():
+            time_mod.sleep(0.15)
+            consumer.auth_ok = True
+            consumer.subscribe_ok = True
+
+        threading.Thread(target=_become_ready_late).start()
+
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=_StubStore(positions=[{"symbol": SYMBOL}]), symbol=SYMBOL,
+            ws_ready_timeout=2.0)
+
+        ws_stage = next(s for s in result["stages"] if s["stage"] == "ws_startup")
+        assert ws_stage["ok"] is True
+
+    def test_ws_startup_fails_closed_on_timeout(self):
+        consumer = _StubWSConsumer(auth_ok=False, subscribe_ok=False)
+        bot = _StubBot(ws_consumer=consumer)
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=_StubStore(), symbol=SYMBOL, ws_ready_timeout=0)
+        assert result["ok"] is False
+        assert [s["stage"] for s in result["stages"]] == ["startup", "ws_startup"]
+
+
+# ---------------------------------------------------------------------------
+# FIX 2 — await_ws_observation must drain the WS consumer's pending queues
+# onto the writer thread on every poll, not merely read the evidence file.
+# ---------------------------------------------------------------------------
+
+
+class TestAwaitWsObservationDrainsQueue:
+    def test_drains_on_every_poll_when_store_is_given(self, tmp_path):
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(path, order_link_id="BB-1")
+        consumer = _StubWSConsumer(evidence_path=path)
+        bot = _StubBot(ws_consumer=consumer)
+        store = _StubStore()
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0,
+            store=store) is True
+        assert consumer.drain_calls >= 1
+
+    def test_no_store_given_never_drains(self, tmp_path):
+        """Existing callers (e.g. the pure evidence-polling unit tests
+        above) that pass no `store` must keep working exactly as before —
+        draining is opt-in via `store`, not forced."""
+        path = str(tmp_path / "ws_evidence.jsonl")
+        _write_ws_evidence_record(path, order_link_id="BB-1")
+        consumer = _StubWSConsumer(evidence_path=path)
+        bot = _StubBot(ws_consumer=consumer)
+
+        assert tcr.await_ws_observation(
+            bot=bot, order_link_id="BB-1", timeout_seconds=0) is True
+        assert consumer.drain_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# FIX 3 — final WS flush: stop + join the WS thread, then one last
+# writer-thread drain, BEFORE evidence is verified and the store closes.
+# ---------------------------------------------------------------------------
+
+
+class TestFinalizeWsLifecycle:
+    def test_stops_the_ws_thread_and_drains_once_more(self):
+        consumer = _StubWSConsumer()
+        bot = _StubBot(ws_consumer=consumer)
+        store = _StubStore()
+
+        tcr.finalize_ws_lifecycle(bot=bot, store=store)
+
+        assert bot.ws_stop_calls == 1
+        assert consumer.drain_calls == 1
+
+    def test_no_consumer_is_a_noop(self):
+        bot = _StubBot(ws_consumer=None)
+        store = _StubStore()
+        tcr.finalize_ws_lifecycle(bot=bot, store=store)  # must not raise
+        assert bot.ws_stop_calls == 1
+
+    def test_missing_stop_method_does_not_raise(self):
+        class _NoStopBot:
+            ws_consumer = None
+
+        tcr.finalize_ws_lifecycle(bot=_NoStopBot(), store=_StubStore())
+
+    def test_drain_raising_never_propagates(self):
+        class _ExplodingConsumer(_StubWSConsumer):
+            def drain_and_apply(self, store):
+                raise RuntimeError("disk full")
+
+        bot = _StubBot(ws_consumer=_ExplodingConsumer())
+        tcr.finalize_ws_lifecycle(bot=bot, store=_StubStore())  # must not raise
+        assert bot.ws_stop_calls == 1
+
+    def test_stop_raising_still_attempts_the_drain(self):
+        class _ExplodingStopBot(_StubBot):
+            def _stop_private_ws(self):
+                raise RuntimeError("thread join timed out")
+
+        consumer = _StubWSConsumer()
+        bot = _ExplodingStopBot(ws_consumer=consumer)
+        tcr.finalize_ws_lifecycle(bot=bot, store=_StubStore())  # must not raise
+        assert consumer.drain_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# The critical proof, against a REAL WSPrivateConsumer (never a
+# pre-populated evidence file): tick -> order submitted -> WS event arrives
+# -> queue -> observation wait drains it onto the writer thread -> durable
+# evidence -> success.
+# ---------------------------------------------------------------------------
+
+
+import private_ws_consumer as pwc  # noqa: E402
+
+
+class _WSEvidenceClient:
+    def __init__(self, venue="testnet",
+                ws_private_url="wss://stream-testnet.bybit.com/v5/private"):
+        self.venue = venue
+        self.ws_private_url = ws_private_url
+
+
+class TestRealQueueDrainClosesTheRace:
+    def test_ws_event_after_tick_is_queued_then_drained_and_observed(
+            self, tmp_path):
+        """No pre-populated evidence file. A REAL WSPrivateConsumer only
+        ENQUEUES `handle_raw_message` (the WS thread's job); nothing
+        durable exists until `drain_and_apply` (the writer thread's job)
+        runs. The WS event is delivered from a background thread AFTER
+        this test's own `run_conformance` call has already started its
+        bounded observation wait -- proving the drain happens DURING that
+        wait, not merely once at the start.
+        """
+        import threading
+        import time as time_mod
+
+        ws_evidence_path = str(tmp_path / "ws_evidence.jsonl")
+        order_link_id = "BB-real-race-1"
+        consumer = pwc.WSPrivateConsumer(
+            client=_WSEvidenceClient(), transport_factory=lambda: None,
+            evidence_path=ws_evidence_path, assurance_mode=True)
+        consumer.auth_ok = True
+        consumer.subscribe_ok = True
+
+        order_msg = json.dumps({
+            "topic": "order",
+            "data": [{
+                "symbol": SYMBOL, "orderId": "V-REAL-RACE-1",
+                "orderLinkId": order_link_id, "orderStatus": "Filled",
+                "updatedTime": "1",
+            }],
+        })
+
+        def _deliver_ws_event_late():
+            time_mod.sleep(0.3)
+            # The WS (background) thread: OBSERVE and ENQUEUE only -- see
+            # private_ws_consumer.py's ownership model. Must never itself
+            # write durable evidence or touch the store.
+            consumer.handle_raw_message(order_msg)
+
+        threading.Thread(target=_deliver_ws_event_late).start()
+
+        # Nothing durable yet -- proves this test is not reading a
+        # pre-populated file.
+        assert not os.path.exists(ws_evidence_path) or tcr._read_evidence_records(
+            ws_evidence_path) == []
+
+        bot = _StubBot(ws_consumer=consumer)
+        store = _StubStore(
+            positions=[{"symbol": SYMBOL, "order_link_id": order_link_id}])
+
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=store, symbol=SYMBOL, ws_observation_timeout=3.0)
+
+        ws_observation_stage = next(
+            s for s in result["stages"] if s["stage"] == "ws_observation")
+        assert ws_observation_stage["ok"] is True, (
+            "the bounded observation wait must drain the queued WS event "
+            "onto the writer thread and then see the durable record it "
+            "produces")
+
+        records = tcr._read_evidence_records(ws_evidence_path)
+        assert any(
+            r.get("order_link_id") == order_link_id
+            and r.get("transport") == "ws"
+            and r.get("request", {}).get("topic") == "order"
+            for r in records), "the drained event must be durably on disk"
+        # And it got there via the real StateStore-update path too --
+        # drain_and_apply() applies order/execution events to the store,
+        # exactly like TradingBot.tick() does.
+        assert store.order_status_updates == [
+            (order_link_id, "filled", "V-REAL-RACE-1")]
+
+    def test_final_flush_persists_an_event_the_observation_wait_missed(
+            self, tmp_path):
+        """FIX 3: an event that arrives so late it is NOT caught by the
+        bounded observation wait (ws_observation legitimately times out
+        and the run fails that stage) must still not be lost -- the final
+        flush (finalize_ws_lifecycle) must drain it before evidence
+        verification, proving the record is not silently dropped at
+        shutdown."""
+        import threading
+        import time as time_mod
+
+        ws_evidence_path = str(tmp_path / "ws_evidence.jsonl")
+        order_link_id = "BB-real-late-1"
+        consumer = pwc.WSPrivateConsumer(
+            client=_WSEvidenceClient(), transport_factory=lambda: None,
+            evidence_path=ws_evidence_path, assurance_mode=True)
+        consumer.auth_ok = True
+        consumer.subscribe_ok = True
+
+        order_msg = json.dumps({
+            "topic": "order",
+            "data": [{
+                "symbol": SYMBOL, "orderId": "V-REAL-LATE-1",
+                "orderLinkId": order_link_id, "orderStatus": "Filled",
+                "updatedTime": "1",
+            }],
+        })
+
+        def _deliver_after_observation_gives_up():
+            # Later than the (very short) observation timeout below, so
+            # ws_observation legitimately fails this run -- the point is
+            # what happens to the event that arrives AFTER that.
+            time_mod.sleep(0.3)
+            consumer.handle_raw_message(order_msg)
+
+        threading.Thread(target=_deliver_after_observation_gives_up).start()
+
+        bot = _StubBot(ws_consumer=consumer)
+        store = _StubStore(
+            positions=[{"symbol": SYMBOL, "order_link_id": order_link_id}])
+
+        result = tcr.run_conformance(
+            bot=bot, engine=_StubEngine(), client=_StubClient(),
+            store=store, symbol=SYMBOL, ws_observation_timeout=0.05)
+        ws_observation_stage = next(
+            s for s in result["stages"] if s["stage"] == "ws_observation")
+        assert ws_observation_stage["ok"] is False, (
+            "setup check: the event must genuinely arrive after this "
+            "run's own bounded wait gave up")
+
+        time_mod.sleep(0.3)  # let the late delivery actually land
+        tcr.finalize_ws_lifecycle(bot=bot, store=store)
+
+        records = tcr._read_evidence_records(ws_evidence_path)
+        assert any(
+            r.get("order_link_id") == order_link_id
+            and r.get("request", {}).get("topic") == "order"
+            for r in records), (
+            "an event already received on the wire, sitting in the "
+            "queue, must not disappear at shutdown")

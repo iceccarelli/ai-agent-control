@@ -56,40 +56,64 @@ both given)
 =========================================================================
   1. TradingBot.startup() — REST reconciliation, then (this tool forces
                              `ws_enabled_override=True`) the private-WS
-                             observer connects, authenticates, and
-                             subscribes — the same `_start_private_ws`
-                             production uses, not a separate WS path.
-  2. TradingBot.tick()     — one cycle: a bounded one-shot strategy signals
+                             observer STARTS asynchronously — the same
+                             `_start_private_ws` production uses, not a
+                             separate WS path.
+  2. WS readiness           — bounded wait (`--ws-ready-timeout`,
+                             `await_ws_ready`) for the observer thread to
+                             have actually reached AUTH_OK and
+                             SUBSCRIBE_OK. `startup()` returns before that
+                             thread necessarily gets there, so "the
+                             consumer object exists" is never treated as
+                             "ready".
+  3. TradingBot.tick()     — one cycle: a bounded one-shot strategy signals
                              BUY once, `engine.execute()` submits the order,
                              observes the fill, places and verifies the
                              protective stop — all synchronous, all real.
-  3. WS observation        — bounded wait (`--ws-observation-timeout`) for
-                             the WS observer to actually capture an order
-                             or execution evidence record for THIS order's
+  4. WS observation        — bounded wait (`--ws-observation-timeout`,
+                             `await_ws_observation`) for the WS observer
+                             to actually capture an order or execution
+                             evidence record for THIS order's
                              `order_link_id` — proof the private stream
                              observed the same real order, not merely that
-                             REST did. ASSURANCE mode (this tool always
-                             uses it): missing WS observation is a failed
-                             run, not a soft warning.
-  4. Protection read-back  — `client.get_position()` queried FRESH (not the
+                             REST did. Each poll also DRAINS the
+                             consumer's pending state/evidence queues onto
+                             this (the writer) thread via the existing
+                             `drain_and_apply()` — a real WS event that
+                             arrives after `tick()` already returned has
+                             nowhere else to be applied/written from
+                             before the next real tick, which this bounded
+                             run never takes. ASSURANCE mode (this tool
+                             always uses it): missing WS observation is a
+                             failed run, not a soft warning.
+  5. Protection read-back  — `client.get_position()` queried FRESH (not the
                              local ledger) to confirm the stop the venue
                              itself reports, not merely what execute()
                              believed it set.
-  5. Flatten               — `engine.close_position()`, the same method
+  6. Flatten               — `engine.close_position()`, the same method
                              production uses to exit.
-  6. Final reconciliation  — `client.reconcile_on_startup()`.
-  7. Evidence verification — BOTH evidence chains (REST's, via
+  7. Final reconciliation  — `client.reconcile_on_startup()`.
+  8. Final WS flush        — `finalize_ws_lifecycle()`: stop the WS
+                             thread, JOIN it, then one last
+                             `drain_and_apply()` of anything it received
+                             but that no poll of the bounded observation
+                             wait happened to catch — before the store
+                             closes or evidence is verified, so a real,
+                             already-received observation can never
+                             disappear at shutdown.
+  9. Evidence verification — BOTH evidence chains (REST's, via
                              EvidenceCapturingTransport; WS's, via
                              WSPrivateConsumer's assurance-mode capture)
-                             are hash-chain-verified with
-                             `venue_evidence.verify_chain`. A tamper,
-                             gap, or capture failure in EITHER chain fails
-                             the run — see "ASSURANCE MODE" below.
-  8. WS shutdown + result  — `bot.shutdown()` stops the WS thread; a
-                             machine-readable summary (stage-by-stage
-                             outcome, latencies, both evidence paths, both
-                             chain-verification results) is written to
-                             `--out`.
+                             are hash-chain-verified, AND their actual
+                             content is checked (`verify_evidence_
+                             completeness`) — a clean chain around missing
+                             evidence is not proof. A tamper, gap,
+                             missing record, or capture failure fails the
+                             run — see "ASSURANCE MODE" below.
+  10. Shutdown + result    — `bot.shutdown()`; a machine-readable summary
+                             (stage-by-stage outcome, latencies, both
+                             evidence paths, both chain-verification
+                             results) is written to `--out`.
 
 ASSURANCE MODE — NO "BEST EFFORT THEREFORE GREEN"
 ====================================================
@@ -123,6 +147,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import logging
 import os
 import sys
 import time
@@ -135,6 +160,8 @@ sys.path.insert(0, BOT)
 sys.path.insert(0, HERE)
 
 import venue_evidence as ve  # noqa: E402
+
+logger = logging.getLogger("testnet_conformance_run")
 
 DEFAULT_EVIDENCE_PATH = os.path.join(
     BOT, "artifacts", "testnet_conformance_evidence.jsonl")
@@ -150,6 +177,12 @@ SYMBOL = "BTCUSDT"
 #: run must terminate, not hang on a stream that never confirms —
 #: mission requirement "bounded WS observation timeout".
 DEFAULT_WS_OBSERVATION_TIMEOUT_SECONDS = 30.0
+#: Bounded wait for the WS observer to reach AUTH_OK/SUBSCRIBE_OK.
+#: `TradingBot._start_private_ws()` starts the observer thread and
+#: returns immediately — auth/subscribe happen asynchronously on that
+#: thread, so reading `auth_ok`/`subscribe_ok` right after `startup()`
+#: returns is a race, not a check (see FIX 1, this review round).
+DEFAULT_WS_READY_TIMEOUT_SECONDS = 15.0
 
 
 class ConformanceRefused(RuntimeError):
@@ -313,10 +346,42 @@ def _is_valid_ws_observation(record: Dict[str, Any], *, order_link_id: str,
     return True
 
 
+def await_ws_ready(*, bot: Any, timeout_seconds: float,
+                   poll_interval: float = 0.1) -> Dict[str, Any]:
+    """FIX 1 — bounded WS readiness wait.
+
+    `TradingBot._start_private_ws()` starts the observer thread and
+    returns immediately (`observation_status` "STARTING"); AUTH_OK and
+    SUBSCRIBE_OK are only ever set by that thread's own
+    connect/authenticate/subscribe sequence, asynchronously, some time
+    after `startup()` has already returned. Reading `ws_consumer` merely
+    EXISTING, or reading `auth_ok`/`subscribe_ok` exactly once right after
+    `startup()`, is a race — "thread exists" is never equated with
+    "ready" here. This polls until `ws_consumer` exists AND `auth_ok` AND
+    `subscribe_ok` are all true, or `timeout_seconds` elapses. Never
+    raises; timeout or an explicit auth/subscribe failure is reported as
+    `ready: False` for the caller to fail the run closed on — this
+    function never decides pass/fail itself, matching every other bounded
+    wait in this tool.
+    """
+    deadline = time.time() + timeout_seconds
+    while True:
+        consumer = getattr(bot, "ws_consumer", None)
+        auth_ok = bool(getattr(consumer, "auth_ok", False)) if consumer else False
+        subscribe_ok = (bool(getattr(consumer, "subscribe_ok", False))
+                        if consumer else False)
+        if consumer is not None and auth_ok and subscribe_ok:
+            return {"ready": True, "auth_ok": auth_ok, "subscribe_ok": subscribe_ok}
+        if time.time() >= deadline:
+            return {"ready": False, "auth_ok": auth_ok, "subscribe_ok": subscribe_ok}
+        time.sleep(poll_interval)
+
+
 def await_ws_observation(*, bot: Any, order_link_id: str,
                          timeout_seconds: float,
                          poll_interval: float = 0.1,
-                         run_start_utc: Optional[str] = None) -> bool:
+                         run_start_utc: Optional[str] = None,
+                         store: Any = None) -> bool:
     """Poll the WS evidence log (not an in-memory counter) for a record
     that proves THIS run's own private stream observed THIS order — see
     `_is_valid_ws_observation` (FIX 3) for exactly what "proves" requires;
@@ -324,6 +389,19 @@ def await_ws_observation(*, bot: Any, order_link_id: str,
     `timeout_seconds`; returns False (never raises) on timeout, matching
     `run_conformance`'s "a failed stage is data, not an exception"
     convention.
+
+    FIX 2 — drains the WS consumer's pending state/evidence queues onto
+    the writer thread (this thread, via the EXISTING
+    `drain_and_apply()`) on every poll, BEFORE inspecting the evidence
+    file. A real WS event that arrived after the one `bot.tick()` already
+    ran is only sitting in `WSPrivateConsumer`'s in-memory queues (see
+    private_ws_consumer.py's ownership model) until something on the
+    writer thread drains it — there is no guaranteed second tick during
+    this bounded wait, so this loop IS that writer-thread drain. Never a
+    second writer: `store` is only ever passed to the consumer's own
+    `drain_and_apply()`, exactly like `TradingBot.tick()` does it.
+    `store=None` (the default) skips draining, e.g. for callers/tests that
+    only want the pure evidence-file-polling behavior.
     """
     consumer = getattr(bot, "ws_consumer", None)
     if consumer is None:
@@ -331,6 +409,8 @@ def await_ws_observation(*, bot: Any, order_link_id: str,
     evidence_path = getattr(consumer, "evidence_path", None)
     deadline = time.time() + timeout_seconds
     while True:
+        if store is not None:
+            consumer.drain_and_apply(store)
         for record in _read_evidence_records(evidence_path):
             if _is_valid_ws_observation(
                     record, order_link_id=order_link_id,
@@ -341,10 +421,48 @@ def await_ws_observation(*, bot: Any, order_link_id: str,
         time.sleep(poll_interval)
 
 
+def finalize_ws_lifecycle(*, bot: Any, store: Any) -> None:
+    """FIX 3 — final WS flush, before the store closes and evidence is
+    verified.
+
+    Stops the WS observer thread (`bot._stop_private_ws()` — signals it
+    and JOINS it, so it has genuinely stopped touching anything, not just
+    been asked to), then performs ONE LAST writer-thread drain
+    (`drain_and_apply()`, the exact same mechanism `TradingBot.tick()`
+    and `await_ws_observation()` above already use — never a second
+    writer) of whatever the WS thread had already received and queued but
+    that no poll of the bounded observation wait happened to catch before
+    it returned. An event already on the wire, sitting in the queue, must
+    not silently disappear at shutdown.
+
+    Ownership stays exactly as everywhere else in this lifecycle: the WS
+    thread only ever observed/enqueued it; this call is what performs the
+    actual state mutation and durable evidence write, and it runs on the
+    calling (writer) thread. Never raises — a cleanup-path failure here
+    must not prevent evidence verification or shutdown from running; it
+    is exactly the kind of thing `evidence_capture_failed`/the completeness
+    check already exist to catch instead.
+    """
+    stop = getattr(bot, "_stop_private_ws", None)
+    if callable(stop):
+        try:
+            stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("_stop_private_ws() raised during final WS flush")
+    consumer = getattr(bot, "ws_consumer", None)
+    if consumer is not None:
+        try:
+            consumer.drain_and_apply(store)
+        except Exception:  # noqa: BLE001
+            logger.exception("final WS drain_and_apply() raised")
+
+
 def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
                     symbol: str = SYMBOL,
                     ws_observation_timeout: float =
-                    DEFAULT_WS_OBSERVATION_TIMEOUT_SECONDS) -> Dict[str, Any]:
+                    DEFAULT_WS_OBSERVATION_TIMEOUT_SECONDS,
+                    ws_ready_timeout: float =
+                    DEFAULT_WS_READY_TIMEOUT_SECONDS) -> Dict[str, Any]:
     """The bounded lifecycle itself: startup (REST reconciliation + WS
     connect/auth/subscribe) -> one tick -> WS observation -> protection
     read-back -> flatten -> final reconciliation -> evidence-chain
@@ -368,20 +486,19 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     if not started:
         return _finalize(stages, timestamps, ok=False)
 
-    # FIX 5: a connected WebSocket alone is not sufficient — the
-    # integrated lifecycle must have explicitly established AUTH_OK and
-    # SUBSCRIBE_OK (see private_ws_consumer.WSPrivateConsumer.run_once).
-    # `getattr(..., False)` so a consumer double without these attributes
-    # fails closed rather than raising.
-    consumer = bot.ws_consumer
-    auth_ok = bool(getattr(consumer, "auth_ok", False)) if consumer else False
-    subscribe_ok = (bool(getattr(consumer, "subscribe_ok", False))
-                    if consumer else False)
-    ws_ready = consumer is not None and auth_ok and subscribe_ok
-    _stage("ws_startup", ws_ready,
+    # FIX 5 + FIX 1 (this review round): a connected WebSocket alone is
+    # not sufficient — the integrated lifecycle must have explicitly
+    # established AUTH_OK and SUBSCRIBE_OK (see
+    # private_ws_consumer.WSPrivateConsumer.run_once). `startup()` starts
+    # that thread ASYNCHRONOUSLY and returns before it necessarily gets
+    # there, so this is a BOUNDED WAIT (`await_ws_ready`), not a single
+    # immediate read — "thread exists" is never equated with "ready".
+    ws_ready_result = await_ws_ready(bot=bot, timeout_seconds=ws_ready_timeout)
+    _stage("ws_startup", ws_ready_result["ready"],
           observation_status=bot.observation_status,
-          auth_ok=auth_ok, subscribe_ok=subscribe_ok)
-    if not ws_ready:
+          auth_ok=ws_ready_result["auth_ok"],
+          subscribe_ok=ws_ready_result["subscribe_ok"])
+    if not ws_ready_result["ready"]:
         return _finalize(stages, timestamps, ok=False)
 
     bot.tick()
@@ -396,7 +513,7 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     ws_observed = await_ws_observation(
         bot=bot, order_link_id=order_link_id,
         timeout_seconds=ws_observation_timeout,
-        run_start_utc=run_start_utc)
+        run_start_utc=run_start_utc, store=store)
     _stage("ws_observation", ws_observed, order_link_id=order_link_id,
           timeout_seconds=ws_observation_timeout)
     if not ws_observed:
@@ -584,6 +701,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                         default=DEFAULT_WS_OBSERVATION_TIMEOUT_SECONDS,
                         help="bounded wait for the WS observer to capture "
                              "this order's evidence before failing closed")
+    parser.add_argument("--ws-ready-timeout", type=float,
+                        default=DEFAULT_WS_READY_TIMEOUT_SECONDS,
+                        help="bounded wait for the WS observer to reach "
+                             "AUTH_OK/SUBSCRIBE_OK before failing closed")
     parser.add_argument("--out", default=DEFAULT_RESULT_PATH)
     args = parser.parse_args(argv)
 
@@ -630,14 +751,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         result = run_conformance(
             bot=bot, engine=engine, client=client, store=store,
             symbol=args.symbol,
-            ws_observation_timeout=args.ws_observation_timeout)
+            ws_observation_timeout=args.ws_observation_timeout,
+            ws_ready_timeout=args.ws_ready_timeout)
+    finally:
+        # FIX 3 — final WS flush: stop the WS thread, join it, then run
+        # ONE LAST writer-thread drain of whatever it had queued but that
+        # no poll of the bounded observation wait happened to catch —
+        # BEFORE the store closes and evidence is verified, so a real
+        # observation already received on the wire can never disappear
+        # at shutdown. Runs even when run_conformance stopped early on a
+        # failed stage. `evidence_capture_failed` is read AFTER this, on
+        # purpose: this final drain can itself set it.
+        try:
+            finalize_ws_lifecycle(bot=bot, store=store)
+        except Exception:  # noqa: BLE001
+            print("finalize_ws_lifecycle() raised during cleanup",
+                  file=sys.stderr)
         evidence_capture_failed = bool(
             bot.ws_consumer.evidence_capture_failed if bot.ws_consumer
             else True)
-    finally:
         # WS shutdown is part of the bounded lifecycle this tool exercises
         # — never leave the observer thread/socket running past the run
-        # this process is about to report on.
+        # this process is about to report on. finalize_ws_lifecycle()
+        # already stopped/joined the WS thread above; shutdown() closing
+        # it again is a no-op (main.TradingBot._stop_private_ws() returns
+        # immediately once self.ws_thread is None).
         try:
             bot.shutdown()
         except Exception:  # noqa: BLE001
