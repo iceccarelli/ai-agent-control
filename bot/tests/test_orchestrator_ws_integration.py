@@ -13,6 +13,7 @@ import json
 import os
 import queue
 import sys
+import threading
 import time
 
 import pytest
@@ -91,11 +92,26 @@ def _text_frame(obj):
 
 
 class _ScriptedTransport:
-    def __init__(self, frames):
+    """`block_when_exhausted`: once frames run out, `recv()` blocks for a
+    few seconds (via a real `threading.Event`, never set) instead of
+    raising immediately. Without this, a script that exhausts right after
+    the events a test cares about triggers an IMMEDIATE reconnect on the
+    WS thread — racing, at real millisecond scale, against the main
+    thread's own assertions/`tick()` call on `needs_reconciliation`. That
+    race is real (see private_ws_consumer.py's run_forever docstring for
+    the production-side half of this fix: flag before I/O) but a test
+    should not depend on winning it — blocking keeps the connection
+    "open but idle" for long enough that the test's synchronous assertion
+    window reliably completes first.
+    """
+
+    def __init__(self, frames, *, block_when_exhausted=False):
         self._frames = list(frames)
         self.sent = []
         self.connected = False
         self.closed = False
+        self._block_when_exhausted = block_when_exhausted
+        self._block_event = threading.Event()
 
     def connect(self):
         self.connected = True
@@ -108,11 +124,14 @@ class _ScriptedTransport:
 
     def recv(self, timeout=None):
         if not self._frames:
+            if self._block_when_exhausted:
+                self._block_event.wait(timeout=5.0)
             raise wt.WSClosed("scripted transport exhausted")
         return self._frames.pop(0)
 
     def close(self):
         self.closed = True
+        self._block_event.set()  # unblock a pending recv() immediately
 
 
 class _BlockingFactory:
@@ -147,6 +166,7 @@ def _build_bot(tmp_path, exchange, ws_factory):
     bot = m.TradingBot(
         config=cfg, store=store, client=client, risk_manager=risk,
         engine=engine, strategy=strategy, ws_transport_factory=ws_factory,
+        ws_evidence_path=str(tmp_path / "ws_evidence.jsonl"),
     )
     return bot, store, strategy
 
@@ -249,7 +269,7 @@ class TestFullApplicationLifecycleWithWS:
             _text_frame({"topic": "position", "data": [{
                 "symbol": SYMBOL, "updatedTime": "2",
             }]}),
-        ])
+        ], block_when_exhausted=True)
         ws_factory.provide(events_transport)
 
         assert _wait_until(lambda: bot.ws_consumer.applied_event_count >= 3), (
@@ -295,6 +315,9 @@ class TestFullApplicationLifecycleWithWS:
         # nothing about the WS path touched it:
         assert store.positions_without_stops() == []
 
+        # Unblock the parked recv() immediately rather than waiting out
+        # its 5s timeout, so shutdown() below is fast.
+        events_transport.close()
         bot.shutdown()
 
     def test_reconciliation_failure_leaves_the_gap_unresolved(
@@ -368,4 +391,89 @@ class TestFullApplicationLifecycleWithWS:
 
         assert bot.ws_thread is None
         assert bot.ws_stop_event.is_set()
+        assert transport.closed is True
+
+
+class _BlockingRecvTransport:
+    """`recv()` blocks for exactly `timeout` seconds (like a real socket
+    timeout) and then raises — never resolved by any outside event. Its
+    blocking duration is driven entirely by whatever
+    `private_ws_consumer.RECV_TIMEOUT_SECONDS` the caller passes in, the
+    SAME value `TradingBot._stop_private_ws()`'s fix reads to size its
+    join() — so this proves the two are actually tied together, not
+    merely that "the test waited long enough"."""
+
+    def __init__(self, auth_subscribe_frames):
+        self._frames = list(auth_subscribe_frames)
+        self.sent = []
+        self.connected = False
+        self.closed = False
+        self._never = threading.Event()
+
+    def connect(self):
+        self.connected = True
+
+    def send_text(self, text):
+        self.sent.append(text)
+
+    def send_pong(self, payload):
+        pass
+
+    def recv(self, timeout=None):
+        if self._frames:
+            return self._frames.pop(0)
+        self._never.wait(timeout=timeout)
+        raise wt.WSClosed("simulated real-socket recv timeout")
+
+    def close(self):
+        self.closed = True
+
+
+class TestWsShutdownIsARealSynchronizationBoundary:
+    """The remaining lifecycle race this review round closes:
+    `_stop_private_ws()` used to join() for a FIXED 10s regardless of how
+    long the receive loop's own `recv()` can legitimately block
+    (`RECV_TIMEOUT_SECONDS`, 25s in production) — a join shorter than that
+    is not a real synchronization boundary. RECV_TIMEOUT_SECONDS and the
+    safety margin are both monkeypatched down so this test runs fast, but
+    the RELATIONSHIP under test (join budget = RECV_TIMEOUT_SECONDS +
+    margin) is exactly what production uses, just scaled down.
+    """
+
+    def test_shutdown_waits_for_the_blocked_recv_then_the_thread_is_really_gone(
+            self, tmp_path, exchange, monkeypatch):
+        import private_ws_consumer as pwc
+
+        monkeypatch.setattr(pwc, "RECV_TIMEOUT_SECONDS", 0.3)
+        monkeypatch.setattr(m, "WS_SHUTDOWN_SAFETY_MARGIN_SECONDS", 0.2)
+
+        ws_factory = _BlockingFactory()
+        bot, store, strategy = _build_bot(tmp_path, exchange, ws_factory)
+        assert bot.startup() is True
+
+        transport = _BlockingRecvTransport([
+            _text_frame({"op": "auth", "success": True}),
+            _text_frame({"op": "subscribe", "success": True}),
+        ])
+        ws_factory.provide(transport)
+        assert _wait_until(
+            lambda: bot.ws_consumer is not None and bot.ws_consumer.subscribe_ok)
+
+        # 1. The WS thread is genuinely BLOCKED inside recv() right now —
+        # not merely "started", actually inside the receive loop, exactly
+        # the state that made the old fixed-10s join a coin flip.
+        assert bot.ws_thread.is_alive()
+
+        started = time.time()
+        bot.shutdown()  # calls _stop_private_ws() internally
+        elapsed = time.time() - started
+
+        # 2. shutdown genuinely WAITED for the blocked recv to time out
+        # (>= the patched RECV_TIMEOUT_SECONDS) rather than giving up
+        # early at some fixed, shorter budget.
+        assert elapsed >= pwc.RECV_TIMEOUT_SECONDS
+        # The thread is verifiably gone -- a real synchronization
+        # boundary, not merely "we stopped waiting for it".
+        assert bot.ws_thread is None
+        assert bot.ws_shutdown_failed is False
         assert transport.closed is True

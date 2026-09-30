@@ -453,6 +453,12 @@ class Config:
     # -- runtime ------------------------------------------------------------
     LOOP_INTERVAL_SECONDS: float
     ENABLE_HEALTH_SERVER: bool
+    #: Starts `main.TradingBot`'s private-WS observer (see
+    #: `TradingBot._start_private_ws`). Off by default: WS is fast
+    #: observation on top of the REST path, never required for correct
+    #: operation, and an operator opts in explicitly rather than it
+    #: silently starting because credentials happen to be present.
+    PRIVATE_WS_ENABLED: bool
     HEALTHCHECK_HOST: str
     HEALTHCHECK_PORT: int
     DECISIONS_RETENTION_DAYS: int
@@ -870,6 +876,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
 
         LOOP_INTERVAL_SECONDS=parse_float(env, "LOOP_INTERVAL_SECONDS", 60.0, low=0.01, high=3600.0),
         ENABLE_HEALTH_SERVER=parse_bool(env.get("ENABLE_HEALTH_SERVER"), False),
+        PRIVATE_WS_ENABLED=parse_bool(env.get("PRIVATE_WS_ENABLED"), False),
         # Loopback by default. The endpoint is unauthenticated and reports
         # positions and kill-switch state; exposing it on every interface is
         # an operator decision, not a default.

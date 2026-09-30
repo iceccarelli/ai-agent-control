@@ -59,6 +59,14 @@ logger = logging.getLogger("main")
 
 __all__ = ["TradingBot", "build_bot", "main"]
 
+#: Safety margin added on top of `private_ws_consumer.RECV_TIMEOUT_SECONDS`
+#: when joining the WS thread at shutdown — see
+#: `TradingBot._stop_private_ws()`. The receive loop's own blocking
+#: `recv()` call is the longest interval between the WS thread checking
+#: `ws_stop_event`; the join budget must exceed that, not guess a fixed
+#: number smaller than it.
+WS_SHUTDOWN_SAFETY_MARGIN_SECONDS = 5.0
+
 
 # ---------------------------------------------------------------------------
 # health server
@@ -110,6 +118,9 @@ class TradingBot:
         strategy: Optional[Any] = None,
         carry: Optional[Any] = None,
         ws_transport_factory: Optional[Callable[[], Any]] = None,
+        ws_evidence_path: Optional[str] = None,
+        ws_enabled_override: Optional[bool] = None,
+        ws_assurance_mode: bool = False,
     ) -> None:
         #: Injectable seam for the private-WS transport, exactly like
         #: `client`/`engine`/`strategy` above — production leaves this
@@ -119,9 +130,30 @@ class TradingBot:
         #: can be driven through the actual application lifecycle without a
         #: socket. See `_start_private_ws`.
         self._ws_transport_factory = ws_transport_factory
+        #: Same idea for the WS evidence log path: `None` (production)
+        #: reads `cfg.WS_EVIDENCE_PATH`/falls back to
+        #: `private_ws_consumer.DEFAULT_WS_EVIDENCE_PATH`; tests pass an
+        #: explicit `tmp_path`-based file so they never write into the
+        #: real repository's `artifacts/` directory as a side effect.
+        self._ws_evidence_path = ws_evidence_path
+        #: `None` (production): the config flag `PRIVATE_WS_ENABLED`
+        #: decides, unchanged. `True`/`False`: overrides it explicitly —
+        #: used by tools/testnet_conformance_run.py, which needs WS
+        #: started as part of its bounded run regardless of the general
+        #: trading config, without requiring an extra environment
+        #: variable beyond what the conformance preflight already checks.
+        self._ws_enabled_override = ws_enabled_override
+        #: Passed straight through to WSPrivateConsumer — see
+        #: private_ws_consumer.py's "EVIDENCE FAILURE SEMANTICS". False
+        #: (NORMAL) for real trading; the conformance runner passes True.
+        self._ws_assurance_mode = ws_assurance_mode
         self.ws_consumer: Optional[Any] = None
         self.ws_thread: Optional[threading.Thread] = None
         self.ws_stop_event = threading.Event()
+        #: True only if `_stop_private_ws()` ever joined its timeout
+        #: budget with the thread still alive — a real shutdown failure,
+        #: not the ordinary case. See `_stop_private_ws()`.
+        self.ws_shutdown_failed = False
         #: "DISABLED" (PRIVATE_WS_ENABLED is false, the default — REST-only
         #: observation, unchanged from before this attribute existed),
         #: "STARTING", "HEALTHY" (a WS-flagged gap was cleared by a
@@ -428,7 +460,10 @@ class TradingBot:
         has (see `tick()`'s unconditional observe_exits/
         check_naked_positions calls, which do not depend on this at all).
         """
-        if not bool(getattr(self.cfg, "PRIVATE_WS_ENABLED", False)):
+        enabled = self._ws_enabled_override
+        if enabled is None:
+            enabled = bool(getattr(self.cfg, "PRIVATE_WS_ENABLED", False))
+        if not enabled:
             self._observation_state = "DISABLED"
             return
         try:
@@ -440,8 +475,12 @@ class TradingBot:
                 url = self.client.ws_private_url
                 transport_factory = lambda: _wt.PrivateWebSocket(url)  # noqa: E731
 
+            evidence_path = self._ws_evidence_path or str(getattr(
+                self.cfg, "WS_EVIDENCE_PATH", "") or _pwc.DEFAULT_WS_EVIDENCE_PATH)
             self.ws_consumer = _pwc.WSPrivateConsumer(
-                client=self.client, transport_factory=transport_factory)
+                client=self.client, transport_factory=transport_factory,
+                evidence_path=evidence_path,
+                assurance_mode=self._ws_assurance_mode)
             self.ws_stop_event = threading.Event()
             self.ws_thread = threading.Thread(
                 target=self.ws_consumer.run_forever,
@@ -459,18 +498,46 @@ class TradingBot:
             self._observation_state = "DEGRADED"
 
     def _stop_private_ws(self) -> None:
-        """Signal the consumer to stop, wait for its thread to actually
-        exit, and never leave a socket or a daemon thread outliving
-        shutdown. If it does not stop in time, that is reported — not
-        silently accepted as "close enough"."""
+        """Signal the consumer to stop and wait for its thread to
+        ACTUALLY exit — not merely for as long as we're willing to wait.
+
+        The receive loop can be blocked inside a single
+        `transport.recv()` for up to `private_ws_consumer.
+        RECV_TIMEOUT_SECONDS` before it next checks `ws_stop_event` (see
+        that module's `run_once`/`run_forever`) — a join() timeout
+        shorter than that is not a real synchronization boundary, it is a
+        coin flip that happens to usually win. This joins for
+        `RECV_TIMEOUT_SECONDS + WS_SHUTDOWN_SAFETY_MARGIN_SECONDS`, so a
+        caller relying on this call meaning "the WS thread is genuinely
+        stopped" (e.g. tools/testnet_conformance_run.py's
+        `finalize_ws_lifecycle`, before it performs what MUST be the
+        final drain) can trust that.
+
+        If the thread is STILL alive after that — a real, unexpected
+        shutdown failure, not the ordinary case — the thread reference is
+        DELIBERATELY NOT discarded (a discarded-but-still-running thread
+        could keep enqueueing observations nobody will ever drain) and
+        `observation_status` is forced to DEGRADED so nothing downstream
+        can read this as a clean shutdown.
+        """
         if self.ws_thread is None:
             return
         self.ws_stop_event.set()
-        self.ws_thread.join(timeout=10.0)
+        import private_ws_consumer as _pwc
+
+        shutdown_timeout = _pwc.RECV_TIMEOUT_SECONDS + WS_SHUTDOWN_SAFETY_MARGIN_SECONDS
+        self.ws_thread.join(timeout=shutdown_timeout)
         if self.ws_thread.is_alive():
             logger.error(
-                "private-WS thread did not stop within the shutdown "
-                "timeout; any observation gap it held is unresolved")
+                "private-WS thread did not stop within %.1fs (RECV_TIMEOUT_"
+                "SECONDS=%.1fs + margin); this is a real shutdown failure, "
+                "not a soft warning -- preserving the thread reference "
+                "(never discarding it while still alive) and forcing "
+                "observation_status to DEGRADED",
+                shutdown_timeout, _pwc.RECV_TIMEOUT_SECONDS)
+            self._observation_state = "DEGRADED"
+            self.ws_shutdown_failed = True
+            return
         self.ws_thread = None
 
     def _absorb_ws_observations(self, *, rest_ok: bool) -> None:
