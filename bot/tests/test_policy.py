@@ -39,6 +39,17 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import policy as pol  # noqa: E402
 
+# Same convention as test_training.py: scikit-learn is an OPTIONAL runtime
+# dependency (see requirements.txt) needed only to train/save/load a policy.
+# Without it every test in this file previously errored with
+# ModuleNotFoundError instead of reporting what actually happened: the
+# dependency required to run them is not installed here. That is a SKIP, not
+# a failure — install scikit-learn to get real coverage of this file again.
+pytestmark = pytest.mark.skipif(
+    not pol.sklearn_available(),
+    reason=f"scikit-learn is unavailable: {pol.unavailability_reason()}",
+)
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 POLICY_PATH = os.path.join(REPO, "policy.py")
 

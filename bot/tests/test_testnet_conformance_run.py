@@ -155,7 +155,7 @@ class _StubStore:
     def positions_without_stops(self):
         return self._naked
 
-    def update_order_status(self, order_link_id, status, exchange_id=""):
+    def update_order_status(self, order_link_id, status, exchange_id="", *, source="rest"):
         self.order_status_updates.append((order_link_id, status, exchange_id))
 
 

@@ -323,4 +323,14 @@ class FakeBybit:
         if path.endswith("realtime"):
             rows = [r for r in rows
                     if r["orderStatus"] in ("New", "Untriggered", "PartiallyFilled")]
+        # Real Bybit's GET /v5/order/realtime `orderFilter` narrows the
+        # result to exactly one of Order/StopOrder/tpslOrder, the same way
+        # `orderFilter` narrows `cancel-all` (see that path above). Modeling
+        # it here is what lets a caller (e.g. tools/recon_packet.py) prove it
+        # enumerates the three spot order kinds separately rather than
+        # getting the same unfiltered list back three times.
+        requested_filter = params.get("orderFilter")
+        if requested_filter:
+            rows = [r for r in rows
+                    if r.get("orderFilter", "Order") == requested_filter]
         return self._ok({"list": rows})

@@ -164,6 +164,101 @@ def test_reconcile_still_catches_a_stop_this_process_never_recorded(tmp_path):
     assert float(row["stop_price"]) > 0
 
 
+class TestSpotNakedRecoveryIsIdempotent:
+    """RECOVERY BOUNDARY: after a spot protective stop is accepted at the
+    venue, before this process durably records that fact (a crash between
+    `place_stop_order` succeeding and `set_position_stop`/`verify_stop`
+    completing, or between two calls that both observe "naked" before
+    either has written the stop back).
+
+    `place_stop_order`'s `orderLinkId` is a fresh `store.next_order_seq()`
+    on every call — unlike an entry order, it is never deduplicated as a
+    retry of the same intent. On LINEAR that is harmless (the stop is a
+    position field, idempotently overwritten — see
+    `test_a_stop_cleared_at_the_venue_is_reprotected` and
+    `test_reconcile_still_catches_a_stop_this_process_never_recorded`,
+    both LinearCfg). On SPOT, calling `_protect_or_close_naked` twice for
+    the same naked-looking position without a venue check first placed a
+    SECOND, independent live stop order for the same quantity — this
+    class proves that no longer happens.
+    """
+
+    def test_happy_path_no_existing_stop_places_exactly_one(self, tmp_path):
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, Cfg(), fake)
+        store.upsert_position(SYMBOL, "Buy", 0.01, 60_000.0, stop_price=0.0)
+        row = store.open_positions()[0]
+
+        outcome = engine._protect_or_close_naked(SYMBOL, row, reason="NAKED_ON_STARTUP")
+
+        assert outcome == "REPROTECTED"
+        stop_orders = [o for o in fake.orders.values()
+                      if o.get("orderFilter") == "StopOrder"]
+        assert len(stop_orders) == 1
+        assert float(store.open_positions()[0]["stop_price"]) > 0
+
+    def test_a_stop_already_live_at_the_venue_is_recognized_not_duplicated(
+            self, tmp_path):
+        """The exact crash: the venue already has a live stop for this
+        symbol (a prior call — this process or an earlier, crashed one —
+        already placed and the venue accepted it), but the ledger's
+        stop_price is still 0 (never durably recorded). Re-running the
+        naked-recovery path must find and adopt that stop, not place a
+        second one."""
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, Cfg(), fake)
+        store.upsert_position(SYMBOL, "Buy", 0.01, 60_000.0, stop_price=0.0)
+        row = store.open_positions()[0]
+
+        first = engine._protect_or_close_naked(SYMBOL, row, reason="NAKED_ON_STARTUP")
+        assert first == "REPROTECTED"
+        stop_orders_after_first = [o for o in fake.orders.values()
+                                   if o.get("orderFilter") == "StopOrder"]
+        assert len(stop_orders_after_first) == 1
+
+        # Simulate the crash: the ledger "forgets" it already recorded the
+        # stop (stop_price reset to 0), exactly what a crash between the
+        # venue accepting the order and set_position_stop committing would
+        # leave behind. The venue's own state is untouched -- it still has
+        # exactly the one live stop from the call above.
+        store.set_position_stop(SYMBOL, 0.0)
+        row_again = store.open_positions()[0]
+        assert float(row_again["stop_price"]) == 0.0
+
+        second = engine._protect_or_close_naked(
+            SYMBOL, row_again, reason="NAKED_ON_STARTUP")
+
+        assert second == "REPROTECTED"
+        stop_orders_after_second = [o for o in fake.orders.values()
+                                    if o.get("orderFilter") == "StopOrder"]
+        assert len(stop_orders_after_second) == 1, (
+            "a second, independent live stop order was placed for a "
+            "position that already had one resting at the venue")
+        assert float(store.open_positions()[0]["stop_price"]) > 0
+
+    def test_reconcile_on_startup_after_a_crash_does_not_duplicate_the_stop(
+            self, tmp_path):
+        """The full path a real restart takes: reconcile() (not the
+        private helper directly) reading a ledger whose stop_price never
+        got durably written, against a venue that already has the stop."""
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, Cfg(), fake)
+        store.upsert_position(SYMBOL, "Buy", 0.01, 60_000.0, stop_price=0.0)
+        row = store.open_positions()[0]
+        engine._protect_or_close_naked(SYMBOL, row, reason="NAKED_ON_STARTUP")
+        store.set_position_stop(SYMBOL, 0.0)  # crash before this was recorded
+
+        summary = engine.reconcile()
+
+        assert summary["naked_positions"] == [SYMBOL]
+        stop_orders = [o for o in fake.orders.values()
+                      if o.get("orderFilter") == "StopOrder"]
+        assert len(stop_orders) == 1, (
+            "reconcile() on restart placed a duplicate spot stop order "
+            "instead of recognizing the one already live at the venue")
+        assert float(store.open_positions()[0]["stop_price"]) > 0
+
+
 class TestClearPositionStop:
     def test_spot_refuses(self, tmp_path):
         fake = FakeBybit()

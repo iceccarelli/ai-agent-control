@@ -57,6 +57,27 @@ the maximally strict version of this test and remains a genuine gap; this
 file closes the specific, narrower gap the audit named ("no subprocess, no
 OS-level process kill/restart") without overclaiming it also covers
 container-level orchestration.
+
+EXIT-SIDE CRASH BOUNDARIES (added: prior coverage above proves only the
+ENTRY side -- intent/order/ack/fill/position/protection -- survives a real
+process crash; the EXIT side -- exit order submitted, exit fill observed,
+trade record persisted, position/evidence state finalised -- had none).
+`TestExitCrashRecovery` below closes that gap for the highest-risk boundary:
+a crash between `TradingEngine.record_exit_fill`'s `store.record_trade`
+call and its `store.remove_position`/`upsert_position` call. Both are
+separate synchronous commits (see `StateStore._exec`), so a real kill
+between them is exactly reproducible by letting the first process run the
+real, unmocked call through to the first commit and then writing back the
+position row it was about to remove -- the same technique
+`_proc1_leave_naked_position` above already uses to represent "the crash
+already happened at this exact point" using real store state, not a mock.
+The invariant proven: replaying `observe_exits()`/`record_exit_fill()` from
+a genuinely fresh OS process, given the same still-open position row and
+the same venue closed-pnl history, books the trade at most ONCE (no
+duplicate row, no double-counted `daily_anchor.realised_pnl` -- see
+`StateStore.record_trade`'s docstring) and still finishes the position's
+removal that the crash interrupted, rather than leaving it orphaned open
+forever.
 """
 from __future__ import annotations
 
@@ -68,6 +89,10 @@ import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS = os.path.dirname(os.path.abspath(__file__))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from persistence import StateStore  # noqa: E402
 
 EQUITY = 100_000.0
 
@@ -139,6 +164,12 @@ def _venue_snapshot(exchange) -> dict:
         "balances": dict(exchange.balances),
         "orders": {k: dict(v) for k, v in exchange.orders.items()},
         "positions": {k: dict(v) for k, v in exchange.positions.items()},
+        # Linear-only /v5/position/closed-pnl history -- empty for every
+        # existing (spot) test above; included so the exit-crash tests below
+        # can hand the recovering process the SAME closed-pnl rows the first
+        # process saw, exactly as a real venue's history would still answer
+        # after the bot process (not the exchange) restarts.
+        "closed_pnl": [dict(r) for r in getattr(exchange, "closed_pnl", [])],
     }
 
 
@@ -148,6 +179,7 @@ def _venue_from_snapshot(snapshot: dict):
     exchange = FakeBybit(balances=dict(snapshot["balances"]), equity=EQUITY)
     exchange.orders = {k: dict(v) for k, v in snapshot["orders"].items()}
     exchange.positions = {k: dict(v) for k, v in snapshot["positions"].items()}
+    exchange.closed_pnl = [dict(r) for r in snapshot.get("closed_pnl") or []]
     return exchange
 
 
@@ -238,6 +270,94 @@ def _proc2_recover_naked_position(db_path: str, venue_snapshot: dict,
     })
 
 
+class LinearLiveCfg(LiveCfg):
+    """`observe_exits`/`record_exit_fill` are linear-only -- see
+    `trading_engine.py`'s docstring for why (spot holdings are balances, not
+    positions)."""
+
+    CATEGORY = "linear"
+    ALLOW_SHORTS = True
+
+
+def _build_linear_engine(db_path: str, exchange):
+    import bybit_connection as bc
+    import trading_engine as te
+    from persistence import StateStore
+    from risk_management import BillionaireRiskManager
+
+    store = StateStore(db_path)
+    cfg = LinearLiveCfg()
+    client = bc.BybitClient(config=cfg, store=store, transport=exchange)
+    risk = BillionaireRiskManager(config=cfg, store=store)
+    engine = te.TradingEngine(
+        client=client, risk_manager=risk, store=store, config=cfg)
+    return engine, store
+
+
+def _proc1_exit_fill_crash_before_position_removed(db_path: str, out_queue) -> None:
+    """Runs the REAL `observe_exits()` -> `record_exit_fill()` ->
+    `store.record_trade()` + `store.remove_position()` sequence to
+    completion (nothing mocked), then reproduces the exact disk state a hard
+    kill BETWEEN those two commits would have left: the trade is durably
+    recorded, but the position row `remove_position` just deleted is written
+    straight back — precisely what a `kill -9` landing after the first
+    commit and before the second would leave on disk, using the same
+    technique `_proc1_leave_naked_position` above uses to represent a crash
+    point with real store state. Then it crashes hard."""
+    _import_path()
+    import time as _time
+    from fake_bybit import FakeBybit
+
+    exchange = FakeBybit(balances={"USDT": 100_000.0}, equity=EQUITY)
+    # Venue is flat (fully exited already) and the closed-pnl history is the
+    # honest record of that exit — exactly `tests/test_observe_exits.py::
+    # test_stop_fill_at_venue_is_booked_at_closed_pnl_price`'s setup.
+    exchange.closed_pnl.append({
+        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.01",
+        "avgExitPrice": "61000", "closedPnl": "-10.6", "orderId": "ORD-1",
+        "updatedTime": str(int(_time.time() * 1000) + 1_000),
+    })
+    engine, store = _build_linear_engine(db_path, exchange)
+    store.update_equity(EQUITY)
+    store.upsert_position("BTCUSDT", "Sell", 0.01, 60_000.0, stop_price=61_000.0)
+
+    summary = engine.observe_exits()
+    trades_before_crash = len(store._query("SELECT * FROM trades"))
+    anchor_before_crash = store.ensure_daily_anchor(EQUITY).realised_pnl
+
+    # Reproduce the crash point: `remove_position` above already committed
+    # the DELETE for real; write the row back to represent a kill landing
+    # before that commit reached disk (record_trade's commit, one line
+    # earlier in record_exit_fill, already has).
+    store.upsert_position("BTCUSDT", "Sell", 0.01, 60_000.0, stop_price=61_000.0)
+
+    _put_and_crash(out_queue, {
+        "observe_exits_summary": summary,
+        "trades_before_crash": trades_before_crash,
+        "anchor_before_crash": anchor_before_crash,
+        "venue": _venue_snapshot(exchange),
+    })
+
+
+def _proc2_exit_fill_recover(db_path: str, venue_snapshot: dict, out_queue) -> None:
+    """A genuinely fresh process, fresh `TradingEngine`, fresh `FakeBybit`
+    built only from process 1's venue snapshot (same closed-pnl history,
+    same flat position). Replays exactly the next scheduled cycle would:
+    `observe_exits()` again, against the position row the crash left open."""
+    _import_path()
+    exchange = _venue_from_snapshot(venue_snapshot)
+    engine, store = _build_linear_engine(db_path, exchange)
+
+    summary = engine.observe_exits()
+
+    _put_and_crash(out_queue, {
+        "observe_exits_summary": summary,
+        "trades_after_replay": len(store._query("SELECT * FROM trades")),
+        "anchor_after_replay": store.ensure_daily_anchor(EQUITY).realised_pnl,
+        "open_position_count_after_replay": store.open_position_count(),
+    })
+
+
 def _run(target, args) -> dict:
     ctx = multiprocessing.get_context("fork")
     queue = ctx.Queue()
@@ -302,3 +422,194 @@ class TestRealProcessRestart:
         r3 = _run(_proc3_reread, (db_path,))
         assert r3["unresolved"] == [], (
             "process 2's resolution was not durably visible to process 3")
+
+
+@pytest.mark.skipif(
+    multiprocessing.get_start_method(allow_none=True) not in (None, "fork")
+    and "fork" not in multiprocessing.get_all_start_methods(),
+    reason="fork start method unavailable on this platform")
+class TestExitCrashRecovery:
+    """The EXIT side of the lifecycle, across a real OS process crash.
+
+    Prior coverage in this file (`TestRealProcessRestart`) proves entry-side
+    crash boundaries -- order submitted, ack pending, naked position -- are
+    handled correctly by a genuinely fresh process. Nothing proved the same
+    for the exit side: exit fill observed -> trade persisted -> position
+    state finalised. The crash point exercised here is exactly that last
+    gap: a kill between `record_exit_fill`'s `store.record_trade()` commit
+    and its `store.remove_position()` commit.
+    """
+
+    def test_exit_fill_is_not_double_booked_after_a_real_process_crash(
+            self, tmp_path):
+        db_path = str(tmp_path / "state.db")
+
+        r1 = _run(_proc1_exit_fill_crash_before_position_removed, (db_path,))
+        assert r1["trades_before_crash"] == 1
+        assert r1["anchor_before_crash"] == pytest.approx(-10.6)
+
+        r2 = _run(_proc2_exit_fill_recover, (db_path, r1["venue"]))
+
+        assert r2["trades_after_replay"] == 1, (
+            "a real process crash between booking the trade and removing "
+            "the position it closed caused the replayed exit to be booked "
+            "TWICE after restart")
+        assert r2["anchor_after_replay"] == pytest.approx(r1["anchor_before_crash"]), (
+            "daily_anchor.realised_pnl was double-counted by the replayed "
+            "exit -- this corrupts the daily-loss/drawdown gates even if "
+            "the trades table itself looked deduplicated")
+        assert r2["open_position_count_after_replay"] == 0, (
+            "the position the crash interrupted removing was left "
+            "orphaned open forever instead of being finished off by the "
+            "replay")
+
+    def test_a_genuinely_different_exit_is_still_booked_after_a_crash(
+            self, tmp_path):
+        """Negative control: the dedupe guard must not swallow a REAL second
+        exit that merely happens to follow a crash-recovered one -- only an
+        exact replay of the same venue exit (same closed-pnl orderId) is a
+        no-op, never a new, distinct one."""
+        db_path = str(tmp_path / "state.db")
+
+        r1 = _run(_proc1_exit_fill_crash_before_position_removed, (db_path,))
+
+        def _proc2_new_position_then_new_exit(db_path, venue_snapshot, out_queue):
+            _import_path()
+            import time as _time
+            exchange = _venue_from_snapshot(venue_snapshot)
+            engine, store = _build_linear_engine(db_path, exchange)
+
+            # Recover the crash-interrupted exit first, exactly as the real
+            # next cycle would.
+            engine.observe_exits()
+
+            # A brand-new, unrelated position and a brand-new venue exit --
+            # different symbol, different closed-pnl orderId.
+            store.upsert_position("ETHUSDT", "Buy", 1.0, 2_000.0, stop_price=1_900.0)
+            exchange.closed_pnl.append({
+                "symbol": "ETHUSDT", "side": "Sell", "qty": "1.0",
+                "avgExitPrice": "2100", "closedPnl": "100", "orderId": "ORD-2",
+                "updatedTime": str(int(_time.time() * 1000) + 2_000),
+            })
+            engine.observe_exits()
+
+            _put_and_crash(out_queue, {
+                "trades": len(store._query("SELECT * FROM trades")),
+                "open_position_count": store.open_position_count(),
+            })
+
+        r2 = _run(_proc2_new_position_then_new_exit, (db_path, r1["venue"]))
+        assert r2["trades"] == 2, (
+            "a genuinely different exit was wrongly deduplicated against "
+            "the crash-recovered one")
+        assert r2["open_position_count"] == 0
+
+
+class TestWSStatusMonotonicGuard:
+    """`StateStore.update_order_status(..., source="ws")`'s guard, exercised
+    against the real on-disk store (not a stub) -- this is the property gap
+    a prior audit cycle flagged: a stale/out-of-order WS event, possible on
+    reconnect replay since `private_ws_consumer._Deduplicator` is an
+    in-memory LRU that a restart resets, must not regress a terminal order's
+    status. `source="rest"` (the default, what `BybitClient` uses) must stay
+    completely unaffected, since REST is the venue's own authoritative
+    answer, not a replayed observation.
+    """
+
+    def _store(self, tmp_path) -> StateStore:
+        store = StateStore(str(tmp_path / "state.db"))
+        store.claim_writer()
+        store.record_order("BB-1", "BTCUSDT", "Buy", "Market", 0.01)
+        return store
+
+    def test_stale_ws_new_after_filled_does_not_regress(self, tmp_path):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+
+        # A replayed/out-of-order "New" delivered after the terminal
+        # "Filled" -- e.g. resent by the venue on reconnect, or delivered
+        # out of order across independent delivery paths.
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+
+        assert store.get_order("BB-1")["status"] == "filled", (
+            "a stale WS 'New' regressed a terminal order's status")
+
+    def test_duplicate_terminal_ws_event_is_a_harmless_noop(self, tmp_path):
+        """Re-delivery of the SAME terminal status (a normal duplicate, not
+        an attack) must apply cleanly with no error and no anomaly journal
+        entry."""
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+
+        assert store.get_order("BB-1")["status"] == "filled"
+        anomalies = [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ]
+        assert anomalies == [], "a genuine duplicate must not be journalled"
+
+    def test_legitimate_advancement_still_applies_new_partial_filled(self, tmp_path):
+        """New -> PartiallyFilled -> Filled, delivered in the correct order,
+        must not be blocked by the guard -- it only ever blocks a move OUT
+        OF a terminal status."""
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == "submitted"
+
+        store.update_order_status("BB-1", "partial", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == "partial"
+
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == "filled"
+
+        assert [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ] == []
+
+    def test_stale_partial_after_cancelled_does_not_regress(self, tmp_path):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "cancelled", exchange_id="V-1", source="ws")
+        store.update_order_status("BB-1", "partial", exchange_id="V-1", source="ws")
+
+        assert store.get_order("BB-1")["status"] == "cancelled", (
+            "a stale WS 'PartiallyFilled' regressed a cancelled order")
+
+    def test_blocked_regression_is_journalled_and_inspectable(self, tmp_path):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "rejected", exchange_id="V-1", source="ws")
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+
+        anomalies = [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ]
+        assert len(anomalies) == 1
+        import json as _json
+        detail = _json.loads(anomalies[0]["detail"])
+        assert detail["order_link_id"] == "BB-1"
+        assert detail["from_status"] == "rejected"
+        assert detail["to_status"] == "submitted"
+        assert anomalies[0]["symbol"] == "BTCUSDT"
+
+    def test_rest_reconciliation_is_unaffected_by_the_ws_guard(self, tmp_path):
+        """REST (`source="rest"`, the default) must remain free to correct
+        any status, including what would be a "regression" for a WS-sourced
+        write -- it is the venue's own authoritative answer, e.g.
+        `reconcile_on_startup` discovering the exchange actually cancelled
+        an order the local ledger still shows as filled from a bad fill
+        poll, or any other terminal-to-terminal correction."""
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", "filled", exchange_id="V-1", source="ws")
+
+        store.update_order_status("BB-1", "cancelled", exchange_id="V-1")  # source="rest" default
+        assert store.get_order("BB-1")["status"] == "cancelled"
+
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="rest")
+        assert store.get_order("BB-1")["status"] == "submitted"
+
+        assert [
+            d for d in store.recent_decisions()
+            if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
+        ] == []

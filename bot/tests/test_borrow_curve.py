@@ -165,8 +165,16 @@ class TestTheRealSeries:
         after = curve.rate_at(ms(2022, 12, 18, 18))
         assert after > before * 5
 
+    @pytest.mark.data_freshness
     def test_it_prices_essentially_all_of_the_frozen_window(self, curve):
-        """The refusal must cost coverage, but not much: one print."""
+        """The refusal must cost coverage, but not much: one print.
+
+        `curve` is frozen at its own last observation, but the funding
+        corpus it is priced against keeps growing with the daily accrual.
+        Every new print past the curve's own end is, by definition, one more
+        unpriceable stamp — so this count is supposed to drift wider as real
+        time passes without the curve being re-extended. See bot/pytest.ini.
+        """
         import csv
         import gzip
         path = os.path.join(

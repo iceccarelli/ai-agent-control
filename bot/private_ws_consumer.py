@@ -32,9 +32,14 @@ So: `order`/`execution` topic events are normalized, deduplicated, and
 placed on `self._pending` (a `queue.Queue`, thread-safe by construction).
 `drain_and_apply(store)` — called ONLY from the writer thread, i.e. from
 `TradingBot.tick()` — pops everything pending and calls
-`store.update_order_status()` there, exactly like
-`BybitClient.reconcile_on_startup()` does (same idempotent method, same
-authority, a second OBSERVER of it rather than a second writer).
+`store.update_order_status(..., source="ws")` there, the same method
+`BybitClient.reconcile_on_startup()` calls (with `source="rest"`, its
+default) — a second OBSERVER of it rather than a second writer, but NOT
+given the same unconditional authority: `source="ws"` puts the write
+through `StateStore`'s monotonic-status guard, so a stale/out-of-order WS
+event can never regress an order already recorded as terminal (filled/
+cancelled/rejected), while REST reconciliation is unaffected and remains
+fully authoritative. See `persistence.update_order_status`'s docstring.
 `position` topic events still never touch the store at all, from any
 thread: a `position` message only sets `needs_reconciliation` and
 records which symbol changed (`dirty_symbols`), so the next REST-driven
@@ -487,9 +492,16 @@ class WSPrivateConsumer:
             except queue.Empty:
                 break
             try:
+                # source="ws": this write is a replayed/observed network
+                # event, not the venue's own REST answer, so it goes through
+                # persistence.StateStore's monotonic-status guard -- a
+                # stale/out-of-order event (possible on reconnect, since
+                # `_Deduplicator` above is reset by a restart) cannot regress
+                # an order already recorded as terminal. See
+                # `update_order_status`'s docstring for the exact invariant.
                 store.update_order_status(
                     event.order_link_id, event.status,
-                    exchange_id=event.venue_order_id)
+                    exchange_id=event.venue_order_id, source="ws")
                 applied.append(event)
             except Exception:  # noqa: BLE001
                 logger.exception(

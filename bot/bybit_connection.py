@@ -756,7 +756,19 @@ class BybitClient:
                         return float(raw)
         return 0.0
 
-    def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_open_orders(
+        self, symbol: Optional[str] = None, *, order_filter: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Open orders for `symbol` (or the whole category if omitted).
+
+        `order_filter` is optional and defaults to omitted, which is exactly
+        the previous behaviour of this method (every existing caller keeps
+        its original contract). Passing one of `_SPOT_CANCEL_ALL_ORDER_
+        FILTERS` ("Order", "StopOrder", "tpslOrder") narrows the read the
+        same way it narrows `cancel_all` — see that constant's docstring for
+        why a single unfiltered spot read does not already cover all three.
+        This is a read (`GET /v5/order/realtime`), never a mutation.
+        """
         params: Dict[str, Any] = {"category": self.category}
         if symbol:
             params["symbol"] = symbol
@@ -764,6 +776,8 @@ class BybitClient:
             # settleCoin is a linear/inverse filter used to ask for "everything
             # settled in USDT". Spot has no settle currency and rejects it.
             params["settleCoin"] = "USDT"
+        if order_filter:
+            params["orderFilter"] = order_filter
         payload = self._request(
             "GET", "/v5/order/realtime", params=params, signed=True
         )
@@ -1421,6 +1435,38 @@ class BybitClient:
             return True, f"orderStatus={status}"
         except BybitAPIError as exc:
             return False, f"STOP_UNVERIFIABLE: {exc}"
+
+    def find_live_spot_stop(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """The already-live SPOT protective stop order for ``symbol``, if any.
+
+        RECOVERY INVARIANT this exists to hold (crash boundary: after a
+        protective stop is accepted at the venue, before this process
+        durably records that fact): ``place_stop_order`` mints a FRESH
+        ``orderLinkId`` from ``store.next_order_seq()`` on every call, so
+        two calls are never deduplicated as "the same submission" the way
+        ``place_order``'s (or a retried ``record_order``) idempotent-intent
+        insert is for entries. On LINEAR that is harmless — the protective
+        stop is a field on the position (``_place_position_stop``), and
+        re-setting it just overwrites the same field. On SPOT it is a
+        distinct standing conditional order every time, so calling
+        ``place_stop_order`` again for a position that already has one
+        resting at the venue creates a SECOND, independent live stop for
+        the same quantity instead of recognizing the first.
+
+        This is a read-only venue query (``GET /v5/order/realtime`` via
+        ``get_open_orders``, ``orderFilter="StopOrder"``), never a
+        mutation. Returns ``None`` on linear (that path never needs it —
+        see above) and when spot genuinely has no live stop for the
+        symbol, so a caller can tell "already protected, nothing to do"
+        from "actually naked, must protect".
+        """
+        if self.is_linear:
+            return None
+        for row in self.get_open_orders(symbol, order_filter="StopOrder"):
+            status = str(row.get("orderStatus", ""))
+            if status in {"Untriggered", "New", "PartiallyFilled"}:
+                return dict(row)
+        return None
 
     # -- linear-only account surface ---------------------------------------
 

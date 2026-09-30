@@ -430,6 +430,10 @@ class _TickBroker(Venue, _SnapBroker):
 def _bot(broker):
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]
+    # 1fadf8c wired a private-WS drain into tick() gated on this attribute;
+    # a __new__-built stub never runs __init__'s default, so tick() raised
+    # AttributeError before reaching anything this test means to exercise.
+    bot.ws_consumer = None
     bot.store = mock.Mock(is_kill_switch_engaged=lambda: (False, ""))
     bot.strategy = None
     bot._stop = mock.Mock(is_set=lambda: False)

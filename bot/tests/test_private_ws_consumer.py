@@ -108,11 +108,16 @@ class TestDeduplicator:
 
 
 class _StubStore:
+    """Records every call; `source` is accepted (drain_and_apply always
+    passes ``source="ws"``) but this stub does not itself enforce the
+    monotonic guard -- that invariant is `persistence.StateStore`'s, and is
+    proven against the real store in test_process_restart_recovery.py."""
+
     def __init__(self):
         self.updates = []
 
-    def update_order_status(self, order_link_id, status, exchange_id=""):
-        self.updates.append((order_link_id, status, exchange_id))
+    def update_order_status(self, order_link_id, status, exchange_id="", *, source="rest"):
+        self.updates.append((order_link_id, status, exchange_id, source))
 
 
 class _StubClient:
@@ -145,14 +150,14 @@ class TestHandleRawMessage:
 
         drained = consumer.drain_and_apply(store)
         assert len(drained) == 1
-        assert store.updates == [("BB-entry-1", "filled", "V-1")]
+        assert store.updates == [("BB-entry-1", "filled", "V-1", "ws")]
 
     def test_execution_event_is_queued_then_applied_on_drain(self):
         consumer, store = self._consumer()
         consumer.handle_raw_message(EXECUTION_MSG)
         assert store.updates == []
         consumer.drain_and_apply(store)
-        assert store.updates == [("BB-entry-1", "filled", "V-1")]
+        assert store.updates == [("BB-entry-1", "filled", "V-1", "ws")]
 
     def test_position_event_never_writes_the_store(self):
         """REST remains the authority for position economics/protection —
@@ -280,7 +285,7 @@ class TestRunOnce:
         assert set(subscribe_sent["args"]) == set(pwc.WSPrivateConsumer.TOPICS)
         assert store.updates == [], "the WS thread itself must never write"
         consumer.drain_and_apply(store)
-        assert store.updates == [("BB-entry-1", "filled", "V-1")]
+        assert store.updates == [("BB-entry-1", "filled", "V-1", "ws")]
 
     def test_max_messages_bound_stops_cleanly_for_tests(self):
         store = _StubStore()
@@ -367,7 +372,7 @@ class TestRunForever:
             "a reconnect must always flag that observation may have a gap")
         assert store.updates == [], "run_forever's own thread must never write"
         consumer.drain_and_apply(store)
-        assert store.updates == [("BB-entry-1", "filled", "V-1")]
+        assert store.updates == [("BB-entry-1", "filled", "V-1", "ws")]
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +739,7 @@ class TestEvidenceWriterThreadOwnership:
 
         consumer.drain_and_apply(store)
 
-        assert store.updates == [("BB-entry-1", "filled", "V-1")]
+        assert store.updates == [("BB-entry-1", "filled", "V-1", "ws")]
         assert len(_read_records(path)) == 1
 
     def test_drain_evidence_with_nothing_queued_is_a_noop(self, tmp_path):

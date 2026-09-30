@@ -161,7 +161,13 @@ class TestTheCorpusReachesInception:
 
 
 @needs_8h
+@pytest.mark.data_freshness
 class TestThePairingIsLosslessWhereItClaimsToBe:
+    """EXPECTED pins exact row counts against the real, live settlement
+    corpus. The daily accrual keeps appending real prints, so these counts
+    are supposed to drift out of date and need a re-pin on a schedule — that
+    is corpus growth, not a code regression. See bot/pytest.ini."""
+
     @pytest.mark.parametrize("asset", sorted(EXPECTED))
     def test_the_counts_are_what_the_measurement_assumed(self, asset):
         prints, paired, dropped = EXPECTED[asset]
