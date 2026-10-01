@@ -190,8 +190,88 @@ def new_run_id() -> str:
 
 
 def _estimate_leg_fee(*, price: float, qty: float, taker_fee: float) -> float:
-    """A STATIC fallback, used only for a leg whose real fee is unknown."""
+    """A STATIC fallback, used only for a leg whose real fee amount is
+    unknown. Always already in the accounting unit (it is modelled as a
+    rate against notional, which is quoted in the accounting unit), so it
+    never itself needs conversion — unlike a real venue fee, which can
+    come back in the base coin."""
     return abs(price * qty * taker_fee)
+
+
+def split_symbol_units(symbol: str) -> Tuple[str, str]:
+    """`(base, quote)` for a spot pair symbol, by suffix — "BTCUSDT" ->
+    ("BTC", "USDT"). This is ONLY used to know what a KNOWN currency
+    converts against (e.g. "the venue said BTC; the quote leg of this
+    symbol is USDT, so multiply by price"); it is never used to invent a
+    currency extract_fee did not report (see `venue_fees.py`).
+    """
+    for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return symbol[: -len(quote)], quote
+    return symbol, ""
+
+
+@dataclass(frozen=True)
+class FeeConversion:
+    """What happened when this leg's raw venue fee was turned into the
+    accounting unit — enough to audit or reproduce the conversion, per the
+    hardening pass's requirement that a conversion never be silent."""
+
+    #: "identity" (already in the accounting unit), "converted" (base-coin
+    #: amount multiplied by this leg's own trade price), "unresolved"
+    #: (amount known but its currency could not be converted — a raw fact
+    #: preserved, never guessed into a number), "unknown" (no amount at
+    #: all; `account_unit_amount` is a labelled STATIC ESTIMATE, never
+    #: realized), or "zero_qty" (nothing to convert).
+    status: str
+    account_unit_amount: Optional[float]
+    rate: Optional[float] = None
+    basis: str = ""
+
+
+def _convert_leg_fee(
+    *, amount: Optional[float], currency: Optional[str], known: bool,
+    leg_price: float, qty: float, taker_fee: float, accounting_unit: str,
+    base_coin: str,
+) -> FeeConversion:
+    """One leg's raw venue fee -> the accounting unit, or an explicit
+    refusal to guess. NEVER sums a BTC amount and a USDT amount as though
+    they were the same number — the real BTCUSDT defect this exists to
+    foreclose: an entry fee charged in BTC and an exit fee charged in
+    USDT are not numerically additive until this conversion happens, and
+    it only happens when the currency is actually known and matches
+    either the accounting unit (identity) or the pair's base coin (priced
+    conversion, same basis `ledger.py`'s `spot_buy(fee_btc, price)`
+    already uses for the carry book).
+    """
+    if qty <= 0:
+        return FeeConversion(status="zero_qty", account_unit_amount=0.0)
+    if not known or amount is None:
+        estimate = _estimate_leg_fee(price=leg_price, qty=qty, taker_fee=taker_fee)
+        return FeeConversion(
+            status="unknown", account_unit_amount=estimate,
+            basis=f"static taker_fee={taker_fee} estimate (no real fee known)")
+    if currency is None:
+        # A real, known amount — but with no currency to convert it by.
+        # Guessing here is exactly the defect this module exists to
+        # refuse: preserve the raw amount, claim nothing converted.
+        return FeeConversion(
+            status="unresolved", account_unit_amount=None,
+            basis="amount known but currency unknown; conversion refused")
+    if currency == accounting_unit:
+        return FeeConversion(
+            status="identity", account_unit_amount=amount, rate=1.0,
+            basis=f"already {accounting_unit}")
+    if currency == base_coin and leg_price > 0:
+        return FeeConversion(
+            status="converted", account_unit_amount=amount * leg_price,
+            rate=leg_price,
+            basis=f"{currency}->{accounting_unit} at this leg's own trade "
+                 f"price {leg_price}")
+    return FeeConversion(
+        status="unresolved", account_unit_amount=None,
+        basis=f"no conversion basis for currency={currency!r} "
+             f"(expected {accounting_unit!r} or {base_coin!r})")
 
 
 def build_cash_ledger(
@@ -216,8 +296,10 @@ def build_cash_ledger(
     exit_order_id: str = "",
     entry_fee: Optional[float] = None,
     entry_fee_known: bool = False,
+    entry_fee_currency: Optional[str] = None,
     exit_fee: Optional[float] = None,
     exit_fee_known: bool = False,
+    exit_fee_currency: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Machine-readable cash ledger. Testnet PnL is fake dollars — never cash.
 
@@ -235,43 +317,64 @@ def build_cash_ledger(
     artefact is lying around" as "the source code that ran does not match
     `code_commit`" — the one thing a `-dirty` suffix cannot distinguish.
 
-    Fee reconciliation: `entry_fee`/`exit_fee` + their `_known` flags are
-    the venue's own `cumExecFee` as `trading_engine.close_position` already
-    read it and booked it on the local trade row (see
-    `trading_engine.venue_fee`) — passed straight through, never
-    re-derived. The static `taker_fee` estimate is used ONLY to fill a leg
-    whose real fee is unknown (e.g. no fill ever resolved), and
-    `fees_source` says, per run, whether this ledger's `fees_usd` is
-    venue-confirmed, partly estimated, or fully estimated — so a reader
-    never mistakes one for the other.
+    Fee reconciliation: `entry_fee`/`exit_fee` (+ currency, + `_known`)
+    are the venue's own `cumExecFee` as `trading_engine.close_position`
+    already read and booked it (see `venue_fees.extract_fee`) — passed
+    straight through, never re-derived. A raw venue fee is an amount in
+    WHATEVER currency the venue charged it in — for this exact symbol,
+    conventionally the base coin on entry (a spot BUY) and the quote coin
+    on exit (a spot SELL), see `INVENTORY.md` D11/D44 — and is never
+    itself "USD" or directly additive across legs charged in different
+    currencies. `_convert_leg_fee` makes that conversion explicit, with a
+    recorded basis, or refuses rather than guess; the static `taker_fee`
+    estimate is used ONLY to fill a leg whose real AMOUNT is unknown, and
+    is never substituted for a known amount whose currency merely could
+    not be converted. `fees_source` says, per run, whether the aggregate
+    is venue-confirmed, partly estimated, fully estimated, or contains an
+    unresolved (known-but-unconvertible) leg — so a reader never mistakes
+    one state for another.
     """
     if gross_pnl is None and qty > 0 and entry_price > 0 and exit_price > 0:
         # Long-only session path.
         gross_pnl = (exit_price - entry_price) * qty
 
-    if qty > 0:
-        resolved_entry_fee = (
-            float(entry_fee) if entry_fee_known and entry_fee is not None
-            else _estimate_leg_fee(price=entry_price, qty=qty, taker_fee=taker_fee))
-        resolved_exit_fee = (
-            float(exit_fee) if exit_fee_known and exit_fee is not None
-            else _estimate_leg_fee(price=exit_price, qty=qty, taker_fee=taker_fee))
-    else:
-        resolved_entry_fee = 0.0
-        resolved_exit_fee = 0.0
-    fees = resolved_entry_fee + resolved_exit_fee
+    base_coin, accounting_unit = split_symbol_units(symbol)
+    if not accounting_unit:
+        accounting_unit = "UNKNOWN_QUOTE"
 
-    known_legs = int(bool(entry_fee_known)) + int(bool(exit_fee_known))
-    if known_legs == 2:
+    entry_conv = _convert_leg_fee(
+        amount=entry_fee, currency=entry_fee_currency, known=bool(entry_fee_known),
+        leg_price=entry_price, qty=qty, taker_fee=taker_fee,
+        accounting_unit=accounting_unit, base_coin=base_coin)
+    exit_conv = _convert_leg_fee(
+        amount=exit_fee, currency=exit_fee_currency, known=bool(exit_fee_known),
+        leg_price=exit_price, qty=qty, taker_fee=taker_fee,
+        accounting_unit=accounting_unit, base_coin=base_coin)
+
+    statuses = {entry_conv.status, exit_conv.status}
+    if statuses <= {"identity", "converted", "zero_qty"}:
         fees_source = "venue"
-    elif known_legs == 1:
-        fees_source = "partial_venue_partial_estimated"
-    else:
+    elif "unresolved" in statuses:
+        # A known amount exists that this ledger refuses to silently turn
+        # into a number — the aggregate below is BEST-EFFORT, not
+        # realized, no matter what the other leg resolved to.
+        fees_source = "unresolved_mixed_unit"
+    elif statuses <= {"unknown", "zero_qty"}:
         fees_source = "estimated"
+    else:
+        fees_source = "partial_venue_partial_estimated"
+
+    # Best-effort total in the accounting unit: converted/identity/estimate
+    # legs contribute their number; an "unresolved" leg contributes NOTHING
+    # (never zero-as-silent-omission — `fees_source` flags exactly this).
+    resolved_entry_fee = entry_conv.account_unit_amount
+    resolved_exit_fee = exit_conv.account_unit_amount
+    fees = (resolved_entry_fee or 0.0) + (resolved_exit_fee or 0.0)
+    fees_fully_realized = fees_source == "venue"
 
     pnl = float(gross_pnl or 0.0) - fees
     return {
-        "schema": "cash_ledger/1",
+        "schema": "cash_ledger/2",
         "date_utc": _utc_date(),
         "run_id": str(run_id or ""),
         "code_commit": str(code_commit or prov.UNKNOWN),
@@ -280,13 +383,51 @@ def build_cash_ledger(
         "category": str(category or "spot"),
         "symbol": symbol,
         "n_fills": int(n_fills),
+        #: The accounting unit every converted/account-unit figure below
+        #: is denominated in — this symbol's quote coin (e.g. "USDT" for
+        #: BTCUSDT). NOT audited USD: no USDT->USD conversion is performed
+        #: or claimed anywhere in this ledger.
+        "accounting_unit": accounting_unit,
+        #: Legacy key names, KEPT for the one existing reader
+        #: (`main()`'s own `pnl_usd` stderr print) — but "usd" here has
+        #: always actually meant `accounting_unit`; see
+        #: `pnl_account_unit`/`fees_account_unit` for the same numbers
+        #: under their accurate name, and `fees_source`/`fees_realized`
+        #: for whether this number may be read as realized at all.
         "pnl_usd": round(float(pnl), 8),
         "fees_usd": round(float(fees), 8),
+        "pnl_account_unit": round(float(pnl), 8),
+        "fees_account_unit": round(float(fees), 8),
         "fees_source": fees_source,
-        "entry_fee_usd": round(float(resolved_entry_fee), 8),
+        "fees_realized": fees_fully_realized,
+        "entry_fee_amount": entry_fee if entry_fee_known else None,
+        "entry_fee_currency": entry_fee_currency if entry_fee_known else None,
         "entry_fee_known": bool(entry_fee_known),
-        "exit_fee_usd": round(float(resolved_exit_fee), 8),
+        "entry_fee_account_unit": (
+            round(float(resolved_entry_fee), 8)
+            if resolved_entry_fee is not None else None),
+        "entry_fee_conversion": {
+            "status": entry_conv.status, "rate": entry_conv.rate,
+            "basis": entry_conv.basis,
+        },
+        # Legacy alias — None (not 0.0) when unresolved, never a silent
+        # zero standing in for "could not convert".
+        "entry_fee_usd": (
+            round(float(resolved_entry_fee), 8)
+            if resolved_entry_fee is not None else None),
+        "exit_fee_amount": exit_fee if exit_fee_known else None,
+        "exit_fee_currency": exit_fee_currency if exit_fee_known else None,
         "exit_fee_known": bool(exit_fee_known),
+        "exit_fee_account_unit": (
+            round(float(resolved_exit_fee), 8)
+            if resolved_exit_fee is not None else None),
+        "exit_fee_conversion": {
+            "status": exit_conv.status, "rate": exit_conv.rate,
+            "basis": exit_conv.basis,
+        },
+        "exit_fee_usd": (
+            round(float(resolved_exit_fee), 8)
+            if resolved_exit_fee is not None else None),
         "flat": bool(flat),
         "allows_live": False,
         "note": (
@@ -307,11 +448,46 @@ def build_cash_ledger(
 
 
 def write_json(path: str, payload: Dict[str, Any]) -> str:
+    """Overwrite-in-place write. For a MUTABLE "latest view" only — see
+    `write_run_scoped_record` for the immutable per-run record."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
     return path
+
+
+class RunRecordAlreadyExists(RuntimeError):
+    """A `(run_id, kind)` record already exists. Refused — never silently
+    replaced, truncated, or merged. The original bytes on disk are
+    untouched by this call."""
+
+
+def _write_json_exclusive(path: str, payload: Dict[str, Any]) -> None:
+    """Create `path` and write `payload` to it, or raise if it already
+    exists — `os.O_CREAT | os.O_EXCL` is atomic at the OS/filesystem
+    level (a single syscall decides create-vs-exists), unlike the
+    race-prone `if not os.path.exists(path): write(path)`, where a second
+    process can pass the `exists()` check before the first one's `write`
+    lands. Two processes racing to create the SAME path: exactly one
+    `open` succeeds, the other raises `FileExistsError` immediately,
+    before either has written a single byte — there is no window where a
+    second writer's content could land in the same file as the first's.
+    """
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except BaseException:
+        # The create succeeded but the write didn't finish — remove the
+        # partial file rather than leave a corrupt "record" behind that a
+        # later read would have to distinguish from a complete one.
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
 
 
 def write_run_scoped_record(
@@ -320,17 +496,26 @@ def write_run_scoped_record(
 ) -> str:
     """Persist `payload` under `<runs_dir>/<run_id>/<kind>.json` — the
     IMMUTABLE record this run_id's `kind` of artefact exists at, once and
-    permanently. Distinct run_ids never collide (see `new_run_id`); the
-    same run_id can legitimately gain more than one `kind` (a ledger,
-    later found not-flat, is followed by a failure for the SAME run), so
-    the directory itself is not exist_ok=False, but neither file is ever
-    reopened for writing once this call returns.
+    permanently.
 
-    Also appends one line to `index_path` — append-only, never rewritten —
-    so a reader can enumerate every run this tool has ever produced a
-    record for without having to list the runs directory, and so the run
-    before this one is never erased the way overwriting a singleton
-    ledger/failure file always erased it.
+    FIRST write for a given `(run_id, kind)`: succeeds, and appends one
+    line to `index_path`. SECOND write for the SAME `(run_id, kind)`:
+    raises `RunRecordAlreadyExists` — the original file's bytes are
+    untouched, and no duplicate index line is appended (the index write
+    happens only after the exclusive file create has already succeeded,
+    so a refused second write never reaches it). Distinct run_ids never
+    collide (see `new_run_id`); the same run_id legitimately gains more
+    than one `kind` (a ledger, later found not-flat, is followed by a
+    failure for the SAME run) — those are different files, not a
+    collision.
+
+    `index_path` is append-only; a concurrent duplicate attempt against
+    the SAME `(run_id, kind)` still cannot produce two canonical records,
+    because the exclusive file create — not the index — is what decides
+    "first writer wins"; the index can never show two different writers
+    claiming to have been first for the same identity, because only the
+    one whose `_write_json_exclusive` actually succeeded ever reaches the
+    `open(..., "a")` below.
 
     A missing `run_id` is a caller bug, not a reason to guess one; this
     silently no-ops rather than inventing a directory with no identity.
@@ -338,7 +523,13 @@ def write_run_scoped_record(
     if not run_id:
         return ""
     manifest_path = os.path.join(runs_dir, run_id, f"{kind}.json")
-    write_json(manifest_path, payload)
+    os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+    try:
+        _write_json_exclusive(manifest_path, payload)
+    except FileExistsError as exc:
+        raise RunRecordAlreadyExists(
+            f"a {kind!r} record for run_id={run_id!r} already exists at "
+            f"{manifest_path!r} — refusing to overwrite it") from exc
     os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
     with open(index_path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({
@@ -450,8 +641,10 @@ def run_session(
         "exit_order_id": "",
         "entry_fee": None,
         "entry_fee_known": False,
+        "entry_fee_currency": None,
         "exit_fee": None,
         "exit_fee_known": False,
+        "exit_fee_currency": None,
         "stages": [],
     }
 
@@ -538,6 +731,7 @@ def _run_session_body(
     entry_detail = dict(report.detail or {})
     out["entry_fee"] = entry_detail.get("entry_fee")
     out["entry_fee_known"] = bool(entry_detail.get("entry_fee") is not None)
+    out["entry_fee_currency"] = entry_detail.get("entry_fee_currency")
 
     positions = {p["symbol"]: p for p in store.open_positions()}
     row = positions.get(symbol)
@@ -588,8 +782,10 @@ def _run_session_body(
     if "entry_fee" in close_detail:
         out["entry_fee"] = close_detail.get("entry_fee")
         out["entry_fee_known"] = bool(close_detail.get("entry_fee_known"))
+        out["entry_fee_currency"] = close_detail.get("entry_fee_currency")
     out["exit_fee"] = close_detail.get("exit_fee")
     out["exit_fee_known"] = bool(close_detail.get("exit_fee_known"))
+    out["exit_fee_currency"] = close_detail.get("exit_fee_currency")
     if executed_exit > 0:
         out["n_fills"] = 2
 
@@ -733,40 +929,72 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("ZERO FILLS — exit 2", file=sys.stderr)
         return 2
 
-    ledger = build_cash_ledger(
-        symbol=str(result.get("symbol") or args.symbol),
-        category=str(result.get("category") or "spot"),
-        n_fills=n_fills,
-        entry_price=float(result.get("entry_price") or 0.0),
-        exit_price=float(result.get("exit_price") or 0.0),
-        qty=float(result.get("qty") or 0.0),
-        flat=bool(result.get("flat")),
-        taker_fee=float(getattr(cfg, "TAKER_FEE", 0.001) or 0.001),
-        gross_pnl=float(result.get("gross_pnl") or 0.0),
-        run_id=run_id,
-        code_commit=code_commit,
-        source_tree_clean=source_tree_clean,
-        workspace_dirty=workspace_dirty,
-        entry_order_link_id=str(result.get("entry_order_link_id") or ""),
-        stop_order_link_id=str(result.get("stop_order_link_id") or ""),
-        take_profit_ids=tuple(result.get("take_profit_ids") or ()),
-        exit_order_link_id=str(result.get("exit_order_link_id") or ""),
-        exit_order_id=str(result.get("exit_order_id") or ""),
-        entry_fee=result.get("entry_fee"),
-        entry_fee_known=bool(result.get("entry_fee_known")),
-        exit_fee=result.get("exit_fee"),
-        exit_fee_known=bool(result.get("exit_fee_known")),
-    )
-    run_manifest_path = write_run_scoped_record(
-        ledger, run_id=run_id, kind="ledger",
-        runs_dir=args.runs_dir, index_path=args.runs_index)
-    # `args.ledger` (cash_ledger.json by default) stays a DERIVED "latest"
-    # view for convenience — the run-scoped file just written above, under
-    # this run_id, is the immutable record.
-    if run_manifest_path:
-        ledger["run_manifest_path"] = run_manifest_path
-    ledger["artifact_role"] = "latest_view"
-    write_json(args.ledger, ledger)
+    # Everything from here down is BOOKKEEPING on data `run_session()`
+    # already produced. A bug or disk fault in bookkeeping itself (a bad
+    # ledger field, a full disk, a genuine (run_id, kind) collision) must
+    # not erase the order identity `result` already holds — so this whole
+    # block is one try/except whose failure path still calls
+    # `write_failure` with that identity, rather than letting the
+    # exception propagate and leave NOTHING written at all.
+    try:
+        ledger = build_cash_ledger(
+            symbol=str(result.get("symbol") or args.symbol),
+            category=str(result.get("category") or "spot"),
+            n_fills=n_fills,
+            entry_price=float(result.get("entry_price") or 0.0),
+            exit_price=float(result.get("exit_price") or 0.0),
+            qty=float(result.get("qty") or 0.0),
+            flat=bool(result.get("flat")),
+            taker_fee=float(getattr(cfg, "TAKER_FEE", 0.001) or 0.001),
+            gross_pnl=float(result.get("gross_pnl") or 0.0),
+            run_id=run_id,
+            code_commit=code_commit,
+            source_tree_clean=source_tree_clean,
+            workspace_dirty=workspace_dirty,
+            entry_order_link_id=str(result.get("entry_order_link_id") or ""),
+            stop_order_link_id=str(result.get("stop_order_link_id") or ""),
+            take_profit_ids=tuple(result.get("take_profit_ids") or ()),
+            exit_order_link_id=str(result.get("exit_order_link_id") or ""),
+            exit_order_id=str(result.get("exit_order_id") or ""),
+            entry_fee=result.get("entry_fee"),
+            entry_fee_known=bool(result.get("entry_fee_known")),
+            entry_fee_currency=result.get("entry_fee_currency"),
+            exit_fee=result.get("exit_fee"),
+            exit_fee_known=bool(result.get("exit_fee_known")),
+            exit_fee_currency=result.get("exit_fee_currency"),
+        )
+        run_manifest_path = write_run_scoped_record(
+            ledger, run_id=run_id, kind="ledger",
+            runs_dir=args.runs_dir, index_path=args.runs_index)
+        # `args.ledger` (cash_ledger.json by default) stays a DERIVED
+        # "latest" view for convenience — the run-scoped file just written
+        # above, under this run_id, is the immutable record.
+        if run_manifest_path:
+            ledger["run_manifest_path"] = run_manifest_path
+        ledger["artifact_role"] = "latest_view"
+        write_json(args.ledger, ledger)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("ledger/latest-view/index bookkeeping raised")
+        write_failure(
+            args.failure_out,
+            reason=f"bookkeeping raised after a real session: "
+                   f"{type(exc).__name__}: {exc}",
+            network_order_submitted=True, entry_fills=entry_fills,
+            flatten_attempted=bool(result.get("flatten_attempted")),
+            run_id=run_id, code_commit=code_commit,
+            source_tree_clean=source_tree_clean, workspace_dirty=workspace_dirty,
+            entry_order_link_id=result.get("entry_order_link_id") or "",
+            stop_order_link_id=result.get("stop_order_link_id") or "",
+            take_profit_ids=list(result.get("take_profit_ids") or ()),
+            exit_order_link_id=result.get("exit_order_link_id") or "",
+            exit_order_id=result.get("exit_order_id") or "",
+            entry_fee=result.get("entry_fee"),
+            entry_fee_currency=result.get("entry_fee_currency"),
+            exit_fee=result.get("exit_fee"),
+            exit_fee_currency=result.get("exit_fee_currency"),
+            runs_dir=args.runs_dir, runs_index=args.runs_index,
+        )
+        return 1
     print(json.dumps(ledger, indent=2, sort_keys=True))
 
     if not ledger["flat"]:

@@ -59,6 +59,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+import venue_fees
+
 logger = logging.getLogger(__name__)
 
 #: Quantity differences below this fraction of the leg are venue rounding, not
@@ -887,14 +889,16 @@ class CarryBroker:
 
     @staticmethod
     def _fee(row: Dict[str, Any]) -> Optional[float]:
-        raw = row.get("cumExecFee")
-        if raw is None or str(raw).strip() == "":
-            return None
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) else None
+        """`cumExecFee` as `venue_fees.extract_fee` reads it — the ONE
+        extraction authority, shared with `trading_engine.venue_fee`.
+        Returns bare `.amount` (`None` for unknown) to keep this method's
+        existing `Optional[float]` contract for every caller in this file;
+        `LegFill`/`Leg` carry a fee amount only, not its currency — the
+        currency this leg's fee actually came in is a fact this module has
+        always assumed from context (BTC on a spot BUY, USDT elsewhere;
+        see `ledger.py`'s `spot_buy`), not one it has tracked per-row.
+        """
+        return venue_fees.extract_fee(row).amount
 
     @staticmethod
     def _fill_from(response: Optional[Dict[str, Any]],

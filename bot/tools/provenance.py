@@ -87,8 +87,37 @@ def workspace_dirty(repo: Optional[str] = None) -> Optional[bool]:
     return bool(status.stdout.strip())
 
 
+#: Pathspecs `source_tree_clean` checks — every input that materially
+#: changes what `testnet_session.py` (or any Python entry point in this
+#: tree) actually DOES when it runs, traced from the real import graph and
+#: dependency files rather than assumed:
+#:  - `*.py`: the interpreted source itself.
+#:  - `requirements.txt` / `constraints.txt`: the exact dependency
+#:    versions this process's import machinery resolves against — a pinned
+#:    version bump changes behaviour as surely as an edited .py file, with
+#:    no corresponding line in any `*.py` diff.
+#: Checked by tracing `tools/testnet_session.py`'s own transitive imports
+#: (`config`, `bybit_connection`, `trading_engine`, `persistence`,
+#: `venue_fees`, `carry_broker` is NOT imported by this path) plus `ls
+#: bot/*.txt` — not assumed.
+#:
+#: EXPLICITLY NOT COVERED, on purpose, and this is a real limitation, not
+#: an oversight: `Dockerfile`/`fly.toml`/`scripts/*.sh` (the deployment
+#: envelope this process runs INSIDE, not an input this process reads),
+#: `cpp/carrycore.*` (the carry book's native core — a different asset
+#: class's code path, never imported by `testnet_session.py`), and the
+#: gap between a dependency FILE being clean and the INSTALLED packages
+#: actually matching it (this function reads git state, not the virtualenv
+#: `pip freeze` would show). A `True` from this function is therefore "the
+#: files this repo tracks as this process's source and pinned
+#: dependencies are unmodified" — not "this process's execution is fully
+#: reproducible from a bare checkout," which no single boolean here claims.
+_SOURCE_PATHSPECS = ("*.py", "requirements.txt", "constraints.txt")
+
+
 def source_tree_clean(repo: Optional[str] = None) -> Optional[bool]:
-    """True iff no TRACKED `*.py` file differs from `HEAD`.
+    """True iff no TRACKED execution-relevant file (`_SOURCE_PATHSPECS`)
+    differs from `HEAD`.
 
     Deliberately narrower than `workspace_dirty`: an untracked artefact or
     data file sitting in the working tree makes `git status --porcelain`
@@ -99,13 +128,14 @@ def source_tree_clean(repo: Optional[str] = None) -> Optional[bool]:
     irrelevant, is lying around uncommitted". This answers the question
     that actually matters for an execution artefact: did the SOURCE that
     executed match `code_commit`. Returns `None` when git itself could not
-    be asked.
+    be asked. See `_SOURCE_PATHSPECS` for exactly what is and is not
+    checked, and why.
     """
     repo = repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     try:
         status = subprocess.run(
-            ["git", "status", "--porcelain", "--", "*.py"], cwd=repo,
-            text=True, capture_output=True, timeout=10,
+            ["git", "status", "--porcelain", "--", *_SOURCE_PATHSPECS],
+            cwd=repo, text=True, capture_output=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
         return None

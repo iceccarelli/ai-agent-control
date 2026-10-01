@@ -203,6 +203,17 @@ class TradeRecord:
     #: nothing" apart from "the real cost was never recorded".
     entry_fee_known: bool = True
     exit_fee_known: bool = True
+    #: The currency the venue actually charged this fee in (e.g. "BTC" on
+    #: a spot BUY, "USDT" on a spot SELL — see `venue_fees.py`), or `None`
+    #: when unknown/not applicable. `entry_fee`/`exit_fee` stay bare
+    #: numeric amounts for every existing reader (`trade_stats.py`,
+    #: `risk_management.py`) that already sums them — these two fields are
+    #: additive, so a reader that wants to detect a mixed-currency trade
+    #: (the real BTCUSDT case: BTC entry fee, USDT exit fee) now can,
+    #: without this dataclass silently asserting the two amounts are the
+    #: same unit by summing them itself.
+    entry_fee_currency: Optional[str] = None
+    exit_fee_currency: Optional[str] = None
     #: A durable, venue-derived identity for the exit this trade books --
     #: e.g. ``f"exit:{exit_order_link_id}"`` for an engine-initiated close,
     #: or a key derived from the closed-pnl orderId(s) for an
@@ -290,7 +301,9 @@ CREATE TABLE IF NOT EXISTS trades (
     meta           TEXT NOT NULL DEFAULT '{}',
     dedupe_key     TEXT NOT NULL DEFAULT '',
     entry_fee_known INTEGER NOT NULL DEFAULT 1,
-    exit_fee_known  INTEGER NOT NULL DEFAULT 1
+    exit_fee_known  INTEGER NOT NULL DEFAULT 1,
+    entry_fee_currency TEXT,
+    exit_fee_currency  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_day ON trades(day);
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_epoch);
@@ -610,6 +623,8 @@ class StateStore:
             "dedupe_key": "TEXT NOT NULL DEFAULT ''",
             "entry_fee_known": "INTEGER NOT NULL DEFAULT 1",
             "exit_fee_known": "INTEGER NOT NULL DEFAULT 1",
+            "entry_fee_currency": "TEXT",
+            "exit_fee_currency": "TEXT",
         },
     }
 
@@ -1040,8 +1055,9 @@ class StateStore:
         cur = self._exec(
             "INSERT INTO trades(symbol, side, qty, entry_price, exit_price, gross_pnl,"
             " entry_fee, exit_fee, net_pnl, opened_epoch, closed_epoch, day,"
-            " order_link_id, meta, dedupe_key, entry_fee_known, exit_fee_known)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " order_link_id, meta, dedupe_key, entry_fee_known, exit_fee_known,"
+            " entry_fee_currency, exit_fee_currency)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(dedupe_key) WHERE dedupe_key <> '' DO NOTHING",
             (
                 trade.symbol, trade.side, float(trade.qty), float(trade.entry_price),
@@ -1052,6 +1068,8 @@ class StateStore:
                 str(trade.dedupe_key or ""),
                 1 if trade.entry_fee_known else 0,
                 1 if trade.exit_fee_known else 0,
+                (str(trade.entry_fee_currency) if trade.entry_fee_currency else None),
+                (str(trade.exit_fee_currency) if trade.exit_fee_currency else None),
             ),
         )
         if cur.rowcount != 1:

@@ -35,6 +35,7 @@ class _FakeStore:
         self.trades = []
         self.removed = []
         self.journal_entries = []
+        self.upserts = []
 
     def open_positions(self):
         return [self._position] if self._position else []
@@ -45,12 +46,24 @@ class _FakeStore:
 
     def remove_position(self, symbol):
         self.removed.append(symbol)
+        self._position = None
 
     def journal(self, symbol, kind, reason, detail):
         self.journal_entries.append((symbol, kind, reason, detail))
 
     def update_order_status(self, order_link_id, status):
         pass
+
+    def upsert_position(self, symbol, side, qty, entry_price, *,
+                        stop_price=0.0, order_link_id="", meta=None):
+        import json as _json
+        self.upserts.append(dict(meta or {}))
+        self._position = {
+            "symbol": symbol, "side": side, "qty": qty,
+            "entry_price": entry_price, "stop_price": stop_price,
+            "opened_epoch": 1000.0, "order_link_id": order_link_id,
+            "meta": _json.dumps(dict(meta or {})),
+        }
 
 
 class _FakeOrderResult:
@@ -85,38 +98,26 @@ def _engine(store, client):
     return engine
 
 
-def _position(*, entry_fee_meta=None, entry_price=100.0, qty=1.0, side="Buy"):
+def _position(*, entry_fee_meta=None, entry_fee_currency=None,
+              entry_price=100.0, qty=1.0, side="Buy"):
     import json as _json
+    meta = {}
+    if entry_fee_meta is not None:
+        meta["entry_fee"] = entry_fee_meta
+        meta["entry_fee_currency"] = entry_fee_currency
     return {
         "symbol": SYMBOL, "side": side, "qty": qty, "entry_price": entry_price,
         "opened_epoch": 1000.0,
-        "meta": _json.dumps({} if entry_fee_meta is None
-                            else {"entry_fee": entry_fee_meta}),
+        "meta": _json.dumps(meta),
     }
-
-
-class TestVenueFeeExtraction:
-    def test_known_fee_is_a_float(self):
-        assert te.venue_fee({"cumExecFee": "0.0123"}) == 0.0123
-
-    def test_missing_fee_is_none_not_zero(self):
-        assert te.venue_fee({}) is None
-        assert te.venue_fee({"cumExecFee": None}) is None
-        assert te.venue_fee({"cumExecFee": ""}) is None
-        assert te.venue_fee(None) is None
-
-    def test_garbage_fee_is_none(self):
-        assert te.venue_fee({"cumExecFee": "not-a-number"}) is None
-        assert te.venue_fee({"cumExecFee": "nan"}) is None
-        assert te.venue_fee({"cumExecFee": "inf"}) is None
 
 
 class TestCloseBooksTheVenuesOwnFee:
     def test_exit_fee_known_uses_venues_cumExecFee_not_a_static_estimate(self):
-        store = _FakeStore(_position(entry_fee_meta=0.05))
+        store = _FakeStore(_position(entry_fee_meta=0.05, entry_fee_currency="BTC"))
         client = _FakeClient(exit_order_row={
             "orderStatus": "Filled", "cumExecQty": "1.0", "avgPrice": "101.0",
-            "cumExecFee": "0.0202",
+            "cumExecFee": "0.0202", "feeCurrency": "USDT",
         })
         engine = _engine(store, client)
         report = engine.close_position(symbol=SYMBOL, reason="test")
@@ -124,12 +125,36 @@ class TestCloseBooksTheVenuesOwnFee:
         trade = store.trades[0]
         assert trade.entry_fee == 0.05
         assert trade.entry_fee_known is True
+        assert trade.entry_fee_currency == "BTC"
         assert trade.exit_fee == 0.0202
         assert trade.exit_fee_known is True
+        assert trade.exit_fee_currency == "USDT"
         assert report.detail["entry_fee"] == 0.05
+        assert report.detail["entry_fee_currency"] == "BTC"
         assert report.detail["exit_fee"] == 0.0202
+        assert report.detail["exit_fee_currency"] == "USDT"
         assert report.detail["entry_fee_known"] is True
         assert report.detail["exit_fee_known"] is True
+
+    def test_real_btcusdt_spot_shape_entry_fee_in_btc_exit_fee_in_usdt(self):
+        """The ACTUAL Bybit spot convention this repo's own INVENTORY.md
+        documents (D11/D44): a spot BUY's fee is charged in the base coin,
+        a spot SELL's fee in the quote coin. These are genuinely different
+        units and must never be summed as if they were the same currency
+        — this test exists so that non-mixing claim is checked against the
+        real shape, not a contrived one."""
+        store = _FakeStore(_position(entry_fee_meta=0.000002355,
+                                     entry_fee_currency="BTC"))
+        client = _FakeClient(exit_order_row={
+            "orderStatus": "Filled", "cumExecQty": "1.0", "avgPrice": "83364.5",
+            "cumExecFee": "0.0834", "feeCurrency": "USDT",
+        })
+        engine = _engine(store, client)
+        engine.close_position(symbol=SYMBOL, reason="test")
+        trade = store.trades[0]
+        assert trade.entry_fee_currency == "BTC"
+        assert trade.exit_fee_currency == "USDT"
+        assert trade.entry_fee_currency != trade.exit_fee_currency
 
     def test_unknown_fee_is_recorded_as_unknown_not_silently_zero(self):
         store = _FakeStore(_position(entry_fee_meta=None))
@@ -145,20 +170,85 @@ class TestCloseBooksTheVenuesOwnFee:
         # venue-confirmed zero-fee fill.
         assert trade.entry_fee == 0.0
         assert trade.entry_fee_known is False
+        assert trade.entry_fee_currency is None
         assert trade.exit_fee == 0.0
         assert trade.exit_fee_known is False
+        assert trade.exit_fee_currency is None
         assert report.detail["entry_fee_known"] is False
         assert report.detail["exit_fee_known"] is False
+
+    def test_known_zero_fee_is_distinct_from_unknown(self):
+        """`known_zero != unknown`: the venue can genuinely charge 0."""
+        store = _FakeStore(_position(entry_fee_meta=0.0, entry_fee_currency="BTC"))
+        client = _FakeClient(exit_order_row={
+            "orderStatus": "Filled", "cumExecQty": "1.0", "avgPrice": "101.0",
+            "cumExecFee": "0", "feeCurrency": "USDT",
+        })
+        engine = _engine(store, client)
+        engine.close_position(symbol=SYMBOL, reason="test")
+        trade = store.trades[0]
+        assert trade.entry_fee == 0.0
+        assert trade.entry_fee_known is True
+        assert trade.exit_fee == 0.0
+        assert trade.exit_fee_known is True
 
     def test_reconciliation_entry_fee_survives_from_meta_to_trade_row(self):
         """entry fee was captured at OPEN time (position meta) and must
         reconcile through to the row `close_position` books at EXIT time —
         the two must never silently disagree."""
-        store = _FakeStore(_position(entry_fee_meta=0.0314159))
+        store = _FakeStore(_position(entry_fee_meta=0.0314159,
+                                     entry_fee_currency="BTC"))
         client = _FakeClient(exit_order_row={
             "orderStatus": "Filled", "cumExecQty": "1.0", "avgPrice": "101.0",
-            "cumExecFee": "0.01",
+            "cumExecFee": "0.01", "feeCurrency": "USDT",
         })
         engine = _engine(store, client)
         engine.close_position(symbol=SYMBOL, reason="test")
         assert store.trades[0].entry_fee == 0.0314159
+        assert store.trades[0].entry_fee_currency == "BTC"
+
+
+class TestEntryFeeSurvivesAPartialExit:
+    """requirement: entry fee survives -> partial exit -> final close ->
+    record_trade. Proven through the actual `record_exit_fill` ->
+    `close_position` call path, not by inspecting the source."""
+
+    def test_entry_fee_and_currency_reach_the_final_close_after_a_partial_exit(
+            self):
+        store = _FakeStore(_position(
+            entry_fee_meta=0.00001, entry_fee_currency="BTC",
+            entry_price=100.0, qty=2.0))
+        client = _FakeClient(exit_order_row={
+            "orderStatus": "Filled", "cumExecQty": "1.0", "avgPrice": "101.0",
+            "cumExecFee": "0.03", "feeCurrency": "USDT",
+        })
+        engine = _engine(store, client)
+
+        # A take-profit leg fills for HALF the position — exchange-side,
+        # discovered the way `observe_exits` discovers it.
+        fully_closed = engine.record_exit_fill(
+            symbol=SYMBOL, qty=1.0, price=105.0, fee=0.0,
+            reason="tp_leg_fill", dedupe_key="tp-leg-1")
+        assert fully_closed is False
+        # The remaining position's meta must still carry the ORIGINAL
+        # entry fee fact — `upsert_position` REPLACES meta wholesale, so
+        # this is the one place that fact could silently vanish.
+        assert store.upserts[-1]["entry_fee"] == 0.00001
+        assert store.upserts[-1]["entry_fee_currency"] == "BTC"
+        # The partial booking itself is an ESTIMATE (no real fill to read
+        # a fee from), correctly marked unknown — not what this test is
+        # about, but worth pinning down so it is not mistaken for venue
+        # truth later.
+        assert store.trades[0].entry_fee_known is False
+
+        # Now the remainder is closed for real, through the production
+        # close_position() path, against the position row record_exit_fill
+        # just rewrote.
+        report = engine.close_position(symbol=SYMBOL, reason="final_close")
+        assert report.ok
+        final_trade = store.trades[-1]
+        assert final_trade.entry_fee == 0.00001
+        assert final_trade.entry_fee_known is True
+        assert final_trade.entry_fee_currency == "BTC"
+        assert final_trade.exit_fee == 0.03
+        assert final_trade.exit_fee_currency == "USDT"

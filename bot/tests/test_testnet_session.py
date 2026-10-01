@@ -418,45 +418,293 @@ class TestRunScopedImmutableRecords:
         assert payload["run_manifest_path"].endswith("failure.json")
         assert "RUN-D" in payload["run_manifest_path"]
 
+    # -- genuine immutability: exclusive creation, not exists()->write() --
+
+    def test_first_write_succeeds(self, tmp_path):
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        path = ts.write_run_scoped_record(
+            {"schema": "cash_ledger/2", "pnl_usd": 1.0},
+            run_id="RUN-E", kind="ledger", runs_dir=runs_dir,
+            index_path=index_path)
+        assert os.path.exists(path)
+
+    def test_second_write_to_the_same_run_id_and_kind_raises(self, tmp_path):
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        ts.write_run_scoped_record(
+            {"pnl_usd": 1.0}, run_id="RUN-F", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        with pytest.raises(ts.RunRecordAlreadyExists):
+            ts.write_run_scoped_record(
+                {"pnl_usd": 999.0}, run_id="RUN-F", kind="ledger",
+                runs_dir=runs_dir, index_path=index_path)
+
+    def test_file_contents_remain_the_original_bytes_after_a_refused_rewrite(
+            self, tmp_path):
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        path = ts.write_run_scoped_record(
+            {"pnl_usd": 1.0}, run_id="RUN-G", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        original_bytes = open(path, "rb").read()
+        try:
+            ts.write_run_scoped_record(
+                {"pnl_usd": 999.0}, run_id="RUN-G", kind="ledger",
+                runs_dir=runs_dir, index_path=index_path)
+        except ts.RunRecordAlreadyExists:
+            pass
+        assert open(path, "rb").read() == original_bytes
+
+    def test_same_run_different_kinds_both_succeed(self, tmp_path):
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        ts.write_run_scoped_record(
+            {"pnl_usd": 1.0}, run_id="RUN-H", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        path2 = ts.write_run_scoped_record(
+            {"failure": "x"}, run_id="RUN-H", kind="failure",
+            runs_dir=runs_dir, index_path=index_path)
+        assert os.path.exists(path2)
+
+    def test_different_runs_same_kind_both_succeed(self, tmp_path):
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        path1 = ts.write_run_scoped_record(
+            {"pnl_usd": 1.0}, run_id="RUN-I1", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        path2 = ts.write_run_scoped_record(
+            {"pnl_usd": 2.0}, run_id="RUN-I2", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        assert path1 != path2
+        assert os.path.exists(path1) and os.path.exists(path2)
+
+    def test_duplicate_index_identity_rejected_no_extra_line_appended(
+            self, tmp_path):
+        """A refused second write must not append a duplicate index
+        record for the same (run_id, kind) — the index write only
+        happens after the exclusive file create already succeeded."""
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        ts.write_run_scoped_record(
+            {"pnl_usd": 1.0}, run_id="RUN-J", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        try:
+            ts.write_run_scoped_record(
+                {"pnl_usd": 2.0}, run_id="RUN-J", kind="ledger",
+                runs_dir=runs_dir, index_path=index_path)
+        except ts.RunRecordAlreadyExists:
+            pass
+        lines = [
+            json.loads(line) for line in
+            open(index_path, encoding="utf-8").read().splitlines() if line]
+        matching = [e for e in lines
+                   if e["run_id"] == "RUN-J" and e["kind"] == "ledger"]
+        assert len(matching) == 1
+
+    def test_restart_style_repetition_cannot_overwrite_an_existing_record(
+            self, tmp_path):
+        """Simulates a process restart that re-derives the SAME run_id
+        (e.g. a bug, or a deliberate retry with a reused identifier) and
+        tries to write the same record again — must be refused, not
+        silently accepted as "latest value wins"."""
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        original = {"pnl_usd": 1.0, "note": "first boot"}
+        ts.write_run_scoped_record(
+            original, run_id="RUN-RESTART", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        with pytest.raises(ts.RunRecordAlreadyExists):
+            ts.write_run_scoped_record(
+                {"pnl_usd": 2.0, "note": "restarted boot"},
+                run_id="RUN-RESTART", kind="ledger",
+                runs_dir=runs_dir, index_path=index_path)
+        on_disk = json.loads(open(
+            os.path.join(runs_dir, "RUN-RESTART", "ledger.json"),
+            encoding="utf-8").read())
+        assert on_disk["note"] == "first boot"
+
+    def test_concurrent_duplicate_attempt_cannot_produce_two_canonical_records(
+            self, tmp_path):
+        """Exclusive creation (O_CREAT|O_EXCL) is atomic at the OS level:
+        of two attempts to create the same path, exactly one succeeds —
+        there is no `exists()`-then-`write()` window for both to pass the
+        check before either writes."""
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        results = []
+        for payload in ({"pnl_usd": 1.0}, {"pnl_usd": 2.0}):
+            try:
+                ts.write_run_scoped_record(
+                    payload, run_id="RUN-RACE", kind="ledger",
+                    runs_dir=runs_dir, index_path=index_path)
+                results.append("ok")
+            except ts.RunRecordAlreadyExists:
+                results.append("refused")
+        assert results == ["ok", "refused"]
+        # Exactly one record exists, with exactly one winner's content.
+        assert os.path.exists(os.path.join(runs_dir, "RUN-RACE", "ledger.json"))
+
 
 class TestFeeReconciliationInLedger:
     """build_cash_ledger must prefer authoritative venue fee data over a
-    static taker-fee estimate, and say which one it used."""
+    static taker-fee estimate, say which one it used, and NEVER add a raw
+    BTC amount to a raw USDT amount as though they were the same number.
+    Case letters below match the hardening-pass requirement matrix."""
 
-    def test_both_legs_known_reports_fees_source_venue(self):
+    # -- CASE B: both known, same accounting unit (USDT/USDT) -----------
+    def test_case_b_both_legs_known_same_unit_reports_fees_source_venue(self):
         ledger = ts.build_cash_ledger(
             symbol="BTCUSDT", category="spot", n_fills=2,
             entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
-            entry_fee=0.05, entry_fee_known=True,
-            exit_fee=0.03, exit_fee_known=True, taker_fee=0.999)
+            entry_fee=0.05, entry_fee_known=True, entry_fee_currency="USDT",
+            exit_fee=0.03, exit_fee_known=True, exit_fee_currency="USDT",
+            taker_fee=0.999)
         assert ledger["fees_source"] == "venue"
+        assert ledger["fees_realized"] is True
         # 0.999 taker_fee would make the estimate enormous — proves the
         # static estimate was never consulted when both legs are known.
-        assert ledger["fees_usd"] == 0.08
+        assert ledger["fees_account_unit"] == 0.08
+        assert ledger["accounting_unit"] == "USDT"
         assert ledger["entry_fee_known"] is True
         assert ledger["exit_fee_known"] is True
 
-    def test_both_legs_unknown_falls_back_to_static_estimate(self):
+    # -- CASE A / H: real BTCUSDT shape — BTC entry fee, USDT exit fee --
+    def test_case_a_btc_entry_fee_usdt_exit_fee_converts_not_adds_raw(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.00001, entry_fee_known=True, entry_fee_currency="BTC",
+            exit_fee=0.03, exit_fee_known=True, exit_fee_currency="USDT",
+            taker_fee=0.001)
+        assert ledger["fees_source"] == "venue"
+        assert ledger["fees_realized"] is True
+        # entry: 0.00001 BTC * 100.0 (its own fill price) = 0.001 USDT
+        assert ledger["entry_fee_account_unit"] == 0.001
+        assert ledger["entry_fee_conversion"]["status"] == "converted"
+        assert ledger["entry_fee_conversion"]["rate"] == 100.0
+        # exit: already USDT — identity, no multiplication
+        assert ledger["exit_fee_account_unit"] == 0.03
+        assert ledger["exit_fee_conversion"]["status"] == "identity"
+        assert ledger["fees_account_unit"] == round(0.001 + 0.03, 8)
+        # The raw amounts (0.00001 and 0.03) were NEVER added directly —
+        # that would be 0.03001, numerically close but conceptually wrong
+        # and a coincidence of this example's small numbers, not a
+        # guarantee; the real proof is `rate == 100.0` above showing the
+        # conversion actually multiplied through before summing.
+        assert ledger["entry_fee_amount"] == 0.00001
+        assert ledger["entry_fee_currency"] == "BTC"
+        assert ledger["exit_fee_amount"] == 0.03
+        assert ledger["exit_fee_currency"] == "USDT"
+
+    # -- CASE D: both unknown -----------------------------------------
+    def test_case_d_both_legs_unknown_falls_back_to_static_estimate(self):
         ledger = ts.build_cash_ledger(
             symbol="BTCUSDT", category="spot", n_fills=2,
             entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
             taker_fee=0.001)
         assert ledger["fees_source"] == "estimated"
-        assert ledger["fees_usd"] == round(100.0 * 1.0 * 0.001 + 101.0 * 1.0 * 0.001, 8)
+        assert ledger["fees_realized"] is False
+        assert ledger["fees_account_unit"] == round(
+            100.0 * 1.0 * 0.001 + 101.0 * 1.0 * 0.001, 8)
         assert ledger["entry_fee_known"] is False
         assert ledger["exit_fee_known"] is False
 
-    def test_one_leg_known_one_estimated_is_reported_as_partial(self):
+    # -- CASE C: one known, one unknown ---------------------------------
+    def test_case_c_one_leg_known_one_estimated_is_reported_as_partial(self):
         ledger = ts.build_cash_ledger(
             symbol="BTCUSDT", category="spot", n_fills=2,
             entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
-            entry_fee=0.05, entry_fee_known=True, taker_fee=0.001)
+            entry_fee=0.05, entry_fee_known=True, entry_fee_currency="USDT",
+            taker_fee=0.001)
         assert ledger["fees_source"] == "partial_venue_partial_estimated"
+        assert ledger["fees_realized"] is False
         assert ledger["entry_fee_known"] is True
         assert ledger["exit_fee_known"] is False
-        # entry leg is the venue's 0.05, exit leg is the static estimate.
-        assert ledger["entry_fee_usd"] == 0.05
-        assert ledger["exit_fee_usd"] == round(101.0 * 1.0 * 0.001, 8)
+        # entry leg is the venue's 0.05, exit leg is the static estimate —
+        # the aggregate must NOT silently read as fully known.
+        assert ledger["entry_fee_account_unit"] == 0.05
+        assert ledger["exit_fee_account_unit"] == round(101.0 * 1.0 * 0.001, 8)
+
+    # -- CASE E / G: malformed / foreign currency, no conversion basis --
+    def test_case_e_malformed_currency_rejects_conversion_no_fake_number(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.05, entry_fee_known=True, entry_fee_currency="ETH",
+            exit_fee=0.03, exit_fee_known=True, exit_fee_currency="USDT",
+            taker_fee=0.001)
+        assert ledger["fees_source"] == "unresolved_mixed_unit"
+        assert ledger["fees_realized"] is False
+        assert ledger["entry_fee_conversion"]["status"] == "unresolved"
+        # The raw fact is preserved — never dropped, never guessed into a
+        # number this ledger cannot back up.
+        assert ledger["entry_fee_amount"] == 0.05
+        assert ledger["entry_fee_currency"] == "ETH"
+        assert ledger["entry_fee_account_unit"] is None
+        assert ledger["entry_fee_usd"] is None
+
+    def test_case_g_amount_known_currency_unknown_rejects_conversion(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.05, entry_fee_known=True, entry_fee_currency=None,
+            exit_fee=0.03, exit_fee_known=True, exit_fee_currency="USDT",
+            taker_fee=0.001)
+        assert ledger["fees_source"] == "unresolved_mixed_unit"
+        assert ledger["entry_fee_conversion"]["status"] == "unresolved"
+        assert ledger["entry_fee_account_unit"] is None
+
+    # -- CASE F: a currency that matches the base coin but with no usable
+    #    price to convert at (invalid conversion rate) --------------------
+    def test_case_f_invalid_conversion_rate_is_rejected(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=0.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.00001, entry_fee_known=True, entry_fee_currency="BTC",
+            exit_fee=0.03, exit_fee_known=True, exit_fee_currency="USDT",
+            taker_fee=0.001)
+        assert ledger["entry_fee_conversion"]["status"] == "unresolved"
+        assert ledger["entry_fee_account_unit"] is None
+        assert ledger["fees_source"] == "unresolved_mixed_unit"
+
+    # -- CASE J / K: known zero vs. unknown must stay distinct ----------
+    def test_case_j_known_zero_fee_is_realized_not_estimated(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.0, entry_fee_known=True, entry_fee_currency="USDT",
+            exit_fee=0.0, exit_fee_known=True, exit_fee_currency="USDT")
+        assert ledger["fees_source"] == "venue"
+        assert ledger["fees_realized"] is True
+        assert ledger["entry_fee_account_unit"] == 0.0
+        assert ledger["entry_fee_conversion"]["status"] == "identity"
+
+    def test_case_k_absent_fee_is_unknown_not_known_zero(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            taker_fee=0.001)
+        assert ledger["entry_fee_known"] is False
+        assert ledger["entry_fee_amount"] is None
+        assert ledger["entry_fee_conversion"]["status"] == "unknown"
+
+    # -- CASE I: conversion metadata must always be reproducible --------
+    def test_case_i_conversion_basis_is_never_empty_when_a_leg_had_qty(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.00001, entry_fee_known=True, entry_fee_currency="BTC",
+            exit_fee=0.03, exit_fee_known=True, exit_fee_currency="USDT")
+        assert ledger["entry_fee_conversion"]["basis"]
+        assert ledger["exit_fee_conversion"]["basis"]
+
+    def test_accounting_unit_is_never_labelled_usd_without_evidence(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True)
+        assert ledger["accounting_unit"] == "USDT"
+        assert ledger["accounting_unit"] != "USD"
 
 
 class TestProvenancePrecision:
@@ -473,7 +721,9 @@ class TestProvenancePrecision:
                        cwd=repo, check=True)
         subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
         (repo / "main.py").write_text("print('hi')\n")
-        subprocess.run(["git", "add", "main.py"], cwd=repo, check=True)
+        (repo / "requirements.txt").write_text("requests==2.31.0\n")
+        subprocess.run(["git", "add", "main.py", "requirements.txt"],
+                       cwd=repo, check=True)
         subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
         return repo
 
@@ -506,6 +756,36 @@ class TestProvenancePrecision:
         repo = self._git_repo(tmp_path)
         assert prov.workspace_dirty(str(repo)) is False
         assert prov.source_tree_clean(str(repo)) is True
+
+    def test_modified_execution_relevant_non_python_input_is_unclean(
+            self, tmp_path):
+        """requirements.txt pins the exact dependency versions this
+        process's import machinery resolves against — a version bump
+        changes behaviour exactly as a `.py` edit would, with no line in
+        any `.py` diff to show it. `source_tree_clean` must catch it."""
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+        import provenance as prov
+        repo = self._git_repo(tmp_path)
+        (repo / "requirements.txt").write_text("requests==99.0.0\n")
+        assert prov.workspace_dirty(str(repo)) is True
+        assert prov.source_tree_clean(str(repo)) is False
+
+    def test_mixed_source_and_artifact_dirtiness_is_not_conflated(
+            self, tmp_path):
+        """One tracked source file modified AND one untracked artefact
+        present at the same time: both facts must be visible and
+        distinct, not collapsed into a single signal."""
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+        import provenance as prov
+        repo = self._git_repo(tmp_path)
+        (repo / "main.py").write_text("print('changed')\n")
+        (repo / "cash_ledger.json").write_text("{}\n")
+        assert prov.workspace_dirty(str(repo)) is True
+        assert prov.source_tree_clean(str(repo)) is False
 
     def test_ledger_code_commit_is_never_suffixed_with_dirty(self):
         """`code_commit` must be a bare sha; `-dirty` belongs only to the
@@ -576,6 +856,92 @@ class TestSubmitAndFlattenNames:
 
         ts.flatten_position(Eng(), symbol="BTCUSDT")
         assert calls["symbol"] == "BTCUSDT"
+
+
+class TestBookkeepingFailureSurvivability:
+    """requirement: exception during ledger writing / latest-view writing
+    / index writing must not erase the order identity a real session
+    already produced — a failure.json must still carry it."""
+
+    def _full_success_stack(self):
+        fake_cfg = _cfg()
+        fake_store = types.SimpleNamespace(
+            open_positions=lambda: [
+                {"symbol": "BTCUSDT", "entry_price": 100.0, "qty": 1.0}],
+            close=lambda: None,
+        )
+        fake_client = types.SimpleNamespace(
+            base_url="https://api-testnet.bybit.com",
+            get_last_price=lambda s: 100.0, cancel_all=lambda s: None,
+        )
+        fake_engine = types.SimpleNamespace(
+            paper=False, sizer=None,
+            execute=lambda intent: types.SimpleNamespace(
+                ok=True, stage="complete", reason="ENTERED_AND_PROTECTED",
+                qty=1.0, entry_order_link_id="BB-entr-bk",
+                stop_order_link_id="BB-stop-bk", take_profit_ids=(),
+                detail={"entry_fee": 0.00001, "entry_fee_currency": "BTC"}),
+            close_position=lambda *, symbol, reason: types.SimpleNamespace(
+                ok=True, reason="CLOSED", detail={
+                    "exit_avg_price": 101.0, "executed_exit_qty": 1.0,
+                    "gross_pnl": 1.0, "exit_order_link_id": "BB-clos-bk",
+                    "exit_order_id": "777",
+                    "entry_fee": 0.00001, "entry_fee_currency": "BTC",
+                    "entry_fee_known": True,
+                    "exit_fee": 0.03, "exit_fee_currency": "USDT",
+                    "exit_fee_known": True,
+                }),
+        )
+        return fake_cfg, fake_store, fake_client, fake_engine
+
+    def test_ledger_write_failure_falls_back_to_failure_json_with_identity(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BYBIT_VENUE", "testnet")
+        fake_cfg, fake_store, fake_client, fake_engine = self._full_success_stack()
+
+        def fake_build(**kw):
+            return fake_cfg, fake_store, fake_client, fake_engine, object
+
+        monkeypatch.setattr(ts, "_build_session_stack", fake_build)
+        monkeypatch.setattr(
+            ts.tcr, "run_preflight",
+            lambda cfg, client: types.SimpleNamespace(ok=True, checks={}))
+        monkeypatch.setattr(
+            ts, "position_is_flat",
+            lambda client, store, *, symbol, run_entry_qty, run_exit_qty: (
+                True, {}))
+
+        original_write = ts.write_run_scoped_record
+
+        def exploding_write(payload, *, run_id, kind, **kw):
+            if kind == "ledger":
+                raise OSError("simulated disk failure during ledger write")
+            return original_write(payload, run_id=run_id, kind=kind, **kw)
+
+        monkeypatch.setattr(ts, "write_run_scoped_record", exploding_write)
+
+        failure_path = tmp_path / "fail.json"
+        rc = ts.main([
+            "--failure-out", str(failure_path),
+            "--ledger", str(tmp_path / "cash_ledger.json"),
+            "--state-db", str(tmp_path / "s.db"),
+            "--evidence-path", str(tmp_path / "e.jsonl"),
+            "--runs-dir", str(tmp_path / "runs"),
+            "--runs-index", str(tmp_path / "runs" / "index.jsonl"),
+        ])
+        assert rc == 1
+        payload = json.loads(failure_path.read_text())
+        assert "bookkeeping raised" in payload["failure"]
+        # The order identity a REAL session produced must survive the
+        # bookkeeping exception that happened afterward.
+        assert payload["entry_order_link_id"] == "BB-entr-bk"
+        assert payload["stop_order_link_id"] == "BB-stop-bk"
+        assert payload["exit_order_link_id"] == "BB-clos-bk"
+        assert payload["exit_order_id"] == "777"
+        assert payload["entry_fee"] == 0.00001
+        assert payload["entry_fee_currency"] == "BTC"
+        assert payload["exit_fee"] == 0.03
+        assert payload["exit_fee_currency"] == "USDT"
 
 
 class TestZeroFillsExitCode:
