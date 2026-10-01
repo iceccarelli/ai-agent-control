@@ -10,6 +10,7 @@ Invariants protected (audit S2/S3/S7):
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -49,6 +50,24 @@ class LossyTransport:
         return status, text
 
 
+class LossyTransportThen170141(LossyTransport):
+    """Same lost-reply/retry scenario, but the exchange answers the retry's
+    inevitable duplicate-id rejection the way the real testnet rejection did:
+    retCode 170141, "Duplicate clientOrderId" (FakeBybit's own duplicate
+    branch only ever emits 170130 "Duplicate orderLinkId"). Proves 170141 and
+    the clientOrderId wording are both recognized, not just 170130."""
+
+    def request(self, method, url, **kw):
+        status, text = super().request(method, url, **kw)
+        if method == "POST" and url.endswith("/v5/order/create"):
+            payload = json.loads(text)
+            if payload.get("retCode") == 170130:
+                payload["retCode"] = 170141
+                payload["retMsg"] = "Duplicate clientOrderId"
+                text = json.dumps(payload)
+        return status, text
+
+
 @pytest.fixture()
 def store(tmp_path):
     s = StateStore(str(tmp_path / "state.db"))
@@ -72,11 +91,37 @@ def test_duplicate_link_id_after_lost_reply_is_recorded_from_the_exchange(store)
     assert len(fake.orders) == 1
 
 
+def test_duplicate_rejection_with_170141_and_clientorderid_wording_is_recovered(
+    store,
+):
+    """The real testnet rejection (BB-entr-1-... / retCode 170141 "Duplicate
+    clientOrderId") must take the same path as 110072/170130: resolved by
+    querying the exchange for the order that already exists, never recorded
+    as a plain 'rejected' row that would leave a real fill unaccounted for."""
+    fake = FakeBybit()
+    lossy = LossyTransportThen170141(fake)
+    client = bc.BybitClient(config=Cfg(), store=store, transport=lossy)
+    result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
+    assert lossy.lost == 1
+    assert result.ok is True, result
+    assert result.reason == "SUBMITTED"
+    row = store.get_order(result.order_link_id)
+    assert row["status"] in {"submitted", "filled"}
+    assert row["exchange_id"]
+    # exactly ONE order exists at the venue - nothing was resubmitted, and
+    # the duplicate rejection was not recorded as a hard failure.
+    assert len(fake.orders) == 1
+
+
 def test_duplicate_looks_like_helper_matches_code_and_message():
     assert bc.BybitClient._looks_like_duplicate_link_id(
         bc.PermanentAPIError("x", ret_code=110072))
     assert bc.BybitClient._looks_like_duplicate_link_id(
         bc.PermanentAPIError("Duplicate orderLinkId", ret_code=999))
+    assert bc.BybitClient._looks_like_duplicate_link_id(
+        bc.PermanentAPIError("x", ret_code=170141))
+    assert bc.BybitClient._looks_like_duplicate_link_id(
+        bc.PermanentAPIError("Duplicate clientOrderId", ret_code=999))
     assert not bc.BybitClient._looks_like_duplicate_link_id(
         bc.PermanentAPIError("insufficient balance", ret_code=110007))
 

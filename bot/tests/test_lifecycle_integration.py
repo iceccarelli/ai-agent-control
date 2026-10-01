@@ -316,6 +316,37 @@ class TestNoDoubleExecution:
         assert exchange.orders == {}
 
 
+class TestExecutedQuantityIsVenueConfirmed:
+    """A nominally ``Filled`` order with no reported ``cumExecQty`` is a venue-
+    response anomaly, not evidence of a full fill. Defaulting it to the
+    REQUESTED quantity (as the entry path used to) would silently open a
+    position sized from intent rather than from what the exchange actually
+    confirms filled, and would make the ZERO_FILL guard below it unreachable.
+    The exit path never had this bug: it already defaults the same field to
+    0.0, which is what the entry path is made to match."""
+
+    def test_missing_fill_qty_on_a_filled_order_is_zero_fill_not_the_requested_size(
+        self, stack
+    ):
+        engine, client, risk, store, exchange = stack
+        real_create = exchange._create_order
+
+        def filled_but_qty_unreported(body):
+            status, text = real_create(body)
+            row = exchange.orders.get(body.get("orderLinkId", ""))
+            if (row is not None and row.get("_purpose") == "entry"
+                    and row.get("orderStatus") == "Filled"):
+                row["cumExecQty"] = "0"
+            return status, text
+
+        exchange._create_order = filled_but_qty_unreported
+
+        report = engine.execute(buy_intent())
+        assert report.ok is False
+        assert report.reason == "ZERO_FILL"
+        assert store.open_positions() == []
+
+
 # ---------------------------------------------------------------------------
 # signal handling
 # ---------------------------------------------------------------------------

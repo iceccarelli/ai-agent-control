@@ -212,6 +212,58 @@ class TestIdempotency:
         )
         assert len(oid) <= 36
 
+    def test_same_database_file_same_retry_same_link_id(self, tmp_path):
+        """The durable-session half of the invariant: a database file that is
+        reopened (a crash/restart of the SAME session) must keep minting the
+        same id for the same (seq, intent) pair, because its session token is
+        persisted in that file and does not change."""
+        db = str(tmp_path / "s.db")
+        s1 = StateStore(db)
+        token = s1.session_boot_token()
+        a = bc.build_order_link_id(
+            seq=1, symbol="BTCUSDT", side="Buy", qty="0.001",
+            session_token=token,
+        )
+        s1.close()
+
+        s2 = StateStore(db)  # same file: a restart of the same session
+        assert s2.session_boot_token() == token
+        b = bc.build_order_link_id(
+            seq=1, symbol="BTCUSDT", side="Buy", qty="0.001",
+            session_token=s2.session_boot_token(),
+        )
+        s2.close()
+        assert a == b
+
+    def test_two_fresh_database_files_never_collide_even_at_the_same_seq(
+        self, tmp_path
+    ):
+        """The bug behind the real testnet rejection (retCode 170141 on
+        BB-entr-1-...): two unrelated sessions, each starting from a brand
+        new/wiped state database, both allocate seq=1 for their first order.
+        Before the session token existed, an identical intent (same symbol/
+        side/qty/purpose, a market order with an empty price component) at
+        seq=1 minted the exact same orderLinkId and the second submission was
+        rejected by the exchange as a duplicate of the first, even though the
+        two sessions were unrelated. A fresh database file must mint its own
+        session token, so the id differs even when seq and the rest of the
+        intent are identical."""
+        s1 = StateStore(str(tmp_path / "session_a.db"))
+        s2 = StateStore(str(tmp_path / "session_b.db"))
+        assert s1.session_boot_token() != s2.session_boot_token()
+
+        a = bc.build_order_link_id(
+            seq=1, symbol="BTCUSDT", side="Buy", qty="0.001",
+            session_token=s1.session_boot_token(),
+        )
+        b = bc.build_order_link_id(
+            seq=1, symbol="BTCUSDT", side="Buy", qty="0.001",
+            session_token=s2.session_boot_token(),
+        )
+        s1.close()
+        s2.close()
+        assert a != b
+
     def test_sequence_survives_a_restart(self, tmp_path, exchange):
         """The property that makes a post-crash retry safe."""
         db = str(tmp_path / "s.db")
