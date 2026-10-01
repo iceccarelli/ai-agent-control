@@ -101,6 +101,112 @@ class TestNeverSetsLiveAuthorized:
         ]).issubset(ledger.keys())
 
 
+class TestEvidenceAttribution:
+    """A ledger/failure file with no run_id, commit, or order identity is
+    not attributable to the run that produced it — it reads the same as
+    any other run or a stale leftover. These lock in the fields a reader
+    needs to tell them apart."""
+
+    def test_ledger_carries_run_id_and_git_commit(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            run_id="RUN-1", git_commit="deadbeef" * 5)
+        assert ledger["run_id"] == "RUN-1"
+        assert ledger["git_commit"] == "deadbeef" * 5
+
+    def test_ledger_without_explicit_commit_still_stamps_a_sentinel(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True)
+        # Never silently absent: a caller that forgets to pass git_commit
+        # gets an explicit sentinel, never an empty/missing field a reader
+        # could mistake for "clean".
+        assert ledger["git_commit"]
+
+    def test_ledger_carries_order_identity(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_order_link_id="BB-entr-1",
+            stop_order_link_id="BB-stop-1",
+            take_profit_ids=("BB-tp-1",),
+            exit_order_link_id="BB-clos-1",
+            exit_order_id="2315982563845695488",
+        )
+        assert ledger["entry_order_link_id"] == "BB-entr-1"
+        assert ledger["stop_order_link_id"] == "BB-stop-1"
+        assert ledger["take_profit_ids"] == ["BB-tp-1"]
+        assert ledger["exit_order_link_id"] == "BB-clos-1"
+        assert ledger["exit_order_id"] == "2315982563845695488"
+
+    def test_two_run_ids_never_collide(self):
+        assert ts.new_run_id() != ts.new_run_id()
+
+    def test_failure_payload_carries_run_id_and_git_commit(self, tmp_path):
+        path = ts.write_failure(
+            str(tmp_path / "fail.json"), reason="boom",
+            run_id="RUN-2", git_commit="cafebabe" * 5)
+        payload = json.loads(open(path, encoding="utf-8").read())
+        assert payload["run_id"] == "RUN-2"
+        assert payload["git_commit"] == "cafebabe" * 5
+
+    def test_failure_payload_without_explicit_commit_still_stamps_a_sentinel(
+            self, tmp_path):
+        path = ts.write_failure(str(tmp_path / "fail.json"), reason="boom")
+        payload = json.loads(open(path, encoding="utf-8").read())
+        assert payload["git_commit"]
+
+    def test_run_session_surfaces_order_identity_on_success(self, monkeypatch):
+        fake_cfg = _cfg()
+        fake_store = types.SimpleNamespace(
+            open_positions=lambda: [
+                {"symbol": "BTCUSDT", "entry_price": 100.0, "qty": 1.0}],
+        )
+        fake_client = types.SimpleNamespace(
+            base_url="https://api-testnet.bybit.com",
+            get_last_price=lambda s: 100.0,
+            cancel_all=lambda s: None,
+        )
+
+        def fake_execute(intent):
+            return types.SimpleNamespace(
+                ok=True, stage="complete", reason="ENTERED_AND_PROTECTED",
+                qty=1.0, entry_order_link_id="BB-entr-9",
+                stop_order_link_id="BB-stop-9",
+                take_profit_ids=("BB-tp-9",), detail={})
+
+        def fake_close(*, symbol, reason):
+            return types.SimpleNamespace(
+                ok=True, reason="CLOSED", detail={
+                    "exit_avg_price": 101.0, "executed_exit_qty": 1.0,
+                    "gross_pnl": 1.0, "exit_order_link_id": "BB-clos-9",
+                    "exit_order_id": "999",
+                })
+
+        fake_engine = types.SimpleNamespace(
+            paper=False, sizer=None,
+            execute=fake_execute, close_position=fake_close)
+
+        import testnet_conformance_run as tcr
+        monkeypatch.setattr(
+            tcr, "run_preflight",
+            lambda cfg, client: types.SimpleNamespace(ok=True, checks={}))
+        monkeypatch.setattr(
+            ts, "position_is_flat",
+            lambda client, store, *, symbol, run_entry_qty, run_exit_qty: (
+                True, {}))
+
+        result = ts.run_session(
+            cfg=fake_cfg, store=fake_store, client=fake_client,
+            engine=fake_engine, symbol="BTCUSDT")
+        assert result["entry_order_link_id"] == "BB-entr-9"
+        assert result["stop_order_link_id"] == "BB-stop-9"
+        assert result["take_profit_ids"] == ("BB-tp-9",)
+        assert result["exit_order_link_id"] == "BB-clos-9"
+        assert result["exit_order_id"] == "999"
+
+
 class TestNotionalCapThisPathOnly:
     def test_capped_sizer_reduces_qty(self):
         from position_sizing import SizingResult, SizingRequest

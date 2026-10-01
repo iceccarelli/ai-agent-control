@@ -35,6 +35,7 @@ import logging
 import os
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +46,7 @@ sys.path.insert(0, HERE)
 
 import venue_evidence as ve  # noqa: E402
 import testnet_conformance_run as tcr  # noqa: E402
+import provenance as prov  # noqa: E402
 
 logger = logging.getLogger("testnet_session")
 
@@ -164,6 +166,20 @@ def _utc_date() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
 
 
+def new_run_id() -> str:
+    """One identifier per `main()` invocation, shared by the ledger and any
+    failure JSON it writes.
+
+    Without this, two sessions run on the same date_utc produce two
+    `cash_ledger.json` payloads a reader cannot tell apart — the second
+    silently overwrites the first's evidence. A run_id does not stop the
+    overwrite (the ledger is still a singleton file), but it ties whatever
+    IS on disk to one unambiguous run, and to that run's order ids and
+    `testnet_session_evidence.jsonl` hash-chain records.
+    """
+    return f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
+
+
 def _estimate_fees(*, entry_price: float, exit_price: float, qty: float,
                    taker_fee: float) -> float:
     return abs(entry_price * qty * taker_fee) + abs(exit_price * qty * taker_fee)
@@ -180,8 +196,22 @@ def build_cash_ledger(
     flat: bool,
     taker_fee: float = 0.001,
     gross_pnl: Optional[float] = None,
+    run_id: str = "",
+    git_commit: str = "",
+    entry_order_link_id: str = "",
+    stop_order_link_id: str = "",
+    take_profit_ids: Tuple[str, ...] = (),
+    exit_order_link_id: str = "",
+    exit_order_id: str = "",
 ) -> Dict[str, Any]:
-    """Machine-readable cash ledger. Testnet PnL is fake dollars — never cash."""
+    """Machine-readable cash ledger. Testnet PnL is fake dollars — never cash.
+
+    `run_id`/`git_commit` and the order identity fields are what let this
+    singleton file be attributed to one specific session rather than read
+    as "the" result: without them, a stale or unrelated run looks exactly
+    like the one a reader is trying to verify (no order id to check it
+    against, no commit to say what code produced it).
+    """
     if gross_pnl is None and qty > 0 and entry_price > 0 and exit_price > 0:
         # Long-only session path.
         gross_pnl = (exit_price - entry_price) * qty
@@ -192,6 +222,8 @@ def build_cash_ledger(
     return {
         "schema": "cash_ledger/1",
         "date_utc": _utc_date(),
+        "run_id": str(run_id or ""),
+        "git_commit": str(git_commit or prov.UNKNOWN),
         "category": str(category or "spot"),
         "symbol": symbol,
         "n_fills": int(n_fills),
@@ -208,6 +240,11 @@ def build_cash_ledger(
         "entry_price": float(entry_price or 0.0),
         "exit_price": float(exit_price or 0.0),
         "qty": float(qty or 0.0),
+        "entry_order_link_id": str(entry_order_link_id or ""),
+        "stop_order_link_id": str(stop_order_link_id or ""),
+        "take_profit_ids": list(take_profit_ids or ()),
+        "exit_order_link_id": str(exit_order_link_id or ""),
+        "exit_order_id": str(exit_order_id or ""),
     }
 
 
@@ -219,10 +256,12 @@ def write_json(path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
-def write_failure(path: str, *, reason: str, **extra: Any) -> str:
+def write_failure(path: str, *, reason: str, run_id: str = "", **extra: Any) -> str:
     payload = {
         "schema": "testnet_session_failure/1",
         "date_utc": _utc_date(),
+        "run_id": str(run_id or ""),
+        "git_commit": str(extra.pop("git_commit", "") or prov.UNKNOWN),
         "status": "FAILED",
         "failure": reason,
         "network_order_submitted": bool(extra.pop("network_order_submitted", False)),
@@ -293,6 +332,11 @@ def run_session(
         "qty": 0.0,
         "gross_pnl": 0.0,
         "network_order_submitted": False,
+        "entry_order_link_id": "",
+        "stop_order_link_id": "",
+        "take_profit_ids": (),
+        "exit_order_link_id": "",
+        "exit_order_id": "",
         "stages": [],
     }
 
@@ -329,6 +373,12 @@ def run_session(
     out["network_order_submitted"] = report.stage not in ("paper", "signal", "pre_gate",
                                                           "sizing", "equity", "filters",
                                                           "quote", "exit_plan", "final_gate")
+    # Order identity — carried on `report` itself (ExecutionReport fields),
+    # not inside `report.detail`. Captured here regardless of outcome: a
+    # rejected/unconfirmed entry still has an orderLinkId worth keeping.
+    out["entry_order_link_id"] = str(getattr(report, "entry_order_link_id", "") or "")
+    out["stop_order_link_id"] = str(getattr(report, "stop_order_link_id", "") or "")
+    out["take_profit_ids"] = tuple(getattr(report, "take_profit_ids", ()) or ())
 
     positions = {p["symbol"]: p for p in store.open_positions()}
     row = positions.get(symbol)
@@ -354,6 +404,8 @@ def run_session(
     exit_price = float((close.detail or {}).get("exit_avg_price") or 0.0)
     executed_exit = float((close.detail or {}).get("executed_exit_qty") or 0.0)
     gross = float((close.detail or {}).get("gross_pnl") or 0.0)
+    exit_order_link_id = str((close.detail or {}).get("exit_order_link_id") or "")
+    exit_order_id = str((close.detail or {}).get("exit_order_id") or "")
     out["stages"].append({
         "stage": "flatten",
         "ok": bool(close.ok),
@@ -361,9 +413,13 @@ def run_session(
         "exit_avg_price": exit_price,
         "executed_exit_qty": executed_exit,
         "gross_pnl": gross,
+        "exit_order_link_id": exit_order_link_id,
+        "exit_order_id": exit_order_id,
     })
     out["exit_price"] = exit_price
     out["gross_pnl"] = gross
+    out["exit_order_link_id"] = exit_order_link_id
+    out["exit_order_id"] = exit_order_id
     if executed_exit > 0:
         out["n_fills"] = 2
 
@@ -401,6 +457,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+    # One identifier and one commit stamp for everything this invocation
+    # writes (ledger and/or failure), so either artefact can be tied back
+    # to the exact run and the exact code that produced it.
+    run_id = new_run_id()
+    git_commit = prov.git_commit(BOT)
+
     # Hard refuse before building anything if venue env is wrong.
     venue = (os.environ.get("BYBIT_VENUE") or "").strip().lower()
     # Allow unset here only if config will default sandbox→testnet; still
@@ -409,7 +471,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_failure(
             args.failure_out,
             reason=f"BYBIT_VENUE={venue!r}; this tool arms on testnet only",
-            network_order_submitted=False, entry_fills=0)
+            network_order_submitted=False, entry_fills=0,
+            run_id=run_id, git_commit=git_commit)
         print(f"REFUSED: BYBIT_VENUE={venue!r}", file=sys.stderr)
         return 1
 
@@ -420,7 +483,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_failure(
             args.failure_out,
             reason=f"stack build failed: {type(exc).__name__}: {exc}",
-            network_order_submitted=False, entry_fills=0)
+            network_order_submitted=False, entry_fills=0,
+            run_id=run_id, git_commit=git_commit)
         print(f"stack build failed: {exc}", file=sys.stderr)
         return 1
 
@@ -428,7 +492,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_failure(
             args.failure_out,
             reason=f"cfg.BYBIT_VENUE={getattr(cfg, 'BYBIT_VENUE', None)!r}",
-            network_order_submitted=False, entry_fills=0)
+            network_order_submitted=False, entry_fills=0,
+            run_id=run_id, git_commit=git_commit)
         return 1
 
     try:
@@ -446,7 +511,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.failure_out,
             reason=f"run_session raised: {type(exc).__name__}: {exc}",
             network_order_submitted=False, entry_fills=0,
-            flatten_attempted=True)
+            flatten_attempted=True,
+            run_id=run_id, git_commit=git_commit)
         return 1
     finally:
         try:
@@ -466,6 +532,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             flatten_attempted=bool(result.get("flatten_attempted")),
             stages=result.get("stages"),
             preflight=result.get("preflight"),
+            run_id=run_id, git_commit=git_commit,
+            entry_order_link_id=result.get("entry_order_link_id") or "",
+            stop_order_link_id=result.get("stop_order_link_id") or "",
         )
         print("ZERO FILLS — exit 2", file=sys.stderr)
         return 2
@@ -480,6 +549,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         flat=bool(result.get("flat")),
         taker_fee=float(getattr(cfg, "TAKER_FEE", 0.001) or 0.001),
         gross_pnl=float(result.get("gross_pnl") or 0.0),
+        run_id=run_id,
+        git_commit=git_commit,
+        entry_order_link_id=str(result.get("entry_order_link_id") or ""),
+        stop_order_link_id=str(result.get("stop_order_link_id") or ""),
+        take_profit_ids=tuple(result.get("take_profit_ids") or ()),
+        exit_order_link_id=str(result.get("exit_order_link_id") or ""),
+        exit_order_id=str(result.get("exit_order_id") or ""),
     )
     write_json(args.ledger, ledger)
     print(json.dumps(ledger, indent=2, sort_keys=True))
@@ -494,6 +570,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             ledger_written=True,
             ledger=ledger,
             flat_detail=result.get("flat_detail"),
+            run_id=run_id, git_commit=git_commit,
         )
         return 1
 
