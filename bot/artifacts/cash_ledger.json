@@ -1,0 +1,16 @@
+{
+  "allows_live": false,
+  "category": "spot",
+  "date_utc": "2026-10-01",
+  "entry_price": 83320.0,
+  "exit_price": 83319.7,
+  "fees_usd": 0.39293641,
+  "flat": true,
+  "n_fills": 2,
+  "note": "Testnet PnL is fake dollars, not cash. Forward shadow book is about -0.94 R on 4 trades; this path's $1000 notional cap is not profit and can lose more fake dollars.",
+  "pnl_usd": -0.39364381,
+  "qty": 0.002358,
+  "schema": "cash_ledger/1",
+  "session_notional_cap_usd": 1000.0,
+  "symbol": "BTCUSDT"
+}
