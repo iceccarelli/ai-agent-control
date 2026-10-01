@@ -1,0 +1,18 @@
+{
+  "schema": "testnet_session_failure/1",
+  "date_utc": "2026-10-01",
+  "status": "BLOCKED",
+  "tip_sha": "bb9a791ada67c8583893be8c01b909ca0b9ba210",
+  "remote_main_descends_from_tip": true,
+  "local_workspace": "/workspaces/ai-agent-control",
+  "local_workspace_present": false,
+  "local_head_sha": null,
+  "failure": "Execution terminal does not contain the requested repository checkout; /workspaces/ai-agent-control is absent and git clone/fetch cannot resolve github.com from this terminal.",
+  "network_order_submitted": false,
+  "entry_fills": 0,
+  "flatten_attempted": false,
+  "ledger_written": false,
+  "allows_live": false,
+  "live_authorized": false,
+  "note": "No testnet order was submitted. No testnet PnL was created or represented as cash."
+}
