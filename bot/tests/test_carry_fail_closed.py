@@ -170,6 +170,9 @@ class _Store:
         self.seq += 1
         return self.seq
 
+    def session_boot_token(self):
+        return "test-session-token"
+
     def trip_kill_switch(self, reason):
         pass
 

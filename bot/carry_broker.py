@@ -120,22 +120,38 @@ class CarryBroker:
 
     def __init__(self, *, client: Any, sequence_source: Any, order_gate: Any,
                  link_id_builder: Any = None,
-                 duplicate_ret_codes: Tuple[int, ...] = (110072, 170130)) -> None:
+                 duplicate_ret_codes: Optional[Tuple[int, ...]] = None,
+                 session_token: str = "") -> None:
         if not callable(order_gate):
             raise TypeError("order_gate must be callable -> (may_send, reason)")
         self.client = client
         self.sequence_source = sequence_source
         self.order_gate = order_gate
+        #: Mixed into every minted orderLinkId so a fresh sequence_source
+        #: (seq restarting at 1 after a wiped/new state database) cannot
+        #: collide with an id a *different* session already used at the
+        #: exchange. See bybit_connection.build_order_link_id and
+        #: StateStore.session_boot_token.
+        self.session_token = session_token
         #: Venue rules and the account's own fee tier, fetched once per
         #: process. They are facts about the venue and the account, not
         #: decisions, and they change on a timescale of weeks — but they are
         #: NEVER guessed: an unreadable rule raises and the engine refuses.
         self._lot_rules: Dict[Tuple[str, str], Dict[str, float]] = {}
         self._fee_rates: Dict[Tuple[str, str], Dict[str, float]] = {}
-        self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
+        if link_id_builder is None or duplicate_ret_codes is None:
+            import bybit_connection as _bybit_connection
         if link_id_builder is None:
-            from bybit_connection import build_order_link_id
-            link_id_builder = build_order_link_id
+            link_id_builder = _bybit_connection.build_order_link_id
+        if duplicate_ret_codes is None:
+            # Single source of truth: bybit_connection.DUPLICATE_LINK_ID_RET_CODES.
+            # This used to be a separate hardcoded tuple here that silently
+            # drifted from the one in bybit_connection.py (it was missing
+            # retCode 170141, which a real duplicate clientOrderId rejection
+            # then fell through as a hard failure instead of being resolved
+            # by querying the exchange).
+            duplicate_ret_codes = tuple(_bybit_connection.DUPLICATE_LINK_ID_RET_CODES)
+        self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
         self._build_link_id = link_id_builder
 
     # -- the engine's three calls -----------------------------------------
@@ -156,7 +172,7 @@ class CarryBroker:
         link_id = self._build_link_id(
             seq=int(self.sequence_source(product, symbol, "carry")),
             symbol=symbol, side=side, qty=qty_text,
-            purpose=f"carry-{product}")
+            purpose=f"carry-{product}", session_token=self.session_token)
 
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Market", "qty": qty_text,
@@ -262,7 +278,7 @@ class CarryBroker:
         link_id = self._build_link_id(
             seq=int(self.sequence_source(product, symbol, "carry")),
             symbol=symbol, side=side, qty=qty_text, price=price_text,
-            purpose=f"carry-{product}-maker")
+            purpose=f"carry-{product}-maker", session_token=self.session_token)
 
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": qty_text, "price": price_text,
