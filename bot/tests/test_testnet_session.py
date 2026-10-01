@@ -40,6 +40,8 @@ class TestRefuseMainnet:
             "--ledger", str(ledger),
             "--state-db", str(tmp_path / "s.db"),
             "--evidence-path", str(tmp_path / "e.jsonl"),
+            "--runs-dir", str(tmp_path / "runs"),
+            "--runs-index", str(tmp_path / "runs" / "index.jsonl"),
         ])
         assert rc == 1
         payload = json.loads(failure.read_text())
@@ -56,6 +58,8 @@ class TestRefuseMainnet:
             "--ledger", str(tmp_path / "cash_ledger.json"),
             "--state-db", str(tmp_path / "s.db"),
             "--evidence-path", str(tmp_path / "e.jsonl"),
+            "--runs-dir", str(tmp_path / "runs"),
+            "--runs-index", str(tmp_path / "runs" / "index.jsonl"),
         ])
         assert rc == 1
         assert "demo" in json.loads(failure.read_text())["failure"].lower()
@@ -107,22 +111,22 @@ class TestEvidenceAttribution:
     any other run or a stale leftover. These lock in the fields a reader
     needs to tell them apart."""
 
-    def test_ledger_carries_run_id_and_git_commit(self):
+    def test_ledger_carries_run_id_and_code_commit(self):
         ledger = ts.build_cash_ledger(
             symbol="BTCUSDT", category="spot", n_fills=2,
             entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
-            run_id="RUN-1", git_commit="deadbeef" * 5)
+            run_id="RUN-1", code_commit="deadbeef" * 5)
         assert ledger["run_id"] == "RUN-1"
-        assert ledger["git_commit"] == "deadbeef" * 5
+        assert ledger["code_commit"] == "deadbeef" * 5
 
     def test_ledger_without_explicit_commit_still_stamps_a_sentinel(self):
         ledger = ts.build_cash_ledger(
             symbol="BTCUSDT", category="spot", n_fills=2,
             entry_price=100.0, exit_price=101.0, qty=1.0, flat=True)
-        # Never silently absent: a caller that forgets to pass git_commit
+        # Never silently absent: a caller that forgets to pass code_commit
         # gets an explicit sentinel, never an empty/missing field a reader
         # could mistake for "clean".
-        assert ledger["git_commit"]
+        assert ledger["code_commit"]
 
     def test_ledger_carries_order_identity(self):
         ledger = ts.build_cash_ledger(
@@ -143,19 +147,24 @@ class TestEvidenceAttribution:
     def test_two_run_ids_never_collide(self):
         assert ts.new_run_id() != ts.new_run_id()
 
-    def test_failure_payload_carries_run_id_and_git_commit(self, tmp_path):
+    def test_failure_payload_carries_run_id_and_code_commit(self, tmp_path):
         path = ts.write_failure(
             str(tmp_path / "fail.json"), reason="boom",
-            run_id="RUN-2", git_commit="cafebabe" * 5)
+            run_id="RUN-2", code_commit="cafebabe" * 5,
+            runs_dir=str(tmp_path / "runs"),
+            runs_index=str(tmp_path / "runs" / "index.jsonl"))
         payload = json.loads(open(path, encoding="utf-8").read())
         assert payload["run_id"] == "RUN-2"
-        assert payload["git_commit"] == "cafebabe" * 5
+        assert payload["code_commit"] == "cafebabe" * 5
 
     def test_failure_payload_without_explicit_commit_still_stamps_a_sentinel(
             self, tmp_path):
-        path = ts.write_failure(str(tmp_path / "fail.json"), reason="boom")
+        path = ts.write_failure(
+            str(tmp_path / "fail.json"), reason="boom", run_id="RUN-X",
+            runs_dir=str(tmp_path / "runs"),
+            runs_index=str(tmp_path / "runs" / "index.jsonl"))
         payload = json.loads(open(path, encoding="utf-8").read())
-        assert payload["git_commit"]
+        assert payload["code_commit"]
 
     def test_run_session_surfaces_order_identity_on_success(self, monkeypatch):
         fake_cfg = _cfg()
@@ -205,6 +214,311 @@ class TestEvidenceAttribution:
         assert result["take_profit_ids"] == ("BB-tp-9",)
         assert result["exit_order_link_id"] == "BB-clos-9"
         assert result["exit_order_id"] == "999"
+
+    def test_run_session_surfaces_fee_reconciliation_from_close_detail(
+            self, monkeypatch):
+        """close.detail is the authority for BOTH fee legs (it re-reads
+        entry fee from position meta and reads exit fee from the exit
+        fill) — run_session must take them from there, not re-derive."""
+        fake_cfg = _cfg()
+        fake_store = types.SimpleNamespace(
+            open_positions=lambda: [
+                {"symbol": "BTCUSDT", "entry_price": 100.0, "qty": 1.0}],
+        )
+        fake_client = types.SimpleNamespace(
+            base_url="https://api-testnet.bybit.com",
+            get_last_price=lambda s: 100.0, cancel_all=lambda s: None,
+        )
+        fake_engine = types.SimpleNamespace(
+            paper=False, sizer=None,
+            execute=lambda intent: types.SimpleNamespace(
+                ok=True, stage="complete", reason="ENTERED_AND_PROTECTED",
+                qty=1.0, entry_order_link_id="e", stop_order_link_id="s",
+                take_profit_ids=(), detail={"entry_fee": 0.04}),
+            close_position=lambda *, symbol, reason: types.SimpleNamespace(
+                ok=True, reason="CLOSED", detail={
+                    "exit_avg_price": 101.0, "executed_exit_qty": 1.0,
+                    "gross_pnl": 1.0, "exit_order_link_id": "x",
+                    "exit_order_id": "1",
+                    "entry_fee": 0.04, "entry_fee_known": True,
+                    "exit_fee": 0.011, "exit_fee_known": True,
+                }),
+        )
+        import testnet_conformance_run as tcr
+        monkeypatch.setattr(
+            tcr, "run_preflight",
+            lambda cfg, client: types.SimpleNamespace(ok=True, checks={}))
+        monkeypatch.setattr(
+            ts, "position_is_flat",
+            lambda client, store, *, symbol, run_entry_qty, run_exit_qty: (
+                True, {}))
+        result = ts.run_session(
+            cfg=fake_cfg, store=fake_store, client=fake_client,
+            engine=fake_engine, symbol="BTCUSDT")
+        assert result["entry_fee"] == 0.04
+        assert result["entry_fee_known"] is True
+        assert result["exit_fee"] == 0.011
+        assert result["exit_fee_known"] is True
+
+    def test_exception_after_entry_submission_preserves_order_identity(
+            self, monkeypatch):
+        """Requirement: a Python exception raised AFTER a real network
+        submission must not erase the order identity that submission
+        produced. Here `close_position` (the flatten call) raises; the
+        entry's orderLinkId/stop/fee were already captured and must
+        survive into `run_session`'s return value."""
+        fake_cfg = _cfg()
+        fake_store = types.SimpleNamespace(
+            open_positions=lambda: [
+                {"symbol": "BTCUSDT", "entry_price": 100.0, "qty": 1.0}],
+        )
+        fake_client = types.SimpleNamespace(
+            base_url="https://api-testnet.bybit.com",
+            get_last_price=lambda s: 100.0, cancel_all=lambda s: None,
+        )
+
+        def fake_execute(intent):
+            return types.SimpleNamespace(
+                ok=True, stage="complete", reason="ENTERED_AND_PROTECTED",
+                qty=1.0, entry_order_link_id="BB-entr-crash",
+                stop_order_link_id="BB-stop-crash",
+                take_profit_ids=(), detail={"entry_fee": 0.01})
+
+        def fake_close(*, symbol, reason):
+            raise RuntimeError("simulated network drop mid-close")
+
+        fake_engine = types.SimpleNamespace(
+            paper=False, sizer=None,
+            execute=fake_execute, close_position=fake_close)
+
+        import testnet_conformance_run as tcr
+        monkeypatch.setattr(
+            tcr, "run_preflight",
+            lambda cfg, client: types.SimpleNamespace(ok=True, checks={}))
+
+        result = ts.run_session(
+            cfg=fake_cfg, store=fake_store, client=fake_client,
+            engine=fake_engine, symbol="BTCUSDT")
+
+        assert result["ok"] is False
+        assert result["entry_order_link_id"] == "BB-entr-crash"
+        assert result["stop_order_link_id"] == "BB-stop-crash"
+        assert result["entry_fee"] == 0.01
+        assert result["entry_fee_known"] is True
+        assert "RuntimeError" in result["exception"]
+        assert "simulated network drop" in result["failure"]
+
+    def test_exception_before_any_flatten_attempt_tries_a_best_effort_close(
+            self, monkeypatch):
+        """A crash between the entry report coming back and the flatten
+        call being reached (e.g. reading the position row) must still
+        attempt one best-effort close — never silently leave a
+        known-submitted entry naked with no attempt made at all."""
+        fake_cfg = _cfg()
+
+        class ExplodingStore:
+            def open_positions(self):
+                raise RuntimeError("store read failed")
+
+        fake_client = types.SimpleNamespace(
+            base_url="https://api-testnet.bybit.com",
+            get_last_price=lambda s: 100.0, cancel_all=lambda s: None,
+        )
+        close_calls = []
+
+        def fake_close(*, symbol, reason):
+            close_calls.append(reason)
+            return types.SimpleNamespace(ok=True, reason="CLOSED", detail={})
+
+        fake_engine = types.SimpleNamespace(
+            paper=False, sizer=None,
+            execute=lambda intent: types.SimpleNamespace(
+                ok=True, stage="complete", reason="ENTERED_AND_PROTECTED",
+                qty=1.0, entry_order_link_id="BB-entr-exploding",
+                stop_order_link_id="", take_profit_ids=(), detail={}),
+            close_position=fake_close)
+
+        import testnet_conformance_run as tcr
+        monkeypatch.setattr(
+            tcr, "run_preflight",
+            lambda cfg, client: types.SimpleNamespace(ok=True, checks={}))
+
+        result = ts.run_session(
+            cfg=fake_cfg, store=ExplodingStore(), client=fake_client,
+            engine=fake_engine, symbol="BTCUSDT")
+
+        assert result["entry_order_link_id"] == "BB-entr-exploding"
+        assert close_calls == ["session_error_flatten"]
+        assert result["flatten_attempted"] is True
+
+
+class TestRunScopedImmutableRecords:
+    """Requirement: a run_id's record is written once and never silently
+    overwritten by a different run; the top-level cash_ledger.json/
+    testnet_session_failure.json singleton is a DERIVED latest view only."""
+
+    def test_two_runs_never_overwrite_each_others_record(self, tmp_path):
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        first = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            run_id="RUN-A", code_commit="a" * 40)
+        second = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=200.0, exit_price=201.0, qty=2.0, flat=True,
+            run_id="RUN-B", code_commit="b" * 40)
+        path_a = ts.write_run_scoped_record(
+            first, run_id="RUN-A", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        path_b = ts.write_run_scoped_record(
+            second, run_id="RUN-B", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        assert path_a != path_b
+        recovered_a = json.loads(open(path_a, encoding="utf-8").read())
+        recovered_b = json.loads(open(path_b, encoding="utf-8").read())
+        # RUN-A's record is still RUN-A's — writing RUN-B never touched it.
+        assert recovered_a["entry_price"] == 100.0
+        assert recovered_b["entry_price"] == 200.0
+        index_lines = [
+            json.loads(line) for line in
+            open(index_path, encoding="utf-8").read().splitlines() if line]
+        assert [e["run_id"] for e in index_lines] == ["RUN-A", "RUN-B"]
+
+    def test_same_run_ledger_then_failure_coexist_as_separate_records(
+            self, tmp_path):
+        """The `not ledger['flat']` path writes a ledger AND a failure for
+        the SAME run_id — both facts about that run must survive, not the
+        second overwriting the first."""
+        runs_dir = str(tmp_path / "runs")
+        index_path = str(tmp_path / "runs" / "index.jsonl")
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=False,
+            run_id="RUN-C", code_commit="c" * 40)
+        ts.write_run_scoped_record(
+            ledger, run_id="RUN-C", kind="ledger",
+            runs_dir=runs_dir, index_path=index_path)
+        ts.write_failure(
+            str(tmp_path / "fail.json"), reason="position not flat after session",
+            run_id="RUN-C", code_commit="c" * 40,
+            runs_dir=runs_dir, runs_index=index_path)
+        run_dir = os.path.join(runs_dir, "RUN-C")
+        assert os.path.exists(os.path.join(run_dir, "ledger.json"))
+        assert os.path.exists(os.path.join(run_dir, "failure.json"))
+
+    def test_latest_view_is_marked_derived_and_points_at_the_run_record(
+            self, tmp_path):
+        path = ts.write_failure(
+            str(tmp_path / "fail.json"), reason="boom", run_id="RUN-D",
+            runs_dir=str(tmp_path / "runs"),
+            runs_index=str(tmp_path / "runs" / "index.jsonl"))
+        payload = json.loads(open(path, encoding="utf-8").read())
+        assert payload["artifact_role"] == "latest_view"
+        assert payload["run_manifest_path"].endswith("failure.json")
+        assert "RUN-D" in payload["run_manifest_path"]
+
+
+class TestFeeReconciliationInLedger:
+    """build_cash_ledger must prefer authoritative venue fee data over a
+    static taker-fee estimate, and say which one it used."""
+
+    def test_both_legs_known_reports_fees_source_venue(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.05, entry_fee_known=True,
+            exit_fee=0.03, exit_fee_known=True, taker_fee=0.999)
+        assert ledger["fees_source"] == "venue"
+        # 0.999 taker_fee would make the estimate enormous — proves the
+        # static estimate was never consulted when both legs are known.
+        assert ledger["fees_usd"] == 0.08
+        assert ledger["entry_fee_known"] is True
+        assert ledger["exit_fee_known"] is True
+
+    def test_both_legs_unknown_falls_back_to_static_estimate(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            taker_fee=0.001)
+        assert ledger["fees_source"] == "estimated"
+        assert ledger["fees_usd"] == round(100.0 * 1.0 * 0.001 + 101.0 * 1.0 * 0.001, 8)
+        assert ledger["entry_fee_known"] is False
+        assert ledger["exit_fee_known"] is False
+
+    def test_one_leg_known_one_estimated_is_reported_as_partial(self):
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            entry_fee=0.05, entry_fee_known=True, taker_fee=0.001)
+        assert ledger["fees_source"] == "partial_venue_partial_estimated"
+        assert ledger["entry_fee_known"] is True
+        assert ledger["exit_fee_known"] is False
+        # entry leg is the venue's 0.05, exit leg is the static estimate.
+        assert ledger["entry_fee_usd"] == 0.05
+        assert ledger["exit_fee_usd"] == round(101.0 * 1.0 * 0.001, 8)
+
+
+class TestProvenancePrecision:
+    """Requirement: a `-dirty` workspace must never be misread as the
+    SOURCE CODE itself differing from its claimed commit — a stray
+    untracked artefact is not the same fact as a modified .py file."""
+
+    def _git_repo(self, tmp_path):
+        import subprocess
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@example.com"],
+                       cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+        (repo / "main.py").write_text("print('hi')\n")
+        subprocess.run(["git", "add", "main.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        return repo
+
+    def test_untracked_non_source_file_is_workspace_dirty_but_source_clean(
+            self, tmp_path):
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+        import provenance as prov
+        repo = self._git_repo(tmp_path)
+        (repo / "cash_ledger.json").write_text("{}\n")
+        assert prov.workspace_dirty(str(repo)) is True
+        assert prov.source_tree_clean(str(repo)) is True
+
+    def test_modified_tracked_source_is_both_dirty_and_unclean(self, tmp_path):
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+        import provenance as prov
+        repo = self._git_repo(tmp_path)
+        (repo / "main.py").write_text("print('changed')\n")
+        assert prov.workspace_dirty(str(repo)) is True
+        assert prov.source_tree_clean(str(repo)) is False
+
+    def test_clean_repo_is_neither_dirty_nor_unclean(self, tmp_path):
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+        import provenance as prov
+        repo = self._git_repo(tmp_path)
+        assert prov.workspace_dirty(str(repo)) is False
+        assert prov.source_tree_clean(str(repo)) is True
+
+    def test_ledger_code_commit_is_never_suffixed_with_dirty(self):
+        """`code_commit` must be a bare sha; `-dirty` belongs only to the
+        separate `workspace_dirty`/`source_tree_clean` fields."""
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            code_commit="f" * 40, source_tree_clean=False,
+            workspace_dirty=True)
+        assert ledger["code_commit"] == "f" * 40
+        assert not ledger["code_commit"].endswith("-dirty")
+        assert ledger["source_tree_clean"] is False
+        assert ledger["workspace_dirty"] is True
 
 
 class TestNotionalCapThisPathOnly:
@@ -303,6 +617,8 @@ class TestZeroFillsExitCode:
             "--ledger", str(tmp_path / "cash_ledger.json"),
             "--state-db", str(tmp_path / "s.db"),
             "--evidence-path", str(tmp_path / "e.jsonl"),
+            "--runs-dir", str(tmp_path / "runs"),
+            "--runs-index", str(tmp_path / "runs" / "index.jsonl"),
         ])
         assert rc == 2
         assert json.loads(failure.read_text())["entry_fills"] == 0

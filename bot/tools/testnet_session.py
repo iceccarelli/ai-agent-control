@@ -60,6 +60,15 @@ DEFAULT_EVIDENCE_PATH = os.path.join(
 DEFAULT_LEDGER_PATH = os.path.join(BOT, "artifacts", "cash_ledger.json")
 DEFAULT_FAILURE_PATH = os.path.join(
     BOT, "artifacts", "testnet_session_failure.json")
+#: Run-scoped, immutable records: one directory per run_id, never
+#: overwritten. `DEFAULT_LEDGER_PATH`/`DEFAULT_FAILURE_PATH` above remain a
+#: DERIVED "latest" view for convenience — these are the actual record.
+DEFAULT_RUNS_DIR = os.path.join(BOT, "artifacts", "testnet_runs")
+#: Append-only index of every run this tool has ever written a record for.
+#: Never rewritten in place — a new run never erases the line that named
+#: the run before it, which is exactly what reusing the singleton ledger/
+#: failure paths alone always did.
+DEFAULT_RUNS_INDEX = os.path.join(DEFAULT_RUNS_DIR, "index.jsonl")
 
 
 class SessionRefused(RuntimeError):
@@ -180,9 +189,9 @@ def new_run_id() -> str:
     return f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
 
 
-def _estimate_fees(*, entry_price: float, exit_price: float, qty: float,
-                   taker_fee: float) -> float:
-    return abs(entry_price * qty * taker_fee) + abs(exit_price * qty * taker_fee)
+def _estimate_leg_fee(*, price: float, qty: float, taker_fee: float) -> float:
+    """A STATIC fallback, used only for a leg whose real fee is unknown."""
+    return abs(price * qty * taker_fee)
 
 
 def build_cash_ledger(
@@ -197,38 +206,87 @@ def build_cash_ledger(
     taker_fee: float = 0.001,
     gross_pnl: Optional[float] = None,
     run_id: str = "",
-    git_commit: str = "",
+    code_commit: str = "",
+    source_tree_clean: Optional[bool] = None,
+    workspace_dirty: Optional[bool] = None,
     entry_order_link_id: str = "",
     stop_order_link_id: str = "",
     take_profit_ids: Tuple[str, ...] = (),
     exit_order_link_id: str = "",
     exit_order_id: str = "",
+    entry_fee: Optional[float] = None,
+    entry_fee_known: bool = False,
+    exit_fee: Optional[float] = None,
+    exit_fee_known: bool = False,
 ) -> Dict[str, Any]:
     """Machine-readable cash ledger. Testnet PnL is fake dollars — never cash.
 
-    `run_id`/`git_commit` and the order identity fields are what let this
+    `run_id`/`code_commit` and the order identity fields are what let this
     singleton file be attributed to one specific session rather than read
     as "the" result: without them, a stale or unrelated run looks exactly
     like the one a reader is trying to verify (no order id to check it
     against, no commit to say what code produced it).
+
+    `code_commit` is always a bare `HEAD` sha — never the `-dirty`-suffixed
+    form `tools/provenance.git_commit` returns elsewhere in this repo.
+    `source_tree_clean` (no tracked `*.py` differs from that commit) and
+    `workspace_dirty` (ANYTHING uncommitted, tracked or not) are reported
+    separately, precisely so a reader cannot misread "some untracked
+    artefact is lying around" as "the source code that ran does not match
+    `code_commit`" — the one thing a `-dirty` suffix cannot distinguish.
+
+    Fee reconciliation: `entry_fee`/`exit_fee` + their `_known` flags are
+    the venue's own `cumExecFee` as `trading_engine.close_position` already
+    read it and booked it on the local trade row (see
+    `trading_engine.venue_fee`) — passed straight through, never
+    re-derived. The static `taker_fee` estimate is used ONLY to fill a leg
+    whose real fee is unknown (e.g. no fill ever resolved), and
+    `fees_source` says, per run, whether this ledger's `fees_usd` is
+    venue-confirmed, partly estimated, or fully estimated — so a reader
+    never mistakes one for the other.
     """
     if gross_pnl is None and qty > 0 and entry_price > 0 and exit_price > 0:
         # Long-only session path.
         gross_pnl = (exit_price - entry_price) * qty
-    fees = _estimate_fees(
-        entry_price=entry_price, exit_price=exit_price, qty=qty,
-        taker_fee=taker_fee) if qty > 0 else 0.0
+
+    if qty > 0:
+        resolved_entry_fee = (
+            float(entry_fee) if entry_fee_known and entry_fee is not None
+            else _estimate_leg_fee(price=entry_price, qty=qty, taker_fee=taker_fee))
+        resolved_exit_fee = (
+            float(exit_fee) if exit_fee_known and exit_fee is not None
+            else _estimate_leg_fee(price=exit_price, qty=qty, taker_fee=taker_fee))
+    else:
+        resolved_entry_fee = 0.0
+        resolved_exit_fee = 0.0
+    fees = resolved_entry_fee + resolved_exit_fee
+
+    known_legs = int(bool(entry_fee_known)) + int(bool(exit_fee_known))
+    if known_legs == 2:
+        fees_source = "venue"
+    elif known_legs == 1:
+        fees_source = "partial_venue_partial_estimated"
+    else:
+        fees_source = "estimated"
+
     pnl = float(gross_pnl or 0.0) - fees
     return {
         "schema": "cash_ledger/1",
         "date_utc": _utc_date(),
         "run_id": str(run_id or ""),
-        "git_commit": str(git_commit or prov.UNKNOWN),
+        "code_commit": str(code_commit or prov.UNKNOWN),
+        "source_tree_clean": source_tree_clean,
+        "workspace_dirty": workspace_dirty,
         "category": str(category or "spot"),
         "symbol": symbol,
         "n_fills": int(n_fills),
         "pnl_usd": round(float(pnl), 8),
         "fees_usd": round(float(fees), 8),
+        "fees_source": fees_source,
+        "entry_fee_usd": round(float(resolved_entry_fee), 8),
+        "entry_fee_known": bool(entry_fee_known),
+        "exit_fee_usd": round(float(resolved_exit_fee), 8),
+        "exit_fee_known": bool(exit_fee_known),
         "flat": bool(flat),
         "allows_live": False,
         "note": (
@@ -256,12 +314,56 @@ def write_json(path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
-def write_failure(path: str, *, reason: str, run_id: str = "", **extra: Any) -> str:
+def write_run_scoped_record(
+    payload: Dict[str, Any], *, run_id: str, kind: str,
+    runs_dir: str = DEFAULT_RUNS_DIR, index_path: str = DEFAULT_RUNS_INDEX,
+) -> str:
+    """Persist `payload` under `<runs_dir>/<run_id>/<kind>.json` — the
+    IMMUTABLE record this run_id's `kind` of artefact exists at, once and
+    permanently. Distinct run_ids never collide (see `new_run_id`); the
+    same run_id can legitimately gain more than one `kind` (a ledger,
+    later found not-flat, is followed by a failure for the SAME run), so
+    the directory itself is not exist_ok=False, but neither file is ever
+    reopened for writing once this call returns.
+
+    Also appends one line to `index_path` — append-only, never rewritten —
+    so a reader can enumerate every run this tool has ever produced a
+    record for without having to list the runs directory, and so the run
+    before this one is never erased the way overwriting a singleton
+    ledger/failure file always erased it.
+
+    A missing `run_id` is a caller bug, not a reason to guess one; this
+    silently no-ops rather than inventing a directory with no identity.
+    """
+    if not run_id:
+        return ""
+    manifest_path = os.path.join(runs_dir, run_id, f"{kind}.json")
+    write_json(manifest_path, payload)
+    os.makedirs(os.path.dirname(index_path) or ".", exist_ok=True)
+    with open(index_path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "run_id": run_id,
+            "kind": kind,
+            "manifest_path": manifest_path,
+            "written_at_utc": dt.datetime.now(dt.timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "code_commit": payload.get("code_commit"),
+        }, sort_keys=True) + "\n")
+    return manifest_path
+
+
+def write_failure(
+    path: str, *, reason: str, run_id: str = "",
+    runs_dir: str = DEFAULT_RUNS_DIR, runs_index: str = DEFAULT_RUNS_INDEX,
+    **extra: Any,
+) -> str:
     payload = {
         "schema": "testnet_session_failure/1",
         "date_utc": _utc_date(),
         "run_id": str(run_id or ""),
-        "git_commit": str(extra.pop("git_commit", "") or prov.UNKNOWN),
+        "code_commit": str(extra.pop("code_commit", "") or prov.UNKNOWN),
+        "source_tree_clean": extra.pop("source_tree_clean", None),
+        "workspace_dirty": extra.pop("workspace_dirty", None),
         "status": "FAILED",
         "failure": reason,
         "network_order_submitted": bool(extra.pop("network_order_submitted", False)),
@@ -273,6 +375,15 @@ def write_failure(path: str, *, reason: str, run_id: str = "", **extra: Any) -> 
         "note": "No testnet PnL was represented as cash.",
     }
     payload.update(extra)
+    run_manifest_path = write_run_scoped_record(
+        payload, run_id=run_id, kind="failure",
+        runs_dir=runs_dir, index_path=runs_index)
+    if run_manifest_path:
+        payload["run_manifest_path"] = run_manifest_path
+    # `path` (cash_ledger.json's sibling, testnet_session_failure.json by
+    # default) is the DERIVED "latest" view — the run-scoped file above,
+    # one per run_id, is the record of this specific run.
+    payload["artifact_role"] = "latest_view"
     return write_json(path, payload)
 
 
@@ -337,6 +448,10 @@ def run_session(
         "take_profit_ids": (),
         "exit_order_link_id": "",
         "exit_order_id": "",
+        "entry_fee": None,
+        "entry_fee_known": False,
+        "exit_fee": None,
+        "exit_fee_known": False,
         "stages": [],
     }
 
@@ -355,6 +470,44 @@ def run_session(
         out["failure"] = "engine.paper is true; refusing"
         return out
 
+    try:
+        out = _run_session_body(
+            out, cfg=cfg, store=store, client=client, engine=engine,
+            symbol=symbol)
+    except Exception as exc:  # noqa: BLE001
+        # Survivable failure evidence: whatever order identity `out` already
+        # holds (set incrementally, below, the moment each report/close
+        # comes back) is NOT lost just because something raised before this
+        # function could return normally — a crash after a real network
+        # submission must not erase the ids that submission produced.
+        logger.exception("run_session body raised")
+        out["exception"] = f"{type(exc).__name__}: {exc}"
+        if "failure" not in out:
+            out["failure"] = f"run_session raised: {out['exception']}"
+        if not out.get("flatten_attempted") and out.get("entry_order_link_id"):
+            # An entry was actually submitted (it has an orderLinkId) and
+            # nothing has attempted to close it yet — try once, best-effort,
+            # rather than leave it silently naked. Gated on the orderLinkId
+            # rather than `entry_fills`: a crash between the entry report
+            # coming back and this function noticing the fill still leaves
+            # a real submitted order, with real identity, worth trying to
+            # flatten.
+            out["flatten_attempted"] = True
+            try:
+                flatten_position(engine, symbol=symbol,
+                                 reason="session_error_flatten")
+            except Exception:  # noqa: BLE001
+                logger.exception("best-effort flatten after exception raised")
+    return out
+
+
+def _run_session_body(
+    out: Dict[str, Any], *, cfg: Any, store: Any, client: Any, engine: Any,
+    symbol: str,
+) -> Dict[str, Any]:
+    """The risky part of `run_session`, split out so its caller can wrap it
+    in one try/except and still return whatever `out` holds at the moment
+    of failure — see `run_session`'s docstring."""
     last = float(client.get_last_price(symbol))
     stop = last * 0.98
     take = last * 1.05
@@ -379,6 +532,12 @@ def run_session(
     out["entry_order_link_id"] = str(getattr(report, "entry_order_link_id", "") or "")
     out["stop_order_link_id"] = str(getattr(report, "stop_order_link_id", "") or "")
     out["take_profit_ids"] = tuple(getattr(report, "take_profit_ids", ()) or ())
+    # Authoritative entry fee (trading_engine.venue_fee's cumExecFee read),
+    # carried through report.detail exactly as the engine booked it locally
+    # — never re-derived here, so there is one authority for this number.
+    entry_detail = dict(report.detail or {})
+    out["entry_fee"] = entry_detail.get("entry_fee")
+    out["entry_fee_known"] = bool(entry_detail.get("entry_fee") is not None)
 
     positions = {p["symbol"]: p for p in store.open_positions()}
     row = positions.get(symbol)
@@ -420,6 +579,17 @@ def run_session(
     out["gross_pnl"] = gross
     out["exit_order_link_id"] = exit_order_link_id
     out["exit_order_id"] = exit_order_id
+    # `close.detail` is the authoritative source for BOTH fee legs: it is
+    # produced by the same `close_position()` call that just booked the
+    # local trade row, re-reading the entry fee from position meta and
+    # reading the exit fee from the exit fill itself — overrides the
+    # entry-stage heuristic above rather than duplicating its logic.
+    close_detail = dict(close.detail or {})
+    if "entry_fee" in close_detail:
+        out["entry_fee"] = close_detail.get("entry_fee")
+        out["entry_fee_known"] = bool(close_detail.get("entry_fee_known"))
+    out["exit_fee"] = close_detail.get("exit_fee")
+    out["exit_fee_known"] = bool(close_detail.get("exit_fee_known"))
     if executed_exit > 0:
         out["n_fills"] = 2
 
@@ -451,17 +621,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--evidence-path", default=DEFAULT_EVIDENCE_PATH)
     parser.add_argument("--ledger", default=DEFAULT_LEDGER_PATH)
     parser.add_argument("--failure-out", default=DEFAULT_FAILURE_PATH)
+    parser.add_argument("--runs-dir", default=DEFAULT_RUNS_DIR)
+    parser.add_argument("--runs-index", default=DEFAULT_RUNS_INDEX)
     args = parser.parse_args(argv)
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
-    # One identifier and one commit stamp for everything this invocation
-    # writes (ledger and/or failure), so either artefact can be tied back
-    # to the exact run and the exact code that produced it.
+    # One identifier and one provenance stamp for everything this
+    # invocation writes (ledger and/or failure), so either artefact can be
+    # tied back to the exact run and the exact code that produced it.
+    # `code_commit` is bare (no `-dirty` suffix) — `source_tree_clean` and
+    # `workspace_dirty` carry that distinction explicitly instead.
     run_id = new_run_id()
-    git_commit = prov.git_commit(BOT)
+    code_commit = prov.git_commit(BOT, mark_dirty=False)
+    source_tree_clean = prov.source_tree_clean(BOT)
+    workspace_dirty = prov.workspace_dirty(BOT)
 
     # Hard refuse before building anything if venue env is wrong.
     venue = (os.environ.get("BYBIT_VENUE") or "").strip().lower()
@@ -472,7 +648,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.failure_out,
             reason=f"BYBIT_VENUE={venue!r}; this tool arms on testnet only",
             network_order_submitted=False, entry_fills=0,
-            run_id=run_id, git_commit=git_commit)
+            run_id=run_id, code_commit=code_commit,
+            source_tree_clean=source_tree_clean, workspace_dirty=workspace_dirty,
+            runs_dir=args.runs_dir, runs_index=args.runs_index)
         print(f"REFUSED: BYBIT_VENUE={venue!r}", file=sys.stderr)
         return 1
 
@@ -484,7 +662,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.failure_out,
             reason=f"stack build failed: {type(exc).__name__}: {exc}",
             network_order_submitted=False, entry_fills=0,
-            run_id=run_id, git_commit=git_commit)
+            run_id=run_id, code_commit=code_commit,
+            source_tree_clean=source_tree_clean, workspace_dirty=workspace_dirty,
+            runs_dir=args.runs_dir, runs_index=args.runs_index)
         print(f"stack build failed: {exc}", file=sys.stderr)
         return 1
 
@@ -493,7 +673,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.failure_out,
             reason=f"cfg.BYBIT_VENUE={getattr(cfg, 'BYBIT_VENUE', None)!r}",
             network_order_submitted=False, entry_fills=0,
-            run_id=run_id, git_commit=git_commit)
+            run_id=run_id, code_commit=code_commit,
+            source_tree_clean=source_tree_clean, workspace_dirty=workspace_dirty,
+            runs_dir=args.runs_dir, runs_index=args.runs_index)
         return 1
 
     try:
@@ -512,7 +694,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             reason=f"run_session raised: {type(exc).__name__}: {exc}",
             network_order_submitted=False, entry_fills=0,
             flatten_attempted=True,
-            run_id=run_id, git_commit=git_commit)
+            run_id=run_id, code_commit=code_commit,
+            source_tree_clean=source_tree_clean, workspace_dirty=workspace_dirty,
+            runs_dir=args.runs_dir, runs_index=args.runs_index)
         return 1
     finally:
         try:
@@ -532,9 +716,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             flatten_attempted=bool(result.get("flatten_attempted")),
             stages=result.get("stages"),
             preflight=result.get("preflight"),
-            run_id=run_id, git_commit=git_commit,
+            run_id=run_id, code_commit=code_commit,
+            source_tree_clean=source_tree_clean, workspace_dirty=workspace_dirty,
+            exception=result.get("exception") or "",
+            # Whatever order identity exists survives even a zero-fill
+            # failure — an entry that was submitted and then the process
+            # raised still has an orderLinkId worth keeping (requirement:
+            # failure evidence must not lose known order identity).
             entry_order_link_id=result.get("entry_order_link_id") or "",
             stop_order_link_id=result.get("stop_order_link_id") or "",
+            take_profit_ids=list(result.get("take_profit_ids") or ()),
+            exit_order_link_id=result.get("exit_order_link_id") or "",
+            exit_order_id=result.get("exit_order_id") or "",
+            runs_dir=args.runs_dir, runs_index=args.runs_index,
         )
         print("ZERO FILLS — exit 2", file=sys.stderr)
         return 2
@@ -550,13 +744,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         taker_fee=float(getattr(cfg, "TAKER_FEE", 0.001) or 0.001),
         gross_pnl=float(result.get("gross_pnl") or 0.0),
         run_id=run_id,
-        git_commit=git_commit,
+        code_commit=code_commit,
+        source_tree_clean=source_tree_clean,
+        workspace_dirty=workspace_dirty,
         entry_order_link_id=str(result.get("entry_order_link_id") or ""),
         stop_order_link_id=str(result.get("stop_order_link_id") or ""),
         take_profit_ids=tuple(result.get("take_profit_ids") or ()),
         exit_order_link_id=str(result.get("exit_order_link_id") or ""),
         exit_order_id=str(result.get("exit_order_id") or ""),
+        entry_fee=result.get("entry_fee"),
+        entry_fee_known=bool(result.get("entry_fee_known")),
+        exit_fee=result.get("exit_fee"),
+        exit_fee_known=bool(result.get("exit_fee_known")),
     )
+    run_manifest_path = write_run_scoped_record(
+        ledger, run_id=run_id, kind="ledger",
+        runs_dir=args.runs_dir, index_path=args.runs_index)
+    # `args.ledger` (cash_ledger.json by default) stays a DERIVED "latest"
+    # view for convenience — the run-scoped file just written above, under
+    # this run_id, is the immutable record.
+    if run_manifest_path:
+        ledger["run_manifest_path"] = run_manifest_path
+    ledger["artifact_role"] = "latest_view"
     write_json(args.ledger, ledger)
     print(json.dumps(ledger, indent=2, sort_keys=True))
 
@@ -570,7 +779,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             ledger_written=True,
             ledger=ledger,
             flat_detail=result.get("flat_detail"),
-            run_id=run_id, git_commit=git_commit,
+            run_id=run_id, code_commit=code_commit,
+            source_tree_clean=source_tree_clean, workspace_dirty=workspace_dirty,
         )
         return 1
 

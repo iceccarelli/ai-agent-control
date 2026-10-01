@@ -66,6 +66,54 @@ def git_commit(repo: Optional[str] = None, *, mark_dirty: bool = True) -> str:
     return sha
 
 
+def workspace_dirty(repo: Optional[str] = None) -> Optional[bool]:
+    """True iff `git status --porcelain` reports ANY change anywhere in the
+    working tree — tracked or untracked. This is exactly the check
+    `git_commit`'s `-dirty` suffix already makes, exposed as its own field
+    so a caller that wants to reason about it does not have to parse a
+    suffix off a commit string. Returns `None` when git itself could not
+    be asked (no repo, git missing, timeout) — never a guessed boolean.
+    """
+    repo = repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=repo, text=True,
+            capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if status.returncode != 0:
+        return None
+    return bool(status.stdout.strip())
+
+
+def source_tree_clean(repo: Optional[str] = None) -> Optional[bool]:
+    """True iff no TRACKED `*.py` file differs from `HEAD`.
+
+    Deliberately narrower than `workspace_dirty`: an untracked artefact or
+    data file sitting in the working tree makes `git status --porcelain`
+    (and `git_commit`'s `-dirty` suffix) non-empty without a single line of
+    source having changed. Collapsing both facts into one "-dirty" string
+    invites a reader to conclude "the code that ran does not match its
+    claimed commit" from evidence that only shows "something, possibly
+    irrelevant, is lying around uncommitted". This answers the question
+    that actually matters for an execution artefact: did the SOURCE that
+    executed match `code_commit`. Returns `None` when git itself could not
+    be asked.
+    """
+    repo = repo or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--", "*.py"], cwd=repo,
+            text=True, capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if status.returncode != 0:
+        return None
+    return not status.stdout.strip()
+
+
 def is_real_commit(value: str) -> bool:
     """True only for an actual sha (dirty or not), not a sentinel."""
     if not value or value in (UNKNOWN, UNAVAILABLE):

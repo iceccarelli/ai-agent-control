@@ -194,6 +194,15 @@ class TradeRecord:
     closed_epoch: float
     order_link_id: str = ""
     meta: Dict[str, Any] = field(default_factory=dict)
+    #: Whether `entry_fee`/`exit_fee` are the venue's own reported figure
+    #: (`cumExecFee`) rather than a 0.0 the caller supplied for lack of one.
+    #: Default True preserves every existing caller's behaviour (a synthetic
+    #: or backtest fee is "known" by construction); only
+    #: `TradingEngine.close_position` sets these False when the venue fill
+    #: did not carry a fee, so a reader of `trades` can tell "charged
+    #: nothing" apart from "the real cost was never recorded".
+    entry_fee_known: bool = True
+    exit_fee_known: bool = True
     #: A durable, venue-derived identity for the exit this trade books --
     #: e.g. ``f"exit:{exit_order_link_id}"`` for an engine-initiated close,
     #: or a key derived from the closed-pnl orderId(s) for an
@@ -279,7 +288,9 @@ CREATE TABLE IF NOT EXISTS trades (
     day            TEXT NOT NULL,
     order_link_id  TEXT NOT NULL DEFAULT '',
     meta           TEXT NOT NULL DEFAULT '{}',
-    dedupe_key     TEXT NOT NULL DEFAULT ''
+    dedupe_key     TEXT NOT NULL DEFAULT '',
+    entry_fee_known INTEGER NOT NULL DEFAULT 1,
+    exit_fee_known  INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_trades_day ON trades(day);
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_epoch);
@@ -595,7 +606,11 @@ class StateStore:
         },
         "regime_history": {"detail": "TEXT NOT NULL DEFAULT '{}'"},
         "memory_kv": {"updated_epoch": "REAL NOT NULL DEFAULT 0.0"},
-        "trades": {"dedupe_key": "TEXT NOT NULL DEFAULT ''"},
+        "trades": {
+            "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+            "entry_fee_known": "INTEGER NOT NULL DEFAULT 1",
+            "exit_fee_known": "INTEGER NOT NULL DEFAULT 1",
+        },
     }
 
     def _migrate_additive(self) -> None:
@@ -1025,7 +1040,8 @@ class StateStore:
         cur = self._exec(
             "INSERT INTO trades(symbol, side, qty, entry_price, exit_price, gross_pnl,"
             " entry_fee, exit_fee, net_pnl, opened_epoch, closed_epoch, day,"
-            " order_link_id, meta, dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " order_link_id, meta, dedupe_key, entry_fee_known, exit_fee_known)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(dedupe_key) WHERE dedupe_key <> '' DO NOTHING",
             (
                 trade.symbol, trade.side, float(trade.qty), float(trade.entry_price),
@@ -1034,6 +1050,8 @@ class StateStore:
                 float(trade.closed_epoch), utc_day(trade.closed_epoch),
                 trade.order_link_id, json.dumps(trade.meta, default=str),
                 str(trade.dedupe_key or ""),
+                1 if trade.entry_fee_known else 0,
+                1 if trade.exit_fee_known else 0,
             ),
         )
         if cur.rowcount != 1:

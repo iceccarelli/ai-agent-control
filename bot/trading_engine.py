@@ -86,6 +86,29 @@ __all__ = [
 ]
 
 
+def venue_fee(row: Optional[Mapping[str, Any]]) -> Optional[float]:
+    """`cumExecFee` as the venue reported it, or ``None`` when it did not say.
+
+    Same semantics, same field, as `carry_broker.CarryBroker._fee` — this is
+    not a second implementation of fee extraction, it is the same rule
+    applied on the spot/entry-exit path, which never imported the carry
+    subsystem and has no other place this lives. An unknown fee must never
+    be read as a zero fee: `trading_engine.close_position` used to default
+    `exit_fee`/`entry_fee` to 0.0 unconditionally, which books a cost of
+    nothing when the venue's own fill response actually carried one.
+    """
+    if not row:
+        return None
+    raw = row.get("cumExecFee")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 # ---------------------------------------------------------------------------
 # value types
 # ---------------------------------------------------------------------------
@@ -501,6 +524,11 @@ class TradingEngine:
         # this makes entry consistent with it.
         filled_qty = float(fill.get("cumExecQty") or 0.0)
         avg_price = float(fill.get("avgPrice") or intent.entry_price)
+        # Authoritative, never estimated: the venue's own cumExecFee for this
+        # fill, or None when it did not say. Carried in position meta so
+        # `close_position` can book the REAL entry fee instead of the 0.0 it
+        # used to default to.
+        entry_fee = venue_fee(fill)
         if filled_qty <= 0:
             return self._report(stage="fill", reason="ZERO_FILL", symbol=symbol,
                                 entry_order_link_id=entry.order_link_id)
@@ -566,7 +594,7 @@ class TradingEngine:
         self.store.upsert_position(
             symbol, side, filled_qty, avg_price, stop_price=plan.stop_price,
             order_link_id=entry.order_link_id,
-            meta={"stop_order_link_id": protected},
+            meta={"stop_order_link_id": protected, "entry_fee": entry_fee},
         )
 
         # -- 10. take-profit legs (best effort; the stop is what matters) --
@@ -609,7 +637,7 @@ class TradingEngine:
             entry_order_link_id=entry.order_link_id,
             stop_order_link_id=protected,
             take_profit_ids=tuple(tp_ids),
-            detail={"avg_price": avg_price},
+            detail={"avg_price": avg_price, "entry_fee": entry_fee},
         )
 
     # -- entry execution ---------------------------------------------------
@@ -916,6 +944,21 @@ class TradingEngine:
         qty = float(row["qty"])
         entry_price = float(row["entry_price"])
 
+        row_meta: Dict[str, Any] = {}
+        try:
+            row_meta = json.loads(str(row.get("meta") or "{}"))
+        except Exception:  # noqa: BLE001
+            row_meta = {}
+        # The venue's own fee for THIS position's entry, captured when it was
+        # opened (see `execute`'s `venue_fee(fill)` / `entry_fee` meta write).
+        # `None` here means the venue never said — not that the fee was
+        # zero — and `entry_fee_known` carries that distinction into the
+        # booked trade row rather than letting the `entry_fee=0.0` default
+        # below stand in for "no cost was charged".
+        stored_entry_fee = row_meta.get("entry_fee")
+        entry_fee_known = stored_entry_fee is not None
+        entry_fee_actual = float(stored_entry_fee) if entry_fee_known else float(entry_fee)
+
         result = self.client.place_order(
             symbol=symbol, side=exit_side, qty=qty, order_type="Market",
             purpose="close", reduce_only=True,
@@ -943,6 +986,13 @@ class TradingEngine:
         # never resolved — an unconfirmed exit is not evidence of one.
         executed_exit_qty = float((fill or {}).get("cumExecQty") or 0.0)
         exit_status = str((fill or {}).get("orderStatus", "") or "")
+        # Same authority as the entry side: the venue's own cumExecFee for
+        # THIS exit fill, never a static TAKER_FEE estimate standing in for
+        # it when the real number is sitting right there in the fill the
+        # engine already polled.
+        stored_exit_fee = venue_fee(fill)
+        exit_fee_known = stored_exit_fee is not None
+        exit_fee_actual = float(stored_exit_fee) if exit_fee_known else float(exit_fee)
 
         self.client.cancel_all(symbol)
 
@@ -958,7 +1008,8 @@ class TradingEngine:
         self.store.record_trade(TradeRecord(
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
             exit_price=realised_exit, gross_pnl=gross,
-            entry_fee=entry_fee, exit_fee=exit_fee,
+            entry_fee=entry_fee_actual, exit_fee=exit_fee_actual,
+            entry_fee_known=entry_fee_known, exit_fee_known=exit_fee_known,
             opened_epoch=float(row.get("opened_epoch") or utc_now_epoch()),
             closed_epoch=utc_now_epoch(),
             order_link_id=result.order_link_id,
@@ -967,8 +1018,9 @@ class TradingEngine:
         ))
         self.store.remove_position(symbol)
         self.store.journal(symbol, "CLOSED", reason, {
-            "gross_pnl": gross, "fees": entry_fee + exit_fee,
-            "net_pnl": gross - entry_fee - exit_fee,
+            "gross_pnl": gross, "fees": entry_fee_actual + exit_fee_actual,
+            "net_pnl": gross - entry_fee_actual - exit_fee_actual,
+            "entry_fee_known": entry_fee_known, "exit_fee_known": exit_fee_known,
         })
         # Exit identity/quantity evidence (mission "REAL FINDING #3"):
         # extends the existing ExecutionReport.detail path -- never a
@@ -987,6 +1039,10 @@ class TradingEngine:
                 "executed_exit_qty": executed_exit_qty,
                 "exit_avg_price": realised_exit,
                 "exit_status": exit_status,
+                "entry_fee": entry_fee_actual,
+                "entry_fee_known": entry_fee_known,
+                "exit_fee": exit_fee_actual,
+                "exit_fee_known": exit_fee_known,
             })
 
     def observe_exits(self) -> Dict[str, Any]:
@@ -1157,6 +1213,13 @@ class TradingEngine:
             symbol=symbol, side=side, qty=closed_qty,
             entry_price=entry_price, exit_price=float(price),
             gross_pnl=gross, entry_fee=entry_fee_share, exit_fee=float(fee),
+            # Both figures here are estimates (a static taker-fee rate times
+            # notional), never the venue's own `cumExecFee` — this path
+            # books an exchange-side exit discovered via closed-pnl, not a
+            # direct fill query, so there is no raw fill to read a real fee
+            # from. Marked unknown rather than left to default True, which
+            # would claim a precision this estimate does not have.
+            entry_fee_known=False, exit_fee_known=False,
             opened_epoch=float(row.get("opened_epoch") or utc_now_epoch()),
             closed_epoch=utc_now_epoch(),
             order_link_id=order_link_id, meta={"reason": reason, "partial": True},
@@ -1253,7 +1316,13 @@ class TradingEngine:
             symbol, side, remaining, entry_price,
             stop_price=stop_price,
             order_link_id=str(row.get("order_link_id") or ""),
-            meta={"stop_order_link_id": new_stop_id},
+            # `upsert_position` REPLACES meta wholesale, never merges it — so
+            # the entry fee recorded at bracket time must be carried forward
+            # explicitly here or it silently vanishes the moment a partial
+            # exit rewrites the position row, and the eventual close would
+            # book an entry fee of 0.0 for a fee that was in fact known.
+            meta={"stop_order_link_id": new_stop_id,
+                  "entry_fee": meta.get("entry_fee")},
         )
         self.store.journal(symbol, "PARTIAL_EXIT", reason,
                            {"closed": closed_qty, "remaining": remaining,
