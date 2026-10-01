@@ -492,7 +492,14 @@ class TradingEngine:
             return self._report(stage="fill", reason="FILL_UNCONFIRMED",
                                 symbol=symbol, entry_order_link_id=entry.order_link_id)
 
-        filled_qty = float(fill.get("cumExecQty") or sizing.qty)
+        # A missing/zero cumExecQty on a nominally terminal "Filled" status is
+        # a venue-response anomaly, not evidence of a full fill: it used to
+        # default to the REQUESTED qty (sizing.qty), which made the ZERO_FILL
+        # check below unreachable and risked opening a position sized from
+        # intent rather than from what the exchange actually reports filled.
+        # The exit path (below) already defaults to 0.0 for the same field;
+        # this makes entry consistent with it.
+        filled_qty = float(fill.get("cumExecQty") or 0.0)
         avg_price = float(fill.get("avgPrice") or intent.entry_price)
         if filled_qty <= 0:
             return self._report(stage="fill", reason="ZERO_FILL", symbol=symbol,

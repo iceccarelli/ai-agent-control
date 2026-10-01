@@ -140,9 +140,13 @@ TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
 #: resolved by querying the id, never by recording a rejection.
 #:   110072 - linear/inverse "OrderLinkedID is duplicate"
 #:   170130 - spot "Duplicate orderLinkId" (also what tests/fake_bybit.py emits)
+#:   170141 - spot "Duplicate clientOrderId" (seen on a real testnet rejection;
+#:             Bybit's own V5 docs use "clientOrderId" and "orderLinkId"
+#:             interchangeably for this field, so this is the same condition
+#:             as 170130 under a different code/wording)
 #: The message is matched as well because the code table is not under our
 #: control; a miss here degrades to the previous behaviour (row 'rejected').
-DUPLICATE_LINK_ID_RET_CODES = frozenset({110072, 170130})
+DUPLICATE_LINK_ID_RET_CODES = frozenset({110072, 170130, 170141})
 
 TERMINAL_ORDER_STATUS = frozenset({
     "Filled", "Cancelled", "Rejected", "PartiallyFilledCanceled", "Deactivated",
@@ -290,14 +294,28 @@ def build_order_link_id(
     qty: str,
     purpose: str = "entry",
     price: str = "",
+    session_token: str = "",
     prefix: str = "BB",
 ) -> str:
     """Deterministic, restart-safe ``orderLinkId`` (<= 36 chars).
 
-    The id is a function of a **persisted** sequence number and the order intent.
-    Same intent + same sequence number => same id, in this process or the next
-    one. That is what makes a retry after a timed-out submit safe: the exchange
-    rejects the duplicate id instead of opening a second position.
+    The id is a function of a **persisted** sequence number, the order intent,
+    and ``session_token`` — a random value minted once per database file (see
+    ``StateStore.session_boot_token``). Same intent + same sequence number +
+    same session token => same id, in this process or the next one. That is
+    what makes a retry after a timed-out submit safe: the exchange rejects the
+    duplicate id instead of opening a second position.
+
+    ``session_token`` is what keeps that safe-retry property from becoming an
+    accidental cross-session collision: ``seq`` only counts up *within* one
+    database file, so a fresh file (new checkout, wiped state dir, new
+    container) restarts it at 1. Without a session-distinguishing input, two
+    unrelated sessions submitting the same intent (same symbol/side/qty/price/
+    purpose at seq=1) would mint the exact same id and the second one would be
+    rejected by the exchange as a duplicate of the first (Bybit retCode
+    170141) even though they are unrelated orders. The token is not a random
+    *retry* — it is fixed for the lifetime of one database file, so retries
+    within a session are unaffected; only a genuinely new session changes it.
 
     The legacy module had 21 generators. Among them: ``perf_counter()//30``
     buckets (reset to 0 on restart), ``uuid4``, ``secrets.token_hex``, salted
@@ -305,7 +323,7 @@ def build_order_link_id(
     ``time.strftime(gmtime(perf_counter()))``, which always produced
     ``"19700101"``. None survived a restart.
     """
-    seed = f"{seq}|{symbol}|{side}|{qty}|{price}|{purpose}"
+    seed = f"{seq}|{symbol}|{side}|{qty}|{price}|{purpose}|{session_token}"
     digest = hashlib.blake2b(seed.encode("utf-8"), digest_size=12).hexdigest()
     oid = f"{prefix}-{purpose[:4]}-{seq}-{digest}"
     if len(oid) > 36:
@@ -819,6 +837,7 @@ class BybitClient:
         seq = self.store.next_order_seq()
         return build_order_link_id(
             seq=seq, symbol=symbol, side=side, qty=qty,
+            session_token=self.store.session_boot_token(),
             purpose=purpose, price=price,
             prefix=str(getattr(self.cfg, "ORDERLINK_PREFIX", "BB")),
         )
@@ -1021,8 +1040,10 @@ class BybitClient:
     def _looks_like_duplicate_link_id(exc: PermanentAPIError) -> bool:
         if exc.ret_code in DUPLICATE_LINK_ID_RET_CODES:
             return True
-        msg = str(exc).lower()
-        return "duplicate" in msg and "orderlink" in msg.replace(" ", "")
+        msg = str(exc).lower().replace(" ", "")
+        if "duplicate" not in msg:
+            return False
+        return "orderlink" in msg or "clientorder" in msg
 
     def _recover_landed_order(self, *, symbol: str, oid: str,
                               purpose: str) -> Optional[OrderResult]:

@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
 import threading
 import time
@@ -316,6 +317,21 @@ CREATE TABLE IF NOT EXISTS order_seq (
     next_id INTEGER NOT NULL DEFAULT 1
 );
 
+-- One random token minted the first time this database file is ever opened,
+-- and never regenerated after that. order_seq's counter is only durable
+-- *within* a single database file: a fresh file (new checkout, wiped state
+-- dir, new container) restarts it at 1, so two unrelated sessions that
+-- happen to submit the same intent (same symbol/side/qty/purpose) could
+-- otherwise mint byte-identical orderLinkIds and collide at the exchange
+-- (Bybit retCode 170141). Mixing this token into the id makes "new session"
+-- (= new database file) produce a different id even when the counter
+-- coincides, while leaving it untouched across restarts of the *same*
+-- session (same file) so retries still dedupe correctly.
+CREATE TABLE IF NOT EXISTS session_identity (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    boot_token TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS decisions (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_epoch      REAL NOT NULL,
@@ -514,7 +530,14 @@ class StateStore:
                 "INSERT OR IGNORE INTO order_seq(id, next_id) VALUES(1, 1)",
             ):
                 self._conn.execute(stmt)
+            # OR IGNORE: a token already present (this database file has been
+            # opened before) is kept; only a brand-new file gets a fresh one.
+            self._conn.execute(
+                "INSERT OR IGNORE INTO session_identity(id, boot_token) VALUES(1, ?)",
+                (secrets.token_hex(6),),
+            )
             self._conn.commit()
+            self._boot_token: Optional[str] = None
         except Exception as exc:  # noqa: BLE001 - re-raised as PersistenceError
             raise PersistenceError(f"cannot open state store at {path!r}: {exc}") from exc
 
@@ -1116,6 +1139,23 @@ class StateStore:
         ]
 
     # -- orders + deterministic idempotency --------------------------------
+
+    def session_boot_token(self) -> str:
+        """The random token minted once for this database file.
+
+        Durable across restarts that reuse this file (same session), distinct
+        for any other database file (a fresh checkout or wiped state dir is a
+        new session by definition). See ``session_identity`` in the schema.
+        """
+        if self._boot_token is None:
+            cur = self._conn.execute(
+                "SELECT boot_token FROM session_identity WHERE id = 1"
+            )
+            row = cur.fetchone()
+            if row is None:
+                raise PersistenceError("session_identity row missing")
+            self._boot_token = str(row["boot_token"])
+        return self._boot_token
 
     def next_order_seq(self) -> int:  # noqa: D401 - see docstring below
         """Monotonic, persisted order counter.

@@ -1113,6 +1113,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                     client=bot.client,
                     sequence_source=lambda product, symbol, purpose:
                         bot.store.next_order_seq(),
+                    session_token=bot.store.session_boot_token(),
                     order_gate=_carry_orders_permitted),
                 bot.carry_journal,
                 ms=lambda: int(time.time() * 1000),
