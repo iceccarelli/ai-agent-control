@@ -26,6 +26,13 @@ missing, it refuses. What it writes is a transcription of a decision a
 human already made and already put in writing elsewhere; it invents no new
 fact and asks no new question.
 
+A checklist citing an artifact by NAME is not evidence — it is a claim about
+evidence. This tool additionally requires every cited artifact to actually
+EXIST ON DISK at its recorded `bot/artifacts/<name>` path and to parse as
+JSON. A checklist that types `[x]` and a plausible-looking path, with no
+file behind it, is exactly the forgery this gate exists to prevent, and
+this tool refuses rather than transcribe it.
+
 WHAT THIS TOOL WILL NOT DO
 ===========================
 * It touches ONE checklist item only: `checklist.linear_protective_stop_verified`.
@@ -72,6 +79,7 @@ DEFAULT_CHECKLIST = os.path.join(
 DEFAULT_MEMO = os.path.join(
     REPO, "docs", "promotion", "LINEAR_STOP_MARGIN_MEMO.md")
 DEFAULT_GATE = pg.GATE_PATH
+DEFAULT_ARTIFACTS_DIR = os.path.join(REPO, "artifacts")
 
 #: One artifact name per venue item, in order. At least the Item 1 name must
 #: appear in the checklist text - the read-back that started this whole
@@ -139,8 +147,22 @@ def _artifacts_cited(text: str) -> List[str]:
     return [name for name in KNOWN_ARTIFACTS if name in text]
 
 
+def _artifacts_missing_on_disk(names: List[str], artifacts_dir: str) -> List[str]:
+    """Names the checklist cites but for which no readable JSON file exists
+    under `artifacts_dir`. A citation is a claim; this is the check that
+    the claim is backed by an actual file, not just a plausible-looking
+    string in prose."""
+    missing = []
+    for name in names:
+        path = os.path.join(artifacts_dir, name)
+        if _load_json(path) is None:
+            missing.append(name)
+    return missing
+
+
 def evaluate(*, checklist_path: str = DEFAULT_CHECKLIST,
-             memo_path: str = DEFAULT_MEMO) -> Dict[str, Any]:
+             memo_path: str = DEFAULT_MEMO,
+             artifacts_dir: str = DEFAULT_ARTIFACTS_DIR) -> Dict[str, Any]:
     """Read-only: is there enough signed evidence to transcribe? Fails closed."""
     checklist_text = _load_text(checklist_path)
     if checklist_text is None:
@@ -168,6 +190,15 @@ def evaluate(*, checklist_path: str = DEFAULT_CHECKLIST,
                 "reason": (f"checklist does not cite {ITEM_1_ARTIFACT!r} - "
                            "the Item 1 read-back that started this item")}
 
+    missing = _artifacts_missing_on_disk(artifacts, artifacts_dir)
+    if missing:
+        return {"ok": False,
+                "reason": (
+                    "checklist cites artifact(s) that do not exist as "
+                    f"readable JSON under {artifacts_dir}: {missing}. A name "
+                    "in prose is a claim, not proof; this refuses rather "
+                    "than transcribe an unresolvable citation.")}
+
     evidence = (
         f"Checklist evidence complete: all four venue items [x] in "
         f"docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md; Sign-off "
@@ -186,8 +217,10 @@ def _recount_items_complete(gate: Dict[str, Any]) -> int:
 
 
 def sync(*, checklist_path: str = DEFAULT_CHECKLIST, memo_path: str = DEFAULT_MEMO,
-          gate_path: str = DEFAULT_GATE, write: bool = False) -> Dict[str, Any]:
-    check = evaluate(checklist_path=checklist_path, memo_path=memo_path)
+          gate_path: str = DEFAULT_GATE, artifacts_dir: str = DEFAULT_ARTIFACTS_DIR,
+          write: bool = False) -> Dict[str, Any]:
+    check = evaluate(checklist_path=checklist_path, memo_path=memo_path,
+                      artifacts_dir=artifacts_dir)
     if not check["ok"]:
         return check
 
@@ -248,12 +281,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="margin memo to require exists (default: %(default)s)")
     parser.add_argument("--gate", default=DEFAULT_GATE,
                         help="promotion gate JSON to sync (default: %(default)s)")
+    parser.add_argument("--artifacts-dir", default=DEFAULT_ARTIFACTS_DIR,
+                        help="directory the cited artifacts must actually exist "
+                             "in (default: %(default)s)")
     parser.add_argument("--write", action="store_true",
                         help="persist the change; default is dry-run (print only)")
     args = parser.parse_args(argv)
 
     result = sync(checklist_path=args.checklist, memo_path=args.memo,
-                  gate_path=args.gate, write=args.write)
+                  gate_path=args.gate, artifacts_dir=args.artifacts_dir,
+                  write=args.write)
     if not result["ok"]:
         print(f"REFUSE: {result['reason']}")
         return 1

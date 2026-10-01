@@ -34,7 +34,7 @@
 | State / accounting | `bot/persistence.py` | SQLite WAL, durable orders/positions/trades/execution quality, one-writer discipline, kill switch | Reconstructability after restart/crash |
 | Signal / edge | `bot/signals/funding_carry_fade_v1.py`; `bot/signals/funding_carry_fade_btc_v1.py`; `bot/tools/slice76_forward_shadow.py`; `bot/EDGE.md` | Frozen `FUND_ABS=0.0001`, close-join, barrier eligibility, fixed schedule/caps, forward-only scoring | Preserves the experiment; prevents post-hoc rescue |
 | Linear stop evidence | `bot/tools/linear_stop_venue_drill.py`; `bot/tests/test_linear_stop_venue_drill.py`; `docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md`; `bot/tools/sync_linear_stop_gate_evidence.py` | Testnet placement/read-back/restart/naked/margin evidence; syncs only the specific checklist item | Reusable execution-safety evidence |
-| Forward gate | `bot/artifacts/slice59_promotion_gate.json`; `bot/tools/slice76_promotion_gate.py`; `bot/tools/sync_forward_shadow_gate_observation.py` | Stable gate path; current checklist is 4/8 complete; refuses until forward/human items close | Prevents alpha and operations claims from becoming live authority |
+| Forward gate | `bot/artifacts/slice59_promotion_gate.json`; `bot/tools/slice76_promotion_gate.py`; `bot/tools/sync_forward_shadow_gate_observation.py` | Stable gate path; current checklist is 3/8 complete; refuses until forward/human items close | Prevents alpha and operations claims from becoming live authority |
 | Settlement / financing corpora | `bot/data/real_settlement_8h`; `bot/tools/fetch_settlement_klines.py`; `bot/tools/basis_at_settlement.py`; `bot/data/real_borrow`; `bot/tools/fetch_borrow_rates.py`; `bot/carry_costs.py`; `bot/tools/borrow_curve.py` | 8h settlement basis and OKX lending-rate floor | Turns carry economics from gross funding-only math into a measurable financing/cost surface |
 | CI / host boundaries | `.github/workflows/stage-b-forward-accrual.yml`; `docs/human/NO_GLUE_OPS.md` | GitHub Actions accrual/commit path; factory/Codespaces operational alternatives; cloud coding agents are offline-only by charter | Reliability of overnight evidence collection; avoids two-writer/glue-ops failures |
 
@@ -65,7 +65,7 @@
 | P1-02 | P1 | Human promotion integrity | `promote_forward_shadow.py` enforces the two human flags but does not validate freshness or frozen-constant identity before copying. Existing tests prove “no human flag = refuse”, not “stale/dirty/retuned scratch = refuse”. | Require expected constants fingerprint + frozen constant set + current corpus frontier; refuse stale `observed_at_utc`, dirty provenance, or mismatched `FUND_ABS`. Human-only promotion remains unchanged. | **(a)** prevents bad evidence from replacing good evidence; **(c)** strengthens the promotion-control product. | 1 day |
 | P1-03 | P1 | OMS / execution | Current execution confirmation is REST-poll based: submit → `get_order` realtime/history → terminal status. There is no production private-WebSocket execution-event consumer or venue execution-event ledger found in the runtime tree. | Add an execution-event adapter/state machine with reconnect, sequence/order correlation, and REST reconciliation fallback; do not change trade authority. | **(b)** faster/stronger fill truth; **(c)** direct reusable OMS connector component. | 2–4 days |
 | P1-04 | P1 | Position truth | Durable startup reconciliation exists and duplicate/lost-reply tests are strong, but a compact periodic venue-vs-local drift heartbeat is not part of the evidence packet. `observe_exits` is defensive, but the operator still needs multiple sources after an incident. | Add a deterministic reconciliation snapshot: local positions/orders, venue positions/orders, unknown/ orphan / reduced / stop state, one hashable report. | **(b)** reduces state-drift loss; **(c)** sellable reconciliation module. | 1–2 days |
-| P1-05 | P1 | Gate accounting | `slice59_promotion_gate.json` is the canonical mutable gate path, now holding current 4/8 state, while numbered slice artifacts are historical snapshots. This is correct but non-obvious; reviewer code explicitly had to stop “highest slice wins” behavior. | Keep stable `GATE_PATH`, but add a machine-readable `gate_schema_version`, `current_slice`, source artifact hash and explicit “stable gate path” label. | **(a)** removes false-blocker/operator errors; **(c)** improves evidence packet interoperability. | 0.5 day |
+| P1-05 | P1 | Gate accounting | `slice59_promotion_gate.json` is the canonical mutable gate path, now holding current 3/8 state, while numbered slice artifacts are historical snapshots. This is correct but non-obvious; reviewer code explicitly had to stop “highest slice wins” behavior. | Keep stable `GATE_PATH`, but add a machine-readable `gate_schema_version`, `current_slice`, source artifact hash and explicit “stable gate path” label. | **(a)** removes false-blocker/operator errors; **(c)** improves evidence packet interoperability. | 0.5 day |
 | P1-06 | P1 | Host / CI boundary | `.github/workflows/stage-b-forward-accrual.yml` runs on `ubuntu-latest`; `NO_GLUE_OPS.md` says factory Mac is the only corpus-write host, while the workflow comments call Codespaces a proven egress alternative. This is a documented split-brain ops contract. | Declare one canonical scheduled writer and one manual failover host; add a single-writer lock/lease check across hosts before `--write`. | **(a)** prevents missed or double accrual; **(b)** fewer operational gaps. | 1 day |
 | P1-07 | P1 | Financing | Borrow history bottoms at the OKX public-lending floor around 2021-12-14; the carry corpus reaches to 2019. The repo itself says this leaves the early financed period uncosted. A stale/hung OKX fetch can consume operator attention. | Add freshness/coverage status to the product surface and make financed-carry outputs explicitly “financing incomplete” until coverage is sufficient; add timeout/attention telemetry. | **(a)** avoids false financed-PnL certainty; **(c)** sells corpus-health/financing analytics. | 1–2 days |
 | P1-08 | P1 | Settlement timing | The 8h settlement corpus exists and is refreshed, but settlement-basis measurement is not the Stage B forward gate. Current signal evidence is daily-close/funding-print based. | Build a read-only settlement reconciliation report that aligns 00/08/16 UTC perp/spot basis to every eligible observation. Do not feed it back into thresholds until separately re-declared. | **(a)** better economic attribution; **(c)** paid basis/settlement analytics. | 1–2 days |
@@ -146,17 +146,20 @@ Current canonical gate: `bot/artifacts/slice59_promotion_gate.json`.
 - `forward_shadow_clean`: **open**, 4/20 and 49/180.
 - `m4_recent_half_accepted_or_recovered`: **open**.
 - `kill_switch_drill_recorded`: **complete**.
-- `linear_protective_stop_verified`: **complete**.
+- `linear_protective_stop_verified`: **open**. Briefly read complete after a
+  sync from a signed checklist; reverted when an audit found none of the
+  eight `bot/artifacts/linear_*.json` transcripts that checklist cited exist
+  in this repository. See `artifacts/LINEAR_STOP_VENUE_GAP.md`.
 - `notional_cap_within_policy`: **complete**, $100.
 - `live_trading_ack_present`: **open**, `live_authorized=false`.
 - `models_current_absent_or_contained`: **complete**.
 
-Therefore **4/8 complete** and the gate must remain false.
+Therefore **3/8 complete** and the gate must remain false.
 
 ### Existing sync tools
 
 - `bot/tools/sync_forward_shadow_gate_observation.py`: may sync **only** `forward_shadow_clean`; it requires ≥20 trades and ≥180 days and never writes human items.
-- `bot/tools/sync_linear_stop_gate_evidence.py`: may sync **only** `linear_protective_stop_verified`; it requires the four signed/recorded venue items and never writes M-4, live ACK or `allows_live`.
+- `bot/tools/sync_linear_stop_gate_evidence.py`: may sync **only** `linear_protective_stop_verified`; it requires the four signed/recorded venue items, requires every artifact those items cite to exist on disk as readable JSON, and never writes M-4, live ACK or `allows_live`.
 
 Human-only items stay human-only because their security property is the absence of machine authority, not merely a boolean schema field.
 

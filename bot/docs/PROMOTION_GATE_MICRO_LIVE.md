@@ -1,15 +1,20 @@
 # PROMOTION GATE — MICRO-LIVE
 
-**Status: REFUSE. 4 of 8 items complete. `promotion_gate_allows_live()` returns
+**Status: REFUSE. 3 of 8 items complete. `promotion_gate_allows_live()` returns
 `False` and nothing in this repository can make it return `True` today.**
 
 `kill_switch_drill_recorded` moved from incomplete to complete when a human
 witnessed the mechanical drill and signed it (transcript:
 `bot/artifacts/kill_switch_drill.json`). `linear_protective_stop_verified`
-moved from incomplete to complete when `tools/sync_linear_stop_gate_evidence.py`
-transcribed the signed `docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md`
-(all four venue items proven on Bybit testnet, Verified by Vincenzo
-Ceccarelli, 2026-09-27) into the gate JSON. Four items remain open, all
+briefly read `complete: true`, synced by `tools/sync_linear_stop_gate_evidence.py`
+from a checklist that ticked all four venue items and cited eight
+`bot/artifacts/linear_*.json` transcripts (Verified by Vincenzo Ceccarelli,
+2026-09-27) — but an audit found none of those eight files exist in this
+repository or in its git history at any commit. The checklist recorded a
+claim, not a file. It has been reverted to blank and the gate item to
+`complete: false`; `tools/sync_linear_stop_gate_evidence.py` now also
+refuses to sync unless every cited artifact exists on disk as readable
+JSON, so this cannot recur silently. Five items remain open, all
 human-owned or observation-owned, so the gate refuses exactly as before. A
 count moving is not the gate softening.
 

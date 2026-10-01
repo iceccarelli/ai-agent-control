@@ -490,12 +490,14 @@ def _regime_bars(n, seed):
 
 
 class TestConcurrencyStructure:
-    @pytest.mark.parametrize("module", LIVE_MODULES)
+    @pytest.mark.parametrize("module", [m for m in LIVE_MODULES if m != "main.py"])
     def test_no_module_spawns_an_unmanaged_thread(self, module):
         """The legacy code ran a busy-spin monitor thread per analyser instance
         and built a new instance per signal, progressively starving itself of
-        CPU. Only `main.py` may start a thread, and only the daemon health
-        server."""
+        CPU. Only `main.py` may start a thread, and only its two named,
+        managed daemon threads (see
+        ``test_main_py_owns_exactly_the_two_named_daemon_threads`` below) --
+        nothing else in the live module set is allowed to."""
         tree = ast.parse(open(os.path.join(REPO, module), encoding="utf-8").read())
         starts = [
             node.lineno for node in ast.walk(tree)
@@ -503,10 +505,70 @@ class TestConcurrencyStructure:
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "Thread"
         ]
-        if module == "main.py":
-            assert len(starts) <= 1, "main.py starts more than one thread"
-        else:
-            assert starts == [], f"{module} spawns a thread at {starts}"
+        assert starts == [], f"{module} spawns a thread at {starts}"
+
+    def test_main_py_owns_exactly_the_two_named_daemon_threads(self):
+        """`main.py`'s architecture intentionally runs two managed daemon
+        threads, each with a single owner:
+
+        - the health server, started only by ``start_health_server``
+        - the private-WS observer, started only by ``_start_private_ws``
+
+        This asserts the contract those two methods promise, not an arbitrary
+        headcount: exactly two ``threading.Thread(...)`` call sites exist in
+        the whole module, each is ``daemon=True`` (so a crash can never hang
+        process exit -- see ``_stop_private_ws`` for the deliberate, bounded
+        join this depends on), each carries the literal name the rest of the
+        module and the health payload identify it by, and neither call site
+        lives anywhere but its one intended owner. A third call site, a
+        thread created outside those two methods, a non-daemon thread, or a
+        silent rename would all be the same "unmanaged thread" failure mode
+        this suite exists to catch, just with a different shape than the
+        legacy per-signal analyser thread it was originally written against.
+        """
+        source = open(os.path.join(REPO, "main.py"), encoding="utf-8").read()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                child.parent = node
+
+        def enclosing_function(node):
+            while node is not None:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return node.name
+                node = getattr(node, "parent", None)
+            return None
+
+        thread_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "Thread"
+        ]
+        assert len(thread_calls) == 2, (
+            "main.py must create exactly the two managed daemon threads "
+            f"(health, private-ws); found {len(thread_calls)} Thread(...) "
+            f"call(s) at line(s) {[n.lineno for n in thread_calls]}"
+        )
+
+        owners = {}
+        for call in thread_calls:
+            kwargs = {kw.arg: kw.value for kw in call.keywords}
+            name_node = kwargs.get("name")
+            daemon_node = kwargs.get("daemon")
+            assert isinstance(name_node, ast.Constant) and isinstance(
+                name_node.value, str
+            ), f"Thread() at line {call.lineno} has no literal name= kwarg"
+            assert isinstance(daemon_node, ast.Constant) and daemon_node.value is True, (
+                f"Thread(name={name_node.value!r}) at line {call.lineno} is "
+                "not daemon=True"
+            )
+            owners[name_node.value] = enclosing_function(call)
+
+        assert owners == {
+            "health": "start_health_server",
+            "private-ws": "_start_private_ws",
+        }, f"unexpected thread ownership map: {owners}"
 
     @pytest.mark.parametrize("module", LIVE_MODULES)
     def test_no_module_sleeps_in_a_hot_path_without_bound(self, module):

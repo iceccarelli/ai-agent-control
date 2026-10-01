@@ -163,16 +163,17 @@ the file `promotion_gate.GATE_PATH` resolves to:
 | `notional_cap_within_policy` | — | **complete** |
 | `models_current_absent_or_contained` | — | **complete** |
 | `human_risk_memo_signed` | human | open — *this memo* (§7 signatures blank) |
-| `linear_protective_stop_verified` | human | **complete** — `slice59_promotion_gate.json` now reads `complete: true`, synced from the signed `LINEAR_STOP_VERIFICATION_CHECKLIST.md` (Verified by Vincenzo Ceccarelli, 2026-09-27) via `tools/sync_linear_stop_gate_evidence.py`. Desync closed. |
+| `linear_protective_stop_verified` | human | open — briefly read **complete**, synced from a signed `LINEAR_STOP_VERIFICATION_CHECKLIST.md` (Verified by Vincenzo Ceccarelli, 2026-09-27); reverted after an audit found none of the eight `bot/artifacts/linear_*.json` transcripts it cited exist in this repository. Checklist and gate item both back to blank/incomplete. |
 | `live_trading_ack_present` | human | open |
 | `m4_recent_half_accepted_or_recovered` | human | open — §4 above: **NOT ACCEPTED** is a decision to hold, not a completion. Only ACCEPTED-in-writing or forward recovery under the unchanged threshold satisfies this item. |
 | `forward_shadow_clean` | observation | open — 4/20 trades, 48/180 days |
 
-**4 of 8 complete, read directly from `slice59_promotion_gate.json` as it
-stands.** `promotion_gate_allows_live()` returns False regardless — three
-human items (`human_risk_memo_signed`, `live_trading_ack_present`,
-`m4_recent_half_accepted_or_recovered`) and one observation item
-(`forward_shadow_clean`) remain open, and the live-arming chain
+**3 of 8 complete, read directly from `slice59_promotion_gate.json` as it
+stands.** `promotion_gate_allows_live()` returns False regardless — four
+human items (`human_risk_memo_signed`, `linear_protective_stop_verified`,
+`live_trading_ack_present`, `m4_recent_half_accepted_or_recovered`) and one
+observation item (`forward_shadow_clean`) remain open, and the live-arming
+chain
 (`config.is_live_authorized`) is consulted independently of this checklist
 and is not satisfied either.
 

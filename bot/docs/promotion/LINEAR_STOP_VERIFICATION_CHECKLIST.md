@@ -1,8 +1,15 @@
-# LINEAR PROTECTIVE-STOP VERIFICATION
-> **Status (2026-09-27):** Venue Items 1–4 are recorded below from real Bybit
-> **testnet** drills (tips through `b8dcd84`). Memo:
-> `docs/promotion/LINEAR_STOP_MARGIN_MEMO.md`. This file does **not** flip
-> `allows_live`. Sign-off and the simulator-gap human choice are below.
+# LINEAR PROTECTIVE-STOP VERIFICATION (TEMPLATE — NOT YET PERFORMED)
+
+> **Blank. No venue drill has been run against this checklist. This
+> document's existence completes no checklist item.** An earlier version of
+> this file recorded all four venue items `[x]`, a filled `observed:` line
+> per item, and a human Sign-off — but the eight `bot/artifacts/linear_*.json`
+> transcripts it cited were never committed to this repository and have no
+> git history at all. The claim was typed, not backed by a file anyone can
+> read. That version was a forgery of exactly the kind this checklist exists
+> to prevent, and it has been reverted to blank here. Nothing in this file
+> flips `allows_live`, and nothing in this file may be marked `[x]` again
+> until a real transcript exists on disk for it.
 ---
 ## Why this item exists, and why it is the one most likely to be waved through
 `docs/PAPER_OPERATOR_RUNBOOK.md` §H records a limitation that matters more here
@@ -22,89 +29,34 @@ item 1 added `LinearSimulatedExchange`, in which the stop is written by
 `BybitClient.verify_stop`, and triggered against the bar — including the case
 where liquidation is nearer than the stop and fills first. See
 `bot/tests/test_linear_simulator.py::TestTheProtectiveStopEndToEnd`.
-**Venue Items 1–4 below are now recorded from real testnet drills** via
-`bot/tools/linear_stop_venue_drill.py` (not the Phase D carry drill
+**Venue Items 1–4 below are NOT recorded.** They remain unverified: no venue
+drill via `bot/tools/linear_stop_venue_drill.py` (not the Phase D carry drill
 `bot/tools/drill.py` / `artifacts/linear_stop_drill.json`, which never calls
-`trading-stop` / `verify_stop`).
+`trading-stop` / `verify_stop`) has produced a transcript that is actually on
+disk in this repository.
 Every standing safety claim in this repository — *"a confirmed position always
 has a verified protective stop"* — is asserted and tested on the spot path and
 on the linear simulator. This checklist exists because the claim must also be
-demonstrated on the **live venue** for linear.
+demonstrated on the **live venue** for linear, and the SIMULATION half being
+done does not make the VENUE half true.
 ## What "verified" has to mean before micro-live
-Not "the code exists". Not "a unit test passes". All four, demonstrated and
-recorded:
-[x] 1. A protective stop is PLACED on the venue for a linear position, and its
+Not "the code exists". Not "a unit test passes". Not "an `observed:` line was
+typed". All four, demonstrated and recorded, with the transcript actually
+committed at the path named:
+[ ] 1. A protective stop is PLACED on the venue for a linear position, and its
 existence is confirmed by reading it back from the exchange — not from
 local state.
-observed: 2026-09-27 Codespace; tip 2c84e89 (PR #41 loader fix on
-PR #40 tool). Command:
-cd bot && python3 tools/linear_stop_venue_drill.py --arm 
---notional 100 
---out artifacts/linear_protective_stop_venue.json
-Venue testnet, CATEGORY=linear. Stages all ok.
-open: order_link_id=BB-line-1-111dc1e450b286feb6ae8b64
-filled_size=0.001 avg_price=84707
-attach: order_link_id=BB-stop-2-144dcdb4c35cd5d5cdd3c2aa
-trigger_price≈80471.365 mechanism=position
-(real BybitClient place_stop_order / trading-stop path)
-verify: live=True detail=stopLoss=80471.3
-endpoint=GET /v5/position/list (stopLoss field)
-position_evidence: side=Buy size=0.001 stopLoss=80471.3
-tpslMode=Full positionIdx=0
-flatten: BB-line-3-11db9bce8a55029af1808a70
-final_reconcile: venue_perp_qty=0.0 FLAT
-stop_still_live=False stop_detail=NO_POSITION
-orders_sent=2 verdict=PASSED
-transcript: bot/artifacts/linear_protective_stop_venue.json
-NOTE: Phase D carry drill (artifacts/linear_stop_drill.json) is NOT
-this evidence.
-
-[x] 2. The stop SURVIVES a process restart. Kill the process with a position
+observed: ______________________
+[ ] 2. The stop SURVIVES a process restart. Kill the process with a position
 open; confirm on restart that the stop is still on the venue and that
 reconciliation sees it.
-observed: 2026-09-27 Codespace tip 228fb87. HOLD→exit→VERIFY→FLATTEN
-via bot/tools/linear_stop_venue_drill.py (not session_tail).
-HOLD: --hold --notional 100 --out artifacts/linear_stop_hold.json
-open BB-line-1-ca5950b3b936bada4a415a02 size 0.001 @ 84704;
-attach BB-stop-2-25ad10a46cd165956d771743 stopLoss=80468.7
-live=True; process exited (pid 3097) leaving position+stop.
-VERIFY (new process pid 3668): --verify
---out artifacts/linear_stop_verify_after_restart.json
-verdict=VERIFIED venue_perp_qty=0.001 live=True
-detail=stopLoss=80468.7 (GET /v5/position/list).
-FLATTEN: --flatten --out artifacts/linear_stop_flatten.json
-BB-line-1-36e7bad50964a10a825f7a91 → FLAT stop_still_live=False.
-
-[x] 3. A position that somehow ends up NAKED is detected within one cycle and
+observed: ______________________
+[ ] 3. A position that somehow ends up NAKED is detected within one cycle and
 either re-protected or flattened. Induce this deliberately.
-observed: 2026-09-27 Codespace tip b10cfc7. induce→observe→flatten via
-bot/tools/linear_stop_venue_drill.py; production entrypoint
-trading_engine.TradingEngine.check_naked_positions.
-INDUCE: --induce-naked --notional 100
---out artifacts/linear_stop_naked_induce.json
-open BB-line-1-d2fc7168d05e30b0f45ce4cb @ 85020.1;
-attach stopLoss=80769; clear_stop POST trading-stop stopLoss=0
-(BB-stop-3-ef4b2d0c…); confirm_naked live=False
-detail=POSITION_HAS_NO_STOP_LOSS size=0.001.
-OBSERVE: --observe-naked --from induce.json
---state-db artifacts/linear_stop_naked_state.db
---out artifacts/linear_stop_naked_observe.json
-verdict=REPROTECTED; reprotected=['BTCUSDT'];
-confirm live=True stopLoss=83319.6 (one cycle).
-FLATTEN: artifacts/linear_stop_naked_flatten.json → FLAT.
-
-[x] 4. Margin and liquidation behaviour on linear is understood and documented
+observed: ______________________
+[ ] 4. Margin and liquidation behaviour on linear is understood and documented
 for the proposed notional, including what happens at the cap.
-observed: 2026-09-27 Codespace tip b8dcd84.
---margin-doc --notional 100
---out artifacts/linear_stop_margin_doc.json → DOCUMENTED;
---flatten → artifacts/linear_stop_margin_doc_flatten.json FLAT.
-size 0.001 @ avgPrice 85032.9 mark 84998.83 notional≈84.999 (< cap 100);
-stopLoss 80781.1 (~5.00% below entry); leverage 10;
-positionIM 8.54197428 USDT; positionMM 0.32258742 USDT;
-liqPrice empty (BEYOND_VENUE_PRICE_BOUNDS_OR_EMPTY) → nearer=unknown;
-USDT walletBalance≈1084.58; totalEquity≈9968.76.
-Memo: docs/promotion/LINEAR_STOP_MARGIN_MEMO.md (filled same numbers).
+observed: ______________________
 
 
 ## The simulator gap — say which of the two was done
@@ -114,30 +66,24 @@ Memo: docs/promotion/LINEAR_STOP_MARGIN_MEMO.md (filled same numbers).
 and the extension is tested
 path to the work: backtest.LinearSimulatedExchange
 bot/tests/test_linear_simulator.py (25 tests)
-NOTE: engineering fact only. Venue Items 1–4 are separately recorded above.
+NOTE: engineering fact only. Venue Items 1–4 are separately recorded above,
+and are UNCHECKED until real venue evidence exists.
 
-[x] OR micro-live proceeds on TESTNET only, with the simulator gap accepted
+
+[ ] OR micro-live proceeds on TESTNET only, with the simulator gap accepted
 in writing, and the memo says so explicitly
 memo section: docs/promotion/LINEAR_STOP_MARGIN_MEMO.md §5
-+ this checklist Sign-off (2026-09-27)
++ this checklist Sign-off
 
 
 > Choosing neither is not an option. An unverified stop path on the instrument
 > the signal trades is the failure mode that turns a 100 USD pilot into an
-> unbounded one. Items 1–4 close the venue stop questions on testnet.
+> unbounded one. Items 1–4 must close the venue stop questions on testnet
+> before either box above may be ticked.
 
 ## Sign-off
 
 
-Verified by         : Vincenzo Ceccarelli  date: 2026-09-27
+Verified by         : ______________________  date: __________
 Reviewed by         : ______________________  date: __________
-Evidence log path   : bot/artifacts/linear_protective_stop_venue.json
-bot/artifacts/linear_stop_hold.json
-bot/artifacts/linear_stop_verify_after_restart.json
-bot/artifacts/linear_stop_flatten.json
-bot/artifacts/linear_stop_naked_induce.json
-bot/artifacts/linear_stop_naked_observe.json
-bot/artifacts/linear_stop_naked_flatten.json
-bot/artifacts/linear_stop_margin_doc.json
-bot/docs/promotion/LINEAR_STOP_MARGIN_MEMO.md
-
+Evidence log path   : ______________________

@@ -65,6 +65,16 @@ def _write_json(path, payload):
         json.dump(payload, handle)
 
 
+def _write_all_known_artifacts(artifacts_dir):
+    """A citation is only good once the file it names actually exists. Tests
+    that exercise the flip-to-complete path stand up a real (fixture)
+    artifact per `KNOWN_ARTIFACTS` name so the existence check the tool
+    performs has something genuine to find."""
+    os.makedirs(artifacts_dir, exist_ok=True)
+    for name in sync_tool.KNOWN_ARTIFACTS:
+        _write_json(os.path.join(artifacts_dir, name), {"verdict": "PASSED"})
+
+
 def _gate(*, complete: bool = False) -> dict:
     return {
         "checklist": {
@@ -95,17 +105,25 @@ def _gate(*, complete: bool = False) -> dict:
 
 
 class TestASignedChecklistFlipsExactlyOneItem:
+    """These fixtures stand up their own artifact files under `tmp_path` so
+    the tool's existence check has real, if fake, JSON to find — the tool
+    must not care THAT the bytes are fabricated for a test, only that a file
+    genuinely exists where the checklist says it does."""
+
     def test_dry_run_prints_the_change_and_writes_nothing(self, tmp_path):
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         _write_json(gate_path, _gate())
+        _write_all_known_artifacts(artifacts_dir)
         before = open(gate_path, encoding="utf-8").read()
 
         result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                                gate_path=gate_path, write=False)
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=False)
 
         assert result["ok"] is True
         assert result["changed"] is True
@@ -116,13 +134,16 @@ class TestASignedChecklistFlipsExactlyOneItem:
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         original = _gate()
         _write_json(gate_path, original)
+        _write_all_known_artifacts(artifacts_dir)
 
         result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                                gate_path=gate_path, write=True)
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
         assert result["written"] is True
 
         gate = json.load(open(gate_path, encoding="utf-8"))
@@ -142,12 +163,15 @@ class TestASignedChecklistFlipsExactlyOneItem:
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         _write_json(gate_path, _gate())
+        _write_all_known_artifacts(artifacts_dir)
 
         result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                                gate_path=gate_path, write=True)
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
         assert result["items_complete_old"] == 3
         assert result["items_complete_new"] == 4
 
@@ -158,12 +182,14 @@ class TestASignedChecklistFlipsExactlyOneItem:
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         _write_json(gate_path, _gate())
+        _write_all_known_artifacts(artifacts_dir)
 
         rc = sync_tool.main(["--checklist", checklist_path, "--memo", memo_path,
-                            "--gate", gate_path])
+                            "--gate", gate_path, "--artifacts-dir", artifacts_dir])
         assert rc == 0
         assert "False -> True" in capsys.readouterr().out
 
@@ -171,18 +197,85 @@ class TestASignedChecklistFlipsExactlyOneItem:
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
+        _write_text(checklist_path, SIGNED_CHECKLIST)
+        _write_text(memo_path, MEMO_TEXT)
+        _write_json(gate_path, _gate())
+        _write_all_known_artifacts(artifacts_dir)
+
+        first = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
+                               gate_path=gate_path, artifacts_dir=artifacts_dir,
+                               write=True)
+        assert first["written"] is True
+
+        second = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
+        assert second["changed"] is False
+        assert second["written"] is False
+
+
+class TestRefusesWhenCitedArtifactsDoNotExistOnDisk:
+    """The exact defect this PR found in the real repo: a checklist can cite
+    an artifact by name with nothing behind it. Reproduced here with a
+    synthetic checklist/memo so the case is exercised even when the real
+    repo's own checklist is blank (see `TestAppliedToTheRealRepoFiles`)."""
+
+    def test_a_fully_signed_checklist_still_refuses_if_no_artifact_exists(self, tmp_path):
+        checklist_path = str(tmp_path / "checklist.md")
+        memo_path = str(tmp_path / "memo.md")
+        gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")  # deliberately never created
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         _write_json(gate_path, _gate())
 
-        first = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                               gate_path=gate_path, write=True)
-        assert first["written"] is True
+        result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
 
-        second = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                                gate_path=gate_path, write=True)
-        assert second["changed"] is False
-        assert second["written"] is False
+        assert result["ok"] is False
+        assert "linear_protective_stop_venue.json" in result["reason"]
+        gate = json.load(open(gate_path, encoding="utf-8"))
+        assert gate["checklist"]["linear_protective_stop_verified"]["complete"] is False
+
+    def test_a_partially_missing_artifact_set_also_refuses(self, tmp_path):
+        checklist_path = str(tmp_path / "checklist.md")
+        memo_path = str(tmp_path / "memo.md")
+        gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
+        _write_text(checklist_path, SIGNED_CHECKLIST)
+        _write_text(memo_path, MEMO_TEXT)
+        _write_json(gate_path, _gate())
+        _write_all_known_artifacts(artifacts_dir)
+        # Item 1's own artifact is real; one other cited file is not.
+        os.remove(os.path.join(artifacts_dir, "linear_stop_hold.json"))
+
+        result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
+
+        assert result["ok"] is False
+        assert "linear_stop_hold.json" in result["reason"]
+
+    def test_a_non_json_file_at_the_path_still_refuses(self, tmp_path):
+        checklist_path = str(tmp_path / "checklist.md")
+        memo_path = str(tmp_path / "memo.md")
+        gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
+        _write_text(checklist_path, SIGNED_CHECKLIST)
+        _write_text(memo_path, MEMO_TEXT)
+        _write_json(gate_path, _gate())
+        _write_all_known_artifacts(artifacts_dir)
+        _write_text(os.path.join(artifacts_dir, sync_tool.ITEM_1_ARTIFACT),
+                    "not json at all")
+
+        result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
+
+        assert result["ok"] is False
+        assert sync_tool.ITEM_1_ARTIFACT in result["reason"]
 
 
 class TestRefusesRatherThanTranscribesAJudgmentCall:
@@ -253,24 +346,30 @@ class TestRefusesRatherThanTranscribesAJudgmentCall:
     def test_missing_gate_file_refuses(self, tmp_path):
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
+        _write_all_known_artifacts(artifacts_dir)
         missing_gate = str(tmp_path / "no_such_gate.json")
 
         result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                                gate_path=missing_gate, write=True)
+                                gate_path=missing_gate, artifacts_dir=artifacts_dir,
+                                write=True)
         assert result["ok"] is False
 
     def test_gate_without_the_checklist_item_refuses(self, tmp_path):
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         _write_json(gate_path, {"checklist": {}})
+        _write_all_known_artifacts(artifacts_dir)
 
         result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                                gate_path=gate_path, write=True)
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
         assert result["ok"] is False
 
     def test_cli_exits_one_when_refused(self, tmp_path):
@@ -312,16 +411,20 @@ class TestNeverTouchesADifferentHumanItemOrLiveArming:
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         original = _gate()
         _write_json(gate_path, original)
+        _write_all_known_artifacts(artifacts_dir)
         before_memo = copy.deepcopy(original["checklist"]["human_risk_memo_signed"])
         before_m4 = copy.deepcopy(
             original["checklist"]["m4_recent_half_accepted_or_recovered"])
 
-        sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                       gate_path=gate_path, write=True)
+        result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
+        assert result["written"] is True
 
         gate = json.load(open(gate_path, encoding="utf-8"))
         assert gate["checklist"]["human_risk_memo_signed"] == before_memo
@@ -331,12 +434,16 @@ class TestNeverTouchesADifferentHumanItemOrLiveArming:
         checklist_path = str(tmp_path / "checklist.md")
         memo_path = str(tmp_path / "memo.md")
         gate_path = str(tmp_path / "gate.json")
+        artifacts_dir = str(tmp_path / "artifacts")
         _write_text(checklist_path, SIGNED_CHECKLIST)
         _write_text(memo_path, MEMO_TEXT)
         _write_json(gate_path, _gate())
+        _write_all_known_artifacts(artifacts_dir)
 
-        sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
-                       gate_path=gate_path, write=True)
+        result = sync_tool.sync(checklist_path=checklist_path, memo_path=memo_path,
+                                gate_path=gate_path, artifacts_dir=artifacts_dir,
+                                write=True)
+        assert result["written"] is True
 
         gate = json.load(open(gate_path, encoding="utf-8"))
         assert "allows_live" not in gate
@@ -345,21 +452,45 @@ class TestNeverTouchesADifferentHumanItemOrLiveArming:
 
 class TestAppliedToTheRealRepoFiles:
     """The actual, committed checklist + memo, read straight - proves the
-    regexes work against the real prose, not only a hand-built fixture."""
+    regexes work against the real prose, not only a hand-built fixture.
 
-    def test_the_real_checklist_and_memo_evaluate_ok(self):
+    The checklist and the gate file were both found, on audit, to disagree
+    with reality: the checklist ticked all four venue items and cited eight
+    `bot/artifacts/linear_*.json` transcripts, and the gate JSON had been
+    synced to `complete: true` from that signing — but none of the eight
+    cited files were ever committed to this repository. There is no history
+    for them at all (`git log --all` on each path is empty). The claim was
+    typed, not backed. The checklist has been reverted to its blank template
+    state and the gate item back to `complete: false` until real venue
+    evidence exists; these tests now assert that truthful (refusing) state
+    instead of the fabricated one."""
+
+    def test_the_real_checklist_is_blank_and_evaluate_refuses(self):
         result = sync_tool.evaluate()
-        assert result["ok"] is True, result.get("reason")
-        assert result["verified_by"] == "Vincenzo Ceccarelli"
-        assert result["verified_date"] == "2026-09-27"
-        assert sync_tool.ITEM_1_ARTIFACT in result["artifacts"]
+        assert result["ok"] is False
+        assert "not all four venue items are [x]" in result["reason"]
 
-    def test_dry_run_against_the_real_gate_file_is_a_no_op_once_synced(self):
-        """This PR runs the tool with --write against the real gate file, so
-        by the time this test runs the desync is already closed - a second,
-        read-only pass must find nothing left to change."""
-        result = sync_tool.sync(write=False)
-        assert result["ok"] is True
-        assert result["old"]["complete"] is True
-        assert result["new"]["complete"] is True
-        assert result["changed"] is False
+    def test_the_real_gate_item_reads_incomplete(self):
+        gate = json.load(open(sync_tool.DEFAULT_GATE, encoding="utf-8"))
+        item = gate["checklist"]["linear_protective_stop_verified"]
+        assert item["complete"] is False
+        assert "signature" not in item
+
+    def test_none_of_the_eight_cited_artifacts_exist_on_disk(self):
+        """The audit finding, pinned as a regression test: if any of these
+        ever reappear as real, committed venue transcripts, this test (and
+        the checklist) should be updated together - not one without the
+        other."""
+        for name in sync_tool.KNOWN_ARTIFACTS:
+            path = os.path.join(sync_tool.DEFAULT_ARTIFACTS_DIR, name)
+            assert not os.path.isfile(path), (
+                f"{name} now exists on disk - if this is genuine venue "
+                "evidence, re-sign the checklist and re-run "
+                "tools/sync_linear_stop_gate_evidence.py --write; do not "
+                "just delete this assertion")
+
+    def test_a_write_against_the_real_tree_refuses_and_changes_nothing(self):
+        before = open(sync_tool.DEFAULT_GATE, encoding="utf-8").read()
+        result = sync_tool.sync(write=True)
+        assert result["ok"] is False
+        assert open(sync_tool.DEFAULT_GATE, encoding="utf-8").read() == before

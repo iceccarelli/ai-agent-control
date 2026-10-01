@@ -1,12 +1,16 @@
 # LINEAR PROTECTIVE-STOP — WHAT IS STILL MISSING, AND THE EXACT COMMANDS
 
 > **This inventory verifies nothing and completes nothing.**
-> `slice59_promotion_gate.json`'s `linear_protective_stop_verified` now
-> reads **`complete: true`** — transcribed from the signed CHECKLIST (all
-> four venue items `[x]`, Verified by Vincenzo Ceccarelli, 2026-09-27) by
-> `tools/sync_linear_stop_gate_evidence.py --write`, a tool that refuses to
-> write anything unless the checklist is already fully signed. It exists so
-> the human doing the work does not also have to reconstruct *how*.
+> `slice59_promotion_gate.json`'s `linear_protective_stop_verified` reads
+> **`complete: false`**. It briefly read `true`, transcribed from a CHECKLIST
+> that ticked all four venue items and was signed (Verified by Vincenzo
+> Ceccarelli, 2026-09-27) — but the eight `bot/artifacts/linear_*.json`
+> transcripts that checklist cited were never committed to this repository,
+> at that commit or any other. Both the checklist and the gate item have
+> been reverted; `tools/sync_linear_stop_gate_evidence.py --write` now also
+> refuses to write unless every cited artifact exists on disk as readable
+> JSON. It exists so the human doing the work does not also have to
+> reconstruct *how*.
 
 **This is not a second checklist.** `docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md`
 is the authority on *what must be true* — its four venue items and its sign-off
@@ -14,9 +18,11 @@ block are unchanged and are not restated here. What was missing was the
 operational layer: which command, on which venue, producing which file. That is
 all this document adds.
 
-Drafted 2026-09-17 by an agent. Updated 2026-09-27: all four venue items are
-done on testnet (§0, §3) and the gate JSON now matches the signed checklist
-(§5) — no other checklist item touched.
+Drafted 2026-09-17 by an agent. Updated 2026-09-27: all four venue items were
+marked done on testnet (§0, §3) and the gate JSON was synced to match the
+signed checklist (§5). Reverted in a later audit: none of the eight cited
+transcripts exist in this repository, so both the checklist and the gate
+item are back to incomplete (§4, §5) — no other checklist item touched.
 
 ---
 
@@ -24,9 +30,9 @@ done on testnet (§0, §3) and the gate JSON now matches the signed checklist
 
 | | |
 |---|---|
-| Gate entry (`slice59_promotion_gate.json`) | now **complete** — see §5. Was *"not documented … A human must document how a protective stop is verified on linear before any micro-live."* |
+| Gate entry (`slice59_promotion_gate.json`) | **incomplete** — see §5. Reads *"NOT documented … Run `bot/tools/linear_stop_venue_drill.py` against real Bybit testnet for each of the four items, commit the resulting transcripts."* |
 | Simulator half | **done** — `backtest.LinearSimulatedExchange`, `tests/test_linear_simulator.py` (25 tests), stop written via `/v5/position/trading-stop`, read back through the real `BybitClient.verify_stop`, liquidation-before-stop ordering covered |
-| Venue half | **done on testnet.** All four items of the checklist are `[x]`, each with a real venue transcript — see §3 below and `LINEAR_STOP_VERIFICATION_CHECKLIST.md`. |
+| Venue half | **NOT done — unverified.** All four items of the checklist are `[ ]`; a prior `[x]` state was reverted because none of its eight cited `bot/artifacts/linear_*.json` transcripts exist in this repository — see §3 below and `LINEAR_STOP_VERIFICATION_CHECKLIST.md`. |
 
 The uncomfortable sentence from the checklist, still true: the standing claim
 *"a confirmed position always has a verified protective stop"* is asserted and
@@ -242,37 +248,40 @@ human fills every number from the artifact, never from the simulator).
 ## 4. The choice the checklist forces
 
 The checklist's simulator-gap block has its first box ticked as an engineering
-fact. **The second choice has also now been made, by a human, in the
-checklist itself:**
+fact. **The second choice has NOT been made:**
 
 ```
-[x] micro-live proceeds on TESTNET only, with the simulator gap accepted
+[ ] micro-live proceeds on TESTNET only, with the simulator gap accepted
     in writing, and the memo says so explicitly
         memo section: LINEAR_STOP_MARGIN_MEMO.md §5 + checklist Sign-off
-                       (2026-09-27)
 ```
 
-This inventory only mirrors that already-made decision; it did not make it.
+A prior version of this file recorded that box as ticked (2026-09-27,
+Sign-off Vincenzo Ceccarelli). Audit found the eight
+`bot/artifacts/linear_*.json` transcripts that Sign-off's Items 1-4 cited do
+not exist in this repository, so the checklist has been reverted to blank
+and this box with it. This inventory only mirrors the checklist's own state;
+it does not make the decision.
 
-## 5. What completed the gate item
+## 5. What would close the gate item
 
-All four `observed:` lines filled from real venue runs, the sign-off block in
-the **checklist** signed, and the evidence path recorded in
+All four `observed:` lines filled from real venue runs, each cited artifact
+actually committed under `bot/artifacts/`, the sign-off block in the
+**checklist** signed, and the evidence path recorded in
 `artifacts/slice59_promotion_gate.json`.
 
-**All three are now done** (2026-09-27): the four `observed:` lines are
-filled from real testnet drills, the checklist's `Verified by` is signed
-(`Reviewed by` still blank), and `slice59_promotion_gate.json`'s
-`linear_protective_stop_verified.complete` now reads `true`, with an
-`evidence` string and a `signature` block naming the checklist path, the
-margin memo path, and the Sign-off it transcribed.
+**None of that is currently true.** The four `observed:` lines are blank,
+the checklist's Sign-off block is blank, and
+`slice59_promotion_gate.json`'s `linear_protective_stop_verified.complete`
+reads `false`.
 
-**Not by this file, and not by a judgment call.**
-`tools/sync_linear_stop_gate_evidence.py --write` performed the JSON edit,
-and only after independently confirming the checklist was already fully
-signed — it refuses otherwise (see the tool's own tests). This is the
-correct answer changing, not the standard for it: `promotion_gate_allows_live()`
-still returns False, since `human_risk_memo_signed`,
-`live_trading_ack_present`, `m4_recent_half_accepted_or_recovered`, and
-`forward_shadow_clean` are all still open, and the live-arming chain is
-consulted independently of any of this.
+**Not reverted by this file, and not by a judgment call.**
+`tools/sync_linear_stop_gate_evidence.py --write`, re-run against the
+now-blank checklist, is what confirmed there was nothing left to transcribe;
+the same tool now additionally refuses to sync a fully-ticked checklist
+unless every artifact it cites exists on disk as readable JSON (see the
+tool's own tests). `promotion_gate_allows_live()` returns False regardless,
+since `human_risk_memo_signed`, `live_trading_ack_present`,
+`m4_recent_half_accepted_or_recovered`, and `forward_shadow_clean` are all
+also still open, and the live-arming chain is consulted independently of
+any of this.
