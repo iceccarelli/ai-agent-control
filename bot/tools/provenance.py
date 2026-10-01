@@ -114,10 +114,34 @@ def workspace_dirty(repo: Optional[str] = None) -> Optional[bool]:
 #: reproducible from a bare checkout," which no single boolean here claims.
 _SOURCE_PATHSPECS = ("*.py", "requirements.txt", "constraints.txt")
 
+#: Named explicitly, not left implicit, because the Dockerfile has already
+#: caused one real regression this repo shipped (`venue_fees.py` added to
+#: `trading_engine.py`'s import graph, not added to the Dockerfile's
+#: explicit COPY list — caught by `tests/test_dockerfile.py`, not by
+#: anything in this module). `source_tree_clean` is CODE PROVENANCE: did
+#: the interpreted source and pinned dependencies this process actually
+#: imports match `code_commit`. It says NOTHING about BUILD/DEPLOYMENT
+#: PROVENANCE: whether the container image this process might run inside
+#: (`Dockerfile`, `fly.toml`, `scripts/*.sh`) was built from matching,
+#: unmodified inputs. A clean `source_tree_clean` must never be read as
+#: "this container is reproducible" — that is a different claim, this
+#: module makes no attempt at it, and `BUILD_PROVENANCE_PATHSPECS` names
+#: exactly the files it would have to cover if it did. The one regression
+#: guard this repo actually has for that gap is
+#: `tests/test_dockerfile.py::test_dockerfile_copies_the_import_closure_of_main`
+#: (a CI-time check that the Dockerfile's COPY list matches `main.py`'s
+#: real import closure) — a test, not a provenance stamp carried on any
+#: run's evidence, which is the right size for this: a second runtime
+#: boolean here would invite exactly the "giant provenance framework" this
+#: module deliberately stays smaller than.
+BUILD_PROVENANCE_PATHSPECS = ("Dockerfile", "fly.toml", "scripts/*.sh")
+
 
 def source_tree_clean(repo: Optional[str] = None) -> Optional[bool]:
-    """True iff no TRACKED execution-relevant file (`_SOURCE_PATHSPECS`)
-    differs from `HEAD`.
+    """CODE provenance only — true iff no TRACKED execution-relevant file
+    (`_SOURCE_PATHSPECS`) differs from `HEAD`. See `BUILD_PROVENANCE_PATHSPECS`
+    for the distinct, NOT-covered-here, build/deployment-provenance
+    question this function's name is sometimes mistaken for answering.
 
     Deliberately narrower than `workspace_dirty`: an untracked artefact or
     data file sitting in the working tree makes `git status --porcelain`

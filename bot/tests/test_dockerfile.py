@@ -4,6 +4,15 @@ Invariant protected: an image that cannot start is a deployment that silently
 never trades AND never reconciles. The COPY list is compared against the
 static import closure of main.py, so adding an import without adding a COPY
 fails here rather than in production.
+
+This is this repository's one BUILD/DEPLOYMENT-provenance regression guard
+(see `tools/provenance.py`'s `BUILD_PROVENANCE_PATHSPECS`): a CI-time check,
+not a runtime stamp carried on any execution artefact — `source_tree_clean`
+on a ledger/failure JSON answers a narrower, CODE-provenance-only question
+and explicitly does not cover the Dockerfile. Proven necessary in practice:
+adding `venue_fees.py` to `trading_engine.py`'s import graph without adding
+it to the Dockerfile's COPY list was caught here, not by anything that
+inspects git state.
 """
 from __future__ import annotations
 

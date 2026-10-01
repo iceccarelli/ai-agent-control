@@ -21,19 +21,31 @@ says so, `feeCurrency`. Reading it correctly means three refusals:
   (see `INVENTORY.md` D11/D44), but that is a convention about WHICH
   currency to expect, not permission to assert it when the venue did not
   say so in this specific row.
-- no unit conversion happens here. This module answers "what did the
-  venue say", not "what is that worth in the account's accounting unit" —
-  that is a separate, explicit operation (see `tools/testnet_session.py`'s
-  fee reconciliation), because converting silently is exactly how a BTC
-  fee and a USDT fee end up added together as if they were the same
-  number (the real BTCUSDT spot bug this module exists to make
-  impossible to reintroduce).
+THE SECOND RULE — CONVERSION IS SEPARATE, AND ALSO HAS ONE AUTHORITY
+=====================================================================
+`extract_fee` answers "what did the venue say". `convert_to_account_unit`
+below answers "what is that worth in the account's accounting unit" — a
+distinct, explicit operation with its own authority, for the same reason
+extraction has one: before this module, `tools/testnet_session.py`'s
+ledger builder had its own private copy of this exact conversion logic,
+and `trading_engine.close_position` had none at all — it booked
+`TradeRecord.entry_fee`/`.exit_fee` as raw venue amounts, in whatever
+currency each leg happened to be charged in. For the real BTCUSDT shape
+(entry fee in BTC, exit fee in USDT — see `INVENTORY.md` D11/D44) that
+meant `TradeRecord.total_fees`/`.net_pnl` — read by
+`risk_management.py`'s daily-loss/drawdown/consecutive-loss gates by way
+of `StateStore.record_trade`'s `daily_anchor` update — added a BTC number
+to a USDT number and called the sum a fee. `close_position` now converts
+before booking, using THIS function, so a `TradeRecord` it constructs is
+never capable of holding two fee legs in different currencies —
+`persistence.TradeRecord.total_fees` still checks this and refuses
+instead of guessing, but a well-behaved caller should never trip it.
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -100,3 +112,100 @@ def extract_fee(row: Optional[Mapping[str, Any]]) -> VenueFee:
         return UNKNOWN_FEE
     currency = _clean_currency(row.get("feeCurrency"))
     return VenueFee(amount=amount, currency=currency)
+
+
+# ---------------------------------------------------------------------------
+# conversion — separate operation, same "never guess" discipline
+# ---------------------------------------------------------------------------
+
+
+def split_symbol_units(symbol: str) -> Tuple[str, str]:
+    """`(base, quote)` for a spot pair symbol, by suffix — "BTCUSDT" ->
+    ("BTC", "USDT"). ONLY used to know what a KNOWN currency converts
+    against (e.g. "the venue said BTC; this symbol's quote is USDT, so
+    multiply by price"); never used to invent a currency `extract_fee`
+    did not report.
+    """
+    for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
+        if symbol.endswith(quote) and len(symbol) > len(quote):
+            return symbol[: -len(quote)], quote
+    return symbol, ""
+
+
+def estimate_leg_fee(*, price: float, qty: float, taker_fee: float) -> float:
+    """A STATIC fallback, used only for a leg whose real fee AMOUNT is
+    unknown. Already in the accounting unit by construction (a rate
+    against notional, which is quoted in the accounting unit) — unlike a
+    real venue fee, which can come back in the base coin."""
+    return abs(price * qty * taker_fee)
+
+
+@dataclass(frozen=True)
+class FeeConversion:
+    """What happened when one leg's raw venue fee was turned into the
+    accounting unit — enough to audit or reproduce the conversion, never
+    silent."""
+
+    #: "identity" (already in the accounting unit), "converted" (base-coin
+    #: amount multiplied by this leg's own trade price), "unresolved"
+    #: (amount known but its currency could not be converted — the raw
+    #: fact is preserved elsewhere, never guessed into a number here),
+    #: "unknown" (no amount at all; `account_unit_amount` is a labelled
+    #: STATIC ESTIMATE, never realized), or "zero_qty" (nothing to
+    #: convert).
+    status: str
+    account_unit_amount: Optional[float]
+    rate: Optional[float] = None
+    basis: str = ""
+
+    @property
+    def known(self) -> bool:
+        """True only when `account_unit_amount` reflects a real,
+        venue-confirmed, successfully-converted figure — never true for
+        an estimate or an unresolved leg."""
+        return self.status in ("identity", "converted")
+
+
+def convert_to_account_unit(
+    *, amount: Optional[float], currency: Optional[str], known: bool,
+    leg_price: float, qty: float, taker_fee: float, accounting_unit: str,
+    base_coin: str,
+) -> FeeConversion:
+    """One leg's raw venue fee -> the accounting unit, or an explicit
+    refusal to guess. NEVER sums a BTC amount and a USDT amount as though
+    they were the same number: an entry fee charged in BTC and an exit
+    fee charged in USDT are not numerically additive until this
+    conversion happens, and it only happens when the currency is
+    actually known and matches either the accounting unit (identity) or
+    the pair's base coin (priced conversion — same basis `ledger.py`'s
+    `spot_buy(fee_btc, price)` already uses for the carry book).
+    """
+    if qty <= 0:
+        return FeeConversion(status="zero_qty", account_unit_amount=0.0)
+    if not known or amount is None:
+        estimate = estimate_leg_fee(price=leg_price, qty=qty, taker_fee=taker_fee)
+        return FeeConversion(
+            status="unknown", account_unit_amount=estimate,
+            basis=f"static taker_fee={taker_fee} estimate (no real fee known)")
+    if currency is None:
+        # A real, known amount — but with no currency to convert it by.
+        # Guessing here is exactly the defect this module exists to
+        # refuse: preserve the raw amount elsewhere, claim nothing
+        # converted here.
+        return FeeConversion(
+            status="unresolved", account_unit_amount=None,
+            basis="amount known but currency unknown; conversion refused")
+    if currency == accounting_unit:
+        return FeeConversion(
+            status="identity", account_unit_amount=amount, rate=1.0,
+            basis=f"already {accounting_unit}")
+    if currency == base_coin and leg_price > 0:
+        return FeeConversion(
+            status="converted", account_unit_amount=amount * leg_price,
+            rate=leg_price,
+            basis=f"{currency}->{accounting_unit} at this leg's own trade "
+                 f"price {leg_price}")
+    return FeeConversion(
+        status="unresolved", account_unit_amount=None,
+        basis=f"no conversion basis for currency={currency!r} "
+             f"(expected {accounting_unit!r} or {base_coin!r})")

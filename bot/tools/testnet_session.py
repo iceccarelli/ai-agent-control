@@ -47,6 +47,7 @@ sys.path.insert(0, HERE)
 import venue_evidence as ve  # noqa: E402
 import testnet_conformance_run as tcr  # noqa: E402
 import provenance as prov  # noqa: E402
+import venue_fees  # noqa: E402
 
 logger = logging.getLogger("testnet_session")
 
@@ -189,89 +190,13 @@ def new_run_id() -> str:
     return f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
 
 
-def _estimate_leg_fee(*, price: float, qty: float, taker_fee: float) -> float:
-    """A STATIC fallback, used only for a leg whose real fee amount is
-    unknown. Always already in the accounting unit (it is modelled as a
-    rate against notional, which is quoted in the accounting unit), so it
-    never itself needs conversion — unlike a real venue fee, which can
-    come back in the base coin."""
-    return abs(price * qty * taker_fee)
-
-
-def split_symbol_units(symbol: str) -> Tuple[str, str]:
-    """`(base, quote)` for a spot pair symbol, by suffix — "BTCUSDT" ->
-    ("BTC", "USDT"). This is ONLY used to know what a KNOWN currency
-    converts against (e.g. "the venue said BTC; the quote leg of this
-    symbol is USDT, so multiply by price"); it is never used to invent a
-    currency extract_fee did not report (see `venue_fees.py`).
-    """
-    for quote in ("USDT", "USDC", "USD", "BTC", "ETH"):
-        if symbol.endswith(quote) and len(symbol) > len(quote):
-            return symbol[: -len(quote)], quote
-    return symbol, ""
-
-
-@dataclass(frozen=True)
-class FeeConversion:
-    """What happened when this leg's raw venue fee was turned into the
-    accounting unit — enough to audit or reproduce the conversion, per the
-    hardening pass's requirement that a conversion never be silent."""
-
-    #: "identity" (already in the accounting unit), "converted" (base-coin
-    #: amount multiplied by this leg's own trade price), "unresolved"
-    #: (amount known but its currency could not be converted — a raw fact
-    #: preserved, never guessed into a number), "unknown" (no amount at
-    #: all; `account_unit_amount` is a labelled STATIC ESTIMATE, never
-    #: realized), or "zero_qty" (nothing to convert).
-    status: str
-    account_unit_amount: Optional[float]
-    rate: Optional[float] = None
-    basis: str = ""
-
-
-def _convert_leg_fee(
-    *, amount: Optional[float], currency: Optional[str], known: bool,
-    leg_price: float, qty: float, taker_fee: float, accounting_unit: str,
-    base_coin: str,
-) -> FeeConversion:
-    """One leg's raw venue fee -> the accounting unit, or an explicit
-    refusal to guess. NEVER sums a BTC amount and a USDT amount as though
-    they were the same number — the real BTCUSDT defect this exists to
-    foreclose: an entry fee charged in BTC and an exit fee charged in
-    USDT are not numerically additive until this conversion happens, and
-    it only happens when the currency is actually known and matches
-    either the accounting unit (identity) or the pair's base coin (priced
-    conversion, same basis `ledger.py`'s `spot_buy(fee_btc, price)`
-    already uses for the carry book).
-    """
-    if qty <= 0:
-        return FeeConversion(status="zero_qty", account_unit_amount=0.0)
-    if not known or amount is None:
-        estimate = _estimate_leg_fee(price=leg_price, qty=qty, taker_fee=taker_fee)
-        return FeeConversion(
-            status="unknown", account_unit_amount=estimate,
-            basis=f"static taker_fee={taker_fee} estimate (no real fee known)")
-    if currency is None:
-        # A real, known amount — but with no currency to convert it by.
-        # Guessing here is exactly the defect this module exists to
-        # refuse: preserve the raw amount, claim nothing converted.
-        return FeeConversion(
-            status="unresolved", account_unit_amount=None,
-            basis="amount known but currency unknown; conversion refused")
-    if currency == accounting_unit:
-        return FeeConversion(
-            status="identity", account_unit_amount=amount, rate=1.0,
-            basis=f"already {accounting_unit}")
-    if currency == base_coin and leg_price > 0:
-        return FeeConversion(
-            status="converted", account_unit_amount=amount * leg_price,
-            rate=leg_price,
-            basis=f"{currency}->{accounting_unit} at this leg's own trade "
-                 f"price {leg_price}")
-    return FeeConversion(
-        status="unresolved", account_unit_amount=None,
-        basis=f"no conversion basis for currency={currency!r} "
-             f"(expected {accounting_unit!r} or {base_coin!r})")
+#: Conversion is `venue_fees`'s authority too, not a second copy of it —
+#: `trading_engine.close_position` now normalizes fees the SAME way
+#: before ever booking a `TradeRecord`, so these names are re-exported
+#: here rather than redefined.
+split_symbol_units = venue_fees.split_symbol_units
+FeeConversion = venue_fees.FeeConversion
+_convert_leg_fee = venue_fees.convert_to_account_unit
 
 
 def build_cash_ledger(
@@ -380,6 +305,13 @@ def build_cash_ledger(
         "code_commit": str(code_commit or prov.UNKNOWN),
         "source_tree_clean": source_tree_clean,
         "workspace_dirty": workspace_dirty,
+        #: `source_tree_clean` is CODE provenance (interpreted source +
+        #: pinned dependencies) only. It says nothing about BUILD/
+        #: DEPLOYMENT provenance (Dockerfile, fly.toml, deploy scripts) —
+        #: this run carries no claim about those at all; see
+        #: `provenance.BUILD_PROVENANCE_PATHSPECS`.
+        "provenance_scope": "code_only",
+        "build_provenance_tracked": False,
         "category": str(category or "spot"),
         "symbol": symbol,
         "n_fills": int(n_fills),
@@ -555,6 +487,8 @@ def write_failure(
         "code_commit": str(extra.pop("code_commit", "") or prov.UNKNOWN),
         "source_tree_clean": extra.pop("source_tree_clean", None),
         "workspace_dirty": extra.pop("workspace_dirty", None),
+        "provenance_scope": "code_only",
+        "build_provenance_tracked": False,
         "status": "FAILED",
         "failure": reason,
         "network_order_submitted": bool(extra.pop("network_order_submitted", False)),

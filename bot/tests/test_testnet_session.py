@@ -800,6 +800,29 @@ class TestProvenancePrecision:
         assert ledger["source_tree_clean"] is False
         assert ledger["workspace_dirty"] is True
 
+    def test_ledger_never_implies_a_build_or_container_reproducibility_claim(
+            self):
+        """`source_tree_clean` is CODE provenance only (interpreted source
+        + pinned dependencies). A reader must not be able to mistake it
+        for a claim about the Dockerfile/container this process might run
+        inside — the ledger says so explicitly rather than leaving it
+        implicit."""
+        ledger = ts.build_cash_ledger(
+            symbol="BTCUSDT", category="spot", n_fills=2,
+            entry_price=100.0, exit_price=101.0, qty=1.0, flat=True,
+            code_commit="a" * 40, source_tree_clean=True, workspace_dirty=False)
+        assert ledger["provenance_scope"] == "code_only"
+        assert ledger["build_provenance_tracked"] is False
+
+    def test_failure_payload_also_scopes_provenance_to_code_only(self, tmp_path):
+        path = ts.write_failure(
+            str(tmp_path / "fail.json"), reason="boom", run_id="RUN-SCOPE",
+            runs_dir=str(tmp_path / "runs"),
+            runs_index=str(tmp_path / "runs" / "index.jsonl"))
+        payload = json.loads(open(path, encoding="utf-8").read())
+        assert payload["provenance_scope"] == "code_only"
+        assert payload["build_provenance_tracked"] is False
+
 
 class TestNotionalCapThisPathOnly:
     def test_capped_sizer_reduces_qty(self):

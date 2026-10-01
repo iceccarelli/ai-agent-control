@@ -995,6 +995,43 @@ class TradingEngine:
         exit_fee_actual = float(exit_fee_fact.amount) if exit_fee_known else float(exit_fee)
         exit_fee_currency = exit_fee_fact.currency if exit_fee_known else None
 
+        # Normalize BOTH legs into the symbol's quote coin BEFORE this trade
+        # is ever booked — not after, in some downstream reader. For the
+        # real BTCUSDT shape (entry fee in BTC, exit fee in USDT; see
+        # `venue_fees.py`'s module docstring) this is what stops
+        # `TradeRecord.total_fees`/`.net_pnl` — read by
+        # `risk_management.py`'s daily-loss/drawdown gates via
+        # `record_trade`'s `daily_anchor` update — from silently adding a
+        # BTC number to a USDT number. An amount whose currency cannot be
+        # converted (foreign/unresolved) is NEVER let through as if it
+        # were already in the accounting unit: it is re-marked unknown
+        # here, the same way a never-reported amount already was.
+        base_coin, accounting_unit = venue_fees.split_symbol_units(symbol)
+        if entry_fee_known:
+            entry_conv = venue_fees.convert_to_account_unit(
+                amount=stored_entry_fee, currency=entry_fee_currency, known=True,
+                leg_price=entry_price, qty=qty, taker_fee=0.0,
+                accounting_unit=accounting_unit, base_coin=base_coin)
+            if entry_conv.known:
+                entry_fee_actual = float(entry_conv.account_unit_amount)
+                entry_fee_currency = accounting_unit
+            else:
+                entry_fee_actual = 0.0
+                entry_fee_known = False
+                entry_fee_currency = None
+        if exit_fee_known:
+            exit_conv = venue_fees.convert_to_account_unit(
+                amount=exit_fee_fact.amount, currency=exit_fee_currency, known=True,
+                leg_price=realised_exit, qty=qty, taker_fee=0.0,
+                accounting_unit=accounting_unit, base_coin=base_coin)
+            if exit_conv.known:
+                exit_fee_actual = float(exit_conv.account_unit_amount)
+                exit_fee_currency = accounting_unit
+            else:
+                exit_fee_actual = 0.0
+                exit_fee_known = False
+                exit_fee_currency = None
+
         self.client.cancel_all(symbol)
 
         direction = 1.0 if normalize_side(side) == "Buy" else -1.0

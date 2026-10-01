@@ -109,6 +109,14 @@ class PersistenceError(RuntimeError):
     """
 
 
+class IncompatibleFeeCurrencies(RuntimeError):
+    """`TradeRecord.entry_fee`/`.exit_fee` are in two different, both-known
+    currencies. Raised instead of adding them — the one structural
+    guarantee that a BTC amount and a USDT amount can never be silently
+    booked as one "fee" number, however a `TradeRecord` was built.
+    """
+
+
 def utc_now_epoch() -> float:
     """Wall-clock epoch seconds (UTC).  Survives restarts, unlike perf_counter."""
     return time.time()
@@ -203,15 +211,19 @@ class TradeRecord:
     #: nothing" apart from "the real cost was never recorded".
     entry_fee_known: bool = True
     exit_fee_known: bool = True
-    #: The currency the venue actually charged this fee in (e.g. "BTC" on
-    #: a spot BUY, "USDT" on a spot SELL — see `venue_fees.py`), or `None`
-    #: when unknown/not applicable. `entry_fee`/`exit_fee` stay bare
-    #: numeric amounts for every existing reader (`trade_stats.py`,
-    #: `risk_management.py`) that already sums them — these two fields are
-    #: additive, so a reader that wants to detect a mixed-currency trade
-    #: (the real BTCUSDT case: BTC entry fee, USDT exit fee) now can,
-    #: without this dataclass silently asserting the two amounts are the
-    #: same unit by summing them itself.
+    #: The unit `entry_fee`/`exit_fee` are actually expressed in once a
+    #: caller has resolved them (the symbol's quote coin, e.g. "USDT" for
+    #: BTCUSDT — see `venue_fees.convert_to_account_unit`), or `None` when
+    #: that fee is unknown or could not be converted to a common unit.
+    #: `TradingEngine.close_position` normalizes BOTH legs into the SAME
+    #: unit before ever constructing a `TradeRecord` — a BTC-denominated
+    #: entry fee and a USDT-denominated exit fee (the real BTCUSDT shape)
+    #: are multiplied/identity-mapped into the same quote coin first, so a
+    #: `TradeRecord` it builds should never carry two different known
+    #: currencies here. `total_fees`/`net_pnl` still check this (a
+    #: different caller could construct one directly) and raise rather
+    #: than silently add incompatible amounts — see
+    #: `IncompatibleFeeCurrencies`.
     entry_fee_currency: Optional[str] = None
     exit_fee_currency: Optional[str] = None
     #: A durable, venue-derived identity for the exit this trade books --
@@ -223,7 +235,32 @@ class TradeRecord:
     dedupe_key: str = ""
 
     @property
+    def fees_compatible(self) -> bool:
+        """True iff `entry_fee`/`exit_fee` are safe to add directly.
+
+        Safe when either currency is unset (the untracked/legacy case —
+        every caller that never populated `entry_fee_currency`/
+        `exit_fee_currency` at all, which is every caller except
+        `TradingEngine.close_position`; unchanged, pre-existing
+        behaviour) or when both are set and EQUAL. False only when both
+        are known and genuinely DIFFERENT — a BTC amount and a USDT
+        amount sitting in the same two float fields, which `total_fees`
+        must never silently add.
+        """
+        if self.entry_fee_currency and self.exit_fee_currency:
+            return self.entry_fee_currency == self.exit_fee_currency
+        return True
+
+    @property
     def total_fees(self) -> float:
+        if not self.fees_compatible:
+            raise IncompatibleFeeCurrencies(
+                f"entry_fee is in {self.entry_fee_currency!r}, exit_fee is "
+                f"in {self.exit_fee_currency!r} — cannot sum without an "
+                "explicit conversion; the caller that built this "
+                "TradeRecord must normalize both legs to one accounting "
+                "unit before constructing it (see "
+                "TradingEngine.close_position / venue_fees.convert_to_account_unit)")
         return float(self.entry_fee) + float(self.exit_fee)
 
     @property
