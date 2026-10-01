@@ -10,3 +10,4 @@ __pycache__/
 bot/lib/*.so
 *.patch
 SHA256SUMS
+.bybit_testnet_env
