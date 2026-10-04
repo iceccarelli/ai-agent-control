@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import testnet_session as ts  # noqa: E402
+import main as bot_main  # noqa: E402
 
 
 def _cfg(**over):
@@ -175,6 +176,7 @@ class TestZeroFillsExitCode:
         fake_engine = types.SimpleNamespace(
             paper=False,
             sizer=None,
+            risk=types.SimpleNamespace(),
             execute=lambda intent: types.SimpleNamespace(
                 ok=False, stage="pre_gate", reason="BLOCKED", qty=0.0,
                 detail={}),
@@ -188,8 +190,17 @@ class TestZeroFillsExitCode:
         def fake_preflight(cfg, client):
             return types.SimpleNamespace(ok=True, checks={"environment": "ok"})
 
+        fake_signal_bot = types.SimpleNamespace(
+            strategy=types.SimpleNamespace(
+                signal_for=lambda symbol: types.SimpleNamespace(
+                    symbol=symbol, signal_type="BUY", entry_price=100000.0,
+                    stop_price=98000.0, take_profits=((105000.0, 1.0),)),
+            ),
+        )
+
         monkeypatch.setattr(ts, "_build_session_stack", fake_build)
         monkeypatch.setattr(ts.tcr, "run_preflight", fake_preflight)
+        monkeypatch.setattr(bot_main, "build_bot", lambda **kw: fake_signal_bot)
 
         failure = tmp_path / "fail.json"
         rc = ts.main([
