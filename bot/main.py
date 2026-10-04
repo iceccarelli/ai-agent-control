@@ -43,7 +43,8 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import datetime as dt
-from typing import Any, Callable, Dict, List, Optional
+import math
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config as _config
 from bybit_connection import BybitAPIError, BybitClient
@@ -98,6 +99,64 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_a: Any) -> None:
         """Silence per-request logging; health checks are frequent and noisy."""
+
+
+# ---------------------------------------------------------------------------
+# multi-symbol candidate selection — pure, in-memory, no new schema
+# ---------------------------------------------------------------------------
+
+
+def _candidate_score(intent: Any) -> Optional[float]:
+    """Deterministic score for ranking same-cycle candidates, or ``None``
+    for a candidate that cannot be ranked at all.
+
+    Confidence — already produced by the strategy itself — is the primary
+    score; reward:risk is the fallback for a strategy that leaves it unset.
+    ``None`` for impossible geometry (non-finite price, zero/negative stop
+    distance): that must sort last, never score as a strong candidate.
+    """
+    entry = float(getattr(intent, "entry_price", 0.0) or 0.0)
+    stop = float(getattr(intent, "stop_price", 0.0) or 0.0)
+    if not (math.isfinite(entry) and math.isfinite(stop)) or entry <= 0.0:
+        return None
+    risk = abs(entry - stop)
+    if risk <= 0.0:
+        return None
+
+    confidence = getattr(intent, "confidence", None)
+    if confidence is not None:
+        try:
+            return float(confidence)
+        except (TypeError, ValueError):
+            pass
+
+    reward = 0.0
+    for tp_price, _fraction in (getattr(intent, "take_profits", ()) or ()):
+        if math.isfinite(tp_price):
+            reward = abs(float(tp_price) - entry)
+        break
+    return reward / risk
+
+
+def _select_best_candidate(
+    candidates: List[Tuple[str, Any]],
+) -> Optional[Tuple[str, Any]]:
+    """Pick the single best actionable candidate this cycle, or ``None``
+    (HOLD). An unrankable candidate (see ``_candidate_score``) is rejected
+    before comparison, so a broken intent can never win merely because its
+    symbol was scanned first.
+    """
+    scored = [
+        (score, symbol, intent)
+        for symbol, intent in candidates
+        for score in (_candidate_score(intent),)
+        if score is not None
+    ]
+    if not scored:
+        return None
+    scored.sort(key=lambda row: (-row[0], row[1]))
+    _, symbol, intent = scored[0]
+    return symbol, intent
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +889,11 @@ class TradingBot:
             logger.debug("no strategy attached; no signals evaluated")
             return
 
+        # SCAN MANY, THEN SELECT ONE. Each eligible symbol gets exactly one
+        # strategy call; every candidate it produces is gathered before
+        # anything executes, so the symbol that happens to iterate first no
+        # longer wins by default — the best actionable candidate does.
+        candidates: List[Tuple[str, Any]] = []
         for symbol in self.symbols:
             if self._stop.is_set():
                 return
@@ -842,8 +906,17 @@ class TradingBot:
                 continue
             if intent is None:
                 continue
-            report = self.engine.execute(intent)
-            logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
+            candidates.append((symbol, intent))
+
+        best = _select_best_candidate(candidates)
+        if best is None:
+            logger.debug(
+                "no qualifying candidate across %d eligible symbol(s); HOLD",
+                len(self.symbols))
+            return
+        symbol, intent = best
+        report = self.engine.execute(intent)
+        logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
 
     def _expire_at_horizon(self) -> None:
         """Close any shadow position that has reached HORIZON daily bars.
