@@ -17,7 +17,7 @@ while true; do
     echo "[testnet_session_timer] tick ${tick} at $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
     set +e
-    BYBIT_VENUE=testnet python3 "${BOT_DIR}/tools/testnet_session.py"
+    BYBIT_VENUE=testnet PAPER_TRADING=0 python3 "${BOT_DIR}/tools/testnet_session.py"
     rc=$?
     set -e
 
