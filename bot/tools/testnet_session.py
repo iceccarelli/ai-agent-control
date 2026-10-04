@@ -311,13 +311,29 @@ def run_session(
         out["failure"] = "engine.paper is true; refusing"
         return out
 
-    last = float(client.get_last_price(symbol))
-    stop = last * 0.98
-    take = last * 1.05
+    # The entry geometry comes from the production strategy, not from a
+    # fabricated BUY — build_bot attaches the same signal source main.py's
+    # runtime would (MarketStrategy/ShadowStrategy per BOOK_MODE), so this
+    # tool consults it exactly like the runtime does rather than forcing a
+    # trade just to exercise the fill path.
+    import main as _main
 
-    report = submit_order(
-        engine, symbol=symbol, entry_price=last, stop_price=stop,
-        take_profit=take)
+    bot = _main.build_bot(
+        config=cfg, store=store, client=client, engine=engine,
+        risk_manager=engine.risk)
+    if bot.strategy is None:
+        out["failure"] = "no signal"
+        return out
+    try:
+        intent = bot.strategy.signal_for(symbol)
+    except Exception as exc:  # noqa: BLE001
+        out["failure"] = f"strategy failed: {type(exc).__name__}: {exc}"
+        return out
+    if intent is None:
+        out["failure"] = "no signal"
+        return out
+
+    report = engine.execute(intent)
     out["stages"].append({
         "stage": "entry",
         "ok": bool(report.ok and report.stage not in ("paper",)),
