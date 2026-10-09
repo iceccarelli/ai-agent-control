@@ -72,6 +72,8 @@ from position_sizing import (
 )
 from memory import TradingMemory
 from risk_management import BillionaireRiskManager, normalize_side
+import venue_fees
+from venue_fees import VenueFee
 
 logger = logging.getLogger("engine")
 
@@ -358,6 +360,40 @@ class TradingEngine:
 
     # -- the one entry point ----------------------------------------------
 
+    def _fee_leg(
+        self, *, symbol: str, fact: VenueFee, price: float, qty: float,
+        caller_amount: float = 0.0,
+    ) -> Dict[str, Any]:
+        """One fee leg, in the symbol's quote coin, with its provenance.
+
+        ``realized`` is True only when the venue reported the fee AND it was
+        converted with a recorded basis (identity, or base coin x this leg's own
+        price). Otherwise the amount is NOT realised: it is the caller's figure
+        if one was given, else a static taker-rate estimate, and ``raw`` says
+        which. The raw venue amount and currency are always kept, so a later
+        reader can redo the conversion or see that none was possible.
+        """
+        base, unit = venue_fees.split_symbol_units(symbol)
+        conv = venue_fees.convert_to_account_unit(
+            amount=fact.amount, currency=fact.currency, known=fact.known,
+            leg_price=price, qty=qty, taker_fee=self.taker_fee_estimate,
+            accounting_unit=unit, base_coin=base)
+        raw = {
+            "venue_amount": fact.amount, "venue_currency": fact.currency,
+            "status": conv.status, "basis": conv.basis, "rate": conv.rate,
+            "unit": unit,
+        }
+        if conv.known:
+            return {"amount": float(conv.account_unit_amount), "realized": True,
+                    "currency": unit, "raw": raw}
+        if caller_amount:
+            amount, raw["substitute"] = float(caller_amount), "caller_supplied"
+        else:
+            amount = venue_fees.estimate_leg_fee(
+                price=price, qty=qty, taker_fee=self.taker_fee_estimate)
+            raw["substitute"] = "static_estimate"
+        return {"amount": amount, "realized": False, "currency": None, "raw": raw}
+
     def execute(self, intent: TradeIntent) -> ExecutionReport:
         """Run one trade attempt through every stage, in order.
 
@@ -501,6 +537,10 @@ class TradingEngine:
         # this makes entry consistent with it.
         filled_qty = float(fill.get("cumExecQty") or 0.0)
         avg_price = float(fill.get("avgPrice") or intent.entry_price)
+        # The venue's own fee for this fill, amount AND currency, kept raw in
+        # the position row so the eventual exit(s) can book a realised entry
+        # fee. ``None`` means the venue did not say -- not that it was zero.
+        entry_fee_fact = venue_fees.extract_fee(fill)
         if filled_qty <= 0:
             return self._report(stage="fill", reason="ZERO_FILL", symbol=symbol,
                                 entry_order_link_id=entry.order_link_id)
@@ -566,7 +606,9 @@ class TradingEngine:
         self.store.upsert_position(
             symbol, side, filled_qty, avg_price, stop_price=plan.stop_price,
             order_link_id=entry.order_link_id,
-            meta={"stop_order_link_id": protected},
+            meta={"stop_order_link_id": protected,
+                  "entry_fee": entry_fee_fact.amount,
+                  "entry_fee_currency": entry_fee_fact.currency},
         )
 
         # -- 10. take-profit legs (best effort; the stop is what matters) --
@@ -891,6 +933,14 @@ class TradingEngine:
 
     # -- exits -------------------------------------------------------------
 
+    @staticmethod
+    def _row_meta(row: Mapping[str, Any]) -> Dict[str, Any]:
+        try:
+            meta = json.loads(str(row.get("meta") or "{}"))
+        except Exception:  # noqa: BLE001
+            return {}
+        return meta if isinstance(meta, dict) else {}
+
     def close_position(
         self,
         *,
@@ -915,6 +965,7 @@ class TradingEngine:
         exit_side = "Sell" if normalize_side(side) == "Buy" else "Buy"
         qty = float(row["qty"])
         entry_price = float(row["entry_price"])
+        row_meta = self._row_meta(row)
 
         result = self.client.place_order(
             symbol=symbol, side=exit_side, qty=qty, order_type="Market",
@@ -948,6 +999,20 @@ class TradingEngine:
 
         direction = 1.0 if normalize_side(side) == "Buy" else -1.0
         gross = (realised_exit - entry_price) * qty * direction
+        # Both fee legs, from the venue's own fills where the venue reported
+        # them. The entry fee was captured at fill time (position meta); the
+        # exit fee comes from the exit fill just polled. Anything the venue did
+        # not report is booked as a labelled non-realised figure -- the caller's
+        # `entry_fee`/`exit_fee` if given, else a static estimate -- never as a
+        # silent 0.0 and never flagged realised.
+        entry_leg = self._fee_leg(
+            symbol=symbol,
+            fact=VenueFee(amount=row_meta.get("entry_fee"),
+                          currency=row_meta.get("entry_fee_currency")),
+            price=entry_price, qty=qty, caller_amount=entry_fee)
+        exit_leg = self._fee_leg(
+            symbol=symbol, fact=venue_fees.extract_fee(fill),
+            price=realised_exit, qty=qty, caller_amount=exit_fee)
         # dedupe_key ties this trade to the exit order's own durable id, the
         # same identity `find_live_spot_stop`/`orders(order_link_id)` already
         # rely on -- a crash between this `record_trade` and the
@@ -958,17 +1023,25 @@ class TradingEngine:
         self.store.record_trade(TradeRecord(
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
             exit_price=realised_exit, gross_pnl=gross,
-            entry_fee=entry_fee, exit_fee=exit_fee,
+            entry_fee=entry_leg["amount"], exit_fee=exit_leg["amount"],
+            entry_fee_realized=entry_leg["realized"],
+            exit_fee_realized=exit_leg["realized"],
+            entry_fee_currency=entry_leg["currency"],
+            exit_fee_currency=exit_leg["currency"],
             opened_epoch=float(row.get("opened_epoch") or utc_now_epoch()),
             closed_epoch=utc_now_epoch(),
             order_link_id=result.order_link_id,
-            meta={"reason": reason},
+            meta={"reason": reason,
+                  "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]}},
             dedupe_key=f"exit:{result.order_link_id}" if result.order_link_id else "",
         ))
         self.store.remove_position(symbol)
         self.store.journal(symbol, "CLOSED", reason, {
-            "gross_pnl": gross, "fees": entry_fee + exit_fee,
-            "net_pnl": gross - entry_fee - exit_fee,
+            "gross_pnl": gross,
+            "fees": entry_leg["amount"] + exit_leg["amount"],
+            "net_pnl": gross - entry_leg["amount"] - exit_leg["amount"],
+            "entry_fee_realized": entry_leg["realized"],
+            "exit_fee_realized": exit_leg["realized"],
         })
         # Exit identity/quantity evidence (mission "REAL FINDING #3"):
         # extends the existing ExecutionReport.detail path -- never a
@@ -987,6 +1060,10 @@ class TradingEngine:
                 "executed_exit_qty": executed_exit_qty,
                 "exit_avg_price": realised_exit,
                 "exit_status": exit_status,
+                "entry_fee": entry_leg["amount"],
+                "entry_fee_realized": entry_leg["realized"],
+                "exit_fee": exit_leg["amount"],
+                "exit_fee_realized": exit_leg["realized"],
             })
 
     def observe_exits(self) -> Dict[str, Any]:
@@ -1092,6 +1169,7 @@ class TradingEngine:
         reason: str,
         order_link_id: str = "",
         dedupe_key: str = "",
+        fee_fact: Optional[VenueFee] = None,
     ) -> bool:
         """Account for a partial or full exit that an exchange-side order filled.
 
@@ -1110,6 +1188,11 @@ class TradingEngine:
         ``remove_position``/``upsert_position`` further down leaves this
         exit re-discoverable next cycle, and it must be booked once, not
         twice. See ``StateStore.record_trade``'s docstring.
+
+        ``fee`` is a caller figure and is NEVER treated as realised; only a
+        venue-reported ``fee_fact`` is. ``observe_exits`` has no fill to read a
+        fee from, so exchange-side exits are booked with a labelled estimate and
+        ``exit_fee_realized=False`` until a venue fee source is wired in.
 
         Returns True if the position is now fully closed.
         """
@@ -1131,9 +1214,20 @@ class TradingEngine:
         # Entry fees are apportioned across the parts of the position that
         # close, so a partially-exited trade is not credited a full entry fee
         # twice, nor charged none at all.
-        entry_fee_share = (
-            entry_price * closed_qty * float(getattr(self, "taker_fee_estimate", 0.001))
-        )
+        prior_meta = self._row_meta(row)
+        raw_entry_fee = prior_meta.get("entry_fee")
+        entry_ccy = prior_meta.get("entry_fee_currency")
+        fraction = closed_qty / held
+        # The venue's entry fee is apportioned in its own raw currency, and the
+        # unapportioned remainder is carried forward on the position row below,
+        # so the legs of a partially exited trade sum to exactly one entry fee.
+        share_raw = None if raw_entry_fee is None else float(raw_entry_fee) * fraction
+        entry_leg = self._fee_leg(
+            symbol=symbol, fact=VenueFee(amount=share_raw, currency=entry_ccy),
+            price=entry_price, qty=closed_qty)
+        exit_leg = self._fee_leg(
+            symbol=symbol, fact=fee_fact or venue_fees.UNKNOWN_FEE,
+            price=float(price), qty=closed_qty, caller_amount=float(fee or 0.0))
 
         # `record_trade` is idempotent on `dedupe_key` (see its docstring):
         # a crash between it and the position mutations below leaves this
@@ -1156,10 +1250,17 @@ class TradingEngine:
         self.store.record_trade(TradeRecord(
             symbol=symbol, side=side, qty=closed_qty,
             entry_price=entry_price, exit_price=float(price),
-            gross_pnl=gross, entry_fee=entry_fee_share, exit_fee=float(fee),
+            gross_pnl=gross, entry_fee=entry_leg["amount"],
+            exit_fee=exit_leg["amount"],
+            entry_fee_realized=entry_leg["realized"],
+            exit_fee_realized=exit_leg["realized"],
+            entry_fee_currency=entry_leg["currency"],
+            exit_fee_currency=exit_leg["currency"],
             opened_epoch=float(row.get("opened_epoch") or utc_now_epoch()),
             closed_epoch=utc_now_epoch(),
-            order_link_id=order_link_id, meta={"reason": reason, "partial": True},
+            order_link_id=order_link_id,
+            meta={"reason": reason, "partial": True,
+                  "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]}},
             dedupe_key=dedupe_key,
         ))
 
@@ -1253,7 +1354,12 @@ class TradingEngine:
             symbol, side, remaining, entry_price,
             stop_price=stop_price,
             order_link_id=str(row.get("order_link_id") or ""),
-            meta={"stop_order_link_id": new_stop_id},
+            # upsert_position REPLACES meta, so the unapportioned entry fee must
+            # be carried explicitly or it vanishes on the first partial exit.
+            meta={"stop_order_link_id": new_stop_id,
+                  "entry_fee": (None if raw_entry_fee is None
+                                else float(raw_entry_fee) - share_raw),
+                  "entry_fee_currency": entry_ccy},
         )
         self.store.journal(symbol, "PARTIAL_EXIT", reason,
                            {"closed": closed_qty, "remaining": remaining,

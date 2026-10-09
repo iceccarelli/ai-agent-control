@@ -109,6 +109,14 @@ class PersistenceError(RuntimeError):
     """
 
 
+class IncompatibleFeeCurrencies(RuntimeError):
+    """``TradeRecord.entry_fee``/``exit_fee`` are in two different known currencies.
+
+    Raised instead of adding them: a BTC amount and a USDT amount must never be
+    silently booked as one "fee" number, however the record was built.
+    """
+
+
 def utc_now_epoch() -> float:
     """Wall-clock epoch seconds (UTC).  Survives restarts, unlike perf_counter."""
     return time.time()
@@ -194,6 +202,19 @@ class TradeRecord:
     closed_epoch: float
     order_link_id: str = ""
     meta: Dict[str, Any] = field(default_factory=dict)
+    #: True only when the figure is the venue's own reported fee for that leg
+    #: (``cumExecFee``), converted to the accounting unit with a recorded basis.
+    #: False means the amount is NOT realised economics: it is a static
+    #: estimate, a caller-supplied number, or a legacy row whose provenance was
+    #: never recorded. The default is False on purpose -- a fee has to be shown
+    #: to be realised, never assumed to be.
+    entry_fee_realized: bool = False
+    exit_fee_realized: bool = False
+    #: The unit the stored fee amount is expressed in (the symbol's quote coin)
+    #: when it is a realised figure; ``None`` for anything not realised. Raw
+    #: venue amounts and currencies are kept in ``meta["fees"]``.
+    entry_fee_currency: Optional[str] = None
+    exit_fee_currency: Optional[str] = None
     #: A durable, venue-derived identity for the exit this trade books --
     #: e.g. ``f"exit:{exit_order_link_id}"`` for an engine-initiated close,
     #: or a key derived from the closed-pnl orderId(s) for an
@@ -203,7 +224,18 @@ class TradeRecord:
     dedupe_key: str = ""
 
     @property
+    def fees_realized(self) -> bool:
+        """Both legs are venue-confirmed; only then is ``net_pnl`` realised."""
+        return bool(self.entry_fee_realized and self.exit_fee_realized)
+
+    @property
     def total_fees(self) -> float:
+        if (self.entry_fee_currency and self.exit_fee_currency
+                and self.entry_fee_currency != self.exit_fee_currency):
+            raise IncompatibleFeeCurrencies(
+                f"entry_fee is in {self.entry_fee_currency!r}, exit_fee is in "
+                f"{self.exit_fee_currency!r}; normalise both legs to one "
+                "accounting unit (venue_fees.convert_to_account_unit) first")
         return float(self.entry_fee) + float(self.exit_fee)
 
     @property
@@ -279,7 +311,11 @@ CREATE TABLE IF NOT EXISTS trades (
     day            TEXT NOT NULL,
     order_link_id  TEXT NOT NULL DEFAULT '',
     meta           TEXT NOT NULL DEFAULT '{}',
-    dedupe_key     TEXT NOT NULL DEFAULT ''
+    dedupe_key     TEXT NOT NULL DEFAULT '',
+    entry_fee_realized INTEGER NOT NULL DEFAULT 0,
+    exit_fee_realized  INTEGER NOT NULL DEFAULT 0,
+    entry_fee_currency TEXT,
+    exit_fee_currency  TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_day ON trades(day);
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_epoch);
@@ -595,7 +631,15 @@ class StateStore:
         },
         "regime_history": {"detail": "TEXT NOT NULL DEFAULT '{}'"},
         "memory_kv": {"updated_epoch": "REAL NOT NULL DEFAULT 0.0"},
-        "trades": {"dedupe_key": "TEXT NOT NULL DEFAULT ''"},
+        # Legacy rows migrate as NOT realised (0): their fee provenance was never
+        # recorded, so none of them may be counted as realised economics.
+        "trades": {
+            "dedupe_key": "TEXT NOT NULL DEFAULT ''",
+            "entry_fee_realized": "INTEGER NOT NULL DEFAULT 0",
+            "exit_fee_realized": "INTEGER NOT NULL DEFAULT 0",
+            "entry_fee_currency": "TEXT",
+            "exit_fee_currency": "TEXT",
+        },
     }
 
     def _migrate_additive(self) -> None:
@@ -1025,7 +1069,9 @@ class StateStore:
         cur = self._exec(
             "INSERT INTO trades(symbol, side, qty, entry_price, exit_price, gross_pnl,"
             " entry_fee, exit_fee, net_pnl, opened_epoch, closed_epoch, day,"
-            " order_link_id, meta, dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " order_link_id, meta, dedupe_key, entry_fee_realized,"
+            " exit_fee_realized, entry_fee_currency, exit_fee_currency)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(dedupe_key) WHERE dedupe_key <> '' DO NOTHING",
             (
                 trade.symbol, trade.side, float(trade.qty), float(trade.entry_price),
@@ -1034,6 +1080,10 @@ class StateStore:
                 float(trade.closed_epoch), utc_day(trade.closed_epoch),
                 trade.order_link_id, json.dumps(trade.meta, default=str),
                 str(trade.dedupe_key or ""),
+                1 if trade.entry_fee_realized else 0,
+                1 if trade.exit_fee_realized else 0,
+                (str(trade.entry_fee_currency) if trade.entry_fee_currency else None),
+                (str(trade.exit_fee_currency) if trade.exit_fee_currency else None),
             ),
         )
         if cur.rowcount != 1:
@@ -1056,6 +1106,36 @@ class StateStore:
             "SELECT * FROM trades ORDER BY closed_epoch DESC LIMIT ?", (int(limit),)
         )
         return [dict(r) for r in rows]
+
+    def fee_evidence(self) -> Dict[str, Any]:
+        """How much of the booked net PnL rests on venue-confirmed fees.
+
+        ``net_pnl`` is stored for every trade, but only trades whose BOTH fee
+        legs are venue-confirmed carry realised net economics. The rest hold an
+        estimate, a caller figure, or an unlabelled legacy fee. Any expectancy
+        statement must be computed over ``realized_net_pnl`` alone, or must state
+        how many trades it excluded; this is the count that lets it do so.
+        """
+        rows = self._query(
+            "SELECT COUNT(*) AS n,"
+            " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
+            "     THEN 1 ELSE 0 END) AS realized_n,"
+            " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
+            "     THEN net_pnl ELSE 0 END) AS realized_net,"
+            " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
+            "     THEN 0 ELSE net_pnl END) AS unconfirmed_net"
+            " FROM trades"
+        )
+        r = rows[0]
+        n = int(r["n"] or 0)
+        realized_n = int(r["realized_n"] or 0)
+        return {
+            "trades": n,
+            "fees_realized_trades": realized_n,
+            "fees_unconfirmed_trades": n - realized_n,
+            "realized_net_pnl": float(r["realized_net"] or 0.0),
+            "unconfirmed_net_pnl": float(r["unconfirmed_net"] or 0.0),
+        }
 
     def net_returns(self, limit: int = 500) -> List[float]:
         """Per-trade NET return fractions, oldest first — the Kelly input.
