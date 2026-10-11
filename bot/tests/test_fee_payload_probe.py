@@ -1,156 +1,333 @@
-"""The probe pairs raw venue fee fields with the parse, and sends nothing."""
+"""The probe observes the real payload completely, or says it could not, and
+discloses no private account amounts unless the operator explicitly asks."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+
+import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
+from carry_broker import (CarryBroker, PairIncident, read_log_pages,  # noqa: E402
+                          txlog_windows)
 from test_carry_broker import envelope  # noqa: E402
 from tools import fee_payload_probe as fp  # noqa: E402
 
-
-class History:
-    def __init__(self, spot=(), linear=(), fail=()):
-        self.rows = {"spot": list(spot), "linear": list(linear)}
-        self.fail, self.calls = set(fail), []
-
-    def _request(self, method, endpoint, **kw):
-        self.calls.append((method, endpoint))
-        cat = kw["params"]["category"]
-        if cat in self.fail:
-            raise RuntimeError("history down")
-        return envelope({"list": self.rows[cat]})
-
-
-def row(**kw):
-    base = {"orderId": "1234567890abcdef", "side": "Buy", "orderType": "Market",
-            "orderStatus": "Filled", "cumExecQty": "0.001", "avgPrice": "82000"}
-    base.update(kw)
-    return base
-
-
-def test_modern_and_legacy_rows_are_paired_with_their_parse():
-    h = History(spot=[row(cumFeeDetail={"BTC": "0.000001"})],
-                linear=[row(cumExecFee="0.045", feeCurrency="USDT")])
-    out = fp.probe(h, "BTCUSDT")
-    assert out["verdict"] == "FEE_PAYLOAD_OBSERVED"
-    assert (out["with_cumFeeDetail"], out["parsed_known"],
-            out["parsed_unknown"]) == (1, 2, 0)
-    spot = next(o for o in out["orders"] if o["category"] == "spot")
-    assert spot["raw_fee_fields"] == {"cumFeeDetail": {"BTC": "0.000001"}}
-    assert spot["parsed"]["source"] == "cumFeeDetail"
-    assert spot["order"] == "12345678..."            # truncated id only
-
-
-def test_an_unparsed_real_shape_is_surfaced_not_hidden():
-    out = fp.probe(History(linear=[row(cumFeeDetail="surprise")]), "BTCUSDT")
-    assert out["parsed_unknown"] == 1 and out["parsed_known"] == 0
-    assert out["orders"][0]["raw_fee_fields"] == {"cumFeeDetail": "surprise"}
-
-
-def test_unfilled_orders_are_ignored_and_empty_history_is_said_plainly():
-    out = fp.probe(History(spot=[row(cumExecQty="0", orderStatus="Cancelled")]),
-                   "BTCUSDT")
-    assert out["verdict"] == "NO_FILLED_ORDERS_TO_OBSERVE"
-
-
-def test_an_unreadable_category_is_reported_not_swallowed():
-    out = fp.probe(History(spot=[row(cumExecQty="1")], fail=["linear"]), "BTCUSDT")
-    assert "linear" in out["read_errors"] and out["filled_orders_seen"] == 1
-
-
-def test_it_only_ever_reads_history():
-    h = History(spot=[row()])
-    fp.probe(h, "BTCUSDT")
-    assert {(m, e) for m, e in h.calls} == {("GET", "/v5/order/history")}
-
-
-def test_the_real_command_line_refuses_a_contradictory_environment():
-    env = {"PATH": os.environ["PATH"], "HOME": "/tmp", "BYBIT_VENUE": "testnet",
-           "USE_TESTNET": "0", "BYBIT_API_KEY": "k", "BYBIT_API_SECRET": "s"}
-    proc = subprocess.run(
-        [sys.executable, os.path.join(os.path.dirname(HERE), "tools",
-                                      "fee_payload_probe.py")],
-        env=env, capture_output=True, text=True, timeout=60)
-    assert proc.returncode == 3 and "PREFLIGHT_REFUSED" in proc.stdout
-    assert "Traceback" not in proc.stderr
-
-
-# --- the transaction-log shape probe ---------------------------------------
-
-
-class TxLog:
-    def __init__(self, settlement=(), other=(), fail=()):
-        self.settlement, self.other = list(settlement), list(other)
-        self.fail, self.calls = set(fail), []
-
-    def _request(self, method, endpoint, **kw):
-        self.calls.append((method, endpoint, dict(kw["params"])))
-        p = kw["params"]
-        if "settlement" in self.fail and p.get("type") == "SETTLEMENT":
-            raise RuntimeError("log down")
-        if p.get("type") == "SETTLEMENT":
-            return envelope({"list": self.settlement, "nextPageCursor": ""})
-        return envelope({"list": self.other + self.settlement,
-                         "nextPageCursor": "c1"})
-
-
-def srow(**kw):
-    base = {"id": "1", "symbol": "BTCUSDT", "type": "SETTLEMENT",
-            "funding": "0.01", "size": "-0.001", "currency": "USDT",
-            "transactionTime": "1790000000000", "category": "linear",
-            "cashBalance": "9850.75", "change": "0.01", "cashFlow": "0"}
-    base.update(kw)
-    return base
-
-
+DAY = 86_400_000
 NOW = 1_791_000_000_000
 
-
-def test_settlement_rows_with_size_say_ownership_can_be_verified():
-    out = fp.probe_transaction_log(TxLog([srow(), srow(id="2")]), "BTCUSDT",
-                                   now_ms=NOW)
-    assert out["verdict"] == "SETTLEMENT_ROWS_OBSERVED"
-    assert out["settlement_rows_carry_size"] is True
-    assert "ownership can be verified" in out["note"]
-
-
-def test_settlement_rows_without_size_say_funding_will_stay_provisional():
-    bare = {k: v for k, v in srow().items() if k != "size"}
-    out = fp.probe_transaction_log(TxLog([bare]), "BTCUSDT", now_ms=NOW)
-    assert out["settlement_rows_carry_size"] is False
-    assert "unattributed" in out["note"]
+# Values that must NEVER appear in a default report. Distinctive on purpose.
+SECRETS = {
+    "funding": "13.370042", "size": "-0.0071234", "balance": "99999.123456",
+    "cash_flow": "424242.4242", "fee": "0.0000777", "change": "31337.31337",
+    "id": "ABCDEF0123456789XYZ", "qty": "0.00918273", "price": "81234.56789",
+    "order_id": "ORD-9988776655-FULL",
+}
 
 
-def test_no_settlement_rows_is_said_plainly_and_claims_nothing_about_size():
-    other = [{"id": "9", "type": "TRANSFER_IN", "currency": "USDT",
-              "transactionTime": "1789000000000", "cashBalance": "5"}]
-    out = fp.probe_transaction_log(TxLog([], other), "BTCUSDT", now_ms=NOW)
-    assert out["verdict"] == "NO_SETTLEMENT_ROWS_TO_OBSERVE"
-    assert out["settlement_rows_carry_size"] is None
-    assert "does NOT show whether SETTLEMENT rows carry `size`" in out["note"]
-    assert "TRANSFER_IN" in out["reads"]["any_type"]["types_seen"]
+def srow(i="1", **kw):
+    base = {"id": f"{SECRETS['id']}{i}", "symbol": "BTCUSDT",
+            "type": "SETTLEMENT", "category": "linear",
+            "funding": SECRETS["funding"], "size": SECRETS["size"],
+            "currency": "USDT", "transactionTime": str(NOW - 2 * DAY),
+            "cashBalance": SECRETS["balance"], "cashFlow": SECRETS["cash_flow"],
+            "fee": SECRETS["fee"], "change": SECRETS["change"],
+            "feeRate": "0.0001"}
+    base.update(kw)
+    return base
 
 
-def test_balances_and_cash_flow_are_never_printed():
-    out = fp.probe_transaction_log(TxLog([srow()]), "BTCUSDT", now_ms=NOW)
-    text = repr(out["reads"]["settlement"]["samples"])
-    assert "cashBalance" not in text and "9850.75" not in text
-    assert "cashFlow" not in text and "change" not in text
-    # but their PRESENCE is reported as a key, with no value
-    assert "cashBalance" in out["reads"]["settlement"]["key_presence"]
+def other_row(i="9", **kw):
+    base = {"id": f"T{i}", "symbol": "BTCUSDT", "type": "TRADE",
+            "category": "spot", "funding": "", "size": "0.1",
+            "currency": "BTC", "transactionTime": str(NOW - 3 * DAY),
+            "cashBalance": SECRETS["balance"], "fee": SECRETS["fee"]}
+    base.update(kw)
+    return base
 
 
-def test_an_unreadable_log_is_an_error_not_an_empty_answer_and_only_gets():
-    log = TxLog([srow()], fail=["settlement"])
-    out = fp.probe_transaction_log(log, "BTCUSDT", now_ms=NOW)
-    assert "error" in out["reads"]["settlement"]
-    assert out["verdict"] == "NO_SETTLEMENT_ROWS_TO_OBSERVE"
-    assert {(m, e) for m, e, _ in log.calls} == {
-        ("GET", "/v5/account/transaction-log")}
-    assert all(p["endTime"] - p["startTime"] < 7 * 86_400_000
-               for _, _, p in log.calls)
+class Log:
+    """A scripted, cursor-paginated transaction log.
+
+    `pages[kind]` is a list of pages; a page is the list of rows, an exception,
+    or a raw payload dict. Page n is served for cursor `c<n-1>` (none for the
+    first). Every request is recorded.
+    """
+
+    def __init__(self, settlement=None, any_type=None):
+        self.pages = {"settlement": settlement or [[]],
+                      "any_type": any_type or [[]]}
+        self.requests = []
+        self.calls = []
+
+    def _request(self, method, endpoint, **kw):
+        # Recorded, not asserted: an assertion raised here would be swallowed by
+        # the paginator's error handling and read as an ordinary failed page.
+        self.calls.append((method, endpoint))
+        p = dict(kw["params"])
+        self.requests.append(p)
+        kind = "settlement" if p.get("type") == "SETTLEMENT" else "any_type"
+        pages = self.pages[kind]
+        n = 0 if not p.get("cursor") else int(p["cursor"][1:]) + 1
+        page = pages[min(n, len(pages) - 1)] if callable(pages) is False else None
+        if isinstance(page, Exception):
+            raise page
+        if isinstance(page, dict):
+            return page
+        more = n + 1 < len(pages)
+        return envelope({"list": page, "nextPageCursor": f"c{n}" if more else ""})
+
+
+def run(log, **kw):
+    return fp.probe_transaction_log(log, "BTCUSDT", now_ms=NOW, **kw)
+
+
+# --- P0: complete cursor pagination ---------------------------------------
+
+
+class TestEveryCursorIsFollowed:
+    def test_all_pages_of_both_queries_are_read_and_counted(self):
+        log = Log(settlement=[[srow("1"), srow("2")], [srow("3")], [srow("4")]],
+                  any_type=[[other_row("1")], [other_row("2")]])
+        out = run(log)
+        s, a = out["reads"]["settlement"], out["reads"]["any_type"]
+        assert (s["pages"], s["rows"], s["complete"]) == (3, 4, True)
+        assert (a["pages"], a["rows"], a["complete"]) == (2, 2, True)
+        assert out["complete"] is True and out["verdict"] == "SETTLEMENT_ROWS_OBSERVED"
+
+    def test_the_response_cursor_is_sent_back_as_the_next_requests_cursor(self):
+        log = Log(settlement=[[srow("1")], [srow("2")], [srow("3")]])
+        run(log)
+        settle = [r for r in log.requests if r.get("type") == "SETTLEMENT"]
+        assert [r.get("cursor") for r in settle] == [None, "c0", "c1"]
+
+    def test_field_counts_cover_every_page_not_just_the_first(self):
+        log = Log(settlement=[[srow("1")], [srow("2", size="")], [srow("3")]])
+        out = run(log)
+        size = out["reads"]["settlement"]["size"]
+        assert size["with_direction"] == 2 and size["present"] == 2
+        assert out["settlement_rows_carry_size"] is False   # one row has none
+
+
+class TestIncompleteIsNeverSuccess:
+    @pytest.mark.parametrize("pages,why", [
+        ([[srow("1")], RuntimeError("log down")], "request failed"),
+        ([{"retCode": 0, "result": None}], "no result object"),
+        ([{"retCode": 0, "result": {"nextPageCursor": ""}}], "carries no list"),
+        ([{"retCode": 0, "result": {"list": "nope"}}], "carries no list"),
+        ([{"retCode": 0, "result": {"list": [srow("1"), "x"]}}], "not an object"),
+        ([{"retCode": 0, "result": {"list": [], "nextPageCursor": 7}}],
+         "non-string cursor"),
+    ])
+    def test_a_bad_page_makes_the_whole_observation_incomplete(self, pages, why):
+        out = run(Log(settlement=pages))
+        assert out["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
+        assert out["complete"] is False
+        assert out["settlement_rows_carry_size"] is None
+        assert why in json.dumps(out["errors"])
+        assert out["reads"]["settlement"]["complete"] is False
+
+    def test_a_repeated_cursor_is_refused_not_looped(self):
+        class Loop(Log):
+            def _request(self, method, endpoint, **kw):
+                self.requests.append(dict(kw["params"]))
+                return envelope({"list": [srow(str(len(self.requests)))],
+                                 "nextPageCursor": "same"})
+        log = Loop()
+        out = run(log)
+        assert out["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
+        assert "cursor repeated" in json.dumps(out["errors"])
+        assert len(log.requests) < 12                       # it stopped
+
+    def test_exhausting_the_page_bound_is_incomplete_not_a_short_success(self):
+        class Endless(Log):
+            def _request(self, method, endpoint, **kw):
+                self.requests.append(dict(kw["params"]))
+                n = len(self.requests)
+                if n > 60:                    # fail fast, never hang CI
+                    raise AssertionError("pagination ran past its own bound")
+                return envelope({"list": [srow(str(n))],
+                                 "nextPageCursor": f"cursor-{n}"})
+        out = run(Endless(), max_pages=5)
+        assert out["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
+        assert "did not finish within 5 pages" in json.dumps(out["errors"])
+        assert out["reads"]["settlement"]["pages"] == 5
+
+    def test_a_failure_on_a_later_page_does_not_pass_off_the_first_page(self):
+        out = run(Log(settlement=[[srow("1"), srow("2")], RuntimeError("boom")]))
+        assert out["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
+        assert out["settlement_rows_carry_size"] is None
+        assert "nothing here is a claim about the whole log" in out["note"]
+
+    def test_an_empty_log_that_ENDED_is_different_from_one_that_failed(self):
+        ok = run(Log())
+        assert ok["verdict"] == "NO_SETTLEMENT_ROWS_TO_OBSERVE" and ok["complete"]
+        bad = run(Log(settlement=[RuntimeError("down")]))
+        assert bad["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
+
+
+class TestOverlapAndIdentity:
+    def test_a_row_returned_twice_by_overlapping_windows_is_one_row(self):
+        row = srow("1")
+        log = Log(settlement=[[row, srow("2"), dict(row)]])
+        s = run(log)["reads"]["settlement"]
+        assert s["rows"] == 2 and s["duplicates_collapsed"] == 1
+
+    def test_distinct_rows_that_share_an_id_are_both_kept_and_reported(self):
+        a = srow("1")
+        b = dict(a, funding="-4.5", transactionTime=str(NOW - 9 * 3_600_000))
+        s = run(Log(settlement=[[a, b]]))["reads"]["settlement"]
+        assert s["rows"] == 2 and s["duplicates_collapsed"] == 0
+        assert s["id"]["ids_shared_by_distinct_rows"] == 1
+
+    def test_multi_window_reads_overlap_by_a_millisecond_and_stay_under_7_days(self):
+        log = Log()
+        out = run(log, days=20)
+        assert out["windows"] == len(txlog_windows(NOW - 20 * DAY + 60_000, NOW)) == 3
+        settle = [r for r in log.requests if r.get("type") == "SETTLEMENT"]
+        assert all(r["endTime"] - r["startTime"] < 7 * DAY for r in settle)
+        for prev, nxt in zip(settle, settle[1:]):
+            assert nxt["startTime"] == prev["endTime"]          # no gap
+
+
+class TestThePaginatorItself:
+    def test_it_returns_rows_in_order_and_marks_completion(self):
+        pages = iter([envelope({"list": [{"a": 1}], "nextPageCursor": "x"}),
+                      envelope({"list": [{"a": 2}], "nextPageCursor": ""})])
+        res = read_log_pages(lambda p: next(pages), {})
+        assert res.complete and [r["a"] for r in res.rows] == [1, 2]
+
+    def test_production_funding_reader_refuses_partial_logs(self):
+        class V:
+            calls = 0
+
+            def _request(self, method, endpoint, **kw):
+                V.calls += 1
+                if V.calls == 1:
+                    return envelope({"list": [], "nextPageCursor": "c0"})
+                raise RuntimeError("down")
+        broker = CarryBroker(client=V(), sequence_source=lambda *a: 0,
+                             order_gate=lambda: (False, "ro"))
+        with pytest.raises(PairIncident):
+            broker.get_funding_payments("BTCUSDT", 0, 5_000)
+
+
+# --- P1: privacy ----------------------------------------------------------
+
+
+def all_text(obj):
+    return json.dumps(obj, sort_keys=True, default=str)
+
+
+class TestNoPrivateAmountsByDefault:
+    def log(self):
+        return Log(settlement=[[srow("1"), srow("2")]],
+                   any_type=[[other_row("1"), srow("3")]])
+
+    def test_the_default_log_report_discloses_no_forbidden_value(self):
+        text = all_text(run(self.log()))
+        for name, value in SECRETS.items():
+            assert value not in text, f"default report leaked {name}"
+        # fragments of the secret values must not leak either
+        for fragment in ("13.370", "0.0071", "99999", "424242", "31337"):
+            assert fragment not in text, fragment
+        assert "raw_samples" not in text
+
+    def test_presence_and_parseability_are_still_provable(self):
+        out = run(self.log())
+        s = out["reads"]["settlement"]
+        assert s["rows"] == 2
+        assert s["funding"] == {"present": 2, "parseable": 2, "positive": 2,
+                                "negative": 0, "zero": 0}
+        assert s["size"]["with_direction"] == 2 and s["size"]["short"] == 2
+        assert s["key_presence"]["cashBalance"] == 2     # presence only
+        assert s["id"]["distinct"] == 2 and s["id"]["length_min"] > 10
+        assert s["currencies"] == ["USDT"] and s["types_seen"] == ["SETTLEMENT"]
+        assert s["transactionTime"]["parseable"] == 2
+        assert out["settlement_rows_carry_size"] is True
+
+    def test_unparseable_values_are_visible_as_present_but_not_parseable(self):
+        log = Log(settlement=[[srow("1", funding="n/a", size="x")]])
+        s = run(log)["reads"]["settlement"]
+        assert s["funding"]["present"] == 1 and s["funding"]["parseable"] == 0
+        assert s["size"]["present"] == 1 and s["size"]["with_direction"] == 0
+        assert run(log)["settlement_rows_carry_size"] is False
+
+    def test_raw_samples_are_opt_in_truncate_ids_and_never_show_balances(self):
+        text = all_text(run(self.log(), raw_samples=True))
+        assert SECRETS["funding"] in text and SECRETS["size"] in text   # asked for
+        assert SECRETS["id"] not in text                        # never a full id
+        assert "ABCDEF..." in text
+        for never in ("balance", "cash_flow", "fee", "change"):
+            assert SECRETS[never] not in text
+
+    def test_the_order_probe_default_has_no_amounts_prices_or_ids(self):
+        class Orders:
+            def _request(self, method, endpoint, **kw):
+                assert (method, endpoint) == ("GET", "/v5/order/history")
+                return envelope({"list": [{
+                    "orderId": SECRETS["order_id"], "side": "Buy",
+                    "orderType": "Market", "orderStatus": "Filled",
+                    "cumExecQty": SECRETS["qty"], "avgPrice": SECRETS["price"],
+                    "cumFeeDetail": {"BTC": SECRETS["fee"]}}]})
+        out = fp.probe(Orders(), "BTCUSDT")
+        text = all_text(out)
+        for name in ("qty", "price", "fee", "order_id"):
+            assert SECRETS[name] not in text, name
+        o = out["orders"][0]
+        assert o["has_cumFeeDetail"] and o["parsed_known"]
+        assert o["fee_currencies"] == ["BTC"] and o["parsed_source"] == "cumFeeDetail"
+        raw = all_text(fp.probe(Orders(), "BTCUSDT", raw_samples=True))
+        assert SECRETS["fee"] in raw and SECRETS["order_id"] not in raw
+
+    def test_an_unparsed_real_fee_shape_is_surfaced_not_hidden(self):
+        class Orders:
+            def _request(self, method, endpoint, **kw):
+                rows = [{"orderId": "o", "side": "Buy", "cumExecQty": "1",
+                         "cumFeeDetail": "surprise"}]
+                return envelope({"list": rows if kw["params"]["category"]
+                                 == "spot" else []})
+        out = fp.probe(Orders(), "BTCUSDT")
+        assert out["parsed_unknown"] == 1 and out["orders"][0]["parsed_known"] is False
+        assert out["orders"][0]["fee_fields_present"] == ["cumFeeDetail"]
+
+
+# --- guards ---------------------------------------------------------------
+
+
+class TestReadOnlyAndGuarded:
+    def test_it_only_ever_issues_gets_to_the_transaction_log(self):
+        log = Log(settlement=[[srow("1")], [srow("2")]], any_type=[[other_row()]])
+        run(log, days=20)
+        assert log.calls, "the probe made no request"
+        assert set(log.calls) == {("GET", "/v5/account/transaction-log")}
+
+    def test_the_order_probe_only_ever_issues_gets_to_order_history(self):
+        calls = []
+
+        class Orders:
+            def _request(self, method, endpoint, **kw):
+                calls.append((method, endpoint))
+                return envelope({"list": []})
+        fp.probe(Orders(), "BTCUSDT")
+        assert set(calls) == {("GET", "/v5/order/history")}
+
+    def test_the_real_command_line_refuses_a_contradictory_environment(self):
+        env = {"PATH": os.environ["PATH"], "HOME": "/tmp",
+               "BYBIT_VENUE": "testnet", "USE_TESTNET": "0",
+               "BYBIT_API_KEY": "k", "BYBIT_API_SECRET": "s"}
+        proc = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(HERE), "tools",
+                                          "fee_payload_probe.py"), "--funding"],
+            env=env, capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 3 and "PREFLIGHT_REFUSED" in proc.stdout
+        assert "Traceback" not in proc.stderr
+
+    def test_days_out_of_range_is_refused(self):
+        assert fp.main(["--days", "0"]) == 3
+        assert fp.main(["--days", "91"]) == 3
