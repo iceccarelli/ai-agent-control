@@ -43,9 +43,19 @@ def build_report(db_path: str) -> Dict[str, Any]:
             out["carry"] = {
                 # NO_FILLS first: "every fee confirmed" is vacuously true of a
                 # book that never traded, and must not be printed as a result.
-                "status": ("NO_FILLS" if st["fills"] == 0 else
-                           "REALISED" if st["fees_confirmed"]
-                           else "PROVISIONAL_FEES_INCOMPLETE"),
+                # REALISED needs BOTH sides of the net observed: every fee
+                # stated by the venue AND every funding payment a venue row.
+                "status": (
+                    "NO_FILLS" if (st["net_basis"] == "no_fills"
+                                   or st["fills"] == 0) else
+                    "PROVISIONAL_FEES_INCOMPLETE"
+                    if not st["fees_confirmed"] else
+                    "PROVISIONAL_FUNDING_UNVERIFIED"
+                    if not st["funding_confirmed"] else "REALISED"),
+                "funding_venue_usd": st["funding_venue_usd"],
+                "funding_estimated_usd": st["funding_estimated_usd"],
+                "funding_unattributed": st["funding_unattributed"],
+                "funding_unread": st["funding_unread"],
                 "entries": st["entries"], "funding_usd": st["funding_usd"],
                 "fees_usd": st["fees_usd"], "borrow_usd": st["borrow_usd"],
                 "realised_usd": st["realised_usd"], "net_usd": st["net_usd"],

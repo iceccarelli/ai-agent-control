@@ -54,3 +54,20 @@ def test_a_book_that_never_traded_is_NO_FILLS_not_REALISED(tmp_path):
     report = carry_report.build_report(db)
     assert report["carry"]["status"] == "NO_FILLS"
     assert L.Journal().statement()["net_basis"] == "no_fills"
+
+
+def test_estimated_or_unread_funding_blocks_REALISED(tmp_path):
+    """Fees can all be venue-stated while the income line is still the
+    engine's own number; that is not a realised result."""
+    import ledger as L
+    from test_carry_fee_truth import MARK, build, modern, open_the_hedge
+    _v, journal, engine = build(modern)
+    open_the_hedge(engine)
+    L.funding(journal, ms=journal.entries[-1].ms + 1, ref="est", usd=3.0)
+    db = str(tmp_path / "est.db")
+    store = StateStore(db)
+    store.save_ledger(journal.to_rows())
+    store.close()
+    c = carry_report.build_report(db)["carry"]
+    assert c["status"] == "PROVISIONAL_FUNDING_UNVERIFIED"
+    assert c["funding_estimated_usd"] == 3.0 and c["funding_venue_usd"] == 0.0

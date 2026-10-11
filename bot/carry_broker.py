@@ -56,8 +56,9 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import venue_fees
 
@@ -731,6 +732,115 @@ class CarryBroker:
                 out.append((rate * 1e4, stamp))
         out.sort(key=lambda entry: entry[1])
         return out
+
+    #: Bybit's transaction log refuses a window longer than 7 days.
+    _TXLOG_WINDOW_MS = 7 * 24 * 3600 * 1000 - 1
+    #: The log is documented as holding up to two years. A request reaching back
+    #: further cannot be answered completely, so it is REFUSED, not clipped.
+    _TXLOG_MAX_SPAN_MS = 730 * 24 * 3600 * 1000
+    _TXLOG_PAGE = 50
+    _TXLOG_MAX_PAGES = 40
+
+    def get_funding_payments(self, symbol: str, start_ms: int,
+                             end_ms: Optional[int] = None
+                             ) -> List[Dict[str, Any]]:
+        """Funding the VENUE paid or charged this account, settled rows only.
+
+        `GET /v5/account/transaction-log` (Unified accounts), `type=SETTLEMENT`.
+        Each row's `funding` is signed: positive means RECEIVED, negative means
+        PAID (documented as the opposite of `execFee`). Returned as
+        `{id, ms, usd, currency, size, symbol}`, oldest first, for `symbol`
+        only. `size` is the venue's own position size on the row, which is what
+        lets the ledger check the payment belongs to the book.
+
+        Raises when anything is unreadable or a funding amount is malformed:
+        a partial list would book some settlements and silently drop others,
+        and an unreadable payment is not a payment of zero. The caller dedupes
+        on `id`, so re-reading an overlapping window is safe.
+        """
+        end = int(end_ms if end_ms is not None else time.time() * 1000)
+        start = int(start_ms)
+        if end - start > self._TXLOG_MAX_SPAN_MS:
+            # Silently clipping would return a partial history that looks whole.
+            raise PairIncident(
+                f"funding requested back to {start} but the transaction log "
+                f"holds at most {self._TXLOG_MAX_SPAN_MS // 86_400_000} days; "
+                "the payments before that cannot be read, and a partial list "
+                "is not returned")
+        out: List[Dict[str, Any]] = []
+        window_start = start
+        while True:
+            window_end = min(window_start + self._TXLOG_WINDOW_MS, end)
+            cursor: Optional[str] = None
+            for _page in range(self._TXLOG_MAX_PAGES):
+                params: Dict[str, Any] = {
+                    "accountType": "UNIFIED", "category": LINEAR,
+                    "type": "SETTLEMENT", "startTime": window_start,
+                    "endTime": window_end, "limit": self._TXLOG_PAGE}
+                if cursor:
+                    params["cursor"] = cursor
+                result = self.client._request(
+                    "GET", "/v5/account/transaction-log", signed=True,
+                    params=params)
+                body = self._v5_result(result)
+                rows = body.get("list")
+                if rows is None:
+                    raise PairIncident(
+                        "the transaction log carries no list; funding "
+                        "payments are unreadable, not absent")
+                for row in rows:
+                    parsed = self._funding_row(row, symbol)
+                    if parsed is not None:
+                        out.append(parsed)
+                cursor = body.get("nextPageCursor") or None
+                if not cursor:
+                    break
+            else:
+                raise PairIncident(
+                    "transaction-log pagination did not terminate; refusing "
+                    "to book a partial list of funding payments")
+            if window_end >= end:
+                break
+            # The next window STARTS at this one's last millisecond. The docs do
+            # not say whether endTime is inclusive, so adjacent windows must
+            # overlap by one ms or a row exactly on the boundary could fall in
+            # neither. The caller dedupes by payment identity.
+            window_start = window_end
+        # Overlapping windows (and pages) can return the same row twice; one
+        # payment is one record.
+        unique = {(r["id"], r["ms"], r["usd"]): r for r in out}
+        return sorted(unique.values(), key=lambda r: (r["ms"], r["id"]))
+
+    @staticmethod
+    def _funding_row(row: Dict[str, Any], symbol: str
+                     ) -> Optional[Dict[str, Any]]:
+        if str(row.get("symbol", "")) != symbol:
+            return None
+        # The request filters server-side, but a row of any other type is not a
+        # settlement whatever its fields say: never trust the filter alone.
+        if "type" in row and str(row.get("type")) != "SETTLEMENT":
+            return None
+        raw = row.get("funding")
+        if raw is None or str(raw).strip() == "":
+            return None                       # a TRADE row: no funding on it
+        try:
+            usd = float(raw)
+            stamp = int(row["transactionTime"])
+            ident = str(row["id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"funding row is malformed ({exc!r}): {row!r}") from exc
+        if not math.isfinite(usd) or not ident:
+            raise PairIncident(f"funding row is unusable: {row!r}")
+        size = None
+        if str(row.get("size", "")).strip() != "":
+            try:
+                size = float(row["size"])
+            except (TypeError, ValueError):
+                size = None
+        return {"id": ident, "ms": stamp, "usd": usd, "symbol": symbol,
+                "currency": str(row.get("currency", "")).upper() or None,
+                "size": size}
 
     def get_perp_position(self, symbol: str) -> float:
         """Size of the perp position at the venue, in base units. 0 when flat.
