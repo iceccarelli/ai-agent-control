@@ -78,3 +78,79 @@ def test_the_real_command_line_refuses_a_contradictory_environment():
         env=env, capture_output=True, text=True, timeout=60)
     assert proc.returncode == 3 and "PREFLIGHT_REFUSED" in proc.stdout
     assert "Traceback" not in proc.stderr
+
+
+# --- the transaction-log shape probe ---------------------------------------
+
+
+class TxLog:
+    def __init__(self, settlement=(), other=(), fail=()):
+        self.settlement, self.other = list(settlement), list(other)
+        self.fail, self.calls = set(fail), []
+
+    def _request(self, method, endpoint, **kw):
+        self.calls.append((method, endpoint, dict(kw["params"])))
+        p = kw["params"]
+        if "settlement" in self.fail and p.get("type") == "SETTLEMENT":
+            raise RuntimeError("log down")
+        if p.get("type") == "SETTLEMENT":
+            return envelope({"list": self.settlement, "nextPageCursor": ""})
+        return envelope({"list": self.other + self.settlement,
+                         "nextPageCursor": "c1"})
+
+
+def srow(**kw):
+    base = {"id": "1", "symbol": "BTCUSDT", "type": "SETTLEMENT",
+            "funding": "0.01", "size": "-0.001", "currency": "USDT",
+            "transactionTime": "1790000000000", "category": "linear",
+            "cashBalance": "9850.75", "change": "0.01", "cashFlow": "0"}
+    base.update(kw)
+    return base
+
+
+NOW = 1_791_000_000_000
+
+
+def test_settlement_rows_with_size_say_ownership_can_be_verified():
+    out = fp.probe_transaction_log(TxLog([srow(), srow(id="2")]), "BTCUSDT",
+                                   now_ms=NOW)
+    assert out["verdict"] == "SETTLEMENT_ROWS_OBSERVED"
+    assert out["settlement_rows_carry_size"] is True
+    assert "ownership can be verified" in out["note"]
+
+
+def test_settlement_rows_without_size_say_funding_will_stay_provisional():
+    bare = {k: v for k, v in srow().items() if k != "size"}
+    out = fp.probe_transaction_log(TxLog([bare]), "BTCUSDT", now_ms=NOW)
+    assert out["settlement_rows_carry_size"] is False
+    assert "unattributed" in out["note"]
+
+
+def test_no_settlement_rows_is_said_plainly_and_claims_nothing_about_size():
+    other = [{"id": "9", "type": "TRANSFER_IN", "currency": "USDT",
+              "transactionTime": "1789000000000", "cashBalance": "5"}]
+    out = fp.probe_transaction_log(TxLog([], other), "BTCUSDT", now_ms=NOW)
+    assert out["verdict"] == "NO_SETTLEMENT_ROWS_TO_OBSERVE"
+    assert out["settlement_rows_carry_size"] is None
+    assert "does NOT show whether SETTLEMENT rows carry `size`" in out["note"]
+    assert "TRANSFER_IN" in out["reads"]["any_type"]["types_seen"]
+
+
+def test_balances_and_cash_flow_are_never_printed():
+    out = fp.probe_transaction_log(TxLog([srow()]), "BTCUSDT", now_ms=NOW)
+    text = repr(out["reads"]["settlement"]["samples"])
+    assert "cashBalance" not in text and "9850.75" not in text
+    assert "cashFlow" not in text and "change" not in text
+    # but their PRESENCE is reported as a key, with no value
+    assert "cashBalance" in out["reads"]["settlement"]["key_presence"]
+
+
+def test_an_unreadable_log_is_an_error_not_an_empty_answer_and_only_gets():
+    log = TxLog([srow()], fail=["settlement"])
+    out = fp.probe_transaction_log(log, "BTCUSDT", now_ms=NOW)
+    assert "error" in out["reads"]["settlement"]
+    assert out["verdict"] == "NO_SETTLEMENT_ROWS_TO_OBSERVE"
+    assert {(m, e) for m, e, _ in log.calls} == {
+        ("GET", "/v5/account/transaction-log")}
+    assert all(p["endTime"] - p["startTime"] < 7 * 86_400_000
+               for _, _, p in log.calls)
