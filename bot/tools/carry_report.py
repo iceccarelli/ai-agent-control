@@ -41,7 +41,10 @@ def build_report(db_path: str) -> Dict[str, Any]:
             journal = _ledger.Journal.from_rows(json.loads(row["payload"] or "[]"))
             st = journal.statement()
             out["carry"] = {
-                "status": ("REALISED" if st["fees_confirmed"]
+                # NO_FILLS first: "every fee confirmed" is vacuously true of a
+                # book that never traded, and must not be printed as a result.
+                "status": ("NO_FILLS" if st["fills"] == 0 else
+                           "REALISED" if st["fees_confirmed"]
                            else "PROVISIONAL_FEES_INCOMPLETE"),
                 "entries": st["entries"], "funding_usd": st["funding_usd"],
                 "fees_usd": st["fees_usd"], "borrow_usd": st["borrow_usd"],

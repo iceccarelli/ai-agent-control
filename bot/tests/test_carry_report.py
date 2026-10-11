@@ -41,3 +41,16 @@ def test_it_opens_the_database_read_only(tmp_path):
     before = os.path.getmtime(db)
     carry_report.build_report(db)
     assert os.path.getmtime(db) == before
+
+
+def test_a_book_that_never_traded_is_NO_FILLS_not_REALISED(tmp_path):
+    """The vacuous-truth trap: zero fills means zero unconfirmed fees, and that
+    printed REALISED on a real Codespaces run in which nothing was ordered."""
+    import ledger as L
+    db = str(tmp_path / "idle.db")
+    store = StateStore(db)
+    store.save_ledger(L.Journal().to_rows())
+    store.close()
+    report = carry_report.build_report(db)
+    assert report["carry"]["status"] == "NO_FILLS"
+    assert L.Journal().statement()["net_basis"] == "no_fills"

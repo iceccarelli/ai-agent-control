@@ -245,10 +245,14 @@ class Journal:
             "fees_confirmed": all(
                 fee_counts[k] == 0 for k in ("unknown", "unresolved",
                                              "unlabelled")),
-            "net_basis": ("confirmed" if all(
-                fee_counts[k] == 0 for k in ("unknown", "unresolved",
-                                             "unlabelled"))
-                else "provisional_fees_incomplete"),
+            # Fills in the period. "All fees confirmed" is vacuously true of a
+            # book that never traded; it must not read as a result.
+            "fills": sum(fee_counts.values()),
+            "net_basis": ("no_fills" if sum(fee_counts.values()) == 0 else (
+                "confirmed" if all(
+                    fee_counts[k] == 0 for k in ("unknown", "unresolved",
+                                                 "unlabelled"))
+                else "provisional_fees_incomplete")),
             # Quantities, for reconciliation. NOT valued: an open position's
             # mark is an estimate and this file holds what is not estimated.
             "open_perp_qty": acc[PERP].qty,
