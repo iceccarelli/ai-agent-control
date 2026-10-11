@@ -197,6 +197,13 @@ def build_cash_ledger(
         "n_fills": int(n_fills),
         "pnl_usd": round(float(pnl), 8),
         "fees_usd": round(float(fees), 8),
+        # These two figures are NOT venue-confirmed: fees are a static taker
+        # rate x notional and pnl is gross less that estimate. The venue's own
+        # fee rows (cumFeeDetail) are booked by the engine in the state DB; this
+        # file does not read them.
+        "fees_basis": "static_estimate",
+        "pnl_basis": "gross_minus_estimated_fees",
+        "fees_confirmed": False,
         "flat": bool(flat),
         "allows_live": False,
         "note": (

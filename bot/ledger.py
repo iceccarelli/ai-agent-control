@@ -46,7 +46,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import venue_fees
 
 #: The chart of accounts, spelled once. An account not in here is refused
 #: rather than created: a typo must not silently open a ledger nothing
@@ -85,6 +87,18 @@ class Line:
     qty: float = 0.0
 
 
+#: Entry kinds that move money because an order filled, and so carry a fee.
+FILL_KINDS = ("spot_buy", "spot_sell", "perp_open", "perp_close")
+
+#: How well the fee on a fill entry is known. "" means the entry is not a fill.
+#:   confirmed  - the venue stated it and every currency was booked by name
+#:   unknown    - the venue did not state it; 0 is booked and FLAGGED, not trusted
+#:   unresolved - stated, but a currency has no booking treatment (e.g. MNT);
+#:                the resolvable part is booked, the rest is flagged
+#:   unlabelled - a bare number with no currency evidence (legacy callers)
+FEE_STATUSES = ("", "confirmed", "unknown", "unresolved", "unlabelled")
+
+
 @dataclass
 class Entry:
     ms: int
@@ -92,6 +106,12 @@ class Entry:
     ref: str
     lines: List[Line]
     memo: str = ""
+    #: Persisted with the entry. A counter on the Journal object is lost on
+    #: restart; this is not, so a rebuilt journal cannot claim its fees were
+    #: confirmed when they were not.
+    fee_status: str = ""
+    #: The raw venue fee (components, source field) the booking was made from.
+    fee_raw: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -105,10 +125,13 @@ class Journal:
 
     def __init__(self) -> None:
         self.entries: List[Entry] = []
-        #: Fills whose fee the venue did not state. Counted, never booked as
-        #: zero: an unknown cost that reads as $0.00 is a cost that has left
-        #: the ledger. Phase D resolves each one against the venue.
-        self.unknown_fees: int = 0
+
+    @property
+    def unknown_fees(self) -> int:
+        """Fills whose fee the venue did not state, derived from the entries
+        (so it survives a reload). Each is booked at 0 and FLAGGED: an unknown
+        cost that reads as $0.00 is a cost that has left the ledger."""
+        return sum(1 for e in self.entries if e.fee_status == "unknown")
 
     # -- writing ----------------------------------------------------------
 
@@ -116,6 +139,10 @@ class Journal:
         """Validate, then append. A refusal writes nothing at all."""
         if not entry.lines:
             raise LedgerError(f"entry {entry.ref!r} has no lines")
+        if entry.fee_status not in FEE_STATUSES:
+            raise LedgerError(
+                f"entry {entry.ref!r} has fee_status {entry.fee_status!r}; "
+                f"expected one of {FEE_STATUSES}")
         total = 0.0
         for line in entry.lines:
             if line.account not in ACCOUNTS:
@@ -172,11 +199,14 @@ class Journal:
         """
         acc = {name: Balance() for name in ACCOUNTS}
         total_usd = 0.0
+        fee_counts = {k: 0 for k in FEE_STATUSES if k}
         for entry in self.entries:
             if from_ms is not None and entry.ms < from_ms:
                 continue
             if to_ms is not None and entry.ms > to_ms:
                 continue
+            if entry.fee_status:
+                fee_counts[entry.fee_status] += 1
             for line in entry.lines:
                 acc[line.account].usd += line.usd
                 acc[line.account].qty += line.qty
@@ -205,7 +235,20 @@ class Journal:
             "borrow_usd": borrow_usd,
             "realised_usd": realised_usd,
             "net_usd": net,
-            "fees_unknown": self.unknown_fees,
+            "fees_unknown": fee_counts["unknown"],
+            "fees_unresolved": fee_counts["unresolved"],
+            "fees_unlabelled": fee_counts["unlabelled"],
+            # Every fill's fee venue-stated and booked by currency. Only then is
+            # `net_usd` a confirmed figure; otherwise it is PROVISIONAL and the
+            # fees it nets are a lower bound (unknown/unresolved fees booked as
+            # 0), never to be quoted as realised net economics.
+            "fees_confirmed": all(
+                fee_counts[k] == 0 for k in ("unknown", "unresolved",
+                                             "unlabelled")),
+            "net_basis": ("confirmed" if all(
+                fee_counts[k] == 0 for k in ("unknown", "unresolved",
+                                             "unlabelled"))
+                else "provisional_fees_incomplete"),
             # Quantities, for reconciliation. NOT valued: an open position's
             # mark is an estimate and this file holds what is not estimated.
             "open_perp_qty": acc[PERP].qty,
@@ -222,6 +265,7 @@ class Journal:
 
     def to_rows(self) -> List[Dict[str, Any]]:
         return [{"ms": e.ms, "kind": e.kind, "ref": e.ref, "memo": e.memo,
+                 "fee_status": e.fee_status, "fee_raw": e.fee_raw,
                  "lines": [{"account": l.account, "usd": l.usd, "qty": l.qty}
                            for l in e.lines]} for e in self.entries]
 
@@ -232,9 +276,15 @@ class Journal:
         so a row edited in the file fails here instead of in a statement."""
         journal = cls()
         for row in rows:
+            kind = str(row["kind"])
+            # A row written before fee provenance existed says nothing about its
+            # fee: on a fill it is "unlabelled", never "confirmed".
+            status = str(row.get("fee_status") if "fee_status" in row
+                         else ("unlabelled" if kind in FILL_KINDS else ""))
             journal.post(Entry(
-                ms=int(row["ms"]), kind=str(row["kind"]),
+                ms=int(row["ms"]), kind=kind,
                 ref=str(row["ref"]), memo=str(row.get("memo", "")),
+                fee_status=status, fee_raw=dict(row.get("fee_raw") or {}),
                 lines=[Line(str(l["account"]), float(l["usd"]),
                             float(l.get("qty", 0.0)))
                        for l in row["lines"]]))
@@ -257,7 +307,8 @@ def opening_balance(journal: Journal, *, ms: int, btc: float,
 
 
 def spot_buy(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
-             fee_btc: float) -> Entry:
+             fee_btc: float, fee_usdt: float = 0.0, fee_status: str = "",
+             fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
     """A spot BUY, whose fee the venue takes in BTC (INVENTORY F3).
 
     The wallet ends up holding `qty - fee_btc` while the perp leg hedges
@@ -269,12 +320,15 @@ def spot_buy(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
     return journal.post(Entry(ms=ms, kind="spot_buy", ref=ref, lines=[
         Line(BTC, qty * price, qty=qty),
         Line(USDT, -qty * price, qty=-qty * price),
-        Line(FEES, fee_usd),
-        Line(BTC, -fee_usd, qty=-fee_btc)]))
+        Line(FEES, fee_usd + fee_usdt),
+        Line(BTC, -fee_usd, qty=-fee_btc),
+        Line(USDT, -fee_usdt, qty=-fee_usdt)],
+        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
 
 
 def spot_sell(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
-              cost_basis: float, fee_usd: float) -> Entry:
+              cost_basis: float, fee_usd: float, fee_status: str = "",
+              fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
     proceeds = qty * price
     cost = qty * cost_basis
     return journal.post(Entry(ms=ms, kind="spot_sell", ref=ref, lines=[
@@ -282,22 +336,27 @@ def spot_sell(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
         Line(BTC, -cost, qty=-qty),
         Line(REALISED, -(proceeds - cost)),
         Line(FEES, fee_usd),
-        Line(USDT, -fee_usd, qty=-fee_usd)]))
+        Line(USDT, -fee_usd, qty=-fee_usd)],
+        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
 
 
 def perp_open(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
-              fee_usd: float) -> Entry:
+              fee_usd: float, fee_status: str = "",
+              fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
     """Open (or add to) the short. A derivative costs no principal, so the
     only money that moves is the fee; the position is carried as a quantity."""
     return journal.post(Entry(ms=ms, kind="perp_open", ref=ref, lines=[
         Line(PERP, 0.0, qty=-qty),
         Line(FEES, fee_usd),
         Line(USDT, -fee_usd, qty=-fee_usd)],
-        memo=f"short {qty} @ {price}"))
+        memo=f"short {qty} @ {price}",
+        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
 
 
 def perp_close(journal: Journal, *, ms: int, ref: str, qty: float,
-               price: float, entry_price: float, fee_usd: float) -> Entry:
+               price: float, entry_price: float, fee_usd: float,
+               fee_status: str = "",
+               fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
     """Buy the short back. A short gains when the price falls."""
     realised = qty * (entry_price - price)
     return journal.post(Entry(ms=ms, kind="perp_close", ref=ref, lines=[
@@ -306,7 +365,8 @@ def perp_close(journal: Journal, *, ms: int, ref: str, qty: float,
         Line(REALISED, -realised),
         Line(FEES, fee_usd),
         Line(USDT, -fee_usd, qty=-fee_usd)],
-        memo=f"cover {qty} @ {price} from {entry_price}"))
+        memo=f"cover {qty} @ {price} from {entry_price}",
+        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
 
 
 def funding(journal: Journal, *, ms: int, ref: str, usd: float) -> Entry:
@@ -452,10 +512,8 @@ class LedgerBroker:
             link = str(result.get("order_link_id") or "")
             if link:
                 booked = float(result.get("filled_qty", 0.0) or 0.0)
-                raw = result.get("fee")
                 self._resting[link] = (
-                    side, max(0.0, booked),
-                    None if raw is None else abs(float(raw)))
+                    side, max(0.0, booked), self._fee_set_of(result))
         return result
 
     def cancel_order(self, *, symbol: str, order_link_id: str, product: str):
@@ -493,19 +551,72 @@ class LedgerBroker:
         if extra <= 0:
             return result
 
-        raw = result.get("fee")
-        if raw is None or booked_fee is None:
-            # A cumulative fee that is unknown, or a booked one that was, has
-            # no honest difference. Unknown stays unknown: `_book` counts it.
-            fee_extra = None
-        else:
-            fee_extra = max(0.0, abs(float(raw)) - booked_fee)
+        # The fee on the increment is the difference of two CUMULATIVE venue
+        # figures, taken per currency. Unknown on either side, or a currency
+        # that went backwards, has no honest difference: it stays unknown.
+        total_fee = self._fee_set_of(result)
+        fee_extra = total_fee.minus(booked_fee)
+        if fee_extra.known and any(c.amount < -1e-12
+                                   for c in fee_extra.components):
+            fee_extra = venue_fees.UNKNOWN_FEES
         self._book({"filled_qty": extra,
                     "avg_price": result.get("avg_price", 0.0),
                     "order_link_id": f"{order_link_id}+cancel",
-                    "fee": fee_extra},
+                    "fee_detail": fee_extra.to_dict()},
                    side=side, product=product)
         return result
+
+    @staticmethod
+    def _fee_set_of(result) -> "venue_fees.FeeSet":
+        """The fee on a broker result as a FeeSet.
+
+        `fee_detail` (what `CarryBroker` supplies) is authoritative. A result
+        with only a bare `fee` number has no currency evidence, so it is
+        wrapped with an UNNAMED currency: it can be carried and differenced
+        but never confirmed. No `fee` at all is unknown.
+        """
+        detail = result.get("fee_detail")
+        if detail is not None:
+            return venue_fees.FeeSet.from_dict(detail)
+        raw = result.get("fee")
+        if raw is None:
+            return venue_fees.UNKNOWN_FEES
+        return venue_fees.FeeSet(
+            (venue_fees.VenueFee(abs(float(raw)), None),), True, "bare_float")
+
+    def _resolve_fee(self, result, *, side: str, product: str
+                     ) -> Tuple[float, float, str, Dict[str, Any]]:
+        """``(fee_btc, fee_usdt, status, raw)`` for one fill.
+
+        BTC is booked as BTC only where the venue takes it from the coin
+        received (a spot BUY); USDT is the journal's USD. Any other coin has no
+        booking treatment here, so it is left out and the entry is flagged
+        ``unresolved`` rather than converted on a guess.
+        """
+        fees = self._fee_set_of(result)
+        raw = fees.to_dict()
+        if not fees.known:
+            return 0.0, 0.0, "unknown", raw
+        if fees.source == "bare_float":
+            # No currency evidence: keep the historical convention (spot BUY fee
+            # in BTC, everything else in USD) but say it is only a convention.
+            amount = fees.components[0].amount
+            if product == "spot" and side == "Buy":
+                return amount, 0.0, "unlabelled", raw
+            return 0.0, amount, "unlabelled", raw
+        fee_btc = fee_usdt = 0.0
+        unresolved = False
+        for comp in fees.components:
+            if comp.amount == 0.0:
+                continue
+            if comp.currency == "USDT":
+                fee_usdt += comp.amount
+            elif comp.currency == "BTC" and product == "spot" and side == "Buy":
+                fee_btc += comp.amount
+            else:
+                unresolved = True
+        return fee_btc, fee_usdt, ("unresolved" if unresolved
+                                   else "confirmed"), raw
 
     def _book(self, result, *, side: str, product: str,
               allow_missing_side: bool = False) -> None:
@@ -519,14 +630,8 @@ class LedgerBroker:
             raise LedgerError("a fill with no side cannot be booked")
         if not side:
             return
-        raw_fee = result.get("fee")
-        if raw_fee is None:
-            # UNKNOWN, not zero. Counted so the statement says how many costs
-            # the venue never stated, and Phase D resolves each against it.
-            self.journal.unknown_fees += 1
-            fee = 0.0
-        else:
-            fee = abs(float(raw_fee))
+        fee_btc, fee_usdt, status, fee_raw = self._resolve_fee(
+            result, side=side, product=product)
         ref = str(result.get("order_link_id") or f"fill:{self._ms()}")
         ms = int(self._ms())
 
@@ -536,7 +641,8 @@ class LedgerBroker:
                 # back in BTC; converting it here is what keeps the BTC
                 # balance equal to what the wallet will show.
                 spot_buy(self.journal, ms=ms, ref=ref, qty=qty, price=price,
-                         fee_btc=fee)
+                         fee_btc=fee_btc, fee_usdt=fee_usdt,
+                         fee_status=status, fee_raw=fee_raw)
                 filled = self._spot_qty + qty
                 self._spot_entry = (
                     price if self._spot_entry is None else
@@ -566,7 +672,8 @@ class LedgerBroker:
                 entry = (self._spot_entry if self._spot_entry is not None
                          else price)
                 spot_sell(self.journal, ms=ms, ref=ref, qty=qty, price=price,
-                          cost_basis=entry, fee_usd=fee)
+                          cost_basis=entry, fee_usd=fee_usdt,
+                          fee_status=status, fee_raw=fee_raw)
                 self._spot_qty = max(0.0, self._spot_qty - qty)
                 if self._spot_qty <= 0:
                     self._spot_entry = None
@@ -574,7 +681,7 @@ class LedgerBroker:
 
         if side == "Sell":
             perp_open(self.journal, ms=ms, ref=ref, qty=qty, price=price,
-                      fee_usd=fee)
+                      fee_usd=fee_usdt, fee_status=status, fee_raw=fee_raw)
             filled = self._perp_qty + qty
             self._perp_entry = (
                 price if self._perp_entry is None else
@@ -583,7 +690,8 @@ class LedgerBroker:
         else:
             entry = self._perp_entry if self._perp_entry is not None else price
             perp_close(self.journal, ms=ms, ref=ref, qty=qty, price=price,
-                       entry_price=entry, fee_usd=fee)
+                       entry_price=entry, fee_usd=fee_usdt,
+                       fee_status=status, fee_raw=fee_raw)
             self._perp_qty = max(0.0, self._perp_qty - qty)
             if self._perp_qty <= 0:
                 self._perp_entry = None

@@ -83,9 +83,26 @@ class PerformanceReport:
     days: int = 0
     insufficient_data: bool = True
     notes: Tuple[str, ...] = ()
+    #: Trades whose BOTH fee legs are venue-confirmed vs the rest (estimated,
+    #: caller-supplied, unknown, or legacy rows with no provenance). ``net_pnl``
+    #: above counts every trade; it is realised net economics only when
+    #: ``fees_confirmed`` is True.
+    fee_confirmed_trades: int = 0
+    fee_unconfirmed_trades: int = 0
+
+    @property
+    def fees_confirmed(self) -> bool:
+        return self.trades > 0 and self.fee_unconfirmed_trades == 0
 
     def summary(self) -> str:
         """One-line human summary that never overstates what is known."""
+        text = self._summary_core()
+        if self.trades and not self.fees_confirmed:
+            text += (f" [PROVISIONAL: {self.fee_unconfirmed_trades} of "
+                     f"{self.trades} trades carry unconfirmed fees]")
+        return text
+
+    def _summary_core(self) -> str:
         if self.insufficient_data:
             return (
                 f"{self.trades} trades — insufficient for ratio metrics "
@@ -170,9 +187,19 @@ class PerformanceAnalytics:
         by_day = self._daily_returns(trades)
         days = len(by_day)
 
+        confirmed = sum(
+            1 for t in trades
+            if t.get("entry_fee_realized") and t.get("exit_fee_realized"))
+        if confirmed < n:
+            notes.append(
+                f"{n - confirmed} of {n} trades have fees that are estimated, "
+                "caller-supplied, unknown or unlabelled; net PnL and "
+                "expectancy are PROVISIONAL, not realised")
         report_kwargs: Dict[str, Any] = dict(
             trades=n, wins=len(wins), losses=len(losses),
             gross_pnl=gross, fees=fees, net_pnl=net, days=days,
+            fee_confirmed_trades=confirmed,
+            fee_unconfirmed_trades=n - confirmed,
         )
 
         if n < MIN_TRADES_FOR_RATIOS:
