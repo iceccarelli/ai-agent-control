@@ -56,7 +56,8 @@ class TestBookingFromVenuePayments:
         out = L.book_funding_payments(
             j, [pay(1, 4.25), pay(2, -1.5, ms=T0 + 2 * 3_600_000)], ms=T0 + 10)
         st = j.statement()
-        assert out == {"booked": 2, "duplicate": 0, "unattributed": 0}
+        assert out == {"booked": 2, "duplicate": 0, "unattributed": 0,
+                       "id_collisions": 0}
         assert st["funding_usd"] == pytest.approx(2.75)
         assert st["funding_venue_usd"] == pytest.approx(2.75)
         assert st["funding_estimated_usd"] == 0.0
@@ -235,7 +236,9 @@ def tick(bot, k, after_open=False):
 
 class TestTickBooksWhatTheVenuePaid:
     def _hedged(self, tmp_path):
-        venue, journal, engine = build(modern)
+        # The hedge opens two hours ago on the journal's clock, so a settlement
+        # half an hour after it is a realistic, unambiguous one.
+        venue, journal, engine = build(modern, clock_offset_ms=-2 * 3_600_000)
         store = StateStore(str(tmp_path / "carry.db"))
         bot = make_bot(venue, journal, engine, store)
         for k in (1, 2, 3):
@@ -247,7 +250,7 @@ class TestTickBooksWhatTheVenuePaid:
     def test_funding_comes_from_the_settlement_row_not_the_engine_estimate(
             self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
-        t = journal.entries[-1].ms - 5
+        t = journal.entries[-1].ms + 1_800_000
         venue.settlements.append(row(1, "0.1234", t, size=str(-qty)))
         tick(bot, 4, after_open=True)
         st = journal.statement()
@@ -264,7 +267,7 @@ class TestTickBooksWhatTheVenuePaid:
     def test_polling_again_does_not_double_book(self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
         venue.settlements.append(
-            row(1, "0.1234", journal.entries[-1].ms - 5, size=str(-qty)))
+            row(1, "0.1234", journal.entries[-1].ms + 1_800_000, size=str(-qty)))
         tick(bot, 4, after_open=True)
         tick(bot, 5)
         tick(bot, 6)
@@ -274,7 +277,7 @@ class TestTickBooksWhatTheVenuePaid:
     def test_someone_elses_perp_on_the_same_account_is_not_booked(self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
         venue.settlements.append(row(
-            1, "7.0", journal.entries[-1].ms - 5, size=str(-qty * 10)))
+            1, "7.0", journal.entries[-1].ms + 1_800_000, size=str(-qty * 10)))
         tick(bot, 4)
         st = journal.statement()
         assert st["funding_usd"] == 0.0 and st["funding_unattributed"] == 1
@@ -291,7 +294,7 @@ class TestTickBooksWhatTheVenuePaid:
     def test_the_truth_survives_a_restart(self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
         venue.settlements.append(
-            row(1, "0.1234", journal.entries[-1].ms - 5, size=str(-qty)))
+            row(1, "0.1234", journal.entries[-1].ms + 1_800_000, size=str(-qty)))
         tick(bot, 4)
         live = journal.statement()
         store.close()
@@ -308,3 +311,190 @@ class TestTickBooksWhatTheVenuePaid:
                        StateStore(str(tmp_path / "idle.db")))
         tick(bot, 1)
         assert venue.txlog_calls == []
+
+
+# ---------------------------------------------------------------------------
+# review findings: identity, ownership, completeness, windows, report
+# ---------------------------------------------------------------------------
+
+H = 3_600_000
+
+
+class TestIdentityIsNotJustTheVenueId:
+    def test_two_distinct_payments_sharing_an_id_are_both_booked(self):
+        j = hedged_journal()
+        a = pay("X", 1.0, ms=T0 + H)
+        b = pay("X", 2.0, ms=T0 + 9 * H)               # same id, different payment
+        out = L.book_funding_payments(j, [a, b], ms=T0 + 10)
+        assert out["booked"] == 2 and out["id_collisions"] == 1
+        assert j.statement()["funding_usd"] == pytest.approx(3.0)
+
+    def test_and_re_polling_both_books_neither_again(self):
+        j = hedged_journal()
+        a, b = pay("X", 1.0, ms=T0 + H), pay("X", 2.0, ms=T0 + 9 * H)
+        L.book_funding_payments(j, [a, b], ms=T0 + 10)
+        again = L.book_funding_payments(j, [a, b], ms=T0 + 20)
+        assert again["duplicate"] == 2 and again["booked"] == 0
+        assert j.statement()["funding_usd"] == pytest.approx(3.0)
+        rebuilt = L.Journal.from_rows(j.to_rows())                # and a restart
+        assert L.book_funding_payments(
+            rebuilt, [a, b], ms=T0 + 30)["duplicate"] == 2
+
+
+class TestOwnershipIsConservative:
+    def test_a_row_with_no_position_size_is_not_claimed(self):
+        j = hedged_journal()
+        out = L.book_funding_payments(j, [pay(1, 5.0, size=None)], ms=T0 + 10)
+        assert out["unattributed"] == 1 and j.statement()["funding_usd"] == 0.0
+        assert "no position size" in j.entries[-1].memo
+
+    def test_a_long_of_the_same_size_is_not_our_short(self):
+        j = hedged_journal()
+        out = L.book_funding_payments(j, [pay(1, 5.0, size=+0.5)], ms=T0 + 10)
+        assert out["unattributed"] == 1 and j.statement()["funding_usd"] == 0.0
+
+    def test_a_position_that_changed_within_a_minute_of_the_settlement_is_ambiguous(
+            self):
+        j = hedged_journal()                              # opened at T0
+        out = L.book_funding_payments(
+            j, [pay(1, 5.0, ms=T0 + 30_000)], ms=T0 + 40_000)
+        assert out["unattributed"] == 1
+        assert "within a minute" in j.entries[-1].memo
+
+    def test_ownership_is_judged_at_the_settlement_not_at_the_poll(self):
+        """The book closes AFTER the settlement and polls much later: the
+        payment is still the book's, because it held the position then."""
+        j = hedged_journal()
+        L.perp_close(j, ms=T0 + 5 * H, ref="c1", qty=0.5, price=MARK,
+                     entry_price=MARK, fee_usd=1.0, fee_status="confirmed")
+        out = L.book_funding_payments(
+            j, [pay(1, 5.0, ms=T0 + H)], ms=T0 + 6 * H)
+        assert out["booked"] == 1
+        # and a payment dated after the close is not the book's
+        out = L.book_funding_payments(
+            j, [pay(2, 5.0, ms=T0 + 5 * H + 10 * 60_000, size=0.0)],
+            ms=T0 + 7 * H)
+        assert out["unattributed"] == 1
+
+
+class TestACompleteAnswerIsRequired:
+    def prints(self):
+        return [T0 + 8 * H, T0 + 16 * H]
+
+    def test_a_settlement_held_through_with_no_row_is_flagged_once(self):
+        j = hedged_journal()
+        now = T0 + 30 * H
+        assert L.check_funding_completeness(j, self.prints(), now_ms=now) == 2
+        assert L.check_funding_completeness(j, self.prints(), now_ms=now) == 0
+        st = j.statement()
+        assert st["funding_unread"] == 2 and st["funding_confirmed"] is False
+        assert st["net_basis"] == "provisional_funding_unverified"
+
+    def test_a_matching_venue_row_satisfies_it(self):
+        j = hedged_journal()
+        L.book_funding_payments(
+            j, [pay(1, 1.0, ms=T0 + 8 * H), pay(2, 1.0, ms=T0 + 16 * H)],
+            ms=T0 + 17 * H)
+        assert L.check_funding_completeness(
+            j, self.prints(), now_ms=T0 + 30 * H) == 0
+        assert j.statement()["funding_confirmed"] is True
+
+    def test_nothing_is_owed_while_flat_or_inside_the_delivery_grace(self):
+        flat = L.Journal()
+        assert L.check_funding_completeness(
+            flat, self.prints(), now_ms=T0 + 30 * H) == 0
+        j = hedged_journal()
+        assert L.check_funding_completeness(
+            j, self.prints(), now_ms=T0 + 8 * H + 3_600_000) == 0
+
+
+class TestTheReaderLeavesNoGaps:
+    @staticmethod
+    def venue(rows, *, end_inclusive):
+        class V(Log):
+            def _request(self, method, endpoint, **kw):
+                if endpoint != "/v5/account/transaction-log":
+                    return super()._request(method, endpoint, **kw)
+                p = kw["params"]
+                self.params.append(dict(p))
+                hi = (lambda t: t <= p["endTime"]) if end_inclusive else (
+                    lambda t: t < p["endTime"])
+                return envelope({"list": [
+                    r for r in self.rows
+                    if p["startTime"] <= int(r["transactionTime"]) and
+                    hi(int(r["transactionTime"]))], "nextPageCursor": ""})
+        return V(rows)
+
+    @pytest.mark.parametrize("end_inclusive", [True, False])
+    def test_a_row_exactly_on_a_window_boundary_is_found_under_either_semantics(
+            self, end_inclusive):
+        day = 86_400_000
+        boundary = 7 * day - 1                    # the first window's last ms
+        c = self.venue([row(1, "0.5", boundary)], end_inclusive=end_inclusive)
+        got = broker(c).get_funding_payments("BTCUSDT", 0, 15 * day)
+        assert [g["id"] for g in got] == ["S1"]    # found, and not twice
+
+    def test_a_request_older_than_the_log_is_refused_not_clipped(self):
+        c = Log([])
+        with pytest.raises(PairIncident):
+            broker(c).get_funding_payments("BTCUSDT", 0, 800 * 86_400_000)
+        assert c.params == []                      # nothing partial was fetched
+
+    def test_a_row_that_is_not_a_settlement_is_ignored_whatever_it_carries(self):
+        c = Log([row(1, "9.0", 1_000, type="TRANSFER_IN"),
+                 row(2, "0.5", 2_000)])
+        got = broker(c).get_funding_payments("BTCUSDT", 0, 5_000)
+        assert [g["id"] for g in got] == ["S2"]
+
+
+class TestTheReportNeverSaysRealisedWithoutFills:
+    def test_only_an_unattributed_payment_is_not_REALISED(self, tmp_path):
+        from tools import carry_report
+        j = L.Journal()
+        L.book_funding_payments(j, [pay(1, 5.0)], ms=T0)     # no position at all
+        db = str(tmp_path / "u.db")
+        store = StateStore(db)
+        store.save_ledger(j.to_rows())
+        store.close()
+        assert carry_report.build_report(db)["carry"]["status"] == "NO_FILLS"
+
+
+class TestTickFlagsAMissingSettlementAndBooksTheLateRow:
+    def _hedged_ten_hours_ago(self, tmp_path):
+        venue, journal, engine = build(modern, clock_offset_ms=-10 * H)
+        store = StateStore(str(tmp_path / "carry.db"))
+        bot = make_bot(venue, journal, engine, store)
+        for k in (1, 2, 3):
+            tick(bot, k)
+        qty = abs(journal.balances()[L.PERP].qty)
+        opened = journal.entries[-1].ms
+        venue.prints = [opened + H]                 # one settlement, 9h ago
+        return venue, journal, bot, store, qty, opened
+
+    def test_no_row_for_a_held_settlement_makes_the_statement_provisional(
+            self, tmp_path):
+        venue, journal, bot, store, qty, opened = self._hedged_ten_hours_ago(
+            tmp_path)
+        tick(bot, 4)
+        st = journal.statement()
+        assert st["funding_unread"] == 1 and st["funding_confirmed"] is False
+
+    def test_a_late_row_is_still_booked_but_the_gap_stays_on_record(
+            self, tmp_path):
+        venue, journal, bot, store, qty, opened = self._hedged_ten_hours_ago(
+            tmp_path)
+        tick(bot, 4)
+        venue.settlements.append(row(1, "0.5", opened + H, size=str(-qty)))
+        tick(bot, 5)
+        st = journal.statement()
+        assert st["funding_venue_usd"] == pytest.approx(0.5)
+        assert st["funding_unread"] == 1 and st["funding_confirmed"] is False
+
+    def test_with_its_row_present_nothing_is_flagged(self, tmp_path):
+        venue, journal, bot, store, qty, opened = self._hedged_ten_hours_ago(
+            tmp_path)
+        venue.settlements.append(row(1, "0.5", opened + H, size=str(-qty)))
+        tick(bot, 4)
+        st = journal.statement()
+        assert st["funding_unread"] == 0 and st["funding_confirmed"] is True
+        assert st["net_basis"] == "confirmed"

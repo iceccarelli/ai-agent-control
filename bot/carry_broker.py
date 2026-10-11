@@ -735,8 +735,9 @@ class CarryBroker:
 
     #: Bybit's transaction log refuses a window longer than 7 days.
     _TXLOG_WINDOW_MS = 7 * 24 * 3600 * 1000 - 1
-    #: Longest gap this will walk back over in one call (8 windows).
-    _TXLOG_MAX_SPAN_MS = 8 * 7 * 24 * 3600 * 1000
+    #: The log is documented as holding up to two years. A request reaching back
+    #: further cannot be answered completely, so it is REFUSED, not clipped.
+    _TXLOG_MAX_SPAN_MS = 730 * 24 * 3600 * 1000
     _TXLOG_PAGE = 50
     _TXLOG_MAX_PAGES = 40
 
@@ -758,15 +759,17 @@ class CarryBroker:
         on `id`, so re-reading an overlapping window is safe.
         """
         end = int(end_ms if end_ms is not None else time.time() * 1000)
-        start = max(int(start_ms), end - self._TXLOG_MAX_SPAN_MS)
-        if start > int(start_ms):
-            logger.warning(
-                "funding window clipped to the last %d days: payments before "
-                "%d cannot be read in one call", self._TXLOG_MAX_SPAN_MS //
-                86_400_000, start)
+        start = int(start_ms)
+        if end - start > self._TXLOG_MAX_SPAN_MS:
+            # Silently clipping would return a partial history that looks whole.
+            raise PairIncident(
+                f"funding requested back to {start} but the transaction log "
+                f"holds at most {self._TXLOG_MAX_SPAN_MS // 86_400_000} days; "
+                "the payments before that cannot be read, and a partial list "
+                "is not returned")
         out: List[Dict[str, Any]] = []
         window_start = start
-        while window_start <= end:
+        while True:
             window_end = min(window_start + self._TXLOG_WINDOW_MS, end)
             cursor: Optional[str] = None
             for _page in range(self._TXLOG_MAX_PAGES):
@@ -796,14 +799,26 @@ class CarryBroker:
                 raise PairIncident(
                     "transaction-log pagination did not terminate; refusing "
                     "to book a partial list of funding payments")
-            window_start = window_end + 1
-        out.sort(key=lambda r: (r["ms"], r["id"]))
-        return out
+            if window_end >= end:
+                break
+            # The next window STARTS at this one's last millisecond. The docs do
+            # not say whether endTime is inclusive, so adjacent windows must
+            # overlap by one ms or a row exactly on the boundary could fall in
+            # neither. The caller dedupes by payment identity.
+            window_start = window_end
+        # Overlapping windows (and pages) can return the same row twice; one
+        # payment is one record.
+        unique = {(r["id"], r["ms"], r["usd"]): r for r in out}
+        return sorted(unique.values(), key=lambda r: (r["ms"], r["id"]))
 
     @staticmethod
     def _funding_row(row: Dict[str, Any], symbol: str
                      ) -> Optional[Dict[str, Any]]:
         if str(row.get("symbol", "")) != symbol:
+            return None
+        # The request filters server-side, but a row of any other type is not a
+        # settlement whatever its fields say: never trust the filter alone.
+        if "type" in row and str(row.get("type")) != "SETTLEMENT":
             return None
         raw = row.get("funding")
         if raw is None or str(raw).strip() == "":

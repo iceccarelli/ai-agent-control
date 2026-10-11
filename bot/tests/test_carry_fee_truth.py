@@ -57,6 +57,9 @@ class FeeVenue(FakeClient):
         #: Settlement rows the venue "has paid", as the documented transaction-
         #: log shape. `txlog_fail` makes the endpoint unreadable.
         self.settlements = []
+        #: Public settled-funding print times (ms), served at
+        #: /v5/market/funding/history for the completeness check.
+        self.prints = []
         self.txlog_fail = False
         self.txlog_calls = []
 
@@ -94,6 +97,11 @@ class FeeVenue(FakeClient):
             row = self.orders.get(params.get("orderLinkId"))
             return envelope({"list": [] if row is None else [
                 {k: v for k, v in row.items() if not k.startswith("_")}]})
+        if endpoint == "/v5/market/funding/history":
+            self.calls.append((method, endpoint, params, body))
+            return envelope({"list": [
+                {"fundingRate": "0.0003", "fundingRateTimestamp": str(t)}
+                for t in self.prints]})
         if endpoint == "/v5/account/transaction-log":
             self.calls.append((method, endpoint, params, body))
             self.txlog_calls.append(dict(params))
@@ -137,7 +145,7 @@ def with_mnt(product, side, filled):
     return d
 
 
-def build(fees, *, style="taker", post_only=None):
+def build(fees, *, style="taker", post_only=None, clock_offset_ms=0):
     venue = FeeVenue(fees, post_only=post_only)
     broker = CarryBroker(client=venue, sequence_source=lambda p, s, w: 7,
                          order_gate=lambda: (True, "TEST_VENUE"))
@@ -147,7 +155,7 @@ def build(fees, *, style="taker", post_only=None):
         # Real epoch time, strictly increasing: the funding window is derived
         # from journal stamps, so a fake clock that counts 1000, 2000... would
         # test a world that does not exist.
-        clock[0] = max(clock[0] + 1, int(time.time() * 1000))
+        clock[0] = max(clock[0] + 1, int(time.time() * 1000) + clock_offset_ms)
         return clock[0]
 
     ledger_broker = L.LedgerBroker(broker, journal, ms=ms, spot_symbol="BTCUSDT")

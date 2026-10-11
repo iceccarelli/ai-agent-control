@@ -876,7 +876,10 @@ class TradingBot:
                    if e.basis in ("venue", "unattributed")]
         first_open = next((e.ms for e in perp_fills if e.kind == "perp_open"),
                           perp_fills[0].ms)
-        since = (max(seen_ms) - 3_600_000) if seen_ms else first_open - 60_000
+        # A day of overlap, not an hour: a settlement row delivered late (the
+        # docs warn of delays) must still fall inside the next poll's window.
+        # Re-reading rows already booked is free: they dedupe by identity.
+        since = (max(seen_ms) - 86_400_000) if seen_ms else first_open - 60_000
         try:
             payments = self.carry.broker.get_funding_payments(
                 symbol, max(0, since), now_ms)
@@ -893,6 +896,23 @@ class TradingBot:
         except _ledger.LedgerError:
             logger.exception("funding payments could not be booked")
             return
+        # Completeness: every settlement the hedge was held through must have a
+        # venue row. The public print times say when settlements happened.
+        try:
+            prints = [ms for _bps, ms in
+                      self.carry.broker.get_funding_history(symbol, 200)]
+            missing = _ledger.check_funding_completeness(
+                journal, prints, now_ms=now_ms)
+            if missing:
+                logger.error(
+                    "funding: %d settlement(s) the hedge was held through have "
+                    "NO payment row at the venue; flagged, statement is "
+                    "provisional", missing)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("funding completeness not checked this poll (%s)", exc)
+        if booked["id_collisions"]:
+            logger.warning("funding: %d payment(s) reused a venue id; booked "
+                           "separately", booked["id_collisions"])
         if booked["booked"] or booked["unattributed"]:
             logger.warning(
                 "carry funding: booked %d venue payment(s), %d unattributed; "

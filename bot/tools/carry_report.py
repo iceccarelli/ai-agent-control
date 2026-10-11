@@ -46,7 +46,8 @@ def build_report(db_path: str) -> Dict[str, Any]:
                 # REALISED needs BOTH sides of the net observed: every fee
                 # stated by the venue AND every funding payment a venue row.
                 "status": (
-                    "NO_FILLS" if st["net_basis"] == "no_fills" else
+                    "NO_FILLS" if (st["net_basis"] == "no_fills"
+                                   or st["fills"] == 0) else
                     "PROVISIONAL_FEES_INCOMPLETE"
                     if not st["fees_confirmed"] else
                     "PROVISIONAL_FUNDING_UNVERIFIED"

@@ -437,9 +437,68 @@ def funding(journal: Journal, *, ms: int, ref: str, usd: float,
 SETTLE_CURRENCY = "USDT"
 
 #: Journal stamps are the bot's clock at booking, a little after the real fill.
-#: A settlement is attributed to the book if the book held a position within
-#: this much of it; the venue's own `size` on the row is the real check.
+#: Ownership of a settlement is only claimed when the book's position was the
+#: SAME through this whole span on both sides of it; a fill booked inside it
+#: makes ownership ambiguous, and an ambiguous payment is not claimed.
 ATTRIBUTION_SLACK_MS = 60_000
+
+#: A settlement that should have a venue row is "missing" once this long has
+#: passed, so an ordinary delivery delay does not raise a false alarm.
+MISSING_GRACE_MS = 6 * 3_600_000
+
+#: How closely a settlement row's time must match a public funding print.
+PRINT_MATCH_TOLERANCE_MS = 5 * 60_000
+
+
+def _perp_qty_at(journal: Journal, ms: int) -> float:
+    """Signed perp quantity (short is negative) per entries stamped by `ms`."""
+    return journal.balances(to_ms=int(ms))[PERP].qty
+
+
+def _payment_identity(p: Dict[str, Any]) -> tuple:
+    """What makes two settlement rows the SAME payment.
+
+    The venue's `id` alone is not trusted to be unambiguous: two distinct
+    payments that reused an id must both be booked, and a re-poll of one must
+    still match itself. Identity is therefore the whole observed record.
+    """
+    return (str(p["id"]), int(p["ms"]), float(p["usd"]),
+            str(p.get("symbol") or ""))
+
+
+def _entry_identity(e: Entry) -> Optional[tuple]:
+    r = e.fee_raw
+    if e.basis not in ("venue", "unattributed") or "venue_id" not in r:
+        return None
+    return (str(r["venue_id"]), int(r["venue_ms"]), float(r["venue_usd"]),
+            str(r.get("symbol") or ""))
+
+
+def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
+    """Why this settlement is NOT provably the book's, or None if it is.
+
+    Conservative by construction: every check below can only REFUSE to claim.
+    """
+    if p.get("currency") != SETTLE_CURRENCY:
+        return (f"paid in {p.get('currency')!r}, not {SETTLE_CURRENCY}; "
+                "no conversion basis")
+    t = int(p["ms"])
+    before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
+    after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
+    if abs(after - before) > DUST[PERP]:
+        return ("the book's position changed within a minute of this "
+                "settlement; ownership cannot be established")
+    if abs(after) <= DUST[PERP]:
+        return "the book held no perp position at this settlement"
+    size = p.get("size")
+    if size is None:
+        return ("the venue row carries no position size, so the payment "
+                "cannot be matched to the book's position")
+    # SIGNED: a short is negative. A long of the same size is not ours.
+    if abs(float(size) - after) > max(1e-9, 0.01 * abs(after)):
+        return (f"venue position {float(size)} != the book's {after}; part of "
+                "it is not this book's")
+    return None
 
 
 def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
@@ -448,42 +507,39 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
 
     ``payments`` are settlement rows from the account transaction log:
     ``{id, ms, usd, currency, size, symbol}`` with ``usd`` signed (positive =
-    received). Rules, in order:
+    received). Rules:
 
-    * a row already in the journal (same ``fund:<id>`` ref) is skipped, so a
-      re-poll, a replay and a restart cannot book it twice;
-    * a row in another currency, or one the book held no position for, or whose
-      venue position size disagrees with the book's quantity, is NOT income of
-      this book: it is posted at $0 as ``unattributed`` with the evidence, so a
-      human sees it and the statement stops claiming confirmation;
+    * a payment already in the journal (same id, time, amount and symbol) is
+      skipped, so a re-poll, a replay and a restart cannot book it twice; a
+      DIFFERENT payment that reuses an id is a new payment and is booked;
+    * a payment the book cannot prove is its own (other coin, no position,
+      position changing around the settlement, no venue size, or a signed size
+      that disagrees with the book's quantity) is posted at $0 as
+      ``unattributed`` with the evidence, so a human sees it and the statement
+      stops claiming confirmation;
     * everything else is booked at the venue's amount.
     """
-    seen = {e.ref for e in journal.entries}
-    out = {"booked": 0, "duplicate": 0, "unattributed": 0}
+    known = {i for i in (_entry_identity(e) for e in journal.entries) if i}
+    used_refs = {e.ref for e in journal.entries}
+    out = {"booked": 0, "duplicate": 0, "unattributed": 0, "id_collisions": 0}
     stamp = max(int(ms), journal.entries[-1].ms if journal.entries else 0)
     for p in sorted(payments, key=lambda r: (int(r["ms"]), str(r["id"]))):
-        ref = f"fund:{p['id']}"
-        if ref in seen:
+        ident = _payment_identity(p)
+        if ident in known:
             out["duplicate"] += 1
             continue
-        seen.add(ref)
+        known.add(ident)
+        ref = f"fund:{p['id']}"
+        if ref in used_refs:
+            # A distinct payment under an id already used: keep both, with a
+            # reference that is unique and reproducible.
+            ref = f"fund:{p['id']}#{int(p['ms'])}:{float(p['usd'])!r}"
+            out["id_collisions"] += 1
+        used_refs.add(ref)
         raw = {"venue_id": str(p["id"]), "venue_ms": int(p["ms"]),
                "venue_usd": float(p["usd"]), "currency": p.get("currency"),
                "size": p.get("size"), "symbol": p.get("symbol")}
-        reason = None
-        if p.get("currency") != SETTLE_CURRENCY:
-            reason = (f"paid in {p.get('currency')!r}, not {SETTLE_CURRENCY}; "
-                      "no conversion basis")
-        else:
-            held = abs(journal.balances(
-                to_ms=int(p["ms"]) + ATTRIBUTION_SLACK_MS)[PERP].qty)
-            size = p.get("size")
-            if held <= DUST[PERP]:
-                reason = "the book held no perp position at this settlement"
-            elif size is not None and abs(abs(float(size)) - held) > max(
-                    1e-9, 0.01 * held):
-                reason = (f"venue position {abs(float(size))} != the book's "
-                          f"{held}; part of it is not this book's")
+        reason = _attribution_problem(journal, p)
         if reason is not None:
             journal.post(Entry(
                 ms=stamp, kind="funding_unattributed", ref=ref,
@@ -496,6 +552,40 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
                     basis="venue", raw=raw)
             out["booked"] += 1
     return out
+
+
+def check_funding_completeness(journal: Journal, print_ms: List[int], *,
+                               now_ms: int) -> int:
+    """Flag settlements the book's position was held through with no venue row.
+
+    ``print_ms`` are the public funding settlement times. Each one the book held
+    a stable position through, and old enough to have been delivered, must have
+    a matching venue payment (booked or unattributed) or it is recorded, once, as
+    ``unread``: a missing PAID-funding row would otherwise overstate income while
+    the statement said confirmed. Returns how many new flags were written.
+    """
+    have = [int(e.fee_raw["venue_ms"]) for e in journal.entries
+            if e.basis in ("venue", "unattributed") and "venue_ms" in e.fee_raw]
+    flagged = {e.ref for e in journal.entries if e.kind == "funding_missing"}
+    stamp = max(int(now_ms), journal.entries[-1].ms if journal.entries else 0)
+    written = 0
+    for t in sorted(int(x) for x in print_ms):
+        if t > now_ms - MISSING_GRACE_MS or f"fundmissing:{t}" in flagged:
+            continue
+        before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
+        after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
+        if abs(before) <= DUST[PERP] and abs(after) <= DUST[PERP]:
+            continue                      # flat on both sides: nothing was owed
+        if any(abs(h - t) <= PRINT_MATCH_TOLERANCE_MS for h in have):
+            continue
+        journal.post(Entry(
+            ms=stamp, kind="funding_missing", ref=f"fundmissing:{t}",
+            lines=[Line(USDT, 0.0), Line(FUNDING, 0.0)],
+            memo=f"the book held a position through the {t} settlement and the "
+                 "venue returned no payment row for it"[:300],
+            basis="unread", fee_raw={"print_ms": t}))
+        written += 1
+    return written
 
 
 def mark_funding_unread(journal: Journal, *, ms: int, why: str) -> None:
