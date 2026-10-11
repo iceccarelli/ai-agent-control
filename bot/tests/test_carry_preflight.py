@@ -107,11 +107,56 @@ def test_the_broker_it_uses_cannot_place_an_order_even_if_asked():
                             product="spot")
 
 
-def test_main_refuses_without_testnet(monkeypatch, capsys):
-    for k in ("USE_TESTNET", "LIVE_TRADING_ACK"):
+@pytest.fixture()
+def clean_env(monkeypatch):
+    """Isolate from the ambient shell: a Codespace may already export
+    BYBIT_VENUE, PAPER_TRADING, LIVE_TRADING_ACK and friends."""
+    for k in ("BYBIT_VENUE", "USE_TESTNET", "PAPER_TRADING", "LIVE_TRADING_ACK",
+              "BOOK_MODE", "CARRY_EXECUTION_MODE", "CARRY_EXECUTION_STYLE",
+              "CARRY_BORROW_APR"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("BYBIT_API_KEY", "k")
     monkeypatch.setenv("BYBIT_API_SECRET", "s")
-    monkeypatch.setenv("USE_TESTNET", "0")
+    return monkeypatch
+
+
+def test_main_refuses_without_testnet(clean_env, capsys):
+    clean_env.setenv("USE_TESTNET", "0")
     assert pf.main([]) == 3
     assert "PREFLIGHT_REFUSED" in capsys.readouterr().out
+
+
+def test_main_refuses_a_contradictory_environment_with_a_reason(clean_env, capsys):
+    """The exact state a Codespace produced: BYBIT_VENUE=testnet exported, then
+    USE_TESTNET=0 set on top. Two sources of truth about the exchange."""
+    clean_env.setenv("BYBIT_VENUE", "testnet")
+    clean_env.setenv("USE_TESTNET", "0")
+    assert pf.main([]) == 3
+    out = capsys.readouterr().out
+    assert "PREFLIGHT_REFUSED" in out and "disagree" in out
+
+
+def test_main_refuses_when_a_live_authorisation_is_present(clean_env, capsys):
+    clean_env.setenv("USE_TESTNET", "1")
+    clean_env.setenv("LIVE_TRADING_ACK", "I_UNDERSTAND")
+    assert pf.main([]) == 3
+    assert "live authorisation" in capsys.readouterr().out
+
+
+def test_the_real_command_line_refuses_a_contradictory_environment_cleanly():
+    """A subprocess, because `config` validates the environment at IMPORT time
+    and an in-process test has already imported it with a clean one."""
+    import json
+    import subprocess
+
+    env = {"PATH": os.environ["PATH"], "HOME": "/tmp",
+           "BYBIT_VENUE": "testnet", "USE_TESTNET": "0",
+           "BYBIT_API_KEY": "k", "BYBIT_API_SECRET": "s"}
+    proc = subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(HERE), "tools",
+                                      "carry_preflight.py")],
+        env=env, capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 3, proc.stderr
+    out = json.loads(proc.stdout)
+    assert out["verdict"] == "PREFLIGHT_REFUSED" and "disagree" in out["reason"]
+    assert "Traceback" not in proc.stderr

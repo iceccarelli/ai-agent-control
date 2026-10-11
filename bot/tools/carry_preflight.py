@@ -140,8 +140,19 @@ def main(argv: List[str] | None = None) -> int:
                          "ledger's perp quantity); default: a throwaway file")
     args = ap.parse_args(argv)
 
-    import config as _config
-    cfg = _config.load()
+    try:
+        # `config` loads (and validates) the environment at IMPORT time, so the
+        # import itself is where a contradictory environment is refused.
+        import config as _config
+        cfg = _config.load()
+    except Exception as exc:  # noqa: BLE001
+        if type(exc).__name__ != "ConfigError":
+            raise
+        # A contradictory or invalid environment (for example BYBIT_VENUE and
+        # USE_TESTNET disagreeing) is a refusal with a reason, not a traceback.
+        print(json.dumps({"verdict": "PREFLIGHT_REFUSED",
+                          "reason": f"configuration refused: {exc}"}))
+        return 3
     if not cfg.USE_TESTNET:
         print(json.dumps({"verdict": "PREFLIGHT_REFUSED",
                           "reason": "USE_TESTNET is not set; this tool is "
