@@ -132,14 +132,11 @@ def run_preflight(*, broker: Any, client: Any, cfg: Any, spot_symbol: str,
     }
 
 
-def main(argv: List[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--db", default=None,
-                    help="state database to compare against (read for the "
-                         "ledger's perp quantity); default: a throwaway file")
-    args = ap.parse_args(argv)
-
+def load_testnet_config():
+    """``(cfg, None)`` for a testnet, non-live environment, else ``(None,
+    (json_text, exit_code))``. Shared by every read-only testnet tool so none
+    of them can be pointed at mainnet or run with a live authorisation.
+    """
     try:
         # `config` loads (and validates) the environment at IMPORT time, so the
         # import itself is where a contradictory environment is refused.
@@ -148,22 +145,35 @@ def main(argv: List[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         if type(exc).__name__ != "ConfigError":
             raise
-        # A contradictory or invalid environment (for example BYBIT_VENUE and
-        # USE_TESTNET disagreeing) is a refusal with a reason, not a traceback.
-        print(json.dumps({"verdict": "PREFLIGHT_REFUSED",
-                          "reason": f"configuration refused: {exc}"}))
-        return 3
+        return None, (json.dumps({
+            "verdict": "PREFLIGHT_REFUSED",
+            "reason": f"configuration refused: {exc}"}), 3)
     if not cfg.USE_TESTNET:
-        print(json.dumps({"verdict": "PREFLIGHT_REFUSED",
-                          "reason": "USE_TESTNET is not set; this tool is "
-                                    "testnet-only and read nothing"}))
-        return 3
+        return None, (json.dumps({
+            "verdict": "PREFLIGHT_REFUSED",
+            "reason": "USE_TESTNET is not set; this tool is testnet-only and "
+                      "read nothing"}), 3)
     armed, _why = _config.is_live_authorized(cfg)
     if armed is True or getattr(cfg, "LIVE_TRADING_ACK", ""):
-        print(json.dumps({"verdict": "PREFLIGHT_REFUSED",
-                          "reason": "a live authorisation is present in this "
-                                    "environment; unset it. Nothing was read"}))
-        return 3
+        return None, (json.dumps({
+            "verdict": "PREFLIGHT_REFUSED",
+            "reason": "a live authorisation is present in this environment; "
+                      "unset it. Nothing was read"}), 3)
+    return cfg, None
+
+
+def main(argv: List[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--db", default=None,
+                    help="state database to compare against (read for the "
+                         "ledger's perp quantity); default: a throwaway file")
+    args = ap.parse_args(argv)
+
+    cfg, refusal = load_testnet_config()
+    if refusal is not None:
+        print(refusal[0])
+        return refusal[1]
 
     import persistence
     from carry_broker import CarryBroker
