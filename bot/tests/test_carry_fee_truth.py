@@ -54,6 +54,11 @@ class FeeVenue(FakeClient):
         self._fees = fees
         self._post_only = post_only      # (first_fill, final_fill) or None
         self.orders = {}
+        #: Settlement rows the venue "has paid", as the documented transaction-
+        #: log shape. `txlog_fail` makes the endpoint unreadable.
+        self.settlements = []
+        self.txlog_fail = False
+        self.txlog_calls = []
 
     def _request(self, method, endpoint, *, params=None, body=None,
                  signed=False, retries=3):
@@ -89,6 +94,19 @@ class FeeVenue(FakeClient):
             row = self.orders.get(params.get("orderLinkId"))
             return envelope({"list": [] if row is None else [
                 {k: v for k, v in row.items() if not k.startswith("_")}]})
+        if endpoint == "/v5/account/transaction-log":
+            self.calls.append((method, endpoint, params, body))
+            self.txlog_calls.append(dict(params))
+            if self.txlog_fail:
+                raise RuntimeError("transaction-log down")
+            rows = [r for r in self.settlements
+                    if params["startTime"] <= int(r["transactionTime"])
+                    <= params["endTime"]]
+            page = int(params.get("cursor") or 0)
+            chunk = rows[page * 2:(page + 1) * 2]          # 2 per page
+            more = (page + 1) * 2 < len(rows)
+            return envelope({"list": chunk,
+                             "nextPageCursor": str(page + 1) if more else ""})
         if endpoint == "/v5/market/tickers":
             self.calls.append((method, endpoint, params, body))
             return envelope({"list": [{
@@ -126,7 +144,10 @@ def build(fees, *, style="taker", post_only=None):
     journal, clock = L.Journal(), [0]
 
     def ms():
-        clock[0] += 1000
+        # Real epoch time, strictly increasing: the funding window is derived
+        # from journal stamps, so a fake clock that counts 1000, 2000... would
+        # test a world that does not exist.
+        clock[0] = max(clock[0] + 1, int(time.time() * 1000))
         return clock[0]
 
     ledger_broker = L.LedgerBroker(broker, journal, ms=ms, spot_symbol="BTCUSDT")

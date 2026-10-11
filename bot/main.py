@@ -183,7 +183,10 @@ class TradingBot:
         #: Funding already posted for the OPEN position, so a tick books only
         #: what is new. Reset when the position closes, because the next one
         #: starts its own accrual at zero.
-        self._carry_booked_funding = 0.0
+        #: The ENGINE's running funding estimate for the open hedge. Compared
+        #: with what the venue paid; never booked.
+        self._carry_estimated_funding = 0.0
+        self._last_funding_poll_ms = 0
         self.cfg = config if config is not None else _config.get_config_object()
         self.store = store if store is not None else StateStore()
         self.client = client if client is not None else BybitClient(
@@ -784,30 +787,15 @@ class TradingBot:
                 mark, spot, (mark / spot - 1.0) * 1e4,
                 view.funding_print_bps, view.funding_print_ms,
                 view.funding_bps, decision.detail or "")
-            # THE LEDGER (0044). Fills book themselves through LedgerBroker;
-            # funding does not pass through the broker at all, so it is
-            # posted here from the number the ENGINE reports rather than
-            # recomputed — 0043 is what recomputing it costs.
+            # THE LEDGER (0044). Fills book themselves through LedgerBroker.
+            # FUNDING is booked from what the VENUE paid (the account's
+            # settlement rows), never from the engine's own rate x qty x mark:
+            # that number is an estimate and the engine says so (its mark is
+            # not the settlement mark). The engine's figure is kept only to
+            # compare against.
             journal = getattr(self, "carry_journal", None)
             if journal is not None:
-                import ledger as _ledger
-
-                collected = float((decision.detail or {}).get("collected", 0.0))
-                booked = collected - getattr(self, "_carry_booked_funding", 0.0)
-                if decision.action == "unwound":
-                    self._carry_booked_funding = 0.0
-                else:
-                    self._carry_booked_funding = collected
-                if abs(booked) > 1e-12:
-                    try:
-                        _ledger.funding(
-                            journal, ms=int(time.time() * 1000),
-                            ref=f"fund:{view.funding_print_ms}", usd=booked)
-                    except _ledger.LedgerError:
-                        # A duplicate stamp or an out-of-order entry. Loud,
-                        # never silent: an unbookable funding payment is a
-                        # statement that will not add up.
-                        logger.exception("funding could not be booked")
+                self._book_carry_funding(journal, symbol, decision)
                 try:
                     self.store.save_ledger(journal.to_rows())
                 except Exception:  # noqa: BLE001
@@ -844,6 +832,75 @@ class TradingBot:
                 continue
             report = self.engine.execute(intent)
             logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
+
+    #: Class-level defaults so a bot built without __init__ (tests, tools) works.
+    _carry_estimated_funding = 0.0
+    _last_funding_poll_ms = 0
+
+    #: How often to read the venue's settlement rows. Funding settles every 8h,
+    #: so a few minutes is more than enough and keeps the call count low.
+    FUNDING_POLL_MS = 300_000
+    #: Keep polling this long after the last perp fill: a settlement row can
+    #: post after the position that earned it has already closed.
+    FUNDING_TAIL_MS = 6 * 3_600_000
+
+    def _book_carry_funding(self, journal: Any, symbol: str,
+                            decision: Any) -> None:
+        """Book funding the venue actually paid, once each, attributed to the book.
+
+        Fails visible: an unreadable venue while a position is open writes an
+        `unread` marker (persisted, so the statement cannot claim confirmed
+        funding), and a payment the book cannot claim is journaled at $0 as
+        `unattributed` with its evidence. Never raises into the loop.
+        """
+        import ledger as _ledger
+
+        collected = float((decision.detail or {}).get("collected", 0.0))
+        self._carry_estimated_funding = (
+            0.0 if decision.action == "unwound" else collected)
+
+        now_ms = int(time.time() * 1000)
+        perp_fills = [e for e in journal.entries
+                      if e.kind in ("perp_open", "perp_close")]
+        if not perp_fills:
+            return
+        open_now = abs(journal.balances()[_ledger.PERP].qty) > _ledger.DUST[
+            _ledger.PERP]
+        if not open_now and now_ms - perp_fills[-1].ms > self.FUNDING_TAIL_MS:
+            return
+        if now_ms - self._last_funding_poll_ms < self.FUNDING_POLL_MS:
+            return
+        self._last_funding_poll_ms = now_ms
+
+        seen_ms = [int(e.fee_raw.get("venue_ms", 0)) for e in journal.entries
+                   if e.basis in ("venue", "unattributed")]
+        first_open = next((e.ms for e in perp_fills if e.kind == "perp_open"),
+                          perp_fills[0].ms)
+        since = (max(seen_ms) - 3_600_000) if seen_ms else first_open - 60_000
+        try:
+            payments = self.carry.broker.get_funding_payments(
+                symbol, max(0, since), now_ms)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("funding could not be read from the venue (%s); not "
+                         "booked, and the statement is marked unverified", exc)
+            try:
+                _ledger.mark_funding_unread(journal, ms=now_ms, why=str(exc))
+            except Exception:  # noqa: BLE001
+                logger.exception("funding-unread marker could not be written")
+            return
+        try:
+            booked = _ledger.book_funding_payments(journal, payments, ms=now_ms)
+        except _ledger.LedgerError:
+            logger.exception("funding payments could not be booked")
+            return
+        if booked["booked"] or booked["unattributed"]:
+            logger.warning(
+                "carry funding: booked %d venue payment(s), %d unattributed; "
+                "venue-observed total $%.4f (engine's estimate for the open "
+                "hedge: $%.4f, NOT booked)", booked["booked"],
+                booked["unattributed"],
+                journal.statement()["funding_venue_usd"],
+                self._carry_estimated_funding)
 
     def _expire_at_horizon(self) -> None:
         """Close any shadow position that has reached HORIZON daily bars.
