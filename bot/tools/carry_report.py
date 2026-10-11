@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""What did a carry run actually book, and how much of it is confirmed?
+
+Reads a state database READ-ONLY (SQLite `mode=ro`) and prints the carry
+journal's statement plus the ordinary-trade fee evidence. It places nothing and
+writes nothing.
+
+The one rule it exists to enforce: a net figure is called REALISED only when
+every fill's fee was venue-stated and booked by currency (`fees_confirmed`).
+Otherwise it says PROVISIONAL and names the counts, so an approximate number
+cannot be quoted as a result.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from typing import Any, Dict, List, Optional
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+
+def build_report(db_path: str) -> Dict[str, Any]:
+    import ledger as _ledger
+
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(db_path)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        out: Dict[str, Any] = {"db": db_path}
+        row = conn.execute(
+            "SELECT payload FROM carry_ledger WHERE id = 1").fetchone() \
+            if _has(conn, "carry_ledger") else None
+        if row is None:
+            out["carry"] = {"status": "NO_CARRY_LEDGER"}
+        else:
+            journal = _ledger.Journal.from_rows(json.loads(row["payload"] or "[]"))
+            st = journal.statement()
+            out["carry"] = {
+                "status": ("REALISED" if st["fees_confirmed"]
+                           else "PROVISIONAL_FEES_INCOMPLETE"),
+                "entries": st["entries"], "funding_usd": st["funding_usd"],
+                "fees_usd": st["fees_usd"], "borrow_usd": st["borrow_usd"],
+                "realised_usd": st["realised_usd"], "net_usd": st["net_usd"],
+                "fees_unknown": st["fees_unknown"],
+                "fees_unresolved": st["fees_unresolved"],
+                "fees_unlabelled": st["fees_unlabelled"],
+                "open_perp_qty": st["open_perp_qty"],
+                "fills": [{"ref": e.ref, "kind": e.kind,
+                           "fee_status": e.fee_status}
+                          for e in journal.entries if e.fee_status],
+            }
+        trades: List[sqlite3.Row] = conn.execute(
+            "SELECT * FROM trades").fetchall() if _has(conn, "trades") else []
+        confirmed = [t for t in trades
+                     if "entry_fee_realized" in t.keys()
+                     and t["entry_fee_realized"] and t["exit_fee_realized"]]
+        out["ordinary_trades"] = {
+            "trades": len(trades),
+            "fees_confirmed_trades": len(confirmed),
+            "fees_unconfirmed_trades": len(trades) - len(confirmed),
+            "realised_net_pnl": sum(t["net_pnl"] for t in confirmed),
+            "unconfirmed_net_pnl": sum(
+                t["net_pnl"] for t in trades if t not in confirmed),
+        }
+        return out
+    finally:
+        conn.close()
+
+
+def _has(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,)).fetchone() is not None
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("db", help="path to the state database")
+    args = ap.parse_args(argv)
+    try:
+        report = build_report(args.db)
+    except FileNotFoundError as exc:
+        print(json.dumps({"error": f"no such database: {exc}"}))
+        return 2
+    print(json.dumps(report, indent=2, sort_keys=True, default=str))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
