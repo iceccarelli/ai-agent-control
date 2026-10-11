@@ -446,7 +446,10 @@ class TestExitCrashRecovery:
 
         r1 = _run(_proc1_exit_fill_crash_before_position_removed, (db_path,))
         assert r1["trades_before_crash"] == 1
-        assert r1["anchor_before_crash"] == pytest.approx(-10.6)
+        # -10 gross, 0.60 apportioned entry-fee estimate and 0.61 exit-fee
+        # estimate (61_000 x 0.01 x 0.001). observe_exits has no venue fee to read,
+        # so the exit leg is a labelled estimate, no longer a silent 0.0.
+        assert r1["anchor_before_crash"] == pytest.approx(-11.21)
 
         r2 = _run(_proc2_exit_fill_recover, (db_path, r1["venue"]))
 

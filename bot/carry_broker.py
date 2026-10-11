@@ -59,6 +59,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+import venue_fees
+
 logger = logging.getLogger(__name__)
 
 #: Quantity differences below this fraction of the leg are venue rounding, not
@@ -96,12 +98,18 @@ class LegFill:
     #: is never 0.0 by default: an unknown fee booked as zero is a cost that
     #: disappears from the ledger.
     fee: Optional[float] = None
+    #: The structured fee (`venue_fees.FeeSet.to_dict()`): every currency the
+    #: venue named, the field that said so, and whether it said anything.
+    #: `fee` above is only its single-currency total for legacy callers; the
+    #: ledger books from THIS, so a BTC amount is never read as USDT.
+    fee_detail: Optional[Dict[str, Any]] = None
     detail: Dict[str, Any] = field(default_factory=dict)
 
     def as_engine_result(self) -> Dict[str, Any]:
         """The shape `CarryEngine._fire` consumes."""
         return {"filled_qty": self.filled_qty, "avg_price": self.avg_price,
-                "order_link_id": self.order_link_id, "fee": self.fee}
+                "order_link_id": self.order_link_id, "fee": self.fee,
+                "fee_detail": self.fee_detail}
 
 
 class CarryBroker:
@@ -362,6 +370,7 @@ class CarryBroker:
         return {"filled_qty": filled,
                 "avg_price": float(row.get("avgPrice", 0) or 0),
                 "order_link_id": link_id, "fee": self._fee(row),
+                "fee_detail": self._fee_detail(row),
                 "maker": True, "resting": resting, "status": status}
 
     def get_margin_multiple(self, symbol: str) -> float:
@@ -850,7 +859,7 @@ class CarryBroker:
             filled_qty=float(row.get("cumExecQty", 0) or 0),
             avg_price=float(row.get("avgPrice", 0) or 0),
             order_link_id=link_id, fee=CarryBroker._fee(row),
-            detail=dict(row))
+            fee_detail=CarryBroker._fee_detail(row), detail=dict(row))
 
     # -- Bybit v5 envelope --------------------------------------------------
     #
@@ -886,15 +895,21 @@ class CarryBroker:
         return CarryBroker._v5_result(payload).get("list")
 
     @staticmethod
+    def _fee_detail(row: Dict[str, Any]) -> Dict[str, Any]:
+        """The venue's fee for this order, by the one extraction authority
+        (`venue_fees`): `cumFeeDetail` first, the deprecated `cumExecFee` only
+        when the detail map is absent. Nothing here parses a fee field."""
+        return venue_fees.extract_order_fees(row).to_dict()
+
+    @staticmethod
     def _fee(row: Dict[str, Any]) -> Optional[float]:
-        raw = row.get("cumExecFee")
-        if raw is None or str(raw).strip() == "":
-            return None
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            return None
-        return value if math.isfinite(value) else None
+        """Legacy single number: the fee iff it is one currency, else None.
+
+        Unknown stays None and a multi-currency fee is None too -- a number
+        that silently adds two coins is not a fee. The ledger does not use this;
+        it books from `fee_detail`.
+        """
+        return venue_fees.extract_order_fees(row).single_amount
 
     @staticmethod
     def _fill_from(response: Optional[Dict[str, Any]],
@@ -914,7 +929,8 @@ class CarryBroker:
             filled_qty=float(row.get("cumExecQty", 0) or 0),
             avg_price=float(row.get("avgPrice", 0) or 0),
             order_link_id=str(row.get("orderLinkId", link_id) or link_id),
-            fee=CarryBroker._fee(row), detail=dict(row))
+            fee=CarryBroker._fee(row), fee_detail=CarryBroker._fee_detail(row),
+            detail=dict(row))
 
     def _assert_orders_permitted(self) -> None:
         """Ask the gate. Anything but an explicit (True, reason) refuses."""

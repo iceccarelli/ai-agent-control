@@ -244,6 +244,53 @@ class TestLoop:
         assert strategy.calls == ["BTCUSDT"]
         bot.shutdown()
 
+    def test_every_signalled_symbol_is_executed_until_capacity_binds(
+            self, tmp_path, exchange):
+        """Characterises the live loop: it is NOT first-signal-wins.
+
+        Each eligible symbol is asked exactly once and every signalled one goes
+        to `engine.execute`. Order only matters when MAX_OPEN_POSITIONS binds,
+        and then it is the position-count gate (not the loop) that refuses the
+        later symbol. A confidence-ranked selector would be a new execution
+        policy, not a fix for a first-wins defect that this loop does not have.
+        """
+        class Two(Cfg):
+            TRADING_SYMBOLS = ("BTCUSDT", "ADAUSDT")
+            PAPER_TRADING = False   # exercise the real order path (offline fake)
+
+        prices = {"BTCUSDT": ENTRY, "ADAUSDT": 0.45}
+
+        class PerSymbol(StubStrategy):
+            def signal_for(self, symbol):
+                self.calls.append(symbol)
+                p = prices[symbol]
+                return te.TradeIntent(
+                    symbol=symbol, signal_type="BUY", entry_price=p,
+                    stop_price=p * 0.98, take_profits=((p * 1.05, 1.0),),
+                    confidence=0.8)
+
+        strategy = PerSymbol()
+        bot = build(tmp_path, exchange, cfg=Two(), strategy=strategy)
+        bot.startup()
+        bot.tick()
+        assert strategy.calls == ["BTCUSDT", "ADAUSDT"]
+        assert bot.store.open_position_count() == 2
+        bot.shutdown()
+
+        class OneSlot(Two):
+            MAX_OPEN_POSITIONS = 1
+
+        strategy = PerSymbol()
+        bot = build(tmp_path / "cap", exchange.__class__(
+            balances={"USDT": 100_000.0, "BTC": 5.0}, equity=100_000.0),
+            cfg=OneSlot(), strategy=strategy)
+        bot.startup()
+        bot.tick()
+        assert strategy.calls == ["BTCUSDT", "ADAUSDT"]
+        held = [p["symbol"] for p in bot.store.open_positions()]
+        assert held == ["BTCUSDT"], "capacity, not the loop, must pick the winner"
+        bot.shutdown()
+
     def test_a_halted_risk_layer_stops_the_cycle(self, tmp_path, exchange):
         strategy = StubStrategy()
         bot = build(tmp_path, exchange, strategy=strategy)
