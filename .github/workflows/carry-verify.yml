@@ -1,0 +1,90 @@
+# Targeted correctness gate for the carry system.
+#
+# WHAT THIS IS: a lean, deterministic check that runs on every pull request and
+# every push to main. It exercises the carry funding/fee/report/broker/preflight/
+# probe/live-gate/hold-audit tests, the Fly build-context check and a
+# checkout-safe whitespace check.
+#
+# WHAT THIS IS NOT: the repository's full suite. The full suite carries a known
+# baseline of 69 failures (documentation, corpus and date-relative fixtures) plus
+# 3 files that fail to import on missing modules. Those are NOT run or hidden
+# here and are NOT claimed fixed; they are a separate, pre-existing matter. This
+# job is green only when the carry correctness tests are green.
+#
+# NO CREDENTIALS, NO NETWORK TRADING: no secret is read, no Bybit endpoint is
+# contacted, and nothing here can place an order. Tests use offline fakes.
+name: carry-verify
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carry-verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  carry-correctness:
+    name: carry correctness (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is what the production Dockerfile runs; 3.12 is what
+        # bot/constraints.txt was last pinned against.
+        python: ["3.11", "3.12"]
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Two commits: for a pull request the checked-out commit is the merge
+          # of the PR into its base, so HEAD^1 is the base tip.
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: Whitespace check on the change (checkout-safe)
+        working-directory: .
+        run: |
+          # Compares the change itself, never the working tree, so a clean
+          # checkout cannot make this pass vacuously.
+          git rev-parse --verify HEAD^1
+          git diff --check HEAD^1 HEAD
+
+      - name: Carry correctness tests
+        run: >
+          python -m pytest -q -p no:cacheprovider
+          tests/test_carry_funding_truth.py
+          tests/test_carry_fee_truth.py
+          tests/test_carry_report.py
+          tests/test_carry_broker.py
+          tests/test_carry_preflight.py
+          tests/test_carry_preflight_economics.py
+          tests/test_fee_payload_probe.py
+          tests/test_carry_live_gates.py
+          tests/test_carry_fail_closed.py
+          tests/test_carry_hold_audit.py
+          tests/test_ci_workflow.py
+
+      - name: Fly build context
+        run: python tools/fly_stack.py --check
+
+      - name: Scope of this gate
+        if: always()
+        run: |
+          echo "### carry-verify (python ${{ matrix.python }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "Targeted carry correctness gate only. The repository's full suite has a known baseline of 69 failures (documentation, corpus and date-relative fixtures) and 3 import errors; it is deliberately not run or claimed fixed here." >> "$GITHUB_STEP_SUMMARY"

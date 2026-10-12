@@ -71,3 +71,26 @@ def test_estimated_or_unread_funding_blocks_REALISED(tmp_path):
     c = carry_report.build_report(db)["carry"]
     assert c["status"] == "PROVISIONAL_FUNDING_UNVERIFIED"
     assert c["funding_estimated_usd"] == 3.0 and c["funding_venue_usd"] == 0.0
+
+
+@pytest.mark.parametrize("fees,expected", [
+    ("absent", "PROVISIONAL_FEES_INCOMPLETE"),
+    ("modern", "PROVISIONAL_FUNDING_UNVERIFIED")])
+def test_provisional_state_is_the_same_after_every_restart(tmp_path, fees, expected):
+    """Estimated funding plus (optionally) unstated fees, written to the real
+    store and read back repeatedly the way successive restarts would."""
+    import ledger as L
+    from test_carry_fee_truth import absent, build, modern, open_the_hedge
+    _v, journal, engine = build(absent if fees == "absent" else modern)
+    open_the_hedge(engine)
+    L.funding(journal, ms=journal.entries[-1].ms + 1, ref="est", usd=3.0)
+    db = str(tmp_path / "restart.db")
+    store = StateStore(db)
+    store.save_ledger(journal.to_rows())
+    store.close()
+    seen = set()
+    for _ in range(3):                                   # three "restarts"
+        c = carry_report.build_report(db)["carry"]
+        seen.add((c["status"], c["funding_estimated_usd"], c["fees_unknown"]))
+    assert len(seen) == 1
+    assert next(iter(seen))[0] == expected

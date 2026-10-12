@@ -14,11 +14,24 @@ SAFETY, STRUCTURALLY
     authorisation is present, and it never sets `LIVE_TRADING_ACK`;
   * it prints no key, secret or signature.
 
-Verdicts (exit code): PREFLIGHT_OK (0) | PREFLIGHT_BLOCKED (2) | PREFLIGHT_REFUSED (3,
-wrong environment, nothing was read).
+THREE SEPARATE QUESTIONS, THREE SEPARATE ANSWERS
+  1. READINESS      PREFLIGHT_OK | PREFLIGHT_BLOCKED   (exit 0 | 2)
+     Could the venue be read, and do the safety preconditions hold?
+  2. ENTRY ECONOMICS  ENTRY_ECONOMICS_PASS | _REFUSED | _UNAVAILABLE
+     What the PRODUCTION entry-cost evaluator says about opening a pair right
+     now. This is `CarryEngine.entry_economics`, the very method `on_candle`
+     calls, fed the same funding history, fee rates, execution mode/style and
+     borrow rate; it is not a copy of the formula. UNAVAILABLE means an input was
+     unreadable or stale, which the engine also treats as a refusal.
+  3. ORDER AUTHORISATION  main.carry_orders_permitted, the carry order gate.
+     Reported, never decided here.
+A successful readiness check is NOT a profitable entry, an economics pass is NOT
+permission to trade, and neither can override the order gate or the runtime risk
+checks. Whether a qualifying opportunity exists at run time is the engine's call.
 
-A BLOCKED verdict names every blocker. "No qualifying opportunity" is NOT a
-blocker: the book standing aside is a valid outcome and is not predicted here.
+Exit codes: 0 PREFLIGHT_OK | 2 PREFLIGHT_BLOCKED | 3 PREFLIGHT_REFUSED (wrong
+environment, nothing was read) | 5 with --require-economics-pass when readiness
+is fine but the entry economics are not a pass.
 """
 from __future__ import annotations
 
@@ -27,7 +40,7 @@ import json
 import os
 import sys
 import tempfile
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -45,9 +58,134 @@ def _check(name: str, fn: Callable[[], Any]) -> Dict[str, Any]:
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
+DAY_S = 86_400.0
+
+
+def assess_entry_economics(*, broker: Any, spot_symbol: str, perp_symbol: str,
+                           execution_mode: str, execution_style: Optional[str],
+                           borrow_apr: Optional[float],
+                           now_s: Optional[float] = None) -> Dict[str, Any]:
+    """What the production entry evaluator says right now. Read-only.
+
+    Builds a `CarryEngine` over the (order-refusing) broker, seeds its funding
+    history the way `TradingBot` does at startup, takes the market view the way
+    `tick` does (including its freshness check), and asks the engine's own
+    `entry_economics`. Nothing is placed and `on_candle` is never called.
+    """
+    import time as _time
+
+    import carry_costs
+    from carry_engine import CarryEngine
+    from market_snapshot import take_snapshot
+
+    now = _time.time() if now_s is None else float(now_s)
+    inputs = {
+        "execution_mode": execution_mode, "execution_style": execution_style,
+        "borrow_apr": borrow_apr,
+        "assumed_hold_days": carry_costs.ASSUMED_HOLD_DAYS,
+        "ewma_min_prints": carry_costs.EWMA_MIN_PRINTS,
+        "ewma_alpha": carry_costs.EWMA_ALPHA,
+        "funding_periods_per_day": carry_costs.FUNDING_PERIODS_PER_DAY,
+    }
+    out: Dict[str, Any] = {"state": "ENTRY_ECONOMICS_UNAVAILABLE",
+                           "inputs": inputs, "reason": "", "history": None,
+                           "market_view": None, "evaluator": None}
+
+    def unavailable(reason: str) -> Dict[str, Any]:
+        out["state"], out["reason"] = "ENTRY_ECONOMICS_UNAVAILABLE", reason
+        return out
+
+    if borrow_apr is None or execution_style is None:
+        return unavailable("borrow_apr / execution_style not configured; the "
+                           "engine refuses to be built without them")
+    try:
+        engine = CarryEngine(
+            broker=broker, spot_symbol=spot_symbol, perp_symbol=perp_symbol,
+            borrow_apr=float(borrow_apr), execution_mode=execution_mode,
+            execution_style=execution_style, persist=lambda state: None)
+    except Exception as exc:  # noqa: BLE001
+        return unavailable(f"engine could not be built: {exc}")
+
+    # The funding history, exactly as startup seeds it (8 settled prints).
+    try:
+        prints = list(broker.get_funding_history(perp_symbol,
+                                                 limit=engine.FUNDING_HISTORY))
+    except Exception as exc:  # noqa: BLE001
+        out["history"] = {"readable": False, "error": f"{type(exc).__name__}: {exc}"}
+        return unavailable("funding history unreadable; the engine would stand "
+                           "aside with INSUFFICIENT_FUNDING_HISTORY")
+    stamps = sorted(int(ms) for _bps, ms in prints)
+    out["history"] = {
+        "readable": True, "prints": len(prints),
+        "required_for_ewma": carry_costs.EWMA_MIN_PRINTS,
+        "enough_for_ewma": len(prints) >= carry_costs.EWMA_MIN_PRINTS,
+        "oldest_ms": stamps[0] if stamps else None,
+        "newest_ms": stamps[-1] if stamps else None,
+        "span_days": (round((stamps[-1] - stamps[0]) / 86_400_000, 2)
+                      if stamps else 0.0),
+        "newest_age_hours": (round((now * 1000 - stamps[-1]) / 3_600_000, 2)
+                             if stamps else None),
+        "source": "GET /v5/market/funding/history (public)",
+    }
+    engine.warm_funding_history(prints)
+
+    # The market view, exactly as tick takes it, including the freshness check.
+    try:
+        view = take_snapshot(broker, perp_symbol=perp_symbol,
+                             spot_symbol=spot_symbol, now_s=now)
+        view.assert_fresh()
+    except Exception as exc:  # noqa: BLE001
+        out["market_view"] = {"usable": False,
+                              "error": f"{type(exc).__name__}: {exc}"}
+        return unavailable("market view unusable; tick() would not act on it "
+                           "and neither does this assessment")
+    out["market_view"] = {
+        "usable": True, "source": "take_snapshot (public tickers + funding)",
+        "observed_age_s": round(view.age_s, 2),
+        "perp_mark": view.perp_mark, "spot_mark": view.spot_mark,
+        "basis_bps": round(view.basis_bps, 3),
+        "last_settled_funding_bps": view.funding_print_bps,
+        "last_settled_age_hours": (
+            None if view.funding_print_ms is None else
+            round((now * 1000 - view.funding_print_ms) / 3_600_000, 2)),
+        "venue_clock_skew_s": view.clock_skew_s,
+    }
+
+    econ = engine.entry_economics(
+        mark=view.perp_mark, spot=view.spot_mark,
+        funding_bps=float(view.funding_print_bps or 0.0))
+    out["round_trip_bps"] = econ.round_trip_bps
+    v = econ.verdict
+    if v is not None:
+        out["evaluator"] = {
+            "allowed": bool(v.allowed), "reason": v.reason,
+            "smoothed_funding_bps_per_print": v.smoothed_funding_bps,
+            "expected_carry_bps_per_day": v.expected_carry_bps_per_day,
+            "borrow_bps_per_day": v.borrow_bps_per_day,
+            "amortised_round_trip_bps_per_day":
+                v.amortised_round_trip_bps_per_day,
+            "net_edge_bps_per_day": v.net_edge_bps_per_day,
+            "entry_basis_bps": v.entry_basis_bps,
+            "basis_budget_bps": v.basis_budget_bps, "detail": v.detail,
+        }
+    if econ.refusal is None:
+        out["state"], out["reason"] = (
+            "ENTRY_ECONOMICS_PASS", v.reason if v is not None else "")
+    elif v is None:
+        # The engine refused before the evaluator ran (no spot, unpriced fees).
+        return unavailable(f"{econ.refusal.reason}: "
+                           f"{econ.refusal.detail.get('note', '')}")
+    else:
+        out["state"], out["reason"] = "ENTRY_ECONOMICS_REFUSED", v.reason
+    return out
+
+
 def run_preflight(*, broker: Any, client: Any, cfg: Any, spot_symbol: str,
                   perp_symbol: str, execution_mode: str,
-                  known_perp_qty: float = 0.0) -> Dict[str, Any]:
+                  known_perp_qty: float = 0.0,
+                  execution_style: Optional[str] = None,
+                  borrow_apr: Optional[float] = None,
+                  now_s: Optional[float] = None) -> Dict[str, Any]:
     """Pure function over injected collaborators, so it is testable offline.
 
     ``known_perp_qty`` is what the local ledger believes the perp holds (0.0 on a
@@ -107,22 +245,44 @@ def run_preflight(*, broker: Any, client: Any, cfg: Any, spot_symbol: str,
     if equity is not None and equity <= 0:
         blockers.append(f"equity is {equity}")
 
-    gate_open = (not bool(cfg.PAPER_TRADING)) and bool(cfg.USE_TESTNET)
+    # The REAL carry order gate (main.carry_orders_permitted, the function
+    # build_bot hands to CarryBroker), not a copy of its logic.
+    from main import carry_orders_permitted
+    gate_open, gate_reason = carry_orders_permitted(cfg)
     if not gate_open:
         notes.append(
             "PAPER_TRADING=1: with this environment the carry order gate "
             "refuses every order, so a run would place NOTHING. Set "
             "PAPER_TRADING=0 (USE_TESTNET stays 1) only for the order-capable "
             "run.")
-    notes.append("whether a qualifying opportunity exists is NOT predicted "
-                 "here; the carry gates decide that at run time")
+    economics = assess_entry_economics(
+        broker=broker, spot_symbol=spot_symbol, perp_symbol=perp_symbol,
+        execution_mode=execution_mode, execution_style=execution_style,
+        borrow_apr=borrow_apr, now_s=now_s)
+    notes.append("PREFLIGHT_OK means the reads and safety preconditions "
+                 "completed. It is not a profitable entry, and an economics "
+                 "pass is not permission to trade: orders are controlled only "
+                 "by the carry order gate and the runtime risk checks.")
 
     return {
         "verdict": "PREFLIGHT_BLOCKED" if blockers else "PREFLIGHT_OK",
         "venue": str(getattr(cfg, "BYBIT_VENUE", "testnet")),
         "use_testnet": bool(cfg.USE_TESTNET),
         "paper_trading": bool(cfg.PAPER_TRADING),
-        "order_gate_would_allow_orders": gate_open,
+        "order_gate_would_allow_orders": bool(gate_open),
+        "order_authorization": {
+            "gate_allows_orders": bool(gate_open), "reason": gate_reason,
+            "controlled_by": "main.carry_orders_permitted (the carry order "
+                             "gate) and the runtime risk checks; nothing in "
+                             "this report authorises an order"},
+        "entry_economics": economics,
+        "summary": {
+            "readiness": "PREFLIGHT_BLOCKED" if blockers else "PREFLIGHT_OK",
+            "entry_economics": (economics["state"] + ":" + economics["reason"]
+                                if economics["reason"] else economics["state"]),
+            "order_gate": ("ALLOWS_ORDERS" if gate_open else "REFUSES_ORDERS")
+                          + ":" + str(gate_reason),
+        },
         "execution_mode": execution_mode,
         "symbols": {"spot": spot_symbol, "perp": perp_symbol},
         "reads": {k: (v["value"] if v["ok"] else {"ERROR": v["error"]})
@@ -162,9 +322,22 @@ def load_testnet_config():
     return cfg, None
 
 
+def exit_code(report: Dict[str, Any], *, require_economics_pass: bool) -> int:
+    """Readiness decides 0/2. Economics only matters if the operator asks."""
+    if report["verdict"] != "PREFLIGHT_OK":
+        return 2
+    if require_economics_pass and \
+            report["entry_economics"]["state"] != "ENTRY_ECONOMICS_PASS":
+        return 5
+    return 0
+
+
 def main(argv: List[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--require-economics-pass", action="store_true",
+                    help="exit 5 when readiness is fine but the production "
+                         "entry economics are not ENTRY_ECONOMICS_PASS")
     ap.add_argument("--db", default=None,
                     help="state database to compare against (read for the "
                          "ledger's perp quantity); default: a throwaway file")
@@ -202,11 +375,13 @@ def main(argv: List[str] | None = None) -> int:
             broker=broker, client=client, cfg=cfg,
             spot_symbol=cfg.CARRY_SPOT_SYMBOL, perp_symbol=cfg.CARRY_PERP_SYMBOL,
             execution_mode=str(cfg.CARRY_EXECUTION_MODE),
-            known_perp_qty=known)
+            known_perp_qty=known,
+            execution_style=cfg.CARRY_EXECUTION_STYLE,
+            borrow_apr=cfg.CARRY_BORROW_APR)
     finally:
         store.close()
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
-    return 0 if report["verdict"] == "PREFLIGHT_OK" else 2
+    return exit_code(report, require_economics_pass=args.require_economics_pass)
 
 
 if __name__ == "__main__":

@@ -113,6 +113,102 @@ class LegFill:
                 "fee_detail": self.fee_detail}
 
 
+#: Bybit's transaction log refuses a window longer than 7 days.
+TXLOG_WINDOW_MS = 7 * 24 * 3600 * 1000 - 1
+TXLOG_MAX_PAGES = 40
+TXLOG_PAGE_SIZE = 50
+
+
+def txlog_windows(start_ms: int, end_ms: int) -> List[Tuple[int, int]]:
+    """Contiguous request windows of at most 7 days covering ``[start, end]``.
+
+    Adjacent windows share one millisecond: the docs do not say whether
+    ``endTime`` is inclusive, so a row exactly on a boundary must fall in at
+    least one window under EITHER semantics. Callers dedupe the overlap.
+    """
+    out: List[Tuple[int, int]] = []
+    ws = int(start_ms)
+    end = int(end_ms)
+    while True:
+        we = min(ws + TXLOG_WINDOW_MS, end)
+        out.append((ws, we))
+        if we >= end:
+            return out
+        ws = we
+
+
+@dataclass
+class LogPages:
+    """What a cursor-paginated read actually returned, and whether it is whole.
+
+    ``complete`` is True only when the venue's cursor ran out normally. Anything
+    else (a request error, a malformed page, a repeated cursor, running out of
+    pages) leaves ``complete`` False with the reason in ``error``; ``rows`` is
+    then diagnostic only and must never be treated as the whole log.
+    """
+
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+    pages: int = 0
+    complete: bool = False
+    error: str = ""
+
+
+def read_log_pages(request: Any, params: Dict[str, Any], *,
+                   max_pages: int = TXLOG_MAX_PAGES) -> LogPages:
+    """Follow every ``nextPageCursor`` of one transaction-log query.
+
+    ``request(params)`` performs one GET and returns the v5 envelope. Each page
+    is validated before it is believed: an envelope with a ``result`` object, a
+    ``list`` of objects, and a string cursor. The response cursor becomes the
+    next request's ``cursor``. A cursor seen before, or ``max_pages`` pages
+    without the cursor ending, is an error: partial success is never reported
+    as success. This is the ONE paginator for the log; the production funding
+    reader and the operator probe both use it.
+    """
+    out = LogPages()
+    seen: set = set()
+    cursor: Optional[str] = None
+    while True:
+        if out.pages >= max_pages:
+            out.error = (f"did not finish within {max_pages} pages; the log "
+                         "read is incomplete")
+            return out
+        page_params = dict(params)
+        if cursor:
+            page_params["cursor"] = cursor
+        try:
+            payload = request(page_params)
+        except Exception as exc:  # noqa: BLE001
+            out.error = f"request failed on page {out.pages + 1}: " \
+                        f"{type(exc).__name__}: {exc}"
+            return out
+        result = payload.get("result") if isinstance(payload, dict) else None
+        if not isinstance(result, dict):
+            out.error = f"page {out.pages + 1} has no result object"
+            return out
+        rows = result.get("list")
+        if not isinstance(rows, list):
+            out.error = f"page {out.pages + 1} carries no list"
+            return out
+        if any(not isinstance(r, dict) for r in rows):
+            out.error = f"page {out.pages + 1} holds a row that is not an object"
+            return out
+        out.pages += 1
+        out.rows.extend(rows)
+        nxt = result.get("nextPageCursor")
+        if nxt is None or nxt == "":
+            out.complete = True
+            return out
+        if not isinstance(nxt, str):
+            out.error = f"page {out.pages} returned a non-string cursor"
+            return out
+        if nxt == cursor or nxt in seen:
+            out.error = f"cursor repeated on page {out.pages}; refusing to loop"
+            return out
+        seen.add(nxt)
+        cursor = nxt
+
+
 class CarryBroker:
     """Places paired legs. Idempotent. Reports incidents rather than papering.
 
@@ -733,13 +829,11 @@ class CarryBroker:
         out.sort(key=lambda entry: entry[1])
         return out
 
-    #: Bybit's transaction log refuses a window longer than 7 days.
-    _TXLOG_WINDOW_MS = 7 * 24 * 3600 * 1000 - 1
     #: The log is documented as holding up to two years. A request reaching back
     #: further cannot be answered completely, so it is REFUSED, not clipped.
     _TXLOG_MAX_SPAN_MS = 730 * 24 * 3600 * 1000
-    _TXLOG_PAGE = 50
-    _TXLOG_MAX_PAGES = 40
+    _TXLOG_PAGE = TXLOG_PAGE_SIZE
+    _TXLOG_MAX_PAGES = TXLOG_MAX_PAGES
 
     def get_funding_payments(self, symbol: str, start_ms: int,
                              end_ms: Optional[int] = None
@@ -768,44 +862,23 @@ class CarryBroker:
                 "the payments before that cannot be read, and a partial list "
                 "is not returned")
         out: List[Dict[str, Any]] = []
-        window_start = start
-        while True:
-            window_end = min(window_start + self._TXLOG_WINDOW_MS, end)
-            cursor: Optional[str] = None
-            for _page in range(self._TXLOG_MAX_PAGES):
-                params: Dict[str, Any] = {
-                    "accountType": "UNIFIED", "category": LINEAR,
-                    "type": "SETTLEMENT", "startTime": window_start,
-                    "endTime": window_end, "limit": self._TXLOG_PAGE}
-                if cursor:
-                    params["cursor"] = cursor
-                result = self.client._request(
-                    "GET", "/v5/account/transaction-log", signed=True,
-                    params=params)
-                body = self._v5_result(result)
-                rows = body.get("list")
-                if rows is None:
-                    raise PairIncident(
-                        "the transaction log carries no list; funding "
-                        "payments are unreadable, not absent")
-                for row in rows:
-                    parsed = self._funding_row(row, symbol)
-                    if parsed is not None:
-                        out.append(parsed)
-                cursor = body.get("nextPageCursor") or None
-                if not cursor:
-                    break
-            else:
+        for window_start, window_end in txlog_windows(start, end):
+            res = read_log_pages(
+                lambda p: self.client._request(
+                    "GET", "/v5/account/transaction-log", signed=True, params=p),
+                {"accountType": "UNIFIED", "category": LINEAR,
+                 "type": "SETTLEMENT", "startTime": window_start,
+                 "endTime": window_end, "limit": self._TXLOG_PAGE},
+                max_pages=self._TXLOG_MAX_PAGES)
+            if not res.complete:
+                # A partial list would book some settlements and silently drop
+                # others; an unreadable payment is not a payment of zero.
                 raise PairIncident(
-                    "transaction-log pagination did not terminate; refusing "
-                    "to book a partial list of funding payments")
-            if window_end >= end:
-                break
-            # The next window STARTS at this one's last millisecond. The docs do
-            # not say whether endTime is inclusive, so adjacent windows must
-            # overlap by one ms or a row exactly on the boundary could fall in
-            # neither. The caller dedupes by payment identity.
-            window_start = window_end
+                    f"funding payments are unreadable: {res.error}")
+            for row in res.rows:
+                parsed = self._funding_row(row, symbol)
+                if parsed is not None:
+                    out.append(parsed)
         # Overlapping windows (and pages) can return the same row twice; one
         # payment is one record.
         unique = {(r["id"], r["ms"], r["usd"]): r for r in out}

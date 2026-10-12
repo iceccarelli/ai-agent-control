@@ -87,18 +87,33 @@ FUNDING_PERIODS_PER_DAY = 3
 #: How long a pair is expected to be held, in days. Amortises the one-time round
 #: trip and sizes the basis the carry must cover.
 #:
-#: DERIVED, not chosen. The 0018 backtest ran 20 trades across 1,453 days at
-#: 94.8% exposure, so the realised mean hold was ~69 days. This is set to 30 —
-#: well under that — because a gate that assumes a LONG hold to justify an entry
-#: is a gate arguing for its own conclusion, and because a position exited early
-#: on inverted funding pays the full round trip over fewer days.
+#: HISTORY OF THIS NUMBER, and why it is NOT being changed here.
+#:
+#: It was set to 30 when the 0018 backtest (20 trades over 1,453 days at 94.8%
+#: exposure) showed a realised mean hold of ~69 days: "well under" the measured
+#: hold, because a gate that assumes a LONG hold to justify an entry is arguing
+#: for its own conclusion. That derivation described the OLD backtest, not the
+#: current engine.
+#:
+#: MEASURED AGAIN on the engine as it runs now (`tools/carry_hold_audit.py`, the
+#: real CarryEngine replayed over data/real_bybit_btc_4h, OVERLAY/taker): 78
+#: completed holds, median ~5.8 days, mean ~16.9, 54% shorter than a week, 15%
+#: at least 30, nearly all ended by FUNDING_INVERTED. So 30 is NOT under the
+#: measured hold any more: it is ~1.8x the mean and ~5x the median, and for the
+#: typical trade the round trip is spread over a far longer period than it is
+#: held. The same replay earned ~3x the funding the gate's smoothed rate
+#: predicted at entry, so in aggregate that optimism is offset by a conservative
+#: funding expectation, and 69% of completed trades still lost money after fees:
+#: the profit sits in a minority of long holds that cannot be told apart at entry.
 #:
 #: The sensitivity is not academic. At a 7-day hold the round trip alone is
 #: 4.43 bps/day against 1.80 bps/day of carry at MIN_ENTRY_FUNDING_BPS: the
 #: trade cannot pay for its own entry. At 30 days it is 1.03. This single number
 #: decides whether the strategy is a carry book or a fee generator, and any
-#: change to it must be justified against a measured hold, never tuned until an
-#: entry passes.
+#: change to it must be justified against a measured hold OUT OF SAMPLE and
+#: decided by a human, never tuned until an entry passes. Re-run the audit
+#: before touching it; `tests/test_carry_hold_audit.py` freezes the value so a
+#: change cannot slip in as a side effect.
 ASSUMED_HOLD_DAYS = 30.0
 
 #: EWMA smoothing over funding prints. 0.5 puts half the weight on the newest

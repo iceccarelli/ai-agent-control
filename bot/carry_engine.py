@@ -382,6 +382,21 @@ class CarryDecision:
         return self.acted
 
 
+@dataclass(frozen=True)
+class EntryEconomics:
+    """What the entry cost gate decided, and the decision `on_candle` returns.
+
+    ``refusal`` is None only when the evaluator ALLOWED the entry; every other
+    outcome (no spot, unpriced fees, any evaluator refusal) carries the exact
+    ``CarryDecision`` the engine acts on. ``verdict`` is the evaluator's own
+    object, with its computed economics, when it was reached.
+    """
+
+    round_trip_bps: Optional[float]
+    verdict: Optional[Any]
+    refusal: Optional["CarryDecision"]
+
+
 class CarryEngine:
     """Holds the pair. Acts on candles. Refuses on anything it cannot verify.
 
@@ -640,6 +655,50 @@ class CarryEngine:
                                                "spot")["taker_bps"])
         return 2.0 * (spot + perp)
 
+    def entry_economics(self, *, mark: float, spot: Optional[float],
+                        funding_bps: float = 0.0) -> "EntryEconomics":
+        """The cost gate's answer for opening NOW, exactly as `on_candle` asks it.
+
+        This is the ONE place the entry economics are decided. `on_candle` calls
+        it and returns `refusal` verbatim when there is one; the read-only
+        preflight calls it too, so the operator is told what the engine will
+        actually do and not what a copy of its formula would do. It places
+        nothing and changes no state.
+
+        `spot` is REQUIRED to open. Without it the basis is unknown, and an
+        unknown basis is not a small basis. Refusing is the only honest move:
+        a default here would be a silent risk parameter, which is the exact
+        class of bug 0016 removed from the cap.
+        """
+        if spot is None:
+            return EntryEconomics(None, None, CarryDecision(
+                "stand_aside", reason="SPOT_UNAVAILABLE_BASIS_UNKNOWN",
+                state=BookState.FLAT,
+                detail={"note": "cannot price the basis without a spot mark; "
+                                "an unknown basis is not a small one"}))
+        try:
+            round_trip = self.round_trip_bps()
+        except Exception as exc:  # noqa: BLE001 - an unpriced exit is a refusal
+            return EntryEconomics(None, None, CarryDecision(
+                "stand_aside", reason="FEE_RATES_UNREADABLE",
+                state=BookState.FLAT,
+                detail={"error": f"{type(exc).__name__}: {exc}",
+                        "note": "the venue would not say what this account "
+                                "pays; the round trip is the biggest cost in "
+                                "the book and is never assumed"}))
+        verdict = _costs().evaluate_entry(
+            funding_prints_bps=self._funding_history,
+            perp=mark, spot=spot, borrow_apr=self.borrow_apr,
+            round_trip_bps=round_trip)
+        if not verdict:
+            return EntryEconomics(round_trip, verdict, CarryDecision(
+                "stand_aside", reason=verdict.reason, state=BookState.FLAT,
+                detail={"funding_bps": funding_bps,
+                        "smoothed_bps": verdict.smoothed_funding_bps,
+                        "entry_basis_bps": verdict.entry_basis_bps,
+                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day}))
+        return EntryEconomics(round_trip, verdict, None)
+
     # -- the loop ---------------------------------------------------------
 
     def on_candle(self, *, mark: float, funding_bps: float,
@@ -754,35 +813,9 @@ class CarryEngine:
         # unknown basis is not a small basis. Refusing is the only honest move:
         # a default here would be a silent risk parameter, which is the exact
         # class of bug 0016 removed from the cap.
-        if spot is None:
-            return CarryDecision(
-                "stand_aside", reason="SPOT_UNAVAILABLE_BASIS_UNKNOWN",
-                state=BookState.FLAT,
-                detail={"note": "cannot price the basis without a spot mark; "
-                                "an unknown basis is not a small one"})
-
-        try:
-            round_trip = self.round_trip_bps()
-        except Exception as exc:  # noqa: BLE001 - an unpriced exit is a refusal
-            return CarryDecision(
-                "stand_aside", reason="FEE_RATES_UNREADABLE",
-                state=BookState.FLAT,
-                detail={"error": f"{type(exc).__name__}: {exc}",
-                        "note": "the venue would not say what this account "
-                                "pays; the round trip is the biggest cost in "
-                                "the book and is never assumed"})
-
-        verdict = _costs().evaluate_entry(
-            funding_prints_bps=self._funding_history,
-            perp=mark, spot=spot, borrow_apr=self.borrow_apr,
-            round_trip_bps=round_trip)
-        if not verdict:
-            return CarryDecision(
-                "stand_aside", reason=verdict.reason, state=BookState.FLAT,
-                detail={"funding_bps": funding_bps,
-                        "smoothed_bps": verdict.smoothed_funding_bps,
-                        "entry_basis_bps": verdict.entry_basis_bps,
-                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day})
+        econ = self.entry_economics(mark=mark, spot=spot, funding_bps=funding_bps)
+        if econ.refusal is not None:
+            return econ.refusal
 
         return self._open(mark, spot, funding_bps, timestamp_ms)
 

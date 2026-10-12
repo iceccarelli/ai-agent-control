@@ -43,7 +43,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import datetime as dt
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config as _config
 from bybit_connection import BybitAPIError, BybitClient
@@ -1022,6 +1022,38 @@ class TradingBot:
 # ---------------------------------------------------------------------------
 
 
+def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
+    """May the carry book send an order right now? The ONE answer.
+
+    `build_bot` hands this (bound to its config) to `CarryBroker` as the order
+    gate, asked before EVERY order. The read-only preflight asks the same
+    function so its "order authorisation" line is the real gate's verdict, not
+    a copy of its logic.
+
+    PAPER_TRADING refuses (the carry book has no paper venue). Testnet and demo
+    are both sandboxes that cannot touch real money, so both are permitted, with
+    the reason naming which one. Mainnet needs the live authorisation AND a
+    signed promotion gate.
+    """
+    if bool(cfg.PAPER_TRADING):
+        return (False, "PAPER_TRADING=1: the carry book has no paper venue")
+    if bool(cfg.USE_TESTNET):
+        # Testnet and DEMO are both sandboxes and neither can touch real money,
+        # so both are permitted here — but the reason NAMES which one, so no log
+        # line and no drill transcript can be read as mainnet evidence (0046).
+        return (True, str(getattr(cfg, "BYBIT_VENUE", "testnet")).upper())
+    armed, why = _config.is_live_authorized(cfg)
+    if armed is not True:
+        return (False, f"mainnet URL without live authorisation: {why}")
+    # Defence in depth: start() already refuses a live-armed process whose
+    # promotion gate is unsigned. The broker asks again, per order, so no path
+    # around start() reaches a mainnet carry order.
+    import promotion_gate as _gate
+    if _gate.promotion_gate_allows_live(config=cfg) is not True:
+        return (False, "mainnet URL: the promotion gate is not signed")
+    return (True, "LIVE (authorised, promotion gate signed)")
+
+
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
     """Construct the stack in dependency order.
 
@@ -1133,25 +1165,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         # (PAPER) and the carry broker would still have POSTed to mainnet.
         # Asked before EVERY order, read fresh each time.
         def _carry_orders_permitted():
-            if bool(cfg.PAPER_TRADING):
-                return (False, "PAPER_TRADING=1: the carry book has no paper "
-                               "venue")
-            if bool(cfg.USE_TESTNET):
-                # Testnet and DEMO are both sandboxes and neither can touch
-                # real money, so both are permitted here — but the reason
-                # NAMES which one, so no log line and no drill transcript can
-                # be read as mainnet evidence (0046).
-                return (True, str(getattr(cfg, "BYBIT_VENUE", "testnet")).upper())
-            armed, why = _config.is_live_authorized(cfg)
-            if armed is not True:
-                return (False, f"mainnet URL without live authorisation: {why}")
-            # Defence in depth: start() already refuses a live-armed process
-            # whose promotion gate is unsigned. The broker asks again, per
-            # order, so no path around start() reaches a mainnet carry order.
-            import promotion_gate as _gate
-            if _gate.promotion_gate_allows_live(config=cfg) is not True:
-                return (False, "mainnet URL: the promotion gate is not signed")
-            return (True, "LIVE (authorised, promotion gate signed)")
+            return carry_orders_permitted(cfg)
 
         # HOW THE LONG SIDE IS HELD (0036). No default: "overlay" shorts the
         # perp against BTC the client already owns and never touches their
