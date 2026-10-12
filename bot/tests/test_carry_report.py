@@ -15,12 +15,25 @@ from test_carry_fee_truth import absent, build, modern, open_the_hedge  # noqa: 
 from tools import carry_report  # noqa: E402
 
 
+def _reconciled(journal):
+    """Complete synthetic reads (test data) so only the FEES decide the status."""
+    from carry_broker import FundingHistory, SettlementEvidence
+    import funding_reconcile as R
+    now = journal.entries[-1].ms + 1_000
+    lo = journal.entries[0].ms - 120_000
+    R.reconcile_funding(
+        journal, history=FundingHistory(start_ms=lo, end_ms=now),
+        evidence=SettlementEvidence(start_ms=lo, end_ms=now, windows=1),
+        now_ms=now)
+
+
 @pytest.mark.parametrize("fees,status", [
     (modern, "REALISED"), (absent, "PROVISIONAL_FEES_INCOMPLETE")])
 def test_status_follows_fee_confirmation_across_a_real_database(
         tmp_path, fees, status):
     _venue, journal, engine = build(fees)
     open_the_hedge(engine)
+    _reconciled(journal)
     db = str(tmp_path / "run.db")
     store = StateStore(db)
     store.save_ledger(journal.to_rows())
@@ -29,6 +42,19 @@ def test_status_follows_fee_confirmation_across_a_real_database(
     assert report["carry"]["status"] == status
     assert [f["kind"] for f in report["carry"]["fills"]] == [
         "spot_buy", "perp_open"]
+
+
+def test_fees_confirmed_but_funding_never_reconciled_is_not_REALISED(tmp_path):
+    """The gap this closes: nothing had flagged the funding, so nothing said it
+    was unproven. A lifecycle with no reconciliation record is PROVISIONAL."""
+    _venue, journal, engine = build(modern)
+    open_the_hedge(engine)
+    db = str(tmp_path / "run.db")
+    store = StateStore(db)
+    store.save_ledger(journal.to_rows())
+    store.close()
+    carry = carry_report.build_report(db)["carry"]
+    assert carry["status"] == "PROVISIONAL_FUNDING_UNVERIFIED"
 
 
 def test_a_missing_database_is_an_error_not_an_empty_report(tmp_path, capsys):

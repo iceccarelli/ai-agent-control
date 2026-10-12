@@ -45,6 +45,27 @@ def hedged_journal(qty=0.5):
     return j
 
 
+def opened_ms(journal):
+    """When the hedge's perp leg was booked (the last entry is no longer it: a
+    reconciliation record is written after the open)."""
+    return next(e.ms for e in journal.entries if e.kind == "perp_open")
+
+
+def reconcile(j, prints, *, now_ms, start=None, rows=()):
+    """Run the lifecycle reconciliation against two COMPLETE synthetic reads.
+
+    Test data: public prints at `prints` (ms) and an account log holding `rows`.
+    """
+    from carry_broker import FundingHistory, SettlementEvidence
+    import funding_reconcile as R
+    lo = T0 - 3_600_000 if start is None else start
+    hist = FundingHistory(start_ms=lo, end_ms=now_ms,
+                          prints=[(3.0, int(t)) for t in sorted(prints)])
+    ev = SettlementEvidence(start_ms=lo, end_ms=now_ms, payments=list(rows),
+                            windows=1, pages=1, rows_returned=len(rows))
+    return R.reconcile_funding(j, history=hist, evidence=ev, now_ms=now_ms)
+
+
 def pay(i, usd, *, ms=T0 + 3_600_000, size=-0.5, currency="USDT"):
     return {"id": str(i), "ms": ms, "usd": usd, "currency": currency,
             "size": size, "symbol": "BTCUSDT"}
@@ -61,6 +82,14 @@ class TestBookingFromVenuePayments:
         assert st["funding_usd"] == pytest.approx(2.75)
         assert st["funding_venue_usd"] == pytest.approx(2.75)
         assert st["funding_estimated_usd"] == 0.0
+        # booking alone is not completeness: nothing has established that the
+        # lifecycle's settlements are all here, so it is not yet confirmed
+        assert st["funding_confirmed"] is False
+        assert st["funding_lifecycles"][0]["reasons"] == [
+            "NO_RECONCILIATION_RECORD"]
+        reconcile(j, [T0 + 3_600_000, T0 + 2 * 3_600_000], now_ms=T0 + 20 * H,
+                  rows=[pay(1, 4.25), pay(2, -1.5, ms=T0 + 2 * 3_600_000)])
+        st = j.statement()
         assert st["funding_confirmed"] is True and st["net_basis"] == "confirmed"
 
     def test_the_same_row_is_never_booked_twice(self):
@@ -219,7 +248,7 @@ def make_bot(venue, journal, engine, store):
     return bot
 
 
-def tick(bot, k, after_open=False):
+def tick(bot, k, after_open=False, full_read=True):
     """One real `TradingBot.tick()`. `after_open` delivers a funding print that
     settled AFTER the hedge opened, which is what makes the ENGINE accrue its own
     (estimated) `funding_collected`."""
@@ -229,7 +258,9 @@ def tick(bot, k, after_open=False):
         perp_mark=MARK, spot_mark=MARK, funding_bps=3.0, margin_multiple=5.0,
         observed_at_s=time.time(), funding_print_bps=3.0,
         funding_print_ms=print_ms)
-    bot._last_funding_poll_ms = 0           # defeat the throttle for the test
+    bot._last_funding_poll_ms = 0           # defeat the throttles for the test
+    if full_read:
+        bot._last_reconcile_ms = 0
     with mock.patch("market_snapshot.take_snapshot", return_value=view):
         bot.tick()
 
@@ -243,15 +274,18 @@ class TestTickBooksWhatTheVenuePaid:
         bot = make_bot(venue, journal, engine, store)
         for k in (1, 2, 3):
             tick(bot, k)
-        assert [e.kind for e in journal.entries] == ["spot_buy", "perp_open"]
+        assert [e.kind for e in journal.entries
+                if e.kind != "funding_reconciliation"] == [
+            "spot_buy", "perp_open"]
         qty = abs(journal.balances()[L.PERP].qty)
         return venue, journal, bot, store, qty
 
     def test_funding_comes_from_the_settlement_row_not_the_engine_estimate(
             self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
-        t = journal.entries[-1].ms + 1_800_000
+        t = opened_ms(journal) + 1_800_000
         venue.settlements.append(row(1, "0.1234", t, size=str(-qty)))
+        venue.prints = [t]                    # the public print it belongs to
         tick(bot, 4, after_open=True)
         st = journal.statement()
         assert st["funding_usd"] == pytest.approx(0.1234)    # the venue's figure
@@ -267,7 +301,7 @@ class TestTickBooksWhatTheVenuePaid:
     def test_polling_again_does_not_double_book(self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
         venue.settlements.append(
-            row(1, "0.1234", journal.entries[-1].ms + 1_800_000, size=str(-qty)))
+            row(1, "0.1234", opened_ms(journal) + 1_800_000, size=str(-qty)))
         tick(bot, 4, after_open=True)
         tick(bot, 5)
         tick(bot, 6)
@@ -277,7 +311,7 @@ class TestTickBooksWhatTheVenuePaid:
     def test_someone_elses_perp_on_the_same_account_is_not_booked(self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
         venue.settlements.append(row(
-            1, "7.0", journal.entries[-1].ms + 1_800_000, size=str(-qty * 10)))
+            1, "7.0", opened_ms(journal) + 1_800_000, size=str(-qty * 10)))
         tick(bot, 4)
         st = journal.statement()
         assert st["funding_usd"] == 0.0 and st["funding_unattributed"] == 1
@@ -294,7 +328,7 @@ class TestTickBooksWhatTheVenuePaid:
     def test_the_truth_survives_a_restart(self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
         venue.settlements.append(
-            row(1, "0.1234", journal.entries[-1].ms + 1_800_000, size=str(-qty)))
+            row(1, "0.1234", opened_ms(journal) + 1_800_000, size=str(-qty)))
         tick(bot, 4)
         live = journal.statement()
         store.close()
@@ -321,13 +355,21 @@ H = 3_600_000
 
 
 class TestIdentityIsNotJustTheVenueId:
-    def test_two_distinct_payments_sharing_an_id_are_both_booked(self):
+    def test_two_distinct_payments_sharing_an_id_are_an_identity_conflict(self):
+        """One id for two different payments is not an identity. The first stays
+        as booked; the second is kept as evidence at $0 and the statement is
+        provisional - neither silently dropped nor silently counted."""
         j = hedged_journal()
         a = pay("X", 1.0, ms=T0 + H)
         b = pay("X", 2.0, ms=T0 + 9 * H)               # same id, different payment
         out = L.book_funding_payments(j, [a, b], ms=T0 + 10)
-        assert out["booked"] == 2 and out["id_collisions"] == 1
-        assert j.statement()["funding_usd"] == pytest.approx(3.0)
+        assert out["booked"] == 1 and out["id_collisions"] == 1
+        assert out["unattributed"] == 1
+        st = j.statement()
+        assert st["funding_usd"] == pytest.approx(1.0)
+        assert st["funding_unattributed"] == 1 and st["funding_confirmed"] is False
+        kept = [e for e in j.entries if e.fee_raw.get("identity_conflict")]
+        assert len(kept) == 1 and kept[0].fee_raw["venue_usd"] == 2.0
 
     def test_and_re_polling_both_books_neither_again(self):
         j = hedged_journal()
@@ -335,7 +377,8 @@ class TestIdentityIsNotJustTheVenueId:
         L.book_funding_payments(j, [a, b], ms=T0 + 10)
         again = L.book_funding_payments(j, [a, b], ms=T0 + 20)
         assert again["duplicate"] == 2 and again["booked"] == 0
-        assert j.statement()["funding_usd"] == pytest.approx(3.0)
+        assert again["id_collisions"] == 0
+        assert j.statement()["funding_usd"] == pytest.approx(1.0)
         rebuilt = L.Journal.from_rows(j.to_rows())                # and a restart
         assert L.book_funding_payments(
             rebuilt, [a, b], ms=T0 + 30)["duplicate"] == 2
@@ -397,6 +440,8 @@ class TestACompleteAnswerIsRequired:
             ms=T0 + 17 * H)
         assert L.check_funding_completeness(
             j, self.prints(), now_ms=T0 + 30 * H) == 0
+        reconcile(j, self.prints(), now_ms=T0 + 30 * H, rows=[
+            pay(1, 1.0, ms=T0 + 8 * H), pay(2, 1.0, ms=T0 + 16 * H)])
         assert j.statement()["funding_confirmed"] is True
 
     def test_nothing_is_owed_while_flat_or_inside_the_delivery_grace(self):
@@ -467,7 +512,7 @@ class TestTickFlagsAMissingSettlementAndBooksTheLateRow:
         for k in (1, 2, 3):
             tick(bot, k)
         qty = abs(journal.balances()[L.PERP].qty)
-        opened = journal.entries[-1].ms
+        opened = opened_ms(journal)
         venue.prints = [opened + H]                 # one settlement, 9h ago
         return venue, journal, bot, store, qty, opened
 
