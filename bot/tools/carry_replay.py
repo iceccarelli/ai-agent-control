@@ -331,8 +331,18 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
            impact_bps: float = 0.0, margin_multiple: float = INERT_MARGIN,
            max_entries_per_day: Optional[int] = None,
            risk_class: Any = None,
-           halt_after: Optional[int] = None) -> Dict[str, Any]:
-    """Drive the real engine through `rows`. One bar, one `main.tick`."""
+           halt_after: Optional[int] = None,
+           warm_prints: Sequence[Any] = (),
+           trace: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """Drive the real engine through `rows`. One bar, one `main.tick`.
+
+    ``warm_prints`` are SETTLED prints (``Settlement`` rows) that happened
+    before ``rows[0]``; they seed the engine through ``warm_funding_history``,
+    the same call production makes at start-up, and nothing else: no order is
+    possible on them. ``trace``, if given, receives one dict per walked bar -
+    ``{ms, action, reason, state}`` - the engine's own decision, for tests that
+    prove a decision does not depend on later bars.
+    """
     import ledger as L
     from carry_engine import BookState, CarryEngine
     from carry_risk import CarryRisk
@@ -364,6 +374,10 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     if max_entries_per_day is not None:
         risk_kwargs["max_entries_per_day"] = max_entries_per_day
     engine.pair_risk = (risk_class or CarryRisk)(**risk_kwargs)
+
+    if warm_prints:
+        engine.warm_funding_history(
+            [(float(w.rate) * 1e4, int(w.ms)) for w in warm_prints])
 
     trades: List[Dict[str, Any]] = []
     open_trade: Optional[Dict[str, Any]] = None
@@ -407,6 +421,10 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
                 spot=view.spot_mark, timestamp_ms=int(row.ms),
                 funding_print_ms=view.funding_print_ms)
 
+        if trace is not None:
+            trace.append({"ms": int(row.ms), "action": decision.action,
+                          "reason": decision.reason,
+                          "state": decision.state.name})
         actions[decision.action] = actions.get(decision.action, 0) + 1
         if decision.reason:
             reasons[decision.reason] = reasons.get(decision.reason, 0) + 1

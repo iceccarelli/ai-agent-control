@@ -132,13 +132,16 @@ class Balance:
     qty: float = 0.0
 
 
-def _net_basis(fee_counts: Dict[str, int], fund_counts: Dict[str, int]) -> str:
+def _net_basis(fee_counts: Dict[str, int], fund_counts: Dict[str, int],
+               reconciled: bool = True) -> str:
     """How far the net figure can be trusted, in one word."""
     if sum(fee_counts.values()) + sum(fund_counts.values()) == 0:
         return "no_fills"
     if any(fee_counts[k] for k in ("unknown", "unresolved", "unlabelled")):
         return "provisional_fees_incomplete"
     if any(fund_counts[k] for k in ("engine_estimate", "unattributed", "unread")):
+        return "provisional_funding_unverified"
+    if not reconciled:
         return "provisional_funding_unverified"
     return "confirmed"
 
@@ -249,6 +252,10 @@ class Journal:
                 f"the journal does not balance: ${total_usd:.6f} unaccounted. "
                 "Some entry was written by something other than post().")
 
+        lifecycle_status = lifecycle_reconciliation(
+            self, from_ms=from_ms, to_ms=to_ms)
+        funding_reconciled = all(l["reconciled"] for l in lifecycle_status)
+
         funding_usd = -acc[FUNDING].usd          # income is credit-normal
         fees_usd = acc[FEES].usd
         borrow_usd = acc[BORROW].usd
@@ -289,10 +296,16 @@ class Journal:
             "funding_estimated_entries": fund_counts["engine_estimate"],
             "funding_unattributed": fund_counts["unattributed"],
             "funding_unread": fund_counts["unread"],
-            "funding_confirmed": all(
+            # Confirmed needs BOTH that nothing bad was flagged AND that every
+            # position lifecycle was positively reconciled (see
+            # `lifecycle_reconciliation`): a book that was never checked has
+            # flagged nothing, and absence of a flag is not a check.
+            "funding_confirmed": funding_reconciled and all(
                 fund_counts[k] == 0 for k in ("engine_estimate",
                                               "unattributed", "unread")),
-            "net_basis": _net_basis(fee_counts, fund_counts),
+            "funding_reconciled": funding_reconciled,
+            "funding_lifecycles": lifecycle_status,
+            "net_basis": _net_basis(fee_counts, fund_counts, funding_reconciled),
             # Quantities, for reconciliation. NOT valued: an open position's
             # mark is an estimate and this file holds what is not estimated.
             "open_perp_qty": acc[PERP].qty,
@@ -338,6 +351,137 @@ class Journal:
                             float(l.get("qty", 0.0)))
                        for l in row["lines"]]))
         return journal
+
+
+# -- position lifecycles ---------------------------------------------------
+
+#: Kind of the $0 entry that records one lifecycle's reconciliation outcome.
+RECONCILIATION_KIND = "funding_reconciliation"
+
+#: Exchange-precision policy for "the venue's size is the book's size": equal
+#: within one part in a hundred or 1e-9 coin, whichever is larger. A venue size
+#: of the opposite sign never matches, however close in magnitude.
+SIZE_REL_TOL = 0.01
+SIZE_ABS_TOL = 1e-9
+
+#: A lifecycle that stays provisional this long after it ended is FINAL:
+#: further polling cannot be expected to find what the venue never returned.
+RECONCILIATION_FINAL_AFTER_MS = 7 * 86_400_000
+
+
+@dataclass(frozen=True)
+class Lifecycle:
+    """One continuous non-flat interval of the book's perp exposure.
+
+    Derived ONLY from the journal's perp quantity (never from spot inventory or
+    from a venue account balance). ``end_ms`` is None while open. ``moves`` and
+    ``last_ref`` fingerprint the exposure history inside it, so a reconciliation
+    record made before a later fill is recognisably stale.
+    """
+
+    id: str
+    start_ms: int
+    end_ms: Optional[int]
+    moves: int
+    last_ref: str
+
+    @property
+    def fingerprint(self) -> Tuple[int, str, Optional[int]]:
+        return (self.moves, self.last_ref, self.end_ms)
+
+
+def lifecycles(journal: "Journal") -> List[Lifecycle]:
+    """Every non-flat perp interval, in order, from the persisted entries.
+
+    Ordering is the journal's append order, which `post` forces to be
+    non-decreasing in time; entries sharing a millisecond keep that order. An
+    entry moving the exposure through zero in one step (long to short) ends one
+    lifecycle and starts the next at the same instant. Dust below
+    ``DUST[PERP]`` is flat.
+    """
+    out: List[Lifecycle] = []
+    qty = 0.0
+    start: Optional[int] = None
+    first_ref = ""
+    moves = 0
+    last_ref = ""
+
+    def close(at: int) -> None:
+        nonlocal start, moves, last_ref, first_ref
+        out.append(Lifecycle(f"perp:{start}:{first_ref}", int(start), int(at),
+                             moves, last_ref))
+        start, moves, last_ref, first_ref = None, 0, "", ""
+
+    for e in journal.entries:
+        d = sum(l.qty for l in e.lines if l.account == PERP)
+        if d == 0.0:
+            continue
+        new = qty + d
+        flat_before = abs(qty) <= DUST[PERP]
+        flat_after = abs(new) <= DUST[PERP]
+        flipped = (not flat_before and not flat_after and (qty > 0) != (new > 0))
+        if start is not None and (flat_after or flipped):
+            moves += 1
+            last_ref = e.ref
+            close(e.ms)
+            if flipped:
+                start, first_ref, moves, last_ref = e.ms, e.ref, 1, e.ref
+        elif start is None and not flat_after:
+            start, first_ref, moves, last_ref = e.ms, e.ref, 1, e.ref
+        elif start is not None:
+            moves += 1
+            last_ref = e.ref
+        qty = 0.0 if flat_after else new
+    if start is not None:
+        out.append(Lifecycle(f"perp:{start}:{first_ref}", int(start), None,
+                             moves, last_ref))
+    return out
+
+
+def lifecycle_reconciliation(journal: "Journal", *, from_ms: Optional[int] = None,
+                             to_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+    """One status row per lifecycle: is its funding positively reconciled?
+
+    A lifecycle is ``reconciled`` only when the LATEST reconciliation record
+    written for it (a) says FULLY_RECONCILED, (b) was made against the same
+    exposure history the journal now has (same fills, same end), and (c) for a
+    closed lifecycle, had judged every settlement up to its end. A lifecycle
+    with no record, a stale record or a provisional one is not reconciled, and
+    the reasons are carried verbatim so an operator can read why.
+    """
+    latest: Dict[str, Dict[str, Any]] = {}
+    for e in journal.entries:
+        if e.kind == RECONCILIATION_KIND and e.fee_raw.get("lifecycle_id"):
+            latest[str(e.fee_raw["lifecycle_id"])] = e.fee_raw
+    out: List[Dict[str, Any]] = []
+    for lc in lifecycles(journal):
+        end = lc.end_ms if lc.end_ms is not None else float("inf")
+        if from_ms is not None and end < from_ms:
+            continue
+        if to_ms is not None and lc.start_ms > to_ms:
+            continue
+        rec = latest.get(lc.id)
+        reasons: List[str] = []
+        state = "NOT_RECONCILED"
+        if rec is None:
+            reasons.append("NO_RECONCILIATION_RECORD")
+        else:
+            state = str(rec.get("state", "PROVISIONAL"))
+            reasons = list(rec.get("reasons", []))
+            if list(rec.get("fingerprint", [])) != list(lc.fingerprint):
+                state = "STALE"
+                reasons = ["EXPOSURE_CHANGED_SINCE_RECONCILIATION"] + reasons
+            elif lc.end_ms is not None and int(
+                    rec.get("judged_to_ms", 0)) < lc.end_ms:
+                state = "PENDING_DELIVERY_GRACE"
+                reasons = ["SETTLEMENTS_NOT_YET_JUDGEABLE"] + reasons
+        out.append({
+            "lifecycle_id": lc.id, "start_ms": lc.start_ms, "end_ms": lc.end_ms,
+            "open": lc.end_ms is None, "state": state,
+            "reconciled": state == "FULLY_RECONCILED", "reasons": reasons,
+            "evidence": (rec or {}).get("evidence", {}),
+        })
+    return out
 
 
 # -- the postings ---------------------------------------------------------
@@ -495,7 +639,7 @@ def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
         return ("the venue row carries no position size, so the payment "
                 "cannot be matched to the book's position")
     # SIGNED: a short is negative. A long of the same size is not ours.
-    if abs(float(size) - after) > max(1e-9, 0.01 * abs(after)):
+    if abs(float(size) - after) > max(SIZE_ABS_TOL, SIZE_REL_TOL * abs(after)):
         return (f"venue position {float(size)} != the book's {after}; part of "
                 "it is not this book's")
     return None
@@ -511,7 +655,8 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
 
     * a payment already in the journal (same id, time, amount and symbol) is
       skipped, so a re-poll, a replay and a restart cannot book it twice; a
-      DIFFERENT payment that reuses an id is a new payment and is booked;
+      DIFFERENT payment that reuses an id is an identity conflict: it is kept
+      as evidence at $0 (``identity_conflict``) and the statement is provisional;
     * a payment the book cannot prove is its own (other coin, no position,
       position changing around the settlement, no venue size, or a signed size
       that disagrees with the book's quantity) is posted at $0 as
@@ -520,6 +665,7 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
     * everything else is booked at the venue's amount.
     """
     known = {i for i in (_entry_identity(e) for e in journal.entries) if i}
+    ids_seen = {i[0] for i in known}
     used_refs = {e.ref for e in journal.entries}
     out = {"booked": 0, "duplicate": 0, "unattributed": 0, "id_collisions": 0}
     stamp = max(int(ms), journal.entries[-1].ms if journal.entries else 0)
@@ -528,17 +674,34 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
         if ident in known:
             out["duplicate"] += 1
             continue
+        collision = ident[0] in ids_seen
         known.add(ident)
+        ids_seen.add(ident[0])
         ref = f"fund:{p['id']}"
         if ref in used_refs:
-            # A distinct payment under an id already used: keep both, with a
-            # reference that is unique and reproducible.
+            # A distinct payment under an id already used: keep the evidence,
+            # with a reference that is unique and reproducible.
             ref = f"fund:{p['id']}#{int(p['ms'])}:{float(p['usd'])!r}"
-            out["id_collisions"] += 1
         used_refs.add(ref)
         raw = {"venue_id": str(p["id"]), "venue_ms": int(p["ms"]),
                "venue_usd": float(p["usd"]), "currency": p.get("currency"),
                "size": p.get("size"), "symbol": p.get("symbol")}
+        if collision:
+            # Two different payments under one id: the venue's identity is not
+            # unique, so neither can be taken for the other. The first stays as
+            # booked; this one is kept as evidence at $0, visible and
+            # provisional, and never silently dropped or silently counted.
+            raw["identity_conflict"] = True
+            journal.post(Entry(
+                ms=stamp, kind="funding_unattributed", ref=ref,
+                lines=[Line(USDT, 0.0), Line(FUNDING, 0.0)],
+                memo=(f"venue paid {p['usd']:+.6f} under id {p['id']!r} which "
+                      "already identifies a different payment: identity "
+                      "conflict, not booked as income"),
+                basis="unattributed", fee_raw=raw))
+            out["id_collisions"] += 1
+            out["unattributed"] += 1
+            continue
         reason = _attribution_problem(journal, p)
         if reason is not None:
             journal.post(Entry(
@@ -955,6 +1118,12 @@ class LedgerBroker:
 
     def get_funding_payments(self, symbol, start_ms, end_ms=None):
         return self.inner.get_funding_payments(symbol, start_ms, end_ms)
+
+    def get_funding_history_range(self, symbol, start_ms, end_ms):
+        return self.inner.get_funding_history_range(symbol, start_ms, end_ms)
+
+    def get_funding_evidence(self, symbol, start_ms, end_ms=None):
+        return self.inner.get_funding_evidence(symbol, start_ms, end_ms)
 
     def get_liquidation_view(self, symbol):
         return self.inner.get_liquidation_view(symbol)

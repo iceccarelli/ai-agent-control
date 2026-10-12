@@ -844,6 +844,12 @@ class TradingBot:
     #: post after the position that earned it has already closed.
     FUNDING_TAIL_MS = 6 * 3_600_000
 
+    #: A full read of every pending lifecycle's interval (both venue reads) is
+    #: heavier than the incremental poll, so it runs at most this often - and
+    #: at once whenever a lifecycle has no current reconciliation record.
+    RECONCILE_POLL_MS = 3_600_000
+    _last_reconcile_ms = 0
+
     def _book_carry_funding(self, journal: Any, symbol: str,
                             decision: Any) -> None:
         """Book funding the venue actually paid, once each, attributed to the book.
@@ -851,38 +857,52 @@ class TradingBot:
         Fails visible: an unreadable venue while a position is open writes an
         `unread` marker (persisted, so the statement cannot claim confirmed
         funding), and a payment the book cannot claim is journaled at $0 as
-        `unattributed` with its evidence. Never raises into the loop.
+        `unattributed` with its evidence. Completeness is established per
+        position lifecycle (`funding_reconcile`) and persisted in the journal.
+        Never raises into the loop.
         """
         import ledger as _ledger
+        import funding_reconcile as _recon
 
         collected = float((decision.detail or {}).get("collected", 0.0))
         self._carry_estimated_funding = (
             0.0 if decision.action == "unwound" else collected)
 
         now_ms = int(time.time() * 1000)
-        perp_fills = [e for e in journal.entries
-                      if e.kind in ("perp_open", "perp_close")]
-        if not perp_fills:
+        pending = _recon.pending_lifecycles(journal)
+        if not pending:
             return
-        open_now = abs(journal.balances()[_ledger.PERP].qty) > _ledger.DUST[
-            _ledger.PERP]
-        if not open_now and now_ms - perp_fills[-1].ms > self.FUNDING_TAIL_MS:
-            return
+        status = {r["lifecycle_id"]: r
+                  for r in _ledger.lifecycle_reconciliation(journal)}
+        needs_record = any(
+            status[lc.id]["state"] in ("NOT_RECONCILED", "STALE",
+                                       "PENDING_DELIVERY_GRACE")
+            for lc in pending)
+        # One throttle for every venue read here, including the first read
+        # after a fill: a record that cannot be written must not become a
+        # request storm.
         if now_ms - self._last_funding_poll_ms < self.FUNDING_POLL_MS:
             return
+        full_due = (needs_record or
+                    now_ms - self._last_reconcile_ms >= self.RECONCILE_POLL_MS)
         self._last_funding_poll_ms = now_ms
 
-        seen_ms = [int(e.fee_raw.get("venue_ms", 0)) for e in journal.entries
-                   if e.basis in ("venue", "unattributed")]
-        first_open = next((e.ms for e in perp_fills if e.kind == "perp_open"),
-                          perp_fills[0].ms)
-        # A day of overlap, not an hour: a settlement row delivered late (the
-        # docs warn of delays) must still fall inside the next poll's window.
-        # Re-reading rows already booked is free: they dedupe by identity.
-        since = (max(seen_ms) - 86_400_000) if seen_ms else first_open - 60_000
+        earliest = min(lc.start_ms for lc in pending)
+        evidence = history = None
+        if full_due:
+            self._last_reconcile_ms = now_ms
+            since = max(0, earliest - _ledger.ATTRIBUTION_SLACK_MS)
+        else:
+            seen_ms = [int(e.fee_raw.get("venue_ms", 0)) for e in journal.entries
+                       if e.basis in ("venue", "unattributed")]
+            # A day of overlap, not an hour: a settlement row delivered late
+            # (the docs warn of delays) must still fall inside the next poll's
+            # window. Re-reading booked rows is free: they dedupe by identity.
+            since = max(0, (max(seen_ms) - 86_400_000) if seen_ms
+                        else earliest - _ledger.ATTRIBUTION_SLACK_MS)
+        broker = self.carry.broker
         try:
-            payments = self.carry.broker.get_funding_payments(
-                symbol, max(0, since), now_ms)
+            evidence = broker.get_funding_evidence(symbol, since, now_ms)
         except Exception as exc:  # noqa: BLE001
             logger.error("funding could not be read from the venue (%s); not "
                          "booked, and the statement is marked unverified", exc)
@@ -890,37 +910,50 @@ class TradingBot:
                 _ledger.mark_funding_unread(journal, ms=now_ms, why=str(exc))
             except Exception:  # noqa: BLE001
                 logger.exception("funding-unread marker could not be written")
-            return
-        try:
-            booked = _ledger.book_funding_payments(journal, payments, ms=now_ms)
-        except _ledger.LedgerError:
-            logger.exception("funding payments could not be booked")
-            return
-        # Completeness: every settlement the hedge was held through must have a
-        # venue row. The public print times say when settlements happened.
-        try:
-            prints = [ms for _bps, ms in
-                      self.carry.broker.get_funding_history(symbol, 200)]
-            missing = _ledger.check_funding_completeness(
-                journal, prints, now_ms=now_ms)
-            if missing:
-                logger.error(
-                    "funding: %d settlement(s) the hedge was held through have "
-                    "NO payment row at the venue; flagged, statement is "
-                    "provisional", missing)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("funding completeness not checked this poll (%s)", exc)
-        if booked["id_collisions"]:
-            logger.warning("funding: %d payment(s) reused a venue id; booked "
-                           "separately", booked["id_collisions"])
-        if booked["booked"] or booked["unattributed"]:
-            logger.warning(
-                "carry funding: booked %d venue payment(s), %d unattributed; "
-                "venue-observed total $%.4f (engine's estimate for the open "
-                "hedge: $%.4f, NOT booked)", booked["booked"],
-                booked["unattributed"],
-                journal.statement()["funding_venue_usd"],
-                self._carry_estimated_funding)
+        if evidence is not None:
+            if not evidence.complete:
+                logger.error("funding: the settlement log read is incomplete "
+                             "(%s); valid rows are booked, completeness is "
+                             "not claimed", "; ".join(evidence.errors[:2]))
+                try:
+                    _ledger.mark_funding_unread(
+                        journal, ms=now_ms,
+                        why="; ".join(evidence.errors[:2]))
+                except Exception:  # noqa: BLE001
+                    logger.exception("funding-unread marker not written")
+            try:
+                booked = _ledger.book_funding_payments(
+                    journal, evidence.payments, ms=now_ms)
+            except _ledger.LedgerError:
+                logger.exception("funding payments could not be booked")
+                return
+            if booked["id_collisions"]:
+                logger.warning("funding: %d payment(s) reused a venue id with a "
+                               "different payload; kept as evidence, NOT "
+                               "booked as income", booked["id_collisions"])
+            if booked["booked"] or booked["unattributed"]:
+                logger.warning(
+                    "carry funding: booked %d venue payment(s), %d "
+                    "unattributed; venue-observed total $%.4f (engine's "
+                    "estimate for the open hedge: $%.4f, NOT booked)",
+                    booked["booked"], booked["unattributed"],
+                    journal.statement()["funding_venue_usd"],
+                    self._carry_estimated_funding)
+        if full_due:
+            try:
+                history = broker.get_funding_history_range(
+                    symbol, earliest, now_ms)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("funding history not read this poll (%s)", exc)
+            try:
+                for rec in _recon.reconcile_funding(
+                        journal, history=history,
+                        evidence=evidence, now_ms=now_ms):
+                    logger.warning("funding reconciliation %s: %s",
+                                   rec["state"], ", ".join(rec["reasons"])
+                                   or "complete")
+            except Exception:  # noqa: BLE001
+                logger.exception("funding reconciliation could not be recorded")
 
     def _expire_at_horizon(self) -> None:
         """Close any shadow position that has reached HORIZON daily bars.

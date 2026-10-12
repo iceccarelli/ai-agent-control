@@ -99,9 +99,18 @@ class FeeVenue(FakeClient):
                 {k: v for k, v in row.items() if not k.startswith("_")}]})
         if endpoint == "/v5/market/funding/history":
             self.calls.append((method, endpoint, params, body))
-            return envelope({"list": [
-                {"fundingRate": "0.0003", "fundingRateTimestamp": str(t)}
-                for t in self.prints]})
+            # Honour the documented window and limit, newest first, exactly as
+            # the venue does; a fake that ignored them could not tell a
+            # windowed reader from a broken one.
+            lo = int((params or {}).get("startTime", 0))
+            hi = int((params or {}).get("endTime", 1 << 62))
+            lim = int((params or {}).get("limit", 200))
+            stamps = sorted((t for t in self.prints if lo <= t <= hi),
+                            reverse=True)[:lim]
+            return envelope({"category": "linear", "list": [
+                {"symbol": (params or {}).get("symbol", "BTCUSDT"),
+                 "fundingRate": "0.0003", "fundingRateTimestamp": str(t)}
+                for t in stamps]})
         if endpoint == "/v5/account/transaction-log":
             self.calls.append((method, endpoint, params, body))
             self.txlog_calls.append(dict(params))
@@ -180,7 +189,9 @@ def open_the_hedge(engine):
 
 
 def kinds(journal):
-    return [e.kind for e in journal.entries]
+    """Fill/booking kinds only: reconciliation records are $0 bookkeeping."""
+    return [e.kind for e in journal.entries
+            if e.kind != "funding_reconciliation"]
 
 
 class TestModernFeesReachTheStatement:
@@ -201,7 +212,10 @@ class TestModernFeesReachTheStatement:
         assert st["fees_usd"] > 0
         # a spot BUY fee comes out of the coin received: BTC balance is net of it
         assert st["btc_qty"] == pytest.approx(spot_qty - btc_fee)
-        assert st["fees_confirmed"] is True and st["net_basis"] == "confirmed"
+        assert st["fees_confirmed"] is True
+        # every FEE is confirmed, but the engine-level open never reconciled
+        # funding, so the NET is honestly not yet confirmed
+        assert st["net_basis"] == "provisional_funding_unverified"
         assert (st["fees_unknown"], st["fees_unresolved"],
                 st["fees_unlabelled"]) == (0, 0, 0)
         raw = journal.entries[0].fee_raw

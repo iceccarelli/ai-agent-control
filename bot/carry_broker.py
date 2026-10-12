@@ -209,6 +209,120 @@ def read_log_pages(request: Any, params: Dict[str, Any], *,
         cursor = nxt
 
 
+#: Bybit documents at most 200 rows per funding-history request.
+FUNDING_HISTORY_PAGE = 200
+FUNDING_HISTORY_MAX_REQUESTS = 80
+#: A gap between prints this many times the neighbouring interval is a missing
+#: observation, not a schedule.
+FUNDING_GAP_FACTOR = 1.5
+#: Two intervals this close are the same interval (clock jitter in the stamps).
+FUNDING_INTERVAL_JITTER_MS = 5 * 60_000
+
+
+@dataclass
+class FundingHistory:
+    """Public funding prints over ``[start_ms, end_ms]`` and how whole they are.
+
+    ``complete`` is True only when every request was answered with a valid
+    envelope, nothing was truncated, no row was malformed, outside the window
+    or contradictory, and no gap larger than the neighbouring interval remains.
+    Otherwise ``prints`` is diagnostic only and ``errors``/``gaps`` say why.
+    """
+
+    start_ms: int = 0
+    end_ms: int = 0
+    prints: List[Tuple[float, int]] = field(default_factory=list)  # (bps, ms)
+    requests: int = 0
+    rows_returned: int = 0
+    gaps: List[Tuple[int, int]] = field(default_factory=list)
+    expected: Optional[int] = None
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.errors and not self.gaps
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"start_ms": self.start_ms, "end_ms": self.end_ms,
+                "retrieved": len(self.prints), "expected": self.expected,
+                "requests": self.requests, "rows_returned": self.rows_returned,
+                "gaps": [list(g) for g in self.gaps],
+                "errors": list(self.errors), "complete": self.complete}
+
+
+def funding_gaps(stamps: List[int], *, start_ms: int, end_ms: int
+                 ) -> Tuple[List[Tuple[int, int]], Optional[int]]:
+    """``(suspected missing intervals, expected count)`` from the stamps alone.
+
+    The schedule is NOT assumed: the reference for a gap is its neighbouring
+    interval(s), so an instrument that moves from 8h to 4h settlements is not
+    flagged at the change (a gap equal to a neighbour is a schedule), while an
+    8h hole inside a 4h run is. The span before the first print and after the
+    last is judged against the nearest interval too, because a retention limit
+    shows up as a history that simply starts late. Fewer than three prints give
+    no interval to judge by: nothing is claimed about a span over a day then.
+    """
+    ts = sorted(set(int(t) for t in stamps))
+    gaps: List[Tuple[int, int]] = []
+    if len(ts) < 3:
+        if end_ms - start_ms > 86_400_000:
+            gaps.append((int(start_ms), int(end_ms)))
+        return gaps, None
+    iv = [b - a for a, b in zip(ts, ts[1:])]
+    expected = len(ts)
+    for i, d in enumerate(iv):
+        nb = [iv[j] for j in (i - 1, i + 1) if 0 <= j < len(iv)]
+        if any(abs(d - n) <= FUNDING_INTERVAL_JITTER_MS for n in nb):
+            continue
+        ref = min(nb)
+        if d > FUNDING_GAP_FACTOR * ref:
+            gaps.append((ts[i], ts[i + 1]))
+            expected += max(1, round(d / ref) - 1)
+    first, last = iv[0], iv[-1]
+    if ts[0] - start_ms > FUNDING_GAP_FACTOR * first:
+        gaps.append((int(start_ms), ts[0]))
+        expected += max(1, round((ts[0] - start_ms) / first) - 1)
+    if end_ms - ts[-1] > FUNDING_GAP_FACTOR * last:
+        gaps.append((ts[-1], int(end_ms)))
+        expected += max(1, round((end_ms - ts[-1]) / last) - 1)
+    return gaps, expected
+
+
+@dataclass
+class SettlementEvidence:
+    """What the account transaction log returned for one symbol and interval.
+
+    ``payments`` are validated SETTLEMENT rows (see ``_funding_row``). The
+    counters say what was NOT used and why; ``complete`` is False when any
+    window failed to read or any row was malformed/out of window, in which case
+    absence of a payment proves nothing.
+    """
+
+    start_ms: int = 0
+    end_ms: int = 0
+    payments: List[Dict[str, Any]] = field(default_factory=list)
+    windows: int = 0
+    pages: int = 0
+    rows_returned: int = 0
+    other_symbol_rows: int = 0
+    rejected: Dict[str, int] = field(default_factory=dict)
+    duplicate_rows: int = 0
+    errors: List[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.errors
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"start_ms": self.start_ms, "end_ms": self.end_ms,
+                "settlement_rows": len(self.payments), "windows": self.windows,
+                "pages": self.pages, "rows_returned": self.rows_returned,
+                "other_symbol_rows": self.other_symbol_rows,
+                "rejected": dict(self.rejected),
+                "duplicate_rows": self.duplicate_rows,
+                "errors": list(self.errors), "complete": self.complete}
+
+
 class CarryBroker:
     """Places paired legs. Idempotent. Reports incidents rather than papering.
 
@@ -835,34 +949,134 @@ class CarryBroker:
     _TXLOG_PAGE = TXLOG_PAGE_SIZE
     _TXLOG_MAX_PAGES = TXLOG_MAX_PAGES
 
-    def get_funding_payments(self, symbol: str, start_ms: int,
+    def get_funding_history_range(self, symbol: str, start_ms: int,
+                                  end_ms: int) -> FundingHistory:
+        """Every public funding print in ``[start_ms, end_ms]``, or a verdict why not.
+
+        `GET /v5/market/funding/history` has no cursor: it returns at most 200
+        rows newest first. The window is therefore walked BACKWARDS, each
+        request ending at the oldest stamp of the previous one (that stamp is
+        read twice on purpose: whether ``endTime`` is inclusive is undocumented,
+        and the overlap is deduplicated). A page shorter than the limit ends the
+        walk. Every row is validated (symbol, parseable rate, a stamp inside the
+        window); a repeated stamp with a different rate, a request that makes no
+        progress, and running out of requests all leave the history INCOMPLETE
+        rather than returning what was seen as if it were whole.
+        """
+        out = FundingHistory(start_ms=int(start_ms), end_ms=int(end_ms))
+        if end_ms < start_ms:
+            out.errors.append("end before start")
+            return out
+        seen: Dict[int, float] = {}
+        cur_end = int(end_ms)
+        while True:
+            if out.requests >= FUNDING_HISTORY_MAX_REQUESTS:
+                out.errors.append(
+                    f"not finished within {FUNDING_HISTORY_MAX_REQUESTS} "
+                    "requests; the history is incomplete")
+                break
+            out.requests += 1
+            try:
+                payload = self.client._request(
+                    "GET", "/v5/market/funding/history",
+                    params={"category": LINEAR, "symbol": symbol,
+                            "startTime": int(start_ms), "endTime": cur_end,
+                            "limit": FUNDING_HISTORY_PAGE})
+            except Exception as exc:  # noqa: BLE001
+                out.errors.append(
+                    f"request {out.requests} failed: {type(exc).__name__}: {exc}")
+                break
+            result = payload.get("result") if isinstance(payload, dict) else None
+            rows = result.get("list") if isinstance(result, dict) else None
+            if not isinstance(rows, list) or any(
+                    not isinstance(r, dict) for r in rows):
+                out.errors.append(f"request {out.requests} returned a "
+                                  "malformed envelope")
+                break
+            cat = result.get("category")
+            if cat not in (None, "") and str(cat) != LINEAR:
+                out.errors.append(f"request {out.requests} answered for "
+                                  f"category {cat!r}, not {LINEAR!r}")
+                break
+            out.rows_returned += len(rows)
+            page: List[int] = []
+            bad = False
+            for row in rows:
+                try:
+                    rate = float(row["fundingRate"])
+                    stamp = int(row["fundingRateTimestamp"])
+                except (KeyError, TypeError, ValueError):
+                    out.errors.append("a funding row is malformed")
+                    bad = True
+                    continue
+                if not math.isfinite(rate) or stamp <= 0:
+                    out.errors.append("a funding row is unusable")
+                    bad = True
+                    continue
+                if str(row.get("symbol", symbol)) != symbol:
+                    out.errors.append("a funding row names another symbol")
+                    bad = True
+                    continue
+                if not (start_ms <= stamp <= cur_end):
+                    out.errors.append(
+                        f"a funding row at {stamp} lies outside the requested "
+                        f"window [{start_ms}, {cur_end}]")
+                    bad = True
+                    continue
+                if stamp in seen and seen[stamp] != rate:
+                    out.errors.append(
+                        f"two different rates were returned for {stamp}")
+                    bad = True
+                    continue
+                seen[stamp] = rate
+                page.append(stamp)
+            if bad:
+                break
+            if len(rows) < FUNDING_HISTORY_PAGE:
+                break                       # the window is exhausted
+            oldest = min(page) if page else None
+            if oldest is None or oldest >= cur_end:
+                out.errors.append("a full page made no progress; refusing to "
+                                  "loop")
+                break
+            cur_end = oldest
+            if cur_end <= start_ms:
+                break
+        out.prints = sorted(((r * 1e4, t) for t, r in seen.items()),
+                            key=lambda x: x[1])
+        if not out.errors:
+            out.gaps, out.expected = funding_gaps(
+                [t for _r, t in out.prints], start_ms=int(start_ms),
+                end_ms=int(end_ms))
+        return out
+
+    def get_funding_evidence(self, symbol: str, start_ms: int,
                              end_ms: Optional[int] = None
-                             ) -> List[Dict[str, Any]]:
-        """Funding the VENUE paid or charged this account, settled rows only.
+                             ) -> SettlementEvidence:
+        """The account's SETTLEMENT rows for `symbol`, validated, with a verdict.
 
-        `GET /v5/account/transaction-log` (Unified accounts), `type=SETTLEMENT`.
-        Each row's `funding` is signed: positive means RECEIVED, negative means
-        PAID (documented as the opposite of `execFee`). Returned as
-        `{id, ms, usd, currency, size, symbol}`, oldest first, for `symbol`
-        only. `size` is the venue's own position size on the row, which is what
-        lets the ledger check the payment belongs to the book.
-
-        Raises when anything is unreadable or a funding amount is malformed:
-        a partial list would book some settlements and silently drop others,
-        and an unreadable payment is not a payment of zero. The caller dedupes
-        on `id`, so re-reading an overlapping window is safe.
+        `GET /v5/account/transaction-log` (Unified), `type=SETTLEMENT`, paged
+        through every cursor, in windows of at most 7 days. The server filter is
+        NOT trusted: a row must itself say ``type == SETTLEMENT`` (a row with no
+        type, or any other, is rejected), its ``category`` if present must be
+        linear, and its ``transactionTime`` must lie inside the interval. A
+        malformed row or an unreadable window makes the evidence INCOMPLETE; the
+        valid rows are still returned, because each is a venue fact on its own,
+        but the absence of a payment then proves nothing.
         """
         end = int(end_ms if end_ms is not None else time.time() * 1000)
         start = int(start_ms)
+        ev = SettlementEvidence(start_ms=start, end_ms=end)
         if end - start > self._TXLOG_MAX_SPAN_MS:
             # Silently clipping would return a partial history that looks whole.
-            raise PairIncident(
+            ev.errors.append(
                 f"funding requested back to {start} but the transaction log "
                 f"holds at most {self._TXLOG_MAX_SPAN_MS // 86_400_000} days; "
-                "the payments before that cannot be read, and a partial list "
-                "is not returned")
-        out: List[Dict[str, Any]] = []
+                "the payments before that cannot be read")
+            return ev
+        found: Dict[Tuple[str, int, float], Dict[str, Any]] = {}
         for window_start, window_end in txlog_windows(start, end):
+            ev.windows += 1
             res = read_log_pages(
                 lambda p: self.client._request(
                     "GET", "/v5/account/transaction-log", signed=True, params=p),
@@ -870,32 +1084,72 @@ class CarryBroker:
                  "type": "SETTLEMENT", "startTime": window_start,
                  "endTime": window_end, "limit": self._TXLOG_PAGE},
                 max_pages=self._TXLOG_MAX_PAGES)
+            ev.pages += res.pages
+            ev.rows_returned += len(res.rows)
             if not res.complete:
-                # A partial list would book some settlements and silently drop
-                # others; an unreadable payment is not a payment of zero.
-                raise PairIncident(
-                    f"funding payments are unreadable: {res.error}")
+                ev.errors.append(
+                    f"window {window_start}..{window_end} unreadable: "
+                    f"{res.error}")
             for row in res.rows:
-                parsed = self._funding_row(row, symbol)
-                if parsed is not None:
-                    out.append(parsed)
-        # Overlapping windows (and pages) can return the same row twice; one
-        # payment is one record.
-        unique = {(r["id"], r["ms"], r["usd"]): r for r in out}
-        return sorted(unique.values(), key=lambda r: (r["ms"], r["id"]))
+                try:
+                    parsed = self._funding_row(row, symbol, start, end)
+                except PairIncident as exc:
+                    ev.errors.append(str(exc))
+                    continue
+                if isinstance(parsed, str):
+                    if parsed == "other_symbol":
+                        ev.other_symbol_rows += 1
+                    elif parsed != "no_funding":
+                        ev.rejected[parsed] = ev.rejected.get(parsed, 0) + 1
+                        if parsed in ("out_of_window",):
+                            ev.errors.append(
+                                "a settlement row lies outside the requested "
+                                "interval")
+                    continue
+                key = (parsed["id"], parsed["ms"], parsed["usd"])
+                if key in found:
+                    ev.duplicate_rows += 1
+                found[key] = parsed
+        ev.payments = sorted(found.values(), key=lambda r: (r["ms"], r["id"]))
+        return ev
+
+    def get_funding_payments(self, symbol: str, start_ms: int,
+                             end_ms: Optional[int] = None
+                             ) -> List[Dict[str, Any]]:
+        """Funding the VENUE paid or charged this account, settled rows only.
+
+        Returned as `{id, ms, usd, currency, size, symbol, category}`, oldest
+        first, for `symbol` only; `usd` is signed (positive = RECEIVED) and
+        `size` is the venue's own signed position size on the row. Raises when
+        the evidence is incomplete: a partial list would book some settlements
+        and silently drop others. The production path uses
+        `get_funding_evidence`, which keeps the verdict instead of raising.
+        """
+        ev = self.get_funding_evidence(symbol, start_ms, end_ms)
+        if not ev.complete:
+            raise PairIncident(
+                "funding payments are unreadable: " + "; ".join(ev.errors[:3]))
+        return ev.payments
 
     @staticmethod
-    def _funding_row(row: Dict[str, Any], symbol: str
-                     ) -> Optional[Dict[str, Any]]:
+    def _funding_row(row: Dict[str, Any], symbol: str,
+                     start_ms: Optional[int] = None,
+                     end_ms: Optional[int] = None
+                     ) -> Any:
+        """A parsed payment dict, or a short REASON string it was not used."""
         if str(row.get("symbol", "")) != symbol:
-            return None
+            return "other_symbol"
         # The request filters server-side, but a row of any other type is not a
-        # settlement whatever its fields say: never trust the filter alone.
-        if "type" in row and str(row.get("type")) != "SETTLEMENT":
-            return None
+        # settlement whatever its fields say, and a row that does not state its
+        # type cannot be proved to be one.
+        if str(row.get("type", "")) != "SETTLEMENT":
+            return "wrong_type" if "type" in row else "no_type"
+        category = row.get("category")
+        if category not in (None, "") and str(category) != LINEAR:
+            return "wrong_category"
         raw = row.get("funding")
         if raw is None or str(raw).strip() == "":
-            return None                       # a TRADE row: no funding on it
+            return "no_funding"
         try:
             usd = float(raw)
             stamp = int(row["transactionTime"])
@@ -903,17 +1157,22 @@ class CarryBroker:
         except (KeyError, TypeError, ValueError) as exc:
             raise PairIncident(
                 f"funding row is malformed ({exc!r}): {row!r}") from exc
-        if not math.isfinite(usd) or not ident:
+        if not math.isfinite(usd) or not ident or stamp <= 0:
             raise PairIncident(f"funding row is unusable: {row!r}")
+        if (start_ms is not None and stamp < start_ms) or (
+                end_ms is not None and stamp > end_ms):
+            return "out_of_window"
         size = None
         if str(row.get("size", "")).strip() != "":
             try:
                 size = float(row["size"])
             except (TypeError, ValueError):
                 size = None
+            if size is not None and not math.isfinite(size):
+                size = None
         return {"id": ident, "ms": stamp, "usd": usd, "symbol": symbol,
                 "currency": str(row.get("currency", "")).upper() or None,
-                "size": size}
+                "size": size, "category": LINEAR}
 
     def get_perp_position(self, symbol: str) -> float:
         """Size of the perp position at the venue, in base units. 0 when flat.
