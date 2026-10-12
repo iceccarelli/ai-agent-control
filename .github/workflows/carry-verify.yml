@@ -2,7 +2,9 @@
 #
 # WHAT THIS IS: a lean, deterministic check that runs on every pull request and
 # every push to main. It exercises the carry funding/fee/report/broker/preflight/
-# probe/live-gate/hold-audit tests, the lifecycle funding-reconciliation,
+# probe/live-gate/hold-audit tests, the production image's import closure (a
+# module main.py imports but the Dockerfile does not copy crashes the container,
+# which PR #72 shipped), the lifecycle funding-reconciliation,
 # out-of-sample audit and operator-verdict tests, the Fly build-context check and a
 # checkout-safe whitespace check.
 #
@@ -83,6 +85,8 @@ jobs:
           tests/test_carry_oos_audit.py
           tests/test_carry_replay.py
           tests/test_operator_verdicts.py
+          tests/test_dockerfile.py
+          tests/test_image_ships_the_tools.py
           tests/test_ci_workflow.py
 
       - name: Fly build context
