@@ -248,7 +248,7 @@ def make_bot(venue, journal, engine, store):
     return bot
 
 
-def tick(bot, k, after_open=False, full_read=True):
+def tick(bot, k, after_open=False, full_read=True, throttled=False):
     """One real `TradingBot.tick()`. `after_open` delivers a funding print that
     settled AFTER the hedge opened, which is what makes the ENGINE accrue its own
     (estimated) `funding_collected`."""
@@ -258,9 +258,10 @@ def tick(bot, k, after_open=False, full_read=True):
         perp_mark=MARK, spot_mark=MARK, funding_bps=3.0, margin_multiple=5.0,
         observed_at_s=time.time(), funding_print_bps=3.0,
         funding_print_ms=print_ms)
-    bot._last_funding_poll_ms = 0           # defeat the throttles for the test
-    if full_read:
-        bot._last_reconcile_ms = 0
+    if not throttled:
+        bot._last_funding_poll_ms = 0       # defeat the throttles for the test
+        if full_read:
+            bot._last_reconcile_ms = 0
     with mock.patch("market_snapshot.take_snapshot", return_value=view):
         bot.tick()
 

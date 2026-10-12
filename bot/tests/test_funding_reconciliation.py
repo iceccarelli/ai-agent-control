@@ -719,3 +719,23 @@ class TestMainRouteUsesTheReconciliation:
         assert journal.statement()["funding_confirmed"] is False
         assert "FUNDING_HISTORY_NOT_READ" in journal.statement()[
             "funding_lifecycles"][0]["reasons"]
+
+
+class TestVenueReadsAreThrottled:
+    def test_ticks_inside_the_poll_interval_make_no_further_venue_reads(
+            self, tmp_path):
+        from test_carry_funding_truth import build, make_bot, modern, tick
+        from persistence import StateStore
+        venue, journal, engine = build(modern, clock_offset_ms=-2 * H)
+        bot = make_bot(venue, journal, engine,
+                       StateStore(str(tmp_path / "c.db")))
+        for k in (1, 2, 3):
+            tick(bot, k)
+        reads = len(venue.txlog_calls)
+        calls = len(venue.calls)
+        for k in (4, 5, 6, 7):
+            tick(bot, k, throttled=True)
+        assert len(venue.txlog_calls) == reads
+        funding_history = [c for c in venue.calls[calls:]
+                           if c[1] == "/v5/market/funding/history"]
+        assert funding_history == []

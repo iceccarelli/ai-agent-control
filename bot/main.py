@@ -878,11 +878,13 @@ class TradingBot:
             status[lc.id]["state"] in ("NOT_RECONCILED", "STALE",
                                        "PENDING_DELIVERY_GRACE")
             for lc in pending)
+        # One throttle for every venue read here, including the first read
+        # after a fill: a record that cannot be written must not become a
+        # request storm.
+        if now_ms - self._last_funding_poll_ms < self.FUNDING_POLL_MS:
+            return
         full_due = (needs_record or
                     now_ms - self._last_reconcile_ms >= self.RECONCILE_POLL_MS)
-        if not full_due and now_ms - self._last_funding_poll_ms < \
-                self.FUNDING_POLL_MS:
-            return
         self._last_funding_poll_ms = now_ms
 
         earliest = min(lc.start_ms for lc in pending)
@@ -946,9 +948,7 @@ class TradingBot:
             try:
                 for rec in _recon.reconcile_funding(
                         journal, history=history,
-                        evidence=evidence if evidence is not None and
-                        evidence.start_ms <= earliest else evidence,
-                        now_ms=now_ms):
+                        evidence=evidence, now_ms=now_ms):
                     logger.warning("funding reconciliation %s: %s",
                                    rec["state"], ", ".join(rec["reasons"])
                                    or "complete")
