@@ -77,7 +77,11 @@ PROTOCOL: Dict[str, Any] = {
     "min_completed_per_fold": 20,
     "min_adequate_folds": 3,
     "min_total_completed": 60,
-    "bootstrap": {"resamples": 2000, "seed": 20261012, "level": 0.95},
+    # Sequential trades are serially dependent (funding regimes persist), so the
+    # interval resamples CONSECUTIVE blocks of trades; an i.i.d. resample would
+    # understate the width. The i.i.d. interval is reported for comparison only.
+    "bootstrap": {"resamples": 2000, "seed": 20261012, "level": 0.95,
+                  "block_length": 5},
     "notional_usd": 100_000.0,
     "execution_mode": "overlay",
     "execution_style": "taker",
@@ -182,14 +186,27 @@ def _stats(values: Sequence[float]) -> Dict[str, Any]:
 
 
 def bootstrap_mean_ci(values: Sequence[float], *, resamples: int, seed: int,
-                      level: float) -> Optional[Tuple[float, float]]:
-    """Percentile bootstrap of the mean, deterministic for a given seed."""
+                      level: float, block_length: int = 1
+                      ) -> Optional[Tuple[float, float]]:
+    """Percentile bootstrap of the mean, deterministic for a given seed.
+
+    ``block_length`` > 1 resamples runs of consecutive values (moving blocks),
+    which respects serial dependence; 1 is the i.i.d. bootstrap.
+    """
     if len(values) < 2:
         return None
     rng = random.Random(seed)
     n = len(values)
-    means = sorted(statistics.fmean(rng.choices(values, k=n))
-                   for _ in range(resamples))
+    bl = max(1, min(int(block_length), n))
+    starts = n - bl + 1
+    means = []
+    for _ in range(resamples):
+        out: List[float] = []
+        while len(out) < n:
+            i = rng.randrange(starts)
+            out.extend(values[i:i + bl])
+        means.append(statistics.fmean(out[:n]))
+    means.sort()
     lo = int(((1 - level) / 2) * resamples)
     hi = int((1 - (1 - level) / 2) * resamples) - 1
     return means[lo], means[hi]
@@ -374,9 +391,62 @@ def run_oos(rows: Sequence[Any], *, meta: Optional[Dict[str, Any]] = None,
                 totals[k] += f["gross_modelled"][k]
     test_span_years = max((last_ms + 1 - warm_end) / DAY_MS, 1.0) / 365.25 \
         if blocks else None
-    ci = bootstrap_mean_ci(pooled_nets, **{
-        "resamples": p["bootstrap"]["resamples"],
-        "seed": p["bootstrap"]["seed"], "level": p["bootstrap"]["level"]})
+    # How the blocks relate to ONE continuous run of the same engine. The two
+    # differ by design: a position crossing a block end is censored here, and
+    # the fresh engine of the next block may re-enter (purged). Showing both
+    # keeps the censoring from silently deleting where the profit sat.
+    import carry_costs as _cc
+    import carry_hold_audit as _ha
+    cont_trades = base["continuous"]["trade_rows"]
+
+    def _net(t: Dict[str, Any]) -> float:
+        return _ha._trade_net(t, taker_perp_bps=_cc.TAKER_BPS_PERP,
+                              taker_spot_bps=_cc.TAKER_BPS_SPOT,
+                              mode=p["execution_mode"])["net"]
+    link = []
+    for f in folds:
+        if f.get("status") != "EVALUATED":
+            continue
+        inside = [t for t in cont_trades
+                  if f["start_ms"] <= t["opened_ms"] < f["end_ms"]]
+        crossers = [t for t in inside if t["closed_ms"] >= f["end_ms"]]
+        link.append({
+            "fold": f["fold"],
+            "continuous_run_entries_in_block": len(inside),
+            "fold_run_entries_kept": f["completed"] + f["censored"],
+            "fold_run_entries_purged": f["purged"],
+            "continuous_run_entries_crossing_block_end": len(crossers),
+            "continuous_run_net_of_those_crossers_usd_modelled": (
+                sum(_net(t) for t in crossers) if crossers else None),
+            "continuous_run_net_of_block_entries_usd_modelled": (
+                sum(_net(t) for t in inside) if inside else None)})
+    warm_trades = [t for t in cont_trades if t["opened_ms"] < warm_end]
+    censored_total = {
+        "positions": sum(f["censored"] for f in folds
+                         if f.get("status") == "EVALUATED"),
+        "funding_collected_usd_modelled": sum(
+            c["funding_collected_usd_modelled"] for f in folds
+            if f.get("status") == "EVALUATED" for c in f["censored_exposure"]),
+        "basis_marked_usd_estimate": sum(
+            c["basis_marked_usd_estimate"] for f in folds
+            if f.get("status") == "EVALUATED" for c in f["censored_exposure"]),
+        "purged_reentries": sum(f["purged"] for f in folds
+                                if f.get("status") == "EVALUATED"),
+        "purged_reentries_net_usd_modelled": sum(
+            x["net_usd_modelled"] for f in folds
+            if f.get("status") == "EVALUATED"
+            for x in f["purged_boundary_reentries"]),
+        "note": "excluded from every completed-trade statistic; long holds "
+                "that cross a block end are exactly where an in-sample run "
+                "concentrates its profit, so completed-only figures are "
+                "biased DOWNWARD relative to the continuous run"}
+
+    bs = p["bootstrap"]
+    ci = bootstrap_mean_ci(pooled_nets, resamples=bs["resamples"],
+                           seed=bs["seed"], level=bs["level"],
+                           block_length=bs["block_length"])
+    ci_iid = bootstrap_mean_ci(pooled_nets, resamples=bs["resamples"],
+                               seed=bs["seed"], level=bs["level"])
     completed_total = len(pooled_nets)
     fold_positive = [f for f in folds if f.get("status") == "EVALUATED"
                      and f.get("adequate") and f["gross_modelled"]
@@ -438,12 +508,25 @@ def run_oos(rows: Sequence[Any], *, meta: Optional[Dict[str, Any]] = None,
             "gross_modelled": totals if completed_total else None,
             "stats": _stats(pooled_nets),
             "mean_net_bootstrap_ci": ({
-                "level": p["bootstrap"]["level"], "low": ci[0],
+                "method": "moving-block bootstrap (used by the verdict)",
+                "block_length": bs["block_length"],
+                "level": bs["level"], "low": ci[0],
                 "high": ci[1]} if ci else None),
+            "mean_net_bootstrap_ci_iid_comparison_only": ({
+                "method": "i.i.d. bootstrap; ignores serial dependence, "
+                          "NOT used by the verdict",
+                "level": bs["level"], "low": ci_iid[0],
+                "high": ci_iid[1]} if ci_iid else None),
             "net_annualised_pct": (
                 100.0 * totals["net"] / p["notional_usd"] / test_span_years
                 if completed_total and test_span_years else None),
         },
+        "continuous_run_link": {
+            "blocks": link,
+            "warmup_entries_excluded": len(warm_trades),
+            "warmup_entries_net_usd_modelled": (
+                sum(_net(t) for t in warm_trades) if warm_trades else None)},
+        "censored_exposure_total": censored_total,
         "counterfactuals": diagnostics,
         "verdict": verdict, "verdict_reasons": why,
         "independence": ("NOT_INDEPENDENT: the production constants were "
@@ -457,6 +540,11 @@ def run_oos(rows: Sequence[Any], *, meta: Optional[Dict[str, Any]] = None,
             "real slippage; slippage is a declared walk through measured depth",
             "no venue-observed settlement or fill supports any figure here",
             "mark-to-market of censored exposure is an estimate",
+            "censoring removes long boundary-crossing holds from the "
+            "completed-trade statistics; compare continuous_run_link",
+            "trades are serially dependent; the block bootstrap reduces but "
+            "cannot remove that, and ~80 trades cannot support inference "
+            "about a skewed, regime-driven distribution",
         ],
     }
 

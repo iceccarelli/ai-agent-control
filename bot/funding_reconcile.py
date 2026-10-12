@@ -128,21 +128,14 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
         elif kind == "ambiguous":
             ambiguous.append(t)
 
-    booked = [e for e in journal.entries
-              if e.basis in ("venue", "unattributed") and "venue_ms" in e.fee_raw
-              and lo <= int(e.fee_raw["venue_ms"]) <= hi]
+    flags = L.lifecycle_flags(journal, lc)
+    booked = flags["booked"]
     attributed = [e for e in booked if e.basis == "venue"]
-    unattributed = [e for e in booked if e.basis == "unattributed"]
-    conflicts = [e for e in booked if e.fee_raw.get("identity_conflict")]
+    unattributed, conflicts = flags["unattributed"], flags["conflicts"]
     row_ms = [int(e.fee_raw["venue_ms"]) for e in booked]
 
     matched, missing, orphan_rows = _match(held, row_ms)
-    flagged_missing = [e for e in journal.entries
-                       if e.kind == "funding_missing"
-                       and lo <= int(e.fee_raw.get("print_ms", -1)) <= hi]
-    unread = [e for e in journal.entries if e.kind == "funding_unread"
-              and lc.start_ms <= e.ms <= (lc.end_ms if lc.end_ms is not None
-                                          else int(now_ms) + 1)]
+    flagged_missing, unread = flags["missing"], flags["unread"]
 
     # Only a COMPLETE history can say a row has no public settlement behind it.
     history_whole = (history is not None and not reasons.count(
@@ -230,7 +223,7 @@ def pending_lifecycles(journal: L.Journal) -> List[L.Lifecycle]:
             continue
         rec = latest.get(lc.id)
         if status[lc.id]["reconciled"]:
-            continue
+            continue       # (a CONTRADICTED one is not "reconciled": it re-enters)
         if rec is not None and rec.get("final") and list(
                 rec.get("fingerprint", [])) == list(lc.fingerprint):
             continue
@@ -256,15 +249,22 @@ def reconcile_funding(journal: L.Journal, *, history: Any, evidence: Any,
         L.check_funding_completeness(
             journal, [ms for _bps, ms in history.prints], now_ms=now_ms)
     latest: Dict[str, str] = {}
+    latest_at: Dict[str, int] = {}
     for e in journal.entries:
         if e.kind == L.RECONCILIATION_KIND:
             rec = dict(e.fee_raw)
             if rec.get("lifecycle_id"):
                 latest[str(rec["lifecycle_id"])] = _signature(rec)
+                latest_at[str(rec["lifecycle_id"])] = int(rec.get("as_of_ms", 0))
     for lc in pending_lifecycles(journal):
         rec = assess_lifecycle(journal, lc, history=history,
                                evidence=evidence, now_ms=now_ms)
-        if latest.get(lc.id) == _signature(rec):
+        # An unchanged outcome is not rewritten - except that an OPEN lifecycle's
+        # record is refreshed before it ages out (`ledger.RECORD_MAX_AGE_MS`),
+        # which is what tells a later reader the book was still being checked.
+        if latest.get(lc.id) == _signature(rec) and not (
+                lc.end_ms is None and int(now_ms) - latest_at.get(lc.id, 0)
+                > L.RECORD_MAX_AGE_MS // 3):
             continue
         stamp = max(int(now_ms), journal.entries[-1].ms if journal.entries else 0)
         journal.post(L.Entry(

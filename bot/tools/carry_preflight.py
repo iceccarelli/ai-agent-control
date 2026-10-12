@@ -382,7 +382,8 @@ def main(argv: List[str] | None = None) -> int:
             import ledger as _ledger
             rows = store.load_ledger()
             if rows:
-                statement = _ledger.Journal.from_rows(rows).statement()
+                statement = _ledger.Journal.from_rows(rows).statement(
+                    now_ms=int(__import__('time').time() * 1000))
                 known = abs(statement["open_perp_qty"])
         except Exception as exc:  # noqa: BLE001
             print(json.dumps({"verdict": "PREFLIGHT_BLOCKED",

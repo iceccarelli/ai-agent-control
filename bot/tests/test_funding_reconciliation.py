@@ -739,3 +739,155 @@ class TestVenueReadsAreThrottled:
         funding_history = [c for c in venue.calls[calls:]
                            if c[1] == "/v5/market/funding/history"]
         assert funding_history == []
+
+
+class TestReconciledStatusCannotOutliveItsEvidence:
+    """Found in review of the merged code: a per-lifecycle 'reconciled' could
+    contradict the statement, and an open lifecycle stayed confirmed forever."""
+
+    def test_an_open_lifecycles_record_expires_when_read_with_a_clock(self):
+        j = hedged()
+        recon(j, [], [], now=T0 + 3 * H)
+        assert j.statement()["funding_confirmed"] is True        # no clock: as written
+        fresh = j.statement(now_ms=T0 + 4 * H)
+        assert fresh["funding_confirmed"] is True
+        old = j.statement(now_ms=T0 + 3 * H + L.RECORD_MAX_AGE_MS + 1)
+        lc = old["funding_lifecycles"][0]
+        assert old["funding_confirmed"] is False
+        assert lc["state"] == "STALE_AS_OF"
+        assert lc["reasons"] == ["RECORD_OLDER_THAN_MAX_AGE"]
+
+    def test_the_bot_refreshes_an_unchanged_open_record_before_it_ages_out(self):
+        j = hedged()
+        recon(j, [], [], now=T0 + 3 * H)
+        n = len(j.entries)
+        recon(j, [], [], now=T0 + 4 * H)                  # inside a third of the max age
+        assert len(j.entries) == n
+        recon(j, [], [], now=T0 + 3 * H + L.RECORD_MAX_AGE_MS // 3 + 1)
+        assert len(j.entries) == n + 1
+        st = j.statement(now_ms=T0 + 3 * H + L.RECORD_MAX_AGE_MS // 3 + 2)
+        assert st["funding_confirmed"] is True
+
+    def test_a_closed_reconciled_lifecycle_does_not_expire(self):
+        j = hedged()
+        fill(j, "close", T0 + 5 * H, "c", 0.5)
+        recon(j, [], [], now=T0 + 20 * H)
+        assert j.statement(now_ms=T0 + 900 * 86_400_000)["funding_confirmed"]
+
+    def test_contradicting_evidence_after_reconciliation_downgrades_it_and_keeps_the_trail(
+            self):
+        j = hedged()
+        fill(j, "close", T0 + 5 * H, "c", 0.5)
+        recon(j, [], [], now=T0 + 20 * H)
+        assert state(j)[0]["reconciled"]
+        L.book_funding_payments(
+            j, [pay("X", 2.0, T0 + 3 * H), pay("X", 3.0, T0 + 3 * H + 1000)],
+            ms=T0 + 21 * H)
+        lc = state(j)[0]
+        assert lc["state"] == "CONTRADICTED_AFTER_RECONCILIATION"
+        assert not lc["reconciled"] and "IDENTITY_CONFLICT" in lc["reasons"]
+        # it re-enters reconciliation and a new PROVISIONAL record is appended
+        assert R.pending_lifecycles(j)
+        recon(j, [T0 + 3 * H], [], now=T0 + 22 * H, book=False)
+        records = [e.fee_raw["state"] for e in j.entries
+                   if e.kind == L.RECONCILIATION_KIND]
+        assert records[0] == "FULLY_RECONCILED" and records[-1] == "PROVISIONAL"
+        assert len(records) >= 2                      # the earlier state is not erased
+
+    def test_the_lifecycle_view_and_the_statement_cannot_disagree_on_an_unread_tail(
+            self):
+        j = hedged()
+        fill(j, "close", T0 + 5 * H, "c", 0.5)
+        L.mark_funding_unread(j, ms=T0 + 6 * H, why="down")     # inside the tail
+        recon(j, [], [], now=T0 + 20 * H)
+        st = j.statement()
+        assert st["funding_confirmed"] is False
+        assert "FUNDING_UNREADABLE_WHILE_OPEN" in st["funding_lifecycles"][0][
+            "reasons"]
+        assert not st["funding_lifecycles"][0]["reconciled"]
+
+    def test_a_later_outage_does_not_taint_an_earlier_finished_lifecycle(self):
+        j = hedged()
+        fill(j, "close", T0 + 5 * H, "c", 0.5)
+        recon(j, [], [], now=T0 + 20 * H)
+        L.mark_funding_unread(j, ms=T0 + 400 * H, why="a later outage")
+        assert state(j)[0]["reconciled"]              # lifecycle-scoped
+        assert j.statement()["funding_confirmed"] is False   # the book is not
+
+    def test_a_record_that_claims_whole_while_listing_reasons_is_not_trusted(self):
+        j = hedged()
+        recon(j, [], [], now=T0 + 3 * H)
+        rows = j.to_rows()
+        for r in rows:
+            if r["kind"] == L.RECONCILIATION_KIND:
+                r["fee_raw"]["reasons"] = ["EXPECTED_SETTLEMENT_MISSING"]
+        st = L.Journal.from_rows(rows).statement()
+        assert st["funding_lifecycles"][0]["state"] == "INCONSISTENT_RECORD"
+        assert st["funding_confirmed"] is False
+
+    def test_the_report_reads_with_a_clock(self, tmp_path):
+        import time
+        from persistence import StateStore
+        from tools import carry_report
+        now = int(time.time() * 1000)
+        j = hedged(at=now - 3 * 86_400_000)          # three days ago, never refreshed
+        recon(j, [], [], now=now - 3 * 86_400_000 + 3 * H,
+              start=now - 3 * 86_400_000 - 2 * H)
+        db = str(tmp_path / "r.db")
+        s = StateStore(db)
+        s.save_ledger(j.to_rows())
+        s.close()
+        rep = carry_report.build_report(db)["carry"]
+        assert rep["status"] == "PROVISIONAL_FUNDING_UNVERIFIED"
+        assert rep["funding_lifecycles"][0]["state"] == "STALE_AS_OF"
+
+
+class TestBoundariesAndCorruption:
+    """A settlement exactly on a fill, and a journal that cannot be trusted."""
+
+    @pytest.mark.parametrize("offset,claimed", [
+        (0, False), (-L.ATTRIBUTION_SLACK_MS + 1, False),
+        (L.ATTRIBUTION_SLACK_MS, False),
+        # A fill is stamped when it was BOOKED, which is never before it
+        # happened. One stamped exactly a slack BEFORE the settlement therefore
+        # happened at or before that instant, and the position is the same
+        # through the whole window; one stamped a slack AFTER may have happened
+        # earlier, so it is not claimed.
+        (-L.ATTRIBUTION_SLACK_MS, True), (-L.ATTRIBUTION_SLACK_MS - 1, True),
+        (L.ATTRIBUTION_SLACK_MS + 1, True)])
+    def test_a_settlement_within_the_slack_of_a_fill_is_never_claimed(
+            self, offset, claimed):
+        j = hedged(0.5)
+        t = T0 + 5 * H
+        fill(j, "open", t + offset, "add", 0.1)
+        # the size the venue would report on whichever side of the add it fell
+        size = -0.5 if t < t + offset else -0.6
+        out = L.book_funding_payments(j, [pay(1, 1.0, t, size=size)], ms=t + 2 * H)
+        assert (out["booked"] == 1) is claimed, (offset, out)
+
+    def test_out_of_order_or_corrupt_persisted_rows_are_refused_not_repaired(self):
+        j = hedged()
+        fill(j, "close", T0 + H, "c", 0.5)
+        rows = j.to_rows()
+        with pytest.raises(L.LedgerError):
+            L.Journal.from_rows(list(reversed(rows)))
+        broken = json.loads(json.dumps(rows))
+        broken[0]["lines"][0]["usd"] += 5.0                  # no longer balances
+        with pytest.raises(L.LedgerError):
+            L.Journal.from_rows(broken)
+
+    def test_spot_inventory_alone_never_creates_a_lifecycle_or_a_claim(self):
+        j = L.Journal()
+        L.opening_balance(j, ms=T0, btc=5.0, price=MARK)
+        out = L.book_funding_payments(j, [pay(1, 9.0, T0 + H, size=-5.0)],
+                                      ms=T0 + 2 * H)
+        assert out["unattributed"] == 1 and L.lifecycles(j) == []
+
+    def test_a_restart_does_not_move_a_lifecycles_start(self):
+        j = hedged()
+        fill(j, "open", T0 + 2 * H, "b", 0.1)
+        before = L.lifecycles(j)[0]
+        again = L.lifecycles(L.Journal.from_rows(
+            json.loads(json.dumps(j.to_rows()))))[0]
+        assert again.start_ms == before.start_ms == T0
+        assert again.id == before.id

@@ -221,7 +221,8 @@ class Journal:
         return out
 
     def statement(self, *, from_ms: Optional[int] = None,
-                  to_ms: Optional[int] = None) -> Dict[str, Any]:
+                  to_ms: Optional[int] = None,
+                  now_ms: Optional[int] = None) -> Dict[str, Any]:
         """What the book earned over a period, and the proof that it sums.
 
         Raises when the identity fails, exactly as `carry_backtest.attribution`
@@ -253,7 +254,7 @@ class Journal:
                 "Some entry was written by something other than post().")
 
         lifecycle_status = lifecycle_reconciliation(
-            self, from_ms=from_ms, to_ms=to_ms)
+            self, from_ms=from_ms, to_ms=to_ms, now_ms=now_ms)
         funding_reconciled = all(l["reconciled"] for l in lifecycle_status)
 
         funding_usd = -acc[FUNDING].usd          # income is credit-normal
@@ -438,16 +439,62 @@ def lifecycles(journal: "Journal") -> List[Lifecycle]:
     return out
 
 
+#: An OPEN lifecycle's FULLY_RECONCILED record speaks for the moment it was
+#: made. Read later, with a clock, it is only trusted this long: the bot polls
+#: hourly, so a record older than this was not refreshed (process down, venue
+#: unreadable) and says nothing about the settlements since.
+RECORD_MAX_AGE_MS = 6 * 3_600_000
+
+
+_CONTRADICTIONS = (
+    ("unattributed", "UNATTRIBUTED_SETTLEMENT_ROWS"),
+    ("conflicts", "IDENTITY_CONFLICT"),
+    ("missing", "EXPECTED_SETTLEMENT_MISSING"),
+    ("unread", "FUNDING_UNREADABLE_WHILE_OPEN"))
+
+
+def lifecycle_flags(journal: "Journal", lc: Lifecycle) -> Dict[str, List[Entry]]:
+    """The journal entries that contradict "this lifecycle's funding is whole".
+
+    One definition, used both when a reconciliation record is made and when it
+    is read back, so the two cannot disagree. A closed lifecycle owns the
+    entries up to its end plus the delivery tail it was polled through; an open
+    one owns everything since it began.
+    """
+    lo = lc.start_ms - ATTRIBUTION_SLACK_MS
+    hi = (lc.end_ms + ATTRIBUTION_SLACK_MS) if lc.end_ms is not None \
+        else float("inf")
+    tail = (lc.end_ms + MISSING_GRACE_MS) if lc.end_ms is not None \
+        else float("inf")
+    booked = [e for e in journal.entries
+              if e.basis in ("venue", "unattributed") and "venue_ms" in e.fee_raw
+              and lo <= int(e.fee_raw["venue_ms"]) <= hi]
+    return {
+        "booked": booked,
+        "unattributed": [e for e in booked if e.basis == "unattributed"],
+        "conflicts": [e for e in booked if e.fee_raw.get("identity_conflict")],
+        "missing": [e for e in journal.entries if e.kind == "funding_missing"
+                    and lo <= int(e.fee_raw.get("print_ms", -1)) <= hi],
+        "unread": [e for e in journal.entries if e.kind == "funding_unread"
+                   and lc.start_ms <= e.ms <= tail],
+    }
+
+
 def lifecycle_reconciliation(journal: "Journal", *, from_ms: Optional[int] = None,
-                             to_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+                             to_ms: Optional[int] = None,
+                             now_ms: Optional[int] = None) -> List[Dict[str, Any]]:
     """One status row per lifecycle: is its funding positively reconciled?
 
     A lifecycle is ``reconciled`` only when the LATEST reconciliation record
-    written for it (a) says FULLY_RECONCILED, (b) was made against the same
-    exposure history the journal now has (same fills, same end), and (c) for a
-    closed lifecycle, had judged every settlement up to its end. A lifecycle
-    with no record, a stale record or a provisional one is not reconciled, and
-    the reasons are carried verbatim so an operator can read why.
+    written for it (a) says FULLY_RECONCILED with no reasons, (b) was made
+    against the same exposure history the journal now has, (c) for a closed
+    lifecycle, had judged every settlement up to its end, (d) is not
+    contradicted by anything the journal holds NOW (an unattributed row, an
+    identity conflict, a missing-settlement flag, an unread marker), and (e)
+    when a clock is supplied, for an open lifecycle, is not older than
+    ``RECORD_MAX_AGE_MS``. Otherwise it is not reconciled and the reasons are
+    carried verbatim. Earlier records stay in the journal: the audit trail of a
+    provisional or contradicted state is never overwritten.
     """
     latest: Dict[str, Dict[str, Any]] = {}
     for e in journal.entries:
@@ -468,17 +515,33 @@ def lifecycle_reconciliation(journal: "Journal", *, from_ms: Optional[int] = Non
         else:
             state = str(rec.get("state", "PROVISIONAL"))
             reasons = list(rec.get("reasons", []))
+            if state == "FULLY_RECONCILED" and reasons:
+                # a record cannot be both whole and carry reasons
+                state = "INCONSISTENT_RECORD"
             if list(rec.get("fingerprint", [])) != list(lc.fingerprint):
                 state = "STALE"
                 reasons = ["EXPOSURE_CHANGED_SINCE_RECONCILIATION"] + reasons
             elif lc.end_ms is not None and int(
                     rec.get("judged_to_ms", 0)) < lc.end_ms:
                 state = "PENDING_DELIVERY_GRACE"
-                reasons = ["SETTLEMENTS_NOT_YET_JUDGEABLE"] + reasons
+                reasons = ["SETTLEMENTS_NOT_YET_JUDGEABLE"] + [
+                    r for r in reasons if r != "SETTLEMENTS_NOT_YET_JUDGEABLE"]
+            elif state == "FULLY_RECONCILED":
+                f = lifecycle_flags(journal, lc)
+                contra = [code for name, code in _CONTRADICTIONS if f[name]]
+                if contra:
+                    state = "CONTRADICTED_AFTER_RECONCILIATION"
+                    reasons = contra
+                elif (now_ms is not None and lc.end_ms is None and int(
+                        now_ms) - int(rec.get("as_of_ms", 0))
+                        > RECORD_MAX_AGE_MS):
+                    state = "STALE_AS_OF"
+                    reasons = ["RECORD_OLDER_THAN_MAX_AGE"]
         out.append({
             "lifecycle_id": lc.id, "start_ms": lc.start_ms, "end_ms": lc.end_ms,
             "open": lc.end_ms is None, "state": state,
             "reconciled": state == "FULLY_RECONCILED", "reasons": reasons,
+            "as_of_ms": (rec or {}).get("as_of_ms"),
             "evidence": (rec or {}).get("evidence", {}),
         })
     return out
