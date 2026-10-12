@@ -840,9 +840,6 @@ class TradingBot:
     #: How often to read the venue's settlement rows. Funding settles every 8h,
     #: so a few minutes is more than enough and keeps the call count low.
     FUNDING_POLL_MS = 300_000
-    #: Keep polling this long after the last perp fill: a settlement row can
-    #: post after the position that earned it has already closed.
-    FUNDING_TAIL_MS = 6 * 3_600_000
 
     #: A full read of every pending lifecycle's interval (both venue reads) is
     #: heavier than the incremental poll, so it runs at most this often - and
@@ -872,11 +869,13 @@ class TradingBot:
         pending = _recon.pending_lifecycles(journal)
         if not pending:
             return
-        status = {r["lifecycle_id"]: r
-                  for r in _ledger.lifecycle_reconciliation(journal)}
+        status = {r["lifecycle_id"]: r for r in
+                  _ledger.lifecycle_reconciliation(journal, now_ms=now_ms)}
         needs_record = any(
-            status[lc.id]["state"] in ("NOT_RECONCILED", "STALE",
-                                       "PENDING_DELIVERY_GRACE")
+            status[lc.id]["state"] in (
+                "NOT_RECONCILED", "STALE", "PENDING_DELIVERY_GRACE",
+                "CONTRADICTED_AFTER_RECONCILIATION", "INCONSISTENT_RECORD",
+                "STALE_AS_OF")
             for lc in pending)
         # One throttle for every venue read here, including the first read
         # after a fill: a record that cannot be written must not become a

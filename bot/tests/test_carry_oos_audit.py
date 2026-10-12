@@ -317,6 +317,36 @@ class TestEconomicsAreHonest:
         assert f["stats"]["sem"] is not None
         assert set(f["gross_modelled"]) == {"funding", "basis", "fees", "net"}
 
+    def test_the_interval_respects_serial_dependence(self):
+        # long runs of wins then losses: strongly autocorrelated trade results
+        v = ([50.0] * 10 + [-50.0] * 10) * 4
+        iid = oos.bootstrap_mean_ci(v, resamples=1000, seed=3, level=0.95)
+        blk = oos.bootstrap_mean_ci(v, resamples=1000, seed=3, level=0.95,
+                                    block_length=10)
+        assert (blk[1] - blk[0]) > 1.5 * (iid[1] - iid[0])
+
+    def test_the_verdict_uses_the_block_interval_and_reports_the_iid_one_aside(
+            self, small_protocol):
+        rep = oos.run_oos(trading_series(12), counterfactuals=False)
+        c = rep["combined"]
+        assert "moving-block" in c["mean_net_bootstrap_ci"]["method"]
+        assert "NOT used by the verdict" in c[
+            "mean_net_bootstrap_ci_iid_comparison_only"]["method"]
+        assert oos.PROTOCOL["bootstrap"]["block_length"] > 1
+
+    def test_the_run_passes_the_protocols_block_length_to_the_verdict_interval(
+            self, small_protocol):
+        seen = []
+        real = oos.bootstrap_mean_ci
+
+        def spy(values, **kw):
+            seen.append(kw.get("block_length", 1))
+            return real(values, **kw)
+        with mock.patch.object(oos, "bootstrap_mean_ci", spy):
+            oos.run_oos(trading_series(12), counterfactuals=False)
+        assert seen[0] == oos.PROTOCOL["bootstrap"]["block_length"] > 1
+        assert seen[1] == 1                        # the comparison-only interval
+
     def test_the_bootstrap_is_deterministic(self):
         v = [3.0, -1.0, 4.0, -2.0, 5.0, -9.0, 7.0]
         a = oos.bootstrap_mean_ci(v, resamples=500, seed=1, level=0.95)
@@ -374,6 +404,22 @@ class TestVerdictCannotOverclaim:
 # -- report, provenance, isolation -----------------------------------------
 
 class TestReportAndIsolation:
+    def test_the_report_links_blocks_to_one_continuous_run_and_totals_censoring(
+            self, small_protocol):
+        rows = series([(70, -0.0003), (330, 0.0003)])
+        rep = oos.run_oos(rows, counterfactuals=False)
+        link = rep["continuous_run_link"]
+        assert len(link["blocks"]) == len(rep["folds"])
+        first = link["blocks"][0]
+        # the continuous run's one position opens in block 1 and never ends:
+        # it crosses the block end, and block 1 holds it as censored exposure
+        assert first["continuous_run_entries_in_block"] == 1
+        assert first["continuous_run_entries_crossing_block_end"] == 1
+        assert first["fold_run_entries_kept"] == 1
+        assert rep["censored_exposure_total"]["positions"] == 1
+        assert "biased DOWNWARD" in rep["censored_exposure_total"]["note"]
+        assert link["warmup_entries_excluded"] == 0
+
     def test_the_report_is_valid_json_reproducible_and_labelled_modelled(
             self, small_protocol):
         rows = trading_series(10)

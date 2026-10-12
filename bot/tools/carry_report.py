@@ -44,7 +44,8 @@ def build_report(db_path: str) -> Dict[str, Any]:
             out["carry"] = {"status": "NO_CARRY_LEDGER"}
         else:
             journal = _ledger.Journal.from_rows(json.loads(row["payload"] or "[]"))
-            st = journal.statement()
+            import time as _time
+            st = journal.statement(now_ms=int(_time.time() * 1000))
             import operator_verdicts
             out["carry"] = {
                 # The separate questions (accounting, fees, fills, provenance).
