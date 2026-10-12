@@ -185,8 +185,13 @@ def run_preflight(*, broker: Any, client: Any, cfg: Any, spot_symbol: str,
                   known_perp_qty: float = 0.0,
                   execution_style: Optional[str] = None,
                   borrow_apr: Optional[float] = None,
-                  now_s: Optional[float] = None) -> Dict[str, Any]:
+                  now_s: Optional[float] = None,
+                  statement: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Pure function over injected collaborators, so it is testable offline.
+
+    ``statement`` is the local journal's ``Journal.statement()`` when there is
+    one; it feeds the accounting questions (funding attribution, fees, fills,
+    net-PnL provenance) that a venue read cannot answer. None means no journal.
 
     ``known_perp_qty`` is what the local ledger believes the perp holds (0.0 on a
     fresh state database). A venue position the ledger does not know about is a
@@ -264,8 +269,18 @@ def run_preflight(*, broker: Any, client: Any, cfg: Any, spot_symbol: str,
                  "pass is not permission to trade: orders are controlled only "
                  "by the carry order gate and the runtime risk checks.")
 
+    import operator_verdicts
+    questions = operator_verdicts.nine_questions(
+        reads={k: bool(v["ok"]) for k, v in reads.items()},
+        venue_perp_qty=val("perp_position"), statement=statement,
+        economics=economics, order_gate=bool(gate_open))
+    notes.append("PREFLIGHT_OK answers questions 1-2 only. Accounting "
+                 "completeness (4), fee confirmation (5), fills (8) and the "
+                 "provenance of net PnL (9) come from the journal, and an "
+                 "economics pass (6) or an open gate (7) is neither.")
     return {
         "verdict": "PREFLIGHT_BLOCKED" if blockers else "PREFLIGHT_OK",
+        "questions": questions,
         "venue": str(getattr(cfg, "BYBIT_VENUE", "testnet")),
         "use_testnet": bool(cfg.USE_TESTNET),
         "paper_trading": bool(cfg.PAPER_TRADING),
@@ -282,6 +297,7 @@ def run_preflight(*, broker: Any, client: Any, cfg: Any, spot_symbol: str,
                                 if economics["reason"] else economics["state"]),
             "order_gate": ("ALLOWS_ORDERS" if gate_open else "REFUSES_ORDERS")
                           + ":" + str(gate_reason),
+            "questions": operator_verdicts.one_line(questions),
         },
         "execution_mode": execution_mode,
         "symbols": {"spot": spot_symbol, "perp": perp_symbol},
@@ -361,12 +377,13 @@ def main(argv: List[str] | None = None) -> int:
             client=client, sequence_source=lambda *a: 0,
             order_gate=lambda: (False, "preflight is read-only"))
         known = 0.0
+        statement = None
         try:
             import ledger as _ledger
             rows = store.load_ledger()
             if rows:
-                known = abs(_ledger.Journal.from_rows(rows)
-                            .statement()["open_perp_qty"])
+                statement = _ledger.Journal.from_rows(rows).statement()
+                known = abs(statement["open_perp_qty"])
         except Exception as exc:  # noqa: BLE001
             print(json.dumps({"verdict": "PREFLIGHT_BLOCKED",
                               "blockers": [f"local ledger unreadable: {exc}"]}))
@@ -377,7 +394,7 @@ def main(argv: List[str] | None = None) -> int:
             execution_mode=str(cfg.CARRY_EXECUTION_MODE),
             known_perp_qty=known,
             execution_style=cfg.CARRY_EXECUTION_STYLE,
-            borrow_apr=cfg.CARRY_BORROW_APR)
+            borrow_apr=cfg.CARRY_BORROW_APR, statement=statement)
     finally:
         store.close()
     print(json.dumps(report, indent=2, sort_keys=True, default=str))

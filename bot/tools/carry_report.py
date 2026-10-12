@@ -5,6 +5,11 @@ Reads a state database READ-ONLY (SQLite `mode=ro`) and prints the carry
 journal's statement plus the ordinary-trade fee evidence. It places nothing and
 writes nothing.
 
+It answers the ACCOUNTING questions only (funding attribution, fee confirmation,
+fills, provenance of net PnL); whether the venue is readable, whether the entry
+evaluator would open, and whether the order gate is open are `tools/
+carry_preflight.py`'s, and are reported here as NOT_CHECKED.
+
 The one rule it exists to enforce: a net figure is called REALISED only when
 every fill's fee was venue-stated and booked by currency (`fees_confirmed`).
 Otherwise it says PROVISIONAL and names the counts, so an approximate number
@@ -40,7 +45,16 @@ def build_report(db_path: str) -> Dict[str, Any]:
         else:
             journal = _ledger.Journal.from_rows(json.loads(row["payload"] or "[]"))
             st = journal.statement()
+            import operator_verdicts
             out["carry"] = {
+                # The separate questions (accounting, fees, fills, provenance).
+                # The venue-facing ones (readability, authorisation, economics)
+                # are NOT_CHECKED: this tool reads only the database.
+                "questions": operator_verdicts.nine_questions(statement=st),
+                "funding_lifecycles": st["funding_lifecycles"],
+                "funding_reconciled": st["funding_reconciled"],
+                "net_pnl_provenance": operator_verdicts.net_pnl_provenance(
+                    st["net_basis"]),
                 # NO_FILLS first: "every fee confirmed" is vacuously true of a
                 # book that never traded, and must not be printed as a result.
                 # REALISED needs BOTH sides of the net observed: every fee
