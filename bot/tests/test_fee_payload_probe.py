@@ -110,8 +110,10 @@ class TestEveryCursorIsFollowed:
         log = Log(settlement=[[srow("1")], [srow("2", size="")], [srow("3")]])
         out = run(log)
         size = out["reads"]["settlement"]["size"]
-        assert size["with_direction"] == 2 and size["present"] == 2
-        assert out["settlement_rows_carry_size"] is False   # one row has none
+        assert size["negative"] == 2 and size["present"] == 2
+        obs = out["size_field_observation"]
+        assert obs["status"] == "SOME_ROWS_LACK_PARSEABLE_NONZERO_SIZE"
+        assert obs["size_absent_blank_or_unparseable"] == 1
 
 
 class TestIncompleteIsNeverSuccess:
@@ -128,7 +130,8 @@ class TestIncompleteIsNeverSuccess:
         out = run(Log(settlement=pages))
         assert out["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
         assert out["complete"] is False
-        assert out["settlement_rows_carry_size"] is None
+        assert out["size_field_observation"] == {"status": "OBSERVATION_INCOMPLETE"}
+        assert out["signed_size_semantics"] == "UNVERIFIED"
         assert why in json.dumps(out["errors"])
         assert out["reads"]["settlement"]["complete"] is False
 
@@ -161,7 +164,7 @@ class TestIncompleteIsNeverSuccess:
     def test_a_failure_on_a_later_page_does_not_pass_off_the_first_page(self):
         out = run(Log(settlement=[[srow("1"), srow("2")], RuntimeError("boom")]))
         assert out["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
-        assert out["settlement_rows_carry_size"] is None
+        assert out["size_field_observation"]["status"] == "OBSERVATION_INCOMPLETE"
         assert "nothing here is a claim about the whole log" in out["note"]
 
     def test_an_empty_log_that_ENDED_is_different_from_one_that_failed(self):
@@ -244,19 +247,20 @@ class TestNoPrivateAmountsByDefault:
         assert s["rows"] == 2
         assert s["funding"] == {"present": 2, "parseable": 2, "positive": 2,
                                 "negative": 0, "zero": 0}
-        assert s["size"]["with_direction"] == 2 and s["size"]["short"] == 2
+        assert s["size"]["negative"] == 2 and s["size"]["positive"] == 0
         assert s["key_presence"]["cashBalance"] == 2     # presence only
         assert s["id"]["distinct"] == 2 and s["id"]["length_min"] > 10
         assert s["currencies"] == ["USDT"] and s["types_seen"] == ["SETTLEMENT"]
         assert s["transactionTime"]["parseable"] == 2
-        assert out["settlement_rows_carry_size"] is True
+        assert out["signed_size_semantics"] == "UNVERIFIED"
 
     def test_unparseable_values_are_visible_as_present_but_not_parseable(self):
         log = Log(settlement=[[srow("1", funding="n/a", size="x")]])
         s = run(log)["reads"]["settlement"]
         assert s["funding"]["present"] == 1 and s["funding"]["parseable"] == 0
-        assert s["size"]["present"] == 1 and s["size"]["with_direction"] == 0
-        assert run(log)["settlement_rows_carry_size"] is False
+        assert s["size"]["present"] == 1 and s["size"]["parseable"] == 0
+        obs = run(log)["size_field_observation"]
+        assert obs["status"] == "SOME_ROWS_LACK_PARSEABLE_NONZERO_SIZE"
 
     def test_raw_samples_are_opt_in_truncate_ids_and_never_show_balances(self):
         text = all_text(run(self.log(), raw_samples=True))
@@ -331,3 +335,138 @@ class TestReadOnlyAndGuarded:
     def test_days_out_of_range_is_refused(self):
         assert fp.main(["--days", "0"]) == 3
         assert fp.main(["--days", "91"]) == 3
+
+
+# --- the size claim: field presence is not sign semantics -------------------
+
+
+def _obs(rows):
+    return run(Log(settlement=[rows]))
+
+
+class TestSignedSizeSemanticsAreNeverClaimedByTheProbe:
+    @pytest.mark.parametrize("sizes", [
+        ["0.5", "0.25"],                     # all positive
+        ["-0.5", "-0.25"],                   # all negative
+        ["-0.5", "0.25", "-0.1"],            # mixed
+    ])
+    def test_numeric_signs_alone_never_confirm_what_the_sign_means(self, sizes):
+        out = _obs([srow(str(i), size=v) for i, v in enumerate(sizes)])
+        assert out["verdict"] == "SETTLEMENT_ROWS_OBSERVED" and out["complete"]
+        assert out["signed_size_semantics"] == "UNVERIFIED"
+        assert "independent signed position" in out["signed_size_semantics_reason"]
+        obs = out["size_field_observation"]
+        assert obs["status"] == "ALL_ROWS_HAVE_PARSEABLE_NONZERO_SIZE"
+        assert obs["numeric_negative"] == sum(1 for v in sizes if float(v) < 0)
+        assert obs["numeric_positive"] == sum(1 for v in sizes if float(v) > 0)
+        assert "NOT verified" in out["note"]
+        text = json.dumps(out).lower()
+        for old in ("settlement_rows_carry_size", "with_direction", '"short"',
+                    '"long"', "ownership can be verified", "signed `size`: ownership"):
+            assert old not in text, old
+
+    @pytest.mark.parametrize("size,label", [
+        ("", "blank"), ("   ", "blank"), (None, "absent"), ("0", "zero"),
+        ("0.0", "zero"), ("abc", "unparseable"), ("nan", "unparseable"),
+    ])
+    def test_missing_blank_zero_or_unparseable_size_is_never_a_positive_verdict(
+            self, size, label):
+        row = srow("1")
+        if size is None:
+            del row["size"]
+        else:
+            row["size"] = size
+        out = _obs([row])
+        obs = out["size_field_observation"]
+        assert obs["status"] == "SOME_ROWS_LACK_PARSEABLE_NONZERO_SIZE", label
+        assert out["signed_size_semantics"] == "UNVERIFIED"
+        assert "provisional" in out["note"]
+        assert obs["numeric_negative"] == obs["numeric_positive"] == 0
+
+    def test_one_bad_row_among_good_ones_is_reported_as_a_gap(self):
+        out = _obs([srow("1", size="-0.5"), srow("2", size=""), srow("3", size="0.5")])
+        obs = out["size_field_observation"]
+        assert obs["status"] == "SOME_ROWS_LACK_PARSEABLE_NONZERO_SIZE"
+        assert obs["size_absent_blank_or_unparseable"] == 1 and obs["rows"] == 3
+
+    def test_a_complete_empty_result_says_so_and_infers_nothing(self):
+        out = run(Log(any_type=[[other_row("1"), other_row("2", size="-3")]]))
+        assert out["complete"] is True
+        assert out["verdict"] == "NO_SETTLEMENT_ROWS_TO_OBSERVE"
+        assert out["size_field_observation"] == {"status": "NO_SETTLEMENT_ROWS_OBSERVED"}
+        assert out["signed_size_semantics"] == "UNVERIFIED"
+        assert "no SETTLEMENT rows" in out["note"]
+        assert out["settlement_rows_seen"] == 0
+
+    def test_empty_and_incomplete_are_three_distinct_states(self):
+        empty = run(Log())["size_field_observation"]["status"]
+        seen = _obs([srow("1")])["size_field_observation"]["status"]
+        failed = run(Log(settlement=[[srow("1")], RuntimeError("x")]))
+        assert failed["size_field_observation"]["status"] == "OBSERVATION_INCOMPLETE"
+        assert failed["complete"] is False
+        assert len({empty, seen, failed["size_field_observation"]["status"]}) == 3
+
+    def test_a_failure_on_a_later_page_is_never_a_complete_observation(self):
+        out = run(Log(settlement=[[srow("1", size="-1")], [srow("2", size="-1")],
+                                  RuntimeError("page 3 down")]))
+        assert out["complete"] is False
+        assert out["verdict"] == "LOG_OBSERVATION_INCOMPLETE"
+        assert out["size_field_observation"]["status"] == "OBSERVATION_INCOMPLETE"
+        assert out["reads"]["settlement"]["complete"] is False
+
+    def test_the_size_observation_discloses_counts_only(self):
+        out = _obs([srow("1"), srow("2", size="-0.0071234")])
+        text = all_text(out)
+        for name, value in SECRETS.items():
+            assert value not in text, name
+        assert set(out["size_field_observation"]) == {
+            "status", "rows", "size_present", "size_parseable",
+            "numeric_negative", "numeric_positive", "numeric_zero",
+            "size_absent_blank_or_unparseable", "meaning"}
+
+    def test_raw_samples_stay_opt_in_with_their_privacy_notice(self):
+        default = _obs([srow("1")])
+        assert "raw_samples" not in all_text(default)
+        assert "no account amounts" in default["privacy"]
+        asked = run(Log(settlement=[[srow("1")]]), raw_samples=True)
+        assert "RAW SAMPLES INCLUDED" in asked["privacy"]
+        assert SECRETS["size"] in all_text(asked)
+
+    def test_the_probe_still_issues_only_get_requests(self):
+        log = Log(settlement=[[srow("1")], [srow("2")]], any_type=[[other_row()]])
+        _obs([srow("1")])
+        run(log, days=15)
+        assert log.calls and set(log.calls) == {("GET", "/v5/account/transaction-log")}
+
+
+class TestTheProductionLedgerStillFailsClosedOnSize:
+    """What the probe cannot decide, the reconciliation path decides - and it
+    refuses to attribute a row whose signed size does not equal the book's."""
+
+    def _book(self):
+        import ledger as L
+        j = L.Journal()
+        L.perp_open(j, ms=NOW, ref="o1", qty=0.5, price=80_000.0, fee_usd=1.0,
+                    fee_status="confirmed")
+        return L, j
+
+    @pytest.mark.parametrize("size", [0.5, 0.0, None, -9.0])
+    def test_a_size_that_is_not_the_books_signed_position_books_nothing(self, size):
+        L, j = self._book()
+        pay = {"id": "S1", "ms": NOW + 3 * 3_600_000, "usd": 7.77,
+               "currency": "USDT", "size": size, "symbol": "BTCUSDT"}
+        out = L.book_funding_payments(j, [pay], ms=NOW + 4 * 3_600_000)
+        st = j.statement()
+        assert out["unattributed"] == 1 and out["booked"] == 0
+        assert st["funding_usd"] == 0.0 and st["funding_venue_usd"] == 0.0
+        assert st["funding_confirmed"] is False
+
+    def test_only_the_books_own_signed_size_is_attributed(self):
+        L, j = self._book()
+        pay = {"id": "S1", "ms": NOW + 3 * 3_600_000, "usd": 7.77,
+               "currency": "USDT", "size": -0.5, "symbol": "BTCUSDT"}
+        assert L.book_funding_payments(j, [pay], ms=NOW + 4 * 3_600_000)["booked"] == 1
+
+    def test_the_recorded_semantics_remain_unconfirmed(self):
+        import funding_reconcile as R
+        assert "unconfirmed" in R.SIZE_SEMANTICS

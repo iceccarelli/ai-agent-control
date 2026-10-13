@@ -8,7 +8,9 @@ only, no order, no key, no signature is ever printed.
 
 WHAT THE DEFAULT REPORT CONTAINS (and what it never contains)
   contains   field-presence counts, whether each field is present AND parseable,
-             whether a signed position size is present and has a direction,
+             whether a position `size` is present, parseable and its numeric sign
+             (which does NOT say what the sign means: signed-size semantics
+             stay UNVERIFIED here; only the reconciliation path tests them),
              record types, the parser's verdict per order (known/unknown, which
              field it came from, which coins), page and completeness
              information, and coarse shape facts (id length, row age in days).
@@ -170,8 +172,11 @@ def summarize_rows(rows: List[Dict[str, Any]], symbol: str, *,
     keys: Dict[str, int] = {}
     funding = {"present": 0, "parseable": 0, "positive": 0, "negative": 0,
                "zero": 0}
-    size = {"present": 0, "parseable": 0, "with_direction": 0, "short": 0,
-            "long": 0, "flat": 0}
+    # Field presence and the sign of the NUMBER only. A negative number is not
+    # thereby a short: the probe has no independent position to compare with,
+    # so nothing here says how the venue encodes direction.
+    size = {"present": 0, "parseable": 0, "negative": 0, "positive": 0,
+            "zero": 0}
     ids: List[str] = []
     times: List[float] = []
     currencies: set = set()
@@ -193,14 +198,8 @@ def summarize_rows(rows: List[Dict[str, Any]], symbol: str, *,
             v = _num(s)
             if v is not None:
                 size["parseable"] += 1
-                if v < 0:
-                    size["short"] += 1
-                    size["with_direction"] += 1
-                elif v > 0:
-                    size["long"] += 1
-                    size["with_direction"] += 1
-                else:
-                    size["flat"] += 1
+                size["negative" if v < 0 else "positive" if v > 0
+                     else "zero"] += 1
         if r.get("id") not in (None, ""):
             ids.append(str(r["id"]))
         t = _num(r.get("transactionTime"))
@@ -311,26 +310,53 @@ def probe_transaction_log(client: Any, symbol: str, *, now_ms: int,
     out["complete"] = not all_errors
     out["errors"] = all_errors
     out["settlement_rows_seen"] = settle["rows"]
+    # What this probe can and cannot establish, stated in the output itself.
+    out["signed_size_semantics"] = "UNVERIFIED"
+    out["signed_size_semantics_reason"] = (
+        "this read-only probe has no independent signed position for the "
+        "account at any settlement time, so it cannot tell what the sign of "
+        "`size` means. Ownership is established only by the production "
+        "reconciliation path (ledger.book_funding_payments), which compares "
+        "the row's signed size with the book's own signed perp position.")
     if all_errors:
         out["verdict"] = "LOG_OBSERVATION_INCOMPLETE"
-        out["settlement_rows_carry_size"] = None
+        out["size_field_observation"] = {"status": "OBSERVATION_INCOMPLETE"}
         out["note"] = ("the log read did not complete, so nothing here is a "
                        "claim about the whole log: " + "; ".join(all_errors))
         return out
-    out["settlement_rows_carry_size"] = (
-        None if not settle["rows"]
-        else settle["size"]["with_direction"] == settle["rows"])
-    out["verdict"] = ("SETTLEMENT_ROWS_OBSERVED" if settle["rows"]
-                      else "NO_SETTLEMENT_ROWS_TO_OBSERVE")
+    if not settle["rows"]:
+        out["verdict"] = "NO_SETTLEMENT_ROWS_TO_OBSERVE"
+        out["size_field_observation"] = {"status": "NO_SETTLEMENT_ROWS_OBSERVED"}
+        out["note"] = (
+            "the log was read completely and holds no SETTLEMENT rows in the "
+            "queried window; the shape above comes from other row types only "
+            "and says nothing about SETTLEMENT rows' `size`")
+        return out
+    sz = settle["size"]
+    usable = sz["negative"] + sz["positive"]
+    out["verdict"] = "SETTLEMENT_ROWS_OBSERVED"
+    out["size_field_observation"] = {
+        "status": ("ALL_ROWS_HAVE_PARSEABLE_NONZERO_SIZE"
+                   if usable == settle["rows"]
+                   else "SOME_ROWS_LACK_PARSEABLE_NONZERO_SIZE"),
+        "rows": settle["rows"], "size_present": sz["present"],
+        "size_parseable": sz["parseable"], "numeric_negative": sz["negative"],
+        "numeric_positive": sz["positive"], "numeric_zero": sz["zero"],
+        "size_absent_blank_or_unparseable": settle["rows"] - sz["parseable"],
+        "meaning": "field presence and numeric sign only; not a statement "
+                   "about long/short encoding",
+    }
     out["note"] = (
-        "no settlement rows: the shape above comes from other row types only; "
-        "it does NOT show whether SETTLEMENT rows carry a signed `size`"
-        if not settle["rows"] else
-        ("every SETTLEMENT row carries a parseable signed `size`: ownership can "
-         "be verified" if out["settlement_rows_carry_size"] else
-         "SETTLEMENT rows do NOT all carry a parseable signed `size`: the book "
-         "will book their funding as unattributed and the statement stays "
-         "provisional"))
+        "SETTLEMENT rows were observed. Whether `size` is signed by position "
+        "direction is NOT verified by this probe, whatever the values' signs. "
+        + ("Every row has a parseable nonzero `size`, so the production path "
+           "can compare it with the book's signed position; it will treat any "
+           "row that does not match as unattributed and keep the statement "
+           "provisional."
+           if usable == settle["rows"] else
+           "Some rows have an absent, blank, zero or unparseable `size`: the "
+           "production path cannot attribute those, books them at $0 as "
+           "unattributed, and keeps the statement provisional."))
     return out
 
 
