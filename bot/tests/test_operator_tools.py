@@ -41,7 +41,7 @@ def test_operator_sandbox_ok_reports_gate_false_and_ladder_from_newest_artifact(
                                   "STATE_DB_PATH": str(tmp_path / "none.db")})
     assert code == 0, report["preflight_reasons"]
     assert report["promotion_gate"]["allows_live"] is False
-    assert report["ladder"]["artifact"].endswith("slice76_forward_shadow.json")
+    assert report["ladder"]["artifact"].endswith("forward_shadow_current.json")
     assert len(report["ladder"]["ladder"]) == 6
     assert report["closer_to_autonomous_profit_agent"] is False
     assert report["live_authorized"] is False

@@ -495,7 +495,7 @@ class TestConcurrencyStructure:
         """The legacy code ran a busy-spin monitor thread per analyser instance
         and built a new instance per signal, progressively starving itself of
         CPU. Only `main.py` may start a thread, and only the daemon health
-        server."""
+        server and the stop-event-managed private-WS observer."""
         tree = ast.parse(open(os.path.join(REPO, module), encoding="utf-8").read())
         starts = [
             node.lineno for node in ast.walk(tree)
@@ -504,7 +504,12 @@ class TestConcurrencyStructure:
             and node.func.attr == "Thread"
         ]
         if module == "main.py":
-            assert len(starts) <= 1, "main.py starts more than one thread"
+            # Exactly two, both named daemons: the health server and the
+            # private-WS observer (stop-event managed, REST-only fallback).
+            assert len(starts) <= 2, "main.py starts more than two threads"
+            src = open(os.path.join(REPO, module), encoding="utf-8").read()
+            assert src.count("daemon=True") >= len(starts)
+            assert 'name="health"' in src and 'name="private-ws"' in src
         else:
             assert starts == [], f"{module} spawns a thread at {starts}"
 

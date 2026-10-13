@@ -9,8 +9,8 @@
 # checkout-safe whitespace check.
 #
 # WHAT THIS IS NOT: the repository's full suite. The full suite carries a known
-# baseline of 69 failures (documentation, corpus and date-relative fixtures) plus
-# 3 files that fail to import on missing modules. Those are NOT run or hidden
+# baseline of 61 failures (documentation, corpus and date-relative fixtures). The 3 files that failed to import on deleted
+# modules were removed together with the tools they tested. Those are NOT run or hidden
 # here and are NOT claimed fixed; they are a separate, pre-existing matter. This
 # job is green only when the carry correctness tests are green.
 #
@@ -96,6 +96,11 @@ jobs:
           tests/test_dockerfile.py
           tests/test_image_ships_the_tools.py
           tests/test_ci_workflow.py
+          tests/test_carry_lifecycle_e2e.py
+          tests/test_rewire_machine_b.py
+          tests/test_control_plane_boundary.py
+          tests/test_operator_tools.py
+          tests/test_concurrency_and_dataflow.py
 
       - name: Fly build context
         run: python tools/fly_stack.py --check
@@ -104,7 +109,7 @@ jobs:
         if: always()
         run: |
           echo "### carry-verify (python ${{ matrix.python }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "Targeted carry correctness gate only. The repository's full suite has a known baseline of 69 failures (documentation, corpus and date-relative fixtures) and 3 import errors; it is deliberately not run or claimed fixed here." >> "$GITHUB_STEP_SUMMARY"
+          echo "Targeted carry correctness gate only. The repository's full suite has a known baseline of 61 failures (deleted documentation, date-relative corpus fixtures); it is deliberately not run or claimed fixed here." >> "$GITHUB_STEP_SUMMARY"
 
   production-image:
     name: production image builds and imports offline

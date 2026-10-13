@@ -1,24 +1,15 @@
-"""Re-running the rewire script must not tick the control plane twice.
+"""The rewire script retires the dead control-plane crons and installs none.
 
-`scripts/REWIRE_MACHINE_B_EXECUTION.sh` installs the execution crons on the
-trading host. Its first version guarded the install with
+`scripts/REWIRE_MACHINE_B_EXECUTION.sh` used to install `daily_forward_refresh`
+and `control_plane_tick` crons and smoke-run `reviewer_verdict`, each followed
+by `|| true`. Those tools were deleted deliberately (commit 8d412c6) so a host
+rewired by the old script ran a missing file every hour and the `|| true` made
+it look healthy. The script now strips every line it owns or that names a
+retired job, installs nothing, and exits non-zero if a retired job is still
+scheduled.
 
-    crontab -l | grep -E 'daily_forward_refresh|control_plane_tick' || { ... }
-
-which has two holes that only show up on the second run, on a real host, with
-nobody watching:
-
-1. The guard matches if EITHER job is present, so a host with the refresh cron
-   but no tick cron was declared fine and never repaired.
-2. The filter inside the install branch removed lines containing
-   `control_plane_tick`, but `tools/control_plane_loop.sh` runs the same tick
-   under a different name. A host wired with the loop wrapper got a second,
-   independent ticker.
-
-The cron block is now unconditional and idempotent. This test proves that by
-running the real block out of the shipped file against a FAKE `crontab` on
-PATH — the suite must never touch the operator's actual crontab, and a test
-that mocks the logic instead of the file would not have caught either hole.
+The real cron block is run out of the shipped file against a FAKE `crontab` on
+PATH: the suite must never touch the operator's actual crontab.
 """
 from __future__ import annotations
 
@@ -33,7 +24,8 @@ BOT = os.path.dirname(HERE)
 REPO = os.path.dirname(BOT)
 SCRIPT = os.path.join(REPO, "scripts", "REWIRE_MACHINE_B_EXECUTION.sh")
 
-JOBS = ("daily_forward_refresh", "control_plane_tick")
+RETIRED = ("daily_forward_refresh", "control_plane_tick",
+           "control_plane_loop.sh", "reviewer_verdict")
 
 FAKE_CRONTAB = """#!/usr/bin/env bash
 # Stands in for crontab(1). State lives in $FAKE_CRON_FILE, never in the user's.
@@ -107,87 +99,94 @@ def cron(tmp_path):
     return Cron()
 
 
-class TestTheCronBlockIsIdempotent:
-    def test_a_bare_host_gets_exactly_one_line_per_job(self, cron):
+@pytest.fixture
+def cron(tmp_path):
+    """A PATH with a fake crontab in front of the real one."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "crontab"
+    fake.write_text(FAKE_CRONTAB)
+    fake.chmod(0o755)
+    state = tmp_path / "crontab.txt"
+    state.write_text("")
+
+    class Cron:
+        path = str(state)
+
+        def set(self, text):
+            state.write_text(text if text.endswith("\n") or not text else text + "\n")
+
+        def lines(self):
+            return [ln for ln in state.read_text().splitlines() if ln.strip()]
+
+        def count(self, needle):
+            return sum(1 for ln in self.lines() if needle in ln)
+
+        def run(self):
+            env = dict(os.environ)
+            env["PATH"] = f"{bindir}:{env['PATH']}"
+            env["FAKE_CRON_FILE"] = str(state)
+            script = (
+                "set -euo pipefail\n"
+                'BOT="/opt/aac/bot"\n'
+                'PY="/opt/aac/.venv/bin/python"\n'
+                'CRON_TAG="# aac-machine-b"\n'
+                + _cron_block()
+            )
+            return subprocess.run(["bash", "-c", script], env=env,
+                                  capture_output=True, text=True)
+
+    return Cron()
+
+
+class TestRetiringTheLegacyCrons:
+    @pytest.mark.parametrize("job", RETIRED)
+    def test_a_retired_job_is_removed(self, cron, job):
+        cron.set(f"7 1 * * * cd /opt/aac/bot && python tools/{job}")
         done = cron.run()
         assert done.returncode == 0, done.stderr
-        for job in JOBS:
-            assert cron.count(job) == 1, f"{job}: {cron.lines()}"
+        assert cron.count(job) == 0
 
-    def test_running_it_five_times_still_leaves_one_line_per_job(self, cron):
-        for _ in range(5):
-            assert cron.run().returncode == 0
-        for job in JOBS:
-            assert cron.count(job) == 1, f"{job} duplicated: {cron.lines()}"
-
-    def test_a_half_wired_host_is_repaired(self, cron):
-        """The exact state the old `||` guard declared healthy and skipped."""
-        cron.set("7 1 * * * cd /opt/aac/bot && python tools/daily_forward_refresh.py")
+    def test_it_installs_nothing_on_a_bare_host(self, cron):
         assert cron.run().returncode == 0
-        assert cron.count("daily_forward_refresh") == 1
-        assert cron.count("control_plane_tick") == 1
+        assert cron.lines() == []
 
-    def test_a_host_already_running_the_loop_wrapper_does_not_tick_twice(self, cron):
-        """control_plane_loop.sh calls the same tick under another name."""
+    def test_running_it_repeatedly_is_stable(self, cron):
+        cron.set("7 1 * * * x/daily_forward_refresh.py # aac-machine-b\n"
+                 "0 3 * * * /usr/local/bin/backup.sh")
+        for _ in range(3):
+            assert cron.run().returncode == 0
+        assert cron.lines() == ["0 3 * * * /usr/local/bin/backup.sh"]
+
+    def test_the_loop_wrapper_is_removed_too(self, cron):
         cron.set("0 * * * * /opt/aac/bot/tools/control_plane_loop.sh once")
         assert cron.run().returncode == 0
-        assert cron.count("control_plane_loop.sh") == 0, (
-            "the wrapper survived alongside the direct tick: two tickers")
-        assert cron.count("control_plane_tick") == 1
+        assert cron.count("control_plane_loop.sh") == 0
 
-    def test_it_removes_its_own_tagged_lines_before_writing(self, cron):
-        cron.set("33 4 * * * /some/old/path/tools/control_plane_tick.py "
-                 "# aac-machine-b")
+    def test_its_own_tagged_lines_go_even_if_they_name_no_retired_job(self, cron):
+        cron.set("33 4 * * * /some/old/path/other.py # aac-machine-b")
         assert cron.run().returncode == 0
-        assert cron.count("control_plane_tick") == 1
         assert cron.count("/some/old/path") == 0
 
-
-class TestItDoesNotTouchLinesItDoesNotOwn:
-    def test_an_unrelated_cron_line_survives(self, cron):
-        cron.set("0 3 * * * /usr/local/bin/backup.sh\n"
-                 "*/5 * * * * /Users/me/bin/notify.sh")
-        assert cron.run().returncode == 0
-        assert cron.count("backup.sh") == 1
-        assert cron.count("notify.sh") == 1
-
-    def test_the_operators_own_lines_keep_their_order_and_come_first(self, cron):
+    def test_unrelated_lines_survive_in_order(self, cron):
         cron.set("0 3 * * * /usr/local/bin/backup.sh\n"
                  "0 4 * * * /usr/local/bin/rotate.sh")
         assert cron.run().returncode == 0
         lines = cron.lines()
-        assert lines[0].endswith("backup.sh")
-        assert lines[1].endswith("rotate.sh")
-        assert len(lines) == 4
+        assert lines[0].endswith("backup.sh") and lines[1].endswith("rotate.sh")
+        assert len(lines) == 2
 
-
-class TestTheInstalledLinesAreRunnable:
-    def test_each_line_has_five_schedule_fields_then_a_command(self, cron):
-        assert cron.run().returncode == 0
-        for line in cron.lines():
-            fields = line.split(None, 5)
-            assert len(fields) == 6, line
-            for field in fields[:5]:
-                assert re.fullmatch(r"[-0-9*/,]+", field), (field, line)
-
-    def test_every_line_cds_to_bot_before_running_a_tool(self, cron):
-        """Both tools resolve artifacts/ relative to cwd; cron's cwd is $HOME."""
-        assert cron.run().returncode == 0
-        for line in cron.lines():
-            if any(job in line for job in JOBS):
-                assert "cd /opt/aac/bot &&" in line, line
-
-    def test_every_line_carries_the_ownership_tag(self, cron):
-        assert cron.run().returncode == 0
-        for line in cron.lines():
-            if any(job in line for job in JOBS):
-                assert line.rstrip().endswith("# aac-machine-b"), line
-
-    def test_the_block_verifies_its_own_result(self):
-        """A writer that does not re-read is a writer you have to trust."""
-        block = _cron_block()
-        assert "crontab -l" in block.split("| crontab -", 1)[1]
-        assert "-eq 2" in block
+    def test_it_fails_if_a_retired_job_cannot_be_removed(self, cron):
+        """A crontab that refuses the rewrite must not be reported as clean."""
+        cron.set("7 1 * * * x/daily_forward_refresh.py")
+        bindir = os.path.join(os.path.dirname(cron.path), "bin")
+        stuck = os.path.join(bindir, "crontab")
+        with open(stuck, "w") as fh:
+            fh.write('#!/usr/bin/env bash\ncase "${1:-}" in -l) cat "$FAKE_CRON_FILE";;'
+                     ' -) cat >/dev/null;; esac\n')
+        done = cron.run()
+        assert done.returncode != 0
+        assert "FATAL" in done.stdout
 
 
 class TestTheScriptItself:
@@ -197,15 +196,22 @@ class TestTheScriptItself:
                               text=True)
         assert done.returncode == 0, done.stderr
 
-    def test_it_cds_to_bot_before_running_any_tool(self):
-        """The old version ran a python heredoc at the operator's cwd first."""
+    def test_it_cds_to_bot_before_importing_the_stack(self):
         body = open(SCRIPT, encoding="utf-8").read()
-        cd_at = body.index('cd "$BOT"')
-        for needle in ("tools/reviewer_verdict.py", "tools/control_plane_tick.py"):
-            first = body.index(needle)
-            assert cd_at < first, (
-                f"{needle} is invoked before cd \"$BOT\"; it would resolve "
-                f"artifacts/ against whatever directory the operator was in")
+        assert body.index('cd "$BOT"') < body.index('import main, funding_reconcile')
+
+    def test_no_failure_is_swallowed_on_the_execution_check(self):
+        body = open(SCRIPT, encoding="utf-8").read()
+        line = [ln for ln in body.splitlines() if "import main" in ln][0]
+        assert "|| true" not in line
+
+    def test_it_no_longer_invokes_any_deleted_tool(self):
+        body = open(SCRIPT, encoding="utf-8").read()
+        for gone in ("tools/reviewer_verdict.py", "tools/control_plane_tick.py",
+                     "tools/daily_forward_refresh.py"):
+            assert f"$PY {gone}" not in body and f"python {gone}" not in body
+            assert not os.path.exists(os.path.join(BOT, gone)), gone
+        assert not os.path.exists(os.path.join(BOT, "tools", "control_plane_loop.sh"))
 
     def test_it_places_no_orders_and_arms_nothing(self):
         body = open(SCRIPT, encoding="utf-8").read()
