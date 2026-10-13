@@ -521,6 +521,22 @@ def _fake_http(calls):
 
 
 class TestPublicReader:
+    def test_only_testnet_can_be_named_and_mainnet_is_not_reachable(self):
+        assert set(cs.VENUE_BASE) == {"testnet"}
+        assert all("api.bybit.com" not in u and "stream.bybit.com" not in u
+                   for u in cs.VENUE_BASE.values())
+        for venue in ("mainnet", "mainnet_public", "demo"):
+            with pytest.raises(cs.ShadowRefusal):
+                cs.PublicVenueReader(venue)
+        done = cli("step", "--db", "/dev/null/never.db", "--origin",
+                   "live_public", "--venue", "mainnet", "--borrow-apr", "0.0",
+                   "--execution-mode", "overlay", "--inventory-btc", "0.01",
+                   "--margin-multiple", "5", "--live")
+        assert done.returncode == cs.EXIT_USAGE      # argparse refuses it
+        src = open(os.path.join(BOT, "carry_shadow.py")).read()
+        assert "https://api.bybit.com" not in src
+
+
     def test_it_touches_only_public_market_paths_and_sends_no_credentials(self):
         calls = []
         reader = cs.PublicVenueReader("testnet", http_get=_fake_http(calls))

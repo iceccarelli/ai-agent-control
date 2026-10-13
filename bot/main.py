@@ -344,13 +344,18 @@ class TradingBot:
                 }
             journal = getattr(self, "carry_journal", None)
             if journal is not None:
-                st = journal.statement()
+                # now_ms: without a clock an OPEN lifecycle's reconciliation
+                # record never ages out, so a stale record would read as
+                # reconciled here while carry_report (which passes a clock)
+                # says it is not.
+                st = journal.statement(now_ms=int(time.time() * 1000))
                 status["accounting"] = {
                     k: st.get(k) for k in (
                         "net_basis", "net_usd", "fees_usd", "funding_usd",
                         "fees_confirmed", "funding_confirmed",
                         "funding_reconciled", "funding_unread",
-                        "funding_unattributed", "open_perp_qty")}
+                        "funding_unattributed", "funding_estimated_entries",
+                        "open_perp_qty")}
                 status["last_reconciliation_ms"] = self._last_reconcile_ms or None
             fault = ""
             if engine.state.name == "HALTED":
@@ -989,7 +994,13 @@ class TradingBot:
         self._carry_estimated_funding = (
             0.0 if decision.action == "unwound" else collected)
 
-        now_ms = int(time.time() * 1000)
+        # The judgement clock never precedes the journal's own newest event. A
+        # read window that ends before the lifecycle it covers began (the wall
+        # clock a millisecond behind the stamp of the fill that opened it) is
+        # not "unreadable"; it is an inverted interval, and calling it that
+        # recorded a spurious FUNDING_HISTORY_UNREADABLE for up to an hour.
+        newest = max((e.ms for e in journal.entries), default=0)
+        now_ms = max(int(time.time() * 1000), int(newest))
         pending = _recon.pending_lifecycles(journal)
         if not pending:
             return

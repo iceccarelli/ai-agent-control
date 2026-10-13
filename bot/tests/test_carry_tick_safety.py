@@ -176,8 +176,13 @@ class TestTheOperatorCanSeeTheBook:
         assert status["protective_stop"] == "NOT_APPLICABLE_DELTA_NEUTRAL"
         assert status["market"]["margin_multiple"] is not None
         acct = status["accounting"]
-        assert acct["net_basis"] == "provisional_funding_unverified"
-        assert acct["funding_confirmed"] is False
+        # A hedge opened moments ago, reconciled over complete (empty) evidence:
+        # no settlement was due, so funding is positively ZERO and the net is
+        # fees only. That is "confirmed" under the contract below; it must not
+        # depend on which millisecond the reconciliation happened to run in.
+        _assert_contract(acct)
+        assert acct["net_basis"] == "confirmed"
+        assert acct["funding_usd"] == 0 and acct["fees_usd"] > 0
         assert status["blocking_fault"] == ""
         assert status["last_decision"]["reason"]
 
@@ -276,3 +281,120 @@ class TestRestartWithAnOpenPositionThroughTheRealStartupPath:
         store.close()
         _venue2, engine2, bot2 = self._second_process(tmp_path, perp_qty=0.6)
         assert bot2.carry_cold_start() is False
+
+
+# ---------------------------------------------------------------------------
+# THE ACCOUNTING CONTRACT
+#
+#   net_basis == "confirmed"  <=>  every fill's fee is venue-stated
+#                                  AND no funding entry is an estimate,
+#                                      unattributed or unread
+#                                  AND every position lifecycle's LATEST
+#                                      reconciliation record is FULLY_RECONCILED,
+#                                      made against complete reads, not
+#                                      contradicted since, and (when open)
+#                                      younger than RECORD_MAX_AGE_MS.
+#
+# "The reconciliation ran" is not "funding is confirmed": a run over an
+# unreadable, incomplete, contradicted or stale read is PROVISIONAL.
+# `funding_confirmed` and `funding_reconciled` are the two halves of that rule
+# and `carry_status()` must report them from the same statement, with a clock.
+# ---------------------------------------------------------------------------
+
+
+def _assert_contract(acct):
+    confirmed = (acct["fees_confirmed"] and acct["funding_confirmed"]
+                 and acct["funding_reconciled"])
+    assert (acct["net_basis"] == "confirmed") == bool(confirmed), acct
+    if acct["funding_confirmed"]:
+        assert acct["funding_reconciled"]
+        assert acct["funding_unread"] == 0 and acct["funding_unattributed"] == 0
+    if acct["net_basis"] == "confirmed":
+        assert acct["funding_estimated_entries"] == 0
+
+
+class TestTheFundingAccountingContract:
+    def _status(self, bot):
+        bot.cfg = mock.Mock(USE_TESTNET=True, PAPER_TRADING=False)
+        return bot.carry_status()["accounting"]
+
+    def test_a_reconciliation_window_never_ends_before_the_lifecycle_began(
+            self, tmp_path):
+        """The exact condition that made the status flap: the wall clock one
+        millisecond behind the journal stamp of the opening fill."""
+        import time as _time
+        venue, journal, engine, bot = _hedged(tmp_path)
+        start = min(e.ms for e in journal.entries if e.kind == "perp_open")
+        # drop the record the tick wrote, then reconcile with the clock behind
+        journal.entries[:] = [e for e in journal.entries
+                              if e.kind != "funding_reconciliation"]
+        bot._last_reconcile_ms = bot._last_funding_poll_ms = 0
+        behind = (start - 1) / 1000.0
+        with mock.patch.object(_time, "time", lambda: behind):
+            bot._book_carry_funding(journal, "BTCUSDT",
+                                    mock.Mock(detail={}, action="hold"))
+        rec = [e.fee_raw for e in journal.entries
+               if e.kind == "funding_reconciliation"][-1]
+        assert "FUNDING_HISTORY_UNREADABLE" not in rec["reasons"], rec
+        assert rec["state"] == "FULLY_RECONCILED"
+        assert rec["as_of_ms"] >= start
+        _assert_contract(self._status(bot))
+
+    def test_an_unreadable_account_log_is_provisional_not_confirmed(
+            self, tmp_path):
+        venue, journal, engine, bot = _hedged(tmp_path)
+        journal.entries[:] = [e for e in journal.entries
+                              if e.kind != "funding_reconciliation"]
+        venue.txlog_fail = True
+        bot._last_reconcile_ms = bot._last_funding_poll_ms = 0
+        bot._book_carry_funding(journal, "BTCUSDT",
+                                mock.Mock(detail={}, action="hold"))
+        acct = self._status(bot)
+        _assert_contract(acct)
+        assert acct["net_basis"] == "provisional_funding_unverified"
+        assert acct["funding_confirmed"] is False
+        assert acct["funding_unread"] >= 1
+
+    def test_no_reconciliation_record_at_all_is_provisional(self, tmp_path):
+        venue, journal, engine, bot = _hedged(tmp_path)
+        journal.entries[:] = [e for e in journal.entries
+                              if e.kind != "funding_reconciliation"]
+        acct = self._status(bot)
+        _assert_contract(acct)
+        assert acct["net_basis"] == "provisional_funding_unverified"
+        assert acct["funding_reconciled"] is False
+
+    def test_a_row_the_book_cannot_claim_contradicts_a_clean_reconciliation(
+            self, tmp_path):
+        import ledger as L
+        venue, journal, engine, bot = _hedged(tmp_path)
+        assert self._status(bot)["net_basis"] == "confirmed"
+        opened = next(e for e in journal.entries if e.kind == "perp_open")
+        L.book_funding_payments(journal, [{
+            "id": "X1", "ms": opened.ms + 5, "usd": 3.0, "currency": "USDT",
+            "size": -0.1, "symbol": "BTCUSDT"}], ms=opened.ms + 6)
+        acct = self._status(bot)
+        _assert_contract(acct)
+        assert acct["net_basis"] == "provisional_funding_unverified"
+        assert acct["funding_unattributed"] == 1
+        assert acct["funding_confirmed"] is False
+
+    def test_a_reconciliation_record_that_has_aged_out_is_not_confirmed(
+            self, tmp_path):
+        """carry_status used to ask for a statement WITHOUT a clock, so an open
+        lifecycle's record never aged and /health said confirmed forever."""
+        import time as _time
+        import ledger as L
+        venue, journal, engine, bot = _hedged(tmp_path)
+        assert self._status(bot)["net_basis"] == "confirmed"
+        later = _time.time() + (L.RECORD_MAX_AGE_MS / 1000.0) + 3600
+        with mock.patch.object(_time, "time", lambda: later):
+            acct = self._status(bot)
+        _assert_contract(acct)
+        assert acct["net_basis"] == "provisional_funding_unverified"
+        assert acct["funding_reconciled"] is False
+
+    def test_a_book_that_never_traded_is_no_fills_not_confirmed(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.cfg = mock.Mock(USE_TESTNET=True, PAPER_TRADING=False)
+        assert bot.carry_status()["accounting"]["net_basis"] == "no_fills"

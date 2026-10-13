@@ -121,8 +121,8 @@ class TestTheReviewerCannotReachTheVenue:
         present = self._present()
         if not present:
             pytest.skip("no reviewer module yet — "
-                        "test_the_absence_is_recorded_in_the_charter covers "
-                        "this case and does not skip")
+                        "test_the_retired_writers_stay_retired asserts the "
+                        "retired modules are absent")
         for path in present:
             found = imported_names(path) | dynamic_import_targets(path)
             for name in found:
@@ -134,8 +134,8 @@ class TestTheReviewerCannotReachTheVenue:
         present = self._present()
         if not present:
             pytest.skip("no reviewer module yet — "
-                        "test_the_absence_is_recorded_in_the_charter covers "
-                        "this case and does not skip")
+                        "test_the_retired_writers_stay_retired asserts the "
+                        "retired modules are absent")
         for path in present:
             with open(path, encoding="utf-8") as handle:
                 tree = ast.parse(handle.read(), filename=path)

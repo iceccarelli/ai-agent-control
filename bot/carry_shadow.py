@@ -91,8 +91,10 @@ ASSUMED_SPOT_RULES = {"qty_step": 1e-6, "min_qty": 4.8e-5, "min_notional": 1.0}
 #: Public market-data paths, and nothing else, that the live reader may touch.
 PUBLIC_PATHS = ("/v5/market/time", "/v5/market/tickers",
                 "/v5/market/funding/history")
-VENUE_BASE = {"testnet": "https://api-testnet.bybit.com",
-              "mainnet_public": "https://api.bybit.com"}
+#: Testnet only. There is deliberately no mainnet entry: this project's boundary
+#: is Bybit testnet, and a runtime that cannot name the mainnet host cannot be
+#: pointed at it by a flag. ("historical" below is a label, not a host.)
+VENUE_BASE = {"testnet": "https://api-testnet.bybit.com"}
 
 REQUIRED_OBS = ("perp_mark", "spot_mark", "funding_bps", "funding_print_bps",
                 "funding_print_ms", "observed_at_s")
