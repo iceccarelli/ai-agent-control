@@ -14,6 +14,14 @@
 # here and are NOT claimed fixed; they are a separate, pre-existing matter. This
 # job is green only when the carry correctness tests are green.
 #
+# THE PRODUCTION IMAGE (job `production-image`): the unit tests above run Python
+# in the checkout, which has every module. They cannot see a module that
+# main.py imports but the Dockerfile does not copy - PR #72 shipped exactly
+# that, and only the static closure test noticed. This job builds the REAL image
+# (bot/Dockerfile, context ./bot) on every run and imports the application
+# inside THAT image, offline, read-only and unprivileged. It never starts the
+# application, never publishes the image, and holds no credential.
+#
 # NO CREDENTIALS, NO NETWORK TRADING: no secret is read, no Bybit endpoint is
 # contacted, and nothing here can place an order. Tests use offline fakes.
 name: carry-verify
@@ -97,3 +105,62 @@ jobs:
         run: |
           echo "### carry-verify (python ${{ matrix.python }})" >> "$GITHUB_STEP_SUMMARY"
           echo "Targeted carry correctness gate only. The repository's full suite has a known baseline of 69 failures (documentation, corpus and date-relative fixtures) and 3 import errors; it is deliberately not run or claimed fixed here." >> "$GITHUB_STEP_SUMMARY"
+
+  production-image:
+    name: production image builds and imports offline
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # One tag, built below and run below: the smoke can only ever execute the
+      # image THIS run just built from THIS commit.
+      IMAGE: ai-agent-control-carry-smoke:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the production image (bot/Dockerfile, context ./bot)
+        run: docker build --pull --tag "$IMAGE" ./bot
+
+      - name: Import the application inside the image (offline, no startup)
+        run: |
+          # --entrypoint python3 REPLACES the image's `python3 main.py`: nothing
+          # here can start the trading loop. No network, a read-only root, a
+          # throwaway state volume, no capabilities, and the image's own
+          # unprivileged user. `import main` alone does not prove the closure
+          # (main imports some modules lazily), so funding_reconcile is named.
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --tmpfs /app/state:rw,noexec,nosuid,size=16m \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit 64 \
+            -e USE_TESTNET=1 \
+            -e PAPER_TRADING=1 \
+            -e LIVE_TRADING_ACK= \
+            --entrypoint python3 \
+            "$IMAGE" \
+            -c 'import main; import funding_reconcile; print("production imports OK")'
+
+      - name: Import every shipped module and confirm the image is unprivileged
+        run: |
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+            --tmpfs /app/state:rw,noexec,nosuid,size=16m \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit 64 \
+            -e USE_TESTNET=1 \
+            -e PAPER_TRADING=1 \
+            -e LIVE_TRADING_ACK= \
+            --entrypoint python3 \
+            "$IMAGE" \
+            -c 'import importlib, os, pathlib; assert os.getuid() != 0, "image runs as root"; names = sorted(p.stem for p in pathlib.Path("/app").glob("*.py")); [importlib.import_module(n) for n in names]; print("imported", len(names), "shipped modules as uid", os.getuid())'
+
+      - name: Scope of this job
+        if: always()
+        run: |
+          echo "### production-image" >> "$GITHUB_STEP_SUMMARY"
+          echo "Built bot/Dockerfile from this commit and imported the application inside that image: offline, read-only, unprivileged. The application was not started and the image was not published. This proves the shipped modules import; it says nothing about venue behaviour or profitability." >> "$GITHUB_STEP_SUMMARY"
