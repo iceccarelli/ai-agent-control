@@ -211,3 +211,20 @@ class TestZeroFillsExitCode:
         ])
         assert rc == 2
         assert json.loads(failure.read_text())["entry_fills"] == 0
+
+
+class TestCarryIsPointedAtTheDrill:
+    def test_a_carry_book_is_pointed_at_the_drill_not_called_no_signal(self):
+        cfg = _cfg(PAPER_TRADING=False)
+        engine = mock.Mock()
+        engine.paper = False
+        fake_bot = types.SimpleNamespace(carry=object(), strategy=None)
+        with mock.patch.object(ts.tcr, "run_preflight",
+                               return_value=types.SimpleNamespace(
+                                   ok=True, checks={})), \
+                mock.patch.object(bot_main, "build_bot", return_value=fake_bot):
+            out = ts.run_session(cfg=cfg, store=mock.Mock(), client=mock.Mock(),
+                                 engine=engine)
+        assert out["ok"] is False
+        assert "tools/drill.py" in out["failure"]
+        assert out["network_order_submitted"] is False

@@ -47,6 +47,10 @@ class Venue:
 
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((side, product, qty))
+        if product == "linear":
+            # A faithful venue: its perp position moves with the fills. The
+            # engine now compares it with the book on every held tick.
+            self.perp += qty if side == "Sell" else -qty
         return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x"}
 
     def get_margin_multiple(self, symbol):

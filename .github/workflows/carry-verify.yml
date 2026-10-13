@@ -97,6 +97,13 @@ jobs:
           tests/test_image_ships_the_tools.py
           tests/test_ci_workflow.py
           tests/test_carry_lifecycle_e2e.py
+          tests/test_carry_ambiguous_outcomes.py
+          tests/test_carry_tick_safety.py
+          tests/test_unwind_completeness.py
+          tests/test_carry_cold_start.py
+          tests/test_carry_wiring_authority.py
+          tests/test_drill.py
+          tests/test_testnet_session.py
           tests/test_rewire_machine_b.py
           tests/test_control_plane_boundary.py
           tests/test_operator_tools.py

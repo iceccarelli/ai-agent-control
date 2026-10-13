@@ -328,6 +328,15 @@ def run_session(
     bot = _main.build_bot(
         config=cfg, store=store, client=client, engine=engine,
         risk_manager=engine.risk)
+    if getattr(bot, "carry", None) is not None:
+        # This session is the DIRECTIONAL single-leg path (TradingEngine, with a
+        # stop and a take-profit). The carry book has no signal source and a
+        # different lifecycle; the staged, venue-verified carry drill is
+        # tools/drill.py. Say so instead of reporting a misleading "no signal".
+        out["failure"] = ("BOOK_MODE=carry: this session drives the directional "
+                          "path and cannot exercise the carry book; use "
+                          "tools/drill.py")
+        return out
     if bot.strategy is None:
         out["failure"] = "no signal"
         return out
@@ -361,8 +370,18 @@ def run_session(
         out["entry_fills"] = 0
         return out
 
-    entry_price = float(row.get("entry_price") or last)
+    entry_price = float(row.get("entry_price") or 0.0)
     qty = float(row.get("qty") or 0.0)
+    if entry_price <= 0.0:
+        # No fill price on the ledger row. Inventing one (the old code named an
+        # undefined `last`) would put an invented number into the cash ledger.
+        out["failure"] = "position row has no entry price; not inventing one"
+        out["flatten_attempted"] = False
+        # still flatten: a position exists even though its price is unknown
+        close = flatten_position(engine, symbol=symbol)
+        out["stages"].append({"stage": "flatten", "ok": bool(close.ok),
+                              "reason": close.reason})
+        return out
     out["entry_fills"] = 1 if qty > 0 else 0
     out["entry_price"] = entry_price
     out["qty"] = qty

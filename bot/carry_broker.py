@@ -79,6 +79,18 @@ class PairIncident(RuntimeError):
     """One leg exists that the other does not hedge. Never caught and ignored."""
 
 
+class OrderOutcomeUnknown(PairIncident):
+    """An order was (or may have been) sent and its fate cannot be established.
+
+    The engine treats this as a HALT, never as "the leg did not fill": a
+    timeout after submission is exactly when an order exists at the venue that
+    the book has no record of. ``outcome_unknown`` is what the engine tests, so
+    it needs no import of this module.
+    """
+
+    outcome_unknown = True
+
+
 class CarryOrderRefused(RuntimeError):
     """The process may not send a carry order to this venue. Nothing was sent.
 
@@ -414,27 +426,86 @@ class CarryBroker:
                 # is the only correct move: recording a rejection here would
                 # leave a real leg the ledger does not know about.
                 logger.warning(
-                    "duplicate orderLinkId %s (retCode %s) — the first attempt "
+                    "duplicate orderLinkId %s (retCode %s) - the first attempt "
                     "landed; resolving by query", link_id, ret_code)
                 resolved = self._query_by_link_id(symbol, link_id, product)
                 if resolved is not None:
                     resolved.was_duplicate = True
                     return resolved.as_engine_result()
-                raise PairIncident(
+                raise OrderOutcomeUnknown(
                     f"orderLinkId {link_id} exists at the venue but could not "
                     "be read back; a leg may be live and unhedged") from exc
-            logger.error("leg %s %s %s failed: %s", side, symbol, product, exc)
-            return None
+            if self._definitively_rejected(exc):
+                logger.error("leg %s %s %s rejected: %s",
+                             side, symbol, product, exc)
+                return None
+            # A transport failure, a 5xx, an unparseable 200: the request may
+            # have been executed. "It failed" is NOT established. Ask the
+            # venue by the id this order carried; never report "no fill" (the
+            # engine would hedge or re-send against an order that exists).
+            logger.error("leg %s %s %s outcome unknown (%s); querying the venue",
+                         side, symbol, product, exc)
+            try:
+                state = self._order_state(symbol, link_id, product)
+            except Exception as read_exc:  # noqa: BLE001
+                raise OrderOutcomeUnknown(
+                    f"{link_id}: submission failed ({exc}) and the venue could "
+                    f"not be asked what happened ({read_exc}); the order may "
+                    "be live") from exc
+            if state is None:
+                return None                # the venue has no such order
+            if state["resting"]:
+                raise OrderOutcomeUnknown(
+                    f"{link_id} is {state['status']} at the venue after a "
+                    "failed submission; what it will fill is unknown") from exc
+            return self._engine_result_from_state(state)
 
         fill = self._fill_from(response, link_id)
         if fill.filled_qty <= 0:
-            # Market orders that report nothing filled are queried once rather
-            # than assumed dead: the response and the fill are separate events.
-            resolved = self._query_by_link_id(symbol, link_id, product)
-            if resolved is not None and resolved.filled_qty > 0:
-                return resolved.as_engine_result()
-            return None
+            # Market orders that report nothing filled are queried rather than
+            # assumed dead: the response and the fill are separate events. The
+            # create response carried an orderId, so the order EXISTS: a read
+            # that fails, or finds nothing, is not "no fill".
+            try:
+                state = self._order_state(symbol, link_id, product)
+            except Exception as read_exc:  # noqa: BLE001
+                raise OrderOutcomeUnknown(
+                    f"{link_id} was accepted and could not be read back "
+                    f"({read_exc}); its fill is unknown") from read_exc
+            if state is None:
+                resolved = self._query_by_link_id(symbol, link_id, product)
+                if resolved is not None and resolved.filled_qty > 0:
+                    return resolved.as_engine_result()
+                return None            # terminal with nothing filled
+            if state["resting"] and state["filled_qty"] <= 0:
+                raise OrderOutcomeUnknown(
+                    f"{link_id} is {state['status']} with nothing filled yet; "
+                    "a market order's outcome is unknown")
+            return self._engine_result_from_state(state)
         return fill.as_engine_result()
+
+    @staticmethod
+    def _definitively_rejected(exc: Exception) -> bool:
+        """True only when the VENUE answered 'no' (a non-zero retCode).
+
+        Anything without a venue retCode - a timeout, a connection reset, a
+        5xx, a garbled 200 - leaves the order's fate open.
+        """
+        try:
+            code = int(getattr(exc, "ret_code", 0) or 0)
+        except (TypeError, ValueError):
+            return False
+        # A TransientAPIError is the client giving up after retries on a
+        # condition the venue itself called retryable (busy, internal error):
+        # the request may still have executed.
+        return code != 0 and type(exc).__name__ != "TransientAPIError"
+
+    @staticmethod
+    def _engine_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+        return {"filled_qty": state["filled_qty"],
+                "avg_price": state["avg_price"],
+                "order_link_id": state["order_link_id"],
+                "fee": state["fee"], "fee_detail": state["fee_detail"]}
 
     # -- resting orders (0040) --------------------------------------------
 

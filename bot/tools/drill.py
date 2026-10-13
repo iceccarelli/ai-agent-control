@@ -86,6 +86,50 @@ NOT_PROVEN = [
 ]
 
 
+#: Flat to within this many base units counts as flat at the venue.
+FLAT_DUST = 1e-8
+
+
+def venue_flatness(broker: Any, *, inventory_before: Optional[float]
+                   ) -> tuple[str, Dict[str, Any], str]:
+    """A FRESH read of what the venue holds, never what the book believes.
+
+    Returns ``(verdict, evidence, why)``; verdict is FLAT, NOT_FLAT or
+    UNVERIFIED. Unreadable is UNVERIFIED, which every caller treats as "a
+    human must look": a flat claim that could not be checked is not a flat
+    claim. Three independent facts must agree:
+
+      * the perp position at the venue is zero,
+      * no carry order is still open (one could fill into a flat book),
+      * the client's spot inventory is what it was before the drill (the
+        overlay places no spot order, so any change is a trade nobody asked
+        for).
+    """
+    try:
+        perp = abs(float(broker.get_perp_position(PERP_SYMBOL)))
+        orders = list(broker.get_open_carry_orders(SPOT_SYMBOL, PERP_SYMBOL))
+        inventory = float(broker.get_spot_inventory(SPOT_SYMBOL))
+    except Exception as exc:                                   # noqa: BLE001
+        return "UNVERIFIED", {"error": f"{type(exc).__name__}: {exc}"}, (
+            f"the venue could not be read ({type(exc).__name__}: {exc}); "
+            "flatness is unverified")
+    evidence: Dict[str, Any] = {
+        "venue_perp_qty": perp, "open_orders": len(orders),
+        "spot_inventory": inventory, "spot_inventory_before": inventory_before}
+    problems = []
+    if perp > FLAT_DUST:
+        problems.append(f"the venue still holds {perp} perp")
+    if orders:
+        problems.append(f"{len(orders)} carry order(s) are still open")
+    if inventory_before is not None and abs(inventory - inventory_before) > max(
+            FLAT_DUST, 1e-6 * abs(inventory_before)):
+        problems.append(
+            f"spot inventory moved from {inventory_before} to {inventory}")
+    if problems:
+        return "NOT_FLAT", evidence, "; ".join(problems)
+    return "FLAT", evidence, ""
+
+
 def margin_stage_evidence(*, broker: Any, symbol: str, venue_perp_qty: float,
                           min_margin_multiple: float
                           ) -> tuple[bool, Dict[str, Any], str]:
@@ -236,6 +280,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         from carry_engine import snap_to_lot
         sized = snap_to_lot(wanted, step)
         state["qty"] = sized
+        state["inventory_before"] = btc
         if btc <= 0:
             s.failed(
                 "the wallet holds no BTC. CARRY_EXECUTION_MODE=overlay hedges "
@@ -386,13 +431,14 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                  detail=dict(decision.detail or {}))
 
     def final_reconcile(s: Stage) -> None:
-        venue_qty = abs(float(broker.get_perp_position(PERP_SYMBOL)))
-        if venue_qty > 1e-8:
+        verdict, evidence, why = venue_flatness(
+            broker, inventory_before=state.get("inventory_before"))
+        if verdict != "FLAT":
+            # NOT_FLAT and UNVERIFIED both leave a human in charge.
             d.still_open = True
-            s.failed(f"the venue still holds {venue_qty} after the unwind",
-                     venue_perp_qty=venue_qty, verdict="NOT_FLAT")
+            s.failed(f"{why} after the unwind", verdict=verdict, **evidence)
             return
-        s.passed(venue_perp_qty=venue_qty, verdict="FLAT")
+        s.passed(verdict="FLAT", **evidence)
 
     def statement(s: Stage) -> None:
         st = journal.statement()
@@ -402,6 +448,20 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                      ("final_reconcile", final_reconcile),
                      ("statement", statement)):
         if not d.run_stage(name, fn):
+            # Orders may have left this process whatever the failed stage was
+            # (an ambiguous submission, a halted engine, a pair that would not
+            # reconcile). Say what the venue holds NOW instead of letting the
+            # report claim "nothing is open". A separate stage, so the stage
+            # that actually failed stays the one reported.
+            if name != "final_reconcile":
+                check = d.stage("venue_check_after_failure")
+                verdict, evidence, why = venue_flatness(
+                    broker, inventory_before=state.get("inventory_before"))
+                if verdict == "FLAT":
+                    check.passed(verdict=verdict, **evidence)
+                else:
+                    d.still_open = True
+                    check.failed(why, verdict=verdict, **evidence)
             return _report(d, state, out, cap, verdict="FAILED")
 
     return _report(d, state, out, cap, verdict="PASSED")
@@ -412,9 +472,10 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
     journal = state.get("journal")
     evidence = {s.name: s.evidence for s in d.stages}
     if d.still_open:
-        action = ("A HUMAN MUST ACT NOW: the book is not flat. Close the perp "
-                  "position by hand at the venue, then clear the kill switch. "
-                  "Nothing automated will retry.")
+        action = ("A HUMAN MUST ACT NOW: the book is not flat or could not be "
+                  "verified flat. Inspect the venue's perp position, open "
+                  "orders and spot inventory, close what is open by hand, then "
+                  "clear the kill switch. Nothing automated will retry.")
     elif verdict == "FAILED":
         action = (f"the drill stopped at {d.failed_stage!r}; nothing is open. "
                   "Fix what the stage reports and run it again.")

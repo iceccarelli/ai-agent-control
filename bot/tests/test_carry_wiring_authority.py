@@ -196,3 +196,33 @@ class TestSymbolsComeFromConfigNotADefault:
         bot = _main.build_bot(config=cfg, store=_Store(), client=mock.Mock(),
                               risk_manager=mock.Mock(), engine=mock.Mock())
         assert bot.carry.perp_symbol == "ETHUSDT"
+
+
+class TestTheGateChecksWhereOrdersActuallyGo:
+    def test_a_sandbox_config_with_a_mainnet_client_cannot_send(self):
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
+                            "CARRY_EXECUTION_MODE": "overlay",
+                            "PAPER_TRADING": "0", "USE_TESTNET": "1"})
+        client = mock.Mock()
+        client.base_url = "https://api.bybit.com"
+        bot = _main.build_bot(config=cfg, store=_Store(), client=client,
+                              risk_manager=mock.Mock(), engine=mock.Mock())
+        allowed, why = bot.carry.broker.inner.order_gate()
+        assert allowed is False and "mainnet host" in why
+
+    def test_the_same_config_with_a_testnet_client_may_send(self):
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
+                            "CARRY_EXECUTION_MODE": "overlay",
+                            "PAPER_TRADING": "0", "USE_TESTNET": "1"})
+        client = mock.Mock()
+        client.base_url = "https://api-testnet.bybit.com"
+        bot = _main.build_bot(config=cfg, store=_Store(), client=client,
+                              risk_manager=mock.Mock(), engine=mock.Mock())
+        allowed, why = bot.carry.broker.inner.order_gate()
+        assert allowed is True and "TESTNET" in why
+
+    def test_paper_still_refuses_whatever_the_client_is(self):
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
+                            "CARRY_EXECUTION_MODE": "overlay"})
+        allowed, _why = _main.carry_orders_permitted_for(cfg, mock.Mock())
+        assert allowed is False

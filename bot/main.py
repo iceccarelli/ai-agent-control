@@ -272,8 +272,12 @@ class TradingBot:
         try:
             kill_engaged, kill_reason = self.store.is_kill_switch_engaged()
             naked = [p["symbol"] for p in self.store.positions_without_stops()]
+            carry = self.carry_status()
+            carry_blocked = bool(carry.get("blocking_fault"))
             return {
-                "healthy": not kill_engaged and not naked and self._reconciled,
+                "healthy": (not kill_engaged and not naked and self._reconciled
+                            and not carry_blocked),
+                "carry": carry,
                 "reconciled": self._reconciled,
                 "kill_switch": kill_engaged,
                 "kill_reason": kill_reason,
@@ -292,6 +296,72 @@ class TradingBot:
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    def carry_status(self) -> Dict[str, Any]:
+        """What an operator must know about the carry book, in one place.
+
+        Read-only and credential-free (health is served from another thread).
+        Every figure here is either what the venue last said, what the book
+        recorded, or absent; none is inferred. ``blocking_fault`` is non-empty
+        exactly when the book will not take new exposure.
+        """
+        engine = getattr(self, "carry", None)
+        if engine is None:
+            return {"attached": False}
+        try:
+            status: Dict[str, Any] = {
+                "attached": True,
+                "environment": {
+                    "testnet": bool(getattr(self.cfg, "USE_TESTNET", True)),
+                    "paper": bool(getattr(self.cfg, "PAPER_TRADING", True)),
+                    "execution_mode": str(getattr(engine, "execution_mode", "")),
+                },
+                "book_state": engine.state.value,
+                "last_decision": dict(self._last_carry_decision),
+                # The carry book installs no protective stop BY DESIGN: it is
+                # delta-neutral and its protection is the margin-headroom and
+                # liquidation-distance exits run on every tick.
+                "protective_stop": "NOT_APPLICABLE_DELTA_NEUTRAL",
+                "journal_unsaved": bool(self._journal_unsaved),
+            }
+            position = engine.position
+            if position is None:
+                status["position"] = None
+            else:
+                status["position"] = {
+                    "spot_qty": position.spot.filled_qty,
+                    "perp_short_qty": position.perp.filled_qty,
+                    "net_delta_btc": position.delta_qty,
+                    "opened_ms": position.opened_ms,
+                    "execution_mode": str(getattr(engine, "execution_mode", "")),
+                }
+            view = getattr(engine, "snapshot", None)
+            if view is not None:
+                status["market"] = {
+                    "age_s": round(float(view.age_s), 1) if view.age_s is not None else None,
+                    "margin_multiple": view.margin_multiple,
+                    "basis_bps": view.basis_bps,
+                }
+            journal = getattr(self, "carry_journal", None)
+            if journal is not None:
+                st = journal.statement()
+                status["accounting"] = {
+                    k: st.get(k) for k in (
+                        "net_basis", "net_usd", "fees_usd", "funding_usd",
+                        "fees_confirmed", "funding_confirmed",
+                        "funding_reconciled", "funding_unread",
+                        "funding_unattributed", "open_perp_qty")}
+                status["last_reconciliation_ms"] = self._last_reconcile_ms or None
+            fault = ""
+            if engine.state.name == "HALTED":
+                fault = self._last_carry_decision.get("reason") or "HALTED"
+            elif self._journal_unsaved:
+                fault = "JOURNAL_WRITE_FAILED"
+            status["blocking_fault"] = fault
+            return status
+        except Exception as exc:  # noqa: BLE001
+            return {"attached": True, "blocking_fault": "STATUS_UNREADABLE",
+                    "error": f"{type(exc).__name__}: {exc}"}
 
     def _memory_health(self) -> Dict[str, Any]:
         """A compact view of what the bot remembers, for the health endpoint.
@@ -691,12 +761,20 @@ class TradingBot:
     def tick(self) -> None:
         """One cycle: refresh equity, check the brakes, then consider each symbol."""
         self.session.tick()
+        # A HELD carry pair must be watched whatever the account-level brakes
+        # say. The equity read and the risk layer's halt are directional-book
+        # controls; neither can excuse skipping the margin and liquidation
+        # checks of a short that is live at the venue. They still stop NEW
+        # exposure: with no pair held, both returns below are unchanged.
+        carry_pair_held = (self.carry is not None
+                           and getattr(self.carry, "position", None) is not None)
         try:
             equity = self.client.get_equity()
             self.risk.update_equity(equity)
         except BybitAPIError as exc:
             logger.error("equity unreadable this cycle: %s", exc)
-            return
+            if not carry_pair_held:
+                return
 
         # Apply any WS-observed order/execution events FIRST, on this
         # (the writer) thread — persistence.StateStore enforces a single
@@ -737,8 +815,12 @@ class TradingBot:
         self._absorb_ws_observations(rest_ok=rest_observation_ok)
 
         if self.risk.should_halt_trading():
-            logger.warning("trading halted by the risk layer this cycle")
-            return
+            if not carry_pair_held:
+                logger.warning("trading halted by the risk layer this cycle")
+                return
+            logger.warning(
+                "risk layer halt in force; the held carry pair is still "
+                "monitored (no new exposure can open while it is held)")
 
         # ---- CARRY BOOK ----------------------------------------------------
         # When the carry book is attached it owns the cycle and returns. It is
@@ -769,17 +851,55 @@ class TradingBot:
                 logger.error(
                     "carry market view unusable this cycle (%s); the book is "
                     "NOT touched and no order is sent", exc)
+                self._last_carry_decision = {
+                    "action": "skipped", "reason": "MARKET_VIEW_UNUSABLE",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "at_ms": int(time.time() * 1000)}
                 return
             mark, spot = view.perp_mark, view.spot_mark
+            # An accounting journal that cannot be written down is a book whose
+            # fills, fees and funding will not survive a restart. While a pair
+            # is held the book keeps watching it (monitoring outranks
+            # bookkeeping); with nothing held it must not take on new
+            # exposure it cannot account for.
+            if (self._journal_unsaved and self.carry.position is None
+                    and getattr(self.carry.state, "name", "") != "HALTED"):
+                self.carry._halt(
+                    "JOURNAL_WRITE_FAILED",
+                    "the double-entry journal could not be written on the "
+                    "previous cycle and the book is flat; refusing new "
+                    "exposure it cannot account for")
+                return
             self.carry.snapshot = view
             # The SETTLED print and its stamp, not the ticker's forecast
             # (0034). The loop ticks every LOOP_INTERVAL_SECONDS; a print
             # happens every eight hours. The stamp is how the engine tells
             # them apart.
-            decision = self.carry.on_candle(
-                mark=mark, funding_bps=view.funding_print_bps, spot=spot,
-                timestamp_ms=int(time.time() * 1000),
-                funding_print_ms=view.funding_print_ms)
+            try:
+                decision = self.carry.on_candle(
+                    mark=mark, funding_bps=view.funding_print_bps, spot=spot,
+                    timestamp_ms=int(time.time() * 1000),
+                    funding_print_ms=view.funding_print_ms)
+            except Exception as exc:  # noqa: BLE001
+                # An exception that escapes the engine in the middle of a
+                # two-leg transaction leaves a leg the engine no longer tracks
+                # and a state of OPENING/UNWINDING with no position. The next
+                # tick must not treat that as flat and open again: stop, write
+                # it down, and let cold start compare the ledger with the venue.
+                logger.exception("carry engine raised: %s", exc)
+                if getattr(self.carry.state, "name", "") in (
+                        "OPENING", "UNWINDING"):
+                    self.carry._halt(
+                        "ENGINE_EXCEPTION_MID_TRANSACTION",
+                        f"{type(exc).__name__}: {exc}")
+                    logger.critical(
+                        "carry book HALTED mid-transaction - a human must "
+                        "reconcile the venue against the ledger")
+                return
+            self._last_carry_decision = {
+                "action": str(decision.action), "reason": str(decision.reason),
+                "state": decision.state.value,
+                "at_ms": int(time.time() * 1000)}
             logger.info(
                 "carry: %s (%s) state=%s perp=%.2f spot=%.2f "
                 "basis=%.1fbps settled=%.3fbps@%s predicted=%.3fbps %s",
@@ -798,7 +918,9 @@ class TradingBot:
                 self._book_carry_funding(journal, symbol, decision)
                 try:
                     self.store.save_ledger(journal.to_rows())
+                    self._journal_unsaved = False
                 except Exception:  # noqa: BLE001
+                    self._journal_unsaved = True
                     logger.exception("the ledger could not be written down")
 
             if decision.state.name == "HALTED":
@@ -836,6 +958,8 @@ class TradingBot:
     #: Class-level defaults so a bot built without __init__ (tests, tools) works.
     _carry_estimated_funding = 0.0
     _last_funding_poll_ms = 0
+    _journal_unsaved = False
+    _last_carry_decision: Dict[str, Any] = {}
 
     #: How often to read the venue's settlement rows. Funding settles every 8h,
     #: so a few minutes is more than enough and keeps the call count low.
@@ -1086,6 +1210,28 @@ def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
     return (True, "LIVE (authorised, promotion gate signed)")
 
 
+def carry_orders_permitted_for(cfg: Any, client: Any) -> Tuple[bool, str]:
+    """`carry_orders_permitted`, plus: the client must talk to the venue the
+    config says it talks to.
+
+    The gate above reads flags. The URL is what orders actually travel to. A
+    client built (or injected) against mainnet under a sandbox config would
+    pass every flag check and still send a real order, so the one direction
+    that matters is refused here, per order: a sandbox config with a client
+    whose base URL is the mainnet host.
+    """
+    allowed, why = carry_orders_permitted(cfg)
+    if allowed is not True:
+        return (allowed, why)
+    if bool(cfg.USE_TESTNET):
+        from bybit_connection import MAINNET_REST
+        url = str(getattr(client, "base_url", "") or "").rstrip("/")
+        if url == MAINNET_REST:
+            return (False, f"sandbox config (USE_TESTNET=1) but the client "
+                           f"targets the mainnet host {MAINNET_REST}")
+    return (True, why)
+
+
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
     """Construct the stack in dependency order.
 
@@ -1197,7 +1343,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         # (PAPER) and the carry broker would still have POSTed to mainnet.
         # Asked before EVERY order, read fresh each time.
         def _carry_orders_permitted():
-            return carry_orders_permitted(cfg)
+            return carry_orders_permitted_for(cfg, bot.client)
 
         # HOW THE LONG SIDE IS HELD (0036). No default: "overlay" shorts the
         # perp against BTC the client already owns and never touches their
