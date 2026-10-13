@@ -564,9 +564,10 @@ class TestPublicReader:
 # ---------------------------------------------------------------------------
 
 
-def cli(*args, stdin=None):
+def cli(*args, stdin=None, env=None):
     return subprocess.run([sys.executable, os.path.join(BOT, "carry_shadow.py"),
-                           *args], input=stdin, capture_output=True, text=True)
+                           *args], input=stdin, capture_output=True, text=True,
+                          env=None if env is None else {**os.environ, **env})
 
 
 def flags(tmp_path, origin, *extra, db="cli.db"):
@@ -646,17 +647,55 @@ class TestCli:
                                db="b.db"), stdin=json.dumps(series()[0]))
         assert b.returncode == cs.EXIT_USAGE
 
-    def test_live_with_no_network_exits_nonzero_and_books_nothing(self, tmp_path):
+    def test_a_replayed_file_cannot_claim_the_live_origin(self, tmp_path):
+        now = time.time()
+        f = tmp_path / "obs.jsonl"
+        f.write_text(json.dumps(obs(int((now - 1800) * 1000),
+                                    observed_at_s=now)))
+        done = cli("replay", *flags(tmp_path, "live_public",
+                                    "--observations", str(f), db="r.db"))
+        assert done.returncode == cs.EXIT_USAGE, done.stderr
+        assert not (tmp_path / "r.db").exists()
+
+    def test_a_usage_refusal_leaves_no_book_to_block_the_corrected_command(
+            self, tmp_path):
+        bad = cli("step", *flags(tmp_path, "supplied", "--live", db="u.db"))
+        assert bad.returncode == cs.EXIT_USAGE, bad.stderr
+        assert not (tmp_path / "u.db").exists()
+        now = time.time()
+        o = obs(int((now - 1800) * 1000), observed_at_s=now)
+        good = cli("step", *flags(tmp_path, "supplied", "--observation", "-",
+                                  db="u.db"), stdin=json.dumps(o))
+        assert good.returncode == 0, good.stderr
+
+    def test_live_with_no_network_exits_3_and_creates_no_book(self, tmp_path):
+        # a dead proxy makes the venue unreachable on every host, so this
+        # never silently skips where the network happens to be open
+        dead = {"HTTPS_PROXY": "http://127.0.0.1:9", "https_proxy":
+                "http://127.0.0.1:9", "NO_PROXY": "", "no_proxy": ""}
         done = cli("step", "--db", str(tmp_path / "l.db"), "--origin",
                    "live_public", "--venue", "testnet", "--borrow-apr", "0.0",
                    "--execution-mode", "overlay", "--inventory-btc", "0.01",
-                   "--margin-multiple", "5", "--live")
-        if done.returncode == 0:      # a host that really reaches the venue
-            pytest.skip("this host can read the public venue")
+                   "--margin-multiple", "5", "--live", env=dead)
         assert done.returncode == cs.EXIT_REFUSED_INPUT, done.stderr
-        con = __import__("sqlite3").connect(str(tmp_path / "l.db"))
-        assert con.execute(
-            "SELECT COUNT(*) FROM shadow_observations").fetchone()[0] == 0
+        assert "the venue could not be read" in done.stderr
+        assert not (tmp_path / "l.db").exists()
+
+    def test_live_with_no_network_leaves_an_existing_book_byte_identical(
+            self, tmp_path):
+        path = tmp_path / "l.db"
+        cs.ShadowRuntime(str(path), config(origin="live_public",
+                                           venue="testnet")).close()
+        live = ["--db", str(path), "--origin", "live_public", "--venue",
+                "testnet", "--borrow-apr", "0.0", "--execution-mode",
+                "overlay", "--inventory-btc", "0.01", "--margin-multiple", "5"]
+        before = hashlib.sha256(path.read_bytes()).hexdigest()
+        done = cli("step", *live, "--live",
+                   env={"HTTPS_PROXY": "http://127.0.0.1:9",
+                        "https_proxy": "http://127.0.0.1:9",
+                        "NO_PROXY": "", "no_proxy": ""})
+        assert done.returncode == cs.EXIT_REFUSED_INPUT, done.stderr
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
 # ---------------------------------------------------------------------------

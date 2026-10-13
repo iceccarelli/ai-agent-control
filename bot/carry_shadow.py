@@ -996,12 +996,11 @@ def _read_obs(path: str) -> Any:
         raise ShadowRefusal(EXIT_USAGE, f"cannot read observation: {exc}")
 
 
-def _runtime_from(args: argparse.Namespace) -> ShadowRuntime:
-    config = build_config(
+def _config_from(args: argparse.Namespace) -> Dict[str, Any]:
+    return build_config(
         origin=args.origin, venue=args.venue, borrow_apr=args.borrow_apr,
         execution_mode=args.execution_mode, inventory_btc=args.inventory_btc,
         margin_multiple=args.margin_multiple)
-    return ShadowRuntime(args.db, config)
 
 
 def _print(obj: Any) -> None:
@@ -1048,7 +1047,36 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     rt: Optional[ShadowRuntime] = None
     try:
-        rt = _runtime_from(args)
+        # Everything that can refuse before an observation exists is decided
+        # BEFORE the book is opened: opening a fresh path creates the book and
+        # freezes it to this run's config and origin, so a usage error or an
+        # unreadable venue must not leave behind a bound, empty book that then
+        # refuses the corrected command.
+        config = _config_from(args)
+        obs: Any = None
+        lines: List[str] = []
+        if args.cmd == "step":
+            if args.live:
+                if args.origin != "live_public":
+                    raise ShadowRefusal(EXIT_USAGE,
+                                        "--live requires --origin live_public")
+            elif args.origin == "live_public":
+                raise ShadowRefusal(
+                    EXIT_USAGE, "live_public means this process read the "
+                                "venue; use --live, or another origin")
+        if args.cmd == "replay":
+            if args.origin == "live_public":
+                raise ShadowRefusal(
+                    EXIT_USAGE, "live_public means this process read the "
+                                "venue; a replayed file cannot claim it")
+            try:
+                lines = open(args.observations, encoding="utf-8").read().splitlines()
+            except OSError as exc:
+                raise ShadowRefusal(EXIT_USAGE, str(exc))
+        if args.cmd == "step":
+            obs = (PublicVenueReader(args.venue).observe() if args.live
+                   else _read_obs(args.observation))
+        rt = ShadowRuntime(args.db, config)
         if args.cmd == "report":
             _print({"book": {"origin": rt.store.meta("origin"),
                              "config_fingerprint": rt.fingerprint,
@@ -1057,26 +1085,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                     "economics": rt.economics()})
             return EXIT_OK
         if args.cmd == "step":
-            if args.live:
-                if args.origin != "live_public":
-                    raise ShadowRefusal(EXIT_USAGE,
-                                        "--live requires --origin live_public")
-                obs = PublicVenueReader(args.venue).observe()
-            else:
-                if args.origin == "live_public":
-                    raise ShadowRefusal(
-                        EXIT_USAGE, "live_public means this process read the "
-                                    "venue; use --live, or another origin")
-                obs = _read_obs(args.observation)
             result = rt.step(obs, source=args.observation or "")
             _print(_summarise(result))
             return result["exit"]
         # replay
         last = EXIT_OK
-        try:
-            lines = open(args.observations, encoding="utf-8").read().splitlines()
-        except OSError as exc:
-            raise ShadowRefusal(EXIT_USAGE, str(exc))
         for n, line in enumerate(l for l in lines if l.strip()):
             result = rt.step(json.loads(line), source=f"{args.observations}:{n}")
             last = result["exit"]
