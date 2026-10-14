@@ -514,7 +514,12 @@ class TestTickFlagsAMissingSettlementAndBooksTheLateRow:
             tick(bot, k)
         qty = abs(journal.balances()[L.PERP].qty)
         opened = opened_ms(journal)
-        venue.prints = [opened + H]                 # one settlement, 9h ago
+        # The venue settles every 8h, so a 10h hold spans TWO prints: the one
+        # judged here (9h ago) and the next (1h ago), still inside the delivery
+        # grace. A history holding only the first would be a missing print, not
+        # a quiet market (carry_broker.funding_gaps), which is the point of the
+        # stricter completeness rule this fixture used to violate.
+        venue.prints = [opened + H, opened + 9 * H]
         return venue, journal, bot, store, qty, opened
 
     def test_no_row_for_a_held_settlement_makes_the_statement_provisional(

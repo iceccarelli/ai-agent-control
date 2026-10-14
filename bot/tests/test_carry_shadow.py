@@ -771,3 +771,114 @@ class TestShippedInTheProductionImage:
         wf = open(os.path.join(os.path.dirname(BOT), ".github", "workflows",
                                "carry-verify.yml")).read()
         assert "carry_shadow.py" in wf and "tests/test_carry_shadow.py" in wf
+
+
+class TestARefusedInvocationLeavesNothingBehind:
+    """Opening a fresh path creates the shadow book and freezes it to this
+    run's config and origin. Every refusal that can be decided without the book
+    must be decided before it exists, or the corrected command is refused."""
+
+    def _fresh_path(self, tmp_path, name):
+        return tmp_path / name
+
+    def test_a_stale_observation_creates_no_book(self, tmp_path):
+        db = self._fresh_path(tmp_path, "stale.db")
+        stale = obs(1_700_000_000_000)             # years old, wall-clock origin
+        done = cli("step", *flags(tmp_path, "supplied", "--observation", "-",
+                                  db="stale.db"), stdin=json.dumps(stale))
+        assert done.returncode == cs.EXIT_REFUSED_INPUT, done.stderr
+        assert not db.exists()
+
+    def test_an_incomplete_observation_creates_no_book(self, tmp_path):
+        done = cli("step", *flags(tmp_path, "supplied", "--observation", "-",
+                                  db="inc.db"),
+                   stdin=json.dumps({"perp_mark": 80_000.0}))
+        assert done.returncode == cs.EXIT_REFUSED_INPUT
+        assert not (tmp_path / "inc.db").exists()
+
+    def test_the_corrected_command_is_not_refused_after_a_refused_one(
+            self, tmp_path):
+        """The consequence of the old order: a refused stale step bound the
+        path to its config, and a differently configured retry got exit 4."""
+        stale = obs(1_700_000_000_000)
+        cli("step", *flags(tmp_path, "supplied", "--observation", "-",
+                           db="r.db"), stdin=json.dumps(stale))
+        now = time.time()
+        fresh = obs(int((now - 600) * 1000), observed_at_s=now)
+        changed = flags(tmp_path, "supplied", "--observation", "-", db="r.db")
+        changed[changed.index("--borrow-apr") + 1] = "0.05"
+        done = cli("step", *changed, stdin=json.dumps(fresh))
+        assert done.returncode == cs.EXIT_OK, done.stderr
+
+    def test_a_refused_step_leaves_an_existing_book_untouched_but_logged(
+            self, tmp_path):
+        now = time.time()
+        good = obs(int((now - 600) * 1000), observed_at_s=now)
+        assert cli("step", *flags(tmp_path, "supplied", "--observation", "-",
+                                  db="e.db"),
+                   stdin=json.dumps(good)).returncode == 0
+        import sqlite3
+        con = sqlite3.connect(str(tmp_path / "e.db"))
+        before = con.execute(
+            "SELECT COUNT(*) FROM shadow_observations").fetchone()[0]
+        con.close()
+        stale = obs(1_700_000_000_000)
+        done = cli("step", *flags(tmp_path, "supplied", "--observation", "-",
+                                  db="e.db"), stdin=json.dumps(stale))
+        assert done.returncode == cs.EXIT_REFUSED_INPUT
+        con = sqlite3.connect(str(tmp_path / "e.db"))
+        assert con.execute(
+            "SELECT COUNT(*) FROM shadow_observations").fetchone()[0] == before
+
+    def test_a_malformed_replay_line_creates_no_book_and_books_nothing(
+            self, tmp_path):
+        f = tmp_path / "bad.jsonl"
+        f.write_text(json.dumps(series()[0]) + "\nnot json\n")
+        done = cli("replay", *flags(tmp_path, "historical_replay",
+                                    "--observations", str(f), db="bad.db"))
+        assert done.returncode == cs.EXIT_USAGE, done.stderr
+        assert not (tmp_path / "bad.db").exists()
+
+    def test_an_invalid_first_replay_row_creates_no_book(self, tmp_path):
+        f = tmp_path / "first.jsonl"
+        f.write_text(json.dumps({"perp_mark": 1}) + "\n")
+        done = cli("replay", *flags(tmp_path, "historical_replay",
+                                    "--observations", str(f), db="f.db"))
+        assert done.returncode == cs.EXIT_REFUSED_INPUT
+        assert not (tmp_path / "f.db").exists()
+
+    def test_an_empty_replay_file_is_a_usage_error(self, tmp_path):
+        f = tmp_path / "empty.jsonl"
+        f.write_text("\n")
+        done = cli("replay", *flags(tmp_path, "historical_replay",
+                                    "--observations", str(f), db="z.db"))
+        assert done.returncode == cs.EXIT_USAGE
+        assert not (tmp_path / "z.db").exists()
+
+    def test_report_never_creates_a_book(self, tmp_path):
+        done = cli("report", *flags(tmp_path, "historical_replay", db="no.db"))
+        assert done.returncode == cs.EXIT_USAGE
+        assert not (tmp_path / "no.db").exists()
+
+    def test_replay_can_never_claim_live_public_and_creates_no_book(
+            self, tmp_path):
+        f = tmp_path / "o.jsonl"
+        f.write_text(json.dumps(series()[0]) + "\n")
+        done = cli("replay", *flags(tmp_path, "live_public",
+                                    "--observations", str(f), db="lp.db"))
+        assert done.returncode == cs.EXIT_USAGE
+        assert not (tmp_path / "lp.db").exists()
+
+    def test_a_replayed_row_is_never_labelled_live_public_in_the_book(
+            self, tmp_path):
+        f = tmp_path / "ok.jsonl"
+        f.write_text("\n".join(json.dumps(o) for o in series()))
+        assert cli("replay", *flags(tmp_path, "historical_replay",
+                                    "--observations", str(f),
+                                    db="h.db")).returncode == 0
+        import sqlite3
+        con = sqlite3.connect(str(tmp_path / "h.db"))
+        assert {r[0] for r in con.execute(
+            "SELECT origin FROM shadow_observations")} == {"historical_replay"}
+        assert con.execute("SELECT value FROM shadow_meta WHERE key='origin'"
+                           ).fetchone()[0] == "historical_replay"

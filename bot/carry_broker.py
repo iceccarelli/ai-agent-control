@@ -230,6 +230,12 @@ FUNDING_GAP_FACTOR = 1.5
 #: Two intervals this close are the same interval (clock jitter in the stamps).
 FUNDING_INTERVAL_JITTER_MS = 5 * 60_000
 
+#: The longest settlement interval on a Bybit linear perpetual (BTCUSDT's
+#: ``fundingInterval`` is 480 minutes; other contracts settle more often).
+#: A VENUE FACT used only to say "a window longer than this must hold a print",
+#: never as a trading threshold.
+FUNDING_MAX_INTERVAL_MS = 8 * 3600 * 1000
+
 
 @dataclass
 class FundingHistory:
@@ -277,8 +283,18 @@ def funding_gaps(stamps: List[int], *, start_ms: int, end_ms: int
     ts = sorted(set(int(t) for t in stamps))
     gaps: List[Tuple[int, int]] = []
     if len(ts) < 3:
-        if end_ms - start_ms > 86_400_000:
-            gaps.append((int(start_ms), int(end_ms)))
+        # Fewer than three prints give no interval to judge by, but the venue
+        # itself does: a linear perpetual settles at least every
+        # FUNDING_MAX_INTERVAL_MS, so a stretch longer than that (plus jitter)
+        # with no print in it is not "quiet", it is missing. An EMPTY answer
+        # over a window that must contain a settlement is therefore not a
+        # complete answer and cannot support "zero funding". Windows shorter
+        # than one interval may genuinely hold none, and stay complete.
+        limit = FUNDING_MAX_INTERVAL_MS + FUNDING_INTERVAL_JITTER_MS
+        edges = [int(start_ms)] + ts + [int(end_ms)]
+        for a, b in zip(edges, edges[1:]):
+            if b - a > limit:
+                gaps.append((a, b))
         return gaps, None
     iv = [b - a for a, b in zip(ts, ts[1:])]
     expected = len(ts)

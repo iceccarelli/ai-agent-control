@@ -398,3 +398,62 @@ class TestTheFundingAccountingContract:
         venue, journal, engine, bot = _flat(tmp_path)
         bot.cfg = mock.Mock(USE_TESTNET=True, PAPER_TRADING=False)
         assert bot.carry_status()["accounting"]["net_basis"] == "no_fills"
+
+
+class TestAnEmptyFundingAnswerSupportsZeroOnlyWhereItCanBeProven:
+    """An empty public history is a COMPLETE answer only for a window too short
+    to hold a settlement. Over a window the venue's own cadence says must
+    contain one, empty means missing: it cannot support "funding is zero"."""
+
+    H = 3_600_000
+
+    def test_funding_gaps_flags_an_empty_answer_over_a_window_that_must_hold_a_print(
+            self):
+        from carry_broker import funding_gaps
+        H = self.H
+        assert funding_gaps([], start_ms=0, end_ms=6 * H) == ([], None)
+        gaps, _ = funding_gaps([], start_ms=0, end_ms=20 * H)
+        assert gaps == [(0, 20 * H)]
+        # one print cannot vouch for a 20h window either
+        gaps, _ = funding_gaps([10 * H], start_ms=0, end_ms=20 * H)
+        assert gaps and gaps[0][0] == 0
+        # a print at each end of an 8h cadence is whole
+        assert funding_gaps([0, 8 * H], start_ms=0, end_ms=8 * H)[0] == []
+
+    def _venue_hedged_hours_ago(self, tmp_path, hours):
+        venue, journal, engine = build(modern, clock_offset_ms=-hours * self.H)
+        store = StateStore(str(tmp_path / "carry.db"))
+        bot = make_bot(venue, journal, engine, store)
+        for k in (1, 2, 3):
+            tick(bot, k)
+        journal.entries[:] = [e for e in journal.entries
+                              if e.kind != "funding_reconciliation"]
+        bot.cfg = mock.Mock(USE_TESTNET=True, PAPER_TRADING=False)
+        return venue, journal, bot
+
+    def test_an_empty_history_over_twenty_hours_is_provisional_not_confirmed(
+            self, tmp_path):
+        venue, journal, bot = self._venue_hedged_hours_ago(tmp_path, 20)
+        venue.prints = []                    # the venue "returns nothing"
+        bot._last_reconcile_ms = bot._last_funding_poll_ms = 0
+        bot._book_carry_funding(journal, "BTCUSDT",
+                                mock.Mock(detail={}, action="hold"))
+        rec = [e.fee_raw for e in journal.entries
+               if e.kind == "funding_reconciliation"][-1]
+        assert rec["state"] == "PROVISIONAL"
+        assert "FUNDING_HISTORY_HAS_GAPS" in rec["reasons"]
+        acct = bot.carry_status()["accounting"]
+        _assert_contract(acct)
+        assert acct["net_basis"] == "provisional_funding_unverified"
+        assert acct["funding_confirmed"] is False
+
+    def test_an_empty_history_over_a_short_window_still_supports_zero(
+            self, tmp_path):
+        venue, journal, bot = self._venue_hedged_hours_ago(tmp_path, 3)
+        venue.prints = []
+        bot._last_reconcile_ms = bot._last_funding_poll_ms = 0
+        bot._book_carry_funding(journal, "BTCUSDT",
+                                mock.Mock(detail={}, action="hold"))
+        acct = bot.carry_status()["accounting"]
+        _assert_contract(acct)
+        assert acct["net_basis"] == "confirmed" and acct["funding_usd"] == 0

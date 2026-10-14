@@ -228,3 +228,38 @@ class TestCarryIsPointedAtTheDrill:
         assert out["ok"] is False
         assert "tools/drill.py" in out["failure"]
         assert out["network_order_submitted"] is False
+
+
+class TestTheLedgerIsEvidenceAndIsNeverOverwritten:
+    def test_an_existing_ledger_is_refused_before_anything_is_built_or_sent(
+            self, tmp_path):
+        ledger = tmp_path / "cash_ledger.json"
+        original = '{"schema": "cash_ledger/1", "date_utc": "2026-10-01"}\n'
+        ledger.write_text(original)
+        failure = tmp_path / "fail.json"
+        with mock.patch.object(ts, "_build_session_stack") as stack, \
+                mock.patch.object(ts, "run_session") as session:
+            rc = ts.main(["--ledger", str(ledger), "--failure-out",
+                          str(failure), "--state-db", str(tmp_path / "s.db"),
+                          "--evidence-path", str(tmp_path / "e.jsonl")])
+        assert rc == 1
+        assert ledger.read_text() == original
+        assert not stack.called and not session.called   # nothing was built/sent
+        assert not failure.exists()                        # no second writer
+
+    def test_write_ledger_once_cannot_truncate_an_existing_file(self, tmp_path):
+        path = tmp_path / "l.json"
+        ts.write_ledger_once(str(path), {"a": 1})
+        before = path.read_bytes()
+        with pytest.raises(FileExistsError):
+            ts.write_ledger_once(str(path), {"a": 2})
+        assert path.read_bytes() == before
+
+    def test_the_ledger_labels_its_costs_as_estimates(self):
+        led = ts.build_cash_ledger(symbol="BTCUSDT", category="spot", n_fills=2,
+                                   entry_price=100.0, exit_price=101.0,
+                                   qty=1.0, flat=True)
+        assert led["fees_basis"] == "static_estimate"
+        assert led["fees_confirmed"] is False
+        assert led["pnl_basis"] == "gross_minus_estimated_fees"
+        assert led["allows_live"] is False

@@ -616,6 +616,53 @@ def _clock(now_s: float) -> Iterator[None]:
         market_snapshot.time = saved
 
 
+def _resolve_now(origin: str, obs: Dict[str, Any],
+                 now_s: Optional[float]) -> float:
+    """The clock an observation's freshness is judged against.
+
+    A book that claims a present-day observation (live_public / supplied) is
+    judged against the wall clock, always; only replay / fixture books may be
+    judged against the observation's own clock.
+    """
+    if now_s is None:
+        return time.time() if origin not in OBSERVATION_CLOCK_ORIGINS \
+            else obs["observed_at_s"]
+    if origin not in OBSERVATION_CLOCK_ORIGINS and \
+            abs(now_s - time.time()) > 5:
+        raise ShadowRefusal(EXIT_USAGE, "an explicit clock is only "
+                                        "allowed for replay/fixture books")
+    return now_s
+
+
+def precheck_observation(config: Dict[str, Any], raw_obs: Any, *,
+                         now_s: Optional[float] = None
+                         ) -> Tuple[Dict[str, Any], str]:
+    """Everything that can refuse an observation WITHOUT a database.
+
+    Schema and consistency (``validate_observation``) and freshness (the real
+    ``take_snapshot`` + ``assert_fresh`` path, against a flat simulated venue).
+    The CLI runs this before it opens the shadow book, because opening a fresh
+    path creates the book and freezes it to this run's config and origin: a
+    refused observation must leave nothing behind. ``ShadowRuntime.step`` runs
+    the same checks again against the real book and records the refusal there.
+    """
+    from market_snapshot import take_snapshot
+
+    obs = validate_observation(raw_obs)
+    key = observation_key(obs)
+    now = _resolve_now(config["origin"], obs, now_s)
+    broker = ShadowBroker(config)
+    broker.load(obs, key)
+    with _clock(now):
+        try:
+            take_snapshot(broker, perp_symbol=SYMBOL, spot_symbol=SYMBOL,
+                          now_s=obs["observed_at_s"]).assert_fresh()
+        except Exception as exc:  # noqa: BLE001
+            raise ShadowRefusal(EXIT_REFUSED_INPUT,
+                                f"{type(exc).__name__}: {exc}")
+    return obs, key
+
+
 # ---------------------------------------------------------------------------
 # the runtime
 # ---------------------------------------------------------------------------
@@ -730,13 +777,7 @@ class ShadowRuntime:
             return {"outcome": "DUPLICATE_OBSERVATION", "obs_key": key,
                     "exit": EXIT_OK}
         origin = self.config["origin"]
-        if now_s is None:
-            now_s = time.time() if origin not in OBSERVATION_CLOCK_ORIGINS \
-                else obs["observed_at_s"]
-        elif origin not in OBSERVATION_CLOCK_ORIGINS and \
-                abs(now_s - time.time()) > 5:
-            raise ShadowRefusal(EXIT_USAGE, "an explicit clock is only "
-                                            "allowed for replay/fixture books")
+        now_s = _resolve_now(origin, obs, now_s)
         if s.meta("halted") is not None:
             return {"outcome": "HALTED", "obs_key": key, "exit": EXIT_HALTED,
                     "reason": s.meta("halted")}
@@ -1078,6 +1119,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.cmd == "step":
             obs = (PublicVenueReader(args.venue).observe() if args.live
                    else _read_obs(args.observation))
+            precheck_observation(config, obs)       # schema + freshness
+        elif args.cmd == "replay":
+            parsed = []
+            for n, line in enumerate(l for l in lines if l.strip()):
+                try:
+                    parsed.append(json.loads(line))
+                except ValueError as exc:
+                    raise ShadowRefusal(
+                        EXIT_USAGE, f"observation line {n + 1} is not JSON: "
+                                    f"{exc}")
+            if not parsed:
+                raise ShadowRefusal(EXIT_USAGE, "no observations to replay")
+            precheck_observation(config, parsed[0])   # the first must be valid
+            lines = [json.dumps(o) for o in parsed]
+        elif args.cmd == "report" and not os.path.exists(args.db):
+            raise ShadowRefusal(
+                EXIT_USAGE, f"{args.db} does not exist; report reads a book, "
+                            "it never creates one")
         rt = ShadowRuntime(args.db, config)
         if args.cmd == "report":
             _print({"book": {"origin": rt.store.meta("origin"),
