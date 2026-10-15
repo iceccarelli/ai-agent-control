@@ -411,8 +411,16 @@ class CarryEngine:
     #: three-print smoother with slack, short enough that a regime change is
     #: not diluted by last week.
     FUNDING_HISTORY = 8
-    #: Longer than one 8h settlement interval plus slack means a print was missed.
+    #: Longer than one 8h settlement interval plus slack means a print was missed
+    #: (1.5 x `market_snapshot.FUNDING_INTERVAL_MS`; a test pins the relation).
+    #: Strictly greater than: a gap of exactly this length is not a gap.
     MAX_PRINT_GAP_MS = 12 * 3_600_000
+    #: Perps whose 8h funding cadence is PROVEN from local venue metadata
+    #: (`research/exchange_study/bybit/instrument_linear.json.gz`, BTCUSDT
+    #: `fundingInterval` = 480). The gap rule, `market_snapshot.assert_fresh` and
+    #: `carry_costs.FUNDING_PERIODS_PER_DAY` all assume 8h. Any other symbol has
+    #: no proof here, so the entry gate refuses it rather than guess a cadence.
+    FUNDING_8H_PROVEN = frozenset({"BTCUSDT"})
 
     def __init__(self, *, broker: Any, kill_switch: Any = None,
                  spot_symbol: str = "BTCUSDT", perp_symbol: str = "BTCUSDT",
@@ -539,6 +547,13 @@ class CarryEngine:
         self._funding_history = [float(x) for x in
                                  state.get("funding_history", [])][
                                      -self.FUNDING_HISTORY:]
+        if self._funding_history and self._last_print_ms is None:
+            # Rates with no stamp of the newest one: their age is unknowable,
+            # so the gap rule could never judge them. Not a history.
+            logger.warning("carry: restored funding history has no last-print "
+                           "stamp; discarding %d prints of unknown age",
+                           len(self._funding_history))
+            self._funding_history = []
 
     def _record(self) -> Optional[CarryDecision]:
         """Write the ledger. A failure to write HALTS.
@@ -624,8 +639,19 @@ class CarryEngine:
             if not (self._finite(rate) and int(stamp) > 0):
                 continue
             clean.append((float(rate), int(stamp)))
-        clean.sort(key=lambda row: row[1])
-        clean = clean[-self.FUNDING_HISTORY:]
+        # One row per settlement stamp (first wins), then only the newest run
+        # with no missed settlement in it: a hole (e.g. a malformed row the
+        # broker skipped) must not be smoothed across.
+        by_stamp: Dict[int, float] = {}
+        for rate, stamp in sorted(clean, key=lambda row: row[1]):
+            by_stamp.setdefault(stamp, rate)
+        ordered = sorted(by_stamp.items())
+        run: List[Tuple[float, int]] = []
+        for stamp, rate in ordered:
+            if run and stamp - run[-1][1] > self.MAX_PRINT_GAP_MS:
+                run = []
+            run.append((rate, stamp))
+        clean = run[-self.FUNDING_HISTORY:]
         if not clean:
             return 0
         self._funding_history = [rate for rate, _ms in clean]
@@ -672,6 +698,16 @@ class CarryEngine:
         a default here would be a silent risk parameter, which is the exact
         class of bug 0016 removed from the cap.
         """
+        if self.perp_symbol not in self.FUNDING_8H_PROVEN:
+            return EntryEconomics(None, None, CarryDecision(
+                "stand_aside", reason="FUNDING_CADENCE_UNPROVEN",
+                state=BookState.FLAT,
+                detail={"symbol": self.perp_symbol,
+                        "proven": sorted(self.FUNDING_8H_PROVEN),
+                        "note": "no local venue metadata proves this perp "
+                                "settles every 8h, which the gap rule, the "
+                                "freshness check and the carry-per-day maths "
+                                "all assume; a cadence is never guessed"}))
         if spot is None:
             return EntryEconomics(None, None, CarryDecision(
                 "stand_aside", reason="SPOT_UNAVAILABLE_BASIS_UNKNOWN",
