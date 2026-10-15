@@ -385,3 +385,69 @@ class TestTheTranscriptIsWrittenDown:
         joined = " ".join(report["not_proven"]).lower()
         for term in ("liquidation", "rate limit"):
             assert term in joined, term
+
+
+class TestFlatnessIsVerifiedAgainstTheVenueNotTheBook:
+    """`final_reconcile` used to read only the perp size. Flat means: no perp,
+    no open carry order, and the client's spot inventory untouched."""
+
+    def test_a_carry_order_still_open_after_the_unwind_is_not_flat(self):
+        class Open(Venue):
+            def get_open_carry_orders(self, spot_symbol, perp_symbol):
+                return [{"orderLinkId": "carr-x"}] if self.orders and \
+                    abs(self.perp_qty) < 1e-12 else []
+
+        report = run(Open())
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "final_reconcile"
+        assert report["still_open"] is True
+        assert report["evidence"]["final_reconcile"]["open_orders"] == 1
+
+    def test_a_venue_that_cannot_be_read_at_the_end_is_unverified_not_flat(self):
+        class Dies(Venue):
+            def get_perp_position(self, symbol):
+                if self.orders and abs(self.perp_qty) < 1e-12:
+                    raise RuntimeError("venue unreachable")
+                return super().get_perp_position(symbol)
+
+        report = run(Dies())
+        assert report["verdict"] == "FAILED"
+        assert report["still_open"] is True
+        assert report["evidence"]["final_reconcile"]["verdict"] == "UNVERIFIED"
+
+    def test_spot_inventory_that_moved_is_reported(self):
+        class Moves(Venue):
+            def get_spot_inventory(self, symbol):
+                base = super().get_spot_inventory(symbol)
+                return base - 0.005 if self.orders and \
+                    abs(self.perp_qty) < 1e-12 else base
+
+        report = run(Moves())
+        assert report["failed_stage"] == "final_reconcile"
+        assert "spot inventory moved" in " ".join(
+            s["why"] for s in report["stages"])
+
+    def test_an_ambiguous_leg_leaves_the_report_saying_what_the_venue_holds(self):
+        class Ambiguous(Venue):
+            def place_market(self, *, symbol, side, qty, product):
+                result = super().place_market(
+                    symbol=symbol, side=side, qty=qty, product=product)
+                err = RuntimeError("timed out after submission")
+                err.outcome_unknown = True
+                raise err
+
+        venue = Ambiguous()
+        report = run(venue)
+        assert report["verdict"] == "FAILED"
+        assert report["failed_stage"] == "open"
+        assert venue.perp_qty > 0, "fixture: the order DID execute"
+        assert report["still_open"] is True, "claimed nothing is open"
+        assert "venue_check_after_failure" in [s["stage"] for s in report["stages"]]
+        assert "HUMAN" in report["next_action"].upper()
+
+    def test_a_clean_failure_before_any_exposure_is_still_reported_flat(self):
+        report = run(Venue(perp_fills=False))
+        assert report["still_open"] is False
+        check = [s for s in report["stages"]
+                 if s["stage"] == "venue_check_after_failure"]
+        assert check and check[0]["evidence"]["verdict"] == "FLAT"

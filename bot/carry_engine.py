@@ -855,6 +855,15 @@ class CarryEngine:
             if headroom is not None:
                 return headroom
 
+            # What the VENUE holds, not what the book believes. Delta, drift
+            # and the hedge ratio are all computed from the legs this process
+            # recorded; a manual order, a fill the book missed or a partial
+            # liquidation changes the venue and nothing else. Compared every
+            # tick; never "corrected" by rewriting the ledger to match.
+            mismatch = self._check_venue_position()
+            if mismatch is not None:
+                return mismatch
+
             # Before anything is rebalanced or collected: in OVERLAY, does the
             # client still hold the BTC this short is written against? Adding
             # to, or collecting on, a hedge whose long side has left is
@@ -1227,11 +1236,26 @@ class CarryEngine:
                                  detail={"collected": position.funding_collected,
                                          "execution_mode": OVERLAY})
         wanted_spot = position.spot.filled_qty
-        spot = self._fire(self.spot_symbol, "Sell", wanted_spot, "spot")
-        if perp is None or spot is None:
+        if perp is None or perp.filled_qty <= 0:
+            # The perp is the leg that can be liquidated and the one that
+            # hedges the spot. If it did not close, selling the spot would turn
+            # a hedged pair into a naked short. Leave the pair as it is.
             return self._halt(
                 "UNWIND_INCOMPLETE",
-                f"{reason} — a leg did not close and the book is now naked")
+                f"{reason} — the perp did not close; the spot leg was NOT "
+                "sold because it is still hedging the open short")
+        # Sell spot only in proportion to the perp that actually closed: a
+        # half-closed short against a fully sold spot is a naked short.
+        closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
+            if wanted_perp > 0 else 1.0
+        sell_spot = (wanted_spot if closed_fraction >= 1.0 - 1e-9
+                     else wanted_spot * closed_fraction)
+        spot = self._fire(self.spot_symbol, "Sell", sell_spot, "spot")
+        if spot is None:
+            spot_left = wanted_spot
+            return self._partial_close(
+                reason, perp_left=wanted_perp - perp.filled_qty,
+                spot_left=spot_left)
         perp_left = wanted_perp - perp.filled_qty
         spot_left = wanted_spot - spot.filled_qty
         if perp_left > QTY_DUST or spot_left > QTY_DUST:
@@ -1281,6 +1305,21 @@ class CarryEngine:
 
     def _emergency_unwind_spot(self, spot: Leg, reason: str) -> CarryDecision:
         """The perp never landed. Sell the spot immediately; it is naked long."""
+        if self.state is BookState.HALTED:
+            # The perp order's fate is UNKNOWN (not "did not fill"). Selling the
+            # spot would strip the hedge from a short that may exist; keeping it
+            # may leave a naked long. Neither is decidable here, so do neither:
+            # write the spot down as a position with an empty perp leg so the
+            # ledger, the journal and the next cold start all see the exposure.
+            self.position = CarryPosition(
+                spot=spot,
+                perp=Leg(symbol=self.perp_symbol, side="Sell",
+                         product="linear"),
+                opened_ms=self._last_tick_ms)
+            return self._halt(
+                "PERP_LEG_OUTCOME_UNKNOWN",
+                f"{reason}; the perp order's outcome is unknown and "
+                f"{spot.filled_qty:.10g} spot is held. NOT unwound.")
         self.state = BookState.UNWINDING
         wanted = spot.filled_qty
         closed = self._fire(self.spot_symbol, "Sell", wanted, "spot")
@@ -1332,6 +1371,36 @@ class CarryEngine:
             return self._unwind(self.broker.get_mark(self.perp_symbol),
                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
         return self._check_liquidation_distance()
+
+    def _check_venue_position(self) -> Optional[CarryDecision]:
+        """Does the venue's perp short equal the size the book recorded?
+
+        The pair is not a hedge unless the short the venue holds is the short
+        the book thinks it holds. Unreadable or different halts: the book
+        cannot size a correction from a number it cannot trust, and a
+        correction sent on a wrong belief is a second error.
+        """
+        reader = getattr(self.broker, "get_perp_position", None)
+        if reader is None or self.position is None:
+            return None
+        try:
+            venue = abs(float(reader(self.perp_symbol)))
+        except Exception as exc:  # noqa: BLE001
+            return self._halt(
+                "VENUE_POSITION_UNREADABLE",
+                f"the perp position could not be read "
+                f"({type(exc).__name__}: {exc}); an unverifiable hedge is "
+                "treated as a broken one")
+        if not self._finite(venue):
+            return self._halt("VENUE_POSITION_UNREADABLE",
+                              f"the venue reported a position of {venue!r}")
+        book = self.position.perp.filled_qty
+        if abs(venue - book) > max(QTY_DUST, 1e-9 * max(book, 1.0)):
+            return self._halt(
+                "VENUE_POSITION_DRIFT",
+                f"the venue holds a {venue:.10g} perp short and the book "
+                f"recorded {book:.10g}; the hedge is not what the ledger says")
+        return None
 
     def _check_inventory_cover(self) -> Optional[CarryDecision]:
         """OVERLAY: is the inventory this short was written against still there?
@@ -1517,6 +1586,15 @@ class CarryEngine:
         except Exception as exc:  # noqa: BLE001
             self._last_leg_error = f"{type(exc).__name__}: {exc}"
             logger.error("leg %s %s %s failed: %s", side, symbol, product, exc)
+            if getattr(exc, "outcome_unknown", False):
+                # The order may be live at the venue. "It did not fill" is not
+                # established, so nothing downstream may hedge, unwind or
+                # re-send against it: the book stops and a human reconciles
+                # (cold start compares the ledger with the venue).
+                self._halt(
+                    "LEG_OUTCOME_UNKNOWN",
+                    f"{side} {qty} {symbol} ({product}) may or may not be "
+                    f"live at the venue ({exc}); nothing is sent on top of it")
             return None
         if not result:
             return None

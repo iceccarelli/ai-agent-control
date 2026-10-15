@@ -429,6 +429,20 @@ class _TickBroker(Venue, _SnapBroker):
     def get_funding_print(self, s):
         return (2.0, self.stamp_ms)
 
+    # A faithful venue: the perp position follows the fills, because the engine
+    # compares it with the book on every held tick.
+    perp_short = 0.0
+
+    def place_market(self, *, symbol, side, qty, product):
+        result = Venue.place_market(self, symbol=symbol, side=side, qty=qty,
+                                    product=product)
+        if product == "linear":
+            self.perp_short += qty if side == "Sell" else -qty
+        return result
+
+    def get_perp_position(self, s):
+        return self.perp_short
+
 
 def _bot(broker):
     bot = _main.TradingBot.__new__(_main.TradingBot)

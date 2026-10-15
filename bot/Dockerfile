@@ -22,7 +22,7 @@ RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 # imported unconditionally, so `python3 main.py` died on ModuleNotFoundError
 # before the health server bound and the container restart-looped.
 COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
-     carry_risk.py config.py features.py funding_reconcile.py ledger.py main.py \
+     carry_risk.py carry_shadow.py config.py features.py funding_reconcile.py ledger.py main.py \
      market_data.py \
      market_snapshot.py memory.py ml_strategy.py persistence.py \
      policy.py position_sizing.py private_ws_consumer.py project_status.py \
@@ -30,6 +30,11 @@ COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
      shadow.py shadow_strategy.py technical_analysis.py trading_engine.py \
      venue_fees.py ws_transport.py ./
 COPY signals/ ./signals/
+
+# carry_shadow.py is the forward-shadow runtime: the real CarryEngine against a
+# SIMULATED venue, into its own database (python3 carry_shadow.py step|replay|
+# report). It is not imported by main.py and holds no exchange client; it is
+# shipped so the same runtime that CI exercises is the one in the image.
 
 # The operator tools, named ONE BY ONE — never `COPY tools/`, which would put
 # every script and fetcher in the image.

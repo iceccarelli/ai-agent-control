@@ -9,8 +9,8 @@
 # checkout-safe whitespace check.
 #
 # WHAT THIS IS NOT: the repository's full suite. The full suite carries a known
-# baseline of 69 failures (documentation, corpus and date-relative fixtures) plus
-# 3 files that fail to import on missing modules. Those are NOT run or hidden
+# baseline of 61 failures (documentation, corpus and date-relative fixtures). The 3 files that failed to import on deleted
+# modules were removed together with the tools they tested. Those are NOT run or hidden
 # here and are NOT claimed fixed; they are a separate, pre-existing matter. This
 # job is green only when the carry correctness tests are green.
 #
@@ -100,6 +100,19 @@ jobs:
           tests/test_dockerfile.py
           tests/test_image_ships_the_tools.py
           tests/test_ci_workflow.py
+          tests/test_carry_lifecycle_e2e.py
+          tests/test_carry_ambiguous_outcomes.py
+          tests/test_carry_tick_safety.py
+          tests/test_unwind_completeness.py
+          tests/test_carry_cold_start.py
+          tests/test_carry_wiring_authority.py
+          tests/test_drill.py
+          tests/test_testnet_session.py
+          tests/test_carry_shadow.py
+          tests/test_rewire_machine_b.py
+          tests/test_control_plane_boundary.py
+          tests/test_operator_tools.py
+          tests/test_concurrency_and_dataflow.py
 
       - name: Fly build context
         run: python tools/fly_stack.py --check
@@ -108,7 +121,7 @@ jobs:
         if: always()
         run: |
           echo "### carry-verify (python ${{ matrix.python }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "Targeted carry correctness gate only. The repository's full suite has a known baseline of 69 failures (documentation, corpus and date-relative fixtures) and 3 import errors; it is deliberately not run or claimed fixed here." >> "$GITHUB_STEP_SUMMARY"
+          echo "Targeted carry correctness gate only. The repository's full suite has a known baseline of 61 failures (deleted documentation, date-relative corpus fixtures); it is deliberately not run or claimed fixed here." >> "$GITHUB_STEP_SUMMARY"
 
   production-image:
     name: production image builds and imports offline
@@ -168,3 +181,51 @@ jobs:
         run: |
           echo "### production-image" >> "$GITHUB_STEP_SUMMARY"
           echo "Built bot/Dockerfile from this commit and imported the application inside that image: offline, read-only, unprivileged. The application was not started and the image was not published. This proves the shipped modules import; it says nothing about venue behaviour or profitability." >> "$GITHUB_STEP_SUMMARY"
+
+  shadow-runtime-image:
+    name: forward-shadow runtime runs inside the production image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE: ai-agent-control-shadow-smoke:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the production image (bot/Dockerfile, context ./bot)
+        run: docker build --pull --tag "$IMAGE" ./bot
+
+      - name: Run carry_shadow.py in the image (offline, read-only, no entrypoint)
+        run: |
+          # The shipped CLI, in the shipped image: the real CarryEngine against
+          # its simulated venue, into a throwaway database. One container, so
+          # the database persists between the three calls: a synthetic fixture
+          # observation (origin synthetic_fixture, judged against its own
+          # clock), the SAME observation again (must be a duplicate no-op),
+          # then the report. No network, no credential, no order path.
+          docker run --rm \
+            --network none \
+            --read-only \
+            --tmpfs /tmp:rw,nosuid,size=16m \
+            --cap-drop=ALL \
+            --security-opt=no-new-privileges \
+            --pids-limit 64 \
+            -e USE_TESTNET=1 \
+            -e PAPER_TRADING=1 \
+            -e LIVE_TRADING_ACK= \
+            --entrypoint sh \
+            "$IMAGE" -ec '
+              OBS="{\"perp_mark\":80000,\"spot_mark\":79990,\"funding_bps\":3,\"funding_print_bps\":3,\"funding_print_ms\":1700000000000,\"observed_at_s\":1700000000,\"source\":\"ci fixture\"}"
+              FLAGS="--db /tmp/shadow.db --origin synthetic_fixture --venue historical --borrow-apr 0.0 --execution-mode overlay --inventory-btc 0.01 --margin-multiple 5"
+              echo "$OBS" | python3 carry_shadow.py step $FLAGS --observation - | tee /tmp/first.json
+              grep -q STEP_RECORDED /tmp/first.json
+              echo "$OBS" | python3 carry_shadow.py step $FLAGS --observation - | tee /tmp/second.json
+              grep -q DUPLICATE_OBSERVATION /tmp/second.json
+              python3 carry_shadow.py report $FLAGS | tee /tmp/report.json
+              grep -q "MODELLED NET ECONOMICS" /tmp/report.json
+            '
+
+      - name: Scope of this job
+        if: always()
+        run: |
+          echo "### shadow-runtime-image" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ran the shipped carry_shadow.py CLI inside the image built from this commit: a synthetic fixture observation, then the same observation again (duplicate no-op). Modelled economics only; no network, no credential, no order path." >> "$GITHUB_STEP_SUMMARY"

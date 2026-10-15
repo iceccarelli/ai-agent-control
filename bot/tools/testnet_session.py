@@ -226,6 +226,24 @@ def write_json(path: str, payload: Dict[str, Any]) -> str:
     return path
 
 
+def write_ledger_once(path: str, payload: Dict[str, Any]) -> str:
+    """Write a cash-ledger record that did not exist, or refuse.
+
+    The ledger is a tracked evidence record. `write_json` truncates and
+    rewrites, so every session silently replaced the previous record (the
+    committed 2026-10-01 entry was one run away from being lost). Exclusive
+    create makes overwriting impossible even if two runs race; a second
+    session must name a new `--ledger` path.
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "x", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return path
+
+
 def write_failure(path: str, *, reason: str, **extra: Any) -> str:
     payload = {
         "schema": "testnet_session_failure/1",
@@ -328,6 +346,15 @@ def run_session(
     bot = _main.build_bot(
         config=cfg, store=store, client=client, engine=engine,
         risk_manager=engine.risk)
+    if getattr(bot, "carry", None) is not None:
+        # This session is the DIRECTIONAL single-leg path (TradingEngine, with a
+        # stop and a take-profit). The carry book has no signal source and a
+        # different lifecycle; the staged, venue-verified carry drill is
+        # tools/drill.py. Say so instead of reporting a misleading "no signal".
+        out["failure"] = ("BOOK_MODE=carry: this session drives the directional "
+                          "path and cannot exercise the carry book; use "
+                          "tools/drill.py")
+        return out
     if bot.strategy is None:
         out["failure"] = "no signal"
         return out
@@ -361,8 +388,18 @@ def run_session(
         out["entry_fills"] = 0
         return out
 
-    entry_price = float(row.get("entry_price") or last)
+    entry_price = float(row.get("entry_price") or 0.0)
     qty = float(row.get("qty") or 0.0)
+    if entry_price <= 0.0:
+        # No fill price on the ledger row. Inventing one (the old code named an
+        # undefined `last`) would put an invented number into the cash ledger.
+        out["failure"] = "position row has no entry price; not inventing one"
+        out["flatten_attempted"] = False
+        # still flatten: a position exists even though its price is unknown
+        close = flatten_position(engine, symbol=symbol)
+        out["stages"].append({"stage": "flatten", "ok": bool(close.ok),
+                              "reason": close.reason})
+        return out
     out["entry_fills"] = 1 if qty > 0 else 0
     out["entry_price"] = entry_price
     out["qty"] = qty
@@ -423,6 +460,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    # An existing ledger is evidence. Refuse BEFORE any order can be sent: a
+    # session whose result cannot be recorded must not trade, and nothing here
+    # may overwrite the earlier record. Stderr only: the failure file is a
+    # second tracked-path writer this refusal has no business touching.
+    if os.path.exists(args.ledger):
+        print(f"REFUSED: {args.ledger} already exists and is evidence; pass a "
+              "new --ledger path. Nothing was submitted.", file=sys.stderr)
+        return 1
 
     # Hard refuse before building anything if venue env is wrong.
     venue = (os.environ.get("BYBIT_VENUE") or "").strip().lower()
@@ -504,7 +550,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         taker_fee=float(getattr(cfg, "TAKER_FEE", 0.001) or 0.001),
         gross_pnl=float(result.get("gross_pnl") or 0.0),
     )
-    write_json(args.ledger, ledger)
+    try:
+        write_ledger_once(args.ledger, ledger)
+    except FileExistsError:
+        # Created by someone else while the session ran. The position is
+        # already flat or flagged above; the record is printed, not clobbered.
+        print(f"REFUSED: {args.ledger} appeared during the session; not "
+              "overwritten. Ledger follows on stdout.", file=sys.stderr)
+        print(json.dumps(ledger, indent=2, sort_keys=True))
+        return 1
     print(json.dumps(ledger, indent=2, sort_keys=True))
 
     if not ledger["flat"]:
