@@ -947,7 +947,9 @@ def _avg_cost_realised(fills: Sequence[Tuple], short: bool) -> Tuple[float, floa
             qty += signed
             if abs(qty) < 1e-12:
                 qty, avg = 0.0, 0.0
-            elif (qty > 0) != (signed > 0) and abs(signed) > closing:
+            elif abs(signed) > closing:
+                # The fill carried the position through zero: the remainder is
+                # a NEW position in the other direction, at this fill's price.
                 avg = px
     return realised, qty, avg
 

@@ -882,3 +882,41 @@ class TestARefusedInvocationLeavesNothingBehind:
             "SELECT origin FROM shadow_observations")} == {"historical_replay"}
         assert con.execute("SELECT value FROM shadow_meta WHERE key='origin'"
                            ).fetchone()[0] == "historical_replay"
+
+
+# -- average-cost realised P&L across a position flip ------------------------
+
+class TestAverageCostAcrossAFlip:
+    """A fill that carries the position THROUGH zero realises the part that
+    closed and re-opens the remainder at the fill price. Synthetic fills."""
+
+    def test_a_long_flipped_to_a_short_reopens_at_the_fill_price(self):
+        import carry_shadow as cs
+        realised, qty, avg = cs._avg_cost_realised(
+            [("Buy", 1.0, 100.0), ("Sell", 3.0, 110.0)], short=False)
+        assert realised == pytest.approx(10.0)       # the 1 that closed
+        assert qty == pytest.approx(-2.0)
+        assert avg == pytest.approx(110.0)           # the new short's basis
+
+    def test_a_short_flipped_to_a_long_reopens_at_the_fill_price(self):
+        import carry_shadow as cs
+        realised, qty, avg = cs._avg_cost_realised(
+            [("Sell", 2.0, 100.0), ("Buy", 5.0, 90.0)], short=True)
+        assert realised == pytest.approx(20.0)       # 2 * (100 - 90)
+        assert qty == pytest.approx(3.0)
+        assert avg == pytest.approx(90.0)
+
+    def test_the_flipped_remainder_then_realises_against_its_own_basis(self):
+        import carry_shadow as cs
+        realised, qty, avg = cs._avg_cost_realised(
+            [("Buy", 1.0, 100.0), ("Sell", 3.0, 110.0), ("Buy", 2.0, 105.0)],
+            short=False)
+        assert realised == pytest.approx(10.0 + 2.0 * (110.0 - 105.0))
+        assert qty == pytest.approx(0.0)
+
+    def test_an_ordinary_partial_close_keeps_the_basis(self):
+        import carry_shadow as cs
+        realised, qty, avg = cs._avg_cost_realised(
+            [("Sell", 2.0, 100.0), ("Buy", 1.0, 98.0)], short=True)
+        assert realised == pytest.approx(2.0)
+        assert qty == pytest.approx(-1.0) and avg == pytest.approx(100.0)
