@@ -1272,6 +1272,24 @@ class CarryBroker:
                 "currency": str(row.get("currency", "")).upper() or None,
                 "size": size, "category": LINEAR}
 
+    def get_position_mode(self, symbol: str) -> str:
+        """``"hedge"`` iff the venue lists a hedge-mode slot (positionIdx 1 or
+        2) for the symbol, else ``"one_way"``. Read-only, same call as the
+        position read. An empty list proves nothing about the mode and reads
+        as one-way: a mismatched order is then rejected by the venue with no
+        exposure. Raises when the response is unreadable.
+        """
+        result = self.client._request(
+            "GET", "/v5/position/list", signed=True,
+            params={"category": LINEAR, "symbol": symbol})
+        rows = self._v5_list(result)
+        if rows is None:
+            raise PairIncident(f"cannot read the {symbol} position mode")
+        for row in rows:
+            if str(row.get("positionIdx")) in ("1", "2"):
+                return "hedge"
+        return "one_way"
+
     def get_perp_position(self, symbol: str) -> float:
         """Size of the perp position at the venue, in base units. 0 when flat.
 
