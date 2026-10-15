@@ -121,6 +121,15 @@ def test_malformed_print_does_not_extend_the_history():
     assert e._funding_history == [RICH] * 4      # ignored, last stamp unmoved
 
 
+def test_non_finite_stamp_or_rate_is_ignored_and_never_raises():
+    e = engine([RICH] * 4, 4 * H8)
+    for stamp, bps in ((float("nan"), FRESH), (float("inf"), FRESH),
+                       (5 * H8, float("-inf"))):
+        tick(e, stamp, bps=bps)
+    assert e._funding_history == [RICH] * 4
+    assert e._last_print_ms == 4 * H8
+
+
 # -- restart / restore --------------------------------------------------------
 
 def test_restore_with_history_but_no_stamp_is_discarded():

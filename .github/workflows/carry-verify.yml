@@ -80,6 +80,8 @@ jobs:
         run: >
           python -m pytest -q -p no:cacheprovider
           tests/test_carry_funding_truth.py
+          tests/test_carry_funding_history_gap.py
+          tests/test_carry_funding_prints.py
           tests/test_carry_fee_truth.py
           tests/test_carry_report.py
           tests/test_carry_broker.py

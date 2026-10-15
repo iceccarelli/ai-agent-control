@@ -14,7 +14,7 @@ WORKFLOW = os.path.join(os.path.dirname(BOT), ".github", "workflows",
 REQUIRED = (
     "test_carry_funding_truth", "test_carry_fee_truth", "test_carry_report",
     "test_carry_broker", "test_carry_preflight", "test_fee_payload_probe",
-    "test_carry_live_gates")
+    "test_carry_live_gates", "test_carry_funding_history_gap")
 
 
 @pytest.fixture(scope="module")
