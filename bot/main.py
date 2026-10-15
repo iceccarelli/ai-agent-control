@@ -703,6 +703,19 @@ class TradingBot:
         self.shutdown()
         return 0
 
+    def _persist_carry(self, state: Dict[str, Any]) -> None:
+        """The engine's persist: journal first, then the position.
+
+        The position is written the moment a leg lands; the journal used to be
+        written only at the end of the tick. A kill in between left a position
+        the next start resumed against a journal that had never seen the fill.
+        A failure here raises into the engine, which halts on it.
+        """
+        journal = getattr(self, "carry_journal", None)
+        if journal is not None:
+            self.store.save_ledger(journal.to_rows())
+        self.store.save_carry_position(state)
+
     def carry_cold_start(self) -> bool:
         """Reconcile the carry ledger against the venue. False = do not start.
 
@@ -1432,7 +1445,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # straight through to the store. Not a hasattr guard and not a
             # lambda that swallows: a store without this method is a
             # misconfiguration that must fail at construction.
-            persist=bot.store.save_carry_position,
+            persist=bot._persist_carry,
         )
         # The pair gate. Until now max_notional_usd was the ONLY size control on
         # the carry book: the legs passed through no RiskManager at all. This is
