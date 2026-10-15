@@ -1085,6 +1085,21 @@ class CarryEngine:
                     "naked SHORT")
             perp.filled_qty -= closed.filled_qty
             perp.requested_qty = perp.filled_qty
+            if perp.filled_qty > inventory + QTY_DUST:
+                # The buy-back filled only in part: the short is STILL larger
+                # than the inventory, so it is still naked. Record what the
+                # venue holds (the exposure must not be forgotten), then halt.
+                self.position = CarryPosition(
+                    spot=Leg(symbol=self.spot_symbol, side="Hold",
+                             product="spot", requested_qty=inventory,
+                             filled_qty=inventory, avg_price=spot_mark,
+                             order_link_id="INVENTORY"),
+                    perp=perp, opened_ms=timestamp_ms)
+                return self._halt(
+                    "OVERSOLD_BEYOND_INVENTORY",
+                    f"short {perp.filled_qty} against {inventory} of "
+                    "inventory after a PARTIAL buy-back; the book is still "
+                    "naked SHORT")
 
         hedged = perp.filled_qty
         # The inventory slice this hedge covers. No order was placed for it and

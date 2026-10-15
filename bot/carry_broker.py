@@ -1205,6 +1205,14 @@ class CarryBroker:
                     f"position row for {symbol} is malformed: {row!r}")
             if size == 0.0:
                 continue
+            # positionIdx: 0 one-way, 1 hedge-mode LONG slot, 2 hedge-mode SHORT
+            # slot. Size sitting in the long slot is not this book's hedge
+            # whatever `side` says, and an unrecognised index is not readable.
+            idx = row.get("positionIdx")
+            if idx is not None and str(idx) not in ("0", "2"):
+                raise PairIncident(
+                    f"{symbol} holds {size:.10g} in positionIdx {idx!r}, not "
+                    "the one-way (0) or hedge-mode short (2) slot")
             if str(row.get("side", "")) != "Sell":
                 raise PairIncident(
                     f"{symbol} holds {size:.10g} on side "

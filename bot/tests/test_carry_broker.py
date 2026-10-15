@@ -307,6 +307,16 @@ class TestPerpPositionDirection:
         with pytest.raises(PairIncident):
             self._rows("not a row").get_perp_position("BTCUSDT")
 
+    @pytest.mark.parametrize("idx,ok", [(0, True), ("0", True), (2, True),
+                                         (1, False), ("3", False)])
+    def test_only_the_one_way_or_short_slot_counts(self, idx, ok):
+        b = self._rows({"side": "Sell", "size": "0.25", "positionIdx": idx})
+        if ok:
+            assert b.get_perp_position("BTCUSDT") == pytest.approx(0.25)
+        else:
+            with pytest.raises(PairIncident):
+                b.get_perp_position("BTCUSDT")
+
     def test_hedge_mode_rows_are_summed_and_a_long_leg_is_refused(self):
         b = self._rows({"side": "Sell", "size": "0.1", "positionIdx": 2},
                        {"side": "Sell", "size": "0.15", "positionIdx": 2})

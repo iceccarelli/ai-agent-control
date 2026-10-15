@@ -85,6 +85,18 @@ def _paired(asset: str):
     return stamps, ok, off_grid, missing
 
 
+def _split_missing(asset: str, miss):
+    """Split unpaired prints into (interior holes, prints newer than the klines)."""
+    def end(name):
+        with gzip.open(os.path.join(EIGHT_H, name), "rt") as fh:
+            return max(int(r["open_time_ms"]) + SET_MS
+                       for r in csv.DictReader(fh))
+
+    last = min(end(f"BINANCE_PERP_{asset}USDT_8H.csv.gz"),
+               end(f"BINANCE_SPOT_{asset}USDT_8H.csv.gz"))
+    return ([m for m in miss if m <= last], [m for m in miss if m > last])
+
+
 @needs_8h
 class TestNoCorpusWithoutProvenance:
     """The rule `fetch_binance_klines` states and this fetcher did not follow.
@@ -170,23 +182,39 @@ class TestThePairingIsLosslessWhereItClaimsToBe:
 
     @pytest.mark.parametrize("asset", sorted(EXPECTED))
     def test_the_counts_are_what_the_measurement_assumed(self, asset):
-        prints, paired, dropped = EXPECTED[asset]
+        """The pairing accounts for every print, and what it drops is pinned.
+
+        Absolute row counts grow with the daily accrual, so they are pinned as
+        a FLOOR (the corpus never shrinks); what must not drift is the
+        accounting identity and the historical drops.
+        """
+        prints, _paired_floor, dropped_floor = EXPECTED[asset]
         stamps, ok, off, miss = _paired(asset)
-        assert len(stamps) == prints
-        assert len(ok) == paired
-        assert len(off) + len(miss) == dropped
+        interior, tail = _split_missing(asset, miss)
+        assert len(stamps) >= prints
+        assert len(ok) + len(off) + len(interior) + len(tail) == len(stamps)
+        assert len(off) + len(interior) == dropped_floor
 
     @pytest.mark.parametrize("asset", ("BTC", "ETH"))
     def test_btc_and_eth_drop_nothing_at_all(self, asset):
         _stamps, _ok, off, miss = _paired(asset)
-        assert not off and not miss
+        interior, _tail = _split_missing(asset, miss)
+        assert not off and not interior
 
     @pytest.mark.parametrize("asset", sorted(EXPECTED))
     def test_there_are_no_interior_holes(self, asset):
         """A missing bar in the MIDDLE is a defect. SOL's two are at the
-        contract's own inception edge, which is not one."""
+        contract's own inception edge, which is not one. Prints newer than the
+        newest kline are refresh lag (the loader skips them), not holes."""
         _stamps, _ok, _off, miss = _paired(asset)
-        assert len(miss) <= 2
+        interior, _tail = _split_missing(asset, miss)
+        assert len(interior) <= 2
+
+    @pytest.mark.parametrize("asset", sorted(EXPECTED))
+    def test_unpaired_tail_is_only_refresh_lag(self, asset):
+        _stamps, _ok, _off, miss = _paired(asset)
+        _interior, tail = _split_missing(asset, miss)
+        assert len(tail) <= 3 * 14          # at most two weeks of prints
 
 
 @needs_8h

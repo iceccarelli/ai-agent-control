@@ -181,8 +181,13 @@ class TestTheRealSeries:
             REPO, "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz")
         with gzip.open(path, "rt") as handle:
             stamps = [int(r["funding_time_ms"]) for r in csv.DictReader(handle)]
-        priceable = sum(1 for t in stamps if curve.covers(t))
-        assert priceable == len(stamps) - 1
+        # The curve ends at its own last observation while the funding corpus
+        # keeps growing; prints past that end are corpus growth, not a coverage
+        # defect. Measure the refusal cost INSIDE the curve's own window.
+        window = [t for t in stamps if curve.first_ms <= t <= curve.last_ms]
+        assert len(window) > 1_000
+        priceable = sum(1 for t in window if curve.covers(t))
+        assert priceable == len(window) - 1
 
     def test_the_seven_year_corpus_is_only_partly_priceable(self, curve):
         """The finding that bounds this whole line of work: the financed book
