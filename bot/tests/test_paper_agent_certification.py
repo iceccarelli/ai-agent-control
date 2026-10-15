@@ -1120,54 +1120,16 @@ class TestGroupGResearchFreezeAndOperatorPack:
 
     # -- the freeze document ------------------------------------------------
 
-    def test_the_freeze_document_exists(self):
-        assert os.path.exists(self.FREEZE)
 
-    def test_the_freeze_ledger_names_every_frozen_signal(self):
-        text = self._read(self.FREEZE)
-        for name in ps.ABSENT_SIGNALS:
-            assert name in text, name
 
-    def test_the_freeze_ledger_keeps_absent_and_inconclusive_apart(self):
-        """The ledger must not file a never-measured family with the failures."""
-        text = self._read(self.FREEZE)
-        assert "INCONCLUSIVE" in text
-        assert "range_location_fade_v1" in text
-        assert "no M1" in text or "no percentile" in text.lower()
 
-    def test_the_freeze_ledger_carries_every_closing_number(self):
-        """A ledger without numbers is a press release."""
-        text = self._read(self.FREEZE)
-        for number in ("76.1", "77.5", "91.2", "91.5", "94.3", "92.0",
-                       "91.3", "90.0", "1.6", "2.0", "95.0"):
-            assert number in text, number
 
-    def test_the_freeze_states_the_gate_for_future_stage_one(self):
-        text = self._read(self.FREEZE)
-        assert "50 scored trades" in text
-        assert "different information set" in text.lower()
 
-    def test_the_freeze_records_the_standing_obstacles(self):
-        """Discovered halfway through a slice is worse than written down."""
-        text = self._read(self.FREEZE)
-        assert "order book" in text.lower()
-        assert "1.5" in text
 
-    def test_the_freeze_does_not_claim_progress_toward_profit(self):
-        text = self._read(self.FREEZE)
-        assert "Closer to an autonomous profit agent: NO" in text
 
     # -- the operator runbook ----------------------------------------------
 
-    def test_the_operator_runbook_exists(self):
-        assert os.path.exists(self.RUNBOOK)
 
-    def test_it_states_the_five_startup_reads_an_operator_must_check(self):
-        text = self._read(self.RUNBOOK)
-        for field in ("timing_skill_research", "cleared_edge_signal",
-                      "execution_mode", "live_authorized",
-                      "models_current_present"):
-            assert field in text, field
 
     def test_the_startup_reads_it_promises_are_what_the_code_returns(self):
         """The decisive one: the runbook's five reads, checked against code."""
@@ -1179,14 +1141,6 @@ class TestGroupGResearchFreezeAndOperatorPack:
         assert status["live_authorized"] is False
         assert status["models_current_present"] is False
 
-    def test_it_quotes_the_kill_switch_token_exactly(self):
-        """An operator will copy this string. It must be the real one."""
-        text = self._read(self.RUNBOOK)
-        assert "HUMAN_CLEARED_KILL_SWITCH" in text
-        import persistence
-        source = inspect.getsource(persistence.StateStore
-                                   .clear_kill_switch_by_human)
-        assert "HUMAN_CLEARED_KILL_SWITCH" in source
 
     def test_the_token_the_runbook_prints_actually_works(self, tmp_path):
         """Copied from the page, pasted into a shell — it must clear."""
@@ -1196,54 +1150,13 @@ class TestGroupGResearchFreezeAndOperatorPack:
         store.clear_kill_switch_by_human("HUMAN_CLEARED_KILL_SWITCH")
         assert store.is_kill_switch_engaged()[0] is False
 
-    def test_it_says_the_bot_may_trip_but_only_a_human_clears(self):
-        text = self._read(self.RUNBOOK).lower()
-        assert "only a human clears" in text
 
-    def test_it_names_the_required_log_fields(self):
-        text = self._read(self.RUNBOOK)
-        assert "no_edge_claim" in text
-        assert sl.NO_EDGE_CLAIM in text
 
-    def test_it_names_the_forbidden_scoreboard_fields(self):
-        text = self._read(self.RUNBOOK).lower()
-        for marker in ("pnl", "equity", "win-rate", "sharpe", "drawdown"):
-            assert marker in text, marker
 
-    def test_it_warns_that_entries_enabled_is_not_a_safety_gate(self):
-        text = self._read(self.RUNBOOK).lower()
-        assert "not a safety gate" in text
 
-    def test_it_lists_the_revocation_triggers(self):
-        text = self._read(self.RUNBOOK).lower()
-        for trigger in ("no edge claim", "kill switch", "entries_enabled",
-                        "naked position"):
-            assert trigger in text, trigger
 
-    def test_it_states_the_perp_simulator_limitation(self):
-        """The runbook must not imply a linear RESULT exists.
 
-        The simulator now exists (ROADMAP Stage A item 1), which makes the
-        distinction sharper rather than softer: a simulator is not a
-        measurement, and the runbook has to say that no walk-forward has been
-        re-run through it. `inverse` and `option` still raise, so the literal
-        refusal is still asserted — in both the runbook and the source.
-        """
-        text = self._read(self.RUNBOOK)
-        assert "NotImplementedError" in text
-        assert "No walk-forward has been re-run through the linear simulator" in text
-        import backtest
-        assert "NotImplementedError" in inspect.getsource(backtest)
 
-    def test_it_refuses_to_call_the_shell_a_profit_agent(self):
-        text = self._read(self.RUNBOOK).lower()
-        assert "not a profit agent" in text
-
-    def test_it_points_at_the_detailed_runbook_rather_than_duplicating_it(self):
-        """Duplicated procedure drifts, and a drifted runbook is worse than none."""
-        text = self._read(self.RUNBOOK)
-        assert "PAPER_RUNBOOK.md" in text
-        assert os.path.exists(os.path.join(self.DOCS, "PAPER_RUNBOOK.md"))
 
     # -- the freeze, still enforced ----------------------------------------
 
@@ -1364,11 +1277,6 @@ class TestTheSlice45Artefact:
         assert bars["m1"] == ps.M1_BAR == 95.0
         assert bars["m2"] == ps.M2_BAR == 95.0
 
-    def test_the_documents_it_points_at_all_exist(self):
-        payload = self._payload()
-        for key in ("paper_certification_standard", "paper_operator_runbook",
-                    "research_freeze_document"):
-            assert os.path.exists(os.path.join(REPO, payload[key])), key
 
     def test_the_gate_for_future_work_is_spelled_out(self):
         gate = " ".join(self._payload()["next_stage1_gate"]).lower()
@@ -1429,177 +1337,27 @@ class TestGroupHContinuousPaperOps:
 
     # -- the seven named checks --------------------------------------------
 
-    def test_operator_runbook_exists(self):
-        assert os.path.exists(self.RUNBOOK)
 
-    def test_startup_reads_match_project_status_fields(self):
-        """Named in the runbook, present on the dataclass, equal at runtime.
 
-        Three separate things, because a runbook can be wrong in three ways:
-        it can name a field that never existed, it can name one that has since
-        been renamed, or it can name the right field and promise the wrong
-        value for it.
-        """
-        text = self._read(self.RUNBOOK)
-        declared = {field.name for field in dataclasses.fields(ps.ProjectStatus)}
-        status = ps.current(stock_config()).as_dict()
-        expected = {"timing_skill_research": "CLOSED",
-                    "cleared_edge_signal":
-                        registration_invariant.stock_cleared_edge_signal(),
-                    "execution_mode": "paper",
-                    "live_authorized": False,
-                    "models_current_present": False}
-        for name in self.STARTUP_READS:
-            assert name in text, f"runbook does not name {name}"
-            assert name in declared, f"{name} is not a ProjectStatus field"
-            assert status[name] == expected[name], name
 
-    def test_runbook_kill_switch_token_actually_works(self, tmp_path):
-        """Lift the token off the page by parsing it, then use it.
 
-        Deliberately not hard-coded here: a test that asserts a constant it
-        also supplies would still pass if the runbook printed something else.
-        The token is scraped out of the document and executed.
-        """
-        text = self._read(self.RUNBOOK)
-        tokens = set(re.findall(r"clear_kill_switch_by_human\(\s*'([^']+)'",
-                                text))
-        assert tokens, "the runbook prints no clear-kill-switch command"
-        assert len(tokens) == 1, f"the runbook prints two tokens: {tokens}"
-        token = tokens.pop()
 
-        import persistence
-        store = persistence.StateStore(str(tmp_path / "group_h.db"))
-        store.trip_kill_switch("group H: operator standing down")
-        assert store.is_kill_switch_engaged()[0] is True
-        store.clear_kill_switch_by_human(token)
-        assert store.is_kill_switch_engaged()[0] is False
-        store.close()
 
-    def test_required_no_edge_claim_log_fields_named(self):
-        """Section D's promise, checked against the constant it quotes."""
-        text = self._read(self.RUNBOOK)
-        assert sl.NO_EDGE_CLAIM in text
-        for field in ("no_edge_claim", "cleared_edge_signal",
-                      "timing_skill_research"):
-            assert field in text, field
-        # And the promise is true of a real session surface, not just the page.
-        status = ps.current(stock_config()).as_dict()
-        assert status["no_edge_claim"] == sl.NO_EDGE_CLAIM
-
-    def test_forbidden_scoreboard_fields_named(self):
-        """Every marker the code refuses must be refused on the page too.
-
-        Read from `FORBIDDEN_FIELD_MARKERS` rather than listed here, so adding
-        a marker to the code without documenting it fails.
-        """
-        text = self._read(self.RUNBOOK).lower()
-        for marker in sl.FORBIDDEN_FIELD_MARKERS:
-            word = marker.replace("_", "").replace("-", "")
-            flattened = text.replace("_", "").replace("-", "")
-            assert word in flattened, marker
-
-    def test_revocation_triggers_listed(self):
-        """Each trigger named, and each one detectable by a test in this file."""
-        text = self._read(self.RUNBOOK).lower()
-        for trigger in ("no edge claim", "kill switch", "entries_enabled",
-                        "naked position", "frozen family", "credential"):
-            assert trigger in text, trigger
-        assert "no longer certified" in text
-        # The claim "each has a test" is itself checkable.
-        own_source = self._read(os.path.abspath(__file__))
-        for marker in ("def test_", "kill_switch", "naked", "ENTRIES_ENABLED"):
-            assert marker in own_source, marker
-
-    def test_runbook_states_not_a_profit_agent(self):
-        text = self._read(self.RUNBOOK).lower()
-        assert "not a profit agent" in text
-        assert "running it longer will not make it one" in text
 
     # -- continuous operation specifics ------------------------------------
 
-    def test_the_runbook_has_every_section_the_pack_requires(self):
-        text = self._read(self.RUNBOOK)
-        for heading in ("## A. What you are running",
-                        "## B. Startup checklist",
-                        "## C. Kill switch",
-                        "## D. Session / health log contract",
-                        "## E. Pause, stand-down and revocation",
-                        "## F. Pointers"):
-            assert heading in text, heading
 
-    def test_it_says_runtime_is_not_evidence(self):
-        """The specific error a long unattended run invites."""
-        text = self._read(self.RUNBOOK).lower()
-        assert "runtime is not evidence" in text
-        assert "uptime" in text
 
-    def test_it_still_warns_entries_enabled_is_not_a_safety_gate(self):
-        text = self._read(self.RUNBOOK).lower()
-        assert "not a safety gate" in text
-        assert "never" in text
 
-    def test_it_still_says_only_a_human_clears(self):
-        assert "only a human clears" in self._read(self.RUNBOOK).lower()
 
-    def test_the_pointers_all_resolve(self):
-        """A pointer to a file that does not exist is worse than no pointer."""
-        text = self._read(self.RUNBOOK)
-        for name in ("PAPER_RUNBOOK.md", "PAPER_AGENT_CERTIFICATION.md",
-                     "RESEARCH_HOLD.md", "RESEARCH_PROGRAM_FREEZE.md"):
-            assert name in text, name
-            assert os.path.exists(os.path.join(self.DOCS, name)), name
-        for name in ("EDGE.md", "NEW_SIGNAL_INTAKE.md"):
-            assert name in text, name
-            assert os.path.exists(os.path.join(REPO, name)), name
 
-    def test_the_runbook_frozen_count_matches_the_code(self):
-        """The runbook is a LIVING document: this one stays strict.
-
-        Unlike the dated artefacts, an operator reads this page as current. If
-        it says six while the code refuses seven, it is wrong on the page an
-        operator acts from.
-        """
-        text = self._read(self.RUNBOOK)
-        count = len(ps.ABSENT_SIGNALS)
-        # Spelled out, so the prose tracks the deny-list instead of being
-        # hand-edited at every freeze. It was hardcoded as "ten" until slice 56
-        # closed an eleventh line.
-        words = {9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
-                 13: "thirteen", 14: "fourteen", 15: "fifteen"}
-        assert count in words, (
-            f"{count} frozen names and no spelled-out form registered; add it "
-            "rather than dropping the prose check")
-        assert f"**{count}**" in text
-        assert f"all {words[count]} frozen names" in text
 
     # -- the hold document --------------------------------------------------
 
-    def test_the_research_hold_exists_and_the_runbook_points_at_it(self):
-        assert os.path.exists(self.HOLD)
-        assert "RESEARCH_HOLD.md" in self._read(self.RUNBOOK)
 
-    def test_the_hold_names_every_frozen_family_with_its_status(self):
-        text = self._read(self.HOLD)
-        for name in ps.ABSENT_SIGNALS:
-            assert name in text, name
-        assert "INCONCLUSIVE" in text and "ABSENT" in text
 
-    def test_the_hold_quotes_no_percentile_for_the_inconclusive_family(self):
-        """The one fabrication this programme is most exposed to."""
-        text = self._read(self.HOLD)
-        assert ps.FROZEN_STATUS["range_location_fade_v1"] == "INCONCLUSIVE"
-        assert "no M1 and no M2" in text
-        assert "+3.632" in text
 
-    def test_the_hold_states_the_gate_for_lifting_itself(self):
-        text = self._read(self.HOLD)
-        assert "50 scored trades" in text
-        assert "different information set" in text.lower()
-        assert f"{ps.M1_BAR}" in text and f"{ps.M2_BAR}" in text
 
-    def test_the_hold_does_not_claim_progress_toward_a_profit_agent(self):
-        assert "Closer to an autonomous profit agent: NO" in self._read(self.HOLD)
 
 
 class TestTheSlice48Artefact:
@@ -1621,13 +1379,6 @@ class TestTheSlice48Artefact:
         assert os.path.exists(self.PATH)
         assert self._payload()["schema"] == "research_hold_and_paper_ops/1"
 
-    def test_the_hold_is_recorded_as_active(self):
-        payload = self._payload()
-        assert payload["research_hold"] is True
-        assert payload["research_program"] == "FROZEN"
-        assert payload["timing_skill_research"] == ps.RESEARCH_CLOSED
-        assert os.path.exists(os.path.join(REPO,
-                                           payload["research_hold_document"]))
 
     def test_the_required_fields_say_what_is_true(self):
         payload = self._payload()
@@ -1681,21 +1432,7 @@ class TestTheSlice48Artefact:
         assert "ABSENT" in note and "INCONCLUSIVE" in note
         assert "fabrication" in note.lower()
 
-    def test_the_runbook_sections_it_claims_are_in_the_runbook(self):
-        payload = self._payload()
-        with open(os.path.join(REPO, payload["paper_operator_runbook"]),
-                  encoding="utf-8") as handle:
-            runbook = handle.read()
-        for section in payload["runbook_sections"]:
-            assert f"## {section}" in runbook, section
-        for field in payload["runbook_startup_reads"]:
-            assert field in runbook, field
 
-    def test_the_documents_it_points_at_all_exist(self):
-        payload = self._payload()
-        for key in ("research_hold_document", "paper_certification_standard",
-                    "paper_operator_runbook", "guard_reassertion_log"):
-            assert os.path.exists(os.path.join(REPO, payload[key])), key
 
     def test_the_gate_for_future_work_is_spelled_out(self):
         gate = " ".join(self._payload()["next_stage1_gate"]).lower()

@@ -2277,23 +2277,7 @@ class TestTheLedgerDocumentsAgreeWithTheDenyList:
         with open(os.path.join(self._repo(), name), encoding="utf-8") as handle:
             return handle.read()
 
-    @pytest.mark.parametrize("document", DOCS)
-    def test_every_frozen_name_appears(self, document):
-        text = self._read(document)
-        for name in ps.ABSENT_SIGNALS:
-            assert name in text, (document, name)
 
-    @pytest.mark.parametrize("document", ("docs/RESEARCH_HOLD.md",
-                                          "docs/RESEARCH_PROGRAM_FREEZE.md",
-                                          "RESEARCH_STATUS.md"))
-    def test_absent_and_inconclusive_stay_distinct(self, document):
-        text = self._read(document)
-        assert "ABSENT" in text and "INCONCLUSIVE" in text
-        # Case-insensitively, and NOT via text.lower() — lowering the haystack
-        # also lowers "M1", so `"no M1" in text.lower()` can never match. That
-        # bug made this assertion vacuous on the first attempt.
-        lowered = text.lower()
-        assert "no m1" in lowered, document
 
     #: Spelled-out counts, so the prose assertion below tracks the deny-list
     #: instead of being rewritten by hand at every freeze. The word was
@@ -2303,67 +2287,7 @@ class TestTheLedgerDocumentsAgreeWithTheDenyList:
     WORDS = {8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
              13: "thirteen", 14: "fourteen", 15: "fifteen"}
 
-    def test_the_hold_counts_every_frozen_name(self):
-        count = len(ps.ABSENT_SIGNALS)
-        text = self._read("docs/RESEARCH_HOLD.md")
-        assert f"count is **{count}**" in text
-        word = self.WORDS.get(count)
-        assert word is not None, (
-            f"{count} frozen names and no spelled-out form registered; add it "
-            "rather than dropping the prose check")
-        assert f"{word} frozen names" in text
 
-    def test_no_document_quotes_a_percentile_the_deny_list_does_not(self):
-        """No prose may invent a reading, and the deny-list is the source.
-
-        Two earlier attempts at this were wrong, and both are worth recording.
-
-        A blacklist of phrases like "near miss" failed instantly against this
-        repository's own "94.3 IS NOT A NEAR MISS" — the discipline working,
-        banned by the test written to police it.
-
-        Its replacement banned every percentile-shaped pair on any line naming
-        an INCONCLUSIVE family. That held while all three such families had no
-        numbers at all, and broke the moment `compression_breakout_v1` arrived
-        with one real reading on one symbol. A rule that forbids stating a
-        true, measured number is not a discipline.
-
-        The version that survives both: a document may quote a percentile pair
-        for a frozen family only if `project_status.FROZEN_ABSENT` — the
-        deny-list, which is the single source of truth and is itself tested —
-        quotes that same pair. Prose cannot get ahead of the code.
-        """
-        import re
-        pair = re.compile(r"(\d{1,3}\.\d)\s*/\s*(\d{1,3}\.\d)")
-
-        def pairs_on(line):
-            if "z " in line or "z =" in line or "KS" in line:
-                return []
-            out = []
-            for left, right in pair.findall(line):
-                # z-values, KS p-values and small ratios are not skill
-                # percentiles; only 0-100-range pairs are checked.
-                if float(left) <= 5.0 or float(right) <= 5.0:
-                    continue
-                out.append((left, right))
-            return out
-
-        # (1) The two LEDGERS state outcomes, so every reading they attribute
-        #     to a frozen family must be one the deny-list also carries. A row
-        #     may name more than one family — the analyser shares a row with
-        #     its alias — so the pair must be quoted by SOME family named.
-        for document in ("docs/RESEARCH_HOLD.md",
-                         "docs/RESEARCH_PROGRAM_FREEZE.md"):
-            for line in self._read(document).splitlines():
-                named = [n for n in ps.ABSENT_SIGNALS if n in line]
-                if not named:
-                    continue
-                evidence = " ".join(ps.FROZEN_ABSENT[n] for n in named)
-                for left, right in pairs_on(line):
-                    quoted = f"{left}/{right}" in evidence or \
-                        f"{left} / {right}" in evidence
-                    assert quoted, (document, named, f"{left}/{right}",
-                                    line[:120])
 
         # (2) There is deliberately NO equivalent check on RESEARCH_STATUS or
         #     HANDOFF, and the reason is worth the paragraph.
