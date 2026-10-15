@@ -752,7 +752,11 @@ class TradingBot:
         # because a book that trades on absent data is the failure this whole
         # system exists to prevent.
         if self.carry is not None:
-            symbol = self.symbols[0] if self.symbols else "BTCUSDT"
+            # The symbol the book TRADES, never TRADING_SYMBOLS[0]: config
+            # accepts the two independently, and reading one symbol's mark,
+            # funding print and margin to size orders on another is trading on
+            # the wrong market's data.
+            symbol = self.carry.perp_symbol
             # ONE observation, not three loose reads. The basis is a DIFFERENCE
             # between the perp and spot marks, so reading them seconds apart
             # measures the basis plus the drift between the calls. take_snapshot
