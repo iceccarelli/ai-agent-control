@@ -281,6 +281,32 @@ class TestPerpPositionDirection:
         assert self._rows({"side": "", "size": "0"}).get_perp_position(
             "BTCUSDT") == 0.0
 
+    @pytest.mark.parametrize("size", ["abc", "nan", "inf", "-inf", None, []])
+    def test_a_malformed_or_non_finite_size_is_refused_not_flat(self, size):
+        row = {"side": "Sell", "size": size}
+        if size in (None, []):
+            # absent / empty size on a stated side is "0" to Bybit's own
+            # parser; it must still never be read as the SHORT.
+            assert self._rows(row).get_perp_position("BTCUSDT") == 0.0
+        else:
+            with pytest.raises(PairIncident):
+                self._rows(row).get_perp_position("BTCUSDT")
+
+    @pytest.mark.parametrize("response", [
+        {"retCode": 10002, "retMsg": "timestamp", "result": {}},
+        {"retCode": 0, "retMsg": "OK", "result": None},
+        {"retCode": 0, "retMsg": "OK"},
+        None])
+    def test_an_unreadable_response_is_never_flat(self, response):
+        client = FakeClient()
+        client._request = lambda *a, **k: response
+        with pytest.raises(PairIncident):
+            broker(client).get_perp_position("BTCUSDT")
+
+    def test_a_non_object_row_is_refused(self):
+        with pytest.raises(PairIncident):
+            self._rows("not a row").get_perp_position("BTCUSDT")
+
     def test_hedge_mode_rows_are_summed_and_a_long_leg_is_refused(self):
         b = self._rows({"side": "Sell", "size": "0.1", "positionIdx": 2},
                        {"side": "Sell", "size": "0.15", "positionIdx": 2})
