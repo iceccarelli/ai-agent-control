@@ -124,7 +124,9 @@ class TestUnwindNeverStripsTheHedgeFromAnOpenShort:
 
     def test_a_half_closed_perp_sells_only_half_the_spot(self):
         venue, journal, engine = self._held()
-        spot_qty = engine.position.spot.filled_qty
+        # the wallet holds what was bought less the BTC fee taken from it
+        gross = engine.position.spot.filled_qty
+        spot_qty = gross - engine.position.spot.fee_base_qty
         real = venue._request
 
         def half(method, endpoint, **kw):
@@ -140,5 +142,5 @@ class TestUnwindNeverStripsTheHedgeFromAnOpenShort:
         assert d.reason == "UNWIND_PARTIAL" and d.state is BookState.HALTED
         sold = sum(float(b["qty"]) for b in _orders(venue, "spot", "Sell"))
         assert sold == pytest.approx(spot_qty / 2, rel=1e-6)
-        assert engine.position.perp.filled_qty == pytest.approx(spot_qty / 2)
+        assert engine.position.perp.filled_qty == pytest.approx(gross / 2)
         assert engine.position.spot.filled_qty == pytest.approx(spot_qty / 2)

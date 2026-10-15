@@ -1263,7 +1263,10 @@ class CarryEngine:
                                  state=BookState.FLAT,
                                  detail={"collected": position.funding_collected,
                                          "execution_mode": OVERLAY})
-        wanted_spot = position.spot.filled_qty
+        # What the wallet HOLDS: a spot BUY's fee was taken from the coin
+        # received, and the venue refuses a sell above the free balance.
+        wanted_spot = max(0.0, position.spot.filled_qty
+                          - position.spot.fee_base_qty)
         if perp is None or perp.filled_qty <= 0:
             # The perp is the leg that can be liquidated and the one that
             # hedges the spot. If it did not close, selling the spot would turn
@@ -1325,6 +1328,7 @@ class CarryEngine:
         position.perp.requested_qty = position.perp.filled_qty
         position.spot.filled_qty = max(0.0, spot_left)
         position.spot.requested_qty = position.spot.filled_qty
+        position.spot.fee_base_qty = 0.0      # spot_left is already net of it
         return self._halt(
             "UNWIND_PARTIAL",
             f"{reason} — the close filled short. The venue still holds "
@@ -1349,7 +1353,7 @@ class CarryEngine:
                 f"{reason}; the perp order's outcome is unknown and "
                 f"{spot.filled_qty:.10g} spot is held. NOT unwound.")
         self.state = BookState.UNWINDING
-        wanted = spot.filled_qty
+        wanted = max(0.0, spot.filled_qty - spot.fee_base_qty)   # held, net
         closed = self._fire(self.spot_symbol, "Sell", wanted, "spot")
         if closed is None or closed.filled_qty <= 0:
             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
@@ -1361,6 +1365,7 @@ class CarryEngine:
             # cold start can both see it.
             spot.filled_qty = left
             spot.requested_qty = left
+            spot.fee_base_qty = 0.0
             self.position = CarryPosition(
                 spot=spot,
                 perp=Leg(symbol=self.perp_symbol, side="Sell",
