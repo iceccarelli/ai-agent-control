@@ -146,6 +146,30 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
     if history_whole:
         _m, _up, _ur = _match(in_life, row_ms)
         rows_without_print = len(_ur)
+    # SIGN CROSS-CHECK. The venue's `funding` sign convention has never been
+    # observed on this account, and the ledger books it as signed (positive =
+    # received). The public rate for the same settlement is an independent
+    # witness: a SHORT receives when the rate is positive and pays when it is
+    # negative. A booked row that contradicts it means one of the two sign
+    # conventions is wrong, and every funding dollar in the statement would be
+    # inverted, so the lifecycle cannot be called reconciled.
+    sign_contradictions = 0
+    if history_whole and history is not None:
+        for e in attributed:
+            t, usd = int(e.fee_raw["venue_ms"]), float(e.fee_raw["venue_usd"])
+            near = [(abs(pt - t), bps) for bps, pt in history.prints
+                    if abs(pt - t) <= L.PRINT_MATCH_TOLERANCE_MS]
+            qty = _qty(journal, t)
+            if not near or abs(qty) <= L.DUST[L.PERP] or usd == 0.0:
+                continue
+            rate = min(near)[1]
+            if rate == 0.0:
+                continue
+            expected = (-1.0 if qty > 0 else 1.0) * (1.0 if rate > 0 else -1.0)
+            if (usd > 0) != (expected > 0):
+                sign_contradictions += 1
+    if sign_contradictions:
+        reasons.append("FUNDING_SIGN_CONTRADICTS_PUBLIC_RATE")
     if missing or flagged_missing:
         reasons.append("EXPECTED_SETTLEMENT_MISSING")
     if ambiguous:
@@ -180,6 +204,7 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
             "flagged_missing": len(flagged_missing),
             "ambiguous_ownership": len(ambiguous),
             "pending_delivery_grace": len(pending),
+            "rows_contradicting_public_rate_sign": sign_contradictions,
             "account_rows_attributed": len(attributed),
             "account_rows_unattributed": len(unattributed),
             "account_rows_identity_conflict": len(conflicts),

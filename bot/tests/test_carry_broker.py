@@ -76,6 +76,7 @@ class FakeClient:
         if endpoint == "/v5/position/list":
             return envelope({"list": [{"positionIM": str(self.im),
                                        "positionMM": str(self.mm),
+                                       "side": "Sell" if self.perp_qty else "",
                                        "size": str(self.perp_qty)}]})
         if endpoint == "/v5/account/wallet-balance":
             # Unified wallet rows nest per-coin balances under "coin" - see
@@ -250,6 +251,107 @@ class TestGetPerpPositionRefusesToAssumeFlat:
             "result": {"list": []},
         }
         assert broker(client).get_perp_position("BTCUSDT") == 0.0
+
+
+class TestPerpClosesCannotFlipTheAccountLong:
+    """Every perp BUY from a short-only book is a close, so it is reduce-only."""
+
+    def test_a_perp_buy_is_reduce_only(self):
+        client = FakeClient()
+        broker(client).place_market(symbol="BTCUSDT", side="Buy", qty=0.5,
+                                    product=LINEAR)
+        assert client.created[0]["reduceOnly"] is True
+
+    def test_a_perp_sell_and_spot_orders_are_not(self):
+        client = FakeClient()
+        b = broker(client)
+        b.place_market(symbol="BTCUSDT", side="Sell", qty=0.5, product=LINEAR)
+        b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT)
+        assert all("reduceOnly" not in body for body in client.created)
+
+    def test_a_resting_perp_close_is_reduce_only_too(self):
+        client = FakeClient()
+        try:
+            broker(client).place_post_only(symbol="BTCUSDT", side="Buy",
+                                           qty=0.5, price=99_999.0,
+                                           product=LINEAR)
+        except Exception:
+            pass
+        assert client.created and client.created[0]["reduceOnly"] is True
+
+
+class TestPerpPositionDirection:
+    """This book only ever holds a perp SHORT. Bybit reports `size` unsigned
+    with a `side`; a LONG of the same size is not the book's hedge, and reading
+    `abs(size)` made it indistinguishable from one."""
+
+    @staticmethod
+    def _rows(*rows):
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope({"list": list(rows)})
+        return broker(client)
+
+    def test_a_short_returns_its_size(self):
+        b = self._rows({"side": "Sell", "size": "0.25"})
+        assert b.get_perp_position("BTCUSDT") == pytest.approx(0.25)
+
+    def test_a_long_is_refused_not_read_as_the_short(self):
+        with pytest.raises(PairIncident):
+            self._rows({"side": "Buy", "size": "0.25"}).get_perp_position(
+                "BTCUSDT")
+
+    def test_a_position_with_no_side_is_refused(self):
+        with pytest.raises(PairIncident):
+            self._rows({"size": "0.25"}).get_perp_position("BTCUSDT")
+
+    def test_a_flat_row_needs_no_side(self):
+        assert self._rows({"side": "", "size": "0"}).get_perp_position(
+            "BTCUSDT") == 0.0
+
+    @pytest.mark.parametrize("size", ["abc", "nan", "inf", "-inf", None, []])
+    def test_a_malformed_or_non_finite_size_is_refused_not_flat(self, size):
+        row = {"side": "Sell", "size": size}
+        if size in (None, []):
+            # absent / empty size on a stated side is "0" to Bybit's own
+            # parser; it must still never be read as the SHORT.
+            assert self._rows(row).get_perp_position("BTCUSDT") == 0.0
+        else:
+            with pytest.raises(PairIncident):
+                self._rows(row).get_perp_position("BTCUSDT")
+
+    @pytest.mark.parametrize("response", [
+        {"retCode": 10002, "retMsg": "timestamp", "result": {}},
+        {"retCode": 0, "retMsg": "OK", "result": None},
+        {"retCode": 0, "retMsg": "OK"},
+        None])
+    def test_an_unreadable_response_is_never_flat(self, response):
+        client = FakeClient()
+        client._request = lambda *a, **k: response
+        with pytest.raises(PairIncident):
+            broker(client).get_perp_position("BTCUSDT")
+
+    def test_a_non_object_row_is_refused(self):
+        with pytest.raises(PairIncident):
+            self._rows("not a row").get_perp_position("BTCUSDT")
+
+    @pytest.mark.parametrize("idx,ok", [(0, True), ("0", True), (2, True),
+                                         (1, False), ("3", False)])
+    def test_only_the_one_way_or_short_slot_counts(self, idx, ok):
+        b = self._rows({"side": "Sell", "size": "0.25", "positionIdx": idx})
+        if ok:
+            assert b.get_perp_position("BTCUSDT") == pytest.approx(0.25)
+        else:
+            with pytest.raises(PairIncident):
+                b.get_perp_position("BTCUSDT")
+
+    def test_hedge_mode_rows_are_summed_and_a_long_leg_is_refused(self):
+        b = self._rows({"side": "Sell", "size": "0.1", "positionIdx": 2},
+                       {"side": "Sell", "size": "0.15", "positionIdx": 2})
+        assert b.get_perp_position("BTCUSDT") == pytest.approx(0.25)
+        with pytest.raises(PairIncident):
+            self._rows({"side": "", "size": "0", "positionIdx": 1},
+                       {"side": "Buy", "size": "0.2", "positionIdx": 1},
+                       ).get_perp_position("BTCUSDT")
 
 
 class TestGetOpenCarryOrdersRefusesToAssumeNone:

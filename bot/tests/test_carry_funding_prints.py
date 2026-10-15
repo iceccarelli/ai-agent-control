@@ -134,11 +134,14 @@ class TestAFreshBookIsNotBlindForADay:
 
     def test_prints_are_sorted_and_truncated(self):
         e = self._engine()
-        e.warm_funding_history([(float(k), k * H8) for k in (5, 1, 9, 3, 12,
-                                                             7, 2, 11, 4, 6)])
+        # Contiguous settlements, shuffled: sorting and truncation only. (A
+        # history with holes is not smoothed across; see
+        # test_carry_funding_history_gap.py.)
+        e.warm_funding_history([(float(k), k * H8) for k in (5, 1, 9, 3, 10,
+                                                             7, 2, 8, 4, 6)])
         assert len(e._funding_history) == e.FUNDING_HISTORY
-        assert e._funding_history[-1] == 12.0
-        assert e._last_print_ms == 12 * H8
+        assert e._funding_history[-1] == 10.0
+        assert e._last_print_ms == 10 * H8
 
     def test_malformed_rows_are_dropped_not_booked(self):
         e = self._engine()

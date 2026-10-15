@@ -622,6 +622,44 @@ class TestReconciliationOutcomes:
         assert st["funding_estimated_usd"] == pytest.approx(50.0)
 
 
+class TestPaymentSignAgreesWithThePublicRate:
+    """A short is paid when the public rate is positive. `hist` prints are
+    +1 bps, so a booked row of the opposite sign contradicts the venue's own
+    public rate: the sign convention is wrong somewhere and the lifecycle must
+    not read as reconciled. SYNTHETIC rows; no real account has returned one."""
+
+    def test_a_row_that_agrees_with_the_public_rate_reconciles(self):
+        j = hedged()
+        recon(j, [T0 + 3 * H], [pay(1, 2.0, T0 + 3 * H)], now=T0 + 12 * H)
+        assert state(j)[0]["state"] == "FULLY_RECONCILED"
+        assert state(j)[0]["evidence"]["rows_contradicting_public_rate_sign"] == 0
+
+    def test_a_row_that_contradicts_it_is_provisional(self):
+        j = hedged()
+        recon(j, [T0 + 3 * H], [pay(1, -2.0, T0 + 3 * H)], now=T0 + 12 * H)
+        lc = state(j)[0]
+        assert lc["state"] == "PROVISIONAL"
+        assert "FUNDING_SIGN_CONTRADICTS_PUBLIC_RATE" in lc["reasons"]
+        assert j.statement()["funding_confirmed"] is False
+
+    def test_a_negative_public_rate_with_a_paid_row_agrees(self):
+        j = hedged()
+        negative = CB.FundingHistory(
+            start_ms=T0 - 2 * H, end_ms=T0 + 12 * H,
+            prints=[(-1.0, T0 + 3 * H)])
+        recon(j, [], [pay(1, -2.0, T0 + 3 * H)], now=T0 + 12 * H,
+              history=negative)
+        assert state(j)[0]["state"] == "FULLY_RECONCILED"
+
+    def test_an_incomplete_history_does_not_judge_the_sign(self):
+        j = hedged()
+        recon(j, [T0 + 3 * H], [pay(1, -2.0, T0 + 3 * H)], now=T0 + 12 * H,
+              history=hist([T0 + 3 * H], T0 - 2 * H, T0 + 12 * H,
+                           errors=["boom"]))
+        reasons = state(j)[0]["reasons"]
+        assert "FUNDING_SIGN_CONTRADICTS_PUBLIC_RATE" not in reasons
+
+
 class TestIdempotencyAndPersistence:
     def test_repeating_a_reconciliation_writes_nothing_new(self):
         j = hedged()

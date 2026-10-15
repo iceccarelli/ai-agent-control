@@ -411,6 +411,16 @@ class CarryEngine:
     #: three-print smoother with slack, short enough that a regime change is
     #: not diluted by last week.
     FUNDING_HISTORY = 8
+    #: Longer than one 8h settlement interval plus slack means a print was missed
+    #: (1.5 x `market_snapshot.FUNDING_INTERVAL_MS`; a test pins the relation).
+    #: Strictly greater than: a gap of exactly this length is not a gap.
+    MAX_PRINT_GAP_MS = 12 * 3_600_000
+    #: Perps whose 8h funding cadence is PROVEN from local venue metadata
+    #: (`research/exchange_study/bybit/instrument_linear.json.gz`, BTCUSDT
+    #: `fundingInterval` = 480). The gap rule, `market_snapshot.assert_fresh` and
+    #: `carry_costs.FUNDING_PERIODS_PER_DAY` all assume 8h. Any other symbol has
+    #: no proof here, so the entry gate refuses it rather than guess a cadence.
+    FUNDING_8H_PROVEN = frozenset({"BTCUSDT"})
 
     def __init__(self, *, broker: Any, kill_switch: Any = None,
                  spot_symbol: str = "BTCUSDT", perp_symbol: str = "BTCUSDT",
@@ -514,8 +524,39 @@ class CarryEngine:
             "position": position,
             "last_print_ms": self._last_print_ms,
             "funding_history": list(self._funding_history),
+            "perp_symbol": self.perp_symbol,
+            **({"entry_days": self.pair_risk.export_days()}
+               if getattr(self, "pair_risk", None) is not None
+               and hasattr(self.pair_risk, "export_days") else {}),
             "max_notional_usd": self.max_notional_usd,
         }
+
+    def _utc_now(self) -> "dt.datetime":
+        return dt.datetime.now(dt.timezone.utc)
+
+    def _restore_allowance(self, record: Any) -> None:
+        """Bring back the day's entry allowance from a PERSISTED ledger.
+
+        Called only when a ledger exists (a first-ever run has none and keeps
+        its full allowance). A ledger whose `entry_days` is missing or
+        unreadable cannot prove today's entries were not already spent, so the
+        rest of the UTC day is spent here and the fact is persisted through
+        the same state path - a second restart must not forget it.
+        """
+        risk = getattr(self, "pair_risk", None)
+        if risk is None or not hasattr(risk, "load_days"):
+            return
+        if risk.load_days(record):
+            return
+        added = risk.exhaust_today(now=self._utc_now())
+        logger.warning(
+            "carry: the persisted entry allowance is missing or unreadable; "
+            "no new entry today (%d slot(s) marked spent)", added)
+        try:
+            self.persist(self.to_state())
+        except Exception:  # noqa: BLE001 - blocked in memory regardless
+            logger.critical("the fail-closed entry allowance could not be "
+                            "written down; it holds for this process only")
 
     def restore(self, state: Dict[str, Any]) -> None:
         """Take the ledger's word for the position. Called only after
@@ -533,10 +574,24 @@ class CarryEngine:
             self.position = None
             self.state = BookState.FLAT
         last = state.get("last_print_ms")
-        self._last_print_ms = None if last is None else int(last)
-        self._funding_history = [float(x) for x in
-                                 state.get("funding_history", [])][
-                                     -self.FUNDING_HISTORY:]
+        rates = [float(x) for x in state.get("funding_history", [])][
+            -self.FUNDING_HISTORY:]
+        self._restore_allowance(state.get("entry_days"))
+        recorded = state.get("perp_symbol")
+        foreign = (recorded != self.perp_symbol if recorded is not None
+                   else self.perp_symbol not in self.FUNDING_8H_PROVEN)
+        if rates and (last is None or foreign):
+            # Rates whose age is unknowable (no stamp of the newest), or that
+            # were observed on another market (or a legacy record on a symbol
+            # nothing proves it came from): not a history for THIS book. Leave
+            # whatever the venue warm-up already seeded.
+            logger.warning(
+                "carry: discarding %d restored funding prints (%s)", len(rates),
+                "recorded for " + str(recorded) if foreign
+                else "no last-print stamp")
+        else:
+            self._last_print_ms = None if last is None else int(last)
+            self._funding_history = rates
 
     def _record(self) -> Optional[CarryDecision]:
         """Write the ledger. A failure to write HALTS.
@@ -577,6 +632,12 @@ class CarryEngine:
                                        venue_perp_qty=venue_perp_qty,
                                        venue_spot_qty=venue_spot_qty,
                                        open_orders=open_orders)
+        if decision.action is ColdStart.CLEAN and ledger is not None:
+            # Flat at both ends: there is no pair to restore, but the day's
+            # entry allowance is still spent - a pair opened and closed earlier
+            # today must not buy a second round trip because the process
+            # restarted in between. A ledger that cannot say fails closed.
+            self._restore_allowance(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
             logger.warning("carry cold start: RESUMED %s", decision.detail)
@@ -622,8 +683,19 @@ class CarryEngine:
             if not (self._finite(rate) and int(stamp) > 0):
                 continue
             clean.append((float(rate), int(stamp)))
-        clean.sort(key=lambda row: row[1])
-        clean = clean[-self.FUNDING_HISTORY:]
+        # One row per settlement stamp (first wins), then only the newest run
+        # with no missed settlement in it: a hole (e.g. a malformed row the
+        # broker skipped) must not be smoothed across.
+        by_stamp: Dict[int, float] = {}
+        for rate, stamp in sorted(clean, key=lambda row: row[1]):
+            by_stamp.setdefault(stamp, rate)
+        ordered = sorted(by_stamp.items())
+        run: List[Tuple[float, int]] = []
+        for stamp, rate in ordered:
+            if run and stamp - run[-1][1] > self.MAX_PRINT_GAP_MS:
+                run = []
+            run.append((rate, stamp))
+        clean = run[-self.FUNDING_HISTORY:]
         if not clean:
             return 0
         self._funding_history = [rate for rate, _ms in clean]
@@ -670,6 +742,27 @@ class CarryEngine:
         a default here would be a silent risk parameter, which is the exact
         class of bug 0016 removed from the cap.
         """
+        if self.spot_symbol != self.perp_symbol:
+            # Bybit lists the spot and the linear perp of one asset under the
+            # same name. Different names are different assets: the "basis" is
+            # then a price ratio between unrelated markets (a BTC perp against
+            # an ETH spot is ~-97%, which the basis gate reads as cheap) and
+            # the two legs do not hedge each other.
+            return EntryEconomics(None, None, CarryDecision(
+                "stand_aside", reason="PAIR_SYMBOLS_MISMATCH",
+                state=BookState.FLAT,
+                detail={"spot_symbol": self.spot_symbol,
+                        "perp_symbol": self.perp_symbol}))
+        if self.perp_symbol not in self.FUNDING_8H_PROVEN:
+            return EntryEconomics(None, None, CarryDecision(
+                "stand_aside", reason="FUNDING_CADENCE_UNPROVEN",
+                state=BookState.FLAT,
+                detail={"symbol": self.perp_symbol,
+                        "proven": sorted(self.FUNDING_8H_PROVEN),
+                        "note": "no local venue metadata proves this perp "
+                                "settles every 8h, which the gap rule, the "
+                                "freshness check and the carry-per-day maths "
+                                "all assume; a cadence is never guessed"}))
         if spot is None:
             return EntryEconomics(None, None, CarryDecision(
                 "stand_aside", reason="SPOT_UNAVAILABLE_BASIS_UNKNOWN",
@@ -739,6 +832,20 @@ class CarryEngine:
                      and (self._last_print_ms is None
                           or int(funding_print_ms) > self._last_print_ms))
         if new_print:
+            # The history is rates without stamps. If a settlement was missed
+            # (process down, skipped polling) the new print is NOT adjacent to
+            # the ones held, and days-old prints must not keep weight in a
+            # smoothed rate read as the current regime. Discard them: the gate
+            # then stands aside until EWMA_MIN_PRINTS fresh prints exist.
+            if (self._last_print_ms is not None and self._funding_history
+                    and int(funding_print_ms) - self._last_print_ms
+                    > self.MAX_PRINT_GAP_MS):
+                logger.warning(
+                    "carry: funding print gap of %.1fh (limit %.1fh); "
+                    "discarding %d stale prints from the entry EWMA",
+                    (int(funding_print_ms) - self._last_print_ms) / 3.6e6,
+                    self.MAX_PRINT_GAP_MS / 3.6e6, len(self._funding_history))
+                self._funding_history = []
             self._last_print_ms = int(funding_print_ms)
             self._funding_history.append(float(funding_bps))
             del self._funding_history[:-self.FUNDING_HISTORY]
@@ -1015,6 +1122,21 @@ class CarryEngine:
                     "naked SHORT")
             perp.filled_qty -= closed.filled_qty
             perp.requested_qty = perp.filled_qty
+            if perp.filled_qty > inventory + QTY_DUST:
+                # The buy-back filled only in part: the short is STILL larger
+                # than the inventory, so it is still naked. Record what the
+                # venue holds (the exposure must not be forgotten), then halt.
+                self.position = CarryPosition(
+                    spot=Leg(symbol=self.spot_symbol, side="Hold",
+                             product="spot", requested_qty=inventory,
+                             filled_qty=inventory, avg_price=spot_mark,
+                             order_link_id="INVENTORY"),
+                    perp=perp, opened_ms=timestamp_ms)
+                return self._halt(
+                    "OVERSOLD_BEYOND_INVENTORY",
+                    f"short {perp.filled_qty} against {inventory} of "
+                    "inventory after a PARTIAL buy-back; the book is still "
+                    "naked SHORT")
 
         hedged = perp.filled_qty
         # The inventory slice this hedge covers. No order was placed for it and

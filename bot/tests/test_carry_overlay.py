@@ -211,6 +211,28 @@ class TestAPartialPerpFillIsASmallerHedgeNotAnIncident:
         assert d.reason == "OVERSOLD_BEYOND_INVENTORY"
 
 
+    def test_a_partial_buy_back_that_leaves_the_short_oversized_halts(self):
+        """The excess closed only in part: still short more than the client
+        owns, so the book is still naked SHORT and must not call itself hedged.
+        """
+        class Half(Venue):
+            def place_market(self, *, symbol, side, qty, product):
+                self.orders.append((side, product, qty))
+                if side == "Buy":
+                    return {"filled_qty": qty / 2, "avg_price": MARK,
+                            "order_link_id": "x"}
+                return {"filled_qty": qty * 2, "avg_price": MARK,
+                        "order_link_id": "x"}
+        v = Half(inventory=0.001)
+        e = engine(v)
+        d = open_pair(e)
+        assert d.state is BookState.HALTED
+        assert d.reason == "OVERSOLD_BEYOND_INVENTORY"
+        # the residual exposure is recorded, not forgotten
+        assert e.position is not None
+        assert e.position.perp.filled_qty == pytest.approx(0.0015)
+
+
 class TestTheVenueDecidesTheLot:
     def test_the_size_is_snapped_down_to_the_step(self):
         assert snap_to_lot(0.0012657, 0.001) == pytest.approx(0.001)

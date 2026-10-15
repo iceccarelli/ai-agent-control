@@ -51,7 +51,7 @@ def opened_ms(journal):
     return next(e.ms for e in journal.entries if e.kind == "perp_open")
 
 
-def reconcile(j, prints, *, now_ms, start=None, rows=()):
+def reconcile(j, prints, *, now_ms, start=None, rows=(), rates=None):
     """Run the lifecycle reconciliation against two COMPLETE synthetic reads.
 
     Test data: public prints at `prints` (ms) and an account log holding `rows`.
@@ -60,7 +60,8 @@ def reconcile(j, prints, *, now_ms, start=None, rows=()):
     import funding_reconcile as R
     lo = T0 - 3_600_000 if start is None else start
     hist = FundingHistory(start_ms=lo, end_ms=now_ms,
-                          prints=[(3.0, int(t)) for t in sorted(prints)])
+                          prints=[((rates or {}).get(int(t), 3.0), int(t))
+                                  for t in sorted(prints)])
     ev = SettlementEvidence(start_ms=lo, end_ms=now_ms, payments=list(rows),
                             windows=1, pages=1, rows_returned=len(rows))
     return R.reconcile_funding(j, history=hist, evidence=ev, now_ms=now_ms)
@@ -87,8 +88,11 @@ class TestBookingFromVenuePayments:
         assert st["funding_confirmed"] is False
         assert st["funding_lifecycles"][0]["reasons"] == [
             "NO_RECONCILIATION_RECORD"]
+        # the PAID settlement is one whose public rate was negative (a short
+        # pays then), so the synthetic print carries that sign
         reconcile(j, [T0 + 3_600_000, T0 + 2 * 3_600_000], now_ms=T0 + 20 * H,
-                  rows=[pay(1, 4.25), pay(2, -1.5, ms=T0 + 2 * 3_600_000)])
+                  rows=[pay(1, 4.25), pay(2, -1.5, ms=T0 + 2 * 3_600_000)],
+                  rates={T0 + 2 * 3_600_000: -3.0})
         st = j.statement()
         assert st["funding_confirmed"] is True and st["net_basis"] == "confirmed"
 
