@@ -4,7 +4,7 @@
 WHY THIS EXISTS
 ===============
 INTEGRATION_MAP §7 says it plainly: *"No real market data has been used."*
-Bybit is unreachable from this sandbox, so every number in TEST_REPORT.md came
+Bybit is unreachable from this sandbox, so every number in the original test report came
 from a random walk with no microstructure at all — no book, no spread, no
 depth, no latency. That is fine for exercising the order lifecycle and useless
 for exercising anything that reads a price *as a tradeable price*.

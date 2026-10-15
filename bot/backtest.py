@@ -334,7 +334,7 @@ class SimulatedExchange(Transport):
             # monitor must cancel the siblings the moment a stop fills. The
             # engine does that on the next cycle (`_cancel_protective_orders`),
             # and the residual intra-candle window is a real, acknowledged risk
-            # — recorded in TEST_REPORT.md rather than assumed away.
+            # — acknowledged here rather than assumed away.
             for order in limits:
                 if order.status == "New":
                     order.status = "Cancelled"
