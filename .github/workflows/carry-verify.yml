@@ -82,6 +82,7 @@ jobs:
           tests/test_carry_funding_truth.py
           tests/test_carry_funding_history_gap.py
           tests/test_carry_symbol_authority.py
+          tests/test_carry_venue_direction_integration.py
           tests/test_carry_entry_allowance_survives_restart.py
           tests/test_carry_funding_prints.py
           tests/test_carry_fee_truth.py
