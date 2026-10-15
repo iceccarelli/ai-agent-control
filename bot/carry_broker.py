@@ -375,6 +375,15 @@ class CarryBroker:
 
     # -- the engine's three calls -----------------------------------------
 
+    @staticmethod
+    def _short_only_guard(body: Dict[str, Any]) -> None:
+        """A perp BUY from this book is always a close: it only ever holds a
+        short. `reduceOnly` makes the venue refuse any quantity beyond the
+        position, so a close sized from a drifted book can never flip the
+        account long."""
+        if body.get("category") == LINEAR and body.get("side") == "Buy":
+            body["reduceOnly"] = True
+
     def place_market(self, *, symbol: str, side: str, qty: float,
                      product: str) -> Optional[Dict[str, Any]]:
         """One leg. Deterministic id, so a retry cannot double it."""
@@ -403,6 +412,7 @@ class CarryBroker:
             # Stated on sells too, where it is the venue default, so the unit
             # of every spot qty this module sends is explicit.
             body["marketUnit"] = "baseCoin"
+        self._short_only_guard(body)
         try:
             response = self.client._request(
                 "POST", "/v5/order/create", signed=True, body=body)
@@ -504,6 +514,7 @@ class CarryBroker:
                 "timeInForce": "PostOnly", "orderLinkId": link_id}
         if product == SPOT:
             body["marketUnit"] = "baseCoin"
+        self._short_only_guard(body)
         try:
             self.client._request("POST", "/v5/order/create", signed=True,
                                  body=body)

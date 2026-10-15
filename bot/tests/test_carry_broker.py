@@ -253,6 +253,33 @@ class TestGetPerpPositionRefusesToAssumeFlat:
         assert broker(client).get_perp_position("BTCUSDT") == 0.0
 
 
+class TestPerpClosesCannotFlipTheAccountLong:
+    """Every perp BUY from a short-only book is a close, so it is reduce-only."""
+
+    def test_a_perp_buy_is_reduce_only(self):
+        client = FakeClient()
+        broker(client).place_market(symbol="BTCUSDT", side="Buy", qty=0.5,
+                                    product=LINEAR)
+        assert client.created[0]["reduceOnly"] is True
+
+    def test_a_perp_sell_and_spot_orders_are_not(self):
+        client = FakeClient()
+        b = broker(client)
+        b.place_market(symbol="BTCUSDT", side="Sell", qty=0.5, product=LINEAR)
+        b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT)
+        assert all("reduceOnly" not in body for body in client.created)
+
+    def test_a_resting_perp_close_is_reduce_only_too(self):
+        client = FakeClient()
+        try:
+            broker(client).place_post_only(symbol="BTCUSDT", side="Buy",
+                                           qty=0.5, price=99_999.0,
+                                           product=LINEAR)
+        except Exception:
+            pass
+        assert client.created and client.created[0]["reduceOnly"] is True
+
+
 class TestPerpPositionDirection:
     """This book only ever holds a perp SHORT. Bybit reports `size` unsigned
     with a `side`; a LONG of the same size is not the book's hedge, and reading
