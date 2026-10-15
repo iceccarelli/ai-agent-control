@@ -107,6 +107,7 @@ jobs:
           tests/test_unwind_completeness.py
           tests/test_carry_cold_start.py
           tests/test_carry_cold_start_spot_fee.py
+          tests/test_carry_hedge_mode_refusal.py
           tests/test_carry_wiring_authority.py
           tests/test_drill.py
           tests/test_testnet_session.py

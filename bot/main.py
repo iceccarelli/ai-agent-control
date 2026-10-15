@@ -719,6 +719,15 @@ class TradingBot:
                 "start", exc)
             return False
         try:
+            mode_of = getattr(broker, "get_position_mode", None)
+            if mode_of is not None and \
+                    mode_of(self.carry.perp_symbol) != "one_way":
+                logger.critical(
+                    "carry cold start: %s is in hedge mode; this adapter sends "
+                    "no positionIdx, so every order (including the buy-back of "
+                    "a held short) would be rejected. Switch the account to "
+                    "one-way mode; refusing to start", self.carry.perp_symbol)
+                return False
             venue_perp = float(broker.get_perp_position(self.carry.perp_symbol))
             venue_spot = float(
                 broker.get_spot_inventory(self.carry.spot_symbol))
