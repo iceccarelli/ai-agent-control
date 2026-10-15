@@ -581,6 +581,7 @@ class CarryEngine:
                 negative_funding_streak=int(
                     position.get("negative_funding_streak", 0)))
             self.state = BookState.HEDGED
+            self._reseed_cost_basis()
         else:
             self.position = None
             self.state = BookState.FLAT
@@ -603,6 +604,22 @@ class CarryEngine:
         else:
             self._last_print_ms = None if last is None else int(last)
             self._funding_history = rates
+
+    def _reseed_cost_basis(self) -> None:
+        """Hand the restored legs' entry prices to a broker that books P&L.
+
+        Its weighted entries are process memory; without this a close after a
+        restart realises against its own exit price. The overlay's spot leg is
+        the client's inventory, which was never bought here, so it has none.
+        """
+        reseed = getattr(self.broker, "resume_basis", None)
+        pos = self.position
+        if reseed is None or pos is None:
+            return
+        bought = self.execution_mode == ACQUIRE and pos.spot.avg_price > 0
+        reseed(perp_qty=pos.perp.filled_qty, perp_price=pos.perp.avg_price,
+               spot_qty=pos.spot.filled_qty if bought else 0.0,
+               spot_price=pos.spot.avg_price if bought else None)
 
     def _record(self) -> Optional[CarryDecision]:
         """Write the ledger. A failure to write HALTS.
