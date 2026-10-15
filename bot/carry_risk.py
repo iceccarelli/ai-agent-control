@@ -38,6 +38,7 @@ by accident is notional.
 """
 from __future__ import annotations
 
+import collections
 import datetime as dt
 import math
 from dataclasses import dataclass, field
@@ -166,24 +167,69 @@ class CarryRisk:
         return {"entries": [d.isoformat() for d in self._entries],
                 "broken": [d.isoformat() for d in self._broken]}
 
-    def load_days(self, data: Any) -> None:
-        """Take back a persisted allowance. Anything unreadable is ignored
-        entry by entry: a corrupt record must not invent an allowance, and it
-        cannot widen one, because loading only ADDS spent days."""
+    @staticmethod
+    def _parse_days(data: Any) -> Optional[Dict[str, List[dt.date]]]:
+        """A persisted allowance, or None when ANY part of it is unusable.
+
+        Both buckets must be present as lists of ISO date strings. A wrong
+        type, a missing bucket or one bad date makes the whole record
+        untrustworthy: the unreadable item may have been today's spent entry,
+        so it cannot be skipped and the rest believed.
+        """
         if not isinstance(data, dict):
-            return
-        for key, bucket in (("entries", self._entries),
-                            ("broken", self._broken)):
+            return None
+        out: Dict[str, List[dt.date]] = {}
+        for key in ("entries", "broken"):
             rows = data.get(key)
             if not isinstance(rows, list):
-                continue
+                return None
+            days: List[dt.date] = []
             for raw in rows:
+                if not isinstance(raw, str):
+                    return None
                 try:
-                    day = dt.date.fromisoformat(str(raw))
+                    days.append(dt.date.fromisoformat(raw))
                 except ValueError:
-                    continue
-                bucket.append(day)
-            del bucket[:-32]
+                    return None
+            out[key] = days
+        return out
+
+    def load_days(self, data: Any) -> bool:
+        """Take back a persisted allowance. True when it was valid and loaded.
+
+        Loading is idempotent: each date's count becomes the larger of what is
+        held and what was persisted, so loading twice cannot double-count. A
+        False return means the record could not be trusted and the caller must
+        `exhaust_today`; nothing is loaded from a partly-readable record.
+        """
+        parsed = self._parse_days(data)
+        if parsed is None:
+            return False
+        for key, bucket in (("entries", self._entries),
+                            ("broken", self._broken)):
+            have = collections.Counter(bucket)
+            want = collections.Counter(parsed[key])
+            merged = sorted((have | want).elements())
+            bucket[:] = merged[-32:]
+        return True
+
+    def exhaust_today(self, *, now: Optional[dt.datetime] = None) -> int:
+        """Spend whatever is left of today's allowance. Returns how many
+        entries were added (0 when it was already spent).
+
+        The fail-closed answer to an allowance that cannot be verified: no
+        entry today, and the same ledger format records it so a restart does
+        not forget it. Adds only the shortfall, so repeating it never
+        inflates the count.
+        """
+        today = (now or dt.datetime.now(dt.timezone.utc)).date()
+        used = (sum(1 for d in self._entries if d == today)
+                + sum(1 for d in self._broken if d == today))
+        missing = max(0, self.max_entries_per_day - used)
+        self._entries.extend([today] * missing)
+        self._entries.sort()
+        del self._entries[:-32]
+        return missing
 
     def record_entry(self, *, now: Optional[dt.datetime] = None) -> None:
         """Called only after BOTH legs land. A REFUSED pair (no leg sent) did

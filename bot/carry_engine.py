@@ -531,6 +531,33 @@ class CarryEngine:
             "max_notional_usd": self.max_notional_usd,
         }
 
+    def _utc_now(self) -> "dt.datetime":
+        return dt.datetime.now(dt.timezone.utc)
+
+    def _restore_allowance(self, record: Any) -> None:
+        """Bring back the day's entry allowance from a PERSISTED ledger.
+
+        Called only when a ledger exists (a first-ever run has none and keeps
+        its full allowance). A ledger whose `entry_days` is missing or
+        unreadable cannot prove today's entries were not already spent, so the
+        rest of the UTC day is spent here and the fact is persisted through
+        the same state path - a second restart must not forget it.
+        """
+        risk = getattr(self, "pair_risk", None)
+        if risk is None or not hasattr(risk, "load_days"):
+            return
+        if risk.load_days(record):
+            return
+        added = risk.exhaust_today(now=self._utc_now())
+        logger.warning(
+            "carry: the persisted entry allowance is missing or unreadable; "
+            "no new entry today (%d slot(s) marked spent)", added)
+        try:
+            self.persist(self.to_state())
+        except Exception:  # noqa: BLE001 - blocked in memory regardless
+            logger.critical("the fail-closed entry allowance could not be "
+                            "written down; it holds for this process only")
+
     def restore(self, state: Dict[str, Any]) -> None:
         """Take the ledger's word for the position. Called only after
         `cold_start` has checked it against the venue."""
@@ -549,9 +576,7 @@ class CarryEngine:
         last = state.get("last_print_ms")
         rates = [float(x) for x in state.get("funding_history", [])][
             -self.FUNDING_HISTORY:]
-        risk = getattr(self, "pair_risk", None)
-        if risk is not None and hasattr(risk, "load_days"):
-            risk.load_days(state.get("entry_days"))
+        self._restore_allowance(state.get("entry_days"))
         recorded = state.get("perp_symbol")
         foreign = (recorded != self.perp_symbol if recorded is not None
                    else self.perp_symbol not in self.FUNDING_8H_PROVEN)
@@ -607,14 +632,12 @@ class CarryEngine:
                                        venue_perp_qty=venue_perp_qty,
                                        venue_spot_qty=venue_spot_qty,
                                        open_orders=open_orders)
-        if decision.action is ColdStart.CLEAN and ledger:
+        if decision.action is ColdStart.CLEAN and ledger is not None:
             # Flat at both ends: there is no pair to restore, but the day's
             # entry allowance is still spent - a pair opened and closed earlier
             # today must not buy a second round trip because the process
-            # restarted in between.
-            risk = getattr(self, "pair_risk", None)
-            if risk is not None and hasattr(risk, "load_days"):
-                risk.load_days(ledger.get("entry_days"))
+            # restarted in between. A ledger that cannot say fails closed.
+            self._restore_allowance(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
             logger.warning("carry cold start: RESUMED %s", decision.detail)
