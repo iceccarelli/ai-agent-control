@@ -2,11 +2,17 @@
 # MACHINE B — TRADING EXECUTION HOST
 # Identity check: must have ai-agent-control repo. Must NOT be the ecowoods OpenClaw brain.
 #
-# IDEMPOTENT. Re-running this must leave exactly one cron line per job. The
-# first version could not promise that: it installed crons only when NEITHER
-# job was present, so a host with `daily_forward_refresh` but no
-# `control_plane_tick` was never repaired, and a host already running
-# `control_plane_loop.sh` (which calls the same tick) ended up ticking twice.
+# RETIRES the legacy control-plane crons; installs none.
+#
+# The first versions of this script installed two crons, `daily_forward_refresh`
+# and `control_plane_tick`, and ran `reviewer_verdict` as a smoke check, each
+# followed by `|| true`. Those tools were deleted on purpose (8d412c6: they were
+# a second corpus/mission writer, and their scorer and charter docs went in
+# 538f66c), so a host rewired by the old script ticked a missing file every
+# hour, forever, and the `|| true` made that look like success. This version
+# removes every line it owns or that names a retired job, installs nothing that
+# can write corpus or missions, and FAILS if a retired job is still scheduled
+# afterwards. It is idempotent: re-running it leaves the same crontab.
 set -euo pipefail
 REPO="${AAC_REPO:-$HOME/iceccarelli-factory/ai-agent-control}"
 BOT="$REPO/bot"
@@ -25,40 +31,26 @@ if test -d "$HOME/ecowoods-factory/workspaces/ecowoods-builder"; then
   echo "WARN: ecowoods builder exists on this host — confirm this is still intended as EXECUTION machine"
 fi
 
-echo "=== 1) Execution invariants ==="
-# cd FIRST. Both tools resolve artifacts/ relative to the working directory, so
-# running them from wherever the operator happened to be is how you get a
-# reviewer verdict written into somebody's home directory.
+echo "=== 1) Execution stack imports ==="
+# cd FIRST: the app resolves state/ and artifacts/ relative to the working
+# directory. No `|| true`: a stack that does not import must stop this script.
 cd "$BOT"
-"$PY" tools/reviewer_verdict.py --dry-run >/tmp/aac_reviewer_dry.txt || true
-"$PY" tools/control_plane_tick.py >/tmp/aac_tick.txt || true
-echo "dry-run+tick done"
-"$PY" - <<'PY'
-import json
-from pathlib import Path
-v = json.loads(Path("artifacts/reviewer_verdict.json").read_text())
-print("forward", v["stage_b"]["forward_n_trades"], "/", v["stage_b"]["of_20"])
-print("allows_progress", v.get("allows_progress"), "key", v.get("key_status"))
-print("next:", *v.get("next_actions", [])[:3], sep="\n  ")
-PY
+"$PY" -c 'import main, funding_reconcile; print("execution stack imports OK")'
 
-echo "=== 2) Crons (execution only) ==="
-# Rebuild unconditionally: drop every line we own or that runs either job under
-# any wrapper, then append the two canonical lines. No branch, so no partial
-# state survives and no line is ever written twice.
+echo "=== 2) Crons: retire legacy control-plane jobs (installs none) ==="
+# Drop every line we own or that runs a retired job under any wrapper. Lines we
+# do not own and that do not name a retired job are passed through untouched.
 {
   crontab -l 2>/dev/null \
     | grep -v -F "$CRON_TAG" \
-    | grep -v -E 'daily_forward_refresh|control_plane_tick|control_plane_loop\.sh' \
+    | grep -v -E 'daily_forward_refresh|control_plane_tick|control_plane_loop\.sh|reviewer_verdict|promote_forward_shadow|stage_b_forward_accrual' \
     || true
-  echo "7 1 * * * cd $BOT && $PY tools/daily_forward_refresh.py >> $BOT/state/forward_refresh.log 2>&1 $CRON_TAG"
-  echo "17 * * * * cd $BOT && $PY tools/control_plane_tick.py >> $BOT/state/control_plane_tick.log 2>&1 $CRON_TAG"
 } | crontab -
 
-echo "--- installed (expect exactly 2) ---"
-crontab -l | grep -E 'daily_forward_refresh|control_plane_tick'
-installed=$(crontab -l | grep -c -E 'daily_forward_refresh|control_plane_tick')
-[ "$installed" -eq 2 ] || { echo "FATAL: $installed cron lines, expected 2"; exit 1; }
+echo "--- retired jobs still scheduled (expect 0) ---"
+remaining=$(crontab -l 2>/dev/null | grep -c -E 'daily_forward_refresh|control_plane_tick|control_plane_loop\.sh|reviewer_verdict|promote_forward_shadow|stage_b_forward_accrual' || true)
+echo "$remaining"
+[ "$remaining" -eq 0 ] || { echo "FATAL: $remaining retired cron lines remain"; exit 1; }
 
 echo "=== 3) Role file for this host ==="
 mkdir -p "$BOT/docs/human"
@@ -67,7 +59,7 @@ cat > "$BOT/docs/human/MACHINE_B_EXECUTION.md" <<'MD'
 
 This computer owns:
 - `ai-agent-control` git checkout
-- Bybit/paper runtime, corpus refresh, control_plane_tick
+- Bybit/paper runtime (testnet only)
 - Claude Code builder sessions that edit THIS repo
 
 This computer does NOT own:
@@ -78,8 +70,8 @@ Law:
 - allows_live only via human ACCEPT files
 - OpenClaw agents on MACHINE A talk to this repo via **git push/pull**, not by sharing a filesystem
 
-Crons owned by `scripts/REWIRE_MACHINE_B_EXECUTION.sh` are tagged `# aac-machine-b`.
-Re-running the script rebuilds them; it never appends a second copy.
+This script installs no crons. It retires the legacy control-plane crons
+(`daily_forward_refresh`, `control_plane_tick`) whose tools were deleted.
 MD
 
 echo "=== 4) Stage the role doc (no commit, no push — that is the operator's) ==="

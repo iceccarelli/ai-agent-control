@@ -24,7 +24,6 @@ import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-CHARTER = os.path.join(ROOT, "docs", "human", "AGENT_CONTROL_PLANE.md")
 
 #: Everything that can decide, size, gate or send an order.
 ORDER_PATH = (
@@ -99,7 +98,7 @@ class TestNoLlmOnTheOrderPath:
             assert root not in LLM_MODULES, (
                 f"{module} imports {name!r}: an LLM reached the order path")
 
-    def test_the_list_covers_what_the_charter_claims(self):
+    def test_the_ban_list_is_not_shrunk(self):
         """A shrinking ban list is how this stops protecting anything."""
         assert len(ORDER_PATH) >= 12
         for required in ("main.py", "trading_engine.py", "carry_broker.py",
@@ -122,8 +121,8 @@ class TestTheReviewerCannotReachTheVenue:
         present = self._present()
         if not present:
             pytest.skip("no reviewer module yet — "
-                        "test_the_absence_is_recorded_in_the_charter covers "
-                        "this case and does not skip")
+                        "test_the_retired_writers_stay_retired asserts the "
+                        "retired modules are absent")
         for path in present:
             found = imported_names(path) | dynamic_import_targets(path)
             for name in found:
@@ -135,8 +134,8 @@ class TestTheReviewerCannotReachTheVenue:
         present = self._present()
         if not present:
             pytest.skip("no reviewer module yet — "
-                        "test_the_absence_is_recorded_in_the_charter covers "
-                        "this case and does not skip")
+                        "test_the_retired_writers_stay_retired asserts the "
+                        "retired modules are absent")
         for path in present:
             with open(path, encoding="utf-8") as handle:
                 tree = ast.parse(handle.read(), filename=path)
@@ -149,55 +148,13 @@ class TestTheReviewerCannotReachTheVenue:
                     assert name not in ("clear_kill_switch_by_human",
                                         "set_allows_live"), name
 
-    def test_the_absence_is_recorded_in_the_charter(self):
-        """No skip. Either the module exists, or the charter says it does not."""
-        body = open(CHARTER, encoding="utf-8").read()
-        if self._present():
-            return
-        assert "MUST NOT import" in body
-        for banned in VENUE_MODULES:
-            assert banned in body, (
-                f"the charter must name {banned} as off-limits to the reviewer")
-
-
-class TestTheCharterSaysWhatItMustSay:
-    def test_it_exists(self):
-        assert os.path.isfile(CHARTER), CHARTER
-
-    def test_it_carries_the_five_roles(self):
-        body = open(CHARTER, encoding="utf-8").read()
-        for role in ("EXECUTION BOT", "BUILDER", "REVIEWER", "LOCAL INFERENCE",
-                     "ORCHESTRATOR"):
-            assert role in body, role
-
-    def test_it_pins_the_verdict_schema(self):
-        body = open(CHARTER, encoding="utf-8").read()
-        for key in ("allows_progress", "blockers", "stage_b",
-                    "forward_n_trades", "closed_forward_bars",
-                    "allows_live_must_be_false", "next_actions"):
-            assert key in body, key
-
-    def test_the_verdict_example_is_valid_json_and_fails_closed(self):
-        """A schema nobody can parse is a schema nobody will honour."""
-        body = open(CHARTER, encoding="utf-8").read()
-        block = body.split("```json", 1)[1].split("```", 1)[0]
-        doc = json.loads(block)
-        assert doc["allows_progress"] is False
-        assert doc["risk"]["allows_live_must_be_false"] is True
-        assert set(doc) == {"allows_progress", "blockers", "stage_b", "risk",
-                            "next_actions", "model", "key_status",
-                            "generated_utc"}
-        # The key is a status, never a value.
-        assert doc["key_status"] in ("missing", "present")
-
-    def test_openclaw_is_recorded_absent_with_its_hook_points(self):
-        """ABSENT is a finding. Inventing an integration would be worse."""
-        body = open(CHARTER, encoding="utf-8").read()
-        assert "OpenClaw: ABSENT" in body
-        assert "daily_forward_refresh.py" in body
-        assert "append_closed_corpus.py" in body
-
-    def test_it_does_not_claim_live_is_authorised(self):
-        body = open(CHARTER, encoding="utf-8").read().lower()
-        assert "allows_live" in body
-        assert "nothing in this file authorises live trading" in body
+    def test_the_retired_writers_stay_retired(self):
+        """The charter doc went with the slice diary (538f66c) and the tick /
+        refresh / reviewer / promote tools went in 8d412c6 as a second corpus
+        and mission writer. If one comes back it must be re-reviewed against
+        the single-writer rule, not slipped in: this fails until this list and
+        the two tests above are consciously updated."""
+        for name in ("control_plane_tick.py", "daily_forward_refresh.py",
+                     "promote_forward_shadow.py", "reviewer_verdict.py",
+                     "control_plane_loop.sh"):
+            assert not os.path.exists(os.path.join(ROOT, "tools", name)), name

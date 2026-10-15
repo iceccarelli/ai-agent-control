@@ -77,7 +77,18 @@ def kill_switch_state(db_path: str) -> Tuple[bool, str]:
     return bool(row[0]), str(row[1] or "")
 
 
+CURRENT_SHADOW = "forward_shadow_current.json"
+
+
 def newest_shadow_artifact(repo: str) -> Optional[str]:
+    """The sanctioned `forward_shadow_current.json` if present; otherwise the
+    highest-numbered legacy `sliceNN_forward_shadow.json`. The slice-numbered
+    files were retired (538f66c) and this function kept globbing only for
+    them, so the ladder silently read as absent while the current artifact
+    sat in the same directory."""
+    current = os.path.join(repo, "artifacts", CURRENT_SHADOW)
+    if os.path.isfile(current):
+        return current
     paths = glob.glob(os.path.join(repo, "artifacts", "slice*_forward_shadow.json"))
     if not paths:
         return None

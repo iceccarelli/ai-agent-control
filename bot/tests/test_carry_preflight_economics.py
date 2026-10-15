@@ -250,8 +250,13 @@ class TestTheThreeStatesCannotOverrideEachOther:
             allowed, reason = _main.carry_orders_permitted(cfg(paper))
             assert report["order_authorization"]["gate_allows_orders"] == allowed
             assert report["order_authorization"]["reason"] == reason
-        # and build_bot hands the broker this very function
-        assert "carry_orders_permitted(cfg)" in inspect.getsource(_main.build_bot)
+        # and build_bot hands the broker this very function, plus the check
+        # that the client targets the venue the config names (a strictly
+        # stronger gate that delegates to it rather than copying its logic)
+        assert "carry_orders_permitted_for(cfg, bot.client)" in \
+            inspect.getsource(_main.build_bot)
+        assert "carry_orders_permitted(cfg)" in \
+            inspect.getsource(_main.carry_orders_permitted_for)
 
 
 class TestStructurallyReadOnly:

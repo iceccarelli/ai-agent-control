@@ -72,7 +72,7 @@ def test_it_hides_no_failure(text):
 
 def test_it_does_not_pretend_to_be_the_full_suite(text):
     assert "pytest -q -p no:cacheprovider tests\n" not in text
-    assert "69 failures" in text and "NOT run or hidden" in text
+    assert "61 failures" in text and "NOT run or hidden" in text
 
 
 # ---------------------------------------------------------------------------
