@@ -104,3 +104,59 @@ def test_matching_symbols_are_not_refused_for_pairing():
     d = b.carry.on_candle(mark=100_000.0, funding_bps=5.0, spot=100_000.0,
                           funding_print_ms=rec.stamp)
     assert d.reason != "PAIR_SYMBOLS_MISMATCH"
+
+
+# -- refusing NEW exposure never disables an exit -----------------------------
+
+class FillingVenue(Recorder):
+    def __init__(self):
+        super().__init__()
+        self.orders = []
+
+    held = 0.001                       # the venue's perp short, as it reads
+
+    def get_perp_position(self, s):
+        self._r("position", s)
+        return -self.held
+
+    def place_market(self, *, symbol, side, qty, product):
+        if product == "linear" and side == "Buy":
+            self.held = max(0.0, self.held - qty)
+        self.orders.append((symbol, side, product))
+        return {"filled_qty": qty, "avg_price": 100_000.0,
+                "order_link_id": f"x{len(self.orders)}"}
+
+
+def _held(perp, spot):
+    from dataclasses import asdict
+    from carry_engine import Leg
+    e = CarryEngine(broker=FillingVenue(), max_notional_usd=100.0,
+                    borrow_apr=0.0, execution_mode="acquire",
+                    persist=lambda s: None, perp_symbol=perp, spot_symbol=spot)
+    e.restore({
+        "perp_symbol": perp, "last_print_ms": 0, "funding_history": [],
+        "position": {
+            "spot": asdict(Leg(symbol=spot, side="Buy", product="spot",
+                               requested_qty=0.001, filled_qty=0.001,
+                               avg_price=100_000.0)),
+            "perp": asdict(Leg(symbol=perp, side="Sell", product="linear",
+                               requested_qty=0.001, filled_qty=0.001,
+                               avg_price=100_000.0)),
+            "opened_ms": 1, "funding_collected": 0.0,
+            "negative_funding_streak": 0}})
+    return e
+
+
+def test_a_held_pair_still_unwinds_when_cadence_and_pairing_refuse_entry():
+    for perp, spot in (("ETHUSDT", "ETHUSDT"), ("BTCUSDT", "ETHUSDT")):
+        e = _held(perp, spot)
+        assert e.entry_economics(mark=100_000.0, spot=100_000.0).refusal \
+            is not None                       # new exposure is refused ...
+        d = None
+        for k in (1, 2, 3):                   # ... three negative prints exit
+            d = e.on_candle(mark=100_000.0, funding_bps=-1.0, spot=100_000.0,
+                            funding_print_ms=k * H8)
+        assert d.action == "unwound", (perp, spot, d.reason)
+        assert e.position is None
+        sides = [(s, side) for s, side, _p in e.broker.orders]
+        assert (perp, "Buy") in sides         # the perp short was bought back
