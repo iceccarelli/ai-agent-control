@@ -83,3 +83,24 @@ def test_default_configuration_is_unchanged():
     b, rec = bot(["BTCUSDT"], perp="BTCUSDT")
     b.tick()
     assert perp_reads(rec) == {"BTCUSDT"}
+
+
+def test_spot_and_perp_on_different_assets_never_enter():
+    # A BTC perp against an ETH spot reads as a ~-97% "basis", which the basis
+    # gate would wave through as cheap. Not a hedge: refused before any order.
+    b, rec = bot(["BTCUSDT"], perp="BTCUSDT", spot="ETHUSDT")
+    for k in (3, 2, 1):                      # enough settled history to qualify
+        b.carry.on_candle(mark=100_000.0, funding_bps=5.0, spot=3_000.0,
+                          funding_print_ms=rec.stamp - k * H8)
+    d = b.carry.on_candle(mark=100_000.0, funding_bps=5.0, spot=3_000.0,
+                          funding_print_ms=rec.stamp)
+    assert d.action == "stand_aside"
+    assert d.reason == "PAIR_SYMBOLS_MISMATCH"
+    assert b.carry.position is None
+
+
+def test_matching_symbols_are_not_refused_for_pairing():
+    b, rec = bot(["BTCUSDT"], perp="BTCUSDT", spot="BTCUSDT")
+    d = b.carry.on_candle(mark=100_000.0, funding_bps=5.0, spot=100_000.0,
+                          funding_print_ms=rec.stamp)
+    assert d.reason != "PAIR_SYMBOLS_MISMATCH"

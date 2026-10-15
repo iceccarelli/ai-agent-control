@@ -698,6 +698,17 @@ class CarryEngine:
         a default here would be a silent risk parameter, which is the exact
         class of bug 0016 removed from the cap.
         """
+        if self.spot_symbol != self.perp_symbol:
+            # Bybit lists the spot and the linear perp of one asset under the
+            # same name. Different names are different assets: the "basis" is
+            # then a price ratio between unrelated markets (a BTC perp against
+            # an ETH spot is ~-97%, which the basis gate reads as cheap) and
+            # the two legs do not hedge each other.
+            return EntryEconomics(None, None, CarryDecision(
+                "stand_aside", reason="PAIR_SYMBOLS_MISMATCH",
+                state=BookState.FLAT,
+                detail={"spot_symbol": self.spot_symbol,
+                        "perp_symbol": self.perp_symbol}))
         if self.perp_symbol not in self.FUNDING_8H_PROVEN:
             return EntryEconomics(None, None, CarryDecision(
                 "stand_aside", reason="FUNDING_CADENCE_UNPROVEN",

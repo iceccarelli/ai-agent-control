@@ -166,7 +166,7 @@ def test_symbol_without_proven_8h_cadence_is_refused_even_with_fresh_history():
     # A 4h symbol could hide a missed settlement inside the 12h tolerance, and
     # the carry-per-day maths would be wrong too. No metadata proves any other
     # symbol, so the gate refuses rather than guesses.
-    e = engine([RICH] * 4, 4 * H8, perp_symbol="ETHUSDT")
+    e = engine([RICH] * 4, 4 * H8, perp_symbol="ETHUSDT", spot_symbol="ETHUSDT")
     d = tick(e, 5 * H8, bps=RICH)                # rich, contiguous, would pass
     assert d.action == "stand_aside"
     assert d.reason == "FUNDING_CADENCE_UNPROVEN"
