@@ -948,6 +948,23 @@ class LedgerBroker:
         #: side lives here because a cancel response does not carry one.
         self._resting: Dict[str, tuple] = {}
 
+    def resume_basis(self, *, perp_qty: float = 0.0,
+                     perp_price: Optional[float] = None,
+                     spot_qty: float = 0.0,
+                     spot_price: Optional[float] = None) -> None:
+        """Re-seed the entry prices a restart wiped from this process.
+
+        The weighted entries above live in memory only. A restored pair would
+        otherwise close with ``entry = exit price`` and book its whole move as
+        a realised zero. The engine calls this with the legs it restored from
+        its own ledger, once the venue has agreed with them. A leg with no
+        recorded price (an overlay's inventory) is left unseeded.
+        """
+        if perp_qty > 0 and perp_price is not None and perp_price > 0:
+            self._perp_qty, self._perp_entry = float(perp_qty), float(perp_price)
+        if spot_qty > 0 and spot_price is not None and spot_price > 0:
+            self._spot_qty, self._spot_entry = float(spot_qty), float(spot_price)
+
     # -- orders: booked ---------------------------------------------------
 
     def place_market(self, *, symbol: str, side: str, qty: float,
