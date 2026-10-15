@@ -283,7 +283,13 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
                 "against has left",
                 naked_side="perp",
                 detail={"ledger_spot_qty": ledger_spot, "venue_spot_qty": spot})
-    elif abs(spot - ledger_spot) > dust:
+    elif spot > ledger_spot + dust or \
+            spot < ledger_spot - float(
+                (position.get("spot") or {}).get("fee_base_qty", 0.0) or 0.0
+            ) - dust:
+        # A spot BUY's fee is taken from the coin received, so the wallet may
+        # hold less than the leg filled by exactly the base-coin fee the venue
+        # stated. Any other gap, and any surplus, is a disagreement.
         return ColdStartDecision(
             ColdStart.HALT,
             f"the ledger holds {ledger_spot:.10g} of spot and the venue holds "
@@ -328,6 +334,11 @@ class Leg:
     #: realised fee against the invoice instead of assuming a tier.
     maker_qty: float = 0.0
     taker_qty: float = 0.0
+    #: Base coin the venue withheld as the fee on a spot BUY (it takes it from
+    #: the coin received, so the wallet holds ``filled_qty - fee_base_qty``).
+    #: Only a fee the venue LABELLED with the base coin counts; an unlabelled
+    #: or unknown fee leaves this 0.0 and explains no shortfall.
+    fee_base_qty: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -1605,6 +1616,8 @@ class CarryEngine:
                    avg_price=float(result.get("avg_price", 0.0) or 0.0),
                    order_link_id=str(result.get("order_link_id", "")),
                    fee=None if raw_fee is None else float(raw_fee),
+                   fee_base_qty=self._base_fee_withheld(result, symbol, side,
+                                                        product),
                    taker_qty=filled)
 
     def _rest_then_take(self, symbol: str, side: str, qty: float,
@@ -1683,6 +1696,8 @@ class CarryEngine:
                   avg_price=float(placed.get("avg_price", 0.0) or 0.0),
                   order_link_id=link,
                   fee=None if raw_fee is None else float(raw_fee),
+                  fee_base_qty=self._base_fee_withheld(placed, symbol, side,
+                                                       product),
                   maker_qty=filled)
         if filled + QTY_DUST >= qty or not placed.get("resting"):
             return leg
@@ -1707,7 +1722,34 @@ class CarryEngine:
                                   or leg.avg_price)
             fee = (final or {}).get("fee")
             leg.fee = None if fee is None else float(fee)
+            leg.fee_base_qty = self._base_fee_withheld(final, symbol, side,
+                                                       product)
         return leg
+
+    @staticmethod
+    def _base_fee_withheld(result: Any, symbol: str, side: str,
+                           product: str) -> float:
+        """Base coin the venue took as the fee on a spot BUY, else 0.0.
+
+        Counts only a component the venue named with the base coin; a bare
+        number or an unknown fee proves nothing about what the wallet holds.
+        """
+        if product != "spot" or side != "Buy" or not isinstance(result, dict):
+            return 0.0
+        detail = result.get("fee_detail")
+        if not isinstance(detail, dict) or not detail.get("known"):
+            return 0.0
+        base = symbol[:-4] if symbol.endswith("USDT") else None
+        total = 0.0
+        for comp in detail.get("components") or ():
+            try:
+                amount = float(comp.get("amount"))
+            except (TypeError, ValueError):
+                continue
+            if base and comp.get("currency") == base and math.isfinite(amount) \
+                    and amount > 0:
+                total += amount
+        return total
 
     @staticmethod
     def _as_whole_leg(maker: Optional[Leg]) -> Optional[Leg]:
@@ -1734,7 +1776,8 @@ class CarryEngine:
                    requested_qty=requested, filled_qty=total, avg_price=price,
                    order_link_id=f"{maker.order_link_id}+{taker.order_link_id}",
                    fee=fee, maker_qty=maker.filled_qty,
-                   taker_qty=taker.filled_qty)
+                   taker_qty=taker.filled_qty,
+                   fee_base_qty=maker.fee_base_qty + taker.fee_base_qty)
 
     @staticmethod
     def _gate_now(timestamp_ms: int) -> Optional["dt.datetime"]:
