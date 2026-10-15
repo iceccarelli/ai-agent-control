@@ -411,6 +411,8 @@ class CarryEngine:
     #: three-print smoother with slack, short enough that a regime change is
     #: not diluted by last week.
     FUNDING_HISTORY = 8
+    #: Longer than one 8h settlement interval plus slack means a print was missed.
+    MAX_PRINT_GAP_MS = 12 * 3_600_000
 
     def __init__(self, *, broker: Any, kill_switch: Any = None,
                  spot_symbol: str = "BTCUSDT", perp_symbol: str = "BTCUSDT",
@@ -739,6 +741,20 @@ class CarryEngine:
                      and (self._last_print_ms is None
                           or int(funding_print_ms) > self._last_print_ms))
         if new_print:
+            # The history is rates without stamps. If a settlement was missed
+            # (process down, skipped polling) the new print is NOT adjacent to
+            # the ones held, and days-old prints must not keep weight in a
+            # smoothed rate read as the current regime. Discard them: the gate
+            # then stands aside until EWMA_MIN_PRINTS fresh prints exist.
+            if (self._last_print_ms is not None and self._funding_history
+                    and int(funding_print_ms) - self._last_print_ms
+                    > self.MAX_PRINT_GAP_MS):
+                logger.warning(
+                    "carry: funding print gap of %.1fh (limit %.1fh); "
+                    "discarding %d stale prints from the entry EWMA",
+                    (int(funding_print_ms) - self._last_print_ms) / 3.6e6,
+                    self.MAX_PRINT_GAP_MS / 3.6e6, len(self._funding_history))
+                self._funding_history = []
             self._last_print_ms = int(funding_print_ms)
             self._funding_history.append(float(funding_bps))
             del self._funding_history[:-self.FUNDING_HISTORY]
