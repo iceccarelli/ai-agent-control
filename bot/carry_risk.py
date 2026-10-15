@@ -161,6 +161,30 @@ class CarryRisk:
                              "margin_multiple": margin,
                              "basis_bps": getattr(snapshot, "basis_bps", None)})
 
+    def export_days(self) -> Dict[str, List[str]]:
+        """The allowance as plain data, so it survives the process."""
+        return {"entries": [d.isoformat() for d in self._entries],
+                "broken": [d.isoformat() for d in self._broken]}
+
+    def load_days(self, data: Any) -> None:
+        """Take back a persisted allowance. Anything unreadable is ignored
+        entry by entry: a corrupt record must not invent an allowance, and it
+        cannot widen one, because loading only ADDS spent days."""
+        if not isinstance(data, dict):
+            return
+        for key, bucket in (("entries", self._entries),
+                            ("broken", self._broken)):
+            rows = data.get(key)
+            if not isinstance(rows, list):
+                continue
+            for raw in rows:
+                try:
+                    day = dt.date.fromisoformat(str(raw))
+                except ValueError:
+                    continue
+                bucket.append(day)
+            del bucket[:-32]
+
     def record_entry(self, *, now: Optional[dt.datetime] = None) -> None:
         """Called only after BOTH legs land. A REFUSED pair (no leg sent) did
         not consume the day's entry. A half-filled one is recorded separately,

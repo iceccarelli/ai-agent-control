@@ -525,6 +525,9 @@ class CarryEngine:
             "last_print_ms": self._last_print_ms,
             "funding_history": list(self._funding_history),
             "perp_symbol": self.perp_symbol,
+            **({"entry_days": self.pair_risk.export_days()}
+               if getattr(self, "pair_risk", None) is not None
+               and hasattr(self.pair_risk, "export_days") else {}),
             "max_notional_usd": self.max_notional_usd,
         }
 
@@ -546,6 +549,9 @@ class CarryEngine:
         last = state.get("last_print_ms")
         rates = [float(x) for x in state.get("funding_history", [])][
             -self.FUNDING_HISTORY:]
+        risk = getattr(self, "pair_risk", None)
+        if risk is not None and hasattr(risk, "load_days"):
+            risk.load_days(state.get("entry_days"))
         recorded = state.get("perp_symbol")
         foreign = (recorded != self.perp_symbol if recorded is not None
                    else self.perp_symbol not in self.FUNDING_8H_PROVEN)
@@ -601,6 +607,14 @@ class CarryEngine:
                                        venue_perp_qty=venue_perp_qty,
                                        venue_spot_qty=venue_spot_qty,
                                        open_orders=open_orders)
+        if decision.action is ColdStart.CLEAN and ledger:
+            # Flat at both ends: there is no pair to restore, but the day's
+            # entry allowance is still spent - a pair opened and closed earlier
+            # today must not buy a second round trip because the process
+            # restarted in between.
+            risk = getattr(self, "pair_risk", None)
+            if risk is not None and hasattr(risk, "load_days"):
+                risk.load_days(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
             logger.warning("carry cold start: RESUMED %s", decision.detail)
