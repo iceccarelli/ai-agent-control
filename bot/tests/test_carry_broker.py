@@ -76,6 +76,7 @@ class FakeClient:
         if endpoint == "/v5/position/list":
             return envelope({"list": [{"positionIM": str(self.im),
                                        "positionMM": str(self.mm),
+                                       "side": "Sell" if self.perp_qty else "",
                                        "size": str(self.perp_qty)}]})
         if endpoint == "/v5/account/wallet-balance":
             # Unified wallet rows nest per-coin balances under "coin" - see
@@ -250,6 +251,44 @@ class TestGetPerpPositionRefusesToAssumeFlat:
             "result": {"list": []},
         }
         assert broker(client).get_perp_position("BTCUSDT") == 0.0
+
+
+class TestPerpPositionDirection:
+    """This book only ever holds a perp SHORT. Bybit reports `size` unsigned
+    with a `side`; a LONG of the same size is not the book's hedge, and reading
+    `abs(size)` made it indistinguishable from one."""
+
+    @staticmethod
+    def _rows(*rows):
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope({"list": list(rows)})
+        return broker(client)
+
+    def test_a_short_returns_its_size(self):
+        b = self._rows({"side": "Sell", "size": "0.25"})
+        assert b.get_perp_position("BTCUSDT") == pytest.approx(0.25)
+
+    def test_a_long_is_refused_not_read_as_the_short(self):
+        with pytest.raises(PairIncident):
+            self._rows({"side": "Buy", "size": "0.25"}).get_perp_position(
+                "BTCUSDT")
+
+    def test_a_position_with_no_side_is_refused(self):
+        with pytest.raises(PairIncident):
+            self._rows({"size": "0.25"}).get_perp_position("BTCUSDT")
+
+    def test_a_flat_row_needs_no_side(self):
+        assert self._rows({"side": "", "size": "0"}).get_perp_position(
+            "BTCUSDT") == 0.0
+
+    def test_hedge_mode_rows_are_summed_and_a_long_leg_is_refused(self):
+        b = self._rows({"side": "Sell", "size": "0.1", "positionIdx": 2},
+                       {"side": "Sell", "size": "0.15", "positionIdx": 2})
+        assert b.get_perp_position("BTCUSDT") == pytest.approx(0.25)
+        with pytest.raises(PairIncident):
+            self._rows({"side": "", "size": "0", "positionIdx": 1},
+                       {"side": "Buy", "size": "0.2", "positionIdx": 1},
+                       ).get_perp_position("BTCUSDT")
 
 
 class TestGetOpenCarryOrdersRefusesToAssumeNone:

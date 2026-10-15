@@ -1188,13 +1188,30 @@ class CarryBroker:
         if rows is None:
             raise PairIncident(
                 f"cannot read the {symbol} position; refusing to assume flat")
-        if not rows:
-            return 0.0
-        try:
-            return abs(float(rows[0].get("size", 0) or 0))
-        except (TypeError, ValueError) as exc:
-            raise PairIncident(
-                f"position row for {symbol} is malformed: {rows[0]!r}") from exc
+        # Bybit reports `size` UNSIGNED with a `side`. This book only ever
+        # holds a perp SHORT ("Sell"); a long of the same size is a different
+        # exposure and must not read as the hedge. Any row (one-way mode has
+        # one, hedge mode two) holding size on another side, or on no stated
+        # side, is refused rather than summed into the short.
+        total = 0.0
+        for row in rows:
+            try:
+                size = abs(float(row.get("size", 0) or 0))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise PairIncident(
+                    f"position row for {symbol} is malformed: {row!r}") from exc
+            if not math.isfinite(size):
+                raise PairIncident(
+                    f"position row for {symbol} is malformed: {row!r}")
+            if size == 0.0:
+                continue
+            if str(row.get("side", "")) != "Sell":
+                raise PairIncident(
+                    f"{symbol} holds {size:.10g} on side "
+                    f"{row.get('side')!r}, not a short; this book cannot read "
+                    "that as its hedge")
+            total += size
+        return total
 
     def get_open_carry_orders(self, spot_symbol: str,
                               perp_symbol: str) -> list:
