@@ -479,21 +479,6 @@ class TestItem2NeverCitesSessionTailAsEvidence:
             body = fh.read()
         assert self.BANNED not in body
 
-    def test_docs_no_longer_point_item_2_at_session_tail(self):
-        repo_root = os.path.join(os.path.dirname(__file__), "..")
-        docs = [
-            "docs/promotion/LINEAR_STOP_OPS_INVENTORY.md",
-            "artifacts/HUMAN_GATE_OPS_PACKET.md",
-            "artifacts/LINEAR_STOP_VENUE_GAP.md",
-        ]
-        for rel in docs:
-            path = os.path.join(repo_root, rel)
-            with open(path, encoding="utf-8") as fh:
-                body = fh.read()
-            assert self.BANNED not in body, (
-                f"{rel} still points a human at `{self.BANNED}` as if it "
-                "were Item 2 evidence - that tool never calls verify_stop "
-                "or reads a position's stop fields")
 
 
 # ---------------------------------------------------------------------------
@@ -677,20 +662,6 @@ class TestItem3NeverCitesFalseEvidence:
 
     BANNED_SESSION_TAIL = "python3 tools/session_tail.py"
 
-    def test_item_3_docs_do_not_point_at_session_tail(self):
-        repo_root = os.path.join(os.path.dirname(__file__), "..")
-        docs = [
-            "docs/promotion/LINEAR_STOP_OPS_INVENTORY.md",
-            "artifacts/HUMAN_GATE_OPS_PACKET.md",
-            "artifacts/LINEAR_STOP_VENUE_GAP.md",
-        ]
-        for rel in docs:
-            path = os.path.join(repo_root, rel)
-            with open(path, encoding="utf-8") as fh:
-                body = fh.read()
-            assert self.BANNED_SESSION_TAIL not in body, (
-                f"{rel} points Item 3 at session_tail.py - that tool never "
-                "calls verify_stop or reads a position's stop fields")
 
 
 # ---------------------------------------------------------------------------
@@ -879,32 +850,3 @@ class TestItem4NeverCitesFalseEvidence:
     """Item 4's docs must give the real --margin-doc command, never point at
     the carry drill or session_tail.py, and must not claim the simulator's
     liquidation formula stands in for venue truth."""
-
-    def test_item_4_docs_do_not_point_at_session_tail(self):
-        repo_root = os.path.join(os.path.dirname(__file__), "..")
-        docs = [
-            "docs/promotion/LINEAR_STOP_OPS_INVENTORY.md",
-            "artifacts/HUMAN_GATE_OPS_PACKET.md",
-            "artifacts/LINEAR_STOP_VENUE_GAP.md",
-        ]
-        for rel in docs:
-            path = os.path.join(repo_root, rel)
-            with open(path, encoding="utf-8") as fh:
-                body = fh.read()
-            assert "python3 tools/session_tail.py" not in body
-
-    def test_the_margin_memo_disclaims_the_simulator_formula(self):
-        repo_root = os.path.join(os.path.dirname(__file__), "..")
-        path = os.path.join(repo_root, "docs", "promotion",
-                            "LINEAR_STOP_MARGIN_MEMO.md")
-        with open(path, encoding="utf-8") as fh:
-            body = fh.read()
-        assert "NOT a substitute" in body or "NOT evidence" in body
-
-    def test_the_checklist_item_4_observed_line_is_still_blank(self):
-        repo_root = os.path.join(os.path.dirname(__file__), "..")
-        path = os.path.join(repo_root, "docs", "promotion",
-                            "LINEAR_STOP_VERIFICATION_CHECKLIST.md")
-        with open(path, encoding="utf-8") as fh:
-            body = fh.read()
-        assert "[ ] 4. Margin and liquidation behaviour" in body

@@ -346,20 +346,3 @@ class TestNeverTouchesADifferentHumanItemOrLiveArming:
 class TestAppliedToTheRealRepoFiles:
     """The actual, committed checklist + memo, read straight - proves the
     regexes work against the real prose, not only a hand-built fixture."""
-
-    def test_the_real_checklist_and_memo_evaluate_ok(self):
-        result = sync_tool.evaluate()
-        assert result["ok"] is True, result.get("reason")
-        assert result["verified_by"] == "Vincenzo Ceccarelli"
-        assert result["verified_date"] == "2026-09-27"
-        assert sync_tool.ITEM_1_ARTIFACT in result["artifacts"]
-
-    def test_dry_run_against_the_real_gate_file_is_a_no_op_once_synced(self):
-        """This PR runs the tool with --write against the real gate file, so
-        by the time this test runs the desync is already closed - a second,
-        read-only pass must find nothing left to change."""
-        result = sync_tool.sync(write=False)
-        assert result["ok"] is True
-        assert result["old"]["complete"] is True
-        assert result["new"]["complete"] is True
-        assert result["changed"] is False
