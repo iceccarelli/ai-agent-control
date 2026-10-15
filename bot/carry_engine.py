@@ -524,6 +524,7 @@ class CarryEngine:
             "position": position,
             "last_print_ms": self._last_print_ms,
             "funding_history": list(self._funding_history),
+            "perp_symbol": self.perp_symbol,
             "max_notional_usd": self.max_notional_usd,
         }
 
@@ -543,17 +544,23 @@ class CarryEngine:
             self.position = None
             self.state = BookState.FLAT
         last = state.get("last_print_ms")
-        self._last_print_ms = None if last is None else int(last)
-        self._funding_history = [float(x) for x in
-                                 state.get("funding_history", [])][
-                                     -self.FUNDING_HISTORY:]
-        if self._funding_history and self._last_print_ms is None:
-            # Rates with no stamp of the newest one: their age is unknowable,
-            # so the gap rule could never judge them. Not a history.
-            logger.warning("carry: restored funding history has no last-print "
-                           "stamp; discarding %d prints of unknown age",
-                           len(self._funding_history))
-            self._funding_history = []
+        rates = [float(x) for x in state.get("funding_history", [])][
+            -self.FUNDING_HISTORY:]
+        recorded = state.get("perp_symbol")
+        foreign = (recorded != self.perp_symbol if recorded is not None
+                   else self.perp_symbol not in self.FUNDING_8H_PROVEN)
+        if rates and (last is None or foreign):
+            # Rates whose age is unknowable (no stamp of the newest), or that
+            # were observed on another market (or a legacy record on a symbol
+            # nothing proves it came from): not a history for THIS book. Leave
+            # whatever the venue warm-up already seeded.
+            logger.warning(
+                "carry: discarding %d restored funding prints (%s)", len(rates),
+                "recorded for " + str(recorded) if foreign
+                else "no last-print stamp")
+        else:
+            self._last_print_ms = None if last is None else int(last)
+            self._funding_history = rates
 
     def _record(self) -> Optional[CarryDecision]:
         """Write the ledger. A failure to write HALTS.

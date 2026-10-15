@@ -175,3 +175,43 @@ def test_symbol_without_proven_8h_cadence_is_refused_even_with_fresh_history():
 def test_btcusdt_is_not_refused_for_cadence():
     e = engine([RICH] * 4, 4 * H8)
     assert tick(e, 5 * H8).reason != "FUNDING_CADENCE_UNPROVEN"
+
+
+# -- persisted state belongs to ONE market -----------------------------------
+
+def test_state_records_the_symbol_it_was_built_on():
+    e = engine([RICH] * 4, 4 * H8)
+    assert e.to_state()["perp_symbol"] == "BTCUSDT"
+
+
+def test_history_from_another_symbol_is_not_restored():
+    btc = engine([RICH] * 4, 4 * H8)
+    other = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+                        execution_mode="acquire", persist=lambda s: None,
+                        perp_symbol="ETHUSDT", spot_symbol="ETHUSDT")
+    other.restore(btc.to_state())
+    assert other._funding_history == []
+    assert other._last_print_ms is None
+
+
+def test_discarded_restore_keeps_a_fresher_warm_up():
+    e = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+                    execution_mode="acquire", persist=lambda s: None)
+    e.warm_funding_history([(FRESH, k * H8) for k in (7, 8, 9)])
+    e.restore({"position": None, "funding_history": [RICH] * 4})  # no stamp
+    assert e._funding_history == [FRESH] * 3
+    assert e._last_print_ms == 9 * H8
+
+
+def test_legacy_state_without_a_symbol_is_accepted_only_for_a_proven_symbol():
+    legacy = {"position": None, "funding_history": [RICH] * 4,
+              "last_print_ms": 4 * H8}
+    eth = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+                      execution_mode="acquire", persist=lambda s: None,
+                      perp_symbol="ETHUSDT", spot_symbol="ETHUSDT")
+    eth.restore(legacy)
+    assert eth._funding_history == []
+    btc = CarryEngine(broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+                      execution_mode="acquire", persist=lambda s: None)
+    btc.restore(legacy)
+    assert btc._funding_history == [RICH] * 4
