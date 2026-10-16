@@ -141,3 +141,33 @@ def test_an_unusable_loop_interval_cannot_blank_the_status():
         s = bot.carry_status()
         assert s.get("blocking_fault") != "STATUS_UNREADABLE", bad
         assert s["liquidation_gate"]["stale"] is False
+
+
+# -- a halted book with a held pair has NO automated protection -------------------
+
+def test_a_halted_book_holding_a_pair_says_nothing_is_managing_it():
+    """on_candle returns at once when HALTED: no margin, liquidation or venue
+    check and no exit runs until a human acts. That is the design; the operator
+    must be told the pair is unmanaged, not only that the book halted."""
+    engine = gated()
+    engine._check_margin()
+    engine._halt("LIQUIDATION_PRICE_UNREADABLE", "one transient read failed")
+    s = status_for(engine)
+    assert s["blocking_fault"] != ""
+    assert "HALTED_WITH_OPEN_PAIR" in s["warnings"]
+    d = engine.on_candle(mark=100_000.0, funding_bps=1.0, spot=100_000.0,
+                         funding_print_ms=1_000)
+    assert d.action == "halted"              # and nothing ran: the warning is true
+
+
+def test_a_halted_flat_book_has_no_open_pair_to_warn_about():
+    engine = gated()
+    engine.position = None
+    engine._halt("MARK_UNREADABLE", "x")
+    assert "HALTED_WITH_OPEN_PAIR" not in status_for(engine)["warnings"]
+
+
+def test_a_running_book_is_not_warned():
+    engine = gated()
+    engine._check_margin()
+    assert "HALTED_WITH_OPEN_PAIR" not in status_for(engine)["warnings"]

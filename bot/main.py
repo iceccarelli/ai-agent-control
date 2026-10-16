@@ -390,6 +390,11 @@ class TradingBot:
             status["liquidation_gate"] = gate
             if gate["stale"]:
                 warnings.append("LIQUIDATION_GATE_NOT_READ")
+            if engine.state.name == "HALTED" and position is not None:
+                # A halted engine returns before every held-pair check, so no
+                # margin, liquidation or venue-position check and no exit runs
+                # until a human acts. Said plainly: the pair is unmanaged.
+                warnings.append("HALTED_WITH_OPEN_PAIR")
             status["warnings"] = warnings
             fault = ""
             if engine.state.name == "HALTED":
