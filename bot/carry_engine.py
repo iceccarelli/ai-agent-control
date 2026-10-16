@@ -1405,6 +1405,16 @@ class CarryEngine:
                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
         return self._check_liquidation_distance()
 
+    def check_venue_position_without_a_view(self) -> Optional[CarryDecision]:
+        """The venue-vs-book size check, for a tick that has no usable
+        market view. It is a direct venue read and needs no mark: a held
+        short that drifted or cannot be read halts the book whatever the
+        state of the price feed. Returns None when flat, already halted, or
+        when the venue agrees with the book. Sends nothing."""
+        if self.position is None or self.state is BookState.HALTED:
+            return None
+        return self._check_venue_position()
+
     def _check_venue_position(self) -> Optional[CarryDecision]:
         """Does the venue's perp short equal the size the book recorded?
 
