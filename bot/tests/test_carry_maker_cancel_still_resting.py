@@ -135,3 +135,53 @@ def test_a_cancel_that_took_still_crosses_the_remainder_once():
     assert float(takers[0]["qty"]) == pytest.approx(0.001 * (1 - PARTIAL))
     assert e.position.perp.filled_qty == pytest.approx(0.001)
     assert not kills
+
+
+def test_a_maker_order_that_filled_before_the_cancel_is_one_whole_leg():
+    """The cancel arrived late: the read-back says Filled with the FULL
+    cumulative quantity. That total replaces the placement's partial figure
+    (it is not added to it) and nothing is crossed."""
+    class FilledLate(StickyVenue):
+        def _request(self, method, endpoint, *, params=None, body=None,
+                     signed=False, retries=3):
+            if endpoint == "/v5/order/realtime":
+                link = params["orderLinkId"]
+                order = next(b for b in self.created
+                             if b["orderLinkId"] == link)
+                if link in self.cancelled:
+                    return envelope({"list": [{
+                        "orderStatus": "Filled", "orderLinkId": link,
+                        "cumExecQty": order["qty"],
+                        "avgPrice": order["price"], "cumExecFee": "0"}]})
+            return super()._request(method, endpoint, params=params,
+                                    body=body, signed=signed, retries=retries)
+
+    v = FilledLate()
+    e, d, kills = drive(v)
+    assert d.action == "opened", d.reason
+    assert not market_orders(v)
+    assert e.position.perp.filled_qty == pytest.approx(0.001)
+    assert e.position.perp.maker_qty == pytest.approx(0.001)
+    assert e.position.perp.taker_qty == 0.0
+    assert not kills
+
+
+def test_an_order_that_vanishes_on_the_post_cancel_read_back_halts():
+    """Ambiguous: the cancel was sent and the venue then returns no row for
+    the id. What it filled is unknown, so nothing may be crossed on top."""
+    class Vanishes(StickyVenue):
+        def _request(self, method, endpoint, *, params=None, body=None,
+                     signed=False, retries=3):
+            if endpoint == "/v5/order/realtime" and \
+                    params["orderLinkId"] in self.cancelled:
+                self.calls.append((method, endpoint, params, body))
+                return envelope({"list": []})
+            return super()._request(method, endpoint, params=params,
+                                    body=body, signed=signed, retries=retries)
+
+    v = Vanishes()
+    e, d, kills = drive(v)
+    assert v.cancelled
+    assert not market_orders(v)
+    assert e.state is BookState.HALTED
+    assert any("MAKER_ORDER_UNCANCELLABLE" in k for k in kills), kills
