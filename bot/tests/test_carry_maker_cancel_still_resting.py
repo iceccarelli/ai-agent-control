@@ -185,3 +185,36 @@ def test_an_order_that_vanishes_on_the_post_cancel_read_back_halts():
     assert not market_orders(v)
     assert e.state is BookState.HALTED
     assert any("MAKER_ORDER_UNCANCELLABLE" in k for k in kills), kills
+
+
+def test_an_unfilled_maker_order_cancelled_cleanly_is_then_taken():
+    """The ordinary maker-first outcome: the post-only rests, nothing fills,
+    the cancel takes, the read-back says Cancelled with cumExecQty 0. That is
+    a definite answer (filled nothing, no longer live), so the engine crosses
+    the whole quantity once. It must not read as 'could not be read back'
+    and halt the book."""
+    class UnfilledThenCancelled(StickyVenue):
+        def _request(self, method, endpoint, *, params=None, body=None,
+                     signed=False, retries=3):
+            if endpoint == "/v5/order/realtime":
+                link = params["orderLinkId"]
+                order = next(b for b in self.created
+                             if b["orderLinkId"] == link)
+                if order.get("timeInForce") == "PostOnly":
+                    self.calls.append((method, endpoint, params, body))
+                    status = "Cancelled" if link in self.cancelled else "New"
+                    return envelope({"list": [{
+                        "orderStatus": status, "orderLinkId": link,
+                        "cumExecQty": "0", "avgPrice": "0",
+                        "cumExecFee": "0"}]})
+            return super()._request(method, endpoint, params=params,
+                                    body=body, signed=signed, retries=retries)
+
+    v = UnfilledThenCancelled()
+    e, d, kills = drive(v)
+    assert not kills, kills
+    assert d.action == "opened", d.reason
+    takers = market_orders(v)
+    assert len(takers) == 1 and float(takers[0]["qty"]) == pytest.approx(0.001)
+    assert e.position.perp.maker_qty == 0.0
+    assert e.position.perp.taker_qty == pytest.approx(0.001)

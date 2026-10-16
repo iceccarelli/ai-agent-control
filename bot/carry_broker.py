@@ -478,8 +478,8 @@ class CarryBroker:
                     f"{link_id}: submission failed ({exc}) and the venue could "
                     f"not be asked what happened ({read_exc}); the order may "
                     "be live") from exc
-            if state is None:
-                return None                # the venue has no such order
+            if state is None or self._rejected(state):
+                return None     # no such order, or terminal with nothing filled
             if state["resting"]:
                 raise OrderOutcomeUnknown(
                     f"{link_id} is {state['status']} at the venue after a "
@@ -498,7 +498,7 @@ class CarryBroker:
                 raise OrderOutcomeUnknown(
                     f"{link_id} was accepted and could not be read back "
                     f"({read_exc}); its fill is unknown") from read_exc
-            if state is None:
+            if state is None or self._rejected(state):
                 resolved = self._query_by_link_id(symbol, link_id, product)
                 if resolved is not None and resolved.filled_qty > 0:
                     return resolved.as_engine_result()
@@ -610,7 +610,7 @@ class CarryBroker:
             # response, the same question decides what to do: does the order
             # exist? The venue is asked rather than the error code guessed.
             state = self._order_state(symbol, link_id, product)
-            if state is None:
+            if state is None or self._rejected(state):
                 logger.info(
                     "post-only %s %s %s not accepted (%s); crossing instead",
                     side, symbol, product, exc)
@@ -621,7 +621,17 @@ class CarryBroker:
             raise PairIncident(
                 f"post-only {link_id} was accepted and then could not be read "
                 "back; whether it rests is unknown")
+        if self._rejected(state):
+            # Accepted, then cancelled by the post-only rule before it rested:
+            # nothing exists and nothing filled. The caller is free to cross.
+            return None
         return state
+
+    @staticmethod
+    def _rejected(state: Dict[str, Any]) -> bool:
+        """A fresh order that is already terminal with nothing filled."""
+        return float(state.get("filled_qty", 0) or 0) <= 0 \
+            and not state.get("resting")
 
     def cancel_order(self, *, symbol: str, order_link_id: str,
                      product: str) -> Dict[str, Any]:
@@ -643,6 +653,9 @@ class CarryBroker:
                         order_link_id, exc)
         state = self._order_state(symbol, order_link_id, product)
         if state is None:
+            # No row at all for an id the venue accepted earlier. Nothing can
+            # be said about what it filled; a cancelled-with-zero-fill order
+            # is NOT this case - it comes back as a row and is a definite 0.
             raise PairIncident(
                 f"{order_link_id} could not be read back after a cancel; what "
                 "it filled is unknown")
@@ -672,10 +685,11 @@ class CarryBroker:
         status = str(row.get("orderStatus", ""))
         filled = float(row.get("cumExecQty", 0) or 0)
         resting = status in self.RESTING_STATUSES
-        if filled <= 0 and not resting:
-            # Rejected, or cancelled by the post-only rule. Nothing exists and
-            # nothing filled: the caller is free to cross.
-            return None
+        # A terminal row with nothing filled is still an ANSWER (the order
+        # existed, filled nothing, and is no longer live). Only the caller
+        # knows whether that means "rejected, cross instead" (a fresh
+        # post-only) or "cancelled clean, take the remainder" (a cancel); it
+        # is reported as-is here and never folded into "no row".
         return {"filled_qty": filled,
                 "avg_price": float(row.get("avgPrice", 0) or 0),
                 "order_link_id": link_id, "fee": self._fee(row),
