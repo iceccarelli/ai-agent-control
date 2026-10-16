@@ -73,6 +73,7 @@ the next print's rate, which is the future.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import os
@@ -150,6 +151,70 @@ class LiquidationInputs:
             raise ValueError("liq_price must be callable")
 
     @classmethod
+    def from_observations(cls, observations: Sequence[Dict[str, Any]], *,
+                          source: str, max_age_ms: int = 8 * 3600 * 1000
+                          ) -> "LiquidationInputs":
+        """RECORDED evidence: what the production gate actually read from the
+        venue (`StateStore.load_risk_observations`), for replaying the window
+        it was recorded in.
+
+        For each bar the latest observation AT OR BEFORE the bar is used -
+        never a later one. Nothing earlier than `max_age_ms` (one funding
+        interval, the span a bar summarises) is reused, and a bar with no
+        usable observation is refused, not defaulted: the engine then halts
+        on an unreadable liquidation price or skips the tick, exactly as it
+        does live. A recorded `liq_price` of None is accepted only when the
+        venue said so (BEYOND_VENUE_PRICE_BOUNDS).
+        """
+        if not observations:
+            raise ValueError("no observations to build evidence from")
+        if not str(source).strip():
+            raise ValueError("liquidation inputs must name their source")
+        if not (isinstance(max_age_ms, int) and max_age_ms > 0):
+            raise ValueError("max_age_ms must be a positive integer")
+        ordered = sorted((dict(o) for o in observations),
+                         key=lambda o: int(o["ms"]))
+        stamps = [int(o["ms"]) for o in ordered]
+
+        def latest(bar: Any) -> Dict[str, Any]:
+            i = bisect.bisect_right(stamps, int(bar.ms)) - 1
+            if i < 0:
+                raise LiquidationEvidenceMissing(
+                    f"no observation at or before {cb._iso_ms(int(bar.ms))}")
+            age = int(bar.ms) - stamps[i]
+            if age > max_age_ms:
+                raise LiquidationEvidenceInvalid(
+                    f"the latest observation is {age / 3.6e6:.1f}h older than "
+                    f"{cb._iso_ms(int(bar.ms))} (limit "
+                    f"{max_age_ms / 3.6e6:.1f}h)")
+            return ordered[i]
+
+        def liq_price(_entry: float, bar: Any) -> Optional[float]:
+            o = latest(bar)
+            if o.get("liq_price") is None:
+                if o.get("reason") != "BEYOND_VENUE_PRICE_BOUNDS":
+                    raise LiquidationEvidenceInvalid(
+                        f"observation at {o['ms']} has no liquidation price "
+                        f"and the venue did not call it unreachable "
+                        f"({o.get('reason')!r})")
+                return None
+            return o["liq_price"]
+
+        def account_mm_rate(bar: Any) -> Optional[float]:
+            return latest(bar).get("account_mm_rate")
+
+        def margin_multiple(bar: Any) -> float:
+            value = latest(bar).get("margin_multiple")
+            if value is None:
+                raise LiquidationEvidenceInvalid(
+                    "the observation states no margin ratio")
+            return value
+
+        return cls(kind="recorded", source=source, liq_price=liq_price,
+                   account_mm_rate=account_mm_rate,
+                   margin_multiple=margin_multiple)
+
+    @classmethod
     def declared_isolated(cls, leverage: float, source: str
                           ) -> "LiquidationInputs":
         """A DECLARED scenario: an isolated-margin short at `leverage`, its
@@ -163,6 +228,31 @@ class LiquidationInputs:
                              f"not {leverage!r}")
         return cls(kind="declared", source=source,
                    liq_price=lambda entry, _bar: entry * (1.0 + 1.0 / lev))
+
+
+def recorded_liquidation_from_db(path: str) -> LiquidationInputs:
+    """Recorded evidence from a state database, opened READ-ONLY. Refuses a
+    missing database, a database without the table, and one with no rows."""
+    import sqlite3
+    if not os.path.isfile(path):
+        raise ReplayRefusal(f"{path} does not exist")
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = [dict(r) for r in con.execute(
+                "SELECT * FROM carry_risk_observation ORDER BY ms")]
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise ReplayRefusal(f"{path}: no readable risk observations "
+                            f"({exc})") from exc
+    if not rows:
+        raise ReplayRefusal(f"{path} holds no risk observations")
+    label = (f"state db {os.path.basename(path)} ({len(rows)} observations, "
+             f"{cb._iso_ms(int(rows[0]['ms']))} .. "
+             f"{cb._iso_ms(int(rows[-1]['ms']))})")
+    return LiquidationInputs.from_observations(rows, source=label)
 
 
 def _min_liquidation_distance_pct() -> float:
@@ -623,9 +713,11 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         # time; without it every snapshot is years old and `assert_fresh`
         # refuses the whole corpus — which is itself worth knowing.
         with mock.patch("market_snapshot.time.time", lambda: now_s):
-            view = take_snapshot(broker, perp_symbol="BTCUSDT",
-                                 spot_symbol="BTCUSDT", now_s=now_s)
             try:
+                # main.tick wraps BOTH in one try: a view that cannot be built
+                # (an unreadable margin, say) skips the tick; it never crashes.
+                view = take_snapshot(broker, perp_symbol="BTCUSDT",
+                                     spot_symbol="BTCUSDT", now_s=now_s)
                 view.assert_fresh()
             except Exception as exc:                        # noqa: BLE001
                 reasons["SNAPSHOT_REFUSED"] = \
@@ -939,6 +1031,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "liquidation = entry x (1 + 1/N), initial margin "
                          "only. Runs the production gate on the interval's "
                          "adverse high")
+    ap.add_argument("--recorded-liquidation-db", default="", metavar="DB",
+                    help="RECORDED evidence: replay on the liquidation reads "
+                         "the production gate saved to this state database "
+                         "(opened read-only). Use with --bars covering the "
+                         "recorded window; a bar with no observation at or "
+                         "before it is refused, not defaulted")
     ap.add_argument("--json", default="")
     args = ap.parse_args(argv)
 
@@ -951,6 +1049,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     impact = (0.0 if args.no_impact
               else cb.impact_bps_per_leg(args.repo, args.notional)[0])
     evidence = None
+    if args.recorded_liquidation_db and \
+            args.declare_isolated_leverage is not None:
+        ap.error("recorded and declared liquidation evidence are exclusive")
+    if args.recorded_liquidation_db:
+        evidence = recorded_liquidation_from_db(args.recorded_liquidation_db)
     if args.declare_isolated_leverage is not None:
         evidence = LiquidationInputs.declared_isolated(
             args.declare_isolated_leverage,

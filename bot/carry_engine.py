@@ -443,7 +443,8 @@ class CarryEngine:
                  persist: Any,
                  execution_style: str = TAKER,
                  maker_wait_s: float = DEFAULT_MAKER_WAIT_S,
-                 require_liquidation_check: bool = False) -> None:
+                 require_liquidation_check: bool = False,
+                 risk_observer: Any = None) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -481,6 +482,11 @@ class CarryEngine:
         # test. A live book that cannot read its own liquidation price halts;
         # a test double that was never asked to model one does not.
         self.require_liquidation_check = bool(require_liquidation_check)
+        #: Called with what the liquidation gate read on each held tick, so the
+        #: venue's own numbers (liqPrice, accountMMRate, IM/MM) are kept for a
+        #: later replay. Observation only: its failure never touches a decision.
+        self.risk_observer = risk_observer
+        self._last_margin: Optional[float] = None
         self.persist = persist
         self.execution_mode = execution_mode
         self.broker = broker
@@ -1398,6 +1404,7 @@ class CarryEngine:
 
     def _check_margin(self) -> Optional[CarryDecision]:
         margin = self._margin_multiple()
+        self._last_margin = margin
         if margin is None:
             return self._halt("MARGIN_UNREADABLE",
                               "an unreadable margin is a margin call you cannot see")
@@ -1568,6 +1575,7 @@ class CarryEngine:
                 f"liquidation ({type(exc).__name__}: {exc}); an unreadable "
                 "liquidation price is a margin call you cannot see")
 
+        self._observe_risk(view)
         rate = view.get("account_mm_rate")
         if rate is not None and self._finite(rate) \
                 and float(rate) >= MAX_ACCOUNT_MM_RATE:
@@ -1597,6 +1605,26 @@ class CarryEngine:
                 self.broker.get_mark(self.perp_symbol),
                 f"LIQUIDATION_{float(distance):.1f}PCT_AWAY_BELOW_FLOOR")
         return None
+
+    def _observe_risk(self, view: Dict[str, Any]) -> None:
+        """Hand the gate's read to the observer. Observation only: whatever
+        goes wrong here is logged and ignored, never a trading decision."""
+        observer = self.risk_observer
+        if observer is None:
+            return
+        try:
+            observer({
+                "ms": int(self._last_tick_ms or time.time() * 1000),
+                "symbol": self.perp_symbol, "side": view.get("side", ""),
+                "size": view.get("size"), "mark": view.get("mark"),
+                "liq_price": view.get("liq_price"),
+                "distance_pct": view.get("distance_pct"),
+                "account_mm_rate": view.get("account_mm_rate"),
+                "margin_multiple": self._last_margin,
+                "reason": view.get("reason", "")})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("carry: risk observation not recorded (%s: %s)",
+                           type(exc).__name__, exc)
 
     def _margin_multiple(self) -> Optional[float]:
         try:

@@ -1454,6 +1454,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # never asked to model a liquidation price are unaffected; ON
             # here, because this is the one that loses the position.
             require_liquidation_check=True,
+            # What that gate reads each held tick is kept (additive table, no
+            # new venue request) so a later replay can run on the venue's own
+            # numbers. A store without the method records nothing and says so.
+            risk_observer=getattr(bot.store, "record_risk_observation", None),
             # THE LEDGER (0037). Called by the engine on every state change,
             # straight through to the store. Not a hasattr guard and not a
             # lambda that swallows: a store without this method is a
