@@ -454,13 +454,27 @@ class CarryBroker:
                 logger.warning(
                     "duplicate orderLinkId %s (retCode %s) - the first attempt "
                     "landed; resolving by query", link_id, ret_code)
-                resolved = self._query_by_link_id(symbol, link_id, product)
-                if resolved is not None:
-                    resolved.was_duplicate = True
-                    return resolved.as_engine_result()
-                raise OrderOutcomeUnknown(
-                    f"orderLinkId {link_id} exists at the venue but could not "
-                    "be read back; a leg may be live and unhedged") from exc
+                try:
+                    state = self._order_state(symbol, link_id, product)
+                except Exception as read_exc:  # noqa: BLE001
+                    state = None
+                    logger.error("could not read back %s: %s", link_id, read_exc)
+                if state is None:
+                    raise OrderOutcomeUnknown(
+                        f"orderLinkId {link_id} exists at the venue but could "
+                        "not be read back; a leg may be live and unhedged"
+                    ) from exc
+                if self._rejected(state):
+                    return None     # it existed, is final, and filled nothing
+                if state["resting"]:
+                    # The first attempt is still live. "It did not fill" is
+                    # not established, and a fresh order on top of it is the
+                    # duplicate this branch exists to prevent.
+                    raise OrderOutcomeUnknown(
+                        f"orderLinkId {link_id} is {state['status']!r} at the "
+                        "venue after a duplicate-id rejection; what it will "
+                        "fill is unknown") from exc
+                return self._engine_result_from_state(state)
             if self._definitively_rejected(exc):
                 logger.error("leg %s %s %s rejected: %s",
                              side, symbol, product, exc)
@@ -479,7 +493,14 @@ class CarryBroker:
                     f"not be asked what happened ({read_exc}); the order may "
                     "be live") from exc
             if state is None:
-                return None                # the venue has no such order
+                # This branch is only reached without a venue retCode. No
+                # answer and no row: the request may still be processed.
+                raise OrderOutcomeUnknown(
+                    f"{link_id}: submission got no answer from the venue "
+                    f"({exc}) and the venue shows no row for it yet; the "
+                    "request may still land") from exc
+            if self._rejected(state):
+                return None     # it existed, is final, and filled nothing
             if state["resting"]:
                 raise OrderOutcomeUnknown(
                     f"{link_id} is {state['status']} at the venue after a "
@@ -499,9 +520,10 @@ class CarryBroker:
                     f"{link_id} was accepted and could not be read back "
                     f"({read_exc}); its fill is unknown") from read_exc
             if state is None:
-                resolved = self._query_by_link_id(symbol, link_id, product)
-                if resolved is not None and resolved.filled_qty > 0:
-                    return resolved.as_engine_result()
+                raise OrderOutcomeUnknown(
+                    f"{link_id} was accepted and the venue then shows no row "
+                    "for it; its fill is unknown")
+            if self._rejected(state):
                 return None            # terminal with nothing filled
             if state["resting"] and state["filled_qty"] <= 0:
                 raise OrderOutcomeUnknown(
@@ -534,6 +556,28 @@ class CarryBroker:
                 "fee": state["fee"], "fee_detail": state["fee_detail"]}
 
     # -- resting orders (0040) --------------------------------------------
+
+    def get_venue_time_s(self) -> float:
+        """The venue's clock, in epoch seconds. PUBLIC `/v5/market/time`: no
+        key, no signature.
+
+        `market_snapshot.take_snapshot` checks it against the local clock
+        when the broker offers it; without this reader the live book was
+        never clock-checked (`clock_checked` always False) while the shadow
+        book was. Raises when the venue does not answer with a time; the
+        snapshot then records the check as not made rather than assuming
+        the clocks agree.
+        """
+        result = self._v5_result(
+            self.client._request("GET", "/v5/market/time", signed=False))
+        try:
+            seconds = float(result.get("timeSecond"))
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"venue time is not a time: {result!r}") from exc
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise PairIncident(f"venue time is not a time: {result!r}")
+        return seconds
 
     def get_book_top(self, symbol: str, product: str) -> Dict[str, float]:
         """`{bid, ask}` — the touch, as the venue publishes it.
@@ -610,7 +654,14 @@ class CarryBroker:
             # response, the same question decides what to do: does the order
             # exist? The venue is asked rather than the error code guessed.
             state = self._order_state(symbol, link_id, product)
-            if state is None:
+            if state is None and not self._definitively_rejected(exc):
+                # No venue answer AND no row: the request may be queued and
+                # land after this read. Crossing now could make two legs.
+                raise PairIncident(
+                    f"post-only {link_id} got no answer from the venue "
+                    f"({exc}) and the venue shows no row for it yet; the "
+                    "request may still land") from exc
+            if state is None or self._rejected(state):
                 logger.info(
                     "post-only %s %s %s not accepted (%s); crossing instead",
                     side, symbol, product, exc)
@@ -621,7 +672,17 @@ class CarryBroker:
             raise PairIncident(
                 f"post-only {link_id} was accepted and then could not be read "
                 "back; whether it rests is unknown")
+        if self._rejected(state):
+            # Accepted, then cancelled by the post-only rule before it rested:
+            # nothing exists and nothing filled. The caller is free to cross.
+            return None
         return state
+
+    @staticmethod
+    def _rejected(state: Dict[str, Any]) -> bool:
+        """A fresh order that is already terminal with nothing filled."""
+        return float(state.get("filled_qty", 0) or 0) <= 0 \
+            and not state.get("resting")
 
     def cancel_order(self, *, symbol: str, order_link_id: str,
                      product: str) -> Dict[str, Any]:
@@ -643,15 +704,23 @@ class CarryBroker:
                         order_link_id, exc)
         state = self._order_state(symbol, order_link_id, product)
         if state is None:
+            # No row at all for an id the venue accepted earlier. Nothing can
+            # be said about what it filled; a cancelled-with-zero-fill order
+            # is NOT this case - it comes back as a row and is a definite 0.
             raise PairIncident(
                 f"{order_link_id} could not be read back after a cancel; what "
                 "it filled is unknown")
         return state
 
-    #: Order statuses that mean the order can still fill. Anything else is
-    #: terminal: what it filled is what it will ever fill.
-    RESTING_STATUSES = frozenset({"New", "Created", "PartiallyFilled",
-                                  "Untriggered"})
+    @staticmethod
+    def _terminal_statuses():
+        """The statuses Bybit documents as final, from the one place the
+        client keeps them. Anything else - an open status, a status this code
+        has never seen, or no status at all - is an order that may still
+        fill. The old list here named the RESTING statuses and called
+        everything else terminal, so a truncated row read as a dead order."""
+        import bybit_connection as _bybit_connection
+        return _bybit_connection.TERMINAL_ORDER_STATUS
 
     def _order_state(self, symbol: str, link_id: str,
                      product: str) -> Optional[Dict[str, Any]]:
@@ -661,23 +730,42 @@ class CarryBroker:
         has just been asked to create, that means the order was rejected and
         does not exist.
         """
-        result = self.client._request(
-            "GET", "/v5/order/realtime", signed=True,
-            params={"category": product, "symbol": symbol,
-                    "orderLinkId": link_id})
+        params = {"category": product, "symbol": symbol,
+                  "orderLinkId": link_id}
+        result = self.client._request("GET", "/v5/order/realtime",
+                                      signed=True, params=params)
         rows = self._v5_list(result) or []
         if not rows:
-            return None
+            # Realtime lists OPEN orders. One that filled, was cancelled or
+            # was rejected has left it and is in the history list - the
+            # directional client learned this live ("a filled market order
+            # was always a 404", BybitClient.get_order). Only when neither
+            # list has the id is there no row.
+            result = self.client._request("GET", "/v5/order/history",
+                                          signed=True, params=params)
+            rows = self._v5_list(result) or []
+            if not rows:
+                return None
         row = rows[0]
-        status = str(row.get("orderStatus", ""))
-        filled = float(row.get("cumExecQty", 0) or 0)
-        resting = status in self.RESTING_STATUSES
-        if filled <= 0 and not resting:
-            # Rejected, or cancelled by the post-only rule. Nothing exists and
-            # nothing filled: the caller is free to cross.
-            return None
+        status = str(row.get("orderStatus") or "")
+        filled = self._stated(row, "cumExecQty", f"order {link_id}")
+        if filled > 0:
+            avg = self._stated(row, "avgPrice", f"order {link_id}")
+            if avg <= 0:
+                raise PairIncident(
+                    f"order {link_id} filled {filled} with no usable "
+                    f"avgPrice: {row!r}; a fill without a price cannot be "
+                    "booked")
+        # Fail closed: only a documented terminal status is final.
+        resting = status not in self._terminal_statuses()
+        # A terminal row with nothing filled is still an ANSWER (the order
+        # existed, filled nothing, and is no longer live). Only the caller
+        # knows whether that means "rejected, cross instead" (a fresh
+        # post-only) or "cancelled clean, take the remainder" (a cancel); it
+        # is reported as-is here and never folded into "no row".
         return {"filled_qty": filled,
-                "avg_price": float(row.get("avgPrice", 0) or 0),
+                "avg_price": (float(row.get("avgPrice") or 0)
+                              if filled > 0 else 0.0),
                 "order_link_id": link_id, "fee": self._fee(row),
                 "fee_detail": self._fee_detail(row),
                 "maker": True, "resting": resting, "status": status}
@@ -878,8 +966,9 @@ class CarryBroker:
         for entry in coins:
             if str(entry.get("coin", "")).upper() != coin.upper():
                 continue
+            balance = self._stated(entry, "walletBalance",
+                                   f"wallet row for {coin}")
             try:
-                balance = float(entry.get("walletBalance", 0) or 0)
                 locked = float(entry.get("locked", 0) or 0)
             except (TypeError, ValueError) as exc:
                 raise PairIncident(
@@ -969,8 +1058,8 @@ class CarryBroker:
                     "reason": "NO_POSITION"}
 
         row = rows[0]
+        size = self._stated_size(row, symbol)
         try:
-            size = abs(float(row.get("size", 0) or 0))
             mark = float(row.get("markPrice", 0) or 0)
         except (TypeError, ValueError) as exc:
             raise PairIncident(
@@ -1002,10 +1091,15 @@ class CarryBroker:
             raise PairIncident(
                 f"liqPrice for {symbol} is {raw_liq!r}") from exc
         if not (math.isfinite(liq) and liq > 0 and mark > 0):
-            return {"size": size, "side": side, "mark": mark,
-                    "liq_price": None, "distance_pct": None,
-                    "account_mm_rate": account_mm,
-                    "reason": "LIQ_PRICE_UNUSABLE"}
+            # The venue named a liquidation price and it cannot be measured
+            # (nan, zero, negative, or no usable mark to measure it from).
+            # Only "" means unreachable; anything else unusable is an
+            # unreadable margin call, and the engine halts on it. It used to
+            # come back as distance None, which the engine reads as safe.
+            raise PairIncident(
+                f"liqPrice {raw_liq!r} with mark {mark!r} for {symbol} cannot "
+                "be measured; an unusable liquidation price is not an "
+                "unreachable one")
 
         # A short is liquidated ABOVE the mark, a long below. Either way the
         # answer is a positive distance to the bad side.
@@ -1311,14 +1405,7 @@ class CarryBroker:
         # side, is refused rather than summed into the short.
         total = 0.0
         for row in rows:
-            try:
-                size = abs(float(row.get("size", 0) or 0))
-            except (TypeError, ValueError, AttributeError) as exc:
-                raise PairIncident(
-                    f"position row for {symbol} is malformed: {row!r}") from exc
-            if not math.isfinite(size):
-                raise PairIncident(
-                    f"position row for {symbol} is malformed: {row!r}")
+            size = self._stated_size(row, symbol)
             if size == 0.0:
                 continue
             # positionIdx: 0 one-way, 1 hedge-mode LONG slot, 2 hedge-mode SHORT
@@ -1417,32 +1504,14 @@ class CarryBroker:
             if not rows:
                 return 0.0
             coins = rows[0].get("coin") or []
-            return float(coins[0].get("walletBalance", 0) or 0) if coins else 0.0
+            return (self._stated(coins[0], "walletBalance",
+                                 f"wallet row for {symbol[:-4]}")
+                    if coins else 0.0)
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})
         rows = self._v5_list(result) or []
-        return abs(float(rows[0].get("size", 0) or 0)) if rows else 0.0
-
-    def _query_by_link_id(self, symbol: str, link_id: str,
-                          product: str) -> Optional[LegFill]:
-        try:
-            result = self.client._request(
-                "GET", "/v5/order/realtime", signed=True,
-                params={"category": product, "symbol": symbol,
-                        "orderLinkId": link_id})
-        except Exception as exc:  # noqa: BLE001
-            logger.error("could not read back %s: %s", link_id, exc)
-            return None
-        rows = self._v5_list(result) or []
-        if not rows:
-            return None
-        row = rows[0]
-        return LegFill(
-            filled_qty=float(row.get("cumExecQty", 0) or 0),
-            avg_price=float(row.get("avgPrice", 0) or 0),
-            order_link_id=link_id, fee=CarryBroker._fee(row),
-            fee_detail=CarryBroker._fee_detail(row), detail=dict(row))
+        return self._stated_size(rows[0], symbol) if rows else 0.0
 
     # -- Bybit v5 envelope --------------------------------------------------
     #
@@ -1462,6 +1531,32 @@ class CarryBroker:
     def _v5_result(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """The `result` object of a Bybit v5 envelope."""
         return (payload or {}).get("result") or {}
+
+    @staticmethod
+    def _stated(row: Any, key: str, what: str) -> float:
+        """A finite number the venue STATES in `row[key]`. Absent, null, blank,
+        not a number, or non-finite is unreadable: every one of those used to
+        be read as 0 (`float(row.get(key, 0) or 0)`), which is flat, empty or
+        "filled nothing" - the permissive answer - for a truncated payload."""
+        raw = row.get(key) if isinstance(row, dict) else None
+        if raw is None or str(raw).strip() == "":
+            raise PairIncident(
+                f"{what} does not state {key!r}: {row!r}; an unstated number "
+                "is not zero")
+        try:
+            number = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(f"{what} is malformed: {row!r}") from exc
+        if not math.isfinite(number):
+            raise PairIncident(f"{what} is malformed: {row!r}")
+        return number
+
+    @staticmethod
+    def _stated_size(row: Any, symbol: str) -> float:
+        """The unsigned size a position row STATES. Bybit spells flat as the
+        string "0" (a flat row is proven live to carry it)."""
+        return abs(CarryBroker._stated(row, "size",
+                                       f"position row for {symbol}"))
 
     @staticmethod
     def _v5_list(payload: Optional[Dict[str, Any]]) -> Optional[list]:
@@ -1503,7 +1598,7 @@ class CarryBroker:
         Real Bybit create responses carry only `orderId` in `result` - no
         `cumExecQty`/`avgPrice` - so this legitimately returns a zero fill
         most of the time even after the correct unwrap; that is what sends
-        `place_market` to `_query_by_link_id` next. FakeClients in the test
+        `place_market` to `_order_state` next. FakeClients in the test
         suite simulate an immediate fill for convenience and now do so
         inside a real envelope's `result`, not at its top level.
         """

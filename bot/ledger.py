@@ -1197,6 +1197,14 @@ class LedgerBroker:
     def get_spot_inventory(self, symbol):
         return self.inner.get_spot_inventory(symbol)
 
+    def get_venue_time_s(self):
+        return self.inner.get_venue_time_s()
+
+    def get_position_mode(self, symbol):
+        # Cold start refuses a hedge-mode account through THIS method; a
+        # wrapper that did not forward it made that check silently vanish.
+        return self.inner.get_position_mode(symbol)
+
     def get_perp_position(self, symbol):
         return self.inner.get_perp_position(symbol)
 

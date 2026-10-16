@@ -443,7 +443,8 @@ class CarryEngine:
                  persist: Any,
                  execution_style: str = TAKER,
                  maker_wait_s: float = DEFAULT_MAKER_WAIT_S,
-                 require_liquidation_check: bool = False) -> None:
+                 require_liquidation_check: bool = False,
+                 risk_observer: Any = None) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -481,6 +482,11 @@ class CarryEngine:
         # test. A live book that cannot read its own liquidation price halts;
         # a test double that was never asked to model one does not.
         self.require_liquidation_check = bool(require_liquidation_check)
+        #: Called with what the liquidation gate read on each held tick, so the
+        #: venue's own numbers (liqPrice, accountMMRate, IM/MM) are kept for a
+        #: later replay. Observation only: its failure never touches a decision.
+        self.risk_observer = risk_observer
+        self._last_margin: Optional[float] = None
         self.persist = persist
         self.execution_mode = execution_mode
         self.broker = broker
@@ -1398,6 +1404,7 @@ class CarryEngine:
 
     def _check_margin(self) -> Optional[CarryDecision]:
         margin = self._margin_multiple()
+        self._last_margin = margin
         if margin is None:
             return self._halt("MARGIN_UNREADABLE",
                               "an unreadable margin is a margin call you cannot see")
@@ -1405,6 +1412,16 @@ class CarryEngine:
             return self._unwind(self.broker.get_mark(self.perp_symbol),
                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
         return self._check_liquidation_distance()
+
+    def check_venue_position_without_a_view(self) -> Optional[CarryDecision]:
+        """The venue-vs-book size check, for a tick that has no usable
+        market view. It is a direct venue read and needs no mark: a held
+        short that drifted or cannot be read halts the book whatever the
+        state of the price feed. Returns None when flat, already halted, or
+        when the venue agrees with the book. Sends nothing."""
+        if self.position is None or self.state is BookState.HALTED:
+            return None
+        return self._check_venue_position()
 
     def _check_venue_position(self) -> Optional[CarryDecision]:
         """Does the venue's perp short equal the size the book recorded?
@@ -1558,6 +1575,7 @@ class CarryEngine:
                 f"liquidation ({type(exc).__name__}: {exc}); an unreadable "
                 "liquidation price is a margin call you cannot see")
 
+        self._observe_risk(view)
         rate = view.get("account_mm_rate")
         if rate is not None and self._finite(rate) \
                 and float(rate) >= MAX_ACCOUNT_MM_RATE:
@@ -1566,6 +1584,13 @@ class CarryEngine:
                 f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
 
         distance = view.get("distance_pct")
+        if distance is None and view.get("reason") == "LIQ_PRICE_UNUSABLE":
+            # A broker that names the price unusable has NOT said it is
+            # unreachable. Reading None as safe here skipped the gate.
+            return self._halt(
+                "LIQUIDATION_DISTANCE_UNUSABLE",
+                "the venue named a liquidation price that cannot be measured; "
+                "an unusable price is not an unreachable one")
         if distance is None:
             # Bybit returns "" for liqPrice when it lies outside the venue's
             # price bounds: there is no reachable liquidation price, which is
@@ -1580,6 +1605,26 @@ class CarryEngine:
                 self.broker.get_mark(self.perp_symbol),
                 f"LIQUIDATION_{float(distance):.1f}PCT_AWAY_BELOW_FLOOR")
         return None
+
+    def _observe_risk(self, view: Dict[str, Any]) -> None:
+        """Hand the gate's read to the observer. Observation only: whatever
+        goes wrong here is logged and ignored, never a trading decision."""
+        observer = self.risk_observer
+        if observer is None:
+            return
+        try:
+            observer({
+                "ms": int(self._last_tick_ms or time.time() * 1000),
+                "symbol": self.perp_symbol, "side": view.get("side", ""),
+                "size": view.get("size"), "mark": view.get("mark"),
+                "liq_price": view.get("liq_price"),
+                "distance_pct": view.get("distance_pct"),
+                "account_mm_rate": view.get("account_mm_rate"),
+                "margin_multiple": self._last_margin,
+                "reason": view.get("reason", "")})
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("carry: risk observation not recorded (%s: %s)",
+                           type(exc).__name__, exc)
 
     def _margin_multiple(self) -> Optional[float]:
         try:
@@ -1734,6 +1779,20 @@ class CarryEngine:
                 "MAKER_ORDER_UNCANCELLABLE",
                 f"a post-only {side} of {qty} {symbol} could not be cancelled "
                 f"or read back ({exc}); what it has filled is unknown")
+            return None
+        if (final or {}).get("resting"):
+            # The cancel did not take: the venue still shows the order live
+            # (rejected, rate-limited, or not applied yet). It can fill after
+            # this, so crossing the remainder now is a second leg on top of a
+            # first the book has not finished counting.
+            self._last_leg_error = (
+                f"maker order still {(final or {}).get('status')!r} after cancel")
+            self._halt(
+                "MAKER_ORDER_STILL_RESTING",
+                f"a post-only {side} of {qty} {symbol} is still resting after "
+                f"its cancel (status {(final or {}).get('status')!r}, filled "
+                f"{(final or {}).get('filled_qty')!r}); crossing on top of it "
+                "would open a second leg, so the book stops instead")
             return None
         total = float((final or {}).get("filled_qty", 0.0) or 0.0)
         if total > leg.filled_qty:

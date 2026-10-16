@@ -455,6 +455,26 @@ CREATE TABLE IF NOT EXISTS carry_ledger (
     updated_epoch REAL NOT NULL DEFAULT 0.0
 );
 
+-- What the production liquidation gate READ from the venue on each held tick:
+-- the position's liqPrice (NULL = the venue called it unreachable), the account
+-- maintenance-margin rate and the IM/MM ratio. Immutable (a row is never
+-- rewritten) and additive: it is how a later replay of the same window runs on
+-- the venue's own numbers instead of an assumption. The reads are the ones the
+-- gate already makes; recording them sends nothing.
+CREATE TABLE IF NOT EXISTS carry_risk_observation (
+    ms              INTEGER PRIMARY KEY,
+    symbol          TEXT NOT NULL,
+    side            TEXT NOT NULL DEFAULT '',
+    size            REAL NOT NULL DEFAULT 0.0,
+    mark            REAL NOT NULL DEFAULT 0.0,
+    liq_price       REAL,
+    distance_pct    REAL,
+    account_mm_rate REAL,
+    margin_multiple REAL,
+    reason          TEXT NOT NULL DEFAULT '',
+    recorded_epoch  REAL NOT NULL DEFAULT 0.0
+);
+
 -- Additive indexes for the memory reads.  Both are over existing tables and
 -- change no existing behaviour; they only stop the health thread's aggregate
 -- reads from turning into full scans as the ledger grows.
@@ -965,6 +985,45 @@ class StateStore:
             "updated_epoch = excluded.updated_epoch",
             (len(rows), payload, utc_now_epoch()),
         )
+
+    def record_risk_observation(self, obs: Dict[str, Any]) -> None:
+        """Persist one tick's liquidation-gate read. Immutable: a second
+        observation for the same millisecond is ignored, never an overwrite.
+        Optional numbers stay NULL when the venue did not state them."""
+        def num(key: str) -> Optional[float]:
+            value = obs.get(key)
+            if value is None:
+                return None
+            number = float(value)
+            return number if number == number and abs(number) != float("inf") \
+                else None
+        self._exec(
+            "INSERT OR IGNORE INTO carry_risk_observation(ms, symbol, side, "
+            "size, mark, liq_price, distance_pct, account_mm_rate, "
+            "margin_multiple, reason, recorded_epoch) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (int(obs["ms"]), str(obs.get("symbol", "")),
+             str(obs.get("side", "")), float(obs.get("size") or 0.0),
+             float(obs.get("mark") or 0.0), num("liq_price"),
+             num("distance_pct"), num("account_mm_rate"),
+             num("margin_multiple"), str(obs.get("reason", "")),
+             utc_now_epoch()))
+
+    def load_risk_observations(self, since_ms: Optional[int] = None,
+                               until_ms: Optional[int] = None
+                               ) -> List[Dict[str, Any]]:
+        """Recorded gate reads in time order, optionally within a window."""
+        sql = "SELECT * FROM carry_risk_observation WHERE 1=1"
+        args: List[Any] = []
+        if since_ms is not None:
+            sql += " AND ms >= ?"
+            args.append(int(since_ms))
+        if until_ms is not None:
+            sql += " AND ms <= ?"
+            args.append(int(until_ms))
+        sql += " ORDER BY ms"
+        return [{k: r[k] for k in r.keys() if k != "recorded_epoch"}
+                for r in self._query(sql, tuple(args))]
 
     def load_ledger(self) -> Optional[List[Dict[str, Any]]]:
         """Every entry ever posted, or None when no journal has run here.

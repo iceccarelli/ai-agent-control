@@ -886,6 +886,19 @@ class TradingBot:
                     "action": "skipped", "reason": "MARKET_VIEW_UNUSABLE",
                     "error": f"{type(exc).__name__}: {exc}",
                     "at_ms": int(time.time() * 1000)}
+                # A held pair is not blinded by a bad view: the venue's own
+                # size is read directly and a drifted or unreadable short
+                # halts the book now, not when the feed happens to recover.
+                watched = self.carry.check_venue_position_without_a_view()
+                if watched is not None:
+                    self._last_carry_decision = {
+                        "action": str(watched.action),
+                        "reason": str(watched.reason),
+                        "state": watched.state.value,
+                        "at_ms": int(time.time() * 1000)}
+                    logger.critical(
+                        "carry book HALTED without a market view: %s",
+                        watched.reason)
                 return
             mark, spot = view.perp_mark, view.spot_mark
             # An accounting journal that cannot be written down is a book whose
@@ -1441,6 +1454,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # never asked to model a liquidation price are unaffected; ON
             # here, because this is the one that loses the position.
             require_liquidation_check=True,
+            # What that gate reads each held tick is kept (additive table, no
+            # new venue request) so a later replay can run on the venue's own
+            # numbers. A store without the method records nothing and says so.
+            risk_observer=getattr(bot.store, "record_risk_observation", None),
             # THE LEDGER (0037). Called by the engine on every state change,
             # straight through to the store. Not a hasattr guard and not a
             # lambda that swallows: a store without this method is a

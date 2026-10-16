@@ -170,3 +170,54 @@ def test_cold_start_with_an_unrecorded_short_does_not_start():
     bot, client = cold_bot([SHORT])
     assert bot.carry_cold_start() is False
     assert not client.created
+
+
+# -- a position row that does not STATE its size is unreadable, not flat --------
+#
+# `get_perp_position` read `float(row.get("size", 0) or 0)` and skipped zero
+# rows, so a row saying `side: Sell` with a missing, null or empty `size`
+# (a truncated or malformed payload) read as FLAT. Cold start then called a
+# book holding a live short CLEAN and could open a second hedge against the
+# same liquidation price; the liquidation view read the same row as
+# NO_POSITION and skipped its gate. Bybit sends "0" for a flat row.
+
+UNSTATED_SIZE = [
+    {"side": "Sell", "positionIdx": 0},                      # key absent
+    {"side": "Sell", "size": None, "positionIdx": 0},        # null
+    {"side": "Sell", "size": "", "positionIdx": 0},          # blank
+    {"side": "Sell", "size": "  ", "positionIdx": 0},
+]
+
+
+@pytest.mark.parametrize("row", UNSTATED_SIZE,
+                         ids=["absent", "null", "blank", "spaces"])
+def test_a_position_row_without_a_stated_size_is_not_flat(row):
+    from carry_broker import PairIncident
+    b = broker_with_rows(row)
+    with pytest.raises(PairIncident):
+        b.get_perp_position("BTCUSDT")
+    with pytest.raises(PairIncident):
+        b.get_liquidation_view("BTCUSDT")
+
+
+@pytest.mark.parametrize("row", UNSTATED_SIZE,
+                         ids=["absent", "null", "blank", "spaces"])
+def test_cold_start_does_not_start_on_a_row_that_hides_its_size(row):
+    bot, client = cold_bot([row])
+    assert bot.carry_cold_start() is False
+    assert not client.created
+
+
+def test_a_row_that_states_zero_is_still_flat():
+    """Bybit's own spelling of flat is unchanged."""
+    b = broker_with_rows({"side": "", "size": "0", "positionIdx": 0})
+    assert b.get_perp_position("BTCUSDT") == 0.0
+    assert b.get_liquidation_view("BTCUSDT")["reason"] == "NO_POSITION"
+    bot, _ = cold_bot([{"side": "", "size": "0", "positionIdx": 0}])
+    assert bot.carry_cold_start() is True
+
+
+def test_a_held_book_halts_on_a_row_that_hides_its_size():
+    d = tick(held_engine(broker_with_rows({"side": "Sell", "positionIdx": 0})))
+    assert d.action == "halted"
+    assert d.reason in ("VENUE_POSITION_UNREADABLE", "MARGIN_UNREADABLE")

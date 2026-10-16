@@ -653,6 +653,9 @@ def _print(r: Dict[str, Any]) -> None:
     print(f"  VERDICT {r['verdict']}: {', '.join(r['verdict_reasons'])}")
     print(f"  {r['independence']}")
     print("  MODELLED only: no venue, ledger or order was touched.")
+    print("  !! NOT PRODUCTION-EQUIVALENT: every block ran with the liquidation "
+          "gate NOT_EVALUATED (no liqPrice/accountMMRate in the corpus), so no "
+          "block's P&L includes a liquidation exit.")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
