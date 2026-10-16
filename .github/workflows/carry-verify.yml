@@ -97,6 +97,7 @@ jobs:
           tests/test_funding_reconciliation.py
           tests/test_carry_oos_audit.py
           tests/test_carry_replay.py
+          tests/test_carry_replay_liquidation.py
           tests/test_operator_verdicts.py
           tests/test_dockerfile.py
           tests/test_image_ships_the_tools.py

@@ -37,13 +37,34 @@ two disagree. Those disagreements are the point of the file.
 
 WHAT IT DELIBERATELY DOES NOT MODEL
 ===================================
+THE LIQUIDATION GATE (the production risk gate this replay used to skip)
+------------------------------------------------------------------------
+Production builds the engine with `require_liquidation_check=True`
+(main.build_bot): on every held tick the engine asks the venue for the
+position's `liqPrice` and the account's `accountMMRate`, and unwinds when the
+price is within MIN_LIQUIDATION_DISTANCE_PCT of liquidation. This corpus
+holds settlement closes plus the interval's `perp_high`/`perp_low` - TRADED
+prices. It holds no liquidation price, no leverage, no collateral and no
+account margin ratio, and none of them can be derived from it without
+inventing them.
+
+So the replay does not pretend. With no `LiquidationInputs`:
+  * the default runs the engine with the gate OFF and says so: the report's
+    `liquidation.gate` is NOT_EVALUATED and `production_equivalent` is False;
+    the P&L is research output, not what production would have done;
+  * `require_liquidation_evidence=True` builds the engine exactly as
+    production does and lets it halt, as it does live, on an unreadable
+    liquidation price (a missing input never becomes a safe one).
+With explicit `LiquidationInputs` the production gate runs every held tick on
+the interval's ADVERSE price (the high, for a short) - a safe-looking close
+cannot hide a breach - and a breach exits at the price where the distance
+crossed the floor, not at the close. Only inputs of kind "recorded" that also
+cover the account margin rate and margin multiple can make
+`production_equivalent` True; "declared" inputs are a stated scenario.
+
 `margin_multiple` is `positionIM / positionMM`, and INVENTORY F4 says that
-field is a risk-tier ratio rather than liquidation headroom. There is no honest
-way to reconstruct it offline, so the default is a CONSTANT that never trips
-the floor, and the report says so. `--margin-model=collateral` supplies a
-declared alternative — what the ratio would be if the short's loss were carried
-by the spot leg — and the difference between the two runs is the size of the
-question F4 leaves open. Neither is the venue's number.
+field is a risk-tier ratio rather than liquidation headroom. Without recorded
+evidence it is a CONSTANT that never trips the floor, and the report says so.
 
 The ticker's funding FORECAST is not modelled either: `get_funding_bps` returns
 the last SETTLED print, because the alternative offline is to hand the engine
@@ -57,7 +78,7 @@ import math
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -83,6 +104,81 @@ class ReplayRefusal(RuntimeError):
     """The harness cannot answer a call the engine made. Never swallowed: a
     replay that silently invents a venue answer is the thing this file is
     about."""
+
+
+class LiquidationEvidenceMissing(ReplayRefusal):
+    """The engine asked for a liquidation view and none was supplied. In the
+    replay, as live, that is an unreadable liquidation price - never a safe
+    one."""
+
+
+class LiquidationEvidenceInvalid(ReplayRefusal):
+    """Supplied liquidation inputs are not usable numbers for this bar."""
+
+
+@dataclass(frozen=True)
+class LiquidationInputs:
+    """Explicit liquidation inputs for the production gate. Nothing here has a
+    default value: every number is the caller's, and its provenance is named.
+
+    kind     "recorded" - observed on a venue, with `source` naming the
+             recording; "declared" - a scenario the caller states, NOT a
+             measurement.
+    liq_price(entry_perp, bar) -> the position's liquidation price in quote
+             currency, or None when the venue would say it is beyond its price
+             bounds (a statement, recorded and counted - not a default).
+    account_mm_rate(bar) -> the account maintenance-margin rate, or None.
+    margin_multiple(bar) -> `positionIM / positionMM` for this bar, or None to
+             keep the declared constant.
+    Callables see only the bar being decided on and the entry price: no later
+    bar is reachable from here.
+    """
+
+    kind: str
+    source: str
+    liq_price: Callable[[float, Any], Optional[float]]
+    account_mm_rate: Optional[Callable[[Any], Optional[float]]] = None
+    margin_multiple: Optional[Callable[[Any], float]] = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("recorded", "declared"):
+            raise ValueError(f"kind must be 'recorded' or 'declared', "
+                             f"not {self.kind!r}")
+        if not str(self.source).strip():
+            raise ValueError("liquidation inputs must name their source")
+        if not callable(self.liq_price):
+            raise ValueError("liq_price must be callable")
+
+    @classmethod
+    def declared_isolated(cls, leverage: float, source: str
+                          ) -> "LiquidationInputs":
+        """A DECLARED scenario: an isolated-margin short at `leverage`, its
+        liquidation price at entry x (1 + 1/leverage). Initial margin only -
+        maintenance margin and fees are ignored, so the true price is nearer
+        and this is the optimistic edge of the scenario. Not a measurement,
+        not the venue's number, and not any leverage the book uses."""
+        lev = float(leverage)
+        if not (math.isfinite(lev) and lev >= 1.0):
+            raise ValueError(f"leverage must be a finite number >= 1, "
+                             f"not {leverage!r}")
+        return cls(kind="declared", source=source,
+                   liq_price=lambda entry, _bar: entry * (1.0 + 1.0 / lev))
+
+
+def _min_liquidation_distance_pct() -> float:
+    """The production floor, read from the engine - never restated here."""
+    import carry_engine
+    return float(carry_engine.MIN_LIQUIDATION_DISTANCE_PCT)
+
+
+def _finite_positive(value: Any, what: str) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise LiquidationEvidenceInvalid(f"{what} is {value!r}") from None
+    if not (math.isfinite(number) and number > 0):
+        raise LiquidationEvidenceInvalid(f"{what} is {value!r}")
+    return number
 
 
 @dataclass
@@ -117,6 +213,16 @@ class ReplayBroker:
     fills: List[Fill] = field(default_factory=list)
     perp_qty: float = 0.0
     refusals: Dict[str, int] = field(default_factory=dict)
+    #: Explicit liquidation inputs, or None. None is never read as "safe".
+    liquidation: Optional[LiquidationInputs] = None
+    #: Set by the gate when the interval's adverse price crossed the floor:
+    #: the price the unwind buys back at. Cleared at the start of every bar.
+    forced_perp_price: Optional[float] = None
+    _entry_qty: float = 0.0
+    _entry_notional: float = 0.0
+    liq_stats: Dict[str, Any] = field(default_factory=lambda: {
+        "ticks_evaluated": 0, "min_distance_pct": None,
+        "intrabar_trips": 0, "unreachable_ticks": 0})
 
     # -- what the snapshot reads -----------------------------------------
     @property
@@ -124,6 +230,8 @@ class ReplayBroker:
         return self.rows[self.i]
 
     def get_mark(self, symbol: str) -> float:
+        if self.forced_perp_price is not None:
+            return float(self.forced_perp_price)
         return float(self.bar.perp)
 
     def get_spot_mark(self, symbol: str) -> float:
@@ -138,7 +246,93 @@ class ReplayBroker:
         return float(self.bar.rate) * 1e4, int(self.bar.ms)
 
     def get_margin_multiple(self, symbol: str) -> float:
+        ev = self.liquidation
+        if ev is not None and ev.margin_multiple is not None:
+            return _finite_positive(ev.margin_multiple(self.bar),
+                                    "margin_multiple")
         return float(self.margin_multiple)
+
+    def get_liquidation_view(self, symbol: str) -> Dict[str, Any]:
+        """The production gate's input, from EXPLICIT evidence only.
+
+        Without it this raises, exactly as `CarryBroker` raises on an
+        unreadable position: the engine halts on it. It is never answered
+        with a distant price. With it, the distance is measured from the
+        interval's ADVERSE price - the high, for the short - because the
+        settlement close is only one instant of the interval the gate polls.
+        """
+        ev = self.liquidation
+        if ev is None:
+            raise LiquidationEvidenceMissing(
+                "no liquidation evidence was supplied for this replay: the "
+                "corpus holds no liqPrice, leverage, collateral or "
+                "accountMMRate, and none is invented")
+        bar = self.bar
+        mm = None
+        if ev.account_mm_rate is not None:
+            raw = ev.account_mm_rate(bar)
+            if raw is not None:
+                try:
+                    mm = float(raw)
+                except (TypeError, ValueError):
+                    raise LiquidationEvidenceInvalid(
+                        f"account_mm_rate is {raw!r}") from None
+                if not math.isfinite(mm) or mm < 0:
+                    raise LiquidationEvidenceInvalid(
+                        f"account_mm_rate is {raw!r}")
+        qty = abs(self.perp_qty)
+        close = _finite_positive(bar.perp, "perp close")
+        if qty <= 0 or self._entry_qty <= 0:
+            return {"size": 0.0, "side": "", "mark": close, "liq_price": None,
+                    "distance_pct": None, "account_mm_rate": mm,
+                    "reason": "NO_POSITION"}
+        entry = self._entry_notional / self._entry_qty
+        liq = ev.liq_price(entry, bar)
+        stats = self.liq_stats
+        stats["ticks_evaluated"] += 1
+        if liq is None:
+            stats["unreachable_ticks"] += 1
+            return {"size": qty, "side": "Sell", "mark": close,
+                    "liq_price": None, "distance_pct": None,
+                    "account_mm_rate": mm, "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
+        liq = _finite_positive(liq, "liquidation price")
+        high = _finite_positive(bar.perp_high, "perp high")
+        low = _finite_positive(bar.perp_low, "perp low")
+        if high < close * (1 - 1e-9) or low > close * (1 + 1e-9):
+            raise LiquidationEvidenceInvalid(
+                f"the bar's range [{low}, {high}] excludes its close {close}")
+        adverse = max(close, high)
+        distance = 100.0 * (liq - adverse) / adverse
+        at_close = 100.0 * (liq - close) / close
+        floor = _min_liquidation_distance_pct()
+        prior = stats["min_distance_pct"]
+        stats["min_distance_pct"] = distance if prior is None else min(prior,
+                                                                       distance)
+        if distance < floor:
+            if at_close >= floor:
+                stats["intrabar_trips"] += 1      # the close alone hid it
+            crossing = liq / (1.0 + floor / 100.0)
+            # The price at which the distance crossed the floor, inside the
+            # interval's traded range. If the whole range lies beyond it the
+            # crossing happened in a gap this data cannot place: take the
+            # worst price for a short's buy-back, the high.
+            self.forced_perp_price = adverse if crossing < low \
+                else min(crossing, adverse)
+        return {"size": qty, "side": "Sell", "mark": adverse, "liq_price": liq,
+                "distance_pct": distance, "account_mm_rate": mm, "reason": ""}
+
+    def _note_perp(self, side: str, qty: float, price: float) -> None:
+        """Track the open short's average entry for the liquidation view."""
+        if side == "Sell":
+            self._entry_qty += qty
+            self._entry_notional += qty * price
+        else:
+            if self._entry_qty > 0:
+                avg = self._entry_notional / self._entry_qty
+                self._entry_qty = max(0.0, self._entry_qty - qty)
+                self._entry_notional = self._entry_qty * avg
+            if abs(self.perp_qty) <= 1e-12:
+                self._entry_qty = self._entry_notional = 0.0
 
     # -- what the engine reads --------------------------------------------
     def get_lot_rules(self, symbol: str, product: str) -> Dict[str, float]:
@@ -199,7 +393,11 @@ class ReplayBroker:
     def place_market(self, *, symbol, side, qty, product):
         if qty <= 0 or not math.isfinite(qty):
             return None
-        base = self.bar.perp if product == "linear" else self.bar.spot
+        if product == "linear":
+            base = (self.forced_perp_price if self.forced_perp_price is not None
+                    else self.bar.perp)
+        else:
+            base = self.bar.spot
         price = self._price(side, base)
         rate = (self.taker_perp_bps if product == "linear"
                 else self.taker_spot_bps)
@@ -208,6 +406,7 @@ class ReplayBroker:
                                fee))
         if product == "linear":
             self.perp_qty += qty if side == "Sell" else -qty
+            self._note_perp(side, qty, price)
         return {"filled_qty": qty, "avg_price": price,
                 "order_link_id": f"r{len(self.fills)}",
                 "fee": self._as_venue_fee(fee, price, side, product)}
@@ -224,6 +423,7 @@ class ReplayBroker:
                                fee, maker=True))
         if product == "linear":
             self.perp_qty += qty if side == "Sell" else -qty
+            self._note_perp(side, qty, price)
         return {"filled_qty": qty, "avg_price": price,
                 "order_link_id": f"m{len(self.fills)}",
                 "fee": self._as_venue_fee(fee, price, side, product),
@@ -333,7 +533,9 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
            risk_class: Any = None,
            halt_after: Optional[int] = None,
            warm_prints: Sequence[Any] = (),
-           trace: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+           trace: Optional[List[Dict[str, Any]]] = None,
+           liquidation: Optional[LiquidationInputs] = None,
+           require_liquidation_evidence: bool = False) -> Dict[str, Any]:
     """Drive the real engine through `rows`. One bar, one `main.tick`.
 
     ``warm_prints`` are SETTLED prints (``Settlement`` rows) that happened
@@ -342,6 +544,14 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     possible on them. ``trace``, if given, receives one dict per walked bar -
     ``{ms, action, reason, state}`` - the engine's own decision, for tests that
     prove a decision does not depend on later bars.
+
+    ``liquidation`` is explicit liquidation evidence (see `LiquidationInputs`).
+    Given, the engine is built exactly as production builds it
+    (``require_liquidation_check=True``) and the gate runs on the interval's
+    adverse price. Absent, the gate is NOT evaluated and the report says so
+    (``liquidation.production_equivalent`` is False) - unless
+    ``require_liquidation_evidence`` builds the engine as production does and
+    lets it halt on the unreadable liquidation price, as it would live.
     """
     import ledger as L
     from carry_engine import BookState, CarryEngine
@@ -349,7 +559,8 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     from market_snapshot import take_snapshot
 
     raw_broker = ReplayBroker(rows=rows, impact_bps=impact_bps,
-                              margin_multiple=margin_multiple)
+                              margin_multiple=margin_multiple,
+                              liquidation=liquidation)
     broker = raw_broker
     # The overlay hedges BTC the client already owns. Enough of it that the
     # inventory is never the binding constraint, so a divergence from the
@@ -369,7 +580,13 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         broker=broker, kill_switch=store.trip_kill_switch,
         max_notional_usd=notional, borrow_apr=borrow_apr,
         execution_mode=execution_mode, execution_style=execution_style,
-        persist=lambda state: None)
+        persist=lambda state: None,
+        # main.build_bot sets this True. The replay sets it whenever it can
+        # answer the gate (evidence supplied) or has been told to behave as
+        # production does without evidence (it then halts). Left off only for
+        # research runs, which the report labels.
+        require_liquidation_check=(liquidation is not None
+                                   or require_liquidation_evidence))
     risk_kwargs = {"store": store, "max_notional_usd": notional}
     if max_entries_per_day is not None:
         risk_kwargs["max_entries_per_day"] = max_entries_per_day
@@ -391,6 +608,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     walked = 0
     for index, row in enumerate(rows):
         raw_broker.i = index
+        raw_broker.forced_perp_price = None     # a breach is per interval
         _now["ms"] = int(row.ms)
         walked = index + 1
         if halt_after is not None and index == halt_after:
@@ -562,6 +780,9 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     years = span_days / 365.25
     net = funding_usd + basis_usd - fees_usd - borrow_usd
     held = sum(t["prints_held"] for t in trades) / cb.FUNDING_PERIODS_PER_DAY
+    liquidation_report = _liquidation_report(
+        liquidation, require_liquidation_evidence, raw_broker.liq_stats,
+        engine.require_liquidation_check)
     return {
         "driver": "CarryEngine (the trading class), via main.tick's sequence",
         "window": f"{cb._iso_ms(rows[0].ms)} .. {cb._iso_ms(rows[-1].ms)}",
@@ -571,6 +792,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "execution_mode": execution_mode, "execution_style": execution_style,
         "impact_bps_per_leg": impact_bps,
         "margin_multiple": margin_multiple,
+        "liquidation": liquidation_report,
         "trades": len(trades),
         "orders": len(raw_broker.fills),
         "maker_fills": sum(1 for f in raw_broker.fills if f.maker),
@@ -613,7 +835,47 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             "positionIM/positionMM: a declared constant, not the venue's "
             "number (INVENTORY F4)",
             "partial fills, rate limits, venue rejections",
-        ],
+        ] + ([] if liquidation is not None else [
+            "the production liquidation-distance gate: the corpus holds no "
+            "liqPrice, leverage, collateral or accountMMRate"]),
+    }
+
+
+def _liquidation_report(liquidation: Optional[LiquidationInputs],
+                        required: bool, stats: Dict[str, Any],
+                        engine_flag: bool) -> Dict[str, Any]:
+    """What the replay did about the liquidation gate, and whether its P&L may
+    be called production-equivalent. `production_equivalent` means only that
+    no production RISK gate was skipped or replaced by an assumption; the
+    execution-realism limits in `not_modelled` apply regardless."""
+    why_not: List[str] = []
+    if liquidation is None:
+        gate = "REQUIRED_EVIDENCE_MISSING" if required else "NOT_EVALUATED"
+        why_not.append(
+            "no liquidation evidence: the production liquidation-distance "
+            "gate (liqPrice, accountMMRate) "
+            + ("halts the engine on an unreadable liquidation price, as it "
+               "would live" if required else "was not evaluated"))
+    else:
+        gate = "EVALUATED"
+        if liquidation.kind != "recorded":
+            why_not.append(f"liquidation inputs are {liquidation.kind} "
+                           "(a scenario), not recorded venue observations")
+        if liquidation.account_mm_rate is None:
+            why_not.append("accountMMRate was not supplied: the account-level "
+                           "margin-rate floor was not evaluated")
+        if liquidation.margin_multiple is None:
+            why_not.append("margin_multiple is a declared constant, not the "
+                           "venue's number (INVENTORY F4)")
+    return {
+        "gate": gate,
+        "production_equivalent": not why_not,
+        "why_not_production_equivalent": why_not,
+        "engine_require_liquidation_check": bool(engine_flag),
+        "evidence_kind": None if liquidation is None else liquidation.kind,
+        "evidence_source": None if liquidation is None else liquidation.source,
+        "floor_pct": _min_liquidation_distance_pct(),
+        **stats,
     }
 
 
@@ -666,6 +928,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--bars", default="",
                     help="a settlement series to replay instead of the "
                          "repo corpus (CSV or JSON; see load_bars)")
+    ap.add_argument("--require-liquidation-evidence", action="store_true",
+                    help="build the engine exactly as production does "
+                         "(liquidation gate ON) and let it halt, as it would "
+                         "live, because the corpus holds no liquidation price")
+    ap.add_argument("--declare-isolated-leverage", type=float, default=None,
+                    metavar="N",
+                    help="a DECLARED scenario, not a measurement and not the "
+                         "book's leverage: an isolated short at N x, "
+                         "liquidation = entry x (1 + 1/N), initial margin "
+                         "only. Runs the production gate on the interval's "
+                         "adverse high")
     ap.add_argument("--json", default="")
     args = ap.parse_args(argv)
 
@@ -677,9 +950,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         rows, meta = cb.load_bybit_settlements(args.repo)
     impact = (0.0 if args.no_impact
               else cb.impact_bps_per_leg(args.repo, args.notional)[0])
+    evidence = None
+    if args.declare_isolated_leverage is not None:
+        evidence = LiquidationInputs.declared_isolated(
+            args.declare_isolated_leverage,
+            f"--declare-isolated-leverage {args.declare_isolated_leverage:g} "
+            "(operator-declared scenario)")
     r = replay(rows, notional=args.notional, borrow_apr=args.borrow_apr,
                execution_mode=args.mode, execution_style=args.style,
-               impact_bps=impact, max_entries_per_day=args.entries_per_day)
+               impact_bps=impact, max_entries_per_day=args.entries_per_day,
+               liquidation=evidence,
+               require_liquidation_evidence=args.require_liquidation_evidence)
 
     print("=" * 74)
     print("CARRY REPLAY — the ENGINE driven through history, not a model of it")
@@ -692,6 +973,23 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"{r['execution_style']}, ${r['notional_usd']:,.0f}, borrow "
           f"{r['borrow_apr'] * 100:.1f}%/yr, impact "
           f"{r['impact_bps_per_leg']:.2f} bps/leg")
+    print()
+    liq = r["liquidation"]
+    if liq["production_equivalent"]:
+        print("  LIQUIDATION GATE  evaluated on recorded evidence "
+              f"({liq['evidence_source']})")
+    else:
+        print("  !! NOT PRODUCTION-EQUIVALENT — RESEARCH OUTPUT ONLY !!")
+        print(f"  liquidation gate: {liq['gate']}")
+        for why in liq["why_not_production_equivalent"]:
+            print(f"    - {why}")
+        if liq["gate"] == "EVALUATED":
+            print(f"    evaluated on {liq['evidence_kind']} inputs "
+                  f"({liq['evidence_source']}): {liq['ticks_evaluated']} "
+                  f"held ticks, min distance "
+                  f"{liq['min_distance_pct']:.1f}% vs floor "
+                  f"{liq['floor_pct']:.0f}%, {liq['intrabar_trips']} breach(es) "
+                  "visible only in the interval high")
     print()
     print(f"    funding    ${r['funding_usd']:12,.2f}")
     print(f"    basis      ${r['basis_usd']:12,.2f}")
