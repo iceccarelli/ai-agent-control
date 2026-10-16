@@ -120,7 +120,7 @@ class BaseFeeVenue(PricedVenue):
 def test_base_coin_fee_does_not_leave_ghost_spot_basis_between_round_trips():
     venue = BaseFeeVenue(inventory=5.0)
     journal = L.Journal()
-    broker = L.LedgerBroker(venue, journal, ms=lambda: MS,
+    broker = L.LedgerBroker(venue, journal, ms=lambda: 3 * H8,
                             spot_symbol="BTCUSDT")
 
     first = broker.place_market(symbol="BTCUSDT", side="Buy", qty=1.0,
@@ -157,7 +157,7 @@ def test_restart_reseeds_acquired_spot_basis_with_net_wallet_quantity():
                 fee_base_qty=0.001),
         perp=Leg(symbol="BTCUSDT", side="Sell", product="linear",
                  requested_qty=1.0, filled_qty=1.0, avg_price=MARK),
-        opened_ms=MS)
+        opened_ms=3 * H8)
     e._reseed_cost_basis()
     assert e.broker._spot_qty == pytest.approx(0.999)
     assert e.broker._spot_entry == pytest.approx(MARK)
