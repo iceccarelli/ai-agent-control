@@ -492,8 +492,15 @@ class CarryBroker:
                     f"{link_id}: submission failed ({exc}) and the venue could "
                     f"not be asked what happened ({read_exc}); the order may "
                     "be live") from exc
-            if state is None or self._rejected(state):
-                return None     # no such order, or terminal with nothing filled
+            if state is None:
+                # This branch is only reached without a venue retCode. No
+                # answer and no row: the request may still be processed.
+                raise OrderOutcomeUnknown(
+                    f"{link_id}: submission got no answer from the venue "
+                    f"({exc}) and the venue shows no row for it yet; the "
+                    "request may still land") from exc
+            if self._rejected(state):
+                return None     # it existed, is final, and filled nothing
             if state["resting"]:
                 raise OrderOutcomeUnknown(
                     f"{link_id} is {state['status']} at the venue after a "
@@ -625,6 +632,13 @@ class CarryBroker:
             # response, the same question decides what to do: does the order
             # exist? The venue is asked rather than the error code guessed.
             state = self._order_state(symbol, link_id, product)
+            if state is None and not self._definitively_rejected(exc):
+                # No venue answer AND no row: the request may be queued and
+                # land after this read. Crossing now could make two legs.
+                raise PairIncident(
+                    f"post-only {link_id} got no answer from the venue "
+                    f"({exc}) and the venue shows no row for it yet; the "
+                    "request may still land") from exc
             if state is None or self._rejected(state):
                 logger.info(
                     "post-only %s %s %s not accepted (%s); crossing instead",
