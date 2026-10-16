@@ -487,6 +487,10 @@ class CarryEngine:
         #: later replay. Observation only: its failure never touches a decision.
         self.risk_observer = risk_observer
         self._last_margin: Optional[float] = None
+        #: Wall-clock ms of the last time the liquidation gate got a usable
+        #: read from the broker. Health compares it with now: a held pair
+        #: whose gate has not been read lately is un-evaluated, not safe.
+        self.last_risk_read_ms: Optional[int] = None
         self.persist = persist
         self.execution_mode = execution_mode
         self.broker = broker
@@ -1575,6 +1579,7 @@ class CarryEngine:
                 f"liquidation ({type(exc).__name__}: {exc}); an unreadable "
                 "liquidation price is a margin call you cannot see")
 
+        self.last_risk_read_ms = int(time.time() * 1000)
         self._observe_risk(view)
         rate = view.get("account_mm_rate")
         if rate is not None and self._finite(rate) \

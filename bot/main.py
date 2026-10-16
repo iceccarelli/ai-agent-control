@@ -105,6 +105,12 @@ class _HealthHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
+def _market_snapshot_max_age_s() -> float:
+    """The market view's own freshness bound, read from where it is defined."""
+    import market_snapshot
+    return float(market_snapshot.MAX_SNAPSHOT_AGE_S)
+
+
 class TradingBot:
     """The one orchestrator. Owns startup, the loop, and shutdown."""
 
@@ -357,6 +363,34 @@ class TradingBot:
                         "funding_unattributed", "funding_estimated_entries",
                         "open_perp_qty")}
                 status["last_reconciliation_ms"] = self._last_reconcile_ms or None
+            warnings: List[str] = []
+            gate = {"required": bool(getattr(engine,
+                                             "require_liquidation_check",
+                                             False))}
+            last_read = getattr(engine, "last_risk_read_ms", None)
+            gate["last_read_ms"] = last_read
+            now_ms = int(time.time() * 1000)
+            gate["age_s"] = (None if last_read is None
+                             else round((now_ms - int(last_read)) / 1000.0, 1))
+            # Stale = a REQUIRED gate on a HELD pair that has not read for
+            # longer than the loop can explain: three loop intervals, never
+            # less than the market view's own freshness bound. One missed tick
+            # is not a warning. Informative only: the pair is already
+            # monitored and flagging it must not restart the machine.
+            try:
+                loop_s = float(self.cfg.LOOP_INTERVAL_SECONDS)
+                if not (loop_s > 0 and loop_s < float("inf")):
+                    raise ValueError(loop_s)
+            except (AttributeError, TypeError, ValueError):
+                loop_s = 60.0          # the documented default interval
+            bound_s = max(3.0 * loop_s, _market_snapshot_max_age_s())
+            gate["stale"] = bool(
+                gate["required"] and position is not None
+                and (gate["age_s"] is None or gate["age_s"] > bound_s))
+            status["liquidation_gate"] = gate
+            if gate["stale"]:
+                warnings.append("LIQUIDATION_GATE_NOT_READ")
+            status["warnings"] = warnings
             fault = ""
             if engine.state.name == "HALTED":
                 fault = self._last_carry_decision.get("reason") or "HALTED"
