@@ -173,3 +173,16 @@ class TestItDecidesNothingElse:
         for banned in ("place_market", "live_authorized", "openai",
                        "anthropic"):
             assert banned not in body
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "x"])
+def test_an_unreadable_margin_is_not_a_passing_margin(bad):
+    class S:
+        margin_multiple = bad
+        basis_bps = 1.0
+
+        def assert_fresh(self):
+            pass
+
+    d = risk().gate_open(notional_usd=100.0, snapshot=S(), has_open_pair=False)
+    assert not d and d.reason == "MARGIN_UNREADABLE"
