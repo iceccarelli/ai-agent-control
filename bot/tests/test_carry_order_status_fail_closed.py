@@ -122,3 +122,57 @@ def test_the_classifier_treats_only_documented_terminal_statuses_as_final(
                         sequence_source=lambda *a: 1)._order_state(
         "BTCUSDT", "x", "linear")
     assert state["resting"] is resting
+
+
+# -- the duplicate-orderLinkId path --------------------------------------------
+#
+# A duplicate-id rejection means the FIRST attempt exists at the venue. It was
+# resolved by `_query_by_link_id`, which reads cumExecQty and ignores the
+# status: a first attempt still live with nothing filled came back as "did not
+# fill", and the engine was free to send a new one on the next tick.
+
+class Duplicate(FakeClient):
+    """create raises a duplicate-id retCode; the read-back row is `row`."""
+
+    def __init__(self, row):
+        super().__init__(raise_on_create=110072)
+        self.row = row
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/order/realtime":
+            self.calls.append((method, endpoint, params, body))
+            return envelope({"list": [dict(self.row,
+                                           orderLinkId=params["orderLinkId"])]})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+def _dup(row):
+    return CarryBroker(client=Duplicate(row), order_gate=lambda: (True, "T"),
+                       sequence_source=lambda *a: 1)
+
+
+@pytest.mark.parametrize("row", [
+    {"orderStatus": "New", "cumExecQty": "0", "avgPrice": "0"},
+    {"orderStatus": "PartiallyFilled", "cumExecQty": "0.2", "avgPrice": "1"},
+    {"cumExecQty": "0", "avgPrice": "0"},                        # no status
+], ids=["live-unfilled", "live-partial", "statusless"])
+def test_a_duplicate_whose_first_attempt_is_still_live_is_unknown_not_dead(row):
+    with pytest.raises(OrderOutcomeUnknown):
+        _dup(row).place_market(symbol="BTCUSDT", side="Buy", qty=0.5,
+                               product="spot")
+
+
+def test_a_duplicate_whose_first_attempt_filled_is_that_fill():
+    r = _dup({"orderStatus": "Filled", "cumExecQty": "0.5",
+              "avgPrice": "100000"}).place_market(
+        symbol="BTCUSDT", side="Buy", qty=0.5, product="spot")
+    assert r is not None and r["filled_qty"] == pytest.approx(0.5)
+
+
+def test_a_duplicate_whose_first_attempt_died_unfilled_is_no_fill():
+    r = _dup({"orderStatus": "Cancelled", "cumExecQty": "0",
+              "avgPrice": "0"}).place_market(
+        symbol="BTCUSDT", side="Buy", qty=0.5, product="spot")
+    assert r is None

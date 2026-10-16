@@ -454,13 +454,27 @@ class CarryBroker:
                 logger.warning(
                     "duplicate orderLinkId %s (retCode %s) - the first attempt "
                     "landed; resolving by query", link_id, ret_code)
-                resolved = self._query_by_link_id(symbol, link_id, product)
-                if resolved is not None:
-                    resolved.was_duplicate = True
-                    return resolved.as_engine_result()
-                raise OrderOutcomeUnknown(
-                    f"orderLinkId {link_id} exists at the venue but could not "
-                    "be read back; a leg may be live and unhedged") from exc
+                try:
+                    state = self._order_state(symbol, link_id, product)
+                except Exception as read_exc:  # noqa: BLE001
+                    state = None
+                    logger.error("could not read back %s: %s", link_id, read_exc)
+                if state is None:
+                    raise OrderOutcomeUnknown(
+                        f"orderLinkId {link_id} exists at the venue but could "
+                        "not be read back; a leg may be live and unhedged"
+                    ) from exc
+                if self._rejected(state):
+                    return None     # it existed, is final, and filled nothing
+                if state["resting"]:
+                    # The first attempt is still live. "It did not fill" is
+                    # not established, and a fresh order on top of it is the
+                    # duplicate this branch exists to prevent.
+                    raise OrderOutcomeUnknown(
+                        f"orderLinkId {link_id} is {state['status']!r} at the "
+                        "venue after a duplicate-id rejection; what it will "
+                        "fill is unknown") from exc
+                return self._engine_result_from_state(state)
             if self._definitively_rejected(exc):
                 logger.error("leg %s %s %s rejected: %s",
                              side, symbol, product, exc)
