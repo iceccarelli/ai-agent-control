@@ -20,7 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import ledger as L  # noqa: E402
 import venue_fees  # noqa: E402
-from carry_engine import (ACQUIRE, OVERLAY, BookState, ColdStart,\n                          CarryPosition, Leg)  # noqa: E402
+from carry_engine import (ACQUIRE, OVERLAY, BookState, ColdStart,
+                          CarryPosition, Leg)  # noqa: E402
 from test_carry_cold_start import H8, MARK, Venue, engine  # noqa: E402
 
 QTY = 0.001
