@@ -286,6 +286,7 @@ def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
             "median_usd": (quantile(sorted(e["net"] for _, e in completed), .5)
                            if completed else None)},
         "assessment": None,
+        "liquidation": r["liquidation"],
         "reconciles_with_replay": reconciles,
         "gate_reproduces_every_historical_entry": reproduces == len(trades),
         "sensitivity_to_early_exit": cap_table,
@@ -315,6 +316,11 @@ def _print(a: Dict[str, Any]) -> None:
     print(f"  book   {a['mode'].upper()}/{a['style']}  ${a['notional_usd']:,.0f}  "
           f"round trip {a['round_trip_bps']:.1f} bps  borrow "
           f"{a['borrow_apr'] * 100:.1f}%/yr")
+    if not a["liquidation"]["production_equivalent"]:
+        print(f"  !! NOT PRODUCTION-EQUIVALENT: liquidation gate "
+              f"{a['liquidation']['gate']} (no liqPrice/accountMMRate in the "
+              "corpus); these holds ran without the production liquidation "
+              "exit")
     print(f"  trades {a['trades']} ({a['completed_trades']} completed); exits: "
           f"{a['exit_reasons']}")
     print(f"\n  completed holds (days): min {d['min']:.1f}  p25 {d['p25']:.1f}  "
