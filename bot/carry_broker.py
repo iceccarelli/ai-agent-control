@@ -1049,8 +1049,8 @@ class CarryBroker:
                     "reason": "NO_POSITION"}
 
         row = rows[0]
+        size = self._stated_size(row, symbol)
         try:
-            size = abs(float(row.get("size", 0) or 0))
             mark = float(row.get("markPrice", 0) or 0)
         except (TypeError, ValueError) as exc:
             raise PairIncident(
@@ -1391,14 +1391,7 @@ class CarryBroker:
         # side, is refused rather than summed into the short.
         total = 0.0
         for row in rows:
-            try:
-                size = abs(float(row.get("size", 0) or 0))
-            except (TypeError, ValueError, AttributeError) as exc:
-                raise PairIncident(
-                    f"position row for {symbol} is malformed: {row!r}") from exc
-            if not math.isfinite(size):
-                raise PairIncident(
-                    f"position row for {symbol} is malformed: {row!r}")
+            size = self._stated_size(row, symbol)
             if size == 0.0:
                 continue
             # positionIdx: 0 one-way, 1 hedge-mode LONG slot, 2 hedge-mode SHORT
@@ -1522,6 +1515,27 @@ class CarryBroker:
     def _v5_result(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """The `result` object of a Bybit v5 envelope."""
         return (payload or {}).get("result") or {}
+
+    @staticmethod
+    def _stated_size(row: Any, symbol: str) -> float:
+        """The size a position row STATES, unsigned. A row that does not state
+        one (key absent, null, blank, not a number, non-finite) is unreadable:
+        reading it as 0 turned a truncated payload into a flat book. Bybit's
+        own spelling of flat is the string "0"."""
+        raw = row.get("size") if isinstance(row, dict) else None
+        if raw is None or str(raw).strip() == "":
+            raise PairIncident(
+                f"position row for {symbol} does not state a size: {row!r}; "
+                "an unstated size is not a flat position")
+        try:
+            size = abs(float(raw))
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"position row for {symbol} is malformed: {row!r}") from exc
+        if not math.isfinite(size):
+            raise PairIncident(
+                f"position row for {symbol} is malformed: {row!r}")
+        return size
 
     @staticmethod
     def _v5_list(payload: Optional[Dict[str, Any]]) -> Optional[list]:

@@ -312,13 +312,11 @@ class TestPerpPositionDirection:
     @pytest.mark.parametrize("size", ["abc", "nan", "inf", "-inf", None, []])
     def test_a_malformed_or_non_finite_size_is_refused_not_flat(self, size):
         row = {"side": "Sell", "size": size}
-        if size in (None, []):
-            # absent / empty size on a stated side is "0" to Bybit's own
-            # parser; it must still never be read as the SHORT.
-            assert self._rows(row).get_perp_position("BTCUSDT") == 0.0
-        else:
-            with pytest.raises(PairIncident):
-                self._rows(row).get_perp_position("BTCUSDT")
+        # An unstated or unparseable size is unreadable, never flat and never
+        # the short: Bybit spells flat as "0" (a flat row is proven live to
+        # carry it), so a row without one is a truncated payload.
+        with pytest.raises(PairIncident):
+            self._rows(row).get_perp_position("BTCUSDT")
 
     @pytest.mark.parametrize("response", [
         {"retCode": 10002, "retMsg": "timestamp", "result": {}},
