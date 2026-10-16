@@ -557,6 +557,28 @@ class CarryBroker:
 
     # -- resting orders (0040) --------------------------------------------
 
+    def get_venue_time_s(self) -> float:
+        """The venue's clock, in epoch seconds. PUBLIC `/v5/market/time`: no
+        key, no signature.
+
+        `market_snapshot.take_snapshot` checks it against the local clock
+        when the broker offers it; without this reader the live book was
+        never clock-checked (`clock_checked` always False) while the shadow
+        book was. Raises when the venue does not answer with a time; the
+        snapshot then records the check as not made rather than assuming
+        the clocks agree.
+        """
+        result = self._v5_result(
+            self.client._request("GET", "/v5/market/time", signed=False))
+        try:
+            seconds = float(result.get("timeSecond"))
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(
+                f"venue time is not a time: {result!r}") from exc
+        if not math.isfinite(seconds) or seconds <= 0:
+            raise PairIncident(f"venue time is not a time: {result!r}")
+        return seconds
+
     def get_book_top(self, symbol: str, product: str) -> Dict[str, float]:
         """`{bid, ask}` — the touch, as the venue publishes it.
 

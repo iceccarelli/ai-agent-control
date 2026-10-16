@@ -74,7 +74,8 @@ def test_a_one_way_account_starts_through_build_bot():
 
 @pytest.mark.parametrize("reader", ["get_perp_position", "resume_basis",
                                     "get_open_carry_orders",
-                                    "get_spot_inventory"])
+                                    "get_spot_inventory",
+                                    "get_venue_time_s"])
 def test_every_optional_safety_read_exists_on_the_production_broker(reader):
     """`_check_venue_position`, `_reseed_cost_basis` and cold start look these
     up with getattr(..., None) and skip when absent. The production wrapper
