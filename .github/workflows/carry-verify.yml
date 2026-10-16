@@ -108,6 +108,7 @@ jobs:
           tests/test_carry_cold_start.py
           tests/test_carry_cold_start_spot_fee.py
           tests/test_carry_acquire_unwind_net_of_fee.py
+          tests/test_carry_maker_cancel_still_resting.py
           tests/test_carry_hedge_mode_refusal.py
           tests/test_carry_restart_cost_basis.py
           tests/test_carry_journal_persists_with_position.py

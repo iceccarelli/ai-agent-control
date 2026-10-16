@@ -1734,6 +1734,20 @@ class CarryEngine:
                 f"a post-only {side} of {qty} {symbol} could not be cancelled "
                 f"or read back ({exc}); what it has filled is unknown")
             return None
+        if (final or {}).get("resting"):
+            # The cancel did not take: the venue still shows the order live
+            # (rejected, rate-limited, or not applied yet). It can fill after
+            # this, so crossing the remainder now is a second leg on top of a
+            # first the book has not finished counting.
+            self._last_leg_error = (
+                f"maker order still {(final or {}).get('status')!r} after cancel")
+            self._halt(
+                "MAKER_ORDER_STILL_RESTING",
+                f"a post-only {side} of {qty} {symbol} is still resting after "
+                f"its cancel (status {(final or {}).get('status')!r}, filled "
+                f"{(final or {}).get('filled_qty')!r}); crossing on top of it "
+                "would open a second leg, so the book stops instead")
+            return None
         total = float((final or {}).get("filled_qty", 0.0) or 0.0)
         if total > leg.filled_qty:
             # The venue's number wins: it is the total on that order, and it
