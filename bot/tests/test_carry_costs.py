@@ -181,3 +181,20 @@ class TestItDecidesNothingElse:
         assert param.default is inspect.Parameter.empty
         assert not hasattr(cc, "DEFAULT_BORROW_APR")
         assert cc.ASSUMED_HOLD_DAYS == 30.0
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("kw", [
+    {"round_trip_bps": float("nan")}, {"round_trip_bps": -50.0},
+    {"borrow_apr": float("nan")}, {"borrow_apr": -0.5},
+    {"hold_days": float("nan")}, {"hold_days": 0.0}, {"hold_days": -3.0},
+    {"round_trip_bps": None},
+])
+def test_unstatable_cost_input_never_authorises_entry(kw):
+    args = dict(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05,
+                funding_prints_bps=[1.0] * 12, **at_basis(0.0))
+    args.update(kw)
+    v = cc.evaluate_entry(**args)
+    assert not v.allowed and v.reason == "COST_INPUT_INVALID"

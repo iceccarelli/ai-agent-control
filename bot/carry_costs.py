@@ -167,6 +167,21 @@ def basis_bps(perp: float, spot: float) -> float:
     return (perp / spot - 1.0) * 1e4
 
 
+def _invalid_cost_inputs(borrow_apr, round_trip_bps, hold_days) -> list:
+    out = []
+    for name, value, zero_ok in (("borrow_apr", borrow_apr, True),
+                                 ("round_trip_bps", round_trip_bps, True),
+                                 ("hold_days", hold_days, False)):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            out.append(name)
+            continue
+        if not math.isfinite(v) or v < 0 or (not zero_ok and v == 0):
+            out.append(name)
+    return out
+
+
 def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
                    spot: float, borrow_apr: float, round_trip_bps: float,
                    hold_days: float = ASSUMED_HOLD_DAYS) -> CarryVerdict:
@@ -175,6 +190,13 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
     Order matters. Cheapest and most decisive checks first, so a refusal names
     the binding constraint rather than the first thing that happened to fail.
     """
+    bad = _invalid_cost_inputs(borrow_apr, round_trip_bps, hold_days)
+    if bad:
+        # A NaN or negative cost makes every comparison below come out in
+        # favour of opening. A cost the caller could not state is not free.
+        return CarryVerdict(False, "COST_INPUT_INVALID",
+                            detail={"invalid": bad})
+
     smoothed = ewma_funding_bps(funding_prints_bps)
     if smoothed is None:
         return CarryVerdict(
