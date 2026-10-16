@@ -127,8 +127,7 @@ def test_the_classifier_treats_only_documented_terminal_statuses_as_final(
 # -- the duplicate-orderLinkId path --------------------------------------------
 #
 # A duplicate-id rejection means the FIRST attempt exists at the venue. It was
-# resolved by `_query_by_link_id`, which reads cumExecQty and ignores the
-# status: a first attempt still live with nothing filled came back as "did not
+# resolved by a reader that took cumExecQty and ignored the status: a first attempt still live with nothing filled came back as "did not
 # fill", and the engine was free to send a new one on the next tick.
 
 class Duplicate(FakeClient):
@@ -176,3 +175,53 @@ def test_a_duplicate_whose_first_attempt_died_unfilled_is_no_fill():
               "avgPrice": "0"}).place_market(
         symbol="BTCUSDT", side="Buy", qty=0.5, product="spot")
     assert r is None
+
+
+# -- an accepted market order whose read-back has no row ----------------------
+#
+# The create response carried an orderId, so the order EXISTS. A read-back
+# that then finds no row is not "did not fill": the engine would refuse the
+# leg and could send another next tick, while the first may be live.
+
+class AcceptedThenInvisible(FakeClient):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/order/create":
+            self.created.append(body)
+            return envelope({"orderId": "1", "orderLinkId": body["orderLinkId"]})
+        if endpoint == "/v5/order/realtime":
+            return envelope({"list": [dict(r, orderLinkId=params["orderLinkId"])
+                                      for r in self.rows]})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+def _accepted(rows):
+    seq = itertools.count(1)
+    return CarryBroker(client=AcceptedThenInvisible(rows),
+                       order_gate=lambda: (True, "T"),
+                       sequence_source=lambda *a: next(seq))
+
+
+def test_an_accepted_market_order_with_no_row_is_an_unknown_outcome():
+    with pytest.raises(OrderOutcomeUnknown):
+        _accepted([]).place_market(symbol="BTCUSDT", side="Sell", qty=0.001,
+                                   product="linear")
+
+
+def test_an_accepted_market_order_that_died_unfilled_is_no_fill():
+    r = _accepted([{"orderStatus": "Cancelled", "cumExecQty": "0",
+                    "avgPrice": "0"}]).place_market(
+        symbol="BTCUSDT", side="Sell", qty=0.001, product="linear")
+    assert r is None
+
+
+def test_an_accepted_market_order_that_filled_is_that_fill():
+    r = _accepted([{"orderStatus": "Filled", "cumExecQty": "0.001",
+                    "avgPrice": "100000"}]).place_market(
+        symbol="BTCUSDT", side="Sell", qty=0.001, product="linear")
+    assert r["filled_qty"] == pytest.approx(0.001)

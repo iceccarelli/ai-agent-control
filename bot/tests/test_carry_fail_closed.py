@@ -221,6 +221,11 @@ def _carry_bot(**env):
                     "result": {"list": [
                         {"coin": [{"coin": "BTC", "walletBalance": "5",
                                   "locked": "0"}]}]}}
+        if endpoint == "/v5/order/realtime":
+            # the venue is asked what an accepted order did; it filled
+            return {"retCode": 0, "retMsg": "OK", "result": {"list": [
+                {"orderLinkId": "x", "orderStatus": "Filled",
+                 "cumExecQty": "0.001", "avgPrice": "100000"}]}}
         return {"retCode": 0, "retMsg": "OK", "result": {"orderLinkId": "x"}}
 
     client = mock.Mock()
@@ -313,9 +318,15 @@ class TestTheSpotLegIsSizedInBtc:
 
     def _body(self, product, side="Buy"):
         client = mock.Mock()
-        client._request = mock.Mock(return_value={"orderLinkId": "x",
-                                                  "cumExecQty": "0.001",
-                                                  "avgPrice": "100000"})
+
+        def _request(method, endpoint, **kw):
+            if endpoint == "/v5/order/realtime":
+                return {"retCode": 0, "retMsg": "OK", "result": {"list": [
+                    {"orderLinkId": "x", "orderStatus": "Filled",
+                     "cumExecQty": "0.001", "avgPrice": "100000"}]}}
+            return {"retCode": 0, "retMsg": "OK",
+                    "result": {"orderId": "1", "orderLinkId": "x"}}
+        client._request = mock.Mock(side_effect=_request)
         CarryBroker(client=client, sequence_source=lambda *a: 1,
                     order_gate=lambda: (True, "TEST")).place_market(
             symbol="BTCUSDT", side=side, qty=0.001, product=product)

@@ -512,10 +512,11 @@ class CarryBroker:
                 raise OrderOutcomeUnknown(
                     f"{link_id} was accepted and could not be read back "
                     f"({read_exc}); its fill is unknown") from read_exc
-            if state is None or self._rejected(state):
-                resolved = self._query_by_link_id(symbol, link_id, product)
-                if resolved is not None and resolved.filled_qty > 0:
-                    return resolved.as_engine_result()
+            if state is None:
+                raise OrderOutcomeUnknown(
+                    f"{link_id} was accepted and the venue then shows no row "
+                    "for it; its fill is unknown")
+            if self._rejected(state):
                 return None            # terminal with nothing filled
             if state["resting"] and state["filled_qty"] <= 0:
                 raise OrderOutcomeUnknown(
@@ -1458,26 +1459,6 @@ class CarryBroker:
         rows = self._v5_list(result) or []
         return abs(float(rows[0].get("size", 0) or 0)) if rows else 0.0
 
-    def _query_by_link_id(self, symbol: str, link_id: str,
-                          product: str) -> Optional[LegFill]:
-        try:
-            result = self.client._request(
-                "GET", "/v5/order/realtime", signed=True,
-                params={"category": product, "symbol": symbol,
-                        "orderLinkId": link_id})
-        except Exception as exc:  # noqa: BLE001
-            logger.error("could not read back %s: %s", link_id, exc)
-            return None
-        rows = self._v5_list(result) or []
-        if not rows:
-            return None
-        row = rows[0]
-        return LegFill(
-            filled_qty=float(row.get("cumExecQty", 0) or 0),
-            avg_price=float(row.get("avgPrice", 0) or 0),
-            order_link_id=link_id, fee=CarryBroker._fee(row),
-            fee_detail=CarryBroker._fee_detail(row), detail=dict(row))
-
     # -- Bybit v5 envelope --------------------------------------------------
     #
     # `client._request` returns the WHOLE v5 envelope on retCode 0 -
@@ -1537,7 +1518,7 @@ class CarryBroker:
         Real Bybit create responses carry only `orderId` in `result` - no
         `cumExecQty`/`avgPrice` - so this legitimately returns a zero fill
         most of the time even after the correct unwrap; that is what sends
-        `place_market` to `_query_by_link_id` next. FakeClients in the test
+        `place_market` to `_order_state` next. FakeClients in the test
         suite simulate an immediate fill for convenience and now do so
         inside a real envelope's `result`, not at its top level.
         """
