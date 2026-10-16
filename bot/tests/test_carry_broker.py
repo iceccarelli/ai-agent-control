@@ -59,6 +59,7 @@ class FakeClient:
         if endpoint == "/v5/order/realtime":
             return envelope({"list": [
                 {"cumExecQty": "0.5", "avgPrice": str(self.mark),
+                 "orderStatus": "PartiallyFilled",
                  "orderLinkId": params.get("orderLinkId")}]})
         if endpoint == "/v5/account/fee-rate":
             # 0036: the round trip comes from the account's own fee tier.

@@ -661,10 +661,15 @@ class CarryBroker:
                 "it filled is unknown")
         return state
 
-    #: Order statuses that mean the order can still fill. Anything else is
-    #: terminal: what it filled is what it will ever fill.
-    RESTING_STATUSES = frozenset({"New", "Created", "PartiallyFilled",
-                                  "Untriggered"})
+    @staticmethod
+    def _terminal_statuses():
+        """The statuses Bybit documents as final, from the one place the
+        client keeps them. Anything else - an open status, a status this code
+        has never seen, or no status at all - is an order that may still
+        fill. The old list here named the RESTING statuses and called
+        everything else terminal, so a truncated row read as a dead order."""
+        import bybit_connection as _bybit_connection
+        return _bybit_connection.TERMINAL_ORDER_STATUS
 
     def _order_state(self, symbol: str, link_id: str,
                      product: str) -> Optional[Dict[str, Any]]:
@@ -682,9 +687,10 @@ class CarryBroker:
         if not rows:
             return None
         row = rows[0]
-        status = str(row.get("orderStatus", ""))
+        status = str(row.get("orderStatus") or "")
         filled = float(row.get("cumExecQty", 0) or 0)
-        resting = status in self.RESTING_STATUSES
+        # Fail closed: only a documented terminal status is final.
+        resting = status not in self._terminal_statuses()
         # A terminal row with nothing filled is still an ANSWER (the order
         # existed, filled nothing, and is no longer live). Only the caller
         # knows whether that means "rejected, cross instead" (a fresh
