@@ -470,6 +470,23 @@ class CarryEngine:
             raise ValueError(
                 f"{execution_style!r} is not an execution style "
                 f"{EXECUTION_STYLES}")
+        # A risk parameter that is NaN, infinite or non-positive is a brake
+        # that cannot fire: every comparison against NaN is false.
+        for name, value, floor_ok in (
+                ("max_notional_usd", max_notional_usd, False),
+                ("delta_band", delta_band, False),
+                ("min_margin_multiple", min_margin_multiple, False),
+                ("borrow_apr", borrow_apr, True)):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = float("nan")
+            if not math.isfinite(number) or number < 0 or (
+                    number == 0 and not floor_ok):
+                raise ValueError(
+                    f"{name}={value!r}: must be a finite "
+                    f"{'non-negative' if floor_ok else 'positive'} number; "
+                    "refusing to trade with a limit that cannot fire")
         wait = float(maker_wait_s)
         if not math.isfinite(wait) or wait <= 0:
             raise ValueError(
