@@ -120,3 +120,54 @@ def test_provisional_state_is_the_same_after_every_restart(tmp_path, fees, expec
         seen.add((c["status"], c["funding_estimated_usd"], c["fees_unknown"]))
     assert len(seen) == 1
     assert next(iter(seen))[0] == expected
+
+
+# -- the recorded liquidation evidence, as the operator sees it -------------------
+
+H8 = 8 * 3600 * 1000
+
+
+def _obs(ms, **kw):
+    base = dict(ms=ms, symbol="BTCUSDT", side="Sell", size=0.001, mark=100_000.0,
+                liq_price=130_000.0, distance_pct=30.0, account_mm_rate=0.05,
+                margin_multiple=6.0, reason="")
+    base.update(kw)
+    return base
+
+
+def test_a_book_that_recorded_nothing_says_so(tmp_path):
+    store = StateStore(str(tmp_path / "s.db"))
+    store.close()
+    ev = carry_report.build_report(str(tmp_path / "s.db"))["liquidation_evidence"]
+    assert ev == {"status": "NONE", "observations": 0}
+
+
+def test_recorded_evidence_is_summarised_with_its_gaps(tmp_path):
+    store = StateStore(str(tmp_path / "s.db"))
+    t0 = 1_700_000_000_000
+    store.record_risk_observation(_obs(t0, distance_pct=40.0))
+    store.record_risk_observation(_obs(t0 + 1_000, distance_pct=22.5,
+                                       account_mm_rate=0.31))
+    store.record_risk_observation(_obs(t0 + 1_000 + 3 * H8, liq_price=None,
+                                       distance_pct=None,
+                                       reason="BEYOND_VENUE_PRICE_BOUNDS"))
+    store.close()
+    ev = carry_report.build_report(str(tmp_path / "s.db"))["liquidation_evidence"]
+    assert ev["status"] == "RECORDING"
+    assert ev["observations"] == 3
+    assert ev["first_ms"] == t0 and ev["last_ms"] == t0 + 1_000 + 3 * H8
+    assert ev["min_distance_pct"] == pytest.approx(22.5)
+    assert ev["max_account_mm_rate"] == pytest.approx(0.31)
+    assert ev["unreachable_observations"] == 1
+    assert ev["largest_gap_ms"] == 3 * H8
+    assert ev["gaps_over_one_funding_interval"] == 1       # a replay refuses it
+
+
+def test_the_evidence_summary_leaves_the_database_untouched(tmp_path):
+    store = StateStore(str(tmp_path / "s.db"))
+    store.record_risk_observation(_obs(1_700_000_000_000))
+    store.close()
+    path = str(tmp_path / "s.db")
+    before = os.path.getmtime(path)
+    carry_report.build_report(path)
+    assert os.path.getmtime(path) == before

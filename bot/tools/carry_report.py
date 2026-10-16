@@ -87,6 +87,7 @@ def build_report(db_path: str) -> Dict[str, Any]:
         confirmed = [t for t in trades
                      if "entry_fee_realized" in t.keys()
                      and t["entry_fee_realized"] and t["exit_fee_realized"]]
+        out["liquidation_evidence"] = _liquidation_evidence(conn)
         out["ordinary_trades"] = {
             "trades": len(trades),
             "fees_confirmed_trades": len(confirmed),
@@ -98,6 +99,40 @@ def build_report(db_path: str) -> Dict[str, Any]:
         return out
     finally:
         conn.close()
+
+
+#: One funding interval. An observation older than this does not describe the
+#: settlement a replay bar summarises, so a gap longer than it is a stretch the
+#: replay refuses (carry_replay.LiquidationInputs.from_observations).
+FUNDING_INTERVAL_MS = 8 * 3600 * 1000
+
+
+def _liquidation_evidence(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """What the production liquidation gate has read and kept: how much, over
+    what window, how tight it got, and where the gaps are. Read-only."""
+    if not _has(conn, "carry_risk_observation"):
+        return {"status": "NONE", "observations": 0}
+    rows = conn.execute(
+        "SELECT ms, distance_pct, account_mm_rate, liq_price FROM "
+        "carry_risk_observation ORDER BY ms").fetchall()
+    if not rows:
+        return {"status": "NONE", "observations": 0}
+    stamps = [int(r["ms"]) for r in rows]
+    gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+    distances = [r["distance_pct"] for r in rows if r["distance_pct"] is not None]
+    rates = [r["account_mm_rate"] for r in rows
+             if r["account_mm_rate"] is not None]
+    return {
+        "status": "RECORDING", "observations": len(rows),
+        "first_ms": stamps[0], "last_ms": stamps[-1],
+        "min_distance_pct": min(distances) if distances else None,
+        "max_account_mm_rate": max(rates) if rates else None,
+        "unreachable_observations": sum(
+            1 for r in rows if r["liq_price"] is None),
+        "largest_gap_ms": max(gaps) if gaps else 0,
+        "gaps_over_one_funding_interval": sum(
+            1 for g in gaps if g > FUNDING_INTERVAL_MS),
+    }
 
 
 def _has(conn: sqlite3.Connection, table: str) -> bool:
