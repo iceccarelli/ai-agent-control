@@ -19,7 +19,8 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import ledger as L  # noqa: E402
-from carry_engine import ACQUIRE, OVERLAY, BookState, ColdStart  # noqa: E402
+import venue_fees  # noqa: E402
+from carry_engine import (ACQUIRE, OVERLAY, BookState, ColdStart,\n                          CarryPosition, Leg)  # noqa: E402
 from test_carry_cold_start import H8, MARK, Venue, engine  # noqa: E402
 
 QTY = 0.001
@@ -94,3 +95,68 @@ def test_without_a_restart_nothing_changed():
                 funding_print_ms=3 * H8, timestamp_ms=3 * H8)
     unwind(v, e, 90_000.0)
     assert j.statement()["realised_usd"] == pytest.approx(10.0)
+
+
+
+class BaseFeeVenue(PricedVenue):
+    """A venue that deducts the spot BUY fee from BTC received."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.base_fee_rate = 0.001
+
+    def place_market(self, *, symbol, side, qty, product):
+        out = super().place_market(symbol=symbol, side=side, qty=qty,
+                                   product=product)
+        if product == "spot" and side == "Buy":
+            fee = qty * self.base_fee_rate
+            fees = venue_fees.extract_order_fees(
+                {"cumFeeDetail": {"BTC": str(fee)}})
+            out.update(fee=fees.single_amount, fee_detail=fees.to_dict())
+        return out
+
+
+def test_base_coin_fee_does_not_leave_ghost_spot_basis_between_round_trips():
+    venue = BaseFeeVenue(inventory=5.0)
+    journal = L.Journal()
+    broker = L.LedgerBroker(venue, journal, ms=lambda: MS,
+                            spot_symbol="BTCUSDT")
+
+    first = broker.place_market(symbol="BTCUSDT", side="Buy", qty=1.0,
+                                product="spot")
+    first_held = first["filled_qty"] - 0.001
+    assert broker._spot_qty == pytest.approx(first_held)
+    broker.place_market(symbol="BTCUSDT", side="Sell", qty=first_held,
+                        product="spot")
+    assert broker._spot_qty == pytest.approx(0.0)
+    assert broker._spot_entry is None
+    assert journal.balances()[L.BTC].qty == pytest.approx(0.0, abs=1e-12)
+
+    # A second round trip in the same process must not inherit the first
+    # round's withheld BTC as synthetic inventory or dilute its entry price.
+    venue.px = 120_000.0
+    second = broker.place_market(symbol="BTCUSDT", side="Buy", qty=0.5,
+                                 product="spot")
+    second_held = second["filled_qty"] - 0.0005
+    assert broker._spot_qty == pytest.approx(second_held)
+    assert broker._spot_entry == pytest.approx(120_000.0)
+    broker.place_market(symbol="BTCUSDT", side="Sell", qty=second_held,
+                        product="spot")
+    assert broker._spot_qty == pytest.approx(0.0)
+    assert broker._spot_entry is None
+    assert journal.balances()[L.BTC].qty == pytest.approx(0.0, abs=1e-12)
+
+
+def test_restart_reseeds_acquired_spot_basis_with_net_wallet_quantity():
+    venue = BaseFeeVenue(inventory=5.0)
+    e = wrapped(venue, L.Journal(), ACQUIRE)
+    e.position = CarryPosition(
+        spot=Leg(symbol="BTCUSDT", side="Buy", product="spot",
+                requested_qty=1.0, filled_qty=1.0, avg_price=MARK,
+                fee_base_qty=0.001),
+        perp=Leg(symbol="BTCUSDT", side="Sell", product="linear",
+                 requested_qty=1.0, filled_qty=1.0, avg_price=MARK),
+        opened_ms=MS)
+    e._reseed_cost_basis()
+    assert e.broker._spot_qty == pytest.approx(0.999)
+    assert e.broker._spot_entry == pytest.approx(MARK)

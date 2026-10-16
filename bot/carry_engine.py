@@ -618,7 +618,8 @@ class CarryEngine:
             return
         bought = self.execution_mode == ACQUIRE and pos.spot.avg_price > 0
         reseed(perp_qty=pos.perp.filled_qty, perp_price=pos.perp.avg_price,
-               spot_qty=pos.spot.filled_qty if bought else 0.0,
+               spot_qty=max(0.0, pos.spot.filled_qty - pos.spot.fee_base_qty)
+               if bought else 0.0,
                spot_price=pos.spot.avg_price if bought else None)
 
     def _record(self) -> Optional[CarryDecision]:
