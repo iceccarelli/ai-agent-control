@@ -1576,6 +1576,13 @@ class CarryEngine:
                 f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
 
         distance = view.get("distance_pct")
+        if distance is None and view.get("reason") == "LIQ_PRICE_UNUSABLE":
+            # A broker that names the price unusable has NOT said it is
+            # unreachable. Reading None as safe here skipped the gate.
+            return self._halt(
+                "LIQUIDATION_DISTANCE_UNUSABLE",
+                "the venue named a liquidation price that cannot be measured; "
+                "an unusable price is not an unreachable one")
         if distance is None:
             # Bybit returns "" for liqPrice when it lies outside the venue's
             # price bounds: there is no reachable liquidation price, which is

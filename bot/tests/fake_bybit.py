@@ -300,7 +300,10 @@ class FakeBybit:
             #: evidence needs a fake that actually populates them, not
             #: just an orderStatus.
             "cumExecQty": body["qty"] if status == "Filled" else "0",
-            "avgPrice": body.get("price", "") if status == "Filled" else "",
+            # A real Filled order always carries the price it filled at; a
+            # market order has no limit price, so it fills at the last trade.
+            "avgPrice": ((body.get("price") or str(LAST_PRICE.get(
+                body["symbol"], ""))) if status == "Filled" else ""),
             "_purpose": purpose,
             "_body": body,
         }

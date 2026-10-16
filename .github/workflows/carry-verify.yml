@@ -116,6 +116,7 @@ jobs:
           tests/test_carry_hedge_mode_refusal.py
           tests/test_carry_hedge_mode_refusal_wiring.py
           tests/test_carry_venue_clock_wiring.py
+          tests/test_carry_unstated_numbers.py
           tests/test_carry_restart_cost_basis.py
           tests/test_carry_journal_persists_with_position.py
           tests/test_carry_wiring_authority.py

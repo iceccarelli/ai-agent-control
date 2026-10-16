@@ -748,7 +748,14 @@ class CarryBroker:
                 return None
         row = rows[0]
         status = str(row.get("orderStatus") or "")
-        filled = float(row.get("cumExecQty", 0) or 0)
+        filled = self._stated(row, "cumExecQty", f"order {link_id}")
+        if filled > 0:
+            avg = self._stated(row, "avgPrice", f"order {link_id}")
+            if avg <= 0:
+                raise PairIncident(
+                    f"order {link_id} filled {filled} with no usable "
+                    f"avgPrice: {row!r}; a fill without a price cannot be "
+                    "booked")
         # Fail closed: only a documented terminal status is final.
         resting = status not in self._terminal_statuses()
         # A terminal row with nothing filled is still an ANSWER (the order
@@ -757,7 +764,8 @@ class CarryBroker:
         # post-only) or "cancelled clean, take the remainder" (a cancel); it
         # is reported as-is here and never folded into "no row".
         return {"filled_qty": filled,
-                "avg_price": float(row.get("avgPrice", 0) or 0),
+                "avg_price": (float(row.get("avgPrice") or 0)
+                              if filled > 0 else 0.0),
                 "order_link_id": link_id, "fee": self._fee(row),
                 "fee_detail": self._fee_detail(row),
                 "maker": True, "resting": resting, "status": status}
@@ -958,8 +966,9 @@ class CarryBroker:
         for entry in coins:
             if str(entry.get("coin", "")).upper() != coin.upper():
                 continue
+            balance = self._stated(entry, "walletBalance",
+                                   f"wallet row for {coin}")
             try:
-                balance = float(entry.get("walletBalance", 0) or 0)
                 locked = float(entry.get("locked", 0) or 0)
             except (TypeError, ValueError) as exc:
                 raise PairIncident(
@@ -1082,10 +1091,15 @@ class CarryBroker:
             raise PairIncident(
                 f"liqPrice for {symbol} is {raw_liq!r}") from exc
         if not (math.isfinite(liq) and liq > 0 and mark > 0):
-            return {"size": size, "side": side, "mark": mark,
-                    "liq_price": None, "distance_pct": None,
-                    "account_mm_rate": account_mm,
-                    "reason": "LIQ_PRICE_UNUSABLE"}
+            # The venue named a liquidation price and it cannot be measured
+            # (nan, zero, negative, or no usable mark to measure it from).
+            # Only "" means unreachable; anything else unusable is an
+            # unreadable margin call, and the engine halts on it. It used to
+            # come back as distance None, which the engine reads as safe.
+            raise PairIncident(
+                f"liqPrice {raw_liq!r} with mark {mark!r} for {symbol} cannot "
+                "be measured; an unusable liquidation price is not an "
+                "unreachable one")
 
         # A short is liquidated ABOVE the mark, a long below. Either way the
         # answer is a positive distance to the bad side.
@@ -1490,12 +1504,14 @@ class CarryBroker:
             if not rows:
                 return 0.0
             coins = rows[0].get("coin") or []
-            return float(coins[0].get("walletBalance", 0) or 0) if coins else 0.0
+            return (self._stated(coins[0], "walletBalance",
+                                 f"wallet row for {symbol[:-4]}")
+                    if coins else 0.0)
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})
         rows = self._v5_list(result) or []
-        return abs(float(rows[0].get("size", 0) or 0)) if rows else 0.0
+        return self._stated_size(rows[0], symbol) if rows else 0.0
 
     # -- Bybit v5 envelope --------------------------------------------------
     #
@@ -1517,25 +1533,30 @@ class CarryBroker:
         return (payload or {}).get("result") or {}
 
     @staticmethod
-    def _stated_size(row: Any, symbol: str) -> float:
-        """The size a position row STATES, unsigned. A row that does not state
-        one (key absent, null, blank, not a number, non-finite) is unreadable:
-        reading it as 0 turned a truncated payload into a flat book. Bybit's
-        own spelling of flat is the string "0"."""
-        raw = row.get("size") if isinstance(row, dict) else None
+    def _stated(row: Any, key: str, what: str) -> float:
+        """A finite number the venue STATES in `row[key]`. Absent, null, blank,
+        not a number, or non-finite is unreadable: every one of those used to
+        be read as 0 (`float(row.get(key, 0) or 0)`), which is flat, empty or
+        "filled nothing" - the permissive answer - for a truncated payload."""
+        raw = row.get(key) if isinstance(row, dict) else None
         if raw is None or str(raw).strip() == "":
             raise PairIncident(
-                f"position row for {symbol} does not state a size: {row!r}; "
-                "an unstated size is not a flat position")
+                f"{what} does not state {key!r}: {row!r}; an unstated number "
+                "is not zero")
         try:
-            size = abs(float(raw))
+            number = float(raw)
         except (TypeError, ValueError) as exc:
-            raise PairIncident(
-                f"position row for {symbol} is malformed: {row!r}") from exc
-        if not math.isfinite(size):
-            raise PairIncident(
-                f"position row for {symbol} is malformed: {row!r}")
-        return size
+            raise PairIncident(f"{what} is malformed: {row!r}") from exc
+        if not math.isfinite(number):
+            raise PairIncident(f"{what} is malformed: {row!r}")
+        return number
+
+    @staticmethod
+    def _stated_size(row: Any, symbol: str) -> float:
+        """The unsigned size a position row STATES. Bybit spells flat as the
+        string "0" (a flat row is proven live to carry it)."""
+        return abs(CarryBroker._stated(row, "size",
+                                       f"position row for {symbol}"))
 
     @staticmethod
     def _v5_list(payload: Optional[Dict[str, Any]]) -> Optional[list]:
