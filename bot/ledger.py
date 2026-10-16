@@ -1108,17 +1108,24 @@ class LedgerBroker:
 
         if product == "spot":
             if side == "Buy":
-                # The venue takes a spot BUY fee in the COIN (F3). `fee` came
-                # back in BTC; converting it here is what keeps the BTC
-                # balance equal to what the wallet will show.
+                # The venue withholds a labelled BTC fee from the coin bought.
+                # The broker's basis quantity must therefore follow the wallet's
+                # net holding, not the gross fill: unwinds sell that net amount.
+                held_qty = qty - fee_btc
+                if not math.isfinite(held_qty) or held_qty < -1e-12:
+                    raise LedgerError(
+                        f"spot BUY base fee {fee_btc} exceeds fill {qty}")
+                held_qty = max(0.0, held_qty)
                 spot_buy(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                          fee_btc=fee_btc, fee_usdt=fee_usdt,
                          fee_status=status, fee_raw=fee_raw)
-                filled = self._spot_qty + qty
-                self._spot_entry = (
-                    price if self._spot_entry is None else
-                    (self._spot_entry * self._spot_qty + price * qty) / filled)
-                self._spot_qty = filled
+                if held_qty > 0:
+                    filled = self._spot_qty + held_qty
+                    self._spot_entry = (
+                        price if self._spot_qty <= 0 or self._spot_entry is None
+                        else (self._spot_entry * self._spot_qty
+                              + price * held_qty) / filled)
+                    self._spot_qty = filled
             else:
                 # WHAT IT COST, not what it just sold for.
                 #
