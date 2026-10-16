@@ -70,3 +70,14 @@ def test_a_hedge_mode_account_is_refused_through_build_bot():
 def test_a_one_way_account_starts_through_build_bot():
     bot, _ = built_bot(FLAT_ONE_WAY)
     assert bot.carry_cold_start() is True
+
+
+@pytest.mark.parametrize("reader", ["get_perp_position", "resume_basis",
+                                    "get_open_carry_orders",
+                                    "get_spot_inventory"])
+def test_every_optional_safety_read_exists_on_the_production_broker(reader):
+    """`_check_venue_position`, `_reseed_cost_basis` and cold start look these
+    up with getattr(..., None) and skip when absent. The production wrapper
+    must expose each one, or the check disappears without a trace."""
+    bot, _ = built_bot(FLAT_ONE_WAY)
+    assert callable(getattr(bot.carry.broker, reader, None)), reader
