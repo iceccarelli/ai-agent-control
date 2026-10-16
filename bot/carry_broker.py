@@ -694,13 +694,22 @@ class CarryBroker:
         has just been asked to create, that means the order was rejected and
         does not exist.
         """
-        result = self.client._request(
-            "GET", "/v5/order/realtime", signed=True,
-            params={"category": product, "symbol": symbol,
-                    "orderLinkId": link_id})
+        params = {"category": product, "symbol": symbol,
+                  "orderLinkId": link_id}
+        result = self.client._request("GET", "/v5/order/realtime",
+                                      signed=True, params=params)
         rows = self._v5_list(result) or []
         if not rows:
-            return None
+            # Realtime lists OPEN orders. One that filled, was cancelled or
+            # was rejected has left it and is in the history list - the
+            # directional client learned this live ("a filled market order
+            # was always a 404", BybitClient.get_order). Only when neither
+            # list has the id is there no row.
+            result = self.client._request("GET", "/v5/order/history",
+                                          signed=True, params=params)
+            rows = self._v5_list(result) or []
+            if not rows:
+                return None
         row = rows[0]
         status = str(row.get("orderStatus") or "")
         filled = float(row.get("cumExecQty", 0) or 0)
