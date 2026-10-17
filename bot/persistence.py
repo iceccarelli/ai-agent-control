@@ -992,9 +992,11 @@ class StateStore:
         rows = self._query("SELECT * FROM carry_position WHERE id = 1")
         if not rows:
             return None
-        raw = str(rows[0]["payload"] or "")
-        if not raw:
-            return None
+        raw = rows[0]["payload"]
+        if not isinstance(raw, str) or not raw.strip():
+            raise PersistenceError(
+                "carry_position row exists but its payload is empty or non-text"
+            )
         try:
             state = json.loads(raw)
         except json.JSONDecodeError as exc:
