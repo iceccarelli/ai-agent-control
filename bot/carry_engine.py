@@ -276,7 +276,9 @@ def _ledger_position_problem(position: Any) -> Optional[str]:
 def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
                     venue_perp_qty: float, venue_spot_qty: float,
                     open_orders: Any = (),
-                    dust: float = QTY_DUST) -> ColdStartDecision:
+                    dust: float = QTY_DUST,
+                    expected_spot_symbol: Optional[str] = None,
+                    expected_perp_symbol: Optional[str] = None) -> ColdStartDecision:
     """Compare what the last run believed against what the venue holds.
 
     Pure. It reads both sides and returns a verdict; it never writes to either.
@@ -337,6 +339,22 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
             naked_side="unknown",
             detail={"problem": problem, "venue_perp_qty": perp,
                     "venue_spot_qty": spot})
+
+    # Quantity agreement is not enough: a BTC hedge cannot be resumed as an
+    # ETH pair merely because both legs happen to have the same quantities.
+    # Compare identity with the engine's configured markets before restoring
+    # any persisted state into the running engine.
+    for role, expected in (("spot", expected_spot_symbol),
+                           ("perp", expected_perp_symbol)):
+        actual = position[role]["symbol"]
+        if expected is not None and actual != expected:
+            return ColdStartDecision(
+                ColdStart.HALT,
+                f"the ledger's {role} leg is for {actual!r}, but this process "
+                f"is configured for {expected!r}",
+                naked_side="unknown",
+                detail={f"ledger_{role}_symbol": actual,
+                        f"expected_{role}_symbol": expected})
 
     ledger_perp = abs(float((position.get("perp") or {}).get("filled_qty", 0.0)))
     ledger_spot = abs(float((position.get("spot") or {}).get("filled_qty", 0.0)))
@@ -775,7 +793,9 @@ class CarryEngine:
             decision = plan_cold_start(ledger=ledger,
                                        venue_perp_qty=venue_perp_qty,
                                        venue_spot_qty=venue_spot_qty,
-                                       open_orders=open_orders)
+                                       open_orders=open_orders,
+                                       expected_spot_symbol=self.spot_symbol,
+                                       expected_perp_symbol=self.perp_symbol)
         if decision.action is ColdStart.CLEAN and ledger is not None:
             # Flat at both ends: there is no pair to restore, but the day's
             # entry allowance is still spent - a pair opened and closed earlier
