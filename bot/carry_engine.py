@@ -1740,10 +1740,30 @@ class CarryEngine:
         if not result:
             return None
         raw_fee = result.get("fee")
-        filled = float(result.get("filled_qty", 0.0) or 0.0)
+        # Every comparison against NaN is False, so a NaN fill sails past
+        # `<= 0` and `>= qty` checks downstream and is booked as a hedge. A
+        # fill the book cannot account is an order of unknown outcome.
+        try:
+            filled = float(result.get("filled_qty", 0.0) or 0.0)
+            price = float(result.get("avg_price", 0.0) or 0.0)
+            fee_ok = raw_fee is None or math.isfinite(float(raw_fee))
+        except (TypeError, ValueError):
+            filled = price = float("nan")
+            fee_ok = False
+        if not (math.isfinite(filled) and math.isfinite(price) and fee_ok
+                and filled >= 0 and price >= 0
+                and (filled == 0 or price > 0)
+                and filled <= qty * (1.0 + 1e-6) + QTY_DUST):
+            self._last_leg_error = f"unaccountable fill: {result!r}"
+            self._halt(
+                "LEG_OUTCOME_UNKNOWN",
+                f"{side} {qty} {symbol} ({product}) came back with a fill "
+                f"the book cannot account ({result!r}); the order may be "
+                "live, so nothing is sent on top of it")
+            return None
         return Leg(symbol=symbol, side=side, product=product,
                    requested_qty=qty, filled_qty=filled,
-                   avg_price=float(result.get("avg_price", 0.0) or 0.0),
+                   avg_price=price,
                    order_link_id=str(result.get("order_link_id", "")),
                    fee=None if raw_fee is None else float(raw_fee),
                    fee_base_qty=self._base_fee_withheld(result, symbol, side,
