@@ -673,3 +673,10 @@ def test_a_halt_whose_write_failed_is_written_once_the_store_recovers():
     state["fail"] = False
     candle(eng, ms=121_000, print_ms=1_000)
     assert writes and writes[-1]["book_state"] == "HALTED"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_snap_to_lot_never_hands_a_non_finite_quantity_back(bad):
+    from carry_engine import snap_to_lot
+    assert snap_to_lot(bad, 0.001) == 0.0
+    assert snap_to_lot(bad, 0.0) == 0.0

@@ -148,6 +148,10 @@ def snap_to_lot(qty: float, step: float) -> float:
     rejection. Rounding UP would breach the cap, so it rounds down and the
     caller refuses when what is left is below the minimum.
     """
+    if not math.isfinite(float(qty)):
+        # nan / inf is not a quantity: no order exists for it (Decimal's floor
+        # division would hand NaN or inf straight back to the caller).
+        return 0.0
     if step <= 0:
         return float(qty)
     try:
