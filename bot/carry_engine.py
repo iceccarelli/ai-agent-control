@@ -1659,6 +1659,44 @@ class CarryEngine:
                 "nothing watching the first leg")
         return None
 
+    def _perp_confirmed_gone(self) -> bool:
+        """Is the perp short really gone (liquidated), not merely unreadable or
+        lagging? Only when the venue REFUSED the reduce-only buy-back (the caller
+        has that) AND two position reads, a pause apart, both say flat. A read
+        that fails, or shows any short on either look, is not confirmation."""
+        first = self._venue_short_qty()
+        if first is None or first > QTY_DUST:
+            return False
+        time.sleep(self.UNWIND_REREAD_WAIT_S)
+        second = self._venue_short_qty()
+        return second is not None and second <= QTY_DUST
+
+    def _spot_after_perp_gone(self, position: "CarryPosition", reason: str,
+                              wanted_spot: float) -> CarryDecision:
+        """ACQUIRE: the perp that hedged the spot is gone (liquidated), so the
+        spot is now a naked LONG. Sell it - that only removes exposure - and
+        HALT either way: the journal still shows the perp lifecycle open and the
+        venue's liquidation PnL is a number only a human with the closed-pnl
+        record can post, so the book never calls itself FLAT here."""
+        sell = self._spot_sellable(wanted_spot)
+        sold = (self._fire(self.spot_symbol, "Sell", sell, "spot")
+                if sell > 0 else None)
+        left = max(0.0, wanted_spot - (sold.filled_qty if sold else 0.0))
+        position.perp.filled_qty = 0.0
+        position.perp.requested_qty = 0.0
+        position.spot.filled_qty = left
+        position.spot.requested_qty = left
+        position.spot.fee_base_qty = 0.0
+        if self.pair_risk is not None:
+            self.pair_risk.record_broken_pair(
+                now=self._gate_now(self._last_tick_ms))
+        return self._halt(
+            "PERP_LIQUIDATED_SPOT_SOLD" if left <= QTY_DUST
+            else "PERP_LIQUIDATED_SPOT_PARTIAL",
+            f"{reason} - the venue refused the buy-back and two reads show no "
+            f"short: the perp was liquidated. {left:.10g} of spot is still held; "
+            "the journal's perp lifecycle and the liquidation PnL need a human.")
+
     def _venue_short_qty(self) -> Optional[float]:
         """The perp short the venue reports (0.0 when it reads flat), or None
         when it cannot be read or the broker has no such read. Flat and unread
@@ -1748,6 +1786,9 @@ class CarryEngine:
         # received, and the venue refuses a sell above the free balance.
         wanted_spot = max(0.0, position.spot.filled_qty
                           - position.spot.fee_base_qty)
+        if perp is None and self.state is BookState.UNWINDING \
+                and self._perp_confirmed_gone():
+            return self._spot_after_perp_gone(position, reason, wanted_spot)
         if perp is None or perp.filled_qty <= 0:
             # The perp is the leg that can be liquidated and the one that
             # hedges the spot. If it did not close, selling the spot would turn

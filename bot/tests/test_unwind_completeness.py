@@ -673,3 +673,64 @@ def test_a_halt_whose_write_failed_is_written_once_the_store_recovers():
     state["fail"] = False
     candle(eng, ms=121_000, print_ms=1_000)
     assert writes and writes[-1]["book_state"] == "HALTED"
+
+
+class _LiquidatedVenue(_VenueReadsItsShort):
+    """The short is gone: reads say flat and the reduce-only buy is refused."""
+    def place_market(self, *, symbol, side, qty, product):
+        if product == "linear" and side == "Buy":
+            return None
+        return super().place_market(symbol=symbol, side=side, qty=qty,
+                                    product=product)
+
+
+def test_acquire_sells_the_naked_spot_when_the_perp_is_confirmed_liquidated():
+    v = _LiquidatedVenue()
+    eng = build(v, mode=ACQUIRE)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    v.perp_short = 0.0                       # liquidated
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "PERP_LIQUIDATED_SPOT_SOLD", (
+        d.action, d.reason)
+    assert v.spot_long < 1e-6, "the spot long was left unhedged and unsold"
+    # never FLAT: the journal's perp lifecycle needs a human closeout
+    assert eng.state is BookState.HALTED and eng.position is not None
+    assert eng.position.perp.filled_qty == 0.0
+
+
+def test_acquire_keeps_the_spot_when_the_flat_read_is_not_confirmed():
+    """One flat read and one that still shows the short: not confirmation."""
+    class Flaky(_LiquidatedVenue):
+        reads = 0
+
+        def get_perp_position(self, symbol):
+            type(self).reads += 1
+            # sizing read: the real short; first confirmation: flat; second: short
+            return {1: self.perp_short, 2: 0.0}.get(type(self).reads,
+                                                    self.perp_short)
+    v = Flaky()
+    eng = build(v, mode=ACQUIRE)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    Flaky.reads = 0
+    spot_before = v.spot_long
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before), "spot sold over a live short"
+
+
+def test_overlay_never_sells_the_clients_coin_on_a_liquidated_perp():
+    v = _LiquidatedVenue()
+    eng = build(v, mode=OVERLAY)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    v.perp_short = 0.0
+    v.margin = 1.1
+    orders_before = len(v.orders)
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE"
+    assert not any(o[1] == "spot" and o[0] == "Sell"
+                   for o in v.orders[orders_before:])
