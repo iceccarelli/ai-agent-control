@@ -157,3 +157,52 @@ class TestTheBookStopsOnAnUnaccountableLeg:
                         execution_mode="acquire", persist=lambda s: None)
         assert e._take("BTCUSDT", "Sell", 0.001, "linear") is None
         assert e.state is BookState.HALTED
+
+
+class TestAMakerOrderIsHeldToTheSameStandard:
+    @staticmethod
+    def _engine(placed, final=None):
+        from carry_engine import CarryEngine
+
+        class Stub:
+            orders = []
+
+            def get_book_top(self, symbol, product):
+                return {"bid": MARK - 1, "ask": MARK + 1}
+
+            def place_post_only(self, **kw):
+                return placed
+
+            def cancel_order(self, **kw):
+                return final
+
+            def place_market(self, **kw):
+                Stub.orders.append(kw)
+                return {"filled_qty": kw["qty"], "avg_price": MARK,
+                        "order_link_id": "m"}
+
+        Stub.orders = []
+        e = CarryEngine(broker=Stub(), max_notional_usd=100.0, borrow_apr=0.0,
+                        execution_mode="acquire", persist=lambda s: None,
+                        maker_wait_s=0.001)
+        return e, Stub
+
+    @pytest.mark.parametrize("placed", [
+        {"filled_qty": float("nan"), "avg_price": MARK, "order_link_id": "p"},
+        {"filled_qty": 5.0, "avg_price": MARK, "order_link_id": "p"},   # > asked
+        {"filled_qty": -1.0, "avg_price": MARK, "order_link_id": "p"},
+        {"filled_qty": 0.001, "avg_price": 0.0, "order_link_id": "p"},  # unpriced
+    ])
+    def test_an_unaccountable_maker_fill_halts_and_crosses_nothing(self, placed):
+        e, stub = self._engine(dict(placed, resting=False))
+        assert e._rest_then_take("BTCUSDT", "Sell", 0.001, "linear", 1e-6) is None
+        assert e.state is BookState.HALTED
+        assert stub.orders == [], "crossed on top of an unknown maker order"
+
+    def test_an_unaccountable_cancel_total_halts(self):
+        e, stub = self._engine(
+            {"filled_qty": 0.0, "avg_price": 0.0, "order_link_id": "p",
+             "resting": True},
+            final={"filled_qty": float("nan"), "resting": False})
+        assert e._rest("BTCUSDT", "Sell", 0.001, "linear") is None
+        assert e.state is BookState.HALTED

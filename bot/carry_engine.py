@@ -1718,6 +1718,23 @@ class CarryEngine:
             return self._rest_then_take(symbol, side, qty, product, qty_step)
         return self._take(symbol, side, qty, product)
 
+    @staticmethod
+    def _accountable(result: Any, qty: float) -> Tuple[float, float, bool]:
+        """(filled, avg_price, ok) of a broker result. Not ok when the fill is
+        unparseable, non-finite, negative, unpriced, or larger than the order
+        (beyond venue rounding). Partial fills are fine."""
+        try:
+            filled = float(result.get("filled_qty", 0.0) or 0.0)
+            price = float(result.get("avg_price", 0.0) or 0.0)
+            raw_fee = result.get("fee")
+            fee_ok = raw_fee is None or math.isfinite(float(raw_fee))
+        except (AttributeError, TypeError, ValueError):
+            return float("nan"), float("nan"), False
+        ok = (fee_ok and math.isfinite(filled) and math.isfinite(price)
+              and filled >= 0 and price >= 0 and (filled == 0 or price > 0)
+              and filled <= qty * (1.0 + 1e-6) + QTY_DUST)
+        return filled, price, ok
+
     def _take(self, symbol: str, side: str, qty: float,
               product: str) -> Optional[Leg]:
         """Cross the spread. The path the cost gate priced."""
@@ -1743,17 +1760,8 @@ class CarryEngine:
         # Every comparison against NaN is False, so a NaN fill sails past
         # `<= 0` and `>= qty` checks downstream and is booked as a hedge. A
         # fill the book cannot account is an order of unknown outcome.
-        try:
-            filled = float(result.get("filled_qty", 0.0) or 0.0)
-            price = float(result.get("avg_price", 0.0) or 0.0)
-            fee_ok = raw_fee is None or math.isfinite(float(raw_fee))
-        except (TypeError, ValueError):
-            filled = price = float("nan")
-            fee_ok = False
-        if not (math.isfinite(filled) and math.isfinite(price) and fee_ok
-                and filled >= 0 and price >= 0
-                and (filled == 0 or price > 0)
-                and filled <= qty * (1.0 + 1e-6) + QTY_DUST):
+        filled, price, ok = self._accountable(result, qty)
+        if not ok:
             self._last_leg_error = f"unaccountable fill: {result!r}"
             self._halt(
                 "LEG_OUTCOME_UNKNOWN",
@@ -1838,12 +1846,20 @@ class CarryEngine:
             return None
         if not placed:
             return None                      # rejected: the price moved
-        filled = float(placed.get("filled_qty", 0.0) or 0.0)
+        filled, placed_price, ok = self._accountable(placed, qty)
+        if not ok:
+            self._last_leg_error = f"unaccountable maker fill: {placed!r}"
+            self._halt(
+                "MAKER_ORDER_AMBIGUOUS",
+                f"a post-only {side} of {qty} {symbol} reads back a fill the "
+                f"book cannot account ({placed!r}); it may be resting, so "
+                "nothing is sent on top of it")
+            return None
         raw_fee = placed.get("fee")
         link = str(placed.get("order_link_id", ""))
         leg = Leg(symbol=symbol, side=side, product=product,
                   requested_qty=qty, filled_qty=filled,
-                  avg_price=float(placed.get("avg_price", 0.0) or 0.0),
+                  avg_price=placed_price,
                   order_link_id=link,
                   fee=None if raw_fee is None else float(raw_fee),
                   fee_base_qty=self._base_fee_withheld(placed, symbol, side,
@@ -1876,7 +1892,14 @@ class CarryEngine:
                 f"{(final or {}).get('filled_qty')!r}); crossing on top of it "
                 "would open a second leg, so the book stops instead")
             return None
-        total = float((final or {}).get("filled_qty", 0.0) or 0.0)
+        total, final_price, ok = self._accountable(final or {}, qty)
+        if not ok:
+            self._last_leg_error = f"unaccountable maker fill: {final!r}"
+            self._halt(
+                "MAKER_ORDER_AMBIGUOUS",
+                f"a post-only {side} of {qty} {symbol} read back a total the "
+                f"book cannot account ({final!r}); what it filled is unknown")
+            return None
         if total > leg.filled_qty:
             # The venue's number wins: it is the total on that order, and it
             # may have grown between placement and cancellation.
