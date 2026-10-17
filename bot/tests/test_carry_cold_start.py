@@ -472,3 +472,21 @@ class TestAPersistedPositionThatCannotBeTrustedHaltsTheStart:
                          venue_spot_qty=5.0, open_orders=())
         assert d.action is ColdStart.RESUME
         assert e.position.perp.fee == pytest.approx(0.0055)
+
+class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
+    @pytest.mark.parametrize("role", ["spot", "perp"])
+    def test_foreign_market_leg_halts_through_real_startup(self, role):
+        # Build a genuine serialized engine state, then corrupt only the market
+        # identity. The bot's real cold-start path must refuse to resume it.
+        ledger = opened(Venue()).to_state()
+        ledger["position"][role]["symbol"] = "ETHUSDT"
+        venue = Venue(perp=ledger["position"]["perp"]["filled_qty"])
+        bot, store = TestTheProcessRefusesToStartOnAMismatch()._bot(
+            venue, ledger
+        )
+
+        assert bot.carry_cold_start() is False
+        assert store.trip_kill_switch.called
+        assert bot.carry.state is BookState.HALTED
+        assert venue.orders == []
+
