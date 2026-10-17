@@ -265,3 +265,44 @@ def test_discarded_history_requires_fresh_contiguous_prints_again():
     assert tick(e, 6 * H8).reason == INSUFFICIENT
     assert e._funding_history == [FRESH, FRESH]
     assert all(math.isfinite(x) for x in e._funding_history)
+
+
+# -- the tick clock must agree with the history it is asked to trade on -------
+
+D = 24 * H
+
+
+def clocked(e, now, stamp, bps=FRESH):
+    return e.on_candle(mark=MARK, funding_bps=bps, spot=MARK,
+                       timestamp_ms=now, funding_print_ms=stamp)
+
+
+def test_stamp_less_tick_cannot_enter_on_a_history_that_aged_out():
+    e = engine([RICH] * 4, 4 * H8)
+    d = clocked(e, 4 * H8 + 10 * D, None)           # ten days on, no print
+    assert d.reason == INSUFFICIENT
+    assert e._funding_history == [] and e._last_print_ms is None
+
+
+def test_history_inside_the_gap_limit_stays_eligible_without_a_stamp():
+    e = engine([RICH] * 4, 4 * H8)
+    now = 4 * H8 + CarryEngine.MAX_PRINT_GAP_MS      # exactly 12h: not a gap
+    assert economics(e).refusal is None
+    assert clocked(e, now, None).reason != INSUFFICIENT
+    assert e._funding_history == [RICH] * 4
+
+
+def test_future_ledger_stamp_cannot_freeze_a_stale_history():
+    now = 100 * D
+    e = engine([RICH] * 4, now + 30 * D)             # corrupt, far-future stamp
+    d = clocked(e, now, now - H)                     # a real, fresh print
+    assert d.reason == INSUFFICIENT
+    assert e._funding_history == [FRESH]             # the fresh print counted
+    assert e._last_print_ms == now - H
+
+
+def test_fresh_contiguous_history_with_a_live_clock_is_untouched():
+    now = 100 * D
+    e = engine([RICH] * 4, now - H)
+    assert clocked(e, now, now - H).reason != INSUFFICIENT
+    assert e._funding_history == [RICH] * 4

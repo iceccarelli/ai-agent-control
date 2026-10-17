@@ -859,6 +859,31 @@ class CarryEngine:
 
     # -- the loop ---------------------------------------------------------
 
+    def _drop_history_the_clock_disproves(self, now_ms: int) -> bool:
+        """Discard a funding history whose newest stamp the tick clock refutes.
+
+        Two shapes, both judged on the thresholds the code already owns:
+        a newest print older than `MAX_PRINT_GAP_MS` (settlements were missed
+        and no tick carried a print to say so), and one stamped in the future
+        (a corrupt ledger stamp would make every real print read as a replay
+        and freeze the history). `now_ms` is 0 when the caller has no clock;
+        then nothing can be judged. True when it discarded.
+        """
+        last = self._last_print_ms
+        if now_ms <= 0 or last is None or not self._funding_history:
+            return False
+        from market_snapshot import MAX_CLOCK_SKEW_S
+        if (now_ms - last > self.MAX_PRINT_GAP_MS
+                or last - now_ms > MAX_CLOCK_SKEW_S * 1000.0):
+            logger.warning(
+                "carry: newest funding print is stamped %d, the tick is %d; "
+                "discarding %d prints that cannot be placed in time",
+                last, now_ms, len(self._funding_history))
+            self._funding_history = []
+            self._last_print_ms = None
+            return True
+        return False
+
     def on_candle(self, *, mark: float, funding_bps: float,
                   spot: Optional[float] = None,
                   timestamp_ms: int = 0,
@@ -891,11 +916,18 @@ class CarryEngine:
         # Every PRINT is recorded whether or not the book acts on it — once.
         # The EWMA is only meaningful if the history is complete, and equally
         # meaningless if one print is counted sixty times.
-        new_print = (funding_print_ms is not None
-                     and self._finite(funding_bps)
-                     and self._finite(funding_print_ms)
-                     and (self._last_print_ms is None
-                          or int(funding_print_ms) > self._last_print_ms))
+        def is_new() -> bool:
+            return (funding_print_ms is not None
+                    and self._finite(funding_bps)
+                    and self._finite(funding_print_ms)
+                    and (self._last_print_ms is None
+                         or int(funding_print_ms) > self._last_print_ms))
+
+        new_print = is_new()
+        # No new print to date the history by: the tick clock has to.
+        if not new_print and self._drop_history_the_clock_disproves(
+                int(timestamp_ms or 0)):
+            new_print = is_new()
         if new_print:
             # The history is rates without stamps. If a settlement was missed
             # (process down, skipped polling) the new print is NOT adjacent to
