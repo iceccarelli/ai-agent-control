@@ -1506,6 +1506,18 @@ class CarryEngine:
             detail={"drift_before": drift, "corrected_qty": fill.filled_qty,
                     "drift_after": position.delta_fraction(mark)})
 
+    def _exit_mark(self) -> float:
+        """The reference mark handed to `_unwind`. A ticker that will not
+        answer must not stop a risk exit: the exit orders are market orders and
+        the mark is informational, so an unreadable one is 0.0, never a raise
+        that leaves a book below its floor untouched."""
+        try:
+            return float(self.broker.get_mark(self.perp_symbol))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("carry: exit mark unreadable (%s: %s); the exit "
+                           "does not wait for it", type(exc).__name__, exc)
+            return 0.0
+
     def _unwind(self, mark: float, reason: str) -> CarryDecision:
         """Close both legs. Perp first: it is the leg that can be liquidated."""
         position = self.position
@@ -1676,7 +1688,7 @@ class CarryEngine:
             return self._halt("MARGIN_UNREADABLE",
                               "an unreadable margin is a margin call you cannot see")
         if margin < self.min_margin_multiple:
-            return self._unwind(self.broker.get_mark(self.perp_symbol),
+            return self._unwind(self._exit_mark(),
                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
         return self._check_liquidation_distance()
 
@@ -1862,7 +1874,7 @@ class CarryEngine:
                     "rate is a margin call you cannot see")
             if float(rate) >= MAX_ACCOUNT_MM_RATE:
                 return self._unwind(
-                    self.broker.get_mark(self.perp_symbol),
+                    self._exit_mark(),
                     f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
         elif mode == _MARGIN_ISOLATED:
             # Per-position liquidation: the account rate does not describe it.
@@ -1898,7 +1910,7 @@ class CarryEngine:
                 f"the venue reported a liquidation distance of {distance!r}")
         if float(distance) < MIN_LIQUIDATION_DISTANCE_PCT:
             return self._unwind(
-                self.broker.get_mark(self.perp_symbol),
+                self._exit_mark(),
                 f"LIQUIDATION_{float(distance):.1f}PCT_AWAY_BELOW_FLOOR")
         return None
 

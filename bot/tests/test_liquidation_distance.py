@@ -198,6 +198,25 @@ class TestTheAccountRateIsCheckedToo:
                            timestamp_ms=4 * H8).action == "hold"
 
 
+class TestAnExitDoesNotWaitForTheTicker:
+    def test_a_risk_exit_still_closes_when_the_mark_will_not_read(self):
+        """The exit orders are market orders; an unreadable ticker used to
+        raise out of the tick before `_unwind` ran, leaving the book held and
+        the exception swallowed every tick."""
+        venue = Venue(liq=MARK * 1.05)
+        e = opened(venue, require_liquidation_check=True)
+
+        def boom(symbol):
+            raise RuntimeError("ticker down")
+        venue.get_mark = boom
+        before = len(venue.orders)
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
+        assert d.action == "unwound"
+        assert any(o[0] == "Buy" and o[1] == "linear"
+                   for o in venue.orders[before:])
+
+
 class TestUnreadableIsNotSafe:
     def test_a_venue_that_will_not_say_halts(self):
         """An unreadable liquidation price is a margin call you cannot see —
