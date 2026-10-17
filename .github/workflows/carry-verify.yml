@@ -86,6 +86,7 @@ jobs:
           tests/test_carry_entry_allowance_survives_restart.py
           tests/test_carry_funding_prints.py
           tests/test_carry_fee_truth.py
+          tests/test_carry_overlay.py
           tests/test_carry_report.py
           tests/test_carry_broker.py
           tests/test_carry_preflight.py

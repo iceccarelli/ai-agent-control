@@ -211,6 +211,21 @@ class TestAPartialPerpFillIsASmallerHedgeNotAnIncident:
         assert d.reason == "OVERSOLD_BEYOND_INVENTORY"
 
 
+    def test_a_sub_lot_inventory_shortfall_closes_the_whole_short(self):
+        """A sub-lot excess can leave almost the entire short uncovered."""
+        v = Venue(inventory=0.001)
+        e = engine(v)
+        open_pair(e)
+        # The client withdrew 0.000999 BTC. Only 0.000001 BTC remains to cover
+        # a 0.001 BTC short, while the uncovered amount rounds down to zero.
+        v.inventory = 0.000001
+        d = e._check_inventory_cover()
+        assert d.action == "unwound" and d.reason == "INVENTORY_WITHDRAWN"
+        assert e.position is None and e.state is BookState.FLAT
+        assert v.orders == [("Sell", "linear", 0.001),
+                            ("Buy", "linear", 0.001)]
+
+
     def test_a_partial_buy_back_that_leaves_the_short_oversized_halts(self):
         """The excess closed only in part: still short more than the client
         owns, so the book is still naked SHORT and must not call itself hedged.

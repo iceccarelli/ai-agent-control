@@ -1565,16 +1565,16 @@ class CarryEngine:
                 f"({type(exc).__name__}: {exc})")
         buy = snap_to_lot(excess, step)
         if buy <= 0:
-            # Smaller than one venue lot, so no order exists that would reduce
-            # it. Said out loud rather than hidden, and NOT halted: halting a
-            # book on dust makes the gate unusable, and the funding path must
-            # go on booking what the position earns.
+            # The uncovered amount is below one valid lot. Leaving it open is
+            # NOT safe: a 0.000999 BTC shortfall can leave almost the entire
+            # 0.001 BTC hedge uncovered. Buy back the whole recorded short;
+            # the broker marks linear BUYs reduceOnly, so this cannot flip long.
             logger.warning(
                 "carry: %.10g BTC of the short is no longer covered by "
-                "inventory (%.10g held against a %.10g short), but the "
-                "shortfall is below one lot (%.10g); nothing can be sent",
+                "inventory (%.10g held against a %.10g short); the shortfall "
+                "is below one lot (%.10g), so closing the whole short",
                 excess, inventory, hedged, step)
-            return None
+            buy = hedged
 
         closed = self._fire(self.perp_symbol, "Buy", buy, "linear")
         if closed is None or closed.filled_qty <= 0:
