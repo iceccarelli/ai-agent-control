@@ -489,4 +489,3 @@ class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
         assert store.trip_kill_switch.called
         assert bot.carry.state is BookState.HALTED
         assert venue.orders == []
-
