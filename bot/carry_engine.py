@@ -1876,7 +1876,11 @@ class CarryEngine:
                 detail={"inventory": inventory,
                         "closed_qty": closed.filled_qty})
 
-        if remaining > inventory + QTY_DUST:
+        # The buy-back was snapped DOWN to a lot, so a fully filled order still
+        # leaves the sub-lot shortfall the `buy <= 0` branch above accepts as
+        # unreducible. Only a residue beyond one lot means the order filled
+        # short.
+        if remaining > inventory + max(QTY_DUST, step):
             # The buy-back itself filled short, so part of the short is STILL
             # uncovered. Same rule as any other close that filled short.
             return self._partial_close("INVENTORY_WITHDRAWN",
@@ -1884,8 +1888,8 @@ class CarryEngine:
                                        spot_left=inventory)
         self.position.perp.filled_qty = remaining
         self.position.perp.requested_qty = remaining
-        self.position.spot.filled_qty = remaining
-        self.position.spot.requested_qty = remaining
+        self.position.spot.filled_qty = min(remaining, inventory)
+        self.position.spot.requested_qty = self.position.spot.filled_qty
         failed = self._record()
         if failed is not None:
             return failed
