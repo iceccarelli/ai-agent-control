@@ -571,3 +571,63 @@ def test_a_partial_liquidation_still_closes_to_flat_and_sells_all_the_spot(mode)
     assert v.perp_short < 1e-6
     if mode == ACQUIRE:
         assert v.spot_long < 1e-6
+
+
+class _ReadsScript(_VenueReadsItsShort):
+    """get_perp_position answers from a script first (one entry per call), then
+    tells the truth. Buy-backs of the linear leg fill `fill_ratio` of the ask."""
+    def __init__(self, script=(), fill_ratio=1.0):
+        super().__init__()
+        self.script = list(script)
+        self.fill_ratio = fill_ratio
+
+    def get_perp_position(self, symbol):
+        if self.script:
+            value = self.script.pop(0)
+            return self.perp_short if value is None else value
+        return self.perp_short
+
+    def place_market(self, *, symbol, side, qty, product):
+        if product == "linear" and side == "Buy":
+            qty = qty * self.fill_ratio
+        return super().place_market(symbol=symbol, side=side, qty=qty,
+                                    product=product)
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_flat_read_after_a_partial_close_cannot_erase_the_unfilled_remainder(mode):
+    """The buy-back filled 80%; the post-close position read lies flat (a
+    lagging or empty list). The venue may only ADD to what the fills say is
+    left: the book halts with the short that is still open, not FLAT."""
+    v = _ReadsScript(script=[None, 0.0], fill_ratio=0.8)   # sizing read ok, then flat
+    eng = build(v, mode=mode)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    v.script = [None, 0.0]
+    short_before = v.perp_short
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.position is not None and eng.state is BookState.HALTED
+    assert v.perp_short == pytest.approx(0.2 * short_before)
+    assert eng.position.perp.filled_qty == pytest.approx(0.2 * short_before)
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_lagging_read_right_after_a_complete_close_is_re_read_not_believed(mode):
+    """The close completed but the first position read shows the PRE-close
+    size. The disagreement is re-read after a pause before it is believed, so
+    a finished exit is not turned into a false partial halt (which in ACQUIRE
+    left the spot long unsold)."""
+    v = _ReadsScript(script=[])
+    eng = build(v, mode=mode)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    pre_close = v.perp_short
+    v.script = [None, pre_close]          # sizing read ok, post-close read lags
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound" and eng.state is BookState.FLAT, (d.action, d.reason)
+    assert v.perp_short < 1e-6
+    if mode == ACQUIRE:
+        assert v.spot_long < 1e-6

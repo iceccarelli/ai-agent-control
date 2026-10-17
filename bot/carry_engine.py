@@ -1586,6 +1586,36 @@ class CarryEngine:
             return qty
         return snap_to_lot(qty, step) if self._finite(step) else qty
 
+    #: How long a position list that still shows the pre-close size right after
+    #: a close the fills say completed is given before the disagreement is
+    #: believed (two re-reads). Only paid when venue and fills disagree.
+    UNWIND_REREAD_WAIT_S = 0.5
+
+    def _short_left_after_close(self, fill_left: float) -> Optional[float]:
+        """The perp short still open after a close, as the venue reports it,
+        never LESS than the fills imply. Returns None when the venue cannot be
+        read (the caller keeps the fill arithmetic).
+
+        The venue can only ADD to what the fills say is left: a flat read
+        straight after a partial fill (a lagging or empty list) must not erase
+        an unfilled remainder. And when the fills say the close COMPLETED but the
+        list still shows a short, that list is probably the pre-close one: it is
+        re-read twice, after a pause, before the disagreement is believed."""
+        remaining = self._venue_short_qty()
+        if remaining is None:
+            return None
+        if fill_left <= QTY_DUST and remaining > QTY_DUST:
+            for _ in range(2):
+                time.sleep(self.UNWIND_REREAD_WAIT_S)
+                again = self._venue_short_qty()
+                if again is None:
+                    return None
+                remaining = again
+                if remaining <= QTY_DUST:
+                    break
+        remaining = 0.0 if remaining <= QTY_DUST else remaining
+        return max(fill_left if fill_left > QTY_DUST else 0.0, remaining)
+
     def _venue_short_qty(self) -> Optional[float]:
         """The perp short the venue reports (0.0 when it reads flat), or None
         when it cannot be read or the broker has no such read. Flat and unread
@@ -1634,17 +1664,15 @@ class CarryEngine:
         wanted_perp = (venue_short if venue_short is not None
                        and venue_short > QTY_DUST else book_perp)
         perp = self._fire(self.perp_symbol, "Buy", wanted_perp, "linear")
-        # What the venue still holds AFTER the close, not what the fills imply:
-        # the order was sized from one read (which may have been stale or
-        # larger/smaller than the book), and FLAT must be a fact, not an
-        # inference from fills. Unreadable falls back to the fill arithmetic.
-        remaining = (self._venue_short_qty()
+        # What the venue still holds AFTER the close, added to (never replacing)
+        # what the fills imply: the order was sized from one read (which may
+        # have been stale or larger/smaller than the book), and FLAT must be
+        # confirmed, not inferred. Unreadable falls back to the fill arithmetic.
+        fill_left = (wanted_perp - perp.filled_qty if perp is not None
+                     else wanted_perp)
+        remaining = (self._short_left_after_close(max(0.0, fill_left))
                      if perp is not None and perp.filled_qty > 0 else None)
-        if remaining is not None and remaining <= QTY_DUST:
-            remaining = 0.0
-        perp_left = (remaining if remaining is not None
-                     else (wanted_perp - perp.filled_qty
-                           if perp is not None else wanted_perp))
+        perp_left = remaining if remaining is not None else fill_left
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
             # buying the perp back and nothing else: selling their BTC would
@@ -1692,7 +1720,7 @@ class CarryEngine:
             # to the recorded pair: a stale read that undersized the close
             # leaves most of the short open, and most of the spot must stay
             # with it; a partial liquidation that left nothing sells it all.
-            closed_fraction = (1.0 - min(1.0, remaining / book_perp)
+            closed_fraction = (1.0 - min(1.0, perp_left / book_perp)
                                if book_perp > 0 else 1.0)
         else:
             closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
@@ -2285,7 +2313,8 @@ class CarryEngine:
             self._last_leg_error = f"unaccountable maker fill: {placed!r}"
             self._note_unresolved_order(
                 symbol=symbol, side=side, product=product,
-                link=str((placed or {}).get("order_link_id", "")),
+                link=(str(placed.get("order_link_id", ""))
+                      if isinstance(placed, dict) else ""),
                 requested=qty, filled_seen=0.0,
                 why="MAKER_ORDER_AMBIGUOUS: placement read back unaccountably")
             self._halt(
