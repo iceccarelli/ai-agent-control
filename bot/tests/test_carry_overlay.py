@@ -589,3 +589,34 @@ class TestARebalanceIsSnappedToTheVenueLot:
                         timestamp_ms=4 * H8)
         assert v.orders == [] and not kills
         assert e.state is BookState.HEDGED and d.action != "halted"
+
+
+class TestACoverShortfallBelowOneLotAtOneLotSize:
+    LOT = {"qty_step": 0.001, "min_qty": 0.001, "min_notional": 5.0}
+
+    def test_a_one_lot_hedge_is_closed_when_the_client_keeps_only_part_of_a_lot(self):
+        """At the production cap the whole hedge is ONE lot, so the 'below a
+        lot is dust' rule meant the cover check never fired: the client could
+        hold 0.0002 BTC against a 0.001 short and the book reported HEDGED."""
+        v = Venue(inventory=0.001, lot=self.LOT)
+        e = engine(v, cap=100.0)
+        assert open_pair(e).action == "opened"
+        assert e.position.perp.filled_qty == pytest.approx(0.001)
+        v.inventory = 0.0002
+        v.orders.clear()
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8 + 1, timestamp_ms=3 * H8 + 1)
+        assert d.action == "unwound" and d.reason == "INVENTORY_WITHDRAWN", (
+            d.action, d.reason)
+        assert v.orders == [("Buy", "linear", pytest.approx(0.001))]
+        assert e.position is None and e.state is BookState.FLAT
+
+    def test_dust_against_a_large_hedge_is_still_left_alone(self):
+        v = Venue(inventory=1.0, lot=self.LOT)
+        e = engine(v, cap=100_000.0)
+        assert open_pair(e).action == "opened"
+        v.inventory = 1.0 - 0.0005            # half a lot, 0.05% of the hedge
+        v.orders.clear()
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8 + 1, timestamp_ms=3 * H8 + 1)
+        assert d.action == "hold" and v.orders == []

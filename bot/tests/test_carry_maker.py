@@ -564,3 +564,25 @@ def test_a_maker_buy_re_reads_whether_its_fee_currency_is_known_at_cancel():
     assert leg is not None and leg.filled_qty == pytest.approx(0.001)
     assert leg.base_fee_known is True
     assert leg.fee_base_qty == pytest.approx(0.0000005)
+
+
+@pytest.mark.parametrize("how", ["raises", "unaccountable"])
+def test_a_post_only_that_raises_or_reads_back_unaccountably_leaves_evidence(how):
+    """Same halted-ledger contract as the resting/uncancellable cases: the
+    order's identity and requested size are written beside `position: null`."""
+    class V(Venue):
+        def place_post_only(self, *, symbol, side, qty, price, product):
+            if how == "raises":
+                raise RuntimeError("timed out after send")
+            return {"filled_qty": float("nan"), "avg_price": price,
+                    "order_link_id": "m-1", "fee": None, "resting": True}
+    tripped = []
+    e = engine(V(), kill_switch=tripped.append)
+    d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                    funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+    state = e.to_state()
+    assert state["book_state"] == "HALTED" and state["position"] is None
+    unresolved = state["unresolved_order"]
+    assert unresolved["symbol"] == "BTCUSDT" and unresolved["side"] == "Sell"
+    assert unresolved["requested_qty"] > 0
+    assert "MAKER_ORDER_AMBIGUOUS" in unresolved["why"]

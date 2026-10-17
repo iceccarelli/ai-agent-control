@@ -1933,6 +1933,15 @@ class CarryEngine:
                 f"inventory and the lot rules could not be read "
                 f"({type(exc).__name__}: {exc})")
         buy = snap_to_lot(excess, step)
+        if buy <= 0 and excess > hedged * self.delta_band:
+            # Under one lot, but not dust: the same band that triggers a
+            # rebalance elsewhere says this hedge is materially larger than the
+            # coin behind it. At small size (the production cap is ONE lot) the
+            # whole hedge is a single lot, so "below a lot" would mean "never
+            # enforced". One lot is the smallest order that exists; buying it
+            # can only leave the hedge SMALLER than the inventory (or closed),
+            # never a short the client's coin does not cover.
+            buy = min(step, hedged)
         if buy <= 0:
             # Smaller than one venue lot, so no order exists that would reduce
             # it. Said out loud rather than hidden, and NOT halted: halting a
@@ -2259,6 +2268,10 @@ class CarryEngine:
                 product=product)
         except Exception as exc:  # noqa: BLE001
             self._last_leg_error = f"{type(exc).__name__}: {exc}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link="",
+                requested=qty, filled_seen=0.0,
+                why="MAKER_ORDER_AMBIGUOUS: placement raised, fill unknown")
             self._halt(
                 "MAKER_ORDER_AMBIGUOUS",
                 f"a post-only {side} of {qty} {symbol} may or may not be "
@@ -2270,6 +2283,11 @@ class CarryEngine:
         filled, placed_price, ok = self._accountable(placed, qty)
         if not ok:
             self._last_leg_error = f"unaccountable maker fill: {placed!r}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product,
+                link=str((placed or {}).get("order_link_id", "")),
+                requested=qty, filled_seen=0.0,
+                why="MAKER_ORDER_AMBIGUOUS: placement read back unaccountably")
             self._halt(
                 "MAKER_ORDER_AMBIGUOUS",
                 f"a post-only {side} of {qty} {symbol} reads back a fill the "
