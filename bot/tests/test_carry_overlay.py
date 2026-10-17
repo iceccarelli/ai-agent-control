@@ -518,8 +518,8 @@ class TestAPrintIsBookedEvenWhenAnEarlierCheckReturns:
         v = Venue(inventory=1.0)
         e = engine(v, cap=100.0)
         assert open_pair(e).action == "opened"
-        e.position.spot.filled_qty = 0.0015          # force drift past the band
-        e.position.spot.requested_qty = 0.0015
+        e.position.spot.filled_qty = 0.0035          # force drift past the band
+        e.position.spot.requested_qty = 0.0035
         before = e.position.funding_collected
         d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
                         funding_print_ms=4 * H8, timestamp_ms=4 * H8)
@@ -547,3 +547,45 @@ class TestACoverReductionSnappedToALot:
         assert v.orders == [("Buy", "linear", pytest.approx(0.001))]
         assert e.position.spot.filled_qty == pytest.approx(0.0095)
         assert e.state is BookState.HEDGED
+
+
+class TestARebalanceIsSnappedToTheVenueLot:
+    class LotVenue(Venue):
+        def place_market(self, *, symbol, side, qty, product):
+            self.orders.append((side, product, qty))
+            if abs(qty / 0.001 - round(qty / 0.001)) > 1e-9:
+                return None          # the venue refuses a non-lot quantity
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+
+    def _drifted(self, spot=0.0319):
+        v = self.LotVenue(inventory=1.0,
+                          lot={"qty_step": 0.001, "min_qty": 0.001,
+                               "min_notional": 5.0})
+        kills = []
+        e = engine(v, cap=100.0, kill_switch=kills.append)
+        assert open_pair(e).action == "opened"
+        e.position.perp.filled_qty = 0.030
+        e.position.perp.requested_qty = 0.030
+        e.position.spot.filled_qty = spot
+        e.position.spot.requested_qty = spot
+        e.position.perp.avg_price = MARK
+        e.position.spot.avg_price = MARK
+        v.orders.clear()
+        return v, e, kills
+
+    def test_the_correction_is_a_whole_lot_not_a_rejected_residue(self):
+        v, e, kills = self._drifted()
+        d = e.on_candle(mark=MARK * 1.45, funding_bps=3.0, spot=MARK * 1.45,
+                        timestamp_ms=4 * H8)
+        assert d.action == "rebalanced" and not kills
+        # (LotVenue records each order twice: once itself, once via super())
+        assert v.orders and all(o[2] == pytest.approx(0.001)
+                                for o in v.orders)
+
+    def test_a_correction_below_one_lot_sends_nothing_and_does_not_halt(self):
+        v, e, kills = self._drifted(spot=0.0309)     # 0.0009 off: under a lot
+        d = e.on_candle(mark=MARK * 1.45, funding_bps=3.0, spot=MARK * 1.45,
+                        timestamp_ms=4 * H8)
+        assert v.orders == [] and not kills
+        assert e.state is BookState.HEDGED and d.action != "halted"

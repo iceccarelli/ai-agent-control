@@ -1163,7 +1163,9 @@ class CarryEngine:
 
             drift = self.position.delta_fraction(mark)
             if drift > self.delta_band:
-                return self._rebalance(mark, drift)
+                rebalanced = self._rebalance(mark, drift)
+                if rebalanced is not None:
+                    return rebalanced
 
             # The inversion exit is judged every tick (the streak is persisted
             # with the print above), not only on the tick that booked it.
@@ -1476,7 +1478,7 @@ class CarryEngine:
                     "funding_bps": funding_bps,
                     "execution_mode": OVERLAY})
 
-    def _rebalance(self, mark: float, drift: float) -> CarryDecision:
+    def _rebalance(self, mark: float, drift: float) -> Optional[CarryDecision]:
         """Bring delta back inside the band by trading the PERP leg only.
 
         The perp is the cheap leg (5.5 bps vs 10 bps taker) and the one that can
@@ -1487,7 +1489,26 @@ class CarryEngine:
         assert position is not None
         delta = position.delta_qty
         side = "Sell" if delta > 0 else "Buy"
-        fill = self._fire(self.perp_symbol, side, abs(delta), "linear")
+        try:
+            step = float(self.broker.get_lot_rules(
+                self.perp_symbol, "linear").get("qty_step", 0.0))
+        except Exception as exc:  # noqa: BLE001
+            return self._halt(
+                "VENUE_RULES_UNREADABLE",
+                f"delta is {drift:.2%} of book and the lot rules could not be "
+                f"read ({type(exc).__name__}: {exc})")
+        # Every other order path snaps to the venue's lot; an unsnapped
+        # quantity is a rejection, which halts the book as REBALANCE_FAILED.
+        qty = snap_to_lot(abs(delta), step)
+        if qty <= 0:
+            # Below one venue lot: no order exists that would correct it. Said
+            # out loud, not halted, and the tick carries on to the exit checks.
+            logger.warning(
+                "carry: delta is %.2f%% of book but the correction %.10g is "
+                "below one lot (%.10g); nothing can be sent",
+                drift * 100.0, abs(delta), step)
+            return None
+        fill = self._fire(self.perp_symbol, side, qty, "linear")
         if fill is None or fill.filled_qty <= 0:
             return self._halt(
                 "REBALANCE_FAILED",
