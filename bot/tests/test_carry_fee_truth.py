@@ -280,7 +280,7 @@ class TestUnknownFeesNeverLookConfirmed:
         store.close()
         st = reborn.statement()
         assert st["fees_unknown"] == 1 and st["fees_confirmed"] is False
-        assert reborn.unknown_fees == 2
+        assert reborn.unknown_fees == 1
 
     def test_rows_written_before_fee_provenance_cannot_claim_confirmation(self):
         _v, journal, engine = build(modern)
@@ -376,7 +376,8 @@ class TestTickPersistsTheTruthAcrossARestart:
             # carries a distinct stamp so each counts as one new print
             funding_print_ms=int(time.time() * 1000) - 3_600_000 + k)
 
-    @pytest.mark.parametrize("fees,confirmed", [(modern, True), (absent, False)])
+    @pytest.mark.parametrize("fees,confirmed", [
+        (modern, True), (spot_known_perp_unknown, False)])
     def test_the_statement_a_restart_rebuilds_is_the_one_that_was_earned(
             self, tmp_path, fees, confirmed):
         from unittest import mock

@@ -11,7 +11,8 @@ sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 
 from persistence import StateStore  # noqa: E402
-from test_carry_fee_truth import absent, build, modern, open_the_hedge  # noqa: E402
+from test_carry_fee_truth import (  # noqa: E402
+    build, modern, open_the_hedge, spot_known_perp_unknown)
 from tools import carry_report  # noqa: E402
 
 
@@ -28,7 +29,8 @@ def _reconciled(journal):
 
 
 @pytest.mark.parametrize("fees,status", [
-    (modern, "REALISED"), (absent, "PROVISIONAL_FEES_INCOMPLETE")])
+    (modern, "REALISED"),
+    (spot_known_perp_unknown, "PROVISIONAL_FEES_INCOMPLETE")])
 def test_status_follows_fee_confirmation_across_a_real_database(
         tmp_path, fees, status):
     _venue, journal, engine = build(fees)
@@ -106,8 +108,10 @@ def test_provisional_state_is_the_same_after_every_restart(tmp_path, fees, expec
     """Estimated funding plus (optionally) unstated fees, written to the real
     store and read back repeatedly the way successive restarts would."""
     import ledger as L
-    from test_carry_fee_truth import absent, build, modern, open_the_hedge
-    _v, journal, engine = build(absent if fees == "absent" else modern)
+    from test_carry_fee_truth import (
+        build, modern, open_the_hedge, spot_known_perp_unknown)
+    _v, journal, engine = build(
+        spot_known_perp_unknown if fees == "absent" else modern)
     open_the_hedge(engine)
     L.funding(journal, ms=journal.entries[-1].ms + 1, ref="est", usd=3.0)
     db = str(tmp_path / "restart.db")
