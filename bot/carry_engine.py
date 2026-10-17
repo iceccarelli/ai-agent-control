@@ -597,6 +597,10 @@ class CarryEngine:
         recorded = state.get("perp_symbol")
         foreign = (recorded != self.perp_symbol if recorded is not None
                    else self.perp_symbol not in self.FUNDING_8H_PROVEN)
+        if self.position is not None and (last is None or foreign):
+            # A persisted consecutive-negative count without a usable stamp
+            # for this symbol cannot prove settlement continuity after restart.
+            self.position.negative_funding_streak = 0
         if rates is None:
             logger.warning(
                 "carry: discarding the restored funding history: it holds a "

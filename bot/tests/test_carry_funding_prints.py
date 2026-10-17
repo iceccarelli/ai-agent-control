@@ -306,6 +306,27 @@ class TestTheStreakCountsPrints:
         assert e.position.negative_funding_streak == 0
         assert e._funding_history == [] and e._last_print_ms is None
 
+    def test_missing_last_print_stamp_resets_persisted_negative_streak(self):
+        e = opened()
+        for k in (4, 5):
+            e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                        funding_print_ms=k * H8)
+        assert e.position.negative_funding_streak == 2
+        state = e.to_state()
+        state["last_print_ms"] = None
+
+        restored = CarryEngine(
+            broker=Venue(), max_notional_usd=100.0, borrow_apr=0.05,
+            execution_mode="acquire", persist=lambda s: None)
+        restored.pair_risk = CarryRisk(max_notional_usd=100.0)
+        restored.restore(state)
+        assert restored.position.negative_funding_streak == 0
+
+        d = restored.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                               funding_print_ms=6 * H8)
+        assert d.action == "hold"
+        assert restored.position.negative_funding_streak == 1
+
     def test_three_negative_prints_unwind(self):
         e = opened()
         for k in (4, 5, 6):
