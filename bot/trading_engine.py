@@ -1016,7 +1016,23 @@ class TradingEngine:
         executed_exit_qty = float((fill or {}).get("cumExecQty") or 0.0)
         exit_status = str((fill or {}).get("orderStatus", "") or "")
 
-        self.client.cancel_all(symbol)
+        # The protective orders come off only once the close is CONFIRMED. A
+        # close that was accepted but whose fill never resolved (a poll that
+        # timed out, or an order that ended Rejected / Cancelled) may not have
+        # reduced the position at all; cancelling its stops then would book the
+        # position as closed while it is still open and unprotected. Left in
+        # place, a resting stop on a position that really did close is the lesser
+        # evil: the journal names it so it is cleaned up, never silently lost.
+        if fill is not None:
+            self.client.cancel_all(symbol)
+        else:
+            logger.critical(
+                "close of %s is UNCONFIRMED (no resolved fill for %s): the "
+                "protective orders are left in place", symbol,
+                result.order_link_id)
+            self.store.journal(symbol, "CLOSE_UNCONFIRMED_STOPS_KEPT", reason, {
+                "exit_order_link_id": result.order_link_id,
+                "exit_order_id": result.order_id})
 
         booked = self._book_full_exit(
             symbol=symbol, row=row, exit_order=result, fill=fill, reason=reason,

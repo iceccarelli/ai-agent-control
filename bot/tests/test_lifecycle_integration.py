@@ -639,3 +639,39 @@ class TestPaperMode:
         assert report.ok is False
         assert report.reason == "CONFIDENCE_TOO_LOW"
         store.close()
+
+
+class TestAnUnconfirmedCloseKeepsTheProtectiveOrders:
+    def _watch_cancel_all(self, client):
+        calls = []
+        real = client.cancel_all
+
+        def spy(symbol=None):
+            calls.append(symbol)
+            return real(symbol)
+        client.cancel_all = spy
+        return calls
+
+    def test_a_close_whose_fill_never_resolves_does_not_cancel_the_stops(self, stack):
+        """The docstring promises the stops come off AFTER the close is
+        confirmed. An accepted close whose fill never resolved (timeout, or an
+        order that ended Rejected/Cancelled) may not have reduced the position;
+        cancelling its stops then left it open and unprotected."""
+        engine, client, risk, store, exchange = stack
+        engine.execute(buy_intent())
+        cancels = self._watch_cancel_all(client)
+        engine._await_fill = lambda symbol, link, timeout_s=10.0: None
+        close = engine.close_position(symbol="BTCUSDT", reason="manual")
+        assert cancels == [], "the protective orders were cancelled unconfirmed"
+        assert close.ok                        # booked, marked unconfirmed
+        events = store._query(
+            "SELECT * FROM decisions WHERE decision = ?",
+            ("CLOSE_UNCONFIRMED_STOPS_KEPT",))
+        assert events, "the kept stops were not journaled"
+
+    def test_a_confirmed_close_still_cancels_the_stops(self, stack):
+        engine, client, risk, store, exchange = stack
+        engine.execute(buy_intent())
+        cancels = self._watch_cancel_all(client)
+        close = engine.close_position(symbol="BTCUSDT", reason="manual")
+        assert close.ok and cancels == ["BTCUSDT"]
