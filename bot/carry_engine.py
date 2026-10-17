@@ -151,7 +151,9 @@ def snap_to_lot(qty: float, step: float) -> float:
     if step <= 0:
         return float(qty)
     try:
-        lots = Decimal(str(qty)) // Decimal(str(step))
+        # round() first: a fee-net quantity like 0.026049 - 0.000026 arrives as
+        # 0.026022999999999998 and must floor to 0.026023, not one lot lower.
+        lots = Decimal(str(round(float(qty), 12))) // Decimal(str(step))
         return float(lots * Decimal(str(step)))
     except (InvalidOperation, ValueError):
         return 0.0
@@ -1132,13 +1134,10 @@ class CarryEngine:
                     self.position.negative_funding_streak += 1
                 else:
                     self.position.negative_funding_streak = 0
-                # Written down per print (one every eight hours): the booked
-                # funding and the negative streak lived in memory only, so a
-                # restart reset the streak to zero and delayed the inversion
-                # exit by up to two prints of paying funding.
-                failed = self._record()
-                if failed is not None:
-                    return failed
+                # Booked in memory HERE so that whichever gate acts below
+                # (halt, exit, rebalance) persists it with its own write; the
+                # write for a tick that only holds is made after the gates, so
+                # a failing store cannot stop a margin exit.
 
             headroom = self._check_margin()
             if headroom is not None:
@@ -1166,6 +1165,15 @@ class CarryEngine:
                 rebalanced = self._rebalance(mark, drift)
                 if rebalanced is not None:
                     return rebalanced
+
+            if held:
+                # Written down per print (one every eight hours): the booked
+                # funding and the negative streak lived in memory only, so a
+                # restart reset the streak to zero and delayed the inversion
+                # exit by up to two prints of paying funding.
+                failed = self._record()
+                if failed is not None:
+                    return failed
 
             # The inversion exit is judged every tick (the streak is persisted
             # with the print above), not only on the tick that booked it.
@@ -1605,7 +1613,11 @@ class CarryEngine:
         # margin or liquidation exit runs before the per-tick size check, and
         # closing only the recorded size would leave the excess short open
         # behind a FLAT book. The buy is reduce-only, so it cannot overshoot.
-        wanted_perp = max(book_perp, self._venue_short_qty())
+        venue_short = self._venue_short_qty()
+        # The reduce-only buy is refused above the venue's short, so after a
+        # partial liquidation (exactly when a margin exit fires) the venue's
+        # smaller number is what can be closed. 0.0 means unread: use the book.
+        wanted_perp = venue_short if venue_short > QTY_DUST else book_perp
         perp = self._fire(self.perp_symbol, "Buy", wanted_perp, "linear")
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
@@ -1645,8 +1657,8 @@ class CarryEngine:
                 "sold because it is still hedging the open short")
         # Sell spot only in proportion to the perp that actually closed: a
         # half-closed short against a fully sold spot is a naked short.
-        closed_fraction = min(1.0, perp.filled_qty / book_perp) \
-            if book_perp > 0 else 1.0
+        closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
+            if wanted_perp > 0 else 1.0
         # Sell what the venue can take: the net-of-fee balance floored to the
         # spot lot. The sub-lot remainder is dust no order can move.
         wanted_spot = self._spot_sellable(wanted_spot)

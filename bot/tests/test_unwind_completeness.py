@@ -411,3 +411,49 @@ def test_a_naked_spot_that_cannot_be_sold_is_written_to_the_ledger():
     assert eng.written[-1]["book_state"] == "HALTED"
     assert eng.written[-1]["position"] is not None
     assert eng.written[-1]["position"]["spot"]["filled_qty"] > 0
+
+
+def test_a_failing_ledger_write_on_a_print_tick_does_not_stop_the_margin_exit():
+    """The held print is booked in memory first; its write is made after the
+    gates, so a failing store cannot leave a below-floor short open."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    v.margin = 1.1
+
+    def broken(state):
+        raise OSError("disk full")
+    eng.persist = broken
+    candle(eng, ms=61_000, print_ms=61_000)
+    # The exit itself was sent and filled; the failing store then halts the
+    # book on the unwind's own write, as it always did.
+    assert v.perp_short < 1e-6
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_margin_exit_after_a_partial_liquidation_closes_what_the_venue_holds(mode):
+    """The reduce-only buy is refused above the venue's short: after a partial
+    liquidation the book is larger than the venue and the exit used to ask for
+    the book's number and halt with the short still open."""
+    class Reduces(_VenueReadsItsShort):
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "linear" and side == "Buy" and qty > self.perp_short + 1e-9:
+                return None                  # reduceOnly above the position
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = Reduces()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.perp_short *= 0.4                      # the venue liquidated 60%
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound", (d.action, d.reason)
+    assert eng.state is BookState.FLAT
+    assert v.perp_short < 1e-6
+
+
+def test_snap_to_lot_does_not_floor_float_noise_one_lot_too_low():
+    from carry_engine import snap_to_lot
+    assert snap_to_lot(0.026049 - 0.000026, 1e-6) == pytest.approx(0.026023)
+    assert snap_to_lot(0.00127, 0.001) == pytest.approx(0.001)
+    assert snap_to_lot(0.0009999, 0.001) == 0.0
