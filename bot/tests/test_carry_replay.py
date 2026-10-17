@@ -38,6 +38,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import carry_backtest as cb          # noqa: E402
+import carry_hold_audit as ha         # noqa: E402
 import carry_replay as rp            # noqa: E402
 from carry_engine import BookState, CarryEngine  # noqa: E402
 from carry_risk import CarryRisk     # noqa: E402
@@ -296,3 +297,37 @@ class TestSuppliedDataIsRefusedRatherThanGuessedAt:
         loaded = rp.load_bars(str(path))
         assert [r.ms for r in loaded] == [0, 28800000]
         assert loaded[0].rate == pytest.approx(0.0001)
+
+
+class TestAcquireFeeNetAccounting:
+    def test_acquire_replay_keeps_gross_spot_entry_separate_from_net_inventory(self):
+        report = rp.replay(rows(90, cycle=12), notional=100_000.0,
+                           borrow_apr=0.0, execution_mode="acquire")
+        trades = report["trade_rows"]
+        assert trades, report["reasons"]
+        for trade in trades:
+            # Replay must use the coin the wallet actually holds for basis,
+            # while preserving the gross fill for the entry-fee calculation.
+            assert trade["spot_entry_qty"] > trade["spot_qty"] > 0.0
+            # The perp must never hedge more BTC than the post-fee spot holds.
+            assert trade["qty"] <= trade["spot_qty"] + 1e-9
+
+    def test_acquire_hold_audit_prices_net_spot_pnl_but_gross_entry_fee(self):
+        trade = {
+            "qty": 1.0,
+            "spot_qty": 0.999,
+            "spot_entry_qty": 1.0,
+            "entry_perp": 100_000.0,
+            "exit_perp": 101_000.0,
+            "entry_spot": 100_000.0,
+            "exit_spot": 101_000.0,
+            "funding": 20.0,
+            "open_at_end": False,
+        }
+        result = ha._trade_net(trade, taker_perp_bps=5.5,
+                               taker_spot_bps=10.0, mode="acquire")
+        # -$1 is the basis P&L on 0.999 BTC net held versus a 1 BTC short.
+        # Entry fee uses the gross buy; exit fee uses only the net BTC sold.
+        assert result["basis"] == pytest.approx(-1.0)
+        assert result["fees"] == pytest.approx(311.449)
+        assert result["net"] == pytest.approx(-292.449)
