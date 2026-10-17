@@ -526,3 +526,75 @@ class TestAResumedPairNeedsItsJournal:
         _venue2, engine2, bot2 = t._second_process(tmp_path)
         assert bot2.carry_cold_start() is False
         assert engine2.state is BookState.HALTED
+
+
+def _tick_seeing_the_venue(bot, venue, k):
+    """`tick` from test_carry_funding_truth builds its snapshot by hand (no
+    position size); this one carries the size the venue reports, as the real
+    `take_snapshot` does."""
+    import time as _t
+    from unittest import mock as _mock
+
+    from market_snapshot import MarketSnapshot
+    from test_carry_funding_truth import MARK
+    view = MarketSnapshot(
+        perp_mark=MARK, spot_mark=MARK, funding_bps=3.0, margin_multiple=5.0,
+        observed_at_s=_t.time(), funding_print_bps=3.0,
+        funding_print_ms=int(_t.time() * 1000) - 3_600_000 + k,
+        perp_held=venue.perp_qty)
+    bot._last_funding_poll_ms = 0
+    with _mock.patch("market_snapshot.take_snapshot", return_value=view):
+        bot.tick()
+
+
+class TestAFlatBookRefusesToOpenOverAnUnrecordedShort:
+    def test_a_short_the_book_never_recorded_halts_before_any_order(self, tmp_path):
+        """FLAT is the book's belief. A manual or missed short is invisible to
+        every held-position check; opening on top of it runs the account above
+        the cap with nothing watching until the next tick's size check."""
+        venue, journal, engine, bot = _flat(tmp_path)
+        venue.perp_qty = 0.001                 # a short the book never recorded
+        before = len(venue.created)
+        _tick_seeing_the_venue(bot, venue, 1)
+        assert engine.state is BookState.HALTED
+        assert bot._last_carry_decision["reason"] == "ORPHAN_VENUE_POSITION"
+        for k in (2, 3, 4):
+            _tick_seeing_the_venue(bot, venue, k)
+        assert len(venue.created) == before, "a leg was sent over the orphan"
+
+    def test_a_genuinely_flat_venue_still_opens(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        venue.perp_qty = 0.0
+        for k in (1, 2, 3):
+            _tick_seeing_the_venue(bot, venue, k)
+        assert engine.state is BookState.HEDGED
+
+
+class TestColdStartDoesNotTrustASingleVenueRead:
+    def test_two_reads_that_disagree_refuse_to_start(self, tmp_path):
+        """A FLAT ledger and a position list that lags: the first read says
+        flat (CLEAN), the venue really holds a short. One read would start the
+        book, and it would open a second hedge over that short."""
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.store.save_carry_position(engine.to_state())     # FLAT, persisted
+        bot.CARRY_COLD_START_REREAD_S = 0
+        reads = iter([0.0, 0.5])                  # flat, then the real short
+        bot.carry.broker.get_perp_position = lambda symbol: next(reads)
+        bot.carry.broker.get_spot_inventory = lambda symbol: 0.0
+        assert bot.carry_cold_start() is False
+
+    def test_a_flat_ledger_and_two_flat_reads_still_start(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.store.save_carry_position(engine.to_state())
+        bot.CARRY_COLD_START_REREAD_S = 0
+        bot.carry.broker.get_perp_position = lambda symbol: 0.0
+        bot.carry.broker.get_spot_inventory = lambda symbol: 0.0
+        assert bot.carry_cold_start() is True
+
+    def test_two_agreeing_reads_still_resume(self, tmp_path):
+        t = TestRestartWithAnOpenPositionThroughTheRealStartupPath()
+        t._first_process(tmp_path)
+        venue2, engine2, bot2 = t._second_process(tmp_path)
+        bot2.CARRY_COLD_START_REREAD_S = 0
+        assert bot2.carry_cold_start() is True
+        assert engine2.position is not None

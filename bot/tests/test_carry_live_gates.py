@@ -88,7 +88,12 @@ class Broker:
         return self.funding
 
     def get_perp_position(self, s):
-        return self.held
+        # Flat until the short is actually sold; then what it holds. (It used to
+        # report `held` from the start, i.e. a venue already short while the
+        # book was FLAT - which the orphan check rightly refuses.)
+        sold = any(side == "Sell" and product == "linear"
+                   for side, product in self.orders)
+        return self.held if sold else 0.0
 
     def get_margin_multiple(self, s):
         self.reads["margin"] += 1

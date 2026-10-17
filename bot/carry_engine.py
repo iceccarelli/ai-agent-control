@@ -1633,6 +1633,32 @@ class CarryEngine:
         remaining = 0.0 if remaining <= QTY_DUST else remaining
         return max(floor, remaining)
 
+    def check_venue_flat_while_flat(self, perp_held: Optional[float]
+                                    ) -> Optional[CarryDecision]:
+        """A FLAT book must find the venue flat before it can open.
+
+        FLAT is the book's belief. A short it never recorded (a manual order, a
+        fill it missed) is invisible to every held-position check, and an open
+        on top of it runs the account above the cap with nothing watching the
+        first leg until the next tick's size check halts. `perp_held` is the
+        venue position size from the market snapshot the tick already took (no
+        extra read). None (a hand-built snapshot) checks nothing. Sends nothing.
+        """
+        if (self.position is not None or self.state is not BookState.FLAT
+                or perp_held is None):
+            return None
+        if not self._finite(perp_held):
+            return self._halt("VENUE_POSITION_UNREADABLE",
+                              f"the venue reported a position of {perp_held!r}")
+        if abs(float(perp_held)) > QTY_DUST:
+            return self._halt(
+                "ORPHAN_VENUE_POSITION",
+                f"the book is FLAT but the venue holds a "
+                f"{abs(float(perp_held)):.10g} perp short it never recorded; "
+                "opening a hedge on top of it would exceed the cap with "
+                "nothing watching the first leg")
+        return None
+
     def _venue_short_qty(self) -> Optional[float]:
         """The perp short the venue reports (0.0 when it reads flat), or None
         when it cannot be read or the broker has no such read. Flat and unread

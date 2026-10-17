@@ -94,6 +94,9 @@ class MarketSnapshot:
     #: by hand without them simply carries no print.
     funding_print_bps: Optional[float] = None
     funding_print_ms: Optional[int] = None
+    #: The venue's perp position size in this same observation (the read that
+    #: decides whether margin exists). `None` on a hand-built snapshot.
+    perp_held: Optional[float] = None
 
     @property
     def basis_bps(self) -> float:
@@ -215,6 +218,7 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
                           venue_time_s=venue_time,
                           funding_print_bps=float(print_bps),
                           funding_print_ms=int(print_ms),
+                          perp_held=held,
                           detail={"perp_symbol": perp_symbol,
                                   "spot_symbol": spot_symbol,
                                   "clock_checked": venue_time is not None})

@@ -757,6 +757,25 @@ class TradingBot:
                 broker.get_spot_inventory(self.carry.spot_symbol))
             open_orders = broker.get_open_carry_orders(
                 self.carry.spot_symbol, self.carry.perp_symbol)
+            # ONE read decides RESUME / CLEAN / HALT, and a position list that
+            # lags (a crash right after a fill, a replica behind the matching
+            # engine) can say flat while the venue is short: CLEAN, then a
+            # second hedge. Read both sizes again after a pause; reads that
+            # disagree are not a state to start from.
+            if self.CARRY_COLD_START_REREAD_S > 0:
+                time.sleep(self.CARRY_COLD_START_REREAD_S)
+            again_perp = float(broker.get_perp_position(self.carry.perp_symbol))
+            again_spot = float(
+                broker.get_spot_inventory(self.carry.spot_symbol))
+            tol = 1e-9
+            if (abs(again_perp - venue_perp) > tol
+                    or abs(again_spot - venue_spot) > tol):
+                logger.critical(
+                    "carry cold start: two reads of the venue disagree (perp "
+                    "%.10g then %.10g, spot %.10g then %.10g); refusing to "
+                    "start from a state that is still moving", venue_perp,
+                    again_perp, venue_spot, again_spot)
+                return False
         except Exception as exc:  # noqa: BLE001
             logger.critical(
                 "carry cold start: the venue is unreadable (%s); refusing to "
@@ -954,6 +973,16 @@ class TradingBot:
                     "previous cycle and the book is flat; refusing new "
                     "exposure it cannot account for")
                 return
+            orphan = self.carry.check_venue_flat_while_flat(
+                getattr(view, "perp_held", None))
+            if orphan is not None:
+                self._last_carry_decision = {
+                    "action": str(orphan.action), "reason": str(orphan.reason),
+                    "state": orphan.state.value,
+                    "at_ms": int(time.time() * 1000)}
+                logger.critical("carry book HALTED while FLAT: %s",
+                                orphan.reason)
+                return
             self.carry.snapshot = view
             # The SETTLED print and its stamp, not the ticker's forecast
             # (0034). The loop ticks every LOOP_INTERVAL_SECONDS; a print
@@ -1057,6 +1086,8 @@ class TradingBot:
     _carry_estimated_funding = 0.0
     _last_funding_poll_ms = 0
     _journal_unsaved = False
+    #: Pause between the two cold-start reads of the venue (see carry_cold_start).
+    CARRY_COLD_START_REREAD_S = 0.25
     _carry_held_errors = 0
     _last_carry_decision: Dict[str, Any] = {}
 
