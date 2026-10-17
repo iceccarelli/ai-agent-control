@@ -739,7 +739,6 @@ class CarryEngine:
             self.state = BookState.FLAT
         last = self._restored_stamp(state.get("last_print_ms"))
         rates = self._restored_rates(state.get("funding_history", []))
-        self._restore_allowance(state.get("entry_days"))
         recorded = state.get("perp_symbol")
         foreign = (recorded != self.perp_symbol if recorded is not None
                    else self.perp_symbol not in self.FUNDING_8H_PROVEN)
@@ -760,6 +759,9 @@ class CarryEngine:
         else:
             self._last_print_ms = last
             self._funding_history = rates
+        # Last: a fail-closed write persists `to_state()`, which must already
+        # carry the restored funding stamp and history, not the empty defaults.
+        self._restore_allowance(state.get("entry_days"))
 
     @classmethod
     def _restored_rates(cls, raw: Any) -> Optional[List[float]]:

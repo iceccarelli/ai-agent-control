@@ -254,3 +254,15 @@ def test_a_first_run_writes_nothing_until_there_is_something_to_record():
     e = engine(persist=writes.append)
     flat_cold_start(e, None)
     assert writes == [] and gate(e, NOON).ok
+
+
+def test_the_fail_closed_write_keeps_the_restored_funding_state():
+    """The write that records the spent day must not blank the ledger's
+    funding stamp and history with the engine's pre-restore defaults."""
+    written = []
+    e = engine(persist=written.append)
+    e.restore(flat_ledger(last_print_ms=123, funding_history=[1.0, 2.0]))
+    assert gate(e, NOON).reason == LIMIT
+    assert written[-1]["last_print_ms"] == 123
+    assert written[-1]["funding_history"] == [1.0, 2.0]
+    assert written[-1]["entry_days"]["entries"]
