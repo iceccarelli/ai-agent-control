@@ -26,8 +26,8 @@ def text():
 def test_it_runs_on_pull_requests_and_pushes_to_main(text):
     # Text check on purpose: CI installs only requirements.txt + pytest, so this
     # test must not need a YAML library.
-    assert re.search(r'^on:\n  pull_request:\n  push:\n    branches: \[main, "fix/\*\*"\]\n',
-                     text, re.M), "triggers must include pull_request, main pushes, and fix-branch pushes"
+    assert re.search(r'^on:\n  pull_request:\n  push:\n    branches: \[main, "fix/\*\*", "claude/\*\*"\]\n',
+                     text, re.M), "triggers must include pull_request plus main, fix and claude branch pushes"
 
 
 def test_every_test_file_it_runs_exists_and_the_required_ones_are_present(text):

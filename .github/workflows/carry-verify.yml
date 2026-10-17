@@ -1,7 +1,7 @@
 # Targeted correctness gate for the carry system.
 #
 # WHAT THIS IS: a lean, deterministic check that runs on every pull request and
-# every push to main. It exercises the carry funding/fee/report/broker/preflight/
+# pushes to main, fix/** and claude/** branches. It exercises the carry funding/fee/report/broker/preflight/
 # probe/live-gate/hold-audit tests, the production image's import closure (a
 # module main.py imports but the Dockerfile does not copy crashes the container,
 # which PR #72 shipped), the lifecycle funding-reconciliation,
@@ -29,7 +29,7 @@ name: carry-verify
 on:
   pull_request:
   push:
-    branches: [main, "fix/**"]
+    branches: [main, "fix/**", "claude/**"]
 
 permissions:
   contents: read
