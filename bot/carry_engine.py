@@ -488,14 +488,19 @@ class CarryPosition:
     negative_funding_streak: int = 0
 
     @property
+    def spot_held_qty(self) -> float:
+        """BTC actually held after any explicitly reported base-coin BUY fee."""
+        return max(0.0, self.spot.filled_qty - self.spot.fee_base_qty)
+
+    @property
     def delta_qty(self) -> float:
         """Net BTC exposure. Zero is the whole point of the trade."""
-        return self.spot.filled_qty - self.perp.filled_qty
+        return self.spot_held_qty - self.perp.filled_qty
 
     def delta_fraction(self, mark: float) -> float:
-        """|delta| as a fraction of book notional. The number that trips a
-        rebalance."""
-        book = self.spot.notional + self.perp.notional
+        """|delta| as a fraction of the actual book notional. The number that
+        trips a rebalance."""
+        book = self.spot_held_qty * self.spot.avg_price + self.perp.notional
         if book <= 0:
             return 0.0
         return abs(self.delta_qty * mark) / book
@@ -1300,9 +1305,19 @@ class CarryEngine:
         if spot is None or spot.filled_qty <= 0:
             return self._refused("SPOT_LEG_DID_NOT_FILL")
 
-        # Hedge exactly what the spot leg ACTUALLY filled. Hedging the requested
-        # size instead is how a rounding difference becomes a permanent short.
-        perp = self._fire(self.perp_symbol, "Sell", spot.filled_qty, "linear")
+        # The wallet holds the fill minus any explicitly reported base-coin
+        # fee. Hedge that net BTC, rounded DOWN to a tradable linear lot. If the
+        # fee leaves less than the venue minimum, unwind the spot buy instead
+        # of opening a short larger than the BTC actually held.
+        net_spot_qty = max(0.0, spot.filled_qty - spot.fee_base_qty)
+        hedge_qty = snap_to_lot(
+            net_spot_qty, float(rules.get("qty_step", 0.0)))
+        if (hedge_qty < min_qty or hedge_qty <= 0
+                or hedge_qty * mark < min_notional):
+            return self._emergency_unwind_spot(
+                spot, "SPOT_NET_BELOW_PERP_MINIMUM — base-coin fee left no "
+                      "tradable linear quantity; unwinding spot")
+        perp = self._fire(self.perp_symbol, "Sell", hedge_qty, "linear")
         if perp is None or perp.filled_qty <= 0:
             return self._emergency_unwind_spot(
                 spot, "PERP_LEG_DID_NOT_FILL — spot is naked, unwinding now")
