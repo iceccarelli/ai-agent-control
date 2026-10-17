@@ -50,6 +50,10 @@ class FeeVenue(FakeClient):
     """
 
     def __init__(self, fees, post_only=None, **kw):
+        # Trade-path tests start flat and derive position from actual fills.
+        # The old fixture started at 1 BTC and never applied order deltas, which
+        # accidentally made the old gross-spot hedge look correct forever.
+        kw.setdefault("perp_qty", 0.0)
         super().__init__(**kw)
         self._fees = fees
         self._post_only = post_only      # (first_fill, final_fill) or None
@@ -80,6 +84,10 @@ class FeeVenue(FakeClient):
                        "cumExecQty": body["qty"], "avgPrice": str(MARK),
                        "_cat": body["category"], "_side": body["side"]}
                 row.update(self._fees(body["category"], body["side"], qty))
+            if body["category"] == "linear":
+                applied = float(row["cumExecQty"])
+                self.perp_qty += applied if body["side"] == "Sell" else -applied
+                row["_position_qty_applied"] = applied
             self.orders[link] = row
             return envelope({"orderId": f"id-{link}", "orderLinkId": link})
         if endpoint == "/v5/order/cancel":
@@ -87,6 +95,13 @@ class FeeVenue(FakeClient):
             row = self.orders[body["orderLinkId"]]
             _first, final = self._post_only
             row.update({"orderStatus": "Cancelled", "cumExecQty": str(final)})
+            # Position size follows the CUMULATIVE fill: apply only the increment
+            # since the partial fill already applied on post-only create.
+            if row.get("_cat") == "linear":
+                previous = float(row.get("_position_qty_applied", 0.0))
+                delta = float(final) - previous
+                self.perp_qty += delta if row["_side"] == "Sell" else -delta
+                row["_position_qty_applied"] = float(final)
             # the read-back REPLACES the fee fields (absent means absent)
             for key in ("cumExecFee", "cumFeeDetail", "feeCurrency"):
                 row.pop(key, None)
@@ -144,6 +159,12 @@ def modern(product, side, filled):
 
 
 def absent(product, side, filled):
+    return {}
+
+
+def spot_known_perp_unknown(product, side, filled):
+    if product == "spot" and side == "Buy":
+        return modern(product, side, filled)
     return {}
 
 
@@ -234,27 +255,32 @@ class TestModernFeesReachTheStatement:
 
 
 class TestUnknownFeesNeverLookConfirmed:
-    def test_a_fee_the_venue_never_stated_is_flagged_and_the_net_is_provisional(
-            self):
+    def test_an_unreported_spot_fee_does_not_open_a_perp_short(self):
         venue, journal, engine = build(absent)
-        assert open_the_hedge(engine).action == "opened"
+        decision = open_the_hedge(engine)
+        assert decision.reason == "SPOT_FEE_UNVERIFIABLE"
+        assert engine.state.value == "HALTED"
+        assert engine.position is not None
+        assert engine.position.spot.base_fee_known is False
+        assert engine.position.perp.filled_qty == 0
+        assert not any(order["category"] == "linear" for order in venue.created)
         st = journal.statement()
-        assert st["fees_usd"] == 0.0                     # nothing trusted, nothing invented
-        assert st["fees_unknown"] == 2
+        assert st["fees_usd"] == 0.0
+        assert st["fees_unknown"] == 1
         assert st["fees_confirmed"] is False
         assert st["net_basis"] == "provisional_fees_incomplete"
 
     def test_the_flag_survives_a_restart_through_the_real_store(self, tmp_path):
         """The counter used to live on the Journal object and die with it."""
-        venue, journal, engine = build(absent)
-        open_the_hedge(engine)
+        venue, journal, engine = build(spot_known_perp_unknown)
+        assert open_the_hedge(engine).action == "opened"
         store = StateStore(str(tmp_path / "carry.db"))
         store.save_ledger(journal.to_rows())
         reborn = L.Journal.from_rows(store.load_ledger())
         store.close()
         st = reborn.statement()
-        assert st["fees_unknown"] == 2 and st["fees_confirmed"] is False
-        assert reborn.unknown_fees == 2
+        assert st["fees_unknown"] == 1 and st["fees_confirmed"] is False
+        assert reborn.unknown_fees == 1
 
     def test_rows_written_before_fee_provenance_cannot_claim_confirmation(self):
         _v, journal, engine = build(modern)
@@ -350,7 +376,8 @@ class TestTickPersistsTheTruthAcrossARestart:
             # carries a distinct stamp so each counts as one new print
             funding_print_ms=int(time.time() * 1000) - 3_600_000 + k)
 
-    @pytest.mark.parametrize("fees,confirmed", [(modern, True), (absent, False)])
+    @pytest.mark.parametrize("fees,confirmed", [
+        (modern, True), (spot_known_perp_unknown, False)])
     def test_the_statement_a_restart_rebuilds_is_the_one_that_was_earned(
             self, tmp_path, fees, confirmed):
         from unittest import mock

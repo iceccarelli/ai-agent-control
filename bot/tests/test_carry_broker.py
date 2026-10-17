@@ -53,9 +53,15 @@ class FakeClient:
             # `result` - no cumExecQty/avgPrice (carry_broker._fill_from's
             # own docstring). This fixture still simulates an immediate fill
             # here for tests that want one, inside the real envelope shape.
-            return envelope({"orderLinkId": body["orderLinkId"],
-                             "cumExecQty": body["qty"],
-                             "avgPrice": str(self.mark)})
+            row = {"orderLinkId": body["orderLinkId"],
+                   "cumExecQty": body["qty"],
+                   "avgPrice": str(self.mark)}
+            # This generic fake models a no-fee fill. Tests for unknown fee
+            # evidence use FeeVenue's explicit absent() rows instead.
+            row["cumFeeDetail"] = (
+                {"BTC": "0"} if body["category"] == "spot"
+                and body["side"] == "Buy" else {"USDT": "0"})
+            return envelope(row)
         if endpoint == "/v5/order/realtime":
             return envelope({"list": [
                 {"cumExecQty": "0.5", "avgPrice": str(self.mark),

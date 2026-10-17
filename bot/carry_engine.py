@@ -247,6 +247,9 @@ def _ledger_position_problem(position: Any) -> Optional[str]:
         if not all(isinstance(leg.get(k), str) and leg.get(k)
                    for k in ("symbol", "side", "product")):
             return f"the {role} leg lacks a symbol, side or product"
+        if ("base_fee_known" in leg
+                and not isinstance(leg["base_fee_known"], bool)):
+            return f"the {role} leg has malformed base-fee knowledge"
         if leg["side"] not in sides or leg["product"] != product:
             return (f"the {role} leg is {leg['side']!r} on {leg['product']!r}, "
                     "not a leg of this strategy")
@@ -465,6 +468,9 @@ class Leg:
     #: Only a fee the venue LABELLED with the base coin counts; an unlabelled
     #: or unknown fee leaves this 0.0 and explains no shortfall.
     fee_base_qty: float = 0.0
+    #: True only when each component of a spot BUY fee has an explicit currency.
+    #: A deprecated, unlabelled amount cannot establish BTC actually held.
+    base_fee_known: bool = True
 
     @property
     def notional(self) -> float:
@@ -488,14 +494,19 @@ class CarryPosition:
     negative_funding_streak: int = 0
 
     @property
+    def spot_held_qty(self) -> float:
+        """BTC actually held after any explicitly reported base-coin BUY fee."""
+        return max(0.0, self.spot.filled_qty - self.spot.fee_base_qty)
+
+    @property
     def delta_qty(self) -> float:
         """Net BTC exposure. Zero is the whole point of the trade."""
-        return self.spot.filled_qty - self.perp.filled_qty
+        return self.spot_held_qty - self.perp.filled_qty
 
     def delta_fraction(self, mark: float) -> float:
-        """|delta| as a fraction of book notional. The number that trips a
-        rebalance."""
-        book = self.spot.notional + self.perp.notional
+        """|delta| as a fraction of the actual book notional. The number that
+        trips a rebalance."""
+        book = self.spot_held_qty * self.spot.avg_price + self.perp.notional
         if book <= 0:
             return 0.0
         return abs(self.delta_qty * mark) / book
@@ -1300,9 +1311,32 @@ class CarryEngine:
         if spot is None or spot.filled_qty <= 0:
             return self._refused("SPOT_LEG_DID_NOT_FILL")
 
-        # Hedge exactly what the spot leg ACTUALLY filled. Hedging the requested
-        # size instead is how a rounding difference becomes a permanent short.
-        perp = self._fire(self.perp_symbol, "Sell", spot.filled_qty, "linear")
+        # If the spot BUY fee's currency is unknown, the wallet quantity is
+        # unknown too. Keep the spot fill recorded, send no short, and halt for
+        # reconciliation rather than guessing a hedge size or overselling BTC.
+        if not spot.base_fee_known:
+            self.position = CarryPosition(
+                spot=spot,
+                perp=Leg(symbol=self.perp_symbol, side="Sell",
+                         product="linear"),
+                opened_ms=timestamp_ms)
+            self.pair_risk.record_broken_pair(now=self._gate_now(timestamp_ms))
+            return self._halt(
+                "SPOT_FEE_UNVERIFIABLE",
+                "spot BUY fee currency/amount is not reliably reported; no perp "
+                "order was sent and the spot exposure is recorded for manual "
+                "venue reconciliation")
+        # Hedge the known BTC left after the explicitly labelled base fee,
+        # rounded DOWN to a tradable linear lot.
+        net_spot_qty = max(0.0, spot.filled_qty - spot.fee_base_qty)
+        hedge_qty = snap_to_lot(
+            net_spot_qty, float(rules.get("qty_step", 0.0)))
+        if (hedge_qty < min_qty or hedge_qty <= 0
+                or hedge_qty * mark < min_notional):
+            return self._emergency_unwind_spot(
+                spot, "SPOT_NET_BELOW_PERP_MINIMUM — base-coin fee left no "
+                      "tradable linear quantity; unwinding spot")
+        perp = self._fire(self.perp_symbol, "Sell", hedge_qty, "linear")
         if perp is None or perp.filled_qty <= 0:
             return self._emergency_unwind_spot(
                 spot, "PERP_LEG_DID_NOT_FILL — spot is naked, unwinding now")
@@ -1941,6 +1975,8 @@ class CarryEngine:
                    fee=None if raw_fee is None else float(raw_fee),
                    fee_base_qty=self._base_fee_withheld(result, symbol, side,
                                                         product),
+                   base_fee_known=self._fee_currency_was_reported(
+                       result, side=side, product=product),
                    taker_qty=filled)
 
     def _rest_then_take(self, symbol: str, side: str, qty: float,
@@ -2029,6 +2065,8 @@ class CarryEngine:
                   fee=None if raw_fee is None else float(raw_fee),
                   fee_base_qty=self._base_fee_withheld(placed, symbol, side,
                                                        product),
+                  base_fee_known=self._fee_currency_was_reported(
+                      placed, side=side, product=product),
                   maker_qty=filled)
         if filled + QTY_DUST >= qty or not placed.get("resting"):
             return leg
@@ -2077,6 +2115,27 @@ class CarryEngine:
             leg.fee_base_qty = self._base_fee_withheld(final, symbol, side,
                                                        product)
         return leg
+
+    @staticmethod
+    def _fee_currency_was_reported(result: Any, *, side: str,
+                                   product: str) -> bool:
+        """Whether a spot BUY's fee evidence labels every component currency."""
+        if product != "spot" or side != "Buy":
+            return True
+        if not isinstance(result, dict):
+            return False
+        detail = result.get("fee_detail")
+        if not isinstance(detail, dict) or detail.get("known") is not True:
+            return False
+        components = detail.get("components")
+        if not isinstance(components, list) or not components:
+            return False
+        return all(
+            isinstance(component, dict)
+            and isinstance(component.get("currency"), str)
+            and bool(component["currency"].strip())
+            for component in components
+        )
 
     @staticmethod
     def _base_fee_withheld(result: Any, symbol: str, side: str,
@@ -2129,7 +2188,9 @@ class CarryEngine:
                    order_link_id=f"{maker.order_link_id}+{taker.order_link_id}",
                    fee=fee, maker_qty=maker.filled_qty,
                    taker_qty=taker.filled_qty,
-                   fee_base_qty=maker.fee_base_qty + taker.fee_base_qty)
+                   fee_base_qty=maker.fee_base_qty + taker.fee_base_qty,
+                   base_fee_known=(maker.base_fee_known and
+                                   taker.base_fee_known))
 
     @staticmethod
     def _gate_now(timestamp_ms: int) -> Optional["dt.datetime"]:

@@ -66,7 +66,7 @@ class TestATimeoutAfterSubmission:
         assert len(_orders(venue, "spot", "Buy")) == 1
         assert kinds(journal) == ["spot_buy", "perp_open"]
         assert engine.position.perp.filled_qty == pytest.approx(
-            engine.position.spot.filled_qty)
+            engine.position.spot_held_qty)
 
     def test_an_unreadable_venue_halts_instead_of_calling_it_a_failed_leg(self):
         venue, journal, engine = build(modern)
@@ -142,5 +142,5 @@ class TestUnwindNeverStripsTheHedgeFromAnOpenShort:
         assert d.reason == "UNWIND_PARTIAL" and d.state is BookState.HALTED
         sold = sum(float(b["qty"]) for b in _orders(venue, "spot", "Sell"))
         assert sold == pytest.approx(spot_qty / 2, rel=1e-6)
-        assert engine.position.perp.filled_qty == pytest.approx(gross / 2)
+        assert engine.position.perp.filled_qty == pytest.approx(spot_qty / 2)
         assert engine.position.spot.filled_qty == pytest.approx(spot_qty / 2)

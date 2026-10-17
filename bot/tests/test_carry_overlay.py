@@ -64,8 +64,14 @@ class Venue:
         # fill_ratio applies to the SELL that opens the hedge. A buy-back is
         # exact: a venue that overfills a closing order is a different bug.
         filled = qty * (self.fill_ratio if side == "Sell" else 1.0)
-        return {"filled_qty": filled, "avg_price": MARK,
-                "order_link_id": "x", "fee": 0.0001}
+        out = {"filled_qty": filled, "avg_price": MARK,
+               "order_link_id": "x", "fee": 0.0001}
+        if product == "spot" and side == "Buy":
+            # This fixture tests execution mechanics, not spot-coin fee
+            # deductions. Make the zero-base-fee assumption explicit.
+            out["fee"] = 0.0
+            out["fee_detail"] = {"known": True, "source": "cumFeeDetail", "note": "scripted zero fee in this test venue", "components": [{"amount": 0.0, "currency": "BTC"}]}
+        return out
 
     def get_margin_multiple(self, symbol):
         return 5.0

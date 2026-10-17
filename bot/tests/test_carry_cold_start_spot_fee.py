@@ -40,13 +40,29 @@ class FeeVenue(Venue):
 
 
 def acquired(row):
-    return opened(FeeVenue(spot_row=row), mode=ACQUIRE)
+    venue = FeeVenue(spot_row=row)
+    e = engine(venue, mode=ACQUIRE)
+    d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                    funding_print_ms=3 * 8 * 3600 * 1000,
+                    timestamp_ms=3 * 8 * 3600 * 1000)
+    detail = venue_fees.extract_order_fees(row).to_dict()
+    usable = (detail.get("known") is True
+              and bool(detail.get("components"))
+              and all(isinstance(c.get("currency"), str)
+                      and c["currency"].strip()
+                      for c in detail["components"]))
+    if usable:
+        assert d.action == "opened", d.reason
+    else:
+        assert d.reason == "SPOT_FEE_UNVERIFIABLE"
+    return e
 
 
 def cold(state, venue_spot, mode=ACQUIRE):
-    fresh = engine(Venue(perp=0.001), mode=mode)
+    venue_perp = float(state["position"]["perp"]["filled_qty"])
+    fresh = engine(Venue(perp=venue_perp), mode=mode)
     return fresh.cold_start(ledger=json.loads(json.dumps(state)),
-                            venue_perp_qty=0.001, venue_spot_qty=venue_spot,
+                            venue_perp_qty=venue_perp, venue_spot_qty=venue_spot,
                             open_orders=())
 
 
@@ -73,8 +89,11 @@ def test_a_usdt_fee_explains_no_shortfall():
     assert cold(state, 0.001).action is ColdStart.RESUME
 
 
-def test_an_unstated_fee_explains_no_shortfall():
+def test_an_unstated_fee_never_claims_a_hedged_acquire_book():
     state = acquired({}).to_state()
+    assert state["book_state"] == "HALTED"
+    assert state["position"]["spot"]["base_fee_known"] is False
+    assert state["position"]["perp"]["filled_qty"] == pytest.approx(0.0)
     assert cold(state, 0.001 - FEE_BTC).action is ColdStart.HALT
 
 

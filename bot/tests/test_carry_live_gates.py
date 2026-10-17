@@ -111,7 +111,10 @@ class Broker:
 
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((side, product))
-        return {"filled_qty": qty, "avg_price": self.mark, "order_link_id": "x"}
+        out = {"filled_qty": qty, "avg_price": self.mark, "order_link_id": "x"}
+        if product == "spot" and side == "Buy":
+            out["fee_detail"] = {"known": True, "source": "cumFeeDetail", "note": "scripted zero fee in this test venue", "components": [{"amount": 0.0, "currency": "BTC"}]}
+        return out
 
 
 H8 = 8 * 3600 * 1000

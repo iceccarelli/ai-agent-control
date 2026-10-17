@@ -51,7 +51,10 @@ class Venue:
             # A faithful venue: its perp position moves with the fills. The
             # engine now compares it with the book on every held tick.
             self.perp += qty if side == "Sell" else -qty
-        return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x"}
+        out = {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x"}
+        if product == "spot" and side == "Buy":
+            out["fee_detail"] = {"known": True, "source": "cumFeeDetail", "note": "scripted zero fee in this test venue", "components": [{"amount": 0.0, "currency": "BTC"}]}
+        return out
 
     def get_margin_multiple(self, symbol):
         return 5.0

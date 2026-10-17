@@ -45,16 +45,68 @@ class WalletVenue(Venue):
         return out
 
 
-def run(row):
-    v = WalletVenue(row)
+def open_once(row, venue_cls=WalletVenue):
+    v = venue_cls(row)
     e = engine(v, mode=ACQUIRE)
     d = e.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0,
                     funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+    return v, e, d
+
+
+def run(row):
+    v, e, d = open_once(row)
     assert d.action == "opened", d.reason
     for k in (4, 5, 6):
         e.on_candle(mark=100_000.0, funding_bps=-0.5, spot=100_000.0,
                     funding_print_ms=k * H8, timestamp_ms=k * H8)
     return v, e
+
+
+def test_entry_hedges_net_btc_received_after_base_coin_fee():
+    v, e, d = open_once({"cumFeeDetail": {"BTC": str(FEE_BTC)}})
+    assert d.action == "opened", d.reason
+    assert e.position is not None
+
+    spot = e.position.spot
+    perp = e.position.perp
+    net_spot = spot.filled_qty - spot.fee_base_qty
+    assert spot.fee_base_qty == pytest.approx(FEE_BTC)
+    assert v.wallet == pytest.approx(net_spot)
+    assert perp.requested_qty == pytest.approx(net_spot)
+    assert perp.filled_qty == pytest.approx(net_spot)
+    assert e.position.delta_qty == pytest.approx(0.0, abs=1e-12)
+    assert e.position.delta_fraction(100_000.0) == pytest.approx(0.0, abs=1e-12)
+    assert v.orders[-1][0:2] == ("Sell", "linear")
+    assert v.orders[-1][2] == pytest.approx(net_spot)
+
+
+def test_quote_coin_fee_does_not_reduce_the_spot_quantity_to_hedge():
+    v, e, d = open_once({"cumFeeDetail": {"USDT": "0.1"}})
+    assert d.action == "opened", d.reason
+    assert e.position is not None
+    assert e.position.spot.fee_base_qty == pytest.approx(0.0)
+    assert e.position.perp.filled_qty == pytest.approx(
+        e.position.spot.filled_qty)
+    assert e.position.delta_qty == pytest.approx(0.0, abs=1e-12)
+
+
+def test_net_spot_below_linear_minimum_is_unwound_without_opening_short():
+    class CoarseLinearLotVenue(WalletVenue):
+        def get_lot_rules(self, symbol, product):
+            if product == "linear":
+                return {"qty_step": 0.001, "min_qty": 0.001,
+                        "min_notional": 0.0}
+            return super().get_lot_rules(symbol, product)
+
+    v, e, d = open_once(
+        {"cumFeeDetail": {"BTC": str(FEE_BTC)}},
+        venue_cls=CoarseLinearLotVenue)
+    assert d.action == "unwound", d.reason
+    assert "SPOT_NET_BELOW_PERP_MINIMUM" in d.reason
+    assert e.state is BookState.FLAT
+    assert e.position is None
+    assert v.wallet == pytest.approx(0.0, abs=1e-12)
+    assert all(product != "linear" for _side, product, _qty in v.orders)
 
 
 def test_the_unwind_sells_what_the_wallet_holds_and_ends_flat():
