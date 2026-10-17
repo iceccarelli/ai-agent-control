@@ -510,3 +510,19 @@ class TestAnEmptyFundingAnswerSupportsZeroOnlyWhereItCanBeProven:
         acct = bot.carry_status()["accounting"]
         _assert_contract(acct)
         assert acct["net_basis"] == "confirmed" and acct["funding_usd"] == 0
+
+
+class TestAResumedPairNeedsItsJournal:
+    def test_a_resumed_pair_with_no_journal_in_the_store_refuses_to_start(
+            self, tmp_path):
+        """`_persist_carry` writes the journal BEFORE the position, so a held
+        pair with an empty journal is lost data: its funding would never be
+        booked and nothing would say so."""
+        t = TestRestartWithAnOpenPositionThroughTheRealStartupPath()
+        t._first_process(tmp_path)
+        store = StateStore(str(tmp_path / "carry.db"))
+        store.save_ledger([])                     # the journal is lost
+        store.close()
+        _venue2, engine2, bot2 = t._second_process(tmp_path)
+        assert bot2.carry_cold_start() is False
+        assert engine2.state is BookState.HALTED

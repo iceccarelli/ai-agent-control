@@ -794,6 +794,31 @@ class TradingBot:
                 "carry cold start HALTED — a human must reconcile before this "
                 "process trades: %s", decision.reason)
             return False
+        journal_rows = None
+        if decision.action.value == "RESUME" and \
+                self.carry.position is not None:
+            try:
+                journal_rows = self.store.load_ledger()
+            except Exception as exc:  # noqa: BLE001
+                logger.critical("carry cold start: the journal is unreadable "
+                                "(%s: %s)", type(exc).__name__, exc)
+                journal_rows = []
+        if (decision.action.value == "RESUME" and self.carry.position is not None
+                and not journal_rows):
+            # `_persist_carry` writes the journal BEFORE the position, so a
+            # held pair always has fills in the journal. An empty one is a lost
+            # or truncated ledger: no lifecycle exists to book the venue's
+            # funding against, no fill to realise a close from, and nothing
+            # would say so. Refuse rather than run an unaccountable book.
+            logger.critical(
+                "carry cold start: the ledger holds a resumed pair but the "
+                "double-entry journal is empty; its fills, fees and funding "
+                "cannot be accounted. Refusing to start - a human must "
+                "reconcile the journal")
+            self.carry._halt(
+                "JOURNAL_EMPTY_FOR_HELD_PAIR",
+                "a resumed pair has no journal entries")
+            return False
         return True
 
     def tick(self) -> None:
