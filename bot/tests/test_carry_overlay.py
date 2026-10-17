@@ -215,7 +215,9 @@ class TestAPartialPerpFillIsASmallerHedgeNotAnIncident:
         d = open_pair(e)
         assert d.state is BookState.HALTED
         assert d.reason == "OVERSOLD_BEYOND_INVENTORY"
-
+        # the whole oversized short is still at the venue: it is recorded
+        assert e.position is not None
+        assert e.position.perp.filled_qty == pytest.approx(0.002)
 
     def test_a_partial_buy_back_that_leaves_the_short_oversized_halts(self):
         """The excess closed only in part: still short more than the client

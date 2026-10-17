@@ -395,3 +395,16 @@ def test_a_margin_exit_closes_the_venues_short_not_only_the_recorded_one(mode):
     assert d.action == "unwound"
     assert eng.state is BookState.FLAT
     assert v.perp_short < 1e-6
+
+
+def test_a_naked_spot_that_cannot_be_sold_is_written_to_the_ledger():
+    """ACQUIRE: the perp is rejected and the emergency spot sale fills nothing.
+    The halt used to leave `position: null` in the ledger beside a naked long."""
+    v = Venue(reject={"linear"}, close_fill=0.0)
+    eng = build(v, mode=ACQUIRE)
+    d = candle(eng, ms=1_000)
+    assert d.reason == "NAKED_SPOT_UNWIND_FAILED"
+    assert eng.state is BookState.HALTED
+    assert eng.written[-1]["book_state"] == "HALTED"
+    assert eng.written[-1]["position"] is not None
+    assert eng.written[-1]["position"]["spot"]["filled_qty"] > 0

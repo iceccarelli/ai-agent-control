@@ -1411,6 +1411,14 @@ class CarryEngine:
             closed = (self._fire(self.perp_symbol, "Buy", excess, "linear")
                       if excess > 0 else None)
             if closed is None or closed.filled_qty <= 0:
+                # The whole short is still at the venue: record it before
+                # halting so the exposure is not forgotten.
+                self.position = CarryPosition(
+                    spot=Leg(symbol=self.spot_symbol, side="Hold",
+                             product="spot", requested_qty=inventory,
+                             filled_qty=inventory, avg_price=spot_mark,
+                             order_link_id="INVENTORY"),
+                    perp=perp, opened_ms=timestamp_ms)
                 return self._halt(
                     "OVERSOLD_BEYOND_INVENTORY",
                     f"short {perp.filled_qty} against {inventory} of "
@@ -1675,6 +1683,13 @@ class CarryEngine:
         wanted = max(0.0, spot.filled_qty - spot.fee_base_qty)   # held, net
         closed = self._fire(self.spot_symbol, "Sell", wanted, "spot")
         if closed is None or closed.filled_qty <= 0:
+            # The spot is still held and still naked: write it down so the
+            # ledger, the journal and the next cold start all see it.
+            self.position = CarryPosition(
+                spot=spot,
+                perp=Leg(symbol=self.perp_symbol, side="Sell",
+                         product="linear"),
+                opened_ms=self._last_tick_ms)
             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
         left = wanted - closed.filled_qty
         if left > QTY_DUST:
