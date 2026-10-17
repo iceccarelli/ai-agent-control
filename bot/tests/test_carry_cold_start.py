@@ -338,7 +338,8 @@ class TestTheEngineResumesOrRefuses:
 
 
 class TestTheProcessRefusesToStartOnAMismatch:
-    def _bot(self, venue, ledger):
+    def _bot(self, venue, ledger, *, spot_symbol="BTCUSDT",
+             perp_symbol="BTCUSDT"):
         bot = _main.TradingBot.__new__(_main.TradingBot)
         store = mock.Mock()
         store.load_carry_position.return_value = ledger
@@ -347,6 +348,8 @@ class TestTheProcessRefusesToStartOnAMismatch:
         bot.symbols = ["BTCUSDT"]
         bot.carry = CarryEngine(broker=venue, max_notional_usd=100.0,
                                 borrow_apr=0.0, execution_mode=OVERLAY,
+                                spot_symbol=spot_symbol,
+                                perp_symbol=perp_symbol,
                                 persist=lambda s: None,
                                 kill_switch=store.trip_kill_switch)
         bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
@@ -489,3 +492,16 @@ class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
         assert store.trip_kill_switch.called
         assert bot.carry.state is BookState.HALTED
         assert venue.orders == []
+
+    def test_different_configured_markets_never_resume_as_a_hedge(self):
+        # Even if the ledger exactly matches both configured leg symbols,
+        # ETH spot and BTC perp are not a delta-neutral pair.
+        ledger = opened(Venue()).to_state()
+        ledger["position"]["spot"]["symbol"] = "ETHUSDT"
+        bot, store = self._bot(
+            Venue(perp=0.001), ledger,
+            spot_symbol="ETHUSDT", perp_symbol="BTCUSDT")
+        assert bot.carry_cold_start() is False
+        assert store.trip_kill_switch.called
+        assert bot.carry.state is BookState.HALTED
+
