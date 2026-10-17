@@ -663,6 +663,11 @@ class CarryEngine:
         #: The last exception a leg raised, so a refusal can name it. A leg
         #: that fails for a reason nobody can read is a leg that fails again.
         self._last_leg_error: str = ""
+        #: A maker order whose fate the book could not establish (still
+        #: resting, uncancellable, unreadable). Its size is NOT a position - the
+        #: order may still fill - so it is written beside the halt as evidence,
+        #: never as a leg. Cleared by nothing: a halted book needs a human.
+        self._unresolved_order: Optional[Dict[str, Any]] = None
         #: Market time of the most recent tick, in epoch ms. Carried so the
         #: paths that do not take `timestamp_ms` can still date the day's
         #: entry allowance on the market's calendar rather than the wall
@@ -690,6 +695,8 @@ class CarryEngine:
             "last_print_ms": self._last_print_ms,
             "funding_history": list(self._funding_history),
             "perp_symbol": self.perp_symbol,
+            **({"unresolved_order": dict(self._unresolved_order)}
+               if self._unresolved_order else {}),
             **({"entry_days": self.pair_risk.export_days()}
                if getattr(self, "pair_risk", None) is not None
                and hasattr(self.pair_risk, "export_days") else {}),
@@ -2178,6 +2185,18 @@ class CarryEngine:
             return self._as_whole_leg(maker)
         return self._merge(maker, taker, qty)
 
+    def _note_unresolved_order(self, *, symbol: str, side: str, product: str,
+                               link: str, requested: float, filled_seen: float,
+                               why: str) -> None:
+        """Write down, beside the halt that follows, the order the book could
+        not settle: the floor of what it has already filled. The venue stays the
+        authority for the rest; this is what a human reconciling a HALTED ledger
+        would otherwise find as `position: null`."""
+        self._unresolved_order = {
+            "symbol": symbol, "side": side, "product": product,
+            "order_link_id": link, "requested_qty": float(requested),
+            "filled_qty_seen": float(filled_seen), "why": why}
+
     def _rest(self, symbol: str, side: str, qty: float,
               product: str) -> Optional[Leg]:
         """One post-only order at the touch. Returns what it filled, or None.
@@ -2248,6 +2267,10 @@ class CarryEngine:
                                              product=product)
         except Exception as exc:  # noqa: BLE001
             self._last_leg_error = f"{type(exc).__name__}: {exc}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link=link,
+                requested=qty, filled_seen=leg.filled_qty,
+                why="MAKER_ORDER_UNCANCELLABLE")
             self._halt(
                 "MAKER_ORDER_UNCANCELLABLE",
                 f"a post-only {side} of {qty} {symbol} could not be cancelled "
@@ -2260,6 +2283,13 @@ class CarryEngine:
             # first the book has not finished counting.
             self._last_leg_error = (
                 f"maker order still {(final or {}).get('status')!r} after cancel")
+            seen = (final or {}).get("filled_qty")
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link=link,
+                requested=qty,
+                filled_seen=max(leg.filled_qty,
+                                float(seen) if self._finite(seen) else 0.0),
+                why="MAKER_ORDER_STILL_RESTING")
             self._halt(
                 "MAKER_ORDER_STILL_RESTING",
                 f"a post-only {side} of {qty} {symbol} is still resting after "
@@ -2270,6 +2300,10 @@ class CarryEngine:
         total, final_price, ok = self._accountable(final or {}, qty)
         if not ok:
             self._last_leg_error = f"unaccountable maker fill: {final!r}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link=link,
+                requested=qty, filled_seen=leg.filled_qty,
+                why="MAKER_ORDER_AMBIGUOUS")
             self._halt(
                 "MAKER_ORDER_AMBIGUOUS",
                 f"a post-only {side} of {qty} {symbol} read back a total the "
