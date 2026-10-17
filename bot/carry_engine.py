@@ -1098,34 +1098,12 @@ class CarryEngine:
             del self._funding_history[:-self.FUNDING_HISTORY]
 
         if self.position is not None:
-            headroom = self._check_margin()
-            if headroom is not None:
-                return headroom
-
-            # What the VENUE holds, not what the book believes. Delta, drift
-            # and the hedge ratio are all computed from the legs this process
-            # recorded; a manual order, a fill the book missed or a partial
-            # liquidation changes the venue and nothing else. Compared every
-            # tick; never "corrected" by rewriting the ledger to match.
-            mismatch = self._check_venue_position()
-            if mismatch is not None:
-                return mismatch
-
-            # Before anything is rebalanced or collected: in OVERLAY, does the
-            # client still hold the BTC this short is written against? Adding
-            # to, or collecting on, a hedge whose long side has left is
-            # compounding a naked short.
-            cover = self._check_inventory_cover()
-            if cover is not None:
-                return cover
-
-            drift = self.position.delta_fraction(mark)
-            if drift > self.delta_band:
-                return self._rebalance(mark, drift)
-
-            # A print the pair was HELD through: its stamp is after the open.
-            # The print that triggered the entry, or a late record of an
-            # older settlement, was not earned by this position.
+            # A print the pair was HELD through is booked FIRST, before any
+            # exit, mismatch, cover or rebalance can return: `_last_print_ms`
+            # is already stamped, so a print skipped here is never booked.
+            # Held means its stamp is after the open: the print that triggered
+            # the entry, or a late record of an older settlement, was not
+            # earned by this position.
             held = new_print and int(funding_print_ms) > self.position.opened_ms
             if held:
                 # Booked SIGNED, on WHAT THE POSITION IS WORTH NOW.
@@ -1161,9 +1139,37 @@ class CarryEngine:
                 failed = self._record()
                 if failed is not None:
                     return failed
-                if (self.position.negative_funding_streak
-                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
-                    return self._unwind(mark, "FUNDING_INVERTED")
+
+            headroom = self._check_margin()
+            if headroom is not None:
+                return headroom
+
+            # What the VENUE holds, not what the book believes. Delta, drift
+            # and the hedge ratio are all computed from the legs this process
+            # recorded; a manual order, a fill the book missed or a partial
+            # liquidation changes the venue and nothing else. Compared every
+            # tick; never "corrected" by rewriting the ledger to match.
+            mismatch = self._check_venue_position()
+            if mismatch is not None:
+                return mismatch
+
+            # Before anything is rebalanced or collected: in OVERLAY, does the
+            # client still hold the BTC this short is written against? Adding
+            # to, or collecting on, a hedge whose long side has left is
+            # compounding a naked short.
+            cover = self._check_inventory_cover()
+            if cover is not None:
+                return cover
+
+            drift = self.position.delta_fraction(mark)
+            if drift > self.delta_band:
+                return self._rebalance(mark, drift)
+
+            # The inversion exit is judged every tick (the streak is persisted
+            # with the print above), not only on the tick that booked it.
+            if (self.position.negative_funding_streak
+                    >= NEGATIVE_FUNDING_EXIT_PRINTS):
+                return self._unwind(mark, "FUNDING_INVERTED")
 
             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
                                  state=BookState.HEDGED,

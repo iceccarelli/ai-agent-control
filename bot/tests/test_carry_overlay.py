@@ -508,3 +508,22 @@ class TestTheBrokerReadsTheVenuesRules:
         b.get_lot_rules("BTCUSDT", "linear")
         b.get_fee_rates("BTCUSDT", "linear")
         assert c.calls[0][1]["category"] == "linear"
+
+
+class TestAPrintIsBookedEvenWhenAnEarlierCheckReturns:
+    def test_a_print_that_arrives_with_a_rebalance_is_still_booked(self):
+        """`_last_print_ms` is stamped before the held-position checks, so a
+        print on a tick where the rebalance returned was never booked: the next
+        tick saw it as old."""
+        v = Venue(inventory=1.0)
+        e = engine(v, cap=100.0)
+        assert open_pair(e).action == "opened"
+        e.position.spot.filled_qty = 0.0015          # force drift past the band
+        e.position.spot.requested_qty = 0.0015
+        before = e.position.funding_collected
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
+        assert d.action == "rebalanced"
+        assert e.position.funding_collected > before
+        assert e.position.funding_collected == pytest.approx(
+            before + 3.0 / 1e4 * 0.001 * MARK)
