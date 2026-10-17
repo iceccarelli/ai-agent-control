@@ -375,3 +375,23 @@ class TestTheOverlayKeepsCheckingItsInventory:
         candle(eng, ms=61_000, print_ms=61_000)
         last = eng.written[-1]
         assert last["position"]["perp"]["filled_qty"] == pytest.approx(0.5)
+
+
+class _VenueReadsItsShort(Venue):
+    def get_perp_position(self, symbol):
+        return self.perp_short
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_margin_exit_closes_the_venues_short_not_only_the_recorded_one(mode):
+    """A margin/liquidation exit runs before the per-tick size check. Closing
+    only the recorded size marked the book FLAT with the excess still short."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.perp_short += 0.4          # a fill the book missed, or a manual add
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound"
+    assert eng.state is BookState.FLAT
+    assert v.perp_short < 1e-6

@@ -1522,6 +1522,18 @@ class CarryEngine:
         return CarryDecision("halted", reason=reason, state=BookState.HALTED,
                              detail={"error": self._last_leg_error})
 
+    def _venue_short_qty(self) -> float:
+        """The perp short the venue reports, or 0.0 when it cannot be read or
+        the broker has no such read (the per-tick size check halts on those)."""
+        reader = getattr(self.broker, "get_perp_position", None)
+        if reader is None:
+            return 0.0
+        try:
+            qty = abs(float(reader(self.perp_symbol)))
+        except Exception:  # noqa: BLE001
+            return 0.0
+        return qty if math.isfinite(qty) else 0.0
+
     def _exit_mark(self) -> float:
         """The reference mark handed to `_unwind`. A ticker that will not
         answer must not stop a risk exit: the exit orders are market orders and
@@ -1539,7 +1551,12 @@ class CarryEngine:
         position = self.position
         assert position is not None
         self.state = BookState.UNWINDING
-        wanted_perp = position.perp.filled_qty
+        book_perp = position.perp.filled_qty
+        # Close what the VENUE holds if that is more than the book recorded: a
+        # margin or liquidation exit runs before the per-tick size check, and
+        # closing only the recorded size would leave the excess short open
+        # behind a FLAT book. The buy is reduce-only, so it cannot overshoot.
+        wanted_perp = max(book_perp, self._venue_short_qty())
         perp = self._fire(self.perp_symbol, "Buy", wanted_perp, "linear")
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
@@ -1579,8 +1596,8 @@ class CarryEngine:
                 "sold because it is still hedging the open short")
         # Sell spot only in proportion to the perp that actually closed: a
         # half-closed short against a fully sold spot is a naked short.
-        closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
-            if wanted_perp > 0 else 1.0
+        closed_fraction = min(1.0, perp.filled_qty / book_perp) \
+            if book_perp > 0 else 1.0
         sell_spot = (wanted_spot if closed_fraction >= 1.0 - 1e-9
                      else wanted_spot * closed_fraction)
         spot = self._fire(self.spot_symbol, "Sell", sell_spot, "spot")
