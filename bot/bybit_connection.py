@@ -130,6 +130,11 @@ TRANSIENT_RET_CODES = frozenset({
     130150,  # system busy
 })
 
+#: retCodes after which an order's fate is UNKNOWN, not refused: 0 is "no
+#: retCode was stated" (PermanentAPIError's default), 10000 a server timeout,
+#: 170007 a timeout waiting for the backend.
+UNKNOWN_OUTCOME_RET_CODES = frozenset({0, 10000, 170007})
+
 #: HTTP statuses worth retrying.
 TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
 
@@ -1017,6 +1022,18 @@ class BybitClient:
                     symbol=str(body.get("symbol", "")), oid=oid, purpose=purpose)
                 if recovered is not None:
                     return recovered
+            if exc.ret_code in UNKNOWN_OUTCOME_RET_CODES:
+                # No retCode at all (an unparseable or retCode-less 200, a
+                # non-200) or a timeout the venue itself reported: the order
+                # may have executed. Recording it "rejected" takes it out of the
+                # unresolved set startup reconciliation checks against the
+                # venue. Same rule as the carry broker's classifier.
+                self.store.update_order_status(oid, "unknown")
+                logger.error("order %s outcome unknown (%s): %s", oid,
+                             exc.ret_code, exc)
+                return OrderResult(
+                    order_link_id=oid, reason="OUTCOME_UNKNOWN",
+                    ret_code=exc.ret_code)
             self.store.update_order_status(oid, "rejected")
             logger.error("order %s rejected (%s): %s", oid, exc.ret_code, exc)
             # The id is returned even on failure: the caller needs it to look the

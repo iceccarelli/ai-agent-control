@@ -920,3 +920,42 @@ class TestStructure:
             and "``" not in ln
         ]
         assert offenders == []
+
+
+@pytest.mark.parametrize("body", ["<html>proxy</html>", "",
+                                  '{"retCode": 10000, "retMsg": "timeout"}'])
+def test_a_directional_order_whose_reply_is_unusable_stays_unresolved(
+        body, tmp_path, monkeypatch):
+    """The venue executed the order; the reply was a proxy body or a timeout.
+    Recording it 'rejected' took it out of the unresolved set that startup
+    reconciliation checks against the exchange."""
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    from fake_bybit import API_KEY, API_SECRET, FakeBybit
+    from persistence import StateStore
+
+    class Cfg:
+        USE_TESTNET = True
+        BYBIT_API_KEY = API_KEY
+        BYBIT_API_SECRET = API_SECRET
+        BYBIT_RECV_WINDOW_MS = 5000
+        REQUEST_TIMEOUT_SECONDS = 5.0
+        USE_LEVERAGE = False
+        SYMBOL_FILTERS_TTL = 3600
+        ORDERLINK_PREFIX = "BB"
+
+    exchange = FakeBybit()
+    store = StateStore(str(tmp_path / "s.db"))
+    store.claim_writer()
+    client = bc.BybitClient(config=Cfg(), store=store, transport=exchange)
+    real = exchange.request
+
+    def request(method, url, **kw):
+        out = real(method, url, **kw)          # the venue EXECUTES the order
+        return (200, body) if url.endswith("/v5/order/create") else out
+
+    exchange.request = request
+    result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
+    assert result.reason == "OUTCOME_UNKNOWN"
+    assert store.get_order(result.order_link_id)["status"] == "unknown"
