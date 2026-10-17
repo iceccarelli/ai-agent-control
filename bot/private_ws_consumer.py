@@ -255,7 +255,22 @@ def _normalize_execution_item(item: Dict[str, Any]) -> NormalizedEvent:
             event_id=f"unknown:{identity}", kind="unknown", topic="execution",
             raw=item)
     is_maker_or_taker_fill = exec_type in ("Trade", "")
-    status = "filled" if is_maker_or_taker_fill else ""
+    # One execution is one fill, not the order's end: the order is "filled"
+    # only when nothing is left (`leavesQty` 0). Claiming it for a partial fill
+    # made the order terminal, so the later real PartiallyFilled / Cancelled
+    # events were refused by the monotonic guard and a resting remainder fell
+    # out of reconciliation. A leavesQty that is absent or unusable claims
+    # nothing; the `order` topic carries the status.
+    status = ""
+    if is_maker_or_taker_fill:
+        try:
+            leaves = float(item["leavesQty"])
+        except (KeyError, TypeError, ValueError):
+            leaves = None
+        if leaves is not None and leaves == 0.0:
+            status = "filled"
+        elif leaves is not None and leaves > 0.0:
+            status = "partial"
     # execId is already the venue's own durable, unique-per-fill identity
     # — no timestamp or payload hash needed on top of it (the venue never
     # reissues an execId for two different fills).

@@ -30,6 +30,7 @@ EXECUTION_MSG = json.dumps({
     "data": [{
         "symbol": "BTCUSDT", "orderId": "V-1", "orderLinkId": "BB-entry-1",
         "execId": "E-1", "execType": "Trade",
+        "execQty": "0.01", "orderQty": "0.01", "leavesQty": "0",
     }],
 })
 
@@ -56,6 +57,23 @@ class TestParseWsMessage:
         assert e.kind == "execution"
         assert e.event_id == f"execution:{pwc.deterministic_id('execution', 'E-1')}"
         assert e.status == "filled"
+
+    @pytest.mark.parametrize("leaves,status", [
+        ("0.9", "partial"), ("0", "filled"), (None, ""), ("x", "")],
+        ids=["partial", "complete", "absent", "unusable"])
+    def test_an_execution_claims_the_order_is_filled_only_when_nothing_is_left(
+            self, leaves, status):
+        """One execution is one fill. Marking the order terminal on a partial
+        fill made the monotonic guard refuse its later PartiallyFilled /
+        Cancelled events and dropped a resting remainder out of reconciliation."""
+        item = {"symbol": "BTCUSDT", "orderId": "V-1",
+                "orderLinkId": "BB-entry-1", "execId": "E-9",
+                "execType": "Trade", "execQty": "0.1", "orderQty": "1.0"}
+        if leaves is not None:
+            item["leavesQty"] = leaves
+        (e,) = pwc.parse_ws_message(
+            json.dumps({"topic": "execution", "data": [item]}))
+        assert e.status == status
 
     def test_position_message_normalizes(self):
         events = pwc.parse_ws_message(POSITION_MSG)
