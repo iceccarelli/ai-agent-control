@@ -959,3 +959,38 @@ def test_a_directional_order_whose_reply_is_unusable_stays_unresolved(
     result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
     assert result.reason == "OUTCOME_UNKNOWN"
     assert store.get_order(result.order_link_id)["status"] == "unknown"
+
+
+@pytest.mark.parametrize("status,body", [(401, ""), (200, '{"result": {}}'),
+                                         (200, "<html>proxy</html>")])
+def test_startup_reconciliation_keeps_an_order_unknown_when_the_lookup_got_no_answer(
+        status, body, tmp_path, monkeypatch):
+    """`never_sent` means the venue ANSWERED and has no such order. A lookup
+    that got a proxy body, an auth failure or no retCode says nothing, so the
+    unknown order must stay unknown instead of being closed out."""
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    from fake_bybit import API_KEY, API_SECRET, FakeBybit
+    from persistence import StateStore
+
+    class Cfg:
+        USE_TESTNET = True
+        BYBIT_API_KEY = API_KEY
+        BYBIT_API_SECRET = API_SECRET
+        BYBIT_RECV_WINDOW_MS = 5000
+        REQUEST_TIMEOUT_SECONDS = 5.0
+        USE_LEVERAGE = False
+        SYMBOL_FILTERS_TTL = 3600
+        ORDERLINK_PREFIX = "BB"
+
+    exchange = FakeBybit()
+    store = StateStore(str(tmp_path / "s.db"))
+    store.claim_writer()
+    client = bc.BybitClient(config=Cfg(), store=store, transport=exchange)
+    store.record_order("BB-x", "BTCUSDT", "Buy", "Market", 0.01)
+    store.update_order_status("BB-x", "unknown")
+    exchange.request = lambda method, url, **kw: (status, body)
+    summary = client.reconcile_on_startup()
+    assert store.get_order("BB-x")["status"] == "unknown"
+    assert summary["unknown"] == 1 and summary["resolved"] == 0

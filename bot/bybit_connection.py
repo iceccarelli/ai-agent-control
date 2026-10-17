@@ -815,7 +815,8 @@ class BybitClient:
         return payload.get("result", {}).get("list") or []
 
     def get_order(
-        self, *, symbol: str, order_link_id: str = "", order_id: str = ""
+        self, *, symbol: str, order_link_id: str = "", order_id: str = "",
+        strict: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Query a single order, open or recently closed.
 
@@ -832,14 +833,22 @@ class BybitClient:
         if order_id:
             params["orderId"] = order_id
 
+        unanswered: Optional[PermanentAPIError] = None
         for endpoint in ("/v5/order/realtime", "/v5/order/history"):
             try:
                 payload = self._request("GET", endpoint, params=params, signed=True)
-            except PermanentAPIError:
+            except PermanentAPIError as exc:
+                if exc.ret_code in UNKNOWN_OUTCOME_RET_CODES:
+                    unanswered = exc
                 continue
             rows = payload.get("result", {}).get("list") or []
             if rows:
                 return rows[0]
+        if strict and unanswered is not None:
+            # `None` means the venue ANSWERED and has no such order. A lookup
+            # that got no usable answer (a proxy body, a timeout, an auth
+            # failure) says nothing about whether the order exists.
+            raise unanswered
         return None
 
     # -- orders ------------------------------------------------------------
@@ -1779,7 +1788,8 @@ class BybitClient:
             summary["checked"] += 1
             oid = str(row["order_link_id"])
             try:
-                remote = self.get_order(symbol=str(row["symbol"]), order_link_id=oid)
+                remote = self.get_order(symbol=str(row["symbol"]), order_link_id=oid,
+                                        strict=True)
             except BybitAPIError as exc:
                 logger.error("reconcile: cannot resolve %s: %s", oid, exc)
                 summary["unknown"] += 1

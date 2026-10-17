@@ -1625,26 +1625,20 @@ class CarryEngine:
         # The reduce-only buy is refused above the venue's short, so after a
         # partial liquidation (exactly when a margin exit fires) the venue's
         # smaller number is what can be closed. Unread (None): use the book.
-        # Read FLAT: there is no short left to buy back (it was liquidated), so
-        # no order is sent - a reduce-only buy against a flat position is
-        # refused - and the exit carries on to what it still has to close.
-        venue_flat = venue_short is not None and venue_short <= QTY_DUST
-        if venue_short is None:
-            wanted_perp = book_perp
-        elif venue_flat:
-            wanted_perp = 0.0
-            logger.warning("carry: the exit found the venue already flat "
-                           "(book recorded %.10g); no buy-back sent", book_perp)
-        else:
-            wanted_perp = venue_short
-        perp = (Leg(symbol=self.perp_symbol, side="Buy", product="linear")
-                if venue_flat
-                else self._fire(self.perp_symbol, "Buy", wanted_perp, "linear"))
+        # A venue that reads FLAT (or cannot be read) does not authorise
+        # skipping the close: a flat read straight after a fill, or from a lagging
+        # position list, is indistinguishable from a liquidation, and going FLAT
+        # on it would leave a live short behind a FLAT book. The recorded size is
+        # still sent (reduce-only, so it cannot open anything); if the venue
+        # refuses it the exit halts with the position kept for a human.
+        wanted_perp = (venue_short if venue_short is not None
+                       and venue_short > QTY_DUST else book_perp)
+        perp = self._fire(self.perp_symbol, "Buy", wanted_perp, "linear")
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
             # buying the perp back and nothing else: selling their BTC would
             # be a liquidation nobody asked for.
-            if not venue_flat and (perp is None or perp.filled_qty <= 0):
+            if perp is None or perp.filled_qty <= 0:
                 return self._halt(
                     "UNWIND_INCOMPLETE",
                     f"{reason} — the perp hedge did not close and the "
@@ -1668,7 +1662,7 @@ class CarryEngine:
         # received, and the venue refuses a sell above the free balance.
         wanted_spot = max(0.0, position.spot.filled_qty
                           - position.spot.fee_base_qty)
-        if not venue_flat and (perp is None or perp.filled_qty <= 0):
+        if perp is None or perp.filled_qty <= 0:
             # The perp is the leg that can be liquidated and the one that
             # hedges the spot. If it did not close, selling the spot would turn
             # a hedged pair into a naked short. Leave the pair as it is.

@@ -460,27 +460,39 @@ def test_snap_to_lot_does_not_floor_float_noise_one_lot_too_low():
 
 
 @pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
-def test_a_margin_exit_on_a_venue_already_flat_still_closes_the_rest(mode):
-    """A liquidated short reads flat (0.0), which is not the same as unread. The
-    reduce-only buy against a flat position is refused, and the exit used to
-    halt with the spot long unsold in ACQUIRE."""
+def test_a_flat_read_never_lets_the_exit_skip_the_buy_back(mode):
+    """A lagging position list reads 0.0 while the short is still open. Going
+    FLAT on that left a live short behind a FLAT book; the recorded size is
+    still bought back (reduce-only) and the short really closes."""
+    class Lagging(_VenueReadsItsShort):
+        def get_perp_position(self, symbol):
+            return 0.0                       # the list lags the real position
+    v = Lagging()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound", (d.action, d.reason)
+    assert v.perp_short < 1e-6, "the exit went FLAT with the short still open"
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_refused_buy_back_keeps_the_position_and_halts(mode):
+    """If the venue refuses the reduce-only buy (the short really is gone, or
+    anything else), the book cannot tell which: it halts WITH the position."""
     class Refuses(_VenueReadsItsShort):
         def place_market(self, *, symbol, side, qty, product):
-            if product == "linear" and side == "Buy" and self.perp_short <= 1e-9:
+            if product == "linear" and side == "Buy":
                 return None
             return super().place_market(symbol=symbol, side=side, qty=qty,
                                         product=product)
     v = Refuses()
     eng = build(v, mode=mode)
     candle(eng, ms=1_000)
-    held_spot = v.spot_long if hasattr(v, "spot_long") else None
-    v.perp_short = 0.0                       # the whole short was liquidated
     v.margin = 1.1
     d = candle(eng, ms=61_000, print_ms=1_000)
-    assert d.action == "unwound", (d.action, d.reason)
-    assert eng.state is BookState.FLAT and eng.position is None
-    if mode == ACQUIRE and held_spot is not None:
-        assert v.spot_long < 1e-6, "the spot long was left unsold"
+    assert d.action == "halted" and d.reason == "UNWIND_INCOMPLETE"
+    assert eng.position is not None and eng.state is BookState.HALTED
 
 
 def test_an_unreadable_venue_position_still_closes_the_recorded_short():
