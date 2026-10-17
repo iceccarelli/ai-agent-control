@@ -403,3 +403,34 @@ class TestTickPersistsTheTruthAcrossARestart:
         assert again["fees_usd"] == pytest.approx(live["fees_usd"])
         assert again["fees_unknown"] == live["fees_unknown"]
         assert again["net_basis"] == live["net_basis"]
+
+
+def test_a_resting_order_that_fills_at_cancel_books_its_whole_stated_fee():
+    """A post-only order with no fills reports an empty fee row (unknown). The
+    ledger used that as the baseline, so the fee on the quantity the cancel
+    caught became an unknown difference and was booked as 0."""
+    import ledger as L
+
+    class V:
+        def place_post_only(self, **k):
+            return {"filled_qty": 0.0, "avg_price": 0.0, "order_link_id": "m1",
+                    "fee": None, "resting": True,
+                    "fee_detail": {"known": False, "components": [],
+                                   "source": "", "note": "empty"}}
+
+        def cancel_order(self, **k):
+            return {"filled_qty": 0.4, "avg_price": 30000.0,
+                    "order_link_id": "m1", "resting": False, "fee": 0.0004,
+                    "fee_detail": {"known": True, "source": "cumFeeDetail",
+                                   "note": "",
+                                   "components": [{"amount": 0.0004,
+                                                   "currency": "BTC"}]}}
+
+    journal = L.Journal()
+    broker = L.LedgerBroker(V(), journal, ms=lambda: 1)
+    broker.place_post_only(symbol="BTCUSDT", side="Buy", qty=1.0,
+                           price=30000.0, product="spot")
+    broker.cancel_order(symbol="BTCUSDT", order_link_id="m1", product="spot")
+    assert [e.fee_status for e in journal.entries] == ["confirmed"]
+    assert journal.statement()["fees_unknown"] == 0
+    assert journal.balances()[L.BTC].qty == pytest.approx(0.4 - 0.0004)

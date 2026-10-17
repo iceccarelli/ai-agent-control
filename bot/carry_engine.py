@@ -2274,6 +2274,8 @@ class CarryEngine:
             leg.fee = None if fee is None else float(fee)
             leg.fee_base_qty = self._base_fee_withheld(final, symbol, side,
                                                        product)
+            leg.base_fee_known = self._fee_currency_was_reported(
+                final, side=side, product=product)
         return leg
 
     @staticmethod

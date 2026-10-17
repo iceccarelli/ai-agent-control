@@ -536,3 +536,31 @@ def test_a_halt_from_an_unknown_taker_remainder_is_not_overwritten_by_hedged():
     assert tripped
     assert writes[-1]["book_state"] == "HALTED"
     assert writes[-1]["position"] is not None       # the landed half is written
+
+
+def test_a_maker_buy_re_reads_whether_its_fee_currency_is_known_at_cancel():
+    """The cancel read-back replaces the fill total and the fee, so it must also
+    replace what is KNOWN about the fee's currency; the placement row's unknown
+    answer used to stick and halt a correctly accounted spot BUY."""
+    class V(Venue):
+        def place_post_only(self, *, symbol, side, qty, price, product):
+            self.calls.append(("maker", side, qty, price))
+            return {"filled_qty": 0.0, "avg_price": price,
+                    "order_link_id": "m1", "fee": None, "maker": True,
+                    "resting": True,
+                    "fee_detail": {"known": False, "components": [],
+                                   "source": "", "note": "empty"}}
+
+        def cancel_order(self, *, symbol, order_link_id, product):
+            self.calls.append(("cancel", None, None, None))
+            return {"filled_qty": 0.001, "avg_price": MARK, "fee": 0.0000005,
+                    "resting": False,
+                    "fee_detail": {"known": True, "source": "cumFeeDetail",
+                                   "note": "",
+                                   "components": [{"amount": 0.0000005,
+                                                   "currency": "BTC"}]}}
+    e = engine(V(), mode="acquire")
+    leg = e._rest("BTCUSDT", "Buy", 0.001, "spot")
+    assert leg is not None and leg.filled_qty == pytest.approx(0.001)
+    assert leg.base_fee_known is True
+    assert leg.fee_base_qty == pytest.approx(0.0000005)

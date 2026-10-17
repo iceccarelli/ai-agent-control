@@ -1005,8 +1005,14 @@ class LedgerBroker:
             link = str(result.get("order_link_id") or "")
             if link:
                 booked = float(result.get("filled_qty", 0.0) or 0.0)
-                self._resting[link] = (
-                    side, max(0.0, booked), self._fee_set_of(result))
+                # An order that has filled nothing has paid nothing: that is a
+                # fact, not a missing figure. The venue's empty fee row for it
+                # reads as UNKNOWN, which would make the whole fee on a later
+                # cancel-time fill an unknown difference and drop it.
+                baseline = (venue_fees.FeeSet((), True, "zero_fill",
+                                              "nothing filled, no fee")
+                            if booked <= 0 else self._fee_set_of(result))
+                self._resting[link] = (side, max(0.0, booked), baseline)
         return result
 
     def cancel_order(self, *, symbol: str, order_link_id: str, product: str):
