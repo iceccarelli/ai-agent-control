@@ -73,6 +73,10 @@ PAIR_DUST_FRACTION = 1e-6
 SPOT = "spot"
 LINEAR = "linear"
 
+#: retCodes that report a backend timeout rather than a refusal (10000 server
+#: timeout, 170007 timeout waiting for the backend). The order may be live.
+_TIMEOUT_RET_CODES = frozenset({10000, 170007})
+
 #: The three values Bybit's `GET /v5/account/info` states in `marginMode`. The
 #: account's own statement is the only source of the mode: nothing in this
 #: project configures it, and an absent or other value is NEVER read as one of
@@ -549,10 +553,14 @@ class CarryBroker:
                     "for it; its fill is unknown")
             if self._rejected(state):
                 return None            # terminal with nothing filled
-            if state["resting"] and state["filled_qty"] <= 0:
+            if state["resting"]:
+                # Still live, whatever has filled so far: the rest can land
+                # after this read, on a leg the engine would already have
+                # booked at the partial size and hedged for that size only.
                 raise OrderOutcomeUnknown(
-                    f"{link_id} is {state['status']} with nothing filled yet; "
-                    "a market order's outcome is unknown")
+                    f"{link_id} is {state['status']} with "
+                    f"{state['filled_qty']!r} filled so far; a market order "
+                    "that is still live has no final fill to book")
             return self._engine_result_from_state(state, qty)
         return fill.as_engine_result()
 
@@ -569,8 +577,11 @@ class CarryBroker:
             return False
         # A TransientAPIError is the client giving up after retries on a
         # condition the venue itself called retryable (busy, internal error):
-        # the request may still have executed.
-        return code != 0 and type(exc).__name__ != "TransientAPIError"
+        # the request may still have executed. So may one the venue answered
+        # with a timeout: it says the backend did not answer in time, not
+        # that the order was refused.
+        return (code != 0 and code not in _TIMEOUT_RET_CODES
+                and type(exc).__name__ != "TransientAPIError")
 
     @staticmethod
     def _fill_is_sane(filled: Any, avg_price: Any, requested: float) -> bool:

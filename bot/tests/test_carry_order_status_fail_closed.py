@@ -225,3 +225,75 @@ def test_an_accepted_market_order_that_filled_is_that_fill():
                     "avgPrice": "100000"}]).place_market(
         symbol="BTCUSDT", side="Sell", qty=0.001, product="linear")
     assert r["filled_qty"] == pytest.approx(0.001)
+
+
+# -- an accepted market order still live with part of it filled ---------------
+
+class LivePartialReadback(FakeClient):
+    """Create succeeds with no fill in the response; the read-back says `row`."""
+
+    def __init__(self, row):
+        super().__init__()
+        self.row = row
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/order/create":
+            return envelope({"orderId": "1", "orderLinkId": body["orderLinkId"]})
+        if endpoint == "/v5/order/realtime":
+            return envelope({"list": [dict(self.row,
+                                           orderLinkId=params["orderLinkId"])]})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+def _live_partial_broker(row):
+    return CarryBroker(client=LivePartialReadback(row),
+                       order_gate=lambda: (True, "T"),
+                       sequence_source=lambda *a: 1)
+
+
+def test_an_accepted_market_order_still_live_with_a_partial_fill_is_unknown():
+    with pytest.raises(OrderOutcomeUnknown):
+        _live_partial_broker({"orderStatus": "PartiallyFilled", "cumExecQty": "0.2",
+                   "avgPrice": "100000"}).place_market(
+            symbol="BTCUSDT", side="Sell", qty=1.0, product="linear")
+
+
+def test_an_accepted_market_order_that_ended_partial_is_that_partial_fill():
+    r = _live_partial_broker({"orderStatus": "PartiallyFilledCanceled",
+                   "cumExecQty": "0.2", "avgPrice": "100000"}).place_market(
+        symbol="BTCUSDT", side="Sell", qty=1.0, product="linear")
+    assert r is not None and r["filled_qty"] == pytest.approx(0.2)
+
+
+# -- a venue timeout is not a refusal -----------------------------------------
+
+class TimeoutRefusal(FakeClient):
+    def __init__(self, exc_type, code):
+        super().__init__()
+        self.exc_type, self.code = exc_type, code
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/order/create":
+            raise self.exc_type("venue said no", self.code)
+        if endpoint in ("/v5/order/realtime", "/v5/order/history"):
+            return envelope({"list": []})      # the venue shows no row yet
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+@pytest.mark.parametrize("code", [10000, 170007])
+def test_a_venue_timeout_retcode_is_an_unknown_outcome_not_a_rejection(code):
+    b = CarryBroker(client=TimeoutRefusal(bybit_connection.PermanentAPIError, code),
+                    order_gate=lambda: (True, "T"), sequence_source=lambda *a: 1)
+    with pytest.raises(OrderOutcomeUnknown):
+        b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5, product="spot")
+
+
+def test_an_ordinary_venue_refusal_is_still_a_rejection():
+    b = CarryBroker(client=TimeoutRefusal(bybit_connection.PermanentAPIError, 110007),
+                    order_gate=lambda: (True, "T"), sequence_source=lambda *a: 1)
+    assert b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5,
+                          product="spot") is None
