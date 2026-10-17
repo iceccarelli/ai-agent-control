@@ -72,6 +72,19 @@ PAIR_DUST_FRACTION = 1e-6
 #: guessed at: routing a spot order to the linear endpoint is a naked short.
 SPOT = "spot"
 LINEAR = "linear"
+
+#: The three values Bybit's `GET /v5/account/info` states in `marginMode`. The
+#: account's own statement is the only source of the mode: nothing in this
+#: project configures it, and an absent or other value is NEVER read as one of
+#: these (`CarryBroker.get_margin_mode` raises instead).
+MARGIN_REGULAR = "REGULAR_MARGIN"
+MARGIN_PORTFOLIO = "PORTFOLIO_MARGIN"
+MARGIN_ISOLATED = "ISOLATED_MARGIN"
+MARGIN_MODES = (MARGIN_REGULAR, MARGIN_PORTFOLIO, MARGIN_ISOLATED)
+#: Modes where liquidation is decided at ACCOUNT level, so a valid
+#: `accountMMRate` is required. Isolated margin is per position: the account
+#: rate does not describe it and the per-position liqPrice distance is the gate.
+ACCOUNT_LEVEL_MARGIN_MODES = (MARGIN_REGULAR, MARGIN_PORTFOLIO)
 VALID_PRODUCTS = frozenset({SPOT, LINEAR})
 
 
@@ -1051,6 +1064,23 @@ class CarryBroker:
                 f"settled funding print for {symbol} is unusable: {row!r}")
         return rate * 1e4, stamp
 
+    def get_margin_mode(self) -> str:
+        """The account's margin mode, as the venue states it
+        (`GET /v5/account/info`, `marginMode`). One of `MARGIN_MODES`.
+
+        Raises `PairIncident` when the account cannot be read or states
+        anything else: a missing field is never read as a mode.
+        """
+        result = self.client._request("GET", "/v5/account/info", signed=True)
+        body = self._v5_result(result)
+        raw = body.get("marginMode") if isinstance(body, dict) else None
+        if raw not in MARGIN_MODES:
+            raise PairIncident(
+                f"account marginMode is {raw!r}, not one of {MARGIN_MODES}; "
+                "liquidation semantics unknown, and an unknown margin mode is "
+                "not a safe one")
+        return raw
+
     def get_liquidation_view(self, symbol: str) -> Dict[str, Any]:
         """How far the price can move before this position is liquidated.
 
@@ -1077,25 +1107,42 @@ class CarryBroker:
                 "unknown, and an unreadable one is a margin call you cannot "
                 "see")
 
+        margin_mode = self.get_margin_mode()
         account_mm = None
-        try:
+        if margin_mode in ACCOUNT_LEVEL_MARGIN_MODES:
+            # Required, not a cross-check: under account-level margin the
+            # per-position liqPrice is not the whole answer. A wallet that
+            # cannot be read, or a rate that is missing, malformed, non-finite
+            # or negative, is an unreadable margin call and raises - the
+            # engine halts the held book on it.
             wallet = self.client._request(
                 "GET", "/v5/account/wallet-balance", signed=True,
                 params={"accountType": "UNIFIED"})
-            wrows = self._v5_list(wallet) or []
-            raw = wrows[0].get("accountMMRate") if wrows else None
-            if raw is not None and str(raw).strip() != "":
-                value = float(raw)
-                account_mm = value if math.isfinite(value) else None
-        except Exception:  # noqa: BLE001
-            # The per-position number is the primary measure; the account rate
-            # is the cross-check. Losing the cross-check is recorded as None,
-            # not as zero, and never as "fine".
-            account_mm = None
+            wrows = self._v5_list(wallet)
+            if not wrows or not isinstance(wrows[0], dict):
+                raise PairIncident(
+                    "wallet balance unreadable; accountMMRate unknown under "
+                    f"{margin_mode}, and an unknown account margin rate is a "
+                    "margin call you cannot see")
+            raw = wrows[0].get("accountMMRate")
+            try:
+                if raw is None or isinstance(raw, bool) \
+                        or str(raw).strip() == "":
+                    raise ValueError("absent")
+                account_mm = float(raw)
+            except (TypeError, ValueError) as exc:
+                raise PairIncident(
+                    f"accountMMRate is {raw!r} under {margin_mode}; an "
+                    "unstated account margin rate is not a safe one") from exc
+            if not math.isfinite(account_mm) or account_mm < 0:
+                raise PairIncident(
+                    f"accountMMRate is {raw!r} under {margin_mode}; an "
+                    "unusable account margin rate is not a safe one")
 
         if not rows:
             return {"size": 0.0, "side": "", "mark": 0.0, "liq_price": None,
                     "distance_pct": None, "account_mm_rate": account_mm,
+                    "margin_mode": margin_mode,
                     "reason": "NO_POSITION"}
 
         row = rows[0]
@@ -1118,6 +1165,7 @@ class CarryBroker:
         if size <= 0:
             return {"size": 0.0, "side": "", "mark": mark, "liq_price": None,
                     "distance_pct": None, "account_mm_rate": account_mm,
+                    "margin_mode": margin_mode,
                     "reason": "NO_POSITION"}
 
         raw_liq = row.get("liqPrice")
@@ -1125,6 +1173,7 @@ class CarryBroker:
             return {"size": size, "side": side, "mark": mark,
                     "liq_price": None, "distance_pct": None,
                     "account_mm_rate": account_mm,
+                    "margin_mode": margin_mode,
                     "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
         try:
             liq = float(raw_liq)
@@ -1148,7 +1197,7 @@ class CarryBroker:
                     else 100.0 * (mark - liq) / mark)
         return {"size": size, "side": side, "mark": mark, "liq_price": liq,
                 "distance_pct": distance, "account_mm_rate": account_mm,
-                "reason": ""}
+                "margin_mode": margin_mode, "reason": ""}
 
     def get_funding_history(self, symbol: str,
                             limit: int = 8) -> List[Tuple[float, int]]:

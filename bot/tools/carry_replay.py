@@ -359,6 +359,12 @@ class ReplayBroker:
                 "accountMMRate, and none is invented")
         bar = self.bar
         mm = None
+        # Account-rate evidence supplied -> the account-level (cross) gate runs
+        # and a rate that is not usable halts, as live. None supplied -> a
+        # per-position scenario (e.g. `declared_isolated`): the mandatory
+        # gate is the liquidation distance.
+        mode = ("ISOLATED_MARGIN" if ev.account_mm_rate is None
+                else "REGULAR_MARGIN")
         if ev.account_mm_rate is not None:
             raw = ev.account_mm_rate(bar)
             if raw is not None:
@@ -375,7 +381,7 @@ class ReplayBroker:
         if qty <= 0 or self._entry_qty <= 0:
             return {"size": 0.0, "side": "", "mark": close, "liq_price": None,
                     "distance_pct": None, "account_mm_rate": mm,
-                    "reason": "NO_POSITION"}
+                    "margin_mode": mode, "reason": "NO_POSITION"}
         entry = self._entry_notional / self._entry_qty
         liq = ev.liq_price(entry, bar)
         stats = self.liq_stats
@@ -384,7 +390,8 @@ class ReplayBroker:
             stats["unreachable_ticks"] += 1
             return {"size": qty, "side": "Sell", "mark": close,
                     "liq_price": None, "distance_pct": None,
-                    "account_mm_rate": mm, "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
+                    "account_mm_rate": mm, "margin_mode": mode,
+                    "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
         liq = _finite_positive(liq, "liquidation price")
         high = _finite_positive(bar.perp_high, "perp high")
         low = _finite_positive(bar.perp_low, "perp low")
@@ -409,7 +416,8 @@ class ReplayBroker:
             self.forced_perp_price = adverse if crossing < low \
                 else min(crossing, adverse)
         return {"size": qty, "side": "Sell", "mark": adverse, "liq_price": liq,
-                "distance_pct": distance, "account_mm_rate": mm, "reason": ""}
+                "distance_pct": distance, "account_mm_rate": mm,
+                "margin_mode": mode, "reason": ""}
 
     def _note_perp(self, side: str, qty: float, price: float) -> None:
         """Track the open short's average entry for the liquidation view."""
