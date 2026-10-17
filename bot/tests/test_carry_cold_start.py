@@ -504,3 +504,92 @@ class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
         assert bot.carry_cold_start() is False
         assert store.trip_kill_switch.called
         assert bot.carry.state is BookState.HALTED
+
+
+class _Crash(BaseException):
+    """The process dies; nothing after this line runs."""
+
+
+class TestAnAcquireOpenInterruptedAfterTheSpotBuyIsNotAFlatBook:
+    @staticmethod
+    def _crash_before_the_perp(saved, persist=None):
+        venue = Venue(inventory=0.0)
+        spot_buy = venue.place_market
+
+        def place(**kw):
+            if kw["product"] == "linear":
+                raise _Crash()
+            out = spot_buy(**kw)
+            venue.inventory += kw["qty"]
+            return out
+
+        venue.place_market = place
+        e = engine(venue, mode=ACQUIRE,
+                   persist=persist or (lambda s: saved.append(s)))
+        with pytest.raises(_Crash):
+            e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+        return venue
+
+    def test_the_restart_halts_instead_of_calling_it_clean(self):
+        saved = []
+        venue = self._crash_before_the_perp(saved)
+        assert venue.inventory > 0                    # the coin IS in the wallet
+        restarted = Venue(inventory=venue.inventory)
+        e = engine(restarted, mode=ACQUIRE)
+        d = e.cold_start(ledger=saved[-1], venue_perp_qty=0.0,
+                         venue_spot_qty=venue.inventory, open_orders=())
+        assert d.action is ColdStart.HALT, d.reason
+        assert e.state is BookState.HALTED and e.position is None
+        assert restarted.orders == []
+
+    def test_through_the_real_store_and_startup(self, tmp_path):
+        store = StateStore(str(tmp_path / "s.db"))
+        venue = self._crash_before_the_perp([], persist=store.save_carry_position)
+        restarted = Venue(inventory=venue.inventory)
+        bot = _main.TradingBot.__new__(_main.TradingBot)
+        bot.store, bot.symbols = store, ["BTCUSDT"]
+        bot.carry = engine(restarted, mode=ACQUIRE,
+                           persist=store.save_carry_position)
+        assert bot.carry_cold_start() is False
+        assert restarted.orders == []
+        store.close()
+
+    def test_a_marker_that_cannot_be_written_sends_nothing(self):
+        def unwritable(_state):
+            raise OSError("disk full")
+
+        venue = Venue(inventory=0.0)
+        e = engine(venue, mode=ACQUIRE, persist=unwritable)
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+        assert d.state is BookState.HALTED and venue.orders == []
+
+    def test_an_open_that_lands_nothing_takes_the_marker_down(self):
+        saved = []
+        venue = Venue(inventory=0.0)
+        venue.place_market = lambda **kw: None            # rejected, no fill
+        e = engine(venue, mode=ACQUIRE, persist=lambda s: saved.append(s))
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+        assert d.action == "refused"
+        assert saved[-1]["book_state"] == "FLAT"
+        plan = plan_cold_start(ledger=saved[-1], venue_perp_qty=0.0,
+                               venue_spot_qty=0.0)
+        assert plan.action is ColdStart.CLEAN
+
+    def test_a_completed_open_ends_hedged_not_opening(self):
+        saved = []
+        venue = Venue(inventory=0.0)
+        e = engine(venue, mode=ACQUIRE, persist=lambda s: saved.append(s))
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+        assert d.action == "opened"
+        assert saved[0]["book_state"] == "OPENING"
+        assert saved[-1]["book_state"] == "HEDGED"
+
+    @pytest.mark.parametrize("state", ["OPENING", "UNWINDING"])
+    def test_a_ledger_left_in_a_transaction_state_halts(self, state):
+        d = plan_cold_start(ledger={"book_state": state, "position": None},
+                            venue_perp_qty=0.0, venue_spot_qty=5.0)
+        assert d.action is ColdStart.HALT
