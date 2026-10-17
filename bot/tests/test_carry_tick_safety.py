@@ -598,3 +598,36 @@ class TestColdStartDoesNotTrustASingleVenueRead:
         bot2.CARRY_COLD_START_REREAD_S = 0
         assert bot2.carry_cold_start() is True
         assert engine2.position is not None
+
+
+class TestAnOrphanReadIsConfirmedBeforeItTripsTheKillSwitch:
+    def test_one_stale_list_read_after_a_clean_exit_does_not_halt(self, tmp_path):
+        """The position list can still show a hedge the engine closed a moment
+        ago. One such read halted a FLAT book and tripped the global kill switch
+        (98% of overlay inventory exits under a single stale read)."""
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.CARRY_ORPHAN_REREAD_S = 0
+        venue.perp_qty = 0.001                   # the snapshot's read is stale
+        bot.carry.broker.get_perp_position = lambda symbol: 0.0   # the truth
+        _tick_seeing_the_venue(bot, venue, 1)
+        assert engine.state is not BookState.HALTED
+
+    def test_two_reads_that_both_show_a_short_still_halt(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.CARRY_ORPHAN_REREAD_S = 0
+        venue.perp_qty = 0.001
+        bot.carry.broker.get_perp_position = lambda symbol: 0.001
+        _tick_seeing_the_venue(bot, venue, 1)
+        assert engine.state is BookState.HALTED
+        assert bot._last_carry_decision["reason"] == "ORPHAN_VENUE_POSITION"
+
+
+def test_a_spot_balance_that_accrues_between_the_cold_start_reads_still_starts(
+        tmp_path):
+    venue, journal, engine, bot = _flat(tmp_path)
+    bot.store.save_carry_position(engine.to_state())
+    bot.CARRY_COLD_START_REREAD_S = 0
+    bot.carry.broker.get_perp_position = lambda symbol: 0.0
+    balances = iter([1.0, 1.0 + 1e-9 * 5])      # interest-sized drift
+    bot.carry.broker.get_spot_inventory = lambda symbol: next(balances)
+    assert bot.carry_cold_start() is True

@@ -767,9 +767,11 @@ class TradingBot:
             again_perp = float(broker.get_perp_position(self.carry.perp_symbol))
             again_spot = float(
                 broker.get_spot_inventory(self.carry.spot_symbol))
-            tol = 1e-9
-            if (abs(again_perp - venue_perp) > tol
-                    or abs(again_spot - venue_spot) > tol):
+            # A position does not accrue; a wallet balance can (interest, a
+            # client deposit), so the spot comparison is relative.
+            spot_tol = max(1e-9, 1e-7 * max(abs(venue_spot), abs(again_spot)))
+            if (abs(again_perp - venue_perp) > 1e-9
+                    or abs(again_spot - venue_spot) > spot_tol):
                 logger.critical(
                     "carry cold start: two reads of the venue disagree (perp "
                     "%.10g then %.10g, spot %.10g then %.10g); refusing to "
@@ -973,8 +975,24 @@ class TradingBot:
                     "previous cycle and the book is flat; refusing new "
                     "exposure it cannot account for")
                 return
-            orphan = self.carry.check_venue_flat_while_flat(
-                getattr(view, "perp_held", None))
+            perp_held = getattr(view, "perp_held", None)
+            if (perp_held is not None and self.carry.position is None
+                    and abs(float(perp_held)) > 1e-9
+                    and getattr(self.carry.state, "name", "") == "FLAT"):
+                # A short the book never recorded halts the book (and trips the
+                # kill switch) - so it must be a short that is really there. The
+                # position list can still show the size of a hedge the engine
+                # closed a moment ago (an overlay inventory exit never re-reads
+                # the venue): look again after a pause and halt only on two
+                # reads that agree. Unreadable the second time = keep the first.
+                time.sleep(self.CARRY_ORPHAN_REREAD_S)
+                try:
+                    perp_held = float(self.carry.broker.get_perp_position(
+                        self.carry.perp_symbol))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("carry: orphan re-read failed (%s); "
+                                   "keeping the first read", exc)
+            orphan = self.carry.check_venue_flat_while_flat(perp_held)
             if orphan is not None:
                 self._last_carry_decision = {
                     "action": str(orphan.action), "reason": str(orphan.reason),
@@ -1088,6 +1106,8 @@ class TradingBot:
     _journal_unsaved = False
     #: Pause between the two cold-start reads of the venue (see carry_cold_start).
     CARRY_COLD_START_REREAD_S = 0.25
+    #: Pause before the orphan-position read is repeated (see tick).
+    CARRY_ORPHAN_REREAD_S = 0.5
     _carry_held_errors = 0
     _last_carry_decision: Dict[str, Any] = {}
 
