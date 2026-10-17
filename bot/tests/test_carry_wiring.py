@@ -121,7 +121,11 @@ class _Broker:
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((symbol, side, qty, product))
         return {"filled_qty": qty, "avg_price": self.mark,
-                "order_link_id": f"x{len(self.orders)}"}
+                "order_link_id": f"x{len(self.orders)}",
+                "fee_detail": {"known": True, "source": "cumFeeDetail",
+                               "note": "scripted fee in this test venue",
+                               "components": [{"amount": 0.0,
+                                               "currency": "USDT"}]}}
 
 
 def _bot_with_carry(broker, *, warm_bps=3.0):

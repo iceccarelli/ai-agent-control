@@ -17,6 +17,16 @@ from carry_risk import CarryRisk  # noqa: E402
 from market_snapshot import MarketSnapshot  # noqa: E402
 
 
+
+def _fee_detail(usd=0.0):
+    """A labelled quote-coin fee, as the venue reports it. A spot BUY with an
+    unlabelled fee cannot establish the BTC actually held and the engine halts
+    on it (SPOT_FEE_UNVERIFIABLE), so the fakes must say the currency."""
+    return {"fee_detail": {"known": True, "source": "cumFeeDetail",
+                           "note": "scripted fee in this test venue",
+                           "components": [{"amount": usd,
+                                           "currency": "USDT"}]}}
+
 class FakeBroker:
     """A venue that fills what you ask unless told to misbehave."""
 
@@ -35,7 +45,8 @@ class FakeBroker:
             return None
         price = self.mark * (1 + self.slip if side == "Buy" else 1 - self.slip)
         return {"filled_qty": qty * self.fill_ratio, "avg_price": price,
-                "order_link_id": f"{product}-{len(self.orders)}"}
+                "order_link_id": f"{product}-{len(self.orders)}",
+                **_fee_detail()}
 
     def get_margin_multiple(self, symbol):
         return self.margin
@@ -62,7 +73,7 @@ class _SpotFillsThenVenueDies(FakeBroker):
         self.orders.append((symbol, side, qty, product))
         if len(self.orders) == 1 and product == "spot" and side == "Buy":
             return {"filled_qty": qty, "avg_price": self.mark,
-                    "order_link_id": "spot-1"}
+                    "order_link_id": "spot-1", **_fee_detail()}
         return None
 
 

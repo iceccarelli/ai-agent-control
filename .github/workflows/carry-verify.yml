@@ -115,6 +115,8 @@ jobs:
           tests/test_carry_overlay.py
           tests/test_carry_cold_start_spot_fee.py
           tests/test_carry_acquire_unwind_net_of_fee.py
+          tests/test_carry_engine.py
+          tests/test_carry_wiring.py
           tests/test_carry_maker.py
           tests/test_carry_maker_cancel_still_resting.py
           tests/test_carry_order_status_fail_closed.py
