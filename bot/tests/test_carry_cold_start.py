@@ -498,7 +498,7 @@ class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
         # ETH spot and BTC perp are not a delta-neutral pair.
         ledger = opened(Venue()).to_state()
         ledger["position"]["spot"]["symbol"] = "ETHUSDT"
-        bot, store = self._bot(
+        bot, store = TestTheProcessRefusesToStartOnAMismatch()._bot(
             Venue(perp=0.001), ledger,
             spot_symbol="ETHUSDT", perp_symbol="BTCUSDT")
         assert bot.carry_cold_start() is False
