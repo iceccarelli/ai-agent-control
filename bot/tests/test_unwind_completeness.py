@@ -131,6 +131,7 @@ class Venue:
 
     def get_liquidation_view(self, symbol):
         return {"distance_pct": None, "account_mm_rate": 0.01,
+                "margin_mode": "REGULAR_MARGIN",
                 "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
 
 

@@ -32,7 +32,10 @@ class FakeClient:
     """A venue. Records calls; misbehaves when told."""
 
     def __init__(self, *, mark=100_000.0, im=5.0, mm=1.0,
-                 spot_qty=1.0, perp_qty=1.0, raise_on_create=None):
+                 spot_qty=1.0, perp_qty=1.0, raise_on_create=None,
+                 margin_mode="REGULAR_MARGIN", account_mm_rate="0.05"):
+        self.margin_mode = margin_mode
+        self.account_mm_rate = account_mm_rate
         self.mark = mark
         self.im = im
         self.mm = mm
@@ -79,12 +82,15 @@ class FakeClient:
                                        "positionMM": str(self.mm),
                                        "side": "Sell" if self.perp_qty else "",
                                        "size": str(self.perp_qty)}]})
+        if endpoint == "/v5/account/info":
+            return envelope({"marginMode": self.margin_mode})
         if endpoint == "/v5/account/wallet-balance":
             # Unified wallet rows nest per-coin balances under "coin" - see
             # BybitClient.get_wallet/get_coin_balance in bybit_connection.py,
             # which this fixture mirrors rather than inventing a shape.
             return envelope({"list": [
-                {"coin": [{"walletBalance": str(self.spot_qty)}]}]})
+                {"accountMMRate": self.account_mm_rate,
+                 "coin": [{"walletBalance": str(self.spot_qty)}]}]})
         return envelope({})
 
 

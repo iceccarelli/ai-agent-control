@@ -184,6 +184,15 @@ MIN_LIQUIDATION_DISTANCE_PCT = 15.0
 #: the documentation is precise.
 MAX_ACCOUNT_MM_RATE = 0.50
 
+#: The margin modes the venue states (`CarryBroker.get_margin_mode`), and which
+#: of them decide liquidation at ACCOUNT level (a valid `accountMMRate` is then
+#: mandatory). Isolated margin is per position: the account rate is not applied
+#: and a measured per-position liquidation distance is mandatory instead.
+_MARGIN_REGULAR = "REGULAR_MARGIN"
+_MARGIN_PORTFOLIO = "PORTFOLIO_MARGIN"
+_MARGIN_ISOLATED = "ISOLATED_MARGIN"
+_ACCOUNT_LEVEL_MARGIN_MODES = (_MARGIN_REGULAR, _MARGIN_PORTFOLIO)
+
 #: Unwind when funding has been negative this many consecutive prints. Negative
 #: funding means the trade has inverted: you are now PAYING to hold the hedge.
 #: Three prints is one day — long enough not to react to a single squeeze,
@@ -1797,13 +1806,42 @@ class CarryEngine:
                 f"liquidation ({type(exc).__name__}: {exc}); an unreadable "
                 "liquidation price is a margin call you cannot see")
 
+        if not isinstance(view, dict):
+            return self._halt(
+                "LIQUIDATION_PRICE_UNREADABLE",
+                f"the liquidation view is {type(view).__name__}, not a mapping")
         self._observe_risk(view)
-        rate = view.get("account_mm_rate")
-        if rate is not None and self._finite(rate) \
-                and float(rate) >= MAX_ACCOUNT_MM_RATE:
-            return self._unwind(
-                self.broker.get_mark(self.perp_symbol),
-                f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
+        mode = view.get("margin_mode")
+        if mode in _ACCOUNT_LEVEL_MARGIN_MODES:
+            # Liquidation is decided at account level: the rate is mandatory.
+            # Missing, malformed, non-finite or negative is an unreadable
+            # margin call, not a skipped check.
+            rate = view.get("account_mm_rate")
+            if isinstance(rate, bool) or not self._finite(rate) \
+                    or float(rate) < 0:
+                return self._halt(
+                    "ACCOUNT_MM_RATE_UNUSABLE",
+                    f"margin mode {mode} needs a valid accountMMRate and the "
+                    f"view carries {rate!r}; an unreadable account margin "
+                    "rate is a margin call you cannot see")
+            if float(rate) >= MAX_ACCOUNT_MM_RATE:
+                return self._unwind(
+                    self.broker.get_mark(self.perp_symbol),
+                    f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
+        elif mode == _MARGIN_ISOLATED:
+            # Per-position liquidation: the account rate does not describe it.
+            # The distance below is the gate, and it is mandatory.
+            if view.get("distance_pct") is None \
+                    and view.get("reason") == "BEYOND_VENUE_PRICE_BOUNDS":
+                return self._halt(
+                    "LIQUIDATION_DISTANCE_UNUSABLE",
+                    "isolated margin has no account-level cover and the venue "
+                    "stated no liquidation price for the held position")
+        else:
+            return self._halt(
+                "MARGIN_MODE_UNKNOWN",
+                f"the view states margin mode {mode!r}; liquidation semantics "
+                "are unknown, and an unknown margin mode is not a safe one")
 
         distance = view.get("distance_pct")
         if distance is None and view.get("reason") == "LIQ_PRICE_UNUSABLE":

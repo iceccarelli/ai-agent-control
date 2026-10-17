@@ -90,7 +90,8 @@ def test_an_engine_double_that_reports_an_unusable_price_halts_too():
     the same refusal, whatever produced it."""
     class Unusable:
         def get_liquidation_view(self, symbol):
-            return {"distance_pct": None, "account_mm_rate": None,
+            return {"distance_pct": None, "account_mm_rate": 0.05,
+                    "margin_mode": "REGULAR_MARGIN",
                     "reason": "LIQ_PRICE_UNUSABLE"}
     engine = held_engine(broker_with_rows(dict(POS, liqPrice="")))
     engine.broker = Unusable()
@@ -191,3 +192,162 @@ def test_a_wallet_row_without_a_stated_balance_is_not_zero_btc(entry):
 def test_a_stated_zero_balance_is_still_zero():
     b = wallet_broker([{"coin": "BTC", "walletBalance": "0", "locked": "0"}])
     assert b.get_spot_inventory("BTCUSDT") == 0.0
+
+
+# -- 3. the account margin rate, by margin mode ---------------------------------
+#
+# `get_liquidation_view` used to catch every wallet error and answer
+# `account_mm_rate=None`, which the engine read as "skip the account check".
+# Under account-level margin modes the rate is mandatory; isolated margin is
+# per position and keeps the mandatory liquidation-distance gate instead.
+
+ACCOUNT_LEVEL = ["REGULAR_MARGIN", "PORTFOLIO_MARGIN"]
+BAD_RATES = [None, "", "nan", "inf", "-inf", "-0.1", "abc", True]
+BAD_RATE_IDS = ["null", "blank", "nan", "inf", "-inf", "negative", "text",
+                "bool"]
+SAFE = dict(POS, liqPrice="130000")
+
+
+def moded(row, mode="REGULAR_MARGIN", rate="0.05"):
+    b = broker_with_rows(row)
+    b._client.margin_mode = mode
+    b._client.account_mm_rate = rate
+    return b
+
+
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+@pytest.mark.parametrize("rate", BAD_RATES, ids=BAD_RATE_IDS)
+def test_an_unusable_account_rate_is_not_a_skipped_check(mode, rate):
+    with pytest.raises(PairIncident):
+        moded(SAFE, mode, rate).get_liquidation_view("BTCUSDT")
+
+
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+def test_an_unreadable_wallet_is_not_a_skipped_check(mode):
+    b = moded(SAFE, mode)
+    inner = b._client._request
+
+    def request(method, endpoint, **kw):
+        if endpoint == "/v5/account/wallet-balance":
+            raise RuntimeError("wallet-balance timed out")
+        return inner(method, endpoint, **kw)
+
+    b._client._request = request
+    with pytest.raises(RuntimeError):
+        b.get_liquidation_view("BTCUSDT")
+
+
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+def test_a_wallet_with_no_rows_is_not_a_skipped_check(mode):
+    b = moded(SAFE, mode)
+    inner = b._client._request
+
+    def request(method, endpoint, **kw):
+        if endpoint == "/v5/account/wallet-balance":
+            return envelope({"list": []})
+        return inner(method, endpoint, **kw)
+
+    b._client._request = request
+    with pytest.raises(PairIncident):
+        b.get_liquidation_view("BTCUSDT")
+
+
+@pytest.mark.parametrize("mode", [None, "", "CROSS", "isolated_margin", 1])
+def test_a_margin_mode_the_venue_did_not_state_is_refused(mode):
+    with pytest.raises(PairIncident):
+        moded(SAFE, mode).get_liquidation_view("BTCUSDT")
+
+
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+def test_account_level_modes_carry_their_stated_mode_and_rate(mode):
+    v = moded(SAFE, mode, "0.12").get_liquidation_view("BTCUSDT")
+    assert v["margin_mode"] == mode and v["account_mm_rate"] == 0.12
+
+
+def test_isolated_margin_does_not_borrow_an_account_level_rate():
+    b = moded(SAFE, "ISOLATED_MARGIN", rate=None)
+    v = b.get_liquidation_view("BTCUSDT")
+    assert v["margin_mode"] == "ISOLATED_MARGIN"
+    assert v["account_mm_rate"] is None
+    assert v["distance_pct"] == pytest.approx(30.0)
+    assert not [c for c in b._client.calls
+                if c[1] == "/v5/account/wallet-balance"]
+
+
+def _engine(row, mode="REGULAR_MARGIN", rate="0.05"):
+    engine = held_engine(moded(row, mode, rate))
+    engine.require_liquidation_check = True
+    engine.kill_switch = (tripped := []).append
+    return engine, tripped
+
+
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+@pytest.mark.parametrize("rate", BAD_RATES, ids=BAD_RATE_IDS)
+def test_the_held_book_halts_on_an_unusable_account_rate(mode, rate):
+    engine, tripped = _engine(SAFE, mode, rate)
+    d = tick(engine)
+    assert d.action == "halted" and d.reason == "LIQUIDATION_PRICE_UNREADABLE"
+    assert engine.state is BookState.HALTED and tripped
+    # and it stays frozen: no later tick manages or opens anything
+    assert tick(engine).reason == "KILL_SWITCH_ENGAGED"
+
+
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+def test_a_valid_low_account_rate_still_holds(mode):
+    engine, tripped = _engine(SAFE, mode, "0.05")
+    assert engine._check_liquidation_distance() is None and not tripped
+
+
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+def test_a_high_account_rate_still_unwinds(mode):
+    engine, _ = _engine(SAFE, mode, "0.85")
+    d = engine._check_liquidation_distance()
+    assert d.action == "unwound" and "ACCOUNT_MM_RATE" in d.reason
+
+
+def test_isolated_margin_keeps_the_per_position_distance_gate():
+    engine, _ = _engine(dict(POS, liqPrice="101000"), "ISOLATED_MARGIN", None)
+    d = engine._check_liquidation_distance()
+    assert d.action == "unwound" and "LIQUIDATION_1.0PCT" in d.reason
+    engine, tripped = _engine(SAFE, "ISOLATED_MARGIN", None)
+    assert engine._check_liquidation_distance() is None and not tripped
+
+
+def test_isolated_margin_without_a_liquidation_price_halts():
+    engine, tripped = _engine(dict(POS, liqPrice=""), "ISOLATED_MARGIN", None)
+    d = engine._check_liquidation_distance()
+    assert d.state is BookState.HALTED and tripped
+    assert d.reason == "LIQUIDATION_DISTANCE_UNUSABLE"
+
+
+@pytest.mark.parametrize("view", [
+    None, [], "x",
+    {"distance_pct": 30.0, "account_mm_rate": 0.05},
+    {"distance_pct": 30.0, "account_mm_rate": 0.05, "margin_mode": "CROSS"},
+    {"distance_pct": 30.0, "account_mm_rate": 0.05, "margin_mode": None},
+], ids=["none", "list", "str", "no-mode", "unknown-mode", "null-mode"])
+def test_an_engine_double_with_no_stated_mode_halts(view):
+    class Double:
+        def get_liquidation_view(self, symbol):
+            return view
+    engine = held_engine(broker_with_rows(SAFE))
+    engine.broker = Double()
+    engine.require_liquidation_check = True
+    d = engine._check_liquidation_distance()
+    assert d.state is BookState.HALTED
+
+
+@pytest.mark.parametrize("rate", [None, float("nan"), float("inf"),
+                                  float("-inf"), -0.1, "abc", True])
+@pytest.mark.parametrize("mode", ACCOUNT_LEVEL)
+def test_an_engine_double_with_an_unusable_rate_halts(mode, rate):
+    class Double:
+        def get_liquidation_view(self, symbol):
+            return {"distance_pct": 30.0, "account_mm_rate": rate,
+                    "margin_mode": mode, "reason": ""}
+    engine = held_engine(broker_with_rows(SAFE))
+    engine.broker = Double()
+    engine.require_liquidation_check = True
+    d = engine._check_liquidation_distance()
+    assert d.state is BookState.HALTED
+    assert d.reason == "ACCOUNT_MM_RATE_UNUSABLE"

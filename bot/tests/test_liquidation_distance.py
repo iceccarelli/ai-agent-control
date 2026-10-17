@@ -66,7 +66,9 @@ H8 = 8 * 3600 * 1000
 
 
 class Venue:
-    def __init__(self, *, liq=None, mm_rate=None, raises=False):
+    def __init__(self, *, liq=None, mm_rate=0.05, raises=False,
+                 margin_mode="REGULAR_MARGIN"):
+        self.margin_mode = margin_mode
         self.liq = liq
         self.mm_rate = mm_rate
         self.raises = raises
@@ -101,6 +103,7 @@ class Venue:
                 "distance_pct": (None if self.liq is None
                                  else 100.0 * (self.liq - MARK) / MARK),
                 "account_mm_rate": self.mm_rate,
+                "margin_mode": self.margin_mode,
                 "reason": ("BEYOND_VENUE_PRICE_BOUNDS" if self.liq is None
                            else "")}
 
@@ -250,9 +253,11 @@ class TestTheLiveBookTurnsItOn:
 
 class TestTheBrokerReadsTheRightFields:
     class Client:
-        def __init__(self, position=None, wallet=None):
+        def __init__(self, position=None, wallet=None,
+                     margin_mode="REGULAR_MARGIN"):
             self.position = position
             self.wallet = wallet
+            self.margin_mode = margin_mode
 
         def _request(self, method, endpoint, *, params=None, body=None,
                      signed=False, retries=3):
@@ -263,6 +268,9 @@ class TestTheBrokerReadsTheRightFields:
             # original meaning through carry_broker's real unwrap.
             if endpoint == "/v5/position/list":
                 return {"retCode": 0, "retMsg": "OK", "result": self.position}
+            if endpoint == "/v5/account/info":
+                return {"retCode": 0, "retMsg": "OK",
+                        "result": {"marginMode": self.margin_mode}}
             if endpoint == "/v5/account/wallet-balance":
                 return {"retCode": 0, "retMsg": "OK", "result": self.wallet}
             return {"retCode": 0, "retMsg": "OK", "result": {}}
