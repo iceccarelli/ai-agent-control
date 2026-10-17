@@ -860,17 +860,16 @@ class CarryEngine:
     # -- the loop ---------------------------------------------------------
 
     def _drop_history_the_clock_disproves(self, now_ms: int) -> bool:
-        """Discard a funding history whose newest stamp the tick clock refutes.
+        """Discard funding timing state the tick clock refutes.
 
-        Two shapes, both judged on the thresholds the code already owns:
-        a newest print older than `MAX_PRINT_GAP_MS` (settlements were missed
-        and no tick carried a print to say so), and one stamped in the future
-        (a corrupt ledger stamp would make every real print read as a replay
-        and freeze the history). `now_ms` is 0 when the caller has no clock;
-        then nothing can be judged. True when it discarded.
+        A stale or future stamp is untrustworthy even if its rate list is empty:
+        it otherwise blocks every new print as a replay. The same continuity
+        break invalidates a held position's consecutive-negative-print streak.
+        `now_ms` is 0 when the caller has no clock; then nothing can be judged.
+        True when it discarded the timing state.
         """
         last = self._last_print_ms
-        if now_ms <= 0 or last is None or not self._funding_history:
+        if now_ms <= 0 or last is None:
             return False
         from market_snapshot import MAX_CLOCK_SKEW_S
         if (now_ms - last > self.MAX_PRINT_GAP_MS
@@ -881,6 +880,8 @@ class CarryEngine:
                 last, now_ms, len(self._funding_history))
             self._funding_history = []
             self._last_print_ms = None
+            if self.position is not None:
+                self.position.negative_funding_streak = 0
             return True
         return False
 
@@ -934,7 +935,7 @@ class CarryEngine:
             # the ones held, and days-old prints must not keep weight in a
             # smoothed rate read as the current regime. Discard them: the gate
             # then stands aside until EWMA_MIN_PRINTS fresh prints exist.
-            if (self._last_print_ms is not None and self._funding_history
+            if (self._last_print_ms is not None
                     and int(funding_print_ms) - self._last_print_ms
                     > self.MAX_PRINT_GAP_MS):
                 logger.warning(
@@ -943,6 +944,10 @@ class CarryEngine:
                     (int(funding_print_ms) - self._last_print_ms) / 3.6e6,
                     self.MAX_PRINT_GAP_MS / 3.6e6, len(self._funding_history))
                 self._funding_history = []
+                if self.position is not None:
+                    # An unobserved settlement breaks the consecutive-print
+                    # evidence, even when there were no EWMA rates to clear.
+                    self.position.negative_funding_streak = 0
             self._last_print_ms = int(funding_print_ms)
             self._funding_history.append(float(funding_bps))
             del self._funding_history[:-self.FUNDING_HISTORY]

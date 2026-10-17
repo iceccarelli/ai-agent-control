@@ -301,6 +301,15 @@ def test_future_ledger_stamp_cannot_freeze_a_stale_history():
     assert e._last_print_ms == now - H
 
 
+def test_future_stamp_without_history_cannot_freeze_fresh_prints():
+    now = 100 * D
+    e = engine([], now + 30 * D)             # stamp is corrupt even without rates
+    d = clocked(e, now, now - H)
+    assert d.reason == INSUFFICIENT
+    assert e._funding_history == [FRESH]
+    assert e._last_print_ms == now - H
+
+
 def test_fresh_contiguous_history_with_a_live_clock_is_untouched():
     now = 100 * D
     e = engine([RICH] * 4, now - H)

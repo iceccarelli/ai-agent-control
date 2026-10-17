@@ -274,6 +274,38 @@ class TestTheStreakCountsPrints:
         assert e.position is not None
         assert d.action == "hold"
 
+    def test_a_gap_between_negative_prints_breaks_the_streak(self):
+        e = opened()
+        e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                    funding_print_ms=4 * H8)
+        assert e.position.negative_funding_streak == 1
+
+        # One settlement is missed: 16 hours between the observed prints.
+        d = e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                        funding_print_ms=6 * H8)
+        assert d.action == "hold"
+        assert e.position.negative_funding_streak == 1
+        e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                    funding_print_ms=7 * H8)
+        assert e.position.negative_funding_streak == 2
+        d = e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                        funding_print_ms=8 * H8)
+        assert d.action == "unwound"
+        assert d.reason == "FUNDING_INVERTED"
+
+    def test_a_stamp_less_tick_that_discards_stale_history_resets_the_streak(self):
+        e = opened()
+        e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                    funding_print_ms=4 * H8)
+        assert e.position.negative_funding_streak == 1
+
+        now = 4 * H8 + CarryEngine.MAX_PRINT_GAP_MS + 1
+        d = e.on_candle(mark=MARK, funding_bps=-0.5, spot=MARK,
+                        timestamp_ms=now)
+        assert d.action == "hold"
+        assert e.position.negative_funding_streak == 0
+        assert e._funding_history == [] and e._last_print_ms is None
+
     def test_three_negative_prints_unwind(self):
         e = opened()
         for k in (4, 5, 6):
