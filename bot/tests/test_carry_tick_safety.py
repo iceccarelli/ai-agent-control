@@ -111,6 +111,42 @@ class TestAnEscapedExceptionMidTransactionHalts:
         assert engine.state is BookState.FLAT
 
 
+class TestAHeldBookThatCannotBeManagedHalts:
+    def test_a_repeating_engine_exception_while_held_halts_the_book(self, tmp_path):
+        """Swallowing the exception forever left a held short unmanaged with no
+        halt, no page and a stale status line."""
+        from main import CARRY_MAX_CONSECUTIVE_HELD_ERRORS as LIMIT
+        venue, journal, engine, bot = _hedged(tmp_path)
+
+        def boom(*a, **k):
+            raise ValueError("a defect that repeats")
+
+        engine.on_candle = boom
+        for k in range(1, LIMIT):
+            tick(bot, 3 + k)
+            assert engine.state is BookState.HEDGED
+        tick(bot, 3 + LIMIT)
+        assert engine.state is BookState.HALTED
+        assert engine.position is not None
+
+    def test_a_successful_tick_resets_the_count(self, tmp_path):
+        from main import CARRY_MAX_CONSECUTIVE_HELD_ERRORS as LIMIT
+        venue, journal, engine, bot = _hedged(tmp_path)
+        real = engine.on_candle
+        calls = {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] % LIMIT != 0:
+                raise ValueError("intermittent")
+            return real(*a, **k)
+
+        engine.on_candle = flaky
+        for k in range(1, 3 * LIMIT + 1):
+            tick(bot, 3 + k)
+        assert engine.state is BookState.HEDGED
+
+
 class TestTheVenueIsTheSourceOfTruthForTheShort:
     def test_a_venue_position_that_differs_from_the_book_halts(self, tmp_path):
         venue, journal, engine, bot = _hedged(tmp_path)

@@ -67,6 +67,13 @@ __all__ = ["TradingBot", "build_bot", "main"]
 #: number smaller than it.
 WS_SHUTDOWN_SAFETY_MARGIN_SECONDS = 5.0
 
+#: Consecutive ticks the carry engine may raise while a pair is HELD before the
+#: book is halted. A held short that no tick can manage is an unmanaged
+#: exposure; a raise that repeats is a defect, not a transient read (the
+#: engine's own venue reads halt or exit on their own failures). Not a trading
+#: parameter: it bounds how long an unmanageable book is retried silently.
+CARRY_MAX_CONSECUTIVE_HELD_ERRORS = 3
+
 
 # ---------------------------------------------------------------------------
 # health server
@@ -947,7 +954,21 @@ class TradingBot:
                     logger.critical(
                         "carry book HALTED mid-transaction - a human must "
                         "reconcile the venue against the ledger")
+                elif self.carry.position is not None:
+                    self._carry_held_errors += 1
+                    if (self._carry_held_errors
+                            >= CARRY_MAX_CONSECUTIVE_HELD_ERRORS):
+                        self.carry._halt(
+                            "HELD_BOOK_UNMANAGEABLE",
+                            f"the engine raised on {self._carry_held_errors} "
+                            f"consecutive ticks while a pair was held "
+                            f"({type(exc).__name__}: {exc})")
+                        logger.critical(
+                            "carry book HALTED: a held pair could not be "
+                            "managed for %d ticks - a human must reconcile",
+                            self._carry_held_errors)
                 return
+            self._carry_held_errors = 0
             self._last_carry_decision = {
                 "action": str(decision.action), "reason": str(decision.reason),
                 "state": decision.state.value,
@@ -1011,6 +1032,7 @@ class TradingBot:
     _carry_estimated_funding = 0.0
     _last_funding_poll_ms = 0
     _journal_unsaved = False
+    _carry_held_errors = 0
     _last_carry_decision: Dict[str, Any] = {}
 
     #: How often to read the venue's settlement rows. Funding settles every 8h,
