@@ -680,3 +680,23 @@ def test_snap_to_lot_never_hands_a_non_finite_quantity_back(bad):
     from carry_engine import snap_to_lot
     assert snap_to_lot(bad, 0.001) == 0.0
     assert snap_to_lot(bad, 0.0) == 0.0
+
+
+def test_a_halt_whose_write_failed_logs_the_state_it_could_not_write(caplog):
+    """The ledger is the durable record; when it fails the CRITICAL line must
+    carry the book state and position a human needs to reconcile."""
+    import logging as _logging
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+
+    def broken(state):
+        raise OSError("disk full")
+    eng.persist = broken
+    v.perp_short += 0.4                       # drift -> halt, whose write fails
+    with caplog.at_level(_logging.CRITICAL, logger="carry_engine"):
+        candle(eng, ms=61_000, print_ms=1_000)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "could not be written down" in text
+    assert '"book_state": "HALTED"' in text
+    assert '"position"' in text and '"perp_symbol"' in text

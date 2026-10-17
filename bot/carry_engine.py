@@ -62,6 +62,7 @@ direction. This module has no direction to give it.
 """
 from __future__ import annotations
 
+import json
 import logging
 import datetime as dt
 import math
@@ -2616,8 +2617,17 @@ class CarryEngine:
                 self.persist(self.to_state())
             except Exception:  # noqa: BLE001 - already halting
                 self._halt_unwritten = True
+                # The ledger is the durable record and it just failed, so the
+                # log carries what it could not: the book state, the position
+                # and any unsettled order, as one line a human can act on.
+                try:
+                    snapshot = json.dumps(self.to_state(), sort_keys=True,
+                                          default=str)
+                except Exception:  # noqa: BLE001
+                    snapshot = "<state not serialisable>"
                 logger.critical("the halt itself could not be written down; "
-                                "it is retried on every halted tick")
+                                "it is retried on every halted tick. State: %s",
+                                snapshot)
         return CarryDecision("halted", reason=reason, state=BookState.HALTED,
                              detail={"detail": detail})
 
