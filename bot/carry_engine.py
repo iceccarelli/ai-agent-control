@@ -1364,6 +1364,8 @@ class CarryEngine:
             return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
 
         self.position = position
+        if self.state is BookState.HALTED:
+            return self._halted_with_exposure("PAIR_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
         # Only now: both legs landed. A refused pair consumed nothing; a
         # broken one spent the day through record_broken_pair instead.
@@ -1443,6 +1445,8 @@ class CarryEngine:
         position = CarryPosition(spot=spot_leg, perp=perp,
                                  opened_ms=timestamp_ms)
         self.position = position
+        if self.state is BookState.HALTED:
+            return self._halted_with_exposure("PERP_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
         self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
         failed = self._record()
@@ -1496,6 +1500,8 @@ class CarryEngine:
             # close, with its own fee) is not blended into that entry.
             perp.filled_qty -= fill.filled_qty
         perp.requested_qty = perp.filled_qty
+        if self.state is BookState.HALTED:
+            return self._halted_with_exposure("REBALANCE_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
         failed = self._record()
         if failed is not None:
@@ -1505,6 +1511,16 @@ class CarryEngine:
             state=BookState.HEDGED,
             detail={"drift_before": drift, "corrected_qty": fill.filled_qty,
                     "drift_after": position.delta_fraction(mark)})
+
+    def _halted_with_exposure(self, reason: str) -> CarryDecision:
+        """A leg raised an unknown outcome (`_take` already halted the book)
+        after part of the order filled. Keep the HALT and write down the
+        exposure that did land; never promote the book back to HEDGED."""
+        failed = self._record()
+        if failed is not None:
+            return failed
+        return CarryDecision("halted", reason=reason, state=BookState.HALTED,
+                             detail={"error": self._last_leg_error})
 
     def _exit_mark(self) -> float:
         """The reference mark handed to `_unwind`. A ticker that will not
