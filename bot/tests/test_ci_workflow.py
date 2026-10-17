@@ -26,11 +26,14 @@ def text():
 def test_it_runs_on_pull_requests_and_pushes_to_main_and_fix_branches(text):
     # Text check on purpose: CI installs only requirements.txt + pytest, so this
     # test must not need a YAML library.
-    expected = "on:\\n  pull_request:\\n  push:\\n    branches: [main, 'fix/**']\\n"
-    assert expected.replace("\\n", "\n") in text, (
+    expected = """on:
+  pull_request:
+  push:
+    branches: [main, 'fix/**']
+"""
+    assert expected in text, (
         "triggers must be pull_request and pushes to main and fix/**"
     )
-
 
 def test_every_test_file_it_runs_exists_and_the_required_ones_are_present(text):
     named = re.findall(r"tests/(test_[A-Za-z0-9_]+\.py)", text)
