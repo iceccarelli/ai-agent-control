@@ -297,3 +297,56 @@ def test_an_ordinary_venue_refusal_is_still_a_rejection():
                     order_gate=lambda: (True, "T"), sequence_source=lambda *a: 1)
     assert b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5,
                           product="spot") is None
+
+
+# -- a 200 with no retCode is not a refusal ----------------------------------
+
+@pytest.mark.parametrize("body", ['{"message": "upstream"}', '[]', '{"retCode": null}',
+                                  '{"retCode": "x"}'])
+def test_a_200_without_a_usable_retcode_is_read_back_not_recorded_as_a_refusal(
+        body, tmp_path, monkeypatch):
+    """The order executed and the venue shows it filled. A body with no
+    retCode used to become retCode -1, a definite rejection: place_market
+    returned None without ever reading the order back, and the engine could
+    send it again."""
+    import json
+    import time
+
+    from fake_bybit import API_KEY, API_SECRET
+    from persistence import StateStore
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    class Cfg:
+        USE_TESTNET = True
+        BYBIT_API_KEY = API_KEY
+        BYBIT_API_SECRET = API_SECRET
+        BYBIT_RECV_WINDOW_MS = 5000
+        REQUEST_TIMEOUT_SECONDS = 5.0
+        USE_LEVERAGE = False
+        SYMBOL_FILTERS_TTL = 3600
+        ORDERLINK_PREFIX = "BB"
+
+    class Transport(bybit_connection.Transport):
+        def __init__(self):
+            self.creates = 0
+
+        def request(self, method, url, **kw):
+            if "order/create" in url:
+                self.creates += 1
+                return 200, body
+            return 200, json.dumps({"retCode": 0, "result": {"list": [{
+                "orderStatus": "Filled", "cumExecQty": "0.01",
+                "avgPrice": "100000", "orderLinkId": "x"}]}})
+
+    store = StateStore(str(tmp_path / "s.db"))
+    store.claim_writer()
+    transport = Transport()
+    client = bybit_connection.BybitClient(config=Cfg(), store=store,
+                                          transport=transport)
+    broker = CarryBroker(client=client,
+                         sequence_source=lambda *a: store.next_order_seq(),
+                         order_gate=lambda: (True, ""))
+    result = broker.place_market(symbol="BTCUSDT", side="Sell", qty=0.01,
+                                 product="linear")
+    assert result is not None and result["filled_qty"] == pytest.approx(0.01)
+    assert transport.creates == 1, "the order was re-sent"

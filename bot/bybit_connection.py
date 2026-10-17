@@ -568,7 +568,15 @@ class BybitClient:
                 # Garbage in a 200 is not a reason to trade on nothing.
                 raise PermanentAPIError(f"unparseable response: {exc}", payload=text)
 
-            ret_code = int(payload_json.get("retCode", -1))
+            # A 200 whose body does not state a retCode is not an answer from
+            # the venue's matching engine (an upstream or proxy body): whether
+            # the request executed is unknown, exactly as for an unparseable
+            # body. A made-up retCode (-1) used to read as a definite refusal.
+            try:
+                ret_code = int(payload_json["retCode"])
+            except (TypeError, KeyError, ValueError):
+                raise PermanentAPIError(
+                    "response carries no usable retCode", payload=text)
             ret_msg = str(payload_json.get("retMsg", ""))
             if ret_code == 0:
                 return payload_json

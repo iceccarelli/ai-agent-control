@@ -457,3 +457,40 @@ def test_snap_to_lot_does_not_floor_float_noise_one_lot_too_low():
     assert snap_to_lot(0.026049 - 0.000026, 1e-6) == pytest.approx(0.026023)
     assert snap_to_lot(0.00127, 0.001) == pytest.approx(0.001)
     assert snap_to_lot(0.0009999, 0.001) == 0.0
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_margin_exit_on_a_venue_already_flat_still_closes_the_rest(mode):
+    """A liquidated short reads flat (0.0), which is not the same as unread. The
+    reduce-only buy against a flat position is refused, and the exit used to
+    halt with the spot long unsold in ACQUIRE."""
+    class Refuses(_VenueReadsItsShort):
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "linear" and side == "Buy" and self.perp_short <= 1e-9:
+                return None
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = Refuses()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    held_spot = v.spot_long if hasattr(v, "spot_long") else None
+    v.perp_short = 0.0                       # the whole short was liquidated
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound", (d.action, d.reason)
+    assert eng.state is BookState.FLAT and eng.position is None
+    if mode == ACQUIRE and held_spot is not None:
+        assert v.spot_long < 1e-6, "the spot long was left unsold"
+
+
+def test_an_unreadable_venue_position_still_closes_the_recorded_short():
+    class Unreadable(_VenueReadsItsShort):
+        def get_perp_position(self, symbol):
+            raise RuntimeError("position list unreadable")
+    v = Unreadable()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound", (d.action, d.reason)
+    assert v.perp_short < 1e-6
