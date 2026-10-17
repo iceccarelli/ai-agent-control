@@ -506,3 +506,24 @@ def test_an_unreadable_venue_position_still_closes_the_recorded_short():
     d = candle(eng, ms=61_000, print_ms=1_000)
     assert d.action == "unwound", (d.action, d.reason)
     assert v.perp_short < 1e-6
+
+
+def test_an_overlay_partial_close_never_records_more_spot_than_the_client_holds():
+    """The venue short being closed was LARGER than the book's (a fill the book
+    missed) and the buy-back filled only a tenth: the remainder left to hedge
+    must not be written as client spot above what the book recorded."""
+    class Half(_VenueReadsItsShort):
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "linear" and side == "Buy":
+                qty = qty * 0.1              # fills a tenth of what was asked
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = Half()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    book_spot = eng.position.spot.filled_qty
+    v.perp_short += 0.4                      # a short the book never recorded
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.position.spot.filled_qty <= book_spot + 1e-9

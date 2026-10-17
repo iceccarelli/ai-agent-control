@@ -1647,8 +1647,12 @@ class CarryEngine:
             if left > QTY_DUST:
                 # The hedge is SMALLER, not gone. The remainder is still short
                 # at the venue and the slice it covers is still hedged.
-                return self._partial_close(reason, perp_left=left,
-                                           spot_left=left)
+                # The slice still hedged cannot exceed the client's coin the
+                # book recorded, even when the venue short being closed was
+                # larger than the book's.
+                return self._partial_close(
+                    reason, perp_left=left,
+                    spot_left=min(left, position.spot.filled_qty))
             self.position = None
             self.state = BookState.FLAT
             failed = self._record()
