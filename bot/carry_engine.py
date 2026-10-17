@@ -321,6 +321,20 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
             "restart",
             detail={"venue_perp_qty": perp})
 
+    if state in (BookState.OPENING.value, BookState.UNWINDING.value):
+        # The last write was made BEFORE orders went out and nothing was
+        # written after them: the process died (or the write after the last
+        # fill failed) with a transaction open. What it filled is unknown, and
+        # a spot BUY that landed without its hedge is invisible to the venue
+        # comparison below (an empty ledger only checks the perp).
+        return ColdStartDecision(
+            ColdStart.HALT,
+            f"the last run died mid-transaction ({state}); the ledger cannot "
+            "say what it filled",
+            naked_side="unknown",
+            detail={"book_state": state, "venue_perp_qty": perp,
+                    "venue_spot_qty": spot})
+
     if position is None or position == {}:
         if perp > dust:
             return ColdStartDecision(
@@ -1267,6 +1281,14 @@ class CarryEngine:
         # in front. "Both legs land or neither" is the rule this module exists
         # to enforce; buying a fee tier by widening the window where neither
         # is true would sell the rule for the discount.
+        # WRITE THE INTENT FIRST. The spot BUY is the one order whose landing
+        # leaves no trace the venue comparison can see: a crash between it and
+        # the first ledger write restarts as CLEAN with a naked long in the
+        # wallet. A marker that says "a transaction is open" makes that restart
+        # HALT; a failure to write it means nothing has been sent yet.
+        failed = self._record()
+        if failed is not None:
+            return failed
         spot = self._fire(self.spot_symbol, "Buy", qty, "spot")
         if spot is None or spot.filled_qty <= 0:
             return self._refused("SPOT_LEG_DID_NOT_FILL")
@@ -2112,6 +2134,12 @@ class CarryEngine:
                                  detail={"error": self._last_leg_error,
                                          "refused_as": reason})
         self.state = BookState.FLAT
+        # Nothing landed: take the open-transaction marker back down. A failed
+        # write leaves it up, which only ever errs towards a halt at restart.
+        try:
+            self.persist(self.to_state())
+        except Exception:  # noqa: BLE001
+            logger.error("could not clear the open-transaction marker")
         return CarryDecision("refused", reason=reason, state=BookState.FLAT,
                              detail={"error": self._last_leg_error})
 
