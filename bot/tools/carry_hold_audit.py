@@ -133,18 +133,23 @@ def amortised_bps_per_day(round_trip_bps: float, hold_days: float) -> float:
 def _trade_net(t: Dict[str, Any], *, taker_perp_bps: float,
                taker_spot_bps: float, mode: str) -> Dict[str, float]:
     """Funding, basis and fees of ONE trade, from the replay's own fills."""
-    q = t["qty"]
+    q = t["qty"]                         # perp quantity the engine actually shorted
+    spot_q = t.get("spot_qty", q)         # net BTC held after any base-coin fee
+    spot_entry_q = t.get("spot_entry_qty", spot_q)  # gross spot BUY fill
     basis = (-q * (t["exit_perp"] - t["entry_perp"])
-             + q * (t["exit_spot"] - t["entry_spot"]))
+             + spot_q * (t["exit_spot"] - t["entry_spot"]))
     open_at_end = bool(t.get("open_at_end"))
     perp_fee = q * t["entry_perp"] * taker_perp_bps / 1e4
     if not open_at_end:                       # an open position has not paid exit
         perp_fee += q * t["exit_perp"] * taker_perp_bps / 1e4
     fees = perp_fee
     if mode == "acquire":
-        fees += q * t["entry_spot"] * taker_spot_bps / 1e4
+        # Spot entry fee is paid on the GROSS purchase; the wallet then holds
+        # less BTC if the venue withholds the base-coin fee. The exit fee is on
+        # the net amount sold. Using one quantity for all four legs hid this.
+        fees += spot_entry_q * t["entry_spot"] * taker_spot_bps / 1e4
         if not open_at_end:
-            fees += q * t["exit_spot"] * taker_spot_bps / 1e4
+            fees += spot_q * t["exit_spot"] * taker_spot_bps / 1e4
     funding = float(t["funding"])
     return {"funding": funding, "basis": basis, "fees": fees,
             "net": funding + basis - fees}

@@ -767,7 +767,10 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         if position is not None:
             last_collected = position.funding_collected
         if position is not None and open_trade is None:
-            open_trade = {"opened_ms": int(row.ms), "qty": position.perp.filled_qty,
+            open_trade = {"opened_ms": int(row.ms),
+                          "qty": position.perp.filled_qty,
+                          "spot_qty": position.spot_held_qty,
+                          "spot_entry_qty": position.spot.filled_qty,
                           "entry_perp": position.perp.avg_price,
                           "entry_spot": position.spot.avg_price,
                           "entry_index": index}
@@ -836,8 +839,8 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             # engine, which places one order in overlay and two in acquire.
             perp_leg = -open_trade["qty"] * (open_trade["exit_perp"]
                                              - open_trade["entry_perp"])
-            spot_leg = open_trade["qty"] * (open_trade["exit_spot"]
-                                            - open_trade["entry_spot"])
+            spot_leg = open_trade["spot_qty"] * (open_trade["exit_spot"]
+                                                 - open_trade["entry_spot"])
             basis_usd += perp_leg + spot_leg
             trades.append(open_trade)
             open_trade = None
@@ -863,15 +866,15 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
                       usd=last_collected)
         unrealised_usd = (
             open_trade["qty"] * (open_trade["entry_perp"] - last.perp)
-            + open_trade["qty"] * (last.spot - open_trade["entry_spot"]))
+            + open_trade["spot_qty"] * (last.spot - open_trade["entry_spot"]))
         open_trade.update({"closed_ms": int(last.ms), "exit_perp": last.perp,
                            "exit_spot": last.spot, "reason": "OPEN_AT_END",
                            "open_at_end": True, "funding": last_collected,
                            "prints_held": raw_broker.i - open_trade["entry_index"]})
         basis_usd += (-open_trade["qty"] * (open_trade["exit_perp"]
                                             - open_trade["entry_perp"])
-                      + open_trade["qty"] * (open_trade["exit_spot"]
-                                             - open_trade["entry_spot"]))
+                      + open_trade["spot_qty"] * (open_trade["exit_spot"]
+                                                  - open_trade["entry_spot"]))
         trades.append(open_trade)
 
     unrealised_usd = locals().get("unrealised_usd", 0.0)
