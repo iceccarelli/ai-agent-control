@@ -1634,6 +1634,17 @@ class CarryEngine:
         wanted_perp = (venue_short if venue_short is not None
                        and venue_short > QTY_DUST else book_perp)
         perp = self._fire(self.perp_symbol, "Buy", wanted_perp, "linear")
+        # What the venue still holds AFTER the close, not what the fills imply:
+        # the order was sized from one read (which may have been stale or
+        # larger/smaller than the book), and FLAT must be a fact, not an
+        # inference from fills. Unreadable falls back to the fill arithmetic.
+        remaining = (self._venue_short_qty()
+                     if perp is not None and perp.filled_qty > 0 else None)
+        if remaining is not None and remaining <= QTY_DUST:
+            remaining = 0.0
+        perp_left = (remaining if remaining is not None
+                     else (wanted_perp - perp.filled_qty
+                           if perp is not None else wanted_perp))
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
             # buying the perp back and nothing else: selling their BTC would
@@ -1643,7 +1654,7 @@ class CarryEngine:
                     "UNWIND_INCOMPLETE",
                     f"{reason} — the perp hedge did not close and the "
                     "client's BTC is now unhedged")
-            left = wanted_perp - perp.filled_qty
+            left = perp_left
             if left > QTY_DUST:
                 # The hedge is SMALLER, not gone. The remainder is still short
                 # at the venue and the slice it covers is still hedged.
@@ -1676,8 +1687,16 @@ class CarryEngine:
                 "sold because it is still hedging the open short")
         # Sell spot only in proportion to the perp that actually closed: a
         # half-closed short against a fully sold spot is a naked short.
-        closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
-            if wanted_perp > 0 else 1.0
+        if remaining is not None:
+            # Keep spot against the short the venue STILL holds, in proportion
+            # to the recorded pair: a stale read that undersized the close
+            # leaves most of the short open, and most of the spot must stay
+            # with it; a partial liquidation that left nothing sells it all.
+            closed_fraction = (1.0 - min(1.0, remaining / book_perp)
+                               if book_perp > 0 else 1.0)
+        else:
+            closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
+                if wanted_perp > 0 else 1.0
         # Sell what the venue can take: the net-of-fee balance floored to the
         # spot lot. The sub-lot remainder is dust no order can move.
         wanted_spot = self._spot_sellable(wanted_spot)
@@ -1690,9 +1709,7 @@ class CarryEngine:
         if spot is None:
             spot_left = wanted_spot
             return self._partial_close(
-                reason, perp_left=wanted_perp - perp.filled_qty,
-                spot_left=spot_left)
-        perp_left = wanted_perp - perp.filled_qty
+                reason, perp_left=perp_left, spot_left=spot_left)
         spot_left = wanted_spot - spot.filled_qty
         if perp_left > QTY_DUST or spot_left > QTY_DUST:
             return self._partial_close(reason, perp_left=perp_left,

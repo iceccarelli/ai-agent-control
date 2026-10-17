@@ -527,3 +527,47 @@ def test_an_overlay_partial_close_never_records_more_spot_than_the_client_holds(
     d = candle(eng, ms=61_000, print_ms=1_000)
     assert d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
     assert eng.position.spot.filled_qty <= book_spot + 1e-9
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_an_exit_sized_from_a_stale_read_does_not_declare_flat_over_a_live_short(mode):
+    """The close was sized from one stale position read (a fraction of the real
+    short). FLAT was inferred from the fills; it is now confirmed against the
+    venue, so the short that is still open is recorded and the book halts, and
+    (ACQUIRE) the spot that hedges it is not sold with it."""
+    class StaleOnce(_VenueReadsItsShort):
+        reads = 0
+
+        def get_perp_position(self, symbol):
+            type(self).reads += 1
+            return self.perp_short * 0.2 if type(self).reads == 1 \
+                else self.perp_short
+    v = StaleOnce()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    short_before = v.perp_short
+    spot_before = getattr(v, "spot_long", 0.0)
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.state is BookState.HALTED and eng.position is not None
+    assert v.perp_short == pytest.approx(0.8 * short_before)
+    assert eng.position.perp.filled_qty == pytest.approx(v.perp_short)
+    if mode == ACQUIRE:
+        assert v.spot_long == pytest.approx(0.8 * spot_before, rel=0.05), (
+            "the spot hedging the surviving short was sold")
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_partial_liquidation_still_closes_to_flat_and_sells_all_the_spot(mode):
+    """The case the venue-size sizing exists for must still end FLAT."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.perp_short *= 0.4
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound" and eng.state is BookState.FLAT
+    assert v.perp_short < 1e-6
+    if mode == ACQUIRE:
+        assert v.spot_long < 1e-6

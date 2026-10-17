@@ -31,6 +31,9 @@ QTY = 0.001
 def broker_with_rows(*rows, raises=None):
     client = FakeClient(mark=MARK)
     real = client._request
+    # The rows are the venue's position list; a reduce-only buy closes what
+    # they report, so a read after the exit shows the short that is left.
+    rows = tuple(dict(r) if isinstance(r, dict) else r for r in rows)
 
     def request(method, endpoint, **kw):
         if endpoint == "/v5/position/list":
@@ -40,6 +43,15 @@ def broker_with_rows(*rows, raises=None):
                 return {"retCode": 0, "retMsg": "OK", "result": {}}
             return envelope({"list": [dict(r, positionIM="20", positionMM="5")
                                       for r in rows]})
+        body = kw.get("body") or {}
+        if (endpoint == "/v5/order/create" and body.get("category") == "linear"
+                and body.get("side") == "Buy" and body.get("reduceOnly")):
+            left = float(body["qty"])
+            for r in rows:
+                if isinstance(r, dict) and r.get("size") not in (None, ""):
+                    take = min(left, float(r["size"]))
+                    r["size"] = str(float(r["size"]) - take)
+                    left -= take
         return real(method, endpoint, **kw)
 
     client._request = request

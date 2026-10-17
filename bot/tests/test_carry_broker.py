@@ -50,6 +50,11 @@ class FakeClient:
         self.calls.append((method, endpoint, params, body))
         if endpoint == "/v5/order/create":
             self.created.append(body)
+            if body.get("category") == "linear" and body.get("side") == "Buy" \
+                    and body.get("reduceOnly"):
+                # A reduce-only buy really closes the short the position list
+                # reports; without this the list kept showing the pre-close size.
+                self.perp_qty = max(0.0, self.perp_qty - float(body["qty"]))
             if self.raise_on_create is not None:
                 raise Boom(self.raise_on_create)
             # Real Bybit create responses carry only orderId/orderLinkId in
