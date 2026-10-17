@@ -14,7 +14,9 @@ WORKFLOW = os.path.join(os.path.dirname(BOT), ".github", "workflows",
 REQUIRED = (
     "test_carry_funding_truth", "test_carry_fee_truth", "test_carry_report",
     "test_carry_broker", "test_carry_preflight", "test_fee_payload_probe",
-    "test_carry_live_gates", "test_carry_funding_history_gap")
+    "test_carry_live_gates", "test_carry_funding_history_gap",
+    # a blanked ledger row must refuse to start, not read as a first run
+    "test_carry_cold_start", "test_carry_entry_allowance_survives_restart")
 
 
 @pytest.fixture(scope="module")

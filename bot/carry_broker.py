@@ -474,7 +474,7 @@ class CarryBroker:
                         f"orderLinkId {link_id} is {state['status']!r} at the "
                         "venue after a duplicate-id rejection; what it will "
                         "fill is unknown") from exc
-                return self._engine_result_from_state(state)
+                return self._engine_result_from_state(state, qty)
             if self._definitively_rejected(exc):
                 logger.error("leg %s %s %s rejected: %s",
                              side, symbol, product, exc)
@@ -505,10 +505,21 @@ class CarryBroker:
                 raise OrderOutcomeUnknown(
                     f"{link_id} is {state['status']} at the venue after a "
                     "failed submission; what it will fill is unknown") from exc
-            return self._engine_result_from_state(state)
+            return self._engine_result_from_state(state, qty)
 
-        fill = self._fill_from(response, link_id)
-        if fill.filled_qty <= 0:
+        # The create call returned, so the order EXISTS. Whatever the response
+        # says about its fill is a claim to check, not a fact: text that is
+        # not a number, NaN/inf (every comparison against which is False), a
+        # negative quantity or more than was asked for are not "no fill" and
+        # are not a fill. They send us to the order's own record.
+        try:
+            fill: Optional[LegFill] = self._fill_from(response, link_id)
+        except Exception as parse_exc:  # noqa: BLE001
+            logger.error("%s: create response fill unreadable (%s); reading "
+                         "the order back", link_id, parse_exc)
+            fill = None
+        if fill is None or not self._fill_is_sane(
+                fill.filled_qty, fill.avg_price, qty) or fill.filled_qty <= 0:
             # Market orders that report nothing filled are queried rather than
             # assumed dead: the response and the fill are separate events. The
             # create response carried an orderId, so the order EXISTS: a read
@@ -529,7 +540,7 @@ class CarryBroker:
                 raise OrderOutcomeUnknown(
                     f"{link_id} is {state['status']} with nothing filled yet; "
                     "a market order's outcome is unknown")
-            return self._engine_result_from_state(state)
+            return self._engine_result_from_state(state, qty)
         return fill.as_engine_result()
 
     @staticmethod
@@ -549,7 +560,32 @@ class CarryBroker:
         return code != 0 and type(exc).__name__ != "TransientAPIError"
 
     @staticmethod
-    def _engine_result_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    def _fill_is_sane(filled: Any, avg_price: Any, requested: float) -> bool:
+        """A fill the book can account: finite, not negative, priced when it
+        is non-zero, and no larger than the order (beyond venue rounding).
+        Partial fills are sane; only impossible ones are not."""
+        try:
+            filled, avg_price = float(filled), float(avg_price)
+        except (TypeError, ValueError):
+            return False
+        if not (math.isfinite(filled) and math.isfinite(avg_price)):
+            return False
+        if filled < 0 or avg_price < 0:
+            return False
+        if filled > 0 and avg_price <= 0:
+            return False
+        return filled <= requested * (1.0 + PAIR_DUST_FRACTION)
+
+    @classmethod
+    def _engine_result_from_state(cls, state: Dict[str, Any],
+                                  requested: float) -> Dict[str, Any]:
+        if not cls._fill_is_sane(state["filled_qty"], state["avg_price"],
+                                 requested):
+            raise OrderOutcomeUnknown(
+                f"{state['order_link_id']} reads back a fill the book cannot "
+                f"account (filled {state['filled_qty']!r} at "
+                f"{state['avg_price']!r} of {requested!r} asked); its outcome "
+                "is unknown")
         return {"filled_qty": state["filled_qty"],
                 "avg_price": state["avg_price"],
                 "order_link_id": state["order_link_id"],
@@ -749,6 +785,11 @@ class CarryBroker:
         row = rows[0]
         status = str(row.get("orderStatus") or "")
         filled = self._stated(row, "cumExecQty", f"order {link_id}")
+        if filled < 0:
+            # A negative fill is not "filled nothing": `_rejected` would read
+            # it as a clean terminal row and the caller would cross again.
+            raise PairIncident(
+                f"order {link_id} reports a negative fill {filled}: {row!r}")
         if filled > 0:
             avg = self._stated(row, "avgPrice", f"order {link_id}")
             if avg <= 0:
