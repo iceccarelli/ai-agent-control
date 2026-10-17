@@ -497,9 +497,15 @@ class ReplayBroker:
         if product == "linear":
             self.perp_qty += qty if side == "Sell" else -qty
             self._note_perp(side, qty, price)
+        venue_fee = self._as_venue_fee(fee, price, side, product)
+        fee_currency = ("BTC" if product == "spot" and side == "Buy"
+                        else "USDT")
+        fee_detail = {"known": True, "source": "cumFeeDetail",
+                      "components": [{"amount": venue_fee,
+                                      "currency": fee_currency}]}
         return {"filled_qty": qty, "avg_price": price,
                 "order_link_id": f"r{len(self.fills)}",
-                "fee": self._as_venue_fee(fee, price, side, product)}
+                "fee": venue_fee, "fee_detail": fee_detail}
 
     def place_post_only(self, *, symbol, side, qty, price, product):
         """Every resting order fills, at the touch, at the maker rate.
@@ -514,9 +520,15 @@ class ReplayBroker:
         if product == "linear":
             self.perp_qty += qty if side == "Sell" else -qty
             self._note_perp(side, qty, price)
+        venue_fee = self._as_venue_fee(fee, price, side, product)
+        fee_currency = ("BTC" if product == "spot" and side == "Buy"
+                        else "USDT")
+        fee_detail = {"known": True, "source": "cumFeeDetail",
+                      "components": [{"amount": venue_fee,
+                                      "currency": fee_currency}]}
         return {"filled_qty": qty, "avg_price": price,
                 "order_link_id": f"m{len(self.fills)}",
-                "fee": self._as_venue_fee(fee, price, side, product),
+                "fee": venue_fee, "fee_detail": fee_detail,
                 "maker": True, "resting": False}
 
     def cancel_order(self, *, symbol, order_link_id, product):

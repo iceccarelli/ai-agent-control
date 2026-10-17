@@ -96,17 +96,22 @@ class Venue:
         self.orders.append((side, product, qty, filled))
         if filled <= 0:
             return None
+        # The venue reports a spot BUY fee in BTC and everything else in USDT.
+        # Keep the simulated wallet net of the base-coin fee, just like the
+        # production account.
+        fee = (0.5 / MARK if (product == "spot" and side == "Buy") else 0.5)
+        fee_currency = "BTC" if (product == "spot" and side == "Buy") else "USDT"
         if product == "linear":
             self.perp_short += filled if side == "Sell" else -filled
+        elif side == "Buy":
+            self.spot_long += max(0.0, filled - fee)
         else:
-            self.spot_long += filled if side == "Buy" else -filled
-        # The venue reports a spot BUY fee in the COIN and everything else in
-        # the quote currency (INVENTORY F3). These tests assert no fee
-        # amounts, but a stub that states the wrong unit is how the replay
-        # came to book $388m of fees, so it states the right one.
-        fee = 0.5 / MARK if (product == "spot" and side == "Buy") else 0.5
+            self.spot_long -= filled
+        fee_detail = {"known": True, "source": "cumFeeDetail",
+                      "components": [{"amount": fee, "currency": fee_currency}]}
         return {"filled_qty": filled, "avg_price": MARK,
-                "order_link_id": f"o{len(self.orders)}", "fee": fee}
+                "order_link_id": f"o{len(self.orders)}", "fee": fee,
+                "fee_detail": fee_detail}
 
     def get_margin_multiple(self, symbol):
         return self.margin
@@ -238,8 +243,8 @@ class TestAPartialCloseIsNotAClose:
         v = Venue()
         eng = build(v, mode=ACQUIRE)
         candle(eng, ms=1_000)
-        assert v.spot_long == pytest.approx(1.0)
-        assert v.perp_short == pytest.approx(1.0)
+        assert v.spot_long == pytest.approx(eng.position.spot_held_qty)
+        assert v.perp_short == pytest.approx(eng.position.perp.filled_qty)
 
         v.close_fill = 0.5
         v.margin = 1.1
@@ -259,8 +264,8 @@ class TestAPartialCloseIsNotAClose:
         assert d.state is BookState.HALTED
         assert d.reason == "NAKED_SPOT_UNWIND_PARTIAL"
         assert eng.position is not None
-        assert eng.position.spot.filled_qty == pytest.approx(0.5)
-        assert v.spot_long == pytest.approx(0.5)
+        assert eng.position.spot.filled_qty == pytest.approx(v.spot_long)
+        assert v.spot_long == pytest.approx(0.5 - 0.25 / MARK)
         # No hedge is claimed for it, because none exists.
         assert eng.position.perp.filled_qty == pytest.approx(0.0)
 
