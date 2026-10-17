@@ -1697,10 +1697,18 @@ class CarryEngine:
         market view. It is a direct venue read and needs no mark: a held
         short that drifted or cannot be read halts the book whatever the
         state of the price feed. Returns None when flat, already halted, or
-        when the venue agrees with the book. Sends nothing."""
+        when the venue agrees with the book and its margin is above the floor.
+
+        After the size check, the margin and liquidation gates run: both
+        read the venue directly and need no market view, and a feed that stays
+        unusable must not leave a short below its floor untouched. Their exit
+        is the only order this path can send."""
         if self.position is None or self.state is BookState.HALTED:
             return None
-        return self._check_venue_position()
+        mismatch = self._check_venue_position()
+        if mismatch is not None:
+            return mismatch
+        return self._check_margin()
 
     def _check_venue_position(self) -> Optional[CarryDecision]:
         """Does the venue's perp short equal the size the book recorded?

@@ -75,3 +75,15 @@ def test_a_flat_book_does_nothing_without_a_view(tmp_path):
     assert engine.state is BookState.FLAT
     assert bot._last_carry_decision["reason"] == "MARKET_VIEW_UNUSABLE"
     assert venue.created == []
+
+
+def test_a_short_below_its_margin_floor_exits_even_without_a_view(tmp_path):
+    """The margin gate reads the venue directly; a feed that stays unusable
+    used to leave a short below its floor untouched tick after tick."""
+    venue, journal, engine, bot = _hedged(tmp_path)
+    before = len(venue.created)
+    venue.im, venue.mm = 1.1, 1.0               # margin 1.1x, under the floor
+    tick_with_unusable_view(bot)
+    assert engine.state is BookState.FLAT
+    assert bot._last_carry_decision["reason"].startswith("MARGIN_HEADROOM_")
+    assert len(venue.created) > before
