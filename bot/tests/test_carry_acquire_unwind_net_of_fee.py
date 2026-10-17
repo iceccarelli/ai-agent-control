@@ -98,6 +98,15 @@ def test_net_spot_below_linear_minimum_is_unwound_without_opening_short():
                         "min_notional": 0.0}
             return super().get_lot_rules(symbol, product)
 
+        def get_fee_rates(self, symbol, product):
+            # A fee the tier did NOT predict (the order row carries a base-coin
+            # fee anyway): the pre-trade refusal cannot see it, so this keeps
+            # the in-flight defence under test.
+            rates = dict(super().get_fee_rates(symbol, product))
+            if product == "spot":
+                rates["taker_bps"] = 0.0
+            return rates
+
     v, e, d = open_once(
         {"cumFeeDetail": {"BTC": str(FEE_BTC)}},
         venue_cls=CoarseLinearLotVenue)
@@ -183,3 +192,35 @@ def run_with(venue_cls, row):
         e.on_candle(mark=100_000.0, funding_bps=-0.5, spot=100_000.0,
                     funding_print_ms=k * H8, timestamp_ms=k * H8)
     return v, e
+
+
+class _CoarseLot(WalletVenue):
+    def __init__(self, row, step, **kw):
+        super().__init__(row, **kw)
+        self.step = step
+
+    def get_lot_rules(self, symbol, product):
+        if product == "linear":
+            return {"qty_step": self.step, "min_qty": self.step,
+                    "min_notional": 0.0}
+        return super().get_lot_rules(symbol, product)
+
+
+def test_acquire_refuses_an_entry_whose_fee_would_leave_the_pair_unpaired():
+    """Spot BUY 0.01 with a 10 bps base-coin fee leaves 0.00999; the short snaps
+    to 0.009 and the pair lands 5% unpaired (band 2%), then unwinds: a round
+    trip of fees, again every UTC day. The fee tier already predicts it."""
+    v = _CoarseLot({"cumFeeDetail": {"BTC": "0.00001"}}, step=0.001)
+    e = engine(v, mode=ACQUIRE)
+    d = e.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0,
+                    funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+    assert d.action == "stand_aside" and d.reason == "ACQUIRE_LOT_TOO_COARSE_FOR_FEE"
+    assert v.orders == [], "a leg was sent for a pair that cannot be paired"
+
+
+def test_acquire_still_opens_when_the_lot_is_fine_enough_for_the_fee():
+    v = _CoarseLot({"cumFeeDetail": {"BTC": "0.00001"}}, step=0.000001)
+    e = engine(v, mode=ACQUIRE)
+    d = e.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0,
+                    funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+    assert d.action == "opened", d.reason

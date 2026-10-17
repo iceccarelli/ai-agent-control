@@ -1315,6 +1315,14 @@ class CarryEngine:
                                 "venue lot; a size the venue will not accept "
                                 "is a rejected order, not a smaller book"})
 
+        if self.execution_mode == ACQUIRE:
+            unpaired = self._acquire_fee_leaves_hedge_unpaired(
+                qty, float(rules.get("qty_step", 0.0)))
+            if unpaired is not None:
+                return CarryDecision(
+                    "stand_aside", reason="ACQUIRE_LOT_TOO_COARSE_FOR_FEE",
+                    state=BookState.FLAT, detail=unpaired)
+
         margin = self._margin_multiple()
         if margin is not None and margin < self.min_margin_multiple:
             return CarryDecision("stand_aside", reason="MARGIN_HEADROOM_TOO_THIN",
@@ -1662,6 +1670,36 @@ class CarryEngine:
                 "opening a hedge on top of it would exceed the cap with "
                 "nothing watching the first leg")
         return None
+
+    def _acquire_fee_leaves_hedge_unpaired(self, qty: float, step: float
+                                           ) -> Optional[Dict[str, Any]]:
+        """ACQUIRE buys `qty` of spot and shorts what is LEFT after the spot
+        BUY's fee (taken in the coin received), snapped down to a perp lot. When
+        one lot is a large share of the position that residue exceeds the delta
+        band, the pair lands "unpaired" and is unwound at once: a deterministic
+        round trip of fees, repeated every UTC day. The same fee tier the cost
+        gates already price predicts it before a cent is spent, so the entry is
+        refused instead. Returns the detail when it would, else None (including
+        when the fee tier cannot be read: the in-flight unpaired check remains)."""
+        try:
+            taker = float(self.broker.get_fee_rates(
+                self.spot_symbol, "spot")["taker_bps"]) / 1e4
+        except Exception:  # noqa: BLE001
+            return None
+        if not (self._finite(taker) and 0 < taker < 1) or qty <= 0:
+            return None
+        net = qty * (1.0 - taker)
+        hedge = snap_to_lot(net, step)
+        book = net + hedge
+        residual = (net - hedge) / book if book > 0 else 1.0
+        if residual <= self.delta_band:
+            return None
+        return {"spot_qty": qty, "net_after_fee": net, "hedge_qty": hedge,
+                "predicted_delta_fraction": residual,
+                "delta_band": self.delta_band, "qty_step": step,
+                "note": "after the spot BUY's fee the short snaps down a whole "
+                        "lot and the pair would land unpaired, then unwind: a "
+                        "round trip of fees for nothing"}
 
     def _venue_short_qty(self) -> Optional[float]:
         """The perp short the venue reports (0.0 when it reads flat), or None
