@@ -504,4 +504,3 @@ class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
         assert bot.carry_cold_start() is False
         assert store.trip_kill_switch.called
         assert bot.carry.state is BookState.HALTED
-
