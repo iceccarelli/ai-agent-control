@@ -1130,11 +1130,18 @@ class CarryEngine:
                         funding_bps / 1e4) * self.position.perp.filled_qty * mark
                 if funding_bps < 0:
                     self.position.negative_funding_streak += 1
-                    if (self.position.negative_funding_streak
-                            >= NEGATIVE_FUNDING_EXIT_PRINTS):
-                        return self._unwind(mark, "FUNDING_INVERTED")
                 else:
                     self.position.negative_funding_streak = 0
+                # Written down per print (one every eight hours): the booked
+                # funding and the negative streak lived in memory only, so a
+                # restart reset the streak to zero and delayed the inversion
+                # exit by up to two prints of paying funding.
+                failed = self._record()
+                if failed is not None:
+                    return failed
+                if (self.position.negative_funding_streak
+                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
+                    return self._unwind(mark, "FUNDING_INVERTED")
 
             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
                                  state=BookState.HEDGED,
