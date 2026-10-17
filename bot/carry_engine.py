@@ -1065,6 +1065,16 @@ class CarryEngine:
         """
         self._last_tick_ms = int(timestamp_ms or 0)
         if self.state is BookState.HALTED:
+            if self._halt_unwritten:
+                # The write that records the halt (and any exposure noted with
+                # it) failed once; a store that has recovered must not leave the
+                # ledger showing a book that does not exist.
+                try:
+                    self.persist(self.to_state())
+                    self._halt_unwritten = False
+                    logger.warning("carry: the halt record was written down")
+                except Exception:  # noqa: BLE001
+                    logger.critical("the halt still could not be written down")
             return CarryDecision("halted", reason="KILL_SWITCH_ENGAGED",
                                  state=self.state)
 
@@ -1586,10 +1596,13 @@ class CarryEngine:
             return qty
         return snap_to_lot(qty, step) if self._finite(step) else qty
 
-    #: How long a position list that still shows the pre-close size right after
-    #: a close the fills say completed is given before the disagreement is
-    #: believed (two re-reads). Only paid when venue and fills disagree.
+    #: How long a position list that still shows more short than the fills
+    #: leave is given before the disagreement is believed (two re-reads). Only
+    #: paid when venue and fills disagree.
     UNWIND_REREAD_WAIT_S = 0.5
+
+    #: True while the last HALT could not be persisted (retried each halted tick).
+    _halt_unwritten = False
 
     def _short_left_after_close(self, fill_left: float) -> Optional[float]:
         """The perp short still open after a close, as the venue reports it,
@@ -1604,17 +1617,21 @@ class CarryEngine:
         remaining = self._venue_short_qty()
         if remaining is None:
             return None
-        if fill_left <= QTY_DUST and remaining > QTY_DUST:
+        floor = fill_left if fill_left > QTY_DUST else 0.0
+        if remaining > floor + QTY_DUST:
+            # The list shows MORE short than the fills leave. Complete or
+            # partial, that is most often the pre-close list: re-read twice,
+            # after a pause, and believe the excess only if it persists.
             for _ in range(2):
                 time.sleep(self.UNWIND_REREAD_WAIT_S)
                 again = self._venue_short_qty()
                 if again is None:
                     return None
                 remaining = again
-                if remaining <= QTY_DUST:
+                if remaining <= floor + QTY_DUST:
                     break
         remaining = 0.0 if remaining <= QTY_DUST else remaining
-        return max(fill_left if fill_left > QTY_DUST else 0.0, remaining)
+        return max(floor, remaining)
 
     def _venue_short_qty(self) -> Optional[float]:
         """The perp short the venue reports (0.0 when it reads flat), or None
@@ -2530,7 +2547,9 @@ class CarryEngine:
             try:
                 self.persist(self.to_state())
             except Exception:  # noqa: BLE001 - already halting
-                logger.critical("the halt itself could not be written down")
+                self._halt_unwritten = True
+                logger.critical("the halt itself could not be written down; "
+                                "it is retried on every halted tick")
         return CarryDecision("halted", reason=reason, state=BookState.HALTED,
                              detail={"detail": detail})
 

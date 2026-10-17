@@ -631,3 +631,45 @@ def test_a_lagging_read_right_after_a_complete_close_is_re_read_not_believed(mod
     assert v.perp_short < 1e-6
     if mode == ACQUIRE:
         assert v.spot_long < 1e-6
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_stale_read_on_a_partial_close_is_re_read_before_it_is_believed(mode):
+    """The buy-back filled 60%; the post-close list still shows the PRE-close
+    size once. The excess over the fills is re-read after a pause, so the
+    persisted short is what the venue holds, not the stale figure."""
+    v = _ReadsScript(script=[], fill_ratio=0.6)
+    eng = build(v, mode=mode)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    pre_close = v.perp_short
+    v.script = [None, pre_close]            # sizing read ok, then one stale read
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.position.perp.filled_qty == pytest.approx(0.4 * pre_close)
+    assert v.perp_short == pytest.approx(0.4 * pre_close)
+
+
+def test_a_halt_whose_write_failed_is_written_once_the_store_recovers():
+    """`_halt` swallowed a failed persist and never tried again, leaving the
+    ledger showing a book (and no noted exposure) that the halt had replaced."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    writes = []
+    healthy = eng.persist
+    state = {"fail": True}
+
+    def flaky(s):
+        if state["fail"]:
+            raise OSError("disk full")
+        writes.append(s)
+        healthy(s)
+    eng.persist = flaky
+    v.perp_short += 0.4                     # venue drift -> VENUE_POSITION_DRIFT halt
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and not writes
+    state["fail"] = False
+    candle(eng, ms=121_000, print_ms=1_000)
+    assert writes and writes[-1]["book_state"] == "HALTED"
