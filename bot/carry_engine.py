@@ -68,6 +68,7 @@ import math
 import time
 from decimal import Decimal, InvalidOperation
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as dataclass_fields
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -213,6 +214,65 @@ class ColdStartDecision:
     detail: Dict[str, Any] = field(default_factory=dict)
 
 
+def _real(value: Any, *, minimum: Optional[float] = 0.0) -> bool:
+    """A finite real number that is not a bool (True is 1 to float())."""
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value)
+            and (minimum is None or value >= minimum))
+
+
+#: What a persisted leg may say, by role: (side values, product).
+_LEG_ROLES = {"spot": (("Buy", "Hold"), "spot"), "perp": (("Sell",), "linear")}
+_LEG_NUMBERS = ("requested_qty", "filled_qty", "avg_price", "maker_qty",
+                "taker_qty", "fee_base_qty")
+
+
+def _ledger_position_problem(position: Any) -> Optional[str]:
+    """Why a persisted position cannot be trusted as a hedge, or None.
+
+    Every comparison with NaN is False, so a NaN quantity "agrees" with the
+    venue, a negative one is hidden by abs(), a bool is 1.0, and text raises
+    out of startup instead of halting. Anything ambiguous is a HALT.
+    """
+    if not isinstance(position, dict):
+        return f"the ledger position is a {type(position).__name__}, not a pair"
+    names = {f.name for f in dataclass_fields(Leg)}
+    for role, (sides, product) in _LEG_ROLES.items():
+        leg = position.get(role)
+        if not isinstance(leg, dict):
+            return f"the ledger has no {role} leg"
+        unknown = set(leg) - names
+        if unknown:
+            return f"the {role} leg carries unknown fields {sorted(unknown)}"
+        if not all(isinstance(leg.get(k), str) and leg.get(k)
+                   for k in ("symbol", "side", "product")):
+            return f"the {role} leg lacks a symbol, side or product"
+        if leg["side"] not in sides or leg["product"] != product:
+            return (f"the {role} leg is {leg['side']!r} on {leg['product']!r}, "
+                    "not a leg of this strategy")
+        for key in _LEG_NUMBERS:
+            if key in leg and not _real(leg[key]):
+                return f"the {role} leg's {key} is {leg[key]!r}"
+        if leg.get("fee") is not None and not _real(leg.get("fee"),
+                                                     minimum=None):
+            return f"the {role} leg's fee is {leg['fee']!r}"
+        if leg.get("filled_qty", 0.0) > 0 and not leg.get("avg_price", 0.0) > 0:
+            return f"the {role} leg holds a quantity with no price"
+    if "opened_ms" in position and not (
+            isinstance(position["opened_ms"], int)
+            and not isinstance(position["opened_ms"], bool)
+            and position["opened_ms"] >= 0):
+        return f"opened_ms is {position['opened_ms']!r}"
+    if "funding_collected" in position and not _real(
+            position["funding_collected"], minimum=None):
+        return f"funding_collected is {position['funding_collected']!r}"
+    streak = position.get("negative_funding_streak", 0)
+    if not (isinstance(streak, int) and not isinstance(streak, bool)
+            and streak >= 0):
+        return f"negative_funding_streak is {streak!r}"
+    return None
+
+
 def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
                     venue_perp_qty: float, venue_spot_qty: float,
                     open_orders: Any = (),
@@ -230,6 +290,16 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
     margin and the same liquidation price.
     """
     orders = list(open_orders or ())
+    # The venue's side of the comparison must be a number too; a NaN would
+    # "agree" with anything.
+    if not (_real(venue_perp_qty, minimum=None)
+            and _real(venue_spot_qty, minimum=None)):
+        return ColdStartDecision(
+            ColdStart.HALT,
+            f"the venue's position read is not a number (perp "
+            f"{venue_perp_qty!r}, spot {venue_spot_qty!r})",
+            detail={"venue_perp_qty": repr(venue_perp_qty),
+                    "venue_spot_qty": repr(venue_spot_qty)})
     if orders:
         return ColdStartDecision(
             ColdStart.HALT,
@@ -249,7 +319,7 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
             "restart",
             detail={"venue_perp_qty": perp})
 
-    if not position:
+    if position is None or position == {}:
         if perp > dust:
             return ColdStartDecision(
                 ColdStart.HALT,
@@ -258,6 +328,15 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
                 naked_side="perp", detail={"venue_perp_qty": perp})
         return ColdStartDecision(ColdStart.CLEAN, "no pair in the ledger, none "
                                  "at the venue")
+
+    problem = _ledger_position_problem(position)
+    if problem is not None:
+        return ColdStartDecision(
+            ColdStart.HALT,
+            f"the ledger's position cannot be trusted as a hedge: {problem}",
+            naked_side="unknown",
+            detail={"problem": problem, "venue_perp_qty": perp,
+                    "venue_spot_qty": spot})
 
     ledger_perp = abs(float((position.get("perp") or {}).get("filled_qty", 0.0)))
     ledger_spot = abs(float((position.get("spot") or {}).get("filled_qty", 0.0)))
