@@ -335,9 +335,8 @@ class TestTheOverlayKeepsCheckingItsInventory:
         assert d.state is BookState.HALTED
         assert d.reason == "INVENTORY_LEFT_AND_HEDGE_WOULD_NOT_CLOSE"
 
-    def test_a_shortfall_below_one_venue_lot_does_not_halt_the_book(self):
-        """Dust is not an incident, and halting on it would make the gate
-        unusable. There is no order that would reduce it."""
+    def test_a_shortfall_below_one_venue_lot_closes_the_entire_hedge(self):
+        """No valid partial close exists, so close the whole reduce-only short."""
         v = Venue()
         eng = build(v)
         candle(eng, ms=1_000)
@@ -345,11 +344,12 @@ class TestTheOverlayKeepsCheckingItsInventory:
         before = len(v.orders)
 
         d = candle(eng, ms=61_000, print_ms=61_000)
-        assert eng.state is BookState.HEDGED
-        assert d.action == "hold"
-        assert len(v.orders) == before
-        # and funding still books, because the book is still a book
-        assert eng.position.funding_collected != 0.0
+        assert d.action == "unwound"
+        assert d.reason == "INVENTORY_WITHDRAWN"
+        assert eng.state is BookState.FLAT and eng.position is None
+        assert v.perp_short == pytest.approx(0.0)
+        assert len(v.orders) == before + 1
+        assert v.orders[-1][:3] == ("Buy", "linear", 1.0)
 
     def test_acquire_mode_never_asks_about_inventory(self):
         """In acquire the book bought its own spot; the client's wallet is not
