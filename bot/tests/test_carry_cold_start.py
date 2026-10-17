@@ -338,7 +338,8 @@ class TestTheEngineResumesOrRefuses:
 
 
 class TestTheProcessRefusesToStartOnAMismatch:
-    def _bot(self, venue, ledger):
+    def _bot(self, venue, ledger, *, spot_symbol="BTCUSDT",
+             perp_symbol="BTCUSDT"):
         bot = _main.TradingBot.__new__(_main.TradingBot)
         store = mock.Mock()
         store.load_carry_position.return_value = ledger
@@ -347,6 +348,8 @@ class TestTheProcessRefusesToStartOnAMismatch:
         bot.symbols = ["BTCUSDT"]
         bot.carry = CarryEngine(broker=venue, max_notional_usd=100.0,
                                 borrow_apr=0.0, execution_mode=OVERLAY,
+                                spot_symbol=spot_symbol,
+                                perp_symbol=perp_symbol,
                                 persist=lambda s: None,
                                 kill_switch=store.trip_kill_switch)
         bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
@@ -472,3 +475,32 @@ class TestAPersistedPositionThatCannotBeTrustedHaltsTheStart:
                          venue_spot_qty=5.0, open_orders=())
         assert d.action is ColdStart.RESUME
         assert e.position.perp.fee == pytest.approx(0.0055)
+
+class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
+    @pytest.mark.parametrize("role", ["spot", "perp"])
+    def test_foreign_market_leg_halts_through_real_startup(self, role):
+        # Build a genuine serialized engine state, then corrupt only the market
+        # identity. The bot's real cold-start path must refuse to resume it.
+        ledger = opened(Venue()).to_state()
+        ledger["position"][role]["symbol"] = "ETHUSDT"
+        venue = Venue(perp=ledger["position"]["perp"]["filled_qty"])
+        bot, store = TestTheProcessRefusesToStartOnAMismatch()._bot(
+            venue, ledger
+        )
+
+        assert bot.carry_cold_start() is False
+        assert store.trip_kill_switch.called
+        assert bot.carry.state is BookState.HALTED
+        assert venue.orders == []
+
+    def test_different_configured_markets_never_resume_as_a_hedge(self):
+        # Even if the ledger exactly matches both configured leg symbols,
+        # ETH spot and BTC perp are not a delta-neutral pair.
+        ledger = opened(Venue()).to_state()
+        ledger["position"]["spot"]["symbol"] = "ETHUSDT"
+        bot, store = TestTheProcessRefusesToStartOnAMismatch()._bot(
+            Venue(perp=0.001), ledger,
+            spot_symbol="ETHUSDT", perp_symbol="BTCUSDT")
+        assert bot.carry_cold_start() is False
+        assert store.trip_kill_switch.called
+        assert bot.carry.state is BookState.HALTED

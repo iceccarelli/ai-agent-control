@@ -911,6 +911,17 @@ def reconcile(journal: Journal, *, venue_btc: float, venue_usdt: float,
 
 # -- the broker wrapper ---------------------------------------------------
 
+class BookingFailedAfterFill(RuntimeError):
+    """An order was sent and answered, and the journal could not book it.
+
+    ``outcome_unknown`` is what the engine tests (as for
+    ``carry_broker.OrderOutcomeUnknown``), so it needs no import of this
+    module: the book halts instead of treating the leg as not filled.
+    """
+
+    outcome_unknown = True
+
+
 class LedgerBroker:
     """Every order the engine sends, booked — because it cannot go elsewhere.
 
@@ -971,7 +982,18 @@ class LedgerBroker:
                      product: str):
         result = self.inner.place_market(symbol=symbol, side=side, qty=qty,
                                          product=product)
-        self._book(result, side=side, product=product)
+        try:
+            self._book(result, side=side, product=product)
+        except Exception as exc:  # noqa: BLE001
+            # The venue already ACCEPTED this order. A booking error is not
+            # "the order failed": reporting it as one made the engine buy the
+            # spot again on every tick, or sell the spot under a perp short
+            # that had filled. The fill is real and the book cannot account
+            # for it, which is exactly an outcome the engine must halt on.
+            raise BookingFailedAfterFill(
+                f"{side} {qty} {symbol} ({product}) was sent and the venue "
+                f"returned {result!r}, but booking it failed "
+                f"({type(exc).__name__}: {exc})") from exc
         return result
 
     def place_post_only(self, *, symbol: str, side: str, qty: float,
