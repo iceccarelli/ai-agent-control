@@ -1423,10 +1423,27 @@ class CarryEngine:
                 "REBALANCE_FAILED",
                 f"delta is {drift:.2%} of book and the correction did not fill")
 
+        perp = position.perp
         if side == "Sell":
-            position.perp.filled_qty += fill.filled_qty
+            # More short: the leg's entry is the quantity-weighted price, which
+            # is what the journal holds and what a restart re-seeds it from.
+            # Without it a restored pair realised its close against the
+            # original entry. The fill's own fee belongs to this leg; an
+            # unknown fee on either side stays unknown, never a partial sum.
+            total = perp.filled_qty + fill.filled_qty
+            perp.avg_price = (perp.avg_price * perp.filled_qty
+                              + fill.avg_price * fill.filled_qty) / total
+            perp.fee = (None if perp.fee is None or fill.fee is None
+                        else perp.fee + fill.fee)
+            perp.taker_qty += fill.taker_qty
+            perp.maker_qty += fill.maker_qty
+            perp.filled_qty = total
         else:
-            position.perp.filled_qty -= fill.filled_qty
+            # Buying back CLOSES part of the short. What remains was sold at
+            # its original price; the closing fill (booked by the broker as a
+            # close, with its own fee) is not blended into that entry.
+            perp.filled_qty -= fill.filled_qty
+        perp.requested_qty = perp.filled_qty
         self.state = BookState.HEDGED
         failed = self._record()
         if failed is not None:
