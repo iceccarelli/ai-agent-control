@@ -162,6 +162,12 @@ def absent(product, side, filled):
     return {}
 
 
+def spot_known_perp_unknown(product, side, filled):
+    if product == "spot" and side == "Buy":
+        return modern(product, side, filled)
+    return {}
+
+
 def with_mnt(product, side, filled):
     d = modern(product, side, filled)
     if product == "spot" and side == "Buy":
@@ -249,26 +255,31 @@ class TestModernFeesReachTheStatement:
 
 
 class TestUnknownFeesNeverLookConfirmed:
-    def test_a_fee_the_venue_never_stated_is_flagged_and_the_net_is_provisional(
-            self):
+    def test_an_unreported_spot_fee_does_not_open_a_perp_short(self):
         venue, journal, engine = build(absent)
-        assert open_the_hedge(engine).action == "opened"
+        decision = open_the_hedge(engine)
+        assert decision.reason == "SPOT_FEE_UNVERIFIABLE"
+        assert engine.state.value == "HALTED"
+        assert engine.position is not None
+        assert engine.position.spot.base_fee_known is False
+        assert engine.position.perp.filled_qty == 0
+        assert not any(order["category"] == "linear" for order in venue.created)
         st = journal.statement()
-        assert st["fees_usd"] == 0.0                     # nothing trusted, nothing invented
-        assert st["fees_unknown"] == 2
+        assert st["fees_usd"] == 0.0
+        assert st["fees_unknown"] == 1
         assert st["fees_confirmed"] is False
         assert st["net_basis"] == "provisional_fees_incomplete"
 
     def test_the_flag_survives_a_restart_through_the_real_store(self, tmp_path):
         """The counter used to live on the Journal object and die with it."""
-        venue, journal, engine = build(absent)
-        open_the_hedge(engine)
+        venue, journal, engine = build(spot_known_perp_unknown)
+        assert open_the_hedge(engine).action == "opened"
         store = StateStore(str(tmp_path / "carry.db"))
         store.save_ledger(journal.to_rows())
         reborn = L.Journal.from_rows(store.load_ledger())
         store.close()
         st = reborn.statement()
-        assert st["fees_unknown"] == 2 and st["fees_confirmed"] is False
+        assert st["fees_unknown"] == 1 and st["fees_confirmed"] is False
         assert reborn.unknown_fees == 2
 
     def test_rows_written_before_fee_provenance_cannot_claim_confirmation(self):

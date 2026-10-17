@@ -329,9 +329,13 @@ class TradingBot:
                 status["position"] = None
             else:
                 status["position"] = {
-                    "spot_qty": position.spot_held_qty,
+                    "spot_qty": (position.spot_held_qty
+                                 if position.spot.base_fee_known else None),
+                    "spot_filled_qty": position.spot.filled_qty,
+                    "spot_qty_known": position.spot.base_fee_known,
                     "perp_short_qty": position.perp.filled_qty,
-                    "net_delta_btc": position.delta_qty,
+                    "net_delta_btc": (position.delta_qty
+                                      if position.spot.base_fee_known else None),
                     "opened_ms": position.opened_ms,
                     "execution_mode": str(getattr(engine, "execution_mode", "")),
                 }
