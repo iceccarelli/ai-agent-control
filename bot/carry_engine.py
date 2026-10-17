@@ -1130,11 +1130,18 @@ class CarryEngine:
                         funding_bps / 1e4) * self.position.perp.filled_qty * mark
                 if funding_bps < 0:
                     self.position.negative_funding_streak += 1
-                    if (self.position.negative_funding_streak
-                            >= NEGATIVE_FUNDING_EXIT_PRINTS):
-                        return self._unwind(mark, "FUNDING_INVERTED")
                 else:
                     self.position.negative_funding_streak = 0
+                # Written down per print (one every eight hours): the booked
+                # funding and the negative streak lived in memory only, so a
+                # restart reset the streak to zero and delayed the inversion
+                # exit by up to two prints of paying funding.
+                failed = self._record()
+                if failed is not None:
+                    return failed
+                if (self.position.negative_funding_streak
+                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
+                    return self._unwind(mark, "FUNDING_INVERTED")
 
             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
                                  state=BookState.HEDGED,
@@ -1423,10 +1430,27 @@ class CarryEngine:
                 "REBALANCE_FAILED",
                 f"delta is {drift:.2%} of book and the correction did not fill")
 
+        perp = position.perp
         if side == "Sell":
-            position.perp.filled_qty += fill.filled_qty
+            # More short: the leg's entry is the quantity-weighted price, which
+            # is what the journal holds and what a restart re-seeds it from.
+            # Without it a restored pair realised its close against the
+            # original entry. The fill's own fee belongs to this leg; an
+            # unknown fee on either side stays unknown, never a partial sum.
+            total = perp.filled_qty + fill.filled_qty
+            perp.avg_price = (perp.avg_price * perp.filled_qty
+                              + fill.avg_price * fill.filled_qty) / total
+            perp.fee = (None if perp.fee is None or fill.fee is None
+                        else perp.fee + fill.fee)
+            perp.taker_qty += fill.taker_qty
+            perp.maker_qty += fill.maker_qty
+            perp.filled_qty = total
         else:
-            position.perp.filled_qty -= fill.filled_qty
+            # Buying back CLOSES part of the short. What remains was sold at
+            # its original price; the closing fill (booked by the broker as a
+            # close, with its own fee) is not blended into that entry.
+            perp.filled_qty -= fill.filled_qty
+        perp.requested_qty = perp.filled_qty
         self.state = BookState.HEDGED
         failed = self._record()
         if failed is not None:
@@ -1855,10 +1879,15 @@ class CarryEngine:
         return self._take(symbol, side, qty, product)
 
     @staticmethod
-    def _accountable(result: Any, qty: float) -> Tuple[float, float, bool]:
+    def _accountable(result: Any, qty: float, *,
+                     allow_over: bool = False) -> Tuple[float, float, bool]:
         """(filled, avg_price, ok) of a broker result. Not ok when the fill is
-        unparseable, non-finite, negative, unpriced, or larger than the order
-        (beyond venue rounding). Partial fills are fine."""
+        unparseable, non-finite, negative, unpriced, or (unless `allow_over`)
+        larger than the order beyond venue rounding. Partial fills are fine.
+
+        `allow_over` is for market legs: a finite, priced fill above the order
+        is real exposure the open paths know how to flatten (the overlay buys
+        the excess back); halting on it would leave that short unrecorded."""
         try:
             filled = float(result.get("filled_qty", 0.0) or 0.0)
             price = float(result.get("avg_price", 0.0) or 0.0)
@@ -1868,7 +1897,7 @@ class CarryEngine:
             return float("nan"), float("nan"), False
         ok = (fee_ok and math.isfinite(filled) and math.isfinite(price)
               and filled >= 0 and price >= 0 and (filled == 0 or price > 0)
-              and filled <= qty * (1.0 + 1e-6) + QTY_DUST)
+              and (allow_over or filled <= qty * (1.0 + 1e-6) + QTY_DUST))
         return filled, price, ok
 
     def _take(self, symbol: str, side: str, qty: float,
@@ -1896,7 +1925,7 @@ class CarryEngine:
         # Every comparison against NaN is False, so a NaN fill sails past
         # `<= 0` and `>= qty` checks downstream and is booked as a hedge. A
         # fill the book cannot account is an order of unknown outcome.
-        filled, price, ok = self._accountable(result, qty)
+        filled, price, ok = self._accountable(result, qty, allow_over=True)
         if not ok:
             self._last_leg_error = f"unaccountable fill: {result!r}"
             self._halt(

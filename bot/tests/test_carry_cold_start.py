@@ -593,3 +593,46 @@ class TestAnAcquireOpenInterruptedAfterTheSpotBuyIsNotAFlatBook:
         d = plan_cold_start(ledger={"book_state": state, "position": None},
                             venue_perp_qty=0.0, venue_spot_qty=5.0)
         assert d.action is ColdStart.HALT
+
+
+class TestHeldFundingSurvivesARestart:
+    """Booked funding and the negative-funding streak were memory only: a
+    restart reset the streak to 0 and delayed the FUNDING_INVERTED exit."""
+
+    def _print(self, e, k, bps):
+        return e.on_candle(mark=MARK, funding_bps=bps, spot=MARK,
+                           funding_print_ms=k * H8, timestamp_ms=k * H8)
+
+    def test_every_held_print_is_written_down(self):
+        saved = []
+        e = opened(Venue(inventory=5.0), persist=lambda s: saved.append(s))
+        self._print(e, 4, 2.0)
+        collected = saved[-1]["position"]["funding_collected"]
+        assert collected == pytest.approx(2.0 / 1e4 * 0.001 * MARK)
+        self._print(e, 5, -1.0)
+        assert saved[-1]["position"]["negative_funding_streak"] == 1
+        assert saved[-1]["position"]["funding_collected"] == pytest.approx(
+            collected - 1.0 / 1e4 * 0.001 * MARK)
+
+    def test_two_negative_prints_then_a_restart_still_exit_on_the_third(self):
+        saved = []
+        e = opened(Venue(inventory=5.0), persist=lambda s: saved.append(s))
+        self._print(e, 4, -1.0)
+        self._print(e, 5, -1.0)
+        venue = Venue(inventory=5.0, perp=0.001)
+        again = engine(venue, persist=lambda s: None)
+        again.cold_start(ledger=saved[-1], venue_perp_qty=0.001,
+                         venue_spot_qty=5.0, open_orders=())
+        assert again.position.negative_funding_streak == 2
+        d = self._print(again, 6, -1.0)
+        assert d.action == "unwound" and d.reason == "FUNDING_INVERTED"
+
+    def test_a_ledger_that_cannot_be_written_halts_on_the_print(self):
+        e = opened(Venue(inventory=5.0), persist=lambda s: None)
+
+        def broken(_s):
+            raise OSError("disk full")
+
+        e.persist = broken
+        d = self._print(e, 4, 2.0)
+        assert d.state is BookState.HALTED
