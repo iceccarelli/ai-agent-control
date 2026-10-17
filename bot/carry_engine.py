@@ -340,6 +340,21 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
             detail={"problem": problem, "venue_perp_qty": perp,
                     "venue_spot_qty": spot})
 
+    # A carry pair only neutralises price risk when both legs refer to the
+    # same underlying market. Entry economics already refuses unlike symbols;
+    # a persisted pair must not bypass that rule on restart.
+    if (expected_spot_symbol is not None
+            and expected_perp_symbol is not None
+            and expected_spot_symbol != expected_perp_symbol):
+        return ColdStartDecision(
+            ColdStart.HALT,
+            f"configured spot symbol {expected_spot_symbol!r} differs from "
+            f"configured perp symbol {expected_perp_symbol!r}; these markets "
+            "cannot form a carry hedge",
+            naked_side="unknown",
+            detail={"expected_spot_symbol": expected_spot_symbol,
+                    "expected_perp_symbol": expected_perp_symbol})
+
     # Quantity agreement is not enough: a BTC hedge cannot be resumed as an
     # ETH pair merely because both legs happen to have the same quantities.
     # Compare identity with the engine's configured markets before restoring
