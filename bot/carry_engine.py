@@ -1872,10 +1872,15 @@ class CarryEngine:
         return self._take(symbol, side, qty, product)
 
     @staticmethod
-    def _accountable(result: Any, qty: float) -> Tuple[float, float, bool]:
+    def _accountable(result: Any, qty: float, *,
+                     allow_over: bool = False) -> Tuple[float, float, bool]:
         """(filled, avg_price, ok) of a broker result. Not ok when the fill is
-        unparseable, non-finite, negative, unpriced, or larger than the order
-        (beyond venue rounding). Partial fills are fine."""
+        unparseable, non-finite, negative, unpriced, or (unless `allow_over`)
+        larger than the order beyond venue rounding. Partial fills are fine.
+
+        `allow_over` is for market legs: a finite, priced fill above the order
+        is real exposure the open paths know how to flatten (the overlay buys
+        the excess back); halting on it would leave that short unrecorded."""
         try:
             filled = float(result.get("filled_qty", 0.0) or 0.0)
             price = float(result.get("avg_price", 0.0) or 0.0)
@@ -1885,7 +1890,7 @@ class CarryEngine:
             return float("nan"), float("nan"), False
         ok = (fee_ok and math.isfinite(filled) and math.isfinite(price)
               and filled >= 0 and price >= 0 and (filled == 0 or price > 0)
-              and filled <= qty * (1.0 + 1e-6) + QTY_DUST)
+              and (allow_over or filled <= qty * (1.0 + 1e-6) + QTY_DUST))
         return filled, price, ok
 
     def _take(self, symbol: str, side: str, qty: float,
@@ -1913,7 +1918,7 @@ class CarryEngine:
         # Every comparison against NaN is False, so a NaN fill sails past
         # `<= 0` and `>= qty` checks downstream and is booked as a hedge. A
         # fill the book cannot account is an order of unknown outcome.
-        filled, price, ok = self._accountable(result, qty)
+        filled, price, ok = self._accountable(result, qty, allow_over=True)
         if not ok:
             self._last_leg_error = f"unaccountable fill: {result!r}"
             self._halt(
