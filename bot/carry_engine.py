@@ -591,14 +591,18 @@ class CarryEngine:
         else:
             self.position = None
             self.state = BookState.FLAT
-        last = state.get("last_print_ms")
-        rates = [float(x) for x in state.get("funding_history", [])][
-            -self.FUNDING_HISTORY:]
+        last = self._restored_stamp(state.get("last_print_ms"))
+        rates = self._restored_rates(state.get("funding_history", []))
         self._restore_allowance(state.get("entry_days"))
         recorded = state.get("perp_symbol")
         foreign = (recorded != self.perp_symbol if recorded is not None
                    else self.perp_symbol not in self.FUNDING_8H_PROVEN)
-        if rates and (last is None or foreign):
+        if rates is None:
+            logger.warning(
+                "carry: discarding the restored funding history: it holds a "
+                "value that is not a finite rate, so which settlements it "
+                "covers is unknowable")
+        elif rates and (last is None or foreign):
             # Rates whose age is unknowable (no stamp of the newest), or that
             # were observed on another market (or a legacy record on a symbol
             # nothing proves it came from): not a history for THIS book. Leave
@@ -608,8 +612,34 @@ class CarryEngine:
                 "recorded for " + str(recorded) if foreign
                 else "no last-print stamp")
         else:
-            self._last_print_ms = None if last is None else int(last)
+            self._last_print_ms = last
             self._funding_history = rates
+
+    @classmethod
+    def _restored_rates(cls, raw: Any) -> Optional[List[float]]:
+        """The persisted history as floats, or None if ANY entry is untrustworthy.
+
+        The EWMA skips non-finite values, so a NaN left in the list reads as
+        "fewer prints" while the surviving rich ones, however old, still pass
+        the three-print minimum with no contiguity: a hole is not a smaller
+        history, it is a history that cannot be placed in time.
+        """
+        if not isinstance(raw, (list, tuple)):
+            return None if raw else []
+        rates: List[float] = []
+        for item in raw:
+            if isinstance(item, bool) or not isinstance(item, (int, float)) \
+                    or not math.isfinite(item):
+                return None
+            rates.append(float(item))
+        return rates[-cls.FUNDING_HISTORY:]
+
+    @staticmethod
+    def _restored_stamp(raw: Any) -> Optional[int]:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) \
+                or not math.isfinite(raw) or raw <= 0:
+            return None
+        return int(raw)
 
     def _reseed_cost_basis(self) -> None:
         """Hand the restored legs' entry prices to a broker that books P&L.

@@ -215,3 +215,53 @@ def test_legacy_state_without_a_symbol_is_accepted_only_for_a_proven_symbol():
                       execution_mode="acquire", persist=lambda s: None)
     btc.restore(legacy)
     assert btc._funding_history == [RICH] * 4
+
+
+# -- a persisted history that cannot be trusted is not restored ---------------
+
+import math  # noqa: E402
+
+import pytest  # noqa: E402
+
+NAN = float("nan")
+
+
+def economics(e):
+    return e.entry_economics(mark=MARK, spot=MARK, funding_bps=FRESH)
+
+
+def test_control_clean_rich_history_is_eligible_through_the_entry_gate():
+    e = engine([RICH] * 4, 4 * H8)
+    assert economics(e).refusal is None          # the fixture CAN approve
+
+
+@pytest.mark.parametrize("history", [
+    [RICH] * 3 + [NAN] * 5,                # three stale prints, five holes
+    [RICH] * 3 + [NAN] * 4 + [RICH],
+    [NAN, NAN, RICH, RICH, RICH],
+    [RICH, float("inf"), RICH, RICH],
+    [RICH, "x", RICH, RICH],               # unparseable
+    [RICH, None, RICH, RICH],
+    [RICH, True, RICH, RICH],
+    [RICH, "10", RICH, RICH],              # a string is not a recorded rate
+])
+def test_untrustworthy_restored_history_cannot_authorise_entry(history):
+    e = engine(history, 4 * H8)                  # must not raise either
+    assert e._funding_history == []
+    refusal = economics(e).refusal
+    assert refusal is not None and refusal.reason == INSUFFICIENT
+
+
+@pytest.mark.parametrize("stamp", [NAN, float("inf"), "x", True, 0, -1])
+def test_unreadable_last_print_stamp_discards_the_history(stamp):
+    e = engine([RICH] * 4, stamp)
+    assert e._funding_history == [] and e._last_print_ms is None
+    assert economics(e).refusal.reason == INSUFFICIENT
+
+
+def test_discarded_history_requires_fresh_contiguous_prints_again():
+    e = engine([RICH] * 3 + [NAN] * 5, 4 * H8)
+    assert tick(e, 5 * H8).reason == INSUFFICIENT
+    assert tick(e, 6 * H8).reason == INSUFFICIENT
+    assert e._funding_history == [FRESH, FRESH]
+    assert all(math.isfinite(x) for x in e._funding_history)
