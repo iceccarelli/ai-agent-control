@@ -18,7 +18,7 @@ sys.path.insert(0, HERE)
 from bybit_connection import BybitAPIError, TransientAPIError  # noqa: E402
 import pytest  # noqa: E402
 from carry_engine import BookState  # noqa: E402
-from persistence import StateStore  # noqa: E402
+from persistence import PersistenceError, StateStore  # noqa: E402
 from test_carry_fee_truth import build, modern  # noqa: E402
 from test_carry_funding_truth import make_bot, tick  # noqa: E402
 
@@ -52,6 +52,22 @@ class TestHeldPairIsMonitoredThroughBrakes:
     def test_an_unreadable_equity_does_not_skip_the_margin_exit(self, tmp_path):
         venue, journal, engine, bot = _hedged(tmp_path)
         bot.client.get_equity.side_effect = BybitAPIError("down")
+        venue.im, venue.mm = 1.1, 1.0
+        tick(bot, 4)
+        assert engine.position is None
+
+    @pytest.mark.parametrize("fail", ["store", "wallet"])
+    def test_an_equity_step_that_is_not_an_api_error_does_not_skip_the_exit(
+            self, tmp_path, fail):
+        """The equity step writes the store and parses the wallet: a full disk
+        (PersistenceError) or a malformed field (ValueError) escaped tick()
+        before the carry block and left the held short unmonitored."""
+        venue, journal, engine, bot = _hedged(tmp_path)
+        if fail == "store":
+            bot.risk.update_equity.side_effect = PersistenceError(
+                "state write failed: disk full")
+        else:
+            bot.client.get_equity.side_effect = ValueError("not a float")
         venue.im, venue.mm = 1.1, 1.0
         tick(bot, 4)
         assert engine.position is None

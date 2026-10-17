@@ -802,8 +802,12 @@ class TradingBot:
         try:
             equity = self.client.get_equity()
             self.risk.update_equity(equity)
-        except BybitAPIError as exc:
-            logger.error("equity unreadable this cycle: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            # Not only BybitAPIError: the equity step also writes the store
+            # (PersistenceError: disk full, locked file) and parses the wallet
+            # (ValueError). None of those may skip the held pair's checks.
+            logger.error("equity unreadable this cycle (%s: %s)",
+                         type(exc).__name__, exc)
             if not carry_pair_held:
                 return
 
