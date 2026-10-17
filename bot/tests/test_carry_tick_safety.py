@@ -99,12 +99,13 @@ class TestTheVenueIsTheSourceOfTruthForTheShort:
     def test_a_venue_position_that_differs_from_the_book_halts(self, tmp_path):
         venue, journal, engine, bot = _hedged(tmp_path)
         before = len(venue.created)
+        recorded_short = engine.position.perp.filled_qty
         venue.perp_qty = 0.6                    # someone/something cut the short
         tick(bot, 4)
         assert engine.state is BookState.HALTED
         assert len(venue.created) == before, "a correction was sent on a guess"
         assert engine.position is not None, "the ledger was rewritten to match"
-        assert engine.position.perp.filled_qty == pytest.approx(1.0)
+        assert engine.position.perp.filled_qty == pytest.approx(recorded_short)
 
     def test_an_unreadable_venue_position_halts(self, tmp_path):
         venue, journal, engine, bot = _hedged(tmp_path)
@@ -170,9 +171,9 @@ class TestTheOperatorCanSeeTheBook:
         assert status["attached"] is True and status["book_state"] == "HEDGED"
         assert status["environment"]["testnet"] is True
         pos = status["position"]
-        assert pos["spot_qty"] == pytest.approx(1.0)
-        assert pos["perp_short_qty"] == pytest.approx(1.0)
-        assert pos["net_delta_btc"] == pytest.approx(0.0)
+        assert pos["spot_qty"] == pytest.approx(engine.position.spot_held_qty)
+        assert pos["perp_short_qty"] == pytest.approx(engine.position.perp.filled_qty)
+        assert pos["net_delta_btc"] == pytest.approx(engine.position.delta_qty)
         assert status["protective_stop"] == "NOT_APPLICABLE_DELTA_NEUTRAL"
         assert status["market"]["margin_multiple"] is not None
         acct = status["accounting"]
@@ -234,7 +235,7 @@ class TestRestartWithAnOpenPositionThroughTheRealStartupPath:
         store.close()
         return venue
 
-    def _second_process(self, tmp_path, *, perp_qty=1.0, btc=1.0):
+    def _second_process(self, tmp_path, *, perp_qty=0.999, btc=0.999):
         venue2, journal2, engine2 = build(modern)
         venue2.perp_qty = perp_qty
         real = venue2._request
@@ -258,7 +259,7 @@ class TestRestartWithAnOpenPositionThroughTheRealStartupPath:
         venue2, engine2, bot2 = self._second_process(tmp_path)
         assert bot2.carry_cold_start() is True
         assert engine2.position is not None
-        assert engine2.position.perp.filled_qty == pytest.approx(1.0)
+        assert engine2.position.perp.filled_qty == pytest.approx(venue2.perp_qty)
         tick(bot2, 4)
         assert venue2.created == [], "the restarted book opened a second pair"
 

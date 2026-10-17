@@ -30,9 +30,17 @@ from test_carry_fee_truth import H8, build, modern, open_the_hedge  # noqa: E402
 ENTRY = 100_000.0
 
 
+def cost_basis_fees(product, side, filled):
+    if product == "spot" and side == "Buy":
+        # This suite isolates perp entry/exit basis; use a reported quote-currency
+        # spot fee so quantity remains unchanged and tests exercise one variable.
+        return {"cumExecFee": "0", "cumFeeDetail": {"USDT": "0"}}
+    return modern(product, side, filled)
+
+
 def opened_with_perp_fill_ratio(ratio):
     """Open the hedge, but let the venue fill only `ratio` of the perp order."""
-    venue, journal, engine = build(modern)
+    venue, journal, engine = build(cost_basis_fees)
     real = venue._request
     state = {"done": False}
 
@@ -54,7 +62,7 @@ def opened_with_perp_fill_ratio(ratio):
 def oversized_perp(monkeypatch):
     """A short larger than its spot: the venue and the journal both hold 1.0
     perp against 0.97 spot (e.g. spot was reduced), so the correction is a BUY."""
-    venue, journal, engine = build(modern)
+    venue, journal, engine = build(cost_basis_fees)
     assert open_the_hedge(engine).action == "opened"
     engine.position.spot.filled_qty = 0.97
     engine.position.spot.requested_qty = 0.97
@@ -70,7 +78,7 @@ def rebalance_at(engine, venue, price, monkeypatch):
 
 
 def restored(state):
-    _venue, _journal, fresh = build(modern)
+    _venue, _journal, fresh = build(cost_basis_fees)
     fresh.restore(state)
     return fresh
 

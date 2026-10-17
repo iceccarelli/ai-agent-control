@@ -329,7 +329,7 @@ class TradingBot:
                 status["position"] = None
             else:
                 status["position"] = {
-                    "spot_qty": position.spot.filled_qty,
+                    "spot_qty": position.spot_held_qty,
                     "perp_short_qty": position.perp.filled_qty,
                     "net_delta_btc": position.delta_qty,
                     "opened_ms": position.opened_ms,

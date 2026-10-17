@@ -44,9 +44,10 @@ def acquired(row):
 
 
 def cold(state, venue_spot, mode=ACQUIRE):
-    fresh = engine(Venue(perp=0.001), mode=mode)
+    venue_perp = float(state["position"]["perp"]["filled_qty"])
+    fresh = engine(Venue(perp=venue_perp), mode=mode)
     return fresh.cold_start(ledger=json.loads(json.dumps(state)),
-                            venue_perp_qty=0.001, venue_spot_qty=venue_spot,
+                            venue_perp_qty=venue_perp, venue_spot_qty=venue_spot,
                             open_orders=())
 
 

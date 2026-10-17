@@ -50,6 +50,10 @@ class FeeVenue(FakeClient):
     """
 
     def __init__(self, fees, post_only=None, **kw):
+        # Trade-path tests start flat and derive position from actual fills.
+        # The old fixture started at 1 BTC and never applied order deltas, which
+        # accidentally made the old gross-spot hedge look correct forever.
+        kw.setdefault("perp_qty", 0.0)
         super().__init__(**kw)
         self._fees = fees
         self._post_only = post_only      # (first_fill, final_fill) or None
@@ -80,6 +84,10 @@ class FeeVenue(FakeClient):
                        "cumExecQty": body["qty"], "avgPrice": str(MARK),
                        "_cat": body["category"], "_side": body["side"]}
                 row.update(self._fees(body["category"], body["side"], qty))
+            if body["category"] == "linear":
+                applied = float(row["cumExecQty"])
+                self.perp_qty += applied if body["side"] == "Sell" else -applied
+                row["_position_qty_applied"] = applied
             self.orders[link] = row
             return envelope({"orderId": f"id-{link}", "orderLinkId": link})
         if endpoint == "/v5/order/cancel":
@@ -87,6 +95,13 @@ class FeeVenue(FakeClient):
             row = self.orders[body["orderLinkId"]]
             _first, final = self._post_only
             row.update({"orderStatus": "Cancelled", "cumExecQty": str(final)})
+            # Position size follows the CUMULATIVE fill: apply only the increment
+            # since the partial fill already applied on post-only create.
+            if row.get("_cat") == "linear":
+                previous = float(row.get("_position_qty_applied", 0.0))
+                delta = float(final) - previous
+                self.perp_qty += delta if row["_side"] == "Sell" else -delta
+                row["_position_qty_applied"] = float(final)
             # the read-back REPLACES the fee fields (absent means absent)
             for key in ("cumExecFee", "cumFeeDetail", "feeCurrency"):
                 row.pop(key, None)
