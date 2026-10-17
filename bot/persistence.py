@@ -1051,9 +1051,15 @@ class StateStore:
         rows = self._query("SELECT * FROM carry_position WHERE id = 1")
         if not rows:
             return None
-        raw = str(rows[0]["payload"] or "")
-        if not raw:
-            return None
+        # The row EXISTS, so a book has run here. A payload that is empty,
+        # blank or not text is a lost ledger, never a first run: returning
+        # None would hand a fresh installation's full entry allowance to a
+        # database that has already traded.
+        raw = rows[0]["payload"]
+        if not isinstance(raw, str) or not raw.strip():
+            raise PersistenceError(
+                "carry_position row exists but its payload is empty or not "
+                f"text ({type(raw).__name__}); the ledger is lost, not absent")
         try:
             state = json.loads(raw)
         except json.JSONDecodeError as exc:

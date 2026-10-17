@@ -188,6 +188,35 @@ class TestTheStoreKeepsIt:
                                        "position": {"n": i}})
         assert store.load_carry_position()["position"] == {"n": 2}
 
+    @pytest.mark.parametrize("payload", ["", "   ", "\n\t", b"", b"{}", 7,
+                                         "not json", "[]"])
+    def test_an_existing_row_with_an_unusable_payload_is_not_a_first_run(
+            self, store, payload):
+        from persistence import PersistenceError
+        store.save_carry_position({"book_state": "FLAT", "position": None})
+        with store._lock:
+            store._conn.execute("UPDATE carry_position SET payload = ?",
+                                (payload,))
+            store._conn.commit()
+        with pytest.raises(PersistenceError):
+            store.load_carry_position()
+
+    def test_the_process_refuses_to_start_on_a_blanked_ledger_row(self, store):
+        venue = Venue()
+        store.save_carry_position({"book_state": "FLAT", "position": None})
+        with store._lock:
+            store._conn.execute("UPDATE carry_position SET payload = ''")
+            store._conn.commit()
+        bot = _main.TradingBot.__new__(_main.TradingBot)
+        bot.store = store
+        bot.symbols = ["BTCUSDT"]
+        bot.carry = CarryEngine(broker=venue, max_notional_usd=100.0,
+                                borrow_apr=0.0, execution_mode=OVERLAY,
+                                persist=store.save_carry_position)
+        bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
+        assert bot.carry_cold_start() is False
+        assert venue.orders == []
+
 
 class TestTheColdStartPlan:
     LEDGER = {"book_state": "HEDGED", "execution_mode": OVERLAY,

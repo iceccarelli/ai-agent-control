@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from carry_engine import CarryEngine  # noqa: E402
 from carry_risk import CarryRisk  # noqa: E402
 from market_snapshot import MarketSnapshot  # noqa: E402
-from persistence import StateStore  # noqa: E402
+from persistence import PersistenceError, StateStore  # noqa: E402
 
 NOON = dt.datetime(2026, 10, 15, 12, 0, tzinfo=dt.timezone.utc)
 TOMORROW = NOON + dt.timedelta(days=1)
@@ -85,6 +85,14 @@ def test_the_fail_closed_day_ends_at_the_utc_day_boundary():
     e = engine()
     flat_cold_start(e, flat_ledger())
     assert gate(e, TOMORROW).ok
+
+
+def test_an_existing_empty_carry_payload_is_corruption_not_a_fresh_install(tmp_path):
+    store = StateStore(str(tmp_path / "state.db"))
+    store.save_carry_position(flat_ledger())
+    store._exec("UPDATE carry_position SET payload = '' WHERE id = 1")
+    with pytest.raises(PersistenceError, match="payload is empty"):
+        store.load_carry_position()
 
 
 # -- missing and malformed records --------------------------------------------
