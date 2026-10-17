@@ -415,3 +415,23 @@ class TestSingleSourceOfTruth:
                        "technical_analysis", "performance_analytics",
                        "main", "backtest"):
             importlib.import_module(module)
+
+
+@pytest.mark.parametrize("key", ["USE_TESTNET", "PAPER_TRADING"])
+@pytest.mark.parametrize("typo", ["ture", "flase", "banana", "2", "tru"])
+def test_a_mistyped_sandbox_flag_is_refused_not_read_as_live(key, typo):
+    """`parse_bool` reads every unrecognised token as False; for these two keys
+    False is the LIVE side, so one typo moved the process toward mainnet."""
+    with pytest.raises(config_module.ConfigError):
+        config_module.load({key: typo})
+
+
+@pytest.mark.parametrize("key", ["USE_TESTNET", "PAPER_TRADING"])
+@pytest.mark.parametrize("token,expected", [
+    ("1", True), ("true", True), ("YES", True), ("on", True),
+    ("0", False), ("false", False), ("No", False), ("off", False),
+    ("", True),                 # blank keeps the sandbox default
+])
+def test_recognised_sandbox_flag_tokens_are_still_honoured(key, token, expected):
+    cfg = config_module.load({key: token})
+    assert getattr(cfg, key) is expected

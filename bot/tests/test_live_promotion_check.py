@@ -161,3 +161,36 @@ def test_identity_check_is_negative_only(monkeypatch):
     assert promotion_gate.strategy_is_the_cleared_signal(NamedStrategy())[0] is True
     # a True here is NOT live: the gate's own predicate still refuses on this tree
     assert promotion_gate.promotion_gate_allows_live() is False
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no", "off", 1, 0, {}, [],
+                                   None])
+def test_only_a_real_json_true_marks_a_human_item_complete(value, tmp_path):
+    """`bool()` of the string "false" is True: a hand-edited gate file whose
+    human-owned items said "complete": "false" used to read as approval."""
+    import json
+
+    import promotion_gate as pg
+    keys = [i.key for i in pg.evaluate_promotion_gate(
+        path=str(tmp_path / "missing.json")).items]
+    gate = tmp_path / "gate.json"
+    gate.write_text(json.dumps(
+        {"checklist": {k: {"complete": value, "evidence": "x"} for k in keys}}))
+    verdict = pg.evaluate_promotion_gate(path=str(gate))
+    declared = [i for i in verdict.items if i.evidence == "x"]
+    assert declared, "no item read the declared value"
+    assert not any(i.complete for i in declared)
+    assert verdict.allows_live is False
+
+
+def test_a_real_json_true_still_marks_a_human_item_complete(tmp_path):
+    import json
+
+    import promotion_gate as pg
+    keys = [i.key for i in pg.evaluate_promotion_gate(
+        path=str(tmp_path / "missing.json")).items]
+    gate = tmp_path / "gate.json"
+    gate.write_text(json.dumps(
+        {"checklist": {k: {"complete": True, "evidence": "x"} for k in keys}}))
+    verdict = pg.evaluate_promotion_gate(path=str(gate))
+    assert any(i.complete and i.evidence == "x" for i in verdict.items)

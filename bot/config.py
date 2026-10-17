@@ -114,6 +114,29 @@ def parse_bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in _TRUE_TOKENS
 
 
+_FALSE_TOKENS = frozenset({"0", "false", "f", "no", "n", "off"})
+
+
+def parse_safety_bool(value: Any, name: str, default: bool) -> bool:
+    """A flag that decides sandbox vs live. Blank takes `default`; a recognised
+    true or false token is honoured; ANYTHING ELSE raises. `parse_bool` reads
+    every unrecognised token as False, which for USE_TESTNET / PAPER_TRADING is
+    the LIVE side: a typo like "ture" or "flase" moved the process toward
+    mainnet with no warning."""
+    if value is None or str(value).strip() == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    token = str(value).strip().lower()
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    raise ConfigError(
+        f"{name}={value!r} is not a recognised boolean. Refusing rather than "
+        "reading it as False: this flag decides sandbox versus live.")
+
+
 def parse_pct(env: Mapping[str, str], name: str, default: float) -> float:
     """A fraction in [0, 1]. A percent-style value is REJECTED, not rescaled."""
     raw = env.get(name)
@@ -259,7 +282,7 @@ def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
     raw = env.get("BYBIT_VENUE")
     stated = env.get("USE_TESTNET")
     if raw is None or str(raw).strip() == "":
-        sandbox = parse_bool(stated, True)
+        sandbox = parse_safety_bool(stated, "USE_TESTNET", True)
         return ("testnet" if sandbox else "mainnet"), sandbox
     venue = str(raw).strip().lower()
     if venue not in BYBIT_VENUES:
@@ -269,7 +292,7 @@ def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
             "authenticate against.")
     sandbox = venue != "mainnet"
     if stated is not None and str(stated).strip() != "":
-        if parse_bool(stated, True) != sandbox:
+        if parse_safety_bool(stated, "USE_TESTNET", True) != sandbox:
             raise ConfigError(
                 f"BYBIT_VENUE={venue!r} and USE_TESTNET={stated!r} disagree "
                 "about whether this is a sandbox. Set one of them, not both: "
@@ -704,7 +727,8 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
     env = os.environ if env is None else env
 
     venue, use_testnet = parse_venue(env)
-    paper_trading = parse_bool(env.get("PAPER_TRADING"), True)
+    paper_trading = parse_safety_bool(env.get("PAPER_TRADING"),
+                                      "PAPER_TRADING", True)
     ack = parse_str(env, "LIVE_TRADING_ACK")
     api_key = parse_str(env, "BYBIT_API_KEY")
     api_secret = parse_str(env, "BYBIT_API_SECRET")
