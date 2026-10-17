@@ -1557,6 +1557,20 @@ class CarryEngine:
         return CarryDecision("halted", reason=reason, state=BookState.HALTED,
                              detail={"error": self._last_leg_error})
 
+    def _spot_sellable(self, qty: float) -> float:
+        """`qty` of spot rounded DOWN to the venue's spot lot. The wallet holds
+        the BUY net of a base-coin fee (e.g. 0.0009988), which can carry more
+        decimals than the spot basePrecision; selling it as-is is a rejection
+        and leaves a naked leg. Flooring can only sell less, never more. If the
+        lot rules cannot be read the quantity is sent unchanged (the venue's
+        own answer, and the failure paths record the exposure)."""
+        try:
+            step = float(self.broker.get_lot_rules(
+                self.spot_symbol, "spot").get("qty_step", 0.0))
+        except Exception:  # noqa: BLE001
+            return qty
+        return snap_to_lot(qty, step) if self._finite(step) else qty
+
     def _venue_short_qty(self) -> float:
         """The perp short the venue reports, or 0.0 when it cannot be read or
         the broker has no such read (the per-tick size check halts on those)."""
@@ -1633,9 +1647,15 @@ class CarryEngine:
         # half-closed short against a fully sold spot is a naked short.
         closed_fraction = min(1.0, perp.filled_qty / book_perp) \
             if book_perp > 0 else 1.0
-        sell_spot = (wanted_spot if closed_fraction >= 1.0 - 1e-9
-                     else wanted_spot * closed_fraction)
-        spot = self._fire(self.spot_symbol, "Sell", sell_spot, "spot")
+        # Sell what the venue can take: the net-of-fee balance floored to the
+        # spot lot. The sub-lot remainder is dust no order can move.
+        wanted_spot = self._spot_sellable(wanted_spot)
+        sell_spot = self._spot_sellable(
+            wanted_spot if closed_fraction >= 1.0 - 1e-9
+            else wanted_spot * closed_fraction)
+        spot = (self._fire(self.spot_symbol, "Sell", sell_spot, "spot")
+                if sell_spot > 0 else Leg(symbol=self.spot_symbol, side="Sell",
+                                          product="spot"))
         if spot is None:
             spot_left = wanted_spot
             return self._partial_close(
@@ -1707,7 +1727,8 @@ class CarryEngine:
                 f"{reason}; the perp order's outcome is unknown and "
                 f"{spot.filled_qty:.10g} spot is held. NOT unwound.")
         self.state = BookState.UNWINDING
-        wanted = max(0.0, spot.filled_qty - spot.fee_base_qty)   # held, net
+        wanted = self._spot_sellable(
+            max(0.0, spot.filled_qty - spot.fee_base_qty))   # held, net, on-lot
         closed = self._fire(self.spot_symbol, "Sell", wanted, "spot")
         if closed is None or closed.filled_qty <= 0:
             # The spot is still held and still naked: write it down so the

@@ -123,6 +123,9 @@ class Venue:
         return MARK
 
     def get_lot_rules(self, symbol, product):
+        if product == "spot":
+            # Bybit BTC spot basePrecision, not the linear 0.001 lot.
+            return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 5.0}
         return dict(STEP)
 
     def get_fee_rates(self, symbol, product):

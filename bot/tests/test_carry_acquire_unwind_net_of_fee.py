@@ -135,3 +135,51 @@ def test_a_failed_perp_leg_sells_the_naked_spot_net_of_the_fee_too():
                 funding_print_ms=3 * H8, timestamp_ms=3 * H8)
     assert v.wallet == pytest.approx(0.0, abs=1e-12), (
         "a spot long was left unhedged and unsold")
+
+
+class OnStepSpotVenue(WalletVenue):
+    """The venue refuses a spot quantity that is not a multiple of the spot
+    basePrecision (1e-6): `170137 too many decimals`."""
+
+    def place_market(self, *, symbol, side, qty, product):
+        from decimal import Decimal
+        if product == "spot" and Decimal(repr(qty)) % Decimal("0.000001") != 0:
+            raise RuntimeError("170137 Order quantity has too many decimals")
+        return super().place_market(symbol=symbol, side=side, qty=qty,
+                                    product=product)
+
+
+def test_a_fee_net_spot_sale_is_floored_to_the_spot_lot():
+    """A 1.2e-6 BTC fee leaves a 7-decimal balance (0.0009988). Selling it
+    as-is is a rejection AFTER the perp was bought back: a naked spot long."""
+    v, e = run_with(OnStepSpotVenue, {"cumFeeDetail": {"BTC": "0.0000012"}})
+    assert e.state is BookState.FLAT
+    assert v.wallet < 1e-6                     # only sub-lot dust is left
+    sells = [q for side, product, q in v.orders
+             if product == "spot" and side == "Sell"]
+    assert sells and sells[-1] == pytest.approx(0.000998)
+
+
+def test_an_emergency_spot_sale_is_floored_to_the_spot_lot_too():
+    class PerpRejected(OnStepSpotVenue):
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "linear":
+                return None
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+
+    v = PerpRejected({"cumFeeDetail": {"BTC": "0.0000012"}})
+    e = engine(v, mode=ACQUIRE)
+    e.on_candle(mark=100_000.0, funding_bps=3.0, spot=100_000.0,
+                funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+    assert e.state is BookState.FLAT
+    assert v.wallet < 1e-6
+
+
+def run_with(venue_cls, row):
+    v, e, d = open_once(row, venue_cls=venue_cls)
+    assert d.action == "opened", d.reason
+    for k in (4, 5, 6):
+        e.on_candle(mark=100_000.0, funding_bps=-0.5, spot=100_000.0,
+                    funding_print_ms=k * H8, timestamp_ms=k * H8)
+    return v, e
