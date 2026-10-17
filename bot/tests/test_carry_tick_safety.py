@@ -631,3 +631,18 @@ def test_a_spot_balance_that_accrues_between_the_cold_start_reads_still_starts(
     balances = iter([1.0, 1.0 + 1e-9 * 5])      # interest-sized drift
     bot.carry.broker.get_spot_inventory = lambda symbol: next(balances)
     assert bot.carry_cold_start() is True
+
+
+def test_an_orphan_that_the_confirming_read_could_not_confirm_does_not_halt(tmp_path):
+    """A stale first reading followed by a failing second read halted a book
+    that was really flat (31 cases in the fault campaign). Unconfirmed is not an
+    orphan: the check is skipped this tick and made again on the next."""
+    venue, journal, engine, bot = _flat(tmp_path)
+    bot.CARRY_ORPHAN_REREAD_S = 0
+    venue.perp_qty = 0.001                       # the snapshot's stale read
+
+    def timeout(symbol):
+        raise TimeoutError("position read timed out")
+    bot.carry.broker.get_perp_position = timeout
+    _tick_seeing_the_venue(bot, venue, 1)
+    assert engine.state is not BookState.HALTED

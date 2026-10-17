@@ -984,14 +984,19 @@ class TradingBot:
                 # position list can still show the size of a hedge the engine
                 # closed a moment ago (an overlay inventory exit never re-reads
                 # the venue): look again after a pause and halt only on two
-                # reads that agree. Unreadable the second time = keep the first.
+                # reads that agree. An unreadable second read skips the check this tick.
                 time.sleep(self.CARRY_ORPHAN_REREAD_S)
                 try:
                     perp_held = float(self.carry.broker.get_perp_position(
                         self.carry.perp_symbol))
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("carry: orphan re-read failed (%s); "
-                                   "keeping the first read", exc)
+                    # One stale reading cannot halt a book on its own and the
+                    # confirming read failed: unconfirmed is not an orphan. Skip
+                    # the check this tick; the next tick reads again, so a real
+                    # orphan is delayed by one tick, never missed.
+                    logger.warning("carry: orphan re-read failed (%s); the "
+                                   "check is skipped this tick", exc)
+                    perp_held = None
             orphan = self.carry.check_venue_flat_while_flat(perp_held)
             if orphan is not None:
                 self._last_carry_decision = {
