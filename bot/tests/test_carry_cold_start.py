@@ -220,8 +220,13 @@ class TestTheStoreKeepsIt:
 
 class TestTheColdStartPlan:
     LEDGER = {"book_state": "HEDGED", "execution_mode": OVERLAY,
-              "position": {"perp": {"filled_qty": 0.001},
-                           "spot": {"filled_qty": 0.001}}}
+              "position": {
+                  "perp": {"symbol": "BTCUSDT", "side": "Sell",
+                           "product": "linear", "requested_qty": 0.001,
+                           "filled_qty": 0.001, "avg_price": MARK},
+                  "spot": {"symbol": "BTCUSDT", "side": "Hold",
+                           "product": "spot", "requested_qty": 0.001,
+                           "filled_qty": 0.001, "avg_price": MARK}}}
 
     def plan(self, **kw):
         base = dict(ledger=None, venue_perp_qty=0.0, venue_spot_qty=5.0,
@@ -369,3 +374,101 @@ class TestTheProcessRefusesToStartOnAMismatch:
         body = inspect.getsource(_main.TradingBot.startup)
         assert "carry_cold_start" in body
         assert body.index("carry_cold_start") < body.index("self.engine.reconcile")
+
+
+class TestAPersistedPositionThatCannotBeTrustedHaltsTheStart:
+    """NaN "agrees" with the venue (every comparison is False), abs() hides a
+    negative short, True is 1.0 and text used to raise out of startup. None of
+    them may resume as a hedge; all of them take the existing HALT path."""
+
+    @staticmethod
+    def _ledger(venue, **leg_edits):
+        led = opened(venue).to_state()
+        for path, value in leg_edits.items():
+            role, key = path.split("__")
+            if role == "pos":
+                led["position"][key] = value
+            else:
+                led["position"][role][key] = value
+        return led
+
+    CASES = {
+        "perp_nan": {"perp__filled_qty": float("nan")},
+        "perp_inf": {"perp__filled_qty": float("inf")},
+        "perp_negative": {"perp__filled_qty": -0.001},
+        "perp_bool": {"perp__filled_qty": True},
+        "perp_text": {"perp__filled_qty": "abc"},
+        "perp_numeric_text": {"perp__filled_qty": "0.001"},
+        "spot_nan": {"spot__filled_qty": float("nan")},
+        "price_nan": {"perp__avg_price": float("nan")},
+        "price_negative": {"perp__avg_price": -1.0},
+        "price_missing_for_a_held_qty": {"perp__avg_price": 0.0},
+        "fee_nan": {"perp__fee": float("nan")},
+        "fee_base_negative": {"spot__fee_base_qty": -1.0},
+        "wrong_side": {"perp__side": "Buy"},
+        "wrong_product": {"perp__product": "spot"},
+        "unknown_field": {"perp__bogus": 1},
+        "opened_text": {"pos__opened_ms": "x"},
+        "funding_nan": {"pos__funding_collected": float("nan")},
+        "streak_negative": {"pos__negative_funding_streak": -1},
+        "leg_missing": {"pos__perp": None},
+        "position_not_a_pair": {"pos__spot": [1]},
+    }
+
+    @pytest.mark.parametrize("name", sorted(CASES))
+    def test_it_halts_instead_of_resuming_or_raising(self, name):
+        venue = Venue(perp=0.001)
+        ledger = self._ledger(venue, **self.CASES[name])
+        fresh = Venue(perp=0.001)
+        e = engine(fresh, persist=lambda s: None)
+        d = e.cold_start(ledger=ledger, venue_perp_qty=0.001,
+                         venue_spot_qty=5.0, open_orders=())
+        assert d.action is ColdStart.HALT, d.reason
+        assert e.position is None and e.state is BookState.HALTED
+        assert fresh.orders == []
+
+    def test_a_non_dict_position_is_not_read_as_flat(self):
+        for bad in ([], [1], "x", 0, False):
+            d = plan_cold_start(ledger={"book_state": "HEDGED",
+                                        "position": bad},
+                                venue_perp_qty=0.0, venue_spot_qty=5.0)
+            assert d.action is ColdStart.HALT, bad
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), None, "0.001",
+                                     True])
+    def test_a_venue_read_that_is_not_a_number_halts(self, bad):
+        d = plan_cold_start(ledger=TestTheColdStartPlan.LEDGER,
+                            venue_perp_qty=bad, venue_spot_qty=5.0)
+        assert d.action is ColdStart.HALT
+        d = plan_cold_start(ledger=TestTheColdStartPlan.LEDGER,
+                            venue_perp_qty=0.001, venue_spot_qty=bad)
+        assert d.action is ColdStart.HALT
+
+    def test_the_process_refuses_to_start_and_leaves_the_evidence_alone(
+            self, tmp_path):
+        store = StateStore(str(tmp_path / "s.db"))
+        venue = Venue(perp=0.001)
+        led = self._ledger(venue, perp__filled_qty=float("nan"))
+        store.save_carry_position(led)
+        before = store._query("SELECT payload FROM carry_position")[0]["payload"]
+        fresh = Venue(perp=0.001)
+        e = engine(fresh, persist=store.save_carry_position)
+        bot = _main.TradingBot.__new__(_main.TradingBot)
+        bot.store, bot.symbols, bot.carry = store, ["BTCUSDT"], e
+        assert bot.carry_cold_start() is False
+        after = store._query("SELECT payload FROM carry_position")[0]["payload"]
+        assert after == before, "the corrupt evidence was overwritten"
+        assert fresh.orders == []
+        store.close()
+
+    def test_a_valid_pair_still_resumes_with_a_partial_fill_and_a_fee(self):
+        venue = Venue(perp=0.001)
+        led = self._ledger(venue, perp__filled_qty=0.001, spot__fee=None,
+                           perp__fee=0.0055, spot__fee_base_qty=0.0)
+        led["position"]["perp"]["requested_qty"] = 0.002      # partial
+        fresh = Venue(perp=0.001)
+        e = engine(fresh, persist=lambda s: None)
+        d = e.cold_start(ledger=led, venue_perp_qty=0.001,
+                         venue_spot_qty=5.0, open_orders=())
+        assert d.action is ColdStart.RESUME
+        assert e.position.perp.fee == pytest.approx(0.0055)
