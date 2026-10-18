@@ -939,7 +939,8 @@ class TradingEngine:
             return plan
 
         legs = tuple((price + offset, fraction) for price, fraction in plan.legs)
-        moved = ExitPlan(stop_price=plan.stop_price + offset, legs=legs)
+        moved = ExitPlan(stop_price=plan.stop_price + offset, legs=legs,
+                         stop_distance=plan.stop_distance)
         logger.info(
             "bracket re-anchored: fill %.8f vs planned %.8f (offset %+.8f); "
             "stop %.8f -> %.8f, distance preserved",

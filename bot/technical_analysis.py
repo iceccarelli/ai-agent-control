@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -539,6 +540,9 @@ class MarketStrategy:
         self.higher_interval = higher_interval
         self.lookback = int(lookback)
         self.last_signal: Optional[Signal] = None
+        #: Live feeds are judged against the wall clock. A replay of history
+        #: (backtest) sets this False: its bars are old by construction.
+        self.require_fresh_bars: bool = True
         #: The closed candles the last signal was computed from. Exposed so a
         #: model wrapper can reason about the SAME bars rather than re-fetching:
         #: two fetches a few hundred milliseconds apart can straddle a bar
@@ -572,6 +576,22 @@ class MarketStrategy:
         except Exception:  # noqa: BLE001
             logger.debug("could not record suppressed short for %s", symbol)
 
+    def _bars_are_stale(self, rows: Sequence[Sequence[str]]) -> bool:
+        """True when the newest closed bar is older than two bar lengths.
+
+        A lagging klines feed or a halted symbol otherwise yields a "fresh"
+        signal computed from an old close. An unreadable stamp or a
+        non-minute interval is not judged here.
+        """
+        try:
+            interval_ms = int(self.interval) * 60_000
+            start_ms = int(float(rows[-1][0]))
+        except (TypeError, ValueError, IndexError):
+            return False
+        # A closed bar's start is one interval before it ended; allow the
+        # current bar plus one more of slack.
+        return time.time() * 1000 - start_ms > 3 * interval_ms
+
     def signal_for(self, symbol: str):
         """Return a ``TradeIntent`` or ``None``. Never raises into the loop."""
         from trading_engine import TradeIntent   # local import: avoids a cycle
@@ -596,6 +616,11 @@ class MarketStrategy:
                     higher = None
             self.last_candles = candles
             self.last_rows = rows
+            if self.require_fresh_bars and self._bars_are_stale(rows):
+                self.last_signal = Signal(symbol=symbol, reason="CANDLES_STALE")
+                logger.warning("%s: newest closed candle is too old; no signal",
+                               symbol)
+                return None
             signal = self.analyser.analyse(symbol, candles, higher)
         except Exception as exc:  # noqa: BLE001
             logger.exception("strategy failed for %s", symbol)

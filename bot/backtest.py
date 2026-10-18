@@ -1404,6 +1404,7 @@ class Backtester:
             interval=cfg.interval, higher_interval=cfg.higher_interval,
             config=view,
         )
+        strategy.require_fresh_bars = False      # replayed history is old
 
         result = BacktestResult(starting_equity=cfg.starting_cash)
         exchange.index = min(cfg.warmup_bars, len(self.bars[exchange.primary]) - 2)
