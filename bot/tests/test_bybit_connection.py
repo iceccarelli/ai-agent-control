@@ -994,3 +994,23 @@ def test_startup_reconciliation_keeps_an_order_unknown_when_the_lookup_got_no_an
     summary = client.reconcile_on_startup()
     assert store.get_order("BB-x")["status"] == "unknown"
     assert summary["unknown"] == 1 and summary["resolved"] == 0
+
+
+class TestTakeProfitLegsCannotOpenTheOppositeSide:
+    def test_linear_take_profit_leg_is_reduce_only(self, exchange, store):
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+
+        linear_client = bc.BybitClient(
+            config=LinearCfg(), store=store, transport=exchange)
+        linear_client.place_take_profit(
+            symbol="BTCUSDT", side="Sell", qty=0.001, limit_price=70_000.0)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert body["reduceOnly"] is True
+        assert body["category"] == "linear"
+
+    def test_spot_take_profit_leg_has_no_reduce_only_field(self, client, exchange):
+        client.place_take_profit(
+            symbol="BTCUSDT", side="Sell", qty=0.001, limit_price=70_000.0)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert "reduceOnly" not in body

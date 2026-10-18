@@ -1762,6 +1762,10 @@ class BybitClient:
             symbol=symbol, side=side, qty=qty, order_type="Limit",
             price=limit_price, time_in_force="GTC", purpose="tp",
             filters=filters, order_link_id=order_link_id,
+            # A leg that outlives its position (the stop fired first) must not
+            # open the opposite side when price comes back to it. Spot has no
+            # reduce-only; it also keeps the balance check a sell needs.
+            reduce_only=self.is_linear,
         )
 
     # -- reconciliation ----------------------------------------------------
