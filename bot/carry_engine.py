@@ -1750,11 +1750,21 @@ class CarryEngine:
         this. Unreadable or incomplete evidence is not confirmation."""
         if verified_ms is None or book_perp <= QTY_DUST:
             return False
-        first = self._venue_short_qty()
+
+        def read_once_more_if_unreadable() -> Optional[float]:
+            # One transient timeout must not throw away the evidence; a second
+            # failure (or any non-flat answer) is still not confirmation.
+            value = self._venue_short_qty()
+            if value is None:
+                time.sleep(self.UNWIND_REREAD_WAIT_S)
+                value = self._venue_short_qty()
+            return value
+
+        first = read_once_more_if_unreadable()
         if first is None or first > QTY_DUST:
             return False
         time.sleep(self.UNWIND_REREAD_WAIT_S)
-        second = self._venue_short_qty()
+        second = read_once_more_if_unreadable()
         if second is None or second > QTY_DUST:
             return False
         reader = getattr(self.broker, "get_closed_short_qty_since", None)

@@ -919,3 +919,40 @@ def test_the_baseline_is_stamped_from_before_the_position_read(monkeypatch):
     assert eng._venue_verified_ms is not None
     assert eng._venue_verified_ms < stamps["read_at_ms"], (
         "the baseline is later than the read it vouches for")
+
+
+def _flaky_reads_venue(fail_calls):
+    """A refusing venue whose position read raises on the numbered post-liquidation
+    calls (1-based, counted from the moment the short is gone)."""
+    class Flaky(_RefusingVenue):
+        n = 0
+        armed = False
+
+        def get_perp_position(self, symbol):
+            if self.armed:
+                self.n += 1
+                if self.n in fail_calls:
+                    raise TimeoutError("position read timed out")
+            return self.perp_short
+    return Flaky()
+
+
+def test_one_transient_position_read_timeout_does_not_discard_the_evidence():
+    v = _flaky_reads_venue({2})          # 1 = sizing read, 2 = first confirming read
+    eng, booked = _liquidated_acquire(v)
+    v.closed = booked
+    v.armed = True
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+
+
+def test_two_failed_position_reads_in_a_row_are_still_not_confirmation():
+    v = _flaky_reads_venue({2, 3})
+    eng, booked = _liquidated_acquire(v)
+    v.closed = booked
+    v.armed = True
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason != "PERP_CLOSED_EXTERNALLY_SPOT_SOLD"
+    assert v.spot_long == pytest.approx(spot_before)
