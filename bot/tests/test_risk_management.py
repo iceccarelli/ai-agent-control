@@ -846,3 +846,23 @@ class TestUnresolvedEntriesCountAgainstExposure:
         assert manager._gate_aggregate_exposure(
             qty=0.001, entry_price=100.0, equity=EQUITY).ok is True
 
+
+
+class TestAnUnreadableBookWithActiveLimits:
+    def test_blocks_when_a_depth_limit_is_active(self, manager):
+        manager.min_book_depth_usd = 25_000.0
+        d = manager._gate_book_liquidity({"unavailable": True}, side="Buy")
+        assert d.ok is False and d.reason == "BOOK_UNAVAILABLE"
+
+    def test_blocks_when_an_imbalance_limit_is_active(self, manager):
+        manager.min_book_depth_usd = 0.0
+        manager.max_book_imbalance = 0.85
+        assert manager._gate_book_liquidity({"unavailable": True}, side="Buy").ok is False
+
+    def test_passes_when_no_limit_is_active(self, manager):
+        manager.min_book_depth_usd = 0.0
+        manager.max_book_imbalance = 1.0
+        assert manager._gate_book_liquidity({"unavailable": True}, side="Buy").ok is True
+
+    def test_no_feed_at_all_is_still_a_skip(self, manager):
+        assert manager._gate_book_liquidity(None, side="Buy").ok is True

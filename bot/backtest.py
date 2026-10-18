@@ -1311,6 +1311,7 @@ class Backtester:
             )
         store = StateStore(self.db_path)
         client = BybitClient(config=view, store=store, transport=exchange)
+        client.book_feed_required = False      # replay: no recorded book = no feed
         risk = BillionaireRiskManager(config=view, store=store)
         sizer = BillionairePositionSizing(config=view, risk_manager=risk)
         engine = TradingEngine(

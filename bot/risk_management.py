@@ -904,6 +904,14 @@ class BillionaireRiskManager:
         """
         if book is None:
             return _allow("NO_BOOK_SUPPLIED")
+        if book.get("unavailable") is True:
+            # The feed exists and could not be read. With a depth or imbalance
+            # limit configured that is a limit nobody can check: refuse.
+            if self.min_book_depth_usd > 0.0 or self.max_book_imbalance < 1.0:
+                return _block("BOOK_UNAVAILABLE",
+                              min_depth_usd=self.min_book_depth_usd,
+                              max_imbalance=self.max_book_imbalance)
+            return _allow("NO_BOOK_LIMITS_ACTIVE")
         try:
             # We exit on the opposite side we enter, so the depth that matters
             # for a long is the BID: that is who buys when the stop fires.

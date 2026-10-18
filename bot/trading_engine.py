@@ -284,8 +284,12 @@ class TradingEngine:
         if callable(book_source):
             try:
                 conditions["book"] = book_source(symbol)
+                unavailable = getattr(self.client, "book_feed_unavailable", None)
+                if (conditions["book"] is None and callable(unavailable)
+                        and unavailable(symbol) is True):
+                    conditions["book"] = {"unavailable": True}
             except Exception:  # noqa: BLE001
-                conditions["book"] = None
+                conditions["book"] = {"unavailable": True}
         return conditions
 
     # -- the reference layer, applied in the only direction it may act -----

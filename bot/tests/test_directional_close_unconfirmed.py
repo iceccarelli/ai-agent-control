@@ -114,3 +114,29 @@ def test_two_unpriced_partial_exits_of_equal_size_are_both_booked(tmp_path):
     engine.client.get_last_price = lambda symbol: 58_000.0
     assert engine.observe_exits()["closed"] == 1
     assert len(store._query("SELECT * FROM trades")) == 2
+
+
+def test_an_unreadable_live_book_reaches_the_gate_as_unavailable(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    engine.client.get_book_features = lambda symbol: None
+    engine.client.book_feed_unavailable = lambda symbol: True
+    assert engine._market_conditions("BTCUSDT")["book"] == {"unavailable": True}
+
+
+def test_no_feed_still_reaches_the_gate_as_none(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    engine.client.get_book_features = lambda symbol: None
+    engine.client.book_feed_unavailable = lambda symbol: False
+    assert engine._market_conditions("BTCUSDT")["book"] is None
+
+
+def test_a_raising_book_source_is_unavailable_not_absent(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+
+    def boom(symbol):
+        raise RuntimeError("feed down")
+    engine.client.get_book_features = boom
+    assert engine._market_conditions("BTCUSDT")["book"] == {"unavailable": True}

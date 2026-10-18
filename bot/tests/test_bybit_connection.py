@@ -1027,3 +1027,20 @@ class TestTakeProfitLegsCannotOpenTheOppositeSide:
             symbol="BTCUSDT", side="Sell", qty=0.001, limit_price=70_000.0)
         body = json.loads(exchange.requests[-1]["body"])
         assert "reduceOnly" not in body
+
+
+class TestBookFeedAvailability:
+    def test_a_failed_book_read_is_reported_on_a_live_client(self, client, exchange):
+        exchange.fail_next = None
+        assert client.get_book_features("NOPEUSDT") is None
+        assert client.book_feed_unavailable("NOPEUSDT") is True
+
+    def test_a_replay_client_has_no_feed_to_be_unavailable(self, client):
+        client.book_feed_required = False
+        assert client.get_book_features("NOPEUSDT") is None
+        assert client.book_feed_unavailable("NOPEUSDT") is False
+
+    def test_a_disabled_feed_is_not_unavailable(self, client):
+        client.cfg.USE_ORDERBOOK = False
+        assert client.get_book_features("BTCUSDT") is None
+        assert client.book_feed_unavailable("BTCUSDT") is False

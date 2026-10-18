@@ -413,6 +413,12 @@ class BybitClient:
         self._lock = threading.RLock()
         self._filters: Dict[str, Tuple[float, InstrumentFilters]] = {}
         self._book_warned: set = set()
+        #: True for a live feed: a book that cannot be read is then reported by
+        #: ``book_feed_unavailable`` so the liquidity gate can refuse, rather
+        #: than read as "no book feed". The backtester clears it (a replay
+        #: without a recorded book has no feed to be unavailable).
+        self.book_feed_required: bool = True
+        self._book_failed: Dict[str, bool] = {}
         self._filters_ttl_s = float(getattr(self.cfg, "SYMBOL_FILTERS_TTL", 3600))
         #: Difference between exchange time and local time, in ms.
         self._time_skew_ms = 0
@@ -1634,8 +1640,10 @@ class BybitClient:
         blocks. Those are genuinely different situations and must not collapse
         into one.
         """
+        self._book_failed[symbol] = False
         if not bool(getattr(self.cfg, "USE_ORDERBOOK", True)):
             return None
+        self._book_failed[symbol] = True        # until a usable book is returned
         levels = int(getattr(self.cfg, "BOOK_DEPTH_LEVELS", 25))
         try:
             payload = self._request(
@@ -1669,6 +1677,7 @@ class BybitClient:
             logger.warning("could not read the book for %s: %s", symbol, exc)
             return None
 
+        self._book_failed[symbol] = False
         # Only the scalar measurements cross this boundary. The gate needs
         # numbers, not level ladders, and shipping the ladders would invite a
         # caller to re-derive a figure that has already been derived correctly.
@@ -1686,6 +1695,11 @@ class BybitClient:
             "anomalous_spread": features.anomalous_spread,
             "levels": features.levels,
         }
+
+    def book_feed_unavailable(self, symbol: str) -> bool:
+        """True when the last ``get_book_features`` for ``symbol`` was meant to
+        read a book and could not (request failure, empty or unparseable book)."""
+        return bool(self.book_feed_required and self._book_failed.get(symbol))
 
     def set_leverage(self, symbol: str, leverage: Optional[int] = None) -> bool:
         """Set leverage before trading a linear symbol.
