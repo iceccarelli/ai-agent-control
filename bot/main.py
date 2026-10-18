@@ -1245,7 +1245,20 @@ class TradingBot:
                 continue
             if intent is None:
                 continue
+            # The signal is computed from the last CLOSED bar, so it is the
+            # same for every tick until the next bar closes. Once it has been
+            # traded, an exit (a stop hit minutes later) must not be followed
+            # by the identical entry on the very next tick: that repeats a
+            # round trip, fees included, up to once a tick for the whole bar.
+            signature = (intent.signal_type, float(intent.entry_price),
+                         float(intent.stop_price), tuple(intent.take_profits))
+            traded = self.__dict__.setdefault("_traded_signals", {})
+            if traded.get(symbol) == signature:
+                logger.debug("%s: signal already traded on this bar", symbol)
+                continue
             report = self.engine.execute(intent)
+            if report.ok:
+                traded[symbol] = signature
             logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
 
     #: Class-level defaults so a bot built without __init__ (tests, tools) works.

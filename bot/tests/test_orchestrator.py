@@ -244,6 +244,28 @@ class TestLoop:
         assert strategy.calls == ["BTCUSDT"]
         bot.shutdown()
 
+    def test_a_traded_signal_is_not_traded_again_on_the_same_bar(
+            self, tmp_path, exchange):
+        strategy = StubStrategy()
+        bot = build(tmp_path, exchange, strategy=strategy)
+        bot.startup()
+        sent = []
+        real = bot.engine.execute
+
+        def spy(intent):
+            sent.append(intent)
+            return real(intent)
+        bot.engine.execute = spy
+        bot.tick()
+        assert len(sent) == 1
+        # the position exits (stop hit) and the SAME closed-bar signal returns
+        for row in list(bot.store.open_positions()):
+            bot.store.remove_position(row["symbol"])
+        bot.tick()
+        bot.tick()
+        assert len(sent) == 1, "the identical signal re-entered on the same bar"
+        bot.shutdown()
+
     def test_every_signalled_symbol_is_executed_until_capacity_binds(
             self, tmp_path, exchange):
         """Characterises the live loop: it is NOT first-signal-wins.
