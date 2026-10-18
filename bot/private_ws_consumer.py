@@ -341,6 +341,22 @@ class WSPrivateConsumer:
 
     TOPICS = ("order", "execution", "position")
 
+    @property
+    def needs_reconciliation(self) -> bool:
+        return self._needs_reconciliation
+
+    @needs_reconciliation.setter
+    def needs_reconciliation(self, value: bool) -> None:
+        # Every SET is counted, so the tick that clears the flag can tell a
+        # gap it covered from one that opened after its REST reads.
+        if value:
+            self._reconcile_generation += 1
+        self._needs_reconciliation = bool(value)
+
+    @property
+    def reconcile_generation(self) -> int:
+        return self._reconcile_generation
+
     def __init__(self, *, client: Any, transport_factory: Callable[[], Any],
                 sleep: Callable[[float], None] = time.sleep,
                 evidence_path: Optional[str] = None,
@@ -349,7 +365,8 @@ class WSPrivateConsumer:
         self._transport_factory = transport_factory
         self._sleep = sleep
         self._dedup = _Deduplicator()
-        self.needs_reconciliation = False
+        self._reconcile_generation = 0
+        self._needs_reconciliation = False
         self.dirty_symbols: Set[str] = set()
         self.unknown_message_count = 0
         self.applied_event_count = 0

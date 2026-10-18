@@ -703,8 +703,11 @@ class TradingBot:
         consumer = self.ws_consumer
         if consumer is None:
             return
+        seen = getattr(self, "_ws_generation_at_tick", None)
+        opened_later = (seen is not None and getattr(
+            consumer, "reconcile_generation", seen) != seen)
         if consumer.needs_reconciliation:
-            if rest_ok:
+            if rest_ok and not opened_later:
                 consumer.needs_reconciliation = False
                 consumer.dirty_symbols.clear()
                 self._observation_state = "HEALTHY"
@@ -974,6 +977,9 @@ class TradingBot:
                 logger.warning("unresolved entries settled this cycle: %s", late)
         except Exception as exc:  # noqa: BLE001
             logger.exception("resolve_unresolved_entries failed; continuing: %s", exc)
+        consumer = getattr(self, "ws_consumer", None)
+        self._ws_generation_at_tick = getattr(
+            consumer, "reconcile_generation", None)
         try:
             observed = self.engine.observe_exits()
             if observed.get("closed") or observed.get("reduced"):

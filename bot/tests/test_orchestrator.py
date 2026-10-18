@@ -536,3 +536,31 @@ def test_an_idle_client_does_not_wedge_the_health_server(tmp_path, exchange):
     finally:
         idle.close()
         bot._http.shutdown()
+
+
+class TestAGapOpenedDuringTheTickIsNotClearedByIt:
+    def _bot(self, tmp_path, exchange):
+        from private_ws_consumer import WSPrivateConsumer
+        bot = build(tmp_path, exchange)
+        consumer = WSPrivateConsumer.__new__(WSPrivateConsumer)
+        consumer._reconcile_generation = 0
+        consumer._needs_reconciliation = False
+        consumer.dirty_symbols = set()
+        bot.ws_consumer = consumer
+        bot.ws_thread = None
+        return bot, consumer
+
+    def test_a_flag_set_before_the_tick_is_cleared_after_clean_rest_reads(
+            self, tmp_path, exchange):
+        bot, consumer = self._bot(tmp_path, exchange)
+        consumer.needs_reconciliation = True
+        bot._ws_generation_at_tick = consumer.reconcile_generation
+        bot._absorb_ws_observations(rest_ok=True)
+        assert consumer.needs_reconciliation is False
+
+    def test_a_flag_set_during_the_tick_survives_it(self, tmp_path, exchange):
+        bot, consumer = self._bot(tmp_path, exchange)
+        bot._ws_generation_at_tick = consumer.reconcile_generation
+        consumer.needs_reconciliation = True        # WS thread, mid-tick
+        bot._absorb_ws_observations(rest_ok=True)
+        assert consumer.needs_reconciliation is True

@@ -255,6 +255,15 @@ class TestTheColdStartPlan:
         assert d.action is ColdStart.HALT
         assert d.naked_side == "spot"
 
+    def test_an_acquire_spot_shortfall_names_the_perp_as_the_naked_leg(self):
+        led = dict(self.LEDGER, execution_mode="acquire")
+        less = self.plan(ledger=led, venue_perp_qty=0.001,
+                         venue_spot_qty=0.0004)
+        assert less.action is ColdStart.HALT and less.naked_side == "perp"
+        more = self.plan(ledger=led, venue_perp_qty=0.001,
+                         venue_spot_qty=0.005)
+        assert more.action is ColdStart.HALT and more.naked_side == "spot"
+
     def test_a_size_mismatch_halts(self):
         d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.002)
         assert d.action is ColdStart.HALT

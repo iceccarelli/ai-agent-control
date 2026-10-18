@@ -439,7 +439,7 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
             ColdStart.HALT,
             f"the ledger holds {ledger_spot:.10g} of spot and the venue holds "
             f"{spot:.10g}",
-            naked_side="spot" if spot < ledger_spot else "perp",
+            naked_side="perp" if spot < ledger_spot else "spot",
             detail={"ledger_spot_qty": ledger_spot, "venue_spot_qty": spot})
 
     return ColdStartDecision(
