@@ -213,3 +213,22 @@ def test_a_linear_trade_says_its_pnl_excludes_funding(tmp_path):
     engine.observe_exits()
     meta = json.loads(store._query("SELECT * FROM trades")[0]["meta"])
     assert meta["funding_booked"] is False
+
+
+def test_a_linear_remainder_below_the_dust_threshold_stays_on_the_book(tmp_path):
+    """On linear the remainder is real venue size with a position-attached stop;
+    booking it as dust and deleting the row would leave it unwatched."""
+    fake = FakeBybit()
+    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell",
+                                 "size": "0.00005", "avgPrice": "60000",
+                                 "stopLoss": "61000"}
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open(store, qty=0.001)
+    fake.closed_pnl.append({
+        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.00095", "orderId": "o9",
+        "avgExitPrice": "59000", "closedPnl": "9",
+        "updatedTime": str(int(time.time() * 1000) + 1000)})
+    s = engine.observe_exits()
+    assert s["reduced"] == 1 and s["closed"] == 0
+    rows = store.open_positions()
+    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.00005)

@@ -332,4 +332,4 @@ def spot_buy_net_qty(symbol: str, filled_qty: float, fees: "FeeSet") -> float:
                    if c.currency in (base, None))
     else:
         net *= (1.0 - SPOT_UNSTATED_FEE_ALLOWANCE)
-    return net
+    return round(net, 12)          # drop float noise before it is lot-snapped

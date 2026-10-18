@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 sys.path.insert(0, HERE)
@@ -172,3 +174,18 @@ def test_a_cancelled_order_with_nothing_executed_is_still_unfilled_on_linear(tmp
             return {"orderStatus": "Cancelled", "cumExecQty": "0"}
     engine.client = Client()
     assert engine._await_fill("BTCUSDT", "x", timeout_s=1.0) is None
+
+
+def test_an_emergency_close_that_only_partly_executed_keeps_the_remainder(tmp_path):
+    import trading_engine as te
+    engine, store = _linear(tmp_path)
+    store.upsert_position("BTCUSDT", "Buy", 0.01, 60_000.0, stop_price=58_000.0)
+    engine._await_fill = lambda symbol, link, timeout_s=10.0: {
+        "orderStatus": "PartiallyFilledCanceled", "cumExecQty": "0.004",
+        "avgPrice": "59900"}
+    import position_sizing as ps
+    filters = engine.client.get_instrument_filters("BTCUSDT")
+    engine._emergency_close(symbol="BTCUSDT", exit_side="Sell", qty=0.01,
+                            filters=filters, reason="TEST")
+    rows = store.open_positions()
+    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.006)

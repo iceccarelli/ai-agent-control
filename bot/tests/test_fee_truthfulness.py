@@ -668,3 +668,31 @@ def test_a_close_does_not_floor_float_noise_to_one_lot_step_short(tmp_path):
     engine.close_position(symbol="BTCUSDT", reason="t")
     assert sent and sent[0] == 0.947072
     store.close()
+
+
+class TestQuantitiesSurviveFloatNoiseAndLotSteps:
+    def test_snap_ignores_float_noise_below_any_step(self):
+        from decimal import Decimal
+        import position_sizing as ps
+        assert ps.snap_qty_down(0.3 - 0.0003, Decimal("0.0001")) == Decimal("0.2997")
+        assert ps.snap_qty_down(0.7 - 0.42, Decimal("0.01")) == Decimal("0.28")
+        assert ps.snap_qty_down(0.0099, Decimal("0.01")) == Decimal("0")
+
+    def test_the_net_of_fee_quantity_is_noise_free(self):
+        import venue_fees
+        fees = venue_fees.extract_order_fees({"cumFeeDetail": {"BTC": "0.0003"}})
+        assert venue_fees.spot_buy_net_qty("BTCUSDT", 0.3, fees) == 0.2997
+
+    def test_take_profit_legs_are_snapped_before_the_residual_is_taken(self):
+        """step 0.01, filled 0.19, fractions 0.4/0.3/0.3: snapping each leg only
+        at the client strands 0.02; snapping first gives the last leg the floor
+        losses. And 0.7 split 0.6/0.4 must not lose a step to float noise."""
+        from decimal import Decimal
+        import trading_engine as te
+        step = Decimal("0.01")
+        assert te.TradingEngine._allocate_legs(0.19, [0.4, 0.3, 0.3], step) \
+            == [0.07, 0.05, 0.07]
+        legs = te.TradingEngine._allocate_legs(0.7, [0.6, 0.4], step)
+        assert legs == [0.42, 0.28]
+        # legs that do not cover the position keep their own fractions
+        assert te.TradingEngine._allocate_legs(1.0, [0.5, 0.2], step) == [0.5, 0.2]

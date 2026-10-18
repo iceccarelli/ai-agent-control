@@ -351,6 +351,25 @@ class TradingEngine:
                     "qty_before_memory": sizing.qty},
         )
 
+    @staticmethod
+    def _allocate_legs(filled_qty: float, fractions: Sequence[float],
+                       step: Any) -> List[float]:
+        """Take-profit leg quantities: each snapped to the lot step HERE, the
+        last taking the real residual when the legs are meant to cover the whole
+        position. Leaving the snap to the client floors every leg and strands the
+        floor losses (and, with float noise, a whole step)."""
+        covers_all = abs(sum(fractions) - 1.0) <= 1e-9
+        out: List[float] = []
+        allocated = 0.0
+        for index, fraction in enumerate(fractions):
+            if index == len(fractions) - 1 and covers_all:
+                qty = float(snap_qty_down(max(0.0, filled_qty - allocated), step))
+            else:
+                qty = float(snap_qty_down(filled_qty * fraction, step))
+            out.append(qty)
+            allocated += qty
+        return out
+
     def _spot_sellable_qty(self, symbol: str, filled_qty: float,
                            entry_fees: Any, filters: InstrumentFilters) -> float:
         """What a spot buy left in the account (see ``venue_fees.spot_buy_net_qty``),
@@ -694,18 +713,8 @@ class TradingEngine:
         # remainder that is too small to sell or protect — dust that the
         # position book then has to reason about. Giving the final leg the
         # residual removes the problem at source.
-        leg_quantities: List[float] = []
-        allocated = 0.0
-        # The residual rule is only right when the legs are meant to cover the
-        # whole position; fractions summing to less leave the rest to the stop.
-        covers_all = abs(sum(f for _, f in plan.legs) - 1.0) <= 1e-9
-        for index, (_, fraction) in enumerate(plan.legs):
-            if index == len(plan.legs) - 1 and covers_all:
-                leg_quantities.append(max(0.0, filled_qty - allocated))
-            else:
-                leg_qty = filled_qty * fraction
-                leg_quantities.append(leg_qty)
-                allocated += leg_qty
+        leg_quantities = self._allocate_legs(
+            filled_qty, [f for _, f in plan.legs], filters.qty_step)
 
         for (price, _fraction), leg_qty in zip(plan.legs, leg_quantities):
             leg = self.client.place_take_profit(
@@ -1004,6 +1013,7 @@ class TradingEngine:
             # the venue position is already closed, so whatever happens here the
             # row must leave the book. A failure is loud and journaled so the
             # unbooked exit is a known gap, not a silent one.
+            keep_row = False
             row = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
             if row is not None:
                 try:
@@ -1011,10 +1021,27 @@ class TradingEngine:
                         fill = self._await_fill(symbol, closed.order_link_id)
                     except Exception:  # noqa: BLE001
                         fill = None    # booked below as an UNCONFIRMED exit
-                    self._book_full_exit(
-                        symbol=symbol, row=row, exit_order=closed, fill=fill,
-                        reason=f"EMERGENCY:{reason}")
-                    self._cancel_protective_orders(symbol)
+                    executed = float((fill or {}).get("cumExecQty") or 0.0)
+                    held = float(row["qty"])
+                    if fill is not None and 0.0 < executed < held - max(1e-9, held * 1e-9):
+                        # Only part of it sold: book what sold and keep the rest on
+                        # the book, rather than booking the whole row as gone.
+                        self.record_exit_fill(
+                            symbol=symbol, qty=executed,
+                            price=float(fill.get("avgPrice") or row["entry_price"]),
+                            fee=0.0, reason=f"EMERGENCY:{reason}:PARTIAL",
+                            order_link_id=closed.order_link_id,
+                            dedupe_key=f"exit:{closed.order_link_id}",
+                            fees=venue_fees.extract_order_fees(fill))
+                        logger.critical(
+                            "emergency close of %s only partly executed (%s of "
+                            "%s); the remainder is still held", symbol, executed, held)
+                        keep_row = True
+                    else:
+                        self._book_full_exit(
+                            symbol=symbol, row=row, exit_order=closed, fill=fill,
+                            reason=f"EMERGENCY:{reason}")
+                        self._cancel_protective_orders(symbol)
                 except Exception as exc:  # noqa: BLE001
                     logger.critical(
                         "emergency exit of %s could not be booked as a trade "
@@ -1022,7 +1049,8 @@ class TradingEngine:
                         "removed from the book UNBOOKED", symbol, exc)
                     self.store.journal(symbol, "EMERGENCY_UNBOOKED", reason,
                                        {"error": f"{type(exc).__name__}: {exc}"})
-            self.store.remove_position(symbol)
+            if not keep_row:
+                self.store.remove_position(symbol)
         else:
             logger.critical(
                 "EMERGENCY CLOSE FAILED for %s (%s) — position may be naked and "
@@ -1820,7 +1848,10 @@ class TradingEngine:
             min_notional = float(filters.min_notional)
         except Exception:  # noqa: BLE001
             min_qty = min_notional = 0.0
-        if min_qty and (
+        # Linear only: the remainder is real venue size and its stop is a field
+        # of the position (no minimum applies), so it stays on the book. Dust is
+        # a SPOT notion -- coin that can be neither sold nor protected.
+        if (not getattr(self.client, "is_linear", False)) and min_qty and (
             remaining < min_qty or remaining * float(price) < min_notional
         ):
             self.store.remove_position(symbol)

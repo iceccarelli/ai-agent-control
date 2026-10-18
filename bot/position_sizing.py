@@ -246,7 +246,9 @@ def snap_qty_down(qty: float, step: Decimal) -> Decimal:
     """
     if step <= 0:
         raise ValueError(f"qty step must be positive, got {step}")
-    q = Decimal(str(qty))
+    # Float arithmetic upstream (0.3 - 0.0003 == 0.29969999999999997) leaves
+    # noise far below any lot step; flooring that would sell one step too little.
+    q = Decimal(str(round(float(qty), 12)))
     if q <= 0:
         return Decimal("0")
     return (q / step).to_integral_value(rounding=ROUND_DOWN) * step
