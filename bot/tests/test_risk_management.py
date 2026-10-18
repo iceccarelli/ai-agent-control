@@ -866,3 +866,16 @@ class TestAnUnreadableBookWithActiveLimits:
 
     def test_no_feed_at_all_is_still_a_skip(self, manager):
         assert manager._gate_book_liquidity(None, side="Buy").ok is True
+
+
+class TestRiskRewardRoundingTolerance:
+    def test_a_ladder_built_to_exactly_the_minimum_is_not_refused_for_float_noise(self, manager):
+        d = manager._gate_risk_reward(
+            entry_price=65229.18031003944, stop_price=64812.35691930017,
+            take_profit_price=(65729.36837892656 + 66396.2858041094) / 2)
+        assert d.ok is True, d.detail
+
+    def test_a_real_shortfall_still_blocks(self, manager):
+        d = manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
+                                      take_profit_price=103.9)
+        assert d.ok is False and d.reason == "RISK_REWARD_TOO_LOW"

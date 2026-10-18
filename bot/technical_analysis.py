@@ -325,6 +325,10 @@ class TechnicalAnalysis:
         price = candles.last_close
         upper, lower = float(bands.upper[-1]), float(bands.lower[-1])
         width = max(1e-12, upper - lower)
+        if upper - lower <= 1e-9 * abs(float(bands.middle[-1])):
+            # Flat window: the bands collapse onto the mean and "below the lower
+            # band" becomes a coin flip on float rounding. No information.
+            return ComponentVote("bollinger", 0, 0.0, detail="flat window")
         if price <= lower:
             return ComponentVote("bollinger", 1, min(1.0, (lower - price) / width + 0.5),
                                  detail="below lower band")
@@ -572,6 +576,10 @@ class MarketStrategy:
         """Return a ``TradeIntent`` or ``None``. Never raises into the loop."""
         from trading_engine import TradeIntent   # local import: avoids a cycle
 
+        # A failed fetch must not leave the PREVIOUS symbol's bars in place for the
+        # model wrapper to read as this symbol's.
+        self.last_candles = None
+        self.last_rows = None
         try:
             rows = self.client.get_klines(symbol, self.interval, self.lookback)
             candles = candles_from_klines(rows, self.interval)

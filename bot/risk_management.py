@@ -1008,7 +1008,10 @@ class BillionaireRiskManager:
         if not (math.isfinite(risk) and math.isfinite(reward)) or risk <= 0.0:
             return _block("ZERO_RISK_DISTANCE")
         rr = reward / risk
-        if rr < self.min_risk_reward_ratio:
+        # The strategy builds its ladder to meet the minimum EXACTLY; in floats
+        # that lands a hair under (1.9999999999999825). A relative 1e-9 absorbs
+        # rounding, not a real shortfall.
+        if rr < self.min_risk_reward_ratio * (1.0 - 1e-9):
             return _block("RISK_REWARD_TOO_LOW", rr=rr,
                           minimum=self.min_risk_reward_ratio)
         return _allow("RISK_REWARD_OK", rr=rr)
