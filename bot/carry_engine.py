@@ -840,7 +840,9 @@ class CarryEngine:
 
     def cold_start(self, *, ledger: Optional[Dict[str, Any]],
                    venue_perp_qty: float, venue_spot_qty: float,
-                   open_orders: Any = ()) -> ColdStartDecision:
+                   open_orders: Any = (),
+                   venue_read_started_ms: Optional[int] = None
+                   ) -> ColdStartDecision:
         """Reconcile the ledger against the venue BEFORE the first tick.
 
         RESUME puts the same pair back in the engine. HALT stops the process
@@ -871,6 +873,12 @@ class CarryEngine:
             self._restore_allowance(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
+            if self.position is not None and venue_read_started_ms is not None:
+                # The venue was read from this moment, not from now: a close
+                # that landed after it must still count as new evidence.
+                self._venue_verified_ms = min(
+                    self._venue_verified_ms or venue_read_started_ms,
+                    int(venue_read_started_ms))
             logger.warning("carry cold start: RESUMED %s", decision.detail)
         elif decision.action is ColdStart.HALT:
             self.state = BookState.HALTED

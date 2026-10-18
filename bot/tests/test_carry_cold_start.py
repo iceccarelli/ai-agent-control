@@ -479,6 +479,16 @@ class TestAPersistedPositionThatCannotBeTrustedHaltsTheStart:
         assert d.action is ColdStart.RESUME
         assert e.position.perp.fee == pytest.approx(0.0055)
 
+def test_the_resume_baseline_is_the_start_of_the_venue_read_not_the_restore():
+    venue = Venue(perp=0.001)
+    led = opened(venue).to_state()
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    d = e.cold_start(ledger=led, venue_perp_qty=0.001, venue_spot_qty=5.0,
+                     open_orders=(), venue_read_started_ms=1_000)
+    assert d.action is ColdStart.RESUME
+    assert e._venue_verified_ms == 1_000
+
+
 class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
     @pytest.mark.parametrize("role", ["spot", "perp"])
     def test_foreign_market_leg_halts_through_real_startup(self, role):

@@ -818,6 +818,7 @@ class TradingBot:
                     "one-way mode; refusing to start", self.carry.perp_symbol)
                 return False
             self._log_venue_leverage(broker)
+            read_started_ms = int(time.time() * 1000)
             venue_perp = float(broker.get_perp_position(self.carry.perp_symbol))
             venue_spot = float(
                 broker.get_spot_inventory(self.carry.spot_symbol))
@@ -869,7 +870,7 @@ class TradingBot:
 
         decision = self.carry.cold_start(
             ledger=ledger, venue_perp_qty=venue_perp, venue_spot_qty=venue_spot,
-            open_orders=open_orders)
+            open_orders=open_orders, venue_read_started_ms=read_started_ms)
         logger.warning(
             "carry cold start: %s — %s (ledger=%s venue_perp=%.10g "
             "venue_spot=%.10g open_orders=%d)",
