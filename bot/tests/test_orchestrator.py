@@ -516,3 +516,23 @@ def test_the_bot_opens_the_state_db_its_config_names(tmp_path, exchange):
         config=cfg, store=StateStore(str(tmp_path / "other.db")),
         transport=exchange))
     assert (tmp_path / "named.db").exists()
+
+
+def test_an_idle_client_does_not_wedge_the_health_server(tmp_path, exchange):
+    import socket
+    import urllib.request
+    cfg = Cfg()
+    cfg.ENABLE_HEALTH_SERVER = True
+    cfg.HEALTHCHECK_PORT = 18097
+    bot = build(tmp_path, exchange, cfg=cfg)
+    bot.start_health_server()
+    idle = socket.create_connection(("127.0.0.1", 18097))   # says nothing
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:18097/health",
+                                    timeout=3) as r:
+            assert r.status in (200, 503)
+    except urllib.error.HTTPError as exc:
+        assert exc.code in (200, 503)
+    finally:
+        idle.close()
+        bot._http.shutdown()

@@ -41,7 +41,7 @@ import signal
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import datetime as dt
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -87,6 +87,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
     existed**. If the orchestrator health-checks the port, the task is killed and
     restarted in a loop — and each restart re-entered live trading with amnesia.
     """
+
+    #: A client that connects and says nothing must not hold the server (and
+    #: with it every later check) for ever.
+    timeout = 5
 
     bot: Optional["TradingBot"] = None
 
@@ -464,7 +468,8 @@ class TradingBot:
         port = int(getattr(self.cfg, "HEALTHCHECK_PORT", 8081))
         host = str(getattr(self.cfg, "HEALTHCHECK_HOST", "127.0.0.1") or "127.0.0.1")
         handler = type("_Bound", (_HealthHandler,), {"bot": self})
-        self._http = HTTPServer((host, port), handler)
+        self._http = ThreadingHTTPServer((host, port), handler)
+        self._http.daemon_threads = True
         threading.Thread(
             target=self._http.serve_forever, name="health", daemon=True
         ).start()
