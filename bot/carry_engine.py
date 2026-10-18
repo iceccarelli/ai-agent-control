@@ -1727,14 +1727,21 @@ class CarryEngine:
         # snapshot and a stamp taken after the read would get a closed-pnl row at
         # or before the baseline and be skipped, so the evidence would vanish.
         # A close inside the read window makes the read unequal and sets nothing.
-        stamp = int(time.time() * 1000)
-        try:
-            venue = abs(float(reader(self.perp_symbol)))
-        except Exception:  # noqa: BLE001
-            return
-        if (self._finite(venue)
-                and abs(venue - booked) <= max(QTY_DUST, 1e-9 * max(booked, 1.0))):
-            self._venue_verified_ms = stamp
+        tolerance = max(QTY_DUST, 1e-9 * max(booked, 1.0))
+        for attempt in (1, 2):
+            stamp = int(time.time() * 1000)
+            try:
+                venue = abs(float(reader(self.perp_symbol)))
+            except Exception:  # noqa: BLE001
+                venue = None
+            if (venue is not None and self._finite(venue)
+                    and abs(venue - booked) <= tolerance):
+                self._venue_verified_ms = stamp
+                return
+            if attempt == 1:
+                # A read straight after a fill can lag or time out; look once
+                # more after a pause. Still only an EXACT match sets a baseline.
+                time.sleep(self.UNWIND_REREAD_WAIT_S)
 
     def _perp_confirmed_closed(self, verified_ms: Optional[int],
                                book_perp: float) -> bool:

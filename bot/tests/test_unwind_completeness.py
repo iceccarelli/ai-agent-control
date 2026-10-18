@@ -956,3 +956,36 @@ def test_two_failed_position_reads_in_a_row_are_still_not_confirmation():
     d = candle(eng, ms=61_000, print_ms=1_000)
     assert d.reason != "PERP_CLOSED_EXTERNALLY_SPOT_SOLD"
     assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_the_open_time_baseline_survives_one_lagging_or_failed_read():
+    """A position read straight after a fill can lag or time out; with no baseline
+    a liquidation in the first ticks cannot use the closed-pnl evidence. One more
+    look after a pause, and still only an exact match sets it."""
+    for first in ("raise", "lag"):
+        class OnceBad(_RefusingVenue):
+            n = 0
+
+            def get_perp_position(self, symbol):
+                type(self).n += 1
+                if type(self).n == 1:
+                    if first == "raise":
+                        raise TimeoutError("position read timed out")
+                    return self.perp_short * 0.5      # lagging list
+                return self.perp_short
+        v = OnceBad()
+        eng = build(v, mode=ACQUIRE)
+        eng.UNWIND_REREAD_WAIT_S = 0
+        candle(eng, ms=1_000)
+        assert eng._venue_verified_ms is not None, first
+
+
+def test_the_open_time_baseline_is_not_stamped_when_both_reads_disagree():
+    class AlwaysHalf(_RefusingVenue):
+        def get_perp_position(self, symbol):
+            return self.perp_short * 0.5
+    v = AlwaysHalf()
+    eng = build(v, mode=ACQUIRE)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    assert eng._venue_verified_ms is None
