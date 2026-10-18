@@ -1723,13 +1723,18 @@ class CarryEngine:
         reader = getattr(self.broker, "get_perp_position", None)
         if reader is None:
             return
+        # Stamped from BEFORE the read: a close landing between the venue's
+        # snapshot and a stamp taken after the read would get a closed-pnl row at
+        # or before the baseline and be skipped, so the evidence would vanish.
+        # A close inside the read window makes the read unequal and sets nothing.
+        stamp = int(time.time() * 1000)
         try:
             venue = abs(float(reader(self.perp_symbol)))
         except Exception:  # noqa: BLE001
             return
         if (self._finite(venue)
                 and abs(venue - booked) <= max(QTY_DUST, 1e-9 * max(booked, 1.0))):
-            self._venue_verified_ms = int(time.time() * 1000)
+            self._venue_verified_ms = stamp
 
     def _perp_confirmed_closed(self, verified_ms: Optional[int],
                                book_perp: float) -> bool:
@@ -2047,6 +2052,20 @@ class CarryEngine:
         margin = self._margin_multiple()
         self._last_margin = margin
         if margin is None:
+            if (self.execution_mode == ACQUIRE and self.position is not None
+                    and self._perp_confirmed_closed(
+                        self._venue_verified_ms,
+                        self.position.perp.filled_qty)):
+                # A liquidated short leaves the margin ratio undefined (no
+                # position, no maintenance margin), which reads as "unreadable".
+                # The same evidence gate as the unwind: two flat reads AND the
+                # venue's closed-pnl records totalling the short since the book
+                # last matched it. Otherwise it is the fail-closed halt below.
+                self.state = BookState.UNWINDING
+                pos = self.position
+                return self._spot_after_perp_closed(
+                    pos, "MARGIN_UNDEFINED",
+                    max(0.0, pos.spot.filled_qty - pos.spot.fee_base_qty))
             return self._halt("MARGIN_UNREADABLE",
                               "an unreadable margin is a margin call you cannot see")
         if margin < self.min_margin_multiple:
@@ -2083,6 +2102,7 @@ class CarryEngine:
         reader = getattr(self.broker, "get_perp_position", None)
         if reader is None or self.position is None:
             return None
+        read_started_ms = int(time.time() * 1000)   # the baseline, if it passes
         try:
             venue = abs(float(reader(self.perp_symbol)))
         except Exception as exc:  # noqa: BLE001
@@ -2111,7 +2131,7 @@ class CarryEngine:
                 "VENUE_POSITION_DRIFT",
                 f"the venue holds a {venue:.10g} perp short and the book "
                 f"recorded {book:.10g}; the hedge is not what the ledger says")
-        self._venue_verified_ms = int(time.time() * 1000)
+        self._venue_verified_ms = read_started_ms
         return None
 
     def _check_inventory_cover(self) -> Optional[CarryDecision]:

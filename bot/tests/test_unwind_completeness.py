@@ -864,3 +864,58 @@ def test_the_recovery_sale_is_capped_at_what_the_wallet_holds():
     d = candle(eng, ms=61_000, print_ms=1_000)
     assert d.reason.startswith("PERP_CLOSED_EXTERNALLY_SPOT"), (d.action, d.reason)
     assert v.spot_long < held_before * 0.01, "the wallet's spot was not sold"
+
+
+def test_acquire_recovers_a_liquidation_that_shows_up_as_an_undefined_margin():
+    """A liquidated short leaves positionIM/positionMM undefined, which the
+    engine reads as 'unreadable' and halted on at the margin gate before it could
+    look at the venue's closed-pnl. The same evidence gate now runs there first."""
+    class NoMargin(_RefusingVenue):
+        def get_margin_multiple(self, symbol):
+            if self.perp_short <= 1e-9:
+                raise RuntimeError("no position: margin ratio undefined")
+            return super().get_margin_multiple(symbol)
+    v = NoMargin()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0
+    v.closed = booked
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+
+
+def test_an_undefined_margin_without_the_closed_pnl_record_still_halts_unreadable():
+    class NoMargin(_RefusingVenue):
+        def get_margin_multiple(self, symbol):
+            if self.perp_short <= 1e-9:
+                raise RuntimeError("no position: margin ratio undefined")
+            return super().get_margin_multiple(symbol)
+    v = NoMargin()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0
+    v.closed = 0.0                        # nothing records a close
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "MARGIN_UNREADABLE", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_the_baseline_is_stamped_from_before_the_position_read(monkeypatch):
+    """A close that lands between the venue's snapshot and a stamp taken AFTER the
+    read gets a closed-pnl row at or before the baseline and is skipped, so the
+    evidence would vanish (found by the fault campaign, EARLY LIQ_AFTER=1)."""
+    import carry_engine as ce
+    clock = iter(range(1_000_000, 2_000_000, 7))      # every call advances
+    monkeypatch.setattr(ce.time, "time", lambda: next(clock) / 1000.0)
+    stamps = {}
+
+    class Reads(_RefusingVenue):
+        def get_perp_position(self, symbol):
+            stamps["read_at_ms"] = int(ce.time.time() * 1000)
+            return self.perp_short
+    v = Reads()
+    eng = build(v, mode=ACQUIRE)
+    candle(eng, ms=1_000)                              # the open stamps a baseline
+    assert eng._venue_verified_ms is not None
+    assert eng._venue_verified_ms < stamps["read_at_ms"], (
+        "the baseline is later than the read it vouches for")
