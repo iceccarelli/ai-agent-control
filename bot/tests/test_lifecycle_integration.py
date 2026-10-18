@@ -675,3 +675,21 @@ class TestAnUnconfirmedCloseKeepsTheProtectiveOrders:
         cancels = self._watch_cancel_all(client)
         close = engine.close_position(symbol="BTCUSDT", reason="manual")
         assert close.ok and cancels == ["BTCUSDT"]
+
+
+class TestAnUnresolvedEntryBlocksAnotherEntry:
+    def test_a_second_entry_is_refused_while_the_first_is_unresolved(self, stack):
+        """An entry that was sent but never seen to fill may be a live position
+        the book does not know. A 60s cooldown expiring must not let a second
+        entry stack on it."""
+        engine, client, risk, store, exchange = stack
+        engine._await_fill = lambda symbol, link, timeout_s=10.0: None
+        first = engine.execute(buy_intent())
+        assert first.reason == "FILL_UNCONFIRMED"
+        sent = len([r for r in exchange.requests if "order/create" in r["url"]])
+        store._exec("DELETE FROM symbol_cooldown")             # the 60s ran out
+        second = engine.execute(buy_intent())
+        assert second.ok is False
+        assert second.reason == "ENTRY_ORDER_UNRESOLVED"
+        assert len([r for r in exchange.requests
+                    if "order/create" in r["url"]]) == sent

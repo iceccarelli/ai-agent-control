@@ -562,6 +562,27 @@ class BillionaireRiskManager:
             return _block("POSITION_ALREADY_OPEN", symbol=symbol)
         return _allow("NO_EXISTING_POSITION")
 
+    def _gate_unresolved_entry(self, symbol: str) -> RiskDecision:
+        """No new entry while an earlier entry for the symbol is unresolved.
+
+        An entry whose submit outcome is unknown (timeout, unparseable reply)
+        or that was never seen to fill may be a live position the position
+        book knows nothing about. A second entry would stack on it, with the
+        first lot unprotected. The block lasts until the order is resolved
+        (a terminal status from the venue, or startup reconciliation) -- not
+        for a fixed cooldown, which would expire with the question open.
+        """
+        try:
+            rows = self.store.unresolved_orders()
+        except Exception as exc:  # noqa: BLE001
+            return _block("ORDER_STATE_UNREADABLE", error=str(exc))
+        for r in rows:
+            if (str(r.get("symbol")) == symbol
+                    and str(r.get("purpose")) == "entry"):
+                return _block("ENTRY_ORDER_UNRESOLVED", symbol=symbol,
+                              order_link_id=str(r.get("order_link_id")))
+        return _allow("NO_UNRESOLVED_ENTRY")
+
     def _gate_naked_positions(self) -> RiskDecision:
         """No new trade while any existing position lacks a protective stop.
 
@@ -1001,6 +1022,7 @@ class BillionaireRiskManager:
                 self._gate_drawdown(account_equity),
                 self._gate_naked_positions(),
                 self._gate_existing_position(symbol),
+                self._gate_unresolved_entry(symbol),
                 self._gate_position_count(),
             )
             for decision in account_gates:

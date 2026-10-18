@@ -754,8 +754,7 @@ class TradingEngine:
                     # Terminal, and part of it executed: the venue holds that
                     # quantity, so it is a fill of the executed size -- not an
                     # "unconfirmed" order that leaves exposure nobody tracks.
-                    self.store.update_order_status(
-                        order_link_id, "partiallyfilledcanceled")
+                    self.store.update_order_status(order_link_id, "filled")
                     return order
                 if status in {"Rejected", "Cancelled", "Deactivated"}:
                     self.store.update_order_status(order_link_id, status.lower())
