@@ -721,18 +721,37 @@ class WSPrivateConsumer:
         finally:
             transport.close()
 
+    HANDSHAKE_MAX_FRAMES = 8
+
+    def _await_ack(self, transport: Any, op: str) -> None:
+        """Read until the ack for `op` arrives.
+
+        A data frame that arrives BEFORE the ack is an order or execution event
+        the venue really sent; reading exactly one frame and treating it as the
+        ack dropped it (and left the flag False, so the connection was torn
+        down). Data frames are routed to the normal handler instead.
+        """
+        for _ in range(self.HANDSHAKE_MAX_FRAMES):
+            opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
+            if opcode != 0x1:
+                continue
+            text = payload.decode("utf-8")
+            message = json.loads(text)
+            if isinstance(message, dict) and "topic" in message:
+                self.handle_raw_message(text)
+                continue
+            self._handle_control_message(message)
+            if isinstance(message, dict) and str(message.get("op") or "") == op:
+                return
+
     def _authenticate(self, transport: Any) -> None:
         auth_message = self._client.ws_auth_message()
         transport.send_text(json.dumps(auth_message))
-        opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
-        if opcode == 0x1:
-            self._handle_control_message(json.loads(payload.decode("utf-8")))
+        self._await_ack(transport, "auth")
 
     def _subscribe(self, transport: Any) -> None:
         transport.send_text(json.dumps({"op": "subscribe", "args": list(self.TOPICS)}))
-        opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
-        if opcode == 0x1:
-            self._handle_control_message(json.loads(payload.decode("utf-8")))
+        self._await_ack(transport, "subscribe")
 
     def run_forever(self, stop_event: Any) -> None:
         """Reconnect with backoff until `stop_event.is_set()`. Every

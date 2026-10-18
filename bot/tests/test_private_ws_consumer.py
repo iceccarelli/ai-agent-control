@@ -908,6 +908,20 @@ class TestExplicitAuthAndSubscribeSuccess:
         assert consumer.auth_ok is False
         assert transport.closed is True
 
+    def test_a_data_frame_before_the_subscribe_ack_is_not_dropped(self):
+        client = _StubClient(_StubStore())
+        transport = _ScriptedTransport([
+            _text_frame({"op": "auth", "success": True}),
+            _text_frame(json.loads(ORDER_MSG)),
+            _text_frame({"op": "subscribe", "success": True}),
+        ])
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: transport)
+        with pytest.raises(wt.WSClosed):
+            consumer.run_once()
+        assert consumer.subscribe_ok is True
+        assert consumer.applied_event_count == 1
+
     def test_run_once_raises_when_subscribe_fails(self):
         client = _StubClient(_StubStore())
         transport = _ScriptedTransport([
