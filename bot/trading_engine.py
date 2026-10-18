@@ -580,6 +580,11 @@ class TradingEngine:
             filters=filters, quote=quote,
         )
         if not entry.ok:
+            if entry.reason not in ("OUTCOME_UNKNOWN", "DUPLICATE_INTENT"):
+                # A refused entry starts the short cooldown the risk manager
+                # already defines for it; otherwise the same refused order is
+                # re-sent (and re-recorded) every tick.
+                self.risk.note_submit_result(accepted=False, symbol=symbol)
             return self._report(stage="entry", reason=entry.reason, symbol=symbol,
                                 detail={"ret_code": entry.ret_code},
                                 entry_order_link_id=entry.order_link_id)

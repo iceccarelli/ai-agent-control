@@ -175,6 +175,23 @@ class TestHappyPath:
 # ---------------------------------------------------------------------------
 
 
+class TestARefusedEntryStartsTheSymbolCooldown:
+    def test_the_same_refused_order_is_not_resent_next_tick(self, stack):
+        engine, client, risk, store, exchange = stack
+        risk.trade_cooldown_seconds = 60.0
+        exchange.reject_next_with = (10001, "simulated rejection")
+        first = engine.execute(buy_intent())
+        assert first.ok is False and first.stage == "entry"
+        creates = lambda: sum(  # noqa: E731
+            1 for r in exchange.requests if r["url"].endswith("/order/create"))
+        before = creates()
+        second = engine.execute(buy_intent())
+        assert second.ok is False
+        assert second.reason == "SYMBOL_COOLDOWN" or "COOLDOWN" in str(
+            getattr(second, "detail", "")) + str(second.reason)
+        assert creates() == before
+
+
 class TestNeverNaked:
     def test_a_rejected_stop_closes_the_position_and_trips_the_kill_switch(
         self, stack
