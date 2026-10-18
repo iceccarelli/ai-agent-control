@@ -1178,6 +1178,7 @@ class TradingEngine:
             closed_epoch=utc_now_epoch(),
             order_link_id=link,
             meta={"reason": reason, "exit_fill_confirmed": confirmed,
+                  "funding_booked": not getattr(self.client, "is_linear", False),
                   "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]}},
             dedupe_key=f"exit:{link}" if link else "",
         ))
@@ -1558,6 +1559,7 @@ class TradingEngine:
             closed_epoch=utc_now_epoch(),
             order_link_id=order_link_id,
             meta={"reason": reason, "partial": True,
+                  "funding_booked": not getattr(self.client, "is_linear", False),
                   "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]},
                   "fee_evidence": dict(fee_evidence or {})},
             dedupe_key=dedupe_key,

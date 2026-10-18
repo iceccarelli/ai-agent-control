@@ -197,3 +197,19 @@ def test_spot_untriggered_or_unreadable_orders_book_nothing(tmp_path):
     s = engine.observe_exits()
     assert s["closed"] == 0 and s["reduced"] == 0
     assert store.open_position_count() == 1
+
+
+def test_a_linear_trade_says_its_pnl_excludes_funding(tmp_path):
+    """The directional book does not read the venue's funding settlements, so a
+    linear trade's net pnl must say it is before funding rather than imply it
+    is complete."""
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open(store)
+    fake.closed_pnl.append({
+        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.01", "orderId": "o1",
+        "avgExitPrice": "59000", "closedPnl": "10",
+        "updatedTime": str(int(time.time() * 1000) + 1000)})
+    engine.observe_exits()
+    meta = json.loads(store._query("SELECT * FROM trades")[0]["meta"])
+    assert meta["funding_booked"] is False
