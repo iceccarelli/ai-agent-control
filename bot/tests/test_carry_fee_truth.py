@@ -434,3 +434,64 @@ def test_a_resting_order_that_fills_at_cancel_books_its_whole_stated_fee():
     assert [e.fee_status for e in journal.entries] == ["confirmed"]
     assert journal.statement()["fees_unknown"] == 0
     assert journal.balances()[L.BTC].qty == pytest.approx(0.4 - 0.0004)
+
+
+def _usdt_fee(amount):
+    return {"known": True, "source": "cumFeeDetail", "note": "",
+            "components": [{"amount": amount, "currency": "USDT"}]}
+
+
+def test_a_maker_rebate_on_the_cancel_increment_is_booked_not_discarded():
+    import ledger as L
+
+    class V:
+        def place_post_only(self, **k):
+            return {"filled_qty": 0.003, "avg_price": 30000.0, "order_link_id": "r1",
+                    "resting": True, "fee_detail": _usdt_fee(-0.012)}
+
+        def cancel_order(self, **k):
+            return {"filled_qty": 0.006, "avg_price": 30000.0, "order_link_id": "r1",
+                    "resting": False, "fee_detail": _usdt_fee(-0.024)}
+
+    journal = L.Journal()
+    broker = L.LedgerBroker(V(), journal, ms=lambda: 1)
+    broker.place_post_only(symbol="BTCUSDT", side="Buy", qty=0.01, price=30000.0,
+                           product="spot")
+    broker.cancel_order(symbol="BTCUSDT", order_link_id="r1", product="spot")
+    assert [e.fee_status for e in journal.entries] == ["confirmed", "confirmed"]
+
+
+def test_a_currency_whose_cumulative_fee_went_backwards_stays_unknown():
+    import ledger as L
+
+    class V:
+        def place_post_only(self, **k):
+            return {"filled_qty": 0.003, "avg_price": 30000.0, "order_link_id": "b1",
+                    "resting": True, "fee_detail": _usdt_fee(0.012)}
+
+        def cancel_order(self, **k):
+            return {"filled_qty": 0.006, "avg_price": 30000.0, "order_link_id": "b1",
+                    "resting": False, "fee_detail": _usdt_fee(0.005)}
+
+    journal = L.Journal()
+    broker = L.LedgerBroker(V(), journal, ms=lambda: 1)
+    broker.place_post_only(symbol="BTCUSDT", side="Buy", qty=0.01, price=30000.0,
+                           product="spot")
+    broker.cancel_order(symbol="BTCUSDT", order_link_id="b1", product="spot")
+    assert [e.fee_status for e in journal.entries] == ["confirmed", "unknown"]
+
+
+def test_a_negative_base_fee_on_a_spot_buy_does_not_inflate_the_held_quantity():
+    import ledger as L
+
+    class V:
+        def place_market(self, **k):
+            return {"filled_qty": 0.01, "avg_price": 30000.0, "order_link_id": "n1",
+                    "fee_detail": {"known": True, "source": "cumFeeDetail", "note": "",
+                                   "components": [{"amount": -0.00001,
+                                                   "currency": "BTC"}]}}
+
+    journal = L.Journal()
+    broker = L.LedgerBroker(V(), journal, ms=lambda: 1)
+    broker.place_market(symbol="BTCUSDT", side="Buy", qty=0.01, product="spot")
+    assert journal.balances()[L.BTC].qty == pytest.approx(0.01)
