@@ -306,3 +306,28 @@ def convert_fee_set(
             "confirmed", sum(p.account_unit_amount for p in parts), parts,
             fees.source, fees.note)
     return FeeSetConversion("unresolved", None, parts, fees.source, fees.note)
+
+
+#: Fraction of a spot buy withheld from its exits when the venue stated no fee:
+#: twice the standard 0.1% taker rate. Selling a hair less than held is
+#: harmless; selling more than is held is rejected.
+SPOT_UNSTATED_FEE_ALLOWANCE = 0.002
+
+
+def spot_buy_net_qty(symbol: str, filled_qty: float, fees: "FeeSet") -> float:
+    """What a spot BUY left in the account, before lot snapping.
+
+    Bybit takes a buy's fee in the BASE coin, so the account holds the fill less
+    that fee. A stated fee with no currency (``cumExecFee`` without a
+    ``feeCurrency``, as the order-status endpoint returns it) is read as the
+    base coin too, since that is the coin a buy is charged in. A fee the venue
+    did not state at all is allowed for at ``SPOT_UNSTATED_FEE_ALLOWANCE``.
+    """
+    base, _unit = split_symbol_units(symbol)
+    net = float(filled_qty)
+    if fees.known:
+        net -= sum(float(c.amount) for c in fees.components
+                   if c.currency in (base, None))
+    else:
+        net *= (1.0 - SPOT_UNSTATED_FEE_ALLOWANCE)
+    return net

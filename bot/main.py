@@ -899,6 +899,12 @@ class TradingBot:
         # before any gate reads open_position_count or the loss streak.
         rest_observation_ok = True
         try:
+            late = self.engine.resolve_unresolved_entries()
+            if late.get("resolved") or late.get("adopted"):
+                logger.warning("unresolved entries settled this cycle: %s", late)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("resolve_unresolved_entries failed; continuing: %s", exc)
+        try:
             observed = self.engine.observe_exits()
             if observed.get("closed") or observed.get("reduced"):
                 logger.warning("exits observed this cycle: %s", observed)

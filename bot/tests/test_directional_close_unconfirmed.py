@@ -148,3 +148,27 @@ def test_reanchor_leaves_a_plan_with_no_stop_distance_alone(tmp_path):
     plan = te.ExitPlan(stop_price=98.0, legs=((104.0, 1.0),), stop_distance=0.0)
     assert engine._reanchor(plan, side="Buy", fill_price=100.0) is plan
 
+
+
+def test_a_derivatives_order_cancelled_after_a_partial_fill_counts_as_a_fill(tmp_path):
+    """Only spot reports PartiallyFilledCanceled; linear says Cancelled with an
+    executed quantity. That executed quantity is a held position."""
+    engine, store = _linear(tmp_path)
+
+    class Client:
+        def get_order(self, **kw):
+            return {"orderStatus": "Cancelled", "cumExecQty": "0.003",
+                    "avgPrice": "60000"}
+    engine.client = Client()
+    fill = engine._await_fill("BTCUSDT", "x", timeout_s=1.0)
+    assert fill is not None and float(fill["cumExecQty"]) == 0.003
+
+
+def test_a_cancelled_order_with_nothing_executed_is_still_unfilled_on_linear(tmp_path):
+    engine, store = _linear(tmp_path)
+
+    class Client:
+        def get_order(self, **kw):
+            return {"orderStatus": "Cancelled", "cumExecQty": "0"}
+    engine.client = Client()
+    assert engine._await_fill("BTCUSDT", "x", timeout_s=1.0) is None

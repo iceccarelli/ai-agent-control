@@ -325,12 +325,14 @@ def test_a_spot_entry_that_filled_while_unconfirmed_is_adopted_and_protected(tmp
     def get_order(**kw):
         if kw.get("order_link_id") == "ENT-1":
             return {"orderStatus": "Filled", "cumExecQty": "0.001",
-                    "avgPrice": "60000", "orderId": "V9"}
+                    "avgPrice": "60000", "orderId": "V9",
+                    "cumFeeDetail": {"BTC": "0.000001"}}
         return real(**kw)
     engine.client.get_order = get_order
     engine.reconcile()
     rows = store.open_positions()
-    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.001)
+    # adopted at what the buy LEFT in the account: the fill less its base-coin fee
+    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.000999)
     assert float(rows[0]["stop_price"]) > 0, "the adopted position was left naked"
     assert json.loads(rows[0]["meta"]).get("stop_order_link_id")
     assert store.get_order("ENT-1")["status"] == "filled"
@@ -362,7 +364,7 @@ def test_a_resting_entry_found_at_startup_is_cancelled_and_its_partial_fill_adop
             if state["cancelled"]:
                 return {"orderStatus": "PartiallyFilledCanceled",
                         "cumExecQty": "0.0005", "avgPrice": "60000",
-                        "orderId": "V3"}
+                        "orderId": "V3", "cumFeeDetail": {"BTC": "0.0000005"}}
             return {"orderStatus": "New", "cumExecQty": "0", "orderId": "V3"}
         return real_get(**kw)
 
@@ -375,7 +377,7 @@ def test_a_resting_entry_found_at_startup_is_cancelled_and_its_partial_fill_adop
     engine.reconcile()
     assert state["cancelled"], "the resting entry was left live"
     rows = store.open_positions()
-    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.0005)
+    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.000499)
     assert float(rows[0]["stop_price"]) > 0
     assert "ENT-3" not in [o["order_link_id"] for o in store.unresolved_orders()]
 
@@ -389,3 +391,80 @@ def test_startup_does_not_emergency_close_a_naked_row_the_venue_no_longer_holds(
     assert not any(r["url"].endswith("/v5/position/trading-stop")
                    for r in fake.requests)
     assert store.open_position_count() == 1     # left for observe_exits to book
+
+
+def test_an_adopted_entry_whose_fee_has_no_currency_is_still_net_of_it(tmp_path):
+    """/v5/order/realtime returns cumExecFee without feeCurrency: on a spot buy
+    that fee is the base coin and must come off the adopted quantity."""
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    store.record_order("ENT-4", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+    store.update_order_status("ENT-4", "submitted")
+    real = engine.client.get_order
+
+    def get_order(**kw):
+        if kw.get("order_link_id") == "ENT-4":
+            return {"orderStatus": "Filled", "cumExecQty": "0.001",
+                    "avgPrice": "60000", "orderId": "V4", "cumExecFee": "0.000001"}
+        return real(**kw)
+    engine.client.get_order = get_order
+    engine.reconcile()
+    assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.000999)
+
+
+class TestUnresolvedEntriesAreSettledWhileRunning:
+    def _engine(self, tmp_path, cfg=None):
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, cfg or Cfg(), fake)
+        store.record_order("U1", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+        store.update_order_status("U1", "submitted")
+        return engine, store
+
+    def _serve(self, engine, reply):
+        real = engine.client.get_order
+
+        def get_order(**kw):
+            if kw.get("order_link_id") == "U1":
+                return reply
+            return real(**kw)
+        engine.client.get_order = get_order
+
+    def test_a_cancelled_entry_is_recorded_and_stops_blocking(self, tmp_path):
+        engine, store = self._engine(tmp_path)
+        self._serve(engine, {"orderStatus": "Cancelled", "cumExecQty": "0"})
+        out = engine.resolve_unresolved_entries()
+        assert out["resolved"] == 1
+        assert store.unresolved_orders() == []
+
+    def test_a_spot_entry_that_filled_is_adopted_and_protected(self, tmp_path):
+        engine, store = self._engine(tmp_path)
+        self._serve(engine, {"orderStatus": "Filled", "cumExecQty": "0.001",
+                             "avgPrice": "60000", "orderId": "V1",
+                             "cumFeeDetail": {"BTC": "0.000001"}})
+        out = engine.resolve_unresolved_entries()
+        assert out["adopted"] == [SYMBOL]
+        row = store.open_positions()[0]
+        assert float(row["qty"]) == pytest.approx(0.000999)
+        assert float(row["stop_price"]) > 0
+
+    def test_a_live_order_is_left_alone(self, tmp_path):
+        engine, store = self._engine(tmp_path)
+        self._serve(engine, {"orderStatus": "New", "cumExecQty": "0"})
+        assert engine.resolve_unresolved_entries()["resolved"] == 0
+        assert len(store.unresolved_orders()) == 1
+
+    def test_an_order_the_venue_cannot_find_is_only_never_sent_once_old(self, tmp_path):
+        engine, store = self._engine(tmp_path)
+        self._serve(engine, None)
+        assert engine.resolve_unresolved_entries()["resolved"] == 0
+        engine.UNRESOLVED_ENTRY_NEVER_SENT_AFTER_S = 0.0
+        assert engine.resolve_unresolved_entries()["resolved"] == 1
+        assert store.get_order("U1")["status"] == "never_sent"
+
+    def test_an_executed_linear_entry_stays_blocking(self, tmp_path):
+        engine, store = self._engine(tmp_path, LinearCfg())
+        self._serve(engine, {"orderStatus": "Filled", "cumExecQty": "0.001",
+                             "avgPrice": "60000"})
+        out = engine.resolve_unresolved_entries()
+        assert out["resolved"] == 0 and store.open_positions() == []
+        assert len(store.unresolved_orders()) == 1

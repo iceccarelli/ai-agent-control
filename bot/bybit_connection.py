@@ -1946,6 +1946,24 @@ class BybitClient:
             return
         import venue_fees
         fees = venue_fees.extract_order_fees(remote)
+        # Size to what the buy left in the account (its fee is taken in the base
+        # coin), or the stop placed for it would exceed the balance.
+        net = venue_fees.spot_buy_net_qty(symbol, qty, fees)
+        try:
+            filters = self.get_instrument_filters(symbol)
+            net = float(snap_qty_down(net, filters.qty_step)) if net > 0 else 0.0
+            if net < float(filters.min_qty):
+                self.store.add_dust(symbol, qty)
+                self.store.journal(symbol, "ENTRY_DUST",
+                                   "adopted entry below minimum net of fee",
+                                   {"gross_filled": qty})
+                return
+        except BybitAPIError:
+            logger.warning("reconcile: filters unreadable for %s; adopting the "
+                           "entry at the fill less its fee, unsnapped", symbol)
+        if net <= 0.0:
+            return
+        qty = net
         self.store.upsert_position(
             symbol, "Buy", qty, price, stop_price=0.0,
             order_link_id=str(row["order_link_id"]),

@@ -566,3 +566,12 @@ class TestASpotBuyIsProtectedForWhatIsActuallyHeld:
         assert store._query("SELECT * FROM decisions WHERE decision = ?",
                             ("ENTRY_DUST",))
         store.close()
+
+
+def test_a_stated_fee_without_a_currency_is_the_base_coin_on_a_spot_buy():
+    import venue_fees
+    fees = venue_fees.extract_order_fees({"cumExecFee": "0.002"})
+    assert fees.known
+    assert venue_fees.spot_buy_net_qty("BTCUSDT", 2.0, fees) == pytest.approx(1.998)
+    assert venue_fees.spot_buy_net_qty(
+        "BTCUSDT", 2.0, venue_fees.UNKNOWN_FEES) == pytest.approx(2.0 * 0.998)

@@ -210,6 +210,9 @@ class PrivateWebSocket:
         except OSError as exc:
             raise WSClosed(f"send failed: {exc}") from exc
 
+    #: How long the rest of a frame may take once its first byte has arrived.
+    MID_FRAME_TIMEOUT_S = 10.0
+
     def recv(self, *, timeout: Optional[float] = None) -> Tuple[int, bytes]:
         """One frame: (opcode, payload). Raises WSClosed on a close frame
         or a dead socket, WSProtocolError on anything this client refuses
@@ -218,10 +221,21 @@ class PrivateWebSocket:
         if sock is None:
             raise WSClosed("not connected")
         try:
+            # The caller's timeout bounds only the wait for the FIRST byte of a
+            # frame, where a timeout consumes nothing and is safe to retry. Once
+            # a frame has started it is read to the end: a timeout in the middle
+            # would drop bytes and leave the stream mis-framed.
             sock.settimeout(timeout)
-            header = self._recv_exact(sock, 2)
+            first = self._recv_exact(sock, 1)
         except socket.timeout:
             raise
+        except OSError as exc:
+            raise WSClosed(f"recv failed: {exc}") from exc
+        try:
+            sock.settimeout(self.MID_FRAME_TIMEOUT_S)
+            header = first + self._recv_exact(sock, 1)
+        except socket.timeout as exc:
+            raise WSClosed("timed out in the middle of a frame") from exc
         except OSError as exc:
             raise WSClosed(f"recv failed: {exc}") from exc
         b0, b1 = header[0], header[1]
@@ -237,11 +251,14 @@ class PrivateWebSocket:
             raise WSProtocolError(
                 "server frame was masked; RFC 6455 forbids this — refusing "
                 "a frame from a server that violates the spec")
-        if length == 126:
-            length = struct.unpack("!H", self._recv_exact(sock, 2))[0]
-        elif length == 127:
-            length = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
-        payload = self._recv_exact(sock, length) if length else b""
+        try:
+            if length == 126:
+                length = struct.unpack("!H", self._recv_exact(sock, 2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
+            payload = self._recv_exact(sock, length) if length else b""
+        except socket.timeout as exc:
+            raise WSClosed("timed out in the middle of a frame") from exc
         if opcode == OP_CLOSE:
             raise WSClosed(f"server sent close frame: {payload!r}")
         return opcode, payload

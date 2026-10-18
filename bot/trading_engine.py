@@ -351,24 +351,11 @@ class TradingEngine:
                     "qty_before_memory": sizing.qty},
         )
 
-    #: Fraction of a spot buy withheld from the exits when the venue stated no fee.
-    SPOT_UNSTATED_FEE_ALLOWANCE = 0.002
-
     def _spot_sellable_qty(self, symbol: str, filled_qty: float,
                            entry_fees: Any, filters: InstrumentFilters) -> float:
-        """What a spot buy left in the account: the fill less the base-coin fee,
-        snapped down to the lot step. A fee the venue did not state is allowed
-        for at twice the standard taker rate."""
-        base, _unit = venue_fees.split_symbol_units(symbol)
-        net = float(filled_qty)
-        if entry_fees.known:
-            net -= sum(float(c.amount) for c in entry_fees.components
-                       if c.currency == base)
-        else:
-            # Unstated: hold back twice the 0.1% standard spot taker rate rather
-            # than read a balance that may not have caught up with the fill.
-            # Selling a hair less than held is harmless; selling more is not.
-            net *= (1.0 - self.SPOT_UNSTATED_FEE_ALLOWANCE)
+        """What a spot buy left in the account (see ``venue_fees.spot_buy_net_qty``),
+        snapped down to the lot step."""
+        net = venue_fees.spot_buy_net_qty(symbol, filled_qty, entry_fees)
         if net <= 0.0:
             return 0.0
         return float(snap_qty_down(net, filters.qty_step))
@@ -869,7 +856,7 @@ class TradingEngine:
                 if status == "Filled":
                     self.store.update_order_status(order_link_id, "filled")
                     return order
-                if (status == "PartiallyFilledCanceled"
+                if (status in ("PartiallyFilledCanceled", "Cancelled", "Deactivated")
                         and float(order.get("cumExecQty") or 0.0) > 0.0):
                     # Terminal, and part of it executed: the venue holds that
                     # quantity, so it is a fill of the executed size -- not an
@@ -1342,6 +1329,73 @@ class TradingEngine:
         if abs(executed - exited) > tol:
             return unknown("named orders executed a different quantity")
         return total, {"order_ids": order_ids}, evidence
+
+    #: An order the venue cannot find is only called never-sent once it is this
+    #: old: a create whose reply was lost can take a moment to become visible.
+    UNRESOLVED_ENTRY_NEVER_SENT_AFTER_S = 120.0
+
+    def resolve_unresolved_entries(self) -> Dict[str, Any]:
+        """Settle entries whose outcome the engine never saw, while running.
+
+        An entry left ``submitted``/``unknown`` (a fill poll that timed out, a
+        reply that never came) blocks its symbol and takes a slot against the
+        position and exposure caps. Only a restart used to clear it, so a venue
+        blip parked a symbol until then. Each is looked up at the venue: a
+        terminal order is recorded; a spot buy that executed is adopted into the
+        book and protected (or flattened) like any naked position. A linear fill
+        is left unresolved, loudly, so the gate keeps holding the symbol for a
+        human. Never raises into the loop.
+        """
+        summary: Dict[str, Any] = {"checked": 0, "resolved": 0, "adopted": [],
+                                   "unread": 0}
+        try:
+            rows = [r for r in self.store.unresolved_orders()
+                    if str(r.get("purpose")) == "entry"]
+        except Exception:  # noqa: BLE001
+            logger.exception("could not list unresolved entries")
+            return summary
+        now = utc_now_epoch()
+        for row in rows:
+            summary["checked"] += 1
+            oid, symbol = str(row["order_link_id"]), str(row["symbol"])
+            try:
+                remote = self.client.get_order(symbol=symbol, order_link_id=oid,
+                                               strict=True)
+            except BybitAPIError as exc:
+                logger.warning("unresolved entry %s unreadable: %s", oid, exc)
+                summary["unread"] += 1
+                continue
+            if remote is None:
+                age = now - float(row.get("created_epoch") or now)
+                if age >= self.UNRESOLVED_ENTRY_NEVER_SENT_AFTER_S:
+                    self.store.update_order_status(oid, "never_sent")
+                    summary["resolved"] += 1
+                continue
+            status = str(remote.get("orderStatus", ""))
+            if status not in ("Filled", "Cancelled", "Rejected", "Deactivated",
+                              "PartiallyFilledCanceled"):
+                continue                      # still live: nothing to settle yet
+            executed = float(remote.get("cumExecQty") or 0.0) > 0.0
+            if executed and getattr(self.client, "is_linear", False):
+                logger.critical(
+                    "unresolved entry %s on %s EXECUTED at the venue (linear): "
+                    "left unresolved so the symbol stays blocked until a human "
+                    "reconciles it", oid, symbol)
+                summary["unread"] += 1
+                continue
+            self.store.update_order_status(
+                oid, "filled" if executed else status.lower(),
+                exchange_id=str(remote.get("orderId", "")))
+            summary["resolved"] += 1
+            if executed:
+                adopt = getattr(self.client, "_adopt_filled_spot_entry", None)
+                if callable(adopt):
+                    adopt(row, remote, {})
+                held = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
+                if held is not None and float(held.get("stop_price") or 0.0) <= 0.0:
+                    self._protect_or_close_naked(symbol, held, reason="ENTRY_RESOLVED_LATE")
+                    summary["adopted"].append(symbol)
+        return summary
 
     def observe_exits(self) -> Dict[str, Any]:
         """Notice exchange-side exits (stop / take-profit fills) and book them.
