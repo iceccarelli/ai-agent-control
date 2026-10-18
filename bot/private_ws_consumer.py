@@ -93,6 +93,7 @@ import collections
 import datetime as dt
 import hashlib
 import json
+import socket
 import logging
 import os
 import queue
@@ -677,11 +678,24 @@ class WSPrivateConsumer:
                     "(SUBSCRIBE_OK not established)")
             count = 0
             last_ping = time.time()
+            last_rx = time.time()
+            self._reached_receive_loop = True
             while max_messages is None or count < max_messages:
                 if time.time() - last_ping > PING_INTERVAL_SECONDS:
                     transport.send_text(json.dumps(self._client.ws_ping_message()))
                     last_ping = time.time()
-                opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
+                # Wake in time for the next ping: a quiet private stream must
+                # not sit in recv() past the ping interval, or the connection
+                # is declared dead and torn down every RECV_TIMEOUT seconds.
+                wait = min(RECV_TIMEOUT_SECONDS, max(
+                    0.1, PING_INTERVAL_SECONDS - (time.time() - last_ping)))
+                try:
+                    opcode, payload = transport.recv(timeout=wait)
+                except socket.timeout:
+                    if time.time() - last_rx > 2 * PING_INTERVAL_SECONDS:
+                        raise   # pings went unanswered: the link is dead
+                    continue
+                last_rx = time.time()
                 if opcode == 0x1:  # text
                     self.handle_raw_message(payload.decode("utf-8"))
                     count += 1
@@ -721,6 +735,7 @@ class WSPrivateConsumer:
         attempt = 0
         while not stop_event.is_set():
             connection_error = ""
+            self._reached_receive_loop = False
             try:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001
@@ -733,6 +748,8 @@ class WSPrivateConsumer:
                     connection_event="disconnected", error=connection_error)
             if stop_event.is_set():
                 return
+            if self._reached_receive_loop:
+                attempt = 0     # a connection that worked restarts the backoff
             backoff = RECONNECT_BACKOFF_SECONDS[
                 min(attempt, len(RECONNECT_BACKOFF_SECONDS) - 1)]
             self._sleep(backoff)
