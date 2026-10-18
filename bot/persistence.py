@@ -59,6 +59,7 @@ only way to find out whether the cost model matches reality.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
@@ -560,6 +561,8 @@ class StateStore:
                              "would open a throwaway database")
         self._path = path
         self._lock = threading.RLock()
+        #: >0 while inside ``transaction()``: ``_exec`` then defers its commit.
+        self._tx_depth = 0
         #: Thread id permitted to mutate state; None means unrestricted.
         self._writer_thread: Optional[int] = None
         try:
@@ -792,10 +795,37 @@ class StateStore:
         with self._lock:
             try:
                 cur = self._conn.execute(sql, params)
-                self._conn.commit()
+                if self._tx_depth == 0:
+                    self._conn.commit()
                 return cur
             except Exception as exc:  # noqa: BLE001
                 raise PersistenceError(f"state write failed: {exc}") from exc
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Group several ``_exec`` writes into ONE commit (all or nothing).
+
+        For writes that must not be split by a kill: the carry journal and the
+        carry position, say. Re-entrant; the commit happens when the outermost
+        block exits cleanly, a rollback if it raises."""
+        self._assert_writer()
+        with self._lock:
+            self._tx_depth += 1
+            try:
+                yield self
+            except BaseException:
+                self._tx_depth -= 1
+                if self._tx_depth == 0:
+                    self._conn.rollback()
+                raise
+            else:
+                self._tx_depth -= 1
+                if self._tx_depth == 0:
+                    try:
+                        self._conn.commit()
+                    except Exception as exc:  # noqa: BLE001
+                        self._conn.rollback()
+                        raise PersistenceError(f"state write failed: {exc}") from exc
 
     def _query(self, sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
         with self._lock:
@@ -1142,7 +1172,21 @@ class StateStore:
         but as an int here since legitimate callers already treat a
         positive id as "recorded").
         """
-        cur = self._exec(
+        day = utc_day(trade.closed_epoch)
+        self._assert_writer()
+        with self._lock:
+            try:
+                return self._record_trade_locked(trade, day)
+            except Exception as exc:  # noqa: BLE001
+                self._conn.rollback()
+                raise PersistenceError(f"state write failed: {exc}") from exc
+
+    def _record_trade_locked(self, trade: TradeRecord, day: str) -> int:
+        """The trade row and the day's anchor move in ONE commit: a kill between
+        two commits booked the trade but never credited the anchor, and the
+        dedupe then refused the replay -- the daily-loss gate under-counted that
+        loss for good."""
+        cur = self._conn.execute(
             "INSERT INTO trades(symbol, side, qty, entry_price, exit_price, gross_pnl,"
             " entry_fee, exit_fee, net_pnl, opened_epoch, closed_epoch, day,"
             " order_link_id, meta, dedupe_key, entry_fee_realized,"
@@ -1163,18 +1207,26 @@ class StateStore:
             ),
         )
         if cur.rowcount != 1:
+            self._conn.commit()
             self.journal(trade.symbol, "DUPLICATE_TRADE_BLOCKED",
                         "a trade with an already-booked dedupe_key was not "
                         "re-recorded; daily_anchor was not double-counted",
                         {"dedupe_key": trade.dedupe_key,
                          "order_link_id": trade.order_link_id})
             return 0
-        day = utc_day(trade.closed_epoch)
-        self._exec(
+        # A trade on a day with no anchor row (an exit observed after an outage)
+        # must still be counted: create the anchor from the last known equity.
+        last_equity = self._conn.execute(
+            "SELECT last_equity FROM equity_state WHERE id = 1").fetchone()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, ?)",
+            (day, float(last_equity[0]) if last_equity else 0.0))
+        self._conn.execute(
             "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?, "
             "trades = trades + 1 WHERE day = ?",
             (trade.net_pnl, day),
         )
+        self._conn.commit()
         return int(cur.lastrowid or 0)
 
     def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:

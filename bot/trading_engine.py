@@ -2180,14 +2180,26 @@ class TradingEngine:
         process is a feature, not a leak. The legacy ``stop()`` cancelled
         nothing and closed nothing.
         """
+        # First settle what the venue already did with unresolved entries (an
+        # executed spot buy is adopted and protected), so the cancels below never
+        # act on an entry that in fact filled -- and the process does not exit
+        # leaving a fill unprotected.
+        try:
+            self.resolve_unresolved_entries()
+        except Exception:  # noqa: BLE001
+            logger.exception("could not settle unresolved entries at shutdown")
         for row in self.store.pending_orders():
             purpose = str(row.get("purpose", ""))
             if purpose == "stop" and not cancel_protective:
                 continue
-            self.client.cancel_order(
-                symbol=str(row["symbol"]),
-                order_link_id=str(row["order_link_id"]),
-            )
+            try:
+                self.client.cancel_order(
+                    symbol=str(row["symbol"]),
+                    order_link_id=str(row["order_link_id"]),
+                )
+            except Exception:  # noqa: BLE001
+                # One order that cannot be cancelled must not leave the rest live.
+                logger.exception("shutdown could not cancel %s", row.get("order_link_id"))
         logger.info("shutdown complete; protective stops left in place=%s",
                     not cancel_protective)
 

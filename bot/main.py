@@ -281,9 +281,15 @@ class TradingBot:
             naked = [p["symbol"] for p in self.store.positions_without_stops()]
             carry = self.carry_status()
             carry_blocked = bool(carry.get("blocking_fault"))
+            loop_stalled = self._loop_stalled()
             return {
                 "healthy": (not kill_engaged and not naked and self._reconciled
-                            and not carry_blocked),
+                            and not carry_blocked and not loop_stalled),
+                "loop_stalled": loop_stalled,
+                "consecutive_tick_failures": self._tick_failures,
+                "last_tick_ok_age_s": (None if not self._last_tick_ok_epoch else
+                                       round(time.time() - self._last_tick_ok_epoch, 1)),
+                "risk_halted": self._risk_halted(),
                 "carry": carry,
                 "reconciled": self._reconciled,
                 "kill_switch": kill_engaged,
@@ -303,6 +309,34 @@ class TradingBot:
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    #: Class-level defaults so a bot built without __init__ (tests, tools) works.
+    _last_tick_ok_epoch = 0.0
+    _tick_failures = 0
+    #: A loop is called stalled after this many consecutive failed cycles, or when
+    #: no cycle has completed for this many loop intervals (and at least 120 s).
+    HEALTH_MAX_TICK_FAILURES = 5
+    HEALTH_STALL_INTERVALS = 3
+
+    def _loop_stalled(self) -> bool:
+        """True when the trading loop is failing or has stopped completing.
+
+        A health endpoint that stays green while ``tick()`` raises on every cycle
+        (or hangs on a venue call) tells an operator nothing."""
+        if self._tick_failures >= self.HEALTH_MAX_TICK_FAILURES:
+            return True
+        last = self._last_tick_ok_epoch
+        if not last:
+            return False                      # first cycle not finished yet
+        limit = max(120.0, self.HEALTH_STALL_INTERVALS * float(
+            getattr(self, "loop_interval_s", 60.0) or 60.0))
+        return (time.time() - last) > limit
+
+    def _risk_halted(self) -> bool:
+        try:
+            return bool(self.risk.should_halt_trading())
+        except Exception:  # noqa: BLE001
+            return True
 
     def carry_status(self) -> Dict[str, Any]:
         """What an operator must know about the carry book, in one place.
@@ -700,6 +734,7 @@ class TradingBot:
         self._install_signal_handlers()
         logger.info("trading loop started for %s", ", ".join(self.symbols) or "(none)")
 
+        self._last_tick_ok_epoch = time.time()     # the stall clock starts now
         while not self._stop.is_set():
             try:
                 self.tick()
@@ -707,8 +742,11 @@ class TradingBot:
                 # One bad cycle must not kill the process, but it must be loud
                 # and it must not be silently retried at full speed.
                 logger.exception("cycle failed: %s", exc)
+                self._tick_failures += 1
                 self._stop.wait(min(30.0, self.loop_interval_s))
                 continue
+            self._tick_failures = 0
+            self._last_tick_ok_epoch = time.time()
             self._stop.wait(self.loop_interval_s)
 
         self.shutdown()
@@ -723,9 +761,15 @@ class TradingBot:
         A failure here raises into the engine, which halts on it.
         """
         journal = getattr(self, "carry_journal", None)
-        if journal is not None:
-            self.store.save_ledger(journal.to_rows())
-        self.store.save_carry_position(state)
+        # One commit: a kill between the two left the journal ahead of the
+        # position row, which the next cold start can only halt on.
+        transaction = getattr(self.store, "transaction", None)
+        import contextlib as _contextlib
+        with (transaction() if callable(transaction)
+              else _contextlib.nullcontext()):
+            if journal is not None:
+                self.store.save_ledger(journal.to_rows())
+            self.store.save_carry_position(state)
 
     def _log_venue_leverage(self, broker: Any) -> None:
         """Say what leverage the venue reports for the carry perp. Observation
@@ -1349,13 +1393,15 @@ class TradingBot:
         except Exception:  # noqa: BLE001
             logger.warning("session log could not be closed", exc_info=True)
         try:
-            self.store.release_writer()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
             self.engine.shutdown(cancel_protective=False)
         except Exception:  # noqa: BLE001
             logger.exception("engine shutdown failed")
+        # Released only after the engine's last writes, so the single-writer
+        # assertion still guards them.
+        try:
+            self.store.release_writer()
+        except Exception:  # noqa: BLE001
+            pass
         if self._http is not None:
             try:
                 self._http.shutdown()

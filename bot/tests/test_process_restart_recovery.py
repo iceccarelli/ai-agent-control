@@ -629,3 +629,78 @@ class TestWSStatusMonotonicGuard:
             d for d in store.recent_decisions()
             if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
         ] == []
+
+
+class TestWritesThatMustNotBeSplit:
+    def test_a_booked_trade_and_its_anchor_commit_together(self, tmp_path):
+        """A kill between the trade INSERT and the anchor UPDATE booked the trade
+        but never credited the day's realised pnl; the dedupe then refused the
+        replay. Both must be one commit."""
+        import time as _t
+        from persistence import StateStore, TradeRecord
+        store = StateStore(str(tmp_path / "t.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        trade = TradeRecord(
+            symbol="BTCUSDT", side="Buy", qty=1.0, entry_price=100.0,
+            exit_price=90.0, gross_pnl=-10.0, entry_fee=0.0, exit_fee=0.0,
+            opened_epoch=_t.time() - 10, closed_epoch=_t.time(),
+            order_link_id="X", meta={}, dedupe_key="exit:X")
+        original = store._conn.execute
+        calls = {"n": 0}
+
+        class Dying:
+            """A connection whose anchor UPDATE dies, as a kill would."""
+            def __init__(self, inner):
+                self.inner = inner
+
+            def execute(self, sql, *a, **k):
+                if sql.lstrip().upper().startswith("UPDATE DAILY_ANCHOR"):
+                    calls["n"] += 1
+                    raise RuntimeError("killed between the statements")
+                return self.inner.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+        real = store._conn
+        store._conn = Dying(real)
+        with pytest.raises(Exception):
+            store.record_trade(trade)
+        store._conn = real
+        assert calls["n"] == 1
+        assert store.recent_trades() == [], "the trade stayed booked without its anchor"
+        # the replay is therefore NOT a duplicate and books both
+        assert store.record_trade(trade) > 0
+        anchor = store.ensure_daily_anchor(1_000.0)
+        assert anchor.realised_pnl == pytest.approx(trade.net_pnl)
+        store.close()
+
+    def test_a_trade_on_a_day_without_an_anchor_is_still_counted(self, tmp_path):
+        import time as _t
+        from persistence import StateStore, TradeRecord
+        store = StateStore(str(tmp_path / "t2.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        yesterday = _t.time() - 86_400 * 3
+        store.record_trade(TradeRecord(
+            symbol="BTCUSDT", side="Buy", qty=1.0, entry_price=100.0,
+            exit_price=90.0, gross_pnl=-10.0, entry_fee=0.0, exit_fee=0.0,
+            opened_epoch=yesterday - 5, closed_epoch=yesterday, order_link_id="Y",
+            meta={}, dedupe_key="exit:Y"))
+        row = store._query("SELECT * FROM daily_anchor WHERE realised_pnl != 0")
+        assert row and float(row[0]["realised_pnl"]) == pytest.approx(-10.0)
+        store.close()
+
+    def test_a_transaction_commits_all_or_nothing(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "t3.db"))
+        store.claim_writer()
+        with pytest.raises(RuntimeError):
+            with store.transaction():
+                store.save_carry_position({"book_state": "HEDGED"})
+                raise RuntimeError("killed")
+        assert store._query("SELECT * FROM carry_position") == []
+        with store.transaction():
+            store.save_carry_position({"book_state": "HEDGED"})
+        assert store._query("SELECT book_state FROM carry_position")[0][0] == "HEDGED"
+        store.close()

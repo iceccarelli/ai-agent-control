@@ -392,3 +392,55 @@ class TestStructure:
         assert report.ok, report.reason
         bot.shutdown()
         assert exchange.orders[report.stop_order_link_id]["orderStatus"] == "Untriggered"
+
+
+class TestHealthTellsTheLoopIsDead:
+    def test_a_loop_that_fails_every_cycle_is_unhealthy(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        assert bot.health()["healthy"] is True
+        bot._tick_failures = bot.HEALTH_MAX_TICK_FAILURES
+        payload = bot.health()
+        assert payload["healthy"] is False and payload["loop_stalled"] is True
+
+    def test_a_loop_that_stopped_completing_cycles_is_unhealthy(self, tmp_path, exchange):
+        import time as _t
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        bot._last_tick_ok_epoch = _t.time() - 10_000
+        assert bot.health()["healthy"] is False
+
+    def test_a_risk_halt_is_reported(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        assert "risk_halted" in bot.health()
+
+    def test_shutdown_settles_unresolved_entries_before_cancelling(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        calls = []
+        bot.engine.resolve_unresolved_entries = lambda: calls.append("resolve") or {}
+        real = bot.client.cancel_order
+        bot.client.cancel_order = lambda **kw: calls.append("cancel") or real(**kw)
+        bot.store.record_order("SD1", "BTCUSDT", "Buy", "Limit", 0.001, purpose="entry")
+        bot.store.update_order_status("SD1", "submitted")
+        bot.engine.shutdown()
+        assert calls[0] == "resolve" and "cancel" in calls
+
+    def test_one_failing_cancel_does_not_leave_the_rest_live(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        for i in (1, 2):
+            bot.store.record_order(f"SD{i}", "BTCUSDT", "Buy", "Limit", 0.001,
+                                   purpose="entry")
+            bot.store.update_order_status(f"SD{i}", "submitted")
+        seen = []
+
+        def cancel(**kw):
+            seen.append(kw["order_link_id"])
+            if kw["order_link_id"] == "SD1":
+                raise RuntimeError("network")
+            return True
+        bot.client.cancel_order = cancel
+        bot.engine.shutdown()
+        assert "SD2" in seen
