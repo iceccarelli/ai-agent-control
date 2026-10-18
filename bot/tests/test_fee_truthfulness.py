@@ -696,3 +696,31 @@ class TestQuantitiesSurviveFloatNoiseAndLotSteps:
         assert legs == [0.42, 0.28]
         # legs that do not cover the position keep their own fractions
         assert te.TradingEngine._allocate_legs(1.0, [0.5, 0.2], step) == [0.5, 0.2]
+
+
+def test_a_spot_close_frees_the_coin_its_take_profit_legs_reserve_but_keeps_the_stop(tmp_path):
+    engine, store, _ = _stack(tmp_path, spot_detail)
+    assert engine.execute(buy_intent()).ok
+    order_of_events = []
+    real_cancel, real_place = engine.client.cancel_order, engine.client.place_order
+
+    def cancel(**kw):
+        order_of_events.append(("cancel", kw["order_link_id"]))
+        return real_cancel(**kw)
+
+    def place(**kw):
+        order_of_events.append(("place", kw.get("purpose")))
+        return real_place(**kw)
+    engine.client.cancel_order, engine.client.place_order = cancel, place
+    assert engine.close_position(symbol="BTCUSDT", reason="t").ok
+    tp_ids = {o["order_link_id"] for o in
+              store._query("SELECT * FROM orders WHERE purpose='tp'")}
+    stop_ids = {o["order_link_id"] for o in
+                store._query("SELECT * FROM orders WHERE purpose='stop'")}
+    cancelled_first = [e[1] for e in order_of_events
+                       if e[0] == "cancel"][:len(tp_ids)]
+    place_at = next(i for i, e in enumerate(order_of_events) if e == ("place", "close"))
+    before = {e[1] for e in order_of_events[:place_at] if e[0] == "cancel"}
+    assert tp_ids and tp_ids <= before, "the TP legs were not freed before the sell"
+    assert not (stop_ids & before), "the stop was cancelled before the close"
+    store.close()

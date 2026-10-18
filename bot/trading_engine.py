@@ -1155,6 +1155,14 @@ class TradingEngine:
         entry_price = float(row["entry_price"])
         row_meta = self._row_meta(row)
 
+        if not getattr(self.client, "is_linear", False):
+            # A resting spot limit sell reserves the coin it offers, so the legs
+            # of a take-profit ladder that covers the position leave nothing free
+            # for the close. They are cancelled FIRST (the stop stays: a missing
+            # take-profit costs upside, never capital), and a close that then
+            # fails still has its stop.
+            self._cancel_take_profit_legs(symbol)
+
         result = self.client.place_order(
             symbol=symbol, side=exit_side, qty=qty, order_type="Market",
             purpose="close", reduce_only=True,
@@ -1930,6 +1938,24 @@ class TradingEngine:
                            {"closed": closed_qty, "remaining": remaining,
                             "stop_resized_to": remaining})
         return False
+
+    def _cancel_take_profit_legs(self, symbol: str) -> None:
+        """Cancel the resting take-profit legs for a symbol, one by one, leaving
+        the stop alone. Best effort: a leg that cannot be cancelled stays open."""
+        try:
+            legs = [r for r in self.store.unresolved_orders()
+                    if str(r.get("symbol")) == symbol
+                    and str(r.get("purpose")) == "tp"]
+        except Exception:  # noqa: BLE001
+            logger.exception("could not list take-profit legs for %s", symbol)
+            return
+        for leg in legs:
+            try:
+                self.client.cancel_order(
+                    symbol=symbol, order_link_id=str(leg["order_link_id"]))
+            except Exception:  # noqa: BLE001
+                logger.warning("could not cancel take-profit leg %s",
+                               leg["order_link_id"], exc_info=True)
 
     def _cancel_protective_orders(self, symbol: str) -> None:
         """Cancel every resting stop/TP for a symbol (the OCO half of an exit).
