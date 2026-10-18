@@ -706,7 +706,7 @@ class BybitClient:
                 raise PermanentAPIError(f"no usable quote for {symbol}")
             return {
                 "bid": last, "ask": last, "mid": last,
-                "spread_bps": 0.0, "age_seconds": 0.0, "degraded": True,
+                "spread_bps": 0.0, "age_seconds": None, "degraded": True,
             }
 
         server_ms = int(payload.get("time") or 0)

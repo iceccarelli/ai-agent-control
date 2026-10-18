@@ -1335,7 +1335,8 @@ class TradingEngine:
             if order_ids:
                 dedupe_key = f"exit_pnl:{symbol}:{','.join(order_ids)}"
             else:
-                dedupe_key = f"exit_unread:{symbol}:{since_ms}:{exited:.10f}"
+                dedupe_key = (f"exit_unread:{symbol}:{since_ms}:{held:.10f}:"
+                              f"{exited:.10f}")
             exit_fees, fee_ref, evidence = self._observed_exit_fees(
                 symbol, pnl_rows, exited)
             fully = self.record_exit_fill(symbol=symbol, qty=exited, price=price,

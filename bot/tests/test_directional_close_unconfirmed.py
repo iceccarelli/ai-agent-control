@@ -96,3 +96,21 @@ def test_a_final_exit_after_a_take_profit_is_priced_on_its_own_rows(tmp_path):
     assert len(trades) == 1
     assert float(trades[0]["exit_price"]) == pytest.approx(58_000.0)
     assert float(trades[0]["net_pnl"]) < 0
+
+
+def test_two_unpriced_partial_exits_of_equal_size_are_both_booked(tmp_path):
+    """With closed-pnl lagging (no rows), TP1 then the stop each take 0.005 of
+    a 0.01 position. Their dedupe keys must differ or the second (losing) exit
+    is dropped from the trades table and the loss streak."""
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open(store, side="Buy", qty=0.01, entry=60_000.0)
+    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Buy",
+                                 "size": "0.005", "avgPrice": "60000",
+                                 "stopLoss": "58000"}
+    engine.client.get_last_price = lambda symbol: 62_000.0
+    assert engine.observe_exits()["reduced"] == 1
+    del fake.positions["BTCUSDT"]
+    engine.client.get_last_price = lambda symbol: 58_000.0
+    assert engine.observe_exits()["closed"] == 1
+    assert len(store._query("SELECT * FROM trades")) == 2

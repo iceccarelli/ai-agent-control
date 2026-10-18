@@ -790,6 +790,10 @@ class BillionaireRiskManager:
             return _block("QUOTE_UNPARSEABLE", error=str(exc))
         if bid <= 0.0 or ask <= 0.0 or ask < bid:
             return _block("QUOTE_INVALID", bid=bid, ask=ask)
+        if quote.get("degraded"):
+            # Built from the last price because the ticker had no level-1
+            # quote: the spread is unknown, not zero.
+            return _block("QUOTE_DEGRADED", bid=bid, ask=ask)
         mid = (bid + ask) / 2.0
         spread_bps = (ask - bid) / mid * 10_000.0
         if spread_bps > self.max_spread_bps:
@@ -1069,7 +1073,9 @@ class BillionaireRiskManager:
                     self._journal(symbol, "BLOCK", spread_gate)
                     return spread_gate
 
-            if data_age_seconds is not None:
+            # A quote with no age is not a fresh quote: the gate blocks it
+            # (DATA_AGE_UNKNOWN) rather than being skipped.
+            if data_age_seconds is not None or quote is not None:
                 freshness_gate = self._gate_data_freshness(data_age_seconds)
                 if not freshness_gate.ok:
                     self._journal(symbol, "BLOCK", freshness_gate)

@@ -759,3 +759,27 @@ class TestDecisionJournal:
     def test_approvals_are_journalled_too(self, manager, store):
         manager.gate_order(**good_order())
         assert store.recent_decisions()[0]["decision"] == "ALLOW"
+
+
+class TestAQuoteMustBeFreshAndReal:
+    QUOTE = {"bid": 100.0, "ask": 100.01, "mid": 100.005, "spread_bps": 1.0}
+
+    def test_a_quote_without_an_age_blocks(self, manager):
+        decision = manager.gate_order(
+            **good_order(), quote={**self.QUOTE, "age_seconds": None},
+            data_age_seconds=None)
+        assert decision.ok is False and decision.reason == "DATA_AGE_UNKNOWN"
+
+    def test_a_quote_with_a_fresh_age_passes(self, manager):
+        decision = manager.gate_order(
+            **good_order(), quote={**self.QUOTE, "age_seconds": 0.2},
+            data_age_seconds=0.2)
+        assert decision.ok is True
+
+    def test_a_degraded_quote_is_not_a_zero_spread(self, manager):
+        decision = manager.gate_order(
+            **good_order(),
+            quote={"bid": 100.0, "ask": 100.0, "mid": 100.0, "spread_bps": 0.0,
+                   "age_seconds": 0.0, "degraded": True},
+            data_age_seconds=0.0)
+        assert decision.ok is False and decision.reason == "QUOTE_DEGRADED"

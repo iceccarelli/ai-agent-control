@@ -47,6 +47,7 @@ Because of the last two in particular, live results should be expected to be
 from __future__ import annotations
 
 import json
+import time
 import logging
 import math
 import random
@@ -89,6 +90,19 @@ _TRADE_HARVEST_LIMIT = 512
 #: "No limit" for a ledger read. SQLite needs a number; this is one no backtest
 #: will reach, and it is named so nobody reads it as a meaningful cap.
 _ALL_TRADES = 100_000_000
+
+
+
+def _sim_ticker_reply(row: Dict[str, Any]) -> Tuple[int, str]:
+    """A simulated ticker. The simulator has no order book, so the top of book
+    is the bar close (a zero spread, as before) and the reply is stamped with
+    the wall clock: replayed data is current by construction. The live client
+    treats a quote without a level-1 book or a timestamp as unusable."""
+    price = row["lastPrice"]
+    row = {**row, "bid1Price": price, "ask1Price": price}
+    return 200, json.dumps({"retCode": 0, "retMsg": "OK",
+                            "time": int(time.time() * 1000),
+                            "result": {"list": [row]}})
 
 
 @dataclass(frozen=True)
@@ -443,10 +457,10 @@ class SimulatedExchange(Transport):
             symbol = merged.get("symbol", "")
             if symbol not in self.bars:
                 return ok({"list": []})
-            return ok({"list": [{
+            return _sim_ticker_reply({
                 "symbol": symbol,
                 "lastPrice": str(self.bars[symbol][self.index].close),
-            }]})
+            })
 
         if path == "/v5/market/kline":
             symbol = merged.get("symbol", "")
@@ -1005,10 +1019,10 @@ class LinearSimulatedExchange(SimulatedExchange):
             if symbol not in self.bars:
                 return ok({"list": []})
             bar = self.bars[symbol][self.index]
-            return ok({"list": [{
+            return _sim_ticker_reply({
                 "symbol": symbol, "lastPrice": str(bar.close),
                 "fundingRate": str(self._funding_rate_at(symbol, bar.start_ms)),
-            }]})
+            })
 
         return super().request(method, url, headers=headers, params=params,
                                body=body, timeout=timeout)
