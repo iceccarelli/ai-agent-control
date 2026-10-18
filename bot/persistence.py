@@ -79,7 +79,7 @@ __all__ = [
     "slippage_bps",
 ]
 
-DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH", "state/trading_state.db")
+DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH") or "state/trading_state.db"
 
 #: v1 -> v2 added the memory tables (execution_quality, regime_history,
 #: memory_kv).  The bump is informational: every statement in ``_DDL`` is
@@ -552,6 +552,12 @@ class StateStore:
     """
 
     def __init__(self, path: str = DEFAULT_DB_PATH) -> None:
+        if not str(path).strip():
+            # sqlite3.connect("") opens a private temporary database: the kill
+            # switch, peak equity and daily anchors would silently vanish on
+            # restart. A blank path is a mistake, never a request for that.
+            raise ValueError("StateStore needs a database path; a blank one "
+                             "would open a throwaway database")
         self._path = path
         self._lock = threading.RLock()
         #: Thread id permitted to mutate state; None means unrestricted.

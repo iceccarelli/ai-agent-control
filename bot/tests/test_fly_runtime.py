@@ -256,6 +256,19 @@ class TestADeployCannotArmLiveTradingOrLeakAKey:
             assert any(key in p for p in fly_stack.check(cfg)), key
 
 
+    def test_every_false_spelling_of_the_safety_flags_is_refused(self):
+        for key in ("PAPER_TRADING", "USE_TESTNET"):
+            for value in ("false", "off", "no", " 0", "00", "FALSE"):
+                cfg = fly_stack.template()
+                cfg["env"][key] = value
+                assert any(key in p for p in fly_stack.check(cfg)), (key, value)
+
+    def test_pointing_the_venue_at_mainnet_from_the_repo_is_refused(self):
+        cfg = fly_stack.template()
+        cfg["env"]["BYBIT_VENUE"] = "mainnet"
+        assert any("BYBIT_VENUE" in p for p in fly_stack.check(cfg))
+
+
 class TestTheCarryBookGetsWhatBuildBotDemands:
     def test_carry_without_its_required_keys_is_refused(self):
         """build_bot raises on a missing CARRY_BORROW_APR. On Fly that is not

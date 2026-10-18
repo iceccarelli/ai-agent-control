@@ -456,3 +456,15 @@ class TestRiskControlSwitchesRejectATypo:
         assert getattr(load(**{var: ""}), var) is True
         assert getattr(load(**{var: "false"}), var) is False
         assert getattr(load(**{var: "true"}), var) is True
+
+
+class TestABlankStateDbPathIsNotAThrowawayDatabase:
+    def test_blank_config_value_takes_the_default(self):
+        assert load(STATE_DB_PATH="  ").STATE_DB_PATH == "state/trading_state.db"
+
+    def test_the_store_refuses_a_blank_path(self, tmp_path):
+        from persistence import StateStore
+        with pytest.raises(ValueError):
+            StateStore("")
+        with pytest.raises(ValueError):
+            StateStore("   ")

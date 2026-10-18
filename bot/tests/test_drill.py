@@ -451,3 +451,31 @@ class TestFlatnessIsVerifiedAgainstTheVenueNotTheBook:
         check = [s for s in report["stages"]
                  if s["stage"] == "venue_check_after_failure"]
         assert check and check[0]["evidence"]["verdict"] == "FLAT"
+
+
+class TestTheDrillHonoursTheBooksKillSwitch:
+    def _db(self, tmp_path, engaged):
+        from persistence import StateStore
+        path = str(tmp_path / "book.db")
+        store = StateStore(path)
+        if engaged:
+            store.trip_kill_switch("test halt")
+        store.close()
+        return path
+
+    def test_an_engaged_switch_is_seen(self, tmp_path):
+        import drill
+        engaged, why = drill.book_kill_switch(self._db(tmp_path, True))
+        assert engaged is True and "test halt" in why
+
+    def test_a_clear_switch_and_a_missing_db_do_not_block(self, tmp_path):
+        import drill
+        assert drill.book_kill_switch(self._db(tmp_path, False))[0] is False
+        assert drill.book_kill_switch(str(tmp_path / "none.db"))[0] is False
+        assert drill.book_kill_switch("")[0] is False
+
+    def test_an_unreadable_db_counts_as_engaged(self, tmp_path):
+        import drill
+        bad = tmp_path / "bad.db"
+        bad.write_bytes(b"not a sqlite file at all" * 10)
+        assert drill.book_kill_switch(str(bad))[0] is True

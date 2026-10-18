@@ -66,6 +66,9 @@ SECRET_SHAPED = re.compile(
 ARMING_KEYS = {"LIVE_TRADING_ACK": None, "PAPER_TRADING": "0",
                "USE_TESTNET": "0"}
 
+#: The tokens config.parse_safety_bool reads as False.
+_FALSE_TOKENS = frozenset({"0", "false", "f", "no", "n", "off", "00"})
+
 
 # -- the Docker build context ---------------------------------------------
 #
@@ -283,11 +286,19 @@ def check(cfg: Dict[str, Any]) -> List[str]:
                 "`fly secrets set`, which stores them encrypted and injects "
                 "them at runtime. This file is in git.")
     for key, forbidden in ARMING_KEYS.items():
-        if key in env and (forbidden is None or str(env[key]) == forbidden):
+        # Any token config.parse_safety_bool reads as False arms (not only "0"):
+        # "false", "off", " 0", "no" move the process toward live just the same.
+        value = str(env.get(key, "")).strip().lower()
+        if key in env and (forbidden is None or value in _FALSE_TOKENS):
             problems.append(
                 f"env {key}={env[key]!r} would arm live trading from a file in "
                 "the repository. Arming is a deliberate act with four "
                 "independent conditions; `git push` is not one of them.")
+
+    if str(env.get("BYBIT_VENUE", "")).strip().lower() == "mainnet":
+        problems.append(
+            "env BYBIT_VENUE='mainnet' would point the process at the live "
+            "exchange from a file in the repository.")
 
     # -- the book gets what build_bot demands ----------------------------
     if env.get("BOOK_MODE") == "carry":

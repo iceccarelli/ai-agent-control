@@ -911,7 +911,8 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         DECISIONS_RETENTION_DAYS=parse_int(env, "DECISIONS_RETENTION_DAYS", 90,
                                            low=1, high=3_650),
         LOG_LEVEL="WARNING" if log_level == "WARN" else log_level,
-        STATE_DB_PATH=parse_str(env, "STATE_DB_PATH", "state/trading_state.db"),
+        STATE_DB_PATH=parse_str(env, "STATE_DB_PATH", "state/trading_state.db")
+        or "state/trading_state.db",
         # Which book this process runs. "carry" = delta-neutral spot/perp pair
         # collecting funding; "directional" = the legacy technical voter, whose
         # Stage-1 verdict is ABSENT. They are mutually exclusive: build_bot
