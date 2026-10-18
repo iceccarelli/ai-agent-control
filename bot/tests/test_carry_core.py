@@ -37,7 +37,10 @@ CENT = 0.01
 def native():
     """Build on demand. No compiler is a skip, never a silent Python fallback
     pretending to be fast."""
-    if not core.available() and not core.build():
+    # make is a no-op when the library is current and rebuilds a stale one, so
+    # these tests always exercise the source in the tree.
+    built = core.build()
+    if not built and not core.available():
         pytest.skip("no compiler and no libcarrycore.so")
     return core
 
@@ -246,3 +249,21 @@ class TestTheSweepRefusesToPickAWinner:
         assert [t["trial_id"] for t in trials] == [trial]
         assert str(len(report["cells"])) in trials[0]["note"]
         assert "IN-SAMPLE" in trials[0]["note"]
+
+
+class TestANonFinitePrintCannotOpenAGate:
+    def test_the_gated_trades_still_match_python_when_a_rate_is_nan(self, native, rows):
+        import dataclasses
+        poisoned = list(rows[:400])
+        for i in range(10, 400, 17):
+            poisoned[i] = dataclasses.replace(poisoned[i], rate=float("nan"))
+        python = cb.simulate_settlements_series(
+            poisoned, notional=100_000.0, borrow_apr=0.0, gated=True,
+            impact_bps=1.093, mode=cb.OVERLAY)
+        params = core.params(
+            notional=100_000.0, borrow_apr=0.0, impact_bps=1.093,
+            round_trip_bps=cb.round_trip_bps_for(cb.OVERLAY), gated=True,
+            overlay=True, taker_spot_bps=cb.TAKER_BPS_SPOT,
+            taker_perp_bps=cb.TAKER_BPS_PERP)
+        cpp = core.simulate(poisoned, params)
+        assert cpp["trades"] == python["trades"]

@@ -37,11 +37,18 @@ struct Trade {
 /* carry_costs.ewma_funding_bps: newest last, None below the minimum. */
 bool ewma(const double *prints, int count, double alpha, int min_prints,
           double *out) {
-    if (count < min_prints) return false;
-    double smoothed = prints[0];
-    for (int i = 1; i < count; ++i) {
-        smoothed = alpha * prints[i] + (1.0 - alpha) * smoothed;
+    /* Non-finite prints are dropped BEFORE the minimum is applied, as
+       carry_costs.ewma_funding_bps does. Without this one NaN poisons the
+       average, every comparison against it is false, and the gate opens. */
+    int used = 0;
+    double smoothed = 0.0;
+    for (int i = 0; i < count; ++i) {
+        if (!std::isfinite(prints[i])) continue;
+        smoothed = (used == 0) ? prints[i]
+                               : alpha * prints[i] + (1.0 - alpha) * smoothed;
+        ++used;
     }
+    if (used < min_prints || used == 0) return false;
     *out = smoothed;
     return true;
 }
