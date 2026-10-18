@@ -365,3 +365,32 @@ class TestFundingIsOnlyForWhatWasHeldThroughTheSettlement:
         pos.opened_index = -5           # opened well before
         ex.step()
         assert ex.funding_paid == pytest.approx(-0.01)
+
+
+class TestReduceOnlyNeverOpensOrFlips:
+    def _order(self, side, qty):
+        return bt._SimOrder(
+            order_link_id="r1", symbol=SYMBOL, side=side, order_type="Market",
+            qty=qty, price=0.0, order_filter="Order", trigger_price=0.0,
+            trigger_direction=0, reduce_only=True)
+
+    def test_an_oversized_reduce_is_cut_to_the_position_not_flipped(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0)
+        open_long(ex, qty=1.0, price=100.0)
+        order = self._order("Sell", 5.0)
+        ex._execute(order, 100.0, taker=True)
+        assert order.status == "Filled" and order.qty == 1.0
+        assert SYMBOL not in ex.positions
+
+    def test_a_reduce_with_nothing_to_reduce_is_refused(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0)
+        order = self._order("Sell", 1.0)
+        ex._execute(order, 100.0, taker=True)
+        assert order.status == "Rejected" and SYMBOL not in ex.positions
+
+    def test_a_reduce_on_the_same_side_does_not_add(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0)
+        open_long(ex, qty=1.0, price=100.0)
+        order = self._order("Buy", 1.0)
+        ex._execute(order, 100.0, taker=True)
+        assert order.status == "Rejected" and ex.positions[SYMBOL].size == 1.0

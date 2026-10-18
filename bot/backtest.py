@@ -174,6 +174,7 @@ class _SimOrder:
     avg_price: float = 0.0
     cum_qty: float = 0.0
     purpose: str = "entry"
+    reduce_only: bool = False
 
 
 class SimulatedExchange(Transport):
@@ -572,6 +573,7 @@ class SimulatedExchange(Transport):
             trigger_price=float(body.get("triggerPrice") or 0.0),
             trigger_direction=int(body.get("triggerDirection") or 0),
             order_id=f"sim-{self._order_seq}",
+            reduce_only=bool(body.get("reduceOnly")),
         )
         order.purpose = (
             "stop" if order.order_filter == "StopOrder"
@@ -584,6 +586,8 @@ class SimulatedExchange(Transport):
         elif order.order_type == "Market":
             self._execute(order, self.bars[symbol][self.index].close, taker=True)
             if order.status == "Rejected":
+                if order.reduce_only:
+                    return err(110017, "reduce-only rule violation")
                 return err(110007, "insufficient balance for market order")
         else:
             order.status = "New"
@@ -779,9 +783,19 @@ class LinearSimulatedExchange(SimulatedExchange):
         if qty <= 0:
             order.status = "Rejected"
             return
-        fee = qty * fill_price * fee_rate
         position = self.positions.get(symbol)
         incoming = 1.0 if normalize_side(order.side) == "Buy" else -1.0
+        if order.reduce_only:
+            # Bybit's reduce-only rule: it can only shrink an opposite
+            # position. With nothing to reduce it is refused; a quantity
+            # beyond the position is cut to it. It never opens or flips.
+            if (position is None or position.size <= 1e-12
+                    or position.direction == incoming):
+                order.status = "Rejected"
+                return
+            qty = min(qty, position.size)
+            order.qty = qty
+        fee = qty * fill_price * fee_rate
 
         if position is None or position.size <= 1e-12:
             # Opening. Initial margin must be affordable from cash.
@@ -1439,6 +1453,10 @@ class Backtester:
         )
 
         result.ending_equity = exchange.equity()
+        if not result.equity_curve or result.equity_curve[-1] != result.ending_equity:
+            # The forced close at the end costs fees and slippage; the curve (and
+            # the drawdown read from it) has to include that last point.
+            result.equity_curve.append(result.ending_equity)
         result.fees_paid = exchange.fees_paid
         result.funding_paid = float(getattr(exchange, "funding_paid", 0.0) or 0.0)
         if abs(result.funding_paid) > 1e-12:

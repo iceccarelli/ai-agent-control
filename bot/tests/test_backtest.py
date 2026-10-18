@@ -435,3 +435,10 @@ class TestFundingIsNotSilentlyOutsideTheTradeStatistics:
                                permissive_config()).run()
         assert result.funding_paid == 0.0
         assert not any("BEFORE funding" in n for n in result.notes)
+
+
+class TestTheEquityCurveEndsAtTheEndingEquity:
+    def test_the_last_point_is_the_equity_after_the_forced_close(self, permissive_view):
+        result = bt.Backtester({"BTCUSDT": synthetic_bars(600)},
+                               permissive_config()).run()
+        assert result.equity_curve[-1] == pytest.approx(result.ending_equity)
