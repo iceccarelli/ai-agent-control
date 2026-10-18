@@ -1028,7 +1028,30 @@ class TradingBot:
                 # A held pair is not blinded by a bad view: the venue's own
                 # size is read directly and a drifted or unreadable short
                 # halts the book now, not when the feed happens to recover.
-                watched = self.carry.check_venue_position_without_a_view()
+                try:
+                    watched = self.carry.check_venue_position_without_a_view()
+                except Exception as watch_exc:  # noqa: BLE001
+                    # The viewless watch can reach an unwind (orders, persist). An
+                    # exception here used to fall to run()'s generic handler,
+                    # outside the held-pair error counter: a held pair with a
+                    # broken feed and a failing unwind was retried forever.
+                    logger.exception("carry viewless watch raised: %s", watch_exc)
+                    if getattr(self.carry.state, "name", "") in (
+                            "OPENING", "UNWINDING"):
+                        self.carry._halt(
+                            "ENGINE_EXCEPTION_MID_TRANSACTION",
+                            f"{type(watch_exc).__name__}: {watch_exc}")
+                    elif self.carry.position is not None:
+                        self._carry_held_errors += 1
+                        if (self._carry_held_errors
+                                >= CARRY_MAX_CONSECUTIVE_HELD_ERRORS):
+                            self.carry._halt(
+                                "HELD_BOOK_UNMANAGEABLE",
+                                f"the viewless watch raised on "
+                                f"{self._carry_held_errors} consecutive ticks "
+                                f"while a pair was held "
+                                f"({type(watch_exc).__name__}: {watch_exc})")
+                    return
                 if watched is not None:
                     self._last_carry_decision = {
                         "action": str(watched.action),
@@ -1072,9 +1095,17 @@ class TradingBot:
                     # confirming read failed: unconfirmed is not an orphan. Skip
                     # the check this tick; the next tick reads again, so a real
                     # orphan is delayed by one tick, never missed.
-                    logger.warning("carry: orphan re-read failed (%s); the "
-                                   "check is skipped this tick", exc)
-                    perp_held = None
+                    # The tick must not TRADE on that either: skipping the check
+                    # while still opening would put a second hedge on top of a
+                    # short the book never recorded. Unconfirmed means stand
+                    # still this tick and read again on the next.
+                    logger.warning("carry: orphan re-read failed (%s); standing "
+                                   "still this tick", exc)
+                    self._last_carry_decision = {
+                        "action": "skipped", "reason": "ORPHAN_UNCONFIRMED",
+                        "state": getattr(self.carry.state, "value", "FLAT"),
+                        "at_ms": int(time.time() * 1000)}
+                    return
             orphan = self.carry.check_venue_flat_while_flat(perp_held)
             if orphan is not None:
                 self._last_carry_decision = {

@@ -87,3 +87,17 @@ def test_a_short_below_its_margin_floor_exits_even_without_a_view(tmp_path):
     assert engine.state is BookState.FLAT
     assert bot._last_carry_decision["reason"].startswith("MARGIN_HEADROOM_")
     assert len(venue.created) > before
+
+
+def test_a_viewless_watch_that_keeps_raising_halts_a_held_pair(tmp_path):
+    """An exception in the viewless watch used to fall to run()'s generic
+    handler, outside the held-pair error counter: retried forever."""
+    from main import CARRY_MAX_CONSECUTIVE_HELD_ERRORS
+    venue, journal, engine, bot = _hedged(tmp_path)
+
+    def boom():
+        raise OSError("disk full while persisting")
+    engine.check_venue_position_without_a_view = boom
+    for _ in range(CARRY_MAX_CONSECUTIVE_HELD_ERRORS):
+        tick_with_unusable_view(bot)
+    assert engine.state is BookState.HALTED

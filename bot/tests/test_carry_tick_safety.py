@@ -644,8 +644,13 @@ def test_an_orphan_that_the_confirming_read_could_not_confirm_does_not_halt(tmp_
     def timeout(symbol):
         raise TimeoutError("position read timed out")
     bot.carry.broker.get_perp_position = timeout
+    orders_before = len(getattr(venue, "created", []))
     _tick_seeing_the_venue(bot, venue, 1)
     assert engine.state is not BookState.HALTED
+    # ... and it must not have TRADED on that tick either: skipping the check
+    # while still opening would stack a second hedge on a short never recorded.
+    assert len(getattr(venue, "created", [])) == orders_before
+    assert bot._last_carry_decision["reason"] == "ORPHAN_UNCONFIRMED"
 
 
 def test_cold_start_logs_the_leverage_the_venue_reports_and_sets_nothing(
