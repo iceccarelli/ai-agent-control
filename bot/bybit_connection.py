@@ -139,7 +139,8 @@ TRANSIENT_RET_CODES = frozenset({
 UNKNOWN_OUTCOME_RET_CODES = frozenset({0, 10000, 170007})
 
 #: HTTP statuses worth retrying.
-TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
+TRANSIENT_HTTP = frozenset({408, 429, 500, 502, 503, 504,
+                            520, 521, 522, 523, 524})
 
 #: Verified against https://bybit-exchange.github.io/docs/v5/enum
 #: retCodes Bybit returns when an orderLinkId was already used. Seen on a

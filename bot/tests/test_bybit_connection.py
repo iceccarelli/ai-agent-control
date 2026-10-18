@@ -581,6 +581,11 @@ class TestRetryClassification:
         exchange.scripted = [(503, "unavailable"), (502, "bad gateway")]
         assert client.get_equity() == pytest.approx(10_000.0)
 
+    def test_gateway_timeouts_are_retried_not_permanent(self, client, exchange):
+        exchange.scripted = [(408, "timeout"), (522, "cf timeout"),
+                             (524, "cf timeout")]
+        assert client.get_equity() == pytest.approx(10_000.0)
+
     def test_unknown_outcome_is_not_resubmitted(self, client, exchange, store):
         """A timed-out submit must never be re-sent blind.
 
