@@ -394,3 +394,15 @@ class TestReduceOnlyNeverOpensOrFlips:
         order = self._order("Buy", 1.0)
         ex._execute(order, 100.0, taker=True)
         assert order.status == "Rejected" and ex.positions[SYMBOL].size == 1.0
+
+
+class TestAdverseEquity:
+    def test_a_long_is_marked_at_the_low_and_a_short_at_the_high(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0,
+                   high=[110.0] * 3, low=[90.0] * 3)
+        open_long(ex, qty=1.0, price=100.0)
+        assert ex.equity() == pytest.approx(1_000.0)
+        assert ex.adverse_equity() == pytest.approx(990.0)
+        ex.positions.clear()
+        open_short(ex, qty=1.0, price=100.0)
+        assert ex.adverse_equity() == pytest.approx(990.0)

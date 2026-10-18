@@ -442,3 +442,21 @@ class TestTheEquityCurveEndsAtTheEndingEquity:
         result = bt.Backtester({"BTCUSDT": synthetic_bars(600)},
                                permissive_config()).run()
         assert result.equity_curve[-1] == pytest.approx(result.ending_equity)
+
+
+class TestIntrabarDrawdown:
+    def test_spot_equity_is_marked_at_the_bars_low(self):
+        bars = [bt.Bar(start_ms=1_600_000_000_000 + i * 3_600_000, open=100.0,
+                       high=101.0, low=80.0, close=100.0, volume=1.0)
+                for i in range(3)]
+        ex = bt.SimulatedExchange({"BTCUSDT": bars}, starting_cash=0.0)
+        ex.balances["BTC"] = 2.0
+        assert ex.equity() == pytest.approx(200.0)
+        assert ex.adverse_equity() == pytest.approx(160.0)
+
+    def test_a_dip_that_recovers_inside_the_bar_shows_in_the_intrabar_drawdown(
+            self, permissive_view):
+        result = bt.Backtester({"BTCUSDT": synthetic_bars(600)},
+                               permissive_config()).run()
+        assert result.max_drawdown_intrabar >= result.max_drawdown
+        assert result.trades > 0

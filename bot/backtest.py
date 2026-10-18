@@ -259,6 +259,16 @@ class SimulatedExchange(Transport):
                 total += held * series[self.index].close
         return total
 
+    def adverse_equity(self) -> float:
+        """Equity with every holding marked at the current bar's LOW: the worst
+        the account stood inside the bar (spot is long-only)."""
+        total = self.balances.get(self.quote_asset, 0.0)
+        for symbol, series in self.bars.items():
+            held = self.balances.get(self._base(symbol), 0.0)
+            if held:
+                total += held * series[self.index].low
+        return total
+
     #: Longest first, so USDT is matched before USD. Reversing this order maps
     #: BTCUSDT to base "BTCUSD"/quote "T", which is the kind of bug that
     #: produces a valid-looking order for an asset that does not exist.
@@ -746,6 +756,16 @@ class LinearSimulatedExchange(SimulatedExchange):
             total += position.unrealised(self.bars[symbol][self.index].close)
         return total
 
+    def adverse_equity(self) -> float:
+        """Equity with every position marked at the bar's adverse extreme (the
+        low for a long, the high for a short)."""
+        total = self.balances.get(self.quote_asset, 0.0)
+        for symbol, position in self.positions.items():
+            bar = self.bars[symbol][self.index]
+            long = normalize_side(position.side) == "Buy"
+            total += position.unrealised(bar.low if long else bar.high)
+        return total
+
     def _cash(self, delta: float) -> None:
         self.balances[self.quote_asset] = (
             self.balances.get(self.quote_asset, 0.0) + float(delta))
@@ -1141,6 +1161,11 @@ class BacktestResult:
     trade_returns: List[float] = field(default_factory=list)
     net_pnl: float = 0.0
     max_drawdown: float = 0.0
+    #: Drawdown with each bar's open positions marked at that bar's adverse
+    #: extreme (low for a long, high for a short), so an intrabar low that
+    #: recovered by the close is not invisible. Positions are those held at the
+    #: bar's close, so this is a tight estimate, not a tick-level reconstruction.
+    max_drawdown_intrabar: float = 0.0
     win_rate: Optional[float] = None
     expectancy: Optional[float] = None
     signals_evaluated: int = 0
@@ -1178,7 +1203,8 @@ class BacktestResult:
             f"ending equity      : {self.ending_equity:,.2f}",
             f"total return       : {self.total_return:+.2%}",
             f"fees paid          : {self.fees_paid:,.2f}",
-            f"max drawdown       : {self.max_drawdown:.2%}",
+            f"max drawdown       : {self.max_drawdown:.2%}"
+            f"  (intrabar {self.max_drawdown_intrabar:.2%})",
         ]
         lines.append(
             f"win rate           : {self.win_rate:.1%}"
@@ -1383,11 +1409,14 @@ class Backtester:
         # feeds back into a decision, and removing it would change no order.
         snapshots: Dict[str, Dict[str, Any]] = {}
         last_trade_id = 0
+        adverse_path: List[float] = []
 
         while True:
             equity = exchange.equity()
             store.update_equity(equity)
             result.equity_curve.append(equity)
+            adverse_path.append(min(equity, exchange.adverse_equity()))
+            adverse_path.append(equity)
 
             # Reap positions the simulator closed via a resting stop or TP.
             inventory_before = self._position_inventory(store)
@@ -1484,6 +1513,8 @@ class Backtester:
                 for t in trades
             ]
         result.max_drawdown = self._max_drawdown(result.equity_curve)
+        result.max_drawdown_intrabar = max(
+            result.max_drawdown, self._max_drawdown(adverse_path))
 
         if len(result.trade_details) != result.trades:
             # The harvest and the ledger are two independent counts of the same
@@ -1841,6 +1872,7 @@ def walk_forward(
             "trades": result.trades,
             "return": result.total_return,
             "max_drawdown": result.max_drawdown,
+            "max_drawdown_intrabar": result.max_drawdown_intrabar,
             "win_rate": result.win_rate,
             "expectancy": result.expectancy,
             "fees": result.fees_paid,
