@@ -1084,3 +1084,16 @@ class TestStopsAreNeverSnappedWiderThanTheSizedRisk:
         stops = [json.loads(r["body"]) for r in exchange.requests
                  if r["url"].endswith("/position/trading-stop")]
         assert Decimal(stops[-1]["stopLoss"]) == Decimal("51000.56")
+
+
+class TestPrivateStreamIsPerVenue:
+    @pytest.mark.parametrize("venue,url", [
+        ("mainnet", "wss://stream.bybit.com/v5/private"),
+        ("testnet", "wss://stream-testnet.bybit.com/v5/private"),
+        ("demo", "wss://stream-demo.bybit.com/v5/private")])
+    def test_the_client_connects_to_its_own_venue(self, store, exchange, venue, url):
+        class VenueCfg(Cfg):
+            BYBIT_VENUE = venue
+            USE_TESTNET = venue != "mainnet"
+        c = bc.BybitClient(config=VenueCfg(), store=store, transport=exchange)
+        assert c.ws_private_url == url

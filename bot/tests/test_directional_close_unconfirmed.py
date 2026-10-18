@@ -140,3 +140,11 @@ def test_a_raising_book_source_is_unavailable_not_absent(tmp_path):
         raise RuntimeError("feed down")
     engine.client.get_book_features = boom
     assert engine._market_conditions("BTCUSDT")["book"] == {"unavailable": True}
+
+
+def test_reanchor_leaves_a_plan_with_no_stop_distance_alone(tmp_path):
+    import trading_engine as te
+    engine, store = _engine(tmp_path, LinearCfg(), FakeBybit())
+    plan = te.ExitPlan(stop_price=98.0, legs=((104.0, 1.0),), stop_distance=0.0)
+    assert engine._reanchor(plan, side="Buy", fill_price=100.0) is plan
+

@@ -659,8 +659,11 @@ class TradingEngine:
         # residual removes the problem at source.
         leg_quantities: List[float] = []
         allocated = 0.0
+        # The residual rule is only right when the legs are meant to cover the
+        # whole position; fractions summing to less leave the rest to the stop.
+        covers_all = abs(sum(f for _, f in plan.legs) - 1.0) <= 1e-9
         for index, (_, fraction) in enumerate(plan.legs):
-            if index == len(plan.legs) - 1:
+            if index == len(plan.legs) - 1 and covers_all:
                 leg_quantities.append(max(0.0, filled_qty - allocated))
             else:
                 leg_qty = filled_qty * fraction
@@ -863,6 +866,8 @@ class TradingEngine:
         # The distance is taken from the plan, whose entry was the signal bar's
         # close. Recovering that close from the plan itself is not possible, so
         # the offset is expressed against the stop directly.
+        if not plan.stop_distance > 0.0:
+            return plan          # no stated risk unit: nothing to re-anchor to
         direction = 1.0 if normalize_side(side) == "Buy" else -1.0
         planned_entry = plan.stop_price + direction * abs(plan.stop_distance)
         offset = fill - planned_entry

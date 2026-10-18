@@ -705,3 +705,21 @@ def test_the_position_row_names_its_take_profit_orders(stack):
     meta = json.loads(store.open_positions()[0]["meta"])
     assert list(meta["tp_order_ids"]) == list(report.take_profit_ids)
     assert meta["tp_order_ids"], "no take-profit legs were placed to name"
+
+
+def test_take_profit_legs_that_do_not_cover_the_position_keep_their_fractions(stack):
+    """Legs summing to 0.7 must be 0.5Q and 0.2Q; the last leg takes the
+    residual only when the legs are meant to cover the whole position."""
+    engine, client, risk, store, exchange = stack
+    placed = []
+    real = client.place_take_profit
+
+    def spy(**kw):
+        placed.append(float(kw["qty"]))
+        return real(**kw)
+    client.place_take_profit = spy
+    report = engine.execute(buy_intent(
+        take_profits=((ENTRY * 1.04, 0.5), (ENTRY * 1.06, 0.2))))
+    assert report.ok, report.reason
+    assert len(placed) == 2
+    assert placed[1] / placed[0] == pytest.approx(0.4, rel=0.05)

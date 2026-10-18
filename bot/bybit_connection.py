@@ -113,6 +113,9 @@ VENUE_REST = {"mainnet": MAINNET_REST, "testnet": TESTNET_REST,
               "demo": DEMO_REST}
 MAINNET_WS_PRIVATE = "wss://stream.bybit.com/v5/private"
 TESTNET_WS_PRIVATE = "wss://stream-testnet.bybit.com/v5/private"
+DEMO_WS_PRIVATE = "wss://stream-demo.bybit.com/v5/private"
+VENUE_WS_PRIVATE = {"mainnet": MAINNET_WS_PRIVATE, "testnet": TESTNET_WS_PRIVATE,
+                    "demo": DEMO_WS_PRIVATE}
 
 #: Bybit retCodes that are worth retrying with the SAME orderLinkId.
 #:
@@ -381,9 +384,9 @@ class BybitClient:
                 "against")
         self.venue = venue
         self.base_url = VENUE_REST[venue]
-        self.ws_private_url = (
-            TESTNET_WS_PRIVATE if self.testnet else MAINNET_WS_PRIVATE
-        )
+        # By venue, like REST: demo credentials are only valid on the demo
+        # stream, which is not the testnet one.
+        self.ws_private_url = VENUE_WS_PRIVATE[venue]
         #: "spot" or "linear". THE fork this client is built around — see the
         #: class docstring. Read from config once, here, so no call site can
         #: disagree with another about which product it is trading.
