@@ -667,14 +667,27 @@ class TestReconciliation:
         assert summary["resolved"] == 1
         assert store.get_order("BB-entry-99-deadbeef")["status"] == "never_sent"
 
-    def test_a_live_order_is_marked_still_open(self, client, store, exchange):
+    def test_a_live_protective_order_is_marked_still_open(self, client, store, exchange):
+        result = client.place_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001,
+            order_type="Limit", price=90_000.0, purpose="tp",
+        )
+        store.update_order_status(result.order_link_id, "pending")
+        summary = client.reconcile_on_startup()
+        assert summary["still_open"] == 1
+
+    def test_a_live_entry_order_is_cancelled_not_left_resting(
+            self, client, store, exchange):
+        """Nobody is left to watch a resting entry after a restart; if it filled
+        later there would be a position with no stop and no ledger row."""
         result = client.place_order(
             symbol="BTCUSDT", side="Buy", qty=0.001,
             order_type="Limit", price=40_000.0,
         )
         store.update_order_status(result.order_link_id, "pending")
         summary = client.reconcile_on_startup()
-        assert summary["still_open"] == 1
+        assert summary["still_open"] == 0 and summary["resolved"] == 1
+        assert store.get_order(result.order_link_id)["status"] == "cancelled"
 
     def test_a_filled_order_is_resolved(self, client, store, exchange):
         result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)

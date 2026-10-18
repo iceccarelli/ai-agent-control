@@ -1679,6 +1679,32 @@ class TradingEngine:
 
     # -- startup -----------------------------------------------------------
 
+    def _record_stop_id(self, symbol: str, row: Mapping[str, Any],
+                        stop_id: str) -> None:
+        """Name the live protective stop (and any resting take-profit legs) on
+        the row. Spot exits are observed, and partial exits resize the stop,
+        from these ids; a re-protected row that lacks them is never booked on
+        a stop-out and leaves the old stop live beside the resized one."""
+        meta = self._row_meta(row)
+        if stop_id:
+            meta["stop_order_link_id"] = stop_id
+        if not meta.get("tp_order_ids"):
+            try:
+                meta["tp_order_ids"] = [
+                    str(o["order_link_id"]) for o in self.store.pending_orders()
+                    if str(o.get("symbol")) == symbol
+                    and str(o.get("purpose")) == "tp"]
+            except Exception:  # noqa: BLE001
+                logger.exception("could not recover tp ids for %s", symbol)
+        current = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
+        if current is None:
+            return
+        self.store.upsert_position(
+            symbol, str(current["side"]), float(current["qty"]),
+            float(current["entry_price"]),
+            stop_price=float(current.get("stop_price") or 0.0),
+            order_link_id=str(current.get("order_link_id") or ""), meta=meta)
+
     def _protect_or_close_naked(
         self, symbol: str, row: Dict[str, Any], *, reason: str
     ) -> str:
@@ -1720,6 +1746,7 @@ class TradingEngine:
         if existing is not None:
             live_trigger = float(existing.get("triggerPrice") or 0.0) or stop
             self.store.set_position_stop(symbol, live_trigger)
+            self._record_stop_id(symbol, row, str(existing.get("orderLinkId") or ""))
             self.store.journal(symbol, "REPROTECTED", reason, {
                 "mechanism": "already_live_at_venue",
                 "order_link_id": existing.get("orderLinkId", ""),
@@ -1737,6 +1764,7 @@ class TradingEngine:
         )
         if placed:
             self.store.set_position_stop(symbol, stop)
+            self._record_stop_id(symbol, row, str(placed))
             return "REPROTECTED"
         self._emergency_close(
             symbol=symbol, exit_side=exit_side, qty=float(row["qty"]),
@@ -1763,6 +1791,20 @@ class TradingEngine:
             row = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
             if row is None:
                 continue
+            if getattr(self.client, "is_linear", False):
+                # The venue may already be flat (closed or liquidated while we
+                # were down). There is nothing to protect then, and an
+                # emergency close of a flat symbol would trip the kill switch
+                # for no reason; observe_exits books the real exit.
+                try:
+                    remote = self.client.get_position(symbol)
+                    flat = float((remote or {}).get("size", 0) or 0) <= 0
+                except Exception:  # noqa: BLE001
+                    flat = False
+                if flat:
+                    logger.warning("reconcile: %s is naked in the ledger but flat "
+                                   "at the venue; left for observe_exits", symbol)
+                    continue
             outcome = self._protect_or_close_naked(
                 symbol, row, reason="NAKED_ON_STARTUP")
             if outcome == "REPROTECTED":

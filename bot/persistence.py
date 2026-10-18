@@ -491,7 +491,12 @@ EXECUTION_OUTCOMES = ("filled", "partial", "rejected", "cancelled", "unfilled")
 #: Used only by :meth:`StateStore.update_order_status`'s ``source="ws"``
 #: monotonic guard -- REST (``source="rest"``, the default) is unaffected
 #: and remains free to write any status at any time, terminal or not.
-LOCAL_TERMINAL_ORDER_STATUS = frozenset({"filled", "cancelled", "rejected"})
+#: REST also writes the venue's other terminal statuses lowercased
+#: (``PartiallyFilledCanceled``, ``Deactivated``) and reconcile writes
+#: ``never_sent``; a replayed WS event must not revive those either.
+LOCAL_TERMINAL_ORDER_STATUS = frozenset({
+    "filled", "cancelled", "rejected",
+    "partiallyfilledcanceled", "deactivated", "never_sent"})
 
 
 def slippage_bps(side: str, intended_price: float, fill_price: float) -> float:

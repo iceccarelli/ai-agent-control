@@ -1811,7 +1811,29 @@ class BybitClient:
                     oid, status.lower(), exchange_id=str(remote.get("orderId", ""))
                 )
                 summary["resolved"] += 1
+                self._adopt_filled_spot_entry(row, remote, summary)
             elif status in OPEN_ORDER_STATUS:
+                if str(row.get("purpose")) == "entry":
+                    # A resting entry from a dead process has nobody to watch
+                    # it: when it fills there is a position with no stop and
+                    # no ledger row. Cancel it, and book what it executed.
+                    try:
+                        self.cancel_order(symbol=str(row["symbol"]),
+                                          order_link_id=oid)
+                        after = self.get_order(symbol=str(row["symbol"]),
+                                               order_link_id=oid, strict=True)
+                    except BybitAPIError as exc:
+                        logger.error("reconcile: cannot cancel entry %s: %s",
+                                     oid, exc)
+                        after = None
+                    after_status = str((after or {}).get("orderStatus", ""))
+                    if after_status in TERMINAL_ORDER_STATUS:
+                        self.store.update_order_status(
+                            oid, after_status.lower(),
+                            exchange_id=str(after.get("orderId", "")))
+                        summary["resolved"] += 1
+                        self._adopt_filled_spot_entry(row, after, summary)
+                        continue
                 self.store.update_order_status(
                     oid, "submitted", exchange_id=str(remote.get("orderId", ""))
                 )
@@ -1843,6 +1865,50 @@ class BybitClient:
                         symbol, remote.get("size"))
         logger.info("startup reconciliation: %s", summary)
         return summary
+
+    def _adopt_filled_spot_entry(self, row: Mapping[str, Any],
+                                 remote: Mapping[str, Any],
+                                 summary: Dict[str, Any]) -> None:
+        """Give the book the position an unconfirmed spot entry created.
+
+        An entry whose fill was never confirmed in-process (a poll that timed
+        out, a crash after the submit) can fill at the venue afterwards. On
+        spot there is no position list to reveal it, so without this the coin
+        is held with no ledger row and no stop, and the next signal stacks a
+        second entry on it. The row is written with no stop, so the naked
+        handling that follows reconciliation protects it (or flattens it).
+        Linear is left to the orphan check, which fails closed.
+        """
+        if not self.is_spot or str(row.get("purpose")) != "entry":
+            return
+        if normalize_side(str(row.get("side", ""))) != "Buy":
+            return
+        try:
+            qty = float(remote.get("cumExecQty") or 0.0)
+            price = float(remote.get("avgPrice") or 0.0)
+        except (TypeError, ValueError):
+            return
+        symbol = str(row["symbol"])
+        if qty <= 0 or price <= 0:
+            return
+        if symbol in {str(p.get("symbol")) for p in self.store.open_positions()}:
+            return
+        import venue_fees
+        fees = venue_fees.extract_order_fees(remote)
+        self.store.upsert_position(
+            symbol, "Buy", qty, price, stop_price=0.0,
+            order_link_id=str(row["order_link_id"]),
+            meta={"entry_fees": fees.to_dict(),
+                  "entry_fee_ref": {"order_link_id": str(row["order_link_id"]),
+                                    "order_id": str(remote.get("orderId") or "")},
+                  "adopted_at_reconcile": True})
+        self.store.journal(symbol, "ENTRY_ADOPTED_AT_RECONCILE",
+                           "unconfirmed spot entry had filled", {
+                               "order_link_id": str(row["order_link_id"]),
+                               "qty": qty, "avg_price": price})
+        logger.critical("reconcile: unconfirmed spot entry %s had filled "
+                        "(%s %s @ %s); adopted into the book for protection",
+                        row["order_link_id"], qty, symbol, price)
 
     # -- private websocket -------------------------------------------------
 

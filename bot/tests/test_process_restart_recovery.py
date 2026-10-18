@@ -537,6 +537,16 @@ class TestWSStatusMonotonicGuard:
         assert store.get_order("BB-1")["status"] == "filled", (
             "a stale WS 'New' regressed a terminal order's status")
 
+    @pytest.mark.parametrize("terminal", [
+        "partiallyfilledcanceled", "deactivated", "never_sent"])
+    def test_stale_ws_event_does_not_revive_a_rest_written_terminal(
+            self, tmp_path, terminal):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", terminal, exchange_id="V-1")   # REST
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == terminal
+        assert "BB-1" not in [o["order_link_id"] for o in store.unresolved_orders()]
+
     def test_duplicate_terminal_ws_event_is_a_harmless_noop(self, tmp_path):
         """Re-delivery of the SAME terminal status (a normal duplicate, not
         an attack) must apply cleanly with no error and no anomaly journal

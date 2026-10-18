@@ -292,3 +292,100 @@ class TestClearPositionStop:
         assert "REJECTED" in result.reason
         # Nothing changed at the venue - the rejected write never landed.
         assert fake.positions[SYMBOL]["stopLoss"] == "57000"
+
+
+def test_a_reprotected_spot_row_names_its_new_stop(tmp_path):
+    """Spot exits are observed, and partial exits resize the stop, from the ids
+    on the row. A re-protected row without them is never booked on a stop-out."""
+    import json
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    store.upsert_position(SYMBOL, "Buy", 0.001, 60_000.0, stop_price=0.0)
+    row = store.open_positions()[0]
+    outcome = engine._protect_or_close_naked(SYMBOL, row, reason="NAKED_ON_STARTUP")
+    assert outcome == "REPROTECTED"
+    after = store.open_positions()[0]
+    assert float(after["stop_price"]) > 0
+    stop_id = json.loads(after["meta"]).get("stop_order_link_id")
+    assert stop_id, "the re-protected row does not name its stop"
+    assert any(str(o["order_link_id"]) == stop_id for o in store.pending_orders())
+
+
+def test_a_spot_entry_that_filled_while_unconfirmed_is_adopted_and_protected(tmp_path):
+    """FILL_UNCONFIRMED leaves the entry 'submitted'. If it filled at the venue
+    the coin is held with no ledger row and no stop; startup reconciliation
+    must adopt it so the naked handling protects it."""
+    import json
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    store.record_order("ENT-1", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+    store.update_order_status("ENT-1", "submitted")
+    real = engine.client.get_order
+
+    def get_order(**kw):
+        if kw.get("order_link_id") == "ENT-1":
+            return {"orderStatus": "Filled", "cumExecQty": "0.001",
+                    "avgPrice": "60000", "orderId": "V9"}
+        return real(**kw)
+    engine.client.get_order = get_order
+    engine.reconcile()
+    rows = store.open_positions()
+    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.001)
+    assert float(rows[0]["stop_price"]) > 0, "the adopted position was left naked"
+    assert json.loads(rows[0]["meta"]).get("stop_order_link_id")
+    assert store.get_order("ENT-1")["status"] == "filled"
+    engine.reconcile()                      # a second restart adopts nothing new
+    assert len(store.open_positions()) == 1
+
+
+def test_a_cancelled_unfilled_spot_entry_is_not_adopted(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    store.record_order("ENT-2", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+    store.update_order_status("ENT-2", "submitted")
+    engine.client.get_order = lambda **kw: {
+        "orderStatus": "Cancelled", "cumExecQty": "0", "avgPrice": "0"}
+    engine.reconcile()
+    assert store.open_positions() == []
+
+
+def test_a_resting_entry_found_at_startup_is_cancelled_and_its_partial_fill_adopted(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    store.record_order("ENT-3", SYMBOL, "Buy", "Limit", 0.002, purpose="entry")
+    store.update_order_status("ENT-3", "submitted")
+    state = {"cancelled": False}
+    real_get, real_cancel = engine.client.get_order, engine.client.cancel_order
+
+    def get_order(**kw):
+        if kw.get("order_link_id") == "ENT-3":
+            if state["cancelled"]:
+                return {"orderStatus": "PartiallyFilledCanceled",
+                        "cumExecQty": "0.0005", "avgPrice": "60000",
+                        "orderId": "V3"}
+            return {"orderStatus": "New", "cumExecQty": "0", "orderId": "V3"}
+        return real_get(**kw)
+
+    def cancel_order(**kw):
+        if kw.get("order_link_id") == "ENT-3":
+            state["cancelled"] = True
+            return True
+        return real_cancel(**kw)
+    engine.client.get_order, engine.client.cancel_order = get_order, cancel_order
+    engine.reconcile()
+    assert state["cancelled"], "the resting entry was left live"
+    rows = store.open_positions()
+    assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.0005)
+    assert float(rows[0]["stop_price"]) > 0
+    assert "ENT-3" not in [o["order_link_id"] for o in store.unresolved_orders()]
+
+
+def test_startup_does_not_emergency_close_a_naked_row_the_venue_no_longer_holds(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    store.upsert_position(SYMBOL, "Buy", 0.001, 60_000.0, stop_price=0.0)
+    engine.reconcile()                      # the venue is flat (no fake position)
+    assert not any(r["url"].endswith("/v5/order/create") for r in fake.requests)
+    assert not any(r["url"].endswith("/v5/position/trading-stop")
+                   for r in fake.requests)
+    assert store.open_position_count() == 1     # left for observe_exits to book
