@@ -400,3 +400,34 @@ def test_closed_short_qty_is_unknown_when_the_evidence_is_not_trustworthy(rows):
 def test_no_closed_pnl_rows_is_zero_not_unknown():
     assert _closed_pnl_broker([]).get_closed_short_qty_since(
         "BTCUSDT", 1_000) == 0.0
+
+
+# -- the venue's reported leverage is visible, never set or gated on ----------
+
+class LeverageClient(FakeClient):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/position/list":
+            self.calls.append((method, endpoint, params, body))
+            return envelope({"list": self.rows})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+@pytest.mark.parametrize("rows,expected", [
+    ([{"size": "0", "leverage": "10"}], 10.0),
+    ([{"size": "0.5", "leverage": "3.5"}], 3.5),
+    ([{"size": "0"}], None), ([{"size": "0", "leverage": ""}], None),
+    ([{"size": "0", "leverage": "nan"}], None),
+    ([{"size": "0", "leverage": "0"}], None), ([], None),
+])
+def test_the_venues_reported_leverage_is_read_not_assumed(rows, expected):
+    b = CarryBroker(client=LeverageClient(rows), order_gate=lambda: (True, "T"),
+                    sequence_source=lambda *a: 1)
+    assert b.get_position_leverage("BTCUSDT") == expected
+    # read only: no leverage-setting request is ever made
+    assert not [c for c in b.client.calls if "set-leverage" in c[1]]

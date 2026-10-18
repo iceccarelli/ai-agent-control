@@ -727,6 +727,27 @@ class TradingBot:
             self.store.save_ledger(journal.to_rows())
         self.store.save_carry_position(state)
 
+    def _log_venue_leverage(self, broker: Any) -> None:
+        """Say what leverage the venue reports for the carry perp. Observation
+        only: this process does not set, change or gate on it (the startup setter
+        covers the directional symbols, not the carry perp), so without this line
+        the number the book actually runs at is recorded nowhere."""
+        reader = getattr(broker, "get_position_leverage", None)
+        if reader is None:
+            return
+        try:
+            leverage = reader(self.carry.perp_symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("carry: could not read the venue's leverage for %s "
+                           "(%s: %s)", self.carry.perp_symbol,
+                           type(exc).__name__, exc)
+            return
+        logger.warning(
+            "carry: the venue reports %s leverage on %s (observed only; this "
+            "process neither set nor gates on it)",
+            "UNSTATED" if leverage is None else f"{leverage:g}x",
+            self.carry.perp_symbol)
+
     def carry_cold_start(self) -> bool:
         """Reconcile the carry ledger against the venue. False = do not start.
 
@@ -752,6 +773,7 @@ class TradingBot:
                     "a held short) would be rejected. Switch the account to "
                     "one-way mode; refusing to start", self.carry.perp_symbol)
                 return False
+            self._log_venue_leverage(broker)
             venue_perp = float(broker.get_perp_position(self.carry.perp_symbol))
             venue_spot = float(
                 broker.get_spot_inventory(self.carry.spot_symbol))

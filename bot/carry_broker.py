@@ -1467,6 +1467,25 @@ class CarryBroker:
                 "currency": str(row.get("currency", "")).upper() or None,
                 "size": size, "category": LINEAR}
 
+    def get_position_leverage(self, symbol: str) -> Optional[float]:
+        """The leverage the venue reports on this symbol's position row
+        (`GET /v5/position/list`, `leverage`), or None when it is not stated.
+
+        READ-ONLY and informational: this process never sets or gates on it.
+        It exists so the number is visible, because nothing else records it.
+        """
+        result = self.client._request(
+            "GET", "/v5/position/list", signed=True,
+            params={"category": LINEAR, "symbol": symbol})
+        rows = self._v5_list(result)
+        if not rows or not isinstance(rows[0], dict):
+            return None
+        try:
+            value = float(rows[0].get("leverage"))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
     def get_position_mode(self, symbol: str) -> str:
         """``"hedge"`` iff the venue lists a hedge-mode slot (positionIdx 1 or
         2) for the symbol, else ``"one_way"``. Read-only, same call as the

@@ -646,3 +646,19 @@ def test_an_orphan_that_the_confirming_read_could_not_confirm_does_not_halt(tmp_
     bot.carry.broker.get_perp_position = timeout
     _tick_seeing_the_venue(bot, venue, 1)
     assert engine.state is not BookState.HALTED
+
+
+def test_cold_start_logs_the_leverage_the_venue_reports_and_sets_nothing(
+        tmp_path, caplog):
+    import logging as _logging
+    venue, journal, engine, bot = _flat(tmp_path)
+    bot.store.save_carry_position(engine.to_state())
+    bot.CARRY_COLD_START_REREAD_S = 0
+    bot.carry.broker.get_perp_position = lambda symbol: 0.0
+    bot.carry.broker.get_spot_inventory = lambda symbol: 0.0
+    bot.carry.broker.get_position_leverage = lambda symbol: 7.0
+    with caplog.at_level(_logging.WARNING, logger="main"):
+        assert bot.carry_cold_start() is True
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "7x leverage" in text and "neither set nor gates" in text
+    assert not [c for c in venue.calls if "set-leverage" in c[1]]
