@@ -405,6 +405,31 @@ class TestTickPersistsTheTruthAcrossARestart:
         assert again["net_basis"] == live["net_basis"]
 
 
+    def test_a_write_that_dies_between_journal_and_position_leaves_neither(self, tmp_path):
+        """_persist_carry writes the journal and the position in ONE transaction:
+        if the position write is killed after the journal write, the journal
+        write is rolled back, so a restart cannot see a journal ahead of its
+        position. (The end-of-tick journal save is a separate, later write.)"""
+        venue, journal, engine = build(modern)
+        store = StateStore(str(tmp_path / "carry.db"))
+        bot = self._bot(venue, journal, engine, store)
+        journal_rows = [{"ms": 1, "kind": "x"}]
+        bot.carry_journal = type("J", (), {"to_rows": lambda self: journal_rows})()
+
+        def die(state):
+            raise RuntimeError("killed between the two writes")
+        real = store.save_carry_position
+        store.save_carry_position = die
+        with pytest.raises(RuntimeError):
+            bot._persist_carry({"book_state": "HEDGED"})
+        store.save_carry_position = real
+        store.close()
+        store = StateStore(str(tmp_path / "carry.db"))
+        assert not store.load_ledger(), "the journal survived without its position"
+        assert not store.load_carry_position()
+        store.close()
+
+
 def test_a_resting_order_that_fills_at_cancel_books_its_whole_stated_fee():
     """A post-only order with no fills reports an empty fee row (unknown). The
     ledger used that as the baseline, so the fee on the quantity the cancel
