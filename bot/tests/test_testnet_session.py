@@ -213,6 +213,52 @@ class TestZeroFillsExitCode:
         assert json.loads(failure.read_text())["entry_fills"] == 0
 
 
+class TestTheFailureRecordOnlyClaimsWhatIsKnown:
+    def _run(self, tmp_path, monkeypatch, flatten_raises):
+        monkeypatch.setenv("BYBIT_VENUE", "testnet")
+        monkeypatch.delenv("USE_TESTNET", raising=False)
+        fake_store = types.SimpleNamespace(open_positions=lambda: [],
+                                           close=lambda: None)
+        fake_client = types.SimpleNamespace(
+            base_url="https://api-testnet.bybit.com",
+            get_last_price=lambda s: 100000.0)
+        fake_engine = types.SimpleNamespace(paper=False, sizer=None,
+                                            risk=types.SimpleNamespace())
+        monkeypatch.setattr(ts, "_build_session_stack",
+                            lambda **kw: (_cfg(), fake_store, fake_client,
+                                          fake_engine, object))
+        monkeypatch.setattr(ts.tcr, "run_preflight", lambda cfg, client:
+                            types.SimpleNamespace(ok=True, checks={}))
+
+        def boom(**kw):
+            raise RuntimeError("after the order was sent")
+        monkeypatch.setattr(ts, "run_session", boom)
+
+        def flatten(engine, **kw):
+            if flatten_raises:
+                raise RuntimeError("flatten rejected")
+        monkeypatch.setattr(ts, "flatten_position", flatten)
+        failure = tmp_path / "fail.json"
+        rc = ts.main(["--failure-out", str(failure),
+                      "--ledger", str(tmp_path / "cash_ledger.json"),
+                      "--state-db", str(tmp_path / "s.db"),
+                      "--evidence-path", str(tmp_path / "e.jsonl")])
+        return rc, json.loads(failure.read_text())
+
+    def test_an_exception_does_not_claim_no_order_was_sent(self, tmp_path, monkeypatch):
+        rc, record = self._run(tmp_path, monkeypatch, flatten_raises=False)
+        assert rc == 1
+        assert record["network_order_submitted"] is True      # possible, not denied
+        assert "UNKNOWN" in record["order_state"]
+        assert record["flatten_attempted"] is True
+
+    def test_a_flatten_that_itself_raised_is_not_recorded_as_attempted(
+            self, tmp_path, monkeypatch):
+        rc, record = self._run(tmp_path, monkeypatch, flatten_raises=True)
+        assert record["flatten_attempted"] is False
+        assert "flatten rejected" in record["flatten_error"]
+
+
 class TestCarryIsPointedAtTheDrill:
     def test_a_carry_book_is_pointed_at_the_drill_not_called_no_signal(self):
         cfg = _cfg(PAPER_TRADING=False)

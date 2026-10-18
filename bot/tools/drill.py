@@ -462,6 +462,28 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                 else:
                     d.still_open = True
                     check.failed(why, verdict=verdict, **evidence)
+                    # A stage failed BEFORE the planned unwind (the pair would not
+                    # reconcile, the engine raised after sending): the hedge the
+                    # engine can close is still open. Try the engine's own
+                    # reduce-only unwind once, then say what the venue holds.
+                    if (name in ("open", "pair") and engine.position is not None
+                            and state.get("perp") is not None):
+                        abort = d.stage("abort_unwind")
+                        try:
+                            decision = engine._unwind(state["perp"], "DRILL_ABORT")
+                            d.orders_sent = len(journal.entries)
+                            verdict2, evidence2, why2 = venue_flatness(
+                                broker,
+                                inventory_before=state.get("inventory_before"))
+                            if verdict2 == "FLAT":
+                                d.still_open = False
+                                abort.passed(action=decision.action,
+                                             verdict=verdict2, **evidence2)
+                            else:
+                                abort.failed(why2, action=decision.action,
+                                             verdict=verdict2, **evidence2)
+                        except Exception as exc:  # noqa: BLE001
+                            abort.failed(f"{type(exc).__name__}: {exc}")
             return _report(d, state, out, cap, verdict="FAILED")
 
     return _report(d, state, out, cap, verdict="PASSED")

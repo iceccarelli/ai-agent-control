@@ -8,6 +8,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BOT_DIR="$(dirname "$HERE")"
 
+# One timer at a time: two overlapping loops would run two sessions against the
+# same state database and symbol.
+LOCK_FILE="${TESTNET_SESSION_TIMER_LOCK:-/tmp/testnet_session_timer.lock}"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+    echo "[testnet_session_timer] another timer holds ${LOCK_FILE}; refusing to start" >&2
+    exit 1
+fi
+
 INTERVAL_SECONDS="${1:-900}"
 MAX_TICKS="${2:-0}"
 

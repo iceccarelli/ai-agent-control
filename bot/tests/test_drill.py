@@ -479,3 +479,22 @@ class TestTheDrillHonoursTheBooksKillSwitch:
         bad = tmp_path / "bad.db"
         bad.write_bytes(b"not a sqlite file at all" * 10)
         assert drill.book_kill_switch(str(bad))[0] is True
+
+
+class TestAFailureBeforeTheUnwindStillTriesToClose:
+    def test_a_pair_that_will_not_reconcile_gets_one_engine_unwind_attempt(self):
+        """The venue shows a size the book does not hold; the engine's own
+        reduce-only unwind is still tried once rather than left to a human."""
+        class Drifting(Venue):
+            """Flat at preflight; once the book has sold, the venue shows 0.5."""
+            def get_perp_position(self, symbol):
+                self._live()
+                return 0.5 if self.orders else 0.0
+        venue = Drifting()
+        report = run(venue)
+        assert report["failed_stage"] == "pair"
+        stages = [s["stage"] for s in report["stages"]]
+        assert "abort_unwind" in stages
+        closing = [o for o in venue.orders if o[0] == "Buy" and o[1] == "linear"]
+        assert closing, "no closing order was attempted after the failed pair"
+        assert report["still_open"] is True       # the venue still reads non-flat

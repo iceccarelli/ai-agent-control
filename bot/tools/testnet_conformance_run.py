@@ -819,7 +819,38 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
         if not stages[-1]["ok"]:
             return _finalize(stages, timestamps, ok=False)
 
-    bot.tick()
+    def _abort_flatten(why: str) -> None:
+        """A stage failed AFTER the entry order was sent: do not leave the run's
+        position (or its resting legs) open on the venue. Close it reduce-only,
+        cancel what rests, and record what the venue holds afterwards."""
+        try:
+            report = engine.close_position(symbol=symbol,
+                                           reason="conformance_abort")
+            closed_ok, closed_reason = bool(report.ok), str(report.reason)
+        except Exception as exc:  # noqa: BLE001
+            closed_ok, closed_reason = False, f"{type(exc).__name__}: {exc}"
+        try:
+            client.cancel_all(symbol)
+        except Exception:  # noqa: BLE001
+            pass
+        _stage("abort_flatten", closed_ok, after=why, reason=closed_reason)
+        try:
+            flat = verify_remote_flat(client=client, symbol=symbol,
+                                      run_entry_qty=float(
+                                          (row or {}).get("qty") or 0.0),
+                                      run_exit_qty=0.0)
+            _stage("abort_remote_flat_verification", flat.pop("ok"), **flat)
+        except Exception as exc:  # noqa: BLE001
+            _stage("abort_remote_flat_verification", False,
+                   error=f"{type(exc).__name__}: {exc}")
+
+    row = None
+    try:
+        bot.tick()
+    except Exception as exc:  # noqa: BLE001
+        _stage("entry", False, error=f"{type(exc).__name__}: {exc}")
+        _abort_flatten("tick_raised")
+        return _finalize(stages, timestamps, ok=False)
     positions = {p["symbol"]: p for p in store.open_positions()}
     row = positions.get(symbol)
     _stage("entry", row is not None,
@@ -836,12 +867,14 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     _stage("ws_observation", ws_observed, order_link_id=order_link_id,
           timeout_seconds=ws_observation_timeout)
     if not ws_observed:
+        _abort_flatten("ws_observation")
         return _finalize(stages, timestamps, ok=False)
 
     naked = store.positions_without_stops()
     protected_locally = not any(p.get("symbol") == symbol for p in naked)
     _stage("protection_local", protected_locally)
     if not protected_locally:
+        _abort_flatten("protection_local")
         return _finalize(stages, timestamps, ok=False)
 
     # Category-correct: get_position()/stopLoss is LINEAR-only and raises
@@ -851,6 +884,7 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
         client=client, store=store, symbol=symbol, entry_row=row)
     _stage("protection_readback", protection.pop("ok"), **protection)
     if not stages[-1]["ok"]:
+        _abort_flatten("protection_readback")
         return _finalize(stages, timestamps, ok=False)
 
     close_report = engine.close_position(symbol=symbol, reason="conformance_flatten")
