@@ -543,6 +543,15 @@ class CarryBroker:
             # that fails, or finds nothing, is not "no fill".
             try:
                 state = self._order_state(symbol, link_id, product)
+                # The order is known to exist and a market order settles in
+                # milliseconds; a read that races the matching engine (no row
+                # yet, still "New") is asked again before the book is halted
+                # over a fill that was fine.
+                for _ in range(self.ORDER_READBACK_POLLS):
+                    if state is not None and not state["resting"]:
+                        break
+                    time.sleep(self.ORDER_READBACK_SLEEP_S)
+                    state = self._order_state(symbol, link_id, product)
             except Exception as read_exc:  # noqa: BLE001
                 raise OrderOutcomeUnknown(
                     f"{link_id} was accepted and could not be read back "
@@ -563,6 +572,9 @@ class CarryBroker:
                     "that is still live has no final fill to book")
             return self._engine_result_from_state(state, qty)
         return fill.as_engine_result()
+
+    ORDER_READBACK_POLLS = 4
+    ORDER_READBACK_SLEEP_S = 0.2
 
     @staticmethod
     def _definitively_rejected(exc: Exception) -> bool:
@@ -1598,14 +1610,37 @@ class CarryBroker:
         out = []
         for category, symbol, mine_only in ((LINEAR, perp_symbol, False),
                                             (SPOT, spot_symbol, True)):
-            result = self.client._request(
-                "GET", "/v5/order/realtime", signed=True,
-                params={"category": category, "symbol": symbol, "openOnly": 0})
-            rows = self._v5_list(result)
-            if rows is None:
+            # ONE page is 20 rows by default; an order pushed onto page two
+            # is still a live order, so every page is read or the read fails.
+            rows: list = []
+            cursor = ""
+            seen_cursors: set = set()
+            for _page in range(20):
+                params = {"category": category, "symbol": symbol,
+                          "openOnly": 0, "limit": 50}
+                if cursor:
+                    params["cursor"] = cursor
+                result = self.client._request(
+                    "GET", "/v5/order/realtime", signed=True, params=params)
+                page = self._v5_list(result)
+                if page is None:
+                    raise PairIncident(
+                        f"cannot read open {category} orders for {symbol}; "
+                        "refusing to assume there are none")
+                rows.extend(page)
+                nxt = CarryBroker._v5_result(result).get("nextPageCursor")
+                if not nxt:
+                    break
+                if nxt in seen_cursors:
+                    raise PairIncident(
+                        f"open {category} order paging for {symbol} looped; "
+                        "refusing to assume the list is complete")
+                seen_cursors.add(nxt)
+                cursor = str(nxt)
+            else:
                 raise PairIncident(
-                    f"cannot read open {category} orders for {symbol}; "
-                    "refusing to assume there are none")
+                    f"open {category} orders for {symbol} did not finish "
+                    "paging; refusing to assume the list is complete")
             for row in rows:
                 link = str(row.get("orderLinkId", ""))
                 if mine_only and "carr" not in link:

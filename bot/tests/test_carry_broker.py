@@ -386,6 +386,33 @@ class TestGetOpenCarryOrdersRefusesToAssumeNone:
         client._request = lambda *a, **k: envelope({"list": []})
         assert broker(client).get_open_carry_orders("BTCUSDT", "BTCUSDT") == []
 
+    def test_a_second_page_of_open_orders_is_read(self):
+        client = FakeClient()
+        calls = []
+
+        def req(method, path, **kw):
+            params = kw["params"]
+            calls.append(dict(params))
+            if params["category"] == LINEAR and not params.get("cursor"):
+                return envelope({"list": [{"orderLinkId": "x1",
+                                           "orderStatus": "New"}],
+                                 "nextPageCursor": "c2"})
+            if params["category"] == LINEAR:
+                return envelope({"list": [{"orderLinkId": "x2",
+                                           "orderStatus": "New"}],
+                                 "nextPageCursor": ""})
+            return envelope({"list": []})
+        client._request = req
+        orders = broker(client).get_open_carry_orders("BTCUSDT", "BTCUSDT")
+        assert [o["orderLinkId"] for o in orders] == ["x1", "x2"]
+
+    def test_a_looping_cursor_refuses_to_assume_the_list_is_complete(self):
+        client = FakeClient()
+        client._request = lambda *a, **k: envelope(
+            {"list": [], "nextPageCursor": "same"})
+        with pytest.raises(PairIncident):
+            broker(client).get_open_carry_orders("BTCUSDT", "BTCUSDT")
+
     def test_a_missing_list_key_refuses_to_assume_none(self):
         client = FakeClient()
         client._request = lambda *a, **k: envelope({})
@@ -566,3 +593,42 @@ class TestItDrivesTheEngine:
         assert len(client.created) == 2
         assert {c["category"] for c in client.created} == {SPOT, LINEAR}
         assert {c["side"] for c in client.created} == {"Buy", "Sell"}
+
+
+class _RacingReadback(FakeClient):
+    """The create response carries no fill; the first read-back races the
+    matching engine ("New", then no row) and only the third shows Filled."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = 0
+
+    def _request(self, method, endpoint, **kw):
+        if endpoint == "/v5/order/create":
+            self.calls.append((method, endpoint, kw.get("params"),
+                               kw.get("body")))
+            return envelope({"orderId": "1",
+                             "orderLinkId": kw["body"]["orderLinkId"]})
+        if endpoint in ("/v5/order/realtime", "/v5/order/history"):
+            self.reads += 1
+            link = kw["params"].get("orderLinkId")
+            if self.reads == 1:
+                return envelope({"list": [{"orderLinkId": link,
+                                           "orderStatus": "New",
+                                           "cumExecQty": "0",
+                                           "avgPrice": "0"}]})
+            if self.reads == 2:
+                return envelope({"list": []})
+            return envelope({"list": [{
+                "orderLinkId": link, "orderStatus": "Filled",
+                "cumExecQty": "0.001", "avgPrice": "100000",
+                "cumFeeDetail": {"USDT": "0.05"}}]})
+        return super()._request(method, endpoint, **kw)
+
+
+def test_an_accepted_market_order_is_read_again_before_the_book_halts():
+    b = broker(_RacingReadback())
+    b.ORDER_READBACK_SLEEP_S = 0
+    fill = b.place_market(symbol="BTCUSDT", side="Buy", qty=0.001,
+                          product=LINEAR)
+    assert fill is not None and float(fill["filled_qty"]) == pytest.approx(0.001)
