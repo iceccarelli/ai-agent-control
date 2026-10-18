@@ -266,3 +266,24 @@ def test_the_fail_closed_write_keeps_the_restored_funding_state():
     assert written[-1]["last_print_ms"] == 123
     assert written[-1]["funding_history"] == [1.0, 2.0]
     assert written[-1]["entry_days"]["entries"]
+
+
+# -- a broken pair is on disk before the unwind returns -------------------------
+
+def test_a_clean_emergency_spot_unwind_persists_the_spent_allowance():
+    from carry_engine import Leg
+    saved = []
+    e = engine(persist=lambda s: saved.append(s))
+    e._utc_now = lambda: NOON
+    e._last_tick_ms = int(NOON.timestamp() * 1000)
+    e._gate_now = lambda ms: NOON
+    spot = Leg(symbol="BTCUSDT", side="Buy", product="spot")
+    spot.filled_qty = spot.requested_qty = 0.001
+    sold = Leg(symbol="BTCUSDT", side="Sell", product="spot")
+    sold.filled_qty = sold.requested_qty = 0.001
+    e._fire = lambda *a, **k: sold
+    e._spot_sellable = lambda q: q
+    d = e._emergency_unwind_spot(spot, "perp refused")
+    assert d.state.name == "FLAT"
+    assert saved, "the unwind must have been journalled"
+    assert saved[-1]["entry_days"]["broken"] == ["2026-10-15"]

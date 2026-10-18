@@ -2050,15 +2050,16 @@ class CarryEngine:
                 "still held with nothing hedging it")
         self.position = None
         self.state = BookState.FLAT
-        failed = self._record()
-        if failed is not None:
-            return failed
         # A spot round trip was paid for nothing. Without this, a venue that
         # rejects the perp leg made the book buy and sell spot every tick:
-        # 8 round trips in 10 ticks, measured (INVENTORY D4).
+        # 8 round trips in 10 ticks, measured (INVENTORY D4). Counted BEFORE
+        # the journal save so the persisted allowance includes it.
         if self.pair_risk is not None:
             self.pair_risk.record_broken_pair(
                 now=self._gate_now(self._last_tick_ms))
+        failed = self._record()
+        if failed is not None:
+            return failed
         return CarryDecision("unwound", acted=True, reason=reason,
                              state=BookState.FLAT,
                              detail={"error": self._last_leg_error})
