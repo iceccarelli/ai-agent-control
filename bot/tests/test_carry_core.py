@@ -267,3 +267,25 @@ class TestANonFinitePrintCannotOpenAGate:
             taker_perp_bps=cb.TAKER_BPS_PERP)
         cpp = core.simulate(poisoned, params)
         assert cpp["trades"] == python["trades"]
+
+
+class TestEdgeCasesBothSidesAgreeOn:
+    def test_an_entry_on_the_last_row_is_not_booked_as_a_phantom_round_trip(
+            self, native, rows):
+        import dataclasses
+        tail = [dataclasses.replace(r, rate=-0.0001) for r in rows[:5]]
+        tail[-1] = dataclasses.replace(tail[-1], rate=0.0003)   # would open here
+        python = cb.simulate_settlements_series(
+            tail, notional=100_000.0, borrow_apr=0.0, gated=False,
+            impact_bps=0.0, mode=cb.OVERLAY)
+        params = core.params(
+            notional=100_000.0, borrow_apr=0.0, impact_bps=0.0,
+            round_trip_bps=cb.round_trip_bps_for(cb.OVERLAY), gated=False,
+            overlay=True, taker_spot_bps=cb.TAKER_BPS_SPOT,
+            taker_perp_bps=cb.TAKER_BPS_PERP)
+        cpp = core.simulate(tail, params)
+        assert python["trades"] == 0 and cpp["trades"] == 0
+
+    def test_zero_exit_prints_is_refused(self, native):
+        with pytest.raises(ValueError):
+            core.params(negative_exit_prints=0)

@@ -143,6 +143,10 @@ def params(*, notional: float = 100_000.0, entry_bps: float = 0.2,
            overlay: bool = False, ewma_min_prints: int = 3,
            negative_exit_prints: int = 3,
            funding_history: int = 8) -> Params:
+    if int(negative_exit_prints) < 1:
+        # A streak is never below 0, so 0 would exit on the first print after
+        # entry whatever its sign: a one-print hold at double fees.
+        raise ValueError("negative_exit_prints must be at least 1")
     return Params(notional, entry_bps, borrow_apr, impact_bps, round_trip_bps,
                   hold_days, taker_spot_bps, taker_perp_bps, ewma_alpha,
                   int(bool(gated)), int(bool(overlay)), ewma_min_prints,
@@ -175,6 +179,8 @@ def sweep(settlements: Sequence[Any], base: Params, *,
     rows = _rows(settlements)
     entries = (ctypes.c_double * len(entry_grid))(*[float(x) for x in entry_grid])
     holds = (ctypes.c_double * len(hold_grid))(*[float(x) for x in hold_grid])
+    if any(int(x) < 1 for x in exit_grid):
+        raise ValueError("every negative_exit_prints in the grid must be >= 1")
     exits = (ctypes.c_int32 * len(exit_grid))(*[int(x) for x in exit_grid])
     total = len(entry_grid) * len(hold_grid) * len(exit_grid)
     out = (Result * total)()

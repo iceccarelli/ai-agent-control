@@ -1037,7 +1037,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
                            + p * perp_leg_bps) / 1e4
         t.impact += t.qty * (spot_legs * s + p) * impact_bps / 1e4
 
-    for st in rows:
+    last_index = len(rows) - 1
+    for index, st in enumerate(rows):
         r_bps = st.rate * 1e4
         history.append(r_bps)
         if live is not None:
@@ -1077,7 +1078,10 @@ def simulate_settlements_series(rows: List[Settlement], *,
         else:
             may_open = r_bps >= entry_bps
 
-        if may_open:
+        # An entry on the final row has no settlement left to be held through:
+        # it would book as a zero-day round trip paying both legs' fees for
+        # nothing, biasing the last row's result down.
+        if may_open and index < last_index:
             qty = notional / st.perp
             live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
                          entry_perp=st.perp)

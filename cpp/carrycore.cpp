@@ -140,7 +140,8 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         } else {
             may_open = r_bps >= p.entry_bps;
         }
-        if (may_open) {
+        /* No entry on the final row: no settlement is left to hold through. */
+        if (may_open && i < n - 1) {
             live = Trade();
             live.qty = p.notional / st.perp;
             live.entry_spot = st.spot;
