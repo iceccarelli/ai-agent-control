@@ -1266,7 +1266,9 @@ class TradingEngine:
             order_ids: List[str] = []
             pnl_rows: List[Dict[str, Any]] = []
             try:
-                pnl_rows = self.client.get_closed_pnl(symbol, since_ms=since_ms)
+                pnl_rows = self._rows_of_this_exit(
+                    self.client.get_closed_pnl(symbol, since_ms=since_ms),
+                    exited)
                 qty_sum = sum(float(r.get("qty", 0) or 0) for r in pnl_rows)
                 if qty_sum > 0:
                     price = sum(float(r.get("avgExitPrice", 0) or 0)
@@ -1317,6 +1319,44 @@ class TradingEngine:
             logger.warning("observe_exits: %s exited %.8g @ %.8g (%s) fully=%s",
                            symbol, exited, price, reason, fully)
         return summary
+
+    @staticmethod
+    def _rows_of_this_exit(rows: List[Dict[str, Any]],
+                           exited: float) -> List[Dict[str, Any]]:
+        """The newest closed-pnl rows that add up to ``exited``.
+
+        The venue lists every close since the position opened, including the
+        partial exits already booked. Averaging all of them prices a later
+        exit at a blend of earlier ones (a stop-out after a take-profit would
+        be booked as a win). When the newest rows sum exactly to the quantity
+        that has just left, those are the exit; otherwise the full list is
+        returned unchanged and the caller's existing handling applies.
+        """
+        def stamp(r: Dict[str, Any]) -> float:
+            try:
+                return float(r.get("updatedTime", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        if len(rows) >= TradingEngine._CLOSED_PNL_PAGE:
+            return rows          # a full page may be truncated: say nothing new
+        tolerance = max(1e-9, abs(exited) * 1e-9)
+        taken: List[Dict[str, Any]] = []
+        total = 0.0
+        for r in sorted(rows, key=stamp, reverse=True):
+            try:
+                qty = float(r.get("qty", 0) or 0)
+            except (TypeError, ValueError):
+                return rows
+            if qty <= 0:
+                continue
+            taken.append(r)
+            total += qty
+            if abs(total - exited) <= tolerance:
+                return taken
+            if total > exited:
+                return rows
+        return rows
 
     def record_exit_fill(
         self,
