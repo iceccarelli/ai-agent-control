@@ -749,6 +749,14 @@ class TradingEngine:
                 if status == "Filled":
                     self.store.update_order_status(order_link_id, "filled")
                     return order
+                if (status == "PartiallyFilledCanceled"
+                        and float(order.get("cumExecQty") or 0.0) > 0.0):
+                    # Terminal, and part of it executed: the venue holds that
+                    # quantity, so it is a fill of the executed size -- not an
+                    # "unconfirmed" order that leaves exposure nobody tracks.
+                    self.store.update_order_status(
+                        order_link_id, "partiallyfilledcanceled")
+                    return order
                 if status in {"Rejected", "Cancelled", "Deactivated"}:
                     self.store.update_order_status(order_link_id, status.lower())
                     return None
@@ -1015,6 +1023,31 @@ class TradingEngine:
         # never resolved — an unconfirmed exit is not evidence of one.
         executed_exit_qty = float((fill or {}).get("cumExecQty") or 0.0)
         exit_status = str((fill or {}).get("orderStatus", "") or "")
+
+        # On linear the venue's position list is the truth, and observe_exits
+        # books the real exit from it. A close that did not execute in full
+        # (no resolved fill, or a partial one) must therefore leave the row and
+        # the stops in place: booking it as closed would hide a position that
+        # is still open, and a new entry could stack on it.
+        if (getattr(self.client, "is_linear", False)
+                and executed_exit_qty < qty - max(1e-9, qty * 1e-9)):
+            logger.critical(
+                "close of %s did not execute in full (%.12g of %.12g, %s): the "
+                "position row and protective orders are kept", symbol,
+                executed_exit_qty, qty, exit_status or "unresolved")
+            self.store.journal(symbol, "CLOSE_UNCONFIRMED_STOPS_KEPT", reason, {
+                "exit_order_link_id": result.order_link_id,
+                "exit_order_id": result.order_id,
+                "executed_exit_qty": executed_exit_qty})
+            return self._report(
+                stage="close", reason="CLOSE_UNCONFIRMED", symbol=symbol,
+                qty=qty, detail={
+                    "exit_order_link_id": result.order_link_id,
+                    "exit_order_id": result.order_id,
+                    "exit_side": exit_side,
+                    "requested_exit_qty": qty,
+                    "executed_exit_qty": executed_exit_qty,
+                    "exit_status": exit_status or "UNCONFIRMED"})
 
         # The protective orders come off only once the close is CONFIRMED. A
         # close that was accepted but whose fill never resolved (a poll that
