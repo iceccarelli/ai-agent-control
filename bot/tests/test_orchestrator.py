@@ -444,3 +444,53 @@ class TestHealthTellsTheLoopIsDead:
         bot.client.cancel_order = cancel
         bot.engine.shutdown()
         assert "SD2" in seen
+
+
+class TestStartupDoesNotTouchTheVenueWhenItMust:
+    def _spy(self, bot):
+        calls = []
+        bot.client.set_leverage = lambda symbol, leverage=None: calls.append(
+            symbol) or True
+        return calls
+
+    def test_paper_on_the_mainnet_endpoint_does_not_set_leverage(
+            self, tmp_path, exchange):
+        cfg = Cfg()
+        cfg.USE_TESTNET = False
+        cfg.PAPER_TRADING = True
+        cfg.ALLOW_SHORTS = True
+        bot = build(tmp_path, exchange, cfg=cfg)
+        calls = self._spy(bot)
+        bot.startup()
+        assert calls == []
+        bot.shutdown()
+
+    def test_an_engaged_kill_switch_does_not_set_leverage(
+            self, tmp_path, exchange):
+        cfg = Cfg()
+        cfg.ALLOW_SHORTS = True
+        bot = build(tmp_path, exchange, cfg=cfg)
+        bot.store.trip_kill_switch("previous run")
+        calls = self._spy(bot)
+        assert bot.startup() is False
+        assert calls == []
+        bot.shutdown()
+
+    def test_the_sandbox_still_sets_leverage(self, tmp_path, exchange):
+        cfg = Cfg()
+        cfg.ALLOW_SHORTS = True
+        bot = build(tmp_path, exchange, cfg=cfg)
+        calls = self._spy(bot)
+        bot.startup()
+        assert calls
+        bot.shutdown()
+
+
+def test_the_bot_opens_the_state_db_its_config_names(tmp_path, exchange):
+    path = str(tmp_path / "named.db")
+    cfg = Cfg()
+    cfg.STATE_DB_PATH = path
+    bot = m.TradingBot(config=cfg, client=bc.BybitClient(
+        config=cfg, store=StateStore(str(tmp_path / "other.db")),
+        transport=exchange))
+    assert (tmp_path / "named.db").exists()

@@ -1086,6 +1086,24 @@ class TestStopsAreNeverSnappedWiderThanTheSizedRisk:
         assert Decimal(stops[-1]["stopLoss"]) == Decimal("51000.56")
 
 
+class TestAPositionStopWithoutAVenueAnswerIsUnknownNotRejected:
+    def test_a_retcode_less_failure_marks_the_stop_unknown(self, exchange, store):
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+        c = bc.BybitClient(config=LinearCfg(), store=store, transport=exchange)
+        real = c._request
+
+        def flaky(method, path, **kw):
+            if path == "/v5/position/trading-stop":
+                raise bc.PermanentAPIError("unparseable 200", 0)
+            return real(method, path, **kw)
+        c._request = flaky
+        res = c.place_stop_order(symbol="BTCUSDT", side="Sell", qty=0.001,
+                                 trigger_price=49_000.0)
+        assert not res.ok and res.reason == "OUTCOME_UNKNOWN"
+        assert store.get_order(res.order_link_id)["status"] == "unknown"
+
+
 class TestPrivateStreamIsPerVenue:
     @pytest.mark.parametrize("venue,url", [
         ("mainnet", "wss://stream.bybit.com/v5/private"),

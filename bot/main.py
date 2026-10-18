@@ -195,7 +195,16 @@ class TradingBot:
         self._carry_estimated_funding = 0.0
         self._last_funding_poll_ms = 0
         self.cfg = config if config is not None else _config.get_config_object()
-        self.store = store if store is not None else StateStore()
+        if store is None:
+            # The configured path, not an import-time environment read: a
+            # config built from an explicit mapping must not silently open a
+            # different database (and with it a cleared kill switch and an
+            # unbounded daily-loss anchor).
+            db_path = getattr(self.cfg, "STATE_DB_PATH", None)
+            store = (StateStore(db_path.strip())
+                     if isinstance(db_path, str) and db_path.strip()
+                     else StateStore())
+        self.store = store
         self.client = client if client is not None else BybitClient(
             config=self.cfg, store=self.store
         )
@@ -504,7 +513,18 @@ class TradingBot:
         # Leverage is set BEFORE reconciliation, because reconciliation may
         # need to close a position and the exchange rejects a reduce order whose
         # symbol has no leverage configured. On spot this is a no-op.
-        if bool(getattr(self.cfg, "ALLOW_SHORTS", False)):
+        # A process that was degraded to paper on the MAINNET endpoint (live
+        # requested, not authorised) must not change the real account's
+        # leverage either; neither may one that is about to refuse to start
+        # on an engaged kill switch.
+        mainnet_paper = (bool(getattr(self.cfg, "PAPER_TRADING", True))
+                         and not bool(getattr(self.cfg, "USE_TESTNET", True)))
+        if mainnet_paper:
+            logger.warning("paper mode on the mainnet endpoint: leverage "
+                           "is not changed")
+        if (bool(getattr(self.cfg, "ALLOW_SHORTS", False))
+                and not mainnet_paper
+                and not self.store.is_kill_switch_engaged()[0]):
             for symbol in self.symbols:
                 if not self.client.set_leverage(symbol):
                     logger.critical(

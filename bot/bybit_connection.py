@@ -1421,6 +1421,13 @@ class BybitClient:
         try:
             self._request("POST", "/v5/position/trading-stop", body=body, signed=True)
         except PermanentAPIError as exc:
+            if exc.ret_code in UNKNOWN_OUTCOME_RET_CODES:
+                # No venue retCode: the request may have landed. "rejected"
+                # would take the row out of what reconciliation checks.
+                self.store.update_order_status(oid, "unknown")
+                logger.error("position stop outcome unknown for %s: %s",
+                             symbol, exc)
+                return OrderResult(order_link_id=oid, reason="OUTCOME_UNKNOWN")
             self.store.update_order_status(oid, "rejected")
             logger.error("position stop rejected for %s: %s", symbol, exc)
             return OrderResult(
