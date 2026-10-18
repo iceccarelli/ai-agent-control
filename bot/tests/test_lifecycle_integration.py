@@ -483,6 +483,16 @@ class TestClosing:
             trades[0]["gross_pnl"] - 2.0
         )
 
+    def test_a_losing_close_starts_the_symbol_cooldown(self, stack):
+        engine, client, risk, store, exchange = stack
+        risk.trade_cooldown_seconds = 60.0
+        engine.execute(buy_intent())
+        close = engine.close_position(
+            symbol="BTCUSDT", reason="manual", entry_fee=50.0, exit_fee=50.0)
+        assert close.ok
+        assert store.consecutive_losses() >= 1
+        assert store.symbol_cooldown_remaining("BTCUSDT") > 0.0
+
     def test_close_report_exposes_exit_identity_and_execution_evidence(self, stack):
         """FIX (exit assurance): close_position()'s report must carry the
         EXIT's own identity/quantity/price -- extending the existing

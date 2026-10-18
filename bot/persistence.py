@@ -870,6 +870,7 @@ class StateStore:
         if eq < 0.0:
             raise PersistenceError(f"refusing to store negative equity {equity!r}")
         now = utc_now_epoch()
+        before = self.get_equity_state()
         self._exec(
             "UPDATE equity_state SET peak_equity = MAX(peak_equity, ?), "
             "last_equity = ?, updated_epoch = ? WHERE id = 1",
@@ -882,7 +883,15 @@ class StateStore:
         # brake — the same failure mode as the legacy in-memory state.  Because
         # this is INSERT OR IGNORE against a persisted row, a restart inside the
         # same UTC day keeps the original anchor.
-        self.ensure_daily_anchor(eq)
+        # A new day is anchored at the LAST equity this store saw when that
+        # was recent: a loss taken while the process was down (or between the
+        # last read of yesterday and the first of today) is then still inside
+        # today's brake instead of becoming its starting point.
+        prior = None
+        if (before.last_equity > 0.0 and before.updated_epoch > 0.0
+                and 0.0 <= now - before.updated_epoch <= self.ANCHOR_CARRY_MAX_AGE_S):
+            prior = before.last_equity
+        self.ensure_daily_anchor(eq, prior_equity=prior)
         return self.get_equity_state()
 
     def drawdown_fraction(self, equity: Optional[float] = None) -> float:
@@ -891,7 +900,11 @@ class StateStore:
 
     # -- daily anchors -----------------------------------------------------
 
-    def ensure_daily_anchor(self, equity: float, day: Optional[str] = None) -> DailyAnchor:
+    #: How old the previous observation may be and still start a new day.
+    ANCHOR_CARRY_MAX_AGE_S = 36 * 3600.0
+
+    def ensure_daily_anchor(self, equity: float, day: Optional[str] = None,
+                            prior_equity: Optional[float] = None) -> DailyAnchor:
         """Return today's anchor, creating it from ``equity`` on first call.
 
         Idempotent: the anchor is written once per UTC day and never moved, so
@@ -910,7 +923,8 @@ class StateStore:
         if not rows:
             self._exec(
                 "INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, ?)",
-                (d, float(equity)),
+                (d, float(prior_equity) if prior_equity and prior_equity > 0.0
+                 else float(equity)),
             )
             rows = self._query("SELECT * FROM daily_anchor WHERE day = ?", (d,))
         r = rows[0]

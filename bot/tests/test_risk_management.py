@@ -899,3 +899,26 @@ class TestRiskRewardRoundingTolerance:
         d = manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
                                       take_profit_price=103.9)
         assert d.ok is False and d.reason == "RISK_REWARD_TOO_LOW"
+
+
+class TestADownTimeLossStillCountsForTheNewDay:
+    def test_the_new_day_is_anchored_at_the_last_known_equity(
+            self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0                    # some UTC afternoon
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.update_equity(10_000.0)
+        # the process is down across midnight; equity fell 10% meanwhile
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 12 * 3600.0)
+        store.update_equity(9_000.0)
+        assert store.daily_loss_fraction(9_000.0) == pytest.approx(0.10)
+
+    def test_a_stale_previous_observation_is_not_carried(
+            self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.update_equity(10_000.0)
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 5 * 86_400.0)
+        store.update_equity(9_000.0)
+        assert store.daily_loss_fraction(9_000.0) == pytest.approx(0.0)

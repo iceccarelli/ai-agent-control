@@ -1069,6 +1069,19 @@ class TradingEngine:
                     "kill_switch": True},
         )
 
+    def _cooldown_after_loss(self, symbol: str) -> None:
+        """Start the symbol cooldown when the position that just closed lost.
+
+        The most recent position in the trades table is the one just booked, so
+        a streak of at least one means it closed at or below zero net. Uses the
+        existing TRADE_COOLDOWN_SECONDS; never raises into the exit path.
+        """
+        try:
+            if self.store.consecutive_losses() >= 1:
+                self.risk.set_cooldown(symbol)
+        except Exception:  # noqa: BLE001
+            logger.debug("loss cooldown not set for %s", symbol, exc_info=True)
+
     # -- stop management ---------------------------------------------------
 
     def move_stop(
@@ -1347,6 +1360,7 @@ class TradingEngine:
             dedupe_key=f"exit:{link}" if link else "",
         ))
         self.store.remove_position(symbol)
+        self._cooldown_after_loss(symbol)
         self.store.journal(symbol, "CLOSED", reason, {
             "gross_pnl": gross,
             "fees": entry_leg["amount"] + exit_leg["amount"],
@@ -1840,6 +1854,7 @@ class TradingEngine:
         remaining = round(held - closed_qty, 12)
         if remaining <= 1e-12:
             self.store.remove_position(symbol)
+            self._cooldown_after_loss(symbol)
             # OCO: the position is gone, so every sibling protective order must
             # go with it. Without this, a filled stop leaves the take-profit legs
             # resting, and they later fill against a position that no longer
