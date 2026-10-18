@@ -1421,6 +1421,7 @@ class CarryEngine:
         failed = self._record()
         if failed is not None:
             return failed
+        self._confirm_venue_after_open(perp.filled_qty)
         return CarryDecision(
             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
@@ -1710,6 +1711,26 @@ class CarryEngine:
                         "lot and the pair would land unpaired, then unwind: a "
                         "round trip of fees for nothing"}
 
+    def _confirm_venue_after_open(self, booked: float) -> None:
+        """Establish the "book == venue" baseline at the moment of the open.
+
+        The per-tick size check that normally sets it runs AFTER the margin gate,
+        so a short liquidated in the first tick or two had no baseline and the
+        closed-pnl evidence (`_perp_confirmed_closed`) could never be used. One
+        read right after the fills: equal -> the baseline is now; anything else
+        (unequal, unreadable, no such read) leaves it unset and the per-tick check
+        decides, exactly as before."""
+        reader = getattr(self.broker, "get_perp_position", None)
+        if reader is None:
+            return
+        try:
+            venue = abs(float(reader(self.perp_symbol)))
+        except Exception:  # noqa: BLE001
+            return
+        if (self._finite(venue)
+                and abs(venue - booked) <= max(QTY_DUST, 1e-9 * max(booked, 1.0))):
+            self._venue_verified_ms = int(time.time() * 1000)
+
     def _perp_confirmed_closed(self, verified_ms: Optional[int],
                                book_perp: float) -> bool:
         """Did something other than this engine close the perp short?
@@ -1749,7 +1770,18 @@ class CarryEngine:
         HALT either way: the journal still shows the perp lifecycle open and the
         venue's closing PnL is a figure only a human with its closed-pnl record
         can post, so the book never calls itself FLAT here."""
-        sell = self._spot_sellable(wanted_spot)
+        # Never more than the wallet holds: when the BUY's fee currency was not
+        # stated the recorded quantity can exceed what is actually there, and the
+        # venue refuses an oversell. Capped by the book's own recorded quantity
+        # too, so unrelated BTC in the account is never sold.
+        sellable = wanted_spot
+        try:
+            held = float(self.broker.get_spot_inventory(self.spot_symbol))
+            if self._finite(held) and held >= 0:
+                sellable = min(wanted_spot, held)
+        except Exception:  # noqa: BLE001
+            pass
+        sell = self._spot_sellable(sellable)
         sold = (self._fire(self.spot_symbol, "Sell", sell, "spot")
                 if sell > 0 else None)
         left = max(0.0, wanted_spot - (sold.filled_qty if sold else 0.0))

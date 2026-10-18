@@ -545,6 +545,7 @@ def test_an_exit_sized_from_a_stale_read_does_not_declare_flat_over_a_live_short
     v = StaleOnce()
     eng = build(v, mode=mode)
     candle(eng, ms=1_000)
+    StaleOnce.reads = 0                  # count only the exit's own reads
     short_before = v.perp_short
     spot_before = getattr(v, "spot_long", 0.0)
     v.margin = 1.1
@@ -763,6 +764,7 @@ def test_acquire_keeps_the_spot_without_a_closed_pnl_record_of_the_whole_short(c
 def test_acquire_keeps_the_spot_when_the_book_was_never_confirmed_against_the_venue():
     v = _RefusingVenue()
     eng, booked = _liquidated_acquire(v, verify_first=False)
+    eng._venue_verified_ms = None        # no baseline (e.g. the read after the open failed)
     v.closed = booked
     spot_before = v.spot_long
     d = candle(eng, ms=31_000, print_ms=1_000)
@@ -809,3 +811,56 @@ def test_acquire_drift_halt_keeps_the_spot_without_the_closed_pnl_record():
     d = candle(eng, ms=61_000, print_ms=1_000)
     assert d.reason == "VENUE_POSITION_DRIFT", (d.action, d.reason)
     assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_acquire_recovers_a_liquidation_in_the_very_first_tick_after_the_open():
+    """The per-tick size check that normally sets the baseline runs AFTER the
+    margin gate, so a short liquidated right after the open had no baseline and
+    the closed-pnl evidence could never be used. The open now reads the venue once
+    and stamps it when the book and the venue agree."""
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v, verify_first=False)   # no tick in between
+    assert eng._venue_verified_ms is not None
+    v.closed = booked
+    d = candle(eng, ms=31_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+
+
+def test_the_baseline_after_an_open_is_not_stamped_on_a_disagreeing_read():
+    class Disagrees(_RefusingVenue):
+        def get_perp_position(self, symbol):
+            return self.perp_short * 0.5        # the venue shows half of the fills
+    v = Disagrees()
+    eng = build(v, mode=ACQUIRE)
+    candle(eng, ms=1_000)                       # opens
+    assert eng._venue_verified_ms is None
+
+
+def test_the_recovery_sale_is_capped_at_what_the_wallet_holds():
+    """When the spot BUY's fee currency was not stated, the recorded quantity can
+    exceed the wallet and the venue refuses the oversell: the recovery fired and
+    sold nothing. The sale is capped at the wallet (and at the book's own
+    quantity, so unrelated BTC is never sold)."""
+    class ShortWallet(_RefusingVenue):
+        def __init__(self):
+            super().__init__()
+            self.wallet_cut = 0.0
+
+        def get_spot_inventory(self, symbol):
+            return max(0.0, self.spot_long - self.wallet_cut)
+
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "spot" and side == "Sell" \
+                    and qty > self.spot_long - self.wallet_cut + 1e-12:
+                return None                    # the venue refuses an oversell
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = ShortWallet()
+    eng, booked = _liquidated_acquire(v)
+    v.wallet_cut = 0.0000012                   # the fee the book did not know of
+    v.closed = booked
+    held_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason.startswith("PERP_CLOSED_EXTERNALLY_SPOT"), (d.action, d.reason)
+    assert v.spot_long < held_before * 0.01, "the wallet's spot was not sold"
