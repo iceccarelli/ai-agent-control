@@ -704,3 +704,87 @@ class TestWritesThatMustNotBeSplit:
             store.save_carry_position({"book_state": "HEDGED"})
         assert store._query("SELECT book_state FROM carry_position")[0][0] == "HEDGED"
         store.close()
+
+
+class TestStateStoreReviewFixes:
+    def _trade(self, **kw):
+        import time as _t
+        from persistence import TradeRecord
+        base = dict(symbol="BTCUSDT", side="Buy", qty=1.0, entry_price=100.0,
+                    exit_price=99.0, gross_pnl=-1.0, entry_fee=0.0, exit_fee=0.0,
+                    opened_epoch=1_700_000_000.0, closed_epoch=_t.time(),
+                    order_link_id="X", meta={}, dedupe_key="")
+        base.update(kw)
+        return TradeRecord(**base)
+
+    def test_the_loss_streak_counts_positions_not_partial_exit_rows(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "ls.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        for i in range(3):          # ONE position, stopped out in three fills
+            store.record_trade(self._trade(closed_epoch=1_700_000_100.0 + i,
+                                           dedupe_key=f"exit:p{i}"))
+        assert store.consecutive_losses() == 1
+        store.close()
+
+    def test_a_small_winning_partial_does_not_hide_a_losing_position(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "ls2.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        store.record_trade(self._trade(closed_epoch=1_700_000_100.0, gross_pnl=-1.0,
+                                       dedupe_key="exit:a"))
+        store.record_trade(self._trade(closed_epoch=1_700_000_200.0, gross_pnl=-5.0,
+                                       dedupe_key="exit:b", opened_epoch=1_700_000_050.0))
+        store.record_trade(self._trade(closed_epoch=1_700_000_300.0, gross_pnl=+2.0,
+                                       exit_price=102.0, dedupe_key="exit:c",
+                                       opened_epoch=1_700_000_050.0))
+        # position 1050 nets -3 (a loss); position 000 loses: a streak of 2
+        assert store.consecutive_losses() == 2
+        store.close()
+
+    def test_a_record_trade_inside_a_transaction_is_rolled_back_with_it(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "tx.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        with pytest.raises(RuntimeError):
+            with store.transaction():
+                store.save_carry_position({"book_state": "OPEN"})
+                store.record_trade(self._trade(dedupe_key="exit:tx"))
+                raise RuntimeError("killed")
+        assert not store.load_carry_position()
+        assert store.recent_trades() == []
+        store.close()
+
+    def test_an_old_execution_quality_table_still_opens(self, tmp_path):
+        import sqlite3
+        from persistence import StateStore
+        path = str(tmp_path / "old.db")
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE execution_quality(id INTEGER PRIMARY KEY "
+                    "AUTOINCREMENT, ts_epoch REAL NOT NULL, symbol TEXT NOT NULL, "
+                    "side TEXT NOT NULL)")
+        con.commit()
+        con.close()
+        store = StateStore(path)               # raised "no such column: outcome"
+        store.close()
+
+    def test_a_trade_before_any_equity_does_not_create_a_zero_anchor(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "za.db"))
+        store.claim_writer()
+        store.record_trade(self._trade())
+        store.update_equity(1_000.0)
+        assert store.daily_loss_fraction(900.0) == pytest.approx(0.1)
+        store.close()
+
+    def test_a_zero_anchor_is_repaired_from_the_first_positive_equity(self, tmp_path):
+        from persistence import StateStore, utc_day
+        store = StateStore(str(tmp_path / "zr.db"))
+        store.claim_writer()
+        store._exec("INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, 0.0)",
+                    (utc_day(),))
+        assert store.ensure_daily_anchor(500.0).start_equity == 500.0
+        store.close()

@@ -468,3 +468,20 @@ class TestABlankStateDbPathIsNotAThrowawayDatabase:
             StateStore("")
         with pytest.raises(ValueError):
             StateStore("   ")
+
+
+class TestALossLimitOfOneIsNotAPercent:
+    @pytest.mark.parametrize("var", ["MAX_DAILY_LOSS_PCT", "MAX_DRAWDOWN_PCT",
+                                     "STOP_LOSS_PCT"])
+    def test_one_is_rejected_as_a_never_binding_limit(self, var):
+        with pytest.raises(Exception) as excinfo:
+            load(**{var: "1"})
+        assert type(excinfo.value).__name__ == "ConfigError"
+
+    @pytest.mark.parametrize("var", ["MAX_DAILY_LOSS_PCT", "MAX_DRAWDOWN_PCT",
+                                     "STOP_LOSS_PCT"])
+    def test_a_real_fraction_still_loads(self, var):
+        assert getattr(load(**{var: "0.05"}), var) == pytest.approx(0.05)
+
+    def test_a_disabled_imbalance_limit_of_one_is_still_allowed(self):
+        assert load(MAX_BOOK_IMBALANCE="1").MAX_BOOK_IMBALANCE == 1.0

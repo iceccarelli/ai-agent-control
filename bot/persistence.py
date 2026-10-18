@@ -405,9 +405,6 @@ CREATE TABLE IF NOT EXISTS execution_quality (
     time_to_fill_s REAL,
     meta           TEXT NOT NULL DEFAULT '{}'
 );
-CREATE INDEX IF NOT EXISTS idx_execq_symbol ON execution_quality(symbol);
-CREATE INDEX IF NOT EXISTS idx_execq_ts ON execution_quality(ts_epoch);
-CREATE INDEX IF NOT EXISTS idx_execq_outcome ON execution_quality(outcome);
 
 -- The regime observed at a moment in time, per symbol.  Observations only:
 -- the outcome of trades opened under a regime is derived by joining to
@@ -694,6 +691,18 @@ class StateStore:
                 # SQLite cannot add a NOT NULL column without a default; every
                 # declaration above therefore carries one.
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        # Indexes on columns an OLDER execution_quality table may lack are created
+        # only after the ALTER loop: in _DDL they made opening such a database
+        # fail with "no such column", which takes the brakes offline.
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_execq_symbol ON execution_quality(symbol)",
+            "CREATE INDEX IF NOT EXISTS idx_execq_ts ON execution_quality(ts_epoch)",
+            "CREATE INDEX IF NOT EXISTS idx_execq_outcome ON execution_quality(outcome)",
+        ):
+            try:
+                self._conn.execute(stmt)
+            except Exception:  # noqa: BLE001 - an index is never worth the store
+                pass
         # Partial unique index, created here (not in _DDL) because it targets
         # `trades.dedupe_key`, a column that only exists on a fresh database
         # via the CREATE TABLE above -- on an OLDER database it exists only
@@ -891,6 +900,13 @@ class StateStore:
         """
         d = day or utc_day()
         rows = self._query("SELECT * FROM daily_anchor WHERE day = ?", (d,))
+        if rows and float(rows[0]["start_equity"]) <= 0.0 and float(equity) > 0.0:
+            # An anchor created before any equity was known (start 0.0) is
+            # repaired from the first positive reading instead of locking the
+            # daily-loss gate for the day.
+            self._exec("UPDATE daily_anchor SET start_equity = ? WHERE day = ? "
+                       "AND start_equity <= 0.0", (float(equity), d))
+            rows = self._query("SELECT * FROM daily_anchor WHERE day = ?", (d,))
         if not rows:
             self._exec(
                 "INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, ?)",
@@ -1178,7 +1194,8 @@ class StateStore:
             try:
                 return self._record_trade_locked(trade, day)
             except Exception as exc:  # noqa: BLE001
-                self._conn.rollback()
+                if self._tx_depth == 0:
+                    self._conn.rollback()      # inside transaction(): its owner does
                 raise PersistenceError(f"state write failed: {exc}") from exc
 
     def _record_trade_locked(self, trade: TradeRecord, day: str) -> int:
@@ -1207,7 +1224,8 @@ class StateStore:
             ),
         )
         if cur.rowcount != 1:
-            self._conn.commit()
+            if self._tx_depth == 0:
+                self._conn.commit()
             self.journal(trade.symbol, "DUPLICATE_TRADE_BLOCKED",
                         "a trade with an already-booked dedupe_key was not "
                         "re-recorded; daily_anchor was not double-counted",
@@ -1218,15 +1236,21 @@ class StateStore:
         # must still be counted: create the anchor from the last known equity.
         last_equity = self._conn.execute(
             "SELECT last_equity FROM equity_state WHERE id = 1").fetchone()
-        self._conn.execute(
-            "INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, ?)",
-            (day, float(last_equity[0]) if last_equity else 0.0))
-        self._conn.execute(
-            "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?, "
-            "trades = trades + 1 WHERE day = ?",
-            (trade.net_pnl, day),
-        )
-        self._conn.commit()
+        known_equity = float(last_equity[0]) if last_equity else 0.0
+        if known_equity > 0.0:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, ?)",
+                (day, known_equity))
+            self._conn.execute(
+                "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?, "
+                "trades = trades + 1 WHERE day = ?",
+                (trade.net_pnl, day),
+            )
+        # else: no equity has been observed, so there is nothing to anchor the
+        # day to. A zero-equity anchor would lock the daily-loss gate for the
+        # whole UTC day, so none is created; the trade row itself is booked.
+        if self._tx_depth == 0:
+            self._conn.commit()
         return int(cur.lastrowid or 0)
 
     def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
@@ -1284,13 +1308,24 @@ class StateStore:
         return out
 
     def consecutive_losses(self) -> int:
-        """Count of the most recent unbroken run of fee-aware losing trades."""
+        """Count of the most recent unbroken run of fee-aware losing POSITIONS.
+
+        A position that exits in several fills (partial take-profits, a stop
+        filled in pieces) is several ``trades`` rows. Counting rows made one
+        stopped-out position look like three losses, and let a small winning
+        partial reset the streak over a position that lost overall. Rows are
+        therefore summed per position -- same symbol and open time -- before the
+        sign is read.
+        """
         rows = self._query(
-            "SELECT net_pnl FROM trades ORDER BY closed_epoch DESC LIMIT 200"
+            "SELECT symbol, opened_epoch, SUM(net_pnl) AS net, "
+            "MAX(closed_epoch) AS last_closed, MAX(id) AS last_id "
+            "FROM trades GROUP BY symbol, opened_epoch "
+            "ORDER BY last_closed DESC, last_id DESC LIMIT 200"
         )
         n = 0
         for r in rows:
-            if float(r["net_pnl"]) <= 0.0:
+            if float(r["net"]) <= 0.0:
                 n += 1
             else:
                 break

@@ -160,6 +160,20 @@ def parse_pct(env: Mapping[str, str], name: str, default: float) -> float:
     return value
 
 
+def parse_limit_fraction(env: Mapping[str, str], name: str, default: float) -> float:
+    """A loss / drawdown / stop limit: a fraction STRICTLY between 0 and 1.
+
+    ``parse_pct`` accepts 1.0 (a true probability or a disabled imbalance
+    limit), but for a loss limit ``1`` is almost always "1%" typed as a
+    percent -- and as a fraction it is 100%, a brake that can never fire."""
+    value = parse_pct(env, name, default)
+    if value >= 1.0:
+        raise ConfigError(
+            f"{name}={value:g} would be a 100% limit, which can never bind. If "
+            "you meant a percent, use the fraction (1% is 0.01).")
+    return value
+
+
 def parse_float(
     env: Mapping[str, str], name: str, default: float,
     *, low: float = -math.inf, high: float = math.inf,
@@ -839,9 +853,9 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         MAX_TOTAL_EXPOSURE_PCT=max_exposure,
         MAX_CORRELATION_EXPOSURE_PCT=parse_pct(env, "MAX_CORRELATION_EXPOSURE_PCT", 0.30),
         RISK_PER_TRADE_PCT=risk_per_trade,
-        MAX_DAILY_LOSS_PCT=parse_pct(env, "MAX_DAILY_LOSS_PCT", 0.02),
-        MAX_DRAWDOWN_PCT=parse_pct(env, "MAX_DRAWDOWN_PCT", 0.10),
-        STOP_LOSS_PCT=parse_pct(env, "STOP_LOSS_PCT", 0.02),
+        MAX_DAILY_LOSS_PCT=parse_limit_fraction(env, "MAX_DAILY_LOSS_PCT", 0.02),
+        MAX_DRAWDOWN_PCT=parse_limit_fraction(env, "MAX_DRAWDOWN_PCT", 0.10),
+        STOP_LOSS_PCT=parse_limit_fraction(env, "STOP_LOSS_PCT", 0.02),
         MAX_OPEN_POSITIONS=parse_int(env, "MAX_OPEN_POSITIONS", 3, low=1, high=50),
         MAX_CONSECUTIVE_LOSSES=parse_int(env, "MAX_CONSECUTIVE_LOSSES", 4, low=1, high=100),
         TRADE_COOLDOWN_SECONDS=parse_float(env, "TRADE_COOLDOWN_SECONDS", 60.0, low=0.0, high=86_400.0),
