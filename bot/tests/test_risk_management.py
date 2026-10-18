@@ -783,3 +783,37 @@ class TestAQuoteMustBeFreshAndReal:
                    "age_seconds": 0.0, "degraded": True},
             data_age_seconds=0.0)
         assert decision.ok is False and decision.reason == "QUOTE_DEGRADED"
+
+
+class TestUnresolvedEntriesCountAgainstTheCap:
+    def test_entries_awaiting_confirmation_fill_the_position_cap(self, manager, store):
+        for i, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT"]):
+            store.record_order(f"E{i}", sym, "Buy", "Market", 1.0, purpose="entry")
+            store.update_order_status(f"E{i}", "submitted")
+        assert manager.max_open_positions == 3
+        decision = manager._gate_position_count()
+        assert decision.ok is False and decision.reason == "MAX_OPEN_POSITIONS"
+
+    def test_a_resolved_entry_does_not_count(self, manager, store):
+        store.record_order("E9", "AAAUSDT", "Buy", "Market", 1.0, purpose="entry")
+        store.update_order_status("E9", "filled")
+        assert manager._gate_position_count().ok is True
+
+
+class TestNonFiniteLevelsBlock:
+    NAN = float("nan")
+
+    def test_nan_take_profit_blocks(self, manager):
+        d = manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
+                                      take_profit_price=self.NAN)
+        assert d.ok is False
+
+    def test_nan_entry_blocks_in_rr_and_stop_sanity(self, manager):
+        assert manager._gate_risk_reward(entry_price=self.NAN, stop_price=98.0,
+                                         take_profit_price=104.0).ok is False
+        assert manager._gate_stop_sanity(side="Buy", entry_price=self.NAN,
+                                         stop_price=98.0).ok is False
+
+    def test_inf_levels_block(self, manager):
+        assert manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
+                                         take_profit_price=float("inf")).ok is False

@@ -530,6 +530,13 @@ class BillionaireRiskManager:
     def _gate_position_count(self) -> RiskDecision:
         try:
             n = self.store.open_position_count()
+            # An entry that was sent and never seen to fill may be a live
+            # position the book has no row for yet; it counts against the cap
+            # until it is resolved.
+            held = {str(p.get("symbol")) for p in self.store.open_positions()}
+            n += len({str(o.get("symbol")) for o in self.store.unresolved_orders()
+                      if str(o.get("purpose")) == "entry"
+                      and str(o.get("symbol")) not in held})
         except Exception as exc:  # noqa: BLE001
             return _block("POSITION_COUNT_UNREADABLE", error=str(exc))
         if n >= self.max_open_positions:
@@ -931,7 +938,8 @@ class BillionaireRiskManager:
         """
         if stop_price is None or not math.isfinite(float(stop_price)) or stop_price <= 0.0:
             return _block("NO_STOP_LOSS", stop=stop_price)
-        if entry_price <= 0.0:
+        if entry_price is None or not math.isfinite(float(entry_price)) \
+                or entry_price <= 0.0:
             return _block("NO_ENTRY_PRICE", entry=entry_price)
         direction = normalize_side(side)
         if direction is None:
@@ -956,11 +964,12 @@ class BillionaireRiskManager:
         Audit C7: the legacy path overwrote a failing RR with the minimum and
         proceeded. That is fabricated data in the most direct sense.
         """
-        if take_profit_price is None or float(take_profit_price) <= 0.0:
+        if (take_profit_price is None or not math.isfinite(float(take_profit_price))
+                or float(take_profit_price) <= 0.0):
             return _block("NO_TAKE_PROFIT")
         risk = abs(float(entry_price) - float(stop_price))
         reward = abs(float(take_profit_price) - float(entry_price))
-        if risk <= 0.0:
+        if not (math.isfinite(risk) and math.isfinite(reward)) or risk <= 0.0:
             return _block("ZERO_RISK_DISTANCE")
         rr = reward / risk
         if rr < self.min_risk_reward_ratio:
