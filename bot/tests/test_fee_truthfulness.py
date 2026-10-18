@@ -575,3 +575,9 @@ def test_a_stated_fee_without_a_currency_is_the_base_coin_on_a_spot_buy():
     assert venue_fees.spot_buy_net_qty("BTCUSDT", 2.0, fees) == pytest.approx(1.998)
     assert venue_fees.spot_buy_net_qty(
         "BTCUSDT", 2.0, venue_fees.UNKNOWN_FEES) == pytest.approx(2.0 * 0.998)
+
+
+def test_a_rebate_never_makes_a_spot_buy_hold_more_than_it_filled():
+    import venue_fees
+    fees = venue_fees.extract_order_fees({"cumFeeDetail": {"BTC": "-0.001"}})
+    assert venue_fees.spot_buy_net_qty("BTCUSDT", 2.0, fees) == pytest.approx(2.0)

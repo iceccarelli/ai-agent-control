@@ -1342,9 +1342,11 @@ class TradingEngine:
         position and exposure caps. Only a restart used to clear it, so a venue
         blip parked a symbol until then. Each is looked up at the venue: a
         terminal order is recorded; a spot buy that executed is adopted into the
-        book and protected (or flattened) like any naked position. A linear fill
-        is left unresolved, loudly, so the gate keeps holding the symbol for a
-        human. Never raises into the loop.
+        book and protected (or flattened) like any naked position, and is only
+        marked filled once that has actually happened. A linear fill, or an
+        adoption that could not be completed, is left unresolved -- loudly,
+        once, and not re-queried every tick -- so the gate keeps holding the
+        symbol for a human. Never raises into the loop.
         """
         summary: Dict[str, Any] = {"checked": 0, "resolved": 0, "adopted": [],
                                    "unread": 0}
@@ -1355,47 +1357,74 @@ class TradingEngine:
             logger.exception("could not list unresolved entries")
             return summary
         now = utc_now_epoch()
+        stuck = self.__dict__.setdefault("_stuck_entries", {})
         for row in rows:
-            summary["checked"] += 1
             oid, symbol = str(row["order_link_id"]), str(row["symbol"])
+            if stuck.get(oid, 0.0) > now:
+                continue                      # flagged for a human; not re-queried
+            summary["checked"] += 1
             try:
-                remote = self.client.get_order(symbol=symbol, order_link_id=oid,
-                                               strict=True)
-            except BybitAPIError as exc:
-                logger.warning("unresolved entry %s unreadable: %s", oid, exc)
+                self._resolve_one_entry(row, oid, symbol, now, summary, stuck)
+            except Exception:  # noqa: BLE001
+                logger.exception("could not settle unresolved entry %s", oid)
                 summary["unread"] += 1
-                continue
-            if remote is None:
-                age = now - float(row.get("created_epoch") or now)
-                if age >= self.UNRESOLVED_ENTRY_NEVER_SENT_AFTER_S:
-                    self.store.update_order_status(oid, "never_sent")
-                    summary["resolved"] += 1
-                continue
-            status = str(remote.get("orderStatus", ""))
-            if status not in ("Filled", "Cancelled", "Rejected", "Deactivated",
-                              "PartiallyFilledCanceled"):
-                continue                      # still live: nothing to settle yet
-            executed = float(remote.get("cumExecQty") or 0.0) > 0.0
-            if executed and getattr(self.client, "is_linear", False):
-                logger.critical(
-                    "unresolved entry %s on %s EXECUTED at the venue (linear): "
-                    "left unresolved so the symbol stays blocked until a human "
-                    "reconciles it", oid, symbol)
-                summary["unread"] += 1
-                continue
-            self.store.update_order_status(
-                oid, "filled" if executed else status.lower(),
-                exchange_id=str(remote.get("orderId", "")))
-            summary["resolved"] += 1
-            if executed:
-                adopt = getattr(self.client, "_adopt_filled_spot_entry", None)
-                if callable(adopt):
-                    adopt(row, remote, {})
-                held = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
-                if held is not None and float(held.get("stop_price") or 0.0) <= 0.0:
-                    self._protect_or_close_naked(symbol, held, reason="ENTRY_RESOLVED_LATE")
-                    summary["adopted"].append(symbol)
         return summary
+
+    #: How long an entry that cannot be settled automatically is left alone
+    #: (and not re-queried) before it is looked at again.
+    STUCK_ENTRY_RECHECK_S = 600.0
+
+    def _resolve_one_entry(self, row: Mapping[str, Any], oid: str, symbol: str,
+                           now: float, summary: Dict[str, Any],
+                           stuck: Dict[str, float]) -> None:
+        try:
+            remote = self.client.get_order(symbol=symbol, order_link_id=oid,
+                                           strict=True)
+        except BybitAPIError as exc:
+            logger.warning("unresolved entry %s unreadable: %s", oid, exc)
+            summary["unread"] += 1
+            return
+        if remote is None:
+            age = now - float(row.get("created_epoch") or now)
+            if age >= self.UNRESOLVED_ENTRY_NEVER_SENT_AFTER_S:
+                self.store.update_order_status(oid, "never_sent")
+                summary["resolved"] += 1
+            return
+        status = str(remote.get("orderStatus", ""))
+        if status not in ("Filled", "Cancelled", "Rejected", "Deactivated",
+                          "PartiallyFilledCanceled"):
+            return                            # still live: nothing to settle yet
+        executed = float(remote.get("cumExecQty") or 0.0) > 0.0
+        if not executed:
+            self.store.update_order_status(
+                oid, status.lower(), exchange_id=str(remote.get("orderId", "")))
+            summary["resolved"] += 1
+            return
+        if getattr(self.client, "is_linear", False):
+            logger.critical(
+                "unresolved entry %s on %s EXECUTED at the venue (linear): left "
+                "unresolved so the symbol stays blocked until a human reconciles "
+                "it", oid, symbol)
+            stuck[oid] = now + self.STUCK_ENTRY_RECHECK_S
+            summary["unread"] += 1
+            return
+        adopt = getattr(self.client, "_adopt_filled_spot_entry", None)
+        adopted = adopt(row, remote, {}) if callable(adopt) else False
+        if adopted is not True:
+            logger.critical(
+                "unresolved spot entry %s on %s executed but could not be "
+                "recorded; left unresolved for a human", oid, symbol)
+            stuck[oid] = now + self.STUCK_ENTRY_RECHECK_S
+            summary["unread"] += 1
+            return
+        self.store.update_order_status(
+            oid, "filled", exchange_id=str(remote.get("orderId", "")))
+        summary["resolved"] += 1
+        held = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
+        if (held is not None and str(held.get("order_link_id")) == oid
+                and float(held.get("stop_price") or 0.0) <= 0.0):
+            self._protect_or_close_naked(symbol, held, reason="ENTRY_RESOLVED_LATE")
+            summary["adopted"].append(symbol)
 
     def observe_exits(self) -> Dict[str, Any]:
         """Notice exchange-side exits (stop / take-profit fills) and book them.

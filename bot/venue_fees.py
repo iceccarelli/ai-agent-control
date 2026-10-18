@@ -326,7 +326,9 @@ def spot_buy_net_qty(symbol: str, filled_qty: float, fees: "FeeSet") -> float:
     base, _unit = split_symbol_units(symbol)
     net = float(filled_qty)
     if fees.known:
-        net -= sum(float(c.amount) for c in fees.components
+        # A negative amount (a rebate) never adds to what is held: the fill is
+        # the most a buy can leave.
+        net -= sum(max(0.0, float(c.amount)) for c in fees.components
                    if c.currency in (base, None))
     else:
         net *= (1.0 - SPOT_UNSTATED_FEE_ALLOWANCE)

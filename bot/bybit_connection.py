@@ -1862,7 +1862,11 @@ class BybitClient:
                     oid, status.lower(), exchange_id=str(remote.get("orderId", ""))
                 )
                 summary["resolved"] += 1
-                self._adopt_filled_spot_entry(row, remote, summary)
+                if self._adopt_filled_spot_entry(row, remote, summary) is False:
+                    # Executed but not recorded: keep it unresolved.
+                    self.store.update_order_status(oid, "submitted")
+                    summary["resolved"] -= 1
+                    summary["unknown"] += 1
             elif status in OPEN_ORDER_STATUS:
                 if str(row.get("purpose")) == "entry":
                     # A resting entry from a dead process has nobody to watch
@@ -1883,7 +1887,10 @@ class BybitClient:
                             oid, after_status.lower(),
                             exchange_id=str(after.get("orderId", "")))
                         summary["resolved"] += 1
-                        self._adopt_filled_spot_entry(row, after, summary)
+                        if self._adopt_filled_spot_entry(row, after, summary) is False:
+                            self.store.update_order_status(oid, "submitted")
+                            summary["resolved"] -= 1
+                            summary["unknown"] += 1
                         continue
                 self.store.update_order_status(
                     oid, "submitted", exchange_id=str(remote.get("orderId", ""))
@@ -1919,7 +1926,7 @@ class BybitClient:
 
     def _adopt_filled_spot_entry(self, row: Mapping[str, Any],
                                  remote: Mapping[str, Any],
-                                 summary: Dict[str, Any]) -> None:
+                                 summary: Dict[str, Any]) -> Optional[bool]:
         """Give the book the position an unconfirmed spot entry created.
 
         An entry whose fill was never confirmed in-process (a poll that timed
@@ -1929,21 +1936,33 @@ class BybitClient:
         second entry on it. The row is written with no stop, so the naked
         handling that follows reconciliation protects it (or flattens it).
         Linear is left to the orphan check, which fails closed.
+
+        Returns ``None`` when there is nothing to adopt (not a spot entry, or
+        nothing executed), ``True`` when the entry is now in the book (or its
+        remainder booked as dust), ``False`` when it SHOULD have been adopted
+        and was not -- the caller must then leave the order unresolved so it is
+        looked at again, never mark it filled with the coin unrecorded.
         """
         if not self.is_spot or str(row.get("purpose")) != "entry":
-            return
+            return None
         if normalize_side(str(row.get("side", ""))) != "Buy":
-            return
+            return None
         try:
             qty = float(remote.get("cumExecQty") or 0.0)
             price = float(remote.get("avgPrice") or 0.0)
         except (TypeError, ValueError):
-            return
+            return False
         symbol = str(row["symbol"])
-        if qty <= 0 or price <= 0:
-            return
-        if symbol in {str(p.get("symbol")) for p in self.store.open_positions()}:
-            return
+        if qty <= 0:
+            return None
+        if price <= 0:
+            return False
+        held = {str(p.get("symbol")): p for p in self.store.open_positions()}
+        if symbol in held:
+            # Already this entry's position (adopted before) is done; a
+            # DIFFERENT position on the symbol means this lot cannot be booked
+            # without overwriting it.
+            return str(held[symbol].get("order_link_id")) == str(row["order_link_id"])
         import venue_fees
         fees = venue_fees.extract_order_fees(remote)
         # Size to what the buy left in the account (its fee is taken in the base
@@ -1957,12 +1976,16 @@ class BybitClient:
                 self.store.journal(symbol, "ENTRY_DUST",
                                    "adopted entry below minimum net of fee",
                                    {"gross_filled": qty})
-                return
+                return True
         except BybitAPIError:
             logger.warning("reconcile: filters unreadable for %s; adopting the "
                            "entry at the fill less its fee, unsnapped", symbol)
         if net <= 0.0:
-            return
+            self.store.add_dust(symbol, qty)
+            self.store.journal(symbol, "ENTRY_DUST",
+                               "adopted entry nothing left net of fee",
+                               {"gross_filled": qty})
+            return True
         qty = net
         self.store.upsert_position(
             symbol, "Buy", qty, price, stop_price=0.0,
@@ -1978,6 +2001,7 @@ class BybitClient:
         logger.critical("reconcile: unconfirmed spot entry %s had filled "
                         "(%s %s @ %s); adopted into the book for protection",
                         row["order_link_id"], qty, symbol, price)
+        return True
 
     # -- private websocket -------------------------------------------------
 

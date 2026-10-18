@@ -468,3 +468,64 @@ class TestUnresolvedEntriesAreSettledWhileRunning:
         out = engine.resolve_unresolved_entries()
         assert out["resolved"] == 0 and store.open_positions() == []
         assert len(store.unresolved_orders()) == 1
+
+
+class TestAnEntryIsOnlyMarkedFilledOnceItIsRecorded:
+    def _setup(self, tmp_path, reply):
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, Cfg(), fake)
+        store.record_order("U2", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+        store.update_order_status("U2", "submitted")
+        real = engine.client.get_order
+        calls = []
+
+        def get_order(**kw):
+            if kw.get("order_link_id") == "U2":
+                calls.append(1)
+                return reply
+            return real(**kw)
+        engine.client.get_order = get_order
+        return engine, store, calls
+
+    def test_a_missing_average_price_leaves_it_unresolved(self, tmp_path):
+        engine, store, _ = self._setup(tmp_path, {
+            "orderStatus": "Cancelled", "cumExecQty": "0.001", "avgPrice": "0"})
+        out = engine.resolve_unresolved_entries()
+        assert out["resolved"] == 0 and store.open_positions() == []
+        assert [o["order_link_id"] for o in store.unresolved_orders()] == ["U2"]
+
+    def test_a_position_that_cannot_be_adopted_is_not_protected_or_closed(self, tmp_path):
+        engine, store, _ = self._setup(tmp_path, {
+            "orderStatus": "Filled", "cumExecQty": "0.001", "avgPrice": "60000",
+            "cumFeeDetail": {"BTC": "0.000001"}})
+        # a DIFFERENT position already on the symbol, with a recorded stop
+        store.upsert_position(SYMBOL, "Buy", 0.002, 59_000.0, stop_price=57_000.0,
+                              order_link_id="OTHER")
+        out = engine.resolve_unresolved_entries()
+        assert out["adopted"] == [] and out["resolved"] == 0
+        row = store.open_positions()[0]
+        assert row["order_link_id"] == "OTHER" and float(row["qty"]) == 0.002
+        assert [o["order_link_id"] for o in store.unresolved_orders()] == ["U2"]
+
+    def test_a_stuck_entry_is_not_requeried_every_tick(self, tmp_path):
+        engine, store, calls = self._setup(tmp_path, {
+            "orderStatus": "Filled", "cumExecQty": "0.001", "avgPrice": "0"})
+        engine.resolve_unresolved_entries()
+        engine.resolve_unresolved_entries()
+        engine.resolve_unresolved_entries()
+        assert len(calls) == 1
+
+    def test_one_failing_row_does_not_stop_the_rest(self, tmp_path):
+        engine, store, _ = self._setup(tmp_path, {
+            "orderStatus": "Cancelled", "cumExecQty": "0"})
+        store.record_order("U3", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+        store.update_order_status("U3", "submitted")
+        real = engine.client.get_order
+
+        def get_order(**kw):
+            if kw.get("order_link_id") == "U3":
+                raise RuntimeError("boom")
+            return real(**kw)
+        engine.client.get_order = get_order
+        out = engine.resolve_unresolved_entries()
+        assert out["resolved"] == 1                    # U2 still settled
