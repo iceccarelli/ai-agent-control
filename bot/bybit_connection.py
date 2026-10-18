@@ -1306,8 +1306,11 @@ class BybitClient:
         if snapped_qty <= 0 or snapped_qty < filters.min_qty:
             return OrderResult(reason="STOP_QTY_BELOW_MIN")
 
+        # snap_price speaks in POSITION sides; this order is the exit.
+        position_side = "Buy" if direction == "Sell" else "Sell"
         trigger = snap_price(
-            float(trigger_price), filters.tick_size, side=direction, is_stop=True
+            float(trigger_price), filters.tick_size, side=position_side,
+            is_stop=True
         )
         # A Sell stop protects a long and fires on a fall.
         trigger_direction = 2 if direction == "Sell" else 1
@@ -1370,8 +1373,13 @@ class BybitClient:
 
         # A Sell exit protects a long, so its stop sits BELOW; snap away from
         # the market on the conservative side.
+        # snap_price speaks in POSITION sides; this order is the exit. A long's
+        # stop (Sell exit) rounds UP, toward entry: never a wider stop than the
+        # one the size was budgeted for.
+        position_side = "Buy" if normalize_side(exit_side) == "Sell" else "Sell"
         trigger = snap_price(
-            float(trigger_price), filters.tick_size, side=exit_side, is_stop=True
+            float(trigger_price), filters.tick_size, side=position_side,
+            is_stop=True
         )
         if float(trigger) <= 0:
             return OrderResult(reason="STOP_PRICE_NON_POSITIVE")

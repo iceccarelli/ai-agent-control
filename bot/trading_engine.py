@@ -116,6 +116,11 @@ class TradeIntent:
     #: calibration measured over realised outcomes, may fill this in.
     win_probability: Optional[float] = None
     reason: str = ""
+    #: A hard ceiling on the order's notional (USD), set by a strategy whose
+    #: contract caps its size (the shadow book's frozen 100 USD). Sizing can
+    #: only be reduced to it, never raised, and a size that cannot meet the
+    #: exchange minimum under it is skipped rather than rounded up.
+    max_notional_usd: Optional[float] = None
 
     @property
     def side(self) -> Optional[str]:
@@ -346,6 +351,34 @@ class TradingEngine:
                     "qty_before_memory": sizing.qty},
         )
 
+    def _apply_notional_cap(
+        self, intent: "TradeIntent", sizing: SizingResult,
+        filters: InstrumentFilters,
+    ) -> SizingResult:
+        """Clamp the size to the strategy's own notional ceiling. Only reduces."""
+        cap = intent.max_notional_usd
+        if cap is None:
+            return sizing
+        price = float(intent.entry_price)
+        try:
+            cap = float(cap)
+        except (TypeError, ValueError):
+            cap = float("nan")
+        if not (math.isfinite(cap) and cap > 0.0 and price > 0.0):
+            return replace(sizing, qty=0.0, reason="NOTIONAL_CAP_INVALID",
+                           detail={**dict(sizing.detail), "cap": intent.max_notional_usd})
+        if sizing.qty * price <= cap:
+            return sizing
+        capped = float(snap_qty_down(cap / price, filters.qty_step))
+        if (capped <= 0.0 or capped < float(filters.min_qty)
+                or capped * price < float(filters.min_notional)):
+            return replace(sizing, qty=0.0, reason="NOTIONAL_CAP_BELOW_MIN",
+                           detail={**dict(sizing.detail), "cap_usd": cap,
+                                   "capped_qty": capped})
+        return replace(sizing, qty=capped,
+                       detail={**dict(sizing.detail), "qty_before_cap": sizing.qty,
+                               "notional_cap_usd": cap})
+
     def _remember_execution(self, **kwargs: Any) -> None:
         """Record what an order actually cost. Never raises into the trade path.
 
@@ -472,6 +505,10 @@ class TradingEngine:
         # exchange minimum the trade is skipped rather than rounded back up —
         # rounding up is how a "reduce risk" mechanism ends up increasing it.
         sizing = self._apply_memory_throttle(symbol, sizing, filters)
+        if not sizing.should_trade:
+            return self._report(stage="sizing", reason=sizing.reason, symbol=symbol,
+                                detail=dict(sizing.detail))
+        sizing = self._apply_notional_cap(intent, sizing, filters)
         if not sizing.should_trade:
             return self._report(stage="sizing", reason=sizing.reason, symbol=symbol,
                                 detail=dict(sizing.detail))

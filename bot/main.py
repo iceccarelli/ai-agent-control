@@ -902,6 +902,10 @@ class TradingBot:
             observed = self.engine.observe_exits()
             if observed.get("closed") or observed.get("reduced"):
                 logger.warning("exits observed this cycle: %s", observed)
+            if observed.get("unread"):
+                # A position the venue could not be asked about was not
+                # observed: the gap the WS flagged is still open.
+                rest_observation_ok = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("observe_exits failed; continuing: %s", exc)
             rest_observation_ok = False
@@ -914,6 +918,8 @@ class TradingBot:
             naked = self.engine.check_naked_positions()
             if naked.get("reprotected") or naked.get("flattened"):
                 logger.warning("naked positions handled this cycle: %s", naked)
+            if naked.get("unread") or naked.get("skipped"):
+                rest_observation_ok = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("check_naked_positions failed; continuing: %s", exc)
             rest_observation_ok = False
@@ -1118,6 +1124,9 @@ class TradingBot:
             if not self.risk.can_trade(symbol):
                 continue
             try:
+                sync = getattr(self.strategy, "sync_from_store", None)
+                if callable(sync):
+                    sync(self.store)
                 intent = self.strategy.signal_for(symbol)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("strategy failed for %s: %s", symbol, exc)

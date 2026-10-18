@@ -876,7 +876,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         BREAKEVEN_AFTER_FIRST_TP=parse_bool(env.get("BREAKEVEN_AFTER_FIRST_TP"), True),
 
         DATA_DIR=parse_str(env, "DATA_DIR", "data"),
-        USE_ORDERBOOK=parse_bool(env.get("USE_ORDERBOOK"), True),
+        USE_ORDERBOOK=parse_safety_bool(env.get("USE_ORDERBOOK"), "USE_ORDERBOOK", True),
         BOOK_DEPTH_LEVELS=parse_int(env, "BOOK_DEPTH_LEVELS", 25, low=1, high=200),
         MIN_BOOK_DEPTH_USD=parse_float(env, "MIN_BOOK_DEPTH_USD", 25_000.0, low=0.0, high=1e9),
         MAX_BOOK_IMBALANCE=parse_pct(env, "MAX_BOOK_IMBALANCE", 0.85),
@@ -891,7 +891,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         POLICY_BLOCK_REASON=policy_reason,
         POLICY_MIN_PROBABILITY=parse_pct(env, "POLICY_MIN_PROBABILITY", 0.0),
 
-        MEMORY_ENABLED=parse_bool(env.get("MEMORY_ENABLED"), True),
+        MEMORY_ENABLED=parse_safety_bool(env.get("MEMORY_ENABLED"), "MEMORY_ENABLED", True),
         MEMORY_MIN_SAMPLES=parse_int(env, "MEMORY_MIN_SAMPLES", 20, low=5, high=10_000),
         MEMORY_LOOKBACK_TRADES=parse_int(env, "MEMORY_LOOKBACK_TRADES", 500, low=30, high=100_000),
         # The floor on how far recorded experience may shrink a size. It can

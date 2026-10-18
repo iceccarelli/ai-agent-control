@@ -353,6 +353,32 @@ class TestFullApplicationLifecycleWithWS:
 
         bot.shutdown()
 
+    def test_an_unread_position_leaves_the_gap_unresolved(
+            self, tmp_path, exchange):
+        """observe_exits swallows a venue read failure and reports it as
+        ``unread``. A position that could not be read was not observed, so the
+        WS-flagged gap must stay open."""
+        ws_factory = _BlockingFactory()
+        bot, store, strategy = _build_bot(tmp_path, exchange, ws_factory)
+        assert bot.startup() is True
+        transport = _ScriptedTransport([
+            _text_frame({"op": "auth", "success": True}),
+            _text_frame({"op": "subscribe", "success": True}),
+            _text_frame({"topic": "position", "data": [{
+                "symbol": SYMBOL, "updatedTime": "1"}]}),
+        ])
+        ws_factory.provide(transport)
+        assert _wait_until(lambda: bot.ws_consumer.needs_reconciliation is True)
+
+        bot.engine.observe_exits = lambda: {
+            "checked": 1, "closed": 0, "reduced": 0, "unread": 1,
+            "price_approximated": 0}
+        bot.tick()
+
+        assert bot.ws_consumer.needs_reconciliation is True
+        assert bot.observation_status == "DEGRADED"
+        bot.shutdown()
+
     def test_ws_disabled_by_default_is_unaffected(self, tmp_path, exchange):
         """PRIVATE_WS_ENABLED defaults False — this whole feature must be
         inert, byte-for-byte the same as before it existed, unless

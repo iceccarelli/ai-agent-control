@@ -934,3 +934,64 @@ def payload_registers_nothing(payload):
     """A shadow replay carries none of the fields the OOS gate requires."""
     return not all(key in payload for key in
                    ("verdict", "m1", "m2", "observed", "oos_folds_sha256"))
+
+
+class TestTheShadowCapsAreEnforcedOnTheRealPath:
+    def test_the_intent_carries_the_frozen_notional_ceiling(self):
+        intent = _strategy().signal_for("BTCUSDT")
+        assert intent.max_notional_usd == shadow.SHADOW_MAX_NOTIONAL_USD
+
+    def test_the_engine_clamps_a_larger_size_to_the_ceiling(self):
+        import trading_engine as te
+        import position_sizing as ps
+        from decimal import Decimal
+        filters = ps.InstrumentFilters(
+            symbol="BTCUSDT", tick_size=Decimal("0.1"), qty_step=Decimal("0.001"),
+            min_qty=Decimal("0.001"), min_notional=Decimal("5"))
+        intent = te.TradeIntent(
+            symbol="BTCUSDT", signal_type="SELL", entry_price=60_000.0,
+            stop_price=61_000.0, max_notional_usd=100.0)
+        sizing = ps.SizingResult(symbol="BTCUSDT", qty=0.0444, notional=2666.0,
+                                 reason="OK")
+        eng = te.TradingEngine.__new__(te.TradingEngine)
+        out = eng._apply_notional_cap(intent, sizing, filters)
+        assert out.qty * 60_000.0 <= 100.0
+        assert out.qty == 0.001 and out.should_trade
+
+    def test_a_cap_below_the_exchange_minimum_skips_rather_than_rounds_up(self):
+        import trading_engine as te
+        import position_sizing as ps
+        from decimal import Decimal
+        filters = ps.InstrumentFilters(
+            symbol="BTCUSDT", tick_size=Decimal("0.1"), qty_step=Decimal("0.001"),
+            min_qty=Decimal("0.01"), min_notional=Decimal("5"))
+        intent = te.TradeIntent(
+            symbol="BTCUSDT", signal_type="SELL", entry_price=60_000.0,
+            stop_price=61_000.0, max_notional_usd=100.0)
+        sizing = ps.SizingResult(symbol="BTCUSDT", qty=0.5, reason="OK")
+        out = te.TradingEngine.__new__(te.TradingEngine)._apply_notional_cap(
+            intent, sizing, filters)
+        assert out.should_trade is False and out.reason == "NOTIONAL_CAP_BELOW_MIN"
+
+    def test_an_intent_without_a_ceiling_is_untouched(self):
+        import trading_engine as te
+        import position_sizing as ps
+        intent = te.TradeIntent(symbol="BTCUSDT", signal_type="BUY",
+                                entry_price=100.0, stop_price=98.0)
+        sizing = ps.SizingResult(symbol="BTCUSDT", qty=5.0, reason="OK")
+        assert te.TradingEngine.__new__(te.TradingEngine)._apply_notional_cap(
+            intent, sizing, None) is sizing
+
+    def test_the_caps_come_from_the_ledger_not_process_memory(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "s.db"))
+        s = _strategy()
+        s.sync_from_store(store)
+        assert s.signal_for("BTCUSDT") is not None          # nothing held
+        store.upsert_position("BTCUSDT", "Sell", 0.001, 60_000.0, stop_price=61_000.0)
+        # the position was opened "now" in wall time; strategy clock is 2026-03-01
+        s2 = _strategy(now=lambda: dt.datetime.now(dt.timezone.utc))
+        s2.sync_from_store(store)
+        assert s2.caps.open_positions == 1
+        assert s2.signal_for("BTCUSDT") is None
+        assert "position(s) already open" in s2.last_refusal

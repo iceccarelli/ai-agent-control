@@ -435,3 +435,24 @@ def test_a_mistyped_sandbox_flag_is_refused_not_read_as_live(key, typo):
 def test_recognised_sandbox_flag_tokens_are_still_honoured(key, token, expected):
     cfg = config_module.load({key: token})
     assert getattr(cfg, key) is expected
+
+
+class TestRiskControlSwitchesRejectATypo:
+    """USE_ORDERBOOK and MEMORY_ENABLED switch risk controls OFF when False, so
+    an unrecognised token must raise rather than be read as False."""
+
+    @pytest.mark.parametrize("var", ["USE_ORDERBOOK", "MEMORY_ENABLED"])
+    @pytest.mark.parametrize("typo", ["ture", "enabled", "yes please"])
+    def test_a_typo_raises(self, var, typo):
+        # By name: other tests in this module reload `config`, so the class
+        # imported at the top may no longer be the one that is raised.
+        with pytest.raises(Exception) as excinfo:
+            load(**{var: typo})
+        assert type(excinfo.value).__name__ == "ConfigError"
+
+    @pytest.mark.parametrize("var", ["USE_ORDERBOOK", "MEMORY_ENABLED"])
+    def test_recognised_tokens_and_blank_are_honoured(self, var):
+        assert getattr(load(), var) is True
+        assert getattr(load(**{var: ""}), var) is True
+        assert getattr(load(**{var: "false"}), var) is False
+        assert getattr(load(**{var: "true"}), var) is True

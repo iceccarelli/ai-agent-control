@@ -1044,3 +1044,43 @@ class TestBookFeedAvailability:
         client.cfg.USE_ORDERBOOK = False
         assert client.get_book_features("BTCUSDT") is None
         assert client.book_feed_unavailable("BTCUSDT") is False
+
+
+class TestStopsAreNeverSnappedWiderThanTheSizedRisk:
+    """The size was budgeted from the unsnapped stop distance. Snapping the
+    stop away from entry (down for a long, up for a short) risks more than
+    budgeted, so a long's stop rounds UP and a short's rounds DOWN."""
+
+    def test_spot_long_stop_rounds_toward_entry(self, client, exchange):
+        client.place_stop_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001, trigger_price=49_000.567)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert Decimal(body["triggerPrice"]) == Decimal("49000.57")
+
+    def test_spot_short_stop_rounds_toward_entry(self, client, exchange):
+        exchange.balances["USDT"] = 1_000_000.0
+        client.place_stop_order(
+            symbol="BTCUSDT", side="Buy", qty=0.001, trigger_price=51_000.563)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert Decimal(body["triggerPrice"]) == Decimal("51000.56")
+
+    def _linear(self, exchange, store):
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+        return bc.BybitClient(config=LinearCfg(), store=store, transport=exchange)
+
+    def test_linear_long_stop_rounds_toward_entry(self, exchange, store):
+        c = self._linear(exchange, store)
+        c.place_stop_order(symbol="BTCUSDT", side="Sell", qty=0.001,
+                           trigger_price=49_000.567)
+        stops = [json.loads(r["body"]) for r in exchange.requests
+                 if r["url"].endswith("/position/trading-stop")]
+        assert Decimal(stops[-1]["stopLoss"]) == Decimal("49000.57")
+
+    def test_linear_short_stop_rounds_toward_entry(self, exchange, store):
+        c = self._linear(exchange, store)
+        c.place_stop_order(symbol="BTCUSDT", side="Buy", qty=0.001,
+                           trigger_price=51_000.563)
+        stops = [json.loads(r["body"]) for r in exchange.requests
+                 if r["url"].endswith("/position/trading-stop")]
+        assert Decimal(stops[-1]["stopLoss"]) == Decimal("51000.56")

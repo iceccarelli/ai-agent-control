@@ -151,6 +151,8 @@ class ShadowStrategy:
             # NEVER set. This field belongs to a promoted model and no model
             # exists; filling it here would be inventing a calibration.
             win_probability=None,
+            # The frozen cap, enforced by the engine on the sized quantity.
+            max_notional_usd=float(shadow.SHADOW_MAX_NOTIONAL_USD),
             reason=(
                 f"SHADOW {shadow.SHADOW_SIGNAL} {direction} — research clear "
                 f"only, paper, capped at {risk:.2f} USD notional. Not a live "
@@ -202,6 +204,26 @@ class ShadowStrategy:
         return direction, entry_price, atr
 
     # -- bookkeeping the shell drives ---------------------------------------
+
+    def sync_from_store(self, store: Any) -> None:
+        """Take the cap counters from the ledger, not from in-process memory.
+
+        Nothing else drives ``record_fill`` / ``record_close`` (stops and
+        take-profits fill at the venue, and a restart empties the counters), so
+        the one-open and one-per-day caps would never bind. The position book
+        and the trades table are the truth: open positions are the rows held
+        now; today's entries are the distinct opens (by open time) among the
+        rows held and the trades booked since 00:00 UTC.
+        """
+        now = self._now()
+        day = now.date().isoformat()
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        held = store.open_positions()
+        opened = {float(p.get("opened_epoch") or 0.0) for p in held}
+        opened |= {float(r["opened_epoch"]) for r in store._query(
+            "SELECT opened_epoch FROM trades WHERE opened_epoch >= ?", (start,))}
+        self.caps.open_positions = len(held)
+        self.caps.entries_by_day[day] = len({e for e in opened if e >= start})
 
     def record_fill(self, *, day: str) -> None:
         self.caps.record_entry(day=day)
