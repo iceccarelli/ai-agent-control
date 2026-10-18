@@ -607,3 +607,18 @@ def test_a_ws_cancel_of_a_part_filled_entry_does_not_release_it(tmp_path):
     assert store.get_order("C1")["status"] == "submitted"
     assert [o["order_link_id"] for o in store.unresolved_orders()] == ["C1"]
     store.close()
+
+
+def test_a_stop_that_fires_between_the_two_reads_is_not_an_emergency(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open_ledger_and_venue(store, fake)
+    # get_position (first read) sees the position; the venue stop fires before
+    # verify_stop's own read, which finds it flat.
+    engine.client.verify_stop = lambda **kw: (False, "NO_POSITION")
+
+    result = engine.check_naked_positions()
+
+    assert result["flattened"] == [] and result["reprotected"] == []
+    assert not any(r["url"].endswith("/v5/order/create") for r in fake.requests)
+    assert not store.is_kill_switch_engaged()[0]

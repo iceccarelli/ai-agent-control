@@ -2159,6 +2159,11 @@ class TradingEngine:
             live, detail = self.client.verify_stop(symbol=symbol, order_link_id="")
             if live:
                 continue
+            if detail == "NO_POSITION":
+                # The venue's own stop fired between the two reads. Flat is not
+                # naked: booking the exit is observe_exits()'s job, and an
+                # "emergency close" of nothing would trip the kill switch.
+                continue
             logger.critical("NAKED position detected mid-cycle: %s (%s)",
                             symbol, detail)
             outcome = self._protect_or_close_naked(
