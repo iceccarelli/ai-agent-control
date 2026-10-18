@@ -694,6 +694,13 @@ class TradingEngine:
             purpose="entry", filters=filters,
         )
         if not maker.ok:
+            if maker.reason in {"OUTCOME_UNKNOWN", "DUPLICATE_INTENT"}:
+                # The maker order may be resting at the venue. A taker beside
+                # it would be a second entry; report the unknown and let the
+                # unresolved-entry gate hold the symbol until it is resolved.
+                logger.error("maker entry for %s has an unknown outcome (%s); "
+                             "no taker is sent", symbol, maker.reason)
+                return maker
             logger.info("maker entry rejected for %s (%s); using taker",
                         symbol, maker.reason)
             return self.client.place_order(
@@ -711,15 +718,26 @@ class TradingEngine:
         residual = self.client.get_order(
             symbol=symbol, order_link_id=maker.order_link_id
         )
+        status = str((residual or {}).get("orderStatus", ""))
+        if status not in {"Filled", "Cancelled", "Rejected", "Deactivated",
+                          "PartiallyFilledCanceled"}:
+            # The cancel did not take, or the order cannot be read: it may
+            # still be resting or filling. Do not send a taker beside it.
+            logger.error("maker entry %s for %s is not confirmed cancelled "
+                         "(%r); no taker is sent", maker.order_link_id, symbol,
+                         status or "unread")
+            return OrderResult(ok=False, order_link_id=maker.order_link_id,
+                               reason="MAKER_ENTRY_UNRESOLVED")
         already = float((residual or {}).get("cumExecQty") or 0.0)
-        remaining = max(0.0, qty - already)
-        if remaining <= 0.0:
-            return maker
         if already > 0.0:
+            # Part of the maker order executed. That lot is what the book
+            # must carry (the entry is confirmed from this order); a taker for
+            # the rest would leave the maker lot unrecorded and unprotected.
             logger.info("maker entry partially filled %s of %s on %s; "
-                        "completing with a taker order", already, qty, symbol)
+                        "keeping the partial fill", already, qty, symbol)
+            return maker
         return self.client.place_order(
-            symbol=symbol, side=side, qty=remaining,
+            symbol=symbol, side=side, qty=qty,
             order_type="Market", purpose="entry", filters=filters,
         )
 
