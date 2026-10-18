@@ -350,3 +350,53 @@ def test_a_200_without_a_usable_retcode_is_read_back_not_recorded_as_a_refusal(
                                  product="linear")
     assert result is not None and result["filled_qty"] == pytest.approx(0.01)
     assert transport.creates == 1, "the order was re-sent"
+
+
+# -- closed-pnl as POSITIVE evidence that the perp short was closed -----------
+
+class ClosedPnlClient(FakeClient):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/position/closed-pnl":
+            self.calls.append((method, endpoint, params, body))
+            return envelope({"list": self.rows})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+def _closed_pnl_broker(rows):
+    return CarryBroker(client=ClosedPnlClient(rows),
+                       order_gate=lambda: (True, "T"),
+                       sequence_source=lambda *a: 1)
+
+
+def _row(qty, side="Buy", stamp=2_000):
+    return {"orderId": "o", "side": side, "qty": str(qty),
+            "updatedTime": str(stamp), "closedPnl": "-1"}
+
+
+def test_closed_short_qty_sums_the_closing_side_rows_after_the_moment():
+    b = _closed_pnl_broker([_row(0.3), _row(0.2), _row(9, side="Sell"),
+                            _row(5, stamp=900)])           # before since_ms
+    assert b.get_closed_short_qty_since("BTCUSDT", 1_000) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("rows", [
+    [_row(0.1)] * 50,                           # a full page may be truncated
+    [{"orderId": "o", "side": "Buy", "qty": "x", "updatedTime": "2000"}],
+    [{"orderId": "o", "side": "Buy", "qty": "nan", "updatedTime": "2000"}],
+    [{"orderId": "o", "side": "Buy", "qty": "-1", "updatedTime": "2000"}],
+    ["not a row"],
+], ids=["full-page", "bad-qty", "nan-qty", "negative-qty", "not-a-dict"])
+def test_closed_short_qty_is_unknown_when_the_evidence_is_not_trustworthy(rows):
+    assert _closed_pnl_broker(rows).get_closed_short_qty_since(
+        "BTCUSDT", 1_000) is None
+
+
+def test_no_closed_pnl_rows_is_zero_not_unknown():
+    assert _closed_pnl_broker([]).get_closed_short_qty_since(
+        "BTCUSDT", 1_000) == 0.0

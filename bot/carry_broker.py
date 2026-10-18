@@ -1525,6 +1525,47 @@ class CarryBroker:
             total += size
         return total
 
+    #: closed-pnl page size; a full page may be truncated and proves nothing.
+    _CLOSED_PNL_PAGE = 50
+
+    def get_closed_short_qty_since(self, symbol: str, since_ms: int
+                                   ) -> Optional[float]:
+        """Perp short quantity the venue reports CLOSED since `since_ms`
+        (`GET /v5/position/closed-pnl`: rows carry `qty`, the closing `side`
+        and `updatedTime`, the shape `BybitClient.get_closed_pnl` documents).
+
+        A closed-pnl row exists only because a position was closed - by any
+        order, ours, a liquidation or a manual one - so a total here is
+        POSITIVE evidence of a close, which a flat-reading position list is
+        not (that can lag). None when it cannot be established: a page that may
+        be truncated, a row that does not parse, or an unreadable response.
+        Raises on a failed request.
+        """
+        result = self.client._request(
+            "GET", "/v5/position/closed-pnl", signed=True,
+            params={"category": LINEAR, "symbol": symbol,
+                    "startTime": int(since_ms), "limit": self._CLOSED_PNL_PAGE})
+        rows = self._v5_list(result)
+        if rows is None or len(rows) >= self._CLOSED_PNL_PAGE:
+            return None
+        total = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            try:
+                stamp = int(row.get("updatedTime") or 0)
+                qty = float(row.get("qty"))
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(qty) or qty < 0:
+                return None
+            if stamp <= int(since_ms):
+                continue
+            if str(row.get("side", "")) != "Buy":     # the CLOSING side of a short
+                continue
+            total += qty
+        return total
+
     def get_open_carry_orders(self, spot_symbol: str,
                               perp_symbol: str) -> list:
         """Orders that could still fill into this book.

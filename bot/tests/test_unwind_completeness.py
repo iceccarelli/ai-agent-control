@@ -700,3 +700,112 @@ def test_a_halt_whose_write_failed_logs_the_state_it_could_not_write(caplog):
     assert "could not be written down" in text
     assert '"book_state": "HALTED"' in text
     assert '"position"' in text and '"perp_symbol"' in text
+
+
+class _RefusingVenue(_VenueReadsItsShort):
+    """The venue refuses the reduce-only buy-back; closed-pnl says what it says."""
+    def __init__(self, closed=None):
+        super().__init__()
+        self.closed = closed            # None -> unreadable / incomplete evidence
+        self.closed_asked_since = None
+
+    def place_market(self, *, symbol, side, qty, product):
+        if product == "linear" and side == "Buy":
+            return None
+        return super().place_market(symbol=symbol, side=side, qty=qty,
+                                    product=product)
+
+    def get_closed_short_qty_since(self, symbol, since_ms):
+        self.closed_asked_since = since_ms
+        return self.closed
+
+
+def _liquidated_acquire(venue, *, verify_first=True):
+    eng = build(venue, mode=ACQUIRE)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)                                  # opens
+    if verify_first:
+        candle(eng, ms=31_000, print_ms=1_000)             # book == venue: verified
+    booked = eng.position.perp.filled_qty
+    venue.perp_short = 0.0                                 # the short is gone
+    venue.margin = 1.1
+    return eng, booked
+
+
+def test_acquire_sells_the_naked_spot_when_the_venue_records_the_close():
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.closed = booked                    # closed-pnl: the whole short closed
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (
+        d.action, d.reason)
+    assert v.spot_long < 1e-6, "the spot long was left unhedged and unsold"
+    assert v.closed_asked_since is not None
+    # never FLAT: the journal's perp lifecycle needs a human closeout
+    assert eng.state is BookState.HALTED and eng.position is not None
+    assert eng.position.perp.filled_qty == 0.0
+
+
+@pytest.mark.parametrize("closed", [None, 0.0, 0.5])
+def test_acquire_keeps_the_spot_without_a_closed_pnl_record_of_the_whole_short(closed):
+    """A flat-reading list with a refused buy-back and NO (or less than the
+    short's worth of) closed-pnl record is what a LAGGING list looks like. The
+    spot hedges a short that may still be open: it is not sold."""
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.closed = None if closed is None else booked * closed
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before), "spot sold over a live short"
+
+
+def test_acquire_keeps_the_spot_when_the_book_was_never_confirmed_against_the_venue():
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v, verify_first=False)
+    v.closed = booked
+    spot_before = v.spot_long
+    d = candle(eng, ms=31_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_overlay_never_sells_the_clients_coin_on_a_closed_perp():
+    v = _RefusingVenue()
+    eng = build(v, mode=OVERLAY)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    candle(eng, ms=31_000, print_ms=1_000)
+    v.closed = eng.position.perp.filled_qty
+    v.perp_short = 0.0
+    v.margin = 1.1
+    before = len(v.orders)
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE"
+    assert not any(o[1] == "spot" and o[0] == "Sell" for o in v.orders[before:])
+
+
+def test_acquire_drift_halt_sells_the_naked_spot_when_the_venue_records_the_close():
+    """The per-tick size check meets a liquidated short first (most liquidations
+    in the fault campaign never reached the unwind). Same evidence gate: two flat
+    reads AND closed-pnl records totalling the short since the book last matched
+    the venue."""
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0                        # healthy: the size check is what fires
+    v.closed = booked
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+    assert eng.state is BookState.HALTED
+
+
+def test_acquire_drift_halt_keeps_the_spot_without_the_closed_pnl_record():
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0
+    v.closed = 0.0                        # a lagging list: no row, no evidence
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "VENUE_POSITION_DRIFT", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before)

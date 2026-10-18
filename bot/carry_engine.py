@@ -776,6 +776,8 @@ class CarryEngine:
         # Last: a fail-closed write persists `to_state()`, which must already
         # carry the restored funding stamp and history, not the empty defaults.
         self._restore_allowance(state.get("entry_days"))
+        if self.position is not None:
+            self._venue_verified_ms = int(time.time() * 1000)  # cold start checked it
 
     @classmethod
     def _restored_rates(cls, raw: Any) -> Optional[List[float]]:
@@ -1617,6 +1619,12 @@ class CarryEngine:
     #: True while the last HALT could not be persisted (retried each halted tick).
     _halt_unwritten = False
 
+    #: Wall-clock ms of the last moment the book's perp size was CONFIRMED equal
+    #: to the venue's (a passing `_check_venue_position`, or a cold-start resume),
+    #: cleared whenever the engine itself sends a perp order. A close the venue
+    #: reports since then, with no order of ours in between, was not ours.
+    _venue_verified_ms: Optional[int] = None
+
     def _short_left_after_close(self, fill_left: float) -> Optional[float]:
         """The perp short still open after a close, as the venue reports it,
         never LESS than the fills imply. Returns None when the venue cannot be
@@ -1702,6 +1710,66 @@ class CarryEngine:
                         "lot and the pair would land unpaired, then unwind: a "
                         "round trip of fees for nothing"}
 
+    def _perp_confirmed_closed(self, verified_ms: Optional[int],
+                               book_perp: float) -> bool:
+        """Did something other than this engine close the perp short?
+
+        Needs ALL of: the book's size was confirmed equal to the venue's at a
+        known moment (`verified_ms`) with no perp order of ours since; the venue
+        REFUSED our buy-back (the caller has that); two position reads, a pause
+        apart, both read flat; AND the venue's own closed-pnl records since that
+        moment total at least the recorded short. The last is positive evidence
+        a close happened (liquidation, ADL, a manual order); a position list
+        that merely lags produces no closed-pnl row, so it can never satisfy
+        this. Unreadable or incomplete evidence is not confirmation."""
+        if verified_ms is None or book_perp <= QTY_DUST:
+            return False
+        first = self._venue_short_qty()
+        if first is None or first > QTY_DUST:
+            return False
+        time.sleep(self.UNWIND_REREAD_WAIT_S)
+        second = self._venue_short_qty()
+        if second is None or second > QTY_DUST:
+            return False
+        reader = getattr(self.broker, "get_closed_short_qty_since", None)
+        if reader is None:
+            return False
+        try:
+            closed = reader(self.perp_symbol, int(verified_ms))
+        except Exception:  # noqa: BLE001
+            return False
+        if closed is None or not self._finite(closed):
+            return False
+        return float(closed) >= book_perp * (1.0 - 1e-6) - QTY_DUST
+
+    def _spot_after_perp_closed(self, position: "CarryPosition", reason: str,
+                                wanted_spot: float) -> CarryDecision:
+        """ACQUIRE: the perp that hedged the spot was closed by something else,
+        so the spot is a naked LONG. Sell it (that only removes exposure) and
+        HALT either way: the journal still shows the perp lifecycle open and the
+        venue's closing PnL is a figure only a human with its closed-pnl record
+        can post, so the book never calls itself FLAT here."""
+        sell = self._spot_sellable(wanted_spot)
+        sold = (self._fire(self.spot_symbol, "Sell", sell, "spot")
+                if sell > 0 else None)
+        left = max(0.0, wanted_spot - (sold.filled_qty if sold else 0.0))
+        position.perp.filled_qty = 0.0
+        position.perp.requested_qty = 0.0
+        position.spot.filled_qty = left
+        position.spot.requested_qty = left
+        position.spot.fee_base_qty = 0.0
+        if self.pair_risk is not None:
+            self.pair_risk.record_broken_pair(
+                now=self._gate_now(self._last_tick_ms))
+        return self._halt(
+            "PERP_CLOSED_EXTERNALLY_SPOT_SOLD" if left <= QTY_DUST
+            else "PERP_CLOSED_EXTERNALLY_SPOT_PARTIAL",
+            f"{reason} - the venue refused the buy-back, two reads show no "
+            f"short and its closed-pnl records show the short was closed since "
+            f"the last time the book matched it. {left:.10g} of spot is still "
+            "held; the journal's perp lifecycle and the closing PnL need a "
+            "human.")
+
     def _venue_short_qty(self) -> Optional[float]:
         """The perp short the venue reports (0.0 when it reads flat), or None
         when it cannot be read or the broker has no such read. Flat and unread
@@ -1733,6 +1801,7 @@ class CarryEngine:
         assert position is not None
         self.state = BookState.UNWINDING
         book_perp = position.perp.filled_qty
+        verified_ms = self._venue_verified_ms
         # Close what the VENUE holds if that is more than the book recorded: a
         # margin or liquidation exit runs before the per-tick size check, and
         # closing only the recorded size would leave the excess short open
@@ -1791,6 +1860,9 @@ class CarryEngine:
         # received, and the venue refuses a sell above the free balance.
         wanted_spot = max(0.0, position.spot.filled_qty
                           - position.spot.fee_base_qty)
+        if perp is None and self.state is BookState.UNWINDING \
+                and self._perp_confirmed_closed(verified_ms, book_perp):
+            return self._spot_after_perp_closed(position, reason, wanted_spot)
         if perp is None or perp.filled_qty <= 0:
             # The perp is the leg that can be liquidated and the one that
             # hedges the spot. If it did not close, selling the spot would turn
@@ -1992,10 +2064,22 @@ class CarryEngine:
                               f"the venue reported a position of {venue!r}")
         book = self.position.perp.filled_qty
         if abs(venue - book) > max(QTY_DUST, 1e-9 * max(book, 1.0)):
+            if (self.execution_mode == ACQUIRE and venue <= QTY_DUST
+                    and self._perp_confirmed_closed(
+                        self._venue_verified_ms, book)):
+                # The short is gone and the venue's own closed-pnl records say
+                # it was CLOSED since the book last matched it: the spot is a
+                # naked long. Same evidence gate, same HALT, as the unwind.
+                self.state = BookState.UNWINDING
+                pos = self.position
+                return self._spot_after_perp_closed(
+                    pos, "VENUE_POSITION_DRIFT",
+                    max(0.0, pos.spot.filled_qty - pos.spot.fee_base_qty))
             return self._halt(
                 "VENUE_POSITION_DRIFT",
                 f"the venue holds a {venue:.10g} perp short and the book "
                 f"recorded {book:.10g}; the hedge is not what the ledger says")
+        self._venue_verified_ms = int(time.time() * 1000)
         return None
 
     def _check_inventory_cover(self) -> Optional[CarryDecision]:
@@ -2239,6 +2323,8 @@ class CarryEngine:
               qty_step: float = 0.0) -> Optional[Leg]:
         if qty <= 0 or not self._finite(qty):
             return None
+        if symbol == self.perp_symbol and product == "linear":
+            self._venue_verified_ms = None      # we are about to change it
         if patient and self.execution_style == MAKER_FIRST:
             return self._rest_then_take(symbol, side, qty, product, qty_step)
         return self._take(symbol, side, qty, product)

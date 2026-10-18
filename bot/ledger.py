@@ -1251,6 +1251,9 @@ class LedgerBroker:
     def get_liquidation_view(self, symbol):
         return self.inner.get_liquidation_view(symbol)
 
+    def get_closed_short_qty_since(self, symbol, since_ms):
+        return self.inner.get_closed_short_qty_since(symbol, since_ms)
+
     def get_open_carry_orders(self, spot_symbol, perp_symbol):
         return self.inner.get_open_carry_orders(spot_symbol, perp_symbol)
 
