@@ -460,3 +460,22 @@ class TestIntrabarDrawdown:
                                permissive_config()).run()
         assert result.max_drawdown_intrabar >= result.max_drawdown
         assert result.trades > 0
+
+
+class TestASpotBuyPaysItsFeeInTheBaseCoin:
+    def test_the_account_receives_the_quantity_less_the_fee(self):
+        bars = [bt.Bar(start_ms=1_600_000_000_000 + i * 3_600_000, open=100.0,
+                       high=101.0, low=99.0, close=100.0, volume=1.0)
+                for i in range(3)]
+        ex = bt.SimulatedExchange({"BTCUSDT": bars}, starting_cash=1_000.0,
+                                  taker_fee=0.001, slippage=0.0)
+        order = bt._SimOrder(
+            order_link_id="b1", symbol="BTCUSDT", side="Buy", order_type="Market",
+            qty=2.0, price=0.0, order_filter="Order", trigger_price=0.0,
+            trigger_direction=0)
+        ex.orders["b1"] = order
+        ex._execute(order, 100.0, taker=True)
+        assert order.status == "Filled"
+        assert ex.balances["USDT"] == pytest.approx(1_000.0 - 200.0)
+        assert ex.balances["BTC"] == pytest.approx(2.0 - 0.002)
+        assert ex._as_row(order)["cumFeeDetail"] == {"BTC": "0.0020000000"}

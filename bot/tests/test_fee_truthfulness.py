@@ -101,6 +101,12 @@ def _fees(t):
     return json.loads(t["meta"])["fees"]
 
 
+def _gross(held_qty):
+    """The quantity BOUGHT. On spot the buy's 0.1% fee is taken in the base
+    coin, so the account (and the position, stop and exit) hold 0.999 of it."""
+    return held_qty / (1.0 - 0.001)
+
+
 def _round_trip(tmp_path, fee_for):
     engine, store, _ = _stack(tmp_path, fee_for)
     report = engine.execute(buy_intent())
@@ -116,10 +122,10 @@ class TestModernCumFeeDetail:
         store, t, qty = _round_trip(tmp_path, spot_detail)
         f = _fees(t)
         assert t["entry_fee_realized"] == 1 and t["entry_fee_currency"] == "USDT"
-        assert t["entry_fee"] == pytest.approx(qty * 0.001 * FILL_PRICE)
+        assert t["entry_fee"] == pytest.approx(_gross(qty) * 0.001 * FILL_PRICE)
         part = f["entry"]["parts"][0]
         assert (part["venue_amount"], part["venue_currency"]) == (
-            pytest.approx(qty * 0.001), "BTC")
+            pytest.approx(_gross(qty) * 0.001), "BTC")
         assert part["status"] == "converted" and part["rate"] == FILL_PRICE
         assert f["entry"]["source"] == "cumFeeDetail"
         assert f["entry"]["ref"]["order_link_id"]          # fill association
@@ -139,7 +145,7 @@ class TestModernCumFeeDetail:
             d["cumExecFee"] = "0"
             return d
         store, t, qty = _round_trip(tmp_path, fee_for)
-        assert t["entry_fee"] == pytest.approx(qty * 0.001 * FILL_PRICE)
+        assert t["entry_fee"] == pytest.approx(_gross(qty) * 0.001 * FILL_PRICE)
         assert t["entry_fee"] > 0
         assert t["exit_fee"] > 0
         assert t["entry_fee_realized"] == 1 and t["exit_fee_realized"] == 1
@@ -154,7 +160,7 @@ class TestModernCumFeeDetail:
         store, t, qty = _round_trip(tmp_path, fee_for)
         assert t["entry_fee_realized"] == 1 and t["exit_fee_realized"] == 1
         assert _fees(t)["entry"]["source"] == "cumExecFee"
-        assert t["entry_fee"] == pytest.approx(qty * 0.001 * FILL_PRICE)
+        assert t["entry_fee"] == pytest.approx(_gross(qty) * 0.001 * FILL_PRICE)
         store.close()
 
     def test_reported_zero_is_confirmed_and_distinct_from_unknown(self, tmp_path):
@@ -526,3 +532,37 @@ class TestFeeSetRules:
         ok = vf.convert_fee_set(vf.FeeSet(
             (vf.VenueFee(0.5, "BTC"),), True, "cumFeeDetail"), **kw)
         assert ok.confirmed and ok.account_unit_amount == 50.0
+
+
+class TestASpotBuyIsProtectedForWhatIsActuallyHeld:
+    def test_the_stop_and_legs_are_sized_net_of_the_base_coin_fee(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        report = engine.execute(buy_intent())
+        assert report.ok, report
+        row = store.open_positions()[0]
+        held = float(row["qty"])
+        buys = [o for o in store._query("SELECT * FROM orders WHERE purpose='entry'")]
+        bought = float(buys[0]["qty"])
+        assert held < bought, "the position still claims the gross fill"
+        assert held == pytest.approx(bought * (1 - 0.001), abs=1e-5)
+        protective = store._query(
+            "SELECT * FROM orders WHERE purpose IN ('stop','tp')")
+        assert protective
+        assert max(float(o["qty"]) for o in protective) <= held + 1e-9
+        stop = [o for o in protective if o["purpose"] == "stop"][0]
+        assert float(stop["qty"]) == pytest.approx(held, abs=1e-9)
+        assert sum(float(o["qty"]) for o in protective if o["purpose"] == "tp") \
+            == pytest.approx(held, abs=1e-5)
+        store.close()
+
+    def test_a_fill_that_leaves_nothing_sellable_is_booked_as_dust(self, tmp_path):
+        def eaten(side, qty):
+            return ({"cumFeeDetail": {"BTC": f"{qty:.8f}"}} if side == "Buy"
+                    else {"cumFeeDetail": {"USDT": "0"}})
+        engine, store, _ = _stack(tmp_path, eaten)
+        report = engine.execute(buy_intent())
+        assert report.ok is False and report.reason == "ZERO_SELLABLE"
+        assert store.open_positions() == []
+        assert store._query("SELECT * FROM decisions WHERE decision = ?",
+                            ("ENTRY_DUST",))
+        store.close()

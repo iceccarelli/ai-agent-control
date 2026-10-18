@@ -351,6 +351,28 @@ class TradingEngine:
                     "qty_before_memory": sizing.qty},
         )
 
+    #: Fraction of a spot buy withheld from the exits when the venue stated no fee.
+    SPOT_UNSTATED_FEE_ALLOWANCE = 0.002
+
+    def _spot_sellable_qty(self, symbol: str, filled_qty: float,
+                           entry_fees: Any, filters: InstrumentFilters) -> float:
+        """What a spot buy left in the account: the fill less the base-coin fee,
+        snapped down to the lot step. A fee the venue did not state is allowed
+        for at twice the standard taker rate."""
+        base, _unit = venue_fees.split_symbol_units(symbol)
+        net = float(filled_qty)
+        if entry_fees.known:
+            net -= sum(float(c.amount) for c in entry_fees.components
+                       if c.currency == base)
+        else:
+            # Unstated: hold back twice the 0.1% standard spot taker rate rather
+            # than read a balance that may not have caught up with the fill.
+            # Selling a hair less than held is harmless; selling more is not.
+            net *= (1.0 - self.SPOT_UNSTATED_FEE_ALLOWANCE)
+        if net <= 0.0:
+            return 0.0
+        return float(snap_qty_down(net, filters.qty_step))
+
     def _apply_notional_cap(
         self, intent: "TradeIntent", sizing: SizingResult,
         filters: InstrumentFilters,
@@ -585,6 +607,32 @@ class TradingEngine:
         if filled_qty <= 0:
             return self._report(stage="fill", reason="ZERO_FILL", symbol=symbol,
                                 entry_order_link_id=entry.order_link_id)
+
+        # On spot the fee of a BUY is taken in the BASE coin (the venue's own
+        # testnet record: cumExecQty 0.002344 BTC, fee 0.000002344 BTC), so the
+        # account holds less than cumExecQty. A stop or take-profit sized to the
+        # gross fill asks to sell coin that is not there. Everything below
+        # (the position row, the stop, the legs) is sized to what is held.
+        if (not getattr(self.client, "is_linear", False)
+                and normalize_side(side) == "Buy"):
+            filled_qty = self._spot_sellable_qty(symbol, filled_qty, entry_fees,
+                                                 filters)
+            if filled_qty < float(filters.min_qty):
+                # Held, but too little to sell or to protect: dust, booked as
+                # such rather than forgotten (the same rule a partial exit's
+                # remainder follows).
+                try:
+                    self.store.add_dust(symbol, float(fill.get("cumExecQty") or 0.0))
+                except Exception:  # noqa: BLE001
+                    logger.warning("could not record dust for %s", symbol,
+                                   exc_info=True)
+                self.store.journal(symbol, "ENTRY_DUST", "net of fee below minimum", {
+                    "gross_filled": float(fill.get("cumExecQty") or 0.0)})
+                filled_qty = 0.0
+            if filled_qty <= 0:
+                return self._report(stage="fill", reason="ZERO_SELLABLE",
+                                    symbol=symbol,
+                                    entry_order_link_id=entry.order_link_id)
 
         self.store.upsert_position(
             symbol, side, filled_qty, avg_price, stop_price=0.0,

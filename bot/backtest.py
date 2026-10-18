@@ -175,6 +175,8 @@ class _SimOrder:
     cum_qty: float = 0.0
     purpose: str = "entry"
     reduce_only: bool = False
+    fee_coin: str = ""
+    fee_amount: float = 0.0
 
 
 class SimulatedExchange(Transport):
@@ -400,11 +402,17 @@ class SimulatedExchange(Transport):
         fee = notional * fee_rate
 
         if order.side == "Buy":
-            if self.balances.get(self.quote_asset, 0.0) < notional + fee:
+            # Bybit spot takes a BUY's fee in the BASE coin (the venue's own
+            # testnet record shows it), so the quote pays the notional only and
+            # the account receives the quantity less the fee.
+            if self.balances.get(self.quote_asset, 0.0) < notional:
                 order.status = "Rejected"
                 return
-            self.balances[self.quote_asset] -= notional + fee
-            self.balances[base] = self.balances.get(base, 0.0) + order.qty
+            fee_base = order.qty * fee_rate
+            self.balances[self.quote_asset] -= notional
+            self.balances[base] = (self.balances.get(base, 0.0)
+                                   + order.qty - fee_base)
+            order.fee_coin, order.fee_amount = base, fee_base
         else:
             if self.balances.get(base, 0.0) < order.qty - 1e-12:
                 order.status = "Rejected"
@@ -413,6 +421,7 @@ class SimulatedExchange(Transport):
             self.balances[self.quote_asset] = (
                 self.balances.get(self.quote_asset, 0.0) + notional - fee
             )
+            order.fee_coin, order.fee_amount = self.quote_asset, fee
 
         self.fees_paid += fee
         order.status = "Filled"
@@ -613,6 +622,8 @@ class SimulatedExchange(Transport):
             "orderFilter": order.order_filter,
             "triggerPrice": str(order.trigger_price),
             "avgPrice": str(order.avg_price), "cumExecQty": str(order.cum_qty),
+            "cumFeeDetail": ({order.fee_coin: f"{order.fee_amount:.10f}"}
+                             if order.fee_coin else {}),
         }
 
 
