@@ -800,8 +800,13 @@ def check_funding_completeness(journal: Journal, print_ms: List[int], *,
             continue
         before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
         after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
-        if abs(before) <= DUST[PERP] and abs(after) <= DUST[PERP]:
-            continue                      # flat on both sides: nothing was owed
+        if abs(before) <= DUST[PERP] or abs(after) <= DUST[PERP]:
+            # Flat on EITHER side of the print: the book opened or closed within
+            # the attribution slack of it, so whether it held through the
+            # settlement is not established by the bot's clock. That is the
+            # OWNERSHIP_AMBIGUOUS case (funding_reconcile), not a missing venue
+            # row; a permanent "held a position through it" flag would be false.
+            continue
         if any(abs(h - t) <= PRINT_MATCH_TOLERANCE_MS for h in have):
             continue
         journal.post(Entry(
