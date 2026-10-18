@@ -1070,6 +1070,16 @@ class TradingBot:
             # bookkeeping); with nothing held it must not take on new
             # exposure it cannot account for.
             if (self._journal_unsaved and self.carry.position is None
+                    and getattr(getattr(self, "carry_journal", None), "to_rows", None)
+                    and getattr(self.carry.state, "name", "") != "HALTED"):
+                # One transient store error is not a reason to stand down for
+                # good: write it again first, and halt only if that fails too.
+                try:
+                    self.store.save_ledger(self.carry_journal.to_rows())
+                    self._journal_unsaved = False
+                except Exception:  # noqa: BLE001
+                    logger.exception("the ledger retry also failed")
+            if (self._journal_unsaved and self.carry.position is None
                     and getattr(self.carry.state, "name", "") != "HALTED"):
                 self.carry._halt(
                     "JOURNAL_WRITE_FAILED",

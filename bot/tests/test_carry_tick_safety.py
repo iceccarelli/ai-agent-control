@@ -194,6 +194,16 @@ class TestAJournalThatCannotBeWrittenBlocksNewExposure:
         assert engine.state is BookState.HALTED
         assert len(venue.created) == before
 
+    def test_one_transient_store_error_does_not_halt_a_flat_book(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.store.save_ledger = mock.Mock(
+            side_effect=[OSError("busy"), None, None, None, None])
+        tick(bot, 1)
+        assert bot._journal_unsaved is True
+        tick(bot, 2)
+        assert bot._journal_unsaved is False
+        assert engine.state is not BookState.HALTED
+
     def test_a_held_pair_keeps_being_monitored_when_the_journal_fails(
             self, tmp_path):
         venue, journal, engine, bot = _hedged(tmp_path)
