@@ -1858,15 +1858,7 @@ class BybitClient:
 
             status = str(remote.get("orderStatus", ""))
             if status in TERMINAL_ORDER_STATUS:
-                self.store.update_order_status(
-                    oid, status.lower(), exchange_id=str(remote.get("orderId", ""))
-                )
-                summary["resolved"] += 1
-                if self._adopt_filled_spot_entry(row, remote, summary) is False:
-                    # Executed but not recorded: keep it unresolved.
-                    self.store.update_order_status(oid, "submitted")
-                    summary["resolved"] -= 1
-                    summary["unknown"] += 1
+                self._settle_terminal_order(row, remote, summary)
             elif status in OPEN_ORDER_STATUS:
                 if str(row.get("purpose")) == "entry":
                     # A resting entry from a dead process has nobody to watch
@@ -1883,14 +1875,7 @@ class BybitClient:
                         after = None
                     after_status = str((after or {}).get("orderStatus", ""))
                     if after_status in TERMINAL_ORDER_STATUS:
-                        self.store.update_order_status(
-                            oid, after_status.lower(),
-                            exchange_id=str(after.get("orderId", "")))
-                        summary["resolved"] += 1
-                        if self._adopt_filled_spot_entry(row, after, summary) is False:
-                            self.store.update_order_status(oid, "submitted")
-                            summary["resolved"] -= 1
-                            summary["unknown"] += 1
+                        self._settle_terminal_order(row, after, summary)
                         continue
                 self.store.update_order_status(
                     oid, "submitted", exchange_id=str(remote.get("orderId", ""))
@@ -1924,6 +1909,39 @@ class BybitClient:
         logger.info("startup reconciliation: %s", summary)
         return summary
 
+    def _settle_terminal_order(self, row: Mapping[str, Any],
+                               remote: Mapping[str, Any],
+                               summary: Dict[str, Any]) -> None:
+        """Record a terminal order -- an entry that executed only AFTER it has
+        been put in the book. Writing the terminal status first would drop it
+        out of ``unresolved_orders`` with the coin unrecorded, and a crash or an
+        error between the two steps would lose it for good."""
+        oid = str(row["order_link_id"])
+        status = str(remote.get("orderStatus", ""))
+        is_entry = str(row.get("purpose")) == "entry"
+        try:
+            executed = float(remote.get("cumExecQty") or 0.0)
+        except (TypeError, ValueError):
+            executed = float("nan")
+        if is_entry and status == "Filled" and not executed > 0.0:
+            # "Filled" with no executed quantity is an anomaly, not proof that
+            # nothing was bought.
+            logger.error("reconcile: %s is Filled with cumExecQty=%r; left "
+                         "unresolved", oid, remote.get("cumExecQty"))
+            summary["unknown"] += 1
+            return
+        try:
+            adopted = self._adopt_filled_spot_entry(row, remote, summary)
+        except Exception:  # noqa: BLE001
+            logger.exception("reconcile: could not adopt %s", oid)
+            adopted = False
+        if adopted is False:
+            summary["unknown"] += 1           # executed but not recorded
+            return
+        self.store.update_order_status(
+            oid, status.lower(), exchange_id=str(remote.get("orderId", "")))
+        summary["resolved"] += 1
+
     def _adopt_filled_spot_entry(self, row: Mapping[str, Any],
                                  remote: Mapping[str, Any],
                                  summary: Dict[str, Any]) -> Optional[bool]:
@@ -1950,6 +1968,9 @@ class BybitClient:
         try:
             qty = float(remote.get("cumExecQty") or 0.0)
             price = float(remote.get("avgPrice") or 0.0)
+            if price <= 0 and qty > 0:
+                # No average price, but the executed value is the same fact.
+                price = float(remote.get("cumExecValue") or 0.0) / qty
         except (TypeError, ValueError):
             return False
         symbol = str(row["symbol"])

@@ -522,7 +522,10 @@ class TestWSStatusMonotonicGuard:
     def _store(self, tmp_path) -> StateStore:
         store = StateStore(str(tmp_path / "state.db"))
         store.claim_writer()
-        store.record_order("BB-1", "BTCUSDT", "Buy", "Market", 0.01)
+        # A protective-leg purpose: the monotonic guard is about status order,
+        # and an ENTRY "Filled" additionally waits for its position row
+        # (test_a_ws_fill_for_an_unrecorded_entry_does_not_release_it).
+        store.record_order("BB-1", "BTCUSDT", "Sell", "Limit", 0.01, purpose="tp")
         return store
 
     def test_stale_ws_new_after_filled_does_not_regress(self, tmp_path):

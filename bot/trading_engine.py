@@ -1358,6 +1358,9 @@ class TradingEngine:
             return summary
         now = utc_now_epoch()
         stuck = self.__dict__.setdefault("_stuck_entries", {})
+        live_ids = {str(r["order_link_id"]) for r in rows}
+        for gone in [k for k in stuck if k not in live_ids]:
+            del stuck[gone]
         for row in rows:
             oid, symbol = str(row["order_link_id"]), str(row["symbol"])
             if stuck.get(oid, 0.0) > now:
@@ -1367,6 +1370,7 @@ class TradingEngine:
                 self._resolve_one_entry(row, oid, symbol, now, summary, stuck)
             except Exception:  # noqa: BLE001
                 logger.exception("could not settle unresolved entry %s", oid)
+                stuck[oid] = now + self.STUCK_ENTRY_RECHECK_S   # logged once, not per tick
                 summary["unread"] += 1
         return summary
 
@@ -1395,6 +1399,14 @@ class TradingEngine:
                           "PartiallyFilledCanceled"):
             return                            # still live: nothing to settle yet
         executed = float(remote.get("cumExecQty") or 0.0) > 0.0
+        if status == "Filled" and not executed:
+            # `execute` treats a Filled with no executed quantity as an anomaly
+            # (ZERO_FILL), not as proof that nothing was bought.
+            logger.critical("unresolved entry %s is Filled with cumExecQty=%r; "
+                            "left for a human", oid, remote.get("cumExecQty"))
+            stuck[oid] = now + self.STUCK_ENTRY_RECHECK_S
+            summary["unread"] += 1
+            return
         if not executed:
             self.store.update_order_status(
                 oid, status.lower(), exchange_id=str(remote.get("orderId", "")))

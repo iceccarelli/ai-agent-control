@@ -529,3 +529,68 @@ class TestAnEntryIsOnlyMarkedFilledOnceItIsRecorded:
         engine.client.get_order = get_order
         out = engine.resolve_unresolved_entries()
         assert out["resolved"] == 1                    # U2 still settled
+
+
+class TestStartupAdoptsBeforeItMarksFilled:
+    def _rec(self, tmp_path, reply, cfg=None):
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, cfg or Cfg(), fake)
+        store.record_order("R1", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+        store.update_order_status("R1", "submitted")
+        real = engine.client.get_order
+
+        def get_order(**kw):
+            if kw.get("order_link_id") == "R1":
+                return reply
+            return real(**kw)
+        engine.client.get_order = get_order
+        return engine, store
+
+    def test_an_adoption_that_raises_leaves_the_order_unresolved(self, tmp_path):
+        engine, store = self._rec(tmp_path, {
+            "orderStatus": "Filled", "cumExecQty": "0.001", "avgPrice": "60000",
+            "cumFeeDetail": {"BTC": "0.000001"}})
+
+        def boom(*a, **k):
+            raise RuntimeError("db hiccup")
+        engine.store.upsert_position = boom
+        summary = engine.client.reconcile_on_startup()
+        assert summary["unknown"] == 1
+        assert [o["order_link_id"] for o in store.unresolved_orders()] == ["R1"]
+
+    def test_a_filled_order_with_no_executed_quantity_stays_unresolved(self, tmp_path):
+        engine, store = self._rec(tmp_path, {
+            "orderStatus": "Filled", "cumExecQty": "0", "avgPrice": "0"})
+        summary = engine.client.reconcile_on_startup()
+        assert summary["unknown"] == 1
+        assert [o["order_link_id"] for o in store.unresolved_orders()] == ["R1"]
+
+    def test_a_missing_average_price_is_recovered_from_the_executed_value(self, tmp_path):
+        engine, store = self._rec(tmp_path, {
+            "orderStatus": "Filled", "cumExecQty": "0.001", "avgPrice": "0",
+            "cumExecValue": "60.0", "cumFeeDetail": {"BTC": "0.000001"}})
+        summary = engine.client.reconcile_on_startup()
+        assert summary["unknown"] == 0
+        row = store.open_positions()[0]
+        assert float(row["entry_price"]) == pytest.approx(60_000.0)
+        assert store.get_order("R1")["status"] == "filled"
+
+    def test_the_resolver_also_holds_a_zero_quantity_fill(self, tmp_path):
+        engine, store = self._rec(tmp_path, {
+            "orderStatus": "Filled", "cumExecQty": "0", "avgPrice": "0"})
+        out = engine.resolve_unresolved_entries()
+        assert out["resolved"] == 0 and len(store.unresolved_orders()) == 1
+
+
+def test_a_ws_fill_for_an_unrecorded_entry_does_not_release_it(tmp_path):
+    from persistence import StateStore
+    store = StateStore(str(tmp_path / "w.db"))
+    store.record_order("W1", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+    store.update_order_status("W1", "submitted")
+    store.update_order_status("W1", "filled", source="ws")
+    assert store.get_order("W1")["status"] == "submitted"
+    assert [o["order_link_id"] for o in store.unresolved_orders()] == ["W1"]
+    store.upsert_position(SYMBOL, "Buy", 0.001, 60_000.0, order_link_id="W1")
+    store.update_order_status("W1", "filled", source="ws")
+    assert store.get_order("W1")["status"] == "filled"
+    store.close()
