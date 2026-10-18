@@ -594,3 +594,16 @@ def test_a_ws_fill_for_an_unrecorded_entry_does_not_release_it(tmp_path):
     store.update_order_status("W1", "filled", source="ws")
     assert store.get_order("W1")["status"] == "filled"
     store.close()
+
+
+def test_a_ws_cancel_of_a_part_filled_entry_does_not_release_it(tmp_path):
+    """PartiallyFilledCanceled reaches the store as "cancelled": an entry that
+    executed in part must not go terminal on that event alone."""
+    from persistence import StateStore
+    store = StateStore(str(tmp_path / "c.db"))
+    store.record_order("C1", SYMBOL, "Buy", "Market", 0.001, purpose="entry")
+    store.update_order_status("C1", "submitted")
+    store.update_order_status("C1", "cancelled", source="ws")
+    assert store.get_order("C1")["status"] == "submitted"
+    assert [o["order_link_id"] for o in store.unresolved_orders()] == ["C1"]
+    store.close()

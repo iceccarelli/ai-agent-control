@@ -1436,16 +1436,19 @@ class StateStore:
                 return
             if (
                 current is not None
-                and status == "filled"
+                and status in ("filled", "cancelled")
                 and str(current.get("purpose")) == "entry"
                 and current_status not in LOCAL_TERMINAL_ORDER_STATUS
                 and not any(str(p.get("order_link_id")) == order_link_id
                             for p in self.open_positions())
             ):
-                # A WS "Filled" for an ENTRY that no position row records yet.
-                # Marking it filled would drop it out of the unresolved set (and
-                # the entry gates) with the fill unrecorded; the REST fill path
-                # or the resolver writes it once the position exists.
+                # A WS "Filled" -- or "cancelled", which is what a partial-then-
+                # cancelled order maps to -- for an ENTRY that no position row
+                # records yet. Marking it terminal would drop it out of the
+                # unresolved set (and the entry gates) with any executed lot
+                # unrecorded; the REST fill path or the resolver writes it once
+                # the position exists (a cancel with nothing executed is cleared
+                # by the resolver on the next tick).
                 self.journal(
                     str(current.get("symbol", "")), "WS_FILL_HELD_UNTIL_RECORDED",
                     "WS reported an entry filled before any position records it; "
