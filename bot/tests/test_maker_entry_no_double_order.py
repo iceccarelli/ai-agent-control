@@ -70,7 +70,8 @@ def test_a_part_filled_maker_keeps_its_own_lot_and_sends_no_taker(tmp_path):
     result, client = _enter(
         tmp_path, maker,
         {"orderStatus": "PartiallyFilledCanceled", "cumExecQty": "0.4"})
-    assert result is maker
+    assert result.order_link_id == "M"
+    assert result.raw.get("maker_fill") is True, "a maker lot is recorded maker"
     assert [o["order_type"] for o in client.orders] == ["Limit"]
 
 
@@ -81,3 +82,23 @@ def test_a_cleanly_cancelled_unfilled_maker_falls_back_to_one_taker(tmp_path):
     assert result.order_link_id == "TAKER"
     assert [o["order_type"] for o in client.orders] == ["Limit", "Market"]
     assert client.orders[1]["qty"] == 1.0
+
+
+def test_a_taker_fallback_is_not_recorded_as_a_maker_fill(tmp_path):
+    result, _client = _enter(
+        tmp_path, OrderResult(ok=True, order_link_id="M", reason="SUBMITTED"),
+        {"orderStatus": "Cancelled", "cumExecQty": "0"})
+    assert not result.raw.get("maker_fill")
+
+
+def test_a_maker_that_fills_in_time_is_recorded_as_a_maker_fill(tmp_path):
+    engine, _store = _engine(tmp_path, LinearCfg(), FakeBybit())
+    engine.prefer_maker = True
+    engine.maker_timeout_s = 0.0
+    engine._await_fill = lambda symbol, link, timeout_s=10.0: {
+        "orderStatus": "Filled", "cumExecQty": "1"}
+    engine.client = StubClient(
+        OrderResult(ok=True, order_link_id="M", reason="SUBMITTED"), None)
+    result = engine._enter(symbol="BTCUSDT", side="Buy", qty=1.0, filters=None,
+                           quote={"bid": 100.0, "ask": 100.1})
+    assert result.raw.get("maker_fill") is True

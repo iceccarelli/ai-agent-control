@@ -816,7 +816,7 @@ class TradingEngine:
         filled = self._await_fill(symbol, maker.order_link_id,
                                   timeout_s=self.maker_timeout_s)
         if filled is not None:
-            return maker
+            return replace(maker, raw={**maker.raw, "maker_fill": True})
 
         # Not filled in time. Cancel FIRST, then decide what is left to do.
         self.client.cancel_order(symbol=symbol, order_link_id=maker.order_link_id)
@@ -844,7 +844,7 @@ class TradingEngine:
             # the rest would leave the maker lot unrecorded and unprotected.
             logger.info("maker entry partially filled %s of %s on %s; "
                         "keeping the partial fill", already, qty, symbol)
-            return maker
+            return replace(maker, raw={**maker.raw, "maker_fill": True})
         return self.client.place_order(
             symbol=symbol, side=side, qty=qty,
             order_type="Market", purpose="entry", filters=filters,
