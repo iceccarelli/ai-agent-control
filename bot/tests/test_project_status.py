@@ -408,6 +408,17 @@ class TestTheRegistrationHookRefuses:
         assert ps.cleared_edge_signal_from_artifacts(str(tmp_path)) == \
             "some_future_signal"
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), 100.5, -1.0])
+    def test_a_non_finite_or_out_of_range_percentile_is_refused(self, tmp_path, bad):
+        """`nan < bar` is False, so a forged NaN percentile used to pass."""
+        s = summary()
+        s["m1"] = {**s["m1"], "percentile": bad}
+        s["m2"] = {**s["m2"], "percentile": bad}
+        with open(os.path.join(str(tmp_path), "x_summary.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(s, handle)           # json writes NaN/Infinity literals
+        assert ps.cleared_edge_signal_from_artifacts(str(tmp_path)) is None
+
     @pytest.mark.parametrize("verdict", [
         "EDGE_EVIDENCE_ABSENT", "INCONCLUSIVE", "", "positive",
         "edge_evidence_positive",
