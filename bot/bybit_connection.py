@@ -1707,6 +1707,32 @@ class BybitClient:
             "levels": features.levels,
         }
 
+    def get_book_ladders(self, symbol: str) -> Optional[Tuple[list, list]]:
+        """The raw ``(bids, asks)`` ladders for ``symbol``, or None when unread.
+
+        What the model's feature code accepts (it measures the book with the
+        same ``market_data`` code the backtester uses). ``get_book_features``
+        returns only the scalar summary the liquidity gate needs, which that
+        code cannot rebuild a book from.
+        """
+        if not bool(getattr(self.cfg, "USE_ORDERBOOK", True)):
+            return None
+        levels = int(getattr(self.cfg, "BOOK_DEPTH_LEVELS", 25))
+        try:
+            payload = self._request(
+                "GET", "/v5/market/orderbook",
+                params={"category": self.category, "symbol": symbol,
+                        "limit": min(200, max(1, levels))},
+            )
+        except BybitAPIError as exc:
+            logger.debug("orderbook unavailable for %s: %s", symbol, exc)
+            return None
+        result = payload.get("result", {}) or {}
+        bids, asks = result.get("b") or [], result.get("a") or []
+        if not bids and not asks:
+            return None
+        return list(bids), list(asks)
+
     def book_feed_unavailable(self, symbol: str) -> bool:
         """True when the last ``get_book_features`` for ``symbol`` was meant to
         read a book and could not (request failure, empty or unparseable book)."""

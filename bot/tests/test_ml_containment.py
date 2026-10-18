@@ -393,6 +393,7 @@ class TestTheModelMayOnlyPropose:
         return ml.PolicyStrategy(
             FakeBase(), config=cfg_for("live", **cfg_over),
             policy=FakePolicy(decision),
+            drift_monitor=ml.PolicyDriftMonitor(baseline_brier=0.2),
         )
 
     def test_live_attaches_only_the_probability(self):
@@ -468,6 +469,7 @@ class TestTheModelMayOnlyPropose:
         strategy = ml.PolicyStrategy(
             base, config=cfg_for("live"),
             policy=FakePolicy(FakeDecision(direction="SHORT", probability=0.2)),
+            drift_monitor=ml.PolicyDriftMonitor(baseline_brier=0.2),
         )
         result = strategy.signal_for("BTCUSDT")
         assert result.win_probability == pytest.approx(0.8)
@@ -712,6 +714,7 @@ class TestTheOperatorCanSeeWhatIsHappening:
         strategy = ml.PolicyStrategy(
             FakeBase(), config=cfg_for("live"),
             policy=FakePolicy(FakeDecision(direction="SHORT")),
+            drift_monitor=ml.PolicyDriftMonitor(baseline_brier=0.2),
         )
         strategy.signal_for("BTCUSDT")
         assert strategy.snapshot()["disagreements"] == 1
@@ -732,3 +735,58 @@ class TestTheOperatorCanSeeWhatIsHappening:
         strategy = ml.PolicyStrategy(FakeBase(), config=cfg_for("off"))
         assert callable(strategy.signal_for)
         assert hasattr(strategy, "last_signal")
+
+
+class TestTheModelIsHandedABookItCanMeasure:
+    """get_book_features returns a scalar dict the feature code refuses, so the
+    live/shadow model silently produced no decision on every tick."""
+
+    def _client(self, tmp_path, book):
+        import bybit_connection as bc
+        from fake_bybit import FakeBybit
+        from persistence import StateStore
+        from test_orchestrator import Cfg
+        fake = FakeBybit()
+        fake.book = book
+        store = StateStore(str(tmp_path / "s.db"))
+        return bc.BybitClient(config=Cfg(), store=store, transport=fake)
+
+    def test_ladders_are_what_the_feature_code_accepts(self, tmp_path):
+        import features
+        client = self._client(tmp_path, {
+            "b": [["100.0", "5"], ["99.9", "5"]], "a": [["100.1", "5"], ["100.2", "5"]]})
+        ladders = client.get_book_ladders("BTCUSDT")
+        assert ladders is not None
+        measured = features._coerce_book(ladders)
+        assert measured is not None and measured.usable
+        with pytest.raises(TypeError):
+            features._coerce_book(client.get_book_features("BTCUSDT"))
+
+    def test_an_unreadable_book_gives_no_ladders(self, tmp_path):
+        assert self._client(tmp_path, None).get_book_ladders("BTCUSDT") is None
+
+    def test_the_strategy_asks_for_the_ladders(self):
+        base = FakeBase()
+        base.client = type("C", (), {
+            "get_book_ladders": lambda self, s: ([["1", "1"]], [["2", "1"]]),
+            "get_book_features": lambda self, s: {"mid": 1.5}})()
+        strategy = ml.PolicyStrategy(base, config=cfg_for("live"),
+                                     policy=FakePolicy(FakeDecision(probability=0.7)))
+        assert strategy._book_for("BTCUSDT") == ([["1", "1"]], [["2", "1"]])
+
+
+class TestALiveModelNeedsAWayToBeDemoted:
+    def test_without_a_drift_monitor_the_model_may_not_propose(self):
+        strategy = ml.PolicyStrategy(
+            FakeBase(), config=cfg_for("live"),
+            policy=FakePolicy(FakeDecision(probability=0.8)))
+        allowed, reason = strategy.may_propose()
+        assert allowed is False and "NO_DRIFT_MONITOR" in reason
+        assert strategy.signal_for("BTCUSDT").win_probability is None
+
+    def test_with_a_monitor_it_may(self):
+        strategy = ml.PolicyStrategy(
+            FakeBase(), config=cfg_for("live"),
+            policy=FakePolicy(FakeDecision(probability=0.8)),
+            drift_monitor=ml.PolicyDriftMonitor(baseline_brier=0.2))
+        assert strategy.may_propose()[0] is True
