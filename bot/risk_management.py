@@ -651,6 +651,26 @@ class BillionaireRiskManager:
             )
         return _allow("POSITION_SIZE_OK", notional_fraction=frac)
 
+    def _unresolved_entry_exposure(self, positions: List[Dict[str, Any]]
+                                   ) -> Optional[List[Dict[str, Any]]]:
+        """Entries sent but not seen to fill, valued like positions.
+
+        They may be live exposure the book has no row for, so the exposure
+        and correlation caps must count them. Returns None when one cannot be
+        valued (a market order records no price): the caller blocks.
+        """
+        held = {str(p.get("symbol")) for p in positions}
+        pending: List[Dict[str, Any]] = []
+        for o in self.store.unresolved_orders():
+            if str(o.get("purpose")) != "entry" or str(o.get("symbol")) in held:
+                continue
+            price = float(o.get("price") or 0.0)
+            if not (math.isfinite(price) and price > 0.0):
+                return None
+            pending.append({"symbol": o.get("symbol"), "qty": o.get("qty"),
+                            "entry_price": price, "side": o.get("side")})
+        return pending
+
     def _gate_aggregate_exposure(
         self, *, qty: float, entry_price: float, equity: float
     ) -> RiskDecision:
@@ -658,8 +678,12 @@ class BillionaireRiskManager:
             return _block("EQUITY_UNKNOWN", equity=equity)
         try:
             positions = self.store.open_positions()
+            pending = self._unresolved_entry_exposure(positions)
         except Exception as exc:  # noqa: BLE001
             return _block("EXPOSURE_UNREADABLE", error=str(exc))
+        if pending is None:
+            return _block("EXPOSURE_UNRESOLVED_ENTRY")
+        positions = list(positions) + pending
         current = sum(
             abs(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)))
             for p in positions
@@ -678,8 +702,12 @@ class BillionaireRiskManager:
             return _block("EQUITY_UNKNOWN", equity=equity)
         try:
             positions = self.store.open_positions()
+            pending = self._unresolved_entry_exposure(positions)
         except Exception as exc:  # noqa: BLE001
             return _block("CORRELATION_UNREADABLE", error=str(exc))
+        if pending is None:
+            return _block("EXPOSURE_UNRESOLVED_ENTRY")
+        positions = list(positions) + pending
         bucket = self.correlation.bucket_of(symbol)
         by_bucket = self.correlation.exposure_by_bucket(positions)
         proposed = by_bucket.get(bucket, 0.0) + abs(float(qty) * float(entry_price))

@@ -817,3 +817,32 @@ class TestNonFiniteLevelsBlock:
     def test_inf_levels_block(self, manager):
         assert manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
                                          take_profit_price=float("inf")).ok is False
+
+
+class TestUnresolvedEntriesCountAgainstExposure:
+    def _pending(self, store, price, qty=1.0, sym="AAAUSDT"):
+        store.record_order("EX1", sym, "Buy", "Limit" if price else "Market",
+                           qty, price=price, purpose="entry")
+        store.update_order_status("EX1", "submitted")
+
+    def test_a_priced_pending_entry_adds_to_aggregate_exposure(self, manager, store):
+        limit = manager.max_total_exposure_pct
+        self._pending(store, price=EQUITY * limit * 0.9, qty=1.0)
+        d = manager._gate_aggregate_exposure(qty=1.0, entry_price=EQUITY * limit * 0.2,
+                                             equity=EQUITY)
+        assert d.ok is False and d.reason == "AGGREGATE_EXPOSURE_CAP"
+
+    def test_an_unpriced_pending_entry_blocks_exposure_and_correlation(
+            self, manager, store):
+        self._pending(store, price=0.0)
+        assert manager._gate_aggregate_exposure(
+            qty=0.001, entry_price=100.0, equity=EQUITY).reason == \
+            "EXPOSURE_UNRESOLVED_ENTRY"
+        assert manager._gate_correlation_bucket(
+            symbol="BTCUSDT", qty=0.001, entry_price=100.0,
+            equity=EQUITY).reason == "EXPOSURE_UNRESOLVED_ENTRY"
+
+    def test_no_pending_entry_changes_nothing(self, manager):
+        assert manager._gate_aggregate_exposure(
+            qty=0.001, entry_price=100.0, equity=EQUITY).ok is True
+
