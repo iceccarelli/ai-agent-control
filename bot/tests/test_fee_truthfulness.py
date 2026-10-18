@@ -581,3 +581,90 @@ def test_a_rebate_never_makes_a_spot_buy_hold_more_than_it_filled():
     import venue_fees
     fees = venue_fees.extract_order_fees({"cumFeeDetail": {"BTC": "-0.001"}})
     assert venue_fees.spot_buy_net_qty("BTCUSDT", 2.0, fees) == pytest.approx(2.0)
+
+
+class TestOrderLifecycleStaysConsistent:
+    def test_cancelling_an_entry_does_not_write_a_terminal_status(self, tmp_path):
+        """"Order not found" also means "already filled": only the venue's own
+        record may settle an entry, after what it executed is in the book."""
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        store.record_order("EC1", "BTCUSDT", "Buy", "Market", 0.001, purpose="entry")
+        store.update_order_status("EC1", "submitted")
+        assert engine.client.cancel_order(symbol="BTCUSDT", order_link_id="EC1")
+        assert store.get_order("EC1")["status"] == "submitted"
+        store.record_order("TP1", "BTCUSDT", "Sell", "Limit", 0.001, purpose="tp")
+        store.update_order_status("TP1", "submitted")
+        assert engine.client.cancel_order(symbol="BTCUSDT", order_link_id="TP1")
+        assert store.get_order("TP1")["status"] == "cancelled"
+        store.close()
+
+    def test_a_failed_venue_cancel_leaves_the_protective_legs_open_locally(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        report = engine.execute(buy_intent())
+        assert report.ok
+        engine.client.cancel_all = lambda symbol=None: False
+        engine._cancel_protective_orders("BTCUSDT")
+        legs = store._query("SELECT * FROM orders WHERE purpose IN ('stop','tp')")
+        assert legs and all(o["status"] != "cancelled" for o in legs)
+        assert store._query("SELECT * FROM decisions WHERE decision = ?",
+                            ("PROTECTIVE_CANCEL_FAILED",))
+        store.close()
+
+    def test_a_full_close_marks_its_protective_legs_cancelled(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        assert engine.execute(buy_intent()).ok
+        assert engine.close_position(symbol="BTCUSDT", reason="t").ok
+        legs = store._query("SELECT * FROM orders WHERE purpose IN ('stop','tp')")
+        assert legs and all(o["status"] == "cancelled" for o in legs)
+        store.close()
+
+    def test_an_entry_is_marked_filled_only_once_its_position_exists(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+
+        def boom(*a, **k):
+            raise RuntimeError("db hiccup")
+        store.upsert_position = boom
+        with pytest.raises(RuntimeError):
+            engine.execute(buy_intent())
+        entry = store._query("SELECT * FROM orders WHERE purpose='entry'")[0]
+        assert entry["status"] != "filled"
+        assert entry["order_link_id"] in [o["order_link_id"]
+                                         for o in store.unresolved_orders()]
+        store.close()
+
+    def test_a_spot_close_that_only_partly_sold_books_only_what_sold(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        assert engine.execute(buy_intent()).ok
+        held = float(store.open_positions()[0]["qty"])
+        engine._await_fill = lambda symbol, link, timeout_s=10.0: {
+            "orderStatus": "PartiallyFilledCanceled",
+            "cumExecQty": f"{held * 0.4:.6f}", "avgPrice": str(FILL_PRICE)}
+        report = engine.close_position(symbol="BTCUSDT", reason="t")
+        assert report.reason == "CLOSE_PARTIAL" and report.ok is False
+        rows = store.open_positions()
+        assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(held * 0.6, rel=1e-3)
+        assert len(store._query("SELECT * FROM trades")) == 1
+        store.close()
+
+
+def test_a_close_does_not_floor_float_noise_to_one_lot_step_short(tmp_path):
+    """A row quantity of 0.9470719999999999 (float noise on 0.947072) used to
+    snap DOWN to 0.947071: a one-step dust remainder on every such close."""
+    engine, store, _ = _stack(tmp_path, spot_detail)
+    assert engine.execute(buy_intent()).ok
+    row = store.open_positions()[0]
+    store.upsert_position("BTCUSDT", "Buy", 0.9470719999999999, float(row["entry_price"]),
+                          stop_price=float(row["stop_price"]),
+                          order_link_id=str(row["order_link_id"]), meta=row["meta"] and
+                          __import__("json").loads(row["meta"]))
+    sent = []
+    real = engine.client.place_order
+
+    def spy(**kw):
+        if kw.get("purpose") == "close":
+            sent.append(kw["qty"])
+        return real(**kw)
+    engine.client.place_order = spy
+    engine.close_position(symbol="BTCUSDT", reason="t")
+    assert sent and sent[0] == 0.947072
+    store.close()

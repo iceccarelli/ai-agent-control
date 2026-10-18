@@ -616,6 +616,7 @@ class TradingEngine:
                 self.store.journal(symbol, "ENTRY_DUST", "net of fee below minimum", {
                     "gross_filled": float(fill.get("cumExecQty") or 0.0)})
                 filled_qty = 0.0
+                self.store.update_order_status(entry.order_link_id, "filled")
             if filled_qty <= 0:
                 return self._report(stage="fill", reason="ZERO_SELLABLE",
                                     symbol=symbol,
@@ -625,6 +626,7 @@ class TradingEngine:
             symbol, side, filled_qty, avg_price, stop_price=0.0,
             order_link_id=entry.order_link_id, meta=entry_meta,
         )
+        self.store.update_order_status(entry.order_link_id, "filled")
 
         # What the entry ACTUALLY cost against what the strategy assumed. This
         # is the measurement that tells an operator whether SLIPPAGE_BPS is a
@@ -818,6 +820,10 @@ class TradingEngine:
             return OrderResult(ok=False, order_link_id=maker.order_link_id,
                                reason="MAKER_ENTRY_UNRESOLVED")
         already = float((residual or {}).get("cumExecQty") or 0.0)
+        if already <= 0.0 and status in ("Cancelled", "Rejected", "Deactivated"):
+            # Verified at the venue: nothing executed. (cancel_order leaves an
+            # entry row for the venue's record to settle.)
+            self.store.update_order_status(maker.order_link_id, status.lower())
         if already > 0.0:
             # Part of the maker order executed. That lot is what the book
             # must carry (the entry is confirmed from this order); a taker for
@@ -854,14 +860,14 @@ class TradingEngine:
             if order:
                 status = str(order.get("orderStatus", ""))
                 if status == "Filled":
-                    self.store.update_order_status(order_link_id, "filled")
+                    self._record_fill_status(order_link_id)
                     return order
                 if (status in ("PartiallyFilledCanceled", "Cancelled", "Deactivated")
                         and float(order.get("cumExecQty") or 0.0) > 0.0):
                     # Terminal, and part of it executed: the venue holds that
                     # quantity, so it is a fill of the executed size -- not an
                     # "unconfirmed" order that leaves exposure nobody tracks.
-                    self.store.update_order_status(order_link_id, "filled")
+                    self._record_fill_status(order_link_id)
                     return order
                 if status in {"Rejected", "Cancelled", "Deactivated"}:
                     self.store.update_order_status(order_link_id, status.lower())
@@ -869,6 +875,15 @@ class TradingEngine:
             time.sleep(delay)
             delay = min(1.0, delay * 1.5)
         return None
+
+    def _record_fill_status(self, order_link_id: str) -> None:
+        """Mark a fill-polled order filled -- except an ENTRY, which is marked
+        only once its position row exists (``execute`` does that), so a failure
+        between the two cannot leave a terminal order and no position."""
+        row = self.store.get_order(order_link_id)
+        if row is not None and str(row.get("purpose")) == "entry":
+            return
+        self.store.update_order_status(order_link_id, "filled")
 
     def _reanchor(self, plan: ExitPlan, *, side: str, fill_price: float) -> ExitPlan:
         """Shift the bracket so it is measured from the price we actually paid.
@@ -999,6 +1014,7 @@ class TradingEngine:
                     self._book_full_exit(
                         symbol=symbol, row=row, exit_order=closed, fill=fill,
                         reason=f"EMERGENCY:{reason}")
+                    self._cancel_protective_orders(symbol)
                 except Exception as exc:  # noqa: BLE001
                     logger.critical(
                         "emergency exit of %s could not be booked as a trade "
@@ -1103,7 +1119,11 @@ class TradingEngine:
 
         side = str(row["side"])
         exit_side = "Sell" if normalize_side(side) == "Buy" else "Buy"
-        qty = float(row["qty"])
+        # Float subtraction leaves noise (0.9470719999999999 for 0.947072), and
+        # snapping that DOWN to the lot step sells one step too little: a
+        # permanent dust remainder on every close. Twelve places is far below any
+        # lot step and removes the noise.
+        qty = round(float(row["qty"]), 12)
         entry_price = float(row["entry_price"])
         row_meta = self._row_meta(row)
 
@@ -1157,6 +1177,27 @@ class TradingEngine:
                     "executed_exit_qty": executed_exit_qty,
                     "exit_status": exit_status or "UNCONFIRMED"})
 
+        if (not getattr(self.client, "is_linear", False)
+                and 0.0 < executed_exit_qty < qty - max(1e-9, qty * 1e-9)):
+            # Spot: only part of the position sold and the rest was cancelled.
+            # Booking the whole row as closed (and cancelling the stop) would
+            # leave the unsold remainder held with no stop and no row. Book what
+            # sold; record_exit_fill reduces the row and resizes the stop.
+            avg = float((fill or {}).get("avgPrice") or 0.0) or entry_price
+            self.record_exit_fill(
+                symbol=symbol, qty=executed_exit_qty, price=avg, fee=0.0,
+                reason=f"{reason}:PARTIAL_CLOSE", order_link_id=result.order_link_id,
+                dedupe_key=f"exit:{result.order_link_id}",
+                fees=venue_fees.extract_order_fees(fill or {}),
+                fee_ref={"order_link_id": result.order_link_id,
+                         "order_id": str((fill or {}).get("orderId") or "")})
+            return self._report(
+                stage="close", reason="CLOSE_PARTIAL", symbol=symbol, qty=qty,
+                detail={"exit_order_link_id": result.order_link_id,
+                        "requested_exit_qty": qty,
+                        "executed_exit_qty": executed_exit_qty,
+                        "exit_status": exit_status or "PARTIAL"})
+
         # The protective orders come off only once the close is CONFIRMED. A
         # close that was accepted but whose fill never resolved (a poll that
         # timed out, or an order that ended Rejected / Cancelled) may not have
@@ -1165,7 +1206,7 @@ class TradingEngine:
         # place, a resting stop on a position that really did close is the lesser
         # evil: the journal names it so it is cleaned up, never silently lost.
         if fill is not None:
-            self.client.cancel_all(symbol)
+            self._cancel_protective_orders(symbol)
         else:
             logger.critical(
                 "close of %s is UNCONFIRMED (no resolved fill for %s): the "
@@ -1754,7 +1795,7 @@ class TradingEngine:
             dedupe_key=dedupe_key,
         ))
 
-        remaining = held - closed_qty
+        remaining = round(held - closed_qty, 12)
         if remaining <= 1e-12:
             self.store.remove_position(symbol)
             # OCO: the position is gone, so every sibling protective order must
@@ -1860,14 +1901,28 @@ class TradingEngine:
         return False
 
     def _cancel_protective_orders(self, symbol: str) -> None:
-        """Cancel every resting stop/TP for a symbol (the OCO half of an exit)."""
+        """Cancel every resting stop/TP for a symbol (the OCO half of an exit).
+
+        The local rows are marked cancelled only if the venue cancel succeeded:
+        a row marked cancelled over a leg that is still live would never be
+        looked at again, and that leg could later sell coin the book does not
+        hold. On failure they stay open for startup reconcile to chase."""
         try:
-            self.client.cancel_all(symbol)
+            ok = bool(self.client.cancel_all(symbol))
         except Exception:  # noqa: BLE001
             logger.exception("could not cancel protective orders for %s", symbol)
-        for row in self.store.pending_orders():
-            if str(row.get("symbol")) == symbol and str(row.get("purpose")) in ("stop", "tp"):
-                self.store.update_order_status(str(row["order_link_id"]), "cancelled")
+            ok = False
+        rows = [r for r in self.store.unresolved_orders()
+                if str(r.get("symbol")) == symbol
+                and str(r.get("purpose")) in ("stop", "tp")]
+        if not ok:
+            if rows:
+                self.store.journal(symbol, "PROTECTIVE_CANCEL_FAILED",
+                                   "venue cancel-all failed; legs left open locally",
+                                   {"legs": [str(r["order_link_id"]) for r in rows]})
+            return
+        for row in rows:
+            self.store.update_order_status(str(row["order_link_id"]), "cancelled")
 
     # -- startup -----------------------------------------------------------
 

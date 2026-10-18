@@ -1209,7 +1209,7 @@ class BybitClient:
             self._request("POST", "/v5/order/cancel", body=body, signed=True)
         except PermanentAPIError as exc:
             if exc.ret_code in (110001, 170213):  # already gone
-                self.store.update_order_status(order_link_id or order_id, "cancelled")
+                self._mark_cancelled(order_link_id or order_id)
                 return True
             logger.error("cancel failed for %s: %s", order_link_id or order_id, exc)
             return False
@@ -1217,8 +1217,19 @@ class BybitClient:
             logger.error("cancel unresolved for %s: %s", order_link_id or order_id, exc)
             return False
         if order_link_id:
-            self.store.update_order_status(order_link_id, "cancelled")
+            self._mark_cancelled(order_link_id)
         return True
+
+    def _mark_cancelled(self, order_link_id: str) -> None:
+        """Record a cancel locally -- except for an ENTRY, whose true outcome
+        (it may have executed before the cancel landed, and "order not found"
+        also means "already filled") only the venue's own record can say. An
+        entry row is left for the fill path / resolver / reconcile to settle
+        from that record, after anything it executed has been put in the book."""
+        row = self.store.get_order(order_link_id) if order_link_id else None
+        if row is not None and str(row.get("purpose")) == "entry":
+            return
+        self.store.update_order_status(order_link_id, "cancelled")
 
     #: On SPOT, `/v5/order/cancel-all`'s `orderFilter` accepts exactly one
     #: of these per call and DEFAULTS TO "Order" ALONE when omitted —
