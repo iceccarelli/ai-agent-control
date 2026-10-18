@@ -639,6 +639,16 @@ class TradingEngine:
                 logger.warning("take-profit leg rejected for %s at %s: %s",
                                symbol, price, leg.reason)
 
+        if tp_ids:
+            # Spot exits are observed from these orders (there is no venue
+            # position to read), so the row has to name them.
+            self.store.upsert_position(
+                symbol, side, filled_qty, avg_price, stop_price=plan.stop_price,
+                order_link_id=entry.order_link_id,
+                meta={"stop_order_link_id": protected, **entry_meta,
+                      "tp_order_ids": list(tp_ids)},
+            )
+
         self.store.journal(symbol, "ENTERED", "bracketed", {
             "qty": filled_qty, "avg_price": avg_price,
             "stop": plan.stop_price, "tp_legs": len(tp_ids),
@@ -1261,7 +1271,7 @@ class TradingEngine:
         summary: Dict[str, Any] = {"checked": 0, "closed": 0, "reduced": 0,
                                    "unread": 0, "price_approximated": 0}
         if not getattr(self.client, "is_linear", False):
-            return summary
+            return self._observe_spot_exits(summary)
         for row in list(self.store.open_positions()):
             symbol = str(row["symbol"])
             summary["checked"] += 1
@@ -1337,6 +1347,72 @@ class TradingEngine:
                            symbol, exited, price, reason, fully)
         return summary
 
+    def _observe_spot_exits(self, summary: Dict[str, Any]) -> Dict[str, Any]:
+        """Book spot stop / take-profit fills from the orders themselves.
+
+        Spot has no venue position to compare with, so the protective orders
+        the row names (its stop and its take-profit legs) are read. One that
+        has reached a terminal state with executed quantity is a real exit:
+        it is booked through ``record_exit_fill`` (which also resizes the
+        stop and cancels the siblings), once -- an order already booked on
+        the row is skipped. Without this a spot stop-out was invisible: the
+        row stayed open, the loss never reached the streak brake, and the
+        position count never came back down.
+        """
+        for row in list(self.store.open_positions()):
+            symbol = str(row["symbol"])
+            meta = self._row_meta(row)
+            booked = set(meta.get("booked_exit_orders") or [])
+            ids = [str(meta.get("stop_order_link_id") or "")] + [
+                str(i) for i in (meta.get("tp_order_ids") or [])]
+            summary["checked"] += 1
+            for link in ids:
+                if not link or link in booked:
+                    continue
+                try:
+                    order = self.client.get_order(symbol=symbol, order_link_id=link)
+                except BybitAPIError as exc:
+                    logger.error("observe_exits: cannot read %s order %s: %s",
+                                 symbol, link, exc)
+                    summary["unread"] += 1
+                    continue
+                if not order:
+                    continue
+                status = str(order.get("orderStatus", ""))
+                if status not in ("Filled", "PartiallyFilledCanceled"):
+                    continue
+                try:
+                    qty = float(order.get("cumExecQty") or 0.0)
+                    price = float(order.get("avgPrice") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                current = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
+                if current is None:
+                    break
+                qty = min(qty, float(current["qty"]))
+                if qty <= 0 or price <= 0:
+                    logger.error("observe_exits: %s order %s is %s but reports "
+                                 "qty=%s price=%s; not booked", symbol, link,
+                                 status, order.get("cumExecQty"),
+                                 order.get("avgPrice"))
+                    summary["unread"] += 1
+                    continue
+                fees = venue_fees.extract_order_fees(order)
+                fully = self.record_exit_fill(
+                    symbol=symbol, qty=qty, price=price, fee=0.0,
+                    reason="VENUE_EXIT_SPOT", order_link_id=link,
+                    dedupe_key=f"exit_spot:{link}", fees=fees,
+                    fee_ref={"order_link_id": link,
+                             "order_id": str(order.get("orderId") or "")},
+                    booked_order_id=link)
+                summary["closed" if fully else "reduced"] += 1
+                logger.warning("observe_exits: spot %s exited %.8g @ %.8g via %s "
+                               "fully=%s", symbol, qty, price, link, fully)
+                # One exit per symbol per cycle: a partial exit replaces the
+                # stop, so the row is re-read next cycle.
+                break
+        return summary
+
     @staticmethod
     def _rows_of_this_exit(rows: List[Dict[str, Any]],
                            exited: float) -> List[Dict[str, Any]]:
@@ -1388,6 +1464,7 @@ class TradingEngine:
         fees: Optional[FeeSet] = None,
         fee_ref: Optional[Mapping[str, Any]] = None,
         fee_evidence: Optional[Mapping[str, Any]] = None,
+        booked_order_id: str = "",
     ) -> bool:
         """Account for a partial or full exit that an exchange-side order filled.
 
@@ -1579,7 +1656,11 @@ class TradingEngine:
             # be carried explicitly or it vanishes on the first partial exit.
             meta={"stop_order_link_id": new_stop_id,
                   "entry_fees": entry_remaining.to_dict(),
-                  "entry_fee_ref": prior_meta.get("entry_fee_ref") or {}},
+                  "entry_fee_ref": prior_meta.get("entry_fee_ref") or {},
+                  "tp_order_ids": list(prior_meta.get("tp_order_ids") or []),
+                  "booked_exit_orders": sorted(
+                      set(prior_meta.get("booked_exit_orders") or [])
+                      | ({booked_order_id} if booked_order_id else set()))},
         )
         self.store.journal(symbol, "PARTIAL_EXIT", reason,
                            {"closed": closed_qty, "remaining": remaining,

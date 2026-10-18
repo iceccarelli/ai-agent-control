@@ -8,6 +8,7 @@ order and never invents a position.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -50,11 +51,11 @@ def _open(store, symbol="BTCUSDT", side="Sell", qty=0.01, entry=60_000.0):
     store.upsert_position(symbol, side, qty, entry, stop_price=61_000.0)
 
 
-def test_spot_does_nothing(tmp_path):
+def test_spot_with_no_filled_protective_order_does_nothing(tmp_path):
     fake = FakeBybit()
     engine, store = _engine(tmp_path, Cfg(), fake)
     _open(store)
-    assert engine.observe_exits()["checked"] == 0
+    assert engine.observe_exits()["closed"] == 0
     assert store.open_position_count() == 1
 
 
@@ -131,3 +132,68 @@ def test_never_places_an_order(tmp_path):
     _open(store)
     engine.observe_exits()
     assert not any(r["url"].endswith("/v5/order/create") for r in fake.requests)
+
+
+# -- spot: exits are read from the protective orders themselves -----------
+
+
+def _spot_row(store, qty=0.01, entry=60_000.0, stop_id="STOP1", tps=("TP1",)):
+    store.upsert_position(
+        "BTCUSDT", "Buy", qty, entry, stop_price=58_800.0,
+        meta={"stop_order_link_id": stop_id, "tp_order_ids": list(tps)})
+
+
+def _serve(engine, orders):
+    real = engine.client.get_order
+
+    def get_order(*, symbol, order_link_id="", order_id="", strict=False):
+        if order_link_id in orders:
+            return orders[order_link_id]
+        return None
+    engine.client.get_order = get_order
+    return real
+
+
+def test_spot_stop_fill_is_booked_as_a_loss_and_closes_the_row(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    _spot_row(store)
+    _serve(engine, {"STOP1": {"orderStatus": "Filled", "cumExecQty": "0.01",
+                              "avgPrice": "58800", "orderId": "V1"}})
+    s = engine.observe_exits()
+    assert s["closed"] == 1
+    assert store.open_position_count() == 0
+    trades = store._query("SELECT * FROM trades")
+    assert len(trades) == 1
+    assert float(trades[0]["exit_price"]) == pytest.approx(58_800.0)
+    assert float(trades[0]["net_pnl"]) < 0
+    assert engine.observe_exits()["closed"] == 0          # nothing re-booked
+
+
+def test_spot_partial_take_profit_reduces_once_and_is_not_rebooked(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    _spot_row(store, qty=0.01, tps=("TP1", "TP2"))
+    _serve(engine, {"TP1": {"orderStatus": "Filled", "cumExecQty": "0.004",
+                            "avgPrice": "62000", "orderId": "V2"}})
+    assert engine.observe_exits()["reduced"] == 1
+    row = store.open_positions()[0]
+    assert float(row["qty"]) == pytest.approx(0.006)
+    for _ in range(3):                                     # later cycles
+        engine.observe_exits()
+    assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.006)
+    assert len(store._query("SELECT * FROM trades")) == 1
+    meta = json.loads(store.open_positions()[0]["meta"])
+    assert "TP1" in meta["booked_exit_orders"]
+    assert meta["tp_order_ids"] == ["TP1", "TP2"]
+
+
+def test_spot_untriggered_or_unreadable_orders_book_nothing(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    _spot_row(store)
+    _serve(engine, {"STOP1": {"orderStatus": "Untriggered", "cumExecQty": "0"},
+                    "TP1": {"orderStatus": "New", "cumExecQty": "0"}})
+    s = engine.observe_exits()
+    assert s["closed"] == 0 and s["reduced"] == 0
+    assert store.open_position_count() == 1

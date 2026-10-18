@@ -693,3 +693,15 @@ class TestAnUnresolvedEntryBlocksAnotherEntry:
         assert second.reason == "ENTRY_ORDER_UNRESOLVED"
         assert len([r for r in exchange.requests
                     if "order/create" in r["url"]]) == sent
+
+
+def test_the_position_row_names_its_take_profit_orders(stack):
+    """Spot exits are observed from the protective orders, so the row must
+    carry the ids of the legs the entry placed."""
+    import json
+    engine, client, risk, store, exchange = stack
+    report = engine.execute(buy_intent())
+    assert report.ok
+    meta = json.loads(store.open_positions()[0]["meta"])
+    assert list(meta["tp_order_ids"]) == list(report.take_profit_ids)
+    assert meta["tp_order_ids"], "no take-profit legs were placed to name"
