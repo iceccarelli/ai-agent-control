@@ -254,6 +254,20 @@ class TestWalkForward:
         with pytest.raises(ValueError):
             bt.walk_forward({"BTCUSDT": synthetic_bars(50)}, folds=4)
 
+    def test_the_real_funding_series_reaches_every_fold(self, permissive_view, monkeypatch):
+        seen = []
+        real = bt.Backtester
+
+        class Spy(real):
+            def __init__(self, *a, **k):
+                seen.append(k.get("funding_by_symbol"))
+                super().__init__(*a, **k)
+        monkeypatch.setattr(bt, "Backtester", Spy)
+        series = {"BTCUSDT": [(1_600_000_000_000, 0.0003)]}
+        bt.walk_forward({"BTCUSDT": synthetic_bars(1200)}, permissive_config(),
+                        folds=4, funding_by_symbol=series)
+        assert len(seen) == 4 and all(f == series for f in seen)
+
     def test_every_fold_reports_its_own_blocked_reasons(self, permissive_view):
         folds = bt.walk_forward({"BTCUSDT": synthetic_bars(1200)},
                                 permissive_config(), folds=4)
@@ -374,3 +388,50 @@ class TestDataLoading:
         )
         bars = bt.load_bars_csv(str(path))
         assert bars[0].start_ms < bars[1].start_ms
+
+
+class TestASpotStopThatTheBarGapsThrough:
+    def _exchange(self, open_, low):
+        bars = [
+            bt.Bar(start_ms=1_600_000_000_000, open=100.0, high=100.5, low=99.5,
+                   close=100.0, volume=100.0),
+            bt.Bar(start_ms=1_600_003_600_000, open=open_, high=open_ + 0.5,
+                   low=low, close=open_, volume=100.0),
+        ]
+        ex = bt.SimulatedExchange({"BTCUSDT": bars}, starting_cash=0.0)
+        ex.balances["BTC"] = 1.0
+        ex.orders["S1"] = bt._SimOrder(
+            order_link_id="S1", symbol="BTCUSDT", side="Sell",
+            order_type="Market", qty=1.0, price=0.0, order_filter="StopOrder",
+            trigger_price=95.0, trigger_direction=2, status="Untriggered",
+            purpose="stop")
+        ex.index = 1
+        return ex
+
+    def test_a_gap_below_the_stop_fills_at_the_open(self):
+        ex = self._exchange(open_=90.0, low=88.0)
+        ex._resolve_bar("BTCUSDT", ex.bars["BTCUSDT"][1])
+        fill = [f for f in ex.fill_log if f["purpose"] == "stop"][0]
+        assert fill["price"] == pytest.approx(90.0 * (1 - ex.slippage))
+
+    def test_a_stop_reached_inside_the_bar_fills_at_the_trigger(self):
+        ex = self._exchange(open_=100.0, low=94.0)
+        ex._resolve_bar("BTCUSDT", ex.bars["BTCUSDT"][1])
+        fill = [f for f in ex.fill_log if f["purpose"] == "stop"][0]
+        assert fill["price"] == pytest.approx(95.0 * (1 - ex.slippage))
+
+
+class TestFundingIsNotSilentlyOutsideTheTradeStatistics:
+    def test_a_linear_run_reports_its_funding_and_says_the_trade_stats_exclude_it(
+            self, permissive_view):
+        cfg = permissive_config(category="linear")
+        result = bt.Backtester({"BTCUSDT": synthetic_bars(900)}, cfg).run()
+        assert result.trades > 0, "the run needs trades to hold through a settlement"
+        assert result.funding_paid != 0.0
+        assert any("BEFORE funding" in n for n in result.notes)
+
+    def test_a_spot_run_has_no_funding_and_no_note(self, permissive_view):
+        result = bt.Backtester({"BTCUSDT": synthetic_bars(600)},
+                               permissive_config()).run()
+        assert result.funding_paid == 0.0
+        assert not any("BEFORE funding" in n for n in result.notes)

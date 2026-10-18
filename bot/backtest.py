@@ -333,7 +333,13 @@ class SimulatedExchange(Transport):
             if touched:
                 # A stop becomes a market order: it fills at the trigger, with
                 # slippage against us.
-                self._execute(order, order.trigger_price, taker=True)
+                # ... and a bar that OPENS through the trigger gaps past it:
+                # the market order fills at the open, not at a price the bar
+                # never traded at.
+                gap_safe = (min(order.trigger_price, bar.open)
+                            if order.trigger_direction == 2
+                            else max(order.trigger_price, bar.open))
+                self._execute(order, gap_safe, taker=True)
                 if order.status == "Filled":
                     exited = True
 
@@ -820,6 +826,12 @@ class LinearSimulatedExchange(SimulatedExchange):
             "fee": fee, "purpose": order.purpose, "bar": self.index,
         })
 
+    @staticmethod
+    def _gap_through(long: bool, stop: float, bar: Any) -> float:
+        """Where a stop actually fills: at the trigger, unless the bar OPENED
+        beyond it, in which case at the open."""
+        return min(stop, bar.open) if long else max(stop, bar.open)
+
     def _close_at(self, symbol: str, price: float, *, purpose: str) -> None:
         """Close the whole position at ``price`` and log it as an exit fill.
 
@@ -834,6 +846,11 @@ class LinearSimulatedExchange(SimulatedExchange):
             return
         exit_side = "Sell" if normalize_side(position.side) == "Buy" else "Buy"
         qty = position.size
+        if purpose == "stop":
+            # A triggered stop is a market order: slippage against us, as on
+            # spot. (A resting take-profit limit is not slipped.)
+            price = price * ((1 - self.slippage) if exit_side == "Sell"
+                             else (1 + self.slippage))
         fee = qty * price * self.taker_fee
         self._cash(position.direction * qty * (price - position.entry_price) - fee)
         self.fees_paid += fee
@@ -866,7 +883,14 @@ class LinearSimulatedExchange(SimulatedExchange):
         span = self.FUNDING_INTERVAL_MS
         start, end = bar.start_ms, bar.start_ms + self._bar_span_ms(symbol)
         first = ((start + span - 1) // span) * span
+        # A position that opened at the previous bar's close opened AT this
+        # bar's start. A settlement stamped exactly then happens before that
+        # fill: the position did not hold through it, so it neither pays nor
+        # receives it.
+        just_opened = position.opened_index == self.index - 1
         for settle in range(first, end, span):
+            if just_opened and settle == start:
+                continue
             key = (symbol, settle)
             if key in self._funded:
                 continue
@@ -902,11 +926,13 @@ class LinearSimulatedExchange(SimulatedExchange):
                 # a guess about the path.
                 stop_first = (stop > liq) if long else (stop < liq)
                 if stop_first:
-                    self._close_at(symbol, stop, purpose="stop")
+                    self._close_at(symbol, self._gap_through(long, stop, bar),
+                                   purpose="stop")
                 else:
                     self._liquidate(symbol, liq)
             elif hit_stop:
-                self._close_at(symbol, stop, purpose="stop")
+                self._close_at(symbol, self._gap_through(long, stop, bar),
+                               purpose="stop")
             elif hit_liq:
                 self._liquidate(symbol, liq)
             else:
@@ -1093,6 +1119,10 @@ class BacktestResult:
     starting_equity: float = 0.0
     ending_equity: float = 0.0
     fees_paid: float = 0.0
+    #: Funding paid (+) or received (-) over the run. Linear only. It is in
+    #: ``ending_equity`` and ``net_pnl`` but NOT in the per-trade ledger, so
+    #: win rate / expectancy / R are before funding; ``notes`` says so.
+    funding_paid: float = 0.0
     equity_curve: List[float] = field(default_factory=list)
     trade_returns: List[float] = field(default_factory=list)
     net_pnl: float = 0.0
@@ -1410,6 +1440,12 @@ class Backtester:
 
         result.ending_equity = exchange.equity()
         result.fees_paid = exchange.fees_paid
+        result.funding_paid = float(getattr(exchange, "funding_paid", 0.0) or 0.0)
+        if abs(result.funding_paid) > 1e-12:
+            result.notes.append(
+                f"funding {result.funding_paid:+.4f} is in ending_equity and "
+                "net_pnl but not in the per-trade ledger: win_rate, expectancy "
+                "and the R statistics are BEFORE funding.")
         result.net_pnl = result.ending_equity - result.starting_equity
 
         # ``recent_trades()`` defaults to the newest 200 rows. Reading the
@@ -1731,6 +1767,7 @@ def walk_forward(
     folds: int = 4,
     train_fraction: float = 0.6,
     books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+    funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Roll train/test windows forward and report **out-of-sample** results only.
 
@@ -1774,7 +1811,11 @@ def walk_forward(
         }
         fold_cfg = BacktestConfig(**{**cfg.__dict__})
         fold_cfg.warmup_bars = train_end - start
-        result = Backtester(window, fold_cfg, books_by_symbol=book_window).run()
+        # Funding is looked up by TIMESTAMP, not index, so the whole series is
+        # handed to every fold; without it a linear fold silently priced
+        # funding at the constant 1 bp whatever the real prints were.
+        result = Backtester(window, fold_cfg, books_by_symbol=book_window,
+                            funding_by_symbol=funding_by_symbol).run()
         out.append({
             "fold": i + 1,
             "train_bars": train_end - start,
