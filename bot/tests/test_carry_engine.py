@@ -406,3 +406,26 @@ class TestItCannotExpressADirectionalBet:
                                "carry_engine.py"), encoding="utf-8") as fh:
             body = fh.read()
         assert "live_authorized" not in body
+
+
+def test_a_halted_book_holding_a_position_keeps_reading_its_margin(caplog):
+    import logging
+    import carry_engine as ce
+    from carry_engine import CarryPosition, Leg
+
+    class V:
+        def get_margin_multiple(self, symbol):
+            return 1.1
+
+    e = ce.CarryEngine(broker=V(), max_notional_usd=100.0, borrow_apr=0.0,
+                       execution_mode="overlay", persist=lambda s: None)
+    e.position = CarryPosition(
+        spot=Leg(symbol="BTCUSDT", side="Buy", product="spot"),
+        perp=Leg(symbol="BTCUSDT", side="Sell", product="linear"),
+        opened_ms=1)
+    e.state = ce.BookState.HALTED
+    with caplog.at_level(logging.CRITICAL):
+        d = e.on_candle(mark=100_000.0, funding_bps=1.0, timestamp_ms=10_000)
+    assert d.action == "halted" or d.reason == "KILL_SWITCH_ENGAGED"
+    assert d.detail["halted_margin_multiple"] == 1.1
+    assert "BELOW" in caplog.text

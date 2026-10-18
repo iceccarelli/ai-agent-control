@@ -1091,7 +1091,8 @@ class CarryEngine:
                 except Exception:  # noqa: BLE001
                     logger.critical("the halt still could not be written down")
             return CarryDecision("halted", reason="KILL_SWITCH_ENGAGED",
-                                 state=self.state)
+                                 state=self.state,
+                                 detail=self._halted_watch(timestamp_ms))
 
         if not self._finite(mark) or mark <= 0:
             return self._halt("MARK_UNREADABLE",
@@ -2374,6 +2375,36 @@ class CarryEngine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("carry: risk observation not recorded (%s: %s)",
                            type(exc).__name__, exc)
+
+    HALTED_WATCH_EVERY_MS = 60_000
+
+    def _halted_watch(self, timestamp_ms: int) -> Dict[str, Any]:
+        """A halted book that still holds a position keeps LOOKING at it.
+
+        Read-only: it places nothing. A halt stops the engine trading, not the
+        short from approaching its liquidation price, and a log line is the
+        only thing between that and an operator who has not looked yet.
+        """
+        if self.position is None:
+            return {}
+        now = int(timestamp_ms or 0)
+        last = getattr(self, "_halted_watch_ms", None)
+        if last is not None and now and now - last < self.HALTED_WATCH_EVERY_MS:
+            return {}
+        self._halted_watch_ms = now
+        margin = self._margin_multiple()
+        self._last_margin = margin
+        if margin is None:
+            logger.critical(
+                "carry HALTED with a held position and the margin is "
+                "UNREADABLE; the short is unwatched")
+        elif margin < self.min_margin_multiple:
+            logger.critical(
+                "carry HALTED with a held position and margin %.2fx is BELOW "
+                "the %.2fx floor; the short is near liquidation and the book "
+                "will not act", margin, self.min_margin_multiple)
+        return {"halted_margin_multiple": margin,
+                "margin_floor": self.min_margin_multiple}
 
     def _margin_multiple(self) -> Optional[float]:
         try:
