@@ -1149,7 +1149,10 @@ class LedgerBroker:
         fee_btc, fee_usdt, status, fee_raw = self._resolve_fee(
             result, side=side, product=product)
         ref = str(result.get("order_link_id") or f"fill:{self._ms()}")
-        ms = int(self._ms())
+        # Never behind the journal's last entry: a wall clock that stepped back
+        # must not turn a venue fill into a booking failure.
+        ms = max(int(self._ms()),
+                 self.journal.entries[-1].ms if self.journal.entries else 0)
 
         if product == "spot":
             if side == "Buy":

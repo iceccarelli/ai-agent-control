@@ -1004,8 +1004,9 @@ class StateStore:
         :meth:`clear_kill_switch_by_human`.
         """
         self._exec(
-            "UPDATE kill_switch SET engaged = 1, reason = ?, engaged_epoch = ? "
-            "WHERE id = 1",
+            "UPDATE kill_switch SET reason = CASE WHEN engaged = 1 THEN reason "
+            "ELSE ? END, engaged_epoch = CASE WHEN engaged = 1 THEN "
+            "engaged_epoch ELSE ? END, engaged = 1 WHERE id = 1",
             (str(reason), utc_now_epoch()),
         )
 
@@ -1412,15 +1413,17 @@ class StateStore:
         self._assert_writer()
         with self._lock:
             try:
-                cur = self._conn.execute("SELECT next_id FROM order_seq WHERE id = 1")
+                # ONE statement: a second connection to the same file cannot
+                # read the same number between a SELECT and an UPDATE.
+                cur = self._conn.execute(
+                    "UPDATE order_seq SET next_id = next_id + 1 WHERE id = 1 "
+                    "RETURNING next_id - 1")
                 row = cur.fetchone()
                 if row is None:
                     raise PersistenceError("order_seq row missing")
-                n = int(row["next_id"])
-                self._conn.execute(
-                    "UPDATE order_seq SET next_id = ? WHERE id = 1", (n + 1,)
-                )
-                self._conn.commit()
+                n = int(row[0])
+                if self._tx_depth == 0:
+                    self._conn.commit()
                 return n
             except PersistenceError:
                 raise

@@ -788,3 +788,31 @@ class TestStateStoreReviewFixes:
                     (utc_day(),))
         assert store.ensure_daily_anchor(500.0).start_equity == 500.0
         store.close()
+
+
+def test_order_seq_inside_a_transaction_rolls_back_with_it(tmp_path):
+    from persistence import StateStore
+    store = StateStore(str(tmp_path / "s.db"))
+    first = store.next_order_seq()
+    with pytest.raises(RuntimeError):
+        with store.transaction():
+            store.next_order_seq()
+            raise RuntimeError("boom")
+    assert store.next_order_seq() == first + 1
+
+
+def test_two_connections_never_mint_the_same_order_seq(tmp_path):
+    from persistence import StateStore
+    path = str(tmp_path / "s.db")
+    a, b = StateStore(path), StateStore(path)
+    seen = [x.next_order_seq() for x in (a, b, a, b, b, a)]
+    assert len(set(seen)) == len(seen)
+
+
+def test_a_later_halt_keeps_the_first_incidents_reason(tmp_path):
+    from persistence import StateStore
+    store = StateStore(str(tmp_path / "s.db"))
+    store.trip_kill_switch("FIRST")
+    store.trip_kill_switch("SECOND")
+    engaged, reason = store.is_kill_switch_engaged()
+    assert engaged and reason == "FIRST"
