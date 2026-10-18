@@ -604,6 +604,26 @@ class TestFeeAwareAccounting:
         assert d.ok is False
         assert d.reason == "CONSECUTIVE_LOSSES"
 
+    def test_an_elapsed_streak_breaker_resumes_trading_until_new_losses(
+            self, manager, store):
+        def lose(i):
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Buy", qty=0.01,
+                entry_price=50_000.0, exit_price=49_000.0,
+                gross_pnl=-10.0, entry_fee=0.25, exit_fee=0.25,
+                opened_epoch=utc_now_epoch() - 600 + i,
+                closed_epoch=utc_now_epoch() + i))
+        for i in range(manager.max_consecutive_losses):
+            lose(i)
+        assert manager._gate_consecutive_losses().reason == "CONSECUTIVE_LOSSES"
+        store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
+        assert manager._gate_breaker().ok
+        assert manager._gate_consecutive_losses().ok, \
+            "the same old losses re-tripped the breaker: halted for good"
+        for i in range(manager.max_consecutive_losses):
+            lose(100 + i)
+        assert manager._gate_consecutive_losses().reason == "CONSECUTIVE_LOSSES"
+
     def test_net_returns_are_fee_inclusive(self, store):
         store.record_trade(TradeRecord(
             symbol="BTCUSDT", side="Buy", qty=0.01,

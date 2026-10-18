@@ -1324,13 +1324,33 @@ class StateStore:
             "FROM trades GROUP BY symbol, opened_epoch "
             "ORDER BY last_closed DESC, last_id DESC LIMIT 200"
         )
+        base = self._query("SELECT value FROM meta WHERE key = 'loss_streak_baseline'")
+        baseline = float(base[0]["value"]) if base else 0.0
         n = 0
         for r in rows:
+            if float(r["last_closed"] or 0.0) <= baseline:
+                break           # already answered for by an elapsed breaker
             if float(r["net"]) <= 0.0:
                 n += 1
             else:
                 break
         return n
+
+    def reset_loss_streak(self) -> None:
+        """Forget the losses that tripped a breaker whose cooldown has ended.
+
+        Without this the streak gate re-trips the breaker the moment its
+        cooldown clears, and since only a WINNING trade ends a streak (and none
+        can happen while halted) the cooldown never resumed trading at all.
+        """
+        rows = self._query("SELECT MAX(closed_epoch) AS m FROM trades")
+        latest = float(rows[0]["m"] or 0.0) if rows else 0.0
+        if latest <= 0.0:
+            return
+        self._exec(
+            "INSERT INTO meta(key, value) VALUES('loss_streak_baseline', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (repr(latest),))
 
     # -- positions ---------------------------------------------------------
 

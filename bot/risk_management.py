@@ -475,6 +475,8 @@ class BillionaireRiskManager:
             # Cooldown elapsed: clear it and continue. This is the one automatic
             # reset in the module, and it is a *breaker*, not the kill switch.
             self.store.clear_breaker()
+            if "consecutive losing" in str(breaker.reason):
+                self.store.reset_loss_streak()
         return _allow("BREAKER_CLEAR")
 
     def _gate_symbol_cooldown(self, symbol: str) -> RiskDecision:
