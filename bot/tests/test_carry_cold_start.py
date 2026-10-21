@@ -367,6 +367,15 @@ class TestTheProcessRefusesToStartOnAMismatch:
         bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
         return bot, store
 
+    def test_cold_start_reads_thirty_venue_prints_not_eight(self):
+        seen = []
+        venue = Venue()
+        venue.get_funding_history = lambda symbol, limit=8: (
+            seen.append(limit) or [])
+        bot, _store = self._bot(venue, None)
+        assert bot.carry_cold_start() is True
+        assert seen == [30]
+
     def test_a_clean_venue_starts(self):
         bot, _store = self._bot(Venue(), None)
         assert bot.carry_cold_start() is True
