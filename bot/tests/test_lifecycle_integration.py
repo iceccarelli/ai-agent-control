@@ -276,6 +276,27 @@ class TestDeadStopFollowUps:
         assert store.open_positions(), "the position must not be flattened"
         assert not store.is_kill_switch_engaged()[0]
 
+    def test_the_two_cycle_sequence_books_the_partial_leg_then_reprotects(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(cumExecQty=str(part), avgPrice=str(ENTRY * 1.02))
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()                    # last one cancels the legs
+        # the venue now reports the cancelled, part-filled leg as final
+        exchange.orders[tp]["orderStatus"] = "PartiallyFilledCanceled"
+        for other in meta["tp_order_ids"][1:]:
+            exchange.orders[other]["orderStatus"] = "Cancelled"
+        before = float(store.open_positions()[0]["qty"])
+        engine.observe_exits()                        # books the partial fill
+        rows = store.open_positions()
+        assert rows and float(rows[0]["qty"]) == pytest.approx(before - part)
+        assert len(store.recent_trades()) == 1        # the leg's P&L is booked
+        engine.observe_exits()                        # stop re-judged on the true size
+        assert not store.is_kill_switch_engaged()[0]
+        assert store.open_positions()
+
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         engine.observe_exits()
