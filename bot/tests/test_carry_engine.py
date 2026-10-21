@@ -359,6 +359,14 @@ class TestFundingDrivesEntryAndExit:
         assert decision.acted is False
         assert decision.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
 
+    def test_a_perp_discount_beyond_the_budget_is_refused(self):
+        broker = FakeBroker()
+        eng = engine(broker)
+        decision = eng.on_candle(spot=SPOT, mark=SPOT * 0.98, funding_bps=3.0)
+        assert decision.acted is False
+        assert decision.reason == "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET"
+        assert not broker.orders
+
     def test_sustained_negative_funding_unwinds(self):
         eng = engine(FakeBroker())
         eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
@@ -429,3 +437,10 @@ def test_a_halted_book_holding_a_position_keeps_reading_its_margin(caplog):
     assert d.action == "halted" or d.reason == "KILL_SWITCH_ENGAGED"
     assert d.detail["halted_margin_multiple"] == 1.1
     assert "BELOW" in caplog.text
+
+
+def test_there_is_no_funding_floor_knob_that_nothing_reads():
+    import inspect
+    from carry_engine import CarryEngine
+    assert "min_entry_funding_bps" not in inspect.signature(
+        CarryEngine.__init__).parameters

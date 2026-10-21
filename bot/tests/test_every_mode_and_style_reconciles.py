@@ -188,8 +188,10 @@ class TestTheProductNumbersDidNotMove:
     """OVERLAY/taker is what the programme quotes. Nothing above may touch it."""
 
     def test_overlay_taker_net_is_unchanged(self, runs):
+        # Re-pinned (was 29_766.40 / 79 trades) when the entry gate gained its
+        # perp-DISCOUNT bound: two entries the old gate took are now refused.
         assert runs[("overlay", "taker")]["net_usd"] == pytest.approx(
-            29_766.40, abs=0.01)
+            29_889.40, abs=0.01)
 
     def test_overlay_taker_trade_count_is_unchanged(self, runs):
-        assert runs[("overlay", "taker")]["trades"] == 79
+        assert runs[("overlay", "taker")]["trades"] == 77

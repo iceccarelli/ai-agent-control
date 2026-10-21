@@ -87,8 +87,14 @@ class TestOnTheRealEngineAndCorpus:
             t["funding_usd"] + t["basis_usd"] + t["fees_usd"] + t["borrow_usd"],
             abs=1.0)
 
-    def test_the_unchanged_gate_reproduces_every_historical_entry(self, audit):
-        assert audit["gate_reproduces_every_historical_entry"] is True
+    def test_the_gate_reproduces_the_historical_entries_but_the_discount_bound(
+            self, audit):
+        # The engine decided on the quote; the trade rows carry the FILL, which
+        # slips the short below the quote. Five fills landed past the new
+        # discount bound (they passed it at decision time), so the gate
+        # re-run on the recorded fill prices refuses exactly those.
+        assert audit["trades"] == 77
+        assert audit["gate_reproduced_entries"] == 72
 
     def test_counts_are_consistent(self, audit):
         assert audit["trades"] >= audit["completed_trades"] > 0
@@ -101,7 +107,7 @@ class TestOnTheRealEngineAndCorpus:
         assert audit["verdict"]["assumed_hold_days"] == carry_costs.ASSUMED_HOLD_DAYS
         frozen = audit["sensitivity_to_assumed_hold_in_sample"][0]
         assert frozen["hold_days"] == carry_costs.ASSUMED_HOLD_DAYS
-        assert frozen["entries_passed"] == audit["trades"]   # the engine took them
+        assert frozen["entries_passed"] == audit["gate_reproduced_entries"]
 
     def test_the_early_exit_table_is_ordered_and_ends_at_the_full_hold(self, audit):
         caps = audit["sensitivity_to_early_exit"]

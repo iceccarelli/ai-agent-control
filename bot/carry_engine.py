@@ -88,9 +88,12 @@ DELTA_BAND = 0.02
 #: the world, so the trigger sits well before it is needed.
 MIN_MARGIN_MULTIPLE = 2.0
 
-#: Do not open new carry below this forecast 8h rate. At 0.2 bps per 8h the
-#: annualised gross is ~2.2%, which does not clear the 31 bps entry cost inside
-#: a reasonable hold. Below it, hold cash.
+#: RECORDED, NOT ENFORCED. At 0.2 bps per 8h the annualised gross is ~2.2%,
+#: which does not clear the 31 bps entry cost inside a reasonable hold. The
+#: entry gate that actually decides is `carry_costs.evaluate_entry` (smoothed
+#: funding must be positive AND clear costs and the basis budget); this value
+#: is only kept in the shadow runtime's provenance record. There is no
+#: constructor knob for it: one used to exist and nothing read it.
 MIN_ENTRY_FUNDING_BPS = 0.2
 
 #: The two ways this book can hold the long side (0036).
@@ -591,7 +594,6 @@ class CarryEngine:
                  max_notional_usd: float = 100.0,
                  delta_band: float = DELTA_BAND,
                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
-                 min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
                  borrow_apr: float, execution_mode: str,
                  persist: Any,
                  execution_style: str = TAKER,
@@ -649,7 +651,6 @@ class CarryEngine:
         self.max_notional_usd = float(max_notional_usd)
         self.delta_band = float(delta_band)
         self.min_margin_multiple = float(min_margin_multiple)
-        self.min_entry_funding_bps = float(min_entry_funding_bps)
         self.position: Optional[CarryPosition] = None
         self.state = BookState.FLAT
         self.borrow_apr = float(borrow_apr)

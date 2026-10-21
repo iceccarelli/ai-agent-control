@@ -230,6 +230,21 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
                             "Opening into a wide basis is paying up front for "
                             "carry you have not collected yet."})
 
+    # The same budget, the other way: a perp trading at a DISCOUNT converges
+    # back to spot by costing the short, so an entry basis below minus the
+    # budget gives back more than the hold will earn.
+    if entry_basis < -basis_budget:
+        return CarryVerdict(
+            False, "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET",
+            expected_carry_bps_per_day=carry_per_day,
+            borrow_bps_per_day=borrow_per_day,
+            amortised_round_trip_bps_per_day=round_trip_per_day,
+            net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
+            basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed,
+            detail={"note": "the perp trades below spot by more than the "
+                            "net carry over the hold; convergence would "
+                            "cost the short more than funding pays."})
+
     return CarryVerdict(
         True, "CARRY_CLEARS_COSTS_AND_BASIS",
         expected_carry_bps_per_day=carry_per_day,

@@ -75,6 +75,7 @@ bool may_open_gated(const double *history, int count, double perp, double spot,
 
     if (net_edge <= 0.0) return false;      /* CARRY_BELOW_COST_OF_CAPITAL   */
     if (entry_basis > net_edge * p.hold_days) return false; /* BASIS_BUDGET  */
+    if (entry_basis < -(net_edge * p.hold_days)) return false; /* DISCOUNT   */
     return true;
 }
 

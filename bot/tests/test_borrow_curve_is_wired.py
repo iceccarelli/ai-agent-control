@@ -80,9 +80,9 @@ class TestTheScalarPathIsUntouched:
         assert b["trades"] == a["trades"]
 
     def test_the_headline_overlay_number_has_not_moved(self, rows):
-        """+7.23%/yr at 0% borrow is what this corpus has always reported."""
+        """+7.26%/yr at 0% borrow (7.23 before the perp-discount entry bound)."""
         r = settle(rows, borrow_apr=0.0)
-        assert r["net_annualised_pct"] == pytest.approx(7.23, abs=0.01)
+        assert r["net_annualised_pct"] == pytest.approx(7.26, abs=0.01)
 
 
 @needs_corpus

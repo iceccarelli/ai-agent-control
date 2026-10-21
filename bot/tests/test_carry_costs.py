@@ -181,3 +181,14 @@ class TestItDecidesNothingElse:
         assert param.default is inspect.Parameter.empty
         assert not hasattr(cc, "DEFAULT_BORROW_APR")
         assert cc.ASSUMED_HOLD_DAYS == 30.0
+
+
+class TestThePerpDiscountBound:
+    def test_a_discount_beyond_the_budget_is_refused(self):
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(-150.0))
+        assert v.allowed is False
+        assert v.reason == "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET"
+
+    def test_a_small_discount_inside_the_budget_is_allowed(self):
+        v = cc.evaluate_entry(round_trip_bps=cc.ROUND_TRIP_BPS, borrow_apr=0.05, funding_prints_bps=[2.0] * 3, **at_basis(-20.0))
+        assert v.allowed is True
