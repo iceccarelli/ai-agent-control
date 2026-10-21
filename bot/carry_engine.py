@@ -960,6 +960,15 @@ class CarryEngine:
                 tail = tail[:-1]        # on_candle books the live newest
             self._funding_history = [r for _s, r in tail][-self.FUNDING_HISTORY:]
             reseeded = True
+        # The same mark on_candle uses (the current one) when the venue will say;
+        # the entry price only as a last resort.
+        price = 0.0
+        try:
+            price = float(self.broker.get_mark(self.perp_symbol))
+        except Exception:  # noqa: BLE001
+            price = 0.0
+        if not (self._finite(price) and price > 0):
+            price = float(position.perp.avg_price or 0.0)
         for rate, stamp in missed:
             if reseeded:
                 self._last_print_ms = max(self._last_print_ms or 0, stamp)
@@ -971,9 +980,9 @@ class CarryEngine:
             # An ESTIMATE, like on_candle's: the settlement mark is unknown
             # here, so the entry price stands in for it. The ledger books
             # what the venue actually paid.
-            if position.perp.avg_price > 0:
+            if price > 0:
                 position.funding_collected += (
-                    rate / 1e4) * position.perp.filled_qty * position.perp.avg_price
+                    rate / 1e4) * position.perp.filled_qty * price
             if rate < 0:
                 position.negative_funding_streak += 1
             else:

@@ -778,3 +778,17 @@ def test_a_hole_reseeds_the_history_from_the_venue_tail_not_empty():
     e.venue_prints_at_start = [(0.5, base), (0.6, base + 100), (0.7, base + 200)]
     e._catch_up_missed_prints()
     assert e._funding_history == [0.5, 0.6]       # newest left for on_candle
+
+
+def test_the_catch_up_estimate_uses_the_current_mark_when_the_venue_gives_one():
+    venue = Venue(perp=0.001)
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    e.broker.get_mark = lambda symbol: MARK * 1.5
+    e.position = opened(venue).position
+    e.position.opened_ms = 0
+    e.position.funding_collected = 0.0
+    e._last_print_ms = 1_000
+    e.venue_prints_at_start = [(2.0, 2_000), (2.0, 3_000)]
+    e._catch_up_missed_prints()               # one missed, newest left live
+    assert e.position.funding_collected == pytest.approx(
+        (2.0 / 1e4) * e.position.perp.filled_qty * MARK * 1.5)
