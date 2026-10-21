@@ -271,10 +271,22 @@ class TestDeadStopFollowUps:
             self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         client.cancel_order = lambda **kw: False        # the venue refuses
-        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 3):
-            engine.observe_exits()
-        assert store.open_positions(), "the position must not be flattened"
-        assert not store.is_kill_switch_engaged()[0]
+        outcomes = []
+        for _ in range(2 * engine.DEAD_STOP_MAX_DEFERRALS + 3):
+            summary = engine.observe_exits()
+            outcomes.append(summary.get("stop_dead_outcome", {}).get("BTCUSDT"))
+        # after repeated refusals the engine stops waiting and handles the
+        # naked position itself: it must end re-protected or flattened, never
+        # silently left on a dead stop
+        assert any(o in ("REPROTECTED", "FLATTENED") for o in outcomes), outcomes
+        rows = store.open_positions()
+        if rows:
+            import json as _j
+            m = rows[0]["meta"]
+            m = _j.loads(m) if isinstance(m, str) else m
+            assert m["stop_order_link_id"] != meta["stop_order_link_id"]
+            assert exchange.orders[m["stop_order_link_id"]]["orderStatus"] in (
+                "Untriggered", "New")
 
     def test_the_two_cycle_sequence_books_the_partial_leg_then_reprotects(
             self, stack):
@@ -293,9 +305,24 @@ class TestDeadStopFollowUps:
         rows = store.open_positions()
         assert rows and float(rows[0]["qty"]) == pytest.approx(before - part)
         assert len(store.recent_trades()) == 1        # the leg's P&L is booked
-        engine.observe_exits()                        # stop re-judged on the true size
+        engine.observe_exits()                        # stop re-judged
         assert not store.is_kill_switch_engaged()[0]
-        assert store.open_positions()
+        import json as _j
+        m = store.open_positions()[0]["meta"]
+        m = _j.loads(m) if isinstance(m, str) else m
+        # the booking replaced the dead stop with a live one on the true size
+        assert m["stop_order_link_id"] != meta["stop_order_link_id"]
+        assert exchange.orders[m["stop_order_link_id"]]["orderStatus"] in (
+            "Untriggered", "New")
+
+    def test_a_leg_cancelled_with_a_fill_is_booked_not_lost(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(cumExecQty=str(part), avgPrice=str(ENTRY * 1.02),
+                                   orderStatus="Cancelled")
+        engine.observe_exits()
+        assert len(store.recent_trades()) == 1
 
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)

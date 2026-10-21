@@ -1157,6 +1157,24 @@ class TestAfter403ReadsStandDownButWritesDoNot:
             client.get_equity()
         assert len(exchange.requests) == before
 
+    def test_a_cooldown_on_one_read_endpoint_does_not_silence_the_others(
+            self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            client.get_equity()
+        before = len(exchange.requests)
+        client.get_ticker("BTCUSDT") if hasattr(client, "get_ticker") else None
+        assert len(exchange.requests) > before
+
+    def test_a_write_403_does_not_arm_the_read_cooldown(self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            client._request("POST", "/v5/position/trading-stop",
+                            body={"category": "linear"}, signed=True)
+        before = len(exchange.requests)
+        client.get_equity()
+        assert len(exchange.requests) > before
+
     def test_a_write_is_still_attempted_during_the_cooldown(self, client, exchange):
         exchange.scripted = [(403, "forbidden")]
         with pytest.raises(bc.PermanentAPIError):

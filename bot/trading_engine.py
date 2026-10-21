@@ -1694,7 +1694,12 @@ class TradingEngine:
                     # where it is seen. Re-protect, or flatten.
                     dead_stop = link
                     continue
-                if status not in ("Filled", "PartiallyFilledCanceled"):
+                cancelled_with_fill = (
+                    status in ("Cancelled", "Deactivated")
+                    and link != str(meta.get("stop_order_link_id") or "")
+                    and float(order.get("cumExecQty") or 0.0) > 0.0)
+                if status not in ("Filled", "PartiallyFilledCanceled") \
+                        and not cancelled_with_fill:
                     continue
                 try:
                     qty = float(order.get("cumExecQty") or 0.0)
@@ -1731,7 +1736,17 @@ class TradingEngine:
                     # Let the part-filled leg be booked first - but not for
                     # ever: a thin book can leave it part-filled for hours.
                     n = deferrals[symbol] = deferrals.get(symbol, 0) + 1
-                    if n > self.DEAD_STOP_MAX_DEFERRALS:
+                    if n > 2 * self.DEAD_STOP_MAX_DEFERRALS:
+                        # The leg cannot be cancelled or never books: stop
+                        # waiting and judge/protect the position as it is.
+                        logger.critical(
+                            "observe_exits: %s stop %s has stayed dead for %d "
+                            "cycles with a take-profit leg in flight; "
+                            "protecting the position as recorded", symbol,
+                            dead_stop, n)
+                        self._handle_dead_spot_stop(symbol, row, dead_stop,
+                                                    summary)
+                    elif n > self.DEAD_STOP_MAX_DEFERRALS:
                         logger.critical(
                             "observe_exits: %s stop %s is dead and a "
                             "take-profit leg has stayed part-filled for %d "
