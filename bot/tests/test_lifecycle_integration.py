@@ -324,6 +324,44 @@ class TestDeadStopFollowUps:
         engine.observe_exits()
         assert len(store.recent_trades()) == 1
 
+    def test_the_stuck_leg_retry_needs_no_balance_read_and_cancels_engine_ids(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        cancelled = []
+        real = client.cancel_order
+
+        def spy(**kw):
+            cancelled.append(kw["order_link_id"])
+            return real(**kw)
+        client.cancel_order = spy
+        # the balance endpoint is broken AND the local order table forgets the legs
+        client.get_coin_balance = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("wallet down"))
+        engine._cancel_take_profit_legs = lambda symbol: True
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()
+        assert set(meta["tp_order_ids"]) <= set(cancelled)
+
+    def test_a_stuck_leg_reports_the_symbol_once_per_cycle(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        client.cancel_order = lambda **kw: False
+        for _ in range(2 * engine.DEAD_STOP_MAX_DEFERRALS):
+            engine.observe_exits()
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead") == ["BTCUSDT"]
+
+    def test_an_unpriceable_cancelled_fill_defers_instead_of_the_stale_size_path(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        exchange.orders[tp].update(orderStatus="Cancelled", cumExecQty="0.0001",
+                                   avgPrice="0", cumExecValue="0", price="0")
+        for other in meta["tp_order_ids"][1:]:
+            exchange.orders[other]["orderStatus"] = "New"
+        summary = engine.observe_exits()
+        assert "stop_dead_outcome" not in summary      # no protect/flatten attempt
+        assert not store.is_kill_switch_engaged()[0]
+
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         engine.observe_exits()
