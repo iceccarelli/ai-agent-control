@@ -198,6 +198,22 @@ class TestADeadSpotStopIsNotLeftLookingProtected:
             assert summary["stop_dead_outcome"]["BTCUSDT"] == "FLATTENED"
 
 
+class TestADeadStopOverPhantomCoin:
+    def test_a_dead_stop_with_no_coin_is_not_reprotected_or_sold(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Cancelled"
+        exchange.balances["BTC"] = 0.0           # sold/moved behind our back
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead_unverified") == ["BTCUSDT"]
+        assert "stop_dead" not in summary
+        assert not store.is_kill_switch_engaged()[0]
+        assert store.open_positions()           # left for reconcile
+
+
 class TestARefusedEntryStartsTheSymbolCooldown:
     def test_the_same_refused_order_is_not_resent_next_tick(self, stack):
         engine, client, risk, store, exchange = stack

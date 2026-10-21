@@ -1651,9 +1651,13 @@ class TradingEngine:
             symbol = str(row["symbol"])
             meta = self._row_meta(row)
             booked = set(meta.get("booked_exit_orders") or [])
-            ids = [str(meta.get("stop_order_link_id") or "")] + [
-                str(i) for i in (meta.get("tp_order_ids") or [])]
+            # Take-profit legs first: a leg that sold part of the position is
+            # what makes the original-size stop fail, and it must be booked
+            # (resizing the stop) before the stop is judged dead.
+            ids = [str(i) for i in (meta.get("tp_order_ids") or [])] + [
+                str(meta.get("stop_order_link_id") or "")]
             summary["checked"] += 1
+            dead_stop = ""
             for link in ids:
                 if not link or link in booked:
                     continue
@@ -1675,14 +1679,8 @@ class TradingEngine:
                     # our back. The ledger still calls this position
                     # protected; spot has no mid-cycle naked check, so this is
                     # where it is seen. Re-protect, or flatten.
-                    logger.critical(
-                        "observe_exits: the %s stop %s is %s with nothing "
-                        "filled; the position is NAKED", symbol, link, status)
-                    summary.setdefault("stop_dead", []).append(symbol)
-                    outcome = self._protect_or_close_naked(
-                        symbol, row, reason="SPOT_STOP_DEAD")
-                    summary.setdefault("stop_dead_outcome", {})[symbol] = outcome
-                    break
+                    dead_stop = link
+                    continue
                 if status not in ("Filled", "PartiallyFilledCanceled"):
                     continue
                 try:
@@ -1715,7 +1713,42 @@ class TradingEngine:
                 # One exit per symbol per cycle: a partial exit replaces the
                 # stop, so the row is re-read next cycle.
                 break
+            else:
+                if dead_stop:
+                    self._handle_dead_spot_stop(symbol, row, dead_stop, summary)
         return summary
+
+    def _handle_dead_spot_stop(self, symbol: str, row: Mapping[str, Any],
+                               link: str, summary: Dict[str, Any]) -> None:
+        """A spot stop is Rejected/Cancelled/Deactivated with nothing sold."""
+        try:
+            held = float(self.client.get_coin_balance(
+                self.client._base_asset(symbol)))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("observe_exits: cannot read the %s balance to judge "
+                         "the dead stop %s: %s", symbol, link, exc)
+            summary["unread"] += 1
+            return
+        if held < float(row["qty"]) * 0.98:
+            # The coin is not (all) there: the position was sold or moved
+            # behind the row's back. Re-protecting or "emergency selling" coin
+            # that is not held would only trip the kill switch; leave it for
+            # reconcile and say so.
+            logger.critical(
+                "observe_exits: the %s stop %s is dead and only %.8g of the "
+                "%.8g recorded is held; not re-protecting phantom coin",
+                symbol, link, held, float(row["qty"]))
+            self.store.journal(symbol, "STOP_DEAD_COIN_MISSING", link,
+                               {"held": held, "recorded": float(row["qty"])})
+            summary.setdefault("stop_dead_unverified", []).append(symbol)
+            return
+        logger.critical(
+            "observe_exits: the %s stop %s is dead with nothing filled; the "
+            "position is NAKED", symbol, link)
+        summary.setdefault("stop_dead", []).append(symbol)
+        outcome = self._protect_or_close_naked(
+            symbol, row, reason="SPOT_STOP_DEAD", prefer_recorded_stop=True)
+        summary.setdefault("stop_dead_outcome", {})[symbol] = outcome
 
     @staticmethod
     def _rows_of_this_exit(rows: List[Dict[str, Any]],
@@ -2047,7 +2080,8 @@ class TradingEngine:
             order_link_id=str(current.get("order_link_id") or ""), meta=meta)
 
     def _protect_or_close_naked(
-        self, symbol: str, row: Dict[str, Any], *, reason: str
+        self, symbol: str, row: Dict[str, Any], *, reason: str,
+        prefer_recorded_stop: bool = False
     ) -> str:
         """The one reaction to "naked": re-protect, or flatten if that fails.
 
@@ -2063,6 +2097,14 @@ class TradingEngine:
         entry = float(row["entry_price"])
         stop_fraction = float(getattr(self.cfg, "STOP_LOSS_PCT", 0.02))
         stop = entry * (1 - stop_fraction) if side == "Buy" else entry * (1 + stop_fraction)
+        if prefer_recorded_stop:
+            # A ratcheted/tightened stop must not be loosened to the default.
+            try:
+                recorded = float(row.get("stop_price") or 0.0)
+            except (TypeError, ValueError):
+                recorded = 0.0
+            if recorded > 0.0:
+                stop = recorded
 
         # Crash-boundary invariant: do not mint a SECOND live stop order for
         # a position that already has one resting at the venue. This is the
@@ -2107,10 +2149,12 @@ class TradingEngine:
             self.store.set_position_stop(symbol, stop)
             self._record_stop_id(symbol, row, str(placed))
             return "REPROTECTED"
-        self._emergency_close(
+        report = self._emergency_close(
             symbol=symbol, exit_side=exit_side, qty=float(row["qty"]),
             filters=filters, reason=reason,
         )
+        if not (report.detail or {}).get("closed", True):
+            return "FLATTEN_FAILED"
         return "FLATTENED"
 
     def reconcile(self) -> Dict[str, Any]:
