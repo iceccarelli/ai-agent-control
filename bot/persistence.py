@@ -1336,6 +1336,8 @@ class StateStore:
         rows = self._query(
             "SELECT COUNT(*) AS n,"
             " (SELECT COUNT(*) FROM trades WHERE price_provisional = 1) AS prov_n,"
+            " SUM(CASE WHEN json_extract(meta, '$.funding_booked') = 0"
+            "     THEN 1 ELSE 0 END) AS funding_unbooked_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
             "     THEN 1 ELSE 0 END) AS realized_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
@@ -1350,6 +1352,10 @@ class StateStore:
         return {
             "trades": n,
             "price_provisional_trades": int(r["prov_n"] or 0),
+            # Perpetual trades whose net_pnl carries NO funding cash flow: the
+            # directional book does not book funding, so for these the net is
+            # fees-only and must not be read as realised net economics.
+            "funding_unbooked_trades": int(r["funding_unbooked_n"] or 0),
             "fees_realized_trades": realized_n,
             "fees_unconfirmed_trades": n - realized_n,
             "realized_net_pnl": float(r["realized_net"] or 0.0),

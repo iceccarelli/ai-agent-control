@@ -396,3 +396,15 @@ def test_a_take_profit_leg_of_unknown_outcome_is_still_tracked(stack):
     row = store.open_positions()[0]
     meta = json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
     assert seen[0] in meta["tp_order_ids"]
+
+
+def test_perpetual_trades_are_counted_as_funding_unbooked(stack):
+    engine, client, risk, store, exchange = stack
+    from persistence import TradeRecord
+    for booked in (True, False):
+        store.record_trade(TradeRecord(
+            symbol="BTCUSDT", side="Buy", qty=1.0, entry_price=100.0,
+            exit_price=101.0, gross_pnl=1.0, entry_fee=0.0, exit_fee=0.0,
+            opened_epoch=1.0, closed_epoch=2.0 + booked,
+            meta={"funding_booked": booked}, dedupe_key=f"k{booked}"))
+    assert store.fee_evidence()["funding_unbooked_trades"] == 1
