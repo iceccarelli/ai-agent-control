@@ -378,6 +378,28 @@ class TestDeadStopFollowUps:
         assert any(d.get("decision") == "EXIT_PRICE_APPROXIMATED"
                    for d in store.recent_decisions())
 
+    def test_with_reserved_coin_the_cancel_first_path_still_reprotects(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        exchange.reserve_limit_sells = True      # resting legs reserve their coin
+        exchange.balances["BTC"] = float(store.open_positions()[0]["qty"])
+        tp = meta["tp_order_ids"][0]
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(cumExecQty=str(part), avgPrice=str(ENTRY * 1.02))
+        # sanity: nothing is free for a market sell while the legs rest
+        assert exchange._free("BTC", exchange.balances["BTC"]) < float(
+            store.open_positions()[0]["qty"])
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()                # last one cancels the legs
+        for t in meta["tp_order_ids"]:
+            if exchange.orders[t]["orderStatus"] == "Cancelled" and t == tp:
+                exchange.orders[t]["orderStatus"] = "PartiallyFilledCanceled"
+        engine.observe_exits()                    # books the partial fill
+        engine.observe_exits()
+        assert not store.is_kill_switch_engaged()[0]
+        assert store.open_positions()
+        free = exchange._free("BTC", exchange.balances["BTC"])
+        assert free >= float(store.open_positions()[0]["qty"]) - 1e-9
+
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         engine.observe_exits()
