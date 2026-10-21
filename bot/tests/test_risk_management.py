@@ -994,3 +994,32 @@ class TestReviewFollowUps:
         store._exec("INSERT INTO meta(key, value) VALUES"
                     "('loss_streak_baseline', ?)", (repr(t0 + 100),))
         assert store.consecutive_losses() == 0
+
+
+class TestAHumanCanRebaseTheDailyAnchorAfterAWithdrawal:
+    def test_the_withdrawal_is_not_a_loss_once_a_human_says_so(self, store):
+        store.update_equity(10_000.0)
+        assert store.daily_loss_fraction(8_000.0) == pytest.approx(0.2)
+        store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 8_000.0)
+        assert store.daily_loss_fraction(8_000.0) == pytest.approx(0.0)
+        assert store.daily_loss_fraction(7_200.0) == pytest.approx(0.1)
+
+    def test_it_refuses_without_the_exact_acknowledgement(self, store):
+        from persistence import PersistenceError
+        store.update_equity(10_000.0)
+        with pytest.raises(PersistenceError):
+            store.rebase_daily_anchor_by_human("please", 8_000.0)
+        with pytest.raises(PersistenceError):
+            store.rebase_daily_anchor_by_human(
+                "HUMAN_REBASED_DAILY_ANCHOR", float("nan"))
+        assert store.daily_loss_fraction(8_000.0) == pytest.approx(0.2)
+
+    def test_no_automated_code_calls_it(self):
+        import glob
+        import os
+        root = os.path.join(os.path.dirname(__file__), "..")
+        for path in glob.glob(os.path.join(root, "*.py")):
+            if path.endswith("persistence.py"):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                assert "rebase_daily_anchor_by_human" not in fh.read(), path

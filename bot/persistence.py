@@ -1166,6 +1166,27 @@ class StateStore:
             "WHERE id = 1"
         )
 
+    def rebase_daily_anchor_by_human(self, operator_ack: str,
+                                     equity: float) -> None:
+        """Restart today's daily-loss measurement from `equity`.
+
+        For the one case the bot cannot judge: an operator moved money
+        (withdrawal, deposit, transfer) and the equity change is not a trading
+        loss. Human-only, never called from automated code: a brake the bot
+        can reset is not a brake.
+        """
+        if operator_ack != "HUMAN_REBASED_DAILY_ANCHOR":
+            raise PersistenceError(
+                "rebasing the daily anchor requires the exact operator "
+                "acknowledgement; this is a human-only action")
+        eq = float(equity)
+        if not (eq == eq) or eq <= 0.0 or eq in (float("inf"),):
+            raise PersistenceError(f"refusing to rebase onto equity {equity!r}")
+        day = utc_day()
+        self.ensure_daily_anchor(eq, day)
+        self._exec("UPDATE daily_anchor SET start_equity = ?, realised_pnl = 0.0 "
+                   "WHERE day = ?", (eq, day))
+
     # -- per-symbol cooldown ----------------------------------------------
 
     def set_symbol_cooldown(self, symbol: str, seconds: float, reason: str = "") -> None:
