@@ -367,3 +367,32 @@ class TestNoSecondCloseBesideAnUnknownOne:
         # unknown again - what matters is that it was ALLOWED to be sent)
         assert second.reason != "CLOSE_PENDING"
         assert calls.count("close") == 2
+
+
+def test_a_position_reply_without_a_list_is_not_flat(stack):
+    import bybit_connection as bc
+    engine, client, risk, store, exchange = stack
+    client.is_linear = True
+    client._request = lambda *a, **k: {"retCode": 0, "result": {}}
+    with pytest.raises(bc.PermanentAPIError):
+        client.get_position("BTCUSDT")
+
+
+def test_a_take_profit_leg_of_unknown_outcome_is_still_tracked(stack):
+    import json
+    engine, client, risk, store, exchange = stack
+    real = client.place_take_profit
+    seen = []
+
+    def flaky(**kw):
+        res = real(**kw)
+        seen.append(res.order_link_id)
+        if len(seen) == 1:
+            return type(res)(ok=False, order_link_id=res.order_link_id,
+                             reason="OUTCOME_UNKNOWN")
+        return res
+    client.place_take_profit = flaky
+    assert engine.execute(buy_intent()).ok
+    row = store.open_positions()[0]
+    meta = json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+    assert seen[0] in meta["tp_order_ids"]
