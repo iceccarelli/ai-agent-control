@@ -261,6 +261,8 @@ class RequestsTransport(Transport):
             method.upper(), url, headers=dict(headers), params=params,
             data=body, timeout=timeout,
         )
+        #: The headers of the LAST response (rate-limit reset stamp lives here).
+        self.last_headers = {k.lower(): v for k, v in response.headers.items()}
         return response.status_code, response.text
 
 
@@ -570,7 +572,10 @@ class BybitClient:
 
             if status in TRANSIENT_HTTP:
                 last_error = TransientAPIError(f"HTTP {status}", payload=text)
-                self._backoff(attempt)
+                if status == 429:
+                    self._rate_limit_backoff(attempt)
+                else:
+                    self._backoff(attempt)
                 continue
             if status == 401 or status == 403:
                 raise PermanentAPIError(f"auth rejected: HTTP {status}", payload=text)
@@ -604,13 +609,36 @@ class BybitClient:
                     pass
             if ret_code in TRANSIENT_RET_CODES:
                 last_error = TransientAPIError(ret_msg, ret_code, payload_json)
-                self._backoff(attempt)
+                if ret_code in (10006, 10018):
+                    self._rate_limit_backoff(attempt)
+                else:
+                    self._backoff(attempt)
                 continue
 
             raise PermanentAPIError(ret_msg, ret_code, payload_json)
 
         assert last_error is not None
         raise last_error
+
+    RATE_LIMIT_MAX_WAIT_S = 5.0
+
+    def _rate_limit_backoff(self, attempt: int) -> None:
+        """Wait until the venue says the window resets (capped), not a guess.
+
+        Bybit reports the reset instant in `X-Bapi-Limit-Reset-Timestamp`
+        (epoch ms). Retrying inside the window just spends the retries.
+        """
+        wait = min(2.0, 0.15 * (2 ** (attempt - 1)))
+        try:
+            headers = getattr(self.transport, "last_headers", None) or {}
+            reset = headers.get("x-bapi-limit-reset-timestamp")
+            if reset is not None:
+                until = (float(reset) - self._now_ms()) / 1000.0
+                if until == until and until > wait:
+                    wait = min(until + 0.05, self.RATE_LIMIT_MAX_WAIT_S)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(wait)
 
     @staticmethod
     def _backoff(attempt: int) -> None:

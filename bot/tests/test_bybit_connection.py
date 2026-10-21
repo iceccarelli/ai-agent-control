@@ -1120,3 +1120,28 @@ class TestPrivateStreamIsPerVenue:
             USE_TESTNET = venue != "mainnet"
         c = bc.BybitClient(config=VenueCfg(), store=store, transport=exchange)
         assert c.ws_private_url == url
+
+
+class TestRateLimitWaitsForTheVenuesResetStamp:
+    def test_it_sleeps_until_the_reset_header_not_the_short_guess(
+            self, client, exchange, monkeypatch):
+        slept = []
+        monkeypatch.setattr(bc.time, "sleep", lambda s: slept.append(s))
+        now = client._now_ms()
+        exchange.last_headers = {"x-bapi-limit-reset-timestamp": str(now + 3000)}
+        exchange.scripted = [
+            (200, json.dumps({"retCode": 10006, "retMsg": "rate limit", "result": {}}))
+        ]
+        assert client.get_equity() == pytest.approx(10_000.0)
+        assert slept and 2.5 <= max(slept) <= bc.BybitClient.RATE_LIMIT_MAX_WAIT_S
+
+    def test_the_wait_is_capped(self, client, exchange, monkeypatch):
+        slept = []
+        monkeypatch.setattr(bc.time, "sleep", lambda s: slept.append(s))
+        exchange.last_headers = {
+            "x-bapi-limit-reset-timestamp": str(client._now_ms() + 600_000)}
+        exchange.scripted = [
+            (200, json.dumps({"retCode": 10006, "retMsg": "rate limit", "result": {}}))
+        ]
+        client.get_equity()
+        assert max(slept) <= bc.BybitClient.RATE_LIMIT_MAX_WAIT_S
