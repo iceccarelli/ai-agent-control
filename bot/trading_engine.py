@@ -1656,6 +1656,12 @@ class TradingEngine:
         deferrals = self.__dict__.setdefault("_dead_stop_deferrals", {})
         for sym in [s for s in deferrals if s not in {k for k, _ in live_stops}]:
             deferrals.pop(sym, None)
+        # Take-profit legs seen terminal with NOTHING filled (cancelled by us or
+        # the venue) are not read again; in memory only, so a restart re-reads
+        # each once. Dropped with the row.
+        dead_tps = self.__dict__.setdefault("_dead_tp_legs", set())
+        open_symbols = {str(r["symbol"]) for r in open_rows}
+        dead_tps.intersection_update({k for k in dead_tps if k[0] in open_symbols})
         for row in open_rows:
             symbol = str(row["symbol"])
             meta = self._row_meta(row)
@@ -1669,7 +1675,7 @@ class TradingEngine:
             dead_stop = ""
             tp_in_flight = False
             for link in ids:
-                if not link or link in booked:
+                if not link or link in booked or (symbol, link) in dead_tps:
                     continue
                 try:
                     order = self.client.get_order(symbol=symbol, order_link_id=link)
@@ -1681,6 +1687,11 @@ class TradingEngine:
                 if not order:
                     continue
                 status = str(order.get("orderStatus", ""))
+                if (link != str(meta.get("stop_order_link_id") or "")
+                        and status in ("Cancelled", "Rejected", "Deactivated")
+                        and not float(order.get("cumExecQty") or 0.0) > 0.0):
+                    dead_tps.add((symbol, link))
+                    continue
                 if (link != str(meta.get("stop_order_link_id") or "")
                         and status == "PartiallyFilled"):
                     tp_in_flight = True     # coin is leaving; book it first

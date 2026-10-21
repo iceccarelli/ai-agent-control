@@ -400,6 +400,31 @@ class TestDeadStopFollowUps:
         free = exchange._free("BTC", exchange.balances["BTC"])
         assert free >= float(store.open_positions()[0]["qty"]) - 1e-9
 
+    def test_a_cancelled_unfilled_leg_is_not_read_every_cycle(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        tps = meta["tp_order_ids"]
+        assert tps
+        for t in tps:
+            exchange.orders[t]["orderStatus"] = "Cancelled"
+        reads = []
+        real = client.get_order
+
+        def spy(**kw):
+            reads.append(kw["order_link_id"])
+            return real(**kw)
+        client.get_order = spy
+        engine.observe_exits()
+        first = [r for r in reads if r in tps]
+        reads.clear()
+        engine.observe_exits()
+        engine.observe_exits()
+        assert len(first) == len(tps)
+        assert not [r for r in reads if r in tps]      # not read again
+
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         engine.observe_exits()
