@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from unittest import mock
 
 
@@ -21,6 +22,7 @@ from carry_engine import BookState  # noqa: E402
 from persistence import PersistenceError, StateStore  # noqa: E402
 from test_carry_fee_truth import build, modern  # noqa: E402
 from test_carry_funding_truth import make_bot, tick  # noqa: E402
+import main as _main  # noqa: E402
 
 
 def _hedged(tmp_path):
@@ -677,3 +679,41 @@ def test_cold_start_logs_the_leverage_the_venue_reports_and_sets_nothing(
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "7x leverage" in text and "neither set nor gates" in text
     assert not [c for c in venue.calls if "set-leverage" in c[1]]
+
+
+class TestAcquireBorrowIsBooked:
+    def _bot(self, mode, apr):
+        import types
+        import ledger as L
+        leg = types.SimpleNamespace(filled_qty=0.01, avg_price=100_000.0)
+        pos = types.SimpleNamespace(spot=leg, opened_ms=0)
+        carry = types.SimpleNamespace(execution_mode=mode, borrow_apr=apr,
+                                      position=pos)
+        bot = _main.TradingBot.__new__(_main.TradingBot)
+        bot.carry = carry
+        return bot, carry, L.Journal()
+
+    def test_a_held_acquire_pair_accrues_borrow_in_the_journal(self):
+        bot, carry, journal = self._bot("acquire", 0.10)
+        now = int(time.time() * 1000)
+        bot._borrow_since_ms = now - 24 * 3_600_000      # held a day
+        bot._borrow_notional_usd = 1_000.0
+        bot._accrue_carry_borrow(journal, 100_000.0)
+        usd = journal.statement()["borrow_usd"]
+        assert usd == pytest.approx(1_000.0 * 0.10 / 365.0, rel=0.02)
+
+    def test_the_overlay_books_no_borrow(self):
+        bot, carry, journal = self._bot("overlay", 0.10)
+        bot._borrow_since_ms = int(time.time() * 1000) - 86_400_000
+        bot._borrow_notional_usd = 1_000.0
+        bot._accrue_carry_borrow(journal, 100_000.0)
+        assert journal.statement()["borrow_usd"] == 0.0
+
+    def test_the_closing_tick_posts_the_rest_and_stops(self):
+        bot, carry, journal = self._bot("acquire", 0.10)
+        carry.position = None
+        bot._borrow_since_ms = int(time.time() * 1000) - 3_600_000 // 2
+        bot._borrow_notional_usd = 1_000.0
+        bot._accrue_carry_borrow(journal, 100_000.0)
+        assert journal.statement()["borrow_usd"] > 0.0
+        assert bot._borrow_since_ms is None

@@ -1217,6 +1217,7 @@ class TradingBot:
             journal = getattr(self, "carry_journal", None)
             if journal is not None:
                 self._book_carry_funding(journal, symbol, decision)
+                self._accrue_carry_borrow(journal, spot)
                 try:
                     self.store.save_ledger(journal.to_rows())
                     self._journal_unsaved = False
@@ -1292,6 +1293,60 @@ class TradingBot:
     #: at once whenever a lifecycle has no current reconciliation record.
     RECONCILE_POLL_MS = 3_600_000
     _last_reconcile_ms = 0
+
+    #: Borrow accrues continuously; it is posted in chunks of at least this
+    #: long (and in full when the pair closes), so the journal does not take
+    #: an entry per tick.
+    BORROW_POST_EVERY_MS = 3_600_000
+    _borrow_since_ms: Optional[int] = None
+    _borrow_notional_usd = 0.0
+
+    def _accrue_carry_borrow(self, journal: Any, spot_mark: float) -> None:
+        """Book the financing cost of an ACQUIRE pair into the journal.
+
+        The engine's entry gate prices borrow (`borrow_apr`) but the live
+        journal never booked it, so `net_usd` ignored a real cost of the
+        financed spot leg. Overlay holds the client's own coin: no borrow.
+        Never raises into the loop.
+        """
+        try:
+            carry = self.carry
+            if carry is None or carry.execution_mode != "acquire":
+                return
+            apr = float(carry.borrow_apr)
+            if not (apr > 0.0):
+                return
+            now = int(time.time() * 1000)
+            position = carry.position
+            if position is not None:
+                spot_leg = position.spot
+                notional = (float(spot_leg.filled_qty)
+                            * float(spot_mark or spot_leg.avg_price or 0.0))
+                if self._borrow_since_ms is None:
+                    self._borrow_since_ms = int(position.opened_ms or now)
+                    self._borrow_notional_usd = notional
+                    return
+                if now - self._borrow_since_ms < self.BORROW_POST_EVERY_MS:
+                    self._borrow_notional_usd = notional
+                    return
+            elif self._borrow_since_ms is None:
+                return
+            import ledger as _ledger
+            held_ms = max(0, now - self._borrow_since_ms)
+            usd = (self._borrow_notional_usd * apr
+                   * held_ms / (365.0 * 86_400_000.0))
+            if usd > 0.0:
+                newest = max((e.ms for e in journal.entries), default=0)
+                _ledger.borrow(journal, ms=max(now, int(newest)),
+                               ref=f"borrow:{now}", usd=usd)
+            if position is not None:
+                self._borrow_since_ms = now
+                self._borrow_notional_usd = notional
+            else:
+                self._borrow_since_ms = None
+                self._borrow_notional_usd = 0.0
+        except Exception:  # noqa: BLE001
+            logger.exception("borrow accrual failed; the cost is not booked")
 
     def _book_carry_funding(self, journal: Any, symbol: str,
                             decision: Any) -> None:
