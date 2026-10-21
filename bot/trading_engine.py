@@ -1726,6 +1726,9 @@ class TradingEngine:
                         # row's entry price (flat P&L on those units, fees as
                         # stated) and say it is approximate.
                         price = float(current["entry_price"] or 0.0)
+                        # (Conservative by design: this books zero gross, so with
+                        # fees it counts as a LOSS in the streak/cooldown. For a
+                        # risk brake that is the defensible direction.)
                         logger.critical(
                             "observe_exits: %s order %s filled %.8g with no "
                             "price from the venue after %d cycles; booking at "
