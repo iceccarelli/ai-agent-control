@@ -418,12 +418,28 @@ class TestDeadStopFollowUps:
             return real(**kw)
         client.get_order = spy
         engine.observe_exits()
+        engine.observe_exits()          # two dead reads confirm it
         first = [r for r in reads if r in tps]
         reads.clear()
         engine.observe_exits()
         engine.observe_exits()
-        assert len(first) == len(tps)
+        assert len(first) == 2 * len(tps)
         assert not [r for r in reads if r in tps]      # not read again
+
+    def test_one_stale_dead_read_does_not_hide_a_fill_that_settles_after(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        tp = meta["tp_order_ids"][0]
+        exchange.orders[tp]["orderStatus"] = "Cancelled"       # stale snapshot
+        engine.observe_exits()
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(orderStatus="PartiallyFilledCanceled",
+                                   cumExecQty=str(part), avgPrice=str(ENTRY * 1.02))
+        engine.observe_exits()                                 # the fill books
+        assert len(store.recent_trades()) == 1
 
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)

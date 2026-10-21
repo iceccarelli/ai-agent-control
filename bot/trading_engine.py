@@ -1660,8 +1660,11 @@ class TradingEngine:
         # the venue) are not read again; in memory only, so a restart re-reads
         # each once. Dropped with the row.
         dead_tps = self.__dict__.setdefault("_dead_tp_legs", set())
+        dead_reads = self.__dict__.setdefault("_dead_tp_reads", {})
         open_symbols = {str(r["symbol"]) for r in open_rows}
         dead_tps.intersection_update({k for k in dead_tps if k[0] in open_symbols})
+        for k in [k for k in dead_reads if k[0] not in open_symbols]:
+            dead_reads.pop(k, None)
         for row in open_rows:
             symbol = str(row["symbol"])
             meta = self._row_meta(row)
@@ -1690,8 +1693,14 @@ class TradingEngine:
                 if (link != str(meta.get("stop_order_link_id") or "")
                         and status in ("Cancelled", "Rejected", "Deactivated")
                         and not float(order.get("cumExecQty") or 0.0) > 0.0):
-                    dead_tps.add((symbol, link))
+                    # Two consecutive dead reads before it is skipped for good:
+                    # one stale snapshot must not hide a fill still settling.
+                    seen_dead = dead_reads[(symbol, link)] = dead_reads.get(
+                        (symbol, link), 0) + 1
+                    if seen_dead >= 2:
+                        dead_tps.add((symbol, link))
                     continue
+                dead_reads.pop((symbol, link), None)   # not dead on this read
                 if (link != str(meta.get("stop_order_link_id") or "")
                         and status == "PartiallyFilled"):
                     tp_in_flight = True     # coin is leaving; book it first
