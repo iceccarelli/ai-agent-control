@@ -1075,6 +1075,63 @@ class TradingEngine:
                     "kill_switch": True},
         )
 
+    def _settle_pending_closes(self, symbol: str,
+                               row: Mapping[str, Any]) -> Optional[ExecutionReport]:
+        """Never send a second close beside one whose outcome is unknown.
+
+        A close whose reply was lost (OUTCOME_UNKNOWN) leaves its order row
+        non-terminal; the next cycle used to mint a NEW link id and sell again,
+        and on spot (no reduce-only, other base coin may be held) the second
+        sale could take coin that is not the position's. Each such order is
+        asked of the venue first: an unreadable or still-live one blocks the
+        new close; one that executed is booked from its own fill (provisional
+        if the venue states no price); one that ended with nothing executed is
+        settled and the close may proceed. Returns a report to stop with, or
+        None to go on.
+        """
+        try:
+            pending = [o for o in self.store.unresolved_orders()
+                       if str(o.get("symbol")) == symbol
+                       and str(o.get("purpose")) in ("close", "emergency_close")]
+        except Exception:  # noqa: BLE001
+            logger.exception("could not list pending closes for %s", symbol)
+            return self._report(stage="close", reason="CLOSE_PENDING_UNREADABLE",
+                                symbol=symbol)
+        for order_row in pending:
+            link = str(order_row.get("order_link_id") or "")
+            try:
+                order = self.client.get_order(symbol=symbol, order_link_id=link)
+            except BybitAPIError as exc:
+                logger.error("pending close %s unreadable: %s", link, exc)
+                return self._report(stage="close", reason="CLOSE_PENDING",
+                                    symbol=symbol, detail={"exit_order_link_id": link})
+            status = str((order or {}).get("orderStatus", ""))
+            executed = float((order or {}).get("cumExecQty") or 0.0)
+            if order and status in ("Filled", "PartiallyFilledCanceled",
+                                    "Cancelled", "Deactivated") and executed > 0.0:
+                price = float(order.get("avgPrice") or 0.0)
+                qty = min(executed, float(row["qty"]))
+                self.record_exit_fill(
+                    symbol=symbol, qty=qty, price=price, fee=0.0,
+                    reason="CLOSE_RECONCILED", order_link_id=link,
+                    dedupe_key=f"exit:{link}",
+                    fees=venue_fees.extract_order_fees(order),
+                    fee_ref={"order_link_id": link,
+                             "order_id": str(order.get("orderId") or "")},
+                    price_provisional=price <= 0.0)
+                self.store.update_order_status(link, "filled")
+                return self._report(
+                    stage="close", reason="CLOSE_RECONCILED", symbol=symbol,
+                    detail={"exit_order_link_id": link, "executed_exit_qty": qty})
+            if order and status in ("Cancelled", "Rejected", "Deactivated"):
+                self.store.update_order_status(link, status.lower())
+                continue
+            # no row at the venue, or still live: whether it will sell is unknown
+            return self._report(stage="close", reason="CLOSE_PENDING",
+                                symbol=symbol, detail={"exit_order_link_id": link,
+                                                       "status": status or "unread"})
+        return None
+
     def _cooldown_after_loss(self, symbol: str) -> None:
         """Start the symbol cooldown when the position that just closed lost.
 
@@ -1179,6 +1236,15 @@ class TradingEngine:
         qty = round(float(row["qty"]), 12)
         entry_price = float(row["entry_price"])
         row_meta = self._row_meta(row)
+
+        pending = self._settle_pending_closes(symbol, row)
+        if pending is not None:
+            return pending
+        row = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
+        if row is None:
+            return self._report(stage="close", reason="CLOSED_BY_EARLIER_ORDER",
+                                symbol=symbol)
+        qty = round(float(row["qty"]), 12)
 
         if not getattr(self.client, "is_linear", False):
             # A resting spot limit sell reserves the coin it offers, so the legs

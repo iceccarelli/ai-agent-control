@@ -315,3 +315,55 @@ class TestSpotProtectionMustBeAbleToExecute:
             symbol="BTCUSDT", exit_side="Sell", qty=float(row["qty"]),
             filters=filters, reason="TEST")
         assert report.detail["closed"] is True
+
+
+class TestNoSecondCloseBesideAnUnknownOne:
+    def _unknown_close(self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        qty = float(store.open_positions()[0]["qty"])
+        real = client.place_order
+        calls = []
+
+        def lost_reply(**kw):
+            res = real(**kw)
+            calls.append(kw.get("purpose"))
+            if kw.get("purpose") == "close":
+                store.update_order_status(res.order_link_id, "unknown")
+                return type(res)(ok=False, order_link_id=res.order_link_id,
+                                 reason="OUTCOME_UNKNOWN")
+            return res
+        client.place_order = lost_reply
+        first = engine.close_position(symbol="BTCUSDT", reason="horizon")
+        assert first.reason != "CLOSED"
+        return engine, client, store, exchange, calls, qty
+
+    def test_the_retry_does_not_send_a_second_sale(self, stack):
+        engine, client, store, exchange, calls, qty = self._unknown_close(stack)
+        link = [o for o in store.unresolved_orders() if o["purpose"] == "close"][0]
+        exchange.orders[link["order_link_id"]]["orderStatus"] = "New"   # still live
+        sent = calls.count("close")
+        second = engine.close_position(symbol="BTCUSDT", reason="horizon")
+        assert second.reason == "CLOSE_PENDING"
+        assert calls.count("close") == sent
+
+    def test_a_close_that_did_execute_is_booked_from_its_own_fill_not_resold(
+            self, stack):
+        engine, client, store, exchange, calls, qty = self._unknown_close(stack)
+        sent = calls.count("close")
+        second = engine.close_position(symbol="BTCUSDT", reason="horizon")
+        assert second.reason == "CLOSE_RECONCILED"
+        assert calls.count("close") == sent
+        assert store.open_positions() == []
+        assert len(store.recent_trades()) == 1
+
+    def test_a_close_that_ended_with_nothing_executed_allows_a_fresh_one(self, stack):
+        engine, client, store, exchange, calls, qty = self._unknown_close(stack)
+        link = [o for o in store.unresolved_orders() if o["purpose"] == "close"][0]
+        exchange.orders[link["order_link_id"]].update(
+            orderStatus="Cancelled", cumExecQty="0")
+        second = engine.close_position(symbol="BTCUSDT", reason="horizon")
+        # (the test double loses every close reply, so the fresh attempt is
+        # unknown again - what matters is that it was ALLOWED to be sent)
+        assert second.reason != "CLOSE_PENDING"
+        assert calls.count("close") == 2
