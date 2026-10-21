@@ -536,6 +536,15 @@ class BybitClient:
         # under-counts those is the one that would lie.
         if endpoint == "/v5/order/create":
             self.orders_submitted += 1
+        if method == "GET" and time.monotonic() < self._read_cooldown_until:
+            # After a 403 (Bybit's IP-ban response) the READS stand down for a
+            # short while instead of hammering a banned address. Writes are
+            # never failed fast here: a refused write must still take the
+            # normal unknown-outcome path, and an order that was never sent
+            # must not be recorded as one that may have been.
+            raise PermanentAPIError(
+                "HTTP 403 cooldown: reads paused after an auth/ban response",
+                payload="")
         attempt = 0
         last_error: Optional[BybitAPIError] = None
 
@@ -578,6 +587,9 @@ class BybitClient:
                     self._backoff(attempt)
                 continue
             if status == 401 or status == 403:
+                if status == 403:
+                    self._read_cooldown_until = (
+                        time.monotonic() + self.READ_COOLDOWN_AFTER_403_S)
                 raise PermanentAPIError(f"auth rejected: HTTP {status}", payload=text)
             if status != 200:
                 raise PermanentAPIError(f"HTTP {status}", payload=text)
@@ -621,6 +633,8 @@ class BybitClient:
         raise last_error
 
     RATE_LIMIT_MAX_WAIT_S = 5.0
+    READ_COOLDOWN_AFTER_403_S = 30.0
+    _read_cooldown_until = 0.0
 
     def _rate_limit_backoff(self, attempt: int) -> None:
         """Wait until the venue says the window resets (capped), not a guess.

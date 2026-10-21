@@ -1145,3 +1145,26 @@ class TestRateLimitWaitsForTheVenuesResetStamp:
         ]
         client.get_equity()
         assert max(slept) <= bc.BybitClient.RATE_LIMIT_MAX_WAIT_S
+
+
+class TestAfter403ReadsStandDownButWritesDoNot:
+    def test_reads_fail_fast_without_touching_the_network(self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            client.get_equity()
+        before = len(exchange.requests)
+        with pytest.raises(bc.PermanentAPIError, match="cooldown"):
+            client.get_equity()
+        assert len(exchange.requests) == before
+
+    def test_a_write_is_still_attempted_during_the_cooldown(self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            client.get_equity()
+        before = len(exchange.requests)
+        try:
+            client._request("POST", "/v5/position/trading-stop",
+                            body={"category": "linear"}, signed=True)
+        except Exception:
+            pass
+        assert len(exchange.requests) > before
