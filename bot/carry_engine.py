@@ -753,6 +753,10 @@ class CarryEngine:
             self.position = None
             self.state = BookState.FLAT
         last = self._restored_stamp(state.get("last_print_ms"))
+        #: What the LEDGER last saw, kept even when its history is discarded:
+        #: the catch-up counts settlements after THIS, not after the venue
+        #: warm-up's watermark.
+        self._ledger_last_print_ms = last
         rates = self._restored_rates(state.get("funding_history", []))
         recorded = state.get("perp_symbol")
         foreign = (recorded != self.perp_symbol if recorded is not None
@@ -899,6 +903,7 @@ class CarryEngine:
     #: read at cold start. Used once, to count settlements a held pair lived
     #: through while this process was down.
     venue_prints_at_start: Sequence[Tuple[float, int]] = ()
+    _ledger_last_print_ms: Optional[int] = None
 
     def _catch_up_missed_prints(self) -> int:
         """Count the settlements a resumed pair was held through while down.
@@ -911,7 +916,9 @@ class CarryEngine:
         re-estimated here (the ledger books what the venue paid).
         """
         position = self.position
-        last = self._last_print_ms
+        last = self._ledger_last_print_ms
+        if last is None:
+            last = self._last_print_ms
         if position is None or last is None:
             return 0
         by_stamp: Dict[int, float] = {}
@@ -921,8 +928,12 @@ class CarryEngine:
                 by_stamp.setdefault(int(stamp), float(rate))   # one per stamp
         missed = sorted(((rate, stamp) for stamp, rate in by_stamp.items()),
                         key=lambda row: row[1])
-        # Leave the NEWEST for on_candle to book as the live print.
-        missed = missed[:-1] if missed else []
+        # Leave the NEWEST for on_candle to book as the live print - unless
+        # the venue warm-up already moved the watermark past it, in which
+        # case on_candle will never see it as new and it is counted here.
+        if missed and (self._last_print_ms is None
+                       or missed[-1][1] > self._last_print_ms):
+            missed = missed[:-1]
         if missed and missed[0][1] - last > self.MAX_PRINT_GAP_MS:
             # The venue read does not reach back to the last print we saw:
             # settlements are missing between them, and the old prints must
@@ -933,9 +944,11 @@ class CarryEngine:
                 (missed[0][1] - last) / 3.6e6)
             self._funding_history = []
         for rate, stamp in missed:
-            self._funding_history.append(rate)
-            del self._funding_history[:-self.FUNDING_HISTORY]
-            self._last_print_ms = stamp
+            if self._last_print_ms is None or stamp > self._last_print_ms:
+                # (not when the venue warm-up already seeded this print)
+                self._funding_history.append(rate)
+                del self._funding_history[:-self.FUNDING_HISTORY]
+                self._last_print_ms = stamp
             if rate < 0:
                 position.negative_funding_streak += 1
             else:

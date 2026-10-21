@@ -720,3 +720,24 @@ class TestCatchUpIsRobust:
         e = self._e([(-1.0, 1_000 + gap + 10), (-1.0, 1_000 + gap + 20)])
         e._catch_up_missed_prints()
         assert e._funding_history == [-1.0]
+
+
+class TestCatchUpWhenTheLedgerHistoryWasDiscarded:
+    def test_the_ledgers_stamp_not_the_warmups_decides_what_was_missed(self):
+        venue = Venue(perp=0.001)
+        led = opened(venue).to_state()
+        led["last_print_ms"] = 1_000
+        led["perp_symbol"] = "ETHUSDT"             # foreign: history discarded
+        led["funding_history"] = [1.0, 1.0, 1.0]
+        e = engine(Venue(perp=0.001), persist=lambda s: None)
+        prints = [(-1.0, 2_000), (-1.0, 3_000), (-1.0, 4_000)]
+        e._funding_history = []                    # a cold process
+        e._last_print_ms = None
+        e.venue_prints_at_start = prints
+        e.warm_funding_history(prints)             # the watermark is now 4_000
+        e.restore(led)
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 0
+        e._catch_up_missed_prints()
+        assert e.position.negative_funding_streak == 3
+        assert e._last_print_ms == 4_000
