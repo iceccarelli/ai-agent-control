@@ -1061,3 +1061,35 @@ def test_a_human_can_rebase_the_peak_too_after_a_withdrawal(store):
     store.update_equity(10_000.0)
     store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 9_000.0)
     assert store.get_equity_state().peak_equity >= 10_000.0
+
+
+class TestTheLoopCanResumeAfterALossStreakHalt:
+    _later = 0
+
+    def _lose(self, store, n):
+        # each batch closes after the previous one (the streak reads newest first)
+        type(self)._later += 100
+        for i in range(n):
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Buy", qty=0.01, entry_price=50_000.0,
+                exit_price=49_000.0, gross_pnl=-10.0, entry_fee=0.25,
+                exit_fee=0.25, opened_epoch=utc_now_epoch() - 600 + i,
+                closed_epoch=utc_now_epoch() + self._later + i))
+
+    def test_the_halt_check_itself_starts_and_ends_the_cooldown(self, manager, store):
+        self._lose(store, manager.max_consecutive_losses)
+        assert manager.should_halt_trading() is True          # trips + cooling
+        assert store.get_breaker().active
+        store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
+        assert manager.should_halt_trading() is False         # resumed
+        self._lose(store, manager.max_consecutive_losses)
+        assert manager.should_halt_trading() is True          # new losses re-trip
+
+    def test_a_streak_still_at_the_limit_resets_even_if_the_reason_was_overwritten(
+            self, manager, store):
+        self._lose(store, manager.max_consecutive_losses)
+        manager.should_halt_trading()
+        store.trip_breaker("daily loss 6%", 0.0)
+        store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
+        assert manager.should_halt_trading() is False
+
