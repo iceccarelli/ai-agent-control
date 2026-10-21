@@ -658,3 +658,41 @@ class TestHeldFundingSurvivesARestart:
         e.persist = broken
         d = self._print(e, 4, 2.0)
         assert d.state is BookState.HALTED
+
+
+class TestMissedSettlementsAreCountedOnResume:
+    def _resumed(self, prints):
+        venue = Venue(perp=0.001)
+        led = opened(venue).to_state()
+        led["last_print_ms"] = 1_000
+        e = engine(Venue(perp=0.001), persist=lambda s: None)
+        e.venue_prints_at_start = prints
+        d = e.cold_start(ledger=led, venue_perp_qty=0.001, venue_spot_qty=5.0,
+                         open_orders=())
+        assert d.action is ColdStart.RESUME
+        return e
+
+    def test_three_negative_prints_missed_while_down_advance_the_streak(self):
+        e = self._resumed([(-1.0, 2_000), (-1.0, 3_000), (-1.0, 4_000)])
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 0
+        e._last_print_ms = 1_000
+        n = e._catch_up_missed_prints()
+        # the newest is left for on_candle to book as the live print
+        assert n == 2 and e.position.negative_funding_streak == 2
+        assert e._last_print_ms == 3_000
+
+    def test_prints_before_the_pair_opened_are_not_counted(self):
+        e = self._resumed([(-1.0, 2_000), (-1.0, 3_000)])
+        e.position.opened_ms = 2_500
+        e.position.negative_funding_streak = 0
+        e._last_print_ms = 1_000
+        assert e._catch_up_missed_prints() == 0
+
+    def test_a_positive_missed_print_resets_the_streak(self):
+        e = self._resumed([(-1.0, 2_000), (1.0, 3_000), (1.0, 4_000)])
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 5
+        e._last_print_ms = 1_000
+        e._catch_up_missed_prints()
+        assert e.position.negative_funding_streak == 0

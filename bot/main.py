@@ -893,8 +893,10 @@ class TradingBot:
         # A venue that will not hand them over is not a reason to refuse to
         # start — it just means the wait — so this logs and carries on.
         try:
-            warmed = self.carry.warm_funding_history(
-                broker.get_funding_history(self.carry.perp_symbol, limit=8))
+            venue_prints = broker.get_funding_history(
+                self.carry.perp_symbol, limit=8)
+            self.carry.venue_prints_at_start = list(venue_prints)
+            warmed = self.carry.warm_funding_history(venue_prints)
             if warmed:
                 logger.warning("carry: EWMA warmed with %d settled prints",
                                warmed)

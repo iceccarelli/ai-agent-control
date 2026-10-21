@@ -874,6 +874,7 @@ class CarryEngine:
             self._restore_allowance(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
+            self._catch_up_missed_prints()
             if self.position is not None and venue_read_started_ms is not None:
                 # The venue was read from this moment, not from now: a close
                 # that landed after it must still count as new evidence.
@@ -893,6 +894,48 @@ class CarryEngine:
                 decision.reason, decision.naked_side or "unknown",
                 decision.detail)
         return decision
+
+    #: The venue's recent settled prints as `(bps, settlement_ms)`, newest last,
+    #: read at cold start. Used once, to count settlements a held pair lived
+    #: through while this process was down.
+    venue_prints_at_start: Sequence[Tuple[float, int]] = ()
+
+    def _catch_up_missed_prints(self) -> int:
+        """Count the settlements a resumed pair was held through while down.
+
+        After a restart `on_candle` sees only the newest print, so three
+        negative settlements missed during downtime counted as ONE and the
+        FUNDING_INVERTED exit came two prints late. The venue's stamped
+        history lets the missed ones be applied in order: each enters the
+        EWMA history and moves the negative streak. Funding earned is NOT
+        re-estimated here (the ledger books what the venue paid).
+        """
+        position = self.position
+        last = self._last_print_ms
+        if position is None or last is None:
+            return 0
+        missed = sorted(
+            ((float(rate), int(stamp))
+             for rate, stamp in (self.venue_prints_at_start or ())
+             if self._finite(rate) and int(stamp) > last
+             and int(stamp) > int(position.opened_ms or 0)),
+            key=lambda row: row[1])
+        # Leave the NEWEST for on_candle to book as the live print.
+        missed = missed[:-1] if missed else []
+        for rate, stamp in missed:
+            self._funding_history.append(rate)
+            del self._funding_history[:-self.FUNDING_HISTORY]
+            self._last_print_ms = stamp
+            if rate < 0:
+                position.negative_funding_streak += 1
+            else:
+                position.negative_funding_streak = 0
+        if missed:
+            logger.warning(
+                "carry: counted %d funding settlement(s) missed while the "
+                "process was down (streak now %d)", len(missed),
+                position.negative_funding_streak)
+        return len(missed)
 
     def warm_funding_history(self, prints: Sequence[Tuple[float, int]]) -> int:
         """Seed the EWMA from SETTLED prints the venue has already published.
