@@ -247,3 +247,71 @@ def test_the_migration_is_idempotent_across_restarts(tmp_path):
         assert len(store.recent_trades()) == 1
         assert store.provisional_trades() == []
         store.close()
+
+
+class TestAnUnconfirmedCloseIsNeverAPricedTrade:
+    def _close_unresolved(self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        qty = float(store.open_positions()[0]["qty"])
+        engine._await_fill = lambda *a, **k: None       # the poll timed out
+        report = engine.close_position(symbol="BTCUSDT", reason="manual",
+                                       exit_price=ENTRY * 3)   # a caller guess
+        return engine, store, exchange, report, qty
+
+    def test_it_is_booked_provisional_with_no_price_at_all(self, stack):
+        engine, store, exchange, report, qty = self._close_unresolved(stack)
+        rows = store.provisional_trades()
+        assert len(rows) == 1
+        assert rows[0]["exit_price"] == 0.0 and rows[0]["gross_pnl"] == 0.0
+        assert rows[0]["exit_fee_realized"] == 0
+        assert not store.recent_trades() and store.net_returns() == []
+
+    def test_the_venues_executions_then_price_it_once(self, stack):
+        engine, store, exchange, report, qty = self._close_unresolved(stack)
+        link = store.provisional_trades()[0]["order_link_id"]
+        rows = [{"execId": "X1", "orderLinkId": link, "symbol": "BTCUSDT",
+                 "side": "Sell", "execType": "Trade", "execQty": str(qty),
+                 "execPrice": str(ENTRY * 1.01), "execFee": "0.1",
+                 "feeCurrency": "USDT"}]
+        assert engine.reconcile_provisional_exits(lambda s, l: rows)["reconciled"] == 1
+        t = store.recent_trades()[0]
+        assert t["exit_price"] == pytest.approx(ENTRY * 1.01)
+        assert engine.reconcile_provisional_exits(lambda s, l: rows)["checked"] == 0
+
+    def test_a_close_that_never_executed_stays_provisional_for_ever(self, stack):
+        engine, store, exchange, report, qty = self._close_unresolved(stack)
+        for _ in range(3):
+            assert engine.reconcile_provisional_exits(lambda s, l: [])["reconciled"] == 0
+        assert len(store.provisional_trades()) == 1
+        assert not store.recent_trades()
+
+
+class TestSpotProtectionMustBeAbleToExecute:
+    def test_a_replacement_stop_is_placed_only_after_the_legs_free_the_coin(
+            self, stack):
+        import json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        exchange.reserve_limit_sells = True
+        exchange.balances["BTC"] = float(row["qty"])
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Rejected"
+        engine.observe_exits()
+        assert all(exchange.orders[t]["orderStatus"] == "Cancelled"
+                   for t in meta["tp_order_ids"])
+        assert exchange._free("BTC", exchange.balances["BTC"]) >= float(
+            row["qty"]) - 1e-9
+
+    def test_an_emergency_sale_frees_the_reserved_coin_first(self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        exchange.reserve_limit_sells = True
+        exchange.balances["BTC"] = float(row["qty"])
+        filters = client.get_instrument_filters("BTCUSDT")
+        report = engine._emergency_close(
+            symbol="BTCUSDT", exit_side="Sell", qty=float(row["qty"]),
+            filters=filters, reason="TEST")
+        assert report.detail["closed"] is True

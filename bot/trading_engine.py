@@ -1001,6 +1001,12 @@ class TradingEngine:
         automatic recovery from here.
         """
         logger.critical("EMERGENCY CLOSE %s (%s)", symbol, reason)
+        if not getattr(self.client, "is_linear", False):
+            # A resting spot limit sell reserves the coin it offers, so the
+            # emergency market sell has nothing free to sell while a
+            # take-profit leg rests (close_position frees it first for the
+            # same reason). The stop stays; a missing take-profit costs upside.
+            self._cancel_take_profit_legs(symbol)
         closed = self.client.place_order(
             symbol=symbol, side=exit_side, qty=qty, order_type="Market",
             purpose="emergency_close", filters=filters, reduce_only=True,
@@ -1322,10 +1328,17 @@ class TradingEngine:
         entry_price = float(row["entry_price"])
         meta = self._row_meta(row)
         confirmed = fill is not None
+        # No resolved fill: the exit price is UNKNOWN. The row is booked
+        # PROVISIONAL (quantity and fees only, exit_price 0 / gross 0, kept out
+        # of every confirmed-economics reader) and priced later from the
+        # venue's executions by reconcile_provisional_exits. Neither the
+        # caller's figure, the entry price nor the last price stands in.
+        provisional = not confirmed
         realised_exit = float(
             (fill or {}).get("avgPrice") or exit_price or entry_price)
         direction = 1.0 if normalize_side(side) == "Buy" else -1.0
-        gross = (realised_exit - entry_price) * qty * direction
+        gross = (0.0 if provisional
+                 else (realised_exit - entry_price) * qty * direction)
         entry_leg = self._fee_leg(
             symbol=symbol, fees=FeeSet.from_dict(meta.get("entry_fees")),
             price=entry_price, qty=qty, caller_amount=caller_entry_fee,
@@ -1336,6 +1349,8 @@ class TradingEngine:
             ref={"order_link_id": exit_order.order_link_id,
                  "order_id": str((fill or {}).get("orderId")
                                  or getattr(exit_order, "order_id", "") or "")})
+        if provisional:
+            exit_leg = dict(exit_leg, realized=False, currency=None)
         link = str(exit_order.order_link_id or "")
         # dedupe_key ties this trade to the exit order's own durable id, the
         # same identity `find_live_spot_stop`/`orders(order_link_id)` already
@@ -1345,7 +1360,8 @@ class TradingEngine:
         # See `StateStore.record_trade`'s docstring for the mechanism.
         self.store.record_trade(TradeRecord(
             symbol=symbol, side=side, qty=qty, entry_price=entry_price,
-            exit_price=realised_exit, gross_pnl=gross,
+            exit_price=0.0 if provisional else realised_exit,
+            price_provisional=provisional, gross_pnl=gross,
             entry_fee=entry_leg["amount"], exit_fee=exit_leg["amount"],
             entry_fee_realized=entry_leg["realized"],
             exit_fee_realized=exit_leg["realized"],
@@ -1900,6 +1916,11 @@ class TradingEngine:
         logger.critical(
             "observe_exits: the %s stop %s is dead with nothing filled; the "
             "position is NAKED", symbol, link)
+        # A replacement stop is a conditional MARKET sell: it can only execute
+        # on free coin, and resting take-profit legs reserve the coin they
+        # offer. Free it first, or the new stop would verify as "live" and
+        # still be unable to fill.
+        self._cancel_take_profit_legs(symbol)
         summary.setdefault("stop_dead", []).append(symbol)
         outcome = self._protect_or_close_naked(
             symbol, row, reason="SPOT_STOP_DEAD", prefer_recorded_stop=True)
