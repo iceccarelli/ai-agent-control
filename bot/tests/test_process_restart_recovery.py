@@ -321,6 +321,7 @@ def _proc1_exit_fill_crash_before_position_removed(db_path: str, out_queue) -> N
     store.update_equity(EQUITY)
     store.upsert_position("BTCUSDT", "Sell", 0.01, 60_000.0, stop_price=61_000.0)
 
+    saved = dict(store._query("SELECT * FROM positions")[0])
     summary = engine.observe_exits()
     trades_before_crash = len(store._query("SELECT * FROM trades"))
     anchor_before_crash = store.ensure_daily_anchor(EQUITY).realised_pnl
@@ -329,7 +330,11 @@ def _proc1_exit_fill_crash_before_position_removed(db_path: str, out_queue) -> N
     # the DELETE for real; write the row back to represent a kill landing
     # before that commit reached disk (record_trade's commit, one line
     # earlier in record_exit_fill, already has).
+    # (the very same row: a position keeps its open time, which is part of
+    # what identifies the exit it closed)
     store.upsert_position("BTCUSDT", "Sell", 0.01, 60_000.0, stop_price=61_000.0)
+    store._exec("UPDATE positions SET opened_epoch = ? WHERE symbol = ?",
+                (saved["opened_epoch"], "BTCUSDT"))
 
     _put_and_crash(out_queue, {
         "observe_exits_summary": summary,
@@ -668,7 +673,7 @@ class TestWritesThatMustNotBeSplit:
             store.record_trade(trade)
         store._conn = real
         assert calls["n"] == 1
-        assert store.recent_trades() == [], "the trade stayed booked without its anchor"
+        assert store.confirmed_exit_rows() == [], "the trade stayed booked without its anchor"
         # the replay is therefore NOT a duplicate and books both
         assert store.record_trade(trade) > 0
         anchor = store.ensure_daily_anchor(1_000.0)
@@ -755,7 +760,7 @@ class TestStateStoreReviewFixes:
                 store.record_trade(self._trade(dedupe_key="exit:tx"))
                 raise RuntimeError("killed")
         assert not store.load_carry_position()
-        assert store.recent_trades() == []
+        assert store.confirmed_exit_rows() == []
         store.close()
 
     def test_an_old_execution_quality_table_still_opens(self, tmp_path):
@@ -844,5 +849,5 @@ def test_a_legacy_trades_table_gains_the_provisional_column(tmp_path):
     conn.commit()
     conn.close()
     store = StateStore(path)
-    rows = store.recent_trades()
+    rows = store.confirmed_exit_rows()
     assert len(rows) == 1 and rows[0]["price_provisional"] == 0
