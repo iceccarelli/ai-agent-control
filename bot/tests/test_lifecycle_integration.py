@@ -267,7 +267,7 @@ class TestDeadStopFollowUps:
                     for t in meta["tp_order_ids"]]
         assert all(st in ("Cancelled", "Filled") for st in statuses), statuses
 
-    def test_a_refused_leg_cancel_neither_flattens_nor_trips_the_kill_switch(
+    def test_a_stuck_leg_is_alarmed_once_and_never_sent_to_the_emergency_path(
             self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         client.cancel_order = lambda **kw: False        # the venue refuses
@@ -278,15 +278,15 @@ class TestDeadStopFollowUps:
         # after repeated refusals the engine stops waiting and handles the
         # naked position itself: it must end re-protected or flattened, never
         # silently left on a dead stop
-        assert any(o in ("REPROTECTED", "FLATTENED") for o in outcomes), outcomes
-        rows = store.open_positions()
-        if rows:
-            import json as _j
-            m = rows[0]["meta"]
-            m = _j.loads(m) if isinstance(m, str) else m
-            assert m["stop_order_link_id"] != meta["stop_order_link_id"]
-            assert exchange.orders[m["stop_order_link_id"]]["orderStatus"] in (
-                "Untriggered", "New")
+        # a leg that will not cancel never sends the book to the emergency
+        # path (it would only trip the kill switch): it is alarmed once and
+        # the cancel is retried
+        assert not store.is_kill_switch_engaged()[0]
+        assert store.open_positions()
+        assert "BTCUSDT" in summary.get("stop_dead", [])
+        stuck = [d for d in store.recent_decisions()
+                 if d.get("decision") == "STOP_DEAD_LEG_STUCK"]
+        assert len(stuck) == 1
 
     def test_the_two_cycle_sequence_books_the_partial_leg_then_reprotects(
             self, stack):

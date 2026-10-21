@@ -1704,6 +1704,12 @@ class TradingEngine:
                 try:
                     qty = float(order.get("cumExecQty") or 0.0)
                     price = float(order.get("avgPrice") or 0.0)
+                    if price <= 0 and qty > 0:
+                        # a cancelled order may omit avgPrice: derive it, else
+                        # fall back to the leg's own limit price
+                        value = float(order.get("cumExecValue") or 0.0)
+                        price = (value / qty if value > 0
+                                 else float(order.get("price") or 0.0))
                 except (TypeError, ValueError):
                     continue
                 current = {p["symbol"]: p for p in self.store.open_positions()}.get(symbol)
@@ -1737,15 +1743,26 @@ class TradingEngine:
                     # ever: a thin book can leave it part-filled for hours.
                     n = deferrals[symbol] = deferrals.get(symbol, 0) + 1
                     if n > 2 * self.DEAD_STOP_MAX_DEFERRALS:
-                        # The leg cannot be cancelled or never books: stop
-                        # waiting and judge/protect the position as it is.
-                        logger.critical(
-                            "observe_exits: %s stop %s has stayed dead for %d "
-                            "cycles with a take-profit leg in flight; "
-                            "protecting the position as recorded", symbol,
-                            dead_stop, n)
+                        # The leg will not cancel or book. Do NOT fall through
+                        # to the emergency path: the leg still reserves coin and
+                        # the recorded size is stale, so a stop (or an emergency
+                        # sale) would be refused and only trip the kill switch.
+                        # Say so once, loudly, and keep retrying the cancel.
+                        seen = self.__dict__.setdefault("_leg_stuck_journaled", set())
+                        seen.intersection_update(live_stops)
+                        key = (symbol, dead_stop)
+                        if key not in seen:
+                            seen.add(key)
+                            logger.critical(
+                                "observe_exits: %s stop %s has stayed dead for "
+                                "%d cycles and a take-profit leg will not "
+                                "cancel or book; a human must look", symbol,
+                                dead_stop, n)
+                            self.store.journal(symbol, "STOP_DEAD_LEG_STUCK",
+                                               dead_stop, {"cycles": n})
+                        summary.setdefault("stop_dead", []).append(symbol)
                         self._handle_dead_spot_stop(symbol, row, dead_stop,
-                                                    summary)
+                                                    summary, relaxed=True)
                     elif n > self.DEAD_STOP_MAX_DEFERRALS:
                         logger.critical(
                             "observe_exits: %s stop %s is dead and a "

@@ -1148,28 +1148,32 @@ class TestRateLimitWaitsForTheVenuesResetStamp:
 
 
 class TestAfter403ReadsStandDownButWritesDoNot:
+    TICKERS = ("GET", "/v5/market/tickers")
+    KLINE = ("GET", "/v5/market/kline")
+    PARAMS = {"category": "spot", "symbol": "BTCUSDT"}
+
+    def _get(self, client, which):
+        return client._request(which[0], which[1], params=self.PARAMS)
+
     def test_reads_fail_fast_without_touching_the_network(self, client, exchange):
         exchange.scripted = [(403, "forbidden")]
         with pytest.raises(bc.PermanentAPIError):
-            client.get_equity()
+            self._get(client, self.TICKERS)
         before = len(exchange.requests)
         with pytest.raises(bc.PermanentAPIError, match="cooldown"):
-            client.get_equity()
+            self._get(client, self.TICKERS)
         assert len(exchange.requests) == before
 
     def test_a_cooldown_on_one_read_endpoint_does_not_silence_the_others(
             self, client, exchange):
         exchange.scripted = [(403, "forbidden")]
         with pytest.raises(bc.PermanentAPIError):
-            client.get_equity()
+            self._get(client, self.TICKERS)
         before = len(exchange.requests)
-        # a DIFFERENT read endpoint is still sent to the venue
-        client._request("GET", "/v5/market/tickers",
-                        params={"category": "spot", "symbol": "BTCUSDT"})
+        self._get(client, self.KLINE)         # a DIFFERENT read still goes out
         assert len(exchange.requests) > before
-        # while the refused endpoint itself stays paused
         with pytest.raises(bc.PermanentAPIError, match="cooldown"):
-            client.get_equity()
+            self._get(client, self.TICKERS)   # the refused one stays paused
 
     def test_a_write_403_does_not_arm_the_read_cooldown(self, client, exchange):
         exchange.scripted = [(403, "forbidden")]
@@ -1177,13 +1181,13 @@ class TestAfter403ReadsStandDownButWritesDoNot:
             client._request("POST", "/v5/position/trading-stop",
                             body={"category": "linear"}, signed=True)
         before = len(exchange.requests)
-        client.get_equity()
+        self._get(client, self.TICKERS)
         assert len(exchange.requests) > before
 
     def test_a_write_is_still_attempted_during_the_cooldown(self, client, exchange):
         exchange.scripted = [(403, "forbidden")]
         with pytest.raises(bc.PermanentAPIError):
-            client.get_equity()
+            self._get(client, self.TICKERS)
         before = len(exchange.requests)
         try:
             client._request("POST", "/v5/position/trading-stop",
@@ -1191,3 +1195,16 @@ class TestAfter403ReadsStandDownButWritesDoNot:
         except Exception:
             pass
         assert len(exchange.requests) > before
+
+
+def test_safety_reads_are_never_paused_by_a_403(client, exchange):
+    exchange.scripted = [(403, "forbidden")]
+    with pytest.raises(bc.PermanentAPIError):
+        client._request("GET", "/v5/position/list",
+                        params={"category": "linear", "symbol": "BTCUSDT"},
+                        signed=True)
+    before = len(exchange.requests)
+    client._request("GET", "/v5/position/list",
+                    params={"category": "linear", "symbol": "BTCUSDT"},
+                    signed=True)
+    assert len(exchange.requests) > before     # sent, not failed locally

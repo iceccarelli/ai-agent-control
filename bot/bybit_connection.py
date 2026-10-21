@@ -536,7 +536,7 @@ class BybitClient:
         # under-counts those is the one that would lie.
         if endpoint == "/v5/order/create":
             self.orders_submitted += 1
-        if (method == "GET"
+        if (method == "GET" and endpoint not in self.SAFETY_READ_ENDPOINTS
                 and time.monotonic() < self._read_cooldown_until.get(endpoint, 0.0)):
             # After a 403 (Bybit's IP-ban response) the READS stand down for a
             # short while instead of hammering a banned address. Writes are
@@ -588,7 +588,8 @@ class BybitClient:
                     self._backoff(attempt)
                 continue
             if status == 401 or status == 403:
-                if status == 403 and method == "GET":
+                if (status == 403 and method == "GET"
+                        and endpoint not in self.SAFETY_READ_ENDPOINTS):
                     # Per ENDPOINT, and only for a refused READ: a 403 on a
                     # write must not block the reads that resolve its
                     # outcome, and one read path being refused must not
@@ -639,6 +640,14 @@ class BybitClient:
 
     RATE_LIMIT_MAX_WAIT_S = 5.0
     READ_COOLDOWN_AFTER_403_S = 30.0
+    #: Reads that confirm what the book HOLDS or what a stop IS. They are never
+    #: paused: a refused local read-back of a just-placed stop is read as "not
+    #: live" and would flatten the position and trip the kill switch, where a
+    #: direct request might simply have succeeded.
+    SAFETY_READ_ENDPOINTS = frozenset({
+        "/v5/position/list", "/v5/order/realtime", "/v5/order/history",
+        "/v5/execution/list", "/v5/position/closed-pnl",
+        "/v5/account/wallet-balance"})
     @property
     def _read_cooldown_until(self) -> Dict[str, float]:
         return self.__dict__.setdefault("_read_cooldowns", {})
