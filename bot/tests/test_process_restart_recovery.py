@@ -816,3 +816,12 @@ def test_a_later_halt_keeps_the_first_incidents_reason(tmp_path):
     store.trip_kill_switch("SECOND")
     engaged, reason = store.is_kill_switch_engaged()
     assert engaged and reason == "FIRST"
+
+
+def test_order_seq_falls_back_on_an_old_sqlite(tmp_path, monkeypatch):
+    import persistence as P
+    store = P.StateStore(str(tmp_path / "s.db"))
+    first = store.next_order_seq()
+    monkeypatch.setattr(P.sqlite3, "sqlite_version_info", (3, 30, 0))
+    assert store.next_order_seq() == first + 1
+    assert store.next_order_seq() == first + 2

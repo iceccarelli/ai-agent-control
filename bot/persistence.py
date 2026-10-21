@@ -1343,11 +1343,12 @@ class StateStore:
             "FROM trades GROUP BY symbol, opened_epoch "
             "ORDER BY last_closed DESC, last_id DESC LIMIT 200"
         )
-        base = self._query("SELECT value FROM meta WHERE key = 'loss_streak_baseline'")
-        baseline = float(base[0]["value"]) if base else 0.0
+        base = self._query(
+            "SELECT value FROM meta WHERE key = 'loss_streak_baseline_id'")
+        baseline = int(float(base[0]["value"])) if base else 0
         n = 0
         for r in rows:
-            if float(r["last_closed"] or 0.0) <= baseline:
+            if int(r["last_id"] or 0) <= baseline:
                 break           # already answered for by an elapsed breaker
             if float(r["net"]) <= 0.0:
                 n += 1
@@ -1355,21 +1356,48 @@ class StateStore:
                 break
         return n
 
+    def _max_trade_id(self) -> int:
+        rows = self._query("SELECT MAX(id) AS m FROM trades")
+        return int(rows[0]["m"] or 0) if rows else 0
+
+    def _put_meta(self, key: str, value: str) -> None:
+        self._exec(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value))
+
+    def traded_signal(self, symbol: str) -> str:
+        """The signature of the last signal traded on `symbol` ('' if none)."""
+        rows = self._query("SELECT value FROM meta WHERE key = ?",
+                           (f"traded_signal:{symbol}",))
+        return str(rows[0]["value"]) if rows else ""
+
+    def mark_traded_signal(self, symbol: str, signature: str) -> None:
+        self._put_meta(f"traded_signal:{symbol}", str(signature))
+
+    def mark_loss_streak_trip(self) -> None:
+        """Remember the newest trade at the moment a streak breaker trips.
+
+        The losses that tripped it are exactly the trades up to this id; a
+        position that closes during the halt is NOT part of that streak.
+        """
+        self._put_meta("loss_streak_trip_id", str(self._max_trade_id()))
+
     def reset_loss_streak(self) -> None:
         """Forget the losses that tripped a breaker whose cooldown has ended.
 
         Without this the streak gate re-trips the breaker the moment its
         cooldown clears, and since only a WINNING trade ends a streak (and none
         can happen while halted) the cooldown never resumed trading at all.
+        The baseline is a TRADE ID (the one recorded when the breaker
+        tripped), so a loss booked during the halt still counts.
         """
-        rows = self._query("SELECT MAX(closed_epoch) AS m FROM trades")
-        latest = float(rows[0]["m"] or 0.0) if rows else 0.0
-        if latest <= 0.0:
+        trip = self._query(
+            "SELECT value FROM meta WHERE key = 'loss_streak_trip_id'")
+        baseline = int(float(trip[0]["value"])) if trip else self._max_trade_id()
+        if baseline <= 0:
             return
-        self._exec(
-            "INSERT INTO meta(key, value) VALUES('loss_streak_baseline', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (repr(latest),))
+        self._put_meta("loss_streak_baseline_id", str(baseline))
 
     # -- positions ---------------------------------------------------------
 

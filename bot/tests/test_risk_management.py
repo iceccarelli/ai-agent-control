@@ -624,6 +624,23 @@ class TestFeeAwareAccounting:
             lose(100 + i)
         assert manager._gate_consecutive_losses().reason == "CONSECUTIVE_LOSSES"
 
+    def test_a_loss_booked_during_the_halt_still_counts_after_the_reset(
+            self, manager, store):
+        def lose(i):
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Buy", qty=0.01,
+                entry_price=50_000.0, exit_price=49_000.0,
+                gross_pnl=-10.0, entry_fee=0.25, exit_fee=0.25,
+                opened_epoch=utc_now_epoch() - 600 + i,
+                closed_epoch=utc_now_epoch() + i))
+        for i in range(manager.max_consecutive_losses):
+            lose(i)
+        assert manager._gate_consecutive_losses().reason == "CONSECUTIVE_LOSSES"
+        lose(50)                       # a position that closes during the halt
+        store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
+        assert manager._gate_breaker().ok
+        assert store.consecutive_losses() == 1
+
     def test_net_returns_are_fee_inclusive(self, store):
         store.record_trade(TradeRecord(
             symbol="BTCUSDT", side="Buy", qty=0.01,

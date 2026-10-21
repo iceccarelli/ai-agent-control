@@ -585,3 +585,21 @@ def test_the_same_signal_on_a_later_bar_is_traded_again(tmp_path, exchange):
     bot.tick()
     assert len(sent) == 2
     bot.shutdown()
+
+
+def test_a_restart_does_not_re_enter_the_signal_already_traded(tmp_path, exchange):
+    strategy = StubStrategy()
+    strategy.last_rows = [["1000"]]
+    bot = build(tmp_path, exchange, strategy=strategy)
+    bot.startup()
+    sent = []
+    real = bot.engine.execute
+    bot.engine.execute = lambda i: (sent.append(i), real(i))[1]
+    bot.tick()
+    assert len(sent) == 1
+    for row in list(bot.store.open_positions()):
+        bot.store.remove_position(row["symbol"])
+    bot._traded_signals = {}                   # a fresh process, same database
+    bot.tick()
+    assert len(sent) == 1
+    bot.shutdown()

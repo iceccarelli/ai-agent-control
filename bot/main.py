@@ -1271,6 +1271,14 @@ class TradingBot:
             signature = (bar, intent.signal_type, float(intent.entry_price),
                          float(intent.stop_price), tuple(intent.take_profits))
             traded = self.__dict__.setdefault("_traded_signals", {})
+            signature = json.dumps(signature, default=str)
+            if symbol not in traded:
+                # survives a restart: the same bar's signal is not re-entered
+                # just because the process was bounced after a stop-out
+                try:
+                    traded[symbol] = self.store.traded_signal(symbol)
+                except Exception:  # noqa: BLE001
+                    traded[symbol] = ""
             if traded.get(symbol) == signature:
                 logger.debug("%s: signal already traded on this bar", symbol)
                 continue
@@ -1280,6 +1288,10 @@ class TradingBot:
                 # closed again by the safety path is not to be retried on the
                 # same bar either.
                 traded[symbol] = signature
+                try:
+                    self.store.mark_traded_signal(symbol, signature)
+                except Exception:  # noqa: BLE001
+                    logger.exception("could not persist the traded signal")
             logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
 
     #: Class-level defaults so a bot built without __init__ (tests, tools) works.
