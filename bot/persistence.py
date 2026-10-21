@@ -1377,7 +1377,12 @@ class StateStore:
         if rows and str(rows[0]["value"]) == str(scope):
             return False
         self._put_meta("equity_scope", str(scope))
-        self._exec("UPDATE equity_state SET last_equity = 0.0 WHERE id = 1")
+        if rows:
+            # A different account: its last reading AND its peak are not this
+            # one's. A paper peak left in place would read a live account as
+            # a 99% drawdown and halt it; a live peak would read paper as one.
+            self._exec("UPDATE equity_state SET last_equity = 0.0, "
+                       "peak_equity = 0.0 WHERE id = 1")
         return bool(rows)
 
     def traded_signal(self, symbol: str) -> str:

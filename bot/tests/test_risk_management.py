@@ -963,6 +963,8 @@ class TestAScopeChangeDoesNotCarryTheOtherAccountsEquity:
         monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
         store.update_equity(100.0)                     # the live account
         assert store.get_daily_anchor().start_equity == pytest.approx(100.0)
+        assert store.get_equity_state().peak_equity == pytest.approx(100.0)
+        assert store.drawdown_fraction(100.0) == pytest.approx(0.0)
 
     def test_the_same_scope_changes_nothing(self, store):
         assert store.set_equity_scope("a") is False       # first declaration
