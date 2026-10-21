@@ -267,6 +267,15 @@ class TestDeadStopFollowUps:
                     for t in meta["tp_order_ids"]]
         assert all(st in ("Cancelled", "Filled") for st in statuses), statuses
 
+    def test_a_refused_leg_cancel_neither_flattens_nor_trips_the_kill_switch(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        client.cancel_order = lambda **kw: False        # the venue refuses
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 3):
+            engine.observe_exits()
+        assert store.open_positions(), "the position must not be flattened"
+        assert not store.is_kill_switch_engaged()[0]
+
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         engine.observe_exits()

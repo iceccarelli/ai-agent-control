@@ -1760,23 +1760,29 @@ class TradingEngine:
                          "the dead stop %s: %s", symbol, link, exc)
             summary["unread"] += 1
             return
-        if relaxed and held > 0.0:
-            # A take-profit leg has sold part of the position: protect what is
-            # actually held, not the recorded size - and free the coin the
-            # resting leg still reserves, or the new stop (and any emergency
-            # sale) has nothing free to sell. A missing take-profit costs
-            # upside, never capital.
-            try:
-                min_qty = float(self.client.get_instrument_filters(symbol).min_qty)
-            except Exception:  # noqa: BLE001
-                min_qty = 0.0
-            if held < min_qty:
-                logger.critical("observe_exits: %s holds only %.8g, below the "
-                                "minimum order; nothing to protect", symbol, held)
-                summary.setdefault("stop_dead_unverified", []).append(symbol)
-                return
-            self._cancel_take_profit_legs(symbol)
-            row = dict(row, qty=min(float(row["qty"]), held))
+        if relaxed:
+            # A take-profit leg has stayed part-filled while the stop is dead.
+            # Free the coin it reserves and let the NEXT cycle do the rest: the
+            # cancelled leg reports PartiallyFilledCanceled, is booked through
+            # record_exit_fill (resizing the position), and a stop that is
+            # still dead is then judged against the true size by the normal
+            # path. Re-protecting here, in the same breath, would size the new
+            # stop before that booking and could end in an emergency sale that
+            # loses the leg's P&L. A missing take-profit costs upside, never
+            # capital.
+            if self._cancel_take_profit_legs(symbol):
+                logger.critical(
+                    "observe_exits: %s stop %s is dead and a take-profit leg "
+                    "stayed part-filled; cancelled the leg(s), the partial "
+                    "fill is booked and the stop re-judged next cycle",
+                    symbol, link)
+            else:
+                logger.critical(
+                    "observe_exits: %s stop %s is dead and the part-filled "
+                    "take-profit leg could not be cancelled; retrying next "
+                    "cycle", symbol, link)
+            summary.setdefault("stop_dead", []).append(symbol)
+            return
         if held < float(row["qty"]) * 0.98:
             # The coin is not (all) there: the position was sold or moved
             # behind the row's back. Re-protecting or "emergency selling" coin
@@ -2061,23 +2067,30 @@ class TradingEngine:
                             "stop_resized_to": remaining})
         return False
 
-    def _cancel_take_profit_legs(self, symbol: str) -> None:
+    def _cancel_take_profit_legs(self, symbol: str) -> bool:
         """Cancel the resting take-profit legs for a symbol, one by one, leaving
-        the stop alone. Best effort: a leg that cannot be cancelled stays open."""
+        the stop alone. Best effort: a leg that cannot be cancelled stays open.
+        Returns True only if every leg was cancelled (or there were none)."""
         try:
             legs = [r for r in self.store.unresolved_orders()
                     if str(r.get("symbol")) == symbol
                     and str(r.get("purpose")) == "tp"]
         except Exception:  # noqa: BLE001
             logger.exception("could not list take-profit legs for %s", symbol)
-            return
+            return False
+        all_ok = True
         for leg in legs:
             try:
-                self.client.cancel_order(
+                cancelled = self.client.cancel_order(
                     symbol=symbol, order_link_id=str(leg["order_link_id"]))
+                # cancel_order reports a venue refusal by returning False
+                if cancelled is False:
+                    all_ok = False
             except Exception:  # noqa: BLE001
+                all_ok = False
                 logger.warning("could not cancel take-profit leg %s",
                                leg["order_link_id"], exc_info=True)
+        return all_ok
 
     def _cancel_protective_orders(self, symbol: str) -> None:
         """Cancel every resting stop/TP for a symbol (the OCO half of an exit).
