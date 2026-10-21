@@ -369,6 +369,44 @@ class TestNoSecondCloseBesideAnUnknownOne:
         assert calls.count("close") == 2
 
 
+class TestACloseThatExecutedWhileTheProcessWasDown:
+    def test_startup_does_not_drop_it_unbooked_and_the_next_cycle_books_it(
+            self, stack):
+        engine, client, store, exchange, calls, qty = (
+            TestNoSecondCloseBesideAnUnknownOne()._unknown_close(stack))
+        summary = client.reconcile_on_startup()
+        assert summary["unknown"] >= 1                 # left for the engine
+        assert [o for o in store.unresolved_orders() if o["purpose"] == "close"]
+        assert store.open_positions()                  # still on the book
+        sent = calls.count("close")
+        engine.observe_exits()                         # books it from its fill
+        assert store.open_positions() == []
+        assert len(store.confirmed_exit_rows()) == 1
+        assert calls.count("close") == sent            # and sold nothing more
+        assert not [o for o in store.unresolved_orders()
+                    if o["purpose"] == "close"]
+
+
+class TestAStaleCloseRowIsNotReplayedAgainstALaterPosition:
+    def test_a_close_older_than_the_position_is_settled_not_booked(self, stack):
+        engine, client, store, exchange, calls, qty = (
+            TestNoSecondCloseBesideAnUnknownOne()._unknown_close(stack))
+        link = [o for o in store.unresolved_orders()
+                if o["purpose"] == "close"][0]["order_link_id"]
+        # the position it belonged to is gone; a NEW one opens afterwards
+        store.remove_position("BTCUSDT")
+        store.upsert_position("BTCUSDT", "Buy", qty, 50_000.0, stop_price=49_000.0)
+        store._exec("UPDATE positions SET opened_epoch = ? WHERE symbol='BTCUSDT'",
+                    (float(store._query("SELECT created_epoch FROM orders WHERE "
+                                        "order_link_id=?", (link,))[0][0]) + 60,))
+        trades_before = len(store.confirmed_exit_rows())
+        report = engine.close_position(symbol="BTCUSDT", reason="horizon")
+        assert report.reason != "CLOSE_RECONCILED"
+        assert len(store.confirmed_exit_rows()) == trades_before
+        assert store._query("SELECT status FROM orders WHERE order_link_id=?",
+                            (link,))[0][0] == "stale"
+
+
 def test_a_position_reply_without_a_list_is_not_flat(stack):
     import bybit_connection as bc
     engine, client, risk, store, exchange = stack
