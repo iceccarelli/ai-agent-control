@@ -492,8 +492,11 @@ class TradingBot:
             logger.critical("startup blocked: %s", why)
             return False
         try:
-            scope = (f"testnet={bool(getattr(self.cfg, 'USE_TESTNET', True))};"
-                     f"paper={bool(getattr(self.cfg, 'PAPER_TRADING', True))}")
+            # The ACCOUNT is what the equity belongs to: the endpoint decides
+            # that. PAPER_TRADING only changes whether orders are sent, not
+            # whose balance is read, so flipping it must not wipe the peak.
+            scope = (f"venue={getattr(self.cfg, 'BYBIT_VENUE', '')};"
+                     f"testnet={bool(getattr(self.cfg, 'USE_TESTNET', True))}")
             if self.store.set_equity_scope(scope):
                 logger.warning("equity scope changed to %s; yesterday's "
                                "equity will not seed today's anchor", scope)
@@ -894,7 +897,7 @@ class TradingBot:
         # start — it just means the wait — so this logs and carries on.
         try:
             venue_prints = broker.get_funding_history(
-                self.carry.perp_symbol, limit=8)
+                self.carry.perp_symbol, limit=30)
             self.carry.venue_prints_at_start = list(venue_prints)
             warmed = self.carry.warm_funding_history(venue_prints)
             if warmed:

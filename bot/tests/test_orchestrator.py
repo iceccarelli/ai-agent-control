@@ -613,3 +613,27 @@ def test_a_signal_with_no_bar_is_never_persisted(tmp_path, exchange):
     bot.tick()
     assert bot.store.traded_signal("BTCUSDT") == ""
     bot.shutdown()
+
+
+def test_flipping_paper_trading_does_not_wipe_the_peak_but_the_endpoint_does(
+        tmp_path, exchange):
+    cfg = Cfg()
+    bot = build(tmp_path, exchange, cfg=cfg)
+    bot.startup()
+    bot.store.update_equity(250_000.0)
+    peak = bot.store.get_equity_state().peak_equity
+    bot.shutdown()
+
+    cfg2 = Cfg()
+    cfg2.PAPER_TRADING = False                 # same account, orders enabled
+    bot2 = build(tmp_path, exchange, cfg=cfg2)
+    bot2.startup()
+    assert bot2.store.get_equity_state().peak_equity == peak
+    bot2.shutdown()
+
+    cfg3 = Cfg()
+    cfg3.USE_TESTNET = False                   # a different account
+    bot3 = build(tmp_path, exchange, cfg=cfg3)
+    bot3.startup()
+    assert bot3.store.get_equity_state().peak_equity < peak
+    bot3.shutdown()
