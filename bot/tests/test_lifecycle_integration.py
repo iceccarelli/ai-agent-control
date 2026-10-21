@@ -1042,3 +1042,65 @@ def test_take_profit_legs_that_do_not_cover_the_position_keep_their_fractions(st
     assert report.ok, report.reason
     assert len(placed) == 2
     assert placed[1] / placed[0] == pytest.approx(0.4, rel=0.05)
+
+
+class TestAStopThatTriggeredWhileTheProcessWasDown:
+    """Restart reconciliation of a spot protective stop, no venue contact."""
+
+    def _restart(self, stack):
+        engine, client, risk, store, exchange = stack
+        path = store.path          # the old process is simply gone: reopen
+        cfg = LiveCfg()
+        store2 = StateStore(path)
+        store2.claim_writer()
+        client2 = bc.BybitClient(config=cfg, store=store2, transport=exchange)
+        risk2 = BillionaireRiskManager(config=cfg, store=store2)
+        engine2 = te.TradingEngine(
+            client=client2, risk_manager=risk2,
+            position_sizer=BillionairePositionSizing(config=cfg, risk_manager=risk2),
+            store=store2, config=cfg)
+        return engine2, client2, store2
+
+    def _meta(self, store):
+        import json as _j
+        row = store.open_positions()[0]
+        m = row["meta"]
+        return row, (_j.loads(m) if isinstance(m, str) else m)
+
+    def test_a_full_stop_fill_is_booked_once_after_the_restart(self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row, meta = self._meta(store)
+        qty = float(row["qty"])
+        stop = meta["stop_order_link_id"]
+        exchange.orders[stop].update(orderStatus="Filled", cumExecQty=str(qty),
+                                     avgPrice=str(ENTRY * 0.98))
+        engine2, client2, store2 = self._restart(stack)
+        engine2.observe_exits()
+        engine2.observe_exits()                       # replay: still once
+        assert store2.open_positions() == []
+        trades = store2.recent_trades()
+        assert len(trades) == 1
+        assert trades[0]["exit_price"] == pytest.approx(ENTRY * 0.98)
+        assert trades[0]["gross_pnl"] < 0
+        for tp in meta["tp_order_ids"]:               # the OCO half
+            assert exchange.orders[tp]["orderStatus"] == "Cancelled"
+
+    def test_a_partial_stop_fill_then_a_restart_books_the_part_and_keeps_the_rest(
+            self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row, meta = self._meta(store)
+        qty = float(row["qty"])
+        stop = meta["stop_order_link_id"]
+        part = qty / 4
+        exchange.orders[stop].update(orderStatus="PartiallyFilledCanceled",
+                                     cumExecQty=str(part),
+                                     avgPrice=str(ENTRY * 0.98))
+        engine2, client2, store2 = self._restart(stack)
+        engine2.observe_exits()
+        rows = store2.open_positions()
+        assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(qty - part)
+        assert len(store2.recent_trades()) == 1
+        engine2.observe_exits()
+        assert len(store2.recent_trades()) == 1       # not booked twice
