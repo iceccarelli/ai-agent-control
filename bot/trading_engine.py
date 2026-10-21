@@ -1716,6 +1716,25 @@ class TradingEngine:
                 if current is None:
                     break
                 qty = min(qty, float(current["qty"]))
+                if qty > 0 and price <= 0:
+                    unpriced = self.__dict__.setdefault("_unpriced_cycles", {})
+                    n_unpriced = unpriced[(symbol, link)] = unpriced.get(
+                        (symbol, link), 0) + 1
+                    if n_unpriced > self.DEAD_STOP_MAX_DEFERRALS:
+                        # Waiting for a price the venue will not give is how a
+                        # position stays naked for ever. Book the fill at the
+                        # row's entry price (flat P&L on those units, fees as
+                        # stated) and say it is approximate.
+                        price = float(current["entry_price"] or 0.0)
+                        logger.critical(
+                            "observe_exits: %s order %s filled %.8g with no "
+                            "price from the venue after %d cycles; booking at "
+                            "the entry price (APPROXIMATE)", symbol, link, qty,
+                            n_unpriced)
+                        self.store.journal(symbol, "EXIT_PRICE_APPROXIMATED",
+                                           link, {"qty": qty, "price": price})
+                        summary["price_approximated"] = summary.get(
+                            "price_approximated", 0) + 1
                 if qty <= 0 or price <= 0:
                     logger.error("observe_exits: %s order %s is %s but reports "
                                  "qty=%s price=%s; not booked", symbol, link,
@@ -1798,7 +1817,10 @@ class TradingEngine:
             ids = [str(t) for t in
                    (self._row_meta(row).get("tp_order_ids") or [])]
             direct_ok = True
+            booked_ids = set(self._row_meta(row).get("booked_exit_orders") or [])
             for tp in ids:          # the engine's own list, not only the table
+                if tp in booked_ids:
+                    continue        # already filled and booked: nothing to cancel
                 try:
                     if self.client.cancel_order(symbol=symbol,
                                                 order_link_id=tp) is False:

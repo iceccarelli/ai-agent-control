@@ -362,6 +362,22 @@ class TestDeadStopFollowUps:
         assert "stop_dead_outcome" not in summary      # no protect/flatten attempt
         assert not store.is_kill_switch_engaged()[0]
 
+    def test_an_unpriceable_fill_is_booked_approximately_after_a_bound(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        exchange.orders[tp].update(orderStatus="Cancelled", cumExecQty="0.0001",
+                                   avgPrice="0", cumExecValue="0", price="0")
+        for other in meta["tp_order_ids"][1:]:
+            exchange.orders[other]["orderStatus"] = "New"
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS):
+            engine.observe_exits()
+        assert not store.recent_trades()               # still deferring
+        summary = engine.observe_exits()               # the bound is crossed
+        assert summary.get("price_approximated") == 1
+        assert len(store.recent_trades()) == 1
+        assert any(d.get("decision") == "EXIT_PRICE_APPROXIMATED"
+                   for d in store.recent_decisions())
+
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         engine.observe_exits()
