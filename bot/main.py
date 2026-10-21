@@ -491,6 +491,14 @@ class TradingBot:
         if not allowed:
             logger.critical("startup blocked: %s", why)
             return False
+        try:
+            scope = (f"testnet={bool(getattr(self.cfg, 'USE_TESTNET', True))};"
+                     f"paper={bool(getattr(self.cfg, 'PAPER_TRADING', True))}")
+            if self.store.set_equity_scope(scope):
+                logger.warning("equity scope changed to %s; yesterday's "
+                               "equity will not seed today's anchor", scope)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not record the equity scope")
         live_armed, live_why = _config.is_live_authorized(self.cfg)
         logger.warning(
             "mode: %s | testnet=%s paper=%s | %s",

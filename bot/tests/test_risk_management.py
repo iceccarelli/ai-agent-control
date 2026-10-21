@@ -950,3 +950,20 @@ class TestOnlyALossIsCarriedIntoTheNewDay:
         monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
         store.update_equity(15_000.0)
         assert store.get_daily_anchor().start_equity == pytest.approx(15_000.0)
+
+
+class TestAScopeChangeDoesNotCarryTheOtherAccountsEquity:
+    def test_paper_equity_does_not_seed_a_live_days_anchor(self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.set_equity_scope("testnet=True;paper=True")
+        store.update_equity(10_000.0)
+        assert store.set_equity_scope("testnet=False;paper=False") is True
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
+        store.update_equity(100.0)                     # the live account
+        assert store.get_daily_anchor().start_equity == pytest.approx(100.0)
+
+    def test_the_same_scope_changes_nothing(self, store):
+        assert store.set_equity_scope("a") is False       # first declaration
+        assert store.set_equity_scope("a") is False

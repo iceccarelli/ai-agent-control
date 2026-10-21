@@ -1366,6 +1366,20 @@ class StateStore:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value))
 
+    def set_equity_scope(self, scope: str) -> bool:
+        """Declare which account the equity readings belong to.
+
+        When the scope changes (paper -> live, testnet -> mainnet) the last
+        reading belongs to a DIFFERENT account, so it must not seed the new
+        day's anchor. Returns True when the scope changed.
+        """
+        rows = self._query("SELECT value FROM meta WHERE key = 'equity_scope'")
+        if rows and str(rows[0]["value"]) == str(scope):
+            return False
+        self._put_meta("equity_scope", str(scope))
+        self._exec("UPDATE equity_state SET last_equity = 0.0 WHERE id = 1")
+        return bool(rows)
+
     def traded_signal(self, symbol: str) -> str:
         """The signature of the last signal traded on `symbol` ('' if none)."""
         rows = self._query("SELECT value FROM meta WHERE key = ?",
