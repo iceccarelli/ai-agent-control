@@ -63,6 +63,7 @@ import contextlib
 import json
 import os
 import secrets
+import logging
 import sqlite3
 import threading
 import time
@@ -79,6 +80,8 @@ __all__ = [
     "MEMORY_KEY_CONVENTION",
     "slippage_bps",
 ]
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH") or "state/trading_state.db"
 
@@ -1184,8 +1187,10 @@ class StateStore:
             raise PersistenceError(f"refusing to rebase onto equity {equity!r}")
         day = utc_day()
         self.ensure_daily_anchor(eq, day)
-        self._exec("UPDATE daily_anchor SET start_equity = ?, realised_pnl = 0.0 "
-                   "WHERE day = ?", (eq, day))
+        self._exec("UPDATE daily_anchor SET start_equity = ? WHERE day = ?",
+                   (eq, day))
+        logger.warning("daily anchor for %s rebased by a human to %.2f "
+                       "(peak equity is NOT rebased)", day, eq)
 
     # -- per-symbol cooldown ----------------------------------------------
 
@@ -1409,6 +1414,18 @@ class StateStore:
         rows = self._query("SELECT value FROM meta WHERE key = 'equity_scope'")
         if rows and str(rows[0]["value"]) == str(scope):
             return False
+        if rows:
+            # A scope written by the earlier format ("testnet=X;paper=Y") named
+            # the same account when its testnet token agrees: rewrite it in
+            # place instead of treating the deploy itself as an account change
+            # (which would wipe the drawdown peak and today's anchor).
+            import re
+            old = re.fullmatch(r"testnet=(True|False);paper=(?:True|False)",
+                               str(rows[0]["value"]))
+            new = re.search(r"testnet=(True|False)", str(scope))
+            if old and new and old.group(1) == new.group(1):
+                self._put_meta("equity_scope", str(scope))
+                return False
         self._put_meta("equity_scope", str(scope))
         if rows:
             # A different account: its last reading AND its peak are not this

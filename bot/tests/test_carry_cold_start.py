@@ -764,3 +764,17 @@ def test_missed_settlements_are_estimated_into_funding_collected():
     leg = e.position.perp
     assert e.position.funding_collected == pytest.approx(
         2 * (2.0 / 1e4) * leg.filled_qty * leg.avg_price)
+
+
+def test_a_hole_reseeds_the_history_from_the_venue_tail_not_empty():
+    gap = CarryEngine.MAX_PRINT_GAP_MS
+    venue = Venue(perp=0.001)
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    e.position = opened(venue).position
+    e.position.opened_ms = 0
+    e._last_print_ms = 1_000
+    e._funding_history = [1.0, 1.0, 1.0]
+    base = 1_000 + gap + 10
+    e.venue_prints_at_start = [(0.5, base), (0.6, base + 100), (0.7, base + 200)]
+    e._catch_up_missed_prints()
+    assert e._funding_history == [0.5, 0.6]       # newest left for on_candle

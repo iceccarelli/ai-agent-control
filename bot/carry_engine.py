@@ -878,7 +878,8 @@ class CarryEngine:
             self._restore_allowance(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
-            self._catch_up_missed_prints()
+            if self._catch_up_missed_prints():
+                self._record()          # the streak/estimate must survive a crash
             if self.position is not None and venue_read_started_ms is not None:
                 # The venue was read from this moment, not from now: a close
                 # that landed after it must still count as new evidence.
@@ -934,6 +935,7 @@ class CarryEngine:
         if missed and (self._last_print_ms is None
                        or missed[-1][1] > self._last_print_ms):
             missed = missed[:-1]
+        reseeded = False
         if missed and missed[0][1] - last > self.MAX_PRINT_GAP_MS:
             # The venue read does not reach back to the last print we saw:
             # settlements are missing between them, and the old prints must
@@ -943,8 +945,25 @@ class CarryEngine:
                 "one this book saw; discarding the stale funding history",
                 (missed[0][1] - last) / 3.6e6)
             self._funding_history = []
+            # Re-seed from the venue's contiguous tail so the EWMA is not left
+            # empty although the prints are in hand.
+            tail: List[Tuple[int, float]] = []
+            for stamp, rate in sorted(
+                    {int(s): float(r) for r, s in
+                     (self.venue_prints_at_start or ())
+                     if self._finite(r)}.items()):
+                if tail and stamp - tail[-1][0] > self.MAX_PRINT_GAP_MS:
+                    tail = []
+                tail.append((stamp, rate))
+            if tail and (self._last_print_ms is None
+                         or tail[-1][0] > self._last_print_ms):
+                tail = tail[:-1]        # on_candle books the live newest
+            self._funding_history = [r for _s, r in tail][-self.FUNDING_HISTORY:]
+            reseeded = True
         for rate, stamp in missed:
-            if self._last_print_ms is None or stamp > self._last_print_ms:
+            if reseeded:
+                self._last_print_ms = max(self._last_print_ms or 0, stamp)
+            elif self._last_print_ms is None or stamp > self._last_print_ms:
                 # (not when the venue warm-up already seeded this print)
                 self._funding_history.append(rate)
                 del self._funding_history[:-self.FUNDING_HISTORY]

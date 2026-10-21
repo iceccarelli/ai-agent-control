@@ -495,7 +495,9 @@ class TradingBot:
             # The ACCOUNT is what the equity belongs to: the endpoint decides
             # that. PAPER_TRADING only changes whether orders are sent, not
             # whose balance is read, so flipping it must not wipe the peak.
-            scope = (f"venue={getattr(self.cfg, 'BYBIT_VENUE', '')};"
+            venue = getattr(self.cfg, 'BYBIT_VENUE', '')
+            venue = venue.lower() if isinstance(venue, str) else ''
+            scope = (f"venue={venue};"
                      f"testnet={bool(getattr(self.cfg, 'USE_TESTNET', True))}")
             if self.store.set_equity_scope(scope):
                 logger.warning("equity scope changed to %s; yesterday's "

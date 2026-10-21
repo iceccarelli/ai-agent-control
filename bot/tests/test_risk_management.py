@@ -1018,8 +1018,33 @@ class TestAHumanCanRebaseTheDailyAnchorAfterAWithdrawal:
         import glob
         import os
         root = os.path.join(os.path.dirname(__file__), "..")
-        for path in glob.glob(os.path.join(root, "*.py")):
+        for path in (glob.glob(os.path.join(root, "*.py"))
+                     + glob.glob(os.path.join(root, "tools", "*.py"))):
             if path.endswith("persistence.py"):
                 continue
             with open(path, encoding="utf-8") as fh:
                 assert "rebase_daily_anchor_by_human" not in fh.read(), path
+
+
+class TestReviewFollowUps2:
+    def test_the_legacy_scope_string_is_migrated_not_treated_as_a_new_account(
+            self, store):
+        store._exec("INSERT INTO meta(key, value) VALUES('equity_scope', "
+                    "'testnet=True;paper=True')")
+        store.update_equity(10_000.0)
+        assert store.set_equity_scope("venue=testnet;testnet=True") is False
+        assert store.get_equity_state().peak_equity == pytest.approx(10_000.0)
+        assert store.set_equity_scope("venue=testnet;testnet=True") is False
+
+    def test_a_legacy_scope_on_a_different_endpoint_is_a_change(self, store):
+        store._exec("INSERT INTO meta(key, value) VALUES('equity_scope', "
+                    "'testnet=True;paper=True')")
+        store.update_equity(10_000.0)
+        assert store.set_equity_scope("venue=mainnet;testnet=False") is True
+        assert store.get_equity_state().peak_equity == 0.0
+
+    def test_the_rebase_keeps_the_days_realised_pnl(self, store):
+        store.update_equity(10_000.0)
+        store._exec("UPDATE daily_anchor SET realised_pnl = -123.0")
+        store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 8_000.0)
+        assert store.get_daily_anchor().realised_pnl == pytest.approx(-123.0)
