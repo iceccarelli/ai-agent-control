@@ -269,3 +269,30 @@ def test_a_linear_remainder_below_the_dust_threshold_stays_on_the_book(tmp_path)
     assert s["reduced"] == 1 and s["closed"] == 0
     rows = store.open_positions()
     assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(0.00005)
+
+
+def test_two_partial_exits_of_one_venue_order_are_both_booked(tmp_path):
+    """A closed-pnl `orderId` is not one exit: a single order can fill in
+    pieces seen in different cycles. Keying the dedupe on it dropped every
+    piece after the first, leaving the ledger larger than the venue."""
+    fake = FakeBybit()
+    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell", "size": "0.004",
+                                 "avgPrice": "60000", "stopLoss": "61000"}
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open(store, qty=0.01)
+    now = int(time.time() * 1000)
+    fake.closed_pnl.append({
+        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.006", "orderId": "O1",
+        "avgExitPrice": "59000", "closedPnl": "6", "updatedTime": str(now + 1000)})
+    assert engine.observe_exits()["reduced"] == 1
+    fake.positions["BTCUSDT"]["size"] = "0.002"
+    fake.closed_pnl.append({
+        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.002", "orderId": "O1",
+        "avgExitPrice": "58900", "closedPnl": "2.2", "updatedTime": str(now + 2000)})
+    assert engine.observe_exits()["reduced"] == 1
+    assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.002)
+    assert len(store._query("SELECT * FROM trades")) == 2
+    # a replay of the same cycle books nothing more
+    engine.observe_exits()
+    assert len(store._query("SELECT * FROM trades")) == 2
+    assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.002)

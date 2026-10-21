@@ -1699,21 +1699,17 @@ class TradingEngine:
             # Crash-boundary invariant: a process kill between
             # `record_exit_fill`'s `record_trade` and its `remove_position`
             # (or `upsert_position` for a partial) leaves this exact position
-            # row in place, so the next cycle's `observe_exits` recomputes
-            # the SAME `exited`/`price` from the SAME closed-pnl window and
-            # would otherwise book the same exit twice. Preferred key: the
-            # venue's own closed-pnl `orderId`s for this window -- a durable
-            # identity, exactly like an order's `orderLinkId`. When the
-            # closed-pnl read itself failed (the `VENUE_EXIT_PRICE_UNREAD`
-            # branch above), no such id exists; the fallback key is still
-            # stable across an identical replay (same symbol/since_ms/
-            # exited qty) though weaker in the general case -- see
-            # `StateStore.record_trade`'s docstring.
-            if order_ids:
-                dedupe_key = f"exit_pnl:{symbol}:{','.join(order_ids)}"
-            else:
-                dedupe_key = (f"exit_unread:{symbol}:{since_ms}:{held:.10f}:"
-                              f"{exited:.10f}")
+            # row in place, so the next cycle recomputes the SAME exit and
+            # would otherwise book it twice. The key is the POSITION's own
+            # state: which position (symbol + open time) and the quantity it
+            # held before and lost now. An identical replay reproduces it; the
+            # next partial exit of the same position cannot, because the
+            # quantity held only ever falls. The venue's order id is NOT part
+            # of it: one order can fill in pieces across cycles, and a key
+            # built from it silently dropped every piece after the first.
+            dedupe_key = (f"exit_pos:{symbol}:"
+                          f"{float(row.get('opened_epoch', 0) or 0):.6f}:"
+                          f"{held:.10f}:{exited:.10f}")
             exit_fees, fee_ref, evidence = self._observed_exit_fees(
                 symbol, pnl_rows, exited)
             fully = self.record_exit_fill(symbol=symbol, qty=exited, price=price,
