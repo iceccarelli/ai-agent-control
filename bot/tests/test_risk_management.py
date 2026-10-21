@@ -1048,3 +1048,16 @@ class TestReviewFollowUps2:
         store._exec("UPDATE daily_anchor SET realised_pnl = -123.0")
         store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 8_000.0)
         assert store.get_daily_anchor().realised_pnl == pytest.approx(-123.0)
+
+
+def test_a_human_can_rebase_the_peak_too_after_a_withdrawal(store):
+    store.update_equity(10_000.0)
+    assert store.drawdown_fraction(8_000.0) == pytest.approx(0.2)
+    store.rebase_daily_anchor_by_human(
+        "HUMAN_REBASED_DAILY_ANCHOR", 8_000.0, rebase_peak=True)
+    assert store.drawdown_fraction(8_000.0) == pytest.approx(0.0)
+    assert store.drawdown_fraction(7_200.0) == pytest.approx(0.1)
+    # without the flag the peak is left alone
+    store.update_equity(10_000.0)
+    store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 9_000.0)
+    assert store.get_equity_state().peak_equity >= 10_000.0

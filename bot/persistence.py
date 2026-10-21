@@ -1170,7 +1170,8 @@ class StateStore:
         )
 
     def rebase_daily_anchor_by_human(self, operator_ack: str,
-                                     equity: float) -> None:
+                                     equity: float,
+                                     rebase_peak: bool = False) -> None:
         """Restart today's daily-loss measurement from `equity`.
 
         For the one case the bot cannot judge: an operator moved money
@@ -1189,8 +1190,14 @@ class StateStore:
         self.ensure_daily_anchor(eq, day)
         self._exec("UPDATE daily_anchor SET start_equity = ? WHERE day = ?",
                    (eq, day))
+        if rebase_peak:
+            # A withdrawal lowers equity against the stored peak and reads as
+            # a drawdown; the operator can restart that measurement too.
+            self._exec("UPDATE equity_state SET peak_equity = ?, "
+                       "last_equity = ? WHERE id = 1", (eq, eq))
         logger.warning("daily anchor for %s rebased by a human to %.2f "
-                       "(peak equity is NOT rebased)", day, eq)
+                       "(peak equity %s)", day, eq,
+                       "rebased" if rebase_peak else "NOT rebased")
 
     # -- per-symbol cooldown ----------------------------------------------
 
