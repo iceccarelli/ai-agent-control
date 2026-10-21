@@ -1427,6 +1427,21 @@ class StateStore:
                           "net_before": old_net, "net_after": new_net})
             return True
 
+    def add_trade_exit_order_ids(self, trade_id: int, ids: Sequence[str]) -> None:
+        """Record the venue order ids of a still-provisional exit (identity
+        recovered from closed-pnl). Only touches a provisional row."""
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT meta FROM trades WHERE id = ? AND price_provisional = 1",
+                (int(trade_id),)).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["meta"] or "{}")
+            meta["exit_order_ids"] = sorted({str(i) for i in ids})
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+
     def net_returns(self, limit: int = 500) -> List[float]:
         """Per-trade NET return fractions, oldest first — the Kelly input.
 

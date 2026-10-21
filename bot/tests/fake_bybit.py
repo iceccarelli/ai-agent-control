@@ -63,6 +63,8 @@ class FakeBybit:
         self.positions: Dict[str, Dict[str, Any]] = {}
         #: Rows served by /v5/position/closed-pnl (linear). Tests append.
         self.closed_pnl: List[Dict[str, Any]] = []
+        #: Rows served by /v5/execution/list (fills). Tests append.
+        self.executions: List[Dict[str, Any]] = []
         #: Funding rate as a FRACTION per 8h, as the tickers endpoint reports it.
         self.funding_rate: float = 0.0001
         #: Set to a retCode to make the next trading-stop call fail.
@@ -178,6 +180,22 @@ class FakeBybit:
             return self._ok({**self.book,
                              "s": (params or {}).get("symbol", ""),
                              "ts": int(time.time() * 1000), "u": 1})
+
+        if path == "/v5/execution/list":
+            q = params or {}
+            if not (q.get("orderId") or q.get("orderLinkId")):
+                return self._err(10001, "orderId or orderLinkId required here")
+            rows = [r for r in self.executions
+                    if r.get("symbol") == q.get("symbol")
+                    and (not q.get("orderId") or r.get("orderId") == q["orderId"])
+                    and (not q.get("orderLinkId")
+                         or r.get("orderLinkId") == q["orderLinkId"])]
+            limit = max(1, min(int(q.get("limit", 50) or 50), 100))
+            start = int(q.get("cursor") or 0)
+            page = rows[start:start + limit]
+            nxt = str(start + limit) if start + limit < len(rows) else ""
+            return self._ok({"list": page, "nextPageCursor": nxt,
+                             "category": q.get("category", "")})
 
         if path == "/v5/position/closed-pnl":
             symbol = (params or {}).get("symbol", "")

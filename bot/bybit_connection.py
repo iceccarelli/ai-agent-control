@@ -1707,25 +1707,54 @@ class BybitClient:
             deduped.append((stamp, rate))
         return deduped
 
-    def get_executions(self, symbol: str, order_link_id: str,
-                       limit: int = 100) -> List[Dict[str, Any]]:
-        """The venue's own execution rows (fills) of ONE order.
+    EXECUTION_PAGE_CAP = 20
 
-        ``GET /v5/execution/list`` - each row carries ``execId``, ``orderLinkId``,
-        ``symbol``, ``side``, ``execPrice``, ``execQty``, ``execFee``,
-        ``feeCurrency``, ``execType`` and ``execTime``. Read-only. Raises on any
-        failure and returns rows exactly as stated: it never fills a gap.
+    def get_executions(self, symbol: str, order_link_id: str = "", *,
+                       order_id: str = "", start_ms: int = 0, end_ms: int = 0,
+                       limit: int = 100) -> List[Dict[str, Any]]:
+        """The venue's own execution rows (fills) of ONE order, every page.
+
+        ``GET /v5/execution/list`` filtered by ``orderLinkId`` or ``orderId``
+        (a venue-triggered stop/TP has no usable link id; the closed-pnl
+        ``orderId`` is the join key). Rows carry ``execId``, ``orderId``,
+        ``orderLinkId``, ``symbol``, ``side``, ``execPrice``, ``execQty``,
+        ``execFee``, ``feeCurrency``, ``execType`` and ``execTime``. Follows
+        ``nextPageCursor`` until it is exhausted and RAISES if the cap is hit
+        or a cursor repeats: a truncated fill list would fail the exact
+        quantity match anyway, and must never look complete. Read-only.
         """
-        if not order_link_id:
-            raise PermanentAPIError("get_executions needs an order link id")
-        payload = self._request(
-            "GET", "/v5/execution/list", signed=True,
-            params={"category": self.category, "symbol": symbol,
-                    "orderLinkId": order_link_id, "limit": int(limit)})
-        rows = payload.get("result", {}).get("list")
-        if rows is None:
-            raise PermanentAPIError("execution list carries no list")
-        return list(rows)
+        if not (order_link_id or order_id):
+            raise PermanentAPIError(
+                "get_executions needs an order link id or an order id")
+        params: Dict[str, Any] = {"category": self.category, "symbol": symbol,
+                                  "limit": int(limit)}
+        if order_id:
+            params["orderId"] = order_id
+        else:
+            params["orderLinkId"] = order_link_id
+        if start_ms:
+            params["startTime"] = int(start_ms)
+        if end_ms:
+            params["endTime"] = int(end_ms)
+        out: List[Dict[str, Any]] = []
+        seen_cursors: set = set()
+        for _page in range(self.EXECUTION_PAGE_CAP):
+            payload = self._request("GET", "/v5/execution/list", signed=True,
+                                    params=dict(params))
+            result = payload.get("result") or {}
+            rows = result.get("list")
+            if not isinstance(rows, list):
+                raise PermanentAPIError("execution list carries no list")
+            out.extend(rows)
+            cursor = result.get("nextPageCursor")
+            if not cursor:
+                return out
+            if cursor in seen_cursors:
+                raise PermanentAPIError("execution list cursor repeated")
+            seen_cursors.add(cursor)
+            params["cursor"] = cursor
+        raise PermanentAPIError("execution list did not finish within the "
+                                "page cap; not treating it as complete")
 
     def get_closed_pnl(self, symbol: str, *, since_ms: int = 0,
                        limit: int = 50) -> List[Dict[str, Any]]:

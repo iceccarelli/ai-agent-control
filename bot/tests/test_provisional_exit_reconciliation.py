@@ -408,3 +408,149 @@ def test_perpetual_trades_are_counted_as_funding_unbooked(stack):
             opened_epoch=1.0, closed_epoch=2.0 + booked,
             meta={"funding_booked": booked}, dedupe_key=f"k{booked}"))
     assert store.fee_evidence()["funding_unbooked_trades"] == 1
+
+
+# -- linear, venue-triggered exits: identified by the venue ORDER ID ---------
+
+import json as _json  # noqa: E402
+import time as _time  # noqa: E402
+
+from fake_bybit import FakeBybit  # noqa: E402
+from test_observe_exits import LinearCfg, _engine as _lin_engine, _open as _lin_open  # noqa: E402
+
+
+def _lin_ex(exec_id, order_id, qty, price, **over):
+    row = {"execId": exec_id, "orderId": order_id, "orderLinkId": "",
+           "symbol": "BTCUSDT", "side": "Buy", "execType": "Trade",
+           "execQty": str(qty), "execPrice": str(price), "execFee": "0.05",
+           "feeCurrency": "USDT"}
+    row.update(over)
+    return row
+
+
+def _lin_provisional(tmp_path, qty=0.01, closed_pnl_rows=None):
+    fake = FakeBybit()
+    engine, store = _lin_engine(tmp_path, LinearCfg(), fake)
+    _lin_open(store, qty=qty)
+    fake.closed_pnl.extend(closed_pnl_rows if closed_pnl_rows is not None else [{
+        "symbol": "BTCUSDT", "side": "Buy", "qty": str(qty), "orderId": "ORD1",
+        "avgExitPrice": "0", "closedPnl": "0",
+        "updatedTime": str(int(_time.time() * 1000) + 1000)}])
+    engine.observe_exits()
+    assert len(store.provisional_trades()) == 1
+    return engine, store, fake
+
+
+class TestLinearVenueTriggeredExitReconcilesByOrderId:
+    def test_it_reconciles_once_through_the_real_client_path(self, tmp_path):
+        engine, store, fake = _lin_provisional(tmp_path)
+        fake.executions.append(_lin_ex("X1", "ORD1", 0.01, 61_000))
+        assert engine.reconcile_provisional_exits()["reconciled"] == 1
+        t = store.recent_trades()[0]
+        assert t["exit_price"] == pytest.approx(61_000)
+        assert t["gross_pnl"] < 0                        # a short stopped out
+        assert engine.reconcile_provisional_exits()["checked"] == 0
+
+    def test_several_partial_fills_are_volume_weighted(self, tmp_path):
+        engine, store, fake = _lin_provisional(tmp_path)
+        fake.executions += [_lin_ex("X1", "ORD1", 0.004, 61_000),
+                            _lin_ex("X2", "ORD1", 0.006, 62_000)]
+        engine.reconcile_provisional_exits()
+        assert store.recent_trades()[0]["exit_price"] == pytest.approx(
+            (0.004 * 61_000 + 0.006 * 62_000) / 0.01)
+
+    def test_more_than_one_page_of_fills_is_read_in_full(self, tmp_path):
+        engine, store, fake = _lin_provisional(tmp_path, qty=1.5)
+        fake.executions += [_lin_ex(f"X{i}", "ORD1", 0.01, 61_000)
+                            for i in range(150)]
+        assert engine.reconcile_provisional_exits()["reconciled"] == 1
+
+    @pytest.mark.parametrize("bad", [
+        {"orderId": "OTHER"}, {"execType": "BustTrade"}, {"side": "Sell"},
+        {"symbol": "ETHUSDT"}, {"execFee": ""}, {"execPrice": "0"},
+    ])
+    def test_wrong_evidence_leaves_it_provisional(self, tmp_path, bad):
+        engine, store, fake = _lin_provisional(tmp_path)
+        row = _lin_ex("X1", "ORD1", 0.01, 61_000, **bad)
+        if bad.get("symbol"):
+            row["symbol"] = "BTCUSDT"        # the venue filter would hide it:
+            fake.executions.append(dict(row, symbol="ETHUSDT"))   # not served
+        else:
+            fake.executions.append(row)
+        assert engine.reconcile_provisional_exits()["reconciled"] == 0
+        assert len(store.provisional_trades()) == 1
+        assert store.recent_trades() == []
+
+    def test_a_quantity_mismatch_stays_provisional(self, tmp_path):
+        engine, store, fake = _lin_provisional(tmp_path)
+        fake.executions.append(_lin_ex("X1", "ORD1", 0.004, 61_000))
+        assert engine.reconcile_provisional_exits()["reconciled"] == 0
+
+    def test_an_exact_replay_of_one_fill_is_counted_once(self, tmp_path):
+        engine, store, fake = _lin_provisional(tmp_path)
+        row = _lin_ex("X1", "ORD1", 0.01, 61_000)
+        fake.executions += [row, dict(row)]
+        assert engine.reconcile_provisional_exits()["reconciled"] == 1
+
+    def test_a_restart_reconciles_from_the_persisted_identity(self, tmp_path):
+        engine, store, fake = _lin_provisional(tmp_path)
+        fake.executions.append(_lin_ex("X1", "ORD1", 0.01, 61_000))
+        from persistence import StateStore
+        import trading_engine as te
+        store2 = StateStore(store.path)
+        store2.claim_writer()
+        engine.store = store2                       # a fresh process, same DB
+        assert engine.reconcile_provisional_exits()["reconciled"] == 1
+        assert len(store2.recent_trades()) == 1
+
+    def test_identity_is_recovered_from_closed_pnl_when_the_read_had_failed(
+            self, tmp_path):
+        fake = FakeBybit()
+        engine, store = _lin_engine(tmp_path, LinearCfg(), fake)
+        _lin_open(store)
+        real = fake.request
+        state = {"down": True}
+
+        def flaky(method, url, **kw):
+            if "closed-pnl" in url and state["down"]:
+                return 500, "boom"
+            return real(method, url, **kw)
+        fake.request = flaky
+        engine.observe_exits()
+        t = store.provisional_trades()[0]
+        assert _json.loads(t["meta"])["exit_order_ids"] == []
+        state["down"] = False
+        fake.closed_pnl.append({
+            "symbol": "BTCUSDT", "side": "Buy", "qty": "0.01",
+            "orderId": "ORD9", "avgExitPrice": "0", "closedPnl": "0",
+            "updatedTime": str(int(_time.time() * 1000) + 1000)})
+        fake.executions.append(_lin_ex("X1", "ORD9", 0.01, 61_000))
+        assert engine.reconcile_provisional_exits()["reconciled"] == 1
+
+    def test_no_identity_is_never_guessed_from_symbol_side_and_price(
+            self, tmp_path):
+        fake = FakeBybit()
+        engine, store = _lin_engine(tmp_path, LinearCfg(), fake)
+        _lin_open(store)
+        real = fake.request
+        fake.request = lambda m, u, **kw: ((500, "boom") if "closed-pnl" in u
+                                           else real(m, u, **kw))
+        engine.observe_exits()
+        fake.request = real
+        fake.executions.append(_lin_ex("X1", "WHATEVER", 0.01, 61_000))
+        s = engine.reconcile_provisional_exits()
+        assert s["reconciled"] == 0 and len(store.provisional_trades()) == 1
+
+
+def test_get_executions_pages_by_cursor_and_carries_the_order_id(tmp_path):
+    import bybit_connection as bc
+    fake = FakeBybit()
+    engine, store = _lin_engine(tmp_path, LinearCfg(), fake)
+    fake.executions += [_lin_ex(f"X{i}", "ORD1", 0.01, 61_000) for i in range(230)]
+    rows = engine.client.get_executions("BTCUSDT", order_id="ORD1")
+    assert len(rows) == 230
+    sent = [r for r in fake.requests if "execution/list" in r["url"]]
+    assert len(sent) == 3 and all("orderId=ORD1" in r["url"] for r in sent)
+    with pytest.raises(bc.PermanentAPIError):
+        engine.client.get_executions("BTCUSDT")
+    assert engine.client.get_executions("BTCUSDT", order_id="NOPE") == []

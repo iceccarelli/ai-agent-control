@@ -106,24 +106,61 @@ def test_partial_take_profit_reduces_the_ledger(tmp_path):
     assert float(row["qty"]) == pytest.approx(0.004)
 
 
-def test_closed_pnl_unreadable_still_books_the_exit_and_says_so(tmp_path):
+def test_closed_pnl_unreadable_books_the_exit_provisional_not_at_a_market_price(
+        tmp_path):
     fake = FakeBybit()
     engine, store = _engine(tmp_path, LinearCfg(), fake)
     _open(store)
-    calls = {"n": 0}
     real = fake.request
 
     def flaky(method, url, **kw):
         if "closed-pnl" in url:
-            calls["n"] += 1
             return 500, "boom"
+        if "tickers" in url:
+            return 500, "ticker down"          # the last price is not a fallback
         return real(method, url, **kw)
     fake.request = flaky
     s = engine.observe_exits()
-    assert s["closed"] == 1 and s["price_approximated"] == 1
-    assert store.open_position_count() == 0
+    assert s["closed"] == 1 and s["exits_provisional"] == 1
+    assert store.open_position_count() == 0          # the position is not lost
     trade = store._query("SELECT * FROM trades")[0]
-    assert "PRICE_UNREAD" in str(trade["meta"])
+    assert trade["price_provisional"] == 1
+    assert trade["exit_price"] == 0.0 and trade["gross_pnl"] == 0.0
+    assert trade["exit_fee_realized"] == 0
+    assert store.recent_trades() == [] and store.net_returns() == []
+    assert engine.observe_exits()["closed"] == 0        # replay books nothing
+    assert len(store._query("SELECT * FROM trades")) == 1
+
+
+def test_zero_avg_exit_price_is_provisional_and_keeps_the_order_id(tmp_path):
+    import json
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open(store)
+    fake.closed_pnl.append({
+        "symbol": "BTCUSDT", "side": "Buy", "qty": "0.01", "orderId": "ORD1",
+        "avgExitPrice": "0", "closedPnl": "0",
+        "updatedTime": str(int(time.time() * 1000) + 1000)})
+    engine.observe_exits()
+    trade = store._query("SELECT * FROM trades")[0]
+    assert trade["price_provisional"] == 1
+    assert json.loads(trade["meta"])["exit_order_ids"] == ["ORD1"]
+
+
+def test_a_partial_exit_with_no_price_resizes_the_position_once(tmp_path):
+    fake = FakeBybit()
+    fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell",
+                                 "size": "0.004", "avgPrice": "60000",
+                                 "stopLoss": "61000"}
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open(store, qty=0.01)
+    real = fake.request
+    fake.request = lambda m, u, **kw: ((500, "boom") if "closed-pnl" in u
+                                       else real(m, u, **kw))
+    engine.observe_exits()
+    engine.observe_exits()
+    assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.004)
+    assert len(store._query("SELECT * FROM trades")) == 1
 
 
 def test_never_places_an_order(tmp_path):
