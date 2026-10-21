@@ -1667,6 +1667,22 @@ class TradingEngine:
                 if not order:
                     continue
                 status = str(order.get("orderStatus", ""))
+                if (link == str(meta.get("stop_order_link_id") or "")
+                        and status in ("Rejected", "Cancelled", "Deactivated")
+                        and not float(order.get("cumExecQty") or 0.0) > 0.0):
+                    # The protective stop is DEAD with nothing sold: a
+                    # triggered stop the venue refused, or one cancelled behind
+                    # our back. The ledger still calls this position
+                    # protected; spot has no mid-cycle naked check, so this is
+                    # where it is seen. Re-protect, or flatten.
+                    logger.critical(
+                        "observe_exits: the %s stop %s is %s with nothing "
+                        "filled; the position is NAKED", symbol, link, status)
+                    summary.setdefault("stop_dead", []).append(symbol)
+                    outcome = self._protect_or_close_naked(
+                        symbol, row, reason="SPOT_STOP_DEAD")
+                    summary.setdefault("stop_dead_outcome", {})[symbol] = outcome
+                    break
                 if status not in ("Filled", "PartiallyFilledCanceled"):
                     continue
                 try:

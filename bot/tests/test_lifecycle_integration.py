@@ -175,6 +175,29 @@ class TestHappyPath:
 # ---------------------------------------------------------------------------
 
 
+class TestADeadSpotStopIsNotLeftLookingProtected:
+    def test_a_rejected_stop_is_reprotected_or_flattened(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        report = engine.execute(buy_intent())
+        assert report.ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        stop_id = meta["stop_order_link_id"]
+        exchange.orders[stop_id]["orderStatus"] = "Rejected"
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead") == ["BTCUSDT"]
+        # either a fresh live stop was placed, or the position was closed:
+        # it is never left "protected" by a stop that is dead
+        rows = store.open_positions()
+        if rows:
+            new_meta = (_json.loads(rows[0]["meta"])
+                        if isinstance(rows[0]["meta"], str) else rows[0]["meta"])
+            assert new_meta["stop_order_link_id"] != stop_id
+        else:
+            assert summary["stop_dead_outcome"]["BTCUSDT"] == "FLATTENED"
+
+
 class TestARefusedEntryStartsTheSymbolCooldown:
     def test_the_same_refused_order_is_not_resent_next_tick(self, stack):
         engine, client, risk, store, exchange = stack
