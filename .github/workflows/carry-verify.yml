@@ -79,6 +79,13 @@ jobs:
       - name: Carry correctness tests
         run: >
           python -m pytest -q -p no:cacheprovider
+          tests/test_provisional_exit_reconciliation.py
+          tests/test_directional_funding.py
+          tests/test_position_lifecycles.py
+          tests/test_observe_exits.py
+          tests/test_lifecycle_integration.py
+          tests/test_process_restart_recovery.py
+          tests/test_risk_management.py
           tests/test_carry_funding_truth.py
           tests/test_carry_funding_history_gap.py
           tests/test_carry_symbol_authority.py

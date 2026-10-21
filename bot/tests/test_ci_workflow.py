@@ -16,7 +16,12 @@ REQUIRED = (
     "test_carry_broker", "test_carry_preflight", "test_fee_payload_probe",
     "test_carry_live_gates", "test_carry_funding_history_gap",
     # a blanked ledger row must refuse to start, not read as a first run
-    "test_carry_cold_start", "test_carry_entry_allowance_survives_restart")
+    "test_carry_cold_start", "test_carry_entry_allowance_survives_restart",
+    # the money path of the directional book: exits, funding, lifecycles
+    "test_provisional_exit_reconciliation", "test_directional_funding",
+    "test_position_lifecycles", "test_observe_exits",
+    "test_lifecycle_integration", "test_process_restart_recovery",
+    "test_risk_management")
 
 
 @pytest.fixture(scope="module")
