@@ -949,6 +949,12 @@ class CarryEngine:
                 self._funding_history.append(rate)
                 del self._funding_history[:-self.FUNDING_HISTORY]
                 self._last_print_ms = stamp
+            # An ESTIMATE, like on_candle's: the settlement mark is unknown
+            # here, so the entry price stands in for it. The ledger books
+            # what the venue actually paid.
+            if position.perp.avg_price > 0:
+                position.funding_collected += (
+                    rate / 1e4) * position.perp.filled_qty * position.perp.avg_price
             if rate < 0:
                 position.negative_funding_streak += 1
             else:

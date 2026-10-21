@@ -750,3 +750,17 @@ class TestCatchUpWhenTheLedgerHistoryWasDiscarded:
         e._catch_up_missed_prints()
         assert e.position.negative_funding_streak == 3
         assert e._last_print_ms == 4_000
+
+
+def test_missed_settlements_are_estimated_into_funding_collected():
+    venue = Venue(perp=0.001)
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    e.position = opened(venue).position
+    e.position.opened_ms = 0
+    e.position.funding_collected = 0.0
+    e._last_print_ms = 1_000
+    e.venue_prints_at_start = [(2.0, 2_000), (2.0, 3_000), (2.0, 4_000)]
+    e._catch_up_missed_prints()               # two missed, newest left live
+    leg = e.position.perp
+    assert e.position.funding_collected == pytest.approx(
+        2 * (2.0 / 1e4) * leg.filled_qty * leg.avg_price)
