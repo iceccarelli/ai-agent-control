@@ -1719,9 +1719,11 @@ class TradingEngine:
                 if qty <= 0 or price <= 0:
                     logger.error("observe_exits: %s order %s is %s but reports "
                                  "qty=%s price=%s; not booked", symbol, link,
-                                 status, order.get("cumExecQty"),
-                                 order.get("avgPrice"))
+                                 status, order.get("cumExecQty"), price)
                     summary["unread"] += 1
+                    # A fill we cannot price is coin that left: the recorded
+                    # size is stale, so do not judge the stop against it.
+                    tp_in_flight = True
                     continue
                 fees = venue_fees.extract_order_fees(order)
                 fully = self.record_exit_fill(
@@ -1760,7 +1762,6 @@ class TradingEngine:
                                 dead_stop, n)
                             self.store.journal(symbol, "STOP_DEAD_LEG_STUCK",
                                                dead_stop, {"cycles": n})
-                        summary.setdefault("stop_dead", []).append(symbol)
                         self._handle_dead_spot_stop(symbol, row, dead_stop,
                                                     summary, relaxed=True)
                     elif n > self.DEAD_STOP_MAX_DEFERRALS:
@@ -1784,14 +1785,6 @@ class TradingEngine:
                                link: str, summary: Dict[str, Any],
                                relaxed: bool = False) -> None:
         """A spot stop is Rejected/Cancelled/Deactivated with nothing sold."""
-        try:
-            held = float(self.client.get_coin_balance(
-                self.client._base_asset(symbol), total=True))
-        except Exception as exc:  # noqa: BLE001
-            logger.error("observe_exits: cannot read the %s balance to judge "
-                         "the dead stop %s: %s", symbol, link, exc)
-            summary["unread"] += 1
-            return
         if relaxed:
             # A take-profit leg has stayed part-filled while the stop is dead.
             # Free the coin it reserves and let the NEXT cycle do the rest: the
@@ -1802,7 +1795,17 @@ class TradingEngine:
             # stop before that booking and could end in an emergency sale that
             # loses the leg's P&L. A missing take-profit costs upside, never
             # capital.
-            if self._cancel_take_profit_legs(symbol):
+            ids = [str(t) for t in
+                   (self._row_meta(row).get("tp_order_ids") or [])]
+            direct_ok = True
+            for tp in ids:          # the engine's own list, not only the table
+                try:
+                    if self.client.cancel_order(symbol=symbol,
+                                                order_link_id=tp) is False:
+                        direct_ok = False
+                except Exception:  # noqa: BLE001
+                    direct_ok = False
+            if self._cancel_take_profit_legs(symbol) and direct_ok:
                 logger.critical(
                     "observe_exits: %s stop %s is dead and a take-profit leg "
                     "stayed part-filled; cancelled the leg(s), the partial "
@@ -1814,6 +1817,14 @@ class TradingEngine:
                     "take-profit leg could not be cancelled; retrying next "
                     "cycle", symbol, link)
             summary.setdefault("stop_dead", []).append(symbol)
+            return
+        try:
+            held = float(self.client.get_coin_balance(
+                self.client._base_asset(symbol), total=True))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("observe_exits: cannot read the %s balance to judge "
+                         "the dead stop %s: %s", symbol, link, exc)
+            summary["unread"] += 1
             return
         if held < float(row["qty"]) * 0.98:
             # The coin is not (all) there: the position was sold or moved

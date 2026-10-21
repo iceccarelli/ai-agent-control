@@ -1148,8 +1148,8 @@ class TestRateLimitWaitsForTheVenuesResetStamp:
 
 
 class TestAfter403ReadsStandDownButWritesDoNot:
-    TICKERS = ("GET", "/v5/market/tickers")
-    KLINE = ("GET", "/v5/market/kline")
+    TICKERS = ("GET", "/v5/market/kline")           # a cooldown-listed read
+    KLINE = ("GET", "/v5/market/orderbook")          # a different one
     PARAMS = {"category": "spot", "symbol": "BTCUSDT"}
 
     def _get(self, client, which):
@@ -1170,7 +1170,10 @@ class TestAfter403ReadsStandDownButWritesDoNot:
         with pytest.raises(bc.PermanentAPIError):
             self._get(client, self.TICKERS)
         before = len(exchange.requests)
-        self._get(client, self.KLINE)         # a DIFFERENT read still goes out
+        try:
+            self._get(client, self.KLINE)     # a DIFFERENT read still goes out
+        except bc.PermanentAPIError as exc:   # (the fake has no order book)
+            assert "cooldown" not in str(exc)
         assert len(exchange.requests) > before
         with pytest.raises(bc.PermanentAPIError, match="cooldown"):
             self._get(client, self.TICKERS)   # the refused one stays paused
@@ -1208,3 +1211,8 @@ def test_safety_reads_are_never_paused_by_a_403(client, exchange):
                     params={"category": "linear", "symbol": "BTCUSDT"},
                     signed=True)
     assert len(exchange.requests) > before     # sent, not failed locally
+
+
+def test_tickers_and_instrument_filters_are_never_paused(client, exchange):
+    for endpoint in ("/v5/market/tickers", "/v5/market/instruments-info"):
+        assert endpoint not in bc.BybitClient.COOLDOWN_READ_ENDPOINTS
