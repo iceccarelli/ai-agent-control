@@ -1092,4 +1092,3 @@ class TestTheLoopCanResumeAfterALossStreakHalt:
         store.trip_breaker("daily loss 6%", 0.0)
         store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
         assert manager.should_halt_trading() is False
-
