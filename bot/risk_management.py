@@ -475,7 +475,12 @@ class BillionaireRiskManager:
             # Cooldown elapsed: clear it and continue. This is the one automatic
             # reset in the module, and it is a *breaker*, not the kill switch.
             self.store.clear_breaker()
-            if "consecutive losing" in str(breaker.reason):
+            if ("consecutive losing" in str(breaker.reason)
+                    or self.store.consecutive_losses()
+                    >= self.max_consecutive_losses):
+                # (also when a later trip, e.g. the daily-loss one, overwrote
+                # the reason: the streak that is still at the limit would
+                # otherwise re-trip the breaker as soon as it clears)
                 self.store.reset_loss_streak()
         return _allow("BREAKER_CLEAR")
 
@@ -1315,7 +1320,16 @@ class BillionaireRiskManager:
             breaker = self.store.get_breaker()
             if breaker.active and breaker.is_cooling_down():
                 return True
+            if breaker.active:
+                # The cooldown has ended. The loop returns on this check BEFORE
+                # any order reaches the gates, so the one place that clears the
+                # breaker (and forgets the streak that tripped it) must run
+                # here, or the book stays halted for good.
+                self._gate_breaker()
             if self.store.consecutive_losses() >= self.max_consecutive_losses:
+                # At the limit with no breaker running: start its cooldown
+                # now, so there is an end to the halt.
+                self._gate_consecutive_losses()
                 return True
             equity_state = self.store.get_equity_state()
             if equity_state.peak_equity > 0.0:

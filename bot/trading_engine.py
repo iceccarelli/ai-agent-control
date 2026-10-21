@@ -1683,44 +1683,50 @@ class TradingEngine:
             except BybitAPIError as exc:
                 logger.error("observe_exits: closed-pnl unreadable for %s: %s",
                              symbol, exc)
+            provisional = False
             if price is None or price <= 0:
-                try:
-                    price = float(self.client.get_last_price(symbol))
-                except BybitAPIError as exc:
-                    logger.critical("observe_exits: %s exited at the venue but no "
-                                    "price can be read (%s); will retry next cycle",
-                                    symbol, exc)
-                    summary["unread"] += 1
-                    continue
+                # The venue says the quantity LEFT; it has not said at what
+                # price. The last traded price is not that price. The exit is
+                # booked PROVISIONAL (quantity and what fees are known, no
+                # price, no gross), the position and its stop are resized once,
+                # and the price is reconciled later from the venue's own
+                # executions by order id. The row never enters confirmed P&L.
+                provisional = True
+                price = float(row["entry_price"])        # unit placeholder only
                 reason = "VENUE_EXIT_PRICE_UNREAD"
-                summary["price_approximated"] += 1
+                summary["exits_provisional"] = summary.get(
+                    "exits_provisional", 0) + 1
             # Crash-boundary invariant: a process kill between
             # `record_exit_fill`'s `record_trade` and its `remove_position`
             # (or `upsert_position` for a partial) leaves this exact position
-            # row in place, so the next cycle's `observe_exits` recomputes
-            # the SAME `exited`/`price` from the SAME closed-pnl window and
-            # would otherwise book the same exit twice. Preferred key: the
-            # venue's own closed-pnl `orderId`s for this window -- a durable
-            # identity, exactly like an order's `orderLinkId`. When the
-            # closed-pnl read itself failed (the `VENUE_EXIT_PRICE_UNREAD`
-            # branch above), no such id exists; the fallback key is still
-            # stable across an identical replay (same symbol/since_ms/
-            # exited qty) though weaker in the general case -- see
-            # `StateStore.record_trade`'s docstring.
-            if order_ids:
-                dedupe_key = f"exit_pnl:{symbol}:{','.join(order_ids)}"
-            else:
-                dedupe_key = (f"exit_unread:{symbol}:{since_ms}:{held:.10f}:"
-                              f"{exited:.10f}")
+            # row in place, so the next cycle recomputes the SAME exit and
+            # would otherwise book it twice. The key is the POSITION's own
+            # state: which position (symbol + open time) and the quantity it
+            # held before and lost now. An identical replay reproduces it; the
+            # next partial exit of the same position cannot, because the
+            # quantity held only ever falls. The venue's order id is NOT part
+            # of it: one order can fill in pieces across cycles, and a key
+            # built from it silently dropped every piece after the first.
+            dedupe_key = (f"exit_pos:{symbol}:"
+                          f"{float(row.get('opened_epoch', 0) or 0):.6f}:"
+                          f"{held:.10f}:{exited:.10f}")
             exit_fees, fee_ref, evidence = self._observed_exit_fees(
                 symbol, pnl_rows, exited)
             fully = self.record_exit_fill(symbol=symbol, qty=exited, price=price,
                                           fee=0.0, reason=reason,
                                           dedupe_key=dedupe_key, fees=exit_fees,
-                                          fee_ref=fee_ref, fee_evidence=evidence)
+                                          fee_ref=fee_ref, fee_evidence=evidence,
+                                          price_provisional=provisional,
+                                          exit_order_ids=order_ids)
+            if provisional:
+                self.store.journal(symbol, "EXIT_UNPRICED_PROVISIONAL",
+                                   reason, {"qty": exited,
+                                            "exit_order_ids": order_ids})
             summary["closed" if fully else "reduced"] += 1
-            logger.warning("observe_exits: %s exited %.8g @ %.8g (%s) fully=%s",
-                           symbol, exited, price, reason, fully)
+            logger.warning("observe_exits: %s exited %.8g (%s) fully=%s%s",
+                           symbol, exited, reason, fully,
+                           " PROVISIONAL" if provisional else
+                           f" @ {price:.8g}")
         return summary
 
     def _observe_spot_exits(self, summary: Dict[str, Any]) -> Dict[str, Any]:
@@ -2061,7 +2067,9 @@ class TradingEngine:
         """
         link = str(trade.get("order_link_id") or "")
         symbol = str(trade.get("symbol") or "")
-        if not link or not symbol:
+        order_ids = {str(i) for i in (self._row_meta(trade).get("exit_order_ids")
+                                      or []) if i}
+        if not (link or order_ids) or not symbol:
             return None, "the provisional trade has no exit order identity"
         side = normalize_side(str(trade.get("side") or ""))
         if side not in ("Buy", "Sell"):
@@ -2076,7 +2084,9 @@ class TradingEngine:
                 return None, "an execution has no execId"
             if str(ex.get("execType") or "Trade") != "Trade":
                 return None, f"execution {exec_id} is not a Trade"
-            if str(ex.get("orderLinkId") or "") != link:
+            ours = ((link and str(ex.get("orderLinkId") or "") == link)
+                    or str(ex.get("orderId") or "") in order_ids)
+            if not ours:
                 return None, f"execution {exec_id} belongs to another order"
             if str(ex.get("symbol") or "") != symbol:
                 return None, f"execution {exec_id} is for another symbol"
@@ -2121,40 +2131,94 @@ class TradingEngine:
                 "exec_ids": sorted(seen), "fees": fees,
                 "fee_by_currency": dict(fee_by_ccy)}, ""
 
+    def _recover_exit_order_ids(self, trade: Mapping[str, Any]) -> List[str]:
+        """The venue order ids of a linear exit booked while closed-pnl was
+        unreadable, from closed-pnl itself - accepted only if the rows that
+        match close EXACTLY to the booked quantity and each names its order."""
+        reader = getattr(self.client, "get_closed_pnl", None)
+        if reader is None or not getattr(self.client, "is_linear", False):
+            return []
+        qty = float(trade.get("qty") or 0.0)
+        try:
+            rows = reader(str(trade["symbol"]), since_ms=int(
+                float(trade.get("opened_epoch") or 0.0) * 1000))
+        except Exception:  # noqa: BLE001
+            return []
+        chosen = self._rows_of_this_exit(rows, qty)
+        total = sum(float(r.get("qty", 0) or 0) for r in chosen)
+        if (not chosen or abs(total - qty) > max(1e-9, abs(qty) * 1e-9)
+                or any(not r.get("orderId") for r in chosen)):
+            return []
+        return sorted({str(r["orderId"]) for r in chosen})
+
     def reconcile_provisional_exits(
         self, fetch: Optional[Callable[[str, str], Sequence[Mapping[str, Any]]]]
+        = None,
+        fetch_by_order_id: Optional[
+            Callable[[str, str, Mapping[str, Any]], Sequence[Mapping[str, Any]]]]
         = None,
     ) -> Dict[str, Any]:
         """Price the exits that were booked provisional, from the venue's fills.
 
-        `fetch(symbol, order_link_id)` returns the execution rows (default: the
-        client's own read). A row is promoted only on evidence that
-        `validate_exit_executions` accepts and whose fees convert into the
-        accounting unit; otherwise it stays provisional and the reason is
-        counted. Safe to call every cycle: applying the same fills twice is a
-        no-op, and a failed fetch changes nothing.
+        `fetch(symbol, order_link_id)` / `fetch_by_order_id(symbol, order_id,
+        trade)` return execution rows (defaults: the client's own paged read).
+        An exit that carries venue ORDER IDS (a stop/TP the venue triggered) is
+        read by those ids and the union of their fills must equal the booked
+        quantity; one with only a link id is read by the link. A row is
+        promoted only on evidence that `validate_exit_executions` accepts and
+        whose fees convert into the accounting unit; otherwise it stays
+        provisional and the reason is counted. Safe to call every cycle:
+        applying the same fills twice is a no-op, and a failed fetch changes
+        nothing.
         """
         summary: Dict[str, Any] = {"checked": 0, "reconciled": 0, "pending": 0,
                                    "refused": {}}
-        fetch = fetch or getattr(self.client, "get_executions", None)
-        if fetch is None:
+        client_read = getattr(self.client, "get_executions", None)
+        fetch = fetch or client_read
+        if fetch_by_order_id is None and client_read is not None:
+            def fetch_by_order_id(symbol, order_id, trade):  # noqa: E306
+                closed_ms = int(float(trade.get("closed_epoch") or 0.0) * 1000)
+                start = max(0, closed_ms - 24 * 3_600_000)
+                return client_read(symbol, order_id=order_id, start_ms=start,
+                                   end_ms=start + 6 * 86_400_000)
+        if fetch is None and fetch_by_order_id is None:
             summary["unavailable"] = True
             return summary
         for trade in self.store.provisional_trades():
             summary["checked"] += 1
+            ident = str(trade["order_link_id"] or trade["id"])
             try:
-                rows = fetch(str(trade["symbol"]), str(trade["order_link_id"]))
+                ids = [str(i) for i in
+                       (self._row_meta(trade).get("exit_order_ids") or []) if i]
+                if not ids and not trade["order_link_id"]:
+                    ids = self._recover_exit_order_ids(trade)
+                    if ids:
+                        self.store.add_trade_exit_order_ids(int(trade["id"]), ids)
+                        trade = dict(trade, meta=json.dumps(
+                            {**self._row_meta(trade), "exit_order_ids": ids}))
+                if ids and fetch_by_order_id is not None:
+                    rows: List[Mapping[str, Any]] = []
+                    for oid in ids:
+                        rows.extend(fetch_by_order_id(
+                            str(trade["symbol"]), oid, trade))
+                elif trade["order_link_id"] and fetch is not None:
+                    rows = list(fetch(str(trade["symbol"]),
+                                      str(trade["order_link_id"])))
+                else:
+                    summary["pending"] += 1
+                    summary["refused"][ident] = "no exit order identity"
+                    continue
             except Exception as exc:  # noqa: BLE001
                 logger.error("reconcile_provisional_exits: cannot read the "
-                             "fills of %s: %s", trade["order_link_id"], exc)
+                             "fills of %s: %s", ident, exc)
                 summary["pending"] += 1
                 continue
             evidence, reason = self.validate_exit_executions(trade, rows)
             if evidence is None:
                 summary["pending"] += 1
-                summary["refused"][str(trade["order_link_id"])] = reason
+                summary["refused"][ident] = reason
                 logger.warning("reconcile_provisional_exits: %s stays "
-                               "provisional: %s", trade["order_link_id"], reason)
+                               "provisional: %s", ident, reason)
                 continue
             vwap, qty = evidence["vwap"], evidence["qty"]
             direction = 1.0 if normalize_side(str(trade["side"])) == "Buy" else -1.0
@@ -2168,7 +2232,7 @@ class TradingEngine:
                 # a recorded basis: the economics are not confirmed, so the
                 # row stays provisional rather than carry a guessed fee.
                 summary["pending"] += 1
-                summary["refused"][str(trade["order_link_id"])] = (
+                summary["refused"][ident] = (
                     "the execution fee could not be converted into the "
                     "accounting unit")
                 continue
@@ -2199,6 +2263,7 @@ class TradingEngine:
         fee_evidence: Optional[Mapping[str, Any]] = None,
         booked_order_id: str = "",
         price_provisional: bool = False,
+        exit_order_ids: Sequence[str] = (),
     ) -> bool:
         """Account for a partial or full exit that an exchange-side order filled.
 
@@ -2303,6 +2368,7 @@ class TradingEngine:
             closed_epoch=utc_now_epoch(),
             order_link_id=order_link_id,
             meta={"reason": reason, "partial": True,
+                  "exit_order_ids": [str(i) for i in exit_order_ids],
                   "funding_booked": not getattr(self.client, "is_linear", False),
                   "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]},
                   "fee_evidence": dict(fee_evidence or {})},

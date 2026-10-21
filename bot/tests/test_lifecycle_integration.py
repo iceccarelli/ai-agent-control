@@ -304,7 +304,7 @@ class TestDeadStopFollowUps:
         engine.observe_exits()                        # books the partial fill
         rows = store.open_positions()
         assert rows and float(rows[0]["qty"]) == pytest.approx(before - part)
-        assert len(store.recent_trades()) == 1        # the leg's P&L is booked
+        assert len(store.confirmed_exit_rows()) == 1        # the leg's P&L is booked
         engine.observe_exits()                        # stop re-judged
         assert not store.is_kill_switch_engaged()[0]
         import json as _j
@@ -322,7 +322,7 @@ class TestDeadStopFollowUps:
         exchange.orders[tp].update(cumExecQty=str(part), avgPrice=str(ENTRY * 1.02),
                                    orderStatus="Cancelled")
         engine.observe_exits()
-        assert len(store.recent_trades()) == 1
+        assert len(store.confirmed_exit_rows()) == 1
 
     def test_the_stuck_leg_retry_needs_no_balance_read_and_cancels_engine_ids(
             self, stack):
@@ -380,7 +380,7 @@ class TestDeadStopFollowUps:
         # never represented as a fill price, and not a confirmed trade
         assert rows[0]["exit_price"] == 0.0 and rows[0]["gross_pnl"] == 0.0
         assert rows[0]["price_provisional"] == 1
-        assert not store.recent_trades()
+        assert not store.confirmed_exit_rows()
         assert store.net_returns() == []
         assert store.fee_evidence()["price_provisional_trades"] == 1
         assert any(d.get("decision") == "EXIT_UNPRICED_PROVISIONAL"
@@ -447,7 +447,7 @@ class TestDeadStopFollowUps:
         exchange.orders[tp].update(orderStatus="PartiallyFilledCanceled",
                                    cumExecQty=str(part), avgPrice=str(ENTRY * 1.02))
         engine.observe_exits()                                 # the fill books
-        assert len(store.recent_trades()) == 1
+        assert len(store.confirmed_exit_rows()) == 1
 
     def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
@@ -767,7 +767,7 @@ class TestClosing:
             entry_fee=1.0, exit_fee=1.0,
         )
         assert close.ok
-        trades = store.recent_trades()
+        trades = store.confirmed_exit_rows()
         assert len(trades) == 1
         assert trades[0]["entry_fee"] == 1.0
         assert trades[0]["exit_fee"] == 1.0
@@ -1079,7 +1079,7 @@ class TestAStopThatTriggeredWhileTheProcessWasDown:
         engine2.observe_exits()
         engine2.observe_exits()                       # replay: still once
         assert store2.open_positions() == []
-        trades = store2.recent_trades()
+        trades = store2.confirmed_exit_rows()
         assert len(trades) == 1
         assert trades[0]["exit_price"] == pytest.approx(ENTRY * 0.98)
         assert trades[0]["gross_pnl"] < 0
@@ -1101,6 +1101,6 @@ class TestAStopThatTriggeredWhileTheProcessWasDown:
         engine2.observe_exits()
         rows = store2.open_positions()
         assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(qty - part)
-        assert len(store2.recent_trades()) == 1
+        assert len(store2.confirmed_exit_rows()) == 1
         engine2.observe_exits()
-        assert len(store2.recent_trades()) == 1       # not booked twice
+        assert len(store2.confirmed_exit_rows()) == 1       # not booked twice

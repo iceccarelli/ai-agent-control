@@ -1317,12 +1317,87 @@ class StateStore:
             self._conn.commit()
         return int(cur.lastrowid or 0)
 
-    def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
+    #: A position is the unit of performance, not an exit fill: a position that
+    #: leaves in three pieces is ONE sample.  A position is complete when it has
+    #: no row left in ``positions`` and none of its exits is still provisional;
+    #: until then it is not yet a result (a take-profit partial is not a win
+    #: while the remainder can still stop out).
+    _COMPLETE = (
+        "NOT EXISTS (SELECT 1 FROM trades p WHERE p.symbol = {a}.symbol"
+        " AND p.opened_epoch = {a}.opened_epoch AND p.price_provisional = 1)"
+        " AND NOT EXISTS (SELECT 1 FROM positions o WHERE o.symbol = {a}.symbol"
+        " AND o.opened_epoch = {a}.opened_epoch)")
+
+    def lifecycles(self, limit: int = 200, symbol: Optional[str] = None,
+                   with_regime: bool = False) -> List[Dict[str, Any]]:
+        """Completed position lifecycles, newest first, one row each.
+
+        The rows have the shape of a ``trades`` row (so the readers that take
+        one still work) with the exits of one position summed: quantity,
+        gross, fees, funding and net P&L add; the exit price is the quantity
+        weighted mean; the entry fee/realised flags hold only if they hold for
+        every exit; ``exits`` counts the pieces.
+        """
+        where = "" if symbol is None else " AND g.symbol = ?"
+        params: List[Any] = [] if symbol is None else [str(symbol)]
+        regime = (", (SELECT r.regime FROM regime_history r"
+                  "   WHERE r.symbol = t.symbol AND r.ts_epoch <= t.opened_epoch"
+                  "   ORDER BY r.ts_epoch DESC, r.id DESC LIMIT 1) AS regime"
+                  if with_regime else "")
         rows = self._query(
+            f"SELECT t.*{regime} FROM trades t JOIN ("
+            " SELECT g.symbol AS symbol, g.opened_epoch AS opened_epoch,"
+            "  MAX(g.closed_epoch) AS mc FROM trades g"
+            f" WHERE {self._COMPLETE.format(a='g')}{where}"
+            " GROUP BY g.symbol, g.opened_epoch ORDER BY mc DESC LIMIT ?) k"
+            " ON t.symbol = k.symbol AND t.opened_epoch = k.opened_epoch"
+            " ORDER BY k.mc DESC, t.opened_epoch DESC, t.closed_epoch ASC, t.id ASC",
+            tuple(params + [int(limit)]))
+        out: List[Dict[str, Any]] = []
+        group: List[Dict[str, Any]] = []
+        for r in rows:
+            row = dict(r)
+            if group and (row["symbol"], row["opened_epoch"]) != (
+                    group[0]["symbol"], group[0]["opened_epoch"]):
+                out.append(self._fold_lifecycle(group))
+                group = []
+            group.append(row)
+        if group:
+            out.append(self._fold_lifecycle(group))
+        return out
+
+    @staticmethod
+    def _fold_lifecycle(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        last = rows[-1]
+        qty = sum(float(r["qty"]) for r in rows)
+        out = dict(last)
+        out["qty"] = qty
+        out["entry_price"] = (
+            sum(float(r["qty"]) * float(r["entry_price"]) for r in rows) / qty
+            if qty > 0 else float(last["entry_price"]))
+        out["exit_price"] = (
+            sum(float(r["qty"]) * float(r["exit_price"]) for r in rows) / qty
+            if qty > 0 else float(last["exit_price"]))
+        for k in ("gross_pnl", "entry_fee", "exit_fee", "net_pnl"):
+            out[k] = sum(float(r[k]) for r in rows)
+        out["closed_epoch"] = max(float(r["closed_epoch"]) for r in rows)
+        out["entry_fee_realized"] = int(all(int(r["entry_fee_realized"]) for r in rows))
+        out["exit_fee_realized"] = int(all(int(r["exit_fee_realized"]) for r in rows))
+        out["exits"] = len(rows)
+        out["id"] = max(int(r["id"]) for r in rows)
+        out["exit_trade_ids"] = [int(r["id"]) for r in rows]
+        return out
+
+    def confirmed_exit_rows(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """The priced exit ROWS (one per fill), newest first -- the raw ledger
+        beneath :meth:`lifecycles`; for accounting and audit, not statistics."""
+        return [dict(r) for r in self._query(
             "SELECT * FROM trades WHERE price_provisional = 0 "
-            "ORDER BY closed_epoch DESC LIMIT ?", (int(limit),)
-        )
-        return [dict(r) for r in rows]
+            "ORDER BY closed_epoch DESC, id DESC LIMIT ?", (int(limit),))]
+
+    def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Completed position lifecycles (see :meth:`lifecycles`), newest first."""
+        return self.lifecycles(limit)
 
     def fee_evidence(self) -> Dict[str, Any]:
         """How much of the booked net PnL rests on venue-confirmed fees.
@@ -1398,8 +1473,10 @@ class StateStore:
             if exit_price <= 0:
                 raise PersistenceError("exit_price must be positive")
             old_net = float(row["net_pnl"])
-            new_net = float(gross_pnl) - float(row["entry_fee"]) - float(exit_fee)
             meta = json.loads(row["meta"] or "{}")
+            # funding already booked on the row is part of its net
+            new_net = (float(gross_pnl) - float(row["entry_fee"])
+                       - float(exit_fee) + float(meta.get("funding_usd") or 0.0))
             meta["reconciliation"] = {
                 "evidence": dict(evidence),
                 "before": {"exit_price": float(row["exit_price"]),
@@ -1427,19 +1504,118 @@ class StateStore:
                           "net_before": old_net, "net_after": new_net})
             return True
 
-    def net_returns(self, limit: int = 500) -> List[float]:
-        """Per-trade NET return fractions, oldest first — the Kelly input.
+    def trades_awaiting_funding(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Closed linear trades whose funding has not been booked yet."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM trades WHERE json_extract(meta, '$.funding_booked') = 0"
+            " ORDER BY closed_epoch ASC, id ASC LIMIT ?", (int(limit),))]
 
-        Fee-inclusive by construction.  Returns are expressed against the
-        trade's own notional so they are comparable across position sizes.
+    def lifecycle_trades(self, symbol: str, opened_epoch: float
+                         ) -> List[Dict[str, Any]]:
+        """Every exit row of one position (same symbol and open time)."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM trades WHERE symbol = ? AND opened_epoch = ? "
+            "ORDER BY closed_epoch ASC, id ASC",
+            (str(symbol), float(opened_epoch)))]
+
+    def booked_funding_ids(self, symbol: str) -> set:
+        """Venue settlement ids already booked on some trade of ``symbol``."""
+        out: set = set()
+        for r in self._query(
+                "SELECT meta FROM trades WHERE symbol = ? AND "
+                "json_extract(meta, '$.funding_booked') = 1", (str(symbol),)):
+            out.update(str(i) for i in
+                       json.loads(r["meta"] or "{}").get("funding_payment_ids", []))
+        return out
+
+    def set_trade_funding_status(self, trade_id: int, status: str,
+                                 detail: Optional[Mapping[str, Any]] = None
+                                 ) -> None:
+        """Say why a trade's funding is still unbooked (it stays unbooked)."""
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT meta FROM trades WHERE id = ?", (int(trade_id),)
+            ).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["meta"] or "{}")
+            if meta.get("funding_booked") is not False:
+                return
+            if meta.get("funding_status") == status:
+                return
+            meta["funding_status"] = str(status)
+            if detail:
+                meta["funding_detail"] = dict(detail)
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+
+    def book_trade_funding(self, trade_id: int, *, funding_usd: float,
+                           payment_ids: Sequence[str], status: str,
+                           evidence: Mapping[str, Any]) -> bool:
+        """Book the funding the venue settled against one trade, once.
+
+        Atomic: the row is touched only while its funding is still unbooked (a
+        replay or a second process is a no-op returning False); its net P&L and
+        the day's realised P&L move by the same signed amount (positive =
+        received); the ids and evidence are kept on the row.
         """
-        rows = self._query(
-            "SELECT net_pnl, qty, entry_price FROM trades "
-            "WHERE price_provisional = 0 ORDER BY closed_epoch DESC LIMIT ?",
-            (int(limit),),
-        )
+        self._assert_writer()
+        if not (isinstance(funding_usd, (int, float)) and funding_usd == funding_usd
+                and funding_usd not in (float("inf"), float("-inf"))):
+            raise PersistenceError("funding_usd is not a finite number")
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM trades WHERE id = ?", (int(trade_id),)
+            ).fetchone()
+            if row is None:
+                return False
+            meta = json.loads(row["meta"] or "{}")
+            if meta.get("funding_booked") is not False:
+                return False
+            meta.update({"funding_booked": True, "funding_usd": float(funding_usd),
+                         "funding_payment_ids": sorted({str(i) for i in payment_ids}),
+                         "funding_status": str(status),
+                         "funding_evidence": dict(evidence)})
+            meta.pop("funding_detail", None)
+            cur = self._conn.execute(
+                "UPDATE trades SET net_pnl = net_pnl + ?, meta = ? WHERE id = ?",
+                (float(funding_usd), json.dumps(meta, default=str), int(trade_id)))
+            if cur.rowcount != 1:
+                return False
+            self._conn.execute(
+                "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?"
+                " WHERE day = ?", (float(funding_usd), str(row["day"])))
+            self.journal(str(row["symbol"]), "FUNDING_BOOKED", str(status),
+                         {"trade_id": int(trade_id),
+                          "funding_usd": float(funding_usd),
+                          "payment_ids": sorted({str(i) for i in payment_ids})})
+            return True
+
+    def add_trade_exit_order_ids(self, trade_id: int, ids: Sequence[str]) -> None:
+        """Record the venue order ids of a still-provisional exit (identity
+        recovered from closed-pnl). Only touches a provisional row."""
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT meta FROM trades WHERE id = ? AND price_provisional = 1",
+                (int(trade_id),)).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["meta"] or "{}")
+            meta["exit_order_ids"] = sorted({str(i) for i in ids})
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+
+    def net_returns(self, limit: int = 500) -> List[float]:
+        """Per-POSITION NET return fractions, oldest first -- the Kelly input.
+
+        One sample per completed position lifecycle, however many exit fills
+        it took; fee- and funding-inclusive, against the position's own entry
+        notional so sizes are comparable.
+        """
         out: List[float] = []
-        for r in reversed(rows):
+        for r in reversed(self.lifecycles(limit)):
             notional = abs(float(r["qty"]) * float(r["entry_price"]))
             if notional > 0.0:
                 out.append(float(r["net_pnl"]) / notional)
@@ -2092,17 +2268,7 @@ class StateStore:
         ``regime`` is NULL for trades opened before any observation for that
         symbol.  Those trades are not guessed at; they are simply unlabelled.
         """
-        rows = self._query(
-            "SELECT t.*, ("
-            "  SELECT r.regime FROM regime_history r"
-            "   WHERE r.symbol = t.symbol AND r.ts_epoch <= t.opened_epoch"
-            "   ORDER BY r.ts_epoch DESC, r.id DESC LIMIT 1"
-            ") AS regime "
-            "FROM trades t WHERE t.price_provisional = 0 "
-            "ORDER BY t.closed_epoch DESC LIMIT ?",
-            (int(limit),),
-        )
-        return [dict(r) for r in rows]
+        return self.lifecycles(limit, with_regime=True)
 
     # -- namespaced key/value memory ---------------------------------------
 
@@ -2177,14 +2343,7 @@ class StateStore:
 
     def trades_for_symbol(self, symbol: str, limit: int = 500) -> List[Dict[str, Any]]:
         """Most recent closed trades for one symbol, newest first."""
-        return [
-            dict(r)
-            for r in self._query(
-                "SELECT * FROM trades WHERE symbol = ? AND price_provisional = 0 "
-                "ORDER BY closed_epoch DESC LIMIT ?",
-                (str(symbol), int(limit)),
-            )
-        ]
+        return self.lifecycles(limit, symbol=symbol)
 
     def traded_symbols(self) -> List[str]:
         return [
