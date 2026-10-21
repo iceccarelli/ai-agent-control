@@ -1700,6 +1700,26 @@ class BybitClient:
             deduped.append((stamp, rate))
         return deduped
 
+    def get_executions(self, symbol: str, order_link_id: str,
+                       limit: int = 100) -> List[Dict[str, Any]]:
+        """The venue's own execution rows (fills) of ONE order.
+
+        ``GET /v5/execution/list`` - each row carries ``execId``, ``orderLinkId``,
+        ``symbol``, ``side``, ``execPrice``, ``execQty``, ``execFee``,
+        ``feeCurrency``, ``execType`` and ``execTime``. Read-only. Raises on any
+        failure and returns rows exactly as stated: it never fills a gap.
+        """
+        if not order_link_id:
+            raise PermanentAPIError("get_executions needs an order link id")
+        payload = self._request(
+            "GET", "/v5/execution/list", signed=True,
+            params={"category": self.category, "symbol": symbol,
+                    "orderLinkId": order_link_id, "limit": int(limit)})
+        rows = payload.get("result", {}).get("list")
+        if rows is None:
+            raise PermanentAPIError("execution list carries no list")
+        return list(rows)
+
     def get_closed_pnl(self, symbol: str, *, since_ms: int = 0,
                        limit: int = 50) -> List[Dict[str, Any]]:
         """Closed-PnL records for ``symbol`` newer than ``since_ms``. Linear only.

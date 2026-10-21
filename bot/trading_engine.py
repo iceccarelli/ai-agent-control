@@ -52,7 +52,7 @@ import math
 import time
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import config as _config
 from bybit_connection import (
@@ -1943,6 +1943,154 @@ class TradingEngine:
                 return rows
         return rows
 
+    # -- provisional exits: reconciliation ---------------------------------
+
+    @staticmethod
+    def _finite_pos(value: Any) -> Optional[float]:
+        try:
+            x = float(value)
+        except (TypeError, ValueError):
+            return None
+        return x if math.isfinite(x) and x > 0.0 else None
+
+    def validate_exit_executions(
+        self, trade: Mapping[str, Any], executions: Sequence[Mapping[str, Any]],
+    ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Prove (or refuse) that `executions` are the fills of THIS exit.
+
+        Returns ``(evidence, "")`` or ``(None, reason)``. Evidence is accepted
+        only if every row is a Trade execution of the trade's own exit order
+        and symbol, on the closing side, with a unique id, a positive finite
+        price and quantity and a stated fee, and the quantities add up to the
+        booked quantity exactly. Anything else - missing, duplicated with
+        different content, extra, mismatched, incomplete - is refused, and the
+        row stays provisional. A price is never inferred.
+        """
+        link = str(trade.get("order_link_id") or "")
+        symbol = str(trade.get("symbol") or "")
+        if not link or not symbol:
+            return None, "the provisional trade has no exit order identity"
+        side = normalize_side(str(trade.get("side") or ""))
+        if side not in ("Buy", "Sell"):
+            return None, "the provisional trade has no side"
+        exit_side = "Sell" if side == "Buy" else "Buy"
+        seen: Dict[str, Mapping[str, Any]] = {}
+        for ex in executions or ():
+            if not isinstance(ex, Mapping):
+                return None, "an execution row is not an object"
+            exec_id = str(ex.get("execId") or "")
+            if not exec_id:
+                return None, "an execution has no execId"
+            if str(ex.get("execType") or "Trade") != "Trade":
+                return None, f"execution {exec_id} is not a Trade"
+            if str(ex.get("orderLinkId") or "") != link:
+                return None, f"execution {exec_id} belongs to another order"
+            if str(ex.get("symbol") or "") != symbol:
+                return None, f"execution {exec_id} is for another symbol"
+            if normalize_side(str(ex.get("side") or "")) != exit_side:
+                return None, f"execution {exec_id} is on the wrong side"
+            if exec_id in seen:
+                if dict(seen[exec_id]) != dict(ex):
+                    return None, f"execution {exec_id} appears twice differently"
+                continue                    # an exact replay of one fill
+            seen[exec_id] = ex
+        if not seen:
+            return None, "no executions"
+        qty = 0.0
+        notional = 0.0
+        fee_by_ccy: Dict[Optional[str], float] = {}
+        for exec_id, ex in seen.items():
+            q = self._finite_pos(ex.get("execQty"))
+            p = self._finite_pos(ex.get("execPrice"))
+            if q is None or p is None:
+                return None, f"execution {exec_id} has no usable price/quantity"
+            raw_fee = ex.get("execFee")
+            try:
+                fee = float(raw_fee)
+            except (TypeError, ValueError):
+                return None, f"execution {exec_id} states no fee"
+            if not math.isfinite(fee):
+                return None, f"execution {exec_id} states a non-finite fee"
+            ccy = venue_fees._clean_currency(ex.get("feeCurrency"))
+            if ccy is None:
+                return None, f"execution {exec_id} states no fee currency"
+            qty += q
+            notional += q * p
+            fee_by_ccy[ccy] = fee_by_ccy.get(ccy, 0.0) + fee
+        booked = float(trade.get("qty") or 0.0)
+        if abs(qty - booked) > max(1e-9, abs(booked) * 1e-9):
+            return None, (f"executions total {qty:.12g}, the booked exit is "
+                          f"{booked:.12g}")
+        fees = FeeSet(tuple(venue_fees.VenueFee(a, c)
+                            for c, a in fee_by_ccy.items()),
+                      True, "execution")
+        return {"vwap": notional / qty, "qty": qty,
+                "exec_ids": sorted(seen), "fees": fees,
+                "fee_by_currency": dict(fee_by_ccy)}, ""
+
+    def reconcile_provisional_exits(
+        self, fetch: Optional[Callable[[str, str], Sequence[Mapping[str, Any]]]]
+        = None,
+    ) -> Dict[str, Any]:
+        """Price the exits that were booked provisional, from the venue's fills.
+
+        `fetch(symbol, order_link_id)` returns the execution rows (default: the
+        client's own read). A row is promoted only on evidence that
+        `validate_exit_executions` accepts and whose fees convert into the
+        accounting unit; otherwise it stays provisional and the reason is
+        counted. Safe to call every cycle: applying the same fills twice is a
+        no-op, and a failed fetch changes nothing.
+        """
+        summary: Dict[str, Any] = {"checked": 0, "reconciled": 0, "pending": 0,
+                                   "refused": {}}
+        fetch = fetch or getattr(self.client, "get_executions", None)
+        if fetch is None:
+            summary["unavailable"] = True
+            return summary
+        for trade in self.store.provisional_trades():
+            summary["checked"] += 1
+            try:
+                rows = fetch(str(trade["symbol"]), str(trade["order_link_id"]))
+            except Exception as exc:  # noqa: BLE001
+                logger.error("reconcile_provisional_exits: cannot read the "
+                             "fills of %s: %s", trade["order_link_id"], exc)
+                summary["pending"] += 1
+                continue
+            evidence, reason = self.validate_exit_executions(trade, rows)
+            if evidence is None:
+                summary["pending"] += 1
+                summary["refused"][str(trade["order_link_id"])] = reason
+                logger.warning("reconcile_provisional_exits: %s stays "
+                               "provisional: %s", trade["order_link_id"], reason)
+                continue
+            vwap, qty = evidence["vwap"], evidence["qty"]
+            direction = 1.0 if normalize_side(str(trade["side"])) == "Buy" else -1.0
+            gross = (vwap - float(trade["entry_price"])) * qty * direction
+            leg = self._fee_leg(
+                symbol=str(trade["symbol"]), fees=evidence["fees"], price=vwap,
+                qty=qty, ref={"order_link_id": str(trade["order_link_id"]),
+                              "exec_ids": evidence["exec_ids"]})
+            if not leg["realized"]:
+                # The fee could not be converted into the accounting unit with
+                # a recorded basis: the economics are not confirmed, so the
+                # row stays provisional rather than carry a guessed fee.
+                summary["pending"] += 1
+                summary["refused"][str(trade["order_link_id"])] = (
+                    "the execution fee could not be converted into the "
+                    "accounting unit")
+                continue
+            ok = self.store.reconcile_provisional_trade(
+                int(trade["id"]), exit_price=vwap, gross_pnl=gross,
+                exit_fee=float(leg["amount"]), exit_fee_realized=True,
+                exit_fee_currency=leg["currency"],
+                evidence={"exec_ids": evidence["exec_ids"],
+                          "qty": qty, "vwap": vwap,
+                          "fee_by_currency": evidence["fee_by_currency"],
+                          "fee_raw": leg["raw"]})
+            if ok:
+                summary["reconciled"] += 1
+        return summary
+
     def record_exit_fill(
         self,
         *,
@@ -2022,6 +2170,12 @@ class TradingEngine:
             symbol=symbol, fees=fees or venue_fees.UNKNOWN_FEES,
             price=float(price), qty=closed_qty, caller_amount=float(fee or 0.0),
             ref=fee_ref)
+        if price_provisional:
+            # The fee was converted with a PLACEHOLDER price: whatever the
+            # venue stated stays in `raw`, but the stored amount is not
+            # realised economics until reconciliation re-derives it from the
+            # authoritative executions.
+            exit_leg = dict(exit_leg, realized=False, currency=None)
 
         # `record_trade` is idempotent on `dedupe_key` (see its docstring):
         # a crash between it and the position mutations below leaves this

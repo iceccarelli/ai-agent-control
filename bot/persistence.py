@@ -1362,6 +1362,65 @@ class StateStore:
             "SELECT * FROM trades WHERE price_provisional = 1 "
             "ORDER BY closed_epoch DESC LIMIT ?", (int(limit),))]
 
+    def reconcile_provisional_trade(
+        self, trade_id: int, *, exit_price: float, gross_pnl: float,
+        exit_fee: float, exit_fee_realized: bool,
+        exit_fee_currency: Optional[str], evidence: Mapping[str, Any],
+    ) -> bool:
+        """Turn a PROVISIONAL exit into a priced one, atomically, at most once.
+
+        One transaction: the row is updated only if it is still provisional
+        (so a replay, or a second process, is a no-op returning False), the
+        day's realised P&L is corrected by the difference between the old
+        (fee-only) net and the new net, the prior values are kept in
+        ``meta['reconciliation']`` and a journal event is written. The caller
+        has already proven the evidence; this method only applies it.
+        """
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM trades WHERE id = ?", (int(trade_id),)
+            ).fetchone()
+            if row is None or not int(row["price_provisional"]):
+                return False
+            for name, value in (("exit_price", exit_price),
+                                ("gross_pnl", gross_pnl),
+                                ("exit_fee", exit_fee)):
+                if not (isinstance(value, (int, float)) and value == value
+                        and value not in (float("inf"), float("-inf"))):
+                    raise PersistenceError(f"{name} is not a finite number")
+            if exit_price <= 0:
+                raise PersistenceError("exit_price must be positive")
+            old_net = float(row["net_pnl"])
+            new_net = float(gross_pnl) - float(row["entry_fee"]) - float(exit_fee)
+            meta = json.loads(row["meta"] or "{}")
+            meta["reconciliation"] = {
+                "evidence": dict(evidence),
+                "before": {"exit_price": float(row["exit_price"]),
+                           "gross_pnl": float(row["gross_pnl"]),
+                           "exit_fee": float(row["exit_fee"]),
+                           "net_pnl": old_net},
+            }
+            cur = self._conn.execute(
+                "UPDATE trades SET exit_price=?, gross_pnl=?, exit_fee=?,"
+                " net_pnl=?, exit_fee_realized=?, exit_fee_currency=?,"
+                " meta=?, price_provisional=0"
+                " WHERE id=? AND price_provisional=1",
+                (float(exit_price), float(gross_pnl), float(exit_fee), new_net,
+                 1 if exit_fee_realized else 0,
+                 (str(exit_fee_currency) if exit_fee_currency else None),
+                 json.dumps(meta, default=str), int(trade_id)))
+            if cur.rowcount != 1:
+                return False
+            self._conn.execute(
+                "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?"
+                " WHERE day = ?", (new_net - old_net, str(row["day"])))
+            self.journal(str(row["symbol"]), "EXIT_PRICE_RECONCILED",
+                         str(row["order_link_id"]),
+                         {"trade_id": int(trade_id), "exit_price": exit_price,
+                          "net_before": old_net, "net_after": new_net})
+            return True
+
     def net_returns(self, limit: int = 500) -> List[float]:
         """Per-trade NET return fractions, oldest first — the Kelly input.
 

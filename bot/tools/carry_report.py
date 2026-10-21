@@ -82,14 +82,22 @@ def build_report(db_path: str) -> Dict[str, Any]:
                            "fee_status": e.fee_status}
                           for e in journal.entries if e.fee_status],
             }
-        trades: List[sqlite3.Row] = conn.execute(
+        all_trades: List[sqlite3.Row] = conn.execute(
             "SELECT * FROM trades").fetchall() if _has(conn, "trades") else []
+        # An exit booked WITHOUT an authoritative price carries no price and
+        # no gross: it is neither a confirmed nor an "unconfirmed" P&L figure.
+        # It is counted separately and kept out of every sum below.
+        provisional = [t for t in all_trades
+                       if "price_provisional" in t.keys()
+                       and t["price_provisional"]]
+        trades = [t for t in all_trades if t not in provisional]
         confirmed = [t for t in trades
                      if "entry_fee_realized" in t.keys()
                      and t["entry_fee_realized"] and t["exit_fee_realized"]]
         out["liquidation_evidence"] = _liquidation_evidence(conn)
         out["ordinary_trades"] = {
             "trades": len(trades),
+            "price_provisional_trades": len(provisional),
             "fees_confirmed_trades": len(confirmed),
             "fees_unconfirmed_trades": len(trades) - len(confirmed),
             "realised_net_pnl": sum(t["net_pnl"] for t in confirmed),

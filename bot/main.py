@@ -1011,6 +1011,18 @@ class TradingBot:
             logger.exception("observe_exits failed; continuing: %s", exc)
             rest_observation_ok = False
 
+        # Exits booked without an authoritative price are priced from the
+        # venue's own fills as soon as it will state them (read-only; a no-op
+        # when nothing is provisional).
+        try:
+            if self.store.provisional_trades(limit=1):
+                recon = self.engine.reconcile_provisional_exits()
+                if recon.get("reconciled"):
+                    logger.warning("provisional exits reconciled: %s", recon)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("reconcile_provisional_exits failed; "
+                             "continuing: %s", exc)
+
         # A stop that existed and was later cleared AT THE VENUE while the
         # position stayed open is invisible to reconcile()'s ledger-only
         # check, which only runs once at startup. This is the live-venue
