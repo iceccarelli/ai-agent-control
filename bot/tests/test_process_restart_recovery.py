@@ -790,14 +790,13 @@ class TestStateStoreReviewFixes:
         store.close()
 
 
-def test_order_seq_inside_a_transaction_rolls_back_with_it(tmp_path):
-    from persistence import StateStore
+def test_order_seq_inside_a_transaction_is_refused_not_rolled_back(tmp_path):
+    from persistence import PersistenceError, StateStore
     store = StateStore(str(tmp_path / "s.db"))
     first = store.next_order_seq()
-    with pytest.raises(RuntimeError):
+    with pytest.raises(PersistenceError, match="inside transaction"):
         with store.transaction():
             store.next_order_seq()
-            raise RuntimeError("boom")
     assert store.next_order_seq() == first + 1
 
 

@@ -1478,6 +1478,13 @@ class StateStore:
         timed-out submit created a duplicate live order.
         """
         self._assert_writer()
+        if self._tx_depth > 0:
+            # A sequence number must never roll back: the id it minted may
+            # already be at the venue. Inside transaction() it WOULD roll back
+            # and be handed out again for a different intent, so say so loudly.
+            raise PersistenceError(
+                "next_order_seq() inside transaction(): the sequence would "
+                "roll back with it and an orderLinkId could be reused")
         with self._lock:
             try:
                 # ONE statement: a second connection to the same file cannot
@@ -1498,8 +1505,7 @@ class StateStore:
                 if row is None:
                     raise PersistenceError("order_seq row missing")
                 n = int(row[0])
-                if self._tx_depth == 0:
-                    self._conn.commit()
+                self._conn.commit()
                 return n
             except PersistenceError:
                 raise
