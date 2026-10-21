@@ -1353,18 +1353,11 @@ class StateStore:
             " ON t.symbol = k.symbol AND t.opened_epoch = k.opened_epoch"
             " ORDER BY k.mc DESC, t.opened_epoch DESC, t.closed_epoch ASC, t.id ASC",
             tuple(params + [int(limit)]))
-        out: List[Dict[str, Any]] = []
-        group: List[Dict[str, Any]] = []
+        groups: Dict[Tuple[str, float], List[Dict[str, Any]]] = {}
         for r in rows:
             row = dict(r)
-            if group and (row["symbol"], row["opened_epoch"]) != (
-                    group[0]["symbol"], group[0]["opened_epoch"]):
-                out.append(self._fold_lifecycle(group))
-                group = []
-            group.append(row)
-        if group:
-            out.append(self._fold_lifecycle(group))
-        return out
+            groups.setdefault((row["symbol"], row["opened_epoch"]), []).append(row)
+        return [self._fold_lifecycle(g) for g in groups.values()]
 
     @staticmethod
     def _fold_lifecycle(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1504,11 +1497,24 @@ class StateStore:
                           "net_before": old_net, "net_after": new_net})
             return True
 
-    def trades_awaiting_funding(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """Closed linear trades whose funding has not been booked yet."""
+    def trades_awaiting_funding(self, limit: int = 200,
+                                skip_symbols: Sequence[str] = ()
+                                ) -> List[Dict[str, Any]]:
+        """Closed linear trades whose funding has not been booked yet.
+
+        Rows already examined and left unbooked (a status is recorded) sort
+        AFTER rows never examined, so a pile of stuck rows cannot starve the
+        trades behind them; symbols in ``skip_symbols`` are not returned.
+        """
+        marks = ",".join("?" for _ in skip_symbols)
+        where = f" AND symbol NOT IN ({marks})" if skip_symbols else ""
         return [dict(r) for r in self._query(
             "SELECT * FROM trades WHERE json_extract(meta, '$.funding_booked') = 0"
-            " ORDER BY closed_epoch ASC, id ASC LIMIT ?", (int(limit),))]
+            + where +
+            " ORDER BY (json_extract(meta, '$.funding_status') IS NOT NULL"
+            " AND json_extract(meta, '$.funding_status') != 'PENDING_SETTLEMENT_GRACE'),"
+            " closed_epoch ASC, id ASC LIMIT ?",
+            tuple(str(s) for s in skip_symbols) + (int(limit),))]
 
     def lifecycle_trades(self, symbol: str, opened_epoch: float
                          ) -> List[Dict[str, Any]]:
@@ -1517,6 +1523,17 @@ class StateStore:
             "SELECT * FROM trades WHERE symbol = ? AND opened_epoch = ? "
             "ORDER BY closed_epoch ASC, id ASC",
             (str(symbol), float(opened_epoch)))]
+
+    def claimed_exit_order_ids(self, symbol: str, exclude_trade_id: int = 0) -> set:
+        """Venue order ids already named by another exit row of ``symbol``."""
+        out: set = set()
+        for r in self._query("SELECT id, meta FROM trades WHERE symbol = ?",
+                             (str(symbol),)):
+            if int(r["id"]) == int(exclude_trade_id):
+                continue
+            out.update(str(i) for i in
+                       json.loads(r["meta"] or "{}").get("exit_order_ids", []))
+        return out
 
     def booked_funding_ids(self, symbol: str) -> set:
         """Venue settlement ids already booked on some trade of ``symbol``."""

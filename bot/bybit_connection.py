@@ -2086,7 +2086,9 @@ class BybitClient:
             # books it from its own fill (`_settle_pending_closes`).
             logger.warning("reconcile: close %s executed %s while down; left "
                            "unresolved so the exit is booked", oid, executed)
-            summary["unknown"] += 1
+            # (not "unknown": that refuses to start, and the engine can only
+            # book this once it is running)
+            summary["closes_to_settle"] = summary.get("closes_to_settle", 0) + 1
             return
         try:
             adopted = self._adopt_filled_spot_entry(row, remote, summary)

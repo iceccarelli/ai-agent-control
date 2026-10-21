@@ -2169,7 +2169,26 @@ class TradingEngine:
                 float(trade.get("opened_epoch") or 0.0) * 1000))
         except Exception:  # noqa: BLE001
             return []
-        chosen = self._rows_of_this_exit(rows, qty)
+        # Only rows that could be THIS exit: not later than it, and not an
+        # order another booked exit already names. The rows left must add up
+        # to the booked quantity exactly; a larger pool (two unidentified exits
+        # of equal size) is ambiguous, and a wrong identity would price this
+        # exit from someone else's fills, so it is refused.
+        closed_ms = float(trade.get("closed_epoch") or 0.0) * 1000
+        try:
+            claimed = self.store.claimed_exit_order_ids(
+                str(trade["symbol"]), exclude_trade_id=int(trade["id"]))
+        except Exception:  # noqa: BLE001
+            return []
+
+        def stamp(r: Mapping[str, Any]) -> float:
+            try:
+                return float(r.get("updatedTime", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        chosen = [r for r in rows
+                  if str(r.get("orderId") or "") not in claimed
+                  and stamp(r) <= closed_ms + 120_000]
         total = sum(float(r.get("qty", 0) or 0) for r in chosen)
         if (not chosen or abs(total - qty) > max(1e-9, abs(qty) * 1e-9)
                 or any(not r.get("orderId") for r in chosen)):

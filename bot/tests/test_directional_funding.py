@@ -259,3 +259,16 @@ class TestTheLoopHook:
         run, bot = self._bot(store, client)
         run(bot)
         assert _meta(store, tid)["funding_booked"] is False
+
+
+def test_a_pile_of_stuck_rows_cannot_starve_the_trades_behind_them(tmp_path):
+    fake, store, broker = _setup(tmp_path)
+    for _ in range(3):                       # old, unresolvable (carry symbol)
+        _trade(store, opened_h_ago=30.0, closed_h_ago=20.0, symbol="ETHUSDT")
+    df.reconcile_directional_funding(store, broker, now_ms=NOW, limit=3,
+                                     carry_symbols={"ETHUSDT"})
+    fresh = _trade(store, opened_h_ago=3.0, closed_h_ago=1.0)
+    r = df.reconcile_directional_funding(store, broker, now_ms=NOW, limit=3,
+                                         carry_symbols={"ETHUSDT"})
+    assert _meta(store, fresh)["funding_booked"] is True
+    assert r["no_settlement"] == 1
