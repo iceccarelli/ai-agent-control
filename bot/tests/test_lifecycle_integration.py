@@ -362,7 +362,8 @@ class TestDeadStopFollowUps:
         assert "stop_dead_outcome" not in summary      # no protect/flatten attempt
         assert not store.is_kill_switch_engaged()[0]
 
-    def test_an_unpriceable_fill_is_booked_approximately_after_a_bound(self, stack):
+    def test_an_unpriceable_fill_is_booked_provisionally_not_at_the_entry_price(
+            self, stack):
         engine, client, store, exchange, meta = self._dead(stack)
         tp = meta["tp_order_ids"][0]
         exchange.orders[tp].update(orderStatus="Cancelled", cumExecQty="0.0001",
@@ -371,11 +372,18 @@ class TestDeadStopFollowUps:
             exchange.orders[other]["orderStatus"] = "New"
         for _ in range(engine.DEAD_STOP_MAX_DEFERRALS):
             engine.observe_exits()
-        assert not store.recent_trades()               # still deferring
+        assert not store.provisional_trades()          # still deferring
         summary = engine.observe_exits()               # the bound is crossed
-        assert summary.get("price_approximated") == 1
-        assert len(store.recent_trades()) == 1
-        assert any(d.get("decision") == "EXIT_PRICE_APPROXIMATED"
+        assert summary.get("exits_provisional") == 1
+        rows = store.provisional_trades()
+        assert len(rows) == 1
+        # never represented as a fill price, and not a confirmed trade
+        assert rows[0]["exit_price"] == 0.0 and rows[0]["gross_pnl"] == 0.0
+        assert rows[0]["price_provisional"] == 1
+        assert not store.recent_trades()
+        assert store.net_returns() == []
+        assert store.fee_evidence()["price_provisional_trades"] == 1
+        assert any(d.get("decision") == "EXIT_UNPRICED_PROVISIONAL"
                    for d in store.recent_decisions())
 
     def test_with_reserved_coin_the_cancel_first_path_still_reprotects(self, stack):

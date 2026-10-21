@@ -226,6 +226,9 @@ class TradeRecord:
     #: "no durable identity available" (accepted, not enforced) -- see
     #: `StateStore.record_trade`.
     dedupe_key: str = ""
+    #: True when the exit price is UNKNOWN (never an invented one): see the
+    #: ``trades.price_provisional`` column.
+    price_provisional: bool = False
 
     @property
     def fees_realized(self) -> bool:
@@ -319,7 +322,8 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_fee_realized INTEGER NOT NULL DEFAULT 0,
     exit_fee_realized  INTEGER NOT NULL DEFAULT 0,
     entry_fee_currency TEXT,
-    exit_fee_currency  TEXT
+    exit_fee_currency  TEXT,
+    price_provisional  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_trades_day ON trades(day);
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_epoch);
@@ -673,6 +677,11 @@ class StateStore:
             "exit_fee_realized": "INTEGER NOT NULL DEFAULT 0",
             "entry_fee_currency": "TEXT",
             "exit_fee_currency": "TEXT",
+            # 1 = the exit PRICE could not be taken from authoritative
+            # execution data. The row stands in for a real exit (quantity and
+            # fees), carries exit_price 0 and gross 0, and is EXCLUDED from
+            # every confirmed-economics reader until reconciled.
+            "price_provisional": "INTEGER NOT NULL DEFAULT 0",
         },
     }
 
@@ -1260,8 +1269,9 @@ class StateStore:
             "INSERT INTO trades(symbol, side, qty, entry_price, exit_price, gross_pnl,"
             " entry_fee, exit_fee, net_pnl, opened_epoch, closed_epoch, day,"
             " order_link_id, meta, dedupe_key, entry_fee_realized,"
-            " exit_fee_realized, entry_fee_currency, exit_fee_currency)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " exit_fee_realized, entry_fee_currency, exit_fee_currency,"
+            " price_provisional)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(dedupe_key) WHERE dedupe_key <> '' DO NOTHING",
             (
                 trade.symbol, trade.side, float(trade.qty), float(trade.entry_price),
@@ -1274,6 +1284,7 @@ class StateStore:
                 1 if trade.exit_fee_realized else 0,
                 (str(trade.entry_fee_currency) if trade.entry_fee_currency else None),
                 (str(trade.exit_fee_currency) if trade.exit_fee_currency else None),
+                1 if trade.price_provisional else 0,
             ),
         )
         if cur.rowcount != 1:
@@ -1308,7 +1319,8 @@ class StateStore:
 
     def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
         rows = self._query(
-            "SELECT * FROM trades ORDER BY closed_epoch DESC LIMIT ?", (int(limit),)
+            "SELECT * FROM trades WHERE price_provisional = 0 "
+            "ORDER BY closed_epoch DESC LIMIT ?", (int(limit),)
         )
         return [dict(r) for r in rows]
 
@@ -1323,24 +1335,32 @@ class StateStore:
         """
         rows = self._query(
             "SELECT COUNT(*) AS n,"
+            " (SELECT COUNT(*) FROM trades WHERE price_provisional = 1) AS prov_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
             "     THEN 1 ELSE 0 END) AS realized_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
             "     THEN net_pnl ELSE 0 END) AS realized_net,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
             "     THEN 0 ELSE net_pnl END) AS unconfirmed_net"
-            " FROM trades"
+            " FROM trades WHERE price_provisional = 0"
         )
         r = rows[0]
         n = int(r["n"] or 0)
         realized_n = int(r["realized_n"] or 0)
         return {
             "trades": n,
+            "price_provisional_trades": int(r["prov_n"] or 0),
             "fees_realized_trades": realized_n,
             "fees_unconfirmed_trades": n - realized_n,
             "realized_net_pnl": float(r["realized_net"] or 0.0),
             "unconfirmed_net_pnl": float(r["unconfirmed_net"] or 0.0),
         }
+
+    def provisional_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Exits booked WITHOUT an authoritative price, awaiting reconciliation."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM trades WHERE price_provisional = 1 "
+            "ORDER BY closed_epoch DESC LIMIT ?", (int(limit),))]
 
     def net_returns(self, limit: int = 500) -> List[float]:
         """Per-trade NET return fractions, oldest first — the Kelly input.
@@ -1350,7 +1370,7 @@ class StateStore:
         """
         rows = self._query(
             "SELECT net_pnl, qty, entry_price FROM trades "
-            "ORDER BY closed_epoch DESC LIMIT ?",
+            "WHERE price_provisional = 0 ORDER BY closed_epoch DESC LIMIT ?",
             (int(limit),),
         )
         out: List[float] = []
@@ -2013,7 +2033,8 @@ class StateStore:
             "   WHERE r.symbol = t.symbol AND r.ts_epoch <= t.opened_epoch"
             "   ORDER BY r.ts_epoch DESC, r.id DESC LIMIT 1"
             ") AS regime "
-            "FROM trades t ORDER BY t.closed_epoch DESC LIMIT ?",
+            "FROM trades t WHERE t.price_provisional = 0 "
+            "ORDER BY t.closed_epoch DESC LIMIT ?",
             (int(limit),),
         )
         return [dict(r) for r in rows]
@@ -2094,7 +2115,7 @@ class StateStore:
         return [
             dict(r)
             for r in self._query(
-                "SELECT * FROM trades WHERE symbol = ? "
+                "SELECT * FROM trades WHERE symbol = ? AND price_provisional = 0 "
                 "ORDER BY closed_epoch DESC LIMIT ?",
                 (str(symbol), int(limit)),
             )

@@ -1736,28 +1736,37 @@ class TradingEngine:
                 if current is None:
                     break
                 qty = min(qty, float(current["qty"]))
+                provisional = False
                 if qty > 0 and price <= 0:
                     unpriced = self.__dict__.setdefault("_unpriced_cycles", {})
                     n_unpriced = unpriced[(symbol, link)] = unpriced.get(
                         (symbol, link), 0) + 1
                     if n_unpriced > self.DEAD_STOP_MAX_DEFERRALS:
                         # Waiting for a price the venue will not give is how a
-                        # position stays naked for ever. Book the fill at the
-                        # row's entry price (flat P&L on those units, fees as
-                        # stated) and say it is approximate.
+                        # position stays naked for ever. Book the QUANTITY (it
+                        # resizes the position and the stop) as a PROVISIONAL
+                        # exit: no exit price is invented. The row carries
+                        # exit_price 0 / gross 0, is flagged price_provisional,
+                        # and is excluded from confirmed realized P&L,
+                        # expectancy, sizing inputs and promotion evidence until
+                        # reconciled. The entry price below is only a
+                        # placeholder for unit conversions, never stored as a
+                        # fill price. (It still counts in the loss-streak and
+                        # daily-loss brakes: fees are real and the brake errs
+                        # conservative.)
+                        provisional = True
                         price = float(current["entry_price"] or 0.0)
-                        # (Conservative by design: this books zero gross, so with
-                        # fees it counts as a LOSS in the streak/cooldown. For a
-                        # risk brake that is the defensible direction.)
                         logger.critical(
                             "observe_exits: %s order %s filled %.8g with no "
-                            "price from the venue after %d cycles; booking at "
-                            "the entry price (APPROXIMATE)", symbol, link, qty,
-                            n_unpriced)
-                        self.store.journal(symbol, "EXIT_PRICE_APPROXIMATED",
-                                           link, {"qty": qty, "price": price})
-                        summary["price_approximated"] = summary.get(
-                            "price_approximated", 0) + 1
+                            "price from the venue after %d cycles; booking a "
+                            "PROVISIONAL, UNPRICED exit (excluded from "
+                            "confirmed P&L until reconciled)", symbol, link,
+                            qty, n_unpriced)
+                        self.store.journal(symbol, "EXIT_UNPRICED_PROVISIONAL",
+                                           link, {"qty": qty,
+                                                  "status": status})
+                        summary["exits_provisional"] = summary.get(
+                            "exits_provisional", 0) + 1
                 if qty <= 0 or price <= 0:
                     logger.error("observe_exits: %s order %s is %s but reports "
                                  "qty=%s price=%s; not booked", symbol, link,
@@ -1774,7 +1783,7 @@ class TradingEngine:
                     dedupe_key=f"exit_spot:{link}", fees=fees,
                     fee_ref={"order_link_id": link,
                              "order_id": str(order.get("orderId") or "")},
-                    booked_order_id=link)
+                    booked_order_id=link, price_provisional=provisional)
                 summary["closed" if fully else "reduced"] += 1
                 logger.warning("observe_exits: spot %s exited %.8g @ %.8g via %s "
                                "fully=%s", symbol, qty, price, link, fully)
@@ -1948,6 +1957,7 @@ class TradingEngine:
         fee_ref: Optional[Mapping[str, Any]] = None,
         fee_evidence: Optional[Mapping[str, Any]] = None,
         booked_order_id: str = "",
+        price_provisional: bool = False,
     ) -> bool:
         """Account for a partial or full exit that an exchange-side order filled.
 
@@ -1988,7 +1998,11 @@ class TradingEngine:
         entry_price = float(row["entry_price"])
         side = str(row["side"])
         direction = 1.0 if normalize_side(side) == "Buy" else -1.0
-        gross = (float(price) - entry_price) * closed_qty * direction
+        # An exit price the venue never stated is UNKNOWN, not the entry
+        # price: a provisional row carries exit_price 0 and gross 0 and is kept
+        # out of every confirmed-economics reader.
+        gross = (0.0 if price_provisional
+                 else (float(price) - entry_price) * closed_qty * direction)
         # Entry fees are apportioned across the parts of the position that
         # close, so a partially-exited trade is not credited a full entry fee
         # twice, nor charged none at all.
@@ -2029,7 +2043,9 @@ class TradingEngine:
         # needed `find_live_spot_stop` and this one does not).
         self.store.record_trade(TradeRecord(
             symbol=symbol, side=side, qty=closed_qty,
-            entry_price=entry_price, exit_price=float(price),
+            entry_price=entry_price,
+            exit_price=0.0 if price_provisional else float(price),
+            price_provisional=bool(price_provisional),
             gross_pnl=gross, entry_fee=entry_leg["amount"],
             exit_fee=exit_leg["amount"],
             entry_fee_realized=entry_leg["realized"],

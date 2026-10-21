@@ -824,3 +824,25 @@ def test_order_seq_falls_back_on_an_old_sqlite(tmp_path, monkeypatch):
     monkeypatch.setattr(P.sqlite3, "sqlite_version_info", (3, 30, 0))
     assert store.next_order_seq() == first + 1
     assert store.next_order_seq() == first + 2
+
+
+def test_a_legacy_trades_table_gains_the_provisional_column(tmp_path):
+    import sqlite3 as _sq
+    from persistence import StateStore
+    path = str(tmp_path / "legacy.db")
+    conn = _sq.connect(path)
+    conn.execute(
+        "CREATE TABLE trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,"
+        " side TEXT NOT NULL, qty REAL NOT NULL, entry_price REAL NOT NULL,"
+        " exit_price REAL NOT NULL, gross_pnl REAL NOT NULL, entry_fee REAL NOT NULL,"
+        " exit_fee REAL NOT NULL, net_pnl REAL NOT NULL, opened_epoch REAL NOT NULL,"
+        " closed_epoch REAL NOT NULL, day TEXT NOT NULL,"
+        " order_link_id TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}')")
+    conn.execute("INSERT INTO trades(symbol, side, qty, entry_price, exit_price,"
+                 " gross_pnl, entry_fee, exit_fee, net_pnl, opened_epoch,"
+                 " closed_epoch, day) VALUES('BTCUSDT','Buy',1,100,101,1,0,0,1,1,2,'d')")
+    conn.commit()
+    conn.close()
+    store = StateStore(path)
+    rows = store.recent_trades()
+    assert len(rows) == 1 and rows[0]["price_provisional"] == 0
