@@ -56,3 +56,14 @@ class TestStaleBarsGiveNoSignal:
         m = ta.MarketStrategy(self._client(int(time.time() * 1000) - 3_600_000))
         m.signal_for("BTCUSDT")
         assert m.last_signal.reason != "CANDLES_STALE"
+
+
+class TestNamedIntervalsAreFreshnessChecked:
+    def test_daily_bars_a_month_old_are_stale(self):
+        import time
+        import technical_analysis as ta
+        m = ta.MarketStrategy(None, interval="D")
+        old = [[str(int(time.time() * 1000) - 30 * 86_400_000)]]
+        assert m._bars_are_stale(old) is True
+        fresh = [[str(int(time.time() * 1000) - 86_400_000)]]
+        assert m._bars_are_stale(fresh) is False

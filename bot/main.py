@@ -1262,14 +1262,23 @@ class TradingBot:
             # traded, an exit (a stop hit minutes later) must not be followed
             # by the identical entry on the very next tick: that repeats a
             # round trip, fees included, up to once a tick for the whole bar.
-            signature = (intent.signal_type, float(intent.entry_price),
+            rows = getattr(self.strategy, "last_rows", None)
+            bar = None
+            try:
+                bar = rows[-1][0] if rows else None
+            except (TypeError, IndexError, KeyError):
+                bar = None
+            signature = (bar, intent.signal_type, float(intent.entry_price),
                          float(intent.stop_price), tuple(intent.take_profits))
             traded = self.__dict__.setdefault("_traded_signals", {})
             if traded.get(symbol) == signature:
                 logger.debug("%s: signal already traded on this bar", symbol)
                 continue
             report = self.engine.execute(intent)
-            if report.ok:
+            if report.ok or report.stage in ("emergency", "fill"):
+                # Anything that reached the venue counts as traded: an entry
+                # closed again by the safety path is not to be retried on the
+                # same bar either.
                 traded[symbol] = signature
             logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
 
@@ -1322,8 +1331,17 @@ class TradingBot:
                 spot_leg = position.spot
                 notional = (float(spot_leg.filled_qty)
                             * float(spot_mark or spot_leg.avg_price or 0.0))
+                opened = int(position.opened_ms or now)
+                if (self._borrow_since_ms is not None
+                        and opened > self._borrow_since_ms):
+                    self._borrow_since_ms = None        # a different pair
                 if self._borrow_since_ms is None:
-                    self._borrow_since_ms = int(position.opened_ms or now)
+                    # Resume after the last borrow the journal already holds:
+                    # a restart must not book the same hours twice.
+                    posted = max((e.ms for e in journal.entries
+                                  if getattr(e, "kind", "") == "borrow"),
+                                 default=0)
+                    self._borrow_since_ms = max(opened, int(posted))
                     self._borrow_notional_usd = notional
                     return
                 if now - self._borrow_since_ms < self.BORROW_POST_EVERY_MS:

@@ -564,3 +564,24 @@ class TestAGapOpenedDuringTheTickIsNotClearedByIt:
         consumer.needs_reconciliation = True        # WS thread, mid-tick
         bot._absorb_ws_observations(rest_ok=True)
         assert consumer.needs_reconciliation is True
+
+
+def test_the_same_signal_on_a_later_bar_is_traded_again(tmp_path, exchange):
+    strategy = StubStrategy()
+    bot = build(tmp_path, exchange, strategy=strategy)
+    bot.startup()
+    sent = []
+    real = bot.engine.execute
+
+    def spy(intent):
+        sent.append(intent)
+        return real(intent)
+    bot.engine.execute = spy
+    strategy.last_rows = [["1000"]]
+    bot.tick()
+    for row in list(bot.store.open_positions()):
+        bot.store.remove_position(row["symbol"])
+    strategy.last_rows = [["2000"]]               # the next closed bar
+    bot.tick()
+    assert len(sent) == 2
+    bot.shutdown()

@@ -576,17 +576,34 @@ class MarketStrategy:
         except Exception:  # noqa: BLE001
             logger.debug("could not record suppressed short for %s", symbol)
 
-    def _bars_are_stale(self, rows: Sequence[Sequence[str]]) -> bool:
+    _NAMED_INTERVAL_MIN = {"D": 1440, "W": 10080, "M": 44640}
+
+    @classmethod
+    def _interval_ms(cls, interval: Any) -> Optional[int]:
+        text = str(interval)
+        if text in cls._NAMED_INTERVAL_MIN:
+            return cls._NAMED_INTERVAL_MIN[text] * 60_000
+        try:
+            return int(text) * 60_000
+        except ValueError:
+            logger.warning("bar interval %r is not understood; freshness is "
+                           "not checked", interval)
+            return None
+
+    def _bars_are_stale(self, rows: Sequence[Sequence[str]],
+                        interval: Optional[str] = None) -> bool:
         """True when the newest closed bar is older than two bar lengths.
 
         A lagging klines feed or a halted symbol otherwise yields a "fresh"
         signal computed from an old close. An unreadable stamp or a
         non-minute interval is not judged here.
         """
+        interval_ms = self._interval_ms(interval or self.interval)
         try:
-            interval_ms = int(self.interval) * 60_000
             start_ms = int(float(rows[-1][0]))
         except (TypeError, ValueError, IndexError):
+            return False
+        if interval_ms is None:
             return False
         # A closed bar's start is one interval before it ended; allow the
         # current bar plus one more of slack.
@@ -609,7 +626,12 @@ class MarketStrategy:
                     higher_rows = self.client.get_klines(
                         symbol, self.higher_interval, self.lookback
                     )
-                    higher = candles_from_klines(higher_rows, self.higher_interval)
+                    if (self.require_fresh_bars and self._bars_are_stale(
+                            higher_rows, self.higher_interval)):
+                        higher = None       # one fewer component, not an old one
+                    else:
+                        higher = candles_from_klines(
+                            higher_rows, self.higher_interval)
                 except Exception:  # noqa: BLE001
                     # A missing higher timeframe means one fewer component, not
                     # a fabricated one.

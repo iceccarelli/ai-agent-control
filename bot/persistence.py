@@ -891,6 +891,11 @@ class StateStore:
         if (before.last_equity > 0.0 and before.updated_epoch > 0.0
                 and 0.0 <= now - before.updated_epoch <= self.ANCHOR_CARRY_MAX_AGE_S):
             prior = before.last_equity
+        if prior is not None and prior <= eq:
+            # Only a LOSS since the last observation is carried into the new
+            # day. A higher equity (a deposit, a gain) anchors at today's
+            # reading, the stricter choice for the brake.
+            prior = None
         self.ensure_daily_anchor(eq, prior_equity=prior)
         return self.get_equity_state()
 
@@ -1449,10 +1454,19 @@ class StateStore:
             try:
                 # ONE statement: a second connection to the same file cannot
                 # read the same number between a SELECT and an UPDATE.
-                cur = self._conn.execute(
-                    "UPDATE order_seq SET next_id = next_id + 1 WHERE id = 1 "
-                    "RETURNING next_id - 1")
-                row = cur.fetchone()
+                if sqlite3.sqlite_version_info >= (3, 35):
+                    cur = self._conn.execute(
+                        "UPDATE order_seq SET next_id = next_id + 1 "
+                        "WHERE id = 1 RETURNING next_id - 1")
+                    row = cur.fetchone()
+                else:           # no RETURNING: read and bump under the lock
+                    got = self._conn.execute(
+                        "SELECT next_id FROM order_seq WHERE id = 1").fetchone()
+                    row = None if got is None else (int(got[0]),)
+                    if row is not None:
+                        self._conn.execute(
+                            "UPDATE order_seq SET next_id = ? WHERE id = 1",
+                            (row[0] + 1,))
                 if row is None:
                     raise PersistenceError("order_seq row missing")
                 n = int(row[0])

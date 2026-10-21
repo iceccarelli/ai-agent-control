@@ -697,6 +697,7 @@ class TestAcquireBorrowIsBooked:
         bot, carry, journal = self._bot("acquire", 0.10)
         now = int(time.time() * 1000)
         bot._borrow_since_ms = now - 24 * 3_600_000      # held a day
+        carry.position.opened_ms = now - 25 * 3_600_000
         bot._borrow_notional_usd = 1_000.0
         bot._accrue_carry_borrow(journal, 100_000.0)
         usd = journal.statement()["borrow_usd"]
@@ -717,3 +718,19 @@ class TestAcquireBorrowIsBooked:
         bot._accrue_carry_borrow(journal, 100_000.0)
         assert journal.statement()["borrow_usd"] > 0.0
         assert bot._borrow_since_ms is None
+
+
+class TestBorrowAccrualSurvivesARestart:
+    def test_a_restart_does_not_book_the_same_hours_twice(self):
+        import types
+        import ledger as L
+        bot, carry, journal = TestAcquireBorrowIsBooked()._bot("acquire", 0.10)
+        now = int(time.time() * 1000)
+        carry.position.opened_ms = now - 5 * 3_600_000
+        # five hours already journaled before the "restart"
+        L.borrow(journal, ms=now - 60_000, ref="borrow:earlier", usd=1.0)
+        bot._borrow_since_ms = None                    # fresh process
+        bot._accrue_carry_borrow(journal, 100_000.0)   # resume tick: no post
+        assert len(journal.entries) == 1
+        bot._accrue_carry_borrow(journal, 100_000.0)   # next tick, <1h later
+        assert len(journal.entries) == 1, "the journaled hours were booked again"

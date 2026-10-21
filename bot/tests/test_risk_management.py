@@ -909,7 +909,7 @@ class TestADownTimeLossStillCountsForTheNewDay:
         monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
         store.update_equity(10_000.0)
         # the process is down across midnight; equity fell 10% meanwhile
-        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 12 * 3600.0)
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
         store.update_equity(9_000.0)
         assert store.daily_loss_fraction(9_000.0) == pytest.approx(0.10)
 
@@ -922,3 +922,14 @@ class TestADownTimeLossStillCountsForTheNewDay:
         monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 5 * 86_400.0)
         store.update_equity(9_000.0)
         assert store.daily_loss_fraction(9_000.0) == pytest.approx(0.0)
+
+
+class TestOnlyALossIsCarriedIntoTheNewDay:
+    def test_a_deposit_overnight_anchors_at_the_new_equity(self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.update_equity(10_000.0)
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
+        store.update_equity(15_000.0)
+        assert store.get_daily_anchor().start_equity == pytest.approx(15_000.0)
