@@ -1742,6 +1742,8 @@ class TradingEngine:
                 elif dead_stop:
                     deferrals.pop(symbol, None)
                     self._handle_dead_spot_stop(symbol, row, dead_stop, summary)
+                if not (dead_stop and tp_in_flight):
+                    deferrals.pop(symbol, None)     # the grace starts afresh
         return summary
 
     DEAD_STOP_MAX_DEFERRALS = 3
@@ -1760,7 +1762,20 @@ class TradingEngine:
             return
         if relaxed and held > 0.0:
             # A take-profit leg has sold part of the position: protect what is
-            # actually held, not the recorded size.
+            # actually held, not the recorded size - and free the coin the
+            # resting leg still reserves, or the new stop (and any emergency
+            # sale) has nothing free to sell. A missing take-profit costs
+            # upside, never capital.
+            try:
+                min_qty = float(self.client.get_instrument_filters(symbol).min_qty)
+            except Exception:  # noqa: BLE001
+                min_qty = 0.0
+            if held < min_qty:
+                logger.critical("observe_exits: %s holds only %.8g, below the "
+                                "minimum order; nothing to protect", symbol, held)
+                summary.setdefault("stop_dead_unverified", []).append(symbol)
+                return
+            self._cancel_take_profit_legs(symbol)
             row = dict(row, qty=min(float(row["qty"]), held))
         if held < float(row["qty"]) * 0.98:
             # The coin is not (all) there: the position was sold or moved

@@ -259,6 +259,22 @@ class TestDeadStopFollowUps:
         final = engine.observe_exits()
         assert final.get("stop_dead") == ["BTCUSDT"]
 
+    def test_the_relaxed_path_frees_the_coin_the_resting_legs_reserve(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()
+        statuses = [exchange.orders[t]["orderStatus"]
+                    for t in meta["tp_order_ids"]]
+        assert all(st in ("Cancelled", "Filled") for st in statuses), statuses
+
+    def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        engine.observe_exits()
+        assert engine._dead_stop_deferrals.get("BTCUSDT") == 1
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Untriggered"
+        engine.observe_exits()
+        assert "BTCUSDT" not in engine._dead_stop_deferrals
+
     def test_total_balance_is_refused_when_the_row_does_not_state_it(self, stack):
         engine, client, risk, store, exchange = stack
         client.get_wallet = lambda account_type="UNIFIED": {
