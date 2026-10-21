@@ -715,8 +715,10 @@ class CarryBroker:
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": qty_text, "price": price_text,
                 "timeInForce": "PostOnly", "orderLinkId": link_id}
-        if product == SPOT:
-            body["marketUnit"] = "baseCoin"
+        # No marketUnit on a LIMIT order: its qty is base coin by definition,
+        # the field belongs to market orders, and the spot limit orders this
+        # repo has actually sent to testnet (artifacts/testnet_conformance_
+        # evidence.jsonl, the take-profit legs) carry none and were accepted.
         self._short_only_guard(body)
         try:
             self.client._request("POST", "/v5/order/create", signed=True,

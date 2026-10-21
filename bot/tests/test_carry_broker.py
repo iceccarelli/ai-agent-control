@@ -287,6 +287,17 @@ class TestPerpClosesCannotFlipTheAccountLong:
         b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5, product=SPOT)
         assert all("reduceOnly" not in body for body in client.created)
 
+    def test_a_spot_limit_order_carries_no_market_unit(self):
+        client = FakeClient()
+        try:
+            broker(client).place_post_only(symbol="BTCUSDT", side="Buy",
+                                           qty=0.5, price=99_999.0,
+                                           product=SPOT)
+        except Exception:
+            pass
+        assert client.created and "marketUnit" not in client.created[0]
+        assert client.created[0]["orderType"] == "Limit"
+
     def test_a_resting_perp_close_is_reduce_only_too(self):
         client = FakeClient()
         try:
