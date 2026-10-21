@@ -999,9 +999,11 @@ class TradingBot:
             observed = self.engine.observe_exits()
             if observed.get("closed") or observed.get("reduced"):
                 logger.warning("exits observed this cycle: %s", observed)
-            if observed.get("unread"):
+            if (observed.get("unread") or observed.get("stop_dead")
+                    or observed.get("stop_dead_unverified")):
                 # A position the venue could not be asked about was not
-                # observed: the gap the WS flagged is still open.
+                # observed (the gap the WS flagged is still open), and a dead
+                # stop is a state the next cycle must look at again.
                 rest_observation_ok = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("observe_exits failed; continuing: %s", exc)

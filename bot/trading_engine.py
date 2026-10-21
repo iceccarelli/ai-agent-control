@@ -1658,6 +1658,7 @@ class TradingEngine:
                 str(meta.get("stop_order_link_id") or "")]
             summary["checked"] += 1
             dead_stop = ""
+            tp_in_flight = False
             for link in ids:
                 if not link or link in booked:
                     continue
@@ -1671,6 +1672,9 @@ class TradingEngine:
                 if not order:
                     continue
                 status = str(order.get("orderStatus", ""))
+                if (link != str(meta.get("stop_order_link_id") or "")
+                        and status == "PartiallyFilled"):
+                    tp_in_flight = True     # coin is leaving; book it first
                 if (link == str(meta.get("stop_order_link_id") or "")
                         and status in ("Rejected", "Cancelled", "Deactivated")
                         and not float(order.get("cumExecQty") or 0.0) > 0.0):
@@ -1714,7 +1718,7 @@ class TradingEngine:
                 # stop, so the row is re-read next cycle.
                 break
             else:
-                if dead_stop:
+                if dead_stop and not tp_in_flight:
                     self._handle_dead_spot_stop(symbol, row, dead_stop, summary)
         return summary
 
@@ -1723,7 +1727,7 @@ class TradingEngine:
         """A spot stop is Rejected/Cancelled/Deactivated with nothing sold."""
         try:
             held = float(self.client.get_coin_balance(
-                self.client._base_asset(symbol)))
+                self.client._base_asset(symbol), total=True))
         except Exception as exc:  # noqa: BLE001
             logger.error("observe_exits: cannot read the %s balance to judge "
                          "the dead stop %s: %s", symbol, link, exc)
@@ -2103,7 +2107,9 @@ class TradingEngine:
                 recorded = float(row.get("stop_price") or 0.0)
             except (TypeError, ValueError):
                 recorded = 0.0
-            if recorded > 0.0:
+            # (a recorded stop on the wrong side of the entry is not a ratchet)
+            if recorded > 0.0 and (recorded < entry if side == "Buy"
+                                   else recorded > entry):
                 stop = recorded
 
         # Crash-boundary invariant: do not mint a SECOND live stop order for

@@ -815,11 +815,17 @@ class BybitClient:
                     return value
         raise PermanentAPIError("wallet-balance has no usable equity field")
 
-    def get_coin_balance(self, coin: str, account_type: str = "UNIFIED") -> float:
+    def get_coin_balance(self, coin: str, account_type: str = "UNIFIED",
+                         total: bool = False) -> float:
+        """Free coin by default; ``total=True`` is the whole wallet balance
+        INCLUDING what resting orders reserve (take-profit legs reserve the
+        coin they offer, so 'is the position still held?' must ask for total)."""
         wallet = self.get_wallet(account_type)
+        keys = (("walletBalance",) if total
+                else ("availableToWithdraw", "free", "walletBalance"))
         for entry in wallet.get("coin") or []:
             if str(entry.get("coin", "")).upper() == coin.upper():
-                for key in ("availableToWithdraw", "free", "walletBalance"):
+                for key in keys:
                     raw = entry.get(key)
                     if raw not in (None, ""):
                         return float(raw)

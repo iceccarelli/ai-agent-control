@@ -214,6 +214,30 @@ class TestADeadStopOverPhantomCoin:
         assert store.open_positions()           # left for reconcile
 
 
+class TestTheCoinCheckCountsReservedCoin:
+    def test_a_position_whose_coin_is_reserved_by_resting_legs_is_still_held(
+            self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Rejected"
+        # the venue reports the coin as RESERVED: nothing free, all in the wallet
+        real = client.get_wallet
+        qty = float(row["qty"])
+
+        def wallet(account_type="UNIFIED"):
+            w = dict(real(account_type))
+            w["coin"] = [{"coin": "BTC", "walletBalance": str(qty),
+                          "availableToWithdraw": "0"}]
+            return w
+        client.get_wallet = wallet
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead") == ["BTCUSDT"]
+        assert "stop_dead_unverified" not in summary
+
+
 class TestARefusedEntryStartsTheSymbolCooldown:
     def test_the_same_refused_order_is_not_resent_next_tick(self, stack):
         engine, client, risk, store, exchange = stack

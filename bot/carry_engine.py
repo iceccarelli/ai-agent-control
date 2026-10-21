@@ -913,8 +913,9 @@ class CarryEngine:
         negative settlements missed during downtime counted as ONE and the
         FUNDING_INVERTED exit came two prints late. The venue's stamped
         history lets the missed ones be applied in order: each enters the
-        EWMA history and moves the negative streak. Funding earned is NOT
-        re-estimated here (the ledger books what the venue paid).
+        EWMA history, moves the negative streak and adds an ESTIMATE of the
+        funding earned (the current mark stands in for the settlement mark);
+        the ledger books what the venue actually paid.
         """
         position = self.position
         last = self._ledger_last_print_ms
