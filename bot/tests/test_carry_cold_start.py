@@ -696,3 +696,27 @@ class TestMissedSettlementsAreCountedOnResume:
         e._last_print_ms = 1_000
         e._catch_up_missed_prints()
         assert e.position.negative_funding_streak == 0
+
+
+class TestCatchUpIsRobust:
+    def _e(self, prints, last=1_000):
+        venue = Venue(perp=0.001)
+        e = engine(Venue(perp=0.001), persist=lambda s: None)
+        e.position = opened(venue).position
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 0
+        e._last_print_ms = last
+        e._funding_history = [1.0, 1.0, 1.0]
+        e.venue_prints_at_start = prints
+        return e
+
+    def test_a_duplicated_settlement_counts_once(self):
+        e = self._e([(-1.0, 2_000), (-1.0, 2_000), (-1.0, 3_000)])
+        e._catch_up_missed_prints()
+        assert e.position.negative_funding_streak == 1
+
+    def test_a_hole_before_the_missed_prints_discards_the_old_history(self):
+        gap = CarryEngine.MAX_PRINT_GAP_MS
+        e = self._e([(-1.0, 1_000 + gap + 10), (-1.0, 1_000 + gap + 20)])
+        e._catch_up_missed_prints()
+        assert e._funding_history == [-1.0]

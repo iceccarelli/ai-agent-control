@@ -1282,7 +1282,11 @@ class TradingBot:
                          float(intent.stop_price), tuple(intent.take_profits))
             traded = self.__dict__.setdefault("_traded_signals", {})
             signature = json.dumps(signature, default=str)
-            if symbol not in traded:
+            if bar is None:
+                # No bar to key on: dedupe within this process only; a stored
+                # bar-less signature would suppress later signals for ever.
+                traded.setdefault(symbol, "")
+            elif symbol not in traded:
                 # survives a restart: the same bar's signal is not re-entered
                 # just because the process was bounced after a stop-out
                 try:
@@ -1298,10 +1302,11 @@ class TradingBot:
                 # closed again by the safety path is not to be retried on the
                 # same bar either.
                 traded[symbol] = signature
-                try:
-                    self.store.mark_traded_signal(symbol, signature)
-                except Exception:  # noqa: BLE001
-                    logger.exception("could not persist the traded signal")
+                if bar is not None:
+                    try:
+                        self.store.mark_traded_signal(symbol, signature)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("could not persist the traded signal")
             logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
 
     #: Class-level defaults so a bot built without __init__ (tests, tools) works.

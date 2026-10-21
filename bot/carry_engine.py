@@ -914,14 +914,24 @@ class CarryEngine:
         last = self._last_print_ms
         if position is None or last is None:
             return 0
-        missed = sorted(
-            ((float(rate), int(stamp))
-             for rate, stamp in (self.venue_prints_at_start or ())
-             if self._finite(rate) and int(stamp) > last
-             and int(stamp) > int(position.opened_ms or 0)),
-            key=lambda row: row[1])
+        by_stamp: Dict[int, float] = {}
+        for rate, stamp in (self.venue_prints_at_start or ()):
+            if (self._finite(rate) and int(stamp) > last
+                    and int(stamp) > int(position.opened_ms or 0)):
+                by_stamp.setdefault(int(stamp), float(rate))   # one per stamp
+        missed = sorted(((rate, stamp) for stamp, rate in by_stamp.items()),
+                        key=lambda row: row[1])
         # Leave the NEWEST for on_candle to book as the live print.
         missed = missed[:-1] if missed else []
+        if missed and missed[0][1] - last > self.MAX_PRINT_GAP_MS:
+            # The venue read does not reach back to the last print we saw:
+            # settlements are missing between them, and the old prints must
+            # not be smoothed across the hole (on_candle's own rule).
+            logger.warning(
+                "carry: the venue's recent prints start %.1fh after the last "
+                "one this book saw; discarding the stale funding history",
+                (missed[0][1] - last) / 3.6e6)
+            self._funding_history = []
         for rate, stamp in missed:
             self._funding_history.append(rate)
             del self._funding_history[:-self.FUNDING_HISTORY]

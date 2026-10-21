@@ -603,3 +603,13 @@ def test_a_restart_does_not_re_enter_the_signal_already_traded(tmp_path, exchang
     bot.tick()
     assert len(sent) == 1
     bot.shutdown()
+
+
+def test_a_signal_with_no_bar_is_never_persisted(tmp_path, exchange):
+    strategy = StubStrategy()
+    strategy.last_rows = None
+    bot = build(tmp_path, exchange, strategy=strategy)
+    bot.startup()
+    bot.tick()
+    assert bot.store.traded_signal("BTCUSDT") == ""
+    bot.shutdown()

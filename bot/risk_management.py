@@ -522,11 +522,8 @@ class BillionaireRiskManager:
         except Exception as exc:  # noqa: BLE001
             return _block("LOSS_STREAK_UNREADABLE", error=str(exc))
         if n >= self.max_consecutive_losses:
-            try:
-                if not self.store.get_breaker().active:
-                    self.store.mark_loss_streak_trip()
-            except Exception:  # noqa: BLE001
-                logger.exception("could not record the loss-streak trip point")
+            if not self.store.get_breaker().active:
+                self.store.mark_loss_streak_trip()
             self.store.trip_breaker(
                 f"{n} consecutive losing trades", self.breaker_cooldown_seconds
             )

@@ -969,3 +969,28 @@ class TestAScopeChangeDoesNotCarryTheOtherAccountsEquity:
     def test_the_same_scope_changes_nothing(self, store):
         assert store.set_equity_scope("a") is False       # first declaration
         assert store.set_equity_scope("a") is False
+
+
+class TestReviewFollowUps:
+    def test_a_scope_change_drops_todays_anchor_from_the_other_account(
+            self, store, monkeypatch):
+        import persistence as P
+        day = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day)
+        store.set_equity_scope("testnet=True;paper=True")
+        store.update_equity(10_000.0)              # anchor 10_000 for today
+        store.set_equity_scope("testnet=False;paper=False")
+        store.update_equity(100.0)                 # same UTC day, live account
+        assert store.daily_loss_fraction(100.0) == pytest.approx(0.0)
+
+    def test_an_old_timestamp_baseline_is_translated_not_forgotten(self, store):
+        t0 = utc_now_epoch()
+        for i in range(4):
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Buy", qty=0.01,
+                entry_price=50_000.0, exit_price=49_000.0,
+                gross_pnl=-10.0, entry_fee=0.25, exit_fee=0.25,
+                opened_epoch=t0 - 600 + i, closed_epoch=t0 + i))
+        store._exec("INSERT INTO meta(key, value) VALUES"
+                    "('loss_streak_baseline', ?)", (repr(t0 + 100),))
+        assert store.consecutive_losses() == 0

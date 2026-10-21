@@ -1345,7 +1345,19 @@ class StateStore:
         )
         base = self._query(
             "SELECT value FROM meta WHERE key = 'loss_streak_baseline_id'")
-        baseline = int(float(base[0]["value"])) if base else 0
+        if base:
+            baseline = int(float(base[0]["value"]))
+        else:
+            # A database written before the baseline became a trade id holds a
+            # timestamp baseline; translate it once instead of forgetting it.
+            old = self._query(
+                "SELECT value FROM meta WHERE key = 'loss_streak_baseline'")
+            baseline = 0
+            if old:
+                got = self._query(
+                    "SELECT MAX(id) AS m FROM trades WHERE closed_epoch <= ?",
+                    (float(old[0]["value"]),))
+                baseline = int(got[0]["m"] or 0) if got else 0
         n = 0
         for r in rows:
             if int(r["last_id"] or 0) <= baseline:
@@ -1383,6 +1395,8 @@ class StateStore:
             # a 99% drawdown and halt it; a live peak would read paper as one.
             self._exec("UPDATE equity_state SET last_equity = 0.0, "
                        "peak_equity = 0.0 WHERE id = 1")
+            # Today's anchor was set from the OTHER account's equity.
+            self._exec("DELETE FROM daily_anchor WHERE day = ?", (utc_day(),))
         return bool(rows)
 
     def traded_signal(self, symbol: str) -> str:
