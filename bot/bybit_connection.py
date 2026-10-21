@@ -825,6 +825,11 @@ class BybitClient:
                 else ("availableToWithdraw", "free", "walletBalance"))
         for entry in wallet.get("coin") or []:
             if str(entry.get("coin", "")).upper() == coin.upper():
+                if total and entry.get("walletBalance") in (None, ""):
+                    # Total was asked for and the row does not state it:
+                    # returning 0.0 (or the free amount) would be a lie.
+                    raise PermanentAPIError(
+                        f"wallet row for {coin} has no walletBalance")
                 for key in keys:
                     raw = entry.get(key)
                     if raw not in (None, ""):

@@ -1647,7 +1647,16 @@ class TradingEngine:
         row stayed open, the loss never reached the streak brake, and the
         position count never came back down.
         """
-        for row in list(self.store.open_positions()):
+        open_rows = list(self.store.open_positions())
+        live_stops = {(str(r["symbol"]),
+                       str(self._row_meta(r).get("stop_order_link_id") or ""))
+                      for r in open_rows}
+        seen_phantoms = self.__dict__.setdefault("_phantom_journaled", set())
+        seen_phantoms.intersection_update(live_stops)      # healed/closed ones
+        deferrals = self.__dict__.setdefault("_dead_stop_deferrals", {})
+        for sym in [s for s in deferrals if s not in {k for k, _ in live_stops}]:
+            deferrals.pop(sym, None)
+        for row in open_rows:
             symbol = str(row["symbol"])
             meta = self._row_meta(row)
             booked = set(meta.get("booked_exit_orders") or [])
@@ -1718,12 +1727,28 @@ class TradingEngine:
                 # stop, so the row is re-read next cycle.
                 break
             else:
-                if dead_stop and not tp_in_flight:
+                if dead_stop and tp_in_flight:
+                    # Let the part-filled leg be booked first - but not for
+                    # ever: a thin book can leave it part-filled for hours.
+                    n = deferrals[symbol] = deferrals.get(symbol, 0) + 1
+                    if n > self.DEAD_STOP_MAX_DEFERRALS:
+                        logger.critical(
+                            "observe_exits: %s stop %s is dead and a "
+                            "take-profit leg has stayed part-filled for %d "
+                            "cycles; re-protecting what is held", symbol,
+                            dead_stop, n)
+                        self._handle_dead_spot_stop(
+                            symbol, row, dead_stop, summary, relaxed=True)
+                elif dead_stop:
+                    deferrals.pop(symbol, None)
                     self._handle_dead_spot_stop(symbol, row, dead_stop, summary)
         return summary
 
+    DEAD_STOP_MAX_DEFERRALS = 3
+
     def _handle_dead_spot_stop(self, symbol: str, row: Mapping[str, Any],
-                               link: str, summary: Dict[str, Any]) -> None:
+                               link: str, summary: Dict[str, Any],
+                               relaxed: bool = False) -> None:
         """A spot stop is Rejected/Cancelled/Deactivated with nothing sold."""
         try:
             held = float(self.client.get_coin_balance(
@@ -1733,17 +1758,22 @@ class TradingEngine:
                          "the dead stop %s: %s", symbol, link, exc)
             summary["unread"] += 1
             return
+        if relaxed and held > 0.0:
+            # A take-profit leg has sold part of the position: protect what is
+            # actually held, not the recorded size.
+            row = dict(row, qty=min(float(row["qty"]), held))
         if held < float(row["qty"]) * 0.98:
             # The coin is not (all) there: the position was sold or moved
             # behind the row's back. Re-protecting or "emergency selling" coin
             # that is not held would only trip the kill switch; leave it for
             # reconcile and say so.
-            logger.critical(
+            seen = self.__dict__.setdefault("_phantom_journaled", set())
+            first = (symbol, link) not in seen
+            (logger.critical if first else logger.debug)(
                 "observe_exits: the %s stop %s is dead and only %.8g of the "
                 "%.8g recorded is held; not re-protecting phantom coin",
                 symbol, link, held, float(row["qty"]))
-            seen = self.__dict__.setdefault("_phantom_journaled", set())
-            if (symbol, link) not in seen:      # one row, not one per cycle
+            if first:                           # one alarm/row, not one per cycle
                 seen.add((symbol, link))
                 self.store.journal(symbol, "STOP_DEAD_COIN_MISSING", link,
                                    {"held": held, "recorded": float(row["qty"])})
@@ -2096,7 +2126,8 @@ class TradingEngine:
         ``reconcile()`` at startup and ``check_naked_positions()`` mid-cycle —
         so there is exactly one place this decision is made, not two dialects
         that could quietly drift apart. Returns ``"REPROTECTED"``,
-        ``"FLATTENED"``, or ``"SKIPPED_FILTERS_UNREADABLE"`` (the position is
+        ``"FLATTENED"``, ``"FLATTEN_FAILED"`` (the close was refused; the
+        position is still held and unprotected), or ``"SKIPPED_FILTERS_UNREADABLE"`` (the position is
         left naked this cycle; the caller sees it again next cycle).
         """
         side = normalize_side(str(row["side"])) or "Buy"

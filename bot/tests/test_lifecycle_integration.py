@@ -238,6 +238,37 @@ class TestTheCoinCheckCountsReservedCoin:
         assert "stop_dead_unverified" not in summary
 
 
+class TestDeadStopFollowUps:
+    def _dead(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Rejected"
+        for tp in meta.get("tp_order_ids") or []:
+            exchange.orders[tp]["orderStatus"] = "PartiallyFilled"
+        return engine, client, store, exchange, meta
+
+    def test_a_part_filled_leg_defers_the_reprotection_only_a_bounded_time(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        assert meta.get("tp_order_ids"), "fixture must place take-profit legs"
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS):
+            assert "stop_dead" not in engine.observe_exits()
+        final = engine.observe_exits()
+        assert final.get("stop_dead") == ["BTCUSDT"]
+
+    def test_total_balance_is_refused_when_the_row_does_not_state_it(self, stack):
+        engine, client, risk, store, exchange = stack
+        client.get_wallet = lambda account_type="UNIFIED": {
+            "coin": [{"coin": "BTC", "availableToWithdraw": "1"}]}
+        import bybit_connection as _bc
+        with pytest.raises(_bc.PermanentAPIError):
+            client.get_coin_balance("BTC", total=True)
+        assert client.get_coin_balance("BTC") == 1.0
+
+
 class TestARefusedEntryStartsTheSymbolCooldown:
     def test_the_same_refused_order_is_not_resent_next_tick(self, stack):
         engine, client, risk, store, exchange = stack
