@@ -1742,8 +1742,11 @@ class TradingEngine:
                 "observe_exits: the %s stop %s is dead and only %.8g of the "
                 "%.8g recorded is held; not re-protecting phantom coin",
                 symbol, link, held, float(row["qty"]))
-            self.store.journal(symbol, "STOP_DEAD_COIN_MISSING", link,
-                               {"held": held, "recorded": float(row["qty"])})
+            seen = self.__dict__.setdefault("_phantom_journaled", set())
+            if (symbol, link) not in seen:      # one row, not one per cycle
+                seen.add((symbol, link))
+                self.store.journal(symbol, "STOP_DEAD_COIN_MISSING", link,
+                                   {"held": held, "recorded": float(row["qty"])})
             summary.setdefault("stop_dead_unverified", []).append(symbol)
             return
         logger.critical(
@@ -2200,6 +2203,10 @@ class TradingEngine:
                 symbol, row, reason="NAKED_ON_STARTUP")
             if outcome == "REPROTECTED":
                 logger.warning("reconcile: protected naked position %s", symbol)
+            elif outcome != "FLATTENED":
+                logger.critical(
+                    "reconcile: naked position %s was NOT protected or "
+                    "flattened (%s); it is still unprotected", symbol, outcome)
         return summary
 
     def check_naked_positions(self) -> Dict[str, Any]:
@@ -2260,6 +2267,8 @@ class TradingEngine:
                 logger.warning("check_naked_positions: re-protected %s", symbol)
             elif outcome == "FLATTENED":
                 summary["flattened"].append(symbol)
+            elif outcome == "FLATTEN_FAILED":
+                summary.setdefault("flatten_failed", []).append(symbol)
             else:
                 summary["skipped"].append(symbol)
         return summary

@@ -622,3 +622,29 @@ def test_a_stop_that_fires_between_the_two_reads_is_not_an_emergency(tmp_path):
     assert result["flattened"] == [] and result["reprotected"] == []
     assert not any(r["url"].endswith("/v5/order/create") for r in fake.requests)
     assert not store.is_kill_switch_engaged()[0]
+
+
+def test_a_failed_flatten_is_its_own_bucket_and_its_own_alarm(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, LinearCfg(), fake)
+    _open_ledger_and_venue(store, fake)
+    fake.positions[SYMBOL]["stopLoss"] = ""
+    engine._protect_or_close_naked = lambda *a, **k: "FLATTEN_FAILED"
+    result = engine.check_naked_positions()
+    assert result["flatten_failed"] == [SYMBOL]
+    assert result["skipped"] == [] and result["flattened"] == []
+
+
+def test_a_phantom_dead_stop_is_journaled_once_not_every_cycle(tmp_path):
+    fake = FakeBybit()
+    engine, store = _engine(tmp_path, Cfg(), fake)
+    store.upsert_position(SYMBOL, "Buy", 0.001, 60_000.0, stop_price=57_000.0,
+                          meta={"stop_order_link_id": "S1"})
+    fake.orders["S1"] = {"orderLinkId": "S1", "orderStatus": "Cancelled",
+                         "cumExecQty": "0", "symbol": SYMBOL}
+    fake.balances["BTC"] = 0.0
+    engine.observe_exits()
+    engine.observe_exits()
+    rows = [r for r in store.recent_decisions()
+            if r.get("decision") == "STOP_DEAD_COIN_MISSING"]
+    assert len(rows) == 1

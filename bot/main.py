@@ -1017,7 +1017,8 @@ class TradingBot:
             naked = self.engine.check_naked_positions()
             if naked.get("reprotected") or naked.get("flattened"):
                 logger.warning("naked positions handled this cycle: %s", naked)
-            if naked.get("unread") or naked.get("skipped"):
+            if (naked.get("unread") or naked.get("skipped")
+                    or naked.get("flatten_failed")):
                 rest_observation_ok = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("check_naked_positions failed; continuing: %s", exc)
