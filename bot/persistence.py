@@ -1398,8 +1398,10 @@ class StateStore:
             if exit_price <= 0:
                 raise PersistenceError("exit_price must be positive")
             old_net = float(row["net_pnl"])
-            new_net = float(gross_pnl) - float(row["entry_fee"]) - float(exit_fee)
             meta = json.loads(row["meta"] or "{}")
+            # funding already booked on the row is part of its net
+            new_net = (float(gross_pnl) - float(row["entry_fee"])
+                       - float(exit_fee) + float(meta.get("funding_usd") or 0.0))
             meta["reconciliation"] = {
                 "evidence": dict(evidence),
                 "before": {"exit_price": float(row["exit_price"]),
@@ -1425,6 +1427,94 @@ class StateStore:
                          str(row["order_link_id"]),
                          {"trade_id": int(trade_id), "exit_price": exit_price,
                           "net_before": old_net, "net_after": new_net})
+            return True
+
+    def trades_awaiting_funding(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Closed linear trades whose funding has not been booked yet."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM trades WHERE json_extract(meta, '$.funding_booked') = 0"
+            " ORDER BY closed_epoch ASC, id ASC LIMIT ?", (int(limit),))]
+
+    def lifecycle_trades(self, symbol: str, opened_epoch: float
+                         ) -> List[Dict[str, Any]]:
+        """Every exit row of one position (same symbol and open time)."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM trades WHERE symbol = ? AND opened_epoch = ? "
+            "ORDER BY closed_epoch ASC, id ASC",
+            (str(symbol), float(opened_epoch)))]
+
+    def booked_funding_ids(self, symbol: str) -> set:
+        """Venue settlement ids already booked on some trade of ``symbol``."""
+        out: set = set()
+        for r in self._query(
+                "SELECT meta FROM trades WHERE symbol = ? AND "
+                "json_extract(meta, '$.funding_booked') = 1", (str(symbol),)):
+            out.update(str(i) for i in
+                       json.loads(r["meta"] or "{}").get("funding_payment_ids", []))
+        return out
+
+    def set_trade_funding_status(self, trade_id: int, status: str,
+                                 detail: Optional[Mapping[str, Any]] = None
+                                 ) -> None:
+        """Say why a trade's funding is still unbooked (it stays unbooked)."""
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT meta FROM trades WHERE id = ?", (int(trade_id),)
+            ).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["meta"] or "{}")
+            if meta.get("funding_booked") is not False:
+                return
+            if meta.get("funding_status") == status:
+                return
+            meta["funding_status"] = str(status)
+            if detail:
+                meta["funding_detail"] = dict(detail)
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+
+    def book_trade_funding(self, trade_id: int, *, funding_usd: float,
+                           payment_ids: Sequence[str], status: str,
+                           evidence: Mapping[str, Any]) -> bool:
+        """Book the funding the venue settled against one trade, once.
+
+        Atomic: the row is touched only while its funding is still unbooked (a
+        replay or a second process is a no-op returning False); its net P&L and
+        the day's realised P&L move by the same signed amount (positive =
+        received); the ids and evidence are kept on the row.
+        """
+        self._assert_writer()
+        if not (isinstance(funding_usd, (int, float)) and funding_usd == funding_usd
+                and funding_usd not in (float("inf"), float("-inf"))):
+            raise PersistenceError("funding_usd is not a finite number")
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM trades WHERE id = ?", (int(trade_id),)
+            ).fetchone()
+            if row is None:
+                return False
+            meta = json.loads(row["meta"] or "{}")
+            if meta.get("funding_booked") is not False:
+                return False
+            meta.update({"funding_booked": True, "funding_usd": float(funding_usd),
+                         "funding_payment_ids": sorted({str(i) for i in payment_ids}),
+                         "funding_status": str(status),
+                         "funding_evidence": dict(evidence)})
+            meta.pop("funding_detail", None)
+            cur = self._conn.execute(
+                "UPDATE trades SET net_pnl = net_pnl + ?, meta = ? WHERE id = ?",
+                (float(funding_usd), json.dumps(meta, default=str), int(trade_id)))
+            if cur.rowcount != 1:
+                return False
+            self._conn.execute(
+                "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?"
+                " WHERE day = ?", (float(funding_usd), str(row["day"])))
+            self.journal(str(row["symbol"]), "FUNDING_BOOKED", str(status),
+                         {"trade_id": int(trade_id),
+                          "funding_usd": float(funding_usd),
+                          "payment_ids": sorted({str(i) for i in payment_ids})})
             return True
 
     def add_trade_exit_order_ids(self, trade_id: int, ids: Sequence[str]) -> None:

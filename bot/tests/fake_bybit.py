@@ -63,6 +63,10 @@ class FakeBybit:
         self.positions: Dict[str, Dict[str, Any]] = {}
         #: Rows served by /v5/position/closed-pnl (linear). Tests append.
         self.closed_pnl: List[Dict[str, Any]] = []
+        #: account transaction-log SETTLEMENT rows (funding), and a ret code
+        #: to refuse the read with
+        self.settlements: List[Dict[str, Any]] = []
+        self.transaction_log_error: Optional[int] = None
         #: Rows served by /v5/execution/list (fills). Tests append.
         self.executions: List[Dict[str, Any]] = []
         #: Funding rate as a FRACTION per 8h, as the tickers endpoint reports it.
@@ -196,6 +200,15 @@ class FakeBybit:
             nxt = str(start + limit) if start + limit < len(rows) else ""
             return self._ok({"list": page, "nextPageCursor": nxt,
                              "category": q.get("category", "")})
+
+        if path == "/v5/account/transaction-log":
+            q = params or {}
+            if self.transaction_log_error is not None:
+                return self._err(self.transaction_log_error, "txlog refused")
+            lo, hi = int(q.get("startTime", 0)), int(q.get("endTime", 1 << 62))
+            rows = [r for r in self.settlements
+                    if lo <= int(r["transactionTime"]) <= hi]
+            return self._ok({"list": rows, "nextPageCursor": ""})
 
         if path == "/v5/position/closed-pnl":
             symbol = (params or {}).get("symbol", "")

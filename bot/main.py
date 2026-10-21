@@ -1023,6 +1023,15 @@ class TradingBot:
             logger.exception("reconcile_provisional_exits failed; "
                              "continuing: %s", exc)
 
+        # Funding the venue settled against closed directional linear trades
+        # is booked from the account's own settlement records (read-only,
+        # throttled; unreadable evidence leaves the trade unbooked and says so).
+        try:
+            self._book_directional_funding()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("directional funding reconciliation failed; "
+                             "continuing: %s", exc)
+
         # A stop that existed and was later cleared AT THE VENUE while the
         # position stayed open is invisible to reconcile()'s ledger-only
         # check, which only runs once at startup. This is the live-venue
@@ -1414,6 +1423,29 @@ class TradingBot:
                 self._borrow_notional_usd = 0.0
         except Exception:  # noqa: BLE001
             logger.exception("borrow accrual failed; the cost is not booked")
+
+    DIRECTIONAL_FUNDING_POLL_MS = 10 * 60 * 1000
+    _last_directional_funding_ms = 0
+
+    def _book_directional_funding(self) -> None:
+        if not getattr(self.engine.client, "is_linear", False):
+            return
+        now_ms = int(time.time() * 1000)
+        if now_ms - self._last_directional_funding_ms < self.DIRECTIONAL_FUNDING_POLL_MS:
+            return
+        if not self.store.trades_awaiting_funding(limit=1):
+            return
+        self._last_directional_funding_ms = now_ms
+        import directional_funding as _df
+        from carry_broker import CarryBroker
+        reader = CarryBroker(client=self.engine.client,
+                             sequence_source=lambda *a: 0,
+                             order_gate=lambda *a, **k: (False, "read-only"))
+        shared = ({self.carry.perp_symbol} if self.carry is not None else set())
+        res = _df.reconcile_directional_funding(
+            self.store, reader, now_ms=now_ms, carry_symbols=shared)
+        if res["booked"] or res["no_settlement"] or res["left"]:
+            logger.warning("directional funding: %s", res)
 
     def _book_carry_funding(self, journal: Any, symbol: str,
                             decision: Any) -> None:
