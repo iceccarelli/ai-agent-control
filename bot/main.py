@@ -999,11 +999,13 @@ class TradingBot:
             observed = self.engine.observe_exits()
             if observed.get("closed") or observed.get("reduced"):
                 logger.warning("exits observed this cycle: %s", observed)
-            if (observed.get("unread") or observed.get("stop_dead")
-                    or observed.get("stop_dead_unverified")):
+            if observed.get("unread") or observed.get("stop_dead"):
                 # A position the venue could not be asked about was not
                 # observed (the gap the WS flagged is still open), and a dead
-                # stop is a state the next cycle must look at again.
+                # stop is a state the next cycle must look at again. (A
+                # phantom-coin row, "stop_dead_unverified", is alarmed once and
+                # left for reconcile; counting it here would hold the whole
+                # observation state at DEGRADED for every symbol until then.)
                 rest_observation_ok = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("observe_exits failed; continuing: %s", exc)

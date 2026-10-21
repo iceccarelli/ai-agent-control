@@ -637,3 +637,16 @@ def test_flipping_paper_trading_does_not_wipe_the_peak_but_the_endpoint_does(
     bot3.startup()
     assert bot3.store.get_equity_state().peak_equity < peak
     bot3.shutdown()
+
+
+def test_a_phantom_coin_row_does_not_hold_observation_degraded(tmp_path, exchange):
+    bot = build(tmp_path, exchange)
+    bot.startup()
+    bot.engine.observe_exits = lambda: {"checked": 1, "closed": 0,
+                                        "reduced": 0, "unread": 0,
+                                        "stop_dead_unverified": ["BTCUSDT"]}
+    consumer_flag = []
+    bot._absorb_ws_observations = lambda rest_ok: consumer_flag.append(rest_ok)
+    bot.tick()
+    assert consumer_flag and consumer_flag[-1] is True
+    bot.shutdown()
