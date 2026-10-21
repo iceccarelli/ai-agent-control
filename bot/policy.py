@@ -1990,7 +1990,7 @@ class Policy:
         auc_mean = rep.auc_mean
         if auc_mean is None:
             reasons.append("NO_AUC")
-        elif auc_mean < crit.min_auc_mean:
+        elif not (auc_mean >= crit.min_auc_mean):   # NaN fails
             reasons.append(
                 f"AUC_MEAN_TOO_LOW: {auc_mean:.4f} < {crit.min_auc_mean}"
             )
@@ -1998,7 +1998,7 @@ class Policy:
         weak = [
             f"fold {f.fold}={f.auc:.4f}"
             for f in usable
-            if f.auc is not None and f.auc < crit.min_auc_per_fold
+            if f.auc is not None and not (f.auc >= crit.min_auc_per_fold)
         ]
         if weak:
             reasons.append(
@@ -2010,7 +2010,7 @@ class Policy:
         skill = rep.brier_skill
         if skill is None:
             reasons.append("NO_BRIER_SKILL")
-        elif skill < crit.min_brier_skill:
+        elif not (skill >= crit.min_brier_skill):   # NaN fails
             reasons.append(
                 f"BRIER_NO_BETTER_THAN_BASE_RATE: skill={skill:.4f} < "
                 f"{crit.min_brier_skill} (brier={_fmt(rep.brier_mean)} vs "
@@ -2020,7 +2020,7 @@ class Policy:
         ece = rep.calibration.expected_calibration_error
         if ece is None:
             reasons.append("NO_CALIBRATION_MEASUREMENT")
-        elif ece > crit.max_calibration_error:
+        elif not (ece <= crit.max_calibration_error):   # NaN fails
             reasons.append(
                 f"MISCALIBRATED: ece={ece:.4f} > {crit.max_calibration_error}"
             )

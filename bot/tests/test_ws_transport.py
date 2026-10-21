@@ -194,6 +194,23 @@ class TestFramingRoundTrip:
         with pytest.raises(wt.WSClosed):
             ws.recv(timeout=5)
 
+    def test_an_idle_socket_times_out_cleanly_and_can_be_read_again(self):
+        """A timeout while NO frame has started consumes nothing: the next recv
+        still decodes the frame that arrives later."""
+        import socket as _socket
+        ws, server_sock = self._connected_ws()
+        with pytest.raises(_socket.timeout):
+            ws.recv(timeout=0.05)
+        _server_send_frame(server_sock, wt.OP_TEXT, b'{"a":1}')
+        assert ws.recv(timeout=5) == (wt.OP_TEXT, b'{"a":1}')
+
+    def test_a_stall_in_the_middle_of_a_frame_closes_instead_of_misframing(self):
+        ws, server_sock = self._connected_ws()
+        ws.MID_FRAME_TIMEOUT_S = 0.1
+        server_sock.sendall(bytes([0x81]))          # first byte only, then silence
+        with pytest.raises(wt.WSClosed):
+            ws.recv(timeout=5)
+
     def test_fragmented_frame_is_refused_not_misdecoded(self):
         """Deliberate scope limit (see module docstring): a non-final
         (FIN=0) frame must be refused, never silently treated as complete

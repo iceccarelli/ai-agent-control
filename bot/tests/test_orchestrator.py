@@ -244,6 +244,28 @@ class TestLoop:
         assert strategy.calls == ["BTCUSDT"]
         bot.shutdown()
 
+    def test_a_traded_signal_is_not_traded_again_on_the_same_bar(
+            self, tmp_path, exchange):
+        strategy = StubStrategy()
+        bot = build(tmp_path, exchange, strategy=strategy)
+        bot.startup()
+        sent = []
+        real = bot.engine.execute
+
+        def spy(intent):
+            sent.append(intent)
+            return real(intent)
+        bot.engine.execute = spy
+        bot.tick()
+        assert len(sent) == 1
+        # the position exits (stop hit) and the SAME closed-bar signal returns
+        for row in list(bot.store.open_positions()):
+            bot.store.remove_position(row["symbol"])
+        bot.tick()
+        bot.tick()
+        assert len(sent) == 1, "the identical signal re-entered on the same bar"
+        bot.shutdown()
+
     def test_every_signalled_symbol_is_executed_until_capacity_binds(
             self, tmp_path, exchange):
         """Characterises the live loop: it is NOT first-signal-wins.
@@ -392,3 +414,239 @@ class TestStructure:
         assert report.ok, report.reason
         bot.shutdown()
         assert exchange.orders[report.stop_order_link_id]["orderStatus"] == "Untriggered"
+
+
+class TestHealthTellsTheLoopIsDead:
+    def test_a_loop_that_fails_every_cycle_is_unhealthy(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        assert bot.health()["healthy"] is True
+        bot._tick_failures = bot.HEALTH_MAX_TICK_FAILURES
+        payload = bot.health()
+        assert payload["healthy"] is False and payload["loop_stalled"] is True
+
+    def test_a_loop_that_stopped_completing_cycles_is_unhealthy(self, tmp_path, exchange):
+        import time as _t
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        bot._last_tick_ok_epoch = _t.time() - 10_000
+        assert bot.health()["healthy"] is False
+
+    def test_a_risk_halt_is_reported(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        assert "risk_halted" in bot.health()
+
+    def test_shutdown_settles_unresolved_entries_before_cancelling(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        calls = []
+        bot.engine.resolve_unresolved_entries = lambda: calls.append("resolve") or {}
+        real = bot.client.cancel_order
+        bot.client.cancel_order = lambda **kw: calls.append("cancel") or real(**kw)
+        bot.store.record_order("SD1", "BTCUSDT", "Buy", "Limit", 0.001, purpose="entry")
+        bot.store.update_order_status("SD1", "submitted")
+        bot.engine.shutdown()
+        assert calls[0] == "resolve" and "cancel" in calls
+
+    def test_one_failing_cancel_does_not_leave_the_rest_live(self, tmp_path, exchange):
+        bot = build(tmp_path, exchange)
+        assert bot.startup()
+        for i in (1, 2):
+            bot.store.record_order(f"SD{i}", "BTCUSDT", "Buy", "Limit", 0.001,
+                                   purpose="entry")
+            bot.store.update_order_status(f"SD{i}", "submitted")
+        seen = []
+
+        def cancel(**kw):
+            seen.append(kw["order_link_id"])
+            if kw["order_link_id"] == "SD1":
+                raise RuntimeError("network")
+            return True
+        bot.client.cancel_order = cancel
+        bot.engine.shutdown()
+        assert "SD2" in seen
+
+
+class TestStartupDoesNotTouchTheVenueWhenItMust:
+    def _spy(self, bot):
+        calls = []
+        bot.client.set_leverage = lambda symbol, leverage=None: calls.append(
+            symbol) or True
+        return calls
+
+    def test_paper_on_the_mainnet_endpoint_does_not_set_leverage(
+            self, tmp_path, exchange):
+        cfg = Cfg()
+        cfg.USE_TESTNET = False
+        cfg.PAPER_TRADING = True
+        cfg.ALLOW_SHORTS = True
+        bot = build(tmp_path, exchange, cfg=cfg)
+        calls = self._spy(bot)
+        bot.startup()
+        assert calls == []
+        bot.shutdown()
+
+    def test_an_engaged_kill_switch_does_not_set_leverage(
+            self, tmp_path, exchange):
+        cfg = Cfg()
+        cfg.ALLOW_SHORTS = True
+        bot = build(tmp_path, exchange, cfg=cfg)
+        bot.store.trip_kill_switch("previous run")
+        calls = self._spy(bot)
+        assert bot.startup() is False
+        assert calls == []
+        bot.shutdown()
+
+    def test_the_sandbox_still_sets_leverage(self, tmp_path, exchange):
+        cfg = Cfg()
+        cfg.ALLOW_SHORTS = True
+        bot = build(tmp_path, exchange, cfg=cfg)
+        calls = self._spy(bot)
+        bot.startup()
+        assert calls
+        bot.shutdown()
+
+
+def test_the_bot_opens_the_state_db_its_config_names(tmp_path, exchange):
+    path = str(tmp_path / "named.db")
+    cfg = Cfg()
+    cfg.STATE_DB_PATH = path
+    bot = m.TradingBot(config=cfg, client=bc.BybitClient(
+        config=cfg, store=StateStore(str(tmp_path / "other.db")),
+        transport=exchange))
+    assert (tmp_path / "named.db").exists()
+
+
+def test_an_idle_client_does_not_wedge_the_health_server(tmp_path, exchange):
+    import socket
+    import urllib.request
+    cfg = Cfg()
+    cfg.ENABLE_HEALTH_SERVER = True
+    cfg.HEALTHCHECK_PORT = 18097
+    bot = build(tmp_path, exchange, cfg=cfg)
+    bot.start_health_server()
+    idle = socket.create_connection(("127.0.0.1", 18097))   # says nothing
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:18097/health",
+                                    timeout=3) as r:
+            assert r.status in (200, 503)
+    except urllib.error.HTTPError as exc:
+        assert exc.code in (200, 503)
+    finally:
+        idle.close()
+        bot._http.shutdown()
+
+
+class TestAGapOpenedDuringTheTickIsNotClearedByIt:
+    def _bot(self, tmp_path, exchange):
+        from private_ws_consumer import WSPrivateConsumer
+        bot = build(tmp_path, exchange)
+        consumer = WSPrivateConsumer.__new__(WSPrivateConsumer)
+        consumer._reconcile_generation = 0
+        consumer._needs_reconciliation = False
+        consumer.dirty_symbols = set()
+        bot.ws_consumer = consumer
+        bot.ws_thread = None
+        return bot, consumer
+
+    def test_a_flag_set_before_the_tick_is_cleared_after_clean_rest_reads(
+            self, tmp_path, exchange):
+        bot, consumer = self._bot(tmp_path, exchange)
+        consumer.needs_reconciliation = True
+        bot._ws_generation_at_tick = consumer.reconcile_generation
+        bot._absorb_ws_observations(rest_ok=True)
+        assert consumer.needs_reconciliation is False
+
+    def test_a_flag_set_during_the_tick_survives_it(self, tmp_path, exchange):
+        bot, consumer = self._bot(tmp_path, exchange)
+        bot._ws_generation_at_tick = consumer.reconcile_generation
+        consumer.needs_reconciliation = True        # WS thread, mid-tick
+        bot._absorb_ws_observations(rest_ok=True)
+        assert consumer.needs_reconciliation is True
+
+
+def test_the_same_signal_on_a_later_bar_is_traded_again(tmp_path, exchange):
+    strategy = StubStrategy()
+    bot = build(tmp_path, exchange, strategy=strategy)
+    bot.startup()
+    sent = []
+    real = bot.engine.execute
+
+    def spy(intent):
+        sent.append(intent)
+        return real(intent)
+    bot.engine.execute = spy
+    strategy.last_rows = [["1000"]]
+    bot.tick()
+    for row in list(bot.store.open_positions()):
+        bot.store.remove_position(row["symbol"])
+    strategy.last_rows = [["2000"]]               # the next closed bar
+    bot.tick()
+    assert len(sent) == 2
+    bot.shutdown()
+
+
+def test_a_restart_does_not_re_enter_the_signal_already_traded(tmp_path, exchange):
+    strategy = StubStrategy()
+    strategy.last_rows = [["1000"]]
+    bot = build(tmp_path, exchange, strategy=strategy)
+    bot.startup()
+    sent = []
+    real = bot.engine.execute
+    bot.engine.execute = lambda i: (sent.append(i), real(i))[1]
+    bot.tick()
+    assert len(sent) == 1
+    for row in list(bot.store.open_positions()):
+        bot.store.remove_position(row["symbol"])
+    bot._traded_signals = {}                   # a fresh process, same database
+    bot.tick()
+    assert len(sent) == 1
+    bot.shutdown()
+
+
+def test_a_signal_with_no_bar_is_never_persisted(tmp_path, exchange):
+    strategy = StubStrategy()
+    strategy.last_rows = None
+    bot = build(tmp_path, exchange, strategy=strategy)
+    bot.startup()
+    bot.tick()
+    assert bot.store.traded_signal("BTCUSDT") == ""
+    bot.shutdown()
+
+
+def test_flipping_paper_trading_does_not_wipe_the_peak_but_the_endpoint_does(
+        tmp_path, exchange):
+    cfg = Cfg()
+    bot = build(tmp_path, exchange, cfg=cfg)
+    bot.startup()
+    bot.store.update_equity(250_000.0)
+    peak = bot.store.get_equity_state().peak_equity
+    bot.shutdown()
+
+    cfg2 = Cfg()
+    cfg2.PAPER_TRADING = False                 # same account, orders enabled
+    bot2 = build(tmp_path, exchange, cfg=cfg2)
+    bot2.startup()
+    assert bot2.store.get_equity_state().peak_equity == peak
+    bot2.shutdown()
+
+    cfg3 = Cfg()
+    cfg3.USE_TESTNET = False                   # a different account
+    bot3 = build(tmp_path, exchange, cfg=cfg3)
+    bot3.startup()
+    assert bot3.store.get_equity_state().peak_equity < peak
+    bot3.shutdown()
+
+
+def test_a_phantom_coin_row_does_not_hold_observation_degraded(tmp_path, exchange):
+    bot = build(tmp_path, exchange)
+    bot.startup()
+    bot.engine.observe_exits = lambda: {"checked": 1, "closed": 0,
+                                        "reduced": 0, "unread": 0,
+                                        "stop_dead_unverified": ["BTCUSDT"]}
+    consumer_flag = []
+    bot._absorb_ws_observations = lambda rest_ok: consumer_flag.append(rest_ok)
+    bot.tick()
+    assert consumer_flag and consumer_flag[-1] is True
+    bot.shutdown()

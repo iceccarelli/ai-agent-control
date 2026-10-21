@@ -415,3 +415,73 @@ class TestSingleSourceOfTruth:
                        "technical_analysis", "performance_analytics",
                        "main", "backtest"):
             importlib.import_module(module)
+
+
+@pytest.mark.parametrize("key", ["USE_TESTNET", "PAPER_TRADING"])
+@pytest.mark.parametrize("typo", ["ture", "flase", "banana", "2", "tru"])
+def test_a_mistyped_sandbox_flag_is_refused_not_read_as_live(key, typo):
+    """`parse_bool` reads every unrecognised token as False; for these two keys
+    False is the LIVE side, so one typo moved the process toward mainnet."""
+    with pytest.raises(config_module.ConfigError):
+        config_module.load({key: typo})
+
+
+@pytest.mark.parametrize("key", ["USE_TESTNET", "PAPER_TRADING"])
+@pytest.mark.parametrize("token,expected", [
+    ("1", True), ("true", True), ("YES", True), ("on", True),
+    ("0", False), ("false", False), ("No", False), ("off", False),
+    ("", True),                 # blank keeps the sandbox default
+])
+def test_recognised_sandbox_flag_tokens_are_still_honoured(key, token, expected):
+    cfg = config_module.load({key: token})
+    assert getattr(cfg, key) is expected
+
+
+class TestRiskControlSwitchesRejectATypo:
+    """USE_ORDERBOOK and MEMORY_ENABLED switch risk controls OFF when False, so
+    an unrecognised token must raise rather than be read as False."""
+
+    @pytest.mark.parametrize("var", ["USE_ORDERBOOK", "MEMORY_ENABLED"])
+    @pytest.mark.parametrize("typo", ["ture", "enabled", "yes please"])
+    def test_a_typo_raises(self, var, typo):
+        # By name: other tests in this module reload `config`, so the class
+        # imported at the top may no longer be the one that is raised.
+        with pytest.raises(Exception) as excinfo:
+            load(**{var: typo})
+        assert type(excinfo.value).__name__ == "ConfigError"
+
+    @pytest.mark.parametrize("var", ["USE_ORDERBOOK", "MEMORY_ENABLED"])
+    def test_recognised_tokens_and_blank_are_honoured(self, var):
+        assert getattr(load(), var) is True
+        assert getattr(load(**{var: ""}), var) is True
+        assert getattr(load(**{var: "false"}), var) is False
+        assert getattr(load(**{var: "true"}), var) is True
+
+
+class TestABlankStateDbPathIsNotAThrowawayDatabase:
+    def test_blank_config_value_takes_the_default(self):
+        assert load(STATE_DB_PATH="  ").STATE_DB_PATH == "state/trading_state.db"
+
+    def test_the_store_refuses_a_blank_path(self, tmp_path):
+        from persistence import StateStore
+        with pytest.raises(ValueError):
+            StateStore("")
+        with pytest.raises(ValueError):
+            StateStore("   ")
+
+
+class TestALossLimitOfOneIsNotAPercent:
+    @pytest.mark.parametrize("var", ["MAX_DAILY_LOSS_PCT", "MAX_DRAWDOWN_PCT",
+                                     "STOP_LOSS_PCT"])
+    def test_one_is_rejected_as_a_never_binding_limit(self, var):
+        with pytest.raises(Exception) as excinfo:
+            load(**{var: "1"})
+        assert type(excinfo.value).__name__ == "ConfigError"
+
+    @pytest.mark.parametrize("var", ["MAX_DAILY_LOSS_PCT", "MAX_DRAWDOWN_PCT",
+                                     "STOP_LOSS_PCT"])
+    def test_a_real_fraction_still_loads(self, var):
+        assert getattr(load(**{var: "0.05"}), var) == pytest.approx(0.05)
+
+    def test_a_disabled_imbalance_limit_of_one_is_still_allowed(self):
+        assert load(MAX_BOOK_IMBALANCE="1").MAX_BOOK_IMBALANCE == 1.0

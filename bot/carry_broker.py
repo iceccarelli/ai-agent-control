@@ -73,6 +73,10 @@ PAIR_DUST_FRACTION = 1e-6
 SPOT = "spot"
 LINEAR = "linear"
 
+#: retCodes that report a backend timeout rather than a refusal (10000 server
+#: timeout, 170007 timeout waiting for the backend). The order may be live.
+_TIMEOUT_RET_CODES = frozenset({10000, 170007})
+
 #: The three values Bybit's `GET /v5/account/info` states in `marginMode`. The
 #: account's own statement is the only source of the mode: nothing in this
 #: project configures it, and an absent or other value is NEVER read as one of
@@ -539,6 +543,15 @@ class CarryBroker:
             # that fails, or finds nothing, is not "no fill".
             try:
                 state = self._order_state(symbol, link_id, product)
+                # The order is known to exist and a market order settles in
+                # milliseconds; a read that races the matching engine (no row
+                # yet, still "New") is asked again before the book is halted
+                # over a fill that was fine.
+                for _ in range(self.ORDER_READBACK_POLLS):
+                    if state is not None and not state["resting"]:
+                        break
+                    time.sleep(self.ORDER_READBACK_SLEEP_S)
+                    state = self._order_state(symbol, link_id, product)
             except Exception as read_exc:  # noqa: BLE001
                 raise OrderOutcomeUnknown(
                     f"{link_id} was accepted and could not be read back "
@@ -549,12 +562,19 @@ class CarryBroker:
                     "for it; its fill is unknown")
             if self._rejected(state):
                 return None            # terminal with nothing filled
-            if state["resting"] and state["filled_qty"] <= 0:
+            if state["resting"]:
+                # Still live, whatever has filled so far: the rest can land
+                # after this read, on a leg the engine would already have
+                # booked at the partial size and hedged for that size only.
                 raise OrderOutcomeUnknown(
-                    f"{link_id} is {state['status']} with nothing filled yet; "
-                    "a market order's outcome is unknown")
+                    f"{link_id} is {state['status']} with "
+                    f"{state['filled_qty']!r} filled so far; a market order "
+                    "that is still live has no final fill to book")
             return self._engine_result_from_state(state, qty)
         return fill.as_engine_result()
+
+    ORDER_READBACK_POLLS = 4
+    ORDER_READBACK_SLEEP_S = 0.2
 
     @staticmethod
     def _definitively_rejected(exc: Exception) -> bool:
@@ -569,8 +589,11 @@ class CarryBroker:
             return False
         # A TransientAPIError is the client giving up after retries on a
         # condition the venue itself called retryable (busy, internal error):
-        # the request may still have executed.
-        return code != 0 and type(exc).__name__ != "TransientAPIError"
+        # the request may still have executed. So may one the venue answered
+        # with a timeout: it says the backend did not answer in time, not
+        # that the order was refused.
+        return (code != 0 and code not in _TIMEOUT_RET_CODES
+                and type(exc).__name__ != "TransientAPIError")
 
     @staticmethod
     def _fill_is_sane(filled: Any, avg_price: Any, requested: float) -> bool:
@@ -692,8 +715,10 @@ class CarryBroker:
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": qty_text, "price": price_text,
                 "timeInForce": "PostOnly", "orderLinkId": link_id}
-        if product == SPOT:
-            body["marketUnit"] = "baseCoin"
+        # No marketUnit on a LIMIT order: its qty is base coin by definition,
+        # the field belongs to market orders, and the spot limit orders this
+        # repo has actually sent to testnet (artifacts/testnet_conformance_
+        # evidence.jsonl, the take-profit legs) carry none and were accepted.
         self._short_only_guard(body)
         try:
             self.client._request("POST", "/v5/order/create", signed=True,
@@ -1456,6 +1481,25 @@ class CarryBroker:
                 "currency": str(row.get("currency", "")).upper() or None,
                 "size": size, "category": LINEAR}
 
+    def get_position_leverage(self, symbol: str) -> Optional[float]:
+        """The leverage the venue reports on this symbol's position row
+        (`GET /v5/position/list`, `leverage`), or None when it is not stated.
+
+        READ-ONLY and informational: this process never sets or gates on it.
+        It exists so the number is visible, because nothing else records it.
+        """
+        result = self.client._request(
+            "GET", "/v5/position/list", signed=True,
+            params={"category": LINEAR, "symbol": symbol})
+        rows = self._v5_list(result)
+        if not rows or not isinstance(rows[0], dict):
+            return None
+        try:
+            value = float(rows[0].get("leverage"))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
+
     def get_position_mode(self, symbol: str) -> str:
         """``"hedge"`` iff the venue lists a hedge-mode slot (positionIdx 1 or
         2) for the symbol, else ``"one_way"``. Read-only, same call as the
@@ -1514,6 +1558,47 @@ class CarryBroker:
             total += size
         return total
 
+    #: closed-pnl page size; a full page may be truncated and proves nothing.
+    _CLOSED_PNL_PAGE = 50
+
+    def get_closed_short_qty_since(self, symbol: str, since_ms: int
+                                   ) -> Optional[float]:
+        """Perp short quantity the venue reports CLOSED since `since_ms`
+        (`GET /v5/position/closed-pnl`: rows carry `qty`, the closing `side`
+        and `updatedTime`, the shape `BybitClient.get_closed_pnl` documents).
+
+        A closed-pnl row exists only because a position was closed - by any
+        order, ours, a liquidation or a manual one - so a total here is
+        POSITIVE evidence of a close, which a flat-reading position list is
+        not (that can lag). None when it cannot be established: a page that may
+        be truncated, a row that does not parse, or an unreadable response.
+        Raises on a failed request.
+        """
+        result = self.client._request(
+            "GET", "/v5/position/closed-pnl", signed=True,
+            params={"category": LINEAR, "symbol": symbol,
+                    "startTime": int(since_ms), "limit": self._CLOSED_PNL_PAGE})
+        rows = self._v5_list(result)
+        if rows is None or len(rows) >= self._CLOSED_PNL_PAGE:
+            return None
+        total = 0.0
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            try:
+                stamp = int(row.get("updatedTime") or 0)
+                qty = float(row.get("qty"))
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(qty) or qty < 0:
+                return None
+            if stamp <= int(since_ms):
+                continue
+            if str(row.get("side", "")) != "Buy":     # the CLOSING side of a short
+                continue
+            total += qty
+        return total
+
     def get_open_carry_orders(self, spot_symbol: str,
                               perp_symbol: str) -> list:
         """Orders that could still fill into this book.
@@ -1527,14 +1612,37 @@ class CarryBroker:
         out = []
         for category, symbol, mine_only in ((LINEAR, perp_symbol, False),
                                             (SPOT, spot_symbol, True)):
-            result = self.client._request(
-                "GET", "/v5/order/realtime", signed=True,
-                params={"category": category, "symbol": symbol, "openOnly": 0})
-            rows = self._v5_list(result)
-            if rows is None:
+            # ONE page is 20 rows by default; an order pushed onto page two
+            # is still a live order, so every page is read or the read fails.
+            rows: list = []
+            cursor = ""
+            seen_cursors: set = set()
+            for _page in range(20):
+                params = {"category": category, "symbol": symbol,
+                          "openOnly": 0, "limit": 50}
+                if cursor:
+                    params["cursor"] = cursor
+                result = self.client._request(
+                    "GET", "/v5/order/realtime", signed=True, params=params)
+                page = self._v5_list(result)
+                if page is None:
+                    raise PairIncident(
+                        f"cannot read open {category} orders for {symbol}; "
+                        "refusing to assume there are none")
+                rows.extend(page)
+                nxt = CarryBroker._v5_result(result).get("nextPageCursor")
+                if not nxt:
+                    break
+                if nxt in seen_cursors:
+                    raise PairIncident(
+                        f"open {category} order paging for {symbol} looped; "
+                        "refusing to assume the list is complete")
+                seen_cursors.add(nxt)
+                cursor = str(nxt)
+            else:
                 raise PairIncident(
-                    f"cannot read open {category} orders for {symbol}; "
-                    "refusing to assume there are none")
+                    f"open {category} orders for {symbol} did not finish "
+                    "paging; refusing to assume the list is complete")
             for row in rows:
                 link = str(row.get("orderLinkId", ""))
                 if mine_only and "carr" not in link:

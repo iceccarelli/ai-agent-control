@@ -800,8 +800,13 @@ def check_funding_completeness(journal: Journal, print_ms: List[int], *,
             continue
         before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
         after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
-        if abs(before) <= DUST[PERP] and abs(after) <= DUST[PERP]:
-            continue                      # flat on both sides: nothing was owed
+        if abs(before) <= DUST[PERP] or abs(after) <= DUST[PERP]:
+            # Flat on EITHER side of the print: the book opened or closed within
+            # the attribution slack of it, so whether it held through the
+            # settlement is not established by the bot's clock. That is the
+            # OWNERSHIP_AMBIGUOUS case (funding_reconcile), not a missing venue
+            # row; a permanent "held a position through it" flag would be false.
+            continue
         if any(abs(h - t) <= PRINT_MATCH_TOLERANCE_MS for h in have):
             continue
         journal.post(Entry(
@@ -1005,8 +1010,14 @@ class LedgerBroker:
             link = str(result.get("order_link_id") or "")
             if link:
                 booked = float(result.get("filled_qty", 0.0) or 0.0)
-                self._resting[link] = (
-                    side, max(0.0, booked), self._fee_set_of(result))
+                # An order that has filled nothing has paid nothing: that is a
+                # fact, not a missing figure. The venue's empty fee row for it
+                # reads as UNKNOWN, which would make the whole fee on a later
+                # cancel-time fill an unknown difference and drop it.
+                baseline = (venue_fees.FeeSet((), True, "zero_fill",
+                                              "nothing filled, no fee")
+                            if booked <= 0 else self._fee_set_of(result))
+                self._resting[link] = (side, max(0.0, booked), baseline)
         return result
 
     def cancel_order(self, *, symbol: str, order_link_id: str, product: str):
@@ -1049,8 +1060,20 @@ class LedgerBroker:
         # that went backwards, has no honest difference: it stays unknown.
         total_fee = self._fee_set_of(result)
         fee_extra = total_fee.minus(booked_fee)
-        if fee_extra.known and any(c.amount < -1e-12
-                                   for c in fee_extra.components):
+        # "Backwards" means a currency's cumulative MAGNITUDE shrank. A rebate
+        # (a negative fee) that grew more negative is a legitimate increment.
+        if fee_extra.known and total_fee.known and booked_fee.known:
+            def _by_ccy(fees):
+                out = {}
+                for c in fees.components:
+                    out[c.currency] = out.get(c.currency, 0.0) + c.amount
+                return out
+            now_by, was_by = _by_ccy(total_fee), _by_ccy(booked_fee)
+            if any(abs(now_by.get(k, 0.0)) < abs(v) - 1e-12
+                   for k, v in was_by.items()):
+                fee_extra = venue_fees.UNKNOWN_FEES
+        elif fee_extra.known and any(c.amount < -1e-12
+                                     for c in fee_extra.components):
             fee_extra = venue_fees.UNKNOWN_FEES
         self._book({"filled_qty": extra,
                     "avg_price": result.get("avg_price", 0.0),
@@ -1126,13 +1149,19 @@ class LedgerBroker:
         fee_btc, fee_usdt, status, fee_raw = self._resolve_fee(
             result, side=side, product=product)
         ref = str(result.get("order_link_id") or f"fill:{self._ms()}")
-        ms = int(self._ms())
+        # Never behind the journal's last entry: a wall clock that stepped back
+        # must not turn a venue fill into a booking failure.
+        ms = max(int(self._ms()),
+                 self.journal.entries[-1].ms if self.journal.entries else 0)
 
         if product == "spot":
             if side == "Buy":
                 # The venue withholds a labelled BTC fee from the coin bought.
                 # The broker's basis quantity must therefore follow the wallet's
                 # net holding, not the gross fill: unwinds sell that net amount.
+                # A negative base fee (a rebate) never makes the wallet hold
+                # MORE than the fill: the engine ignores it the same way.
+                fee_btc = max(0.0, fee_btc)
                 held_qty = qty - fee_btc
                 if not math.isfinite(held_qty) or held_qty < -1e-12:
                     raise LedgerError(
@@ -1222,6 +1251,9 @@ class LedgerBroker:
     def get_venue_time_s(self):
         return self.inner.get_venue_time_s()
 
+    def get_position_leverage(self, symbol):
+        return self.inner.get_position_leverage(symbol)
+
     def get_position_mode(self, symbol):
         # Cold start refuses a hedge-mode account through THIS method; a
         # wrapper that did not forward it made that check silently vanish.
@@ -1244,6 +1276,9 @@ class LedgerBroker:
 
     def get_liquidation_view(self, symbol):
         return self.inner.get_liquidation_view(symbol)
+
+    def get_closed_short_qty_since(self, symbol, since_ms):
+        return self.inner.get_closed_short_qty_since(symbol, since_ms)
 
     def get_open_carry_orders(self, spot_symbol, perp_symbol):
         return self.inner.get_open_carry_orders(spot_symbol, perp_symbol)

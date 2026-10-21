@@ -225,15 +225,35 @@ class TestWhichLevelIsCrossedFirst:
         ex.step()
         assert ex.liquidations, "liquidation was nearer and did not fire"
 
-    def test_the_stop_closes_the_position_at_the_stop_price(self):
+    def test_a_stop_reached_inside_the_bar_fills_at_the_trigger_less_slippage(self):
+        ex = venue([100.0, 100.0], starting_cash=1_000.0,
+                   high=[100.5, 100.5], low=[99.5, 94.0])
+        position = open_long(ex, qty=1.0, price=100.0)
+        position.stop_loss = 95.0
+        ex.step()
+        fills = [f for f in ex.fill_log if f["purpose"] == "stop"]
+        assert fills and fills[0]["price"] == pytest.approx(95.0 * (1 - ex.slippage))
+        assert SYMBOL not in ex.positions
+
+    def test_a_bar_that_opens_through_the_stop_fills_at_the_open(self):
+        """Open 90, range 88-100, stop 95: nothing traded at 95. The old fill at
+        95 understated this loss by 5 per unit."""
         ex = venue([100.0, 90.0], starting_cash=1_000.0,
                    high=[100.5, 100.0], low=[99.5, 88.0])
         position = open_long(ex, qty=1.0, price=100.0)
         position.stop_loss = 95.0
         ex.step()
         fills = [f for f in ex.fill_log if f["purpose"] == "stop"]
-        assert fills and fills[0]["price"] == pytest.approx(95.0)
-        assert SYMBOL not in ex.positions
+        assert fills and fills[0]["price"] == pytest.approx(90.0 * (1 - ex.slippage))
+
+    def test_a_short_stop_gapping_up_fills_at_the_open_plus_slippage(self):
+        ex = venue([100.0, 110.0], starting_cash=1_000.0,
+                   high=[100.5, 112.0], low=[99.5, 108.0])
+        position = open_short(ex, qty=1.0, price=100.0)
+        position.stop_loss = 105.0
+        ex.step()
+        fills = [f for f in ex.fill_log if f["purpose"] == "stop"]
+        assert fills and fills[0]["price"] == pytest.approx(110.0 * (1 + ex.slippage))
 
 
 class TestTheProtectiveStopEndToEnd:
@@ -322,3 +342,67 @@ class TestTheBacktesterNoLongerRefuses:
             assert drift == {}
         finally:
             store.close()
+
+
+class TestFundingIsOnlyForWhatWasHeldThroughTheSettlement:
+    EIGHT_H = 8 * HOUR
+
+    def _venue(self):
+        boundary = (1_600_000_000_000 // self.EIGHT_H + 1) * self.EIGHT_H
+        ex = venue([100.0, 100.0], starting_cash=1_000.0,
+                   start=boundary - HOUR, funding_rate_per_8h=0.0001)
+        return ex, boundary
+
+    def test_a_position_opened_at_the_settlement_instant_does_not_receive_it(self):
+        ex, boundary = self._venue()
+        open_short(ex, qty=1.0, price=100.0).opened_index = 0
+        ex.step()                       # bar 1 starts exactly at the settlement
+        assert ex.funding_paid == 0.0
+
+    def test_a_position_held_through_the_settlement_does_pay_it(self):
+        ex, boundary = self._venue()
+        pos = open_short(ex, qty=1.0, price=100.0)
+        pos.opened_index = -5           # opened well before
+        ex.step()
+        assert ex.funding_paid == pytest.approx(-0.01)
+
+
+class TestReduceOnlyNeverOpensOrFlips:
+    def _order(self, side, qty):
+        return bt._SimOrder(
+            order_link_id="r1", symbol=SYMBOL, side=side, order_type="Market",
+            qty=qty, price=0.0, order_filter="Order", trigger_price=0.0,
+            trigger_direction=0, reduce_only=True)
+
+    def test_an_oversized_reduce_is_cut_to_the_position_not_flipped(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0)
+        open_long(ex, qty=1.0, price=100.0)
+        order = self._order("Sell", 5.0)
+        ex._execute(order, 100.0, taker=True)
+        assert order.status == "Filled" and order.qty == 1.0
+        assert SYMBOL not in ex.positions
+
+    def test_a_reduce_with_nothing_to_reduce_is_refused(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0)
+        order = self._order("Sell", 1.0)
+        ex._execute(order, 100.0, taker=True)
+        assert order.status == "Rejected" and SYMBOL not in ex.positions
+
+    def test_a_reduce_on_the_same_side_does_not_add(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0)
+        open_long(ex, qty=1.0, price=100.0)
+        order = self._order("Buy", 1.0)
+        ex._execute(order, 100.0, taker=True)
+        assert order.status == "Rejected" and ex.positions[SYMBOL].size == 1.0
+
+
+class TestAdverseEquity:
+    def test_a_long_is_marked_at_the_low_and_a_short_at_the_high(self):
+        ex = venue([100.0] * 3, starting_cash=1_000.0,
+                   high=[110.0] * 3, low=[90.0] * 3)
+        open_long(ex, qty=1.0, price=100.0)
+        assert ex.equity() == pytest.approx(1_000.0)
+        assert ex.adverse_equity() == pytest.approx(990.0)
+        ex.positions.clear()
+        open_short(ex, qty=1.0, price=100.0)
+        assert ex.adverse_equity() == pytest.approx(990.0)

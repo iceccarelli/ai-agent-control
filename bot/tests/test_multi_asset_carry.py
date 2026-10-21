@@ -163,10 +163,10 @@ class TestTheNumbersCarryTheirLabel:
         assert r["corpus"] == "frozen"
 
     def test_frozen_btc_still_reproduces_phase1_decision(self):
-        """The figure PHASE1_DECISION quotes: +9.66%/yr gated at 0% borrow,
+        """The figure PHASE1_DECISION quotes: +9.64%/yr gated (9.66 before the perp-discount entry bound) at 0% borrow,
         15 trades. If this moves, every document citing it is stale."""
         r = cb.simulate(REPO, borrow_apr=0.0, gated=True)
-        assert r["net_annualised_pct"] == pytest.approx(9.66, abs=0.01)
+        assert r["net_annualised_pct"] == pytest.approx(9.64, abs=0.01)
         assert r["trades"] == 15
 
     def test_a_different_asset_is_a_different_number(self):

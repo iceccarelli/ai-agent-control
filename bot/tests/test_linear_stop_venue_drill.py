@@ -850,3 +850,22 @@ class TestItem4NeverCitesFalseEvidence:
     """Item 4's docs must give the real --margin-doc command, never point at
     the carry drill or session_tail.py, and must not claim the simulator's
     liquidation formula stands in for venue truth."""
+
+
+class TestAFailureAfterTheOpenLegClosesWhatIsOpen:
+    def test_a_rejected_stop_triggers_a_reduce_only_abort_flatten(self):
+        client = FakeClient(attach_ok=False)
+        report = run(client)
+        assert report["failed_stage"] == "attach"
+        stages = [s["stage"] for s in report["stages"]]
+        assert "abort_flatten" in stages
+        assert report["still_open"] is False
+        assert "nothing is proven" in report["next_action"] or \
+            "HUMAN" not in report["next_action"].upper()
+
+    def test_an_abort_flatten_that_does_not_close_leaves_it_loud(self):
+        client = FakeClient(attach_ok=False, flatten_ok=False)
+        report = run(client)
+        assert report["failed_stage"] == "attach"
+        assert report["still_open"] is True
+        assert "HUMAN MUST ACT" in report["next_action"]

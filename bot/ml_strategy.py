@@ -293,7 +293,12 @@ class PolicyStrategy:
             return False, f"POLICY_MODE={self.mode}"
         if not self.armed:
             return False, str(getattr(self.cfg, "POLICY_BLOCK_REASON", "not armed"))
-        if self.drift is not None and self.drift.has_drifted():
+        if self.drift is None:
+            # Demotion on drift is the only brake on a live model, and nothing
+            # in the runtime builds or feeds a monitor yet. A model with no way
+            # to be demoted does not get to influence an order.
+            return False, "NO_DRIFT_MONITOR: live influence needs demotion wired"
+        if self.drift.has_drifted():
             return False, f"{PolicyUnavailableReason.DRIFTED}: {self.drift.summary()}"
         return True, "armed"
 
@@ -386,7 +391,11 @@ class PolicyStrategy:
 
     def _book_for(self, symbol: str):
         client = getattr(self.base, "client", None)
-        reader = getattr(client, "get_book_features", None)
+        # The model measures the book itself, from the raw ladders. The scalar
+        # summary `get_book_features` returns (for the liquidity gate) is a dict
+        # its feature code refuses, which left the model never consulted.
+        reader = (getattr(client, "get_book_ladders", None)
+                  or getattr(client, "get_book_features", None))
         if not callable(reader):
             return None
         try:

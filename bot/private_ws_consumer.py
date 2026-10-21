@@ -93,6 +93,7 @@ import collections
 import datetime as dt
 import hashlib
 import json
+import socket
 import logging
 import os
 import queue
@@ -255,7 +256,22 @@ def _normalize_execution_item(item: Dict[str, Any]) -> NormalizedEvent:
             event_id=f"unknown:{identity}", kind="unknown", topic="execution",
             raw=item)
     is_maker_or_taker_fill = exec_type in ("Trade", "")
-    status = "filled" if is_maker_or_taker_fill else ""
+    # One execution is one fill, not the order's end: the order is "filled"
+    # only when nothing is left (`leavesQty` 0). Claiming it for a partial fill
+    # made the order terminal, so the later real PartiallyFilled / Cancelled
+    # events were refused by the monotonic guard and a resting remainder fell
+    # out of reconciliation. A leavesQty that is absent or unusable claims
+    # nothing; the `order` topic carries the status.
+    status = ""
+    if is_maker_or_taker_fill:
+        try:
+            leaves = float(item["leavesQty"])
+        except (KeyError, TypeError, ValueError):
+            leaves = None
+        if leaves is not None and leaves == 0.0:
+            status = "filled"
+        elif leaves is not None and leaves > 0.0:
+            status = "partial"
     # execId is already the venue's own durable, unique-per-fill identity
     # — no timestamp or payload hash needed on top of it (the venue never
     # reissues an execId for two different fills).
@@ -325,6 +341,22 @@ class WSPrivateConsumer:
 
     TOPICS = ("order", "execution", "position")
 
+    @property
+    def needs_reconciliation(self) -> bool:
+        return self._needs_reconciliation
+
+    @needs_reconciliation.setter
+    def needs_reconciliation(self, value: bool) -> None:
+        # Every SET is counted, so the tick that clears the flag can tell a
+        # gap it covered from one that opened after its REST reads.
+        if value:
+            self._reconcile_generation += 1
+        self._needs_reconciliation = bool(value)
+
+    @property
+    def reconcile_generation(self) -> int:
+        return self._reconcile_generation
+
     def __init__(self, *, client: Any, transport_factory: Callable[[], Any],
                 sleep: Callable[[float], None] = time.sleep,
                 evidence_path: Optional[str] = None,
@@ -333,7 +365,8 @@ class WSPrivateConsumer:
         self._transport_factory = transport_factory
         self._sleep = sleep
         self._dedup = _Deduplicator()
-        self.needs_reconciliation = False
+        self._reconcile_generation = 0
+        self._needs_reconciliation = False
         self.dirty_symbols: Set[str] = set()
         self.unknown_message_count = 0
         self.applied_event_count = 0
@@ -662,11 +695,24 @@ class WSPrivateConsumer:
                     "(SUBSCRIBE_OK not established)")
             count = 0
             last_ping = time.time()
+            last_rx = time.time()
+            self._reached_receive_loop = True
             while max_messages is None or count < max_messages:
                 if time.time() - last_ping > PING_INTERVAL_SECONDS:
                     transport.send_text(json.dumps(self._client.ws_ping_message()))
                     last_ping = time.time()
-                opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
+                # Wake in time for the next ping: a quiet private stream must
+                # not sit in recv() past the ping interval, or the connection
+                # is declared dead and torn down every RECV_TIMEOUT seconds.
+                wait = min(RECV_TIMEOUT_SECONDS, max(
+                    0.1, PING_INTERVAL_SECONDS - (time.time() - last_ping)))
+                try:
+                    opcode, payload = transport.recv(timeout=wait)
+                except socket.timeout:
+                    if time.time() - last_rx > 2 * PING_INTERVAL_SECONDS:
+                        raise   # pings went unanswered: the link is dead
+                    continue
+                last_rx = time.time()
                 if opcode == 0x1:  # text
                     self.handle_raw_message(payload.decode("utf-8"))
                     count += 1
@@ -675,18 +721,37 @@ class WSPrivateConsumer:
         finally:
             transport.close()
 
+    HANDSHAKE_MAX_FRAMES = 8
+
+    def _await_ack(self, transport: Any, op: str) -> None:
+        """Read until the ack for `op` arrives.
+
+        A data frame that arrives BEFORE the ack is an order or execution event
+        the venue really sent; reading exactly one frame and treating it as the
+        ack dropped it (and left the flag False, so the connection was torn
+        down). Data frames are routed to the normal handler instead.
+        """
+        for _ in range(self.HANDSHAKE_MAX_FRAMES):
+            opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
+            if opcode != 0x1:
+                continue
+            text = payload.decode("utf-8")
+            message = json.loads(text)
+            if isinstance(message, dict) and "topic" in message:
+                self.handle_raw_message(text)
+                continue
+            self._handle_control_message(message)
+            if isinstance(message, dict) and str(message.get("op") or "") == op:
+                return
+
     def _authenticate(self, transport: Any) -> None:
         auth_message = self._client.ws_auth_message()
         transport.send_text(json.dumps(auth_message))
-        opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
-        if opcode == 0x1:
-            self._handle_control_message(json.loads(payload.decode("utf-8")))
+        self._await_ack(transport, "auth")
 
     def _subscribe(self, transport: Any) -> None:
         transport.send_text(json.dumps({"op": "subscribe", "args": list(self.TOPICS)}))
-        opcode, payload = transport.recv(timeout=RECV_TIMEOUT_SECONDS)
-        if opcode == 0x1:
-            self._handle_control_message(json.loads(payload.decode("utf-8")))
+        self._await_ack(transport, "subscribe")
 
     def run_forever(self, stop_event: Any) -> None:
         """Reconnect with backoff until `stop_event.is_set()`. Every
@@ -706,6 +771,7 @@ class WSPrivateConsumer:
         attempt = 0
         while not stop_event.is_set():
             connection_error = ""
+            self._reached_receive_loop = False
             try:
                 self.run_once()
             except Exception as exc:  # noqa: BLE001
@@ -718,6 +784,8 @@ class WSPrivateConsumer:
                     connection_event="disconnected", error=connection_error)
             if stop_event.is_set():
                 return
+            if self._reached_receive_loop:
+                attempt = 0     # a connection that worked restarts the backoff
             backoff = RECONNECT_BACKOFF_SECONDS[
                 min(attempt, len(RECONNECT_BACKOFF_SECONDS) - 1)]
             self._sleep(backoff)

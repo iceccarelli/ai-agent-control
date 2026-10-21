@@ -249,6 +249,18 @@ class TestTheBrokerCannotBeBypassed:
         assert len(j.entries) == 1
         assert j.balances()[L.PERP].qty == pytest.approx(-1.0)
 
+    def test_a_wall_clock_that_stepped_back_still_books_the_fill(self):
+        j = L.Journal()
+        clock = [MS]
+        b = L.LedgerBroker(self.Venue(), j, ms=lambda: clock[0])
+        b.place_market(symbol="BTCUSDT", side="Sell", qty=1.0,
+                       product="linear")
+        clock[0] = MS - 5_000
+        b.place_market(symbol="BTCUSDT", side="Buy", qty=1.0,
+                       product="linear")
+        assert len(j.entries) == 2
+        assert j.entries[-1].ms >= j.entries[0].ms
+
     def test_every_maker_fill_reaches_the_journal(self):
         j = L.Journal()
         b = L.LedgerBroker(self.Venue(), j, ms=lambda: MS)

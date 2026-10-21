@@ -522,7 +522,10 @@ class TestWSStatusMonotonicGuard:
     def _store(self, tmp_path) -> StateStore:
         store = StateStore(str(tmp_path / "state.db"))
         store.claim_writer()
-        store.record_order("BB-1", "BTCUSDT", "Buy", "Market", 0.01)
+        # A protective-leg purpose: the monotonic guard is about status order,
+        # and an ENTRY "Filled" additionally waits for its position row
+        # (test_a_ws_fill_for_an_unrecorded_entry_does_not_release_it).
+        store.record_order("BB-1", "BTCUSDT", "Sell", "Limit", 0.01, purpose="tp")
         return store
 
     def test_stale_ws_new_after_filled_does_not_regress(self, tmp_path):
@@ -536,6 +539,16 @@ class TestWSStatusMonotonicGuard:
 
         assert store.get_order("BB-1")["status"] == "filled", (
             "a stale WS 'New' regressed a terminal order's status")
+
+    @pytest.mark.parametrize("terminal", [
+        "partiallyfilledcanceled", "deactivated", "never_sent"])
+    def test_stale_ws_event_does_not_revive_a_rest_written_terminal(
+            self, tmp_path, terminal):
+        store = self._store(tmp_path)
+        store.update_order_status("BB-1", terminal, exchange_id="V-1")   # REST
+        store.update_order_status("BB-1", "submitted", exchange_id="V-1", source="ws")
+        assert store.get_order("BB-1")["status"] == terminal
+        assert "BB-1" not in [o["order_link_id"] for o in store.unresolved_orders()]
 
     def test_duplicate_terminal_ws_event_is_a_harmless_noop(self, tmp_path):
         """Re-delivery of the SAME terminal status (a normal duplicate, not
@@ -616,3 +629,220 @@ class TestWSStatusMonotonicGuard:
             d for d in store.recent_decisions()
             if d["decision"] == "WS_STATUS_REGRESSION_BLOCKED"
         ] == []
+
+
+class TestWritesThatMustNotBeSplit:
+    def test_a_booked_trade_and_its_anchor_commit_together(self, tmp_path):
+        """A kill between the trade INSERT and the anchor UPDATE booked the trade
+        but never credited the day's realised pnl; the dedupe then refused the
+        replay. Both must be one commit."""
+        import time as _t
+        from persistence import StateStore, TradeRecord
+        store = StateStore(str(tmp_path / "t.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        trade = TradeRecord(
+            symbol="BTCUSDT", side="Buy", qty=1.0, entry_price=100.0,
+            exit_price=90.0, gross_pnl=-10.0, entry_fee=0.0, exit_fee=0.0,
+            opened_epoch=_t.time() - 10, closed_epoch=_t.time(),
+            order_link_id="X", meta={}, dedupe_key="exit:X")
+        original = store._conn.execute
+        calls = {"n": 0}
+
+        class Dying:
+            """A connection whose anchor UPDATE dies, as a kill would."""
+            def __init__(self, inner):
+                self.inner = inner
+
+            def execute(self, sql, *a, **k):
+                if sql.lstrip().upper().startswith("UPDATE DAILY_ANCHOR"):
+                    calls["n"] += 1
+                    raise RuntimeError("killed between the statements")
+                return self.inner.execute(sql, *a, **k)
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+        real = store._conn
+        store._conn = Dying(real)
+        with pytest.raises(Exception):
+            store.record_trade(trade)
+        store._conn = real
+        assert calls["n"] == 1
+        assert store.recent_trades() == [], "the trade stayed booked without its anchor"
+        # the replay is therefore NOT a duplicate and books both
+        assert store.record_trade(trade) > 0
+        anchor = store.ensure_daily_anchor(1_000.0)
+        assert anchor.realised_pnl == pytest.approx(trade.net_pnl)
+        store.close()
+
+    def test_a_trade_on_a_day_without_an_anchor_is_still_counted(self, tmp_path):
+        import time as _t
+        from persistence import StateStore, TradeRecord
+        store = StateStore(str(tmp_path / "t2.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        yesterday = _t.time() - 86_400 * 3
+        store.record_trade(TradeRecord(
+            symbol="BTCUSDT", side="Buy", qty=1.0, entry_price=100.0,
+            exit_price=90.0, gross_pnl=-10.0, entry_fee=0.0, exit_fee=0.0,
+            opened_epoch=yesterday - 5, closed_epoch=yesterday, order_link_id="Y",
+            meta={}, dedupe_key="exit:Y"))
+        row = store._query("SELECT * FROM daily_anchor WHERE realised_pnl != 0")
+        assert row and float(row[0]["realised_pnl"]) == pytest.approx(-10.0)
+        store.close()
+
+    def test_a_transaction_commits_all_or_nothing(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "t3.db"))
+        store.claim_writer()
+        with pytest.raises(RuntimeError):
+            with store.transaction():
+                store.save_carry_position({"book_state": "HEDGED"})
+                raise RuntimeError("killed")
+        assert store._query("SELECT * FROM carry_position") == []
+        with store.transaction():
+            store.save_carry_position({"book_state": "HEDGED"})
+        assert store._query("SELECT book_state FROM carry_position")[0][0] == "HEDGED"
+        store.close()
+
+
+class TestStateStoreReviewFixes:
+    def _trade(self, **kw):
+        import time as _t
+        from persistence import TradeRecord
+        base = dict(symbol="BTCUSDT", side="Buy", qty=1.0, entry_price=100.0,
+                    exit_price=99.0, gross_pnl=-1.0, entry_fee=0.0, exit_fee=0.0,
+                    opened_epoch=1_700_000_000.0, closed_epoch=_t.time(),
+                    order_link_id="X", meta={}, dedupe_key="")
+        base.update(kw)
+        return TradeRecord(**base)
+
+    def test_the_loss_streak_counts_positions_not_partial_exit_rows(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "ls.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        for i in range(3):          # ONE position, stopped out in three fills
+            store.record_trade(self._trade(closed_epoch=1_700_000_100.0 + i,
+                                           dedupe_key=f"exit:p{i}"))
+        assert store.consecutive_losses() == 1
+        store.close()
+
+    def test_a_small_winning_partial_does_not_hide_a_losing_position(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "ls2.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        store.record_trade(self._trade(closed_epoch=1_700_000_100.0, gross_pnl=-1.0,
+                                       dedupe_key="exit:a"))
+        store.record_trade(self._trade(closed_epoch=1_700_000_200.0, gross_pnl=-5.0,
+                                       dedupe_key="exit:b", opened_epoch=1_700_000_050.0))
+        store.record_trade(self._trade(closed_epoch=1_700_000_300.0, gross_pnl=+2.0,
+                                       exit_price=102.0, dedupe_key="exit:c",
+                                       opened_epoch=1_700_000_050.0))
+        # position 1050 nets -3 (a loss); position 000 loses: a streak of 2
+        assert store.consecutive_losses() == 2
+        store.close()
+
+    def test_a_record_trade_inside_a_transaction_is_rolled_back_with_it(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "tx.db"))
+        store.claim_writer()
+        store.update_equity(1_000.0)
+        with pytest.raises(RuntimeError):
+            with store.transaction():
+                store.save_carry_position({"book_state": "OPEN"})
+                store.record_trade(self._trade(dedupe_key="exit:tx"))
+                raise RuntimeError("killed")
+        assert not store.load_carry_position()
+        assert store.recent_trades() == []
+        store.close()
+
+    def test_an_old_execution_quality_table_still_opens(self, tmp_path):
+        import sqlite3
+        from persistence import StateStore
+        path = str(tmp_path / "old.db")
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE execution_quality(id INTEGER PRIMARY KEY "
+                    "AUTOINCREMENT, ts_epoch REAL NOT NULL, symbol TEXT NOT NULL, "
+                    "side TEXT NOT NULL)")
+        con.commit()
+        con.close()
+        store = StateStore(path)               # raised "no such column: outcome"
+        store.close()
+
+    def test_a_trade_before_any_equity_does_not_create_a_zero_anchor(self, tmp_path):
+        from persistence import StateStore
+        store = StateStore(str(tmp_path / "za.db"))
+        store.claim_writer()
+        store.record_trade(self._trade())
+        store.update_equity(1_000.0)
+        assert store.daily_loss_fraction(900.0) == pytest.approx(0.1)
+        store.close()
+
+    def test_a_zero_anchor_is_repaired_from_the_first_positive_equity(self, tmp_path):
+        from persistence import StateStore, utc_day
+        store = StateStore(str(tmp_path / "zr.db"))
+        store.claim_writer()
+        store._exec("INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, 0.0)",
+                    (utc_day(),))
+        assert store.ensure_daily_anchor(500.0).start_equity == 500.0
+        store.close()
+
+
+def test_order_seq_inside_a_transaction_is_refused_not_rolled_back(tmp_path):
+    from persistence import PersistenceError, StateStore
+    store = StateStore(str(tmp_path / "s.db"))
+    first = store.next_order_seq()
+    with pytest.raises(PersistenceError, match="inside transaction"):
+        with store.transaction():
+            store.next_order_seq()
+    assert store.next_order_seq() == first + 1
+
+
+def test_two_connections_never_mint_the_same_order_seq(tmp_path):
+    from persistence import StateStore
+    path = str(tmp_path / "s.db")
+    a, b = StateStore(path), StateStore(path)
+    seen = [x.next_order_seq() for x in (a, b, a, b, b, a)]
+    assert len(set(seen)) == len(seen)
+
+
+def test_a_later_halt_keeps_the_first_incidents_reason(tmp_path):
+    from persistence import StateStore
+    store = StateStore(str(tmp_path / "s.db"))
+    store.trip_kill_switch("FIRST")
+    store.trip_kill_switch("SECOND")
+    engaged, reason = store.is_kill_switch_engaged()
+    assert engaged and reason == "FIRST"
+
+
+def test_order_seq_falls_back_on_an_old_sqlite(tmp_path, monkeypatch):
+    import persistence as P
+    store = P.StateStore(str(tmp_path / "s.db"))
+    first = store.next_order_seq()
+    monkeypatch.setattr(P.sqlite3, "sqlite_version_info", (3, 30, 0))
+    assert store.next_order_seq() == first + 1
+    assert store.next_order_seq() == first + 2
+
+
+def test_a_legacy_trades_table_gains_the_provisional_column(tmp_path):
+    import sqlite3 as _sq
+    from persistence import StateStore
+    path = str(tmp_path / "legacy.db")
+    conn = _sq.connect(path)
+    conn.execute(
+        "CREATE TABLE trades (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,"
+        " side TEXT NOT NULL, qty REAL NOT NULL, entry_price REAL NOT NULL,"
+        " exit_price REAL NOT NULL, gross_pnl REAL NOT NULL, entry_fee REAL NOT NULL,"
+        " exit_fee REAL NOT NULL, net_pnl REAL NOT NULL, opened_epoch REAL NOT NULL,"
+        " closed_epoch REAL NOT NULL, day TEXT NOT NULL,"
+        " order_link_id TEXT NOT NULL DEFAULT '', meta TEXT NOT NULL DEFAULT '{}')")
+    conn.execute("INSERT INTO trades(symbol, side, qty, entry_price, exit_price,"
+                 " gross_pnl, entry_fee, exit_fee, net_pnl, opened_epoch,"
+                 " closed_epoch, day) VALUES('BTCUSDT','Buy',1,100,101,1,0,0,1,1,2,'d')")
+    conn.commit()
+    conn.close()
+    store = StateStore(path)
+    rows = store.recent_trades()
+    assert len(rows) == 1 and rows[0]["price_provisional"] == 0

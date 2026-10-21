@@ -64,7 +64,7 @@ python3 tools/fly_stack.py --check
 # [http_service], which drags in auto_stop, and a machine stopped while
 # holding a hedge leaves a client unhedged. apps create writes nothing.
 say "3/7  the app"
-if fly status --app "$APP" >/dev/null 2>&1; then
+if "$FLY" status --app "$APP" >/dev/null 2>&1; then
   echo "app $APP already exists"
 else
   "$FLY" apps create "$APP" --org "${FLY_ORG:-personal}" --yes
@@ -88,14 +88,14 @@ if ! python3 tools/fly_stack.py --check; then
 fi
 
 say "4/7  the volume (the ledger lives here; losing it means a human looks)"
-if fly volumes list --app "$APP" 2>/dev/null | grep -q "$VOLUME"; then
+if "$FLY" volumes list --app "$APP" 2>/dev/null | grep -q "$VOLUME"; then
   echo "volume $VOLUME already exists"
 else
   "$FLY" volumes create "$VOLUME" --app "$APP" --region "$REGION" --size 1 --yes
 fi
 
 say "5/7  the outbound IP — this is the address you pin the API key to"
-if fly ips list --app "$APP" 2>/dev/null | grep -qi egress; then
+if "$FLY" ips list --app "$APP" 2>/dev/null | grep -qi egress; then
   echo "an egress IP is already allocated"
 else
   if ! "$FLY" ips allocate-egress --app "$APP" --region "$REGION" --yes; then
@@ -119,7 +119,7 @@ fi
 "$FLY" ips list --app "$APP" || true
 
 say "6/7  secrets"
-if fly secrets list --app "$APP" 2>/dev/null | grep -q BYBIT_API_KEY; then
+if "$FLY" secrets list --app "$APP" 2>/dev/null | grep -q BYBIT_API_KEY; then
   echo "BYBIT_API_KEY is already set"
 else
   echo "Set them now, from the key you pinned to the IPv4 above:"

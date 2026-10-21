@@ -175,6 +175,315 @@ class TestHappyPath:
 # ---------------------------------------------------------------------------
 
 
+class TestADeadSpotStopIsNotLeftLookingProtected:
+    def test_a_rejected_stop_is_reprotected_or_flattened(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        report = engine.execute(buy_intent())
+        assert report.ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        stop_id = meta["stop_order_link_id"]
+        exchange.orders[stop_id]["orderStatus"] = "Rejected"
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead") == ["BTCUSDT"]
+        # either a fresh live stop was placed, or the position was closed:
+        # it is never left "protected" by a stop that is dead
+        rows = store.open_positions()
+        if rows:
+            new_meta = (_json.loads(rows[0]["meta"])
+                        if isinstance(rows[0]["meta"], str) else rows[0]["meta"])
+            assert new_meta["stop_order_link_id"] != stop_id
+        else:
+            assert summary["stop_dead_outcome"]["BTCUSDT"] == "FLATTENED"
+
+
+class TestADeadStopOverPhantomCoin:
+    def test_a_dead_stop_with_no_coin_is_not_reprotected_or_sold(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Cancelled"
+        exchange.balances["BTC"] = 0.0           # sold/moved behind our back
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead_unverified") == ["BTCUSDT"]
+        assert "stop_dead" not in summary
+        assert not store.is_kill_switch_engaged()[0]
+        assert store.open_positions()           # left for reconcile
+
+
+class TestTheCoinCheckCountsReservedCoin:
+    def test_a_position_whose_coin_is_reserved_by_resting_legs_is_still_held(
+            self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Rejected"
+        # the venue reports the coin as RESERVED: nothing free, all in the wallet
+        real = client.get_wallet
+        qty = float(row["qty"])
+
+        def wallet(account_type="UNIFIED"):
+            w = dict(real(account_type))
+            w["coin"] = [{"coin": "BTC", "walletBalance": str(qty),
+                          "availableToWithdraw": "0"}]
+            return w
+        client.get_wallet = wallet
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead") == ["BTCUSDT"]
+        assert "stop_dead_unverified" not in summary
+
+
+class TestDeadStopFollowUps:
+    def _dead(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Rejected"
+        for tp in meta.get("tp_order_ids") or []:
+            exchange.orders[tp]["orderStatus"] = "PartiallyFilled"
+        return engine, client, store, exchange, meta
+
+    def test_a_part_filled_leg_defers_the_reprotection_only_a_bounded_time(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        assert meta.get("tp_order_ids"), "fixture must place take-profit legs"
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS):
+            assert "stop_dead" not in engine.observe_exits()
+        final = engine.observe_exits()
+        assert final.get("stop_dead") == ["BTCUSDT"]
+
+    def test_the_relaxed_path_frees_the_coin_the_resting_legs_reserve(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()
+        statuses = [exchange.orders[t]["orderStatus"]
+                    for t in meta["tp_order_ids"]]
+        assert all(st in ("Cancelled", "Filled") for st in statuses), statuses
+
+    def test_a_stuck_leg_is_alarmed_once_and_never_sent_to_the_emergency_path(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        client.cancel_order = lambda **kw: False        # the venue refuses
+        outcomes = []
+        for _ in range(2 * engine.DEAD_STOP_MAX_DEFERRALS + 3):
+            summary = engine.observe_exits()
+            outcomes.append(summary.get("stop_dead_outcome", {}).get("BTCUSDT"))
+        # after repeated refusals the engine stops waiting and handles the
+        # naked position itself: it must end re-protected or flattened, never
+        # silently left on a dead stop
+        # a leg that will not cancel never sends the book to the emergency
+        # path (it would only trip the kill switch): it is alarmed once and
+        # the cancel is retried
+        assert not store.is_kill_switch_engaged()[0]
+        assert store.open_positions()
+        assert "BTCUSDT" in summary.get("stop_dead", [])
+        stuck = [d for d in store.recent_decisions()
+                 if d.get("decision") == "STOP_DEAD_LEG_STUCK"]
+        assert len(stuck) == 1
+
+    def test_the_two_cycle_sequence_books_the_partial_leg_then_reprotects(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(cumExecQty=str(part), avgPrice=str(ENTRY * 1.02))
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()                    # last one cancels the legs
+        # the venue now reports the cancelled, part-filled leg as final
+        exchange.orders[tp]["orderStatus"] = "PartiallyFilledCanceled"
+        for other in meta["tp_order_ids"][1:]:
+            exchange.orders[other]["orderStatus"] = "Cancelled"
+        before = float(store.open_positions()[0]["qty"])
+        engine.observe_exits()                        # books the partial fill
+        rows = store.open_positions()
+        assert rows and float(rows[0]["qty"]) == pytest.approx(before - part)
+        assert len(store.recent_trades()) == 1        # the leg's P&L is booked
+        engine.observe_exits()                        # stop re-judged
+        assert not store.is_kill_switch_engaged()[0]
+        import json as _j
+        m = store.open_positions()[0]["meta"]
+        m = _j.loads(m) if isinstance(m, str) else m
+        # the booking replaced the dead stop with a live one on the true size
+        assert m["stop_order_link_id"] != meta["stop_order_link_id"]
+        assert exchange.orders[m["stop_order_link_id"]]["orderStatus"] in (
+            "Untriggered", "New")
+
+    def test_a_leg_cancelled_with_a_fill_is_booked_not_lost(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(cumExecQty=str(part), avgPrice=str(ENTRY * 1.02),
+                                   orderStatus="Cancelled")
+        engine.observe_exits()
+        assert len(store.recent_trades()) == 1
+
+    def test_the_stuck_leg_retry_needs_no_balance_read_and_cancels_engine_ids(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        cancelled = []
+        real = client.cancel_order
+
+        def spy(**kw):
+            cancelled.append(kw["order_link_id"])
+            return real(**kw)
+        client.cancel_order = spy
+        # the balance endpoint is broken AND the local order table forgets the legs
+        client.get_coin_balance = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("wallet down"))
+        engine._cancel_take_profit_legs = lambda symbol: True
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()
+        assert set(meta["tp_order_ids"]) <= set(cancelled)
+
+    def test_a_stuck_leg_reports_the_symbol_once_per_cycle(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        client.cancel_order = lambda **kw: False
+        for _ in range(2 * engine.DEAD_STOP_MAX_DEFERRALS):
+            engine.observe_exits()
+        summary = engine.observe_exits()
+        assert summary.get("stop_dead") == ["BTCUSDT"]
+
+    def test_an_unpriceable_cancelled_fill_defers_instead_of_the_stale_size_path(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        exchange.orders[tp].update(orderStatus="Cancelled", cumExecQty="0.0001",
+                                   avgPrice="0", cumExecValue="0", price="0")
+        for other in meta["tp_order_ids"][1:]:
+            exchange.orders[other]["orderStatus"] = "New"
+        summary = engine.observe_exits()
+        assert "stop_dead_outcome" not in summary      # no protect/flatten attempt
+        assert not store.is_kill_switch_engaged()[0]
+
+    def test_an_unpriceable_fill_is_booked_provisionally_not_at_the_entry_price(
+            self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        tp = meta["tp_order_ids"][0]
+        exchange.orders[tp].update(orderStatus="Cancelled", cumExecQty="0.0001",
+                                   avgPrice="0", cumExecValue="0", price="0")
+        for other in meta["tp_order_ids"][1:]:
+            exchange.orders[other]["orderStatus"] = "New"
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS):
+            engine.observe_exits()
+        assert not store.provisional_trades()          # still deferring
+        summary = engine.observe_exits()               # the bound is crossed
+        assert summary.get("exits_provisional") == 1
+        rows = store.provisional_trades()
+        assert len(rows) == 1
+        # never represented as a fill price, and not a confirmed trade
+        assert rows[0]["exit_price"] == 0.0 and rows[0]["gross_pnl"] == 0.0
+        assert rows[0]["price_provisional"] == 1
+        assert not store.recent_trades()
+        assert store.net_returns() == []
+        assert store.fee_evidence()["price_provisional_trades"] == 1
+        assert any(d.get("decision") == "EXIT_UNPRICED_PROVISIONAL"
+                   for d in store.recent_decisions())
+
+    def test_with_reserved_coin_the_cancel_first_path_still_reprotects(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        exchange.reserve_limit_sells = True      # resting legs reserve their coin
+        exchange.balances["BTC"] = float(store.open_positions()[0]["qty"])
+        tp = meta["tp_order_ids"][0]
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(cumExecQty=str(part), avgPrice=str(ENTRY * 1.02))
+        # sanity: nothing is free for a market sell while the legs rest
+        assert exchange._free("BTC", exchange.balances["BTC"]) < float(
+            store.open_positions()[0]["qty"])
+        for _ in range(engine.DEAD_STOP_MAX_DEFERRALS + 1):
+            engine.observe_exits()                # last one cancels the legs
+        for t in meta["tp_order_ids"]:
+            if exchange.orders[t]["orderStatus"] == "Cancelled" and t == tp:
+                exchange.orders[t]["orderStatus"] = "PartiallyFilledCanceled"
+        engine.observe_exits()                    # books the partial fill
+        engine.observe_exits()
+        assert not store.is_kill_switch_engaged()[0]
+        assert store.open_positions()
+        free = exchange._free("BTC", exchange.balances["BTC"])
+        assert free >= float(store.open_positions()[0]["qty"]) - 1e-9
+
+    def test_a_cancelled_unfilled_leg_is_not_read_every_cycle(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        tps = meta["tp_order_ids"]
+        assert tps
+        for t in tps:
+            exchange.orders[t]["orderStatus"] = "Cancelled"
+        reads = []
+        real = client.get_order
+
+        def spy(**kw):
+            reads.append(kw["order_link_id"])
+            return real(**kw)
+        client.get_order = spy
+        engine.observe_exits()
+        engine.observe_exits()          # two dead reads confirm it
+        first = [r for r in reads if r in tps]
+        reads.clear()
+        engine.observe_exits()
+        engine.observe_exits()
+        assert len(first) == 2 * len(tps)
+        assert not [r for r in reads if r in tps]      # not read again
+
+    def test_one_stale_dead_read_does_not_hide_a_fill_that_settles_after(self, stack):
+        import json as _json
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        meta = _json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
+        tp = meta["tp_order_ids"][0]
+        exchange.orders[tp]["orderStatus"] = "Cancelled"       # stale snapshot
+        engine.observe_exits()
+        part = float(store.open_positions()[0]["qty"]) / 4
+        exchange.orders[tp].update(orderStatus="PartiallyFilledCanceled",
+                                   cumExecQty=str(part), avgPrice=str(ENTRY * 1.02))
+        engine.observe_exits()                                 # the fill books
+        assert len(store.recent_trades()) == 1
+
+    def test_the_grace_restarts_once_the_stop_is_healthy_again(self, stack):
+        engine, client, store, exchange, meta = self._dead(stack)
+        engine.observe_exits()
+        assert engine._dead_stop_deferrals.get("BTCUSDT") == 1
+        exchange.orders[meta["stop_order_link_id"]]["orderStatus"] = "Untriggered"
+        engine.observe_exits()
+        assert "BTCUSDT" not in engine._dead_stop_deferrals
+
+    def test_total_balance_is_refused_when_the_row_does_not_state_it(self, stack):
+        engine, client, risk, store, exchange = stack
+        client.get_wallet = lambda account_type="UNIFIED": {
+            "coin": [{"coin": "BTC", "availableToWithdraw": "1"}]}
+        import bybit_connection as _bc
+        with pytest.raises(_bc.PermanentAPIError):
+            client.get_coin_balance("BTC", total=True)
+        assert client.get_coin_balance("BTC") == 1.0
+
+
+class TestARefusedEntryStartsTheSymbolCooldown:
+    def test_the_same_refused_order_is_not_resent_next_tick(self, stack):
+        engine, client, risk, store, exchange = stack
+        risk.trade_cooldown_seconds = 60.0
+        exchange.reject_next_with = (10001, "simulated rejection")
+        first = engine.execute(buy_intent())
+        assert first.ok is False and first.stage == "entry"
+        creates = lambda: sum(  # noqa: E731
+            1 for r in exchange.requests if r["url"].endswith("/order/create"))
+        before = creates()
+        second = engine.execute(buy_intent())
+        assert second.ok is False
+        assert second.reason == "SYMBOL_COOLDOWN" or "COOLDOWN" in str(
+            getattr(second, "detail", "")) + str(second.reason)
+        assert creates() == before
+
+
 class TestNeverNaked:
     def test_a_rejected_stop_closes_the_position_and_trips_the_kill_switch(
         self, stack
@@ -466,6 +775,16 @@ class TestClosing:
             trades[0]["gross_pnl"] - 2.0
         )
 
+    def test_a_losing_close_starts_the_symbol_cooldown(self, stack):
+        engine, client, risk, store, exchange = stack
+        risk.trade_cooldown_seconds = 60.0
+        engine.execute(buy_intent())
+        close = engine.close_position(
+            symbol="BTCUSDT", reason="manual", entry_fee=50.0, exit_fee=50.0)
+        assert close.ok
+        assert store.consecutive_losses() >= 1
+        assert store.symbol_cooldown_remaining("BTCUSDT") > 0.0
+
     def test_close_report_exposes_exit_identity_and_execution_evidence(self, stack):
         """FIX (exit assurance): close_position()'s report must carry the
         EXIT's own identity/quantity/price -- extending the existing
@@ -639,3 +958,149 @@ class TestPaperMode:
         assert report.ok is False
         assert report.reason == "CONFIDENCE_TOO_LOW"
         store.close()
+
+
+class TestAnUnconfirmedCloseKeepsTheProtectiveOrders:
+    def _watch_cancel_all(self, client):
+        calls = []
+        real = client.cancel_all
+
+        def spy(symbol=None):
+            calls.append(symbol)
+            return real(symbol)
+        client.cancel_all = spy
+        return calls
+
+    def test_a_close_whose_fill_never_resolves_does_not_cancel_the_stops(self, stack):
+        """The docstring promises the stops come off AFTER the close is
+        confirmed. An accepted close whose fill never resolved (timeout, or an
+        order that ended Rejected/Cancelled) may not have reduced the position;
+        cancelling its stops then left it open and unprotected."""
+        engine, client, risk, store, exchange = stack
+        engine.execute(buy_intent())
+        cancels = self._watch_cancel_all(client)
+        engine._await_fill = lambda symbol, link, timeout_s=10.0: None
+        close = engine.close_position(symbol="BTCUSDT", reason="manual")
+        assert cancels == [], "the protective orders were cancelled unconfirmed"
+        assert close.ok                        # booked, marked unconfirmed
+        events = store._query(
+            "SELECT * FROM decisions WHERE decision = ?",
+            ("CLOSE_UNCONFIRMED_STOPS_KEPT",))
+        assert events, "the kept stops were not journaled"
+
+    def test_a_confirmed_close_still_cancels_the_stops(self, stack):
+        engine, client, risk, store, exchange = stack
+        engine.execute(buy_intent())
+        cancels = self._watch_cancel_all(client)
+        close = engine.close_position(symbol="BTCUSDT", reason="manual")
+        assert close.ok and cancels == ["BTCUSDT"]
+
+
+class TestAnUnresolvedEntryBlocksAnotherEntry:
+    def test_a_second_entry_is_refused_while_the_first_is_unresolved(self, stack):
+        """An entry that was sent but never seen to fill may be a live position
+        the book does not know. A 60s cooldown expiring must not let a second
+        entry stack on it."""
+        engine, client, risk, store, exchange = stack
+        engine._await_fill = lambda symbol, link, timeout_s=10.0: None
+        first = engine.execute(buy_intent())
+        assert first.reason == "FILL_UNCONFIRMED"
+        sent = len([r for r in exchange.requests if "order/create" in r["url"]])
+        store._exec("DELETE FROM symbol_cooldown")             # the 60s ran out
+        second = engine.execute(buy_intent())
+        assert second.ok is False
+        assert second.reason == "ENTRY_ORDER_UNRESOLVED"
+        assert len([r for r in exchange.requests
+                    if "order/create" in r["url"]]) == sent
+
+
+def test_the_position_row_names_its_take_profit_orders(stack):
+    """Spot exits are observed from the protective orders, so the row must
+    carry the ids of the legs the entry placed."""
+    import json
+    engine, client, risk, store, exchange = stack
+    report = engine.execute(buy_intent())
+    assert report.ok
+    meta = json.loads(store.open_positions()[0]["meta"])
+    assert list(meta["tp_order_ids"]) == list(report.take_profit_ids)
+    assert meta["tp_order_ids"], "no take-profit legs were placed to name"
+
+
+def test_take_profit_legs_that_do_not_cover_the_position_keep_their_fractions(stack):
+    """Legs summing to 0.7 must be 0.5Q and 0.2Q; the last leg takes the
+    residual only when the legs are meant to cover the whole position."""
+    engine, client, risk, store, exchange = stack
+    placed = []
+    real = client.place_take_profit
+
+    def spy(**kw):
+        placed.append(float(kw["qty"]))
+        return real(**kw)
+    client.place_take_profit = spy
+    report = engine.execute(buy_intent(
+        take_profits=((ENTRY * 1.04, 0.5), (ENTRY * 1.06, 0.2))))
+    assert report.ok, report.reason
+    assert len(placed) == 2
+    assert placed[1] / placed[0] == pytest.approx(0.4, rel=0.05)
+
+
+class TestAStopThatTriggeredWhileTheProcessWasDown:
+    """Restart reconciliation of a spot protective stop, no venue contact."""
+
+    def _restart(self, stack):
+        engine, client, risk, store, exchange = stack
+        path = store.path          # the old process is simply gone: reopen
+        cfg = LiveCfg()
+        store2 = StateStore(path)
+        store2.claim_writer()
+        client2 = bc.BybitClient(config=cfg, store=store2, transport=exchange)
+        risk2 = BillionaireRiskManager(config=cfg, store=store2)
+        engine2 = te.TradingEngine(
+            client=client2, risk_manager=risk2,
+            position_sizer=BillionairePositionSizing(config=cfg, risk_manager=risk2),
+            store=store2, config=cfg)
+        return engine2, client2, store2
+
+    def _meta(self, store):
+        import json as _j
+        row = store.open_positions()[0]
+        m = row["meta"]
+        return row, (_j.loads(m) if isinstance(m, str) else m)
+
+    def test_a_full_stop_fill_is_booked_once_after_the_restart(self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row, meta = self._meta(store)
+        qty = float(row["qty"])
+        stop = meta["stop_order_link_id"]
+        exchange.orders[stop].update(orderStatus="Filled", cumExecQty=str(qty),
+                                     avgPrice=str(ENTRY * 0.98))
+        engine2, client2, store2 = self._restart(stack)
+        engine2.observe_exits()
+        engine2.observe_exits()                       # replay: still once
+        assert store2.open_positions() == []
+        trades = store2.recent_trades()
+        assert len(trades) == 1
+        assert trades[0]["exit_price"] == pytest.approx(ENTRY * 0.98)
+        assert trades[0]["gross_pnl"] < 0
+        for tp in meta["tp_order_ids"]:               # the OCO half
+            assert exchange.orders[tp]["orderStatus"] == "Cancelled"
+
+    def test_a_partial_stop_fill_then_a_restart_books_the_part_and_keeps_the_rest(
+            self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row, meta = self._meta(store)
+        qty = float(row["qty"])
+        stop = meta["stop_order_link_id"]
+        part = qty / 4
+        exchange.orders[stop].update(orderStatus="PartiallyFilledCanceled",
+                                     cumExecQty=str(part),
+                                     avgPrice=str(ENTRY * 0.98))
+        engine2, client2, store2 = self._restart(stack)
+        engine2.observe_exits()
+        rows = store2.open_positions()
+        assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(qty - part)
+        assert len(store2.recent_trades()) == 1
+        engine2.observe_exits()
+        assert len(store2.recent_trades()) == 1       # not booked twice

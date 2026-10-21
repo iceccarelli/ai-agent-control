@@ -475,6 +475,8 @@ class BillionaireRiskManager:
             # Cooldown elapsed: clear it and continue. This is the one automatic
             # reset in the module, and it is a *breaker*, not the kill switch.
             self.store.clear_breaker()
+            if "consecutive losing" in str(breaker.reason):
+                self.store.reset_loss_streak()
         return _allow("BREAKER_CLEAR")
 
     def _gate_symbol_cooldown(self, symbol: str) -> RiskDecision:
@@ -520,6 +522,8 @@ class BillionaireRiskManager:
         except Exception as exc:  # noqa: BLE001
             return _block("LOSS_STREAK_UNREADABLE", error=str(exc))
         if n >= self.max_consecutive_losses:
+            if not self.store.get_breaker().active:
+                self.store.mark_loss_streak_trip()
             self.store.trip_breaker(
                 f"{n} consecutive losing trades", self.breaker_cooldown_seconds
             )
@@ -530,6 +534,13 @@ class BillionaireRiskManager:
     def _gate_position_count(self) -> RiskDecision:
         try:
             n = self.store.open_position_count()
+            # An entry that was sent and never seen to fill may be a live
+            # position the book has no row for yet; it counts against the cap
+            # until it is resolved.
+            held = {str(p.get("symbol")) for p in self.store.open_positions()}
+            n += len({str(o.get("symbol")) for o in self.store.unresolved_orders()
+                      if str(o.get("purpose")) == "entry"
+                      and str(o.get("symbol")) not in held})
         except Exception as exc:  # noqa: BLE001
             return _block("POSITION_COUNT_UNREADABLE", error=str(exc))
         if n >= self.max_open_positions:
@@ -561,6 +572,27 @@ class BillionaireRiskManager:
         if symbol in open_symbols:
             return _block("POSITION_ALREADY_OPEN", symbol=symbol)
         return _allow("NO_EXISTING_POSITION")
+
+    def _gate_unresolved_entry(self, symbol: str) -> RiskDecision:
+        """No new entry while an earlier entry for the symbol is unresolved.
+
+        An entry whose submit outcome is unknown (timeout, unparseable reply)
+        or that was never seen to fill may be a live position the position
+        book knows nothing about. A second entry would stack on it, with the
+        first lot unprotected. The block lasts until the order is resolved
+        (a terminal status from the venue, or startup reconciliation) -- not
+        for a fixed cooldown, which would expire with the question open.
+        """
+        try:
+            rows = self.store.unresolved_orders()
+        except Exception as exc:  # noqa: BLE001
+            return _block("ORDER_STATE_UNREADABLE", error=str(exc))
+        for r in rows:
+            if (str(r.get("symbol")) == symbol
+                    and str(r.get("purpose")) == "entry"):
+                return _block("ENTRY_ORDER_UNRESOLVED", symbol=symbol,
+                              order_link_id=str(r.get("order_link_id")))
+        return _allow("NO_UNRESOLVED_ENTRY")
 
     def _gate_naked_positions(self) -> RiskDecision:
         """No new trade while any existing position lacks a protective stop.
@@ -623,6 +655,26 @@ class BillionaireRiskManager:
             )
         return _allow("POSITION_SIZE_OK", notional_fraction=frac)
 
+    def _unresolved_entry_exposure(self, positions: List[Dict[str, Any]]
+                                   ) -> Optional[List[Dict[str, Any]]]:
+        """Entries sent but not seen to fill, valued like positions.
+
+        They may be live exposure the book has no row for, so the exposure
+        and correlation caps must count them. Returns None when one cannot be
+        valued (a market order records no price): the caller blocks.
+        """
+        held = {str(p.get("symbol")) for p in positions}
+        pending: List[Dict[str, Any]] = []
+        for o in self.store.unresolved_orders():
+            if str(o.get("purpose")) != "entry" or str(o.get("symbol")) in held:
+                continue
+            price = float(o.get("price") or 0.0)
+            if not (math.isfinite(price) and price > 0.0):
+                return None
+            pending.append({"symbol": o.get("symbol"), "qty": o.get("qty"),
+                            "entry_price": price, "side": o.get("side")})
+        return pending
+
     def _gate_aggregate_exposure(
         self, *, qty: float, entry_price: float, equity: float
     ) -> RiskDecision:
@@ -630,8 +682,12 @@ class BillionaireRiskManager:
             return _block("EQUITY_UNKNOWN", equity=equity)
         try:
             positions = self.store.open_positions()
+            pending = self._unresolved_entry_exposure(positions)
         except Exception as exc:  # noqa: BLE001
             return _block("EXPOSURE_UNREADABLE", error=str(exc))
+        if pending is None:
+            return _block("EXPOSURE_UNRESOLVED_ENTRY")
+        positions = list(positions) + pending
         current = sum(
             abs(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)))
             for p in positions
@@ -650,8 +706,12 @@ class BillionaireRiskManager:
             return _block("EQUITY_UNKNOWN", equity=equity)
         try:
             positions = self.store.open_positions()
+            pending = self._unresolved_entry_exposure(positions)
         except Exception as exc:  # noqa: BLE001
             return _block("CORRELATION_UNREADABLE", error=str(exc))
+        if pending is None:
+            return _block("EXPOSURE_UNRESOLVED_ENTRY")
+        positions = list(positions) + pending
         bucket = self.correlation.bucket_of(symbol)
         by_bucket = self.correlation.exposure_by_bucket(positions)
         proposed = by_bucket.get(bucket, 0.0) + abs(float(qty) * float(entry_price))
@@ -769,6 +829,10 @@ class BillionaireRiskManager:
             return _block("QUOTE_UNPARSEABLE", error=str(exc))
         if bid <= 0.0 or ask <= 0.0 or ask < bid:
             return _block("QUOTE_INVALID", bid=bid, ask=ask)
+        if quote.get("degraded"):
+            # Built from the last price because the ticker had no level-1
+            # quote: the spread is unknown, not zero.
+            return _block("QUOTE_DEGRADED", bid=bid, ask=ask)
         mid = (bid + ask) / 2.0
         spread_bps = (ask - bid) / mid * 10_000.0
         if spread_bps > self.max_spread_bps:
@@ -844,6 +908,14 @@ class BillionaireRiskManager:
         """
         if book is None:
             return _allow("NO_BOOK_SUPPLIED")
+        if book.get("unavailable") is True:
+            # The feed exists and could not be read. With a depth or imbalance
+            # limit configured that is a limit nobody can check: refuse.
+            if self.min_book_depth_usd > 0.0 or self.max_book_imbalance < 1.0:
+                return _block("BOOK_UNAVAILABLE",
+                              min_depth_usd=self.min_book_depth_usd,
+                              max_imbalance=self.max_book_imbalance)
+            return _allow("NO_BOOK_LIMITS_ACTIVE")
         try:
             # We exit on the opposite side we enter, so the depth that matters
             # for a long is the BID: that is who buys when the stop fires.
@@ -906,7 +978,8 @@ class BillionaireRiskManager:
         """
         if stop_price is None or not math.isfinite(float(stop_price)) or stop_price <= 0.0:
             return _block("NO_STOP_LOSS", stop=stop_price)
-        if entry_price <= 0.0:
+        if entry_price is None or not math.isfinite(float(entry_price)) \
+                or entry_price <= 0.0:
             return _block("NO_ENTRY_PRICE", entry=entry_price)
         direction = normalize_side(side)
         if direction is None:
@@ -931,14 +1004,18 @@ class BillionaireRiskManager:
         Audit C7: the legacy path overwrote a failing RR with the minimum and
         proceeded. That is fabricated data in the most direct sense.
         """
-        if take_profit_price is None or float(take_profit_price) <= 0.0:
+        if (take_profit_price is None or not math.isfinite(float(take_profit_price))
+                or float(take_profit_price) <= 0.0):
             return _block("NO_TAKE_PROFIT")
         risk = abs(float(entry_price) - float(stop_price))
         reward = abs(float(take_profit_price) - float(entry_price))
-        if risk <= 0.0:
+        if not (math.isfinite(risk) and math.isfinite(reward)) or risk <= 0.0:
             return _block("ZERO_RISK_DISTANCE")
         rr = reward / risk
-        if rr < self.min_risk_reward_ratio:
+        # The strategy builds its ladder to meet the minimum EXACTLY; in floats
+        # that lands a hair under (1.9999999999999825). A relative 1e-9 absorbs
+        # rounding, not a real shortfall.
+        if rr < self.min_risk_reward_ratio * (1.0 - 1e-9):
             return _block("RISK_REWARD_TOO_LOW", rr=rr,
                           minimum=self.min_risk_reward_ratio)
         return _allow("RISK_REWARD_OK", rr=rr)
@@ -1001,6 +1078,7 @@ class BillionaireRiskManager:
                 self._gate_drawdown(account_equity),
                 self._gate_naked_positions(),
                 self._gate_existing_position(symbol),
+                self._gate_unresolved_entry(symbol),
                 self._gate_position_count(),
             )
             for decision in account_gates:
@@ -1047,7 +1125,9 @@ class BillionaireRiskManager:
                     self._journal(symbol, "BLOCK", spread_gate)
                     return spread_gate
 
-            if data_age_seconds is not None:
+            # A quote with no age is not a fresh quote: the gate blocks it
+            # (DATA_AGE_UNKNOWN) rather than being skipped.
+            if data_age_seconds is not None or quote is not None:
                 freshness_gate = self._gate_data_freshness(data_age_seconds)
                 if not freshness_gate.ok:
                     self._journal(symbol, "BLOCK", freshness_gate)

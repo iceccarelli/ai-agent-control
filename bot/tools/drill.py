@@ -462,6 +462,28 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                 else:
                     d.still_open = True
                     check.failed(why, verdict=verdict, **evidence)
+                    # A stage failed BEFORE the planned unwind (the pair would not
+                    # reconcile, the engine raised after sending): the hedge the
+                    # engine can close is still open. Try the engine's own
+                    # reduce-only unwind once, then say what the venue holds.
+                    if (name in ("open", "pair") and engine.position is not None
+                            and state.get("perp") is not None):
+                        abort = d.stage("abort_unwind")
+                        try:
+                            decision = engine._unwind(state["perp"], "DRILL_ABORT")
+                            d.orders_sent = len(journal.entries)
+                            verdict2, evidence2, why2 = venue_flatness(
+                                broker,
+                                inventory_before=state.get("inventory_before"))
+                            if verdict2 == "FLAT":
+                                d.still_open = False
+                                abort.passed(action=decision.action,
+                                             verdict=verdict2, **evidence2)
+                            else:
+                                abort.failed(why2, action=decision.action,
+                                             verdict=verdict2, **evidence2)
+                        except Exception as exc:  # noqa: BLE001
+                            abort.failed(f"{type(exc).__name__}: {exc}")
             return _report(d, state, out, cap, verdict="FAILED")
 
     return _report(d, state, out, cap, verdict="PASSED")
@@ -571,6 +593,31 @@ def _load_bot():
     return _main.build_bot(store=store)
 
 
+def book_kill_switch(db_path: str) -> "tuple[bool, str]":
+    """Is the RUNNING book's persisted kill switch engaged? Read-only.
+
+    The drill's own engine uses a scratch database, so without this an engaged
+    switch on the real book would not stop an armed drill. A missing database
+    is "no book state"; one that exists and cannot be read is treated as
+    engaged: arming on an unreadable safety control is the wrong default.
+    """
+    import sqlite3
+    if not db_path or not os.path.isfile(db_path):
+        return False, "no state db"
+    try:
+        con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = con.execute(
+                "SELECT engaged, reason FROM kill_switch LIMIT 1").fetchone()
+        finally:
+            con.close()
+    except Exception as exc:  # noqa: BLE001
+        return True, f"unreadable ({exc})"
+    if not row:
+        return False, "no row"
+    return bool(row[0]), str(row[1] or "")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -608,6 +655,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             "    . ../.venv/bin/activate && python3 tools/drill.py\n",
             file=sys.stderr)
         return 2
+
+    if args.arm:
+        engaged, why = book_kill_switch(
+            str(getattr(getattr(bot, "cfg", None), "STATE_DB_PATH", "") or ""))
+        if engaged:
+            print(f"REFUSED: the running book's kill switch is engaged "
+                  f"({why}). The drill runs on a scratch database and would "
+                  "not see it; a human clears the switch before anything is "
+                  "armed.", file=sys.stderr)
+            return 2
 
     report = run_drill(broker=bot.carry.broker, notional=args.notional,
                        arm=args.arm, out=args.out,

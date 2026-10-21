@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from unittest import mock
 
 
@@ -18,9 +19,10 @@ sys.path.insert(0, HERE)
 from bybit_connection import BybitAPIError, TransientAPIError  # noqa: E402
 import pytest  # noqa: E402
 from carry_engine import BookState  # noqa: E402
-from persistence import StateStore  # noqa: E402
+from persistence import PersistenceError, StateStore  # noqa: E402
 from test_carry_fee_truth import build, modern  # noqa: E402
 from test_carry_funding_truth import make_bot, tick  # noqa: E402
+import main as _main  # noqa: E402
 
 
 def _hedged(tmp_path):
@@ -52,6 +54,22 @@ class TestHeldPairIsMonitoredThroughBrakes:
     def test_an_unreadable_equity_does_not_skip_the_margin_exit(self, tmp_path):
         venue, journal, engine, bot = _hedged(tmp_path)
         bot.client.get_equity.side_effect = BybitAPIError("down")
+        venue.im, venue.mm = 1.1, 1.0
+        tick(bot, 4)
+        assert engine.position is None
+
+    @pytest.mark.parametrize("fail", ["store", "wallet"])
+    def test_an_equity_step_that_is_not_an_api_error_does_not_skip_the_exit(
+            self, tmp_path, fail):
+        """The equity step writes the store and parses the wallet: a full disk
+        (PersistenceError) or a malformed field (ValueError) escaped tick()
+        before the carry block and left the held short unmonitored."""
+        venue, journal, engine, bot = _hedged(tmp_path)
+        if fail == "store":
+            bot.risk.update_equity.side_effect = PersistenceError(
+                "state write failed: disk full")
+        else:
+            bot.client.get_equity.side_effect = ValueError("not a float")
         venue.im, venue.mm = 1.1, 1.0
         tick(bot, 4)
         assert engine.position is None
@@ -93,6 +111,42 @@ class TestAnEscapedExceptionMidTransactionHalts:
         engine.on_candle = boom
         tick(bot, 1)
         assert engine.state is BookState.FLAT
+
+
+class TestAHeldBookThatCannotBeManagedHalts:
+    def test_a_repeating_engine_exception_while_held_halts_the_book(self, tmp_path):
+        """Swallowing the exception forever left a held short unmanaged with no
+        halt, no page and a stale status line."""
+        from main import CARRY_MAX_CONSECUTIVE_HELD_ERRORS as LIMIT
+        venue, journal, engine, bot = _hedged(tmp_path)
+
+        def boom(*a, **k):
+            raise ValueError("a defect that repeats")
+
+        engine.on_candle = boom
+        for k in range(1, LIMIT):
+            tick(bot, 3 + k)
+            assert engine.state is BookState.HEDGED
+        tick(bot, 3 + LIMIT)
+        assert engine.state is BookState.HALTED
+        assert engine.position is not None
+
+    def test_a_successful_tick_resets_the_count(self, tmp_path):
+        from main import CARRY_MAX_CONSECUTIVE_HELD_ERRORS as LIMIT
+        venue, journal, engine, bot = _hedged(tmp_path)
+        real = engine.on_candle
+        calls = {"n": 0}
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] % LIMIT != 0:
+                raise ValueError("intermittent")
+            return real(*a, **k)
+
+        engine.on_candle = flaky
+        for k in range(1, 3 * LIMIT + 1):
+            tick(bot, 3 + k)
+        assert engine.state is BookState.HEDGED
 
 
 class TestTheVenueIsTheSourceOfTruthForTheShort:
@@ -141,6 +195,16 @@ class TestAJournalThatCannotBeWrittenBlocksNewExposure:
         tick(bot, 2)
         assert engine.state is BookState.HALTED
         assert len(venue.created) == before
+
+    def test_one_transient_store_error_does_not_halt_a_flat_book(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.store.save_ledger = mock.Mock(
+            side_effect=[OSError("busy"), None, None, None, None])
+        tick(bot, 1)
+        assert bot._journal_unsaved is True
+        tick(bot, 2)
+        assert bot._journal_unsaved is False
+        assert engine.state is not BookState.HALTED
 
     def test_a_held_pair_keeps_being_monitored_when_the_journal_fails(
             self, tmp_path):
@@ -458,3 +522,215 @@ class TestAnEmptyFundingAnswerSupportsZeroOnlyWhereItCanBeProven:
         acct = bot.carry_status()["accounting"]
         _assert_contract(acct)
         assert acct["net_basis"] == "confirmed" and acct["funding_usd"] == 0
+
+
+class TestAResumedPairNeedsItsJournal:
+    def test_a_resumed_pair_with_no_journal_in_the_store_refuses_to_start(
+            self, tmp_path):
+        """`_persist_carry` writes the journal BEFORE the position, so a held
+        pair with an empty journal is lost data: its funding would never be
+        booked and nothing would say so."""
+        t = TestRestartWithAnOpenPositionThroughTheRealStartupPath()
+        t._first_process(tmp_path)
+        store = StateStore(str(tmp_path / "carry.db"))
+        store.save_ledger([])                     # the journal is lost
+        store.close()
+        _venue2, engine2, bot2 = t._second_process(tmp_path)
+        assert bot2.carry_cold_start() is False
+        assert engine2.state is BookState.HALTED
+
+
+def _tick_seeing_the_venue(bot, venue, k):
+    """`tick` from test_carry_funding_truth builds its snapshot by hand (no
+    position size); this one carries the size the venue reports, as the real
+    `take_snapshot` does."""
+    import time as _t
+    from unittest import mock as _mock
+
+    from market_snapshot import MarketSnapshot
+    from test_carry_funding_truth import MARK
+    view = MarketSnapshot(
+        perp_mark=MARK, spot_mark=MARK, funding_bps=3.0, margin_multiple=5.0,
+        observed_at_s=_t.time(), funding_print_bps=3.0,
+        funding_print_ms=int(_t.time() * 1000) - 3_600_000 + k,
+        perp_held=venue.perp_qty)
+    bot._last_funding_poll_ms = 0
+    with _mock.patch("market_snapshot.take_snapshot", return_value=view):
+        bot.tick()
+
+
+class TestAFlatBookRefusesToOpenOverAnUnrecordedShort:
+    def test_a_short_the_book_never_recorded_halts_before_any_order(self, tmp_path):
+        """FLAT is the book's belief. A manual or missed short is invisible to
+        every held-position check; opening on top of it runs the account above
+        the cap with nothing watching until the next tick's size check."""
+        venue, journal, engine, bot = _flat(tmp_path)
+        venue.perp_qty = 0.001                 # a short the book never recorded
+        before = len(venue.created)
+        _tick_seeing_the_venue(bot, venue, 1)
+        assert engine.state is BookState.HALTED
+        assert bot._last_carry_decision["reason"] == "ORPHAN_VENUE_POSITION"
+        for k in (2, 3, 4):
+            _tick_seeing_the_venue(bot, venue, k)
+        assert len(venue.created) == before, "a leg was sent over the orphan"
+
+    def test_a_genuinely_flat_venue_still_opens(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        venue.perp_qty = 0.0
+        for k in (1, 2, 3):
+            _tick_seeing_the_venue(bot, venue, k)
+        assert engine.state is BookState.HEDGED
+
+
+class TestColdStartDoesNotTrustASingleVenueRead:
+    def test_two_reads_that_disagree_refuse_to_start(self, tmp_path):
+        """A FLAT ledger and a position list that lags: the first read says
+        flat (CLEAN), the venue really holds a short. One read would start the
+        book, and it would open a second hedge over that short."""
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.store.save_carry_position(engine.to_state())     # FLAT, persisted
+        bot.CARRY_COLD_START_REREAD_S = 0
+        reads = iter([0.0, 0.5])                  # flat, then the real short
+        bot.carry.broker.get_perp_position = lambda symbol: next(reads)
+        bot.carry.broker.get_spot_inventory = lambda symbol: 0.0
+        assert bot.carry_cold_start() is False
+
+    def test_a_flat_ledger_and_two_flat_reads_still_start(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.store.save_carry_position(engine.to_state())
+        bot.CARRY_COLD_START_REREAD_S = 0
+        bot.carry.broker.get_perp_position = lambda symbol: 0.0
+        bot.carry.broker.get_spot_inventory = lambda symbol: 0.0
+        assert bot.carry_cold_start() is True
+
+    def test_two_agreeing_reads_still_resume(self, tmp_path):
+        t = TestRestartWithAnOpenPositionThroughTheRealStartupPath()
+        t._first_process(tmp_path)
+        venue2, engine2, bot2 = t._second_process(tmp_path)
+        bot2.CARRY_COLD_START_REREAD_S = 0
+        assert bot2.carry_cold_start() is True
+        assert engine2.position is not None
+
+
+class TestAnOrphanReadIsConfirmedBeforeItTripsTheKillSwitch:
+    def test_one_stale_list_read_after_a_clean_exit_does_not_halt(self, tmp_path):
+        """The position list can still show a hedge the engine closed a moment
+        ago. One such read halted a FLAT book and tripped the global kill switch
+        (98% of overlay inventory exits under a single stale read)."""
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.CARRY_ORPHAN_REREAD_S = 0
+        venue.perp_qty = 0.001                   # the snapshot's read is stale
+        bot.carry.broker.get_perp_position = lambda symbol: 0.0   # the truth
+        _tick_seeing_the_venue(bot, venue, 1)
+        assert engine.state is not BookState.HALTED
+
+    def test_two_reads_that_both_show_a_short_still_halt(self, tmp_path):
+        venue, journal, engine, bot = _flat(tmp_path)
+        bot.CARRY_ORPHAN_REREAD_S = 0
+        venue.perp_qty = 0.001
+        bot.carry.broker.get_perp_position = lambda symbol: 0.001
+        _tick_seeing_the_venue(bot, venue, 1)
+        assert engine.state is BookState.HALTED
+        assert bot._last_carry_decision["reason"] == "ORPHAN_VENUE_POSITION"
+
+
+def test_a_spot_balance_that_accrues_between_the_cold_start_reads_still_starts(
+        tmp_path):
+    venue, journal, engine, bot = _flat(tmp_path)
+    bot.store.save_carry_position(engine.to_state())
+    bot.CARRY_COLD_START_REREAD_S = 0
+    bot.carry.broker.get_perp_position = lambda symbol: 0.0
+    balances = iter([1.0, 1.0 + 1e-9 * 5])      # interest-sized drift
+    bot.carry.broker.get_spot_inventory = lambda symbol: next(balances)
+    assert bot.carry_cold_start() is True
+
+
+def test_an_orphan_that_the_confirming_read_could_not_confirm_does_not_halt(tmp_path):
+    """A stale first reading followed by a failing second read halted a book
+    that was really flat (31 cases in the fault campaign). Unconfirmed is not an
+    orphan: the check is skipped this tick and made again on the next."""
+    venue, journal, engine, bot = _flat(tmp_path)
+    bot.CARRY_ORPHAN_REREAD_S = 0
+    venue.perp_qty = 0.001                       # the snapshot's stale read
+
+    def timeout(symbol):
+        raise TimeoutError("position read timed out")
+    bot.carry.broker.get_perp_position = timeout
+    orders_before = len(getattr(venue, "created", []))
+    _tick_seeing_the_venue(bot, venue, 1)
+    assert engine.state is not BookState.HALTED
+    # ... and it must not have TRADED on that tick either: skipping the check
+    # while still opening would stack a second hedge on a short never recorded.
+    assert len(getattr(venue, "created", [])) == orders_before
+    assert bot._last_carry_decision["reason"] == "ORPHAN_UNCONFIRMED"
+
+
+def test_cold_start_logs_the_leverage_the_venue_reports_and_sets_nothing(
+        tmp_path, caplog):
+    import logging as _logging
+    venue, journal, engine, bot = _flat(tmp_path)
+    bot.store.save_carry_position(engine.to_state())
+    bot.CARRY_COLD_START_REREAD_S = 0
+    bot.carry.broker.get_perp_position = lambda symbol: 0.0
+    bot.carry.broker.get_spot_inventory = lambda symbol: 0.0
+    bot.carry.broker.get_position_leverage = lambda symbol: 7.0
+    with caplog.at_level(_logging.WARNING, logger="main"):
+        assert bot.carry_cold_start() is True
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "7x leverage" in text and "neither set nor gates" in text
+    assert not [c for c in venue.calls if "set-leverage" in c[1]]
+
+
+class TestAcquireBorrowIsBooked:
+    def _bot(self, mode, apr):
+        import types
+        import ledger as L
+        leg = types.SimpleNamespace(filled_qty=0.01, avg_price=100_000.0)
+        pos = types.SimpleNamespace(spot=leg, opened_ms=0)
+        carry = types.SimpleNamespace(execution_mode=mode, borrow_apr=apr,
+                                      position=pos)
+        bot = _main.TradingBot.__new__(_main.TradingBot)
+        bot.carry = carry
+        return bot, carry, L.Journal()
+
+    def test_a_held_acquire_pair_accrues_borrow_in_the_journal(self):
+        bot, carry, journal = self._bot("acquire", 0.10)
+        now = int(time.time() * 1000)
+        bot._borrow_since_ms = now - 24 * 3_600_000      # held a day
+        carry.position.opened_ms = now - 25 * 3_600_000
+        bot._borrow_notional_usd = 1_000.0
+        bot._accrue_carry_borrow(journal, 100_000.0)
+        usd = journal.statement()["borrow_usd"]
+        assert usd == pytest.approx(1_000.0 * 0.10 / 365.0, rel=0.02)
+
+    def test_the_overlay_books_no_borrow(self):
+        bot, carry, journal = self._bot("overlay", 0.10)
+        bot._borrow_since_ms = int(time.time() * 1000) - 86_400_000
+        bot._borrow_notional_usd = 1_000.0
+        bot._accrue_carry_borrow(journal, 100_000.0)
+        assert journal.statement()["borrow_usd"] == 0.0
+
+    def test_the_closing_tick_posts_the_rest_and_stops(self):
+        bot, carry, journal = self._bot("acquire", 0.10)
+        carry.position = None
+        bot._borrow_since_ms = int(time.time() * 1000) - 3_600_000 // 2
+        bot._borrow_notional_usd = 1_000.0
+        bot._accrue_carry_borrow(journal, 100_000.0)
+        assert journal.statement()["borrow_usd"] > 0.0
+        assert bot._borrow_since_ms is None
+
+
+class TestBorrowAccrualSurvivesARestart:
+    def test_a_restart_does_not_book_the_same_hours_twice(self):
+        import types
+        import ledger as L
+        bot, carry, journal = TestAcquireBorrowIsBooked()._bot("acquire", 0.10)
+        now = int(time.time() * 1000)
+        carry.position.opened_ms = now - 5 * 3_600_000
+        # five hours already journaled before the "restart"
+        L.borrow(journal, ms=now - 60_000, ref="borrow:earlier", usd=1.0)
+        bot._borrow_since_ms = None                    # fresh process
+        bot._accrue_carry_borrow(journal, 100_000.0)   # resume tick: no post
+        assert len(journal.entries) == 1
+        bot._accrue_carry_borrow(journal, 100_000.0)   # next tick, <1h later
+        assert len(journal.entries) == 1, "the journaled hours were booked again"

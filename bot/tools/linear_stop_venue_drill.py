@@ -274,6 +274,10 @@ def run_drill(*, client: Any, notional: Optional[float] = None,
     def open_position(s: Stage) -> None:
         filters = state["filters"]
         qty = max(float(filters.min_qty), d.notional / state["mark"])
+        # From the moment an order may have left this process the position is
+        # treated as open until the venue says otherwise (cleared on a verified
+        # flat below): a timeout or exception here is not "nothing happened".
+        d.still_open = True
         result = client.place_order(
             symbol=SYMBOL, side="Buy", qty=qty, order_type="Market",
             purpose="linear_stop_drill", filters=filters)
@@ -352,6 +356,7 @@ def run_drill(*, client: Any, notional: Optional[float] = None,
             return
         live, detail = client.verify_stop(
             symbol=SYMBOL, order_link_id=state.get("stop_order_link_id", ""))
+        d.still_open = False
         s.passed(venue_perp_qty=size, verdict="FLAT",
                  stop_still_live=live, stop_detail=detail)
 
@@ -359,9 +364,38 @@ def run_drill(*, client: Any, notional: Optional[float] = None,
                      ("verify", verify), ("position_evidence", position_evidence),
                      ("flatten", flatten), ("final_reconcile", final_reconcile)):
         if not d.run_stage(name, fn):
+            if name not in ("flatten", "final_reconcile") and d.still_open:
+                _abort_flatten(d, client, state)
             return _report(d, state, out, cap, verdict="FAILED")
 
     return _report(d, state, out, cap, verdict="PASSED")
+
+
+def _abort_flatten(d: "Drill", client: Any, state: Dict[str, Any]) -> None:
+    """A stage failed after the open leg may have filled: close what the VENUE
+    holds (reduce-only) and read it back, instead of reporting 'nothing is
+    proven' over a possibly naked position. Leaves ``still_open`` set unless
+    the venue is read flat."""
+    abort = d.stage("abort_flatten")
+    try:
+        row = client.get_position(SYMBOL)
+        size = abs(float((row or {}).get("size", 0) or 0))
+        if size > 1e-9:
+            result = client.place_order(
+                symbol=SYMBOL, side="Sell", qty=size, order_type="Market",
+                purpose="linear_stop_drill_abort", reduce_only=True,
+                filters=state.get("filters"))
+            d.orders_sent += 1
+            row = client.get_position(SYMBOL)
+            size_after = abs(float((row or {}).get("size", 0) or 0))
+            if not result.ok or size_after > 1e-9:
+                abort.failed(f"abort flatten left {size_after} open "
+                             f"({result.reason})", venue_perp_qty=size_after)
+                return
+        d.still_open = False
+        abort.passed(venue_perp_qty_before=size)
+    except Exception as exc:  # noqa: BLE001
+        abort.failed(f"{type(exc).__name__}: {exc}")
 
 
 def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,

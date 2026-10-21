@@ -506,16 +506,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             symbol=args.symbol)
     except Exception as exc:  # noqa: BLE001
         logger.exception("run_session raised")
-        # Best-effort flatten if a position somehow opened.
+        # Best-effort flatten if a position somehow opened. What is claimed
+        # below is only what is known: the exception may have come after an
+        # order was sent, so submission is recorded as POSSIBLE, and the flatten
+        # as attempted only if it ran without raising.
+        flatten_attempted, flatten_error = False, ""
         try:
             flatten_position(engine, symbol=args.symbol, reason="session_error_flatten")
-        except Exception:  # noqa: BLE001
-            pass
+            flatten_attempted = True
+        except Exception as flatten_exc:  # noqa: BLE001
+            flatten_error = f"{type(flatten_exc).__name__}: {flatten_exc}"
         write_failure(
             args.failure_out,
             reason=f"run_session raised: {type(exc).__name__}: {exc}",
-            network_order_submitted=False, entry_fills=0,
-            flatten_attempted=True)
+            network_order_submitted=True, entry_fills=0,
+            flatten_attempted=flatten_attempted, flatten_error=flatten_error,
+            order_state="UNKNOWN_AFTER_EXCEPTION: the venue was not re-read; "
+                        "check the position and open orders by hand")
         return 1
     finally:
         try:

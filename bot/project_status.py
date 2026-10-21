@@ -547,7 +547,10 @@ def cleared_edge_signal_from_artifacts(
             m2_pct = float(m2.get("percentile"))
         except (TypeError, ValueError):
             continue
-        if m1_pct < float(m1_bar) or m2_pct < float(m2_bar):
+        # Written so that NaN fails: `nan < bar` is False, which would have
+        # passed a forged `"percentile": NaN`. A percentile is within [0, 100].
+        if not (float(m1_bar) <= m1_pct <= 100.0
+                and float(m2_bar) <= m2_pct <= 100.0):
             continue
         if not bool(m2.get("passed")):
             continue

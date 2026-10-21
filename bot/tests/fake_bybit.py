@@ -166,7 +166,8 @@ class FakeBybit:
         if path == "/v5/account/wallet-balance":
             return self._ok({"list": [{
                 "totalEquity": str(self.equity),
-                "coin": [{"coin": c, "availableToWithdraw": str(v),
+                "coin": [{"coin": c,
+                          "availableToWithdraw": str(self._free(c, v)),
                           "walletBalance": str(v)}
                          for c, v in self.balances.items()],
             }]})
@@ -255,7 +256,29 @@ class FakeBybit:
         ).hexdigest()
         return hmac.compare_digest(expected, headers.get("X-BAPI-SIGN", ""))
 
+    #: Opt in: resting spot LIMIT SELLs reserve the coin they offer, so it is
+    #: not free for anything else (a market sell, a triggered stop), as on the
+    #: real venue's unified account.
+    reserve_limit_sells = False
+
+    def _free(self, coin: str, total: float) -> float:
+        if not self.reserve_limit_sells:
+            return total
+        reserved = 0.0
+        for o in self.orders.values():
+            if (o.get("orderType") == "Limit" and o.get("side") == "Sell"
+                    and o.get("orderStatus") in ("New", "PartiallyFilled")
+                    and o["symbol"].startswith(coin)):
+                reserved += max(0.0, float(o["qty"]) - float(o.get("cumExecQty") or 0))
+        return max(0.0, total - reserved)
+
     def _create_order(self, body: Dict[str, Any]) -> Tuple[int, str]:
+        if (self.reserve_limit_sells and body.get("category") == "spot"
+                and body.get("side") == "Sell" and body.get("orderType") == "Market"
+                and body.get("orderFilter") != "StopOrder"):
+            coin = body["symbol"][:-4]
+            if self._free(coin, self.balances.get(coin, 0.0)) + 1e-12 < float(body["qty"]):
+                return self._err(170131, "Insufficient balance (reserved by open orders)")
         if self.reject_next_with is not None:
             code, msg = self.reject_next_with
             self.reject_next_with = None

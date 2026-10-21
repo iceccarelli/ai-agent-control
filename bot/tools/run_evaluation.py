@@ -216,6 +216,10 @@ def main(argv) -> int:
     for line in provenance:
         print(line)
     print()
+    if cfg.category == "linear":
+        print("funding           : constant "
+              f"{cfg.funding_rate_bps_per_8h} bps per 8h for every run below "
+              "(no real funding series is loaded by this tool)")
     print(f"category          : {cfg.category}"
           f"  (shorts {'ENABLED' if cfg.category == 'linear' else 'unavailable'})")
     print(f"operating point   : min_confidence={cfg.min_confidence}, "

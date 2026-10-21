@@ -451,3 +451,50 @@ class TestFlatnessIsVerifiedAgainstTheVenueNotTheBook:
         check = [s for s in report["stages"]
                  if s["stage"] == "venue_check_after_failure"]
         assert check and check[0]["evidence"]["verdict"] == "FLAT"
+
+
+class TestTheDrillHonoursTheBooksKillSwitch:
+    def _db(self, tmp_path, engaged):
+        from persistence import StateStore
+        path = str(tmp_path / "book.db")
+        store = StateStore(path)
+        if engaged:
+            store.trip_kill_switch("test halt")
+        store.close()
+        return path
+
+    def test_an_engaged_switch_is_seen(self, tmp_path):
+        import drill
+        engaged, why = drill.book_kill_switch(self._db(tmp_path, True))
+        assert engaged is True and "test halt" in why
+
+    def test_a_clear_switch_and_a_missing_db_do_not_block(self, tmp_path):
+        import drill
+        assert drill.book_kill_switch(self._db(tmp_path, False))[0] is False
+        assert drill.book_kill_switch(str(tmp_path / "none.db"))[0] is False
+        assert drill.book_kill_switch("")[0] is False
+
+    def test_an_unreadable_db_counts_as_engaged(self, tmp_path):
+        import drill
+        bad = tmp_path / "bad.db"
+        bad.write_bytes(b"not a sqlite file at all" * 10)
+        assert drill.book_kill_switch(str(bad))[0] is True
+
+
+class TestAFailureBeforeTheUnwindStillTriesToClose:
+    def test_a_pair_that_will_not_reconcile_gets_one_engine_unwind_attempt(self):
+        """The venue shows a size the book does not hold; the engine's own
+        reduce-only unwind is still tried once rather than left to a human."""
+        class Drifting(Venue):
+            """Flat at preflight; once the book has sold, the venue shows 0.5."""
+            def get_perp_position(self, symbol):
+                self._live()
+                return 0.5 if self.orders else 0.0
+        venue = Drifting()
+        report = run(venue)
+        assert report["failed_stage"] == "pair"
+        stages = [s["stage"] for s in report["stages"]]
+        assert "abort_unwind" in stages
+        closing = [o for o in venue.orders if o[0] == "Buy" and o[1] == "linear"]
+        assert closing, "no closing order was attempted after the failed pair"
+        assert report["still_open"] is True       # the venue still reads non-flat

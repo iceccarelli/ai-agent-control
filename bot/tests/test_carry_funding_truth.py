@@ -553,3 +553,17 @@ class TestTickFlagsAMissingSettlementAndBooksTheLateRow:
         st = journal.statement()
         assert st["funding_unread"] == 0 and st["funding_confirmed"] is True
         assert st["net_basis"] == "confirmed"
+
+
+def test_a_lifecycle_opened_just_after_a_settlement_is_not_flagged_as_missing_funding():
+    """Opened 10s after a print the book was flat before it and held after:
+    whether it held THROUGH it is the ownership-ambiguity question, not a
+    missing venue row. A permanent funding_missing flag would be false."""
+    import ledger as L
+    journal = L.Journal()
+    t0 = 1_600_000_000_000
+    L.perp_open(journal, ms=t0 + 10_000, ref="o1", qty=0.01, price=30000.0,
+                fee_usd=0.0, fee_status="confirmed", fee_raw={})
+    written = L.check_funding_completeness(journal, [t0], now_ms=t0 + 10 * 3_600_000)
+    assert written == 0
+    assert not [e for e in journal.entries if e.kind == "funding_missing"]

@@ -581,6 +581,11 @@ class TestRetryClassification:
         exchange.scripted = [(503, "unavailable"), (502, "bad gateway")]
         assert client.get_equity() == pytest.approx(10_000.0)
 
+    def test_gateway_timeouts_are_retried_not_permanent(self, client, exchange):
+        exchange.scripted = [(408, "timeout"), (522, "cf timeout"),
+                             (524, "cf timeout")]
+        assert client.get_equity() == pytest.approx(10_000.0)
+
     def test_unknown_outcome_is_not_resubmitted(self, client, exchange, store):
         """A timed-out submit must never be re-sent blind.
 
@@ -667,14 +672,27 @@ class TestReconciliation:
         assert summary["resolved"] == 1
         assert store.get_order("BB-entry-99-deadbeef")["status"] == "never_sent"
 
-    def test_a_live_order_is_marked_still_open(self, client, store, exchange):
+    def test_a_live_protective_order_is_marked_still_open(self, client, store, exchange):
+        result = client.place_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001,
+            order_type="Limit", price=90_000.0, purpose="tp",
+        )
+        store.update_order_status(result.order_link_id, "pending")
+        summary = client.reconcile_on_startup()
+        assert summary["still_open"] == 1
+
+    def test_a_live_entry_order_is_cancelled_not_left_resting(
+            self, client, store, exchange):
+        """Nobody is left to watch a resting entry after a restart; if it filled
+        later there would be a position with no stop and no ledger row."""
         result = client.place_order(
             symbol="BTCUSDT", side="Buy", qty=0.001,
             order_type="Limit", price=40_000.0,
         )
         store.update_order_status(result.order_link_id, "pending")
         summary = client.reconcile_on_startup()
-        assert summary["still_open"] == 1
+        assert summary["still_open"] == 0 and summary["resolved"] == 1
+        assert store.get_order(result.order_link_id)["status"] == "cancelled"
 
     def test_a_filled_order_is_resolved(self, client, store, exchange):
         result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
@@ -920,3 +938,281 @@ class TestStructure:
             and "``" not in ln
         ]
         assert offenders == []
+
+
+@pytest.mark.parametrize("body", ["<html>proxy</html>", "",
+                                  '{"retCode": 10000, "retMsg": "timeout"}'])
+def test_a_directional_order_whose_reply_is_unusable_stays_unresolved(
+        body, tmp_path, monkeypatch):
+    """The venue executed the order; the reply was a proxy body or a timeout.
+    Recording it 'rejected' took it out of the unresolved set that startup
+    reconciliation checks against the exchange."""
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    from fake_bybit import API_KEY, API_SECRET, FakeBybit
+    from persistence import StateStore
+
+    class Cfg:
+        USE_TESTNET = True
+        BYBIT_API_KEY = API_KEY
+        BYBIT_API_SECRET = API_SECRET
+        BYBIT_RECV_WINDOW_MS = 5000
+        REQUEST_TIMEOUT_SECONDS = 5.0
+        USE_LEVERAGE = False
+        SYMBOL_FILTERS_TTL = 3600
+        ORDERLINK_PREFIX = "BB"
+
+    exchange = FakeBybit()
+    store = StateStore(str(tmp_path / "s.db"))
+    store.claim_writer()
+    client = bc.BybitClient(config=Cfg(), store=store, transport=exchange)
+    real = exchange.request
+
+    def request(method, url, **kw):
+        out = real(method, url, **kw)          # the venue EXECUTES the order
+        return (200, body) if url.endswith("/v5/order/create") else out
+
+    exchange.request = request
+    result = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
+    assert result.reason == "OUTCOME_UNKNOWN"
+    assert store.get_order(result.order_link_id)["status"] == "unknown"
+
+
+@pytest.mark.parametrize("status,body", [(401, ""), (200, '{"result": {}}'),
+                                         (200, "<html>proxy</html>")])
+def test_startup_reconciliation_keeps_an_order_unknown_when_the_lookup_got_no_answer(
+        status, body, tmp_path, monkeypatch):
+    """`never_sent` means the venue ANSWERED and has no such order. A lookup
+    that got a proxy body, an auth failure or no retCode says nothing, so the
+    unknown order must stay unknown instead of being closed out."""
+    import time
+
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    from fake_bybit import API_KEY, API_SECRET, FakeBybit
+    from persistence import StateStore
+
+    class Cfg:
+        USE_TESTNET = True
+        BYBIT_API_KEY = API_KEY
+        BYBIT_API_SECRET = API_SECRET
+        BYBIT_RECV_WINDOW_MS = 5000
+        REQUEST_TIMEOUT_SECONDS = 5.0
+        USE_LEVERAGE = False
+        SYMBOL_FILTERS_TTL = 3600
+        ORDERLINK_PREFIX = "BB"
+
+    exchange = FakeBybit()
+    store = StateStore(str(tmp_path / "s.db"))
+    store.claim_writer()
+    client = bc.BybitClient(config=Cfg(), store=store, transport=exchange)
+    store.record_order("BB-x", "BTCUSDT", "Buy", "Market", 0.01)
+    store.update_order_status("BB-x", "unknown")
+    exchange.request = lambda method, url, **kw: (status, body)
+    summary = client.reconcile_on_startup()
+    assert store.get_order("BB-x")["status"] == "unknown"
+    assert summary["unknown"] == 1 and summary["resolved"] == 0
+
+
+class TestTakeProfitLegsCannotOpenTheOppositeSide:
+    def test_linear_take_profit_leg_is_reduce_only(self, exchange, store):
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+
+        linear_client = bc.BybitClient(
+            config=LinearCfg(), store=store, transport=exchange)
+        linear_client.place_take_profit(
+            symbol="BTCUSDT", side="Sell", qty=0.001, limit_price=70_000.0)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert body["reduceOnly"] is True
+        assert body["category"] == "linear"
+
+    def test_spot_take_profit_leg_has_no_reduce_only_field(self, client, exchange):
+        client.place_take_profit(
+            symbol="BTCUSDT", side="Sell", qty=0.001, limit_price=70_000.0)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert "reduceOnly" not in body
+
+
+class TestBookFeedAvailability:
+    def test_a_failed_book_read_is_reported_on_a_live_client(self, client, exchange):
+        exchange.fail_next = None
+        assert client.get_book_features("NOPEUSDT") is None
+        assert client.book_feed_unavailable("NOPEUSDT") is True
+
+    def test_a_replay_client_has_no_feed_to_be_unavailable(self, client):
+        client.book_feed_required = False
+        assert client.get_book_features("NOPEUSDT") is None
+        assert client.book_feed_unavailable("NOPEUSDT") is False
+
+    def test_a_disabled_feed_is_not_unavailable(self, client):
+        client.cfg.USE_ORDERBOOK = False
+        assert client.get_book_features("BTCUSDT") is None
+        assert client.book_feed_unavailable("BTCUSDT") is False
+
+
+class TestStopsAreNeverSnappedWiderThanTheSizedRisk:
+    """The size was budgeted from the unsnapped stop distance. Snapping the
+    stop away from entry (down for a long, up for a short) risks more than
+    budgeted, so a long's stop rounds UP and a short's rounds DOWN."""
+
+    def test_spot_long_stop_rounds_toward_entry(self, client, exchange):
+        client.place_stop_order(
+            symbol="BTCUSDT", side="Sell", qty=0.001, trigger_price=49_000.567)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert Decimal(body["triggerPrice"]) == Decimal("49000.57")
+
+    def test_spot_short_stop_rounds_toward_entry(self, client, exchange):
+        exchange.balances["USDT"] = 1_000_000.0
+        client.place_stop_order(
+            symbol="BTCUSDT", side="Buy", qty=0.001, trigger_price=51_000.563)
+        body = json.loads(exchange.requests[-1]["body"])
+        assert Decimal(body["triggerPrice"]) == Decimal("51000.56")
+
+    def _linear(self, exchange, store):
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+        return bc.BybitClient(config=LinearCfg(), store=store, transport=exchange)
+
+    def test_linear_long_stop_rounds_toward_entry(self, exchange, store):
+        c = self._linear(exchange, store)
+        c.place_stop_order(symbol="BTCUSDT", side="Sell", qty=0.001,
+                           trigger_price=49_000.567)
+        stops = [json.loads(r["body"]) for r in exchange.requests
+                 if r["url"].endswith("/position/trading-stop")]
+        assert Decimal(stops[-1]["stopLoss"]) == Decimal("49000.57")
+
+    def test_linear_short_stop_rounds_toward_entry(self, exchange, store):
+        c = self._linear(exchange, store)
+        c.place_stop_order(symbol="BTCUSDT", side="Buy", qty=0.001,
+                           trigger_price=51_000.563)
+        stops = [json.loads(r["body"]) for r in exchange.requests
+                 if r["url"].endswith("/position/trading-stop")]
+        assert Decimal(stops[-1]["stopLoss"]) == Decimal("51000.56")
+
+
+class TestAPositionStopWithoutAVenueAnswerIsUnknownNotRejected:
+    def test_a_retcode_less_failure_marks_the_stop_unknown(self, exchange, store):
+        class LinearCfg(Cfg):
+            CATEGORY = "linear"
+        c = bc.BybitClient(config=LinearCfg(), store=store, transport=exchange)
+        real = c._request
+
+        def flaky(method, path, **kw):
+            if path == "/v5/position/trading-stop":
+                raise bc.PermanentAPIError("unparseable 200", 0)
+            return real(method, path, **kw)
+        c._request = flaky
+        res = c.place_stop_order(symbol="BTCUSDT", side="Sell", qty=0.001,
+                                 trigger_price=49_000.0)
+        assert not res.ok and res.reason == "OUTCOME_UNKNOWN"
+        assert store.get_order(res.order_link_id)["status"] == "unknown"
+
+
+class TestPrivateStreamIsPerVenue:
+    @pytest.mark.parametrize("venue,url", [
+        ("mainnet", "wss://stream.bybit.com/v5/private"),
+        ("testnet", "wss://stream-testnet.bybit.com/v5/private"),
+        ("demo", "wss://stream-demo.bybit.com/v5/private")])
+    def test_the_client_connects_to_its_own_venue(self, store, exchange, venue, url):
+        class VenueCfg(Cfg):
+            BYBIT_VENUE = venue
+            USE_TESTNET = venue != "mainnet"
+        c = bc.BybitClient(config=VenueCfg(), store=store, transport=exchange)
+        assert c.ws_private_url == url
+
+
+class TestRateLimitWaitsForTheVenuesResetStamp:
+    def test_it_sleeps_until_the_reset_header_not_the_short_guess(
+            self, client, exchange, monkeypatch):
+        slept = []
+        monkeypatch.setattr(bc.time, "sleep", lambda s: slept.append(s))
+        now = client._now_ms()
+        exchange.last_headers = {"x-bapi-limit-reset-timestamp": str(now + 3000)}
+        exchange.scripted = [
+            (200, json.dumps({"retCode": 10006, "retMsg": "rate limit", "result": {}}))
+        ]
+        assert client.get_equity() == pytest.approx(10_000.0)
+        assert slept and 2.5 <= max(slept) <= bc.BybitClient.RATE_LIMIT_MAX_WAIT_S
+
+    def test_the_wait_is_capped(self, client, exchange, monkeypatch):
+        slept = []
+        monkeypatch.setattr(bc.time, "sleep", lambda s: slept.append(s))
+        exchange.last_headers = {
+            "x-bapi-limit-reset-timestamp": str(client._now_ms() + 600_000)}
+        exchange.scripted = [
+            (200, json.dumps({"retCode": 10006, "retMsg": "rate limit", "result": {}}))
+        ]
+        client.get_equity()
+        assert max(slept) <= bc.BybitClient.RATE_LIMIT_MAX_WAIT_S
+
+
+class TestAfter403ReadsStandDownButWritesDoNot:
+    TICKERS = ("GET", "/v5/market/kline")           # a cooldown-listed read
+    KLINE = ("GET", "/v5/market/orderbook")          # a different one
+    PARAMS = {"category": "spot", "symbol": "BTCUSDT"}
+
+    def _get(self, client, which):
+        return client._request(which[0], which[1], params=self.PARAMS)
+
+    def test_reads_fail_fast_without_touching_the_network(self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            self._get(client, self.TICKERS)
+        before = len(exchange.requests)
+        with pytest.raises(bc.PermanentAPIError, match="cooldown"):
+            self._get(client, self.TICKERS)
+        assert len(exchange.requests) == before
+
+    def test_a_cooldown_on_one_read_endpoint_does_not_silence_the_others(
+            self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            self._get(client, self.TICKERS)
+        before = len(exchange.requests)
+        try:
+            self._get(client, self.KLINE)     # a DIFFERENT read still goes out
+        except bc.PermanentAPIError as exc:   # (the fake has no order book)
+            assert "cooldown" not in str(exc)
+        assert len(exchange.requests) > before
+        with pytest.raises(bc.PermanentAPIError, match="cooldown"):
+            self._get(client, self.TICKERS)   # the refused one stays paused
+
+    def test_a_write_403_does_not_arm_the_read_cooldown(self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            client._request("POST", "/v5/position/trading-stop",
+                            body={"category": "linear"}, signed=True)
+        before = len(exchange.requests)
+        self._get(client, self.TICKERS)
+        assert len(exchange.requests) > before
+
+    def test_a_write_is_still_attempted_during_the_cooldown(self, client, exchange):
+        exchange.scripted = [(403, "forbidden")]
+        with pytest.raises(bc.PermanentAPIError):
+            self._get(client, self.TICKERS)
+        before = len(exchange.requests)
+        try:
+            client._request("POST", "/v5/position/trading-stop",
+                            body={"category": "linear"}, signed=True)
+        except Exception:
+            pass
+        assert len(exchange.requests) > before
+
+
+def test_safety_reads_are_never_paused_by_a_403(client, exchange):
+    exchange.scripted = [(403, "forbidden")]
+    with pytest.raises(bc.PermanentAPIError):
+        client._request("GET", "/v5/position/list",
+                        params={"category": "linear", "symbol": "BTCUSDT"},
+                        signed=True)
+    before = len(exchange.requests)
+    client._request("GET", "/v5/position/list",
+                    params={"category": "linear", "symbol": "BTCUSDT"},
+                    signed=True)
+    assert len(exchange.requests) > before     # sent, not failed locally
+
+
+def test_tickers_and_instrument_filters_are_never_paused(client, exchange):
+    for endpoint in ("/v5/market/tickers", "/v5/market/instruments-info"):
+        assert endpoint not in bc.BybitClient.COOLDOWN_READ_ENDPOINTS

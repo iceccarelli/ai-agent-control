@@ -218,3 +218,20 @@ def test_an_unfilled_maker_order_cancelled_cleanly_is_then_taken():
     assert len(takers) == 1 and float(takers[0]["qty"]) == pytest.approx(0.001)
     assert e.position.perp.maker_qty == 0.0
     assert e.position.perp.taker_qty == pytest.approx(0.001)
+
+
+@pytest.mark.parametrize("cancel_raises", [False, True],
+                         ids=["cancel-answered-ok", "cancel-raised"])
+def test_the_halted_ledger_carries_the_unsettled_order_beside_a_null_position(
+        cancel_raises):
+    """The maker slice that already filled is not a position (the order may
+    still fill), but a human reconciling a HALTED ledger must not find only
+    `position: null` beside a venue short."""
+    v = StickyVenue(cancel_raises=cancel_raises)
+    e, d, kills = drive(v)
+    state = e.to_state()
+    assert state["book_state"] == "HALTED" and state["position"] is None
+    unresolved = state["unresolved_order"]
+    assert unresolved["symbol"] == "BTCUSDT" and unresolved["side"] == "Sell"
+    assert unresolved["filled_qty_seen"] > 0
+    assert unresolved["order_link_id"]

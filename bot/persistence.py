@@ -59,9 +59,11 @@ only way to find out whether the cost model matches reality.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import secrets
+import logging
 import sqlite3
 import threading
 import time
@@ -79,7 +81,9 @@ __all__ = [
     "slippage_bps",
 ]
 
-DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH", "state/trading_state.db")
+logger = logging.getLogger(__name__)
+
+DEFAULT_DB_PATH = os.environ.get("STATE_DB_PATH") or "state/trading_state.db"
 
 #: v1 -> v2 added the memory tables (execution_quality, regime_history,
 #: memory_kv).  The bump is informational: every statement in ``_DDL`` is
@@ -222,6 +226,9 @@ class TradeRecord:
     #: "no durable identity available" (accepted, not enforced) -- see
     #: `StateStore.record_trade`.
     dedupe_key: str = ""
+    #: True when the exit price is UNKNOWN (never an invented one): see the
+    #: ``trades.price_provisional`` column.
+    price_provisional: bool = False
 
     @property
     def fees_realized(self) -> bool:
@@ -315,7 +322,8 @@ CREATE TABLE IF NOT EXISTS trades (
     entry_fee_realized INTEGER NOT NULL DEFAULT 0,
     exit_fee_realized  INTEGER NOT NULL DEFAULT 0,
     entry_fee_currency TEXT,
-    exit_fee_currency  TEXT
+    exit_fee_currency  TEXT,
+    price_provisional  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_trades_day ON trades(day);
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_epoch);
@@ -404,9 +412,6 @@ CREATE TABLE IF NOT EXISTS execution_quality (
     time_to_fill_s REAL,
     meta           TEXT NOT NULL DEFAULT '{}'
 );
-CREATE INDEX IF NOT EXISTS idx_execq_symbol ON execution_quality(symbol);
-CREATE INDEX IF NOT EXISTS idx_execq_ts ON execution_quality(ts_epoch);
-CREATE INDEX IF NOT EXISTS idx_execq_outcome ON execution_quality(outcome);
 
 -- The regime observed at a moment in time, per symbol.  Observations only:
 -- the outcome of trades opened under a regime is derived by joining to
@@ -491,7 +496,12 @@ EXECUTION_OUTCOMES = ("filled", "partial", "rejected", "cancelled", "unfilled")
 #: Used only by :meth:`StateStore.update_order_status`'s ``source="ws"``
 #: monotonic guard -- REST (``source="rest"``, the default) is unaffected
 #: and remains free to write any status at any time, terminal or not.
-LOCAL_TERMINAL_ORDER_STATUS = frozenset({"filled", "cancelled", "rejected"})
+#: REST also writes the venue's other terminal statuses lowercased
+#: (``PartiallyFilledCanceled``, ``Deactivated``) and reconcile writes
+#: ``never_sent``; a replayed WS event must not revive those either.
+LOCAL_TERMINAL_ORDER_STATUS = frozenset({
+    "filled", "cancelled", "rejected",
+    "partiallyfilledcanceled", "deactivated", "never_sent"})
 
 
 def slippage_bps(side: str, intended_price: float, fill_price: float) -> float:
@@ -547,8 +557,16 @@ class StateStore:
     """
 
     def __init__(self, path: str = DEFAULT_DB_PATH) -> None:
+        if not str(path).strip():
+            # sqlite3.connect("") opens a private temporary database: the kill
+            # switch, peak equity and daily anchors would silently vanish on
+            # restart. A blank path is a mistake, never a request for that.
+            raise ValueError("StateStore needs a database path; a blank one "
+                             "would open a throwaway database")
         self._path = path
         self._lock = threading.RLock()
+        #: >0 while inside ``transaction()``: ``_exec`` then defers its commit.
+        self._tx_depth = 0
         #: Thread id permitted to mutate state; None means unrestricted.
         self._writer_thread: Optional[int] = None
         try:
@@ -659,6 +677,11 @@ class StateStore:
             "exit_fee_realized": "INTEGER NOT NULL DEFAULT 0",
             "entry_fee_currency": "TEXT",
             "exit_fee_currency": "TEXT",
+            # 1 = the exit PRICE could not be taken from authoritative
+            # execution data. The row stands in for a real exit (quantity and
+            # fees), carries exit_price 0 and gross 0, and is EXCLUDED from
+            # every confirmed-economics reader until reconciled.
+            "price_provisional": "INTEGER NOT NULL DEFAULT 0",
         },
     }
 
@@ -680,6 +703,18 @@ class StateStore:
                 # SQLite cannot add a NOT NULL column without a default; every
                 # declaration above therefore carries one.
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        # Indexes on columns an OLDER execution_quality table may lack are created
+        # only after the ALTER loop: in _DDL they made opening such a database
+        # fail with "no such column", which takes the brakes offline.
+        for stmt in (
+            "CREATE INDEX IF NOT EXISTS idx_execq_symbol ON execution_quality(symbol)",
+            "CREATE INDEX IF NOT EXISTS idx_execq_ts ON execution_quality(ts_epoch)",
+            "CREATE INDEX IF NOT EXISTS idx_execq_outcome ON execution_quality(outcome)",
+        ):
+            try:
+                self._conn.execute(stmt)
+            except Exception:  # noqa: BLE001 - an index is never worth the store
+                pass
         # Partial unique index, created here (not in _DDL) because it targets
         # `trades.dedupe_key`, a column that only exists on a fresh database
         # via the CREATE TABLE above -- on an OLDER database it exists only
@@ -781,10 +816,37 @@ class StateStore:
         with self._lock:
             try:
                 cur = self._conn.execute(sql, params)
-                self._conn.commit()
+                if self._tx_depth == 0:
+                    self._conn.commit()
                 return cur
             except Exception as exc:  # noqa: BLE001
                 raise PersistenceError(f"state write failed: {exc}") from exc
+
+    @contextlib.contextmanager
+    def transaction(self):
+        """Group several ``_exec`` writes into ONE commit (all or nothing).
+
+        For writes that must not be split by a kill: the carry journal and the
+        carry position, say. Re-entrant; the commit happens when the outermost
+        block exits cleanly, a rollback if it raises."""
+        self._assert_writer()
+        with self._lock:
+            self._tx_depth += 1
+            try:
+                yield self
+            except BaseException:
+                self._tx_depth -= 1
+                if self._tx_depth == 0:
+                    self._conn.rollback()
+                raise
+            else:
+                self._tx_depth -= 1
+                if self._tx_depth == 0:
+                    try:
+                        self._conn.commit()
+                    except Exception as exc:  # noqa: BLE001
+                        self._conn.rollback()
+                        raise PersistenceError(f"state write failed: {exc}") from exc
 
     def _query(self, sql: str, params: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
         with self._lock:
@@ -820,6 +882,7 @@ class StateStore:
         if eq < 0.0:
             raise PersistenceError(f"refusing to store negative equity {equity!r}")
         now = utc_now_epoch()
+        before = self.get_equity_state()
         self._exec(
             "UPDATE equity_state SET peak_equity = MAX(peak_equity, ?), "
             "last_equity = ?, updated_epoch = ? WHERE id = 1",
@@ -832,7 +895,20 @@ class StateStore:
         # brake — the same failure mode as the legacy in-memory state.  Because
         # this is INSERT OR IGNORE against a persisted row, a restart inside the
         # same UTC day keeps the original anchor.
-        self.ensure_daily_anchor(eq)
+        # A new day is anchored at the LAST equity this store saw when that
+        # was recent: a loss taken while the process was down (or between the
+        # last read of yesterday and the first of today) is then still inside
+        # today's brake instead of becoming its starting point.
+        prior = None
+        if (before.last_equity > 0.0 and before.updated_epoch > 0.0
+                and 0.0 <= now - before.updated_epoch <= self.ANCHOR_CARRY_MAX_AGE_S):
+            prior = before.last_equity
+        if prior is not None and prior <= eq:
+            # Only a LOSS since the last observation is carried into the new
+            # day. A higher equity (a deposit, a gain) anchors at today's
+            # reading, the stricter choice for the brake.
+            prior = None
+        self.ensure_daily_anchor(eq, prior_equity=prior)
         return self.get_equity_state()
 
     def drawdown_fraction(self, equity: Optional[float] = None) -> float:
@@ -841,7 +917,11 @@ class StateStore:
 
     # -- daily anchors -----------------------------------------------------
 
-    def ensure_daily_anchor(self, equity: float, day: Optional[str] = None) -> DailyAnchor:
+    #: How old the previous observation may be and still start a new day.
+    ANCHOR_CARRY_MAX_AGE_S = 36 * 3600.0
+
+    def ensure_daily_anchor(self, equity: float, day: Optional[str] = None,
+                            prior_equity: Optional[float] = None) -> DailyAnchor:
         """Return today's anchor, creating it from ``equity`` on first call.
 
         Idempotent: the anchor is written once per UTC day and never moved, so
@@ -850,10 +930,18 @@ class StateStore:
         """
         d = day or utc_day()
         rows = self._query("SELECT * FROM daily_anchor WHERE day = ?", (d,))
+        if rows and float(rows[0]["start_equity"]) <= 0.0 and float(equity) > 0.0:
+            # An anchor created before any equity was known (start 0.0) is
+            # repaired from the first positive reading instead of locking the
+            # daily-loss gate for the day.
+            self._exec("UPDATE daily_anchor SET start_equity = ? WHERE day = ? "
+                       "AND start_equity <= 0.0", (float(equity), d))
+            rows = self._query("SELECT * FROM daily_anchor WHERE day = ?", (d,))
         if not rows:
             self._exec(
                 "INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, ?)",
-                (d, float(equity)),
+                (d, float(prior_equity) if prior_equity and prior_equity > 0.0
+                 else float(equity)),
             )
             rows = self._query("SELECT * FROM daily_anchor WHERE day = ?", (d,))
         r = rows[0]
@@ -947,8 +1035,9 @@ class StateStore:
         :meth:`clear_kill_switch_by_human`.
         """
         self._exec(
-            "UPDATE kill_switch SET engaged = 1, reason = ?, engaged_epoch = ? "
-            "WHERE id = 1",
+            "UPDATE kill_switch SET reason = CASE WHEN engaged = 1 THEN reason "
+            "ELSE ? END, engaged_epoch = CASE WHEN engaged = 1 THEN "
+            "engaged_epoch ELSE ? END, engaged = 1 WHERE id = 1",
             (str(reason), utc_now_epoch()),
         )
 
@@ -1089,6 +1178,36 @@ class StateStore:
             "WHERE id = 1"
         )
 
+    def rebase_daily_anchor_by_human(self, operator_ack: str,
+                                     equity: float,
+                                     rebase_peak: bool = False) -> None:
+        """Restart today's daily-loss measurement from `equity`.
+
+        For the one case the bot cannot judge: an operator moved money
+        (withdrawal, deposit, transfer) and the equity change is not a trading
+        loss. Human-only, never called from automated code: a brake the bot
+        can reset is not a brake.
+        """
+        if operator_ack != "HUMAN_REBASED_DAILY_ANCHOR":
+            raise PersistenceError(
+                "rebasing the daily anchor requires the exact operator "
+                "acknowledgement; this is a human-only action")
+        eq = float(equity)
+        if not (eq == eq) or eq <= 0.0 or eq in (float("inf"),):
+            raise PersistenceError(f"refusing to rebase onto equity {equity!r}")
+        day = utc_day()
+        self.ensure_daily_anchor(eq, day)
+        self._exec("UPDATE daily_anchor SET start_equity = ? WHERE day = ?",
+                   (eq, day))
+        if rebase_peak:
+            # A withdrawal lowers equity against the stored peak and reads as
+            # a drawdown; the operator can restart that measurement too.
+            self._exec("UPDATE equity_state SET peak_equity = ?, "
+                       "last_equity = ? WHERE id = 1", (eq, eq))
+        logger.warning("daily anchor for %s rebased by a human to %.2f "
+                       "(peak equity %s)", day, eq,
+                       "rebased" if rebase_peak else "NOT rebased")
+
     # -- per-symbol cooldown ----------------------------------------------
 
     def set_symbol_cooldown(self, symbol: str, seconds: float, reason: str = "") -> None:
@@ -1131,12 +1250,28 @@ class StateStore:
         but as an int here since legitimate callers already treat a
         positive id as "recorded").
         """
-        cur = self._exec(
+        day = utc_day(trade.closed_epoch)
+        self._assert_writer()
+        with self._lock:
+            try:
+                return self._record_trade_locked(trade, day)
+            except Exception as exc:  # noqa: BLE001
+                if self._tx_depth == 0:
+                    self._conn.rollback()      # inside transaction(): its owner does
+                raise PersistenceError(f"state write failed: {exc}") from exc
+
+    def _record_trade_locked(self, trade: TradeRecord, day: str) -> int:
+        """The trade row and the day's anchor move in ONE commit: a kill between
+        two commits booked the trade but never credited the anchor, and the
+        dedupe then refused the replay -- the daily-loss gate under-counted that
+        loss for good."""
+        cur = self._conn.execute(
             "INSERT INTO trades(symbol, side, qty, entry_price, exit_price, gross_pnl,"
             " entry_fee, exit_fee, net_pnl, opened_epoch, closed_epoch, day,"
             " order_link_id, meta, dedupe_key, entry_fee_realized,"
-            " exit_fee_realized, entry_fee_currency, exit_fee_currency)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+            " exit_fee_realized, entry_fee_currency, exit_fee_currency,"
+            " price_provisional)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(dedupe_key) WHERE dedupe_key <> '' DO NOTHING",
             (
                 trade.symbol, trade.side, float(trade.qty), float(trade.entry_price),
@@ -1149,26 +1284,43 @@ class StateStore:
                 1 if trade.exit_fee_realized else 0,
                 (str(trade.entry_fee_currency) if trade.entry_fee_currency else None),
                 (str(trade.exit_fee_currency) if trade.exit_fee_currency else None),
+                1 if trade.price_provisional else 0,
             ),
         )
         if cur.rowcount != 1:
+            if self._tx_depth == 0:
+                self._conn.commit()
             self.journal(trade.symbol, "DUPLICATE_TRADE_BLOCKED",
                         "a trade with an already-booked dedupe_key was not "
                         "re-recorded; daily_anchor was not double-counted",
                         {"dedupe_key": trade.dedupe_key,
                          "order_link_id": trade.order_link_id})
             return 0
-        day = utc_day(trade.closed_epoch)
-        self._exec(
-            "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?, "
-            "trades = trades + 1 WHERE day = ?",
-            (trade.net_pnl, day),
-        )
+        # A trade on a day with no anchor row (an exit observed after an outage)
+        # must still be counted: create the anchor from the last known equity.
+        last_equity = self._conn.execute(
+            "SELECT last_equity FROM equity_state WHERE id = 1").fetchone()
+        known_equity = float(last_equity[0]) if last_equity else 0.0
+        if known_equity > 0.0:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daily_anchor(day, start_equity) VALUES(?, ?)",
+                (day, known_equity))
+            self._conn.execute(
+                "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?, "
+                "trades = trades + 1 WHERE day = ?",
+                (trade.net_pnl, day),
+            )
+        # else: no equity has been observed, so there is nothing to anchor the
+        # day to. A zero-equity anchor would lock the daily-loss gate for the
+        # whole UTC day, so none is created; the trade row itself is booked.
+        if self._tx_depth == 0:
+            self._conn.commit()
         return int(cur.lastrowid or 0)
 
     def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
         rows = self._query(
-            "SELECT * FROM trades ORDER BY closed_epoch DESC LIMIT ?", (int(limit),)
+            "SELECT * FROM trades WHERE price_provisional = 0 "
+            "ORDER BY closed_epoch DESC LIMIT ?", (int(limit),)
         )
         return [dict(r) for r in rows]
 
@@ -1183,24 +1335,91 @@ class StateStore:
         """
         rows = self._query(
             "SELECT COUNT(*) AS n,"
+            " (SELECT COUNT(*) FROM trades WHERE price_provisional = 1) AS prov_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
             "     THEN 1 ELSE 0 END) AS realized_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
             "     THEN net_pnl ELSE 0 END) AS realized_net,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
             "     THEN 0 ELSE net_pnl END) AS unconfirmed_net"
-            " FROM trades"
+            " FROM trades WHERE price_provisional = 0"
         )
         r = rows[0]
         n = int(r["n"] or 0)
         realized_n = int(r["realized_n"] or 0)
         return {
             "trades": n,
+            "price_provisional_trades": int(r["prov_n"] or 0),
             "fees_realized_trades": realized_n,
             "fees_unconfirmed_trades": n - realized_n,
             "realized_net_pnl": float(r["realized_net"] or 0.0),
             "unconfirmed_net_pnl": float(r["unconfirmed_net"] or 0.0),
         }
+
+    def provisional_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Exits booked WITHOUT an authoritative price, awaiting reconciliation."""
+        return [dict(r) for r in self._query(
+            "SELECT * FROM trades WHERE price_provisional = 1 "
+            "ORDER BY closed_epoch DESC LIMIT ?", (int(limit),))]
+
+    def reconcile_provisional_trade(
+        self, trade_id: int, *, exit_price: float, gross_pnl: float,
+        exit_fee: float, exit_fee_realized: bool,
+        exit_fee_currency: Optional[str], evidence: Mapping[str, Any],
+    ) -> bool:
+        """Turn a PROVISIONAL exit into a priced one, atomically, at most once.
+
+        One transaction: the row is updated only if it is still provisional
+        (so a replay, or a second process, is a no-op returning False), the
+        day's realised P&L is corrected by the difference between the old
+        (fee-only) net and the new net, the prior values are kept in
+        ``meta['reconciliation']`` and a journal event is written. The caller
+        has already proven the evidence; this method only applies it.
+        """
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT * FROM trades WHERE id = ?", (int(trade_id),)
+            ).fetchone()
+            if row is None or not int(row["price_provisional"]):
+                return False
+            for name, value in (("exit_price", exit_price),
+                                ("gross_pnl", gross_pnl),
+                                ("exit_fee", exit_fee)):
+                if not (isinstance(value, (int, float)) and value == value
+                        and value not in (float("inf"), float("-inf"))):
+                    raise PersistenceError(f"{name} is not a finite number")
+            if exit_price <= 0:
+                raise PersistenceError("exit_price must be positive")
+            old_net = float(row["net_pnl"])
+            new_net = float(gross_pnl) - float(row["entry_fee"]) - float(exit_fee)
+            meta = json.loads(row["meta"] or "{}")
+            meta["reconciliation"] = {
+                "evidence": dict(evidence),
+                "before": {"exit_price": float(row["exit_price"]),
+                           "gross_pnl": float(row["gross_pnl"]),
+                           "exit_fee": float(row["exit_fee"]),
+                           "net_pnl": old_net},
+            }
+            cur = self._conn.execute(
+                "UPDATE trades SET exit_price=?, gross_pnl=?, exit_fee=?,"
+                " net_pnl=?, exit_fee_realized=?, exit_fee_currency=?,"
+                " meta=?, price_provisional=0"
+                " WHERE id=? AND price_provisional=1",
+                (float(exit_price), float(gross_pnl), float(exit_fee), new_net,
+                 1 if exit_fee_realized else 0,
+                 (str(exit_fee_currency) if exit_fee_currency else None),
+                 json.dumps(meta, default=str), int(trade_id)))
+            if cur.rowcount != 1:
+                return False
+            self._conn.execute(
+                "UPDATE daily_anchor SET realised_pnl = realised_pnl + ?"
+                " WHERE day = ?", (new_net - old_net, str(row["day"])))
+            self.journal(str(row["symbol"]), "EXIT_PRICE_RECONCILED",
+                         str(row["order_link_id"]),
+                         {"trade_id": int(trade_id), "exit_price": exit_price,
+                          "net_before": old_net, "net_after": new_net})
+            return True
 
     def net_returns(self, limit: int = 500) -> List[float]:
         """Per-trade NET return fractions, oldest first — the Kelly input.
@@ -1210,7 +1429,7 @@ class StateStore:
         """
         rows = self._query(
             "SELECT net_pnl, qty, entry_price FROM trades "
-            "ORDER BY closed_epoch DESC LIMIT ?",
+            "WHERE price_provisional = 0 ORDER BY closed_epoch DESC LIMIT ?",
             (int(limit),),
         )
         out: List[float] = []
@@ -1221,17 +1440,121 @@ class StateStore:
         return out
 
     def consecutive_losses(self) -> int:
-        """Count of the most recent unbroken run of fee-aware losing trades."""
+        """Count of the most recent unbroken run of fee-aware losing POSITIONS.
+
+        A position that exits in several fills (partial take-profits, a stop
+        filled in pieces) is several ``trades`` rows. Counting rows made one
+        stopped-out position look like three losses, and let a small winning
+        partial reset the streak over a position that lost overall. Rows are
+        therefore summed per position -- same symbol and open time -- before the
+        sign is read.
+        """
         rows = self._query(
-            "SELECT net_pnl FROM trades ORDER BY closed_epoch DESC LIMIT 200"
+            "SELECT symbol, opened_epoch, SUM(net_pnl) AS net, "
+            "MAX(closed_epoch) AS last_closed, MAX(id) AS last_id "
+            "FROM trades GROUP BY symbol, opened_epoch "
+            "ORDER BY last_closed DESC, last_id DESC LIMIT 200"
         )
+        base = self._query(
+            "SELECT value FROM meta WHERE key = 'loss_streak_baseline_id'")
+        if base:
+            baseline = int(float(base[0]["value"]))
+        else:
+            # A database written before the baseline became a trade id holds a
+            # timestamp baseline; translate it once instead of forgetting it.
+            old = self._query(
+                "SELECT value FROM meta WHERE key = 'loss_streak_baseline'")
+            baseline = 0
+            if old:
+                got = self._query(
+                    "SELECT MAX(id) AS m FROM trades WHERE closed_epoch <= ?",
+                    (float(old[0]["value"]),))
+                baseline = int(got[0]["m"] or 0) if got else 0
         n = 0
         for r in rows:
-            if float(r["net_pnl"]) <= 0.0:
+            if int(r["last_id"] or 0) <= baseline:
+                break           # already answered for by an elapsed breaker
+            if float(r["net"]) <= 0.0:
                 n += 1
             else:
                 break
         return n
+
+    def _max_trade_id(self) -> int:
+        rows = self._query("SELECT MAX(id) AS m FROM trades")
+        return int(rows[0]["m"] or 0) if rows else 0
+
+    def _put_meta(self, key: str, value: str) -> None:
+        self._exec(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value))
+
+    def set_equity_scope(self, scope: str) -> bool:
+        """Declare which account the equity readings belong to.
+
+        When the scope changes (paper -> live, testnet -> mainnet) the last
+        reading belongs to a DIFFERENT account, so it must not seed the new
+        day's anchor. Returns True when the scope changed.
+        """
+        rows = self._query("SELECT value FROM meta WHERE key = 'equity_scope'")
+        if rows and str(rows[0]["value"]) == str(scope):
+            return False
+        if rows:
+            # A scope written by the earlier format ("testnet=X;paper=Y") named
+            # the same account when its testnet token agrees: rewrite it in
+            # place instead of treating the deploy itself as an account change
+            # (which would wipe the drawdown peak and today's anchor).
+            import re
+            old = re.fullmatch(r"testnet=(True|False);paper=(?:True|False)",
+                               str(rows[0]["value"]))
+            new = re.search(r"testnet=(True|False)", str(scope))
+            if old and new and old.group(1) == new.group(1):
+                self._put_meta("equity_scope", str(scope))
+                return False
+        self._put_meta("equity_scope", str(scope))
+        if rows:
+            # A different account: its last reading AND its peak are not this
+            # one's. A paper peak left in place would read a live account as
+            # a 99% drawdown and halt it; a live peak would read paper as one.
+            self._exec("UPDATE equity_state SET last_equity = 0.0, "
+                       "peak_equity = 0.0 WHERE id = 1")
+            # Today's anchor was set from the OTHER account's equity.
+            self._exec("DELETE FROM daily_anchor WHERE day = ?", (utc_day(),))
+        return bool(rows)
+
+    def traded_signal(self, symbol: str) -> str:
+        """The signature of the last signal traded on `symbol` ('' if none)."""
+        rows = self._query("SELECT value FROM meta WHERE key = ?",
+                           (f"traded_signal:{symbol}",))
+        return str(rows[0]["value"]) if rows else ""
+
+    def mark_traded_signal(self, symbol: str, signature: str) -> None:
+        self._put_meta(f"traded_signal:{symbol}", str(signature))
+
+    def mark_loss_streak_trip(self) -> None:
+        """Remember the newest trade at the moment a streak breaker trips.
+
+        The losses that tripped it are exactly the trades up to this id; a
+        position that closes during the halt is NOT part of that streak.
+        """
+        self._put_meta("loss_streak_trip_id", str(self._max_trade_id()))
+
+    def reset_loss_streak(self) -> None:
+        """Forget the losses that tripped a breaker whose cooldown has ended.
+
+        Without this the streak gate re-trips the breaker the moment its
+        cooldown clears, and since only a WINNING trade ends a streak (and none
+        can happen while halted) the cooldown never resumed trading at all.
+        The baseline is a TRADE ID (the one recorded when the breaker
+        tripped), so a loss booked during the halt still counts.
+        """
+        trip = self._query(
+            "SELECT value FROM meta WHERE key = 'loss_streak_trip_id'")
+        baseline = int(float(trip[0]["value"])) if trip else self._max_trade_id()
+        if baseline <= 0:
+            return
+        self._put_meta("loss_streak_baseline_id", str(baseline))
 
     # -- positions ---------------------------------------------------------
 
@@ -1312,16 +1635,33 @@ class StateStore:
         timed-out submit created a duplicate live order.
         """
         self._assert_writer()
+        if self._tx_depth > 0:
+            # A sequence number must never roll back: the id it minted may
+            # already be at the venue. Inside transaction() it WOULD roll back
+            # and be handed out again for a different intent, so say so loudly.
+            raise PersistenceError(
+                "next_order_seq() inside transaction(): the sequence would "
+                "roll back with it and an orderLinkId could be reused")
         with self._lock:
             try:
-                cur = self._conn.execute("SELECT next_id FROM order_seq WHERE id = 1")
-                row = cur.fetchone()
+                # ONE statement: a second connection to the same file cannot
+                # read the same number between a SELECT and an UPDATE.
+                if sqlite3.sqlite_version_info >= (3, 35):
+                    cur = self._conn.execute(
+                        "UPDATE order_seq SET next_id = next_id + 1 "
+                        "WHERE id = 1 RETURNING next_id - 1")
+                    row = cur.fetchone()
+                else:           # no RETURNING: read and bump under the lock
+                    got = self._conn.execute(
+                        "SELECT next_id FROM order_seq WHERE id = 1").fetchone()
+                    row = None if got is None else (int(got[0]),)
+                    if row is not None:
+                        self._conn.execute(
+                            "UPDATE order_seq SET next_id = ? WHERE id = 1",
+                            (row[0] + 1,))
                 if row is None:
                     raise PersistenceError("order_seq row missing")
-                n = int(row["next_id"])
-                self._conn.execute(
-                    "UPDATE order_seq SET next_id = ? WHERE id = 1", (n + 1,)
-                )
+                n = int(row[0])
                 self._conn.commit()
                 return n
             except PersistenceError:
@@ -1422,6 +1762,27 @@ class StateStore:
                         "exchange_id": exchange_id,
                     },
                 )
+                return
+            if (
+                current is not None
+                and status in ("filled", "cancelled")
+                and str(current.get("purpose")) == "entry"
+                and current_status not in LOCAL_TERMINAL_ORDER_STATUS
+                and not any(str(p.get("order_link_id")) == order_link_id
+                            for p in self.open_positions())
+            ):
+                # A WS "Filled" -- or "cancelled", which is what a partial-then-
+                # cancelled order maps to -- for an ENTRY that no position row
+                # records yet. Marking it terminal would drop it out of the
+                # unresolved set (and the entry gates) with any executed lot
+                # unrecorded; the REST fill path or the resolver writes it once
+                # the position exists (a cancel with nothing executed is cleared
+                # by the resolver on the next tick).
+                self.journal(
+                    str(current.get("symbol", "")), "WS_FILL_HELD_UNTIL_RECORDED",
+                    "WS reported an entry filled before any position records it; "
+                    "left for the REST path / resolver",
+                    {"order_link_id": order_link_id, "exchange_id": exchange_id})
                 return
         self._exec(
             "UPDATE orders SET status = ?, updated_epoch = ?, "
@@ -1731,7 +2092,8 @@ class StateStore:
             "   WHERE r.symbol = t.symbol AND r.ts_epoch <= t.opened_epoch"
             "   ORDER BY r.ts_epoch DESC, r.id DESC LIMIT 1"
             ") AS regime "
-            "FROM trades t ORDER BY t.closed_epoch DESC LIMIT ?",
+            "FROM trades t WHERE t.price_provisional = 0 "
+            "ORDER BY t.closed_epoch DESC LIMIT ?",
             (int(limit),),
         )
         return [dict(r) for r in rows]
@@ -1812,7 +2174,7 @@ class StateStore:
         return [
             dict(r)
             for r in self._query(
-                "SELECT * FROM trades WHERE symbol = ? "
+                "SELECT * FROM trades WHERE symbol = ? AND price_provisional = 0 "
                 "ORDER BY closed_epoch DESC LIMIT ?",
                 (str(symbol), int(limit)),
             )

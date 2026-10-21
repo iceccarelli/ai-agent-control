@@ -62,6 +62,7 @@ direction. This module has no direction to give it.
 """
 from __future__ import annotations
 
+import json
 import logging
 import datetime as dt
 import math
@@ -87,9 +88,12 @@ DELTA_BAND = 0.02
 #: the world, so the trigger sits well before it is needed.
 MIN_MARGIN_MULTIPLE = 2.0
 
-#: Do not open new carry below this forecast 8h rate. At 0.2 bps per 8h the
-#: annualised gross is ~2.2%, which does not clear the 31 bps entry cost inside
-#: a reasonable hold. Below it, hold cash.
+#: RECORDED, NOT ENFORCED. At 0.2 bps per 8h the annualised gross is ~2.2%,
+#: which does not clear the 31 bps entry cost inside a reasonable hold. The
+#: entry gate that actually decides is `carry_costs.evaluate_entry` (smoothed
+#: funding must be positive AND clear costs and the basis budget); this value
+#: is only kept in the shadow runtime's provenance record. There is no
+#: constructor knob for it: one used to exist and nothing read it.
 MIN_ENTRY_FUNDING_BPS = 0.2
 
 #: The two ways this book can hold the long side (0036).
@@ -148,10 +152,16 @@ def snap_to_lot(qty: float, step: float) -> float:
     rejection. Rounding UP would breach the cap, so it rounds down and the
     caller refuses when what is left is below the minimum.
     """
+    if not math.isfinite(float(qty)):
+        # nan / inf is not a quantity: no order exists for it (Decimal's floor
+        # division would hand NaN or inf straight back to the caller).
+        return 0.0
     if step <= 0:
         return float(qty)
     try:
-        lots = Decimal(str(qty)) // Decimal(str(step))
+        # round() first: a fee-net quantity like 0.026049 - 0.000026 arrives as
+        # 0.026022999999999998 and must floor to 0.026023, not one lot lower.
+        lots = Decimal(str(round(float(qty), 12))) // Decimal(str(step))
         return float(lots * Decimal(str(step)))
     except (InvalidOperation, ValueError):
         return 0.0
@@ -432,7 +442,7 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
             ColdStart.HALT,
             f"the ledger holds {ledger_spot:.10g} of spot and the venue holds "
             f"{spot:.10g}",
-            naked_side="spot" if spot < ledger_spot else "perp",
+            naked_side="perp" if spot < ledger_spot else "spot",
             detail={"ledger_spot_qty": ledger_spot, "venue_spot_qty": spot})
 
     return ColdStartDecision(
@@ -584,7 +594,6 @@ class CarryEngine:
                  max_notional_usd: float = 100.0,
                  delta_band: float = DELTA_BAND,
                  min_margin_multiple: float = MIN_MARGIN_MULTIPLE,
-                 min_entry_funding_bps: float = MIN_ENTRY_FUNDING_BPS,
                  borrow_apr: float, execution_mode: str,
                  persist: Any,
                  execution_style: str = TAKER,
@@ -642,7 +651,6 @@ class CarryEngine:
         self.max_notional_usd = float(max_notional_usd)
         self.delta_band = float(delta_band)
         self.min_margin_multiple = float(min_margin_multiple)
-        self.min_entry_funding_bps = float(min_entry_funding_bps)
         self.position: Optional[CarryPosition] = None
         self.state = BookState.FLAT
         self.borrow_apr = float(borrow_apr)
@@ -661,6 +669,11 @@ class CarryEngine:
         #: The last exception a leg raised, so a refusal can name it. A leg
         #: that fails for a reason nobody can read is a leg that fails again.
         self._last_leg_error: str = ""
+        #: A maker order whose fate the book could not establish (still
+        #: resting, uncancellable, unreadable). Its size is NOT a position - the
+        #: order may still fill - so it is written beside the halt as evidence,
+        #: never as a leg. Cleared by nothing: a halted book needs a human.
+        self._unresolved_order: Optional[Dict[str, Any]] = None
         #: Market time of the most recent tick, in epoch ms. Carried so the
         #: paths that do not take `timestamp_ms` can still date the day's
         #: entry allowance on the market's calendar rather than the wall
@@ -688,6 +701,8 @@ class CarryEngine:
             "last_print_ms": self._last_print_ms,
             "funding_history": list(self._funding_history),
             "perp_symbol": self.perp_symbol,
+            **({"unresolved_order": dict(self._unresolved_order)}
+               if self._unresolved_order else {}),
             **({"entry_days": self.pair_risk.export_days()}
                if getattr(self, "pair_risk", None) is not None
                and hasattr(self.pair_risk, "export_days") else {}),
@@ -738,8 +753,11 @@ class CarryEngine:
             self.position = None
             self.state = BookState.FLAT
         last = self._restored_stamp(state.get("last_print_ms"))
+        #: What the LEDGER last saw, kept even when its history is discarded:
+        #: the catch-up counts settlements after THIS, not after the venue
+        #: warm-up's watermark.
+        self._ledger_last_print_ms = last
         rates = self._restored_rates(state.get("funding_history", []))
-        self._restore_allowance(state.get("entry_days"))
         recorded = state.get("perp_symbol")
         foreign = (recorded != self.perp_symbol if recorded is not None
                    else self.perp_symbol not in self.FUNDING_8H_PROVEN)
@@ -760,6 +778,11 @@ class CarryEngine:
         else:
             self._last_print_ms = last
             self._funding_history = rates
+        # Last: a fail-closed write persists `to_state()`, which must already
+        # carry the restored funding stamp and history, not the empty defaults.
+        self._restore_allowance(state.get("entry_days"))
+        if self.position is not None:
+            self._venue_verified_ms = int(time.time() * 1000)  # cold start checked it
 
     @classmethod
     def _restored_rates(cls, raw: Any) -> Optional[List[float]]:
@@ -822,7 +845,9 @@ class CarryEngine:
 
     def cold_start(self, *, ledger: Optional[Dict[str, Any]],
                    venue_perp_qty: float, venue_spot_qty: float,
-                   open_orders: Any = ()) -> ColdStartDecision:
+                   open_orders: Any = (),
+                   venue_read_started_ms: Optional[int] = None
+                   ) -> ColdStartDecision:
         """Reconcile the ledger against the venue BEFORE the first tick.
 
         RESUME puts the same pair back in the engine. HALT stops the process
@@ -853,6 +878,14 @@ class CarryEngine:
             self._restore_allowance(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
+            if self._catch_up_missed_prints():
+                self._record()          # the streak/estimate must survive a crash
+            if self.position is not None and venue_read_started_ms is not None:
+                # The venue was read from this moment, not from now: a close
+                # that landed after it must still count as new evidence.
+                self._venue_verified_ms = min(
+                    self._venue_verified_ms or venue_read_started_ms,
+                    int(venue_read_started_ms))
             logger.warning("carry cold start: RESUMED %s", decision.detail)
         elif decision.action is ColdStart.HALT:
             self.state = BookState.HALTED
@@ -866,6 +899,101 @@ class CarryEngine:
                 decision.reason, decision.naked_side or "unknown",
                 decision.detail)
         return decision
+
+    #: The venue's recent settled prints as `(bps, settlement_ms)`, newest last,
+    #: read at cold start. Used once, to count settlements a held pair lived
+    #: through while this process was down.
+    venue_prints_at_start: Sequence[Tuple[float, int]] = ()
+    _ledger_last_print_ms: Optional[int] = None
+
+    def _catch_up_missed_prints(self) -> int:
+        """Count the settlements a resumed pair was held through while down.
+
+        After a restart `on_candle` sees only the newest print, so three
+        negative settlements missed during downtime counted as ONE and the
+        FUNDING_INVERTED exit came two prints late. The venue's stamped
+        history lets the missed ones be applied in order: each enters the
+        EWMA history, moves the negative streak and adds an ESTIMATE of the
+        funding earned (the current mark stands in for the settlement mark);
+        the ledger books what the venue actually paid.
+        """
+        position = self.position
+        last = self._ledger_last_print_ms
+        if last is None:
+            last = self._last_print_ms
+        if position is None or last is None:
+            return 0
+        by_stamp: Dict[int, float] = {}
+        for rate, stamp in (self.venue_prints_at_start or ()):
+            if (self._finite(rate) and int(stamp) > last
+                    and int(stamp) > int(position.opened_ms or 0)):
+                by_stamp.setdefault(int(stamp), float(rate))   # one per stamp
+        missed = sorted(((rate, stamp) for stamp, rate in by_stamp.items()),
+                        key=lambda row: row[1])
+        # Leave the NEWEST for on_candle to book as the live print - unless
+        # the venue warm-up already moved the watermark past it, in which
+        # case on_candle will never see it as new and it is counted here.
+        if missed and (self._last_print_ms is None
+                       or missed[-1][1] > self._last_print_ms):
+            missed = missed[:-1]
+        reseeded = False
+        if missed and missed[0][1] - last > self.MAX_PRINT_GAP_MS:
+            # The venue read does not reach back to the last print we saw:
+            # settlements are missing between them, and the old prints must
+            # not be smoothed across the hole (on_candle's own rule).
+            logger.warning(
+                "carry: the venue's recent prints start %.1fh after the last "
+                "one this book saw; discarding the stale funding history",
+                (missed[0][1] - last) / 3.6e6)
+            self._funding_history = []
+            # Re-seed from the venue's contiguous tail so the EWMA is not left
+            # empty although the prints are in hand.
+            tail: List[Tuple[int, float]] = []
+            for stamp, rate in sorted(
+                    {int(s): float(r) for r, s in
+                     (self.venue_prints_at_start or ())
+                     if self._finite(r)}.items()):
+                if tail and stamp - tail[-1][0] > self.MAX_PRINT_GAP_MS:
+                    tail = []
+                tail.append((stamp, rate))
+            if tail and (self._last_print_ms is None
+                         or tail[-1][0] > self._last_print_ms):
+                tail = tail[:-1]        # on_candle books the live newest
+            self._funding_history = [r for _s, r in tail][-self.FUNDING_HISTORY:]
+            reseeded = True
+        # The same mark on_candle uses (the current one) when the venue will say;
+        # the entry price only as a last resort.
+        price = 0.0
+        try:
+            price = float(self.broker.get_mark(self.perp_symbol))
+        except Exception:  # noqa: BLE001
+            price = 0.0
+        if not (self._finite(price) and price > 0):
+            price = float(position.perp.avg_price or 0.0)
+        for rate, stamp in missed:
+            if reseeded:
+                self._last_print_ms = max(self._last_print_ms or 0, stamp)
+            elif self._last_print_ms is None or stamp > self._last_print_ms:
+                # (not when the venue warm-up already seeded this print)
+                self._funding_history.append(rate)
+                del self._funding_history[:-self.FUNDING_HISTORY]
+                self._last_print_ms = stamp
+            # An ESTIMATE, like on_candle's: the settlement mark is unknown
+            # here, so the entry price stands in for it. The ledger books
+            # what the venue actually paid.
+            if price > 0:
+                position.funding_collected += (
+                    rate / 1e4) * position.perp.filled_qty * price
+            if rate < 0:
+                position.negative_funding_streak += 1
+            else:
+                position.negative_funding_streak = 0
+        if missed:
+            logger.warning(
+                "carry: counted %d funding settlement(s) missed while the "
+                "process was down (streak now %d)", len(missed),
+                position.negative_funding_streak)
+        return len(missed)
 
     def warm_funding_history(self, prints: Sequence[Tuple[float, int]]) -> int:
         """Seed the EWMA from SETTLED prints the venue has already published.
@@ -1054,8 +1182,19 @@ class CarryEngine:
         """
         self._last_tick_ms = int(timestamp_ms or 0)
         if self.state is BookState.HALTED:
+            if self._halt_unwritten:
+                # The write that records the halt (and any exposure noted with
+                # it) failed once; a store that has recovered must not leave the
+                # ledger showing a book that does not exist.
+                try:
+                    self.persist(self.to_state())
+                    self._halt_unwritten = False
+                    logger.warning("carry: the halt record was written down")
+                except Exception:  # noqa: BLE001
+                    logger.critical("the halt still could not be written down")
             return CarryDecision("halted", reason="KILL_SWITCH_ENGAGED",
-                                 state=self.state)
+                                 state=self.state,
+                                 detail=self._halted_watch(timestamp_ms))
 
         if not self._finite(mark) or mark <= 0:
             return self._halt("MARK_UNREADABLE",
@@ -1096,34 +1235,12 @@ class CarryEngine:
             del self._funding_history[:-self.FUNDING_HISTORY]
 
         if self.position is not None:
-            headroom = self._check_margin()
-            if headroom is not None:
-                return headroom
-
-            # What the VENUE holds, not what the book believes. Delta, drift
-            # and the hedge ratio are all computed from the legs this process
-            # recorded; a manual order, a fill the book missed or a partial
-            # liquidation changes the venue and nothing else. Compared every
-            # tick; never "corrected" by rewriting the ledger to match.
-            mismatch = self._check_venue_position()
-            if mismatch is not None:
-                return mismatch
-
-            # Before anything is rebalanced or collected: in OVERLAY, does the
-            # client still hold the BTC this short is written against? Adding
-            # to, or collecting on, a hedge whose long side has left is
-            # compounding a naked short.
-            cover = self._check_inventory_cover()
-            if cover is not None:
-                return cover
-
-            drift = self.position.delta_fraction(mark)
-            if drift > self.delta_band:
-                return self._rebalance(mark, drift)
-
-            # A print the pair was HELD through: its stamp is after the open.
-            # The print that triggered the entry, or a late record of an
-            # older settlement, was not earned by this position.
+            # A print the pair was HELD through is booked FIRST, before any
+            # exit, mismatch, cover or rebalance can return: `_last_print_ms`
+            # is already stamped, so a print skipped here is never booked.
+            # Held means its stamp is after the open: the print that triggered
+            # the entry, or a late record of an older settlement, was not
+            # earned by this position.
             held = new_print and int(funding_print_ms) > self.position.opened_ms
             if held:
                 # Booked SIGNED, on WHAT THE POSITION IS WORTH NOW.
@@ -1152,6 +1269,39 @@ class CarryEngine:
                     self.position.negative_funding_streak += 1
                 else:
                     self.position.negative_funding_streak = 0
+                # Booked in memory HERE so that whichever gate acts below
+                # (halt, exit, rebalance) persists it with its own write; the
+                # write for a tick that only holds is made after the gates, so
+                # a failing store cannot stop a margin exit.
+
+            headroom = self._check_margin()
+            if headroom is not None:
+                return headroom
+
+            # What the VENUE holds, not what the book believes. Delta, drift
+            # and the hedge ratio are all computed from the legs this process
+            # recorded; a manual order, a fill the book missed or a partial
+            # liquidation changes the venue and nothing else. Compared every
+            # tick; never "corrected" by rewriting the ledger to match.
+            mismatch = self._check_venue_position()
+            if mismatch is not None:
+                return mismatch
+
+            # Before anything is rebalanced or collected: in OVERLAY, does the
+            # client still hold the BTC this short is written against? Adding
+            # to, or collecting on, a hedge whose long side has left is
+            # compounding a naked short.
+            cover = self._check_inventory_cover()
+            if cover is not None:
+                return cover
+
+            drift = self.position.delta_fraction(mark)
+            if drift > self.delta_band:
+                rebalanced = self._rebalance(mark, drift)
+                if rebalanced is not None:
+                    return rebalanced
+
+            if held:
                 # Written down per print (one every eight hours): the booked
                 # funding and the negative streak lived in memory only, so a
                 # restart reset the streak to zero and delayed the inversion
@@ -1159,9 +1309,12 @@ class CarryEngine:
                 failed = self._record()
                 if failed is not None:
                     return failed
-                if (self.position.negative_funding_streak
-                        >= NEGATIVE_FUNDING_EXIT_PRINTS):
-                    return self._unwind(mark, "FUNDING_INVERTED")
+
+            # The inversion exit is judged every tick (the streak is persisted
+            # with the print above), not only on the tick that booked it.
+            if (self.position.negative_funding_streak
+                    >= NEGATIVE_FUNDING_EXIT_PRINTS):
+                return self._unwind(mark, "FUNDING_INVERTED")
 
             return CarryDecision("hold", reason="HEDGED_AND_COLLECTING",
                                  state=BookState.HEDGED,
@@ -1276,6 +1429,14 @@ class CarryEngine:
                                 "venue lot; a size the venue will not accept "
                                 "is a rejected order, not a smaller book"})
 
+        if self.execution_mode == ACQUIRE:
+            unpaired = self._acquire_fee_leaves_hedge_unpaired(
+                qty, float(rules.get("qty_step", 0.0)))
+            if unpaired is not None:
+                return CarryDecision(
+                    "stand_aside", reason="ACQUIRE_LOT_TOO_COARSE_FOR_FEE",
+                    state=BookState.FLAT, detail=unpaired)
+
         margin = self._margin_multiple()
         if margin is not None and margin < self.min_margin_multiple:
             return CarryDecision("stand_aside", reason="MARGIN_HEADROOM_TOO_THIN",
@@ -1362,6 +1523,8 @@ class CarryEngine:
             return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
 
         self.position = position
+        if self.state is BookState.HALTED:
+            return self._halted_with_exposure("PAIR_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
         # Only now: both legs landed. A refused pair consumed nothing; a
         # broken one spent the day through record_broken_pair instead.
@@ -1369,6 +1532,7 @@ class CarryEngine:
         failed = self._record()
         if failed is not None:
             return failed
+        self._confirm_venue_after_open(perp.filled_qty)
         return CarryDecision(
             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
@@ -1407,6 +1571,14 @@ class CarryEngine:
             closed = (self._fire(self.perp_symbol, "Buy", excess, "linear")
                       if excess > 0 else None)
             if closed is None or closed.filled_qty <= 0:
+                # The whole short is still at the venue: record it before
+                # halting so the exposure is not forgotten.
+                self.position = CarryPosition(
+                    spot=Leg(symbol=self.spot_symbol, side="Hold",
+                             product="spot", requested_qty=inventory,
+                             filled_qty=inventory, avg_price=spot_mark,
+                             order_link_id="INVENTORY"),
+                    perp=perp, opened_ms=timestamp_ms)
                 return self._halt(
                     "OVERSOLD_BEYOND_INVENTORY",
                     f"short {perp.filled_qty} against {inventory} of "
@@ -1441,6 +1613,8 @@ class CarryEngine:
         position = CarryPosition(spot=spot_leg, perp=perp,
                                  opened_ms=timestamp_ms)
         self.position = position
+        if self.state is BookState.HALTED:
+            return self._halted_with_exposure("PERP_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
         self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
         failed = self._record()
@@ -1456,7 +1630,7 @@ class CarryEngine:
                     "funding_bps": funding_bps,
                     "execution_mode": OVERLAY})
 
-    def _rebalance(self, mark: float, drift: float) -> CarryDecision:
+    def _rebalance(self, mark: float, drift: float) -> Optional[CarryDecision]:
         """Bring delta back inside the band by trading the PERP leg only.
 
         The perp is the cheap leg (5.5 bps vs 10 bps taker) and the one that can
@@ -1467,7 +1641,26 @@ class CarryEngine:
         assert position is not None
         delta = position.delta_qty
         side = "Sell" if delta > 0 else "Buy"
-        fill = self._fire(self.perp_symbol, side, abs(delta), "linear")
+        try:
+            step = float(self.broker.get_lot_rules(
+                self.perp_symbol, "linear").get("qty_step", 0.0))
+        except Exception as exc:  # noqa: BLE001
+            return self._halt(
+                "VENUE_RULES_UNREADABLE",
+                f"delta is {drift:.2%} of book and the lot rules could not be "
+                f"read ({type(exc).__name__}: {exc})")
+        # Every other order path snaps to the venue's lot; an unsnapped
+        # quantity is a rejection, which halts the book as REBALANCE_FAILED.
+        qty = snap_to_lot(abs(delta), step)
+        if qty <= 0:
+            # Below one venue lot: no order exists that would correct it. Said
+            # out loud, not halted, and the tick carries on to the exit checks.
+            logger.warning(
+                "carry: delta is %.2f%% of book but the correction %.10g is "
+                "below one lot (%.10g); nothing can be sent",
+                drift * 100.0, abs(delta), step)
+            return None
+        fill = self._fire(self.perp_symbol, side, qty, "linear")
         if fill is None or fill.filled_qty <= 0:
             return self._halt(
                 "REBALANCE_FAILED",
@@ -1494,6 +1687,8 @@ class CarryEngine:
             # close, with its own fee) is not blended into that entry.
             perp.filled_qty -= fill.filled_qty
         perp.requested_qty = perp.filled_qty
+        if self.state is BookState.HALTED:
+            return self._halted_with_exposure("REBALANCE_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
         failed = self._record()
         if failed is not None:
@@ -1504,13 +1699,300 @@ class CarryEngine:
             detail={"drift_before": drift, "corrected_qty": fill.filled_qty,
                     "drift_after": position.delta_fraction(mark)})
 
+    def _halted_with_exposure(self, reason: str) -> CarryDecision:
+        """A leg raised an unknown outcome (`_take` already halted the book)
+        after part of the order filled. Keep the HALT and write down the
+        exposure that did land; never promote the book back to HEDGED."""
+        failed = self._record()
+        if failed is not None:
+            return failed
+        return CarryDecision("halted", reason=reason, state=BookState.HALTED,
+                             detail={"error": self._last_leg_error})
+
+    def _spot_sellable(self, qty: float) -> float:
+        """`qty` of spot rounded DOWN to the venue's spot lot. The wallet holds
+        the BUY net of a base-coin fee (e.g. 0.0009988), which can carry more
+        decimals than the spot basePrecision; selling it as-is is a rejection
+        and leaves a naked leg. Flooring can only sell less, never more. If the
+        lot rules cannot be read the quantity is sent unchanged (the venue's
+        own answer, and the failure paths record the exposure)."""
+        try:
+            step = float(self.broker.get_lot_rules(
+                self.spot_symbol, "spot").get("qty_step", 0.0))
+        except Exception:  # noqa: BLE001
+            return qty
+        return snap_to_lot(qty, step) if self._finite(step) else qty
+
+    #: How long a position list that still shows more short than the fills
+    #: leave is given before the disagreement is believed (two re-reads). Only
+    #: paid when venue and fills disagree.
+    UNWIND_REREAD_WAIT_S = 0.5
+
+    #: True while the last HALT could not be persisted (retried each halted tick).
+    _halt_unwritten = False
+
+    #: Wall-clock ms of the last moment the book's perp size was CONFIRMED equal
+    #: to the venue's (a passing `_check_venue_position`, or a cold-start resume),
+    #: cleared whenever the engine itself sends a perp order. A close the venue
+    #: reports since then, with no order of ours in between, was not ours.
+    _venue_verified_ms: Optional[int] = None
+
+    def _short_left_after_close(self, fill_left: float) -> Optional[float]:
+        """The perp short still open after a close, as the venue reports it,
+        never LESS than the fills imply. Returns None when the venue cannot be
+        read (the caller keeps the fill arithmetic).
+
+        The venue can only ADD to what the fills say is left: a flat read
+        straight after a partial fill (a lagging or empty list) must not erase
+        an unfilled remainder. And when the fills say the close COMPLETED but the
+        list still shows a short, that list is probably the pre-close one: it is
+        re-read twice, after a pause, before the disagreement is believed."""
+        remaining = self._venue_short_qty()
+        if remaining is None:
+            return None
+        floor = fill_left if fill_left > QTY_DUST else 0.0
+        if remaining > floor + QTY_DUST:
+            # The list shows MORE short than the fills leave. Complete or
+            # partial, that is most often the pre-close list: re-read twice,
+            # after a pause, and believe the excess only if it persists.
+            for _ in range(2):
+                time.sleep(self.UNWIND_REREAD_WAIT_S)
+                again = self._venue_short_qty()
+                if again is None:
+                    return None
+                remaining = again
+                if remaining <= floor + QTY_DUST:
+                    break
+        remaining = 0.0 if remaining <= QTY_DUST else remaining
+        return max(floor, remaining)
+
+    def check_venue_flat_while_flat(self, perp_held: Optional[float]
+                                    ) -> Optional[CarryDecision]:
+        """A FLAT book must find the venue flat before it can open.
+
+        FLAT is the book's belief. A short it never recorded (a manual order, a
+        fill it missed) is invisible to every held-position check, and an open
+        on top of it runs the account above the cap with nothing watching the
+        first leg until the next tick's size check halts. `perp_held` is the
+        venue position size from the market snapshot the tick already took (no
+        extra read). None (a hand-built snapshot) checks nothing. Sends nothing.
+        """
+        if (self.position is not None or self.state is not BookState.FLAT
+                or perp_held is None):
+            return None
+        if not self._finite(perp_held):
+            return self._halt("VENUE_POSITION_UNREADABLE",
+                              f"the venue reported a position of {perp_held!r}")
+        if abs(float(perp_held)) > QTY_DUST:
+            return self._halt(
+                "ORPHAN_VENUE_POSITION",
+                f"the book is FLAT but the venue holds a "
+                f"{abs(float(perp_held)):.10g} perp short it never recorded; "
+                "opening a hedge on top of it would exceed the cap with "
+                "nothing watching the first leg")
+        return None
+
+    def _acquire_fee_leaves_hedge_unpaired(self, qty: float, step: float
+                                           ) -> Optional[Dict[str, Any]]:
+        """ACQUIRE buys `qty` of spot and shorts what is LEFT after the spot
+        BUY's fee (taken in the coin received), snapped down to a perp lot. When
+        one lot is a large share of the position that residue exceeds the delta
+        band, the pair lands "unpaired" and is unwound at once: a deterministic
+        round trip of fees, repeated every UTC day. The same fee tier the cost
+        gates already price predicts it before a cent is spent, so the entry is
+        refused instead. Returns the detail when it would, else None (including
+        when the fee tier cannot be read: the in-flight unpaired check remains)."""
+        try:
+            taker = float(self.broker.get_fee_rates(
+                self.spot_symbol, "spot")["taker_bps"]) / 1e4
+        except Exception:  # noqa: BLE001
+            return None
+        if not (self._finite(taker) and 0 < taker < 1) or qty <= 0:
+            return None
+        net = qty * (1.0 - taker)
+        hedge = snap_to_lot(net, step)
+        book = net + hedge
+        residual = (net - hedge) / book if book > 0 else 1.0
+        if residual <= self.delta_band:
+            return None
+        return {"spot_qty": qty, "net_after_fee": net, "hedge_qty": hedge,
+                "predicted_delta_fraction": residual,
+                "delta_band": self.delta_band, "qty_step": step,
+                "note": "after the spot BUY's fee the short snaps down a whole "
+                        "lot and the pair would land unpaired, then unwind: a "
+                        "round trip of fees for nothing"}
+
+    def _confirm_venue_after_open(self, booked: float) -> None:
+        """Establish the "book == venue" baseline at the moment of the open.
+
+        The per-tick size check that normally sets it runs AFTER the margin gate,
+        so a short liquidated in the first tick or two had no baseline and the
+        closed-pnl evidence (`_perp_confirmed_closed`) could never be used. One
+        read right after the fills: equal -> the baseline is now; anything else
+        (unequal, unreadable, no such read) leaves it unset and the per-tick check
+        decides, exactly as before."""
+        reader = getattr(self.broker, "get_perp_position", None)
+        if reader is None:
+            return
+        # Stamped from BEFORE the read: a close landing between the venue's
+        # snapshot and a stamp taken after the read would get a closed-pnl row at
+        # or before the baseline and be skipped, so the evidence would vanish.
+        # A close inside the read window makes the read unequal and sets nothing.
+        tolerance = max(QTY_DUST, 1e-9 * max(booked, 1.0))
+        for attempt in (1, 2):
+            stamp = int(time.time() * 1000)
+            try:
+                venue = abs(float(reader(self.perp_symbol)))
+            except Exception:  # noqa: BLE001
+                venue = None
+            if (venue is not None and self._finite(venue)
+                    and abs(venue - booked) <= tolerance):
+                self._venue_verified_ms = stamp
+                return
+            if attempt == 1:
+                # A read straight after a fill can lag or time out; look once
+                # more after a pause. Still only an EXACT match sets a baseline.
+                time.sleep(self.UNWIND_REREAD_WAIT_S)
+
+    def _perp_confirmed_closed(self, verified_ms: Optional[int],
+                               book_perp: float) -> bool:
+        """Did something other than this engine close the perp short?
+
+        Needs ALL of: the book's size was confirmed equal to the venue's at a
+        known moment (`verified_ms`) with no perp order of ours since; the venue
+        REFUSED our buy-back (the caller has that); two position reads, a pause
+        apart, both read flat; AND the venue's own closed-pnl records since that
+        moment total at least the recorded short. The last is positive evidence
+        a close happened (liquidation, ADL, a manual order); a position list
+        that merely lags produces no closed-pnl row, so it can never satisfy
+        this. Unreadable or incomplete evidence is not confirmation."""
+        if verified_ms is None or book_perp <= QTY_DUST:
+            return False
+
+        def read_once_more_if_unreadable() -> Optional[float]:
+            # One transient timeout must not throw away the evidence; a second
+            # failure (or any non-flat answer) is still not confirmation.
+            value = self._venue_short_qty()
+            if value is None:
+                time.sleep(self.UNWIND_REREAD_WAIT_S)
+                value = self._venue_short_qty()
+            return value
+
+        first = read_once_more_if_unreadable()
+        if first is None or first > QTY_DUST:
+            return False
+        time.sleep(self.UNWIND_REREAD_WAIT_S)
+        second = read_once_more_if_unreadable()
+        if second is None or second > QTY_DUST:
+            return False
+        reader = getattr(self.broker, "get_closed_short_qty_since", None)
+        if reader is None:
+            return False
+        try:
+            closed = reader(self.perp_symbol, int(verified_ms))
+        except Exception:  # noqa: BLE001
+            return False
+        if closed is None or not self._finite(closed):
+            return False
+        return float(closed) >= book_perp * (1.0 - 1e-6) - QTY_DUST
+
+    def _spot_after_perp_closed(self, position: "CarryPosition", reason: str,
+                                wanted_spot: float) -> CarryDecision:
+        """ACQUIRE: the perp that hedged the spot was closed by something else,
+        so the spot is a naked LONG. Sell it (that only removes exposure) and
+        HALT either way: the journal still shows the perp lifecycle open and the
+        venue's closing PnL is a figure only a human with its closed-pnl record
+        can post, so the book never calls itself FLAT here."""
+        # Never more than the wallet holds: when the BUY's fee currency was not
+        # stated the recorded quantity can exceed what is actually there, and the
+        # venue refuses an oversell. Capped by the book's own recorded quantity
+        # too, so unrelated BTC in the account is never sold.
+        sellable = wanted_spot
+        try:
+            held = float(self.broker.get_spot_inventory(self.spot_symbol))
+            if self._finite(held) and held >= 0:
+                sellable = min(wanted_spot, held)
+        except Exception:  # noqa: BLE001
+            pass
+        sell = self._spot_sellable(sellable)
+        sold = (self._fire(self.spot_symbol, "Sell", sell, "spot")
+                if sell > 0 else None)
+        left = max(0.0, wanted_spot - (sold.filled_qty if sold else 0.0))
+        position.perp.filled_qty = 0.0
+        position.perp.requested_qty = 0.0
+        position.spot.filled_qty = left
+        position.spot.requested_qty = left
+        position.spot.fee_base_qty = 0.0
+        if self.pair_risk is not None:
+            self.pair_risk.record_broken_pair(
+                now=self._gate_now(self._last_tick_ms))
+        return self._halt(
+            "PERP_CLOSED_EXTERNALLY_SPOT_SOLD" if left <= QTY_DUST
+            else "PERP_CLOSED_EXTERNALLY_SPOT_PARTIAL",
+            f"{reason} - the venue refused the buy-back, two reads show no "
+            f"short and its closed-pnl records show the short was closed since "
+            f"the last time the book matched it. {left:.10g} of spot is still "
+            "held; the journal's perp lifecycle and the closing PnL need a "
+            "human.")
+
+    def _venue_short_qty(self) -> Optional[float]:
+        """The perp short the venue reports (0.0 when it reads flat), or None
+        when it cannot be read or the broker has no such read. Flat and unread
+        are different answers: the per-tick size check halts on unreadable."""
+        reader = getattr(self.broker, "get_perp_position", None)
+        if reader is None:
+            return None
+        try:
+            qty = abs(float(reader(self.perp_symbol)))
+        except Exception:  # noqa: BLE001
+            return None
+        return qty if math.isfinite(qty) else None
+
+    def _exit_mark(self) -> float:
+        """The reference mark handed to `_unwind`. A ticker that will not
+        answer must not stop a risk exit: the exit orders are market orders and
+        the mark is informational, so an unreadable one is 0.0, never a raise
+        that leaves a book below its floor untouched."""
+        try:
+            return float(self.broker.get_mark(self.perp_symbol))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("carry: exit mark unreadable (%s: %s); the exit "
+                           "does not wait for it", type(exc).__name__, exc)
+            return 0.0
+
     def _unwind(self, mark: float, reason: str) -> CarryDecision:
         """Close both legs. Perp first: it is the leg that can be liquidated."""
         position = self.position
         assert position is not None
         self.state = BookState.UNWINDING
-        wanted_perp = position.perp.filled_qty
+        book_perp = position.perp.filled_qty
+        verified_ms = self._venue_verified_ms
+        # Close what the VENUE holds if that is more than the book recorded: a
+        # margin or liquidation exit runs before the per-tick size check, and
+        # closing only the recorded size would leave the excess short open
+        # behind a FLAT book. The buy is reduce-only, so it cannot overshoot.
+        venue_short = self._venue_short_qty()
+        # The reduce-only buy is refused above the venue's short, so after a
+        # partial liquidation (exactly when a margin exit fires) the venue's
+        # smaller number is what can be closed. Unread (None): use the book.
+        # A venue that reads FLAT (or cannot be read) does not authorise
+        # skipping the close: a flat read straight after a fill, or from a lagging
+        # position list, is indistinguishable from a liquidation, and going FLAT
+        # on it would leave a live short behind a FLAT book. The recorded size is
+        # still sent (reduce-only, so it cannot open anything); if the venue
+        # refuses it the exit halts with the position kept for a human.
+        wanted_perp = (venue_short if venue_short is not None
+                       and venue_short > QTY_DUST else book_perp)
         perp = self._fire(self.perp_symbol, "Buy", wanted_perp, "linear")
+        # What the venue still holds AFTER the close, added to (never replacing)
+        # what the fills imply: the order was sized from one read (which may
+        # have been stale or larger/smaller than the book), and FLAT must be
+        # confirmed, not inferred. Unreadable falls back to the fill arithmetic.
+        fill_left = (wanted_perp - perp.filled_qty if perp is not None
+                     else wanted_perp)
+        remaining = (self._short_left_after_close(max(0.0, fill_left))
+                     if perp is not None and perp.filled_qty > 0 else None)
+        perp_left = remaining if remaining is not None else fill_left
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
             # buying the perp back and nothing else: selling their BTC would
@@ -1520,12 +2002,16 @@ class CarryEngine:
                     "UNWIND_INCOMPLETE",
                     f"{reason} — the perp hedge did not close and the "
                     "client's BTC is now unhedged")
-            left = wanted_perp - perp.filled_qty
+            left = perp_left
             if left > QTY_DUST:
                 # The hedge is SMALLER, not gone. The remainder is still short
                 # at the venue and the slice it covers is still hedged.
-                return self._partial_close(reason, perp_left=left,
-                                           spot_left=left)
+                # The slice still hedged cannot exceed the client's coin the
+                # book recorded, even when the venue short being closed was
+                # larger than the book's.
+                return self._partial_close(
+                    reason, perp_left=left,
+                    spot_left=min(left, position.spot.filled_qty))
             self.position = None
             self.state = BookState.FLAT
             failed = self._record()
@@ -1539,6 +2025,9 @@ class CarryEngine:
         # received, and the venue refuses a sell above the free balance.
         wanted_spot = max(0.0, position.spot.filled_qty
                           - position.spot.fee_base_qty)
+        if perp is None and self.state is BookState.UNWINDING \
+                and self._perp_confirmed_closed(verified_ms, book_perp):
+            return self._spot_after_perp_closed(position, reason, wanted_spot)
         if perp is None or perp.filled_qty <= 0:
             # The perp is the leg that can be liquidated and the one that
             # hedges the spot. If it did not close, selling the spot would turn
@@ -1549,17 +2038,29 @@ class CarryEngine:
                 "sold because it is still hedging the open short")
         # Sell spot only in proportion to the perp that actually closed: a
         # half-closed short against a fully sold spot is a naked short.
-        closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
-            if wanted_perp > 0 else 1.0
-        sell_spot = (wanted_spot if closed_fraction >= 1.0 - 1e-9
-                     else wanted_spot * closed_fraction)
-        spot = self._fire(self.spot_symbol, "Sell", sell_spot, "spot")
+        if remaining is not None:
+            # Keep spot against the short the venue STILL holds, in proportion
+            # to the recorded pair: a stale read that undersized the close
+            # leaves most of the short open, and most of the spot must stay
+            # with it; a partial liquidation that left nothing sells it all.
+            closed_fraction = (1.0 - min(1.0, perp_left / book_perp)
+                               if book_perp > 0 else 1.0)
+        else:
+            closed_fraction = min(1.0, perp.filled_qty / wanted_perp) \
+                if wanted_perp > 0 else 1.0
+        # Sell what the venue can take: the net-of-fee balance floored to the
+        # spot lot. The sub-lot remainder is dust no order can move.
+        wanted_spot = self._spot_sellable(wanted_spot)
+        sell_spot = self._spot_sellable(
+            wanted_spot if closed_fraction >= 1.0 - 1e-9
+            else wanted_spot * closed_fraction)
+        spot = (self._fire(self.spot_symbol, "Sell", sell_spot, "spot")
+                if sell_spot > 0 else Leg(symbol=self.spot_symbol, side="Sell",
+                                          product="spot"))
         if spot is None:
             spot_left = wanted_spot
             return self._partial_close(
-                reason, perp_left=wanted_perp - perp.filled_qty,
-                spot_left=spot_left)
-        perp_left = wanted_perp - perp.filled_qty
+                reason, perp_left=perp_left, spot_left=spot_left)
         spot_left = wanted_spot - spot.filled_qty
         if perp_left > QTY_DUST or spot_left > QTY_DUST:
             return self._partial_close(reason, perp_left=perp_left,
@@ -1625,9 +2126,17 @@ class CarryEngine:
                 f"{reason}; the perp order's outcome is unknown and "
                 f"{spot.filled_qty:.10g} spot is held. NOT unwound.")
         self.state = BookState.UNWINDING
-        wanted = max(0.0, spot.filled_qty - spot.fee_base_qty)   # held, net
+        wanted = self._spot_sellable(
+            max(0.0, spot.filled_qty - spot.fee_base_qty))   # held, net, on-lot
         closed = self._fire(self.spot_symbol, "Sell", wanted, "spot")
         if closed is None or closed.filled_qty <= 0:
+            # The spot is still held and still naked: write it down so the
+            # ledger, the journal and the next cold start all see it.
+            self.position = CarryPosition(
+                spot=spot,
+                perp=Leg(symbol=self.perp_symbol, side="Sell",
+                         product="linear"),
+                opened_ms=self._last_tick_ms)
             return self._halt("NAKED_SPOT_UNWIND_FAILED", reason)
         left = wanted - closed.filled_qty
         if left > QTY_DUST:
@@ -1652,15 +2161,16 @@ class CarryEngine:
                 "still held with nothing hedging it")
         self.position = None
         self.state = BookState.FLAT
-        failed = self._record()
-        if failed is not None:
-            return failed
         # A spot round trip was paid for nothing. Without this, a venue that
         # rejects the perp leg made the book buy and sell spot every tick:
-        # 8 round trips in 10 ticks, measured (INVENTORY D4).
+        # 8 round trips in 10 ticks, measured (INVENTORY D4). Counted BEFORE
+        # the journal save so the persisted allowance includes it.
         if self.pair_risk is not None:
             self.pair_risk.record_broken_pair(
                 now=self._gate_now(self._last_tick_ms))
+        failed = self._record()
+        if failed is not None:
+            return failed
         return CarryDecision("unwound", acted=True, reason=reason,
                              state=BookState.FLAT,
                              detail={"error": self._last_leg_error})
@@ -1671,10 +2181,24 @@ class CarryEngine:
         margin = self._margin_multiple()
         self._last_margin = margin
         if margin is None:
+            if (self.execution_mode == ACQUIRE and self.position is not None
+                    and self._perp_confirmed_closed(
+                        self._venue_verified_ms,
+                        self.position.perp.filled_qty)):
+                # A liquidated short leaves the margin ratio undefined (no
+                # position, no maintenance margin), which reads as "unreadable".
+                # The same evidence gate as the unwind: two flat reads AND the
+                # venue's closed-pnl records totalling the short since the book
+                # last matched it. Otherwise it is the fail-closed halt below.
+                self.state = BookState.UNWINDING
+                pos = self.position
+                return self._spot_after_perp_closed(
+                    pos, "MARGIN_UNDEFINED",
+                    max(0.0, pos.spot.filled_qty - pos.spot.fee_base_qty))
             return self._halt("MARGIN_UNREADABLE",
                               "an unreadable margin is a margin call you cannot see")
         if margin < self.min_margin_multiple:
-            return self._unwind(self.broker.get_mark(self.perp_symbol),
+            return self._unwind(self._exit_mark(),
                                 f"MARGIN_HEADROOM_{margin:.2f}x_BELOW_FLOOR")
         return self._check_liquidation_distance()
 
@@ -1683,10 +2207,18 @@ class CarryEngine:
         market view. It is a direct venue read and needs no mark: a held
         short that drifted or cannot be read halts the book whatever the
         state of the price feed. Returns None when flat, already halted, or
-        when the venue agrees with the book. Sends nothing."""
+        when the venue agrees with the book and its margin is above the floor.
+
+        After the size check, the margin and liquidation gates run: both
+        read the venue directly and need no market view, and a feed that stays
+        unusable must not leave a short below its floor untouched. Their exit
+        is the only order this path can send."""
         if self.position is None or self.state is BookState.HALTED:
             return None
-        return self._check_venue_position()
+        mismatch = self._check_venue_position()
+        if mismatch is not None:
+            return mismatch
+        return self._check_margin()
 
     def _check_venue_position(self) -> Optional[CarryDecision]:
         """Does the venue's perp short equal the size the book recorded?
@@ -1699,6 +2231,7 @@ class CarryEngine:
         reader = getattr(self.broker, "get_perp_position", None)
         if reader is None or self.position is None:
             return None
+        read_started_ms = int(time.time() * 1000)   # the baseline, if it passes
         try:
             venue = abs(float(reader(self.perp_symbol)))
         except Exception as exc:  # noqa: BLE001
@@ -1712,10 +2245,22 @@ class CarryEngine:
                               f"the venue reported a position of {venue!r}")
         book = self.position.perp.filled_qty
         if abs(venue - book) > max(QTY_DUST, 1e-9 * max(book, 1.0)):
+            if (self.execution_mode == ACQUIRE and venue <= QTY_DUST
+                    and self._perp_confirmed_closed(
+                        self._venue_verified_ms, book)):
+                # The short is gone and the venue's own closed-pnl records say
+                # it was CLOSED since the book last matched it: the spot is a
+                # naked long. Same evidence gate, same HALT, as the unwind.
+                self.state = BookState.UNWINDING
+                pos = self.position
+                return self._spot_after_perp_closed(
+                    pos, "VENUE_POSITION_DRIFT",
+                    max(0.0, pos.spot.filled_qty - pos.spot.fee_base_qty))
             return self._halt(
                 "VENUE_POSITION_DRIFT",
                 f"the venue holds a {venue:.10g} perp short and the book "
                 f"recorded {book:.10g}; the hedge is not what the ledger says")
+        self._venue_verified_ms = read_started_ms
         return None
 
     def _check_inventory_cover(self) -> Optional[CarryDecision]:
@@ -1767,6 +2312,15 @@ class CarryEngine:
                 f"inventory and the lot rules could not be read "
                 f"({type(exc).__name__}: {exc})")
         buy = snap_to_lot(excess, step)
+        if buy <= 0 and excess > hedged * self.delta_band:
+            # Under one lot, but not dust: the same band that triggers a
+            # rebalance elsewhere says this hedge is materially larger than the
+            # coin behind it. At small size (the production cap is ONE lot) the
+            # whole hedge is a single lot, so "below a lot" would mean "never
+            # enforced". One lot is the smallest order that exists; buying it
+            # can only leave the hedge SMALLER than the inventory (or closed),
+            # never a short the client's coin does not cover.
+            buy = min(step, hedged)
         if buy <= 0:
             # Smaller than one venue lot, so no order exists that would reduce
             # it. Said out loud rather than hidden, and NOT halted: halting a
@@ -1800,7 +2354,11 @@ class CarryEngine:
                 detail={"inventory": inventory,
                         "closed_qty": closed.filled_qty})
 
-        if remaining > inventory + QTY_DUST:
+        # The buy-back was snapped DOWN to a lot, so a fully filled order still
+        # leaves the sub-lot shortfall the `buy <= 0` branch above accepts as
+        # unreducible. Only a residue beyond one lot means the order filled
+        # short.
+        if remaining > inventory + max(QTY_DUST, step):
             # The buy-back itself filled short, so part of the short is STILL
             # uncovered. Same rule as any other close that filled short.
             return self._partial_close("INVENTORY_WITHDRAWN",
@@ -1808,8 +2366,8 @@ class CarryEngine:
                                        spot_left=inventory)
         self.position.perp.filled_qty = remaining
         self.position.perp.requested_qty = remaining
-        self.position.spot.filled_qty = remaining
-        self.position.spot.requested_qty = remaining
+        self.position.spot.filled_qty = min(remaining, inventory)
+        self.position.spot.requested_qty = self.position.spot.filled_qty
         failed = self._record()
         if failed is not None:
             return failed
@@ -1860,7 +2418,7 @@ class CarryEngine:
                     "rate is a margin call you cannot see")
             if float(rate) >= MAX_ACCOUNT_MM_RATE:
                 return self._unwind(
-                    self.broker.get_mark(self.perp_symbol),
+                    self._exit_mark(),
                     f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
         elif mode == _MARGIN_ISOLATED:
             # Per-position liquidation: the account rate does not describe it.
@@ -1896,7 +2454,7 @@ class CarryEngine:
                 f"the venue reported a liquidation distance of {distance!r}")
         if float(distance) < MIN_LIQUIDATION_DISTANCE_PCT:
             return self._unwind(
-                self.broker.get_mark(self.perp_symbol),
+                self._exit_mark(),
                 f"LIQUIDATION_{float(distance):.1f}PCT_AWAY_BELOW_FLOOR")
         return None
 
@@ -1919,6 +2477,36 @@ class CarryEngine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("carry: risk observation not recorded (%s: %s)",
                            type(exc).__name__, exc)
+
+    HALTED_WATCH_EVERY_MS = 60_000
+
+    def _halted_watch(self, timestamp_ms: int) -> Dict[str, Any]:
+        """A halted book that still holds a position keeps LOOKING at it.
+
+        Read-only: it places nothing. A halt stops the engine trading, not the
+        short from approaching its liquidation price, and a log line is the
+        only thing between that and an operator who has not looked yet.
+        """
+        if self.position is None:
+            return {}
+        now = int(timestamp_ms or 0)
+        last = getattr(self, "_halted_watch_ms", None)
+        if last is not None and now and now - last < self.HALTED_WATCH_EVERY_MS:
+            return {}
+        self._halted_watch_ms = now
+        margin = self._margin_multiple()
+        self._last_margin = margin
+        if margin is None:
+            logger.critical(
+                "carry HALTED with a held position and the margin is "
+                "UNREADABLE; the short is unwatched")
+        elif margin < self.min_margin_multiple:
+            logger.critical(
+                "carry HALTED with a held position and margin %.2fx is BELOW "
+                "the %.2fx floor; the short is near liquidation and the book "
+                "will not act", margin, self.min_margin_multiple)
+        return {"halted_margin_multiple": margin,
+                "margin_floor": self.min_margin_multiple}
 
     def _margin_multiple(self) -> Optional[float]:
         try:
@@ -1946,6 +2534,8 @@ class CarryEngine:
               qty_step: float = 0.0) -> Optional[Leg]:
         if qty <= 0 or not self._finite(qty):
             return None
+        if symbol == self.perp_symbol and product == "linear":
+            self._venue_verified_ms = None      # we are about to change it
         if patient and self.execution_style == MAKER_FIRST:
             return self._rest_then_take(symbol, side, qty, product, qty_step)
         return self._take(symbol, side, qty, product)
@@ -2044,6 +2634,18 @@ class CarryEngine:
             return self._as_whole_leg(maker)
         return self._merge(maker, taker, qty)
 
+    def _note_unresolved_order(self, *, symbol: str, side: str, product: str,
+                               link: str, requested: float, filled_seen: float,
+                               why: str) -> None:
+        """Write down, beside the halt that follows, the order the book could
+        not settle: the floor of what it has already filled. The venue stays the
+        authority for the rest; this is what a human reconciling a HALTED ledger
+        would otherwise find as `position: null`."""
+        self._unresolved_order = {
+            "symbol": symbol, "side": side, "product": product,
+            "order_link_id": link, "requested_qty": float(requested),
+            "filled_qty_seen": float(filled_seen), "why": why}
+
     def _rest(self, symbol: str, side: str, qty: float,
               product: str) -> Optional[Leg]:
         """One post-only order at the touch. Returns what it filled, or None.
@@ -2077,6 +2679,10 @@ class CarryEngine:
                 product=product)
         except Exception as exc:  # noqa: BLE001
             self._last_leg_error = f"{type(exc).__name__}: {exc}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link="",
+                requested=qty, filled_seen=0.0,
+                why="MAKER_ORDER_AMBIGUOUS: placement raised, fill unknown")
             self._halt(
                 "MAKER_ORDER_AMBIGUOUS",
                 f"a post-only {side} of {qty} {symbol} may or may not be "
@@ -2088,6 +2694,12 @@ class CarryEngine:
         filled, placed_price, ok = self._accountable(placed, qty)
         if not ok:
             self._last_leg_error = f"unaccountable maker fill: {placed!r}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product,
+                link=(str(placed.get("order_link_id", ""))
+                      if isinstance(placed, dict) else ""),
+                requested=qty, filled_seen=0.0,
+                why="MAKER_ORDER_AMBIGUOUS: placement read back unaccountably")
             self._halt(
                 "MAKER_ORDER_AMBIGUOUS",
                 f"a post-only {side} of {qty} {symbol} reads back a fill the "
@@ -2114,6 +2726,10 @@ class CarryEngine:
                                              product=product)
         except Exception as exc:  # noqa: BLE001
             self._last_leg_error = f"{type(exc).__name__}: {exc}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link=link,
+                requested=qty, filled_seen=leg.filled_qty,
+                why="MAKER_ORDER_UNCANCELLABLE")
             self._halt(
                 "MAKER_ORDER_UNCANCELLABLE",
                 f"a post-only {side} of {qty} {symbol} could not be cancelled "
@@ -2126,6 +2742,13 @@ class CarryEngine:
             # first the book has not finished counting.
             self._last_leg_error = (
                 f"maker order still {(final or {}).get('status')!r} after cancel")
+            seen = (final or {}).get("filled_qty")
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link=link,
+                requested=qty,
+                filled_seen=max(leg.filled_qty,
+                                float(seen) if self._finite(seen) else 0.0),
+                why="MAKER_ORDER_STILL_RESTING")
             self._halt(
                 "MAKER_ORDER_STILL_RESTING",
                 f"a post-only {side} of {qty} {symbol} is still resting after "
@@ -2136,6 +2759,10 @@ class CarryEngine:
         total, final_price, ok = self._accountable(final or {}, qty)
         if not ok:
             self._last_leg_error = f"unaccountable maker fill: {final!r}"
+            self._note_unresolved_order(
+                symbol=symbol, side=side, product=product, link=link,
+                requested=qty, filled_seen=leg.filled_qty,
+                why="MAKER_ORDER_AMBIGUOUS")
             self._halt(
                 "MAKER_ORDER_AMBIGUOUS",
                 f"a post-only {side} of {qty} {symbol} read back a total the "
@@ -2152,6 +2779,8 @@ class CarryEngine:
             leg.fee = None if fee is None else float(fee)
             leg.fee_base_qty = self._base_fee_withheld(final, symbol, side,
                                                        product)
+            leg.base_fee_known = self._fee_currency_was_reported(
+                final, side=side, product=product)
         return leg
 
     @staticmethod
@@ -2284,7 +2913,18 @@ class CarryEngine:
             try:
                 self.persist(self.to_state())
             except Exception:  # noqa: BLE001 - already halting
-                logger.critical("the halt itself could not be written down")
+                self._halt_unwritten = True
+                # The ledger is the durable record and it just failed, so the
+                # log carries what it could not: the book state, the position
+                # and any unsettled order, as one line a human can act on.
+                try:
+                    snapshot = json.dumps(self.to_state(), sort_keys=True,
+                                          default=str)
+                except Exception:  # noqa: BLE001
+                    snapshot = "<state not serialisable>"
+                logger.critical("the halt itself could not be written down; "
+                                "it is retried on every halted tick. State: %s",
+                                snapshot)
         return CarryDecision("halted", reason=reason, state=BookState.HALTED,
                              detail={"detail": detail})
 

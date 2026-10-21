@@ -225,3 +225,209 @@ def test_an_accepted_market_order_that_filled_is_that_fill():
                     "avgPrice": "100000"}]).place_market(
         symbol="BTCUSDT", side="Sell", qty=0.001, product="linear")
     assert r["filled_qty"] == pytest.approx(0.001)
+
+
+# -- an accepted market order still live with part of it filled ---------------
+
+class LivePartialReadback(FakeClient):
+    """Create succeeds with no fill in the response; the read-back says `row`."""
+
+    def __init__(self, row):
+        super().__init__()
+        self.row = row
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/order/create":
+            return envelope({"orderId": "1", "orderLinkId": body["orderLinkId"]})
+        if endpoint == "/v5/order/realtime":
+            return envelope({"list": [dict(self.row,
+                                           orderLinkId=params["orderLinkId"])]})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+def _live_partial_broker(row):
+    return CarryBroker(client=LivePartialReadback(row),
+                       order_gate=lambda: (True, "T"),
+                       sequence_source=lambda *a: 1)
+
+
+def test_an_accepted_market_order_still_live_with_a_partial_fill_is_unknown():
+    with pytest.raises(OrderOutcomeUnknown):
+        _live_partial_broker({"orderStatus": "PartiallyFilled", "cumExecQty": "0.2",
+                   "avgPrice": "100000"}).place_market(
+            symbol="BTCUSDT", side="Sell", qty=1.0, product="linear")
+
+
+def test_an_accepted_market_order_that_ended_partial_is_that_partial_fill():
+    r = _live_partial_broker({"orderStatus": "PartiallyFilledCanceled",
+                   "cumExecQty": "0.2", "avgPrice": "100000"}).place_market(
+        symbol="BTCUSDT", side="Sell", qty=1.0, product="linear")
+    assert r is not None and r["filled_qty"] == pytest.approx(0.2)
+
+
+# -- a venue timeout is not a refusal -----------------------------------------
+
+class TimeoutRefusal(FakeClient):
+    def __init__(self, exc_type, code):
+        super().__init__()
+        self.exc_type, self.code = exc_type, code
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/order/create":
+            raise self.exc_type("venue said no", self.code)
+        if endpoint in ("/v5/order/realtime", "/v5/order/history"):
+            return envelope({"list": []})      # the venue shows no row yet
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+@pytest.mark.parametrize("code", [10000, 170007])
+def test_a_venue_timeout_retcode_is_an_unknown_outcome_not_a_rejection(code):
+    b = CarryBroker(client=TimeoutRefusal(bybit_connection.PermanentAPIError, code),
+                    order_gate=lambda: (True, "T"), sequence_source=lambda *a: 1)
+    with pytest.raises(OrderOutcomeUnknown):
+        b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5, product="spot")
+
+
+def test_an_ordinary_venue_refusal_is_still_a_rejection():
+    b = CarryBroker(client=TimeoutRefusal(bybit_connection.PermanentAPIError, 110007),
+                    order_gate=lambda: (True, "T"), sequence_source=lambda *a: 1)
+    assert b.place_market(symbol="BTCUSDT", side="Buy", qty=0.5,
+                          product="spot") is None
+
+
+# -- a 200 with no retCode is not a refusal ----------------------------------
+
+@pytest.mark.parametrize("body", ['{"message": "upstream"}', '[]', '{"retCode": null}',
+                                  '{"retCode": "x"}'])
+def test_a_200_without_a_usable_retcode_is_read_back_not_recorded_as_a_refusal(
+        body, tmp_path, monkeypatch):
+    """The order executed and the venue shows it filled. A body with no
+    retCode used to become retCode -1, a definite rejection: place_market
+    returned None without ever reading the order back, and the engine could
+    send it again."""
+    import json
+    import time
+
+    from fake_bybit import API_KEY, API_SECRET
+    from persistence import StateStore
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    class Cfg:
+        USE_TESTNET = True
+        BYBIT_API_KEY = API_KEY
+        BYBIT_API_SECRET = API_SECRET
+        BYBIT_RECV_WINDOW_MS = 5000
+        REQUEST_TIMEOUT_SECONDS = 5.0
+        USE_LEVERAGE = False
+        SYMBOL_FILTERS_TTL = 3600
+        ORDERLINK_PREFIX = "BB"
+
+    class Transport(bybit_connection.Transport):
+        def __init__(self):
+            self.creates = 0
+
+        def request(self, method, url, **kw):
+            if "order/create" in url:
+                self.creates += 1
+                return 200, body
+            return 200, json.dumps({"retCode": 0, "result": {"list": [{
+                "orderStatus": "Filled", "cumExecQty": "0.01",
+                "avgPrice": "100000", "orderLinkId": "x"}]}})
+
+    store = StateStore(str(tmp_path / "s.db"))
+    store.claim_writer()
+    transport = Transport()
+    client = bybit_connection.BybitClient(config=Cfg(), store=store,
+                                          transport=transport)
+    broker = CarryBroker(client=client,
+                         sequence_source=lambda *a: store.next_order_seq(),
+                         order_gate=lambda: (True, ""))
+    result = broker.place_market(symbol="BTCUSDT", side="Sell", qty=0.01,
+                                 product="linear")
+    assert result is not None and result["filled_qty"] == pytest.approx(0.01)
+    assert transport.creates == 1, "the order was re-sent"
+
+
+# -- closed-pnl as POSITIVE evidence that the perp short was closed -----------
+
+class ClosedPnlClient(FakeClient):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/position/closed-pnl":
+            self.calls.append((method, endpoint, params, body))
+            return envelope({"list": self.rows})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+def _closed_pnl_broker(rows):
+    return CarryBroker(client=ClosedPnlClient(rows),
+                       order_gate=lambda: (True, "T"),
+                       sequence_source=lambda *a: 1)
+
+
+def _row(qty, side="Buy", stamp=2_000):
+    return {"orderId": "o", "side": side, "qty": str(qty),
+            "updatedTime": str(stamp), "closedPnl": "-1"}
+
+
+def test_closed_short_qty_sums_the_closing_side_rows_after_the_moment():
+    b = _closed_pnl_broker([_row(0.3), _row(0.2), _row(9, side="Sell"),
+                            _row(5, stamp=900)])           # before since_ms
+    assert b.get_closed_short_qty_since("BTCUSDT", 1_000) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("rows", [
+    [_row(0.1)] * 50,                           # a full page may be truncated
+    [{"orderId": "o", "side": "Buy", "qty": "x", "updatedTime": "2000"}],
+    [{"orderId": "o", "side": "Buy", "qty": "nan", "updatedTime": "2000"}],
+    [{"orderId": "o", "side": "Buy", "qty": "-1", "updatedTime": "2000"}],
+    ["not a row"],
+], ids=["full-page", "bad-qty", "nan-qty", "negative-qty", "not-a-dict"])
+def test_closed_short_qty_is_unknown_when_the_evidence_is_not_trustworthy(rows):
+    assert _closed_pnl_broker(rows).get_closed_short_qty_since(
+        "BTCUSDT", 1_000) is None
+
+
+def test_no_closed_pnl_rows_is_zero_not_unknown():
+    assert _closed_pnl_broker([]).get_closed_short_qty_since(
+        "BTCUSDT", 1_000) == 0.0
+
+
+# -- the venue's reported leverage is visible, never set or gated on ----------
+
+class LeverageClient(FakeClient):
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def _request(self, method, endpoint, *, params=None, body=None,
+                 signed=False, retries=3):
+        if endpoint == "/v5/position/list":
+            self.calls.append((method, endpoint, params, body))
+            return envelope({"list": self.rows})
+        return super()._request(method, endpoint, params=params, body=body,
+                                signed=signed, retries=retries)
+
+
+@pytest.mark.parametrize("rows,expected", [
+    ([{"size": "0", "leverage": "10"}], 10.0),
+    ([{"size": "0.5", "leverage": "3.5"}], 3.5),
+    ([{"size": "0"}], None), ([{"size": "0", "leverage": ""}], None),
+    ([{"size": "0", "leverage": "nan"}], None),
+    ([{"size": "0", "leverage": "0"}], None), ([], None),
+])
+def test_the_venues_reported_leverage_is_read_not_assumed(rows, expected):
+    b = CarryBroker(client=LeverageClient(rows), order_gate=lambda: (True, "T"),
+                    sequence_source=lambda *a: 1)
+    assert b.get_position_leverage("BTCUSDT") == expected
+    # read only: no leverage-setting request is ever made
+    assert not [c for c in b.client.calls if "set-leverage" in c[1]]

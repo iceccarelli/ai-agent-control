@@ -101,6 +101,12 @@ def _fees(t):
     return json.loads(t["meta"])["fees"]
 
 
+def _gross(held_qty):
+    """The quantity BOUGHT. On spot the buy's 0.1% fee is taken in the base
+    coin, so the account (and the position, stop and exit) hold 0.999 of it."""
+    return held_qty / (1.0 - 0.001)
+
+
 def _round_trip(tmp_path, fee_for):
     engine, store, _ = _stack(tmp_path, fee_for)
     report = engine.execute(buy_intent())
@@ -116,10 +122,10 @@ class TestModernCumFeeDetail:
         store, t, qty = _round_trip(tmp_path, spot_detail)
         f = _fees(t)
         assert t["entry_fee_realized"] == 1 and t["entry_fee_currency"] == "USDT"
-        assert t["entry_fee"] == pytest.approx(qty * 0.001 * FILL_PRICE)
+        assert t["entry_fee"] == pytest.approx(_gross(qty) * 0.001 * FILL_PRICE)
         part = f["entry"]["parts"][0]
         assert (part["venue_amount"], part["venue_currency"]) == (
-            pytest.approx(qty * 0.001), "BTC")
+            pytest.approx(_gross(qty) * 0.001), "BTC")
         assert part["status"] == "converted" and part["rate"] == FILL_PRICE
         assert f["entry"]["source"] == "cumFeeDetail"
         assert f["entry"]["ref"]["order_link_id"]          # fill association
@@ -139,7 +145,7 @@ class TestModernCumFeeDetail:
             d["cumExecFee"] = "0"
             return d
         store, t, qty = _round_trip(tmp_path, fee_for)
-        assert t["entry_fee"] == pytest.approx(qty * 0.001 * FILL_PRICE)
+        assert t["entry_fee"] == pytest.approx(_gross(qty) * 0.001 * FILL_PRICE)
         assert t["entry_fee"] > 0
         assert t["exit_fee"] > 0
         assert t["entry_fee_realized"] == 1 and t["exit_fee_realized"] == 1
@@ -154,7 +160,7 @@ class TestModernCumFeeDetail:
         store, t, qty = _round_trip(tmp_path, fee_for)
         assert t["entry_fee_realized"] == 1 and t["exit_fee_realized"] == 1
         assert _fees(t)["entry"]["source"] == "cumExecFee"
-        assert t["entry_fee"] == pytest.approx(qty * 0.001 * FILL_PRICE)
+        assert t["entry_fee"] == pytest.approx(_gross(qty) * 0.001 * FILL_PRICE)
         store.close()
 
     def test_reported_zero_is_confirmed_and_distinct_from_unknown(self, tmp_path):
@@ -526,3 +532,195 @@ class TestFeeSetRules:
         ok = vf.convert_fee_set(vf.FeeSet(
             (vf.VenueFee(0.5, "BTC"),), True, "cumFeeDetail"), **kw)
         assert ok.confirmed and ok.account_unit_amount == 50.0
+
+
+class TestASpotBuyIsProtectedForWhatIsActuallyHeld:
+    def test_the_stop_and_legs_are_sized_net_of_the_base_coin_fee(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        report = engine.execute(buy_intent())
+        assert report.ok, report
+        row = store.open_positions()[0]
+        held = float(row["qty"])
+        buys = [o for o in store._query("SELECT * FROM orders WHERE purpose='entry'")]
+        bought = float(buys[0]["qty"])
+        assert held < bought, "the position still claims the gross fill"
+        assert held == pytest.approx(bought * (1 - 0.001), abs=1e-5)
+        protective = store._query(
+            "SELECT * FROM orders WHERE purpose IN ('stop','tp')")
+        assert protective
+        assert max(float(o["qty"]) for o in protective) <= held + 1e-9
+        stop = [o for o in protective if o["purpose"] == "stop"][0]
+        assert float(stop["qty"]) == pytest.approx(held, abs=1e-9)
+        assert sum(float(o["qty"]) for o in protective if o["purpose"] == "tp") \
+            == pytest.approx(held, abs=1e-5)
+        store.close()
+
+    def test_a_fill_that_leaves_nothing_sellable_is_booked_as_dust(self, tmp_path):
+        def eaten(side, qty):
+            return ({"cumFeeDetail": {"BTC": f"{qty:.8f}"}} if side == "Buy"
+                    else {"cumFeeDetail": {"USDT": "0"}})
+        engine, store, _ = _stack(tmp_path, eaten)
+        report = engine.execute(buy_intent())
+        assert report.ok is False and report.reason == "ZERO_SELLABLE"
+        assert store.open_positions() == []
+        assert store._query("SELECT * FROM decisions WHERE decision = ?",
+                            ("ENTRY_DUST",))
+        store.close()
+
+
+def test_a_stated_fee_without_a_currency_is_the_base_coin_on_a_spot_buy():
+    import venue_fees
+    fees = venue_fees.extract_order_fees({"cumExecFee": "0.002"})
+    assert fees.known
+    assert venue_fees.spot_buy_net_qty("BTCUSDT", 2.0, fees) == pytest.approx(1.998)
+    assert venue_fees.spot_buy_net_qty(
+        "BTCUSDT", 2.0, venue_fees.UNKNOWN_FEES) == pytest.approx(2.0 * 0.998)
+
+
+def test_a_rebate_never_makes_a_spot_buy_hold_more_than_it_filled():
+    import venue_fees
+    fees = venue_fees.extract_order_fees({"cumFeeDetail": {"BTC": "-0.001"}})
+    assert venue_fees.spot_buy_net_qty("BTCUSDT", 2.0, fees) == pytest.approx(2.0)
+
+
+class TestOrderLifecycleStaysConsistent:
+    def test_cancelling_an_entry_does_not_write_a_terminal_status(self, tmp_path):
+        """"Order not found" also means "already filled": only the venue's own
+        record may settle an entry, after what it executed is in the book."""
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        store.record_order("EC1", "BTCUSDT", "Buy", "Market", 0.001, purpose="entry")
+        store.update_order_status("EC1", "submitted")
+        assert engine.client.cancel_order(symbol="BTCUSDT", order_link_id="EC1")
+        assert store.get_order("EC1")["status"] == "submitted"
+        store.record_order("TP1", "BTCUSDT", "Sell", "Limit", 0.001, purpose="tp")
+        store.update_order_status("TP1", "submitted")
+        assert engine.client.cancel_order(symbol="BTCUSDT", order_link_id="TP1")
+        assert store.get_order("TP1")["status"] == "cancelled"
+        store.close()
+
+    def test_a_failed_venue_cancel_leaves_the_protective_legs_open_locally(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        report = engine.execute(buy_intent())
+        assert report.ok
+        engine.client.cancel_all = lambda symbol=None: False
+        engine._cancel_protective_orders("BTCUSDT")
+        legs = store._query("SELECT * FROM orders WHERE purpose IN ('stop','tp')")
+        assert legs and all(o["status"] != "cancelled" for o in legs)
+        assert store._query("SELECT * FROM decisions WHERE decision = ?",
+                            ("PROTECTIVE_CANCEL_FAILED",))
+        store.close()
+
+    def test_a_full_close_marks_its_protective_legs_cancelled(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        assert engine.execute(buy_intent()).ok
+        assert engine.close_position(symbol="BTCUSDT", reason="t").ok
+        legs = store._query("SELECT * FROM orders WHERE purpose IN ('stop','tp')")
+        assert legs and all(o["status"] == "cancelled" for o in legs)
+        store.close()
+
+    def test_an_entry_is_marked_filled_only_once_its_position_exists(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+
+        def boom(*a, **k):
+            raise RuntimeError("db hiccup")
+        store.upsert_position = boom
+        with pytest.raises(RuntimeError):
+            engine.execute(buy_intent())
+        entry = store._query("SELECT * FROM orders WHERE purpose='entry'")[0]
+        assert entry["status"] != "filled"
+        assert entry["order_link_id"] in [o["order_link_id"]
+                                         for o in store.unresolved_orders()]
+        store.close()
+
+    def test_a_spot_close_that_only_partly_sold_books_only_what_sold(self, tmp_path):
+        engine, store, _ = _stack(tmp_path, spot_detail)
+        assert engine.execute(buy_intent()).ok
+        held = float(store.open_positions()[0]["qty"])
+        engine._await_fill = lambda symbol, link, timeout_s=10.0: {
+            "orderStatus": "PartiallyFilledCanceled",
+            "cumExecQty": f"{held * 0.4:.6f}", "avgPrice": str(FILL_PRICE)}
+        report = engine.close_position(symbol="BTCUSDT", reason="t")
+        assert report.reason == "CLOSE_PARTIAL" and report.ok is False
+        rows = store.open_positions()
+        assert len(rows) == 1 and float(rows[0]["qty"]) == pytest.approx(held * 0.6, rel=1e-3)
+        assert len(store._query("SELECT * FROM trades")) == 1
+        store.close()
+
+
+def test_a_close_does_not_floor_float_noise_to_one_lot_step_short(tmp_path):
+    """A row quantity of 0.9470719999999999 (float noise on 0.947072) used to
+    snap DOWN to 0.947071: a one-step dust remainder on every such close."""
+    engine, store, _ = _stack(tmp_path, spot_detail)
+    assert engine.execute(buy_intent()).ok
+    row = store.open_positions()[0]
+    store.upsert_position("BTCUSDT", "Buy", 0.9470719999999999, float(row["entry_price"]),
+                          stop_price=float(row["stop_price"]),
+                          order_link_id=str(row["order_link_id"]), meta=row["meta"] and
+                          __import__("json").loads(row["meta"]))
+    sent = []
+    real = engine.client.place_order
+
+    def spy(**kw):
+        if kw.get("purpose") == "close":
+            sent.append(kw["qty"])
+        return real(**kw)
+    engine.client.place_order = spy
+    engine.close_position(symbol="BTCUSDT", reason="t")
+    assert sent and sent[0] == 0.947072
+    store.close()
+
+
+class TestQuantitiesSurviveFloatNoiseAndLotSteps:
+    def test_snap_ignores_float_noise_below_any_step(self):
+        from decimal import Decimal
+        import position_sizing as ps
+        assert ps.snap_qty_down(0.3 - 0.0003, Decimal("0.0001")) == Decimal("0.2997")
+        assert ps.snap_qty_down(0.7 - 0.42, Decimal("0.01")) == Decimal("0.28")
+        assert ps.snap_qty_down(0.0099, Decimal("0.01")) == Decimal("0")
+
+    def test_the_net_of_fee_quantity_is_noise_free(self):
+        import venue_fees
+        fees = venue_fees.extract_order_fees({"cumFeeDetail": {"BTC": "0.0003"}})
+        assert venue_fees.spot_buy_net_qty("BTCUSDT", 0.3, fees) == 0.2997
+
+    def test_take_profit_legs_are_snapped_before_the_residual_is_taken(self):
+        """step 0.01, filled 0.19, fractions 0.4/0.3/0.3: snapping each leg only
+        at the client strands 0.02; snapping first gives the last leg the floor
+        losses. And 0.7 split 0.6/0.4 must not lose a step to float noise."""
+        from decimal import Decimal
+        import trading_engine as te
+        step = Decimal("0.01")
+        assert te.TradingEngine._allocate_legs(0.19, [0.4, 0.3, 0.3], step) \
+            == [0.07, 0.05, 0.07]
+        legs = te.TradingEngine._allocate_legs(0.7, [0.6, 0.4], step)
+        assert legs == [0.42, 0.28]
+        # legs that do not cover the position keep their own fractions
+        assert te.TradingEngine._allocate_legs(1.0, [0.5, 0.2], step) == [0.5, 0.2]
+
+
+def test_a_spot_close_frees_the_coin_its_take_profit_legs_reserve_but_keeps_the_stop(tmp_path):
+    engine, store, _ = _stack(tmp_path, spot_detail)
+    assert engine.execute(buy_intent()).ok
+    order_of_events = []
+    real_cancel, real_place = engine.client.cancel_order, engine.client.place_order
+
+    def cancel(**kw):
+        order_of_events.append(("cancel", kw["order_link_id"]))
+        return real_cancel(**kw)
+
+    def place(**kw):
+        order_of_events.append(("place", kw.get("purpose")))
+        return real_place(**kw)
+    engine.client.cancel_order, engine.client.place_order = cancel, place
+    assert engine.close_position(symbol="BTCUSDT", reason="t").ok
+    tp_ids = {o["order_link_id"] for o in
+              store._query("SELECT * FROM orders WHERE purpose='tp'")}
+    stop_ids = {o["order_link_id"] for o in
+                store._query("SELECT * FROM orders WHERE purpose='stop'")}
+    cancelled_first = [e[1] for e in order_of_events
+                       if e[0] == "cancel"][:len(tp_ids)]
+    place_at = next(i for i, e in enumerate(order_of_events) if e == ("place", "close"))
+    before = {e[1] for e in order_of_events[:place_at] if e[0] == "cancel"}
+    assert tp_ids and tp_ids <= before, "the TP legs were not freed before the sell"
+    assert not (stop_ids & before), "the stop was cancelled before the close"
+    store.close()

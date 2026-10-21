@@ -30,6 +30,7 @@ EXECUTION_MSG = json.dumps({
     "data": [{
         "symbol": "BTCUSDT", "orderId": "V-1", "orderLinkId": "BB-entry-1",
         "execId": "E-1", "execType": "Trade",
+        "execQty": "0.01", "orderQty": "0.01", "leavesQty": "0",
     }],
 })
 
@@ -56,6 +57,23 @@ class TestParseWsMessage:
         assert e.kind == "execution"
         assert e.event_id == f"execution:{pwc.deterministic_id('execution', 'E-1')}"
         assert e.status == "filled"
+
+    @pytest.mark.parametrize("leaves,status", [
+        ("0.9", "partial"), ("0", "filled"), (None, ""), ("x", "")],
+        ids=["partial", "complete", "absent", "unusable"])
+    def test_an_execution_claims_the_order_is_filled_only_when_nothing_is_left(
+            self, leaves, status):
+        """One execution is one fill. Marking the order terminal on a partial
+        fill made the monotonic guard refuse its later PartiallyFilled /
+        Cancelled events and dropped a resting remainder out of reconciliation."""
+        item = {"symbol": "BTCUSDT", "orderId": "V-1",
+                "orderLinkId": "BB-entry-1", "execId": "E-9",
+                "execType": "Trade", "execQty": "0.1", "orderQty": "1.0"}
+        if leaves is not None:
+            item["leavesQty"] = leaves
+        (e,) = pwc.parse_ws_message(
+            json.dumps({"topic": "execution", "data": [item]}))
+        assert e.status == status
 
     def test_position_message_normalizes(self):
         events = pwc.parse_ws_message(POSITION_MSG)
@@ -890,6 +908,20 @@ class TestExplicitAuthAndSubscribeSuccess:
         assert consumer.auth_ok is False
         assert transport.closed is True
 
+    def test_a_data_frame_before_the_subscribe_ack_is_not_dropped(self):
+        client = _StubClient(_StubStore())
+        transport = _ScriptedTransport([
+            _text_frame({"op": "auth", "success": True}),
+            _text_frame(json.loads(ORDER_MSG)),
+            _text_frame({"op": "subscribe", "success": True}),
+        ])
+        consumer = pwc.WSPrivateConsumer(
+            client=client, transport_factory=lambda: transport)
+        with pytest.raises(wt.WSClosed):
+            consumer.run_once()
+        assert consumer.subscribe_ok is True
+        assert consumer.applied_event_count == 1
+
     def test_run_once_raises_when_subscribe_fails(self):
         client = _StubClient(_StubStore())
         transport = _ScriptedTransport([
@@ -969,3 +1001,99 @@ class TestExplicitAuthAndSubscribeSuccess:
             "a stale success from the PREVIOUS connection must not carry "
             "over into this one -- auth_ok must reset at the start of "
             "every run_once() call")
+
+
+class TestAQuietStreamIsNotADeadConnection:
+    """recv() must wake in time to send the ping, and a read timeout alone must
+    not tear the connection down (it did, every RECV_TIMEOUT seconds)."""
+
+    class _Idle:
+        def __init__(self, clock, timeouts):
+            self.clock, self.timeouts = clock, timeouts
+            self.frames = [_text_frame({"op": "auth", "success": True}),
+                           _text_frame({"op": "subscribe", "success": True})]
+            self.sent, self.waits = [], []
+
+        def connect(self):
+            pass
+
+        def send_text(self, text):
+            self.sent.append(json.loads(text))
+
+        def send_pong(self, payload):
+            pass
+
+        def close(self):
+            pass
+
+        def recv(self, timeout=None):
+            if self.frames:
+                return self.frames.pop(0)
+            self.waits.append(timeout)
+            self.clock[0] += timeout                 # the wait elapses
+            if self.timeouts <= 0:
+                raise wt.WSClosed("test over")
+            self.timeouts -= 1
+            import socket
+            raise socket.timeout("quiet")
+
+    def _consumer(self, monkeypatch, timeouts):
+        clock = [1_000.0]
+        monkeypatch.setattr(pwc.time, "time", lambda: clock[0])
+        transport = self._Idle(clock, timeouts)
+        consumer = pwc.WSPrivateConsumer(
+            client=_StubClient(_StubStore()), transport_factory=lambda: transport)
+        return consumer, transport
+
+    def test_a_quiet_stream_is_pinged_and_survives_a_read_timeout(self, monkeypatch):
+        consumer, transport = self._consumer(monkeypatch, timeouts=2)
+        with pytest.raises(wt.WSClosed):              # only the scripted end
+            consumer.run_once()
+        assert any(m.get("op") == "ping" for m in transport.sent), \
+            "no ping was sent on a quiet stream"
+        assert max(transport.waits) <= pwc.PING_INTERVAL_SECONDS + 1e-6
+
+    def test_unanswered_pings_still_end_the_connection(self, monkeypatch):
+        import socket
+        consumer, transport = self._consumer(monkeypatch, timeouts=10_000)
+        with pytest.raises(socket.timeout):
+            consumer.run_once()
+
+
+class TestBackoffRestartsAfterAWorkingConnection:
+    def test_a_connection_that_reached_the_receive_loop_resets_the_backoff(self):
+        sleeps = []
+
+        class _Works:
+            def __init__(self):
+                self.frames = [_text_frame({"op": "auth", "success": True}),
+                               _text_frame({"op": "subscribe", "success": True})]
+
+            def connect(self):
+                pass
+
+            def send_text(self, text):
+                pass
+
+            def close(self):
+                pass
+
+            def recv(self, timeout=None):
+                if self.frames:
+                    return self.frames.pop(0)
+                raise wt.WSClosed("dropped")
+
+        consumer = pwc.WSPrivateConsumer(
+            client=_StubClient(_StubStore()), transport_factory=lambda: _Works(),
+            sleep=sleeps.append)
+
+        class _Stop:
+            n = 0
+
+            def is_set(self):
+                self.n += 1
+                return self.n > 9
+
+        consumer.run_forever(_Stop())
+        assert len(sleeps) >= 3
+        assert set(sleeps) == {pwc.RECONNECT_BACKOFF_SECONDS[0]}

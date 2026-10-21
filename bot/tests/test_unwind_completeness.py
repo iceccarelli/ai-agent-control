@@ -123,6 +123,9 @@ class Venue:
         return MARK
 
     def get_lot_rules(self, symbol, product):
+        if product == "spot":
+            # Bybit BTC spot basePrecision, not the linear 0.001 lot.
+            return {"qty_step": 1e-6, "min_qty": 1e-6, "min_notional": 5.0}
         return dict(STEP)
 
     def get_fee_rates(self, symbol, product):
@@ -375,3 +378,614 @@ class TestTheOverlayKeepsCheckingItsInventory:
         candle(eng, ms=61_000, print_ms=61_000)
         last = eng.written[-1]
         assert last["position"]["perp"]["filled_qty"] == pytest.approx(0.5)
+
+
+class _VenueReadsItsShort(Venue):
+    def get_perp_position(self, symbol):
+        return self.perp_short
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_margin_exit_closes_the_venues_short_not_only_the_recorded_one(mode):
+    """A margin/liquidation exit runs before the per-tick size check. Closing
+    only the recorded size marked the book FLAT with the excess still short."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.perp_short += 0.4          # a fill the book missed, or a manual add
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound"
+    assert eng.state is BookState.FLAT
+    assert v.perp_short < 1e-6
+
+
+def test_a_naked_spot_that_cannot_be_sold_is_written_to_the_ledger():
+    """ACQUIRE: the perp is rejected and the emergency spot sale fills nothing.
+    The halt used to leave `position: null` in the ledger beside a naked long."""
+    v = Venue(reject={"linear"}, close_fill=0.0)
+    eng = build(v, mode=ACQUIRE)
+    d = candle(eng, ms=1_000)
+    assert d.reason == "NAKED_SPOT_UNWIND_FAILED"
+    assert eng.state is BookState.HALTED
+    assert eng.written[-1]["book_state"] == "HALTED"
+    assert eng.written[-1]["position"] is not None
+    assert eng.written[-1]["position"]["spot"]["filled_qty"] > 0
+
+
+def test_a_failing_ledger_write_on_a_print_tick_does_not_stop_the_margin_exit():
+    """The held print is booked in memory first; its write is made after the
+    gates, so a failing store cannot leave a below-floor short open."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    v.margin = 1.1
+
+    def broken(state):
+        raise OSError("disk full")
+    eng.persist = broken
+    candle(eng, ms=61_000, print_ms=61_000)
+    # The exit itself was sent and filled; the failing store then halts the
+    # book on the unwind's own write, as it always did.
+    assert v.perp_short < 1e-6
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_margin_exit_after_a_partial_liquidation_closes_what_the_venue_holds(mode):
+    """The reduce-only buy is refused above the venue's short: after a partial
+    liquidation the book is larger than the venue and the exit used to ask for
+    the book's number and halt with the short still open."""
+    class Reduces(_VenueReadsItsShort):
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "linear" and side == "Buy" and qty > self.perp_short + 1e-9:
+                return None                  # reduceOnly above the position
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = Reduces()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.perp_short *= 0.4                      # the venue liquidated 60%
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound", (d.action, d.reason)
+    assert eng.state is BookState.FLAT
+    assert v.perp_short < 1e-6
+
+
+def test_snap_to_lot_does_not_floor_float_noise_one_lot_too_low():
+    from carry_engine import snap_to_lot
+    assert snap_to_lot(0.026049 - 0.000026, 1e-6) == pytest.approx(0.026023)
+    assert snap_to_lot(0.00127, 0.001) == pytest.approx(0.001)
+    assert snap_to_lot(0.0009999, 0.001) == 0.0
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_flat_read_never_lets_the_exit_skip_the_buy_back(mode):
+    """A lagging position list reads 0.0 while the short is still open. Going
+    FLAT on that left a live short behind a FLAT book; the recorded size is
+    still bought back (reduce-only) and the short really closes."""
+    class Lagging(_VenueReadsItsShort):
+        def get_perp_position(self, symbol):
+            return 0.0                       # the list lags the real position
+    v = Lagging()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound", (d.action, d.reason)
+    assert v.perp_short < 1e-6, "the exit went FLAT with the short still open"
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_refused_buy_back_keeps_the_position_and_halts(mode):
+    """If the venue refuses the reduce-only buy (the short really is gone, or
+    anything else), the book cannot tell which: it halts WITH the position."""
+    class Refuses(_VenueReadsItsShort):
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "linear" and side == "Buy":
+                return None
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = Refuses()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "UNWIND_INCOMPLETE"
+    assert eng.position is not None and eng.state is BookState.HALTED
+
+
+def test_an_unreadable_venue_position_still_closes_the_recorded_short():
+    class Unreadable(_VenueReadsItsShort):
+        def get_perp_position(self, symbol):
+            raise RuntimeError("position list unreadable")
+    v = Unreadable()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound", (d.action, d.reason)
+    assert v.perp_short < 1e-6
+
+
+def test_an_overlay_partial_close_never_records_more_spot_than_the_client_holds():
+    """The venue short being closed was LARGER than the book's (a fill the book
+    missed) and the buy-back filled only a tenth: the remainder left to hedge
+    must not be written as client spot above what the book recorded."""
+    class Half(_VenueReadsItsShort):
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "linear" and side == "Buy":
+                qty = qty * 0.1              # fills a tenth of what was asked
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = Half()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    book_spot = eng.position.spot.filled_qty
+    v.perp_short += 0.4                      # a short the book never recorded
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.position.spot.filled_qty <= book_spot + 1e-9
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_an_exit_sized_from_a_stale_read_does_not_declare_flat_over_a_live_short(mode):
+    """The close was sized from one stale position read (a fraction of the real
+    short). FLAT was inferred from the fills; it is now confirmed against the
+    venue, so the short that is still open is recorded and the book halts, and
+    (ACQUIRE) the spot that hedges it is not sold with it."""
+    class StaleOnce(_VenueReadsItsShort):
+        reads = 0
+
+        def get_perp_position(self, symbol):
+            type(self).reads += 1
+            return self.perp_short * 0.2 if type(self).reads == 1 \
+                else self.perp_short
+    v = StaleOnce()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    StaleOnce.reads = 0                  # count only the exit's own reads
+    short_before = v.perp_short
+    spot_before = getattr(v, "spot_long", 0.0)
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.state is BookState.HALTED and eng.position is not None
+    assert v.perp_short == pytest.approx(0.8 * short_before)
+    assert eng.position.perp.filled_qty == pytest.approx(v.perp_short)
+    if mode == ACQUIRE:
+        assert v.spot_long == pytest.approx(0.8 * spot_before, rel=0.05), (
+            "the spot hedging the surviving short was sold")
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_partial_liquidation_still_closes_to_flat_and_sells_all_the_spot(mode):
+    """The case the venue-size sizing exists for must still end FLAT."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=mode)
+    candle(eng, ms=1_000)
+    v.perp_short *= 0.4
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound" and eng.state is BookState.FLAT
+    assert v.perp_short < 1e-6
+    if mode == ACQUIRE:
+        assert v.spot_long < 1e-6
+
+
+class _ReadsScript(_VenueReadsItsShort):
+    """get_perp_position answers from a script first (one entry per call), then
+    tells the truth. Buy-backs of the linear leg fill `fill_ratio` of the ask."""
+    def __init__(self, script=(), fill_ratio=1.0):
+        super().__init__()
+        self.script = list(script)
+        self.fill_ratio = fill_ratio
+
+    def get_perp_position(self, symbol):
+        if self.script:
+            value = self.script.pop(0)
+            return self.perp_short if value is None else value
+        return self.perp_short
+
+    def place_market(self, *, symbol, side, qty, product):
+        if product == "linear" and side == "Buy":
+            qty = qty * self.fill_ratio
+        return super().place_market(symbol=symbol, side=side, qty=qty,
+                                    product=product)
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_flat_read_after_a_partial_close_cannot_erase_the_unfilled_remainder(mode):
+    """The buy-back filled 80%; the post-close position read lies flat (a
+    lagging or empty list). The venue may only ADD to what the fills say is
+    left: the book halts with the short that is still open, not FLAT."""
+    v = _ReadsScript(script=[None, 0.0], fill_ratio=0.8)   # sizing read ok, then flat
+    eng = build(v, mode=mode)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    v.script = [None, 0.0]
+    short_before = v.perp_short
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.position is not None and eng.state is BookState.HALTED
+    assert v.perp_short == pytest.approx(0.2 * short_before)
+    assert eng.position.perp.filled_qty == pytest.approx(0.2 * short_before)
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_lagging_read_right_after_a_complete_close_is_re_read_not_believed(mode):
+    """The close completed but the first position read shows the PRE-close
+    size. The disagreement is re-read after a pause before it is believed, so
+    a finished exit is not turned into a false partial halt (which in ACQUIRE
+    left the spot long unsold)."""
+    v = _ReadsScript(script=[])
+    eng = build(v, mode=mode)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    pre_close = v.perp_short
+    v.script = [None, pre_close]          # sizing read ok, post-close read lags
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "unwound" and eng.state is BookState.FLAT, (d.action, d.reason)
+    assert v.perp_short < 1e-6
+    if mode == ACQUIRE:
+        assert v.spot_long < 1e-6
+
+
+@pytest.mark.parametrize("mode", [OVERLAY, ACQUIRE])
+def test_a_stale_read_on_a_partial_close_is_re_read_before_it_is_believed(mode):
+    """The buy-back filled 60%; the post-close list still shows the PRE-close
+    size once. The excess over the fills is re-read after a pause, so the
+    persisted short is what the venue holds, not the stale figure."""
+    v = _ReadsScript(script=[], fill_ratio=0.6)
+    eng = build(v, mode=mode)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    pre_close = v.perp_short
+    v.script = [None, pre_close]            # sizing read ok, then one stale read
+    v.margin = 1.1
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_PARTIAL", (d.action, d.reason)
+    assert eng.position.perp.filled_qty == pytest.approx(0.4 * pre_close)
+    assert v.perp_short == pytest.approx(0.4 * pre_close)
+
+
+def test_a_halt_whose_write_failed_is_written_once_the_store_recovers():
+    """`_halt` swallowed a failed persist and never tried again, leaving the
+    ledger showing a book (and no noted exposure) that the halt had replaced."""
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+    writes = []
+    healthy = eng.persist
+    state = {"fail": True}
+
+    def flaky(s):
+        if state["fail"]:
+            raise OSError("disk full")
+        writes.append(s)
+        healthy(s)
+    eng.persist = flaky
+    v.perp_short += 0.4                     # venue drift -> VENUE_POSITION_DRIFT halt
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and not writes
+    state["fail"] = False
+    candle(eng, ms=121_000, print_ms=1_000)
+    assert writes and writes[-1]["book_state"] == "HALTED"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_snap_to_lot_never_hands_a_non_finite_quantity_back(bad):
+    from carry_engine import snap_to_lot
+    assert snap_to_lot(bad, 0.001) == 0.0
+    assert snap_to_lot(bad, 0.0) == 0.0
+
+
+def test_a_halt_whose_write_failed_logs_the_state_it_could_not_write(caplog):
+    """The ledger is the durable record; when it fails the CRITICAL line must
+    carry the book state and position a human needs to reconcile."""
+    import logging as _logging
+    v = _VenueReadsItsShort()
+    eng = build(v, mode=OVERLAY)
+    candle(eng, ms=1_000)
+
+    def broken(state):
+        raise OSError("disk full")
+    eng.persist = broken
+    v.perp_short += 0.4                       # drift -> halt, whose write fails
+    with caplog.at_level(_logging.CRITICAL, logger="carry_engine"):
+        candle(eng, ms=61_000, print_ms=1_000)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "could not be written down" in text
+    assert '"book_state": "HALTED"' in text
+    assert '"position"' in text and '"perp_symbol"' in text
+
+
+class _RefusingVenue(_VenueReadsItsShort):
+    """The venue refuses the reduce-only buy-back; closed-pnl says what it says."""
+    def __init__(self, closed=None):
+        super().__init__()
+        self.closed = closed            # None -> unreadable / incomplete evidence
+        self.closed_asked_since = None
+
+    def place_market(self, *, symbol, side, qty, product):
+        if product == "linear" and side == "Buy":
+            return None
+        return super().place_market(symbol=symbol, side=side, qty=qty,
+                                    product=product)
+
+    def get_closed_short_qty_since(self, symbol, since_ms):
+        self.closed_asked_since = since_ms
+        return self.closed
+
+
+def _liquidated_acquire(venue, *, verify_first=True):
+    eng = build(venue, mode=ACQUIRE)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)                                  # opens
+    if verify_first:
+        candle(eng, ms=31_000, print_ms=1_000)             # book == venue: verified
+    booked = eng.position.perp.filled_qty
+    venue.perp_short = 0.0                                 # the short is gone
+    venue.margin = 1.1
+    return eng, booked
+
+
+def test_acquire_sells_the_naked_spot_when_the_venue_records_the_close():
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.closed = booked                    # closed-pnl: the whole short closed
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.action == "halted" and d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (
+        d.action, d.reason)
+    assert v.spot_long < 1e-6, "the spot long was left unhedged and unsold"
+    assert v.closed_asked_since is not None
+    # never FLAT: the journal's perp lifecycle needs a human closeout
+    assert eng.state is BookState.HALTED and eng.position is not None
+    assert eng.position.perp.filled_qty == 0.0
+
+
+@pytest.mark.parametrize("closed", [None, 0.0, 0.5])
+def test_acquire_keeps_the_spot_without_a_closed_pnl_record_of_the_whole_short(closed):
+    """A flat-reading list with a refused buy-back and NO (or less than the
+    short's worth of) closed-pnl record is what a LAGGING list looks like. The
+    spot hedges a short that may still be open: it is not sold."""
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.closed = None if closed is None else booked * closed
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before), "spot sold over a live short"
+
+
+def test_acquire_keeps_the_spot_when_the_book_was_never_confirmed_against_the_venue():
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v, verify_first=False)
+    eng._venue_verified_ms = None        # no baseline (e.g. the read after the open failed)
+    v.closed = booked
+    spot_before = v.spot_long
+    d = candle(eng, ms=31_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_overlay_never_sells_the_clients_coin_on_a_closed_perp():
+    v = _RefusingVenue()
+    eng = build(v, mode=OVERLAY)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    candle(eng, ms=31_000, print_ms=1_000)
+    v.closed = eng.position.perp.filled_qty
+    v.perp_short = 0.0
+    v.margin = 1.1
+    before = len(v.orders)
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "UNWIND_INCOMPLETE"
+    assert not any(o[1] == "spot" and o[0] == "Sell" for o in v.orders[before:])
+
+
+def test_acquire_drift_halt_sells_the_naked_spot_when_the_venue_records_the_close():
+    """The per-tick size check meets a liquidated short first (most liquidations
+    in the fault campaign never reached the unwind). Same evidence gate: two flat
+    reads AND closed-pnl records totalling the short since the book last matched
+    the venue."""
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0                        # healthy: the size check is what fires
+    v.closed = booked
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+    assert eng.state is BookState.HALTED
+
+
+def test_acquire_drift_halt_keeps_the_spot_without_the_closed_pnl_record():
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0
+    v.closed = 0.0                        # a lagging list: no row, no evidence
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "VENUE_POSITION_DRIFT", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_acquire_recovers_a_liquidation_in_the_very_first_tick_after_the_open():
+    """The per-tick size check that normally sets the baseline runs AFTER the
+    margin gate, so a short liquidated right after the open had no baseline and
+    the closed-pnl evidence could never be used. The open now reads the venue once
+    and stamps it when the book and the venue agree."""
+    v = _RefusingVenue()
+    eng, booked = _liquidated_acquire(v, verify_first=False)   # no tick in between
+    assert eng._venue_verified_ms is not None
+    v.closed = booked
+    d = candle(eng, ms=31_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+
+
+def test_the_baseline_after_an_open_is_not_stamped_on_a_disagreeing_read():
+    class Disagrees(_RefusingVenue):
+        def get_perp_position(self, symbol):
+            return self.perp_short * 0.5        # the venue shows half of the fills
+    v = Disagrees()
+    eng = build(v, mode=ACQUIRE)
+    candle(eng, ms=1_000)                       # opens
+    assert eng._venue_verified_ms is None
+
+
+def test_the_recovery_sale_is_capped_at_what_the_wallet_holds():
+    """When the spot BUY's fee currency was not stated, the recorded quantity can
+    exceed the wallet and the venue refuses the oversell: the recovery fired and
+    sold nothing. The sale is capped at the wallet (and at the book's own
+    quantity, so unrelated BTC is never sold)."""
+    class ShortWallet(_RefusingVenue):
+        def __init__(self):
+            super().__init__()
+            self.wallet_cut = 0.0
+
+        def get_spot_inventory(self, symbol):
+            return max(0.0, self.spot_long - self.wallet_cut)
+
+        def place_market(self, *, symbol, side, qty, product):
+            if product == "spot" and side == "Sell" \
+                    and qty > self.spot_long - self.wallet_cut + 1e-12:
+                return None                    # the venue refuses an oversell
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+    v = ShortWallet()
+    eng, booked = _liquidated_acquire(v)
+    v.wallet_cut = 0.0000012                   # the fee the book did not know of
+    v.closed = booked
+    held_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason.startswith("PERP_CLOSED_EXTERNALLY_SPOT"), (d.action, d.reason)
+    assert v.spot_long < held_before * 0.01, "the wallet's spot was not sold"
+
+
+def test_acquire_recovers_a_liquidation_that_shows_up_as_an_undefined_margin():
+    """A liquidated short leaves positionIM/positionMM undefined, which the
+    engine reads as 'unreadable' and halted on at the margin gate before it could
+    look at the venue's closed-pnl. The same evidence gate now runs there first."""
+    class NoMargin(_RefusingVenue):
+        def get_margin_multiple(self, symbol):
+            if self.perp_short <= 1e-9:
+                raise RuntimeError("no position: margin ratio undefined")
+            return super().get_margin_multiple(symbol)
+    v = NoMargin()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0
+    v.closed = booked
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+
+
+def test_an_undefined_margin_without_the_closed_pnl_record_still_halts_unreadable():
+    class NoMargin(_RefusingVenue):
+        def get_margin_multiple(self, symbol):
+            if self.perp_short <= 1e-9:
+                raise RuntimeError("no position: margin ratio undefined")
+            return super().get_margin_multiple(symbol)
+    v = NoMargin()
+    eng, booked = _liquidated_acquire(v)
+    v.margin = 5.0
+    v.closed = 0.0                        # nothing records a close
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "MARGIN_UNREADABLE", (d.action, d.reason)
+    assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_the_baseline_is_stamped_from_before_the_position_read(monkeypatch):
+    """A close that lands between the venue's snapshot and a stamp taken AFTER the
+    read gets a closed-pnl row at or before the baseline and is skipped, so the
+    evidence would vanish (found by the fault campaign, EARLY LIQ_AFTER=1)."""
+    import carry_engine as ce
+    clock = iter(range(1_000_000, 2_000_000, 7))      # every call advances
+    monkeypatch.setattr(ce.time, "time", lambda: next(clock) / 1000.0)
+    stamps = {}
+
+    class Reads(_RefusingVenue):
+        def get_perp_position(self, symbol):
+            stamps["read_at_ms"] = int(ce.time.time() * 1000)
+            return self.perp_short
+    v = Reads()
+    eng = build(v, mode=ACQUIRE)
+    candle(eng, ms=1_000)                              # the open stamps a baseline
+    assert eng._venue_verified_ms is not None
+    assert eng._venue_verified_ms < stamps["read_at_ms"], (
+        "the baseline is later than the read it vouches for")
+
+
+def _flaky_reads_venue(fail_calls):
+    """A refusing venue whose position read raises on the numbered post-liquidation
+    calls (1-based, counted from the moment the short is gone)."""
+    class Flaky(_RefusingVenue):
+        n = 0
+        armed = False
+
+        def get_perp_position(self, symbol):
+            if self.armed:
+                self.n += 1
+                if self.n in fail_calls:
+                    raise TimeoutError("position read timed out")
+            return self.perp_short
+    return Flaky()
+
+
+def test_one_transient_position_read_timeout_does_not_discard_the_evidence():
+    v = _flaky_reads_venue({2})          # 1 = sizing read, 2 = first confirming read
+    eng, booked = _liquidated_acquire(v)
+    v.closed = booked
+    v.armed = True
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason == "PERP_CLOSED_EXTERNALLY_SPOT_SOLD", (d.action, d.reason)
+    assert v.spot_long < 1e-6
+
+
+def test_two_failed_position_reads_in_a_row_are_still_not_confirmation():
+    v = _flaky_reads_venue({2, 3})
+    eng, booked = _liquidated_acquire(v)
+    v.closed = booked
+    v.armed = True
+    spot_before = v.spot_long
+    d = candle(eng, ms=61_000, print_ms=1_000)
+    assert d.reason != "PERP_CLOSED_EXTERNALLY_SPOT_SOLD"
+    assert v.spot_long == pytest.approx(spot_before)
+
+
+def test_the_open_time_baseline_survives_one_lagging_or_failed_read():
+    """A position read straight after a fill can lag or time out; with no baseline
+    a liquidation in the first ticks cannot use the closed-pnl evidence. One more
+    look after a pause, and still only an exact match sets it."""
+    for first in ("raise", "lag"):
+        class OnceBad(_RefusingVenue):
+            n = 0
+
+            def get_perp_position(self, symbol):
+                type(self).n += 1
+                if type(self).n == 1:
+                    if first == "raise":
+                        raise TimeoutError("position read timed out")
+                    return self.perp_short * 0.5      # lagging list
+                return self.perp_short
+        v = OnceBad()
+        eng = build(v, mode=ACQUIRE)
+        eng.UNWIND_REREAD_WAIT_S = 0
+        candle(eng, ms=1_000)
+        assert eng._venue_verified_ms is not None, first
+
+
+def test_the_open_time_baseline_is_not_stamped_when_both_reads_disagree():
+    class AlwaysHalf(_RefusingVenue):
+        def get_perp_position(self, symbol):
+            return self.perp_short * 0.5
+    v = AlwaysHalf()
+    eng = build(v, mode=ACQUIRE)
+    eng.UNWIND_REREAD_WAIT_S = 0
+    candle(eng, ms=1_000)
+    assert eng._venue_verified_ms is None

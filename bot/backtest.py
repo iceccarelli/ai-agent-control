@@ -47,6 +47,7 @@ Because of the last two in particular, live results should be expected to be
 from __future__ import annotations
 
 import json
+import time
 import logging
 import math
 import random
@@ -89,6 +90,19 @@ _TRADE_HARVEST_LIMIT = 512
 #: "No limit" for a ledger read. SQLite needs a number; this is one no backtest
 #: will reach, and it is named so nobody reads it as a meaningful cap.
 _ALL_TRADES = 100_000_000
+
+
+
+def _sim_ticker_reply(row: Dict[str, Any]) -> Tuple[int, str]:
+    """A simulated ticker. The simulator has no order book, so the top of book
+    is the bar close (a zero spread, as before) and the reply is stamped with
+    the wall clock: replayed data is current by construction. The live client
+    treats a quote without a level-1 book or a timestamp as unusable."""
+    price = row["lastPrice"]
+    row = {**row, "bid1Price": price, "ask1Price": price}
+    return 200, json.dumps({"retCode": 0, "retMsg": "OK",
+                            "time": int(time.time() * 1000),
+                            "result": {"list": [row]}})
 
 
 @dataclass(frozen=True)
@@ -160,6 +174,9 @@ class _SimOrder:
     avg_price: float = 0.0
     cum_qty: float = 0.0
     purpose: str = "entry"
+    reduce_only: bool = False
+    fee_coin: str = ""
+    fee_amount: float = 0.0
 
 
 class SimulatedExchange(Transport):
@@ -244,6 +261,16 @@ class SimulatedExchange(Transport):
                 total += held * series[self.index].close
         return total
 
+    def adverse_equity(self) -> float:
+        """Equity with every holding marked at the current bar's LOW: the worst
+        the account stood inside the bar (spot is long-only)."""
+        total = self.balances.get(self.quote_asset, 0.0)
+        for symbol, series in self.bars.items():
+            held = self.balances.get(self._base(symbol), 0.0)
+            if held:
+                total += held * series[self.index].low
+        return total
+
     #: Longest first, so USDT is matched before USD. Reversing this order maps
     #: BTCUSDT to base "BTCUSD"/quote "T", which is the kind of bug that
     #: produces a valid-looking order for an asset that does not exist.
@@ -319,7 +346,13 @@ class SimulatedExchange(Transport):
             if touched:
                 # A stop becomes a market order: it fills at the trigger, with
                 # slippage against us.
-                self._execute(order, order.trigger_price, taker=True)
+                # ... and a bar that OPENS through the trigger gaps past it:
+                # the market order fills at the open, not at a price the bar
+                # never traded at.
+                gap_safe = (min(order.trigger_price, bar.open)
+                            if order.trigger_direction == 2
+                            else max(order.trigger_price, bar.open))
+                self._execute(order, gap_safe, taker=True)
                 if order.status == "Filled":
                     exited = True
 
@@ -369,11 +402,17 @@ class SimulatedExchange(Transport):
         fee = notional * fee_rate
 
         if order.side == "Buy":
-            if self.balances.get(self.quote_asset, 0.0) < notional + fee:
+            # Bybit spot takes a BUY's fee in the BASE coin (the venue's own
+            # testnet record shows it), so the quote pays the notional only and
+            # the account receives the quantity less the fee.
+            if self.balances.get(self.quote_asset, 0.0) < notional:
                 order.status = "Rejected"
                 return
-            self.balances[self.quote_asset] -= notional + fee
-            self.balances[base] = self.balances.get(base, 0.0) + order.qty
+            fee_base = order.qty * fee_rate
+            self.balances[self.quote_asset] -= notional
+            self.balances[base] = (self.balances.get(base, 0.0)
+                                   + order.qty - fee_base)
+            order.fee_coin, order.fee_amount = base, fee_base
         else:
             if self.balances.get(base, 0.0) < order.qty - 1e-12:
                 order.status = "Rejected"
@@ -382,6 +421,7 @@ class SimulatedExchange(Transport):
             self.balances[self.quote_asset] = (
                 self.balances.get(self.quote_asset, 0.0) + notional - fee
             )
+            order.fee_coin, order.fee_amount = self.quote_asset, fee
 
         self.fees_paid += fee
         order.status = "Filled"
@@ -443,10 +483,10 @@ class SimulatedExchange(Transport):
             symbol = merged.get("symbol", "")
             if symbol not in self.bars:
                 return ok({"list": []})
-            return ok({"list": [{
+            return _sim_ticker_reply({
                 "symbol": symbol,
                 "lastPrice": str(self.bars[symbol][self.index].close),
-            }]})
+            })
 
         if path == "/v5/market/kline":
             symbol = merged.get("symbol", "")
@@ -552,6 +592,7 @@ class SimulatedExchange(Transport):
             trigger_price=float(body.get("triggerPrice") or 0.0),
             trigger_direction=int(body.get("triggerDirection") or 0),
             order_id=f"sim-{self._order_seq}",
+            reduce_only=bool(body.get("reduceOnly")),
         )
         order.purpose = (
             "stop" if order.order_filter == "StopOrder"
@@ -564,6 +605,8 @@ class SimulatedExchange(Transport):
         elif order.order_type == "Market":
             self._execute(order, self.bars[symbol][self.index].close, taker=True)
             if order.status == "Rejected":
+                if order.reduce_only:
+                    return err(110017, "reduce-only rule violation")
                 return err(110007, "insufficient balance for market order")
         else:
             order.status = "New"
@@ -579,6 +622,8 @@ class SimulatedExchange(Transport):
             "orderFilter": order.order_filter,
             "triggerPrice": str(order.trigger_price),
             "avgPrice": str(order.avg_price), "cumExecQty": str(order.cum_qty),
+            "cumFeeDetail": ({order.fee_coin: f"{order.fee_amount:.10f}"}
+                             if order.fee_coin else {}),
         }
 
 
@@ -722,6 +767,16 @@ class LinearSimulatedExchange(SimulatedExchange):
             total += position.unrealised(self.bars[symbol][self.index].close)
         return total
 
+    def adverse_equity(self) -> float:
+        """Equity with every position marked at the bar's adverse extreme (the
+        low for a long, the high for a short)."""
+        total = self.balances.get(self.quote_asset, 0.0)
+        for symbol, position in self.positions.items():
+            bar = self.bars[symbol][self.index]
+            long = normalize_side(position.side) == "Buy"
+            total += position.unrealised(bar.low if long else bar.high)
+        return total
+
     def _cash(self, delta: float) -> None:
         self.balances[self.quote_asset] = (
             self.balances.get(self.quote_asset, 0.0) + float(delta))
@@ -759,9 +814,19 @@ class LinearSimulatedExchange(SimulatedExchange):
         if qty <= 0:
             order.status = "Rejected"
             return
-        fee = qty * fill_price * fee_rate
         position = self.positions.get(symbol)
         incoming = 1.0 if normalize_side(order.side) == "Buy" else -1.0
+        if order.reduce_only:
+            # Bybit's reduce-only rule: it can only shrink an opposite
+            # position. With nothing to reduce it is refused; a quantity
+            # beyond the position is cut to it. It never opens or flips.
+            if (position is None or position.size <= 1e-12
+                    or position.direction == incoming):
+                order.status = "Rejected"
+                return
+            qty = min(qty, position.size)
+            order.qty = qty
+        fee = qty * fill_price * fee_rate
 
         if position is None or position.size <= 1e-12:
             # Opening. Initial margin must be affordable from cash.
@@ -806,6 +871,12 @@ class LinearSimulatedExchange(SimulatedExchange):
             "fee": fee, "purpose": order.purpose, "bar": self.index,
         })
 
+    @staticmethod
+    def _gap_through(long: bool, stop: float, bar: Any) -> float:
+        """Where a stop actually fills: at the trigger, unless the bar OPENED
+        beyond it, in which case at the open."""
+        return min(stop, bar.open) if long else max(stop, bar.open)
+
     def _close_at(self, symbol: str, price: float, *, purpose: str) -> None:
         """Close the whole position at ``price`` and log it as an exit fill.
 
@@ -820,6 +891,11 @@ class LinearSimulatedExchange(SimulatedExchange):
             return
         exit_side = "Sell" if normalize_side(position.side) == "Buy" else "Buy"
         qty = position.size
+        if purpose == "stop":
+            # A triggered stop is a market order: slippage against us, as on
+            # spot. (A resting take-profit limit is not slipped.)
+            price = price * ((1 - self.slippage) if exit_side == "Sell"
+                             else (1 + self.slippage))
         fee = qty * price * self.taker_fee
         self._cash(position.direction * qty * (price - position.entry_price) - fee)
         self.fees_paid += fee
@@ -852,7 +928,14 @@ class LinearSimulatedExchange(SimulatedExchange):
         span = self.FUNDING_INTERVAL_MS
         start, end = bar.start_ms, bar.start_ms + self._bar_span_ms(symbol)
         first = ((start + span - 1) // span) * span
+        # A position that opened at the previous bar's close opened AT this
+        # bar's start. A settlement stamped exactly then happens before that
+        # fill: the position did not hold through it, so it neither pays nor
+        # receives it.
+        just_opened = position.opened_index == self.index - 1
         for settle in range(first, end, span):
+            if just_opened and settle == start:
+                continue
             key = (symbol, settle)
             if key in self._funded:
                 continue
@@ -888,11 +971,13 @@ class LinearSimulatedExchange(SimulatedExchange):
                 # a guess about the path.
                 stop_first = (stop > liq) if long else (stop < liq)
                 if stop_first:
-                    self._close_at(symbol, stop, purpose="stop")
+                    self._close_at(symbol, self._gap_through(long, stop, bar),
+                                   purpose="stop")
                 else:
                     self._liquidate(symbol, liq)
             elif hit_stop:
-                self._close_at(symbol, stop, purpose="stop")
+                self._close_at(symbol, self._gap_through(long, stop, bar),
+                               purpose="stop")
             elif hit_liq:
                 self._liquidate(symbol, liq)
             else:
@@ -1005,10 +1090,10 @@ class LinearSimulatedExchange(SimulatedExchange):
             if symbol not in self.bars:
                 return ok({"list": []})
             bar = self.bars[symbol][self.index]
-            return ok({"list": [{
+            return _sim_ticker_reply({
                 "symbol": symbol, "lastPrice": str(bar.close),
                 "fundingRate": str(self._funding_rate_at(symbol, bar.start_ms)),
-            }]})
+            })
 
         return super().request(method, url, headers=headers, params=params,
                                body=body, timeout=timeout)
@@ -1079,10 +1164,19 @@ class BacktestResult:
     starting_equity: float = 0.0
     ending_equity: float = 0.0
     fees_paid: float = 0.0
+    #: Funding paid (+) or received (-) over the run. Linear only. It is in
+    #: ``ending_equity`` and ``net_pnl`` but NOT in the per-trade ledger, so
+    #: win rate / expectancy / R are before funding; ``notes`` says so.
+    funding_paid: float = 0.0
     equity_curve: List[float] = field(default_factory=list)
     trade_returns: List[float] = field(default_factory=list)
     net_pnl: float = 0.0
     max_drawdown: float = 0.0
+    #: Drawdown with each bar's open positions marked at that bar's adverse
+    #: extreme (low for a long, high for a short), so an intrabar low that
+    #: recovered by the close is not invisible. Positions are those held at the
+    #: bar's close, so this is a tight estimate, not a tick-level reconstruction.
+    max_drawdown_intrabar: float = 0.0
     win_rate: Optional[float] = None
     expectancy: Optional[float] = None
     signals_evaluated: int = 0
@@ -1120,7 +1214,8 @@ class BacktestResult:
             f"ending equity      : {self.ending_equity:,.2f}",
             f"total return       : {self.total_return:+.2%}",
             f"fees paid          : {self.fees_paid:,.2f}",
-            f"max drawdown       : {self.max_drawdown:.2%}",
+            f"max drawdown       : {self.max_drawdown:.2%}"
+            f"  (intrabar {self.max_drawdown_intrabar:.2%})",
         ]
         lines.append(
             f"win rate           : {self.win_rate:.1%}"
@@ -1297,6 +1392,7 @@ class Backtester:
             )
         store = StateStore(self.db_path)
         client = BybitClient(config=view, store=store, transport=exchange)
+        client.book_feed_required = False      # replay: no recorded book = no feed
         risk = BillionaireRiskManager(config=view, store=store)
         sizer = BillionairePositionSizing(config=view, risk_manager=risk)
         engine = TradingEngine(
@@ -1308,6 +1404,7 @@ class Backtester:
             interval=cfg.interval, higher_interval=cfg.higher_interval,
             config=view,
         )
+        strategy.require_fresh_bars = False      # replayed history is old
 
         result = BacktestResult(starting_equity=cfg.starting_cash)
         exchange.index = min(cfg.warmup_bars, len(self.bars[exchange.primary]) - 2)
@@ -1324,11 +1421,14 @@ class Backtester:
         # feeds back into a decision, and removing it would change no order.
         snapshots: Dict[str, Dict[str, Any]] = {}
         last_trade_id = 0
+        adverse_path: List[float] = []
 
         while True:
             equity = exchange.equity()
             store.update_equity(equity)
             result.equity_curve.append(equity)
+            adverse_path.append(min(equity, exchange.adverse_equity()))
+            adverse_path.append(equity)
 
             # Reap positions the simulator closed via a resting stop or TP.
             inventory_before = self._position_inventory(store)
@@ -1394,7 +1494,17 @@ class Backtester:
         )
 
         result.ending_equity = exchange.equity()
+        if not result.equity_curve or result.equity_curve[-1] != result.ending_equity:
+            # The forced close at the end costs fees and slippage; the curve (and
+            # the drawdown read from it) has to include that last point.
+            result.equity_curve.append(result.ending_equity)
         result.fees_paid = exchange.fees_paid
+        result.funding_paid = float(getattr(exchange, "funding_paid", 0.0) or 0.0)
+        if abs(result.funding_paid) > 1e-12:
+            result.notes.append(
+                f"funding {result.funding_paid:+.4f} is in ending_equity and "
+                "net_pnl but not in the per-trade ledger: win_rate, expectancy "
+                "and the R statistics are BEFORE funding.")
         result.net_pnl = result.ending_equity - result.starting_equity
 
         # ``recent_trades()`` defaults to the newest 200 rows. Reading the
@@ -1415,6 +1525,8 @@ class Backtester:
                 for t in trades
             ]
         result.max_drawdown = self._max_drawdown(result.equity_curve)
+        result.max_drawdown_intrabar = max(
+            result.max_drawdown, self._max_drawdown(adverse_path))
 
         if len(result.trade_details) != result.trades:
             # The harvest and the ledger are two independent counts of the same
@@ -1716,6 +1828,7 @@ def walk_forward(
     folds: int = 4,
     train_fraction: float = 0.6,
     books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+    funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
 ) -> List[Dict[str, Any]]:
     """Roll train/test windows forward and report **out-of-sample** results only.
 
@@ -1759,7 +1872,11 @@ def walk_forward(
         }
         fold_cfg = BacktestConfig(**{**cfg.__dict__})
         fold_cfg.warmup_bars = train_end - start
-        result = Backtester(window, fold_cfg, books_by_symbol=book_window).run()
+        # Funding is looked up by TIMESTAMP, not index, so the whole series is
+        # handed to every fold; without it a linear fold silently priced
+        # funding at the constant 1 bp whatever the real prints were.
+        result = Backtester(window, fold_cfg, books_by_symbol=book_window,
+                            funding_by_symbol=funding_by_symbol).run()
         out.append({
             "fold": i + 1,
             "train_bars": train_end - start,
@@ -1767,6 +1884,7 @@ def walk_forward(
             "trades": result.trades,
             "return": result.total_return,
             "max_drawdown": result.max_drawdown,
+            "max_drawdown_intrabar": result.max_drawdown_intrabar,
             "win_rate": result.win_rate,
             "expectancy": result.expectancy,
             "fees": result.fees_paid,

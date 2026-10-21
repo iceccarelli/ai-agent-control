@@ -215,7 +215,9 @@ class TestAPartialPerpFillIsASmallerHedgeNotAnIncident:
         d = open_pair(e)
         assert d.state is BookState.HALTED
         assert d.reason == "OVERSOLD_BEYOND_INVENTORY"
-
+        # the whole oversized short is still at the venue: it is recorded
+        assert e.position is not None
+        assert e.position.perp.filled_qty == pytest.approx(0.002)
 
     def test_a_partial_buy_back_that_leaves_the_short_oversized_halts(self):
         """The excess closed only in part: still short more than the client
@@ -506,3 +508,115 @@ class TestTheBrokerReadsTheVenuesRules:
         b.get_lot_rules("BTCUSDT", "linear")
         b.get_fee_rates("BTCUSDT", "linear")
         assert c.calls[0][1]["category"] == "linear"
+
+
+class TestAPrintIsBookedEvenWhenAnEarlierCheckReturns:
+    def test_a_print_that_arrives_with_a_rebalance_is_still_booked(self):
+        """`_last_print_ms` is stamped before the held-position checks, so a
+        print on a tick where the rebalance returned was never booked: the next
+        tick saw it as old."""
+        v = Venue(inventory=1.0)
+        e = engine(v, cap=100.0)
+        assert open_pair(e).action == "opened"
+        e.position.spot.filled_qty = 0.0035          # force drift past the band
+        e.position.spot.requested_qty = 0.0035
+        before = e.position.funding_collected
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
+        assert d.action == "rebalanced"
+        assert e.position.funding_collected > before
+        assert e.position.funding_collected == pytest.approx(
+            before + 3.0 / 1e4 * 0.001 * MARK)
+
+
+class TestACoverReductionSnappedToALot:
+    def test_a_fully_filled_buy_back_leaving_a_sub_lot_residue_does_not_halt(self):
+        """The client withdrew 0.0015 BTC; the buy-back is snapped down to one
+        0.001 lot and fills completely. The 0.0005 left over is below one lot
+        (the same shortfall the engine already tolerates), not a short fill."""
+        v = Venue(inventory=0.011,
+                  lot={"qty_step": 0.001, "min_qty": 0.001, "min_notional": 5.0})
+        kills = []
+        e = engine(v, cap=1100.0, kill_switch=kills.append)
+        assert open_pair(e).action == "opened"
+        v.inventory = 0.0095
+        v.orders.clear()
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8 + 1, timestamp_ms=3 * H8 + 1)
+        assert d.action == "rebalanced" and not kills
+        assert v.orders == [("Buy", "linear", pytest.approx(0.001))]
+        assert e.position.spot.filled_qty == pytest.approx(0.0095)
+        assert e.state is BookState.HEDGED
+
+
+class TestARebalanceIsSnappedToTheVenueLot:
+    class LotVenue(Venue):
+        def place_market(self, *, symbol, side, qty, product):
+            self.orders.append((side, product, qty))
+            if abs(qty / 0.001 - round(qty / 0.001)) > 1e-9:
+                return None          # the venue refuses a non-lot quantity
+            return super().place_market(symbol=symbol, side=side, qty=qty,
+                                        product=product)
+
+    def _drifted(self, spot=0.0319):
+        v = self.LotVenue(inventory=1.0,
+                          lot={"qty_step": 0.001, "min_qty": 0.001,
+                               "min_notional": 5.0})
+        kills = []
+        e = engine(v, cap=100.0, kill_switch=kills.append)
+        assert open_pair(e).action == "opened"
+        e.position.perp.filled_qty = 0.030
+        e.position.perp.requested_qty = 0.030
+        e.position.spot.filled_qty = spot
+        e.position.spot.requested_qty = spot
+        e.position.perp.avg_price = MARK
+        e.position.spot.avg_price = MARK
+        v.orders.clear()
+        return v, e, kills
+
+    def test_the_correction_is_a_whole_lot_not_a_rejected_residue(self):
+        v, e, kills = self._drifted()
+        d = e.on_candle(mark=MARK * 1.45, funding_bps=3.0, spot=MARK * 1.45,
+                        timestamp_ms=4 * H8)
+        assert d.action == "rebalanced" and not kills
+        # (LotVenue records each order twice: once itself, once via super())
+        assert v.orders and all(o[2] == pytest.approx(0.001)
+                                for o in v.orders)
+
+    def test_a_correction_below_one_lot_sends_nothing_and_does_not_halt(self):
+        v, e, kills = self._drifted(spot=0.0309)     # 0.0009 off: under a lot
+        d = e.on_candle(mark=MARK * 1.45, funding_bps=3.0, spot=MARK * 1.45,
+                        timestamp_ms=4 * H8)
+        assert v.orders == [] and not kills
+        assert e.state is BookState.HEDGED and d.action != "halted"
+
+
+class TestACoverShortfallBelowOneLotAtOneLotSize:
+    LOT = {"qty_step": 0.001, "min_qty": 0.001, "min_notional": 5.0}
+
+    def test_a_one_lot_hedge_is_closed_when_the_client_keeps_only_part_of_a_lot(self):
+        """At the production cap the whole hedge is ONE lot, so the 'below a
+        lot is dust' rule meant the cover check never fired: the client could
+        hold 0.0002 BTC against a 0.001 short and the book reported HEDGED."""
+        v = Venue(inventory=0.001, lot=self.LOT)
+        e = engine(v, cap=100.0)
+        assert open_pair(e).action == "opened"
+        assert e.position.perp.filled_qty == pytest.approx(0.001)
+        v.inventory = 0.0002
+        v.orders.clear()
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8 + 1, timestamp_ms=3 * H8 + 1)
+        assert d.action == "unwound" and d.reason == "INVENTORY_WITHDRAWN", (
+            d.action, d.reason)
+        assert v.orders == [("Buy", "linear", pytest.approx(0.001))]
+        assert e.position is None and e.state is BookState.FLAT
+
+    def test_dust_against_a_large_hedge_is_still_left_alone(self):
+        v = Venue(inventory=1.0, lot=self.LOT)
+        e = engine(v, cap=100_000.0)
+        assert open_pair(e).action == "opened"
+        v.inventory = 1.0 - 0.0005            # half a lot, 0.05% of the hedge
+        v.orders.clear()
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=3 * H8 + 1, timestamp_ms=3 * H8 + 1)
+        assert d.action == "hold" and v.orders == []

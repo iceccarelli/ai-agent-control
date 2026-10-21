@@ -17,6 +17,16 @@ from carry_risk import CarryRisk  # noqa: E402
 from market_snapshot import MarketSnapshot  # noqa: E402
 
 
+
+def _fee_detail(usd=0.0):
+    """A labelled quote-coin fee, as the venue reports it. A spot BUY with an
+    unlabelled fee cannot establish the BTC actually held and the engine halts
+    on it (SPOT_FEE_UNVERIFIABLE), so the fakes must say the currency."""
+    return {"fee_detail": {"known": True, "source": "cumFeeDetail",
+                           "note": "scripted fee in this test venue",
+                           "components": [{"amount": usd,
+                                           "currency": "USDT"}]}}
+
 class FakeBroker:
     """A venue that fills what you ask unless told to misbehave."""
 
@@ -35,7 +45,8 @@ class FakeBroker:
             return None
         price = self.mark * (1 + self.slip if side == "Buy" else 1 - self.slip)
         return {"filled_qty": qty * self.fill_ratio, "avg_price": price,
-                "order_link_id": f"{product}-{len(self.orders)}"}
+                "order_link_id": f"{product}-{len(self.orders)}",
+                **_fee_detail()}
 
     def get_margin_multiple(self, symbol):
         return self.margin
@@ -62,7 +73,7 @@ class _SpotFillsThenVenueDies(FakeBroker):
         self.orders.append((symbol, side, qty, product))
         if len(self.orders) == 1 and product == "spot" and side == "Buy":
             return {"filled_qty": qty, "avg_price": self.mark,
-                    "order_link_id": "spot-1"}
+                    "order_link_id": "spot-1", **_fee_detail()}
         return None
 
 
@@ -348,6 +359,14 @@ class TestFundingDrivesEntryAndExit:
         assert decision.acted is False
         assert decision.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
 
+    def test_a_perp_discount_beyond_the_budget_is_refused(self):
+        broker = FakeBroker()
+        eng = engine(broker)
+        decision = eng.on_candle(spot=SPOT, mark=SPOT * 0.98, funding_bps=3.0)
+        assert decision.acted is False
+        assert decision.reason == "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET"
+        assert not broker.orders
+
     def test_sustained_negative_funding_unwinds(self):
         eng = engine(FakeBroker())
         eng.on_candle(spot=SPOT, mark=100_000.0, funding_bps=1.0)
@@ -395,3 +414,33 @@ class TestItCannotExpressADirectionalBet:
                                "carry_engine.py"), encoding="utf-8") as fh:
             body = fh.read()
         assert "live_authorized" not in body
+
+
+def test_a_halted_book_holding_a_position_keeps_reading_its_margin(caplog):
+    import logging
+    import carry_engine as ce
+    from carry_engine import CarryPosition, Leg
+
+    class V:
+        def get_margin_multiple(self, symbol):
+            return 1.1
+
+    e = ce.CarryEngine(broker=V(), max_notional_usd=100.0, borrow_apr=0.0,
+                       execution_mode="overlay", persist=lambda s: None)
+    e.position = CarryPosition(
+        spot=Leg(symbol="BTCUSDT", side="Buy", product="spot"),
+        perp=Leg(symbol="BTCUSDT", side="Sell", product="linear"),
+        opened_ms=1)
+    e.state = ce.BookState.HALTED
+    with caplog.at_level(logging.CRITICAL):
+        d = e.on_candle(mark=100_000.0, funding_bps=1.0, timestamp_ms=10_000)
+    assert d.action == "halted" or d.reason == "KILL_SWITCH_ENGAGED"
+    assert d.detail["halted_margin_multiple"] == 1.1
+    assert "BELOW" in caplog.text
+
+
+def test_there_is_no_funding_floor_knob_that_nothing_reads():
+    import inspect
+    from carry_engine import CarryEngine
+    assert "min_entry_funding_bps" not in inspect.signature(
+        CarryEngine.__init__).parameters

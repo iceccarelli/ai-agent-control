@@ -217,8 +217,11 @@ def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None
                 evidence = f"models/current present: {present}"
         else:
             entry = declared.get(key) if isinstance(declared, dict) else None
-            complete = bool((entry or {}).get("complete")) \
-                if isinstance(entry, dict) else False
+            # Only a real JSON true counts. bool() of a non-empty string is
+            # True, so a hand-edited "complete": "false" / "0" / "no" would
+            # have marked a human-owned item complete.
+            complete = (entry.get("complete") is True
+                        if isinstance(entry, dict) else False)
             evidence = str((entry or {}).get("evidence", "")) \
                 if isinstance(entry, dict) else "not declared in the gate file"
             if not isinstance(entry, dict):

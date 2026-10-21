@@ -41,7 +41,7 @@ import signal
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import datetime as dt
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -67,6 +67,13 @@ __all__ = ["TradingBot", "build_bot", "main"]
 #: number smaller than it.
 WS_SHUTDOWN_SAFETY_MARGIN_SECONDS = 5.0
 
+#: Consecutive ticks the carry engine may raise while a pair is HELD before the
+#: book is halted. A held short that no tick can manage is an unmanaged
+#: exposure; a raise that repeats is a defect, not a transient read (the
+#: engine's own venue reads halt or exit on their own failures). Not a trading
+#: parameter: it bounds how long an unmanageable book is retried silently.
+CARRY_MAX_CONSECUTIVE_HELD_ERRORS = 3
+
 
 # ---------------------------------------------------------------------------
 # health server
@@ -80,6 +87,10 @@ class _HealthHandler(BaseHTTPRequestHandler):
     existed**. If the orchestrator health-checks the port, the task is killed and
     restarted in a loop — and each restart re-entered live trading with amnesia.
     """
+
+    #: A client that connects and says nothing must not hold the server (and
+    #: with it every later check) for ever.
+    timeout = 5
 
     bot: Optional["TradingBot"] = None
 
@@ -188,7 +199,16 @@ class TradingBot:
         self._carry_estimated_funding = 0.0
         self._last_funding_poll_ms = 0
         self.cfg = config if config is not None else _config.get_config_object()
-        self.store = store if store is not None else StateStore()
+        if store is None:
+            # The configured path, not an import-time environment read: a
+            # config built from an explicit mapping must not silently open a
+            # different database (and with it a cleared kill switch and an
+            # unbounded daily-loss anchor).
+            db_path = getattr(self.cfg, "STATE_DB_PATH", None)
+            store = (StateStore(db_path.strip())
+                     if isinstance(db_path, str) and db_path.strip()
+                     else StateStore())
+        self.store = store
         self.client = client if client is not None else BybitClient(
             config=self.cfg, store=self.store
         )
@@ -274,9 +294,15 @@ class TradingBot:
             naked = [p["symbol"] for p in self.store.positions_without_stops()]
             carry = self.carry_status()
             carry_blocked = bool(carry.get("blocking_fault"))
+            loop_stalled = self._loop_stalled()
             return {
                 "healthy": (not kill_engaged and not naked and self._reconciled
-                            and not carry_blocked),
+                            and not carry_blocked and not loop_stalled),
+                "loop_stalled": loop_stalled,
+                "consecutive_tick_failures": self._tick_failures,
+                "last_tick_ok_age_s": (None if not self._last_tick_ok_epoch else
+                                       round(time.time() - self._last_tick_ok_epoch, 1)),
+                "risk_halted": self._risk_halted(),
                 "carry": carry,
                 "reconciled": self._reconciled,
                 "kill_switch": kill_engaged,
@@ -296,6 +322,34 @@ class TradingBot:
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    #: Class-level defaults so a bot built without __init__ (tests, tools) works.
+    _last_tick_ok_epoch = 0.0
+    _tick_failures = 0
+    #: A loop is called stalled after this many consecutive failed cycles, or when
+    #: no cycle has completed for this many loop intervals (and at least 120 s).
+    HEALTH_MAX_TICK_FAILURES = 5
+    HEALTH_STALL_INTERVALS = 3
+
+    def _loop_stalled(self) -> bool:
+        """True when the trading loop is failing or has stopped completing.
+
+        A health endpoint that stays green while ``tick()`` raises on every cycle
+        (or hangs on a venue call) tells an operator nothing."""
+        if self._tick_failures >= self.HEALTH_MAX_TICK_FAILURES:
+            return True
+        last = self._last_tick_ok_epoch
+        if not last:
+            return False                      # first cycle not finished yet
+        limit = max(120.0, self.HEALTH_STALL_INTERVALS * float(
+            getattr(self, "loop_interval_s", 60.0) or 60.0))
+        return (time.time() - last) > limit
+
+    def _risk_halted(self) -> bool:
+        try:
+            return bool(self.risk.should_halt_trading())
+        except Exception:  # noqa: BLE001
+            return True
 
     def carry_status(self) -> Dict[str, Any]:
         """What an operator must know about the carry book, in one place.
@@ -414,7 +468,8 @@ class TradingBot:
         port = int(getattr(self.cfg, "HEALTHCHECK_PORT", 8081))
         host = str(getattr(self.cfg, "HEALTHCHECK_HOST", "127.0.0.1") or "127.0.0.1")
         handler = type("_Bound", (_HealthHandler,), {"bot": self})
-        self._http = HTTPServer((host, port), handler)
+        self._http = ThreadingHTTPServer((host, port), handler)
+        self._http.daemon_threads = True
         threading.Thread(
             target=self._http.serve_forever, name="health", daemon=True
         ).start()
@@ -436,6 +491,19 @@ class TradingBot:
         if not allowed:
             logger.critical("startup blocked: %s", why)
             return False
+        try:
+            # The ACCOUNT is what the equity belongs to: the endpoint decides
+            # that. PAPER_TRADING only changes whether orders are sent, not
+            # whose balance is read, so flipping it must not wipe the peak.
+            venue = getattr(self.cfg, 'BYBIT_VENUE', '')
+            venue = venue.lower() if isinstance(venue, str) else ''
+            scope = (f"venue={venue};"
+                     f"testnet={bool(getattr(self.cfg, 'USE_TESTNET', True))}")
+            if self.store.set_equity_scope(scope):
+                logger.warning("equity scope changed to %s; yesterday's "
+                               "equity will not seed today's anchor", scope)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not record the equity scope")
         live_armed, live_why = _config.is_live_authorized(self.cfg)
         logger.warning(
             "mode: %s | testnet=%s paper=%s | %s",
@@ -463,7 +531,18 @@ class TradingBot:
         # Leverage is set BEFORE reconciliation, because reconciliation may
         # need to close a position and the exchange rejects a reduce order whose
         # symbol has no leverage configured. On spot this is a no-op.
-        if bool(getattr(self.cfg, "ALLOW_SHORTS", False)):
+        # A process that was degraded to paper on the MAINNET endpoint (live
+        # requested, not authorised) must not change the real account's
+        # leverage either; neither may one that is about to refuse to start
+        # on an engaged kill switch.
+        mainnet_paper = (bool(getattr(self.cfg, "PAPER_TRADING", True))
+                         and not bool(getattr(self.cfg, "USE_TESTNET", True)))
+        if mainnet_paper:
+            logger.warning("paper mode on the mainnet endpoint: leverage "
+                           "is not changed")
+        if (bool(getattr(self.cfg, "ALLOW_SHORTS", False))
+                and not mainnet_paper
+                and not self.store.is_kill_switch_engaged()[0]):
             for symbol in self.symbols:
                 if not self.client.set_leverage(symbol):
                     logger.critical(
@@ -637,8 +716,11 @@ class TradingBot:
         consumer = self.ws_consumer
         if consumer is None:
             return
+        seen = getattr(self, "_ws_generation_at_tick", None)
+        opened_later = (seen is not None and getattr(
+            consumer, "reconcile_generation", seen) != seen)
         if consumer.needs_reconciliation:
-            if rest_ok:
+            if rest_ok and not opened_later:
                 consumer.needs_reconciliation = False
                 consumer.dirty_symbols.clear()
                 self._observation_state = "HEALTHY"
@@ -693,6 +775,7 @@ class TradingBot:
         self._install_signal_handlers()
         logger.info("trading loop started for %s", ", ".join(self.symbols) or "(none)")
 
+        self._last_tick_ok_epoch = time.time()     # the stall clock starts now
         while not self._stop.is_set():
             try:
                 self.tick()
@@ -700,8 +783,11 @@ class TradingBot:
                 # One bad cycle must not kill the process, but it must be loud
                 # and it must not be silently retried at full speed.
                 logger.exception("cycle failed: %s", exc)
+                self._tick_failures += 1
                 self._stop.wait(min(30.0, self.loop_interval_s))
                 continue
+            self._tick_failures = 0
+            self._last_tick_ok_epoch = time.time()
             self._stop.wait(self.loop_interval_s)
 
         self.shutdown()
@@ -716,9 +802,36 @@ class TradingBot:
         A failure here raises into the engine, which halts on it.
         """
         journal = getattr(self, "carry_journal", None)
-        if journal is not None:
-            self.store.save_ledger(journal.to_rows())
-        self.store.save_carry_position(state)
+        # One commit: a kill between the two left the journal ahead of the
+        # position row, which the next cold start can only halt on.
+        transaction = getattr(self.store, "transaction", None)
+        import contextlib as _contextlib
+        with (transaction() if callable(transaction)
+              else _contextlib.nullcontext()):
+            if journal is not None:
+                self.store.save_ledger(journal.to_rows())
+            self.store.save_carry_position(state)
+
+    def _log_venue_leverage(self, broker: Any) -> None:
+        """Say what leverage the venue reports for the carry perp. Observation
+        only: this process does not set, change or gate on it (the startup setter
+        covers the directional symbols, not the carry perp), so without this line
+        the number the book actually runs at is recorded nowhere."""
+        reader = getattr(broker, "get_position_leverage", None)
+        if reader is None:
+            return
+        try:
+            leverage = reader(self.carry.perp_symbol)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("carry: could not read the venue's leverage for %s "
+                           "(%s: %s)", self.carry.perp_symbol,
+                           type(exc).__name__, exc)
+            return
+        logger.warning(
+            "carry: the venue reports %s leverage on %s (observed only; this "
+            "process neither set nor gates on it)",
+            "UNSTATED" if leverage is None else f"{leverage:g}x",
+            self.carry.perp_symbol)
 
     def carry_cold_start(self) -> bool:
         """Reconcile the carry ledger against the venue. False = do not start.
@@ -745,11 +858,34 @@ class TradingBot:
                     "a held short) would be rejected. Switch the account to "
                     "one-way mode; refusing to start", self.carry.perp_symbol)
                 return False
+            self._log_venue_leverage(broker)
+            read_started_ms = int(time.time() * 1000)
             venue_perp = float(broker.get_perp_position(self.carry.perp_symbol))
             venue_spot = float(
                 broker.get_spot_inventory(self.carry.spot_symbol))
             open_orders = broker.get_open_carry_orders(
                 self.carry.spot_symbol, self.carry.perp_symbol)
+            # ONE read decides RESUME / CLEAN / HALT, and a position list that
+            # lags (a crash right after a fill, a replica behind the matching
+            # engine) can say flat while the venue is short: CLEAN, then a
+            # second hedge. Read both sizes again after a pause; reads that
+            # disagree are not a state to start from.
+            if self.CARRY_COLD_START_REREAD_S > 0:
+                time.sleep(self.CARRY_COLD_START_REREAD_S)
+            again_perp = float(broker.get_perp_position(self.carry.perp_symbol))
+            again_spot = float(
+                broker.get_spot_inventory(self.carry.spot_symbol))
+            # A position does not accrue; a wallet balance can (interest, a
+            # client deposit), so the spot comparison is relative.
+            spot_tol = max(1e-9, 1e-7 * max(abs(venue_spot), abs(again_spot)))
+            if (abs(again_perp - venue_perp) > 1e-9
+                    or abs(again_spot - venue_spot) > spot_tol):
+                logger.critical(
+                    "carry cold start: two reads of the venue disagree (perp "
+                    "%.10g then %.10g, spot %.10g then %.10g); refusing to "
+                    "start from a state that is still moving", venue_perp,
+                    again_perp, venue_spot, again_spot)
+                return False
         except Exception as exc:  # noqa: BLE001
             logger.critical(
                 "carry cold start: the venue is unreadable (%s); refusing to "
@@ -762,8 +898,10 @@ class TradingBot:
         # A venue that will not hand them over is not a reason to refuse to
         # start — it just means the wait — so this logs and carries on.
         try:
-            warmed = self.carry.warm_funding_history(
-                broker.get_funding_history(self.carry.perp_symbol, limit=8))
+            venue_prints = broker.get_funding_history(
+                self.carry.perp_symbol, limit=30)
+            self.carry.venue_prints_at_start = list(venue_prints)
+            warmed = self.carry.warm_funding_history(venue_prints)
             if warmed:
                 logger.warning("carry: EWMA warmed with %d settled prints",
                                warmed)
@@ -775,7 +913,7 @@ class TradingBot:
 
         decision = self.carry.cold_start(
             ledger=ledger, venue_perp_qty=venue_perp, venue_spot_qty=venue_spot,
-            open_orders=open_orders)
+            open_orders=open_orders, venue_read_started_ms=read_started_ms)
         logger.warning(
             "carry cold start: %s — %s (ledger=%s venue_perp=%.10g "
             "venue_spot=%.10g open_orders=%d)",
@@ -786,6 +924,31 @@ class TradingBot:
             logger.critical(
                 "carry cold start HALTED — a human must reconcile before this "
                 "process trades: %s", decision.reason)
+            return False
+        journal_rows = None
+        if decision.action.value == "RESUME" and \
+                self.carry.position is not None:
+            try:
+                journal_rows = self.store.load_ledger()
+            except Exception as exc:  # noqa: BLE001
+                logger.critical("carry cold start: the journal is unreadable "
+                                "(%s: %s)", type(exc).__name__, exc)
+                journal_rows = []
+        if (decision.action.value == "RESUME" and self.carry.position is not None
+                and not journal_rows):
+            # `_persist_carry` writes the journal BEFORE the position, so a
+            # held pair always has fills in the journal. An empty one is a lost
+            # or truncated ledger: no lifecycle exists to book the venue's
+            # funding against, no fill to realise a close from, and nothing
+            # would say so. Refuse rather than run an unaccountable book.
+            logger.critical(
+                "carry cold start: the ledger holds a resumed pair but the "
+                "double-entry journal is empty; its fills, fees and funding "
+                "cannot be accounted. Refusing to start - a human must "
+                "reconcile the journal")
+            self.carry._halt(
+                "JOURNAL_EMPTY_FOR_HELD_PAIR",
+                "a resumed pair has no journal entries")
             return False
         return True
 
@@ -802,8 +965,12 @@ class TradingBot:
         try:
             equity = self.client.get_equity()
             self.risk.update_equity(equity)
-        except BybitAPIError as exc:
-            logger.error("equity unreadable this cycle: %s", exc)
+        except Exception as exc:  # noqa: BLE001
+            # Not only BybitAPIError: the equity step also writes the store
+            # (PersistenceError: disk full, locked file) and parses the wallet
+            # (ValueError). None of those may skip the held pair's checks.
+            logger.error("equity unreadable this cycle (%s: %s)",
+                         type(exc).__name__, exc)
             if not carry_pair_held:
                 return
 
@@ -820,12 +987,41 @@ class TradingBot:
         # before any gate reads open_position_count or the loss streak.
         rest_observation_ok = True
         try:
+            late = self.engine.resolve_unresolved_entries()
+            if late.get("resolved") or late.get("adopted"):
+                logger.warning("unresolved entries settled this cycle: %s", late)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("resolve_unresolved_entries failed; continuing: %s", exc)
+        consumer = getattr(self, "ws_consumer", None)
+        self._ws_generation_at_tick = getattr(
+            consumer, "reconcile_generation", None)
+        try:
             observed = self.engine.observe_exits()
             if observed.get("closed") or observed.get("reduced"):
                 logger.warning("exits observed this cycle: %s", observed)
+            if observed.get("unread") or observed.get("stop_dead"):
+                # A position the venue could not be asked about was not
+                # observed (the gap the WS flagged is still open), and a dead
+                # stop is a state the next cycle must look at again. (A
+                # phantom-coin row, "stop_dead_unverified", is alarmed once and
+                # left for reconcile; counting it here would hold the whole
+                # observation state at DEGRADED for every symbol until then.)
+                rest_observation_ok = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("observe_exits failed; continuing: %s", exc)
             rest_observation_ok = False
+
+        # Exits booked without an authoritative price are priced from the
+        # venue's own fills as soon as it will state them (read-only; a no-op
+        # when nothing is provisional).
+        try:
+            if self.store.provisional_trades(limit=1):
+                recon = self.engine.reconcile_provisional_exits()
+                if recon.get("reconciled"):
+                    logger.warning("provisional exits reconciled: %s", recon)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("reconcile_provisional_exits failed; "
+                             "continuing: %s", exc)
 
         # A stop that existed and was later cleared AT THE VENUE while the
         # position stayed open is invisible to reconcile()'s ledger-only
@@ -835,6 +1031,9 @@ class TradingBot:
             naked = self.engine.check_naked_positions()
             if naked.get("reprotected") or naked.get("flattened"):
                 logger.warning("naked positions handled this cycle: %s", naked)
+            if (naked.get("unread") or naked.get("skipped")
+                    or naked.get("flatten_failed")):
+                rest_observation_ok = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("check_naked_positions failed; continuing: %s", exc)
             rest_observation_ok = False
@@ -893,7 +1092,30 @@ class TradingBot:
                 # A held pair is not blinded by a bad view: the venue's own
                 # size is read directly and a drifted or unreadable short
                 # halts the book now, not when the feed happens to recover.
-                watched = self.carry.check_venue_position_without_a_view()
+                try:
+                    watched = self.carry.check_venue_position_without_a_view()
+                except Exception as watch_exc:  # noqa: BLE001
+                    # The viewless watch can reach an unwind (orders, persist). An
+                    # exception here used to fall to run()'s generic handler,
+                    # outside the held-pair error counter: a held pair with a
+                    # broken feed and a failing unwind was retried forever.
+                    logger.exception("carry viewless watch raised: %s", watch_exc)
+                    if getattr(self.carry.state, "name", "") in (
+                            "OPENING", "UNWINDING"):
+                        self.carry._halt(
+                            "ENGINE_EXCEPTION_MID_TRANSACTION",
+                            f"{type(watch_exc).__name__}: {watch_exc}")
+                    elif self.carry.position is not None:
+                        self._carry_held_errors += 1
+                        if (self._carry_held_errors
+                                >= CARRY_MAX_CONSECUTIVE_HELD_ERRORS):
+                            self.carry._halt(
+                                "HELD_BOOK_UNMANAGEABLE",
+                                f"the viewless watch raised on "
+                                f"{self._carry_held_errors} consecutive ticks "
+                                f"while a pair was held "
+                                f"({type(watch_exc).__name__}: {watch_exc})")
+                    return
                 if watched is not None:
                     self._last_carry_decision = {
                         "action": str(watched.action),
@@ -911,12 +1133,61 @@ class TradingBot:
             # bookkeeping); with nothing held it must not take on new
             # exposure it cannot account for.
             if (self._journal_unsaved and self.carry.position is None
+                    and getattr(getattr(self, "carry_journal", None), "to_rows", None)
+                    and getattr(self.carry.state, "name", "") != "HALTED"):
+                # One transient store error is not a reason to stand down for
+                # good: write it again first, and halt only if that fails too.
+                try:
+                    self.store.save_ledger(self.carry_journal.to_rows())
+                    self._journal_unsaved = False
+                except Exception:  # noqa: BLE001
+                    logger.exception("the ledger retry also failed")
+            if (self._journal_unsaved and self.carry.position is None
                     and getattr(self.carry.state, "name", "") != "HALTED"):
                 self.carry._halt(
                     "JOURNAL_WRITE_FAILED",
                     "the double-entry journal could not be written on the "
                     "previous cycle and the book is flat; refusing new "
                     "exposure it cannot account for")
+                return
+            perp_held = getattr(view, "perp_held", None)
+            if (perp_held is not None and self.carry.position is None
+                    and abs(float(perp_held)) > 1e-9
+                    and getattr(self.carry.state, "name", "") == "FLAT"):
+                # A short the book never recorded halts the book (and trips the
+                # kill switch) - so it must be a short that is really there. The
+                # position list can still show the size of a hedge the engine
+                # closed a moment ago (an overlay inventory exit never re-reads
+                # the venue): look again after a pause and halt only on two
+                # reads that agree. An unreadable second read skips the check this tick.
+                time.sleep(self.CARRY_ORPHAN_REREAD_S)
+                try:
+                    perp_held = float(self.carry.broker.get_perp_position(
+                        self.carry.perp_symbol))
+                except Exception as exc:  # noqa: BLE001
+                    # One stale reading cannot halt a book on its own and the
+                    # confirming read failed: unconfirmed is not an orphan. Skip
+                    # the check this tick; the next tick reads again, so a real
+                    # orphan is delayed by one tick, never missed.
+                    # The tick must not TRADE on that either: skipping the check
+                    # while still opening would put a second hedge on top of a
+                    # short the book never recorded. Unconfirmed means stand
+                    # still this tick and read again on the next.
+                    logger.warning("carry: orphan re-read failed (%s); standing "
+                                   "still this tick", exc)
+                    self._last_carry_decision = {
+                        "action": "skipped", "reason": "ORPHAN_UNCONFIRMED",
+                        "state": getattr(self.carry.state, "value", "FLAT"),
+                        "at_ms": int(time.time() * 1000)}
+                    return
+            orphan = self.carry.check_venue_flat_while_flat(perp_held)
+            if orphan is not None:
+                self._last_carry_decision = {
+                    "action": str(orphan.action), "reason": str(orphan.reason),
+                    "state": orphan.state.value,
+                    "at_ms": int(time.time() * 1000)}
+                logger.critical("carry book HALTED while FLAT: %s",
+                                orphan.reason)
                 return
             self.carry.snapshot = view
             # The SETTLED print and its stamp, not the ticker's forecast
@@ -943,7 +1214,21 @@ class TradingBot:
                     logger.critical(
                         "carry book HALTED mid-transaction - a human must "
                         "reconcile the venue against the ledger")
+                elif self.carry.position is not None:
+                    self._carry_held_errors += 1
+                    if (self._carry_held_errors
+                            >= CARRY_MAX_CONSECUTIVE_HELD_ERRORS):
+                        self.carry._halt(
+                            "HELD_BOOK_UNMANAGEABLE",
+                            f"the engine raised on {self._carry_held_errors} "
+                            f"consecutive ticks while a pair was held "
+                            f"({type(exc).__name__}: {exc})")
+                        logger.critical(
+                            "carry book HALTED: a held pair could not be "
+                            "managed for %d ticks - a human must reconcile",
+                            self._carry_held_errors)
                 return
+            self._carry_held_errors = 0
             self._last_carry_decision = {
                 "action": str(decision.action), "reason": str(decision.reason),
                 "state": decision.state.value,
@@ -964,6 +1249,7 @@ class TradingBot:
             journal = getattr(self, "carry_journal", None)
             if journal is not None:
                 self._book_carry_funding(journal, symbol, decision)
+                self._accrue_carry_borrow(journal, spot)
                 try:
                     self.store.save_ledger(journal.to_rows())
                     self._journal_unsaved = False
@@ -994,19 +1280,66 @@ class TradingBot:
             if not self.risk.can_trade(symbol):
                 continue
             try:
+                sync = getattr(self.strategy, "sync_from_store", None)
+                if callable(sync):
+                    sync(self.store)
                 intent = self.strategy.signal_for(symbol)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("strategy failed for %s: %s", symbol, exc)
                 continue
             if intent is None:
                 continue
+            # The signal is computed from the last CLOSED bar, so it is the
+            # same for every tick until the next bar closes. Once it has been
+            # traded, an exit (a stop hit minutes later) must not be followed
+            # by the identical entry on the very next tick: that repeats a
+            # round trip, fees included, up to once a tick for the whole bar.
+            rows = getattr(self.strategy, "last_rows", None)
+            bar = None
+            try:
+                bar = rows[-1][0] if rows else None
+            except (TypeError, IndexError, KeyError):
+                bar = None
+            signature = (bar, intent.signal_type, float(intent.entry_price),
+                         float(intent.stop_price), tuple(intent.take_profits))
+            traded = self.__dict__.setdefault("_traded_signals", {})
+            signature = json.dumps(signature, default=str)
+            if bar is None:
+                # No bar to key on: dedupe within this process only; a stored
+                # bar-less signature would suppress later signals for ever.
+                traded.setdefault(symbol, "")
+            elif symbol not in traded:
+                # survives a restart: the same bar's signal is not re-entered
+                # just because the process was bounced after a stop-out
+                try:
+                    traded[symbol] = self.store.traded_signal(symbol)
+                except Exception:  # noqa: BLE001
+                    traded[symbol] = ""
+            if traded.get(symbol) == signature:
+                logger.debug("%s: signal already traded on this bar", symbol)
+                continue
             report = self.engine.execute(intent)
+            if report.ok or report.stage in ("emergency", "fill"):
+                # Anything that reached the venue counts as traded: an entry
+                # closed again by the safety path is not to be retried on the
+                # same bar either.
+                traded[symbol] = signature
+                if bar is not None:
+                    try:
+                        self.store.mark_traded_signal(symbol, signature)
+                    except Exception:  # noqa: BLE001
+                        logger.exception("could not persist the traded signal")
             logger.info("%s -> %s (%s)", symbol, report.reason, report.stage)
 
     #: Class-level defaults so a bot built without __init__ (tests, tools) works.
     _carry_estimated_funding = 0.0
     _last_funding_poll_ms = 0
     _journal_unsaved = False
+    #: Pause between the two cold-start reads of the venue (see carry_cold_start).
+    CARRY_COLD_START_REREAD_S = 0.25
+    #: Pause before the orphan-position read is repeated (see tick).
+    CARRY_ORPHAN_REREAD_S = 0.5
+    _carry_held_errors = 0
     _last_carry_decision: Dict[str, Any] = {}
 
     #: How often to read the venue's settlement rows. Funding settles every 8h,
@@ -1018,6 +1351,69 @@ class TradingBot:
     #: at once whenever a lifecycle has no current reconciliation record.
     RECONCILE_POLL_MS = 3_600_000
     _last_reconcile_ms = 0
+
+    #: Borrow accrues continuously; it is posted in chunks of at least this
+    #: long (and in full when the pair closes), so the journal does not take
+    #: an entry per tick.
+    BORROW_POST_EVERY_MS = 3_600_000
+    _borrow_since_ms: Optional[int] = None
+    _borrow_notional_usd = 0.0
+
+    def _accrue_carry_borrow(self, journal: Any, spot_mark: float) -> None:
+        """Book the financing cost of an ACQUIRE pair into the journal.
+
+        The engine's entry gate prices borrow (`borrow_apr`) but the live
+        journal never booked it, so `net_usd` ignored a real cost of the
+        financed spot leg. Overlay holds the client's own coin: no borrow.
+        Never raises into the loop.
+        """
+        try:
+            carry = self.carry
+            if carry is None or carry.execution_mode != "acquire":
+                return
+            apr = float(carry.borrow_apr)
+            if not (apr > 0.0):
+                return
+            now = int(time.time() * 1000)
+            position = carry.position
+            if position is not None:
+                spot_leg = position.spot
+                notional = (float(spot_leg.filled_qty)
+                            * float(spot_mark or spot_leg.avg_price or 0.0))
+                opened = int(position.opened_ms or now)
+                if (self._borrow_since_ms is not None
+                        and opened > self._borrow_since_ms):
+                    self._borrow_since_ms = None        # a different pair
+                if self._borrow_since_ms is None:
+                    # Resume after the last borrow the journal already holds:
+                    # a restart must not book the same hours twice.
+                    posted = max((e.ms for e in journal.entries
+                                  if getattr(e, "kind", "") == "borrow"),
+                                 default=0)
+                    self._borrow_since_ms = max(opened, int(posted))
+                    self._borrow_notional_usd = notional
+                    return
+                if now - self._borrow_since_ms < self.BORROW_POST_EVERY_MS:
+                    self._borrow_notional_usd = notional
+                    return
+            elif self._borrow_since_ms is None:
+                return
+            import ledger as _ledger
+            held_ms = max(0, now - self._borrow_since_ms)
+            usd = (self._borrow_notional_usd * apr
+                   * held_ms / (365.0 * 86_400_000.0))
+            if usd > 0.0:
+                newest = max((e.ms for e in journal.entries), default=0)
+                _ledger.borrow(journal, ms=max(now, int(newest)),
+                               ref=f"borrow:{now}", usd=usd)
+            if position is not None:
+                self._borrow_since_ms = now
+                self._borrow_notional_usd = notional
+            else:
+                self._borrow_since_ms = None
+                self._borrow_notional_usd = 0.0
+        except Exception:  # noqa: BLE001
+            logger.exception("borrow accrual failed; the cost is not booked")
 
     def _book_carry_funding(self, journal: Any, symbol: str,
                             decision: Any) -> None:
@@ -1205,13 +1601,15 @@ class TradingBot:
         except Exception:  # noqa: BLE001
             logger.warning("session log could not be closed", exc_info=True)
         try:
-            self.store.release_writer()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
             self.engine.shutdown(cancel_protective=False)
         except Exception:  # noqa: BLE001
             logger.exception("engine shutdown failed")
+        # Released only after the engine's last writes, so the single-writer
+        # assertion still guards them.
+        try:
+            self.store.release_writer()
+        except Exception:  # noqa: BLE001
+            pass
         if self._http is not None:
             try:
                 self._http.shutdown()

@@ -44,6 +44,15 @@ H8 = 8 * 3600 * 1000
 BID, ASK = 99_999.9, 100_000.1
 
 
+def _fee_detail(product, usd):
+    """A labelled USDT fee, as the venue reports it: an unlabelled spot BUY fee
+    cannot establish the BTC actually held and the engine halts on it."""
+    return {"fee_detail": {"known": True, "source": "cumFeeDetail",
+                           "note": "scripted fee in this test venue",
+                           "components": [{"amount": usd,
+                                           "currency": "USDT"}]}}
+
+
 class Venue:
     """A venue whose resting orders fill, or do not, on command."""
 
@@ -64,13 +73,14 @@ class Venue:
         return {"filled_qty": filled, "avg_price": price,
                 "order_link_id": f"m{len(self.calls)}",
                 "fee": filled * price * 2.0 / 1e4, "maker": True,
-                "resting": filled < qty}
+                "resting": filled < qty, **_fee_detail(product, filled * price * 2.0 / 1e4)}
 
     def place_market(self, *, symbol, side, qty, product):
         self.calls.append(("taker", side, qty, None))
         return {"filled_qty": qty, "avg_price": MARK,
                 "order_link_id": f"t{len(self.calls)}",
-                "fee": qty * MARK * 5.5 / 1e4, "maker": False}
+                "fee": qty * MARK * 5.5 / 1e4, "maker": False,
+                **_fee_detail(product, qty * MARK * 5.5 / 1e4)}
 
     def cancel_order(self, *, symbol, order_link_id, product):
         self.calls.append(("cancel", None, None, None))
@@ -251,7 +261,8 @@ class TestGettingOutIsNeverSlowedForAFee:
                 if product == "linear":
                     return None
                 return {"filled_qty": qty, "avg_price": MARK,
-                        "order_link_id": "x", "fee": 0.1}
+                        "order_link_id": "x", "fee": 0.1,
+                        **_fee_detail(product, 0.1)}
         v = NoPerp()
         e, d = opened(v, mode="acquire")
         assert "PERP_LEG_DID_NOT_FILL" in d.reason
@@ -502,3 +513,76 @@ class _Store:
 
     def open_positions(self):
         return []
+
+
+class _UnknownTaker(Exception):
+    outcome_unknown = True
+
+
+def test_a_halt_from_an_unknown_taker_remainder_is_not_overwritten_by_hedged():
+    """The maker half filled, the taker remainder's outcome is unknown: `_take`
+    halts the book. The open must not promote it back to HEDGED, record an
+    entry, or write HEDGED over the HALTED ledger."""
+    class V(Venue):
+        def place_market(self, **kw):
+            raise _UnknownTaker("timeout after send")
+    writes, tripped = [], []
+    e = engine(V(maker_fills=False, maker_partial=0.5),
+               kill_switch=tripped.append)
+    e.persist = writes.append
+    d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                    funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+    assert d.action == "halted" and e.state is BookState.HALTED
+    assert tripped
+    assert writes[-1]["book_state"] == "HALTED"
+    assert writes[-1]["position"] is not None       # the landed half is written
+
+
+def test_a_maker_buy_re_reads_whether_its_fee_currency_is_known_at_cancel():
+    """The cancel read-back replaces the fill total and the fee, so it must also
+    replace what is KNOWN about the fee's currency; the placement row's unknown
+    answer used to stick and halt a correctly accounted spot BUY."""
+    class V(Venue):
+        def place_post_only(self, *, symbol, side, qty, price, product):
+            self.calls.append(("maker", side, qty, price))
+            return {"filled_qty": 0.0, "avg_price": price,
+                    "order_link_id": "m1", "fee": None, "maker": True,
+                    "resting": True,
+                    "fee_detail": {"known": False, "components": [],
+                                   "source": "", "note": "empty"}}
+
+        def cancel_order(self, *, symbol, order_link_id, product):
+            self.calls.append(("cancel", None, None, None))
+            return {"filled_qty": 0.001, "avg_price": MARK, "fee": 0.0000005,
+                    "resting": False,
+                    "fee_detail": {"known": True, "source": "cumFeeDetail",
+                                   "note": "",
+                                   "components": [{"amount": 0.0000005,
+                                                   "currency": "BTC"}]}}
+    e = engine(V(), mode="acquire")
+    leg = e._rest("BTCUSDT", "Buy", 0.001, "spot")
+    assert leg is not None and leg.filled_qty == pytest.approx(0.001)
+    assert leg.base_fee_known is True
+    assert leg.fee_base_qty == pytest.approx(0.0000005)
+
+
+@pytest.mark.parametrize("how", ["raises", "unaccountable"])
+def test_a_post_only_that_raises_or_reads_back_unaccountably_leaves_evidence(how):
+    """Same halted-ledger contract as the resting/uncancellable cases: the
+    order's identity and requested size are written beside `position: null`."""
+    class V(Venue):
+        def place_post_only(self, *, symbol, side, qty, price, product):
+            if how == "raises":
+                raise RuntimeError("timed out after send")
+            return {"filled_qty": float("nan"), "avg_price": price,
+                    "order_link_id": "m-1", "fee": None, "resting": True}
+    tripped = []
+    e = engine(V(), kill_switch=tripped.append)
+    d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                    funding_print_ms=3 * H8, timestamp_ms=3 * H8)
+    state = e.to_state()
+    assert state["book_state"] == "HALTED" and state["position"] is None
+    unresolved = state["unresolved_order"]
+    assert unresolved["symbol"] == "BTCUSDT" and unresolved["side"] == "Sell"
+    assert unresolved["requested_qty"] > 0
+    assert "MAKER_ORDER_AMBIGUOUS" in unresolved["why"]

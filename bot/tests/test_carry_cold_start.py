@@ -255,6 +255,15 @@ class TestTheColdStartPlan:
         assert d.action is ColdStart.HALT
         assert d.naked_side == "spot"
 
+    def test_an_acquire_spot_shortfall_names_the_perp_as_the_naked_leg(self):
+        led = dict(self.LEDGER, execution_mode="acquire")
+        less = self.plan(ledger=led, venue_perp_qty=0.001,
+                         venue_spot_qty=0.0004)
+        assert less.action is ColdStart.HALT and less.naked_side == "perp"
+        more = self.plan(ledger=led, venue_perp_qty=0.001,
+                         venue_spot_qty=0.005)
+        assert more.action is ColdStart.HALT and more.naked_side == "spot"
+
     def test_a_size_mismatch_halts(self):
         d = self.plan(ledger=self.LEDGER, venue_perp_qty=0.002)
         assert d.action is ColdStart.HALT
@@ -357,6 +366,15 @@ class TestTheProcessRefusesToStartOnAMismatch:
                                 kill_switch=store.trip_kill_switch)
         bot.carry.pair_risk = CarryRisk(max_notional_usd=100.0)
         return bot, store
+
+    def test_cold_start_reads_thirty_venue_prints_not_eight(self):
+        seen = []
+        venue = Venue()
+        venue.get_funding_history = lambda symbol, limit=8: (
+            seen.append(limit) or [])
+        bot, _store = self._bot(venue, None)
+        assert bot.carry_cold_start() is True
+        assert seen == [30]
 
     def test_a_clean_venue_starts(self):
         bot, _store = self._bot(Venue(), None)
@@ -478,6 +496,16 @@ class TestAPersistedPositionThatCannotBeTrustedHaltsTheStart:
                          venue_spot_qty=5.0, open_orders=())
         assert d.action is ColdStart.RESUME
         assert e.position.perp.fee == pytest.approx(0.0055)
+
+def test_the_resume_baseline_is_the_start_of_the_venue_read_not_the_restore():
+    venue = Venue(perp=0.001)
+    led = opened(venue).to_state()
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    d = e.cold_start(ledger=led, venue_perp_qty=0.001, venue_spot_qty=5.0,
+                     open_orders=(), venue_read_started_ms=1_000)
+    assert d.action is ColdStart.RESUME
+    assert e._venue_verified_ms == 1_000
+
 
 class TestPersistedSymbolsMatchConfiguredMarketsThroughStartup:
     @pytest.mark.parametrize("role", ["spot", "perp"])
@@ -639,3 +667,128 @@ class TestHeldFundingSurvivesARestart:
         e.persist = broken
         d = self._print(e, 4, 2.0)
         assert d.state is BookState.HALTED
+
+
+class TestMissedSettlementsAreCountedOnResume:
+    def _resumed(self, prints):
+        venue = Venue(perp=0.001)
+        led = opened(venue).to_state()
+        led["last_print_ms"] = 1_000
+        e = engine(Venue(perp=0.001), persist=lambda s: None)
+        e.venue_prints_at_start = prints
+        d = e.cold_start(ledger=led, venue_perp_qty=0.001, venue_spot_qty=5.0,
+                         open_orders=())
+        assert d.action is ColdStart.RESUME
+        return e
+
+    def test_three_negative_prints_missed_while_down_advance_the_streak(self):
+        e = self._resumed([(-1.0, 2_000), (-1.0, 3_000), (-1.0, 4_000)])
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 0
+        e._last_print_ms = 1_000
+        n = e._catch_up_missed_prints()
+        # the newest is left for on_candle to book as the live print
+        assert n == 2 and e.position.negative_funding_streak == 2
+        assert e._last_print_ms == 3_000
+
+    def test_prints_before_the_pair_opened_are_not_counted(self):
+        e = self._resumed([(-1.0, 2_000), (-1.0, 3_000)])
+        e.position.opened_ms = 2_500
+        e.position.negative_funding_streak = 0
+        e._last_print_ms = 1_000
+        assert e._catch_up_missed_prints() == 0
+
+    def test_a_positive_missed_print_resets_the_streak(self):
+        e = self._resumed([(-1.0, 2_000), (1.0, 3_000), (1.0, 4_000)])
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 5
+        e._last_print_ms = 1_000
+        e._catch_up_missed_prints()
+        assert e.position.negative_funding_streak == 0
+
+
+class TestCatchUpIsRobust:
+    def _e(self, prints, last=1_000):
+        venue = Venue(perp=0.001)
+        e = engine(Venue(perp=0.001), persist=lambda s: None)
+        e.position = opened(venue).position
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 0
+        e._last_print_ms = last
+        e._funding_history = [1.0, 1.0, 1.0]
+        e.venue_prints_at_start = prints
+        return e
+
+    def test_a_duplicated_settlement_counts_once(self):
+        e = self._e([(-1.0, 2_000), (-1.0, 2_000), (-1.0, 3_000)])
+        e._catch_up_missed_prints()
+        assert e.position.negative_funding_streak == 1
+
+    def test_a_hole_before_the_missed_prints_discards_the_old_history(self):
+        gap = CarryEngine.MAX_PRINT_GAP_MS
+        e = self._e([(-1.0, 1_000 + gap + 10), (-1.0, 1_000 + gap + 20)])
+        e._catch_up_missed_prints()
+        assert e._funding_history == [-1.0]
+
+
+class TestCatchUpWhenTheLedgerHistoryWasDiscarded:
+    def test_the_ledgers_stamp_not_the_warmups_decides_what_was_missed(self):
+        venue = Venue(perp=0.001)
+        led = opened(venue).to_state()
+        led["last_print_ms"] = 1_000
+        led["perp_symbol"] = "ETHUSDT"             # foreign: history discarded
+        led["funding_history"] = [1.0, 1.0, 1.0]
+        e = engine(Venue(perp=0.001), persist=lambda s: None)
+        prints = [(-1.0, 2_000), (-1.0, 3_000), (-1.0, 4_000)]
+        e._funding_history = []                    # a cold process
+        e._last_print_ms = None
+        e.venue_prints_at_start = prints
+        e.warm_funding_history(prints)             # the watermark is now 4_000
+        e.restore(led)
+        e.position.opened_ms = 0
+        e.position.negative_funding_streak = 0
+        e._catch_up_missed_prints()
+        assert e.position.negative_funding_streak == 3
+        assert e._last_print_ms == 4_000
+
+
+def test_missed_settlements_are_estimated_into_funding_collected():
+    venue = Venue(perp=0.001)
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    e.position = opened(venue).position
+    e.position.opened_ms = 0
+    e.position.funding_collected = 0.0
+    e._last_print_ms = 1_000
+    e.venue_prints_at_start = [(2.0, 2_000), (2.0, 3_000), (2.0, 4_000)]
+    e._catch_up_missed_prints()               # two missed, newest left live
+    leg = e.position.perp
+    assert e.position.funding_collected == pytest.approx(
+        2 * (2.0 / 1e4) * leg.filled_qty * leg.avg_price)
+
+
+def test_a_hole_reseeds_the_history_from_the_venue_tail_not_empty():
+    gap = CarryEngine.MAX_PRINT_GAP_MS
+    venue = Venue(perp=0.001)
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    e.position = opened(venue).position
+    e.position.opened_ms = 0
+    e._last_print_ms = 1_000
+    e._funding_history = [1.0, 1.0, 1.0]
+    base = 1_000 + gap + 10
+    e.venue_prints_at_start = [(0.5, base), (0.6, base + 100), (0.7, base + 200)]
+    e._catch_up_missed_prints()
+    assert e._funding_history == [0.5, 0.6]       # newest left for on_candle
+
+
+def test_the_catch_up_estimate_uses_the_current_mark_when_the_venue_gives_one():
+    venue = Venue(perp=0.001)
+    e = engine(Venue(perp=0.001), persist=lambda s: None)
+    e.broker.get_mark = lambda symbol: MARK * 1.5
+    e.position = opened(venue).position
+    e.position.opened_ms = 0
+    e.position.funding_collected = 0.0
+    e._last_print_ms = 1_000
+    e.venue_prints_at_start = [(2.0, 2_000), (2.0, 3_000)]
+    e._catch_up_missed_prints()               # one missed, newest left live
+    assert e.position.funding_collected == pytest.approx(
+        (2.0 / 1e4) * e.position.perp.filled_qty * MARK * 1.5)

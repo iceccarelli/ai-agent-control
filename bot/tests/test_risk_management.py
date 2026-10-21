@@ -604,6 +604,43 @@ class TestFeeAwareAccounting:
         assert d.ok is False
         assert d.reason == "CONSECUTIVE_LOSSES"
 
+    def test_an_elapsed_streak_breaker_resumes_trading_until_new_losses(
+            self, manager, store):
+        def lose(i):
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Buy", qty=0.01,
+                entry_price=50_000.0, exit_price=49_000.0,
+                gross_pnl=-10.0, entry_fee=0.25, exit_fee=0.25,
+                opened_epoch=utc_now_epoch() - 600 + i,
+                closed_epoch=utc_now_epoch() + i))
+        for i in range(manager.max_consecutive_losses):
+            lose(i)
+        assert manager._gate_consecutive_losses().reason == "CONSECUTIVE_LOSSES"
+        store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
+        assert manager._gate_breaker().ok
+        assert manager._gate_consecutive_losses().ok, \
+            "the same old losses re-tripped the breaker: halted for good"
+        for i in range(manager.max_consecutive_losses):
+            lose(100 + i)
+        assert manager._gate_consecutive_losses().reason == "CONSECUTIVE_LOSSES"
+
+    def test_a_loss_booked_during_the_halt_still_counts_after_the_reset(
+            self, manager, store):
+        def lose(i):
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Buy", qty=0.01,
+                entry_price=50_000.0, exit_price=49_000.0,
+                gross_pnl=-10.0, entry_fee=0.25, exit_fee=0.25,
+                opened_epoch=utc_now_epoch() - 600 + i,
+                closed_epoch=utc_now_epoch() + i))
+        for i in range(manager.max_consecutive_losses):
+            lose(i)
+        assert manager._gate_consecutive_losses().reason == "CONSECUTIVE_LOSSES"
+        lose(50)                       # a position that closes during the halt
+        store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
+        assert manager._gate_breaker().ok
+        assert store.consecutive_losses() == 1
+
     def test_net_returns_are_fee_inclusive(self, store):
         store.record_trade(TradeRecord(
             symbol="BTCUSDT", side="Buy", qty=0.01,
@@ -759,3 +796,268 @@ class TestDecisionJournal:
     def test_approvals_are_journalled_too(self, manager, store):
         manager.gate_order(**good_order())
         assert store.recent_decisions()[0]["decision"] == "ALLOW"
+
+
+class TestAQuoteMustBeFreshAndReal:
+    QUOTE = {"bid": 100.0, "ask": 100.01, "mid": 100.005, "spread_bps": 1.0}
+
+    def test_a_quote_without_an_age_blocks(self, manager):
+        decision = manager.gate_order(
+            **good_order(), quote={**self.QUOTE, "age_seconds": None},
+            data_age_seconds=None)
+        assert decision.ok is False and decision.reason == "DATA_AGE_UNKNOWN"
+
+    def test_a_quote_with_a_fresh_age_passes(self, manager):
+        decision = manager.gate_order(
+            **good_order(), quote={**self.QUOTE, "age_seconds": 0.2},
+            data_age_seconds=0.2)
+        assert decision.ok is True
+
+    def test_a_degraded_quote_is_not_a_zero_spread(self, manager):
+        decision = manager.gate_order(
+            **good_order(),
+            quote={"bid": 100.0, "ask": 100.0, "mid": 100.0, "spread_bps": 0.0,
+                   "age_seconds": 0.0, "degraded": True},
+            data_age_seconds=0.0)
+        assert decision.ok is False and decision.reason == "QUOTE_DEGRADED"
+
+
+class TestUnresolvedEntriesCountAgainstTheCap:
+    def test_entries_awaiting_confirmation_fill_the_position_cap(self, manager, store):
+        for i, sym in enumerate(["AAAUSDT", "BBBUSDT", "CCCUSDT"]):
+            store.record_order(f"E{i}", sym, "Buy", "Market", 1.0, purpose="entry")
+            store.update_order_status(f"E{i}", "submitted")
+        assert manager.max_open_positions == 3
+        decision = manager._gate_position_count()
+        assert decision.ok is False and decision.reason == "MAX_OPEN_POSITIONS"
+
+    def test_a_resolved_entry_does_not_count(self, manager, store):
+        store.record_order("E9", "AAAUSDT", "Buy", "Market", 1.0, purpose="entry")
+        store.update_order_status("E9", "filled")
+        assert manager._gate_position_count().ok is True
+
+
+class TestNonFiniteLevelsBlock:
+    NAN = float("nan")
+
+    def test_nan_take_profit_blocks(self, manager):
+        d = manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
+                                      take_profit_price=self.NAN)
+        assert d.ok is False
+
+    def test_nan_entry_blocks_in_rr_and_stop_sanity(self, manager):
+        assert manager._gate_risk_reward(entry_price=self.NAN, stop_price=98.0,
+                                         take_profit_price=104.0).ok is False
+        assert manager._gate_stop_sanity(side="Buy", entry_price=self.NAN,
+                                         stop_price=98.0).ok is False
+
+    def test_inf_levels_block(self, manager):
+        assert manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
+                                         take_profit_price=float("inf")).ok is False
+
+
+class TestUnresolvedEntriesCountAgainstExposure:
+    def _pending(self, store, price, qty=1.0, sym="AAAUSDT"):
+        store.record_order("EX1", sym, "Buy", "Limit" if price else "Market",
+                           qty, price=price, purpose="entry")
+        store.update_order_status("EX1", "submitted")
+
+    def test_a_priced_pending_entry_adds_to_aggregate_exposure(self, manager, store):
+        limit = manager.max_total_exposure_pct
+        self._pending(store, price=EQUITY * limit * 0.9, qty=1.0)
+        d = manager._gate_aggregate_exposure(qty=1.0, entry_price=EQUITY * limit * 0.2,
+                                             equity=EQUITY)
+        assert d.ok is False and d.reason == "AGGREGATE_EXPOSURE_CAP"
+
+    def test_an_unpriced_pending_entry_blocks_exposure_and_correlation(
+            self, manager, store):
+        self._pending(store, price=0.0)
+        assert manager._gate_aggregate_exposure(
+            qty=0.001, entry_price=100.0, equity=EQUITY).reason == \
+            "EXPOSURE_UNRESOLVED_ENTRY"
+        assert manager._gate_correlation_bucket(
+            symbol="BTCUSDT", qty=0.001, entry_price=100.0,
+            equity=EQUITY).reason == "EXPOSURE_UNRESOLVED_ENTRY"
+
+    def test_no_pending_entry_changes_nothing(self, manager):
+        assert manager._gate_aggregate_exposure(
+            qty=0.001, entry_price=100.0, equity=EQUITY).ok is True
+
+
+
+class TestAnUnreadableBookWithActiveLimits:
+    def test_blocks_when_a_depth_limit_is_active(self, manager):
+        manager.min_book_depth_usd = 25_000.0
+        d = manager._gate_book_liquidity({"unavailable": True}, side="Buy")
+        assert d.ok is False and d.reason == "BOOK_UNAVAILABLE"
+
+    def test_blocks_when_an_imbalance_limit_is_active(self, manager):
+        manager.min_book_depth_usd = 0.0
+        manager.max_book_imbalance = 0.85
+        assert manager._gate_book_liquidity({"unavailable": True}, side="Buy").ok is False
+
+    def test_passes_when_no_limit_is_active(self, manager):
+        manager.min_book_depth_usd = 0.0
+        manager.max_book_imbalance = 1.0
+        assert manager._gate_book_liquidity({"unavailable": True}, side="Buy").ok is True
+
+    def test_no_feed_at_all_is_still_a_skip(self, manager):
+        assert manager._gate_book_liquidity(None, side="Buy").ok is True
+
+
+class TestRiskRewardRoundingTolerance:
+    def test_a_ladder_built_to_exactly_the_minimum_is_not_refused_for_float_noise(self, manager):
+        d = manager._gate_risk_reward(
+            entry_price=65229.18031003944, stop_price=64812.35691930017,
+            take_profit_price=(65729.36837892656 + 66396.2858041094) / 2)
+        assert d.ok is True, d.detail
+
+    def test_a_real_shortfall_still_blocks(self, manager):
+        d = manager._gate_risk_reward(entry_price=100.0, stop_price=98.0,
+                                      take_profit_price=103.9)
+        assert d.ok is False and d.reason == "RISK_REWARD_TOO_LOW"
+
+
+class TestADownTimeLossStillCountsForTheNewDay:
+    def test_the_new_day_is_anchored_at_the_last_known_equity(
+            self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0                    # some UTC afternoon
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.update_equity(10_000.0)
+        # the process is down across midnight; equity fell 10% meanwhile
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
+        store.update_equity(9_000.0)
+        assert store.daily_loss_fraction(9_000.0) == pytest.approx(0.10)
+
+    def test_a_stale_previous_observation_is_not_carried(
+            self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.update_equity(10_000.0)
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 5 * 86_400.0)
+        store.update_equity(9_000.0)
+        assert store.daily_loss_fraction(9_000.0) == pytest.approx(0.0)
+
+
+class TestOnlyALossIsCarriedIntoTheNewDay:
+    def test_a_deposit_overnight_anchors_at_the_new_equity(self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.update_equity(10_000.0)
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
+        store.update_equity(15_000.0)
+        assert store.get_daily_anchor().start_equity == pytest.approx(15_000.0)
+
+
+class TestAScopeChangeDoesNotCarryTheOtherAccountsEquity:
+    def test_paper_equity_does_not_seed_a_live_days_anchor(self, store, monkeypatch):
+        import persistence as P
+        day1 = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1)
+        store.set_equity_scope("testnet=True;paper=True")
+        store.update_equity(10_000.0)
+        assert store.set_equity_scope("testnet=False;paper=False") is True
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day1 + 20 * 3600.0)
+        store.update_equity(100.0)                     # the live account
+        assert store.get_daily_anchor().start_equity == pytest.approx(100.0)
+        assert store.get_equity_state().peak_equity == pytest.approx(100.0)
+        assert store.drawdown_fraction(100.0) == pytest.approx(0.0)
+
+    def test_the_same_scope_changes_nothing(self, store):
+        assert store.set_equity_scope("a") is False       # first declaration
+        assert store.set_equity_scope("a") is False
+
+
+class TestReviewFollowUps:
+    def test_a_scope_change_drops_todays_anchor_from_the_other_account(
+            self, store, monkeypatch):
+        import persistence as P
+        day = 1_800_000_000.0
+        monkeypatch.setattr(P, "utc_now_epoch", lambda: day)
+        store.set_equity_scope("testnet=True;paper=True")
+        store.update_equity(10_000.0)              # anchor 10_000 for today
+        store.set_equity_scope("testnet=False;paper=False")
+        store.update_equity(100.0)                 # same UTC day, live account
+        assert store.daily_loss_fraction(100.0) == pytest.approx(0.0)
+
+    def test_an_old_timestamp_baseline_is_translated_not_forgotten(self, store):
+        t0 = utc_now_epoch()
+        for i in range(4):
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Buy", qty=0.01,
+                entry_price=50_000.0, exit_price=49_000.0,
+                gross_pnl=-10.0, entry_fee=0.25, exit_fee=0.25,
+                opened_epoch=t0 - 600 + i, closed_epoch=t0 + i))
+        store._exec("INSERT INTO meta(key, value) VALUES"
+                    "('loss_streak_baseline', ?)", (repr(t0 + 100),))
+        assert store.consecutive_losses() == 0
+
+
+class TestAHumanCanRebaseTheDailyAnchorAfterAWithdrawal:
+    def test_the_withdrawal_is_not_a_loss_once_a_human_says_so(self, store):
+        store.update_equity(10_000.0)
+        assert store.daily_loss_fraction(8_000.0) == pytest.approx(0.2)
+        store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 8_000.0)
+        assert store.daily_loss_fraction(8_000.0) == pytest.approx(0.0)
+        assert store.daily_loss_fraction(7_200.0) == pytest.approx(0.1)
+
+    def test_it_refuses_without_the_exact_acknowledgement(self, store):
+        from persistence import PersistenceError
+        store.update_equity(10_000.0)
+        with pytest.raises(PersistenceError):
+            store.rebase_daily_anchor_by_human("please", 8_000.0)
+        with pytest.raises(PersistenceError):
+            store.rebase_daily_anchor_by_human(
+                "HUMAN_REBASED_DAILY_ANCHOR", float("nan"))
+        assert store.daily_loss_fraction(8_000.0) == pytest.approx(0.2)
+
+    def test_no_automated_code_calls_it(self):
+        import glob
+        import os
+        root = os.path.join(os.path.dirname(__file__), "..")
+        for path in (glob.glob(os.path.join(root, "*.py"))
+                     + glob.glob(os.path.join(root, "tools", "*.py"))):
+            if path.endswith("persistence.py"):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                assert "rebase_daily_anchor_by_human" not in fh.read(), path
+
+
+class TestReviewFollowUps2:
+    def test_the_legacy_scope_string_is_migrated_not_treated_as_a_new_account(
+            self, store):
+        store._exec("INSERT INTO meta(key, value) VALUES('equity_scope', "
+                    "'testnet=True;paper=True')")
+        store.update_equity(10_000.0)
+        assert store.set_equity_scope("venue=testnet;testnet=True") is False
+        assert store.get_equity_state().peak_equity == pytest.approx(10_000.0)
+        assert store.set_equity_scope("venue=testnet;testnet=True") is False
+
+    def test_a_legacy_scope_on_a_different_endpoint_is_a_change(self, store):
+        store._exec("INSERT INTO meta(key, value) VALUES('equity_scope', "
+                    "'testnet=True;paper=True')")
+        store.update_equity(10_000.0)
+        assert store.set_equity_scope("venue=mainnet;testnet=False") is True
+        assert store.get_equity_state().peak_equity == 0.0
+
+    def test_the_rebase_keeps_the_days_realised_pnl(self, store):
+        store.update_equity(10_000.0)
+        store._exec("UPDATE daily_anchor SET realised_pnl = -123.0")
+        store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 8_000.0)
+        assert store.get_daily_anchor().realised_pnl == pytest.approx(-123.0)
+
+
+def test_a_human_can_rebase_the_peak_too_after_a_withdrawal(store):
+    store.update_equity(10_000.0)
+    assert store.drawdown_fraction(8_000.0) == pytest.approx(0.2)
+    store.rebase_daily_anchor_by_human(
+        "HUMAN_REBASED_DAILY_ANCHOR", 8_000.0, rebase_peak=True)
+    assert store.drawdown_fraction(8_000.0) == pytest.approx(0.0)
+    assert store.drawdown_fraction(7_200.0) == pytest.approx(0.1)
+    # without the flag the peak is left alone
+    store.update_equity(10_000.0)
+    store.rebase_daily_anchor_by_human("HUMAN_REBASED_DAILY_ANCHOR", 9_000.0)
+    assert store.get_equity_state().peak_equity >= 10_000.0

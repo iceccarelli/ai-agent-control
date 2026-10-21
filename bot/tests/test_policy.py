@@ -885,6 +885,18 @@ class TestPromotionCriteria:
         assert ok is False
         assert any("AUC_INCONSISTENT_ACROSS_FOLDS" in r for r in reasons)
 
+    def test_nan_metrics_do_not_pass_the_criteria(self, trained):
+        """Every comparison against NaN is False; none of them may read as 'ok'."""
+        rep = trained.training_report.to_dict()
+        nan = float("nan")
+        folds = [{**f, "auc": nan, "brier": nan} for f in rep["folds"]]
+        doctored = pol.TrainingReport.from_dict({**rep, "folds": folds})
+        p = pol.Policy(feature_names=NAMES, schema_version=SCHEMA)
+        p._model = object()
+        p._report = doctored
+        ok, reasons = p.meets_promotion_criteria()
+        assert ok is False, reasons
+
     def test_a_high_brier_skill_bar_is_refused(self, trained):
         ok, reasons = trained.meets_promotion_criteria(
             pol.PromotionCriteria(min_brier_skill=0.99)

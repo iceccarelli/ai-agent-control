@@ -37,11 +37,18 @@ struct Trade {
 /* carry_costs.ewma_funding_bps: newest last, None below the minimum. */
 bool ewma(const double *prints, int count, double alpha, int min_prints,
           double *out) {
-    if (count < min_prints) return false;
-    double smoothed = prints[0];
-    for (int i = 1; i < count; ++i) {
-        smoothed = alpha * prints[i] + (1.0 - alpha) * smoothed;
+    /* Non-finite prints are dropped BEFORE the minimum is applied, as
+       carry_costs.ewma_funding_bps does. Without this one NaN poisons the
+       average, every comparison against it is false, and the gate opens. */
+    int used = 0;
+    double smoothed = 0.0;
+    for (int i = 0; i < count; ++i) {
+        if (!std::isfinite(prints[i])) continue;
+        smoothed = (used == 0) ? prints[i]
+                               : alpha * prints[i] + (1.0 - alpha) * smoothed;
+        ++used;
     }
+    if (used < min_prints || used == 0) return false;
     *out = smoothed;
     return true;
 }
@@ -68,6 +75,7 @@ bool may_open_gated(const double *history, int count, double perp, double spot,
 
     if (net_edge <= 0.0) return false;      /* CARRY_BELOW_COST_OF_CAPITAL   */
     if (entry_basis > net_edge * p.hold_days) return false; /* BASIS_BUDGET  */
+    if (entry_basis < -(net_edge * p.hold_days)) return false; /* DISCOUNT   */
     return true;
 }
 
@@ -133,7 +141,8 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         } else {
             may_open = r_bps >= p.entry_bps;
         }
-        if (may_open) {
+        /* No entry on the final row: no settlement is left to hold through. */
+        if (may_open && i < n - 1) {
             live = Trade();
             live.qty = p.notional / st.perp;
             live.entry_spot = st.spot;

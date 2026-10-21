@@ -294,6 +294,7 @@ def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
         "liquidation": r["liquidation"],
         "reconciles_with_replay": reconciles,
         "gate_reproduces_every_historical_entry": reproduces == len(trades),
+        "gate_reproduced_entries": reproduces,
         "sensitivity_to_early_exit": cap_table,
         "sensitivity_to_assumed_hold_in_sample": horizon_table,
         "caveats": [

@@ -113,6 +113,9 @@ VENUE_REST = {"mainnet": MAINNET_REST, "testnet": TESTNET_REST,
               "demo": DEMO_REST}
 MAINNET_WS_PRIVATE = "wss://stream.bybit.com/v5/private"
 TESTNET_WS_PRIVATE = "wss://stream-testnet.bybit.com/v5/private"
+DEMO_WS_PRIVATE = "wss://stream-demo.bybit.com/v5/private"
+VENUE_WS_PRIVATE = {"mainnet": MAINNET_WS_PRIVATE, "testnet": TESTNET_WS_PRIVATE,
+                    "demo": DEMO_WS_PRIVATE}
 
 #: Bybit retCodes that are worth retrying with the SAME orderLinkId.
 #:
@@ -130,8 +133,14 @@ TRANSIENT_RET_CODES = frozenset({
     130150,  # system busy
 })
 
+#: retCodes after which an order's fate is UNKNOWN, not refused: 0 is "no
+#: retCode was stated" (PermanentAPIError's default), 10000 a server timeout,
+#: 170007 a timeout waiting for the backend.
+UNKNOWN_OUTCOME_RET_CODES = frozenset({0, 10000, 170007})
+
 #: HTTP statuses worth retrying.
-TRANSIENT_HTTP = frozenset({429, 500, 502, 503, 504})
+TRANSIENT_HTTP = frozenset({408, 429, 500, 502, 503, 504,
+                            520, 521, 522, 523, 524})
 
 #: Verified against https://bybit-exchange.github.io/docs/v5/enum
 #: retCodes Bybit returns when an orderLinkId was already used. Seen on a
@@ -252,6 +261,8 @@ class RequestsTransport(Transport):
             method.upper(), url, headers=dict(headers), params=params,
             data=body, timeout=timeout,
         )
+        #: The headers of the LAST response (rate-limit reset stamp lives here).
+        self.last_headers = {k.lower(): v for k, v in response.headers.items()}
         return response.status_code, response.text
 
 
@@ -376,9 +387,9 @@ class BybitClient:
                 "against")
         self.venue = venue
         self.base_url = VENUE_REST[venue]
-        self.ws_private_url = (
-            TESTNET_WS_PRIVATE if self.testnet else MAINNET_WS_PRIVATE
-        )
+        # By venue, like REST: demo credentials are only valid on the demo
+        # stream, which is not the testnet one.
+        self.ws_private_url = VENUE_WS_PRIVATE[venue]
         #: "spot" or "linear". THE fork this client is built around — see the
         #: class docstring. Read from config once, here, so no call site can
         #: disagree with another about which product it is trading.
@@ -408,6 +419,12 @@ class BybitClient:
         self._lock = threading.RLock()
         self._filters: Dict[str, Tuple[float, InstrumentFilters]] = {}
         self._book_warned: set = set()
+        #: True for a live feed: a book that cannot be read is then reported by
+        #: ``book_feed_unavailable`` so the liquidity gate can refuse, rather
+        #: than read as "no book feed". The backtester clears it (a replay
+        #: without a recorded book has no feed to be unavailable).
+        self.book_feed_required: bool = True
+        self._book_failed: Dict[str, bool] = {}
         self._filters_ttl_s = float(getattr(self.cfg, "SYMBOL_FILTERS_TTL", 3600))
         #: Difference between exchange time and local time, in ms.
         self._time_skew_ms = 0
@@ -519,6 +536,16 @@ class BybitClient:
         # under-counts those is the one that would lie.
         if endpoint == "/v5/order/create":
             self.orders_submitted += 1
+        if (method == "GET" and endpoint in self.COOLDOWN_READ_ENDPOINTS
+                and time.monotonic() < self._read_cooldown_until.get(endpoint, 0.0)):
+            # After a 403 (Bybit's IP-ban response) the READS stand down for a
+            # short while instead of hammering a banned address. Writes are
+            # never failed fast here: a refused write must still take the
+            # normal unknown-outcome path, and an order that was never sent
+            # must not be recorded as one that may have been.
+            raise PermanentAPIError(
+                "HTTP 403 cooldown: reads paused after an auth/ban response",
+                payload="")
         attempt = 0
         last_error: Optional[BybitAPIError] = None
 
@@ -555,9 +582,20 @@ class BybitClient:
 
             if status in TRANSIENT_HTTP:
                 last_error = TransientAPIError(f"HTTP {status}", payload=text)
-                self._backoff(attempt)
+                if status == 429:
+                    self._rate_limit_backoff(attempt)
+                else:
+                    self._backoff(attempt)
                 continue
             if status == 401 or status == 403:
+                if (status == 403 and method == "GET"
+                        and endpoint in self.COOLDOWN_READ_ENDPOINTS):
+                    # Per ENDPOINT, and only for a refused READ: a 403 on a
+                    # write must not block the reads that resolve its
+                    # outcome, and one read path being refused must not
+                    # silence the safety reads (position, order, wallet).
+                    self._read_cooldown_until[endpoint] = (
+                        time.monotonic() + self.READ_COOLDOWN_AFTER_403_S)
                 raise PermanentAPIError(f"auth rejected: HTTP {status}", payload=text)
             if status != 200:
                 raise PermanentAPIError(f"HTTP {status}", payload=text)
@@ -568,7 +606,15 @@ class BybitClient:
                 # Garbage in a 200 is not a reason to trade on nothing.
                 raise PermanentAPIError(f"unparseable response: {exc}", payload=text)
 
-            ret_code = int(payload_json.get("retCode", -1))
+            # A 200 whose body does not state a retCode is not an answer from
+            # the venue's matching engine (an upstream or proxy body): whether
+            # the request executed is unknown, exactly as for an unparseable
+            # body. A made-up retCode (-1) used to read as a definite refusal.
+            try:
+                ret_code = int(payload_json["retCode"])
+            except (TypeError, KeyError, ValueError):
+                raise PermanentAPIError(
+                    "response carries no usable retCode", payload=text)
             ret_msg = str(payload_json.get("retMsg", ""))
             if ret_code == 0:
                 return payload_json
@@ -581,13 +627,50 @@ class BybitClient:
                     pass
             if ret_code in TRANSIENT_RET_CODES:
                 last_error = TransientAPIError(ret_msg, ret_code, payload_json)
-                self._backoff(attempt)
+                if ret_code in (10006, 10018):
+                    self._rate_limit_backoff(attempt)
+                else:
+                    self._backoff(attempt)
                 continue
 
             raise PermanentAPIError(ret_msg, ret_code, payload_json)
 
         assert last_error is not None
         raise last_error
+
+    RATE_LIMIT_MAX_WAIT_S = 5.0
+    READ_COOLDOWN_AFTER_403_S = 30.0
+    #: The ONLY reads a 403 pauses: market-data and cost reads that merely
+    #: inform ENTRIES. Everything else (position, order, execution, closed-pnl,
+    #: wallet, instrument filters, tickers) is never failed locally: a refused
+    #: read-back of a just-placed stop is read as "not live" and would flatten
+    #: the position and trip the kill switch, where a direct request might
+    #: simply have succeeded. An allowlist, so a new endpoint defaults safe.
+    COOLDOWN_READ_ENDPOINTS = frozenset({
+        "/v5/market/kline", "/v5/market/orderbook",
+        "/v5/market/funding/history", "/v5/account/fee-rate"})
+
+    @property
+    def _read_cooldown_until(self) -> Dict[str, float]:
+        return self.__dict__.setdefault("_read_cooldowns", {})
+
+    def _rate_limit_backoff(self, attempt: int) -> None:
+        """Wait until the venue says the window resets (capped), not a guess.
+
+        Bybit reports the reset instant in `X-Bapi-Limit-Reset-Timestamp`
+        (epoch ms). Retrying inside the window just spends the retries.
+        """
+        wait = min(2.0, 0.15 * (2 ** (attempt - 1)))
+        try:
+            headers = getattr(self.transport, "last_headers", None) or {}
+            reset = headers.get("x-bapi-limit-reset-timestamp")
+            if reset is not None:
+                until = (float(reset) - self._now_ms()) / 1000.0
+                if until == until and until > wait:
+                    wait = min(until + 0.05, self.RATE_LIMIT_MAX_WAIT_S)
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(wait)
 
     @staticmethod
     def _backoff(attempt: int) -> None:
@@ -693,7 +776,7 @@ class BybitClient:
                 raise PermanentAPIError(f"no usable quote for {symbol}")
             return {
                 "bid": last, "ask": last, "mid": last,
-                "spread_bps": 0.0, "age_seconds": 0.0, "degraded": True,
+                "spread_bps": 0.0, "age_seconds": None, "degraded": True,
             }
 
         server_ms = int(payload.get("time") or 0)
@@ -764,11 +847,22 @@ class BybitClient:
                     return value
         raise PermanentAPIError("wallet-balance has no usable equity field")
 
-    def get_coin_balance(self, coin: str, account_type: str = "UNIFIED") -> float:
+    def get_coin_balance(self, coin: str, account_type: str = "UNIFIED",
+                         total: bool = False) -> float:
+        """Free coin by default; ``total=True`` is the whole wallet balance
+        INCLUDING what resting orders reserve (take-profit legs reserve the
+        coin they offer, so 'is the position still held?' must ask for total)."""
         wallet = self.get_wallet(account_type)
+        keys = (("walletBalance",) if total
+                else ("availableToWithdraw", "free", "walletBalance"))
         for entry in wallet.get("coin") or []:
             if str(entry.get("coin", "")).upper() == coin.upper():
-                for key in ("availableToWithdraw", "free", "walletBalance"):
+                if total and entry.get("walletBalance") in (None, ""):
+                    # Total was asked for and the row does not state it:
+                    # returning 0.0 (or the free amount) would be a lie.
+                    raise PermanentAPIError(
+                        f"wallet row for {coin} has no walletBalance")
+                for key in keys:
                     raw = entry.get(key)
                     if raw not in (None, ""):
                         return float(raw)
@@ -802,7 +896,8 @@ class BybitClient:
         return payload.get("result", {}).get("list") or []
 
     def get_order(
-        self, *, symbol: str, order_link_id: str = "", order_id: str = ""
+        self, *, symbol: str, order_link_id: str = "", order_id: str = "",
+        strict: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Query a single order, open or recently closed.
 
@@ -819,14 +914,22 @@ class BybitClient:
         if order_id:
             params["orderId"] = order_id
 
+        unanswered: Optional[PermanentAPIError] = None
         for endpoint in ("/v5/order/realtime", "/v5/order/history"):
             try:
                 payload = self._request("GET", endpoint, params=params, signed=True)
-            except PermanentAPIError:
+            except PermanentAPIError as exc:
+                if exc.ret_code in UNKNOWN_OUTCOME_RET_CODES:
+                    unanswered = exc
                 continue
             rows = payload.get("result", {}).get("list") or []
             if rows:
                 return rows[0]
+        if strict and unanswered is not None:
+            # `None` means the venue ANSWERED and has no such order. A lookup
+            # that got no usable answer (a proxy body, a timeout, an auth
+            # failure) says nothing about whether the order exists.
+            raise unanswered
         return None
 
     # -- orders ------------------------------------------------------------
@@ -1009,6 +1112,18 @@ class BybitClient:
                     symbol=str(body.get("symbol", "")), oid=oid, purpose=purpose)
                 if recovered is not None:
                     return recovered
+            if exc.ret_code in UNKNOWN_OUTCOME_RET_CODES:
+                # No retCode at all (an unparseable or retCode-less 200, a
+                # non-200) or a timeout the venue itself reported: the order
+                # may have executed. Recording it "rejected" takes it out of the
+                # unresolved set startup reconciliation checks against the
+                # venue. Same rule as the carry broker's classifier.
+                self.store.update_order_status(oid, "unknown")
+                logger.error("order %s outcome unknown (%s): %s", oid,
+                             exc.ret_code, exc)
+                return OrderResult(
+                    order_link_id=oid, reason="OUTCOME_UNKNOWN",
+                    ret_code=exc.ret_code)
             self.store.update_order_status(oid, "rejected")
             logger.error("order %s rejected (%s): %s", oid, exc.ret_code, exc)
             # The id is returned even on failure: the caller needs it to look the
@@ -1166,7 +1281,7 @@ class BybitClient:
             self._request("POST", "/v5/order/cancel", body=body, signed=True)
         except PermanentAPIError as exc:
             if exc.ret_code in (110001, 170213):  # already gone
-                self.store.update_order_status(order_link_id or order_id, "cancelled")
+                self._mark_cancelled(order_link_id or order_id)
                 return True
             logger.error("cancel failed for %s: %s", order_link_id or order_id, exc)
             return False
@@ -1174,8 +1289,19 @@ class BybitClient:
             logger.error("cancel unresolved for %s: %s", order_link_id or order_id, exc)
             return False
         if order_link_id:
-            self.store.update_order_status(order_link_id, "cancelled")
+            self._mark_cancelled(order_link_id)
         return True
+
+    def _mark_cancelled(self, order_link_id: str) -> None:
+        """Record a cancel locally -- except for an ENTRY, whose true outcome
+        (it may have executed before the cancel landed, and "order not found"
+        also means "already filled") only the venue's own record can say. An
+        entry row is left for the fill path / resolver / reconcile to settle
+        from that record, after anything it executed has been put in the book."""
+        row = self.store.get_order(order_link_id) if order_link_id else None
+        if row is not None and str(row.get("purpose")) == "entry":
+            return
+        self.store.update_order_status(order_link_id, "cancelled")
 
     #: On SPOT, `/v5/order/cancel-all`'s `orderFilter` accepts exactly one
     #: of these per call and DEFAULTS TO "Order" ALONE when omitted —
@@ -1266,8 +1392,11 @@ class BybitClient:
         if snapped_qty <= 0 or snapped_qty < filters.min_qty:
             return OrderResult(reason="STOP_QTY_BELOW_MIN")
 
+        # snap_price speaks in POSITION sides; this order is the exit.
+        position_side = "Buy" if direction == "Sell" else "Sell"
         trigger = snap_price(
-            float(trigger_price), filters.tick_size, side=direction, is_stop=True
+            float(trigger_price), filters.tick_size, side=position_side,
+            is_stop=True
         )
         # A Sell stop protects a long and fires on a fall.
         trigger_direction = 2 if direction == "Sell" else 1
@@ -1330,8 +1459,13 @@ class BybitClient:
 
         # A Sell exit protects a long, so its stop sits BELOW; snap away from
         # the market on the conservative side.
+        # snap_price speaks in POSITION sides; this order is the exit. A long's
+        # stop (Sell exit) rounds UP, toward entry: never a wider stop than the
+        # one the size was budgeted for.
+        position_side = "Buy" if normalize_side(exit_side) == "Sell" else "Sell"
         trigger = snap_price(
-            float(trigger_price), filters.tick_size, side=exit_side, is_stop=True
+            float(trigger_price), filters.tick_size, side=position_side,
+            is_stop=True
         )
         if float(trigger) <= 0:
             return OrderResult(reason="STOP_PRICE_NON_POSITIVE")
@@ -1359,6 +1493,13 @@ class BybitClient:
         try:
             self._request("POST", "/v5/position/trading-stop", body=body, signed=True)
         except PermanentAPIError as exc:
+            if exc.ret_code in UNKNOWN_OUTCOME_RET_CODES:
+                # No venue retCode: the request may have landed. "rejected"
+                # would take the row out of what reconciliation checks.
+                self.store.update_order_status(oid, "unknown")
+                logger.error("position stop outcome unknown for %s: %s",
+                             symbol, exc)
+                return OrderResult(order_link_id=oid, reason="OUTCOME_UNKNOWN")
             self.store.update_order_status(oid, "rejected")
             logger.error("position stop rejected for %s: %s", symbol, exc)
             return OrderResult(
@@ -1559,6 +1700,26 @@ class BybitClient:
             deduped.append((stamp, rate))
         return deduped
 
+    def get_executions(self, symbol: str, order_link_id: str,
+                       limit: int = 100) -> List[Dict[str, Any]]:
+        """The venue's own execution rows (fills) of ONE order.
+
+        ``GET /v5/execution/list`` - each row carries ``execId``, ``orderLinkId``,
+        ``symbol``, ``side``, ``execPrice``, ``execQty``, ``execFee``,
+        ``feeCurrency``, ``execType`` and ``execTime``. Read-only. Raises on any
+        failure and returns rows exactly as stated: it never fills a gap.
+        """
+        if not order_link_id:
+            raise PermanentAPIError("get_executions needs an order link id")
+        payload = self._request(
+            "GET", "/v5/execution/list", signed=True,
+            params={"category": self.category, "symbol": symbol,
+                    "orderLinkId": order_link_id, "limit": int(limit)})
+        rows = payload.get("result", {}).get("list")
+        if rows is None:
+            raise PermanentAPIError("execution list carries no list")
+        return list(rows)
+
     def get_closed_pnl(self, symbol: str, *, since_ms: int = 0,
                        limit: int = 50) -> List[Dict[str, Any]]:
         """Closed-PnL records for ``symbol`` newer than ``since_ms``. Linear only.
@@ -1600,8 +1761,10 @@ class BybitClient:
         blocks. Those are genuinely different situations and must not collapse
         into one.
         """
+        self._book_failed[symbol] = False
         if not bool(getattr(self.cfg, "USE_ORDERBOOK", True)):
             return None
+        self._book_failed[symbol] = True        # until a usable book is returned
         levels = int(getattr(self.cfg, "BOOK_DEPTH_LEVELS", 25))
         try:
             payload = self._request(
@@ -1635,6 +1798,7 @@ class BybitClient:
             logger.warning("could not read the book for %s: %s", symbol, exc)
             return None
 
+        self._book_failed[symbol] = False
         # Only the scalar measurements cross this boundary. The gate needs
         # numbers, not level ladders, and shipping the ladders would invite a
         # caller to re-derive a figure that has already been derived correctly.
@@ -1652,6 +1816,37 @@ class BybitClient:
             "anomalous_spread": features.anomalous_spread,
             "levels": features.levels,
         }
+
+    def get_book_ladders(self, symbol: str) -> Optional[Tuple[list, list]]:
+        """The raw ``(bids, asks)`` ladders for ``symbol``, or None when unread.
+
+        What the model's feature code accepts (it measures the book with the
+        same ``market_data`` code the backtester uses). ``get_book_features``
+        returns only the scalar summary the liquidity gate needs, which that
+        code cannot rebuild a book from.
+        """
+        if not bool(getattr(self.cfg, "USE_ORDERBOOK", True)):
+            return None
+        levels = int(getattr(self.cfg, "BOOK_DEPTH_LEVELS", 25))
+        try:
+            payload = self._request(
+                "GET", "/v5/market/orderbook",
+                params={"category": self.category, "symbol": symbol,
+                        "limit": min(200, max(1, levels))},
+            )
+        except BybitAPIError as exc:
+            logger.debug("orderbook unavailable for %s: %s", symbol, exc)
+            return None
+        result = payload.get("result", {}) or {}
+        bids, asks = result.get("b") or [], result.get("a") or []
+        if not bids and not asks:
+            return None
+        return list(bids), list(asks)
+
+    def book_feed_unavailable(self, symbol: str) -> bool:
+        """True when the last ``get_book_features`` for ``symbol`` was meant to
+        read a book and could not (request failure, empty or unparseable book)."""
+        return bool(self.book_feed_required and self._book_failed.get(symbol))
 
     def set_leverage(self, symbol: str, leverage: Optional[int] = None) -> bool:
         """Set leverage before trading a linear symbol.
@@ -1728,6 +1923,10 @@ class BybitClient:
             symbol=symbol, side=side, qty=qty, order_type="Limit",
             price=limit_price, time_in_force="GTC", purpose="tp",
             filters=filters, order_link_id=order_link_id,
+            # A leg that outlives its position (the stop fired first) must not
+            # open the opposite side when price comes back to it. Spot has no
+            # reduce-only; it also keeps the balance check a sell needs.
+            reduce_only=self.is_linear,
         )
 
     # -- reconciliation ----------------------------------------------------
@@ -1754,7 +1953,8 @@ class BybitClient:
             summary["checked"] += 1
             oid = str(row["order_link_id"])
             try:
-                remote = self.get_order(symbol=str(row["symbol"]), order_link_id=oid)
+                remote = self.get_order(symbol=str(row["symbol"]), order_link_id=oid,
+                                        strict=True)
             except BybitAPIError as exc:
                 logger.error("reconcile: cannot resolve %s: %s", oid, exc)
                 summary["unknown"] += 1
@@ -1768,11 +1968,25 @@ class BybitClient:
 
             status = str(remote.get("orderStatus", ""))
             if status in TERMINAL_ORDER_STATUS:
-                self.store.update_order_status(
-                    oid, status.lower(), exchange_id=str(remote.get("orderId", ""))
-                )
-                summary["resolved"] += 1
+                self._settle_terminal_order(row, remote, summary)
             elif status in OPEN_ORDER_STATUS:
+                if str(row.get("purpose")) == "entry":
+                    # A resting entry from a dead process has nobody to watch
+                    # it: when it fills there is a position with no stop and
+                    # no ledger row. Cancel it, and book what it executed.
+                    try:
+                        self.cancel_order(symbol=str(row["symbol"]),
+                                          order_link_id=oid)
+                        after = self.get_order(symbol=str(row["symbol"]),
+                                               order_link_id=oid, strict=True)
+                    except BybitAPIError as exc:
+                        logger.error("reconcile: cannot cancel entry %s: %s",
+                                     oid, exc)
+                        after = None
+                    after_status = str((after or {}).get("orderStatus", ""))
+                    if after_status in TERMINAL_ORDER_STATUS:
+                        self._settle_terminal_order(row, after, summary)
+                        continue
                 self.store.update_order_status(
                     oid, "submitted", exchange_id=str(remote.get("orderId", ""))
                 )
@@ -1804,6 +2018,121 @@ class BybitClient:
                         symbol, remote.get("size"))
         logger.info("startup reconciliation: %s", summary)
         return summary
+
+    def _settle_terminal_order(self, row: Mapping[str, Any],
+                               remote: Mapping[str, Any],
+                               summary: Dict[str, Any]) -> None:
+        """Record a terminal order -- an entry that executed only AFTER it has
+        been put in the book. Writing the terminal status first would drop it
+        out of ``unresolved_orders`` with the coin unrecorded, and a crash or an
+        error between the two steps would lose it for good."""
+        oid = str(row["order_link_id"])
+        status = str(remote.get("orderStatus", ""))
+        is_entry = str(row.get("purpose")) == "entry"
+        try:
+            executed = float(remote.get("cumExecQty") or 0.0)
+        except (TypeError, ValueError):
+            executed = float("nan")
+        if is_entry and status == "Filled" and not executed > 0.0:
+            # "Filled" with no executed quantity is an anomaly, not proof that
+            # nothing was bought.
+            logger.error("reconcile: %s is Filled with cumExecQty=%r; left "
+                         "unresolved", oid, remote.get("cumExecQty"))
+            summary["unknown"] += 1
+            return
+        try:
+            adopted = self._adopt_filled_spot_entry(row, remote, summary)
+        except Exception:  # noqa: BLE001
+            logger.exception("reconcile: could not adopt %s", oid)
+            adopted = False
+        if adopted is False:
+            summary["unknown"] += 1           # executed but not recorded
+            return
+        self.store.update_order_status(
+            oid, status.lower(), exchange_id=str(remote.get("orderId", "")))
+        summary["resolved"] += 1
+
+    def _adopt_filled_spot_entry(self, row: Mapping[str, Any],
+                                 remote: Mapping[str, Any],
+                                 summary: Dict[str, Any]) -> Optional[bool]:
+        """Give the book the position an unconfirmed spot entry created.
+
+        An entry whose fill was never confirmed in-process (a poll that timed
+        out, a crash after the submit) can fill at the venue afterwards. On
+        spot there is no position list to reveal it, so without this the coin
+        is held with no ledger row and no stop, and the next signal stacks a
+        second entry on it. The row is written with no stop, so the naked
+        handling that follows reconciliation protects it (or flattens it).
+        Linear is left to the orphan check, which fails closed.
+
+        Returns ``None`` when there is nothing to adopt (not a spot entry, or
+        nothing executed), ``True`` when the entry is now in the book (or its
+        remainder booked as dust), ``False`` when it SHOULD have been adopted
+        and was not -- the caller must then leave the order unresolved so it is
+        looked at again, never mark it filled with the coin unrecorded.
+        """
+        if not self.is_spot or str(row.get("purpose")) != "entry":
+            return None
+        if normalize_side(str(row.get("side", ""))) != "Buy":
+            return None
+        try:
+            qty = float(remote.get("cumExecQty") or 0.0)
+            price = float(remote.get("avgPrice") or 0.0)
+            if price <= 0 and qty > 0:
+                # No average price, but the executed value is the same fact.
+                price = float(remote.get("cumExecValue") or 0.0) / qty
+        except (TypeError, ValueError):
+            return False
+        symbol = str(row["symbol"])
+        if qty <= 0:
+            return None
+        if price <= 0:
+            return False
+        held = {str(p.get("symbol")): p for p in self.store.open_positions()}
+        if symbol in held:
+            # Already this entry's position (adopted before) is done; a
+            # DIFFERENT position on the symbol means this lot cannot be booked
+            # without overwriting it.
+            return str(held[symbol].get("order_link_id")) == str(row["order_link_id"])
+        import venue_fees
+        fees = venue_fees.extract_order_fees(remote)
+        # Size to what the buy left in the account (its fee is taken in the base
+        # coin), or the stop placed for it would exceed the balance.
+        net = venue_fees.spot_buy_net_qty(symbol, qty, fees)
+        try:
+            filters = self.get_instrument_filters(symbol)
+            net = float(snap_qty_down(net, filters.qty_step)) if net > 0 else 0.0
+            if net < float(filters.min_qty):
+                self.store.add_dust(symbol, qty)
+                self.store.journal(symbol, "ENTRY_DUST",
+                                   "adopted entry below minimum net of fee",
+                                   {"gross_filled": qty})
+                return True
+        except BybitAPIError:
+            logger.warning("reconcile: filters unreadable for %s; adopting the "
+                           "entry at the fill less its fee, unsnapped", symbol)
+        if net <= 0.0:
+            self.store.add_dust(symbol, qty)
+            self.store.journal(symbol, "ENTRY_DUST",
+                               "adopted entry nothing left net of fee",
+                               {"gross_filled": qty})
+            return True
+        qty = net
+        self.store.upsert_position(
+            symbol, "Buy", qty, price, stop_price=0.0,
+            order_link_id=str(row["order_link_id"]),
+            meta={"entry_fees": fees.to_dict(),
+                  "entry_fee_ref": {"order_link_id": str(row["order_link_id"]),
+                                    "order_id": str(remote.get("orderId") or "")},
+                  "adopted_at_reconcile": True})
+        self.store.journal(symbol, "ENTRY_ADOPTED_AT_RECONCILE",
+                           "unconfirmed spot entry had filled", {
+                               "order_link_id": str(row["order_link_id"]),
+                               "qty": qty, "avg_price": price})
+        logger.critical("reconcile: unconfirmed spot entry %s had filled "
+                        "(%s %s @ %s); adopted into the book for protection",
+                        row["order_link_id"], qty, symbol, price)
+        return True
 
     # -- private websocket -------------------------------------------------
 

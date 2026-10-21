@@ -390,7 +390,7 @@ class TestRunConformanceStageSequencing:
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
             "startup", "ws_startup", "entry", "ws_observation",
-            "protection_local"]
+            "protection_local", "abort_flatten", "abort_remote_flat_verification"]
 
     def test_stops_when_venue_readback_disagrees_with_local_belief(self):
         """The whole point of protection_readback: the LOCAL ledger says
@@ -405,7 +405,7 @@ class TestRunConformanceStageSequencing:
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
             "startup", "ws_startup", "entry", "ws_observation",
-            "protection_local", "protection_readback"]
+            "protection_local", "protection_readback", "abort_flatten", "abort_remote_flat_verification"]
 
     def test_protection_readback_error_is_a_failed_stage_not_an_exception(self):
         store = _StubStore(positions=[{"symbol": SYMBOL}], naked=[])
@@ -414,8 +414,9 @@ class TestRunConformanceStageSequencing:
             bot=_StubBot(), engine=_StubEngine(), client=client,
             store=store, symbol=SYMBOL)
         assert result["ok"] is False
-        assert result["stages"][-1]["stage"] == "protection_readback"
-        assert "error" in result["stages"][-1]
+        readback = next(x for x in result["stages"]
+                        if x["stage"] == "protection_readback")
+        assert "error" in readback
 
     def test_flatten_failure_still_records_final_reconciliation(self):
         """close_position() failing does not stop the run early -- the
@@ -670,7 +671,8 @@ class TestWsIntegrationStages:
             store=store, symbol=SYMBOL)
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
-            "startup", "ws_startup", "entry", "ws_observation"]
+            "startup", "ws_startup", "entry", "ws_observation",
+            "abort_flatten", "abort_remote_flat_verification"]
 
     def test_ws_evidence_completeness_fails_the_run_on_capture_failure(
             self, monkeypatch):
@@ -1546,8 +1548,10 @@ class TestRunConformanceProtectionReadbackEndToEnd:
         assert result["ok"] is False
         assert [s["stage"] for s in result["stages"]] == [
             "startup", "ws_startup", "spot_baseline_capture", "entry",
-            "ws_observation", "protection_local", "protection_readback"]
-        assert engine.closed == [], "must not flatten past a failed readback"
+            "ws_observation", "protection_local", "protection_readback",
+            "abort_flatten", "abort_remote_flat_verification"]
+        # no NORMAL flatten past a failed readback; the abort path closes once
+        assert len(engine.closed) == 1
 
 
 class TestEvidenceRequirementsUnchangedByCategoryFix:
@@ -2051,3 +2055,31 @@ class TestRealExitWsEvidenceClosesTheRace:
             and r.get("transport") == "ws"
             and r.get("request", {}).get("topic") == "order"
             for r in records)
+
+
+class TestAFailedStageAfterEntryDoesNotLeaveThePositionOpen:
+    def test_a_ws_timeout_after_entry_flattens_and_says_so(self, monkeypatch):
+        monkeypatch.setattr(tcr, "await_ws_observation", lambda **kw: False)
+        engine = _StubEngine()
+        result = tcr.run_conformance(
+            bot=_StubBot(), engine=engine, client=_StubClient(),
+            store=_StubStore(positions=[{"symbol": SYMBOL,
+                                         "order_link_id": "BB-1"}]),
+            symbol=SYMBOL)
+        assert result["ok"] is False
+        assert engine.closed == [SYMBOL]
+        stages = {s["stage"]: s for s in result["stages"]}
+        assert stages["abort_flatten"]["ok"] is True
+        assert stages["abort_flatten"]["after"] == "ws_observation"
+
+    def test_a_tick_that_raises_after_the_order_still_attempts_the_flatten(self):
+        class RaisingBot(_StubBot):
+            def tick(self):
+                raise RuntimeError("boom after the order was sent")
+        engine = _StubEngine()
+        result = tcr.run_conformance(
+            bot=RaisingBot(), engine=engine, client=_StubClient(),
+            store=_StubStore(positions=[{"symbol": SYMBOL}]), symbol=SYMBOL)
+        assert result["ok"] is False
+        assert engine.closed == [SYMBOL]
+        assert any(s["stage"] == "abort_flatten" for s in result["stages"])
