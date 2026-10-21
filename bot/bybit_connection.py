@@ -1647,7 +1647,14 @@ class BybitClient:
             "GET", "/v5/position/list",
             params={"category": self.category, "symbol": symbol}, signed=True,
         )
-        for row in payload.get("result", {}).get("list") or []:
+        # "flat" must be STATED: a reply with no `list` at all is an unreadable
+        # reply, not an empty one (it used to read as flat and book a full
+        # phantom exit over a live position).
+        rows = (payload.get("result") or {}).get("list")
+        if not isinstance(rows, list):
+            raise PermanentAPIError("position list carries no list; not "
+                                    "treating it as flat")
+        for row in rows:
             if float(row.get("size", 0) or 0) > 0:
                 return row
         return None

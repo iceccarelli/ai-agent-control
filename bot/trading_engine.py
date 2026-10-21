@@ -728,6 +728,12 @@ class TradingEngine:
             )
             if leg.ok:
                 tp_ids.append(leg.order_link_id)
+            elif leg.reason == "OUTCOME_UNKNOWN" and leg.order_link_id:
+                # It may be resting at the venue: track it, so a fill of it is
+                # observed and booked and a close/emergency cancels it.
+                tp_ids.append(leg.order_link_id)
+                logger.warning("take-profit leg %s for %s has an unknown "
+                               "outcome; tracked", leg.order_link_id, symbol)
             else:
                 # A missing TP leg costs upside, not capital. Logged loudly and
                 # carried on; a missing STOP is what triggers the emergency path.
