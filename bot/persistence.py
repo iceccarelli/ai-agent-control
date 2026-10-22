@@ -1377,6 +1377,13 @@ class StateStore:
         out["entry_fee_realized"] = int(all(int(r["entry_fee_realized"]) for r in rows))
         out["exit_fee_realized"] = int(all(int(r["exit_fee_realized"]) for r in rows))
         out["exits"] = len(rows)
+        # Each piece keeps the day it was booked on and its own net, so a
+        # per-day series can attribute a multi-day position to the days its
+        # exits actually happened on, not to the day of the last one.
+        out["pieces"] = [{"id": int(r["id"]), "day": str(r["day"]),
+                          "closed_epoch": float(r["closed_epoch"]),
+                          "net_pnl": float(r["net_pnl"])} for r in rows]
+        out["spans_days"] = len({str(r["day"]) for r in rows}) > 1
         out["id"] = max(int(r["id"]) for r in rows)
         out["exit_trade_ids"] = [int(r["id"]) for r in rows]
         return out
@@ -1472,6 +1479,29 @@ class StateStore:
         return {"count": len(rows), "oldest_age_s": oldest,
                 "lifecycles": len(positions), "stuck": stuck,
                 "reviewed": reviewed, "review_after_s": window}
+
+    def partial_open_lifecycles(self, now: Optional[float] = None
+                                ) -> List[Dict[str, Any]]:
+        """Positions still on the book that have already booked exits.
+
+        Such a position is not a result yet (``lifecycles`` waits for it to
+        close), so one that never closes -- an unsellable remainder, a stop that
+        keeps being re-armed -- would keep its realised pieces out of every
+        statistic for ever.  This names it, with how long since its last exit.
+        """
+        t = utc_now_epoch() if now is None else float(now)
+        out: List[Dict[str, Any]] = []
+        for r in self._query(
+                "SELECT t.symbol AS symbol, t.opened_epoch AS opened_epoch,"
+                " COUNT(*) AS exits, MAX(t.closed_epoch) AS last_exit,"
+                " SUM(t.net_pnl) AS booked_net FROM trades t JOIN positions o"
+                " ON o.symbol = t.symbol AND o.opened_epoch = t.opened_epoch"
+                " GROUP BY t.symbol, t.opened_epoch"):
+            out.append({"symbol": r["symbol"], "opened_epoch": r["opened_epoch"],
+                        "exits": int(r["exits"]),
+                        "booked_net": float(r["booked_net"]),
+                        "since_last_exit_s": max(0.0, t - float(r["last_exit"]))})
+        return out
 
     def acknowledge_unpriced_exit(self, trade_id: int, operator_ack: str,
                                   note: str = "") -> bool:
@@ -1606,6 +1636,16 @@ class StateStore:
             "SELECT * FROM trades WHERE symbol = ? AND opened_epoch = ? "
             "ORDER BY closed_epoch ASC, id ASC",
             (str(symbol), float(opened_epoch)))]
+
+    def funding_unbooked_summary(self) -> Dict[str, Any]:
+        """How many closed linear trades still lack booked funding, and why."""
+        statuses: Dict[str, int] = {}
+        rows = self.trades_awaiting_funding(limit=100_000)
+        for r in rows:
+            st = str(json.loads(r["meta"] or "{}").get("funding_status")
+                     or "NOT_YET_EXAMINED")
+            statuses[st] = statuses.get(st, 0) + 1
+        return {"count": len(rows), "statuses": statuses}
 
     def claimed_exit_order_ids(self, symbol: str, exclude_trade_id: int = 0) -> set:
         """Venue order ids already named by another exit row of ``symbol``."""

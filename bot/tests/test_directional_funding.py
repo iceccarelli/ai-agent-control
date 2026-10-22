@@ -54,7 +54,7 @@ def _trade(store, *, opened_h_ago=20.0, closed_h_ago=1.0, side="Sell",
 
 def _row(i, usd, hours_ago, symbol="BTCUSDT"):
     return {"id": f"S{i}", "symbol": symbol, "type": "SETTLEMENT",
-            "category": "linear", "funding": str(usd),
+            "category": "linear", "funding": str(usd), "change": str(usd),
             "transactionTime": str(int(NOW - hours_ago * H)),
             "currency": "USDT", "size": "-0.01"}
 

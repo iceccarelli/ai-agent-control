@@ -268,7 +268,9 @@ class TestTheOperatorCanSeeTheBook:
         bot.store = mock.Mock(
             is_kill_switch_engaged=lambda: (False, ""),
             positions_without_stops=lambda: [], open_position_count=lambda: 0,
-            unpriced_exit_status=lambda: {"count": 0, "stuck": [], "reviewed": []})
+            unpriced_exit_status=lambda: {"count": 0, "stuck": [], "reviewed": []},
+            partial_open_lifecycles=lambda: [],
+            funding_unbooked_summary=lambda: {"count": 0, "statuses": {}})
         bot.memory = None
         bot.strategy = None
         bot._observation_state = "HEALTHY"

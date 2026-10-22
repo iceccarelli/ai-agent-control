@@ -20,9 +20,16 @@ and, left UNBOOKED (so the statement cannot call the result confirmed):
 ``AMBIGUOUS_SHARED_WITH_CARRY``  the symbol is also traded by the carry book,
                                  whose legs settle on the same account row
 ``DUPLICATE_ID_CONFLICT``        one settlement id with two different amounts
+``FUNDING_SIGN_MISMATCH``        a row's ``funding`` sign is the opposite of its
+                                 wallet ``change`` (who paid whom is unknown)
+``FUNDING_SIGN_UNVERIFIED``      a row has no usable ``change``, or it agrees
+                                 with neither ``funding`` nor its negation
 
-Sign: positive means the account RECEIVED funding (the convention of the carry
-reader; unverified against a live account record).  Read-only: no order is sent.
+Sign: a payment is booked only when the row's ``funding`` is REPRODUCED by its
+own wallet ``change`` (``change = cashFlow + funding - fee``; see
+``carry_broker.funding_sign_check``).  Positive then means the account received
+money.  A row that cannot be cross-checked is never booked.  Read-only: no order
+is sent.
 """
 from __future__ import annotations
 
@@ -113,8 +120,15 @@ def _resolve(store: Any, broker: Any, trade: Dict[str, Any], now_ms: int,
             continue
         seen[pid] = float(p["usd"])
         mine.append(p)
+    signs = {str(p.get("sign") or "unchecked") for p in mine}
+    if "mismatch" in signs:
+        return left(trade, "FUNDING_SIGN_MISMATCH", ids=[p["id"] for p in mine
+                                                         if p.get("sign") == "mismatch"][:5])
+    if signs - {"confirmed"}:
+        return left(trade, "FUNDING_SIGN_UNVERIFIED",
+                    ids=[p["id"] for p in mine if p.get("sign") != "confirmed"][:5])
     evidence = {"window_ms": [start_ms, end_ms], "rows": len(mine),
-                "sign": "positive=received"}
+                "sign": "confirmed against the wallet change (positive=received)"}
     if not mine:
         if end_ms - start_ms >= MAX_FUNDING_INTERVAL_MS:
             return left(trade, "SUSPECT_NO_SETTLEMENT_OVER_INTERVAL",

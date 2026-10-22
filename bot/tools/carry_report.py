@@ -106,6 +106,12 @@ def build_report(db_path: str) -> Dict[str, Any]:
             "price_provisional_reviewed": sum(
                 1 for t in provisional
                 if "operator_reviewed" in (t["meta"] or "")),
+            "funding_unbooked_by_status": _funding_unbooked(trades),
+            "positions_open_after_an_exit": (
+                _count(conn, "SELECT COUNT(*) FROM (SELECT 1 FROM trades t JOIN "
+                       "positions o ON o.symbol = t.symbol AND o.opened_epoch = "
+                       "t.opened_epoch GROUP BY t.symbol, t.opened_epoch)")
+                if _has(conn, "positions") else 0),
             "fees_confirmed_trades": len(confirmed),
             "fees_unconfirmed_trades": len(trades) - len(confirmed),
             "realised_net_pnl": sum(t["net_pnl"] for t in confirmed),
@@ -121,6 +127,27 @@ def build_report(db_path: str) -> Dict[str, Any]:
 #: settlement a replay bar summarises, so a gap longer than it is a stretch the
 #: replay refuses (carry_replay.LiquidationInputs.from_observations).
 FUNDING_INTERVAL_MS = 8 * 3600 * 1000
+
+
+def _count(conn: sqlite3.Connection, sql: str) -> int:
+    try:
+        return int(conn.execute(sql).fetchone()[0])
+    except sqlite3.Error:
+        return 0
+
+
+def _funding_unbooked(trades: List[sqlite3.Row]) -> Dict[str, int]:
+    """Closed trades whose meta says funding is not booked, by stated reason."""
+    out: Dict[str, int] = {}
+    for t in trades:
+        try:
+            meta = json.loads(t["meta"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        if meta.get("funding_booked") is False:
+            key = str(meta.get("funding_status") or "NOT_YET_EXAMINED")
+            out[key] = out.get(key, 0) + 1
+    return out
 
 
 def _liquidation_evidence(conn: sqlite3.Connection) -> Dict[str, Any]:
