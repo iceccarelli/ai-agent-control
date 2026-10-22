@@ -369,6 +369,45 @@ class TestNoSecondCloseBesideAnUnknownOne:
         assert calls.count("close") == 2
 
 
+class TestACloseThatExecutedWhileTheProcessWasDown:
+    def test_startup_does_not_drop_it_unbooked_and_the_next_cycle_books_it(
+            self, stack):
+        engine, client, store, exchange, calls, qty = (
+            TestNoSecondCloseBesideAnUnknownOne()._unknown_close(stack))
+        summary = client.reconcile_on_startup()
+        assert summary["closes_to_settle"] == 1        # left for the engine
+        assert not summary["unknown"]                  # ...and startup may go on
+        assert [o for o in store.unresolved_orders() if o["purpose"] == "close"]
+        assert store.open_positions()                  # still on the book
+        sent = calls.count("close")
+        engine.observe_exits()                         # books it from its fill
+        assert store.open_positions() == []
+        assert len(store.confirmed_exit_rows()) == 1
+        assert calls.count("close") == sent            # and sold nothing more
+        assert not [o for o in store.unresolved_orders()
+                    if o["purpose"] == "close"]
+
+
+class TestAStaleCloseRowIsNotReplayedAgainstALaterPosition:
+    def test_a_close_older_than_the_position_is_settled_not_booked(self, stack):
+        engine, client, store, exchange, calls, qty = (
+            TestNoSecondCloseBesideAnUnknownOne()._unknown_close(stack))
+        link = [o for o in store.unresolved_orders()
+                if o["purpose"] == "close"][0]["order_link_id"]
+        # the position it belonged to is gone; a NEW one opens afterwards
+        store.remove_position("BTCUSDT")
+        store.upsert_position("BTCUSDT", "Buy", qty, 50_000.0, stop_price=49_000.0)
+        store._exec("UPDATE positions SET opened_epoch = ? WHERE symbol='BTCUSDT'",
+                    (float(store._query("SELECT created_epoch FROM orders WHERE "
+                                        "order_link_id=?", (link,))[0][0]) + 60,))
+        trades_before = len(store.confirmed_exit_rows())
+        report = engine.close_position(symbol="BTCUSDT", reason="horizon")
+        assert report.reason != "CLOSE_RECONCILED"
+        assert len(store.confirmed_exit_rows()) == trades_before
+        assert store._query("SELECT status FROM orders WHERE order_link_id=?",
+                            (link,))[0][0] == "stale"
+
+
 def test_a_position_reply_without_a_list_is_not_flat(stack):
     import bybit_connection as bc
     engine, client, risk, store, exchange = stack
@@ -540,6 +579,42 @@ class TestLinearVenueTriggeredExitReconcilesByOrderId:
         fake.executions.append(_lin_ex("X1", "WHATEVER", 0.01, 61_000))
         s = engine.reconcile_provisional_exits()
         assert s["reconciled"] == 0 and len(store.provisional_trades()) == 1
+
+
+class TestRecoveredIdentityIsNeverAnotherExits:
+    def _two_legs(self, tmp_path, claim_b):
+        fake = FakeBybit()
+        engine, store = _lin_engine(tmp_path, LinearCfg(), fake)
+        now = int(_time.time() * 1000)
+        for oid, dt in (("ORD-A", 1000), ("ORD-B", 2000)):
+            fake.closed_pnl.append({
+                "symbol": "BTCUSDT", "side": "Buy", "qty": "0.003",
+                "orderId": oid, "avgExitPrice": "61000", "closedPnl": "0",
+                "updatedTime": str(now + dt)})
+        if claim_b:
+            from persistence import TradeRecord
+            store.record_trade(TradeRecord(
+                symbol="BTCUSDT", side="Sell", qty=0.003, entry_price=60_000.0,
+                exit_price=61_000.0, gross_pnl=-3.0, entry_fee=0.0, exit_fee=0.0,
+                opened_epoch=_time.time() - 100, closed_epoch=_time.time(),
+                meta={"exit_order_ids": ["ORD-B"]}))
+        trade = {"id": 999, "symbol": "BTCUSDT", "qty": 0.003,
+                 "opened_epoch": _time.time() - 100,
+                 "closed_epoch": _time.time()}
+        return engine, trade
+
+    def test_two_unidentified_equal_legs_are_ambiguous_and_refused(self, tmp_path):
+        engine, trade = self._two_legs(tmp_path, claim_b=False)
+        assert engine._recover_exit_order_ids(trade) == []
+
+    def test_an_order_another_exit_already_names_is_not_taken(self, tmp_path):
+        engine, trade = self._two_legs(tmp_path, claim_b=True)
+        assert engine._recover_exit_order_ids(trade) == ["ORD-A"]
+
+    def test_a_row_newer_than_the_exit_is_not_this_exit(self, tmp_path):
+        engine, trade = self._two_legs(tmp_path, claim_b=True)
+        trade["closed_epoch"] = _time.time() - 3600
+        assert engine._recover_exit_order_ids(trade) == []
 
 
 def test_get_executions_pages_by_cursor_and_carries_the_order_id(tmp_path):

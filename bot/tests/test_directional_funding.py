@@ -218,3 +218,57 @@ def test_no_order_is_ever_sent(tmp_path):
     fake.settlements.append(_row(1, 0.3, 12))
     _run(store, broker)
     assert fake.submitted_orders() == []
+
+
+class TestTheLoopHook:
+    """`TradingBot._book_directional_funding` is what the tick loop calls."""
+
+    def _bot(self, store, client, carry=None):
+        import types
+        import main as app
+        bot = types.SimpleNamespace(
+            engine=types.SimpleNamespace(client=client), store=store, carry=carry,
+            DIRECTIONAL_FUNDING_POLL_MS=app.TradingBot.DIRECTIONAL_FUNDING_POLL_MS,
+            _last_directional_funding_ms=0)
+        return app.TradingBot._book_directional_funding, bot
+
+    def test_it_books_for_a_linear_client_and_is_throttled(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        client = broker.client
+        client.is_linear = True
+        tid = _trade(store)
+        fake.settlements.append(_row(1, 0.3, 12))
+        run, bot = self._bot(store, client)
+        run(bot)
+        assert _meta(store, tid)["funding_booked"] is True
+        assert bot._last_directional_funding_ms > 0
+        tid2 = _trade(store, opened_h_ago=40.0, closed_h_ago=30.0)
+        fake.settlements.append(_row(2, 0.1, 35))
+        run(bot)                                   # inside the poll interval
+        assert _meta(store, tid2)["funding_booked"] is False
+        bot._last_directional_funding_ms = 0
+        run(bot)
+        assert _meta(store, tid2)["funding_booked"] is True
+
+    def test_it_does_nothing_for_a_spot_client(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        client = broker.client
+        client.is_linear = False
+        tid = _trade(store)
+        fake.settlements.append(_row(1, 0.3, 12))
+        run, bot = self._bot(store, client)
+        run(bot)
+        assert _meta(store, tid)["funding_booked"] is False
+
+
+def test_a_pile_of_stuck_rows_cannot_starve_the_trades_behind_them(tmp_path):
+    fake, store, broker = _setup(tmp_path)
+    for _ in range(3):                       # old, unresolvable (carry symbol)
+        _trade(store, opened_h_ago=30.0, closed_h_ago=20.0, symbol="ETHUSDT")
+    df.reconcile_directional_funding(store, broker, now_ms=NOW, limit=3,
+                                     carry_symbols={"ETHUSDT"})
+    fresh = _trade(store, opened_h_ago=3.0, closed_h_ago=1.0)
+    r = df.reconcile_directional_funding(store, broker, now_ms=NOW, limit=3,
+                                         carry_symbols={"ETHUSDT"})
+    assert _meta(store, fresh)["funding_booked"] is True
+    assert r["no_settlement"] == 1

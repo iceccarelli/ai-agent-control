@@ -89,6 +89,10 @@ class PerformanceReport:
     #: ``fees_confirmed`` is True.
     fee_confirmed_trades: int = 0
     fee_unconfirmed_trades: int = 0
+    #: Exits still without an authoritative price. Their positions are NOT in
+    #: any figure above; a statement built on this report must say so.
+    unpriced_exits: int = 0
+    unpriced_stuck: int = 0
 
     @property
     def fees_confirmed(self) -> bool:
@@ -100,6 +104,10 @@ class PerformanceReport:
         if self.trades and not self.fees_confirmed:
             text += (f" [PROVISIONAL: {self.fee_unconfirmed_trades} of "
                      f"{self.trades} trades carry unconfirmed fees]")
+        if self.unpriced_exits:
+            text += (f" [UNPRICED: {self.unpriced_exits} exit(s) excluded"
+                     + (f", {self.unpriced_stuck} STUCK past review"
+                        if self.unpriced_stuck else "") + "]")
         return text
 
     def _summary_core(self) -> str:
@@ -167,9 +175,22 @@ class PerformanceAnalytics:
         """Compute everything that can be computed honestly from the record."""
         trades = self._trades()
         notes: List[str] = []
+        try:
+            un = self.store.unpriced_exit_status()
+        except Exception:  # noqa: BLE001
+            un = {"count": 0, "stuck": []}
+        if un["count"]:
+            notes.append(
+                f"{un['count']} exit(s) have no authoritative price and are "
+                "excluded from every figure here, along with their positions"
+                + (f"; {len(un['stuck'])} are stuck past the review window"
+                   if un["stuck"] else ""))
+        unpriced = dict(unpriced_exits=int(un["count"]),
+                        unpriced_stuck=len(un["stuck"]))
 
         if not trades:
-            return PerformanceReport(notes=("no closed trades recorded",))
+            return PerformanceReport(
+                notes=tuple(["no closed trades recorded"] + notes), **unpriced)
 
         gross = sum(float(t.get("gross_pnl", 0.0)) for t in trades)
         fees = sum(
@@ -199,7 +220,7 @@ class PerformanceAnalytics:
             trades=n, wins=len(wins), losses=len(losses),
             gross_pnl=gross, fees=fees, net_pnl=net, days=days,
             fee_confirmed_trades=confirmed,
-            fee_unconfirmed_trades=n - confirmed,
+            fee_unconfirmed_trades=n - confirmed, **unpriced,
         )
 
         if n < MIN_TRADES_FOR_RATIOS:

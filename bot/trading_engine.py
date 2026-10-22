@@ -1105,6 +1105,14 @@ class TradingEngine:
                                 symbol=symbol)
         for order_row in pending:
             link = str(order_row.get("order_link_id") or "")
+            if float(order_row.get("created_epoch") or 0.0) < float(
+                    row.get("opened_epoch") or 0.0):
+                # Sent before THIS position was opened: it belongs to an
+                # earlier one (already booked or gone). Replaying its fill
+                # against this position would book a sale it never made.
+                self.store.update_order_status(link, "stale")
+                self.store.journal(symbol, "STALE_CLOSE_ORDER_SETTLED", link, {})
+                continue
             try:
                 order = self.client.get_order(symbol=symbol, order_link_id=link)
             except BybitAPIError as exc:
@@ -1761,6 +1769,23 @@ class TradingEngine:
             dead_reads.pop(k, None)
         for row in open_rows:
             symbol = str(row["symbol"])
+            try:
+                has_close = any(
+                    str(o.get("symbol")) == symbol
+                    and str(o.get("purpose")) in ("close", "emergency_close")
+                    for o in self.store.unresolved_orders())
+            except Exception:  # noqa: BLE001
+                has_close = False
+            if has_close:
+                # a close that executed while the process was down (or whose
+                # reply was lost) is booked from its own fill, once
+                self._settle_pending_closes(symbol, row)
+                if not any(str(p["symbol"]) == symbol
+                           for p in self.store.open_positions()):
+                    summary["closed"] += 1
+                    continue
+                row = next(p for p in self.store.open_positions()
+                           if str(p["symbol"]) == symbol)
             meta = self._row_meta(row)
             booked = set(meta.get("booked_exit_orders") or [])
             # Take-profit legs first: a leg that sold part of the position is
@@ -2144,7 +2169,26 @@ class TradingEngine:
                 float(trade.get("opened_epoch") or 0.0) * 1000))
         except Exception:  # noqa: BLE001
             return []
-        chosen = self._rows_of_this_exit(rows, qty)
+        # Only rows that could be THIS exit: not later than it, and not an
+        # order another booked exit already names. The rows left must add up
+        # to the booked quantity exactly; a larger pool (two unidentified exits
+        # of equal size) is ambiguous, and a wrong identity would price this
+        # exit from someone else's fills, so it is refused.
+        closed_ms = float(trade.get("closed_epoch") or 0.0) * 1000
+        try:
+            claimed = self.store.claimed_exit_order_ids(
+                str(trade["symbol"]), exclude_trade_id=int(trade["id"]))
+        except Exception:  # noqa: BLE001
+            return []
+
+        def stamp(r: Mapping[str, Any]) -> float:
+            try:
+                return float(r.get("updatedTime", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        chosen = [r for r in rows
+                  if str(r.get("orderId") or "") not in claimed
+                  and stamp(r) <= closed_ms + 120_000]
         total = sum(float(r.get("qty", 0) or 0) for r in chosen)
         if (not chosen or abs(total - qty) > max(1e-9, abs(qty) * 1e-9)
                 or any(not r.get("orderId") for r in chosen)):

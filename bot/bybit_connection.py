@@ -2076,6 +2076,20 @@ class BybitClient:
                          "unresolved", oid, remote.get("cumExecQty"))
             summary["unknown"] += 1
             return
+        if (str(row.get("purpose")) in ("close", "emergency_close")
+                and executed > 0.0
+                and str(row["symbol"]) in {str(p.get("symbol")) for p in
+                                           self.store.open_positions()}):
+            # A close that executed while the process was down: marking it
+            # terminal here would drop it from the unresolved list with the
+            # sale unbooked and the position still on the book. The engine
+            # books it from its own fill (`_settle_pending_closes`).
+            logger.warning("reconcile: close %s executed %s while down; left "
+                           "unresolved so the exit is booked", oid, executed)
+            # (not "unknown": that refuses to start, and the engine can only
+            # book this once it is running)
+            summary["closes_to_settle"] = summary.get("closes_to_settle", 0) + 1
+            return
         try:
             adopted = self._adopt_filled_spot_entry(row, remote, summary)
         except Exception:  # noqa: BLE001
