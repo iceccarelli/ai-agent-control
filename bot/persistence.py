@@ -1665,6 +1665,16 @@ class StateStore:
             statuses[st] = statuses.get(st, 0) + 1
         return {"count": len(rows), "statuses": statuses}
 
+    def claimed_exit_row_keys(self, symbol: str) -> set:
+        """closed-pnl rows (by identity) that an exit of ``symbol`` was priced
+        from: a row prices one exit, whatever its order id."""
+        out: set = set()
+        for r in self._query("SELECT meta FROM trades WHERE symbol = ?",
+                             (str(symbol),)):
+            out.update(str(k) for k in
+                       json.loads(r["meta"] or "{}").get("exit_row_keys", []))
+        return out
+
     def claimed_exit_order_ids(self, symbol: str, exclude_trade_id: int = 0) -> set:
         """Venue order ids already named by another exit row of ``symbol``."""
         out: set = set()

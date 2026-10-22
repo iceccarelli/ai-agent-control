@@ -356,3 +356,54 @@ class TestAPriceNeedsRowsProvenToBeThisExit:
         assert engine.observe_exits()["closed"] == 1
         t = store._query("SELECT * FROM trades")[0]
         assert t["price_provisional"] == 0 and float(t["exit_price"]) == 61_000.0
+
+
+class TestTheTradeAndThePositionChangeAreOneWrite:
+    def _partial(self, tmp_path):
+        fake = FakeBybit()
+        fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell",
+                                     "size": "0.004", "avgPrice": "60000",
+                                     "stopLoss": "61000"}
+        engine, store = _engine(tmp_path, LinearCfg(), fake)
+        _open(store, qty=0.01)
+        fake.closed_pnl.append({
+            "symbol": "BTCUSDT", "side": "Buy", "qty": "0.006", "orderId": "O1",
+            "avgExitPrice": "59000", "closedPnl": "6",
+            "updatedTime": str(int(time.time() * 1000) + 1000)})
+        return fake, engine, store
+
+    def test_a_failure_after_the_trade_is_written_rolls_the_trade_back(self, tmp_path):
+        fake, engine, store = self._partial(tmp_path)
+        real = store.upsert_position
+
+        def boom(*a, **k):
+            raise RuntimeError("killed between the trade and the position")
+        store.upsert_position = boom
+        with pytest.raises(RuntimeError):
+            engine.observe_exits()                 # main.tick logs and continues
+        assert store._query("SELECT * FROM trades") == []          # nothing booked
+        assert float(store.open_positions()[0]["qty"]) == 0.01     # book untouched
+        store.upsert_position = real
+        engine.observe_exits()                     # the replay books it ONCE
+        assert len(store._query("SELECT * FROM trades")) == 1
+        assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.004)
+
+    def test_a_full_exit_failing_to_remove_the_position_books_nothing(self, tmp_path):
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, LinearCfg(), fake)
+        _open(store)
+        fake.closed_pnl.append({
+            "symbol": "BTCUSDT", "side": "Buy", "qty": "0.01", "orderId": "O1",
+            "avgExitPrice": "61000", "closedPnl": "-10",
+            "updatedTime": str(int(time.time() * 1000) + 1000)})
+        real = store.remove_position
+        store.remove_position = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("killed"))
+        with pytest.raises(RuntimeError):
+            engine.observe_exits()
+        assert store._query("SELECT * FROM trades") == []
+        assert len(store.open_positions()) == 1
+        store.remove_position = real
+        engine.observe_exits()
+        assert len(store._query("SELECT * FROM trades")) == 1
+        assert store.open_positions() == []
