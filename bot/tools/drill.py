@@ -76,6 +76,14 @@ stated, never assumed:
     NO_SETTLEMENT_OBSERVED       evidence complete and no row: not a result
     UNCONFIRMED                  anything else (incomplete, unattributed, ...)
 
+The drill runs the OVERLAY mode (the production choice): the short perp is
+written against BTC the account already owns, so the "long" leg is that
+inventory. ACQUIRE (buy the spot leg too) is deliberately not offered here: the
+engine refuses it whenever one perp lot is a large share of the position
+(`ACQUIRE_LOT_TOO_COARSE_FOR_FEE`: the base-coin fee on the spot buy makes the
+snapped short land unpaired), and under the fixed drill cap on BTCUSDT one lot
+is the whole position. Raising the cap is a signed human decision, not a flag.
+
 Exit 0 only when the drill PASSED, the book is flat and the funding status is
 CONFIRMED_FROM_SETTLEMENTS. 3 = refused (not testnet / paper / live-armed),
 2 = cannot start or zero fills, 4 = flat but funding not confirmed,
