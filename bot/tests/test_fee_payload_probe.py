@@ -464,7 +464,8 @@ class TestTheProductionLedgerStillFailsClosedOnSize:
     def test_only_the_books_own_signed_size_is_attributed(self):
         L, j = self._book()
         pay = {"id": "S1", "ms": NOW + 3 * 3_600_000, "usd": 7.77,
-               "currency": "USDT", "size": -0.5, "symbol": "BTCUSDT"}
+               "currency": "USDT", "size": -0.5, "symbol": "BTCUSDT",
+               "sign": "confirmed"}
         assert L.book_funding_payments(j, [pay], ms=NOW + 4 * 3_600_000)["booked"] == 1
 
     def test_the_recorded_semantics_remain_unconfirmed(self):

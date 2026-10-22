@@ -689,6 +689,12 @@ def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
     if p.get("currency") != SETTLE_CURRENCY:
         return (f"paid in {p.get('currency')!r}, not {SETTLE_CURRENCY}; "
                 "no conversion basis")
+    if p.get("sign") != "confirmed":
+        # The direction of the money is not established: the row's funding
+        # sign was not reproduced by its own wallet change. Booking it would
+        # assume who paid whom.
+        return (f"funding sign {p.get('sign') or 'unchecked'}: "
+                f"{p.get('sign_why') or 'no cross-check against the wallet change'}")
     t = int(p["ms"])
     before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
     after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)

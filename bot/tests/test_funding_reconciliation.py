@@ -84,6 +84,7 @@ def broker(venue):
 def srow(i, funding, t, **kw):
     base = {"id": f"S{i}", "symbol": SYM, "type": "SETTLEMENT",
             "category": "linear", "funding": str(funding),
+            "change": str(funding),
             "transactionTime": str(t), "currency": "USDT", "size": "-0.5"}
     base.update(kw)
     return base
@@ -91,7 +92,7 @@ def srow(i, funding, t, **kw):
 
 def pay(i, usd, t, size=-0.5, currency="USDT"):
     return {"id": f"S{i}", "ms": t, "usd": usd, "currency": currency,
-            "size": size, "symbol": SYM}
+            "size": size, "symbol": SYM, "sign": "confirmed"}
 
 
 def hedged(qty=0.5, at=T0):

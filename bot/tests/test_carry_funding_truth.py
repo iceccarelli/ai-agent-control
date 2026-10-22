@@ -69,7 +69,7 @@ def reconcile(j, prints, *, now_ms, start=None, rows=(), rates=None):
 
 def pay(i, usd, *, ms=T0 + 3_600_000, size=-0.5, currency="USDT"):
     return {"id": str(i), "ms": ms, "usd": usd, "currency": currency,
-            "size": size, "symbol": "BTCUSDT"}
+            "size": size, "symbol": "BTCUSDT", "sign": "confirmed"}
 
 
 class TestBookingFromVenuePayments:
@@ -170,8 +170,8 @@ class Log(FakeClient):
 
 def row(i, funding, t, **kw):
     base = {"id": f"S{i}", "symbol": "BTCUSDT", "type": "SETTLEMENT",
-            "funding": funding, "transactionTime": str(t), "currency": "USDT",
-            "size": "-0.5"}
+            "funding": funding, "change": funding,
+            "transactionTime": str(t), "currency": "USDT", "size": "-0.5"}
     base.update(kw)
     return base
 

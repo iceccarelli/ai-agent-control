@@ -333,6 +333,49 @@ def funding_gaps(stamps: List[int], *, start_ms: int, end_ms: int
     return gaps, expected
 
 
+def funding_sign_check(funding: float, change: Any, cash_flow: Any = None,
+                       fee: Any = None) -> Tuple[str, str]:
+    """Cross-check a SETTLEMENT row's ``funding`` sign against its ``change``.
+
+    Field mapping (Bybit v5 ``/v5/account/transaction-log``, Unified account):
+    ``funding`` is the funding component of the row and ``change`` is the
+    resulting WALLET change, ``change = cashFlow + funding - fee`` (the wallet
+    change is unambiguous: positive means the account RECEIVED money).  The
+    sign of ``funding`` is therefore trusted only when ``change`` reproduces it:
+
+    * ``confirmed``  -- ``change`` equals ``funding + cashFlow - fee``
+    * ``mismatch``   -- ``change`` equals ``-funding + cashFlow - fee``: the
+                        two fields disagree about who paid whom
+    * ``unverified`` -- ``change`` is missing, not a finite number, or agrees
+                        with neither.
+
+    A zero funding amount with a zero change is confirmed (no sign to get
+    wrong).  Nothing is assumed: only ``confirmed`` may be booked.
+    """
+    def num(x: Any) -> Optional[float]:
+        if x is None or str(x).strip() == "":
+            return None
+        try:
+            v = float(x)
+        except (TypeError, ValueError):
+            return None
+        return v if math.isfinite(v) else None
+
+    ch = num(change)
+    if ch is None:
+        return "unverified", "the row carries no usable change field"
+    cf = num(cash_flow) or 0.0
+    fe = num(fee) or 0.0
+    tol = 1e-8 + 1e-6 * max(abs(funding), abs(ch))
+    if abs(ch - (funding + cf - fe)) <= tol:
+        return "confirmed", ""
+    if funding != 0.0 and abs(ch - (-funding + cf - fe)) <= tol:
+        return "mismatch", (f"funding {funding!r} but the wallet change is "
+                            f"{ch!r}: opposite signs")
+    return "unverified", (f"change {ch!r} agrees with neither funding "
+                          f"{funding!r} nor its negation")
+
+
 @dataclass
 class SettlementEvidence:
     """What the account transaction log returned for one symbol and interval.
@@ -1477,9 +1520,12 @@ class CarryBroker:
                 size = None
             if size is not None and not math.isfinite(size):
                 size = None
+        sign, why = funding_sign_check(
+            usd, row.get("change"), row.get("cashFlow"), row.get("fee"))
         return {"id": ident, "ms": stamp, "usd": usd, "symbol": symbol,
                 "currency": str(row.get("currency", "")).upper() or None,
-                "size": size, "category": LINEAR}
+                "size": size, "category": LINEAR,
+                "change": row.get("change"), "sign": sign, "sign_why": why}
 
     def get_position_leverage(self, symbol: str) -> Optional[float]:
         """The leverage the venue reports on this symbol's position row
