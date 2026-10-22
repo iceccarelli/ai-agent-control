@@ -210,6 +210,17 @@ class TestTheGateChecksWhereOrdersActuallyGo:
         allowed, why = bot.carry.broker.inner.order_gate()
         assert allowed is False and "mainnet host" in why
 
+    def test_a_client_that_states_no_host_cannot_send(self):
+        cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
+                            "CARRY_EXECUTION_MODE": "overlay",
+                            "PAPER_TRADING": "0", "USE_TESTNET": "1"})
+        client = mock.Mock()
+        client.base_url = ""
+        bot = _main.build_bot(config=cfg, store=_Store(), client=client,
+                              risk_manager=mock.Mock(), engine=mock.Mock())
+        allowed, why = bot.carry.broker.inner.order_gate()
+        assert allowed is False and "no host" in why
+
     def test_the_same_config_with_a_testnet_client_may_send(self):
         cfg = _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": "0.0",
                             "CARRY_EXECUTION_MODE": "overlay",

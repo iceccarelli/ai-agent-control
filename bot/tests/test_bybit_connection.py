@@ -1216,3 +1216,20 @@ def test_safety_reads_are_never_paused_by_a_403(client, exchange):
 def test_tickers_and_instrument_filters_are_never_paused(client, exchange):
     for endpoint in ("/v5/market/tickers", "/v5/market/instruments-info"):
         assert endpoint not in bc.BybitClient.COOLDOWN_READ_ENDPOINTS
+
+
+def test_a_mainnet_client_without_live_authorisation_refuses_the_order_at_the_transport(tmp_path):
+    """Defence in depth: whatever called it, no order leaves a mainnet client
+    that is not live-authorised."""
+    import config as _config
+    from fake_bybit import FakeBybit
+    from persistence import StateStore
+    cfg = _config.load({"BYBIT_VENUE": "mainnet", "PAPER_TRADING": "1"})
+    store = StateStore(str(tmp_path / "s.db"))
+    store.claim_writer()
+    fake = FakeBybit()
+    client = bc.BybitClient(config=cfg, store=store, transport=fake)
+    assert client.venue == "mainnet"
+    result = client._submit({"symbol": "BTCUSDT"}, "oid-1", "entry")
+    assert result.reason == "LIVE_NOT_AUTHORIZED"
+    assert not [r for r in fake.requests if "order/create" in r["url"]]

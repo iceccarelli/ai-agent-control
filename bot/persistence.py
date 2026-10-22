@@ -1405,13 +1405,14 @@ class StateStore:
             "SELECT * FROM trades WHERE price_provisional = 0 "
             "ORDER BY closed_epoch DESC, id DESC LIMIT ?", (int(limit),))]
 
-    def recent_trades(self, limit: int = 200, *,
-                      funding_booked_only: bool = True) -> List[Dict[str, Any]]:
-        """Completed position lifecycles (see :meth:`lifecycles`), newest first.
+    def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Completed position lifecycles (see :meth:`lifecycles`), newest first."""
+        return self.lifecycles(limit)
 
-        ``funding_booked_only=False`` is for a caller that accounts funding
-        itself and says so (the backtest)."""
-        return self.lifecycles(limit, funding_booked_only=funding_booked_only)
+    def lifecycles_funding_excluded(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Completed lifecycles WITHOUT requiring funding to be booked: for a
+        caller that accounts funding itself and says so (the backtest)."""
+        return self.lifecycles(limit, funding_booked_only=False)
 
     def fee_evidence(self) -> Dict[str, Any]:
         """How much of the booked net PnL rests on venue-confirmed fees.

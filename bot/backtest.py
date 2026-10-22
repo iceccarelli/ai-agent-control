@@ -1513,7 +1513,7 @@ class Backtester:
         # to that ceiling that the next parameter change could have crossed it
         # silently. The ledger is the source of truth for the headline block, so
         # it is read in full.
-        trades = store.recent_trades(_ALL_TRADES, funding_booked_only=False)
+        trades = store.lifecycles_funding_excluded(_ALL_TRADES)
         result.trades = len(trades)
         if trades:
             nets = [float(t["net_pnl"]) for t in trades]
@@ -1657,8 +1657,7 @@ class Backtester:
         Returns the highest trade id now accounted for.
         """
         rows = [
-            row for row in store.recent_trades(_TRADE_HARVEST_LIMIT,
-                                           funding_booked_only=False)
+            row for row in store.lifecycles_funding_excluded(_TRADE_HARVEST_LIMIT)
             if int(row.get("id") or 0) > last_trade_id
         ]
         if not rows:

@@ -94,6 +94,16 @@ class Venue:
         self._live()
         return self.margin
 
+    liq_distance_pct = 60.0
+
+    def get_liquidation_view(self, symbol):
+        self._live()
+        return {"size": self.perp_qty, "side": "Sell", "mark": MARK,
+                "liq_price": MARK * (1 + self.liq_distance_pct / 100.0),
+                "distance_pct": self.liq_distance_pct,
+                "account_mm_rate": 0.05, "margin_mode": "REGULAR_MARGIN",
+                "reason": ""}
+
     def get_lot_rules(self, symbol, product):
         self._live()
         return {"qty_step": 0.001, "min_qty": 0.001, "min_notional": 0.0}

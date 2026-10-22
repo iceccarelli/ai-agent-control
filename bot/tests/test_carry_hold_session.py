@@ -185,17 +185,36 @@ class TestItRefusesTheWrongEnvironment:
     def test_everything_else_is_refused(self, over):
         assert D.session_refusal(self._cfg(**over))
 
-    def test_a_client_on_the_mainnet_host_is_refused(self):
-        from bybit_connection import MAINNET_REST
-        client = types.SimpleNamespace(base_url=MAINNET_REST)
-        assert "mainnet host" in D.session_refusal(self._cfg(), client)
+    @pytest.mark.parametrize("url", ["https://api.bybit.com",
+                                     "https://api-demo.bybit.com", "", None,
+                                     "https://example.test"])
+    def test_a_client_that_is_not_positively_the_testnet_host_is_refused(self, url):
+        client = types.SimpleNamespace(base_url=url) if url is not None \
+            else types.SimpleNamespace()
+        assert "testnet host" in D.session_refusal(self._cfg(), client)
+
+    def test_the_testnet_host_is_accepted(self):
+        from bybit_connection import TESTNET_REST
+        client = types.SimpleNamespace(base_url=TESTNET_REST)
+        assert D.session_refusal(self._cfg(), client) is None
 
     def test_hold_without_arm_is_refused_before_anything_loads(self):
         assert D.main(["--hold-for-settlement"]) == 3
 
     def test_zero_min_settlements_is_refused(self):
-        assert D.main(["--arm", "--hold-for-settlement",
-                       "--min-settlements", "0"]) == 3
+        assert D.main(["--arm", "--hold-for-settlement", "--out", "x",
+                       "--cash-ledger", "y", "--min-settlements", "0"]) == 3
+
+    @pytest.mark.parametrize("extra", [
+        [], ["--out", "x"], ["--cash-ledger", "y"],
+        ["--out", "x", "--cash-ledger", "y", "--poll-seconds", "0"],
+        ["--out", "x", "--cash-ledger", "y", "--poll-seconds", "-5"],
+        ["--out", "x", "--cash-ledger", "y", "--max-hold-hours", "0"],
+        ["--out", "x", "--cash-ledger", "y", "--max-hold-hours", "nan"],
+    ])
+    def test_a_hold_that_cannot_save_its_evidence_or_has_nonsense_timing_is_refused(
+            self, extra):
+        assert D.main(["--arm", "--hold-for-settlement"] + extra) == 3
 
 
 class TestTheExitCodeIsHonest:
@@ -213,3 +232,74 @@ class TestTheExitCodeIsHonest:
         rep = {"verdict": "FAILED", "still_open": True, "orders_sent": 4,
                "funding_status": D.CONFIRMED, "cash_ledger": ""}
         assert D.drill_exit_code(rep, hold=True) == 1
+
+
+class TestTheHoldSurvivesWhatARealDaySends:
+    @pytest.mark.parametrize("pay_after", [250.0, 290.0, 310.0])
+    def test_the_close_lands_after_the_ledgers_ownership_slack_at_any_poll_phase(
+            self, clock, tmp_path, pay_after):
+        venue = HoldVenue(clock, pay_after_s=pay_after)
+        report, ledger = _run(venue, clock, tmp_path, poll_s=60.0)
+        assert report["verdict"] == "PASSED", [
+            (s["stage"], s["why"]) for s in report["stages"] if not s["ok"]]
+        assert report["funding_status"] == D.CONFIRMED
+        assert D.drill_exit_code(report, hold=True) == 0
+
+    def test_the_liquidation_gate_is_on_and_its_reads_are_in_the_evidence(
+            self, clock, tmp_path):
+        report, _ = _run(HoldVenue(clock), clock, tmp_path)
+        hold = next(s for s in report["stages"] if s["stage"] == "hold")
+        assert hold["evidence"]["liquidation_reads"] >= 1
+        assert hold["evidence"]["min_liquidation_distance_pct"] == 60.0
+
+    def test_a_close_liquidation_distance_during_the_hold_unwinds_the_pair(
+            self, clock, tmp_path):
+        venue = HoldVenue(clock, pay_after_s=None)
+        venue.liq_distance_pct = 5.0                       # below the 15 % floor
+        report, ledger = _run(venue, clock, tmp_path, max_hold_s=1200.0)
+        assert report["verdict"] == "FAILED" and report["failed_stage"] == "hold"
+        assert venue.perp_qty == pytest.approx(0.0)
+        assert not os.path.exists(ledger)
+
+    def test_a_few_unusable_polls_are_tolerated_a_run_of_them_is_not(
+            self, clock, tmp_path):
+        class Flaky(HoldVenue):
+            fail = 0
+
+            def get_spot_mark(self, symbol):
+                if self.opened_ms is not None and Flaky.fail > 0:
+                    Flaky.fail -= 1
+                    raise RuntimeError("ticker down")
+                return super().get_spot_mark(symbol)
+        Flaky.fail = 2
+        report, _ = _run(Flaky(clock), clock, tmp_path)
+        assert report["verdict"] == "PASSED"
+        Flaky.fail = 99
+        venue = Flaky(clock)
+        report, _ = _run(venue, clock, tmp_path)
+        assert report["verdict"] == "FAILED" and report["failed_stage"] == "hold"
+        assert venue.perp_qty == pytest.approx(0.0)         # still closed
+
+    def test_an_interrupt_during_the_hold_closes_the_pair_and_writes_the_report(
+            self, clock, tmp_path):
+        class Interrupted(HoldVenue):
+            def get_mark(self, symbol):
+                if self.opened_ms is not None and not self.closed:
+                    raise KeyboardInterrupt("operator")
+                return super().get_mark(symbol)
+        venue = Interrupted(clock)
+        out = str(tmp_path / "drill.json")
+        with pytest.raises(KeyboardInterrupt):
+            D.run_drill(broker=venue, arm=True, notional=100.0, venue="testnet",
+                        hold=_plan(clock), out=out)
+        assert venue.perp_qty == pytest.approx(0.0)         # flat, not abandoned
+        data = json.load(open(out))
+        assert data["verdict"] == "FAILED"
+        assert any(s["stage"] == "abort_unwind" and s["ok"] for s in data["stages"])
+
+    def test_a_position_already_at_the_venue_is_reported_as_open_not_nothing(
+            self, clock, tmp_path):
+        report = D.run_drill(broker=HoldVenue(clock, venue_perp=0.5), arm=True,
+                             notional=100.0, venue="testnet", hold=_plan(clock))
+        assert report["failed_stage"] == "flat" and report["still_open"] is True
+        assert "HUMAN MUST ACT" in report["next_action"]
