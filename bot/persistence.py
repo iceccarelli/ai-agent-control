@@ -327,6 +327,7 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_day ON trades(day);
 CREATE INDEX IF NOT EXISTS idx_trades_closed ON trades(closed_epoch);
+CREATE INDEX IF NOT EXISTS idx_trades_lifecycle ON trades(symbol, opened_epoch);
 
 CREATE TABLE IF NOT EXISTS positions (
     symbol        TEXT PRIMARY KEY,
@@ -1319,17 +1320,26 @@ class StateStore:
 
     #: A position is the unit of performance, not an exit fill: a position that
     #: leaves in three pieces is ONE sample.  A position is complete when it has
-    #: no row left in ``positions`` and none of its exits is still provisional;
+    #: no row left in ``positions``, none of its exits is still provisional and
+    #: none still lacks its funding (a perpetual's net without funding is not
+    #: its result);
     #: until then it is not yet a result (a take-profit partial is not a win
     #: while the remainder can still stop out).
     _COMPLETE = (
         "NOT EXISTS (SELECT 1 FROM trades p WHERE p.symbol = {a}.symbol"
         " AND p.opened_epoch = {a}.opened_epoch AND p.price_provisional = 1)"
+        "{funding}"
         " AND NOT EXISTS (SELECT 1 FROM positions o WHERE o.symbol = {a}.symbol"
         " AND o.opened_epoch = {a}.opened_epoch)")
 
+    _FUNDING_BOOKED = (
+        " AND NOT EXISTS (SELECT 1 FROM trades f WHERE f.symbol = {a}.symbol"
+        " AND f.opened_epoch = {a}.opened_epoch"
+        " AND json_extract(f.meta, '$.funding_booked') = 0)")
+
     def lifecycles(self, limit: int = 200, symbol: Optional[str] = None,
-                   with_regime: bool = False) -> List[Dict[str, Any]]:
+                   with_regime: bool = False,
+                   funding_booked_only: bool = True) -> List[Dict[str, Any]]:
         """Completed position lifecycles, newest first, one row each.
 
         The rows have the shape of a ``trades`` row (so the readers that take
@@ -1348,7 +1358,7 @@ class StateStore:
             f"SELECT t.*{regime} FROM trades t JOIN ("
             " SELECT g.symbol AS symbol, g.opened_epoch AS opened_epoch,"
             "  MAX(g.closed_epoch) AS mc FROM trades g"
-            f" WHERE {self._COMPLETE.format(a='g')}{where}"
+            f" WHERE {self._COMPLETE.format(a='g', funding=(self._FUNDING_BOOKED.format(a='g') if funding_booked_only else ''))}{where}"
             " GROUP BY g.symbol, g.opened_epoch ORDER BY mc DESC LIMIT ?) k"
             " ON t.symbol = k.symbol AND t.opened_epoch = k.opened_epoch"
             " ORDER BY k.mc DESC, t.opened_epoch DESC, t.closed_epoch ASC, t.id ASC",
@@ -1395,9 +1405,13 @@ class StateStore:
             "SELECT * FROM trades WHERE price_provisional = 0 "
             "ORDER BY closed_epoch DESC, id DESC LIMIT ?", (int(limit),))]
 
-    def recent_trades(self, limit: int = 200) -> List[Dict[str, Any]]:
-        """Completed position lifecycles (see :meth:`lifecycles`), newest first."""
-        return self.lifecycles(limit)
+    def recent_trades(self, limit: int = 200, *,
+                      funding_booked_only: bool = True) -> List[Dict[str, Any]]:
+        """Completed position lifecycles (see :meth:`lifecycles`), newest first.
+
+        ``funding_booked_only=False`` is for a caller that accounts funding
+        itself and says so (the backtest)."""
+        return self.lifecycles(limit, funding_booked_only=funding_booked_only)
 
     def fee_evidence(self) -> Dict[str, Any]:
         """How much of the booked net PnL rests on venue-confirmed fees.
@@ -1414,10 +1428,13 @@ class StateStore:
             " SUM(CASE WHEN json_extract(meta, '$.funding_booked') = 0"
             "     THEN 1 ELSE 0 END) AS funding_unbooked_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
+            "     AND COALESCE(json_extract(meta, '$.funding_booked'), 1) != 0"
             "     THEN 1 ELSE 0 END) AS realized_n,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
+            "     AND COALESCE(json_extract(meta, '$.funding_booked'), 1) != 0"
             "     THEN net_pnl ELSE 0 END) AS realized_net,"
             " SUM(CASE WHEN entry_fee_realized=1 AND exit_fee_realized=1"
+            "     AND COALESCE(json_extract(meta, '$.funding_booked'), 1) != 0"
             "     THEN 0 ELSE net_pnl END) AS unconfirmed_net"
             " FROM trades WHERE price_provisional = 0"
         )
@@ -1658,14 +1675,35 @@ class StateStore:
                        json.loads(r["meta"] or "{}").get("exit_order_ids", []))
         return out
 
-    def booked_funding_ids(self, symbol: str) -> set:
-        """Venue settlement ids already booked on some trade of ``symbol``."""
-        out: set = set()
+    def booked_funding_ids(self, symbol: str) -> Dict[str, Optional[float]]:
+        """Settlement ids already booked on some trade of ``symbol`` -> the
+        amount booked (None when the row predates amounts being kept)."""
+        out: Dict[str, Optional[float]] = {}
         for r in self._query(
                 "SELECT meta FROM trades WHERE symbol = ? AND "
                 "json_extract(meta, '$.funding_booked') = 1", (str(symbol),)):
-            out.update(str(i) for i in
-                       json.loads(r["meta"] or "{}").get("funding_payment_ids", []))
+            meta = json.loads(r["meta"] or "{}")
+            amounts = {str(p["id"]): float(p["usd"])
+                       for p in meta.get("funding_payments", [])}
+            for i in meta.get("funding_payment_ids", []):
+                out[str(i)] = amounts.get(str(i))
+        return out
+
+    def overlapping_lifecycles(self, symbol: str, opened_epoch: float,
+                               until_epoch: float) -> List[Dict[str, Any]]:
+        """Other positions of ``symbol`` whose life overlaps [opened, until]:
+        a settlement inside the overlap cannot be given to either safely."""
+        out = [dict(r) for r in self._query(
+            "SELECT symbol, opened_epoch, MAX(closed_epoch) AS closed_epoch "
+            "FROM trades WHERE symbol = ? AND opened_epoch != ? "
+            "GROUP BY symbol, opened_epoch "
+            "HAVING opened_epoch < ? AND MAX(closed_epoch) > ?",
+            (str(symbol), float(opened_epoch), float(until_epoch),
+             float(opened_epoch)))]
+        out += [dict(r) for r in self._query(
+            "SELECT symbol, opened_epoch, 0 AS closed_epoch FROM positions "
+            "WHERE symbol = ? AND opened_epoch != ? AND opened_epoch < ?",
+            (str(symbol), float(opened_epoch), float(until_epoch)))]
         return out
 
     def set_trade_funding_status(self, trade_id: int, status: str,
@@ -1692,7 +1730,8 @@ class StateStore:
 
     def book_trade_funding(self, trade_id: int, *, funding_usd: float,
                            payment_ids: Sequence[str], status: str,
-                           evidence: Mapping[str, Any]) -> bool:
+                           evidence: Mapping[str, Any],
+                           payments: Sequence[Mapping[str, Any]] = ()) -> bool:
         """Book the funding the venue settled against one trade, once.
 
         Atomic: the row is touched only while its funding is still unbooked (a
@@ -1715,6 +1754,9 @@ class StateStore:
                 return False
             meta.update({"funding_booked": True, "funding_usd": float(funding_usd),
                          "funding_payment_ids": sorted({str(i) for i in payment_ids}),
+                         "funding_payments": [
+                             {"id": str(p["id"]), "usd": float(p["usd"])}
+                             for p in payments],
                          "funding_status": str(status),
                          "funding_evidence": dict(evidence)})
             meta.pop("funding_detail", None)
@@ -1773,6 +1815,7 @@ class StateStore:
         """
         rows = self._query(
             "SELECT symbol, opened_epoch, SUM(net_pnl) AS net, "
+            "MAX(price_provisional) AS prov, "
             "MAX(closed_epoch) AS last_closed, MAX(id) AS last_id "
             "FROM trades GROUP BY symbol, opened_epoch "
             "ORDER BY last_closed DESC, last_id DESC LIMIT 200"
@@ -1792,11 +1835,22 @@ class StateStore:
                     "SELECT MAX(id) AS m FROM trades WHERE closed_epoch <= ?",
                     (float(old[0]["value"]),))
                 baseline = int(got[0]["m"] or 0) if got else 0
+        # A position still on the book is not a finished decision: a partial
+        # take-profit on it must not read as a win that ends a loss streak.
+        still_open = {(str(o["symbol"]), float(o["opened_epoch"]))
+                      for o in self._query(
+                          "SELECT symbol, opened_epoch FROM positions")}
         n = 0
         for r in rows:
+            if (not int(r["prov"] or 0) and
+                    (str(r["symbol"]), float(r["opened_epoch"])) in still_open):
+                continue
             if int(r["last_id"] or 0) <= baseline:
                 break           # already answered for by an elapsed breaker
-            if float(r["net"]) <= 0.0:
+            # An unpriced exit hides its real result behind fees alone, so a
+            # position with one is a loss until the venue prices it (summing
+            # its fee-only piece with priced winners could end a streak).
+            if int(r["prov"] or 0) or float(r["net"]) <= 0.0:
                 n += 1
             else:
                 break
