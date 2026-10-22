@@ -155,3 +155,43 @@ def test_the_operator_report_carries_the_unpriced_exits(store):
     assert rep["price_provisional_trades"] == 1
     assert rep["price_provisional_oldest_age_s"] > 6 * H
     assert rep["price_provisional_reviewed"] == 0
+
+
+def test_unbooked_funding_is_named_in_the_analytics_and_the_health_payload(store):
+    import json as _json
+    store.record_trade(TradeRecord(
+        symbol="BTCUSDT", side="Sell", qty=0.01, entry_price=60_000.0,
+        exit_price=59_000.0, gross_pnl=10.0, entry_fee=0.1, exit_fee=0.1,
+        opened_epoch=1000.0, closed_epoch=2000.0,
+        meta={"funding_booked": False,
+              "funding_status": "FUNDING_SIGN_UNVERIFIED"}))
+    assert store.funding_unbooked_summary() == {
+        "count": 1, "statuses": {"FUNDING_SIGN_UNVERIFIED": 1}}
+    rep = PerformanceAnalytics(store).report()
+    assert any("NO funding booked" in n for n in rep.notes)
+    import main as app
+    bot = types.SimpleNamespace(
+        store=store, _reconciled=True, started_epoch=0, cfg=types.SimpleNamespace(),
+        observation_status="ok", loop_interval_s=60.0, _tick_failures=0,
+        _last_tick_ok_epoch=0.0, HEALTH_MAX_TICK_FAILURES=5, HEALTH_STALL_INTERVALS=3,
+        carry_status=lambda: {}, _loop_stalled=lambda: False,
+        _risk_halted=lambda: False, _memory_health=lambda: {},
+        _policy_health=lambda: {})
+    payload = app.TradingBot.health(bot)
+    assert payload["funding_unbooked"]["count"] == 1
+    assert "partially_open_after_exit" in payload
+    _json.dumps(payload)                      # servable as the health body
+
+
+def test_the_operator_report_names_unbooked_funding_and_half_closed_positions(store):
+    from tools.carry_report import build_report
+    store.record_trade(TradeRecord(
+        symbol="BTCUSDT", side="Sell", qty=0.004, entry_price=60_000.0,
+        exit_price=59_000.0, gross_pnl=4.0, entry_fee=0.0, exit_fee=0.0,
+        opened_epoch=1000.0, closed_epoch=2000.0,
+        meta={"funding_booked": False, "funding_status": "EVIDENCE_INCOMPLETE"}))
+    store._exec("INSERT INTO positions(symbol, side, qty, entry_price, stop_price,"
+                " opened_epoch) VALUES('BTCUSDT','Sell',0.006,60000,61000,1000.0)")
+    rep = build_report(store.path)["ordinary_trades"]
+    assert rep["funding_unbooked_by_status"] == {"EVIDENCE_INCOMPLETE": 1}
+    assert rep["positions_open_after_an_exit"] == 1

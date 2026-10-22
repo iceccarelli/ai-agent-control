@@ -100,3 +100,34 @@ def test_regime_label_is_read_once_per_position(store):
     _exit(store, opened=1000.0, closed=2000.0, qty=0.005)
     _exit(store, opened=1000.0, closed=2001.0, qty=0.005)
     assert len(store.trades_with_regime()) == 1
+
+
+def test_a_multi_day_position_is_attributed_to_the_days_of_its_exits(store):
+    from performance_analytics import PerformanceAnalytics
+    day1, day2 = 1_700_000_000.0, 1_700_000_000.0 + 86_400.0 * 2
+    store.record_trade(TradeRecord(
+        symbol="BTCUSDT", side="Sell", qty=0.005, entry_price=60_000.0,
+        exit_price=59_000.0, gross_pnl=5.0, entry_fee=0.0, exit_fee=0.0,
+        opened_epoch=day1 - 100, closed_epoch=day1))
+    store.record_trade(TradeRecord(
+        symbol="BTCUSDT", side="Sell", qty=0.005, entry_price=60_000.0,
+        exit_price=61_000.0, gross_pnl=-5.0, entry_fee=0.0, exit_fee=0.0,
+        opened_epoch=day1 - 100, closed_epoch=day2))
+    lc = store.recent_trades()[0]
+    assert lc["spans_days"] is True and len(lc["pieces"]) == 2
+    by_day = PerformanceAnalytics._daily_returns([lc])
+    assert sorted(by_day.values()) == [-5.0, 5.0]        # not one 0.0 day
+    rep = PerformanceAnalytics(store).report()
+    assert any("booking days, not earning days" in n for n in rep.notes)
+
+
+def test_a_position_that_stays_open_after_an_exit_is_named_not_forgotten(store):
+    _exit(store, opened=1000.0, closed=2000.0, qty=0.004, gross=4.0)
+    store._exec("INSERT INTO positions(symbol, side, qty, entry_price, stop_price,"
+                " opened_epoch) VALUES('BTCUSDT','Sell',0.006,60000,61000,1000.0)")
+    [row] = store.partial_open_lifecycles(now=2000.0 + 3600)
+    assert row["symbol"] == "BTCUSDT" and row["exits"] == 1
+    assert row["since_last_exit_s"] == pytest.approx(3600.0)
+    from performance_analytics import PerformanceAnalytics
+    assert any("still open after booking an exit" in n
+               for n in PerformanceAnalytics(store).report().notes)

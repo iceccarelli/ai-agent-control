@@ -155,6 +155,13 @@ class PerformanceAnalytics:
         """
         by_day: Dict[str, float] = defaultdict(float)
         for trade in trades:
+            pieces = trade.get("pieces")
+            if pieces:
+                # a position that left over several days: each exit on its own
+                # day (never everything on the day of the last one)
+                for piece in pieces:
+                    by_day[str(piece["day"])] += float(piece["net_pnl"])
+                continue
             day = str(trade.get("day") or utc_day(float(trade.get("closed_epoch", 0))))
             by_day[day] += float(trade.get("net_pnl", 0.0))
         return dict(by_day)
@@ -185,6 +192,33 @@ class PerformanceAnalytics:
                 "excluded from every figure here, along with their positions"
                 + (f"; {len(un['stuck'])} are stuck past the review window"
                    if un["stuck"] else ""))
+        try:
+            fu = self.store.funding_unbooked_summary()
+        except Exception:  # noqa: BLE001
+            fu = {"count": 0, "statuses": {}}
+        if fu["count"]:
+            notes.append(
+                f"{fu['count']} closed linear trade(s) have NO funding booked "
+                f"({fu['statuses']}); their net P&L excludes funding the venue "
+                "may have paid or charged")
+        try:
+            partial = self.store.partial_open_lifecycles()
+        except Exception:  # noqa: BLE001
+            partial = []
+        if partial:
+            notes.append(
+                f"{len(partial)} position(s) are still open after booking an "
+                "exit; they are not results yet and their realised pieces are "
+                "excluded from every figure here")
+        if any(t.get("spans_days") for t in trades) or any(
+                (t.get("meta") or "").find('"funding_booked": true') >= 0
+                or (t.get("meta") or "").find('"funding_booked":true') >= 0
+                for t in trades):
+            notes.append(
+                "daily figures (Sharpe, Sortino, daily returns) are the day "
+                "each EXIT was booked: funding earned over several days is "
+                "booked on the exit's day, so they describe booking days, not "
+                "earning days, and are not evidence for sizing or expectancy")
         unpriced = dict(unpriced_exits=int(un["count"]),
                         unpriced_stuck=len(un["stuck"]))
 

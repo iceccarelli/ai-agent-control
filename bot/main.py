@@ -301,6 +301,8 @@ class TradingBot:
                             and not carry_blocked and not loop_stalled
                             and not unpriced["stuck"]),
                 "unpriced_exits": unpriced,
+                "partially_open_after_exit": self.store.partial_open_lifecycles(),
+                "funding_unbooked": self.store.funding_unbooked_summary(),
                 "loop_stalled": loop_stalled,
                 "consecutive_tick_failures": self._tick_failures,
                 "last_tick_ok_age_s": (None if not self._last_tick_ok_epoch else
