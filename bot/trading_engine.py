@@ -1676,14 +1676,19 @@ class TradingEngine:
             order_ids: List[str] = []
             pnl_rows: List[Dict[str, Any]] = []
             try:
-                pnl_rows = self._rows_of_this_exit(
-                    self.client.get_closed_pnl(symbol, since_ms=since_ms),
-                    exited)
-                qty_sum = sum(float(r.get("qty", 0) or 0) for r in pnl_rows)
+                all_rows = self.client.get_closed_pnl(symbol, since_ms=since_ms)
+                # A price is accepted ONLY from rows PROVEN to be this exit:
+                # exactly the quantity that left, not a full (possibly
+                # truncated) page, none already named by an exit booked
+                # before. Anything else -- a lagging read that still shows
+                # only an earlier take-profit, a sum that overshoots -- would
+                # price this exit at another fill's price, with full
+                # confidence. That is a provisional exit, not a guess.
+                pnl_rows = self._proven_exit_rows(symbol, all_rows, exited)
+                qty_sum = sum(self._row_qty(r) for r in pnl_rows)
                 if qty_sum > 0:
                     price = sum(float(r.get("avgExitPrice", 0) or 0)
-                                * float(r.get("qty", 0) or 0)
-                                for r in pnl_rows) / qty_sum
+                                * self._row_qty(r) for r in pnl_rows) / qty_sum
                 order_ids = sorted({
                     str(r.get("orderId") or "") for r in pnl_rows
                     if r.get("orderId")
@@ -2028,6 +2033,51 @@ class TradingEngine:
         outcome = self._protect_or_close_naked(
             symbol, row, reason="SPOT_STOP_DEAD", prefer_recorded_stop=True)
         summary.setdefault("stop_dead_outcome", {})[symbol] = outcome
+
+    @staticmethod
+    def _row_qty(r: Mapping[str, Any]) -> float:
+        """Quantity a closed-pnl row CLOSED: ``closedSize`` when the venue
+        states it (``qty`` is the order's size, which overshoots for a
+        partially filled or oversized order), else ``qty``."""
+        for key in ("closedSize", "qty"):
+            try:
+                v = float(r.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v) and v > 0:
+                return v
+        return 0.0
+
+    def _proven_exit_rows(self, symbol: str, rows: List[Dict[str, Any]],
+                          exited: float) -> List[Dict[str, Any]]:
+        """The closed-pnl rows that are provably this exit, or [] (no proof)."""
+        if not rows or len(rows) >= self._CLOSED_PNL_PAGE:
+            return []
+        try:
+            claimed = self.store.claimed_exit_order_ids(symbol)
+        except Exception:  # noqa: BLE001
+            return []
+        fresh = [r for r in rows if str(r.get("orderId") or "") not in claimed]
+
+        def stamp(r: Mapping[str, Any]) -> float:
+            try:
+                return float(r.get("updatedTime", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        tolerance = max(1e-9, abs(exited) * 1e-9)
+        taken: List[Dict[str, Any]] = []
+        total = 0.0
+        for r in sorted(fresh, key=stamp, reverse=True):
+            q = self._row_qty(r)
+            if q <= 0:
+                continue
+            taken.append(r)
+            total += q
+            if abs(total - exited) <= tolerance:
+                return taken
+            if total > exited:
+                return []
+        return []
 
     @staticmethod
     def _rows_of_this_exit(rows: List[Dict[str, Any]],
