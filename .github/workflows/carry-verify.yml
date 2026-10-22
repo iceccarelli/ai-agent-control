@@ -83,6 +83,7 @@ jobs:
           tests/test_directional_funding.py
           tests/test_unpriced_exit_visibility.py
           tests/test_funding_sign_lock.py
+          tests/test_carry_hold_session.py
           tests/test_position_lifecycles.py
           tests/test_observe_exits.py
           tests/test_lifecycle_integration.py

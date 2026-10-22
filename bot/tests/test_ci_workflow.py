@@ -21,6 +21,7 @@ REQUIRED = (
     "test_provisional_exit_reconciliation", "test_directional_funding",
     "test_position_lifecycles", "test_observe_exits",
     "test_unpriced_exit_visibility", "test_funding_sign_lock",
+    "test_carry_hold_session", "test_drill",
     "test_lifecycle_integration", "test_process_restart_recovery",
     "test_risk_management")
 

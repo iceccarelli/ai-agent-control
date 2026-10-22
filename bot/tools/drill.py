@@ -52,6 +52,34 @@ this sequence.
 
     python3 tools/drill.py                      # preflight only, sends nothing
     python3 tools/drill.py --arm --out artifacts/drill.json
+
+HOLD ACROSS A FUNDING SETTLEMENT (the cycle that matters)
+=========================================================
+``--hold-for-settlement`` adds a ``hold`` stage between ``pair`` and ``unwind``
+and a ``funding_final`` stage after ``final_reconcile``. The pair is held, and
+watched every poll by the engine's own ``on_candle`` (margin, venue mismatch,
+inventory cover, inversion exit all still apply), until the account's
+transaction log has paid at least ``--min-settlements`` SETTLEMENT rows that
+the journal booked as venue funding, or ``--max-hold-hours`` run out (then the
+pair is unwound and the drill FAILS: no settlement is not a result). After the
+unwind it re-reads the log until the evidence is complete and the lifecycle is
+reconciled. ``--cash-ledger PATH`` writes ``cash_ledger/2`` (``allows_live``
+always false) whenever the book ends flat after fills, with the funding status
+stated, never assumed:
+
+    CONFIRMED_FROM_SETTLEMENTS   rows the venue paid, sign cross-checked,
+                                 evidence complete, lifecycle reconciled
+                                 (the ledger judges a closed lifecycle only
+                                 6 h after the close: `--settle-wait-hours`)
+    BOOKED_PENDING_RECONCILIATION  the rows are booked, but that 6 h grace has
+                                 not passed; exit 5, never 0
+    NO_SETTLEMENT_OBSERVED       evidence complete and no row: not a result
+    UNCONFIRMED                  anything else (incomplete, unattributed, ...)
+
+Exit 0 only when the drill PASSED, the book is flat and the funding status is
+CONFIRMED_FROM_SETTLEMENTS. 3 = refused (not testnet / paper / live-armed),
+2 = cannot start or zero fills, 4 = flat but funding not confirmed,
+5 = flat, rows booked, reconciliation still inside its grace, 1 = other.
 """
 from __future__ import annotations
 
@@ -60,6 +88,7 @@ import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -223,9 +252,126 @@ class Drill:
         return s.ok
 
 
+@dataclass
+class HoldPlan:
+    """How long to hold the pair, and what has to be paid before it is closed."""
+
+    min_settlements: int = 1
+    max_hold_s: float = 9 * 3600.0
+    poll_s: float = 60.0
+    #: after the unwind: how long to keep re-reading the log for the evidence to
+    #: become complete and the lifecycle reconciled.
+    settle_wait_s: float = 6.25 * 3600.0
+    sleep: Callable[[float], None] = time.sleep
+
+
+CONFIRMED = "CONFIRMED_FROM_SETTLEMENTS"
+#: Rows the venue paid are booked (sign cross-checked, evidence complete, nothing
+#: unattributed) but the ledger will not call the lifecycle reconciled until
+#: `ledger.MISSING_GRACE_MS` after the close: a late settlement could still
+#: arrive. Not a confirmed result; a later read promotes it.
+PENDING = "BOOKED_PENDING_RECONCILIATION"
+NO_SETTLEMENT = "NO_SETTLEMENT_OBSERVED"
+UNCONFIRMED = "UNCONFIRMED"
+
+
+def venue_settlement_rows(journal: Any) -> int:
+    """Funding entries the journal booked from a row the VENUE paid."""
+    return sum(1 for e in journal.entries
+               if e.kind == "funding" and e.basis == "venue")
+
+
+def funding_status(statement: Dict[str, Any], rows: int, evidence_complete: bool,
+                   min_settlements: int) -> str:
+    """The one place the funding answer is decided. Never assumed."""
+    enough = evidence_complete and rows >= max(1, int(min_settlements))
+    if enough and statement.get("funding_confirmed") is True:
+        return CONFIRMED
+    if (enough and not statement.get("funding_unattributed")
+            and not statement.get("funding_unread")
+            and not statement.get("funding_estimated_entries")
+            and statement.get("funding_lifecycles")
+            and all(l.get("state") == "PENDING_DELIVERY_GRACE"
+                    for l in statement["funding_lifecycles"])):
+        return PENDING
+    if evidence_complete and rows == 0:
+        return NO_SETTLEMENT
+    return UNCONFIRMED
+
+
+def session_refusal(cfg: Any, client: Any = None) -> Optional[str]:
+    """Why a hold session must not start here, or None.
+
+    The cash ledger is TESTNET evidence: mainnet, demo, paper and any live
+    authorisation are all refused up front, before a single order could be
+    considered (the order gate would also refuse per order).
+    """
+    if str(getattr(cfg, "BYBIT_VENUE", "")).lower() != "testnet":
+        return (f"BYBIT_VENUE={getattr(cfg, 'BYBIT_VENUE', None)!r}: a hold "
+                "session runs on the testnet venue only")
+    if not bool(getattr(cfg, "USE_TESTNET", False)):
+        return "USE_TESTNET is not set: refusing a non-testnet configuration"
+    if bool(getattr(cfg, "PAPER_TRADING", True)):
+        return ("PAPER_TRADING is on: a paper fill is not venue evidence and "
+                "the carry book has no paper venue")
+    if str(getattr(cfg, "LIVE_TRADING_ACK", "") or ""):
+        return "a live-trading acknowledgement is present: refusing"
+    url = str(getattr(client, "base_url", "") or "").rstrip("/")
+    if url:
+        from bybit_connection import MAINNET_REST
+        if url == MAINNET_REST:
+            return f"the client targets the mainnet host {MAINNET_REST}"
+    return None
+
+
+def write_carry_cash_ledger(path: str, *, journal: Any, state: Dict[str, Any],
+                            status: str, flat: bool, venue: str) -> str:
+    """``cash_ledger/2``: one carry cycle, from the journal, nothing invented."""
+    st = journal.statement()
+    closes = [e for e in journal.entries if e.kind == "perp_close"]
+    qty = sum(next((l.qty for l in e.lines if l.account == "PERP"), 0.0)
+              for e in closes)
+    realised = -sum(next((l.usd for l in e.lines if l.account == "REALISED"), 0.0)
+                    for e in closes)
+    entry = float(state.get("entry_price") or 0.0)
+    exit_price = (entry - realised / qty) if qty > 0 and entry > 0 else 0.0
+    payload = {
+        "schema": "cash_ledger/2",
+        "allows_live": False,
+        "venue": venue,
+        "category": "carry",
+        "symbol": PERP_SYMBOL,
+        "flat": bool(flat),
+        "qty": float(state.get("entry_qty") or 0.0),
+        "entry_price": entry,
+        "exit_price": exit_price,
+        "fills": int(st["fills"]),
+        "fees_usd": float(st["fees_usd"]),
+        "fees_confirmed": bool(st["fees_confirmed"]),
+        "funding_status": status,
+        "funding_venue_usd": float(st["funding_venue_usd"]),
+        "funding_settlements": venue_settlement_rows(journal),
+        "funding_confirmed": bool(st["funding_confirmed"]),
+        "realised_usd": float(st["realised_usd"]),
+        "net_usd": float(st["net_usd"]),
+        "net_basis": st["net_basis"],
+        "note": ("Testnet dollars are not cash. Funding is the amount the "
+                 "venue's own SETTLEMENT rows paid, sign cross-checked; "
+                 "'UNCONFIRMED' and 'NO_SETTLEMENT_OBSERVED' are not results."),
+        "written_ms": int(time.time() * 1000),
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+    os.replace(tmp, path)
+    return path
+
+
 def run_drill(*, broker: Any, notional: Optional[float] = None,
               arm: bool = False, out: str = "", venue: str = "unknown",
-              engine_factory: Any = None) -> Dict[str, Any]:
+              engine_factory: Any = None, hold: Optional[HoldPlan] = None,
+              cash_ledger: str = "") -> Dict[str, Any]:
     """The whole sequence. Returns the transcript whatever happens."""
     import shadow
 
@@ -416,7 +562,64 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
             return
         s.passed(venue_perp_qty=venue_qty, book_perp_qty=book_qty, drift=drift)
 
+    def book_settlements(now_ms: int) -> Any:
+        """Read the account's settlement rows since the open and book them."""
+        opened = engine.position.opened_ms if engine.position else int(
+            state.get("opened_ms") or 0)
+        ev = broker.get_funding_evidence(
+            PERP_SYMBOL, max(0, opened - L.ATTRIBUTION_SLACK_MS), now_ms)
+        state["evidence"] = ev
+        L.book_funding_payments(journal, ev.payments, ms=now_ms)
+        return ev
+
+    def hold_stage(s: Stage) -> None:
+        from market_snapshot import take_snapshot
+        plan = hold
+        state["opened_ms"] = engine.position.opened_ms
+        deadline = time.time() + plan.max_hold_s
+        polls = 0
+        while True:
+            polls += 1
+            now_ms = int(time.time() * 1000)
+            view = take_snapshot(broker, perp_symbol=PERP_SYMBOL,
+                                 spot_symbol=SPOT_SYMBOL)
+            view.assert_fresh()
+            engine.snapshot = view
+            decision = engine.on_candle(
+                mark=view.perp_mark, funding_bps=view.funding_print_bps,
+                spot=view.spot_mark, timestamp_ms=now_ms,
+                funding_print_ms=view.funding_print_ms)
+            d.orders_sent = len(journal.entries)
+            if engine.position is None or engine.state is BookState.HALTED:
+                state["engine_ended"] = decision.action
+                s.failed(f"the book left the hedge on its own "
+                         f"({decision.action}: {decision.reason}) before the "
+                         "settlement was observed", polls=polls,
+                         action=decision.action, reason=decision.reason)
+                return
+            try:
+                book_settlements(now_ms)
+            except Exception as exc:  # noqa: BLE001
+                state["evidence"] = None
+                s.evidence["last_read_error"] = f"{type(exc).__name__}: {exc}"
+            rows = venue_settlement_rows(journal)
+            if rows >= plan.min_settlements:
+                s.passed(polls=polls, settlements=rows,
+                         held_s=(now_ms - state["opened_ms"]) / 1000.0)
+                return
+            if time.time() >= deadline:
+                s.failed("no settlement row was booked within the maximum "
+                         "hold; the pair is unwound and this is not a result",
+                         polls=polls, settlements=rows,
+                         max_hold_s=plan.max_hold_s)
+                return
+            plan.sleep(plan.poll_s)
+
     def unwind(s: Stage) -> None:
+        if engine.position is None and engine.state is BookState.FLAT:
+            s.passed(action="already_flat",
+                     reason=state.get("engine_ended", ""))
+            return
         decision = engine._unwind(state["perp"], "DRILL_COMPLETE")
         d.orders_sent = len(journal.entries)
         if decision.action != "unwound" or engine.state is BookState.HALTED:
@@ -440,13 +643,61 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
             return
         s.passed(verdict="FLAT", **evidence)
 
+    def funding_final(s: Stage) -> None:
+        """After the close: re-read the log until the evidence is complete and
+        the lifecycle reconciled (or the wait runs out). The status is decided
+        by `funding_status` from what the journal holds, not from hope."""
+        import funding_reconcile as R
+        plan = hold
+        start = max(0, int(state["opened_ms"]) - L.ATTRIBUTION_SLACK_MS)
+        end = time.time() + plan.settle_wait_s
+        ev = None
+        while True:
+            now_ms = int(time.time() * 1000)
+            try:
+                ev = book_settlements(now_ms)
+                try:
+                    history = broker.get_funding_history_range(
+                        PERP_SYMBOL, start, now_ms)
+                except Exception:  # noqa: BLE001
+                    history = None
+                R.reconcile_funding(journal, history=history, evidence=ev,
+                                    now_ms=now_ms)
+                st = journal.statement(now_ms=now_ms)
+                if ev.complete and st["funding_reconciled"]:
+                    break
+            except Exception as exc:  # noqa: BLE001
+                s.evidence["last_read_error"] = f"{type(exc).__name__}: {exc}"
+            if time.time() >= end:
+                break
+            plan.sleep(plan.poll_s)
+        st = journal.statement(now_ms=int(time.time() * 1000))
+        rows = venue_settlement_rows(journal)
+        status = funding_status(st, rows, bool(ev is not None and ev.complete),
+                                plan.min_settlements)
+        state["funding_status"] = status
+        evidence = {"funding_status": status, "settlements": rows,
+                    "funding_venue_usd": st["funding_venue_usd"],
+                    "funding_confirmed": st["funding_confirmed"],
+                    "evidence_complete": bool(ev is not None and ev.complete)}
+        if status != CONFIRMED:
+            s.failed(f"funding is {status}: the cycle did not produce "
+                     "confirmed, settlement-booked funding", **evidence)
+            return
+        s.passed(**evidence)
+
     def statement(s: Stage) -> None:
         st = journal.statement()
         s.passed(**{k: v for k, v in st.items() if not k.startswith("_")})
 
-    for name, fn in (("open", open_pair), ("pair", pair), ("unwind", unwind),
-                     ("final_reconcile", final_reconcile),
-                     ("statement", statement)):
+    sequence = [("open", open_pair), ("pair", pair)]
+    if hold is not None:
+        sequence.append(("hold", hold_stage))
+    sequence += [("unwind", unwind), ("final_reconcile", final_reconcile)]
+    if hold is not None:
+        sequence.append(("funding_final", funding_final))
+    sequence.append(("statement", statement))
+    for name, fn in sequence:
         if not d.run_stage(name, fn):
             # Orders may have left this process whatever the failed stage was
             # (an ambiguous submission, a halted engine, a pair that would not
@@ -466,7 +717,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                     # reconcile, the engine raised after sending): the hedge the
                     # engine can close is still open. Try the engine's own
                     # reduce-only unwind once, then say what the venue holds.
-                    if (name in ("open", "pair") and engine.position is not None
+                    if (name in ("open", "pair", "hold") and engine.position is not None
                             and state.get("perp") is not None):
                         abort = d.stage("abort_unwind")
                         try:
@@ -484,9 +735,34 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                                              verdict=verdict2, **evidence2)
                         except Exception as exc:  # noqa: BLE001
                             abort.failed(f"{type(exc).__name__}: {exc}")
-            return _report(d, state, out, cap, verdict="FAILED")
+            return _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
 
-    return _report(d, state, out, cap, verdict="PASSED")
+    return _finish(d, state, out, cap, "PASSED", cash_ledger, venue)
+
+
+def _finish(d: Drill, state: Dict[str, Any], out: str, cap: float,
+            verdict: str, cash_ledger: str, venue: str) -> Dict[str, Any]:
+    """Report, and (hold sessions) write the cash ledger when the book ended
+    flat after real fills -- whatever the funding status, which it states."""
+    report = _report(d, state, out, cap, verdict=verdict)
+    journal = state.get("journal")
+    status = state.get("funding_status", UNCONFIRMED)
+    report["funding_status"] = status
+    report["cash_ledger"] = ""
+    if (cash_ledger and journal is not None and not d.still_open
+            and "funding_status" in state
+            and any(e.kind in ("perp_open", "perp_close")
+                    for e in journal.entries)):
+        try:
+            report["cash_ledger"] = write_carry_cash_ledger(
+                cash_ledger, journal=journal, state=state, status=status,
+                flat=True, venue=venue)
+        except Exception as exc:  # noqa: BLE001
+            report["cash_ledger_error"] = f"{type(exc).__name__}: {exc}"
+    if out:
+        with open(out, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2, default=str)
+    return report
 
 
 def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
@@ -626,7 +902,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="send orders. Without it nothing is sent.")
     ap.add_argument("--notional", type=float, default=None)
     ap.add_argument("--out", default="")
+    ap.add_argument("--hold-for-settlement", action="store_true",
+                    help="hold the pair until the venue has paid a funding "
+                         "settlement, then close and reconcile (needs --arm)")
+    ap.add_argument("--min-settlements", type=int, default=1)
+    ap.add_argument("--max-hold-hours", type=float, default=9.0)
+    ap.add_argument("--poll-seconds", type=float, default=60.0)
+    ap.add_argument("--settle-wait-hours", type=float, default=6.25,
+                    help="after the close, keep re-reading the log this long "
+                         "(the ledger judges a lifecycle 6 h after its end)")
+    ap.add_argument("--cash-ledger", default="",
+                    help="write cash_ledger/2 here when the book ends flat")
     args = ap.parse_args(argv)
+    if args.hold_for_settlement and not args.arm:
+        print("REFUSED: --hold-for-settlement sends orders and needs --arm.",
+              file=sys.stderr)
+        return 3
+    if args.hold_for_settlement and args.min_settlements < 1:
+        print("REFUSED: --min-settlements must be at least 1.", file=sys.stderr)
+        return 3
 
     try:
         bot = _load_bot()
@@ -656,6 +950,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr)
         return 2
 
+    if args.hold_for_settlement:
+        why_not = session_refusal(bot.cfg, getattr(bot.carry.broker, "client", None))
+        if why_not:
+            print(f"REFUSED: {why_not}", file=sys.stderr)
+            return 3
+
     if args.arm:
         engaged, why = book_kill_switch(
             str(getattr(getattr(bot, "cfg", None), "STATE_DB_PATH", "") or ""))
@@ -666,8 +966,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                   "armed.", file=sys.stderr)
             return 2
 
+    plan = (HoldPlan(min_settlements=args.min_settlements,
+                     max_hold_s=args.max_hold_hours * 3600.0,
+                     poll_s=args.poll_seconds,
+                     settle_wait_s=args.settle_wait_hours * 3600.0)
+            if args.hold_for_settlement else None)
     report = run_drill(broker=bot.carry.broker, notional=args.notional,
-                       arm=args.arm, out=args.out,
+                       arm=args.arm, out=args.out, hold=plan,
+                       cash_ledger=args.cash_ledger,
                        venue=str(getattr(bot.cfg, "BYBIT_VENUE", "unknown")
                                  if hasattr(bot, "cfg") else "unknown"))
 
@@ -692,7 +998,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"    - {line}")
     if args.out:
         print(f"\n  transcript: {args.out}")
-    return 0 if report["verdict"] in ("PASSED", "PREFLIGHT_ONLY") else 1
+    return drill_exit_code(report, hold=plan is not None)
+
+
+def drill_exit_code(report: Dict[str, Any], *, hold: bool) -> int:
+    """0 only for a drill that PASSED; with a hold: flat, a cash ledger on disk
+    and funding CONFIRMED_FROM_SETTLEMENTS. Zero fills is 2, flat but funding
+    unconfirmed is 4, anything else that failed is 1."""
+    if report["verdict"] == "PREFLIGHT_ONLY":
+        return 0
+    if not hold:
+        return 0 if report["verdict"] == "PASSED" else 1
+    if report.get("still_open"):
+        return 1
+    if report["verdict"] == "FAILED" and report.get("orders_sent", 0) == 0:
+        return 2
+    if report["verdict"] != "PASSED":
+        if (report.get("funding_status") == PENDING and report.get("cash_ledger")
+                and os.path.isfile(report["cash_ledger"])):
+            return 5
+        return 4 if report.get("funding_status") in (
+            NO_SETTLEMENT, UNCONFIRMED) and report.get("orders_sent", 0) else 1
+    if (report.get("funding_status") == CONFIRMED
+            and report.get("cash_ledger")
+            and os.path.isfile(report["cash_ledger"])):
+        return 0
+    return 4
 
 
 if __name__ == "__main__":
