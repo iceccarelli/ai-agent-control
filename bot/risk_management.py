@@ -599,6 +599,25 @@ class BillionaireRiskManager:
                               order_link_id=str(r.get("order_link_id")))
         return _allow("NO_UNRESOLVED_ENTRY")
 
+    def _gate_unpriced_exit(self) -> RiskDecision:
+        """No new entry while an exit has stayed unpriced past the review window.
+
+        An exit booked without a price is excluded from every result, so a loss
+        sitting in one is invisible to the streak brake, the daily-loss gate
+        and Kelly.  Briefly that is the honest state; past the window it is a
+        blind spot, and adding risk on top of it is refused until the venue
+        prices it or a human acknowledges it.  Existing positions keep being
+        managed: this gates entries only.
+        """
+        try:
+            status = self.store.unpriced_exit_status()
+        except Exception as exc:  # noqa: BLE001
+            return _block("UNPRICED_EXIT_STATE_UNREADABLE", error=str(exc))
+        if status["stuck"]:
+            return _block("UNPRICED_EXIT_STUCK", trade_ids=status["stuck"],
+                          oldest_age_s=status["oldest_age_s"])
+        return _allow("NO_STUCK_UNPRICED_EXIT")
+
     def _gate_naked_positions(self) -> RiskDecision:
         """No new trade while any existing position lacks a protective stop.
 
@@ -1082,6 +1101,7 @@ class BillionaireRiskManager:
                 self._gate_daily_loss(account_equity),
                 self._gate_drawdown(account_equity),
                 self._gate_naked_positions(),
+                self._gate_unpriced_exit(),
                 self._gate_existing_position(symbol),
                 self._gate_unresolved_entry(symbol),
                 self._gate_position_count(),

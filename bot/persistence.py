@@ -1436,6 +1436,89 @@ class StateStore:
             "SELECT * FROM trades WHERE price_provisional = 1 "
             "ORDER BY closed_epoch DESC LIMIT ?", (int(limit),))]
 
+    #: An exit that has stayed unpriced this long is no longer "pending": it is
+    #: a position whose result nobody can see.  New entries are refused until a
+    #: human has looked at it (``acknowledge_unpriced_exit``) or it prices.
+    UNPRICED_EXIT_REVIEW_S = 6 * 3600.0
+    UNPRICED_ACK = "HUMAN_REVIEWED_UNPRICED_EXIT"
+
+    def unpriced_exit_status(self, review_after_s: Optional[float] = None,
+                             now: Optional[float] = None) -> Dict[str, Any]:
+        """Every exit still without an authoritative price, and how stale.
+
+        ``stuck`` are the trade ids unpriced for longer than the review window
+        that no human has acknowledged; they block new entries and must be
+        visible on every operator surface.  ``lifecycles`` counts the
+        positions those rows belong to -- results that Kelly, memory and the
+        analytics cannot see yet.
+        """
+        window = float(self.UNPRICED_EXIT_REVIEW_S if review_after_s is None
+                       else review_after_s)
+        t = utc_now_epoch() if now is None else float(now)
+        rows = self.provisional_trades(limit=100_000)
+        stuck: List[int] = []
+        reviewed: List[int] = []
+        oldest = 0.0
+        positions = set()
+        for r in rows:
+            meta = json.loads(r["meta"] or "{}")
+            age = max(0.0, t - float(r["closed_epoch"]))
+            oldest = max(oldest, age)
+            positions.add((r["symbol"], r["opened_epoch"]))
+            if meta.get("operator_reviewed"):
+                reviewed.append(int(r["id"]))
+            elif age > window:
+                stuck.append(int(r["id"]))
+        return {"count": len(rows), "oldest_age_s": oldest,
+                "lifecycles": len(positions), "stuck": stuck,
+                "reviewed": reviewed, "review_after_s": window}
+
+    def acknowledge_unpriced_exit(self, trade_id: int, operator_ack: str,
+                                  note: str = "") -> bool:
+        """A human has reviewed an exit that will not price.
+
+        It stays PROVISIONAL (no price is invented, it stays out of every
+        statistic and keeps being reported); it only stops blocking entries.
+        """
+        if operator_ack != self.UNPRICED_ACK:
+            raise PersistenceError("operator_ack does not acknowledge an "
+                                   "unpriced exit")
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT meta FROM trades WHERE id = ? AND price_provisional = 1",
+                (int(trade_id),)).fetchone()
+            if row is None:
+                return False
+            meta = json.loads(row["meta"] or "{}")
+            meta["operator_reviewed"] = {"epoch": utc_now_epoch(),
+                                         "note": str(note)[:500]}
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+            self.journal("", "UNPRICED_EXIT_REVIEWED", str(trade_id),
+                         {"trade_id": int(trade_id), "note": str(note)[:500]})
+            return True
+
+    def mark_unpriced_alarm(self, trade_id: int) -> bool:
+        """Record that the stuck-exit alarm fired for this row; True the first
+        time only, so the journal carries one event per stuck exit."""
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT meta, symbol FROM trades WHERE id = ? AND "
+                "price_provisional = 1", (int(trade_id),)).fetchone()
+            if row is None:
+                return False
+            meta = json.loads(row["meta"] or "{}")
+            if meta.get("stuck_alarm_epoch"):
+                return False
+            meta["stuck_alarm_epoch"] = utc_now_epoch()
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+            self.journal(str(row["symbol"]), "UNPRICED_EXIT_STUCK", str(trade_id),
+                         {"trade_id": int(trade_id)})
+            return True
+
     def reconcile_provisional_trade(
         self, trade_id: int, *, exit_price: float, gross_pnl: float,
         exit_fee: float, exit_fee_realized: bool,

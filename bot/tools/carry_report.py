@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import sqlite3
+import time
 import sys
 from typing import Any, Dict, List, Optional
 
@@ -98,6 +99,13 @@ def build_report(db_path: str) -> Dict[str, Any]:
         out["ordinary_trades"] = {
             "trades": len(trades),
             "price_provisional_trades": len(provisional),
+            "price_provisional_oldest_age_s": (
+                max(0.0, time.time() - min(float(t["closed_epoch"])
+                                           for t in provisional))
+                if provisional else 0.0),
+            "price_provisional_reviewed": sum(
+                1 for t in provisional
+                if "operator_reviewed" in (t["meta"] or "")),
             "fees_confirmed_trades": len(confirmed),
             "fees_unconfirmed_trades": len(trades) - len(confirmed),
             "realised_net_pnl": sum(t["net_pnl"] for t in confirmed),

@@ -295,9 +295,12 @@ class TradingBot:
             carry = self.carry_status()
             carry_blocked = bool(carry.get("blocking_fault"))
             loop_stalled = self._loop_stalled()
+            unpriced = self.store.unpriced_exit_status()
             return {
                 "healthy": (not kill_engaged and not naked and self._reconciled
-                            and not carry_blocked and not loop_stalled),
+                            and not carry_blocked and not loop_stalled
+                            and not unpriced["stuck"]),
+                "unpriced_exits": unpriced,
                 "loop_stalled": loop_stalled,
                 "consecutive_tick_failures": self._tick_failures,
                 "last_tick_ok_age_s": (None if not self._last_tick_ok_epoch else
@@ -1023,6 +1026,14 @@ class TradingBot:
             logger.exception("reconcile_provisional_exits failed; "
                              "continuing: %s", exc)
 
+        # An exit that stays unpriced past the review window is a result nobody
+        # can see: alarm once per row (journal) and keep shouting in the log;
+        # the risk gate refuses new entries meanwhile.
+        try:
+            self._alarm_unpriced_exits()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("unpriced-exit alarm failed; continuing: %s", exc)
+
         # Funding the venue settled against closed directional linear trades
         # is booked from the account's own settlement records (read-only,
         # throttled; unreadable evidence leaves the trade unbooked and says so).
@@ -1423,6 +1434,27 @@ class TradingBot:
                 self._borrow_notional_usd = 0.0
         except Exception:  # noqa: BLE001
             logger.exception("borrow accrual failed; the cost is not booked")
+
+    UNPRICED_ALARM_EVERY_S = 600.0
+    _last_unpriced_alarm = 0.0
+
+    def _alarm_unpriced_exits(self) -> None:
+        status = self.store.unpriced_exit_status()
+        if not status["stuck"]:
+            return
+        for tid in status["stuck"]:
+            self.store.mark_unpriced_alarm(tid)
+        now = time.time()
+        if now - self._last_unpriced_alarm >= self.UNPRICED_ALARM_EVERY_S:
+            self._last_unpriced_alarm = now
+            logger.critical(
+                "UNPRICED EXIT STUCK: trade(s) %s have had no authoritative "
+                "price for over %.0f h (oldest %.1f h). Their results are "
+                "invisible to sizing and the loss brakes; new entries are "
+                "REFUSED until the venue prices them or a human acknowledges "
+                "them (StateStore.acknowledge_unpriced_exit).",
+                status["stuck"], status["review_after_s"] / 3600.0,
+                status["oldest_age_s"] / 3600.0)
 
     DIRECTIONAL_FUNDING_POLL_MS = 10 * 60 * 1000
     _last_directional_funding_ms = 0
