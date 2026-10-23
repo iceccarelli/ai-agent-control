@@ -60,16 +60,17 @@ CONFIGS = [
 ]
 
 
-def _both(rows, *, gated, overlay, borrow_apr, impact=1.093, notional=100_000.0):
+def _both(rows, *, gated, overlay, borrow_apr, impact=1.093, notional=100_000.0,
+          latency=cb.LATENCY_ROWS):
     mode = cb.OVERLAY if overlay else cb.ACQUIRE
     python = cb.simulate_settlements_series(
         rows, notional=notional, borrow_apr=borrow_apr, gated=gated,
-        impact_bps=impact, mode=mode)
+        impact_bps=impact, mode=mode, latency_rows=latency)
     params = core.params(
         notional=notional, borrow_apr=borrow_apr, impact_bps=impact,
         round_trip_bps=cb.round_trip_bps_for(mode), gated=gated,
         overlay=overlay, taker_spot_bps=cb.TAKER_BPS_SPOT,
-        taker_perp_bps=cb.TAKER_BPS_PERP)
+        taker_perp_bps=cb.TAKER_BPS_PERP, latency_rows=latency)
     return python, core.simulate(rows, params)
 
 
@@ -95,8 +96,12 @@ class TestItAgreesWithThePythonToTheCent:
     def test_the_exit_rule_counts_prints_in_both(self, native, rows):
         """Three negative PRINTS, not ticks and not days — the thing 0034
         fixed in the engine has to be true here too."""
+        python, cpp = _both(rows, gated=False, overlay=True, borrow_apr=0.0,
+                            latency=0)
+        assert cpp["trades"] == python["trades"] == 87     # zero-latency bound
         python, cpp = _both(rows, gated=False, overlay=True, borrow_apr=0.0)
-        assert cpp["trades"] == python["trades"] == 87
+        assert cpp["trades"] == python["trades"]
+        assert python["latency_rows"] == cb.LATENCY_ROWS == core.LATENCY_ROWS
 
     def test_the_worst_excursion_matches(self, native, rows):
         python, cpp = _both(rows, gated=True, overlay=True, borrow_apr=0.0)

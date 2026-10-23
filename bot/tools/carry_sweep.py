@@ -99,7 +99,8 @@ def run(repo: str, *, notional: float, borrow_apr: float, overlay: bool,
             gated=True, overlay=bool(base.overlay),
             ewma_min_prints=base.ewma_min_prints,
             negative_exit_prints=base.negative_exit_prints,
-            funding_history=base.funding_history)
+            funding_history=base.funding_history,
+            latency_rows=base.latency_rows)
         for cell in core.sweep(rows, p, entry_grid=ENTRY_BPS_GATED,
                                hold_grid=HOLD_DAYS, exit_grid=EXIT_PRINTS):
             cell.pop("entry_bps", None)

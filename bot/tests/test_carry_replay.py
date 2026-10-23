@@ -219,7 +219,8 @@ class TestTheEngineAndTheSimulatorAgree:
                            impact_bps=impact)
         sim = cb.simulate_settlements_series(
             data, notional=100_000.0, borrow_apr=0.0, gated=True,
-            impact_bps=impact, mode="overlay")
+            impact_bps=impact, mode="overlay",
+            latency_rows=0)   # the replay engine fills on the decision row
 
         assert engine["trades"] == sim["trades"]
         assert engine["market_exposure_pct"] == pytest.approx(
@@ -245,7 +246,8 @@ class TestTheEngineAndTheSimulatorAgree:
                            impact_bps=0.0)
         sim = cb.simulate_settlements_series(
             data, notional=100_000.0, borrow_apr=0.0, gated=True,
-            impact_bps=0.0, mode="overlay")
+            impact_bps=0.0, mode="overlay",
+            latency_rows=0)
 
         # one open at the end, and one fewer close than open
         still_open = [t for t in engine["trade_rows"] if t.get("open_at_end")]

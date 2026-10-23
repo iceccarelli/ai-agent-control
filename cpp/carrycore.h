@@ -57,6 +57,8 @@ typedef struct {
     int ewma_min_prints;
     int negative_exit_prints;
     int funding_history;         /* prints the EWMA may see */
+    int latency_rows;            /* rows between a decision and its fill; 0 is
+                                    the old zero-latency upper bound */
 } CarryParams;
 
 typedef struct {
@@ -72,6 +74,8 @@ typedef struct {
     int32_t closed_trades;       /* excludes the one open at the window end */
     int32_t losing_trades;
     int32_t refusals;            /* gated entries the cost gate refused */
+    int32_t unresolved_entries;  /* decided, but the fill row is past the data */
+    int32_t unresolved_exits;    /* decided, but the fill row is past the data */
 } CarryResult;
 
 /* One simulation. Returns 0 on success, non-zero on bad input. */

@@ -80,8 +80,9 @@ class TestTheScalarPathIsUntouched:
         assert b["trades"] == a["trades"]
 
     def test_the_headline_overlay_number_has_not_moved(self, rows):
-        """+7.26%/yr at 0% borrow (7.23 before the perp-discount entry bound)."""
-        r = settle(rows, borrow_apr=0.0)
+        """+7.26%/yr at 0% borrow (7.23 before the perp-discount entry bound), on the
+        ZERO-LATENCY model: an upper bound, see tests/test_carry_latency.py."""
+        r = settle(rows, borrow_apr=0.0, latency_rows=0)
         assert r["net_annualised_pct"] == pytest.approx(7.26, abs=0.01)
 
 

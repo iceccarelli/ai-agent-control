@@ -40,6 +40,9 @@ ROOT = os.path.dirname(HERE)                 # bot/
 CPP_DIR = os.path.join(os.path.dirname(ROOT), "cpp")
 LIB_PATH = os.path.join(ROOT, "lib", "libcarrycore.so")
 
+# Mirrors carry_backtest.LATENCY_ROWS (a test asserts they are equal).
+LATENCY_ROWS = 1
+
 
 class Settlement(ctypes.Structure):
     _fields_ = [("ms", ctypes.c_int64), ("perp", ctypes.c_double),
@@ -58,7 +61,8 @@ class Params(ctypes.Structure):
                 ("gated", ctypes.c_int), ("overlay", ctypes.c_int),
                 ("ewma_min_prints", ctypes.c_int),
                 ("negative_exit_prints", ctypes.c_int),
-                ("funding_history", ctypes.c_int)]
+                ("funding_history", ctypes.c_int),
+                ("latency_rows", ctypes.c_int)]
 
 
 class Result(ctypes.Structure):
@@ -69,7 +73,9 @@ class Result(ctypes.Structure):
                 ("max_adverse_short_pct", ctypes.c_double),
                 ("trades", ctypes.c_int32), ("closed_trades", ctypes.c_int32),
                 ("losing_trades", ctypes.c_int32),
-                ("refusals", ctypes.c_int32)]
+                ("refusals", ctypes.c_int32),
+                ("unresolved_entries", ctypes.c_int32),
+                ("unresolved_exits", ctypes.c_int32)]
 
     def as_dict(self) -> Dict[str, Any]:
         return {name: getattr(self, name) for name, _t in self._fields_}
@@ -142,7 +148,10 @@ def params(*, notional: float = 100_000.0, entry_bps: float = 0.2,
            ewma_alpha: float = 0.5, gated: bool = False,
            overlay: bool = False, ewma_min_prints: int = 3,
            negative_exit_prints: int = 3,
-           funding_history: int = 8) -> Params:
+           funding_history: int = 8,
+           latency_rows: int = LATENCY_ROWS) -> Params:
+    if int(latency_rows) < 0:
+        raise ValueError("latency_rows cannot be negative")
     if int(negative_exit_prints) < 1:
         # A streak is never below 0, so 0 would exit on the first print after
         # entry whatever its sign: a one-print hold at double fees.
@@ -150,7 +159,7 @@ def params(*, notional: float = 100_000.0, entry_bps: float = 0.2,
     return Params(notional, entry_bps, borrow_apr, impact_bps, round_trip_bps,
                   hold_days, taker_spot_bps, taker_perp_bps, ewma_alpha,
                   int(bool(gated)), int(bool(overlay)), ewma_min_prints,
-                  negative_exit_prints, funding_history)
+                  negative_exit_prints, funding_history, int(latency_rows))
 
 
 def simulate(settlements: Sequence[Any], p: Params) -> Dict[str, Any]:
