@@ -596,3 +596,33 @@ class TestMalformedInputNeverRaises:
         cap2 = er.capture_from_records(chain)
         r2 = er.reconcile(fill_claims=[fx.claim()], captures=[cap2], now_ms=fx.NOW)
         assert fill(r2)["resolved"]
+
+
+class TestTheCliRefusesUnreadableInputsCleanly:
+    """A session with zero fills writes no ledger; pointing the validator at the
+    missing file used to end in a traceback."""
+
+    def test_a_missing_ledger_is_a_refusal_not_a_traceback(self, tmp_path, capsys):
+        code = er.main(["--ledger", str(tmp_path / "absent.json"),
+                        "--now-ms", str(fx.NOW)])
+        assert code == 3
+        assert "not readable" in capsys.readouterr().err
+
+    def test_a_missing_claims_file(self, tmp_path, capsys):
+        assert er.main(["--claims", str(tmp_path / "absent.json"),
+                        "--now-ms", str(fx.NOW)]) == 3
+
+    @pytest.mark.parametrize("text", ["not json", "[1, 2]", "", "null"])
+    def test_malformed_inputs(self, tmp_path, capsys, text):
+        bad = tmp_path / "bad.json"
+        bad.write_text(text)
+        for flag in ("--ledger", "--claims"):
+            assert er.main([flag, str(bad), "--now-ms", str(fx.NOW)]) == 3
+        assert "refusing" in capsys.readouterr().err
+
+    def test_a_missing_evidence_file_is_a_broken_chain_in_the_report(self, tmp_path, capsys):
+        out = tmp_path / "r" / "r.json"
+        code = er.main(["--evidence", str(tmp_path / "absent.jsonl"),
+                        "--now-ms", str(fx.NOW), "--json", str(out)])
+        report = json.load(open(out))
+        assert code == 2 and report["captures"][0]["intact"] is False
