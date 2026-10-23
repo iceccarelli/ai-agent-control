@@ -105,6 +105,34 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         t.impact += t.qty * (spot_legs * s + q) * p.impact_bps / 1e4;
     };
 
+    const int latency = p.latency_rows < 0 ? 0 : p.latency_rows;
+    int64_t entry_fill_at = -1;           /* row a decided entry fills on */
+    int64_t exit_fill_at = -1;            /* row a decided exit fills on  */
+    bool exit_signalled = false;
+    int unresolved_entries = 0, unresolved_exits = 0;
+
+    auto close_live = [&](const CarrySettlement &st) {
+        live.closed_ms = st.ms;
+        live.exit_spot = st.spot;
+        live.exit_perp = st.perp;
+        charge(live, st.spot, st.perp);
+        trades.push_back(live);
+        has_live = false;
+        streak = 0;
+        exit_fill_at = -1;
+        exit_signalled = false;
+    };
+    auto open_live = [&](const CarrySettlement &st) {
+        live = Trade();
+        live.qty = p.notional / st.perp;
+        live.entry_spot = st.spot;
+        live.entry_perp = st.perp;
+        live.opened_ms = st.ms;
+        charge(live, st.spot, st.perp);
+        has_live = true;
+        streak = 0;
+    };
+
     for (int32_t i = 0; i < n; ++i) {
         const CarrySettlement &st = rows[i];
         const double r_bps = st.rate * 1e4;
@@ -116,20 +144,37 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
             history[history_len++] = r_bps;
         }
 
+        if (entry_fill_at >= 0) {
+            if (i < entry_fill_at) continue;       /* decided, not yet filled */
+            open_live(st);                         /* this row's print is not ours */
+            entry_fill_at = -1;
+            continue;
+        }
+
         if (has_live) {
-            live.funding += st.rate * live.qty * st.perp;
+            double funding = st.rate * live.qty * st.perp;
+            /* Held until the fill: a payment is owed, a receipt not assumed. */
+            if (exit_fill_at == i) funding = std::min(funding, 0.0);
+            live.funding += funding;
             live.borrow += per_print_borrow * live.qty * st.spot;
             live.max_adverse_pct = std::max(
                 live.max_adverse_pct, 100.0 * (st.perp_high / live.entry_perp - 1.0));
+            if (exit_fill_at == i) {
+                close_live(st);
+                continue;
+            }
+            if (exit_signalled) continue;
             streak = (r_bps < 0.0) ? streak + 1 : 0;
             if (streak >= p.negative_exit_prints) {
-                live.closed_ms = st.ms;
-                live.exit_spot = st.spot;
-                live.exit_perp = st.perp;
-                charge(live, st.spot, st.perp);
-                trades.push_back(live);
-                has_live = false;
-                streak = 0;
+                if (latency == 0) {
+                    close_live(st);
+                } else if (static_cast<int64_t>(i) + latency <= n - 1) {
+                    exit_fill_at = static_cast<int64_t>(i) + latency;
+                    exit_signalled = true;
+                } else {
+                    ++unresolved_exits;            /* stays open; marked at the end */
+                    exit_signalled = true;
+                }
             }
             continue;
         }
@@ -141,16 +186,16 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         } else {
             may_open = r_bps >= p.entry_bps;
         }
-        /* No entry on the final row: no settlement is left to hold through. */
-        if (may_open && i < n - 1) {
-            live = Trade();
-            live.qty = p.notional / st.perp;
-            live.entry_spot = st.spot;
-            live.entry_perp = st.perp;
-            live.opened_ms = st.ms;
-            charge(live, st.spot, st.perp);
-            has_live = true;
-            streak = 0;
+        if (!may_open) continue;
+        /* A fill on the last row or past it has no settlement left to hold
+           through: abstained and counted, never filled at the last price. */
+        const int64_t fill_row = static_cast<int64_t>(i) + latency;
+        if (fill_row >= n - 1) {
+            ++unresolved_entries;
+        } else if (latency == 0) {
+            open_live(st);
+        } else {
+            entry_fill_at = fill_row;
         }
     }
 
@@ -181,6 +226,8 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
     }
     r.trades = static_cast<int32_t>(trades.size());
     r.refusals = refusals;
+    r.unresolved_entries = unresolved_entries;
+    r.unresolved_exits = unresolved_exits;
     *out = r;
     return 0;
 }
@@ -232,4 +279,4 @@ extern "C" int32_t carry_sweep(const CarrySettlement *rows, int32_t n,
     return total;
 }
 
-extern "C" const char *carrycore_version(void) { return "carrycore/1 (0039)"; }
+extern "C" const char *carrycore_version(void) { return "carrycore/2 (latency)"; }

@@ -22,6 +22,7 @@ REQUIRED = (
     "test_position_lifecycles", "test_observe_exits",
     "test_unpriced_exit_visibility", "test_funding_sign_lock",
     "test_carry_hold_session", "test_drill",
+    "test_simulator_fill_contract", "test_funding_window", "test_carry_latency", "test_linear_simulator",
     # live arming and the order/exit path
     "test_config", "test_live_promotion_check", "test_micro_live_preflight", "test_bybit_connection", "test_kill_switch_drill", "test_orchestrator", "test_naked_position_handling", "test_directional_close_unconfirmed",
     "test_lifecycle_integration", "test_process_restart_recovery",

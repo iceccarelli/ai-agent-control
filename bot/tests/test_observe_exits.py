@@ -407,3 +407,24 @@ class TestTheTradeAndThePositionChangeAreOneWrite:
         engine.observe_exits()
         assert len(store._query("SELECT * FROM trades")) == 1
         assert store.open_positions() == []
+
+
+class TestAnUnpricedExitMakesLaterOnesUnprovable:
+    def test_the_next_exit_is_not_priced_from_the_unpriced_ones_own_row(self, tmp_path):
+        fake = FakeBybit()
+        fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell",
+                                     "size": "0.005", "avgPrice": "60000",
+                                     "stopLoss": "61000"}
+        engine, store = _engine(tmp_path, LinearCfg(), fake)
+        _open(store, qty=0.01)
+        engine.observe_exits()                    # closed-pnl empty: A is provisional
+        [a] = store._query("SELECT * FROM trades")
+        assert a["price_provisional"] == 1
+        fake.positions.pop("BTCUSDT")             # B: the other 0.005 leaves
+        fake.closed_pnl.append({                  # only A's row has appeared so far,
+            "symbol": "BTCUSDT", "side": "Buy", "qty": "0.005",   # same size as B
+            "orderId": "OA", "avgExitPrice": "59000", "closedPnl": "5",
+            "updatedTime": str(int(time.time() * 1000) + 1000)})
+        engine.observe_exits()
+        b = store._query("SELECT * FROM trades ORDER BY id DESC LIMIT 1")[0]
+        assert b["price_provisional"] == 1 and float(b["exit_price"]) == 0.0

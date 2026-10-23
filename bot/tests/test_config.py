@@ -485,3 +485,14 @@ class TestALossLimitOfOneIsNotAPercent:
 
     def test_a_disabled_imbalance_limit_of_one_is_still_allowed(self):
         assert load(MAX_BOOK_IMBALANCE="1").MAX_BOOK_IMBALANCE == 1.0
+
+
+def test_a_typo_in_a_safety_flag_on_a_mapping_config_is_never_read_as_live():
+    """parse_bool read 'ture' as False, i.e. NOT a sandbox: with an ack and keys
+    that authorised live. A mapping now gets the strict parse and is refused."""
+    import config as C
+    mapping = {"USE_TESTNET": "ture", "PAPER_TRADING": "0",
+               "LIVE_TRADING_ACK": "I_UNDERSTAND",
+               "BYBIT_API_KEY": "k", "BYBIT_API_SECRET": "s"}
+    allowed, why = C.is_live_authorized(mapping)
+    assert allowed is False and "LIVE_BLOCKED" in why

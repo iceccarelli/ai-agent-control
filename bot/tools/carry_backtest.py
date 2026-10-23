@@ -97,6 +97,10 @@ TAKER_BPS_PERP = 5.5         # Binance USDT-M taker, no VIP
 BORROW_APR = 0.05            # financing on the spot leg, 5%/yr
 ENTRY_FUNDING_BPS = 0.2      # do not open below this 8h rate
 NEGATIVE_EXIT_PRINTS = 3     # consecutive negative prints before unwinding
+#: Funding rows between a decision and its fill. One row is one 8 h funding
+#: interval, so 1 is a coarse stress bound, NOT a measured latency; 0 is the old
+#: zero-latency model and is an upper bound on what the rules can earn.
+LATENCY_ROWS = 1
 FUNDING_PERIODS_PER_DAY = 3
 
 #: How the long side is held (0036), mirroring carry_engine.
@@ -636,6 +640,10 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
 
     return {
         "clock": "daily_close",
+        # The decision reads the day's closing prints and fills at that same
+        # close: zero latency by construction, an upper bound. The settlement
+        # clock (simulate_settlements_series) is the one with a fill gap.
+        "fill_model": "same_close_zero_latency_upper_bound",
         # D43, and the same pair the settlement sim reports. `borrow_source`
         # says WHICH financing was charged; `borrow_periods_unpriced` how many
         # days the curve could not cover and therefore fell back to the
@@ -998,11 +1006,35 @@ def simulate_settlements_series(rows: List[Settlement], *,
                                 impact_bps: float = 0.0,
                                 mode: str = ACQUIRE,
                                 exec_fee_bps: Optional[float] = None,
-                                borrow_curve: Any = None
+                                borrow_curve: Any = None,
+                                latency_rows: int = LATENCY_ROWS
                                 ) -> Dict[str, Any]:
     """One step per funding print. The rules are the engine's, in its units:
     a print is a print (not a day, not a tick), three consecutive negative
-    PRINTS exit, and the EWMA sees the last eight PRINTS."""
+    PRINTS exit, and the EWMA sees the last eight PRINTS.
+
+    SIGNAL IS NOT FILL. A decision is taken on row i from what had printed by
+    row i. The orders cannot reach the book at that instant, so the fill is at
+    row i + `latency_rows`, at THAT row's prices, and an entry fill owns only
+    the prints stamped strictly after it (a print at the fill instant belongs
+    to whoever held the position before). An exit is held through its fill
+    row: a print there is charged if it is a payment and NOT credited if it
+    would be a receipt -- the order of settlement and fill inside that instant
+    is unknowable at this resolution, so the unfavourable one is assumed.
+
+    A decision whose fill row lies beyond the data is NOT filled at the last
+    price: an entry is counted in `unresolved_entries` and abstained, an exit
+    in `unresolved_exits` and the position is left open and marked. A result
+    with either count above zero has an end-of-window artefact in it.
+
+    `latency_rows=0` restores the old zero-latency model (fill at the signal
+    row's own prices); it is an upper bound, not an estimate. One row is one
+    8-hour funding interval, so `latency_rows=1` is a deliberately coarse
+    stress bound, not a measured latency: the data here is settlement-stamped
+    OHLC, not ticks, and the two legs cannot be separated finer than a row."""
+    if int(latency_rows) < 0:
+        raise ValueError("latency_rows cannot be negative")
+    latency_rows = int(latency_rows)
     trades: List[Trade] = []
     live: Optional[Trade] = None
     streak = 0
@@ -1038,12 +1070,43 @@ def simulate_settlements_series(rows: List[Settlement], *,
         t.impact += t.qty * (spot_legs * s + p) * impact_bps / 1e4
 
     last_index = len(rows) - 1
+    entry_fill_at: Optional[int] = None       # row on which a decided entry fills
+    exit_fill_at: Optional[int] = None        # row on which a decided exit fills
+    exit_signalled = False
+    unresolved_entries = unresolved_exits = 0
+
+    def close_live(st: Settlement, reason: str) -> None:
+        nonlocal live, streak, exit_fill_at, exit_signalled
+        live.closed = _when(st.ms)
+        live.exit_spot, live.exit_perp = st.spot, st.perp
+        charge(live, st.spot, st.perp)
+        live.reason = reason
+        trades.append(live)
+        live, streak = None, 0
+        exit_fill_at, exit_signalled = None, False
+
     for index, st in enumerate(rows):
         r_bps = st.rate * 1e4
         history.append(r_bps)
+
+        if entry_fill_at is not None:
+            if index < entry_fill_at:
+                continue                       # decided, not yet filled
+            # The fill. The print stamped on this row is not this position's.
+            qty = notional / st.perp
+            live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
+                         entry_perp=st.perp)
+            charge(live, st.spot, st.perp)
+            streak, entry_fill_at = 0, None
+            continue
+
         if live is not None:
-            # Held through this settlement: the short receives (pays) it.
-            live.funding += st.rate * live.qty * st.perp
+            funding = st.rate * live.qty * st.perp
+            if exit_fill_at == index:
+                # Held until the fill: a payment is owed, a receipt is not
+                # assumed.
+                funding = min(funding, 0.0)
+            live.funding += funding
             if borrow_curve is None:
                 live.borrow += per_print_borrow * live.qty * st.spot
             else:
@@ -1057,14 +1120,20 @@ def simulate_settlements_series(rows: List[Settlement], *,
             live.max_adverse_short_pct = max(
                 live.max_adverse_short_pct,
                 100.0 * (st.perp_high / live.entry_perp - 1.0))
+            if exit_fill_at == index:
+                close_live(st, "FUNDING_INVERTED")
+                continue
+            if exit_signalled:
+                continue
             streak = streak + 1 if r_bps < 0 else 0
             if streak >= NEGATIVE_EXIT_PRINTS:
-                live.closed = _when(st.ms)
-                live.exit_spot, live.exit_perp = st.spot, st.perp
-                charge(live, st.spot, st.perp)
-                live.reason = "FUNDING_INVERTED"
-                trades.append(live)
-                live, streak = None, 0
+                if latency_rows == 0:
+                    close_live(st, "FUNDING_INVERTED")
+                elif index + latency_rows <= last_index:
+                    exit_fill_at, exit_signalled = index + latency_rows, True
+                else:
+                    unresolved_exits += 1       # stays open; marked at the end
+                    exit_signalled = True
             continue
 
         if gated:
@@ -1078,15 +1147,22 @@ def simulate_settlements_series(rows: List[Settlement], *,
         else:
             may_open = r_bps >= entry_bps
 
-        # An entry on the final row has no settlement left to be held through:
-        # it would book as a zero-day round trip paying both legs' fees for
-        # nothing, biasing the last row's result down.
-        if may_open and index < last_index:
+        if not may_open:
+            continue
+        # An entry whose fill row is the last row, or beyond it, has no
+        # settlement left to be held through: it would book as a zero-day round
+        # trip paying both legs' fees for nothing. It is abstained, and counted.
+        fill_row = index + latency_rows
+        if fill_row >= last_index:
+            unresolved_entries += 1
+        elif latency_rows == 0:
             qty = notional / st.perp
             live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
                          entry_perp=st.perp)
             charge(live, st.spot, st.perp)
             streak = 0
+        else:
+            entry_fill_at = fill_row
 
     if live is not None:
         last = rows[-1]
@@ -1109,6 +1185,14 @@ def simulate_settlements_series(rows: List[Settlement], *,
         "window": f"{_iso_ms(rows[0].ms)} .. {_iso_ms(rows[-1].ms)}",
         "years": years, "notional_usd": notional,
         "settlements": len(rows),
+        "latency_rows": latency_rows,
+        "unresolved_entries": unresolved_entries,
+        "unresolved_exits": unresolved_exits,
+        "latency_note": ("signal and fill are separated by latency_rows funding "
+                         "rows; a row is 8h, so this is a coarse stress bound, "
+                         "not a measured latency. Both legs fill on the same "
+                         "row at that row's prices: legging risk, partial "
+                         "fills, queue position and spread are NOT modelled."),
         "trades": len(trades), "closed_trades": len(closed),
         "closed_net_usd": sum(t.net for t in closed),
         "open_at_end_marked_usd": sum(t.net for t in marked),
@@ -1171,7 +1255,8 @@ def simulate_settlement(repo: str, *, venue: str = "bybit",
                         borrow_apr: float = BORROW_APR, gated: bool = False,
                         impact: bool = True,
                         mode: str = ACQUIRE,
-                        exec_fee_bps: Optional[float] = None
+                        exec_fee_bps: Optional[float] = None,
+                        latency_rows: int = LATENCY_ROWS
                         ) -> Dict[str, Any]:
     """The settlement-clock run. Same venue; prices at 00/08/16 UTC."""
     if venue == "bybit":
@@ -1186,7 +1271,8 @@ def simulate_settlement(repo: str, *, venue: str = "bybit",
     r = simulate_settlements_series(rows, notional=notional,
                                     entry_bps=entry_bps, borrow_apr=borrow_apr,
                                     gated=gated, impact_bps=bps, mode=mode,
-                                    exec_fee_bps=exec_fee_bps)
+                                    exec_fee_bps=exec_fee_bps,
+                                    latency_rows=latency_rows)
     r.update(quotability(same_venue=meta["same_venue"], settlement_clock=True,
                          impact_applied=impact, gated=gated))
     r.update({"venue": venue, "spot_source": meta["label"],
@@ -1390,6 +1476,11 @@ def main(argv=None) -> int:
                         help="8h clock only: bybit = the venue the broker "
                              "trades on (committed corpus); binance needs "
                              "tools/fetch_settlement_klines.py --write first")
+    parser.add_argument("--latency-rows", type=int, default=LATENCY_ROWS,
+                        help="8h clock only: funding rows between a decision "
+                             "and its fill (default %(default)s; 0 is the "
+                             "zero-latency upper bound). One row is 8 hours: a "
+                             "coarse stress bound, not a measured latency.")
     parser.add_argument("--exec-fee-bps", type=float, default=None,
                         help="bps PER LEG actually paid on fills (default: "
                              "the declared taker tier). The entry gate goes "
@@ -1515,7 +1606,8 @@ def _main_settlement(args) -> int:
         head = simulate_settlement(args.repo, venue=args.venue,
                                    notional=args.notional, impact=impact,
                                    mode=args.mode,
-                                   exec_fee_bps=args.exec_fee_bps)
+                                   exec_fee_bps=args.exec_fee_bps,
+                                    latency_rows=args.latency_rows)
         print(f"  source     : {head['spot_source']}")
         print(f"  execution  : {head['execution_mode'].upper()}"
               f"   round trip {head['round_trip_bps']:.1f} bps")
@@ -1527,11 +1619,13 @@ def _main_settlement(args) -> int:
             u = simulate_settlement(args.repo, venue=args.venue,
                                     notional=args.notional, borrow_apr=apr,
                                     impact=impact, mode=args.mode,
-                                    exec_fee_bps=args.exec_fee_bps)
+                                    exec_fee_bps=args.exec_fee_bps,
+                                    latency_rows=args.latency_rows)
             g = simulate_settlement(args.repo, venue=args.venue,
                                     notional=args.notional, borrow_apr=apr,
                                     gated=True, impact=impact, mode=args.mode,
-                                    exec_fee_bps=args.exec_fee_bps)
+                                    exec_fee_bps=args.exec_fee_bps,
+                                    latency_rows=args.latency_rows)
             print(f"  {apr*100:7.1f}% "
                   f"{u['net_annualised_pct']:+8.2f}%/yr n={u['trades']:<3d} "
                   f"{g['net_annualised_pct']:+8.2f}%/yr n={g['trades']:<3d}")
@@ -1543,7 +1637,8 @@ def _main_settlement(args) -> int:
                             notional=args.notional, entry_bps=args.entry_bps,
                             borrow_apr=args.borrow_apr, gated=args.gated,
                             impact=impact, mode=args.mode,
-                            exec_fee_bps=args.exec_fee_bps)
+                            exec_fee_bps=args.exec_fee_bps,
+                            latency_rows=args.latency_rows)
     print("=" * 74)
     print("CARRY BACKTEST — two legs, every cost  "
           "(clock: settlement 00/08/16 UTC)")
@@ -1558,6 +1653,14 @@ def _main_settlement(args) -> int:
           f"   round trip {r['round_trip_bps']:.1f} bps"
           + ("   (the client's BTC is never bought or sold)"
              if r["execution_mode"] == OVERLAY else ""))
+    print(f"  fill latency      {r['latency_rows']} funding row(s) after the "
+          f"decision" + ("   (ZERO-LATENCY upper bound)"
+                         if r["latency_rows"] == 0 else "   (coarse 8h stress "
+                         "bound, not a measured latency)"))
+    if r["unresolved_entries"] or r["unresolved_exits"]:
+        print(f"  UNRESOLVED        {r['unresolved_entries']} entries "
+              f"abstained, {r['unresolved_exits']} exits left open: the "
+              "window ends inside a decision. Not filled at the last price.")
     if r.get("exec_fee_bps_per_leg") is not None:
         print(f"  fills CHARGED at  {r['exec_fee_bps_per_leg']:.2f} bps/leg = "
               f"{r['charged_round_trip_bps']:.1f} bps round trip, while the "

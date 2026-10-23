@@ -1715,7 +1715,9 @@ class TradingEngine:
                 # only an earlier take-profit, a sum that overshoots -- would
                 # price this exit at another fill's price, with full
                 # confidence. That is a provisional exit, not a guess.
-                pnl_rows = self._proven_exit_rows(symbol, all_rows, exited)
+                pnl_rows = self._proven_exit_rows(
+                    symbol, all_rows, exited,
+                    float(row.get("opened_epoch", 0) or 0.0))
                 qty_sum = sum(self._row_qty(r) for r in pnl_rows)
                 if qty_sum > 0:
                     price = sum(float(r.get("avgExitPrice", 0) or 0)
@@ -2107,10 +2109,25 @@ class TradingEngine:
             "orderId", "updatedTime", "closedSize", "qty", "avgExitPrice"))
 
     def _proven_exit_rows(self, symbol: str, rows: List[Dict[str, Any]],
-                          exited: float) -> List[Dict[str, Any]]:
+                          exited: float,
+                          opened_epoch: float = 0.0) -> List[Dict[str, Any]]:
         """The closed-pnl rows that are provably this exit, or [] (no proof)."""
         if not rows or len(rows) >= self._CLOSED_PNL_PAGE:
             return []
+        if opened_epoch:
+            # An exit of THIS position is unpriced AND unproven (it claimed no
+            # closed-pnl row): which row belongs to which exit is no longer
+            # something the rows can prove -- its own row looks free and could
+            # price the next exit at the wrong price. Until the earlier
+            # exit is priced by the venue's executions, later ones are
+            # provisional too.
+            try:
+                if any(int(t["price_provisional"])
+                       and not self._row_meta(t).get("exit_row_keys")
+                       for t in self.store.lifecycle_trades(symbol, opened_epoch)):
+                    return []
+            except Exception:  # noqa: BLE001
+                return []
         try:
             claimed = self.store.claimed_exit_row_keys(symbol)
         except Exception:  # noqa: BLE001
@@ -2647,11 +2664,7 @@ class TradingEngine:
                     # BOOK the dust rather than forgetting it: the inventory is
                     # still on the exchange, and a book that does not say so
                     # cannot honour "the ledger explains the entire equity change".
-                    try:
-                        total_dust = self.store.add_dust(symbol, remaining)
-                    except Exception:  # noqa: BLE001
-                        logger.warning("could not record dust for %s", symbol,
-                                       exc_info=True)
+                    total_dust = self.store.add_dust(symbol, remaining)
             else:
                 self.store.upsert_position(
                     symbol, side, remaining, entry_price,

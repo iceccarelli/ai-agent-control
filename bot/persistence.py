@@ -121,24 +121,31 @@ class IncompatibleFeeCurrencies(RuntimeError):
     """
 
 
-#: A REPLAY may drive the clock from its bars (``set_clock``). None = real time.
-_CLOCK: Optional[Callable[[], float]] = None
+#: A REPLAY may drive the clock from its bars (``set_clock``). Per THREAD: a
+#: replay's time must never be seen by another thread of the process (a health
+#: server, a websocket consumer), and two replays cannot interleave.
+_CLOCK_LOCAL = threading.local()
+
+
+def current_clock() -> Optional[Callable[[], float]]:
+    """The replacement clock installed on THIS thread, or None (real time)."""
+    return getattr(_CLOCK_LOCAL, "clock", None)
 
 
 def set_clock(fn: Optional[Callable[[], float]]) -> Optional[Callable[[], float]]:
-    """Install (or, with None, remove) a replacement clock; returns the previous
-    one. Only a replay uses this: it makes the day boundary, the daily-loss
-    anchor and every stamp follow the REPLAYED time, not the seconds the replay
-    takes to run on one wall-clock day."""
-    global _CLOCK
-    previous, _CLOCK = _CLOCK, fn
+    """Install (or, with None, remove) a replacement clock for the calling
+    thread; returns the previous one. Only a replay uses this: it makes the day
+    boundary, the daily-loss anchor and every stamp follow the REPLAYED time,
+    not the seconds the replay takes to run on one wall-clock day."""
+    previous = current_clock()
+    _CLOCK_LOCAL.clock = fn
     return previous
 
 
 def utc_now_epoch() -> float:
     """Epoch seconds (UTC).  Survives restarts, unlike perf_counter.  Real time
-    unless a replay installed its own clock (``set_clock``)."""
-    clock = _CLOCK
+    unless a replay installed its own clock on this thread (``set_clock``)."""
+    clock = current_clock()
     return clock() if clock is not None else time.time()
 
 

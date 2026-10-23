@@ -513,10 +513,15 @@ class TestTheSettlementRunIsHonest:
 
 
 class TestPrintsNotTicks:
+    """Pinned at latency_rows=0, the zero-latency upper bound these arithmetic
+    facts were first established on. tests/test_carry_latency.py covers the
+    model with a gap between signal and fill."""
+
     def test_three_negative_prints_exit_on_the_third(self):
         rows = [_st(0, 0.0001)] + [_st(i, -0.00001) for i in (1, 2, 3)]
         r = cb.simulate_settlements_series(rows, notional=100_000.0,
-                                           borrow_apr=0.0, impact_bps=0.0)
+                                           borrow_apr=0.0, impact_bps=0.0,
+                                           latency_rows=0)
         t = r["trade_log"][0]
         assert t["reason"] == "FUNDING_INVERTED"
         assert t["closed"] == str(cb._when(rows[3].ms))
@@ -525,14 +530,16 @@ class TestPrintsNotTicks:
         rows = [_st(0, 0.0001), _st(1, -0.00001), _st(2, -0.00001),
                 _st(3, 0.0001), _st(4, -0.00001)]
         r = cb.simulate_settlements_series(rows, notional=100_000.0,
-                                           borrow_apr=0.0, impact_bps=0.0)
+                                           borrow_apr=0.0, impact_bps=0.0,
+                                           latency_rows=0)
         assert r["trade_log"][0]["reason"] == "OPEN_AT_END"
 
     def test_each_print_is_booked_once(self):
         n = 10
         rows = [_st(i, 0.0001) for i in range(n)]
         r = cb.simulate_settlements_series(rows, notional=60_000.0,
-                                           borrow_apr=0.0, impact_bps=0.0)
+                                           borrow_apr=0.0, impact_bps=0.0,
+                                           latency_rows=0)
         qty = 60_000.0 / 60_000.0
         # opened at print 0, held through prints 1..n-1
         assert r["attribution"]["funding_usd"] == pytest.approx(
@@ -541,7 +548,8 @@ class TestPrintsNotTicks:
     def test_negative_prints_are_booked_as_paid(self):
         rows = [_st(0, 0.0001), _st(1, -0.0002), _st(2, 0.0001)]
         r = cb.simulate_settlements_series(rows, notional=60_000.0,
-                                           borrow_apr=0.0, impact_bps=0.0)
+                                           borrow_apr=0.0, impact_bps=0.0,
+                                           latency_rows=0)
         assert r["attribution"]["funding_usd"] == pytest.approx(
             (-0.0002 + 0.0001) * 60_000.0)
 

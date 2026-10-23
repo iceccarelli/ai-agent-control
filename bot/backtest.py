@@ -24,6 +24,13 @@ WHAT IS MODELLED
 * **Taker and maker fees**, applied on both legs, defaulting to Bybit spot rates.
 * **Slippage**, as a fraction of price, applied against the trader.
 * **Intrabar stop and take-profit fills**, checked against each bar's high/low.
+  A stop triggers on a touch (inclusive: it is a market order once reached). A
+  RESTING LIMIT or take-profit fills only when the bar trades THROUGH its price
+  (high > price for a sell, low < price for a buy): a bar whose extreme merely
+  equals the price proves the price printed, not that a resting order, which
+  sits in a queue, filled. ``touch_fills=True`` restores the touch rule for a
+  deliberate comparison. A fill is at the order's price, never improved to the
+  open on a gap (price improvement is not credited).
 * **Conservative bar resolution**: if a bar's range touches both the stop and a
   take-profit, the **stop is assumed to fill first**. Real data cannot tell us
   the order, and assuming the favourable one is how backtests lie.
@@ -198,7 +205,11 @@ class SimulatedExchange(Transport):
         slippage: float = 0.0005,
         instrument_filters: Optional[Mapping[str, Mapping[str, str]]] = None,
         books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+        touch_fills: bool = False,
     ) -> None:
+        #: See the module docstring: False (the default) requires a resting
+        #: limit to be traded THROUGH before it fills.
+        self.touch_fills = bool(touch_fills)
         self.bars = {s: list(b) for s, b in bars_by_symbol.items()}
         #: Optional per-bar L2 ladders, index-aligned with ``bars``: entry *i*
         #: is the book as it stood at the close of bar *i*, as
@@ -320,6 +331,19 @@ class SimulatedExchange(Transport):
             self._resolve_bar(symbol, series[self.index])
         return True
 
+    def _limit_reached(self, side: str, price: float, bar: Bar) -> bool:
+        """Did this bar trade far enough for a RESTING limit at ``price`` to fill?
+
+        A sell limit needs the market to trade above it, a buy limit below it. A
+        bar whose high (low) merely EQUALS the price is a touch: the price
+        printed, but a resting order sits behind the queue and OHLC cannot say
+        it was reached by the volume. ``touch_fills=True`` keeps the inclusive
+        rule."""
+        sell = normalize_side(side) == "Sell"
+        if self.touch_fills:
+            return bar.high >= price if sell else bar.low <= price
+        return bar.high > price if sell else bar.low < price
+
     def _resolve_bar(self, symbol: str, bar: Bar) -> None:
         """Fill any resting order this bar's range would have touched.
 
@@ -376,11 +400,7 @@ class SimulatedExchange(Transport):
         for order in limits:
             if order.status != "New":
                 continue
-            filled = (
-                bar.high >= order.price if order.side == "Sell"
-                else bar.low <= order.price
-            )
-            if filled:
+            if self._limit_reached(order.side, order.price, bar):
                 self._execute(order, order.price, taker=False)
                 if order.status == "Filled":
                     # A take-profit that closes the remaining size makes the
@@ -644,6 +664,9 @@ class _SimPosition:
     take_profit: float = 0.0
     leverage: float = 1.0
     opened_index: int = 0
+    #: quantity ADDED at a bar close whose next bar starts on a settlement: it
+    #: was bought after that settlement, so it does not pay or receive it.
+    late_adds: Dict[int, float] = field(default_factory=dict)
 
     @property
     def direction(self) -> float:
@@ -675,7 +698,8 @@ class LinearSimulatedExchange(SimulatedExchange):
     ====================================================
     * **No base balance.** A position is margin-collateralised. ``equity()`` is
       cash plus unrealised PnL, marked continuously.
-    * **Funding accrues.** Every 8h settlement the position crosses, a long
+    * **Funding accrues.** Every 8h settlement the position holds through (see
+      the event-order contract below), a long
       PAYS positive funding and a short receives it. This is the term whose
       absence made a linear backtest flattering, so it is charged from a real
       series when one is supplied and from a declared constant otherwise.
@@ -714,8 +738,18 @@ class LinearSimulatedExchange(SimulatedExchange):
     * The maintenance-margin rate is a single number, not Bybit's tiered risk
       ladder. Tier 1 BTCUSDT is 0.33%; the default here is 0.5%, which is
       stricter, and it is a constructor argument rather than a constant.
-    * Funding is charged at the settlement the bar CONTAINS. Sub-bar timing is
-      not modelled, which matters only for bars longer than 8h.
+    * FUNDING EVENT ORDER (one contract, tested). A settlement stamped at a
+      bar's START precedes everything in it and is valued at the open; one
+      strictly INSIDE a bar cannot be ordered against a stop, take-profit or
+      partial exit by OHLC, so the unfavourable order is assumed per sign (a
+      payment is charged on the size at the open as if the position were held;
+      a receipt only on what is still held when the bar ends, nothing if it was
+      closed in the bar), valued at the less favourable of open/close. An
+      engine fill at a bar's close happens just AFTER a settlement stamped at
+      the next bar's start: what was held before it pays or receives that
+      settlement once, what the fill opens or adds does not. A hole in the data
+      does not drop the settlements inside it. Every charge is logged against
+      the POSITION that paid it. Sub-bar timing is otherwise not modelled.
     """
 
     #: Bybit settles funding at 00:00, 08:00 and 16:00 UTC.
@@ -732,6 +766,7 @@ class LinearSimulatedExchange(SimulatedExchange):
         slippage: float = 0.0005,
         instrument_filters: Optional[Mapping[str, Mapping[str, str]]] = None,
         books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+        touch_fills: bool = False,
         funding_rate_per_8h: float = 0.0001,
         funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
         maintenance_margin_rate: float = 0.005,
@@ -741,6 +776,7 @@ class LinearSimulatedExchange(SimulatedExchange):
             bars_by_symbol, starting_cash=starting_cash, quote_asset=quote_asset,
             taker_fee=taker_fee, maker_fee=maker_fee, slippage=slippage,
             instrument_filters=instrument_filters, books_by_symbol=books_by_symbol,
+            touch_fills=touch_fills,
         )
         self.positions: Dict[str, _SimPosition] = {}
         self.funding_rate_per_8h = float(funding_rate_per_8h)
@@ -754,12 +790,19 @@ class LinearSimulatedExchange(SimulatedExchange):
         self.maintenance_margin_rate = float(maintenance_margin_rate)
         self.leverage = float(leverage)
         self.funding_paid = 0.0
-        #: every settlement actually charged to cash: (symbol, settle_ms, paid),
-        #: so a trade can be given the funding of ITS hold.
-        self.funding_log: List[Tuple[str, int, float]] = []
+        #: every settlement actually charged to cash:
+        #: (symbol, settle_ms, paid, opened_bar_start_ms). The last field names
+        #: the POSITION that was charged (the start of the bar it was opened in),
+        #: so a trade is given the funding of its own hold, not of a time window
+        #: that may be a bar out of step with when the engine reaped it.
+        self.funding_log: List[Tuple[str, int, float, int]] = []
         self.liquidations: List[Dict[str, Any]] = []
         #: Settlements already charged, so a re-resolved bar cannot double-bill.
         self._funded: set = set()
+        #: True while a bar's range is being resolved: a fill then happened
+        #: INSIDE the bar. Outside it, an order is the engine's, filled at the
+        #: close of the bar it has just observed.
+        self._resolving = False
 
     # -- accounting --------------------------------------------------------
 
@@ -849,8 +892,21 @@ class LinearSimulatedExchange(SimulatedExchange):
             notional = position.size * position.entry_price + qty * fill_price
             position.size += qty
             position.entry_price = notional / position.size
+            boundary = None if self._resolving else self._boundary_after_close(symbol)
+            if boundary is not None:
+                position.late_adds[boundary] = (
+                    position.late_adds.get(boundary, 0.0) + qty)
         else:
             closing = min(qty, position.size)
+            boundary = None if self._resolving else self._boundary_after_close(symbol)
+            if boundary is not None and position.opened_index != self.index:
+                # filled at this bar's close, just AFTER the settlement stamped
+                # at the next bar's start: the quantity that leaves still held
+                # through it, so it pays or receives it once, here.
+                bar_now = self.bars[symbol][self.index]
+                self._charge_settlement(
+                    symbol, boundary, self._snapshot(symbol, position, bar_now),
+                    closing, bar_now.close, tag=f"exit:{order.order_link_id}")
             self._cash(position.direction * closing
                        * (fill_price - position.entry_price))
             position.size -= closing
@@ -923,31 +979,112 @@ class LinearSimulatedExchange(SimulatedExchange):
                 break
         return self.funding_rate_per_8h if best is None else best
 
+    def _charge_settlement(self, symbol: str, settle: int, snapshot: Tuple,
+                           size: float, mark: float, tag: str = "") -> None:
+        """Book ONE settlement against the position that held it. Exactly once
+        per (symbol, settlement, position): a re-resolved bar cannot double-bill."""
+        direction, opened_start_ms, opened_index = snapshot
+        key = (symbol, settle, opened_index, tag)
+        if key in self._funded or size <= 0.0:
+            return
+        self._funded.add(key)
+        rate = self._funding_rate_at(symbol, settle)
+        paid = direction * rate * size * mark
+        self._cash(-paid)
+        self.funding_paid += paid
+        self.funding_log.append((symbol, int(settle), float(paid),
+                                 int(opened_start_ms)))
+
+    def _settlements_in(self, symbol: str, bar: Bar) -> List[int]:
+        """Settlements this bar owns: from the end of the previous bar (a hole
+        in the data does not make the settlements inside it vanish) up to this
+        bar's end, half-open: a settlement stamped at a bar's start belongs to
+        that bar, one stamped at its end to the next."""
+        span = self.FUNDING_INTERVAL_MS
+        series = self.bars[symbol]
+        i = self.index
+        begin = bar.start_ms
+        if 0 < i < len(series) and series[i] is bar:
+            begin = min(bar.start_ms, series[i - 1].start_ms + self._bar_span_ms(symbol))
+        end = bar.start_ms + self._bar_span_ms(symbol)
+        first = ((begin + span - 1) // span) * span
+        return list(range(first, end, span))
+
+    def _boundary_after_close(self, symbol: str) -> Optional[int]:
+        """The settlement stamped exactly at the start of the NEXT bar, if any:
+        the instant an order filled at this bar's close is exposed to."""
+        series = self.bars[symbol]
+        nxt = self.index + 1
+        if nxt >= len(series):
+            return None
+        stamp = int(series[nxt].start_ms)
+        return stamp if stamp % self.FUNDING_INTERVAL_MS == 0 else None
+
+    def _snapshot(self, symbol: str, position: "_SimPosition",
+                  bar: Bar) -> Tuple[float, int, int]:
+        """(direction, start_ms of the bar the position was opened in, its bar
+        index): which POSITION a settlement is charged to."""
+        series = self.bars[symbol]
+        idx = position.opened_index
+        opened_ms = (int(series[idx].start_ms) if 0 <= idx < len(series)
+                     else int(bar.start_ms))
+        return (position.direction, opened_ms, idx)
+
+    def _fund_at_open(self, symbol: str, bar: Bar, snapshot: Tuple,
+                      size: float) -> None:
+        """A settlement stamped exactly at the bar's START happens before
+        anything inside the bar: the position held at the open pays or receives
+        it, valued at the open. A position opened at the previous bar's close
+        opened AT this start, after the settlement, and does not hold through
+        it (that boundary is strict: it neither pays nor receives)."""
+        position = self.positions.get(symbol)
+        for settle in self._settlements_in(symbol, bar):
+            if settle > bar.start_ms:
+                continue
+            if settle == bar.start_ms:
+                if snapshot[2] == self.index - 1:
+                    continue                          # opened after it
+                late = position.late_adds.get(settle, 0.0) if position else 0.0
+                self._charge_settlement(symbol, settle, snapshot,
+                                        size - late, bar.open)
+            else:                                     # inside a hole in the data
+                self._charge_settlement(symbol, settle, snapshot, size, bar.open)
+
+    def _fund_inside(self, symbol: str, bar: Bar, snapshot: Tuple,
+                     size_start: float, size_end: float, still_held: bool) -> None:
+        """Settlements strictly INSIDE the bar (bars longer than the funding
+        interval). OHLC does not say whether a stop, take-profit or partial
+        exit in this bar came before or after them, so the unfavourable order is
+        assumed for each sign instead of the favourable one:
+
+        * a PAYMENT is charged on the larger quantity (the size at the open) at
+          the less favourable of open/close, as if the position were still held;
+        * a RECEIPT is credited only on the quantity still held when the bar
+          ends (nothing if the position was closed in the bar), at the less
+          favourable of open/close.
+
+        A position that is simply still held pays and receives normally."""
+        direction = snapshot[0]
+        for settle in self._settlements_in(symbol, bar):
+            if settle <= bar.start_ms:
+                continue
+            rate = self._funding_rate_at(symbol, settle)
+            if direction * rate > 0:                       # it PAYS
+                self._charge_settlement(symbol, settle, snapshot, size_start,
+                                        max(bar.open, bar.close))
+            elif still_held:                               # it would RECEIVE
+                self._charge_settlement(symbol, settle, snapshot, size_end,
+                                        min(bar.open, bar.close))
+
     def _apply_funding(self, symbol: str, bar: Bar) -> None:
-        """Charge every 8h settlement this bar contains. A long pays a positive rate."""
+        """Charge the settlements a bar contains to a position that is HELD
+        through the whole bar (the unit contract of the two halves above)."""
         position = self.positions.get(symbol)
         if position is None or position.size <= 0:
             return
-        span = self.FUNDING_INTERVAL_MS
-        start, end = bar.start_ms, bar.start_ms + self._bar_span_ms(symbol)
-        first = ((start + span - 1) // span) * span
-        # A position that opened at the previous bar's close opened AT this
-        # bar's start. A settlement stamped exactly then happens before that
-        # fill: the position did not hold through it, so it neither pays nor
-        # receives it.
-        just_opened = position.opened_index == self.index - 1
-        for settle in range(first, end, span):
-            if just_opened and settle == start:
-                continue
-            key = (symbol, settle)
-            if key in self._funded:
-                continue
-            self._funded.add(key)
-            rate = self._funding_rate_at(symbol, settle)
-            paid = position.direction * rate * position.size * bar.close
-            self._cash(-paid)
-            self.funding_paid += paid
-            self.funding_log.append((symbol, int(settle), float(paid)))
+        snapshot = self._snapshot(symbol, position, bar)
+        self._fund_at_open(symbol, bar, snapshot, position.size)
+        self._fund_inside(symbol, bar, snapshot, position.size, position.size, True)
 
     def _bar_span_ms(self, symbol: str) -> int:
         series = self.bars[symbol]
@@ -956,7 +1093,29 @@ class LinearSimulatedExchange(SimulatedExchange):
         return max(1, series[1].start_ms - series[0].start_ms)
 
     def _resolve_bar(self, symbol: str, bar: Bar) -> None:
-        self._apply_funding(symbol, bar)
+        self._resolving = True
+        try:
+            self._resolve_bar_inner(symbol, bar)
+        finally:
+            self._resolving = False
+
+    def _resolve_bar_inner(self, symbol: str, bar: Bar) -> None:
+        held = self.positions.get(symbol)
+        snapshot = None
+        size_start = 0.0
+        if held is not None and held.size > 0:
+            snapshot = self._snapshot(symbol, held, bar)
+            size_start = held.size
+            self._fund_at_open(symbol, bar, snapshot, size_start)
+        self._resolve_prices(symbol, bar)
+        if snapshot is not None:
+            after = self.positions.get(symbol)
+            still_held = (after is not None and after.size > 0
+                          and after.opened_index == snapshot[2])
+            self._fund_inside(symbol, bar, snapshot, size_start,
+                              after.size if still_held else 0.0, still_held)
+
+    def _resolve_prices(self, symbol: str, bar: Bar) -> None:
         position = self.positions.get(symbol)
         if position is not None and position.size > 0:
             long = normalize_side(position.side) == "Buy"
@@ -986,8 +1145,8 @@ class LinearSimulatedExchange(SimulatedExchange):
                 self._liquidate(symbol, liq)
             else:
                 position_tp = position.take_profit
-                if position_tp > 0 and (
-                        bar.high >= position_tp if long else bar.low <= position_tp):
+                if position_tp > 0 and self._limit_reached(
+                        "Sell" if long else "Buy", position_tp, bar):
                     self._close_at(symbol, position_tp, purpose="tp")
             del adverse
 
@@ -997,10 +1156,19 @@ class LinearSimulatedExchange(SimulatedExchange):
                 continue
             if order.order_type != "Limit":
                 continue
-            filled = (bar.high >= order.price if order.side == "Sell"
-                      else bar.low <= order.price)
-            if filled and symbol in self.positions:
+            if (self._limit_reached(order.side, order.price, bar)
+                    and symbol in self.positions):
                 self._execute(order, order.price, taker=False)
+
+        # A reduce-only leg belongs to the position it was placed against: when
+        # that position is gone (a stop, liquidation or take-profit closed it)
+        # the leg is cancelled, as on the spot venue, instead of waiting to
+        # reduce whatever position is opened next.
+        if symbol not in self.positions:
+            for order in self.orders.values():
+                if (order.symbol == symbol and order.status == "New"
+                        and order.reduce_only):
+                    order.status = "Cancelled"
 
     def _liquidate(self, symbol: str, price: float) -> None:
         position = self.positions.get(symbol)
@@ -1132,6 +1300,8 @@ class BacktestConfig:
     #: "spot" (long-only) or "linear" (shorts and funding). The simulator
     #: honours the difference; it does not pretend a spot account can short.
     category: str = "spot"
+    #: True restores "a touch fills a resting limit" (see the module docstring).
+    touch_fills: bool = False
     funding_rate_bps_per_8h: float = 1.0
     #: Maintenance margin, linear only. Bybit's BTCUSDT tier 1 is 0.33%; this
     #: default is stricter. A single rate rather than the tiered risk ladder,
@@ -1169,8 +1339,10 @@ class BacktestResult:
     ending_equity: float = 0.0
     fees_paid: float = 0.0
     #: Funding paid (+) or received (-) over the run. Linear only. It is in
-    #: ``ending_equity`` and ``net_pnl`` but NOT in the per-trade ledger, so
-    #: win rate / expectancy / R are before funding; ``notes`` says so.
+    #: ``ending_equity`` and ``net_pnl``, and each trade is ALSO given the
+    #: funding of its own hold (``Backtester._net_of_funding``), so win rate /
+    #: expectancy / R are after funding; ``notes`` says so and checks that the
+    #: per-trade funding adds up to this figure.
     funding_paid: float = 0.0
     equity_curve: List[float] = field(default_factory=list)
     trade_returns: List[float] = field(default_factory=list)
@@ -1359,6 +1531,9 @@ class Backtester:
         straddling midnight re-anchored at an arbitrary bar."""
         import persistence
 
+        if persistence.current_clock() is not None:
+            raise RuntimeError("a replay clock is already installed on this "
+                               "thread: replays do not nest")
         self._clock_exchange = None
 
         def replay_now() -> float:
@@ -1410,12 +1585,14 @@ class Backtester:
                 funding_rate_per_8h=cfg.funding_rate_bps_per_8h / 10_000.0,
                 funding_by_symbol=self.funding,
                 maintenance_margin_rate=cfg.maintenance_margin_rate,
+                touch_fills=cfg.touch_fills,
             )
         else:
             exchange = SimulatedExchange(
                 self.bars, starting_cash=cfg.starting_cash,
                 taker_fee=cfg.taker_fee, maker_fee=cfg.maker_fee,
                 slippage=cfg.slippage, books_by_symbol=self.books,
+                touch_fills=cfg.touch_fills,
             )
         self._clock_exchange = exchange
         store = StateStore(self.db_path)
@@ -1442,7 +1619,8 @@ class Backtester:
         # ledger does not carry it: ``TradeRecord`` records what a trade earned,
         # while the stop that defined its risk lives on the *position* row and
         # is deleted the moment the position closes. The same is true of when
-        # the trade started — ``opened_epoch`` is wall-clock, not a bar.
+        # the trade started — ``opened_epoch`` is the replayed bar's start
+        # (the replay's own clock), not a wall-clock time.
         #
         # So the position book is snapshotted each bar and the ledger is
         # harvested whenever it changes. This is pure observation: nothing here
@@ -1545,6 +1723,13 @@ class Backtester:
         trades = self._net_of_funding(
             exchange, store.lifecycles_funding_excluded(_ALL_TRADES))
         result.trades = len(trades)
+        if getattr(exchange, "funding_log", None):
+            attributed = -sum(float(t.get("funding_usd", 0.0)) for t in trades)
+            if abs(attributed - result.funding_paid) > 1e-6:
+                result.notes.append(
+                    f"funding attribution does NOT reconcile: {result.funding_paid:+.6f} "
+                    f"was charged to cash but {attributed:+.6f} is in the trades; "
+                    "the per-trade statistics are not after all of it.")
         if trades:
             nets = [float(t["net_pnl"]) for t in trades]
             wins = [x for x in nets if x > 0]
@@ -1570,8 +1755,8 @@ class Backtester:
             )
         if result.trade_details:
             # Round-trip cost on config.py's definition, for spot: two taker
-            # legs plus slippage. Funding is a linear-only term and this
-            # simulator refuses linear, so it is absent rather than assumed 0.
+            # legs plus slippage. Funding is a linear-only term and is NOT in
+            # this figure (it is in each linear trade's net, and in the notes).
             round_trip_bps = (
                 2.0 * cfg.taker_fee + cfg.slippage
             ) * 10_000.0
@@ -1672,7 +1857,10 @@ class Backtester:
     @staticmethod
     def _net_of_funding(exchange: SimulatedExchange,
                         rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Give each per-position row the funding its hold paid (positive = paid).
+        """Give each per-position row the funding its hold paid.
+
+        ``funding_usd`` is signed as MONEY (positive = received); the sum of the
+        settlements charged to the position is subtracted from ``net_pnl``.
 
         The simulator charges funding to cash; the trade ledger, being fills,
         never sees it. A trade's result is its fills AND its funding, so the
@@ -1684,10 +1872,9 @@ class Backtester:
             return rows
         out: List[Dict[str, Any]] = []
         for row in rows:
-            opened_ms = float(row["opened_epoch"]) * 1000.0
-            closed_ms = float(row["closed_epoch"]) * 1000.0
-            paid = sum(p for sym, ms, p in log
-                       if sym == row["symbol"] and opened_ms < ms <= closed_ms)
+            opened_ms = int(round(float(row["opened_epoch"]) * 1000.0))
+            paid = sum(p for sym, _ms, p, opened in log
+                       if sym == row["symbol"] and opened == opened_ms)
             out.append(dict(row, net_pnl=float(row["net_pnl"]) - paid,
                             funding_usd=-paid))
         return out
@@ -1767,6 +1954,9 @@ class Backtester:
                 "entry_fee": float(row["entry_fee"]),
                 "exit_fee": float(row["exit_fee"]),
                 "net_pnl": float(row["net_pnl"]),
+                #: funding this position's hold received (+) or paid (-); already
+                #: inside net_pnl above. 0.0 on spot.
+                "funding_usd": float(row.get("funding_usd", 0.0)),
                 "initial_stop_price": initial_stop,
                 "entry_index": entry_index,
                 "exit_index": exchange.index,

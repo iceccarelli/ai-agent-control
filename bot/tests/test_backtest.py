@@ -437,6 +437,23 @@ class TestFundingIsNotSilentlyOutsideTheTradeStatistics:
         # larger than the tolerance, so the assertion above means something
         assert abs(result.funding_paid) > 0.05
 
+    @pytest.mark.parametrize("aligned", [False, True])
+    def test_every_settlement_charged_is_given_to_exactly_one_trade(
+            self, permissive_view, aligned):
+        """The per-trade funding adds up to the funding charged to cash, to the
+        cent, whatever the bars' alignment to the 00/08/16 settlements."""
+        bars = synthetic_bars(900)
+        if aligned:
+            shift = (-bars[0].start_ms) % (8 * 3_600_000)
+            bars = [bt.Bar(b.start_ms + shift, b.open, b.high, b.low, b.close,
+                           b.volume) for b in bars]
+        cfg = permissive_config(category="linear")
+        result = bt.Backtester({"BTCUSDT": bars}, cfg).run()
+        assert result.trades > 0 and abs(result.funding_paid) > 1e-6
+        assert not any("does NOT reconcile" in n for n in result.notes), result.notes
+        given = -sum(d.get("funding_usd", 0.0) for d in result.trade_details)
+        assert given == pytest.approx(result.funding_paid, abs=1e-9)
+
     def test_a_spot_run_has_no_funding_and_no_note(self, permissive_view):
         result = bt.Backtester({"BTCUSDT": synthetic_bars(600)},
                                permissive_config()).run()
@@ -526,4 +543,39 @@ class TestTheReplayHasItsOwnClock:
         before = persistence.utc_now_epoch()
         self._run(tmp_path, "a")
         assert abs(persistence.utc_now_epoch() - before) < 3600
-        assert persistence._CLOCK is None
+        assert persistence.current_clock() is None
+
+
+class TestTheReplayClockIsContained:
+    def test_another_thread_never_sees_replay_time(self):
+        import threading
+        import persistence
+        seen = []
+        previous = persistence.set_clock(lambda: 123.0)
+        try:
+            t = threading.Thread(target=lambda: seen.append(persistence.utc_now_epoch()))
+            t.start()
+            t.join()
+            assert persistence.utc_now_epoch() == 123.0
+        finally:
+            persistence.set_clock(previous)
+        assert seen[0] > 1_000_000_000          # real time, not 123.0
+
+    def test_it_is_restored_after_an_exception_inside_the_replay(self, monkeypatch):
+        import persistence
+        runner = bt.Backtester({"BTCUSDT": synthetic_bars(300)}, permissive_config())
+        monkeypatch.setattr(runner, "_replay",
+                            lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        with pytest.raises(RuntimeError):
+            runner.run()
+        assert persistence.current_clock() is None
+
+    def test_replays_do_not_nest(self):
+        import persistence
+        previous = persistence.set_clock(lambda: 1.0)
+        try:
+            with pytest.raises(RuntimeError, match="do not nest"):
+                bt.Backtester({"BTCUSDT": synthetic_bars(300)},
+                              permissive_config()).run()
+        finally:
+            persistence.set_clock(previous)

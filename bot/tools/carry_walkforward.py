@@ -116,7 +116,7 @@ def grid_id() -> str:
 # -- parameters -----------------------------------------------------------
 
 def base_params(*, notional: float, borrow_apr: float, impact_bps: float,
-                overlay: bool):
+                overlay: bool, latency_rows: int = cb.LATENCY_ROWS):
     """The costs and the book. Everything the SEARCH varies is overwritten
     per cell; everything here is held fixed across the whole run."""
     return core.params(
@@ -124,7 +124,8 @@ def base_params(*, notional: float, borrow_apr: float, impact_bps: float,
         round_trip_bps=cb.round_trip_bps_for(cb.OVERLAY if overlay
                                              else cb.ACQUIRE),
         gated=True, overlay=overlay,
-        taker_spot_bps=cb.TAKER_BPS_SPOT, taker_perp_bps=cb.TAKER_BPS_PERP)
+        taker_spot_bps=cb.TAKER_BPS_SPOT, taker_perp_bps=cb.TAKER_BPS_PERP,
+        latency_rows=latency_rows)
 
 
 def cell_params(base, cell: Dict[str, Any]):
@@ -136,7 +137,8 @@ def cell_params(base, cell: Dict[str, Any]):
         ewma_alpha=float(cell["ewma_alpha"]), gated=True,
         overlay=bool(base.overlay), ewma_min_prints=base.ewma_min_prints,
         negative_exit_prints=int(cell["negative_exit_prints"]),
-        funding_history=base.funding_history)
+        funding_history=base.funding_history,
+            latency_rows=base.latency_rows)
     return p
 
 
@@ -194,7 +196,8 @@ def sweep_cells(rows: Sequence[Any], base) -> List[Dict[str, Any]]:
             gated=True, overlay=bool(base.overlay),
             ewma_min_prints=base.ewma_min_prints,
             negative_exit_prints=base.negative_exit_prints,
-            funding_history=base.funding_history)
+            funding_history=base.funding_history,
+            latency_rows=base.latency_rows)
         for cell in core.sweep(rows, p, entry_grid=[0.0], hold_grid=HOLD_DAYS,
                                exit_grid=EXIT_PRINTS):
             cell["ewma_alpha"] = float(alpha)
