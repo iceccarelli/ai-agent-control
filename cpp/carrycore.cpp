@@ -56,6 +56,15 @@ bool ewma(const double *prints, int count, double alpha, int min_prints,
 /* carry_costs.evaluate_entry, gate for gate, in order. */
 bool may_open_gated(const double *history, int count, double perp, double spot,
                     const CarryParams &p) {
+    /* carry_costs._invalid_cost_inputs: a NaN, a missing or non-positive
+       round trip / hold / price, or a negative borrow is refused, not priced. */
+    if (!(std::isfinite(perp) && perp > 0.0) ||
+        !(std::isfinite(spot) && spot > 0.0) ||
+        !(std::isfinite(p.round_trip_bps) && p.round_trip_bps > 0.0) ||
+        !(std::isfinite(p.hold_days) && p.hold_days > 0.0) ||
+        !(std::isfinite(p.borrow_apr) && p.borrow_apr >= 0.0)) {
+        return false;                       /* COST_INPUT_INVALID            */
+    }
     double smoothed = 0.0;
     if (!ewma(history, count, p.ewma_alpha, p.ewma_min_prints, &smoothed)) {
         return false;                       /* INSUFFICIENT_FUNDING_HISTORY */
@@ -279,4 +288,4 @@ extern "C" int32_t carry_sweep(const CarrySettlement *rows, int32_t n,
     return total;
 }
 
-extern "C" const char *carrycore_version(void) { return "carrycore/2 (latency)"; }
+extern "C" const char *carrycore_version(void) { return "carrycore/3 (latency, cost-input gate)"; }

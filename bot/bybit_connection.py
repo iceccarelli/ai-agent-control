@@ -117,6 +117,62 @@ DEMO_WS_PRIVATE = "wss://stream-demo.bybit.com/v5/private"
 VENUE_WS_PRIVATE = {"mainnet": MAINNET_WS_PRIVATE, "testnet": TESTNET_WS_PRIVATE,
                     "demo": DEMO_WS_PRIVATE}
 
+#: The one hostname each venue may be reached on. The request path checks the
+#: URL it is ACTUALLY about to send against this, so a base_url that was
+#: reassigned, subclassed or monkey-patched after construction cannot carry a
+#: testnet-labelled client to the production host (or the reverse).
+VENUE_HOSTS = {"mainnet": "api.bybit.com", "testnet": "api-testnet.bybit.com",
+               "demo": "api-demo.bybit.com"}
+
+#: Endpoints that can open or enlarge exposure. On mainnet these leave the
+#: process only when live trading is authorised in the config the client was
+#: built from - checked at the one transport every caller shares, including
+#: `carry_broker`, which calls `_request` directly and so never passes through
+#: `_submit`. Cancels and protective stops are deliberately NOT here: refusing
+#: to cancel an order on an unarmed mainnet client would be the unsafe choice.
+EXPOSURE_ENDPOINTS = frozenset({"/v5/order/create", "/v5/position/set-leverage"})
+
+
+def resolve_client_venue(cfg: Any) -> str:
+    """Which venue this config means, or a refusal. Never a guess.
+
+    * ``BYBIT_VENUE`` (when stated) must be a known venue, and ``USE_TESTNET``
+      (when stated) must agree with it: a duck-typed or hand-built config does
+      not pass through ``config.load``, which is where the same contradiction
+      is refused for the real environment.
+    * With no venue, ``USE_TESTNET`` alone decides, and only a stated
+      boolean counts: absent, ``None`` and the empty string are refused rather
+      than read as "not testnet", which is how an unset flag becomes mainnet.
+    """
+    import config as _config
+
+    raw = getattr(cfg, "BYBIT_VENUE", None)
+    stated = getattr(cfg, "USE_TESTNET", None)
+    sandbox: Optional[bool] = None
+    if stated is not None and str(stated).strip() != "":
+        try:
+            sandbox = _config.parse_safety_bool(stated, "USE_TESTNET", True)
+        except _config.ConfigError as exc:
+            raise ValueError(f"USE_TESTNET is unreadable ({exc}); refusing "
+                             "rather than guessing the venue") from exc
+    if raw is None or str(raw).strip() == "":
+        if sandbox is None:
+            raise ValueError(
+                "neither BYBIT_VENUE nor USE_TESTNET is stated; refusing "
+                "rather than choosing an exchange")
+        return "testnet" if sandbox else "mainnet"
+    venue = str(raw).strip().lower()
+    if venue not in VENUE_REST:
+        raise ValueError(
+            f"BYBIT_VENUE={raw!r} is not one of {sorted(VENUE_REST)}; "
+            "refusing rather than guessing which exchange to authenticate "
+            "against")
+    if sandbox is not None and sandbox != (venue != "mainnet"):
+        raise ValueError(
+            f"BYBIT_VENUE={venue!r} and USE_TESTNET={stated!r} disagree about "
+            "whether this is a sandbox; refusing")
+    return venue
+
 #: Bybit retCodes that are worth retrying with the SAME orderLinkId.
 #:
 #: Deliberately short. The legacy transport retried 110001 ("order does not
@@ -374,17 +430,11 @@ class BybitClient:
         #: `session_log.PaperSessionLog` reports it verbatim.
         self.orders_submitted = 0
 
-        self.testnet = bool(self.cfg.USE_TESTNET)
-        # The venue name is the authority; USE_TESTNET is the DERIVED sandbox
-        # flag every safety gate already reads (0046). A config that states
-        # both and contradicts itself never gets here: config.load refuses it.
-        venue = str(getattr(self.cfg, "BYBIT_VENUE", "") or
-                    ("testnet" if self.testnet else "mainnet"))
-        if venue not in VENUE_REST:
-            raise ValueError(
-                f"BYBIT_VENUE={venue!r} is not one of {sorted(VENUE_REST)}; "
-                "refusing rather than guessing which exchange to authenticate "
-                "against")
+        # The venue is resolved ONCE, centrally, and refused when the config
+        # contradicts itself or states nothing (resolve_client_venue). USE_TESTNET
+        # is then the DERIVED sandbox flag every safety gate already reads.
+        venue = resolve_client_venue(self.cfg)
+        self.testnet = venue != "mainnet"
         self.venue = venue
         self.base_url = VENUE_REST[venue]
         # By venue, like REST: demo credentials are only valid on the demo
@@ -431,6 +481,40 @@ class BybitClient:
 
     # -- clock -------------------------------------------------------------
 
+    def _assert_endpoint_matches_venue(self, url: str) -> None:
+        """The URL about to be sent must be https on this venue's one host.
+
+        Checked against the string the transport will receive, not against the
+        label the client was built with.
+        """
+        from urllib.parse import urlsplit
+        parts = urlsplit(url)
+        if parts.scheme != "https" or parts.hostname != VENUE_HOSTS.get(
+                self.venue):
+            raise PermanentAPIError(
+                f"endpoint host {parts.hostname!r} is not the {self.venue} "
+                f"host {VENUE_HOSTS.get(self.venue)!r}; nothing was sent")
+
+    def describe(self) -> Dict[str, Any]:
+        """What this client is pointed at, with no secret in it.
+
+        Credentials are reported as present or absent; neither the key, the
+        secret, a signature nor a credential-bearing URL appears here.
+        """
+        from urllib.parse import urlsplit
+        import config as _config
+        armed, _why = _config.is_live_authorized(self.cfg)
+        return {"venue": self.venue, "host": urlsplit(self.base_url).hostname,
+                "sandbox": self.testnet, "category": self.category,
+                "credentials_present": bool(self.api_key and self.api_secret),
+                "live_authorized": armed is True,
+                "orders_submitted": self.orders_submitted}
+
+    def __repr__(self) -> str:
+        return (f"<BybitClient venue={self.venue} host="
+                f"{VENUE_HOSTS.get(self.venue)} credentials="
+                f"{'present' if self.api_key else 'absent'}>")
+
     def _now_ms(self) -> int:
         """Epoch milliseconds, skew-corrected.
 
@@ -444,6 +528,7 @@ class BybitClient:
 
     def sync_time(self) -> int:
         """Measure clock skew against the exchange. Returns the skew in ms."""
+        self._assert_endpoint_matches_venue(f"{self.base_url}/v5/market/time")
         try:
             status, text = self.transport.request(
                 "GET", f"{self.base_url}/v5/market/time", headers={},
@@ -530,6 +615,15 @@ class BybitClient:
         """
         method = method.upper()
         url = f"{self.base_url}{endpoint}"
+        self._assert_endpoint_matches_venue(url)
+        if self.venue == "mainnet" and endpoint in EXPOSURE_ENDPOINTS:
+            import config as _config
+            armed, why = _config.is_live_authorized(self.cfg)
+            if armed is not True:
+                logger.critical("%s REFUSED at the transport: mainnet without "
+                                "live authorisation (%s)", endpoint, why)
+                raise PermanentAPIError(
+                    f"LIVE_NOT_AUTHORIZED: {endpoint} on mainnet ({why})")
         # Count order submissions at the one place every call passes through.
         # Incremented before the attempt, not after a success: an order whose
         # response was lost still left the process, and a session log that

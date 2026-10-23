@@ -29,6 +29,49 @@ import tempfile
 
 import pytest
 
+# ---------------------------------------------------------------------------
+# OFFLINE BY DEFAULT: no inherited credentials, no network.
+#
+# A developer shell or CI runner may carry real exchange credentials and a live
+# or testnet venue selection. A test that builds a client without an injected
+# transport would then SIGN AND SEND a real request. So, before any test module
+# is imported (config reads the environment at import), the venue/credential
+# variables are removed from this process, and the HTTP layer refuses to leave
+# the machine. The caller's environment is restored when the session ends.
+# Opt out for a deliberate, separately authorised integration run only:
+#   BOT_ALLOW_NETWORK_TESTS=1 (and it still needs its own explicit arming).
+# ---------------------------------------------------------------------------
+_SCRUBBED = ("BYBIT_API_KEY", "BYBIT_API_SECRET", "BYBIT_VENUE", "USE_TESTNET",
+             "PAPER_TRADING", "LIVE_TRADING_ACK")
+_ALLOW_NETWORK = os.environ.get("BOT_ALLOW_NETWORK_TESTS") == "1"
+_SAVED_ENV = {} if _ALLOW_NETWORK else {
+    k: os.environ.pop(k) for k in _SCRUBBED if k in os.environ}
+
+
+class NetworkBlocked(RuntimeError):
+    """A test tried to make a real HTTP request."""
+
+
+def _blocked(self, method, url, *args, **kwargs):
+    raise NetworkBlocked(
+        f"offline test run: {str(method).upper()} to "
+        f"{str(url).split('?')[0]} was blocked (set BOT_ALLOW_NETWORK_TESTS=1 "
+        "only for a deliberately authorised integration run)")
+
+
+if not _ALLOW_NETWORK:
+    try:
+        import requests as _requests
+        _requests.Session.request = _blocked
+    except ImportError:                                  # pragma: no cover
+        pass
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _restore_caller_environment():
+    yield
+    os.environ.update(_SAVED_ENV)
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _disable_data_read_ledger():

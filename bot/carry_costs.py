@@ -167,6 +167,27 @@ def basis_bps(perp: float, spot: float) -> float:
     return (perp / spot - 1.0) * 1e4
 
 
+def _usable(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _invalid_cost_inputs(*, borrow_apr: Any, round_trip_bps: Any,
+                         hold_days: Any) -> List[str]:
+    """Names of the inputs the gate may not price. Empty means all usable."""
+    bad: List[str] = []
+    for name, value, minimum_exclusive in (
+            ("round_trip_bps", round_trip_bps, True),
+            ("hold_days", hold_days, True), ("borrow_apr", borrow_apr, False)):
+        number = _usable(value)
+        if number is None or (number <= 0 if minimum_exclusive else number < 0):
+            bad.append(name)
+    return bad
+
+
 def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
                    spot: float, borrow_apr: float, round_trip_bps: float,
                    hold_days: float = ASSUMED_HOLD_DAYS) -> CarryVerdict:
@@ -175,6 +196,23 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
     Order matters. Cheapest and most decisive checks first, so a refusal names
     the binding constraint rather than the first thing that happened to fail.
     """
+    # EVERY COST INPUT MUST BE A USABLE NUMBER, or the book does not open.
+    # A NaN anywhere below turns every comparison false: `net_edge <= 0` and
+    # `entry_basis > budget` both fail to refuse and the entry is ALLOWED. A
+    # missing, zero or negative round trip reads as free execution, and a
+    # negative borrow as income. None of those is a conservative bound, so each
+    # is refused and named rather than priced.
+    invalid = _invalid_cost_inputs(borrow_apr=borrow_apr,
+                                   round_trip_bps=round_trip_bps,
+                                   hold_days=hold_days)
+    if invalid:
+        return CarryVerdict(
+            False, "COST_INPUT_INVALID",
+            detail={"fields": invalid,
+                    "note": "a cost that is missing, non-finite, zero where it "
+                            "must be positive, or negative is not priced; the "
+                            "gate refuses instead of assuming it is free"})
+
     smoothed = ewma_funding_bps(funding_prints_bps)
     if smoothed is None:
         return CarryVerdict(
@@ -195,7 +233,7 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
 
     try:
         entry_basis = basis_bps(perp, spot)
-    except ValueError as exc:
+    except (ValueError, TypeError) as exc:
         return CarryVerdict(False, "BASIS_UNREADABLE",
                             smoothed_funding_bps=smoothed,
                             detail={"error": str(exc)})
