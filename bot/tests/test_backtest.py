@@ -437,6 +437,23 @@ class TestFundingIsNotSilentlyOutsideTheTradeStatistics:
         # larger than the tolerance, so the assertion above means something
         assert abs(result.funding_paid) > 0.05
 
+    @pytest.mark.parametrize("aligned", [False, True])
+    def test_every_settlement_charged_is_given_to_exactly_one_trade(
+            self, permissive_view, aligned):
+        """The per-trade funding adds up to the funding charged to cash, to the
+        cent, whatever the bars' alignment to the 00/08/16 settlements."""
+        bars = synthetic_bars(900)
+        if aligned:
+            shift = (-bars[0].start_ms) % (8 * 3_600_000)
+            bars = [bt.Bar(b.start_ms + shift, b.open, b.high, b.low, b.close,
+                           b.volume) for b in bars]
+        cfg = permissive_config(category="linear")
+        result = bt.Backtester({"BTCUSDT": bars}, cfg).run()
+        assert result.trades > 0 and abs(result.funding_paid) > 1e-6
+        assert not any("does NOT reconcile" in n for n in result.notes), result.notes
+        given = -sum(d.get("funding_usd", 0.0) for d in result.trade_details)
+        assert given == pytest.approx(result.funding_paid, abs=1e-9)
+
     def test_a_spot_run_has_no_funding_and_no_note(self, permissive_view):
         result = bt.Backtester({"BTCUSDT": synthetic_bars(600)},
                                permissive_config()).run()
