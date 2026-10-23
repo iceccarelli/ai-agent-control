@@ -1619,6 +1619,27 @@ class StateStore:
                     raise PersistenceError(f"{name} is not a finite number")
             if exit_price <= 0:
                 raise PersistenceError("exit_price must be positive")
+            # An execution is one fill: if another exit row already names any
+            # of these, pricing this one from them would count the fill twice.
+            # Checked inside the same transaction as the update.
+            raw_ids = evidence.get("exec_ids")
+            named = {n for n in (self.normalize_exec_id(i) for i in (
+                raw_ids if isinstance(raw_ids, (list, tuple)) else ())) if n}
+            if named & self.claimed_exit_exec_ids(
+                    str(row["symbol"]), exclude_trade_id=int(trade_id)):
+                # journalled ONCE per trade: a refusal that repeats every cycle
+                # must not also grow the journal every cycle
+                seen = self._conn.execute(
+                    "SELECT 1 FROM decisions WHERE symbol = ? AND decision = ? "
+                    "AND json_extract(detail, '$.trade_id') = ? LIMIT 1",
+                    (str(row["symbol"]), "EXIT_EXEC_ALREADY_CLAIMED",
+                     int(trade_id))).fetchone()
+                if seen is None:
+                    self.journal(str(row["symbol"]), "EXIT_EXEC_ALREADY_CLAIMED",
+                                 str(row["order_link_id"]),
+                                 {"trade_id": int(trade_id),
+                                  "exec_ids": sorted(named)})
+                return False
             old_net = float(row["net_pnl"])
             meta = json.loads(row["meta"] or "{}")
             # funding already booked on the row is part of its net
@@ -1696,6 +1717,52 @@ class StateStore:
                              (str(symbol),)):
             out.update(str(k) for k in
                        json.loads(r["meta"] or "{}").get("exit_row_keys", []))
+        return out
+
+    @staticmethod
+    def normalize_exec_id(value: Any) -> Optional[str]:
+        """The comparison form of a venue execution id: a non-blank string,
+        stripped and case-folded. Anything else is not an id (None), so a
+        malformed value can neither raise nor be claimed as its characters."""
+        if not isinstance(value, str):
+            return None
+        text = value.strip().casefold()
+        return text or None
+
+    def claimed_exit_exec_ids(self, symbol: str, exclude_trade_id: int = 0) -> set:
+        """Venue EXECUTION ids (normalised, see `normalize_exec_id`) already
+        named as pricing an exit of ``symbol``: either recorded with the exit
+        when it was booked (``exit_exec_ids``) or by a later reconciliation
+        (``reconciliation.evidence.exec_ids``). One execution is one fill and
+        can price one exit row only. A row whose recorded ids are malformed
+        contributes nothing and never raises."""
+        out: set = set()
+        for r in self._query("SELECT id, meta FROM trades WHERE symbol = ?",
+                             (str(symbol),)):
+            if int(r["id"]) == int(exclude_trade_id):
+                continue
+            out.update(self._row_exec_ids(r["meta"]))
+        return out
+
+    @classmethod
+    def _row_exec_ids(cls, meta_text: Any) -> set:
+        try:
+            meta = json.loads(meta_text or "{}")
+        except (ValueError, TypeError):
+            return set()
+        if not isinstance(meta, dict):
+            return set()
+
+        def ids(value: Any) -> set:
+            if not isinstance(value, (list, tuple)):
+                return set()
+            return {n for n in (cls.normalize_exec_id(v) for v in value) if n}
+
+        out = ids(meta.get("exit_exec_ids"))
+        recon = meta.get("reconciliation")
+        evidence = recon.get("evidence") if isinstance(recon, dict) else None
+        if isinstance(evidence, dict):
+            out |= ids(evidence.get("exec_ids"))
         return out
 
     def claimed_exit_order_ids(self, symbol: str, exclude_trade_id: int = 0) -> set:

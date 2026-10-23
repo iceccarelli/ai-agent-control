@@ -1212,6 +1212,10 @@ def claims_from_store(db_path: str, *, environment: str = "unknown",
             recon = meta.get("reconciliation") if isinstance(meta, dict) else None
             evid = recon.get("evidence") if isinstance(recon, dict) else None
             exec_ids = evid.get("exec_ids") if isinstance(evid, dict) else None
+            booked = meta.get("exit_exec_ids") if isinstance(meta, dict) else None
+            if isinstance(booked, list) and booked:
+                # recorded with the exit itself, in the same transaction
+                exec_ids = booked
             trade_claims.append({
                 "claim_id": f"trade:{t['id']}", "source": source,
                 "environment": environment, "symbol": t["symbol"],
