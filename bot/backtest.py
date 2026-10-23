@@ -24,6 +24,13 @@ WHAT IS MODELLED
 * **Taker and maker fees**, applied on both legs, defaulting to Bybit spot rates.
 * **Slippage**, as a fraction of price, applied against the trader.
 * **Intrabar stop and take-profit fills**, checked against each bar's high/low.
+  A stop triggers on a touch (inclusive: it is a market order once reached). A
+  RESTING LIMIT or take-profit fills only when the bar trades THROUGH its price
+  (high > price for a sell, low < price for a buy): a bar whose extreme merely
+  equals the price proves the price printed, not that a resting order, which
+  sits in a queue, filled. ``touch_fills=True`` restores the touch rule for a
+  deliberate comparison. A fill is at the order's price, never improved to the
+  open on a gap (price improvement is not credited).
 * **Conservative bar resolution**: if a bar's range touches both the stop and a
   take-profit, the **stop is assumed to fill first**. Real data cannot tell us
   the order, and assuming the favourable one is how backtests lie.
@@ -198,7 +205,11 @@ class SimulatedExchange(Transport):
         slippage: float = 0.0005,
         instrument_filters: Optional[Mapping[str, Mapping[str, str]]] = None,
         books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+        touch_fills: bool = False,
     ) -> None:
+        #: See the module docstring: False (the default) requires a resting
+        #: limit to be traded THROUGH before it fills.
+        self.touch_fills = bool(touch_fills)
         self.bars = {s: list(b) for s, b in bars_by_symbol.items()}
         #: Optional per-bar L2 ladders, index-aligned with ``bars``: entry *i*
         #: is the book as it stood at the close of bar *i*, as
@@ -320,6 +331,19 @@ class SimulatedExchange(Transport):
             self._resolve_bar(symbol, series[self.index])
         return True
 
+    def _limit_reached(self, side: str, price: float, bar: Bar) -> bool:
+        """Did this bar trade far enough for a RESTING limit at ``price`` to fill?
+
+        A sell limit needs the market to trade above it, a buy limit below it. A
+        bar whose high (low) merely EQUALS the price is a touch: the price
+        printed, but a resting order sits behind the queue and OHLC cannot say
+        it was reached by the volume. ``touch_fills=True`` keeps the inclusive
+        rule."""
+        sell = normalize_side(side) == "Sell"
+        if self.touch_fills:
+            return bar.high >= price if sell else bar.low <= price
+        return bar.high > price if sell else bar.low < price
+
     def _resolve_bar(self, symbol: str, bar: Bar) -> None:
         """Fill any resting order this bar's range would have touched.
 
@@ -376,11 +400,7 @@ class SimulatedExchange(Transport):
         for order in limits:
             if order.status != "New":
                 continue
-            filled = (
-                bar.high >= order.price if order.side == "Sell"
-                else bar.low <= order.price
-            )
-            if filled:
+            if self._limit_reached(order.side, order.price, bar):
                 self._execute(order, order.price, taker=False)
                 if order.status == "Filled":
                     # A take-profit that closes the remaining size makes the
@@ -746,6 +766,7 @@ class LinearSimulatedExchange(SimulatedExchange):
         slippage: float = 0.0005,
         instrument_filters: Optional[Mapping[str, Mapping[str, str]]] = None,
         books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+        touch_fills: bool = False,
         funding_rate_per_8h: float = 0.0001,
         funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
         maintenance_margin_rate: float = 0.005,
@@ -755,6 +776,7 @@ class LinearSimulatedExchange(SimulatedExchange):
             bars_by_symbol, starting_cash=starting_cash, quote_asset=quote_asset,
             taker_fee=taker_fee, maker_fee=maker_fee, slippage=slippage,
             instrument_filters=instrument_filters, books_by_symbol=books_by_symbol,
+            touch_fills=touch_fills,
         )
         self.positions: Dict[str, _SimPosition] = {}
         self.funding_rate_per_8h = float(funding_rate_per_8h)
@@ -1123,8 +1145,8 @@ class LinearSimulatedExchange(SimulatedExchange):
                 self._liquidate(symbol, liq)
             else:
                 position_tp = position.take_profit
-                if position_tp > 0 and (
-                        bar.high >= position_tp if long else bar.low <= position_tp):
+                if position_tp > 0 and self._limit_reached(
+                        "Sell" if long else "Buy", position_tp, bar):
                     self._close_at(symbol, position_tp, purpose="tp")
             del adverse
 
@@ -1134,10 +1156,19 @@ class LinearSimulatedExchange(SimulatedExchange):
                 continue
             if order.order_type != "Limit":
                 continue
-            filled = (bar.high >= order.price if order.side == "Sell"
-                      else bar.low <= order.price)
-            if filled and symbol in self.positions:
+            if (self._limit_reached(order.side, order.price, bar)
+                    and symbol in self.positions):
                 self._execute(order, order.price, taker=False)
+
+        # A reduce-only leg belongs to the position it was placed against: when
+        # that position is gone (a stop, liquidation or take-profit closed it)
+        # the leg is cancelled, as on the spot venue, instead of waiting to
+        # reduce whatever position is opened next.
+        if symbol not in self.positions:
+            for order in self.orders.values():
+                if (order.symbol == symbol and order.status == "New"
+                        and order.reduce_only):
+                    order.status = "Cancelled"
 
     def _liquidate(self, symbol: str, price: float) -> None:
         position = self.positions.get(symbol)
@@ -1269,6 +1300,8 @@ class BacktestConfig:
     #: "spot" (long-only) or "linear" (shorts and funding). The simulator
     #: honours the difference; it does not pretend a spot account can short.
     category: str = "spot"
+    #: True restores "a touch fills a resting limit" (see the module docstring).
+    touch_fills: bool = False
     funding_rate_bps_per_8h: float = 1.0
     #: Maintenance margin, linear only. Bybit's BTCUSDT tier 1 is 0.33%; this
     #: default is stricter. A single rate rather than the tiered risk ladder,
@@ -1549,12 +1582,14 @@ class Backtester:
                 funding_rate_per_8h=cfg.funding_rate_bps_per_8h / 10_000.0,
                 funding_by_symbol=self.funding,
                 maintenance_margin_rate=cfg.maintenance_margin_rate,
+                touch_fills=cfg.touch_fills,
             )
         else:
             exchange = SimulatedExchange(
                 self.bars, starting_cash=cfg.starting_cash,
                 taker_fee=cfg.taker_fee, maker_fee=cfg.maker_fee,
                 slippage=cfg.slippage, books_by_symbol=self.books,
+                touch_fills=cfg.touch_fills,
             )
         self._clock_exchange = exchange
         store = StateStore(self.db_path)
