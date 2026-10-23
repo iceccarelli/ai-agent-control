@@ -84,6 +84,9 @@ jobs:
           tests/test_unpriced_exit_visibility.py
           tests/test_funding_sign_lock.py
           tests/test_carry_hold_session.py
+          tests/test_simulator_fill_contract.py
+          tests/test_linear_simulator.py
+          tests/test_backtest.py
           tests/test_bybit_connection.py
           tests/test_cancel_books_the_increment.py
           tests/test_carry_core.py

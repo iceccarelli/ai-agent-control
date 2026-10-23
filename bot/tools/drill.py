@@ -1037,7 +1037,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr)
         return 2
 
-    if args.hold_for_settlement:
+    if args.hold_for_settlement or args.arm:
         why_not = session_refusal(bot.cfg, getattr(bot.carry.broker, "client", None))
         if why_not:
             print(f"REFUSED: {why_not}", file=sys.stderr)

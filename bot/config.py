@@ -697,9 +697,16 @@ def is_live_authorized(cfg: Any = None) -> Tuple[bool, str]:
     if isinstance(cfg, Config):
         return cfg.LIVE_AUTHORIZED, cfg.LIVE_BLOCK_REASON
     get = (cfg.get if isinstance(cfg, Mapping) else lambda k, d=None: getattr(cfg, k, d))
+    try:
+        use_testnet = parse_safety_bool(get("USE_TESTNET", True), "USE_TESTNET", True)
+        paper_trading = parse_safety_bool(get("PAPER_TRADING", True),
+                                          "PAPER_TRADING", True)
+    except ConfigError as exc:
+        # a typo in a safety flag is never read as "live"
+        return False, f"LIVE_BLOCKED: {exc}"
     _, authorized, reason = _resolve_live_gate(
-        use_testnet=parse_bool(get("USE_TESTNET", True), True),
-        paper_trading=parse_bool(get("PAPER_TRADING", True), True),
+        use_testnet=use_testnet,
+        paper_trading=paper_trading,
         ack=str(get("LIVE_TRADING_ACK", "") or ""),
         api_key=str(get("BYBIT_API_KEY", "") or ""),
         api_secret=str(get("BYBIT_API_SECRET", "") or ""),

@@ -543,4 +543,39 @@ class TestTheReplayHasItsOwnClock:
         before = persistence.utc_now_epoch()
         self._run(tmp_path, "a")
         assert abs(persistence.utc_now_epoch() - before) < 3600
-        assert persistence._CLOCK is None
+        assert persistence.current_clock() is None
+
+
+class TestTheReplayClockIsContained:
+    def test_another_thread_never_sees_replay_time(self):
+        import threading
+        import persistence
+        seen = []
+        previous = persistence.set_clock(lambda: 123.0)
+        try:
+            t = threading.Thread(target=lambda: seen.append(persistence.utc_now_epoch()))
+            t.start()
+            t.join()
+            assert persistence.utc_now_epoch() == 123.0
+        finally:
+            persistence.set_clock(previous)
+        assert seen[0] > 1_000_000_000          # real time, not 123.0
+
+    def test_it_is_restored_after_an_exception_inside_the_replay(self, monkeypatch):
+        import persistence
+        runner = bt.Backtester({"BTCUSDT": synthetic_bars(300)}, permissive_config())
+        monkeypatch.setattr(runner, "_replay",
+                            lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        with pytest.raises(RuntimeError):
+            runner.run()
+        assert persistence.current_clock() is None
+
+    def test_replays_do_not_nest(self):
+        import persistence
+        previous = persistence.set_clock(lambda: 1.0)
+        try:
+            with pytest.raises(RuntimeError, match="do not nest"):
+                bt.Backtester({"BTCUSDT": synthetic_bars(300)},
+                              permissive_config()).run()
+        finally:
+            persistence.set_clock(previous)

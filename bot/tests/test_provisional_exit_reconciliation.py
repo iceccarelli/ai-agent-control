@@ -780,3 +780,17 @@ def test_an_exit_booked_days_after_its_fills_is_still_found(tmp_path):
     engine.client.get_executions = spy
     assert engine.reconcile_provisional_exits()["reconciled"] == 1
     assert seen["start_ms"] <= fill_ms <= seen["end_ms"]
+
+
+def test_a_dust_booking_that_fails_takes_the_trade_with_it(stack):
+    engine, client, risk, store, exchange = stack
+    assert engine.execute(buy_intent()).ok
+    held = float(store.open_positions()[0]["qty"])
+    min_qty = float(client.get_instrument_filters("BTCUSDT").min_qty)
+    store.add_dust = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("disk"))
+    with pytest.raises(RuntimeError):
+        engine.record_exit_fill(symbol="BTCUSDT", qty=held - min_qty / 2,
+                                price=ENTRY, fee=0.0, reason="TEST",
+                                dedupe_key="t:dust")
+    assert store._query("SELECT * FROM trades") == []          # not half-booked
+    assert float(store.open_positions()[0]["qty"]) == pytest.approx(held)

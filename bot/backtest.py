@@ -1531,6 +1531,9 @@ class Backtester:
         straddling midnight re-anchored at an arbitrary bar."""
         import persistence
 
+        if persistence.current_clock() is not None:
+            raise RuntimeError("a replay clock is already installed on this "
+                               "thread: replays do not nest")
         self._clock_exchange = None
 
         def replay_now() -> float:

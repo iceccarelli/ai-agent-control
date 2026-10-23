@@ -329,6 +329,12 @@ def load_testnet_config():
             "verdict": "PREFLIGHT_REFUSED",
             "reason": "USE_TESTNET is not set; this tool is testnet-only and "
                       "read nothing"}), 3)
+    if str(getattr(cfg, "BYBIT_VENUE", "testnet")).lower() != "testnet":
+        return None, (json.dumps({
+            "verdict": "PREFLIGHT_REFUSED",
+            "reason": f"BYBIT_VENUE={getattr(cfg, 'BYBIT_VENUE', None)!r}: this "
+                      "tool is testnet-only (demo is real market data with "
+                      "simulated matching, not the testnet) and read nothing"}), 3)
     armed, _why = _config.is_live_authorized(cfg)
     if armed is True or getattr(cfg, "LIVE_TRADING_ACK", ""):
         return None, (json.dumps({

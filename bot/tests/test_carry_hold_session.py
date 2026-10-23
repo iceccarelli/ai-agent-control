@@ -303,3 +303,16 @@ class TestTheHoldSurvivesWhatARealDaySends:
                              notional=100.0, venue="testnet", hold=_plan(clock))
         assert report["failed_stage"] == "flat" and report["still_open"] is True
         assert "HUMAN MUST ACT" in report["next_action"]
+
+
+def test_a_plain_arm_is_checked_against_the_venue_too(monkeypatch):
+    """--arm without --hold-for-settlement used to skip session_refusal and rely
+    on the per-order gate alone."""
+    bot = types.SimpleNamespace(
+        cfg=types.SimpleNamespace(BYBIT_VENUE="mainnet", USE_TESTNET=False,
+                                  PAPER_TRADING=False, LIVE_TRADING_ACK="x"),
+        carry=types.SimpleNamespace(
+            broker=types.SimpleNamespace(client=types.SimpleNamespace(
+                base_url="https://api.bybit.com"))))
+    monkeypatch.setattr(D, "_load_bot", lambda: bot)
+    assert D.main(["--arm"]) == 3

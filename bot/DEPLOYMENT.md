@@ -11,9 +11,13 @@ real data — not an authorisation to deploy.
 
 ### Rotate the API keys
 
-`.env.production.ORIGINAL_DO_NOT_DEPLOY` in this repository contains live Bybit
-credentials. They are in the git history, and the original Dockerfile copied
-them into every image (`COPY . /app`, no `.dockerignore`).
+`.env.production.ORIGINAL_DO_NOT_DEPLOY` held live Bybit credentials in the
+SOURCE this repository was imported from, and the original Dockerfile copied
+them into every image (`COPY . /app`, no `.dockerignore`). A scan of this
+repository's full git history (612 commits) finds no such file and no credential
+value, so the exposure is in that original upload/source and in any image built
+from it, not provably in this history. Nothing can show the keys were never in a
+file or image, so treat them as compromised regardless.
 
 **Treat them as fully compromised.**
 
@@ -248,7 +252,7 @@ the process is intentional. Allow ≥30 s for graceful termination.
 ## 4. Pre-flight checklist
 
 - [ ] Old API keys revoked; account inspected for stray positions, orders, loans
-- [ ] `.env.production.ORIGINAL_DO_NOT_DEPLOY` deleted; images purged
+- [ ] `.env.production.ORIGINAL_DO_NOT_DEPLOY` deleted wherever the original source lives; images purged
 - [ ] New keys: spot trade + read only, **no withdrawal**, IP-bound
 - [ ] `.dockerignore` excludes `.env*`, `state/`, `_dead/`
 - [ ] Gate 1: 618 tests green

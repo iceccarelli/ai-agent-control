@@ -160,3 +160,17 @@ def test_the_real_command_line_refuses_a_contradictory_environment_cleanly():
     out = json.loads(proc.stdout)
     assert out["verdict"] == "PREFLIGHT_REFUSED" and "disagree" in out["reason"]
     assert "Traceback" not in proc.stderr
+
+
+def test_the_read_only_tools_refuse_the_demo_venue_not_just_mainnet(monkeypatch):
+    import json as _json
+    import types as _types
+    import config as C
+    import carry_preflight as P
+    cfg = _types.SimpleNamespace(USE_TESTNET=True, BYBIT_VENUE="demo",
+                                 LIVE_TRADING_ACK="")
+    monkeypatch.setattr(C, "load", lambda *a, **k: cfg)
+    got, refusal = P.load_testnet_config()
+    assert got is None
+    body, code = refusal
+    assert code == 3 and "testnet-only" in _json.loads(body)["reason"]
