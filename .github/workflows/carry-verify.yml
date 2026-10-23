@@ -85,6 +85,7 @@ jobs:
           tests/test_funding_sign_lock.py
           tests/test_carry_hold_session.py
           tests/test_simulator_fill_contract.py
+          tests/test_funding_window.py
           tests/test_linear_simulator.py
           tests/test_backtest.py
           tests/test_bybit_connection.py
