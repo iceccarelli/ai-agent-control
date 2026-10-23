@@ -138,12 +138,16 @@ def infer_environment_from_url(url: str) -> str:
     Returns "unknown" rather than guessing when the host does not match any
     known venue — never defaults to a networked environment.
     """
-    text = str(url or "")
+    from urllib.parse import urlsplit
+    parts = urlsplit(str(url or ""))
+    # The hostname must EQUAL a venue host. A substring test accepted
+    # "https://api.bybit.com.evil.io" and "https://evil.io/api.bybit.com" as
+    # mainnet, which is how a look-alike URL launders a transcript.
     for env, host in VENUE_HOSTS.items():
-        if host in text:
+        if parts.scheme == "https" and parts.hostname == host:
             return env
     for env, host in WS_VENUE_HOSTS.items():
-        if host in text:
+        if parts.scheme == "wss" and parts.hostname == host:
             return env
     return "unknown"
 
