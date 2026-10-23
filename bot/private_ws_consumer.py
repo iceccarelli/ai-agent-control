@@ -134,6 +134,10 @@ def deterministic_id(*parts: str) -> str:
 RECV_TIMEOUT_SECONDS = 25.0  # Bybit pings/expects traffic ~every 20s
 PING_INTERVAL_SECONDS = 20.0
 RECONNECT_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 20.0)
+#: How often a CONNECTED receive loop wakes to see whether it was asked to stop.
+#: Without this bound a healthy connection is only left when it breaks, so a
+#: shutdown request on a working stream is never honoured.
+STOP_POLL_SECONDS = 1.0
 DEDUP_MAX_SIZE = 10_000
 
 #: Order-lifecycle statuses this consumer will fast-forward the ledger to.
@@ -665,6 +669,19 @@ class WSPrivateConsumer:
 
     # -- the part that needs a real (or fake) transport ------------------
 
+    _stop_requested = False
+
+    def request_stop(self) -> None:
+        """Ask the receive loop to leave a HEALTHY connection and return.
+
+        `run_forever` only looked at its stop event between connections, and
+        `run_once` loops until the transport raises - so on a live stream the
+        thread never stopped, and a caller that needs a genuine shutdown (the
+        conformance run's final drain) timed out. A plain flag, read at least
+        once a second by the loop; safe to set from any thread.
+        """
+        self._stop_requested = True
+
     def run_once(self, *, max_messages: Optional[int] = None) -> None:
         """Connect, auth, subscribe, and receive until the transport ends
         the connection (raises) or `max_messages` is reached (test-only
@@ -698,13 +715,15 @@ class WSPrivateConsumer:
             last_rx = time.time()
             self._reached_receive_loop = True
             while max_messages is None or count < max_messages:
+                if self._stop_requested:
+                    return
                 if time.time() - last_ping > PING_INTERVAL_SECONDS:
                     transport.send_text(json.dumps(self._client.ws_ping_message()))
                     last_ping = time.time()
                 # Wake in time for the next ping: a quiet private stream must
                 # not sit in recv() past the ping interval, or the connection
                 # is declared dead and torn down every RECV_TIMEOUT seconds.
-                wait = min(RECV_TIMEOUT_SECONDS, max(
+                wait = min(RECV_TIMEOUT_SECONDS, STOP_POLL_SECONDS, max(
                     0.1, PING_INTERVAL_SECONDS - (time.time() - last_ping)))
                 try:
                     opcode, payload = transport.recv(timeout=wait)
@@ -769,6 +788,7 @@ class WSPrivateConsumer:
         disconnect runs AFTER, and does not affect the flag's timeliness.
         """
         attempt = 0
+        self._stop_requested = False
         while not stop_event.is_set():
             connection_error = ""
             self._reached_receive_loop = False
