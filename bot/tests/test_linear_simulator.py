@@ -406,3 +406,136 @@ class TestAdverseEquity:
         ex.positions.clear()
         open_short(ex, qty=1.0, price=100.0)
         assert ex.adverse_equity() == pytest.approx(990.0)
+
+
+DAY = 24 * HOUR
+# a UTC-midnight start, so a daily bar contains settlements at +0h, +8h, +16h
+MIDNIGHT = ((1_600_000_000_000 // DAY) + 1) * DAY
+
+
+class TestFundingStopsWhenThePositionStops:
+    """The event-order contract of one bar that contains several settlements.
+
+    A settlement stamped at the bar's START precedes everything in the bar. A
+    settlement INSIDE the bar cannot be ordered against a stop, take-profit or
+    partial exit by OHLC, so the unfavourable order is assumed per sign: a
+    payment is charged as if the position were still held, a receipt is not
+    credited to a position that was closed in the bar."""
+
+    RATE = 0.001
+
+    def _daily(self, side, *, low=None, high=None, cash=100_000.0, **kw):
+        # bar 0 is the position's opening bar; bar 1 is the bar under test
+        ex = venue([100.0, 100.0], start=MIDNIGHT, span=DAY,
+                   starting_cash=cash, funding_rate_per_8h=self.RATE,
+                   high=high or [100.5, 100.5], low=low or [99.5, 99.5], **kw)
+        pos = (open_long if side == "Buy" else open_short)(ex, qty=1.0, price=100.0)
+        pos.opened_index = -5                    # held through the open of bar 1
+        ex.index = 0
+        return ex, pos
+
+    def test_a_long_still_held_pays_all_three_settlements(self):
+        ex, _ = self._daily("Buy")
+        ex.step()
+        assert ex.funding_paid == pytest.approx(3 * self.RATE * 100.0)
+
+    def test_a_short_still_held_receives_all_three_settlements(self):
+        ex, _ = self._daily("Sell")
+        ex.step()
+        assert ex.funding_paid == pytest.approx(-3 * self.RATE * 100.0)
+
+    def test_a_short_stopped_in_the_bar_receives_only_the_settlement_at_the_open(self):
+        ex, pos = self._daily("Sell", high=[100.5, 120.0])
+        pos.stop_loss = 110.0
+        ex.step()
+        assert SYMBOL not in ex.positions                    # it was stopped
+        # the settlement stamped at the bar's start precedes the stop; the two
+        # inside the bar are not credited to a position that was closed in it
+        assert ex.funding_paid == pytest.approx(-1 * self.RATE * 100.0)
+
+    def test_a_long_stopped_in_the_bar_still_pays_every_settlement(self):
+        ex, pos = self._daily("Buy", low=[99.5, 80.0])
+        pos.stop_loss = 90.0
+        ex.step()
+        assert SYMBOL not in ex.positions
+        # the favourable order (stop before the later settlements) is NOT assumed
+        assert ex.funding_paid == pytest.approx(3 * self.RATE * 100.0, rel=0.06)
+        assert ex.funding_paid >= 3 * self.RATE * 90.0
+
+    def test_funding_after_the_position_closed_is_never_charged_again(self):
+        ex, pos = self._daily("Buy", low=[99.5, 80.0, 80.0])
+        ex.bars[SYMBOL].append(bt.Bar(MIDNIGHT + 2 * DAY, 100.0, 100.5, 99.5, 100.0, 1.0))
+        pos.stop_loss = 90.0
+        ex.step()
+        paid = ex.funding_paid
+        ex.step()                                            # next bar: flat
+        assert ex.funding_paid == paid
+
+    def test_a_partial_reduction_charges_a_payer_on_the_larger_size_and_a_receiver_on_the_smaller(self):
+        def run(side):
+            ex, pos = self._daily(side)
+            pos.size = 2.0
+            ex.orders["tp1"] = bt._SimOrder(
+                order_link_id="tp1", symbol=SYMBOL,
+                side="Sell" if side == "Buy" else "Buy", order_type="Limit",
+                qty=1.0, price=100.4, order_filter="Order", trigger_price=0.0,
+                trigger_direction=0, purpose="tp", reduce_only=True)
+            ex.step()
+            assert ex.positions[SYMBOL].size == pytest.approx(1.0)   # reduced to 1
+            return ex.funding_paid
+        long_paid = run("Buy")
+        short_paid = run("Sell")
+        assert long_paid == pytest.approx(3 * self.RATE * 2.0 * 100.0, rel=0.01)
+        # at-open settlement on the full 2.0, the two in-bar ones on the 1.0 left
+        assert short_paid == pytest.approx(
+            -(self.RATE * 2.0 * 100.0 + 2 * self.RATE * 1.0 * 100.0), rel=0.01)
+
+    def test_a_re_resolved_bar_cannot_double_bill(self):
+        ex, _ = self._daily("Buy")
+        ex.step()
+        once = ex.funding_paid
+        ex._resolve_bar(SYMBOL, ex.bars[SYMBOL][ex.index])
+        ex._resolve_bar(SYMBOL, ex.bars[SYMBOL][ex.index])
+        assert ex.funding_paid == pytest.approx(once)
+
+    def test_a_position_opened_at_the_open_does_not_hold_through_that_settlement(self):
+        ex, pos = self._daily("Buy")
+        pos.opened_index = 0                                 # opened at bar 0's close
+        ex.step()
+        # the settlement at bar 1's start is before the fill; only the two
+        # inside the bar are held through
+        assert ex.funding_paid == pytest.approx(2 * self.RATE * 100.0)
+
+    def test_the_log_names_the_position_that_was_charged(self):
+        ex = venue([100.0] * 3, start=MIDNIGHT, span=DAY, starting_cash=100_000.0,
+                   funding_rate_per_8h=self.RATE)
+        pos = open_long(ex, qty=1.0, price=100.0)
+        pos.opened_index = 0                        # opened in bar 0
+        ex.index = 1
+        ex.step()                                   # bar 2: held through all three
+        assert len(ex.funding_log) == 3
+        assert {opened for *_rest, opened in ex.funding_log} == {MIDNIGHT}
+
+    def test_cash_reconciles_with_pnl_fees_and_funding(self):
+        ex, pos = self._daily("Buy", low=[99.5, 80.0])
+        pos.stop_loss = 90.0
+        start = ex.balances[ex.quote_asset]
+        ex.step()
+        pnl = sum(f["qty"] * (f["price"] - 100.0) for f in ex.fill_log)
+        fees = sum(f["fee"] for f in ex.fill_log)
+        assert ex.balances[ex.quote_asset] == pytest.approx(
+            start + pnl - fees - ex.funding_paid)
+
+
+class TestFundingIsGivenToThePositionThatPaidIt:
+    def test_two_sequential_positions_of_one_symbol_keep_their_own_funding(self):
+        class Fake:
+            funding_log = [(SYMBOL, 1, 5.0, 1000), (SYMBOL, 2, 3.0, 1000),
+                           (SYMBOL, 3, -2.0, 9000)]
+        rows = [{"symbol": SYMBOL, "opened_epoch": 1.0, "closed_epoch": 99.0,
+                 "net_pnl": 10.0},
+                {"symbol": SYMBOL, "opened_epoch": 9.0, "closed_epoch": 99.0,
+                 "net_pnl": 4.0}]
+        a, b = bt.Backtester._net_of_funding(Fake(), rows)
+        assert (a["net_pnl"], a["funding_usd"]) == (10.0 - 8.0, -8.0)
+        assert (b["net_pnl"], b["funding_usd"]) == (4.0 + 2.0, 2.0)

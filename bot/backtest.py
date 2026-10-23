@@ -754,9 +754,12 @@ class LinearSimulatedExchange(SimulatedExchange):
         self.maintenance_margin_rate = float(maintenance_margin_rate)
         self.leverage = float(leverage)
         self.funding_paid = 0.0
-        #: every settlement actually charged to cash: (symbol, settle_ms, paid),
-        #: so a trade can be given the funding of ITS hold.
-        self.funding_log: List[Tuple[str, int, float]] = []
+        #: every settlement actually charged to cash:
+        #: (symbol, settle_ms, paid, opened_bar_start_ms). The last field names
+        #: the POSITION that was charged (the start of the bar it was opened in),
+        #: so a trade is given the funding of its own hold, not of a time window
+        #: that may be a bar out of step with when the engine reaped it.
+        self.funding_log: List[Tuple[str, int, float, int]] = []
         self.liquidations: List[Dict[str, Any]] = []
         #: Settlements already charged, so a re-resolved bar cannot double-bill.
         self._funded: set = set()
@@ -923,31 +926,86 @@ class LinearSimulatedExchange(SimulatedExchange):
                 break
         return self.funding_rate_per_8h if best is None else best
 
-    def _apply_funding(self, symbol: str, bar: Bar) -> None:
-        """Charge every 8h settlement this bar contains. A long pays a positive rate."""
-        position = self.positions.get(symbol)
-        if position is None or position.size <= 0:
+    def _charge_settlement(self, symbol: str, settle: int, snapshot: Tuple,
+                           size: float, mark: float) -> None:
+        """Book ONE settlement against the position that held it. Exactly once
+        per (symbol, settlement, position): a re-resolved bar cannot double-bill."""
+        direction, opened_start_ms, opened_index = snapshot
+        key = (symbol, settle, opened_index)
+        if key in self._funded or size <= 0.0:
             return
+        self._funded.add(key)
+        rate = self._funding_rate_at(symbol, settle)
+        paid = direction * rate * size * mark
+        self._cash(-paid)
+        self.funding_paid += paid
+        self.funding_log.append((symbol, int(settle), float(paid),
+                                 int(opened_start_ms)))
+
+    def _settlements_in(self, symbol: str, bar: Bar) -> List[int]:
         span = self.FUNDING_INTERVAL_MS
         start, end = bar.start_ms, bar.start_ms + self._bar_span_ms(symbol)
         first = ((start + span - 1) // span) * span
-        # A position that opened at the previous bar's close opened AT this
-        # bar's start. A settlement stamped exactly then happens before that
-        # fill: the position did not hold through it, so it neither pays nor
-        # receives it.
-        just_opened = position.opened_index == self.index - 1
-        for settle in range(first, end, span):
-            if just_opened and settle == start:
+        return list(range(first, end, span))
+
+    def _snapshot(self, symbol: str, position: "_SimPosition",
+                  bar: Bar) -> Tuple[float, int, int]:
+        """(direction, start_ms of the bar the position was opened in, its bar
+        index): which POSITION a settlement is charged to."""
+        series = self.bars[symbol]
+        idx = position.opened_index
+        opened_ms = (int(series[idx].start_ms) if 0 <= idx < len(series)
+                     else int(bar.start_ms))
+        return (position.direction, opened_ms, idx)
+
+    def _fund_at_open(self, symbol: str, bar: Bar, snapshot: Tuple,
+                      size: float) -> None:
+        """A settlement stamped exactly at the bar's START happens before
+        anything inside the bar: the position held at the open pays or receives
+        it, valued at the open. A position opened at the previous bar's close
+        opened AT this start, after the settlement, and does not hold through
+        it (that boundary is strict: it neither pays nor receives)."""
+        if snapshot[2] == self.index - 1:
+            return
+        for settle in self._settlements_in(symbol, bar):
+            if settle == bar.start_ms:
+                self._charge_settlement(symbol, settle, snapshot, size, bar.open)
+
+    def _fund_inside(self, symbol: str, bar: Bar, snapshot: Tuple,
+                     size_start: float, size_end: float, still_held: bool) -> None:
+        """Settlements strictly INSIDE the bar (bars longer than the funding
+        interval). OHLC does not say whether a stop, take-profit or partial
+        exit in this bar came before or after them, so the unfavourable order is
+        assumed for each sign instead of the favourable one:
+
+        * a PAYMENT is charged on the larger quantity (the size at the open) at
+          the less favourable of open/close, as if the position were still held;
+        * a RECEIPT is credited only on the quantity still held when the bar
+          ends (nothing if the position was closed in the bar), at the less
+          favourable of open/close.
+
+        A position that is simply still held pays and receives normally."""
+        direction = snapshot[0]
+        for settle in self._settlements_in(symbol, bar):
+            if settle == bar.start_ms:
                 continue
-            key = (symbol, settle)
-            if key in self._funded:
-                continue
-            self._funded.add(key)
             rate = self._funding_rate_at(symbol, settle)
-            paid = position.direction * rate * position.size * bar.close
-            self._cash(-paid)
-            self.funding_paid += paid
-            self.funding_log.append((symbol, int(settle), float(paid)))
+            if direction * rate > 0:                       # it PAYS
+                self._charge_settlement(symbol, settle, snapshot, size_start,
+                                        max(bar.open, bar.close))
+            elif still_held:                               # it would RECEIVE
+                self._charge_settlement(symbol, settle, snapshot, size_end,
+                                        min(bar.open, bar.close))
+
+    def _apply_funding(self, symbol: str, bar: Bar) -> None:
+        """Charge the settlements a bar contains to a position that is HELD
+        through the whole bar (the unit contract of the two halves above)."""
+        position = self.positions.get(symbol)
+        if position is None or position.size <= 0:
+            return
+        snapshot = self._snapshot(symbol, position, bar)
+        self._fund_at_open(symbol, bar, snapshot, position.size)
+        self._fund_inside(symbol, bar, snapshot, position.size, position.size, True)
 
     def _bar_span_ms(self, symbol: str) -> int:
         series = self.bars[symbol]
@@ -956,7 +1014,22 @@ class LinearSimulatedExchange(SimulatedExchange):
         return max(1, series[1].start_ms - series[0].start_ms)
 
     def _resolve_bar(self, symbol: str, bar: Bar) -> None:
-        self._apply_funding(symbol, bar)
+        held = self.positions.get(symbol)
+        snapshot = None
+        size_start = 0.0
+        if held is not None and held.size > 0:
+            snapshot = self._snapshot(symbol, held, bar)
+            size_start = held.size
+            self._fund_at_open(symbol, bar, snapshot, size_start)
+        self._resolve_prices(symbol, bar)
+        if snapshot is not None:
+            after = self.positions.get(symbol)
+            still_held = (after is not None and after.size > 0
+                          and after.opened_index == snapshot[2])
+            self._fund_inside(symbol, bar, snapshot, size_start,
+                              after.size if still_held else 0.0, still_held)
+
+    def _resolve_prices(self, symbol: str, bar: Bar) -> None:
         position = self.positions.get(symbol)
         if position is not None and position.size > 0:
             long = normalize_side(position.side) == "Buy"
@@ -1684,10 +1757,9 @@ class Backtester:
             return rows
         out: List[Dict[str, Any]] = []
         for row in rows:
-            opened_ms = float(row["opened_epoch"]) * 1000.0
-            closed_ms = float(row["closed_epoch"]) * 1000.0
-            paid = sum(p for sym, ms, p in log
-                       if sym == row["symbol"] and opened_ms < ms <= closed_ms)
+            opened_ms = int(round(float(row["opened_epoch"]) * 1000.0))
+            paid = sum(p for sym, _ms, p, opened in log
+                       if sym == row["symbol"] and opened == opened_ms)
             out.append(dict(row, net_pnl=float(row["net_pnl"]) - paid,
                             funding_usd=-paid))
         return out
