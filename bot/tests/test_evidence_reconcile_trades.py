@@ -511,3 +511,69 @@ class TestTheStoreAdapterIsRobust:
         assert er.main(["--store", str(tmp_path / "nope.db"),
                         "--now-ms", str(fx.NOW)]) == 3
         assert "refusing" in capsys.readouterr().err
+
+
+class TestProvenExitAllocation:
+    """A reconciled provisional exit stores the execIds that priced it, so a
+    partial exit split across trade rows CAN be proven, exactly."""
+
+    def two_exit_execs(self):
+        return [fx.exec_row(3, order=X_ORD, link="EXT-1", side="Sell", qty="0.001",
+                            price="60100", fee="0.00006", t=fx.T0 + 600_000),
+                fx.exec_row(4, order=X_ORD, link="EXT-1", side="Sell", qty="0.001",
+                            price="60200", fee="0.00006", t=fx.T0 + 610_000)]
+
+    def half(self, n, price, **over):
+        t = trade(claim_id=f"T{n}", qty=0.001, exit_price=price,
+                  gross_pnl=(price - 60005.0) * 0.001, entry_fee=0.00006,
+                  exit_fee=0.00006, exit_exec_ids=[f"EXEC-{n + 2}"])
+        t.update(over)
+        return t
+
+    def test_each_half_reconciles_when_the_executions_are_named(self):
+        s = specs(exit_=self.two_exit_execs())
+        r = go([self.half(1, 60100.0), self.half(2, 60200.0)], s)
+        assert [v["resolved"] for v in r["trades"]] == [True, True]
+        assert r["pnl_claim_allowed"] is True
+
+    def test_without_the_execution_ids_the_split_is_unproven(self):
+        s = specs(exit_=self.two_exit_execs())
+        a = self.half(1, 60100.0)
+        del a["exit_exec_ids"]
+        assert "EXIT_ALLOCATION_UNPROVEN" in verdict(go([a], s))["issues"]
+
+    def test_one_execution_cannot_price_two_trades(self):
+        s = specs(exit_=self.two_exit_execs())
+        r = go([self.half(1, 60100.0), self.half(2, 60100.0,
+                                                 exit_exec_ids=["EXEC-3"])], s)
+        assert all("EXIT_OVERCLAIMED" in v["issues"] and not v["resolved"]
+                   for v in r["trades"])
+
+    def test_a_named_execution_the_capture_lacks_blocks(self):
+        s = specs(exit_=self.two_exit_execs())
+        v = verdict(go([self.half(1, 60100.0, exit_exec_ids=["EXEC-99"])], s))
+        assert "VENUE_DISAGREES:exit_exec_missing" in v["issues"]
+        assert not v["resolved"]
+
+    def test_the_price_must_be_that_executions_price(self):
+        s = specs(exit_=self.two_exit_execs())
+        v = verdict(go([self.half(1, 60200.0)], s))
+        assert "VENUE_DISAGREES:exit_price" in v["issues"]
+
+    def test_named_executions_that_do_not_add_up_to_the_trade_are_refused(self):
+        s = specs(exit_=self.two_exit_execs())
+        v = verdict(go([self.half(1, 60100.0, qty=0.002,
+                                  gross_pnl=(60100.0 - 60005.0) * 0.002,
+                                  entry_fee=0.00012)], s))
+        assert not v["resolved"]
+
+    def test_the_adapter_carries_the_reconciled_execution_ids(self, tmp_path):
+        path = TestTheStoreAdapter().make_store(tmp_path)
+        conn = sqlite3.connect(path)
+        conn.execute("UPDATE trades SET meta = ?", (json.dumps({
+            "exit_order_ids": [X_ORD],
+            "reconciliation": {"evidence": {"exec_ids": ["EXEC-3", "EXEC-4"]}}}),))
+        conn.commit()
+        conn.close()
+        c = er.claims_from_store(path)
+        assert c["trade_claims"][0]["exit_exec_ids"] == ["EXEC-3", "EXEC-4"]

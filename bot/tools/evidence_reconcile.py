@@ -785,6 +785,7 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
     # quantity each claim asks the venue to have supplied, per shared leg
     entry_use: Dict[Tuple[str, str], float] = {}
     exit_use: Dict[Tuple[str, str], float] = {}
+    exec_use: Dict[Tuple[str, str], int] = {}
     for c in claims:
         env, q = _s(c.get("environment")), _num(c.get("qty")) or 0.0
         link = c.get("entry_order_link_id")
@@ -793,6 +794,8 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
             entry_use[key] = entry_use.get(key, 0.0) + q
         for oid in _exit_ids(c.get("exit_order_ids")) or []:
             exit_use[(env, oid)] = exit_use.get((env, oid), 0.0) + q
+        for eid in _exit_ids(c.get("exit_exec_ids")) or []:
+            exec_use[(env, eid)] = exec_use.get((env, eid), 0) + 1
 
     out = []
     for i, claim in enumerate(claims):
@@ -838,9 +841,10 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
             if claim.get(f"{leg}_fee_realized") is not True:
                 issues.append(f"{leg.upper()}_FEE_NOT_REALIZED")
         exit_ids = _exit_ids(claim.get("exit_order_ids"))
-        if exit_ids is None:
+        exec_sel = _exit_ids(claim.get("exit_exec_ids"))
+        if exit_ids is None or exec_sel is None:
             issues.append("MALFORMED_CLAIM")
-            exit_ids = []
+            exit_ids, exec_sel = exit_ids or [], exec_sel or []
         link = claim.get("entry_order_link_id")
         link = link.strip() if isinstance(link, str) else ""
         env = _s(claim.get("environment"))
@@ -858,8 +862,20 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
         if provenance == CLAIMED_TESTNET_FILL and not issues_block(gate):
             e_rows, e_conf = _leg(indexes, env, link=link)
             x_rows, x_conf = _leg(indexes, env, orders=exit_ids)
+            x_all = x_rows
+            if exec_sel and not (e_conf or x_conf):
+                # the store names exactly which executions priced this exit
+                # (a reconciled provisional exit): the allocation is PROVEN, not
+                # inferred from the order total
+                if any(e not in x_all for e in exec_sel):
+                    issues.append("VENUE_DISAGREES:exit_exec_missing")
+                    x_rows = {}
+                else:
+                    x_rows = {e: x_all[e] for e in exec_sel}
             if e_conf or x_conf:
                 issues.append("VENUE_ROWS_CONTRADICT")
+            elif "VENUE_DISAGREES:exit_exec_missing" in issues:
+                pass
             elif not e_rows or not x_rows:
                 issues.append("NOT_IN_CAPTURE")
             elif any(str(r.get("execType", "")) != "Trade" or
@@ -887,10 +903,13 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
                         issues.append("VENUE_DISAGREES:leg_qty")
                     if entry_use.get((env, link), 0.0) > eq * (1 + QTY_REL_TOL) + 1e-12:
                         issues.append("ENTRY_OVERCLAIMED")
-                    if any(exit_use.get((env, o), 0.0) > sum(
+                    if exec_sel:
+                        if any(exec_use.get((env, e), 0) > 1 for e in exec_sel):
+                            issues.append("EXIT_OVERCLAIMED")
+                    elif any(exit_use.get((env, o), 0.0) > sum(
                             _num(r.get("execQty")) or 0.0 for r in x_rows.values()
                             if str(r.get("orderId")) == o) * (1 + QTY_REL_TOL) + 1e-12
-                           for o in exit_ids):
+                             for o in exit_ids):
                         issues.append("EXIT_OVERCLAIMED")
                     if len(e_cur) != 1 or len(x_cur) != 1:
                         issues.append("VENUE_DISAGREES:fee_currency")
@@ -1190,6 +1209,9 @@ def claims_from_store(db_path: str, *, environment: str = "unknown",
             except (ValueError, TypeError):
                 meta = {}
             ids = meta.get("exit_order_ids") if isinstance(meta, dict) else None
+            recon = meta.get("reconciliation") if isinstance(meta, dict) else None
+            evid = recon.get("evidence") if isinstance(recon, dict) else None
+            exec_ids = evid.get("exec_ids") if isinstance(evid, dict) else None
             trade_claims.append({
                 "claim_id": f"trade:{t['id']}", "source": source,
                 "environment": environment, "symbol": t["symbol"],
@@ -1205,7 +1227,7 @@ def claims_from_store(db_path: str, *, environment: str = "unknown",
                 "opened_ms": int(float(t["opened_epoch"]) * 1000),
                 "closed_ms": int(float(t["closed_epoch"]) * 1000),
                 "entry_order_link_id": t.get("order_link_id", ""),
-                "exit_order_ids": ids})
+                "exit_order_ids": ids, "exit_exec_ids": exec_ids})
         except (KeyError, TypeError, ValueError, OverflowError):
             trade_claims.append({"_malformed": "unreadable trade row"})
     return {"order_claims": order_claims, "trade_claims": trade_claims}
