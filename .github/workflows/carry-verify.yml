@@ -89,6 +89,8 @@ jobs:
           tests/test_carry_latency.py
           tests/test_carry_cost_inputs.py
           tests/test_venue_isolation.py
+          tests/test_evidence_reconcile.py
+          tests/test_venue_evidence.py
           tests/test_linear_simulator.py
           tests/test_backtest.py
           tests/test_bybit_connection.py
