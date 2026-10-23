@@ -1554,6 +1554,67 @@ class TradingEngine:
             return unknown("named orders executed a different quantity")
         return total, {"order_ids": order_ids}, evidence
 
+    def _exit_execution_ids(
+        self, *, symbol: str, side: str, order_ids: Sequence[str],
+        exited: float, price: float,
+    ) -> Tuple[List[str], str]:
+        """The venue execution ids that PROVE a venue-triggered exit, or why not.
+
+        Closed-PnL rows carry an average price and an order id but no
+        execution ids, so a stop/take-profit exit priced from them could not be
+        tied to individual fills. This reads the named orders' executions (a
+        read-only GET) and accepts them only when `validate_exit_executions`
+        does - every row a Trade execution of these orders, symbol and closing
+        side, unique, priced, with a stated fee, adding up to the booked
+        quantity EXACTLY - their VWAP agrees with the closed-PnL price, and no
+        other exit row already names any of them. Anything else returns no ids:
+        the exit is still booked exactly as before, just not provable. Never
+        raises and never changes how the exit is accounted.
+        """
+        try:
+            return self._exit_execution_ids_unchecked(
+                symbol=symbol, side=side, order_ids=order_ids, exited=exited,
+                price=price)
+        except Exception as exc:  # noqa: BLE001 - provability is optional
+            return [], f"proof failed: {type(exc).__name__}"
+
+    def _exit_execution_ids_unchecked(
+        self, *, symbol: str, side: str, order_ids: Sequence[str],
+        exited: float, price: float,
+    ) -> Tuple[List[str], str]:
+        if not order_ids:
+            return [], "no exit order ids"
+        rows: List[Mapping[str, Any]] = []
+        try:
+            for oid in order_ids:
+                rows.extend(self.client.get_executions(symbol, order_id=str(oid)))
+        except Exception as exc:  # noqa: BLE001 - provability is optional
+            return [], f"executions unreadable: {type(exc).__name__}"
+        norm = self.store.normalize_exec_id
+        seen_norm: Dict[str, str] = {}
+        for ex in rows:
+            raw = ex.get("execId") if isinstance(ex, Mapping) else None
+            n = norm(raw)
+            if n is None:
+                return [], "an execution carries no usable id"
+            if n in seen_norm and seen_norm[n] != raw:
+                return [], "two execution ids differ only in case or spacing"
+            seen_norm[n] = raw
+        probe = {"symbol": symbol, "side": side, "qty": float(exited),
+                 "order_link_id": "",
+                 "meta": json.dumps({"exit_order_ids": [str(i) for i in order_ids]})}
+        evidence, reason = self.validate_exit_executions(probe, rows)
+        if evidence is None:
+            return [], reason
+        if price > 0 and abs(float(evidence["vwap"]) - float(price)) > max(
+                1e-9, 1e-6 * float(price)):
+            return [], (f"executions price {evidence['vwap']:.12g} but "
+                        f"closed-pnl says {float(price):.12g}")
+        named = {norm(i) for i in evidence["exec_ids"]}
+        if named & self.store.claimed_exit_exec_ids(symbol):
+            return [], "an execution is already named by another exit"
+        return list(evidence["exec_ids"]), ""
+
     #: An order the venue cannot find is only called never-sent once it is this
     #: old: a create whose reply was lost can take a moment to become visible.
     UNRESOLVED_ENTRY_NEVER_SENT_AFTER_S = 120.0
@@ -1758,12 +1819,20 @@ class TradingEngine:
                           f"{held:.10f}:{exited:.10f}")
             exit_fees, fee_ref, evidence = self._observed_exit_fees(
                 symbol, pnl_rows, exited)
+            exec_ids: List[str] = []
+            if not provisional:
+                exec_ids, why_not = self._exit_execution_ids(
+                    symbol=symbol, side=str(row["side"]), order_ids=order_ids,
+                    exited=exited, price=float(price))
+                if not exec_ids:
+                    evidence = {**evidence, "exec_ids_unproven": why_not}
             fully = self.record_exit_fill(symbol=symbol, qty=exited, price=price,
                                           fee=0.0, reason=reason,
                                           dedupe_key=dedupe_key, fees=exit_fees,
                                           fee_ref=fee_ref, fee_evidence=evidence,
                                           price_provisional=provisional,
                                           exit_order_ids=order_ids,
+                                          exit_exec_ids=exec_ids,
                                           exit_row_keys=[self._row_key(r)
                                                          for r in pnl_rows])
             if provisional:
@@ -2480,6 +2549,17 @@ class TradingEngine:
                           "fee_raw": leg["raw"]})
             if ok:
                 summary["reconciled"] += 1
+            else:
+                # not applied: already priced by another process, or one of
+                # these executions is already named by another exit (the store
+                # journals that once). Counted and logged, never silent.
+                summary["pending"] += 1
+                summary["refused"][ident] = (
+                    "not applied: already priced, or an execution is already "
+                    "named by another exit")
+                logger.warning("reconcile_provisional_exits: %s was not "
+                               "applied (already priced, or an execution is "
+                               "already named by another exit)", ident)
         return summary
 
     def record_exit_fill(
@@ -2499,6 +2579,7 @@ class TradingEngine:
         price_provisional: bool = False,
         exit_order_ids: Sequence[str] = (),
         exit_row_keys: Sequence[str] = (),
+        exit_exec_ids: Sequence[str] = (),
     ) -> bool:
         """Account for a partial or full exit that an exchange-side order filled.
 
@@ -2605,6 +2686,7 @@ class TradingEngine:
             meta={"reason": reason, "partial": True,
                   "exit_order_ids": [str(i) for i in exit_order_ids],
                   "exit_row_keys": [str(k) for k in exit_row_keys],
+                  "exit_exec_ids": [str(k) for k in exit_exec_ids],
                   "funding_booked": not getattr(self.client, "is_linear", False),
                   "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]},
                   "fee_evidence": dict(fee_evidence or {})},
