@@ -40,7 +40,7 @@ def _setup(tmp_path):
     return fake, store, broker
 
 
-def _trade(store, *, opened_h_ago=20.0, closed_h_ago=1.0, side="Sell",
+def _trade(store, *, opened_h_ago=30.0, closed_h_ago=8.0, side="Sell",
            symbol="BTCUSDT", provisional=False, net=0.0):
     return store.record_trade(TradeRecord(
         symbol=symbol, side=side, qty=0.01, entry_price=60_000.0,
@@ -52,11 +52,11 @@ def _trade(store, *, opened_h_ago=20.0, closed_h_ago=1.0, side="Sell",
         meta={"funding_booked": False}))
 
 
-def _row(i, usd, hours_ago, symbol="BTCUSDT"):
+def _row(i, usd, hours_ago, symbol="BTCUSDT", size="-0.01"):
     return {"id": f"S{i}", "symbol": symbol, "type": "SETTLEMENT",
             "category": "linear", "funding": str(usd), "change": str(usd),
             "transactionTime": str(int(NOW - hours_ago * H)),
-            "currency": "USDT", "size": "-0.01"}
+            "currency": "USDT", "size": size}
 
 
 def _meta(store, tid):
@@ -76,7 +76,7 @@ def test_received_and_paid_funding_are_booked_with_their_sign(tmp_path):
     fake, store, broker = _setup(tmp_path)
     tid = _trade(store)
     base = _net(store, tid)
-    fake.settlements += [_row(1, 0.30, 12), _row(2, -0.05, 4)]
+    fake.settlements += [_row(1, 0.30, 12), _row(2, -0.05, 10)]
     r = _run(store, broker)
     assert r["booked"] == 1
     assert _net(store, tid) == pytest.approx(base + 0.25)
@@ -100,7 +100,7 @@ def test_a_replay_books_nothing_twice(tmp_path):
 
 def test_a_short_hold_with_a_complete_empty_log_is_zero_not_missing(tmp_path):
     fake, store, broker = _setup(tmp_path)
-    tid = _trade(store, opened_h_ago=3.0, closed_h_ago=1.0)
+    tid = _trade(store, opened_h_ago=8.5, closed_h_ago=8.0)
     r = _run(store, broker)
     assert r["no_settlement"] == 1
     assert _meta(store, tid)["funding_status"] == "NO_SETTLEMENT_IN_HOLD_WINDOW"
@@ -108,7 +108,7 @@ def test_a_short_hold_with_a_complete_empty_log_is_zero_not_missing(tmp_path):
 
 def test_a_long_hold_with_no_settlement_is_suspect_and_stays_unbooked(tmp_path):
     fake, store, broker = _setup(tmp_path)
-    tid = _trade(store, opened_h_ago=30.0, closed_h_ago=1.0)
+    tid = _trade(store)
     r = _run(store, broker)
     assert r["statuses"] == {"SUSPECT_NO_SETTLEMENT_OVER_INTERVAL": 1}
     assert _meta(store, tid)["funding_booked"] is False
@@ -151,18 +151,18 @@ def test_a_recent_exit_waits_for_late_settlement_rows(tmp_path):
 
 def test_rows_for_other_symbols_and_outside_the_hold_are_not_attributed(tmp_path):
     fake, store, broker = _setup(tmp_path)
-    tid = _trade(store, opened_h_ago=10.0, closed_h_ago=2.0)
-    fake.settlements += [_row(1, 9.0, 12), _row(2, 9.0, 1),
-                         _row(3, 9.0, 5, symbol="ETHUSDT"), _row(4, 0.4, 6)]
+    tid = _trade(store, opened_h_ago=40.0, closed_h_ago=8.0)
+    fake.settlements += [_row(1, 9.0, 45), _row(2, 9.0, 7),
+                         _row(3, 9.0, 20, symbol="ETHUSDT"), _row(4, 0.4, 30)]
     _run(store, broker)
     assert _meta(store, tid)["funding_usd"] == pytest.approx(0.4)
 
 
 def test_a_settlement_belongs_to_the_exit_row_open_when_it_settled(tmp_path):
     fake, store, broker = _setup(tmp_path)
-    a = _trade(store, opened_h_ago=20.0, closed_h_ago=10.0)
-    b = _trade(store, opened_h_ago=20.0, closed_h_ago=2.0)
-    fake.settlements += [_row(1, 0.5, 15), _row(2, 0.3, 5)]
+    a = _trade(store, opened_h_ago=40.0, closed_h_ago=20.0)
+    b = _trade(store, opened_h_ago=40.0, closed_h_ago=8.0)
+    fake.settlements += [_row(1, 0.5, 30, size="-0.02"), _row(2, 0.3, 12)]
     _run(store, broker)
     assert _meta(store, a)["funding_usd"] == pytest.approx(0.5)
     assert _meta(store, b)["funding_usd"] == pytest.approx(0.3)
@@ -267,8 +267,90 @@ def test_a_pile_of_stuck_rows_cannot_starve_the_trades_behind_them(tmp_path):
         _trade(store, opened_h_ago=30.0, closed_h_ago=20.0, symbol="ETHUSDT")
     df.reconcile_directional_funding(store, broker, now_ms=NOW, limit=3,
                                      carry_symbols={"ETHUSDT"})
-    fresh = _trade(store, opened_h_ago=3.0, closed_h_ago=1.0)
+    fresh = _trade(store, opened_h_ago=8.5, closed_h_ago=8.0)
     r = df.reconcile_directional_funding(store, broker, now_ms=NOW, limit=3,
                                          carry_symbols={"ETHUSDT"})
     assert _meta(store, fresh)["funding_booked"] is True
     assert r["no_settlement"] == 1
+
+
+class TestAttributionIsSafeNotJustSigned:
+    def test_a_recent_exit_is_not_final_before_the_ledgers_grace(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        tid = _trade(store, opened_h_ago=10.0, closed_h_ago=5.0)   # < 6 h ago
+        fake.settlements.append(_row(1, 0.3, 7))
+        r = _run(store, broker)
+        assert r["statuses"] == {"PENDING_SETTLEMENT_GRACE": 1}
+        assert _meta(store, tid)["funding_booked"] is False
+
+    def test_a_row_whose_size_is_not_what_the_trade_held_is_not_booked(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        tid = _trade(store)
+        fake.settlements.append(_row(1, 0.3, 12, size="-0.5"))
+        assert _run(store, broker)["statuses"] == {"SETTLEMENT_SIZE_MISMATCH": 1}
+        assert _meta(store, tid)["funding_booked"] is False
+
+    def test_a_row_with_no_size_is_not_booked(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        tid = _trade(store)
+        row = _row(1, 0.3, 12)
+        del row["size"]
+        fake.settlements.append(row)
+        assert _run(store, broker)["statuses"] == {"SETTLEMENT_SIZE_UNVERIFIED": 1}
+
+    @pytest.mark.parametrize("hours", [30 - 0.005, 8 + 0.005])
+    def test_a_settlement_within_a_minute_of_either_end_is_ambiguous(
+            self, tmp_path, hours):
+        fake, store, broker = _setup(tmp_path)
+        tid = _trade(store)
+        fake.settlements.append(_row(1, 0.3, hours))
+        assert _run(store, broker)["statuses"] == {"BOUNDARY_AMBIGUOUS": 1}
+        assert _meta(store, tid)["funding_booked"] is False
+
+    def test_two_positions_alive_at_the_same_time_are_not_given_a_row(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        a = _trade(store, opened_h_ago=30.0, closed_h_ago=8.0)
+        b = _trade(store, opened_h_ago=9.0, closed_h_ago=7.5)      # opened before a "closed"
+        fake.settlements.append(_row(1, 0.3, 12))
+        r = _run(store, broker)
+        assert r["booked"] == 0 and r["no_settlement"] == 0
+        assert _meta(store, a)["funding_status"] == "AMBIGUOUS_OVERLAPPING_POSITION"
+        assert _meta(store, b)["funding_status"] == "AMBIGUOUS_OVERLAPPING_POSITION"
+
+    def test_a_hold_of_an_hour_or_more_with_an_empty_log_is_never_zero(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        tid = _trade(store, opened_h_ago=10.0, closed_h_ago=8.0)    # 2 h hold
+        r = _run(store, broker)
+        assert r["statuses"] == {"SUSPECT_NO_SETTLEMENT_OVER_INTERVAL": 1}
+
+    def test_an_id_booked_elsewhere_with_another_amount_is_a_conflict(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        a = _trade(store, opened_h_ago=60.0, closed_h_ago=40.0)
+        fake.settlements.append(_row(1, 1.0, 50))
+        assert _run(store, broker)["booked"] == 1
+        b = _trade(store, opened_h_ago=30.0, closed_h_ago=8.0)
+        fake.settlements.append(_row(1, 2.0, 12))        # same id, other amount
+        r = _run(store, broker)
+        assert r["statuses"] == {"DUPLICATE_ID_CONFLICT": 1}
+        assert _meta(store, b)["funding_booked"] is False
+
+    def test_a_perpetual_without_its_funding_is_not_a_confirmed_sample(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        tid = _trade(store)
+        assert store.net_returns() == []                  # fees-only: no sample
+        assert store.recent_trades() == []
+        assert store.fee_evidence()["realized_net_pnl"] == 0.0
+        fake.settlements.append(_row(1, 0.3, 12))
+        _run(store, broker)
+        assert len(store.net_returns()) == 1 and len(store.recent_trades()) == 1
+
+    def test_one_unbooked_piece_keeps_the_whole_position_out(self, tmp_path):
+        fake, store, broker = _setup(tmp_path)
+        _trade(store, opened_h_ago=40.0, closed_h_ago=20.0)
+        b = _trade(store, opened_h_ago=40.0, closed_h_ago=8.0)
+        bad = _row(2, 0.3, 12)
+        bad["change"] = "-0.3"                            # piece 2: sign mismatch
+        fake.settlements += [_row(1, 0.5, 30, size="-0.02"), bad]
+        r = _run(store, broker)
+        assert r["booked"] == 1 and _meta(store, b)["funding_booked"] is False
+        assert store.net_returns() == []                  # not a sample yet

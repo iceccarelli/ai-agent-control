@@ -324,11 +324,14 @@ def session_refusal(cfg: Any, client: Any = None) -> Optional[str]:
                 "the carry book has no paper venue")
     if str(getattr(cfg, "LIVE_TRADING_ACK", "") or ""):
         return "a live-trading acknowledgement is present: refusing"
-    url = str(getattr(client, "base_url", "") or "").rstrip("/")
-    if url:
-        from bybit_connection import MAINNET_REST
-        if url == MAINNET_REST:
-            return f"the client targets the mainnet host {MAINNET_REST}"
+    if client is not None:
+        # POSITIVE identification: the client must say it talks to the testnet
+        # host. A missing, demo, custom or mainnet URL is not testnet evidence.
+        from bybit_connection import TESTNET_REST
+        url = str(getattr(client, "base_url", "") or "").rstrip("/")
+        if url != TESTNET_REST:
+            return (f"the client's host is {url or 'unstated'!r}, not the "
+                    f"testnet host {TESTNET_REST}")
     return None
 
 
@@ -376,6 +379,12 @@ def write_carry_cash_ledger(path: str, *, journal: Any, state: Dict[str, Any],
     return path
 
 
+#: Consecutive polls without a usable market view the hold tolerates.
+HOLD_MAX_BLIND_POLLS = 5
+#: Past the ledger's ownership slack, so the close is clearly after it.
+HOLD_AGING_MARGIN_MS = 15_000
+
+
 def run_drill(*, broker: Any, notional: Optional[float] = None,
               arm: bool = False, out: str = "", venue: str = "unknown",
               engine_factory: Any = None, hold: Optional[HoldPlan] = None,
@@ -406,6 +415,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         state["venue_perp_qty"] = held
         orders = list(broker.get_open_carry_orders(SPOT_SYMBOL, PERP_SYMBOL))
         if held > 0 or orders:
+            d.still_open = True       # something IS open: say so, not "nothing is"
             s.failed(
                 f"the venue already holds {held} and has {len(orders)} open "
                 "order(s). A drill that opens on top of something already "
@@ -527,7 +537,12 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         broker=booked, kill_switch=_Store().trip_kill_switch,
         max_notional_usd=d.notional, borrow_apr=0.0,
         execution_mode="overlay", execution_style="taker",
-        persist=lambda s: None)
+        persist=lambda s: None,
+        # The one check that protects the held short from the margin call
+        # (F4): ON here exactly as in the production book, and what it reads
+        # each held tick is kept so the hold's evidence can show it.
+        require_liquidation_check=True,
+        risk_observer=lambda obs: state.setdefault("risk_obs", []).append(obs))
     engine.pair_risk = CarryRisk(store=_Store(), max_notional_usd=d.notional)
     engine.warm_funding_history(state["prints"])
     state["engine"] = engine
@@ -581,22 +596,47 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         return ev
 
     def hold_stage(s: Stage) -> None:
+        """Hold, watched, until the settlement is booked AND has aged past the
+        ledger's ownership slack (a close inside it would make the settlement
+        'ambiguous' and the lifecycle unconfirmable)."""
         from market_snapshot import take_snapshot
         plan = hold
         state["opened_ms"] = engine.position.opened_ms
         deadline = time.time() + plan.max_hold_s
         polls = 0
+        blind = 0
         while True:
             polls += 1
             now_ms = int(time.time() * 1000)
-            view = take_snapshot(broker, perp_symbol=PERP_SYMBOL,
-                                 spot_symbol=SPOT_SYMBOL)
-            view.assert_fresh()
-            engine.snapshot = view
-            decision = engine.on_candle(
-                mark=view.perp_mark, funding_bps=view.funding_print_bps,
-                spot=view.spot_mark, timestamp_ms=now_ms,
-                funding_print_ms=view.funding_print_ms)
+            try:
+                view = take_snapshot(broker, perp_symbol=PERP_SYMBOL,
+                                     spot_symbol=SPOT_SYMBOL)
+                view.assert_fresh()
+                engine.snapshot = view
+                blind = 0
+                decision = engine.on_candle(
+                    mark=view.perp_mark, funding_bps=view.funding_print_bps,
+                    spot=view.spot_mark, timestamp_ms=now_ms,
+                    funding_print_ms=view.funding_print_ms)
+            except Exception as exc:  # noqa: BLE001
+                # What production does: a cycle without a usable market view
+                # still WATCHES the venue position; a few in a row are
+                # tolerated, a run of them is not.
+                blind += 1
+                s.evidence["last_view_error"] = f"{type(exc).__name__}: {exc}"
+                decision = engine.check_venue_position_without_a_view()
+                if blind >= HOLD_MAX_BLIND_POLLS or (
+                        decision is not None
+                        and engine.state is BookState.HALTED):
+                    s.failed(f"{blind} consecutive polls without a usable "
+                             "market view", polls=polls)
+                    return
+                if time.time() >= deadline:
+                    s.failed("the maximum hold ended without a usable view",
+                             polls=polls)
+                    return
+                plan.sleep(plan.poll_s)
+                continue
             d.orders_sent = len(journal.entries)
             if engine.position is None or engine.state is BookState.HALTED:
                 state["engine_ended"] = decision.action
@@ -607,15 +647,27 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                 return
             try:
                 book_settlements(now_ms)
+                s.evidence.pop("last_read_error", None)
             except Exception as exc:  # noqa: BLE001
                 state["evidence"] = None
                 s.evidence["last_read_error"] = f"{type(exc).__name__}: {exc}"
             rows = venue_settlement_rows(journal)
             if rows >= plan.min_settlements:
-                s.passed(polls=polls, settlements=rows,
-                         held_s=(now_ms - state["opened_ms"]) / 1000.0)
-                return
-            if time.time() >= deadline:
+                aged = max(int(e.fee_raw.get("venue_ms", 0))
+                           for e in journal.entries
+                           if e.kind == "funding" and e.basis == "venue"
+                           ) + L.ATTRIBUTION_SLACK_MS + HOLD_AGING_MARGIN_MS
+                if now_ms >= aged:
+                    obs = state.get("risk_obs", [])
+                    dists = [o["distance_pct"] for o in obs
+                             if o.get("distance_pct") is not None]
+                    s.passed(polls=polls, settlements=rows,
+                             held_s=(now_ms - state["opened_ms"]) / 1000.0,
+                             liquidation_reads=len(obs),
+                             min_liquidation_distance_pct=(
+                                 min(dists) if dists else None))
+                    return
+            elif time.time() >= deadline:
                 s.failed("no settlement row was booked within the maximum "
                          "hold; the pair is unwound and this is not a result",
                          polls=polls, settlements=rows,
@@ -705,45 +757,55 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     if hold is not None:
         sequence.append(("funding_final", funding_final))
     sequence.append(("statement", statement))
-    for name, fn in sequence:
-        if not d.run_stage(name, fn):
-            # Orders may have left this process whatever the failed stage was
-            # (an ambiguous submission, a halted engine, a pair that would not
-            # reconcile). Say what the venue holds NOW instead of letting the
-            # report claim "nothing is open". A separate stage, so the stage
-            # that actually failed stays the one reported.
-            if name != "final_reconcile":
-                check = d.stage("venue_check_after_failure")
-                verdict, evidence, why = venue_flatness(
-                    broker, inventory_before=state.get("inventory_before"))
-                if verdict == "FLAT":
-                    check.passed(verdict=verdict, **evidence)
-                else:
-                    d.still_open = True
-                    check.failed(why, verdict=verdict, **evidence)
-                    # A stage failed BEFORE the planned unwind (the pair would not
-                    # reconcile, the engine raised after sending): the hedge the
-                    # engine can close is still open. Try the engine's own
-                    # reduce-only unwind once, then say what the venue holds.
-                    if (name in ("open", "pair", "hold") and engine.position is not None
-                            and state.get("perp") is not None):
-                        abort = d.stage("abort_unwind")
-                        try:
-                            decision = engine._unwind(state["perp"], "DRILL_ABORT")
-                            d.orders_sent = len(journal.entries)
-                            verdict2, evidence2, why2 = venue_flatness(
-                                broker,
-                                inventory_before=state.get("inventory_before"))
-                            if verdict2 == "FLAT":
-                                d.still_open = False
-                                abort.passed(action=decision.action,
-                                             verdict=verdict2, **evidence2)
-                            else:
-                                abort.failed(why2, action=decision.action,
-                                             verdict=verdict2, **evidence2)
-                        except Exception as exc:  # noqa: BLE001
-                            abort.failed(f"{type(exc).__name__}: {exc}")
-            return _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
+    def recover(name: str) -> None:
+        if name != "final_reconcile":
+            check = d.stage("venue_check_after_failure")
+            verdict, evidence, why = venue_flatness(
+                broker, inventory_before=state.get("inventory_before"))
+            if verdict == "FLAT":
+                check.passed(verdict=verdict, **evidence)
+            else:
+                d.still_open = True
+                check.failed(why, verdict=verdict, **evidence)
+                # A stage failed BEFORE the planned unwind (the pair would not
+                # reconcile, the engine raised after sending): the hedge the
+                # engine can close is still open. Try the engine's own
+                # reduce-only unwind once, then say what the venue holds.
+                if (name in ("open", "pair", "hold") and engine.position is not None
+                        and state.get("perp") is not None):
+                    abort = d.stage("abort_unwind")
+                    try:
+                        decision = engine._unwind(state["perp"], "DRILL_ABORT")
+                        d.orders_sent = len(journal.entries)
+                        verdict2, evidence2, why2 = venue_flatness(
+                            broker,
+                            inventory_before=state.get("inventory_before"))
+                        if verdict2 == "FLAT":
+                            d.still_open = False
+                            abort.passed(action=decision.action,
+                                         verdict=verdict2, **evidence2)
+                        else:
+                            abort.failed(why2, action=decision.action,
+                                         verdict=verdict2, **evidence2)
+                    except Exception as exc:  # noqa: BLE001
+                        abort.failed(f"{type(exc).__name__}: {exc}")
+
+    try:
+        for name, fn in sequence:
+            if not d.run_stage(name, fn):
+                recover(name)
+                return _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
+    except BaseException as exc:
+        # Ctrl-C, SIGTERM, anything: the pair may be open. Close it through
+        # the engine, say what the venue holds, write the report, and only then
+        # let the interruption continue.
+        d.failed_stage = d.failed_stage or "interrupted"
+        d.stage("interrupted").failed(f"{type(exc).__name__}: {exc}")
+        try:
+            recover("hold")
+        finally:
+            _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
+        raise
 
     return _finish(d, state, out, cap, "PASSED", cash_ledger, venue)
 
@@ -926,9 +988,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("REFUSED: --hold-for-settlement sends orders and needs --arm.",
               file=sys.stderr)
         return 3
-    if args.hold_for_settlement and args.min_settlements < 1:
-        print("REFUSED: --min-settlements must be at least 1.", file=sys.stderr)
-        return 3
+    if args.hold_for_settlement:
+        import math
+        problems = []
+        if not args.out or not args.cash_ledger:
+            problems.append("--out and --cash-ledger are both required: a run "
+                            "that cannot save its evidence cannot succeed")
+        if args.min_settlements < 1:
+            problems.append("--min-settlements must be at least 1")
+        if not (math.isfinite(args.poll_seconds)
+                and 1.0 <= args.poll_seconds <= 3600.0):
+            problems.append("--poll-seconds must be between 1 and 3600")
+        if not (math.isfinite(args.max_hold_hours)
+                and 0.0 < args.max_hold_hours <= 48.0):
+            problems.append("--max-hold-hours must be in (0, 48]")
+        if not (math.isfinite(args.settle_wait_hours)
+                and 0.0 <= args.settle_wait_hours <= 48.0):
+            problems.append("--settle-wait-hours must be in [0, 48]")
+        if problems:
+            print("REFUSED: " + "; ".join(problems) + ".", file=sys.stderr)
+            return 3
 
     try:
         bot = _load_bot()
@@ -974,6 +1053,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                   "armed.", file=sys.stderr)
             return 2
 
+    if args.hold_for_settlement:
+        import signal
+
+        def _terminate(signum, frame):            # noqa: ARG001
+            raise KeyboardInterrupt(f"signal {signum}")
+        # an interrupt during the hold closes the pair and writes the report
+        signal.signal(signal.SIGTERM, _terminate)
     plan = (HoldPlan(min_settlements=args.min_settlements,
                      max_hold_s=args.max_hold_hours * 3600.0,
                      poll_s=args.poll_seconds,

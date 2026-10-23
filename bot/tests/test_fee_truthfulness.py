@@ -336,11 +336,18 @@ class TestAnEmergencyFlattenIsNeverDerailedByAccounting:
         engine._await_fill = flaky
         report = engine.execute(buy_intent())
         assert report.stage == "emergency"
-        assert store.open_positions() == []
         assert store.is_kill_switch_engaged()[0] is True
+        # The emergency sell was accepted but its fill could not be read: the
+        # position is NOT declared closed (it may still be held). The row stays
+        # for the order-truth observer, which books the exit from the order's
+        # own fill once it can be read.
+        assert len(store.open_positions()) == 1
+        assert store._query("SELECT * FROM trades") == []
+        engine._await_fill = real_await
+        engine.observe_exits()
+        assert store.open_positions() == []
         t = _trade(store)
-        assert json.loads(t["meta"])["exit_fill_confirmed"] is False
-        assert t["exit_fee_realized"] == 0           # no fill, no confirmed fee
+        assert t["price_provisional"] == 0 and t["exit_price"] > 0   # a real price
         store.close()
 
     def test_a_booking_failure_still_removes_the_position_and_is_journaled(

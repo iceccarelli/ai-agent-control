@@ -1100,6 +1100,20 @@ class BybitClient:
 
     def _submit(self, body: Dict[str, Any], oid: str, purpose: str) -> OrderResult:
         """Send an order, mapping every outcome onto a truthful OrderResult."""
+        if self.venue == "mainnet":
+            # Defence in depth at the transport: the startup gate and the
+            # per-order gate of the carry book are not the only things between
+            # a caller and the real exchange. A mainnet order leaves this
+            # process only when live trading is authorised in the config this
+            # client was built from.
+            import config as _config
+            armed, why = _config.is_live_authorized(self.cfg)
+            if armed is not True:
+                self.store.update_order_status(oid, "rejected")
+                logger.critical("order %s REFUSED at the transport: mainnet "
+                                "without live authorisation (%s)", oid, why)
+                return OrderResult(order_link_id=oid,
+                                   reason="LIVE_NOT_AUTHORIZED")
         try:
             payload = self._request(
                 "POST", "/v5/order/create", body=body, signed=True

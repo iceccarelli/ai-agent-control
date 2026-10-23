@@ -296,3 +296,114 @@ def test_two_partial_exits_of_one_venue_order_are_both_booked(tmp_path):
     engine.observe_exits()
     assert len(store._query("SELECT * FROM trades")) == 2
     assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.002)
+
+
+class TestAPriceNeedsRowsProvenToBeThisExit:
+    def _venue(self, tmp_path, size, held=0.01):
+        fake = FakeBybit()
+        if size:
+            fake.positions["BTCUSDT"] = {
+                "symbol": "BTCUSDT", "side": "Sell", "size": str(size),
+                "avgPrice": "60000", "stopLoss": "61000"}
+        engine, store = _engine(tmp_path, LinearCfg(), fake)
+        _open(store, qty=held)
+        return fake, engine, store
+
+    def _row(self, qty, price, oid, **kw):
+        row = {"symbol": "BTCUSDT", "side": "Buy", "qty": str(qty),
+               "orderId": oid, "avgExitPrice": str(price), "closedPnl": "0",
+               "updatedTime": str(int(time.time() * 1000) + 1000)}
+        row.update(kw)
+        return row
+
+    def test_a_lagging_read_showing_only_an_earlier_exit_is_not_a_price(self, tmp_path):
+        fake, engine, store = self._venue(tmp_path, size=0.007)
+        fake.closed_pnl.append(self._row(0.003, 59_000, "TP1"))
+        assert engine.observe_exits()["reduced"] == 1            # TP1 booked, priced
+        fake.positions.pop("BTCUSDT")                            # stop takes the rest
+        engine.observe_exits()                                   # closed-pnl still lags
+        rows = store._query("SELECT * FROM trades ORDER BY id")
+        assert len(rows) == 2
+        assert (rows[1]["price_provisional"], float(rows[1]["exit_price"])) == (1, 0.0)
+        assert float(rows[1]["gross_pnl"]) == 0.0
+
+    def test_a_row_for_an_order_an_earlier_exit_already_names_is_not_reused(self, tmp_path):
+        fake, engine, store = self._venue(tmp_path, size=0.007)
+        fake.closed_pnl.append(self._row(0.003, 59_000, "TP1"))
+        engine.observe_exits()
+        fake.positions["BTCUSDT"]["size"] = "0.004"              # another 0.003 left
+        engine.observe_exits()                                   # only TP1's row exists
+        last = store._query("SELECT * FROM trades ORDER BY id DESC LIMIT 1")[0]
+        assert last["price_provisional"] == 1
+
+    def test_a_full_page_of_rows_proves_nothing(self, tmp_path):
+        fake, engine, store = self._venue(tmp_path, size=0)
+        for i in range(50):
+            fake.closed_pnl.append(self._row(0.01, 61_000, f"O{i}"))
+        engine.observe_exits()
+        assert store._query("SELECT price_provisional FROM trades")[0][0] == 1
+
+    def test_closed_size_not_the_order_qty_is_what_counts(self, tmp_path):
+        fake, engine, store = self._venue(tmp_path, size=0.006)
+        fake.closed_pnl.append(self._row(1.0, 59_500, "BIG", closedSize="0.004"))
+        assert engine.observe_exits()["reduced"] == 1
+        t = store._query("SELECT * FROM trades")[0]
+        assert t["price_provisional"] == 0 and float(t["exit_price"]) == 59_500.0
+
+    def test_an_exact_match_is_still_priced(self, tmp_path):
+        fake, engine, store = self._venue(tmp_path, size=0)
+        fake.closed_pnl.append(self._row(0.01, 61_000, "STOP"))
+        assert engine.observe_exits()["closed"] == 1
+        t = store._query("SELECT * FROM trades")[0]
+        assert t["price_provisional"] == 0 and float(t["exit_price"]) == 61_000.0
+
+
+class TestTheTradeAndThePositionChangeAreOneWrite:
+    def _partial(self, tmp_path):
+        fake = FakeBybit()
+        fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell",
+                                     "size": "0.004", "avgPrice": "60000",
+                                     "stopLoss": "61000"}
+        engine, store = _engine(tmp_path, LinearCfg(), fake)
+        _open(store, qty=0.01)
+        fake.closed_pnl.append({
+            "symbol": "BTCUSDT", "side": "Buy", "qty": "0.006", "orderId": "O1",
+            "avgExitPrice": "59000", "closedPnl": "6",
+            "updatedTime": str(int(time.time() * 1000) + 1000)})
+        return fake, engine, store
+
+    def test_a_failure_after_the_trade_is_written_rolls_the_trade_back(self, tmp_path):
+        fake, engine, store = self._partial(tmp_path)
+        real = store.upsert_position
+
+        def boom(*a, **k):
+            raise RuntimeError("killed between the trade and the position")
+        store.upsert_position = boom
+        with pytest.raises(RuntimeError):
+            engine.observe_exits()                 # main.tick logs and continues
+        assert store._query("SELECT * FROM trades") == []          # nothing booked
+        assert float(store.open_positions()[0]["qty"]) == 0.01     # book untouched
+        store.upsert_position = real
+        engine.observe_exits()                     # the replay books it ONCE
+        assert len(store._query("SELECT * FROM trades")) == 1
+        assert float(store.open_positions()[0]["qty"]) == pytest.approx(0.004)
+
+    def test_a_full_exit_failing_to_remove_the_position_books_nothing(self, tmp_path):
+        fake = FakeBybit()
+        engine, store = _engine(tmp_path, LinearCfg(), fake)
+        _open(store)
+        fake.closed_pnl.append({
+            "symbol": "BTCUSDT", "side": "Buy", "qty": "0.01", "orderId": "O1",
+            "avgExitPrice": "61000", "closedPnl": "-10",
+            "updatedTime": str(int(time.time() * 1000) + 1000)})
+        real = store.remove_position
+        store.remove_position = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("killed"))
+        with pytest.raises(RuntimeError):
+            engine.observe_exits()
+        assert store._query("SELECT * FROM trades") == []
+        assert len(store.open_positions()) == 1
+        store.remove_position = real
+        engine.observe_exits()
+        assert len(store._query("SELECT * FROM trades")) == 1
+        assert store.open_positions() == []

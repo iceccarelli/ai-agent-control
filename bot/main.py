@@ -1747,6 +1747,9 @@ def carry_orders_permitted_for(cfg: Any, client: Any) -> Tuple[bool, str]:
         if url == MAINNET_REST:
             return (False, f"sandbox config (USE_TESTNET=1) but the client "
                            f"targets the mainnet host {MAINNET_REST}")
+        if not url:
+            return (False, "sandbox config (USE_TESTNET=1) but the client "
+                           "states no host: the venue it talks to is unknown")
     return (True, why)
 
 

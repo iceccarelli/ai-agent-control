@@ -254,7 +254,11 @@ class TestAnUnconfirmedCloseIsNeverAPricedTrade:
         engine, client, risk, store, exchange = stack
         assert engine.execute(buy_intent()).ok
         qty = float(store.open_positions()[0]["qty"])
-        engine._await_fill = lambda *a, **k: None       # the poll timed out
+        # the order FILLED in full but states no price anywhere (no avgPrice,
+        # no executed value): the exit is real, its price is not known
+        engine._await_fill = lambda *a, **k: {
+            "orderStatus": "Filled", "cumExecQty": str(qty), "avgPrice": "0",
+            "orderId": "X-1"}
         report = engine.close_position(symbol="BTCUSDT", reason="manual",
                                        exit_price=ENTRY * 3)   # a caller guess
         return engine, store, exchange, report, qty
@@ -285,6 +289,69 @@ class TestAnUnconfirmedCloseIsNeverAPricedTrade:
             assert engine.reconcile_provisional_exits(lambda s, l: [])["reconciled"] == 0
         assert len(store.provisional_trades()) == 1
         assert not store.confirmed_exit_rows()
+
+
+class TestACloseThatSoldNothingIsNotAClose:
+    def test_a_spot_close_whose_fill_never_resolves_keeps_the_row_and_the_stop(
+            self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        engine._await_fill = lambda *a, **k: None       # the poll timed out
+        report = engine.close_position(symbol="BTCUSDT", reason="manual")
+        assert not report.ok and report.reason == "CLOSE_UNCONFIRMED"
+        assert len(store.open_positions()) == 1          # the coin is still held
+        assert store._query("SELECT * FROM trades") == []
+
+    def test_a_rejected_spot_close_is_not_booked_either(self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        engine._await_fill = lambda *a, **k: {
+            "orderStatus": "Rejected", "cumExecQty": "0", "avgPrice": "0"}
+        report = engine.close_position(symbol="BTCUSDT", reason="manual")
+        assert report.reason == "CLOSE_UNCONFIRMED"
+        assert len(store.open_positions()) == 1
+        assert store._query("SELECT * FROM trades") == []
+
+    def test_an_emergency_close_that_cannot_be_confirmed_keeps_the_row_and_stops(
+            self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        row = store.open_positions()[0]
+        cancels = []
+        real = client.cancel_all
+        client.cancel_all = lambda *a, **k: (cancels.append(a), real(*a, **k))[1]
+        engine._await_fill = lambda *a, **k: None
+        engine._emergency_close(
+            symbol="BTCUSDT", exit_side="Sell", qty=float(row["qty"]),
+            filters=client.get_instrument_filters("BTCUSDT"), reason="TEST")
+        assert len(store.open_positions()) == 1
+        assert cancels == []
+        assert store._query("SELECT * FROM trades") == []
+        assert store._query("SELECT * FROM decisions WHERE decision = "
+                            "'EMERGENCY_UNCONFIRMED'")
+
+    def test_a_partial_close_with_no_stated_price_is_provisional_not_zero_gross(
+            self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        qty = float(store.open_positions()[0]["qty"])
+        engine._await_fill = lambda *a, **k: {
+            "orderStatus": "PartiallyFilledCanceled", "cumExecQty": str(qty / 2),
+            "avgPrice": "0", "orderId": "X-2"}
+        engine.close_position(symbol="BTCUSDT", reason="manual")
+        [row] = store._query("SELECT * FROM trades")
+        assert row["price_provisional"] == 1 and row["exit_price"] == 0.0
+
+    def test_a_remainder_is_not_dust_just_because_the_exit_price_is_unknown(
+            self, stack):
+        engine, client, risk, store, exchange = stack
+        assert engine.execute(buy_intent()).ok
+        qty = float(store.open_positions()[0]["qty"])
+        engine.record_exit_fill(symbol="BTCUSDT", qty=qty / 2, price=0.0, fee=0.0,
+                                reason="TEST", price_provisional=True,
+                                dedupe_key="t:1")
+        [pos] = store.open_positions()
+        assert float(pos["qty"]) == pytest.approx(qty / 2)   # still a position
 
 
 class TestSpotProtectionMustBeAbleToExecute:
@@ -629,3 +696,87 @@ def test_get_executions_pages_by_cursor_and_carries_the_order_id(tmp_path):
     with pytest.raises(bc.PermanentAPIError):
         engine.client.get_executions("BTCUSDT")
     assert engine.client.get_executions("BTCUSDT", order_id="NOPE") == []
+
+
+class TestOneOrderBookedAsSeveralExits:
+    def _chunks(self, tmp_path):
+        fake = FakeBybit()
+        engine, store = _lin_engine(tmp_path, LinearCfg(), fake)
+        _lin_open(store, qty=0.01)
+        now = int(_time.time() * 1000)
+        fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell",
+                                     "size": "0.007", "avgPrice": "60000",
+                                     "stopLoss": "61000"}
+        fake.closed_pnl.append({"symbol": "BTCUSDT", "side": "Buy",
+                                "qty": "0.003", "orderId": "ORD1",
+                                "avgExitPrice": "0", "closedPnl": "0",
+                                "updatedTime": str(now + 1000)})
+        engine.observe_exits()
+        fake.positions.pop("BTCUSDT")
+        fake.closed_pnl.append({"symbol": "BTCUSDT", "side": "Buy",
+                                "qty": "0.007", "orderId": "ORD1",
+                                "avgExitPrice": "0", "closedPnl": "0",
+                                "updatedTime": str(now + 2000)})
+        engine.observe_exits()
+        assert len(store.provisional_trades()) == 2
+        return engine, store, fake
+
+    def test_each_chunk_gets_its_own_executions_oldest_first(self, tmp_path):
+        engine, store, fake = self._chunks(tmp_path)
+        fake.executions += [
+            _lin_ex("X1", "ORD1", 0.003, 61_000, execTime="1000"),
+            _lin_ex("X2", "ORD1", 0.004, 61_100, execTime="2000"),
+            _lin_ex("X3", "ORD1", 0.003, 61_200, execTime="3000")]
+        assert engine.reconcile_provisional_exits()["reconciled"] == 2
+        first, second = sorted(store.confirmed_exit_rows(), key=lambda r: r["id"])
+        assert first["exit_price"] == pytest.approx(61_000)
+        assert second["exit_price"] == pytest.approx(
+            (0.004 * 61_100 + 0.003 * 61_200) / 0.007)
+
+    def test_an_execution_that_straddles_the_boundary_is_never_split(self, tmp_path):
+        engine, store, fake = self._chunks(tmp_path)
+        fake.executions += [
+            _lin_ex("X1", "ORD1", 0.005, 61_000, execTime="1000"),
+            _lin_ex("X2", "ORD1", 0.005, 61_100, execTime="2000")]
+        assert engine.reconcile_provisional_exits()["reconciled"] == 0
+        assert len(store.provisional_trades()) == 2
+        assert store.confirmed_exit_rows() == []
+
+    def test_a_second_closed_pnl_row_of_the_same_order_still_prices_the_next_chunk(
+            self, tmp_path):
+        fake = FakeBybit()
+        engine, store = _lin_engine(tmp_path, LinearCfg(), fake)
+        _lin_open(store, qty=0.01)
+        now = int(_time.time() * 1000)
+        fake.positions["BTCUSDT"] = {"symbol": "BTCUSDT", "side": "Sell",
+                                     "size": "0.004", "avgPrice": "60000",
+                                     "stopLoss": "61000"}
+        fake.closed_pnl.append({"symbol": "BTCUSDT", "side": "Buy", "qty": "0.006",
+                                "orderId": "O1", "avgExitPrice": "59000",
+                                "closedPnl": "6", "updatedTime": str(now + 1000)})
+        engine.observe_exits()
+        fake.positions["BTCUSDT"]["size"] = "0.002"
+        fake.closed_pnl.append({"symbol": "BTCUSDT", "side": "Buy", "qty": "0.002",
+                                "orderId": "O1", "avgExitPrice": "58900",
+                                "closedPnl": "2", "updatedTime": str(now + 2000)})
+        engine.observe_exits()
+        assert store.provisional_trades() == []              # both were priced
+        prices = sorted(float(r["exit_price"]) for r in store.confirmed_exit_rows())
+        assert prices == [58_900.0, 59_000.0]
+
+
+def test_an_exit_booked_days_after_its_fills_is_still_found(tmp_path):
+    engine, store, fake = _lin_provisional(tmp_path)
+    t = store.provisional_trades()[0]
+    fill_ms = int(t["closed_epoch"] * 1000)
+    # fills happened at the original close; the exit was only BOOKED 2 days later
+    store._exec("UPDATE trades SET opened_epoch = ?, closed_epoch = ? WHERE id = ?",
+                (t["closed_epoch"] - 3600, t["closed_epoch"] + 2 * 86400, t["id"]))
+    seen = {}
+
+    def spy(symbol, *a, **k):
+        seen.update(k)
+        return [_lin_ex("X1", "ORD1", 0.01, 61_000, execTime=str(fill_ms))]
+    engine.client.get_executions = spy
+    assert engine.reconcile_provisional_exits()["reconciled"] == 1
+    assert seen["start_ms"] <= fill_ms <= seen["end_ms"]

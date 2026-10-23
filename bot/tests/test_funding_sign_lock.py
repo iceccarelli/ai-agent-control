@@ -80,7 +80,7 @@ class TestDirectionalBookingRefusesAnUnconfirmedSign:
     def test_one_bad_row_among_good_ones_blocks_the_whole_trade(self, tmp_path):
         fake, store, broker = _setup(tmp_path)
         tid = _trade(store)
-        bad = _row(2, 0.1, 6)
+        bad = _row(2, 0.1, 10)
         bad["change"] = "-0.1"
         fake.settlements += [_row(1, 0.3, 12), bad]
         _run(store, broker)

@@ -1041,12 +1041,31 @@ class TradingEngine:
                         fill = None    # booked below as an UNCONFIRMED exit
                     executed = float((fill or {}).get("cumExecQty") or 0.0)
                     held = float(row["qty"])
-                    if fill is not None and 0.0 < executed < held - max(1e-9, held * 1e-9):
+                    tol = max(1e-9, held * 1e-9)
+                    if fill is None or executed <= tol:
+                        # The order was ACCEPTED; nothing says it sold. A
+                        # rejected or unresolved reduce-only order leaves the
+                        # position open: keep the row AND its protective
+                        # orders, and let the venue-truth observers book the
+                        # exit if it did execute. (The kill switch is already
+                        # tripped, so nothing new can open meanwhile.)
+                        logger.critical(
+                            "emergency close of %s is UNCONFIRMED (no executed "
+                            "quantity for %s): the position row and protective "
+                            "orders are kept", symbol, closed.order_link_id)
+                        self.store.journal(
+                            symbol, "EMERGENCY_UNCONFIRMED", reason,
+                            {"exit_order_link_id": closed.order_link_id,
+                             "exit_order_id": closed.order_id})
+                        keep_row = True
+                    elif executed < held - tol:
                         # Only part of it sold: book what sold and keep the rest on
                         # the book, rather than booking the whole row as gone.
+                        avg = self._fill_price(fill)
                         self.record_exit_fill(
                             symbol=symbol, qty=executed,
-                            price=float(fill.get("avgPrice") or row["entry_price"]),
+                            price=avg or float(row["entry_price"]),
+                            price_provisional=avg <= 0.0,
                             fee=0.0, reason=f"EMERGENCY:{reason}:PARTIAL",
                             order_link_id=closed.order_link_id,
                             dedupe_key=f"exit:{closed.order_link_id}",
@@ -1298,8 +1317,15 @@ class TradingEngine:
         # (no resolved fill, or a partial one) must therefore leave the row and
         # the stops in place: booking it as closed would hide a position that
         # is still open, and a new entry could stack on it.
-        if (getattr(self.client, "is_linear", False)
-                and executed_exit_qty < qty - max(1e-9, qty * 1e-9)):
+        tol = max(1e-9, qty * 1e-9)
+        if ((getattr(self.client, "is_linear", False)
+                and executed_exit_qty < qty - tol)
+                or (not getattr(self.client, "is_linear", False)
+                    and executed_exit_qty <= tol)):
+            # (spot: a close that sold NOTHING -- rejected, cancelled, or whose
+            # fill never resolved -- is not a close: the coin is still held, so
+            # the row and its stop stay and `_settle_pending_closes` books the
+            # order later if it did execute.)
             logger.critical(
                 "close of %s did not execute in full (%.12g of %.12g, %s): the "
                 "position row and protective orders are kept", symbol,
@@ -1324,9 +1350,10 @@ class TradingEngine:
             # Booking the whole row as closed (and cancelling the stop) would
             # leave the unsold remainder held with no stop and no row. Book what
             # sold; record_exit_fill reduces the row and resizes the stop.
-            avg = float((fill or {}).get("avgPrice") or 0.0) or entry_price
+            avg = self._fill_price(fill)
             self.record_exit_fill(
-                symbol=symbol, qty=executed_exit_qty, price=avg, fee=0.0,
+                symbol=symbol, qty=executed_exit_qty,
+                price=avg or entry_price, fee=0.0, price_provisional=avg <= 0.0,
                 reason=f"{reason}:PARTIAL_CLOSE", order_link_id=result.order_link_id,
                 dedupe_key=f"exit:{result.order_link_id}",
                 fees=venue_fees.extract_order_fees(fill or {}),
@@ -1407,15 +1434,15 @@ class TradingEngine:
         qty = float(row["qty"])
         entry_price = float(row["entry_price"])
         meta = self._row_meta(row)
-        confirmed = fill is not None
-        # No resolved fill: the exit price is UNKNOWN. The row is booked
-        # PROVISIONAL (quantity and fees only, exit_price 0 / gross 0, kept out
-        # of every confirmed-economics reader) and priced later from the
-        # venue's executions by reconcile_provisional_exits. Neither the
-        # caller's figure, the entry price nor the last price stands in.
+        # No resolved fill, or a fill that states no price: the exit price is
+        # UNKNOWN. The row is booked PROVISIONAL (quantity and fees only,
+        # exit_price 0 / gross 0, kept out of every confirmed-economics reader)
+        # and priced later from the venue's executions by
+        # reconcile_provisional_exits. Neither the caller's figure, the entry
+        # price nor the last price stands in.
+        realised_exit = self._fill_price(fill)
+        confirmed = fill is not None and realised_exit > 0.0
         provisional = not confirmed
-        realised_exit = float(
-            (fill or {}).get("avgPrice") or exit_price or entry_price)
         direction = 1.0 if normalize_side(side) == "Buy" else -1.0
         gross = (0.0 if provisional
                  else (realised_exit - entry_price) * qty * direction)
@@ -1425,7 +1452,8 @@ class TradingEngine:
             ref=meta.get("entry_fee_ref"))
         exit_leg = self._fee_leg(
             symbol=symbol, fees=venue_fees.extract_order_fees(fill),
-            price=realised_exit, qty=qty, caller_amount=caller_exit_fee,
+            price=realised_exit if confirmed else entry_price,   # unit only
+            qty=qty, caller_amount=caller_exit_fee,
             ref={"order_link_id": exit_order.order_link_id,
                  "order_id": str((fill or {}).get("orderId")
                                  or getattr(exit_order, "order_id", "") or "")})
@@ -1438,24 +1466,27 @@ class TradingEngine:
         # `remove_position` below leaves the position row in place, so a
         # retried/replayed close must not book it twice.
         # See `StateStore.record_trade`'s docstring for the mechanism.
-        self.store.record_trade(TradeRecord(
-            symbol=symbol, side=side, qty=qty, entry_price=entry_price,
-            exit_price=0.0 if provisional else realised_exit,
-            price_provisional=provisional, gross_pnl=gross,
-            entry_fee=entry_leg["amount"], exit_fee=exit_leg["amount"],
-            entry_fee_realized=entry_leg["realized"],
-            exit_fee_realized=exit_leg["realized"],
-            entry_fee_currency=entry_leg["currency"],
-            exit_fee_currency=exit_leg["currency"],
-            opened_epoch=float(row.get("opened_epoch") or utc_now_epoch()),
-            closed_epoch=utc_now_epoch(),
-            order_link_id=link,
-            meta={"reason": reason, "exit_fill_confirmed": confirmed,
-                  "funding_booked": not getattr(self.client, "is_linear", False),
-                  "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]}},
-            dedupe_key=f"exit:{link}" if link else "",
-        ))
-        self.store.remove_position(symbol)
+        # One transaction for the trade and the removal of the position it
+        # closes: a kill between them left the position beside a booked exit.
+        with self.store.transaction():
+            self.store.record_trade(TradeRecord(
+                symbol=symbol, side=side, qty=qty, entry_price=entry_price,
+                exit_price=0.0 if provisional else realised_exit,
+                price_provisional=provisional, gross_pnl=gross,
+                entry_fee=entry_leg["amount"], exit_fee=exit_leg["amount"],
+                entry_fee_realized=entry_leg["realized"],
+                exit_fee_realized=exit_leg["realized"],
+                entry_fee_currency=entry_leg["currency"],
+                exit_fee_currency=exit_leg["currency"],
+                opened_epoch=float(row.get("opened_epoch") or utc_now_epoch()),
+                closed_epoch=utc_now_epoch(),
+                order_link_id=link,
+                meta={"reason": reason, "exit_fill_confirmed": confirmed,
+                      "funding_booked": not getattr(self.client, "is_linear", False),
+                      "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]}},
+                dedupe_key=f"exit:{link}" if link else "",
+            ))
+            self.store.remove_position(symbol)
         self._cooldown_after_loss(symbol)
         self.store.journal(symbol, "CLOSED", reason, {
             "gross_pnl": gross,
@@ -1676,14 +1707,19 @@ class TradingEngine:
             order_ids: List[str] = []
             pnl_rows: List[Dict[str, Any]] = []
             try:
-                pnl_rows = self._rows_of_this_exit(
-                    self.client.get_closed_pnl(symbol, since_ms=since_ms),
-                    exited)
-                qty_sum = sum(float(r.get("qty", 0) or 0) for r in pnl_rows)
+                all_rows = self.client.get_closed_pnl(symbol, since_ms=since_ms)
+                # A price is accepted ONLY from rows PROVEN to be this exit:
+                # exactly the quantity that left, not a full (possibly
+                # truncated) page, none already named by an exit booked
+                # before. Anything else -- a lagging read that still shows
+                # only an earlier take-profit, a sum that overshoots -- would
+                # price this exit at another fill's price, with full
+                # confidence. That is a provisional exit, not a guess.
+                pnl_rows = self._proven_exit_rows(symbol, all_rows, exited)
+                qty_sum = sum(self._row_qty(r) for r in pnl_rows)
                 if qty_sum > 0:
                     price = sum(float(r.get("avgExitPrice", 0) or 0)
-                                * float(r.get("qty", 0) or 0)
-                                for r in pnl_rows) / qty_sum
+                                * self._row_qty(r) for r in pnl_rows) / qty_sum
                 order_ids = sorted({
                     str(r.get("orderId") or "") for r in pnl_rows
                     if r.get("orderId")
@@ -1725,7 +1761,9 @@ class TradingEngine:
                                           dedupe_key=dedupe_key, fees=exit_fees,
                                           fee_ref=fee_ref, fee_evidence=evidence,
                                           price_provisional=provisional,
-                                          exit_order_ids=order_ids)
+                                          exit_order_ids=order_ids,
+                                          exit_row_keys=[self._row_key(r)
+                                                         for r in pnl_rows])
             if provisional:
                 self.store.journal(symbol, "EXIT_UNPRICED_PROVISIONAL",
                                    reason, {"qty": exited,
@@ -2030,6 +2068,76 @@ class TradingEngine:
         summary.setdefault("stop_dead_outcome", {})[symbol] = outcome
 
     @staticmethod
+    def _fill_price(fill: Optional[Mapping[str, Any]]) -> float:
+        """The price an order actually executed at, from the order's own
+        fields (``avgPrice``, else executed value / executed quantity), or 0.0.
+        Never the entry price, a caller figure or a market price."""
+        if not fill:
+            return 0.0
+        for getter in (
+                lambda f: float(f.get("avgPrice") or 0.0),
+                lambda f: (float(f.get("cumExecValue") or 0.0)
+                           / float(f.get("cumExecQty") or 0.0))):
+            try:
+                v = getter(fill)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if math.isfinite(v) and v > 0.0:
+                return v
+        return 0.0
+
+    @staticmethod
+    def _row_qty(r: Mapping[str, Any]) -> float:
+        """Quantity a closed-pnl row CLOSED: ``closedSize`` when the venue
+        states it (``qty`` is the order's size, which overshoots for a
+        partially filled or oversized order), else ``qty``."""
+        for key in ("closedSize", "qty"):
+            try:
+                v = float(r.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(v) and v > 0:
+                return v
+        return 0.0
+
+    @staticmethod
+    def _row_key(r: Mapping[str, Any]) -> str:
+        """A closed-pnl row's identity: one row prices one exit."""
+        return "|".join(str(r.get(k) or "") for k in (
+            "orderId", "updatedTime", "closedSize", "qty", "avgExitPrice"))
+
+    def _proven_exit_rows(self, symbol: str, rows: List[Dict[str, Any]],
+                          exited: float) -> List[Dict[str, Any]]:
+        """The closed-pnl rows that are provably this exit, or [] (no proof)."""
+        if not rows or len(rows) >= self._CLOSED_PNL_PAGE:
+            return []
+        try:
+            claimed = self.store.claimed_exit_row_keys(symbol)
+        except Exception:  # noqa: BLE001
+            return []
+        fresh = [r for r in rows if self._row_key(r) not in claimed]
+
+        def stamp(r: Mapping[str, Any]) -> float:
+            try:
+                return float(r.get("updatedTime", 0) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        tolerance = max(1e-9, abs(exited) * 1e-9)
+        taken: List[Dict[str, Any]] = []
+        total = 0.0
+        for r in sorted(fresh, key=stamp, reverse=True):
+            q = self._row_qty(r)
+            if q <= 0:
+                continue
+            taken.append(r)
+            total += q
+            if abs(total - exited) <= tolerance:
+                return taken
+            if total > exited:
+                return []
+        return []
+
+    @staticmethod
     def _rows_of_this_exit(rows: List[Dict[str, Any]],
                            exited: float) -> List[Dict[str, Any]]:
         """The newest closed-pnl rows that add up to ``exited``.
@@ -2195,6 +2303,64 @@ class TradingEngine:
             return []
         return sorted({str(r["orderId"]) for r in chosen})
 
+    def _allocate_order_executions(
+            self, trade: Mapping[str, Any],
+            rows: Sequence[Mapping[str, Any]]) -> Sequence[Mapping[str, Any]]:
+        """When one venue order's fills were booked as several exits (it filled
+        over several cycles), give this exit ITS fills: the order's executions,
+        oldest first, are dealt out to the exits that name the order, oldest
+        first, and only if every boundary falls between whole executions.
+        Anything that does not divide exactly is returned unchanged (and then
+        fails validation): an execution is never split to make the sums work."""
+        ids = {str(i) for i in (self._row_meta(trade).get("exit_order_ids") or [])}
+        if not ids or not rows:
+            return rows
+        total = 0.0
+        seen_ids = set()
+        for ex in rows:
+            eid = str(ex.get("execId") or "")
+            if eid in seen_ids:
+                continue
+            seen_ids.add(eid)
+            q = self._finite_pos(ex.get("execQty"))
+            if q is None:
+                return rows
+            total += q
+        booked = float(trade.get("qty") or 0.0)
+        tol = max(1e-9, abs(booked) * 1e-9)
+        if abs(total - booked) <= tol:
+            return rows
+        try:
+            siblings = [t for t in self.store.lifecycle_trades(
+                str(trade["symbol"]), trade["opened_epoch"])
+                if ids & {str(i) for i in
+                          (self._row_meta(t).get("exit_order_ids") or [])}]
+        except Exception:  # noqa: BLE001
+            return rows
+        if len(siblings) < 2 or abs(
+                sum(float(t["qty"]) for t in siblings) - total) > tol:
+            return rows
+        unique = {}
+        for ex in rows:
+            unique.setdefault(str(ex.get("execId") or ""), ex)
+        ordered = sorted(unique.values(), key=lambda e: (
+            str(e.get("execTime") or ""), str(e.get("execId") or "")))
+        cursor = 0
+        for sib in sorted(siblings, key=lambda t: (float(t["closed_epoch"]),
+                                                   int(t["id"]))):
+            want = float(sib["qty"])
+            chunk: List[Mapping[str, Any]] = []
+            got = 0.0
+            while cursor < len(ordered) and got < want - tol:
+                chunk.append(ordered[cursor])
+                got += float(self._finite_pos(ordered[cursor].get("execQty")) or 0.0)
+                cursor += 1
+            if abs(got - want) > tol:
+                return rows                 # a boundary inside one execution
+            if int(sib["id"]) == int(trade["id"]):
+                return chunk
+        return rows
+
     def reconcile_provisional_exits(
         self, fetch: Optional[Callable[[str, str], Sequence[Mapping[str, Any]]]]
         = None,
@@ -2221,10 +2387,16 @@ class TradingEngine:
         fetch = fetch or client_read
         if fetch_by_order_id is None and client_read is not None:
             def fetch_by_order_id(symbol, order_id, trade):  # noqa: E306
+                # The fills lie between the position's open and the moment the
+                # exit was booked. Anchor on those (an exit booked after an
+                # outage of more than a day is still found), inside the venue's
+                # 7-day limit on one query.
+                day = 86_400_000
                 closed_ms = int(float(trade.get("closed_epoch") or 0.0) * 1000)
-                start = max(0, closed_ms - 24 * 3_600_000)
+                opened_ms = int(float(trade.get("opened_epoch") or 0.0) * 1000)
+                start = max(0, opened_ms - 60_000, closed_ms - 6 * day)
                 return client_read(symbol, order_id=order_id, start_ms=start,
-                                   end_ms=start + 6 * 86_400_000)
+                                   end_ms=start + int(6.9 * day))
         if fetch is None and fetch_by_order_id is None:
             summary["unavailable"] = True
             return summary
@@ -2257,6 +2429,7 @@ class TradingEngine:
                              "fills of %s: %s", ident, exc)
                 summary["pending"] += 1
                 continue
+            rows = list(self._allocate_order_executions(trade, rows))
             evidence, reason = self.validate_exit_executions(trade, rows)
             if evidence is None:
                 summary["pending"] += 1
@@ -2308,6 +2481,7 @@ class TradingEngine:
         booked_order_id: str = "",
         price_provisional: bool = False,
         exit_order_ids: Sequence[str] = (),
+        exit_row_keys: Sequence[str] = (),
     ) -> bool:
         """Account for a partial or full exit that an exchange-side order filled.
 
@@ -2397,7 +2571,7 @@ class TradingEngine:
         # would (see `move_stop`'s docstring and `_protect_or_close_naked`'s
         # spot-specific guard for that case, which is why the fix there
         # needed `find_live_spot_stop` and this one does not).
-        self.store.record_trade(TradeRecord(
+        trade_record = TradeRecord(
             symbol=symbol, side=side, qty=closed_qty,
             entry_price=entry_price,
             exit_price=0.0 if price_provisional else float(price),
@@ -2413,55 +2587,94 @@ class TradingEngine:
             order_link_id=order_link_id,
             meta={"reason": reason, "partial": True,
                   "exit_order_ids": [str(i) for i in exit_order_ids],
+                  "exit_row_keys": [str(k) for k in exit_row_keys],
                   "funding_booked": not getattr(self.client, "is_linear", False),
                   "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]},
                   "fee_evidence": dict(fee_evidence or {})},
             dedupe_key=dedupe_key,
-        ))
+        )
 
         remaining = round(held - closed_qty, 12)
-        if remaining <= 1e-12:
-            self.store.remove_position(symbol)
-            self._cooldown_after_loss(symbol)
-            # OCO: the position is gone, so every sibling protective order must
-            # go with it. Without this, a filled stop leaves the take-profit legs
-            # resting, and they later fill against a position that no longer
-            # exists — selling inventory the bot does not hold, or re-entering
-            # the market unintentionally.
-            self._cancel_protective_orders(symbol)
-            self.store.journal(symbol, "CLOSED", reason,
-                               {"qty": closed_qty, "gross_pnl": gross})
-            return True
-
+        full = remaining <= 1e-12
+        stop_price = float(row.get("stop_price") or 0.0)
+        old_stop_id = str(prior_meta.get("stop_order_link_id") or "")
         # A remainder below the exchange minimum is DUST: it cannot be
         # protected by a stop and cannot be sold, because both orders would be
         # rejected for being under the minimum quantity/notional. Tracking it as
         # an open position would mean carrying a position the system can neither
         # exit nor protect, and reporting it as protected would be a lie. It is
         # recorded as closed, with the dust logged explicitly.
-        try:
-            filters = self.client.get_instrument_filters(symbol)
-            min_qty = float(filters.min_qty)
-            min_notional = float(filters.min_notional)
-        except Exception:  # noqa: BLE001
-            min_qty = min_notional = 0.0
-        # Linear only: the remainder is real venue size and its stop is a field
-        # of the position (no minimum applies), so it stays on the book. Dust is
-        # a SPOT notion -- coin that can be neither sold nor protected.
-        if (not getattr(self.client, "is_linear", False)) and min_qty and (
-            remaining < min_qty or remaining * float(price) < min_notional
-        ):
-            self.store.remove_position(symbol)
-            self._cancel_protective_orders(symbol)
-            # BOOK the dust rather than forgetting it. The position is closed
-            # because the remainder cannot be sold or protected; the inventory
-            # is still on the exchange, and a book that does not say so cannot
-            # honour "the ledger explains the entire equity change".
-            total_dust = remaining
+        dust = False
+        if not full:
             try:
-                total_dust = self.store.add_dust(symbol, remaining)
+                filters = self.client.get_instrument_filters(symbol)
+                min_qty = float(filters.min_qty)
+                min_notional = float(filters.min_notional)
             except Exception:  # noqa: BLE001
-                logger.warning("could not record dust for %s", symbol, exc_info=True)
+                min_qty = min_notional = 0.0
+            # Linear only: the remainder is real venue size and its stop is a
+            # field of the position (no minimum applies), so it stays on the
+            # book. Dust is a SPOT notion -- coin that can be neither sold nor
+            # protected. An unpriced exit (price 0) is no evidence the
+            # remainder is small: value it at the entry price, never at zero.
+            unit = float(price) if float(price) > 0.0 else entry_price
+            dust = bool(
+                (not getattr(self.client, "is_linear", False)) and min_qty and (
+                    remaining < min_qty or remaining * unit < min_notional))
+
+        def position_meta(stop_id: str) -> Dict[str, Any]:
+            return {"stop_order_link_id": stop_id,
+                    "entry_fees": entry_remaining.to_dict(),
+                    "entry_fee_ref": prior_meta.get("entry_fee_ref") or {},
+                    "tp_order_ids": list(prior_meta.get("tp_order_ids") or []),
+                    "booked_exit_orders": sorted(
+                        set(prior_meta.get("booked_exit_orders") or [])
+                        | ({booked_order_id} if booked_order_id else set()))}
+
+        # ONE transaction for everything the ledger and the position book say
+        # about this exit: a kill between the trade and the position change
+        # used to leave the old quantity on the book beside a booked exit, and
+        # the next cycle -- seeing a different venue size -- booked a second,
+        # different exit on top (the dedupe key is the position's state).
+        # Venue calls (cancel, resize the stop) cannot be in a transaction and
+        # follow it; each is replay-safe.
+        total_dust = remaining
+        with self.store.transaction():
+            self.store.record_trade(trade_record)
+            if full or dust:
+                self.store.remove_position(symbol)
+                if dust:
+                    # BOOK the dust rather than forgetting it: the inventory is
+                    # still on the exchange, and a book that does not say so
+                    # cannot honour "the ledger explains the entire equity change".
+                    try:
+                        total_dust = self.store.add_dust(symbol, remaining)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("could not record dust for %s", symbol,
+                                       exc_info=True)
+            else:
+                self.store.upsert_position(
+                    symbol, side, remaining, entry_price,
+                    stop_price=stop_price,
+                    order_link_id=str(row.get("order_link_id") or ""),
+                    # upsert_position REPLACES meta, so the unapportioned entry
+                    # fee must be carried explicitly or it vanishes on the first
+                    # partial exit.
+                    meta=position_meta(old_stop_id))
+
+        if full:
+            self._cooldown_after_loss(symbol)
+            # OCO: the position is gone, so every sibling protective order must
+            # go with it. Without this, a filled stop leaves the take-profit legs
+            # resting, and they later fill against a position that no longer
+            # exists -- selling inventory the bot does not hold, or re-entering
+            # the market unintentionally.
+            self._cancel_protective_orders(symbol)
+            self.store.journal(symbol, "CLOSED", reason,
+                               {"qty": closed_qty, "gross_pnl": gross})
+            return True
+        if dust:
+            self._cancel_protective_orders(symbol)
             self.store.journal(symbol, "CLOSED", f"{reason}+dust", {
                 "dust_qty": remaining,
                 "dust_total": total_dust,
@@ -2476,53 +2689,31 @@ class TradingEngine:
             )
             return True
 
-        stop_price = float(row.get("stop_price") or 0.0)
-        meta = {}
-        try:
-            meta = json.loads(str(row.get("meta") or "{}"))
-        except Exception:  # noqa: BLE001
-            meta = {}
-        old_stop_id = str(meta.get("stop_order_link_id") or "")
-
         # Re-size the protective stop to the REMAINING quantity.
         #
         # This is not housekeeping. A stop left sized for the original position
         # is rejected by the exchange the moment it triggers ("insufficient
         # balance"), because a take-profit already sold part of the inventory.
         # The position then has no working protection at all, while both the
-        # bot and the exchange still show a resting stop order. A backtest
-        # reconciliation run surfaced this: positions were entered and never
-        # exited, because every stop trigger bounced.
-        new_stop_id = old_stop_id
+        # bot and the exchange still show a resting stop order.
         if stop_price > 0:
             exit_side = "Sell" if normalize_side(side) == "Buy" else "Buy"
             replacement = self.move_stop(
                 symbol=symbol, exit_side=exit_side, qty=remaining,
                 new_stop=stop_price, old_stop_link_id=old_stop_id,
             )
-            if replacement:
-                new_stop_id = replacement
-            else:
+            if replacement and replacement != old_stop_id:
+                self.store.upsert_position(
+                    symbol, side, remaining, entry_price,
+                    stop_price=stop_price,
+                    order_link_id=str(row.get("order_link_id") or ""),
+                    meta=position_meta(replacement))
+            elif not replacement:
                 logger.critical(
                     "could not resize the stop for %s after a partial exit; the "
                     "remaining %.8f is protected only by an over-sized stop that "
                     "the exchange will reject", symbol, remaining,
                 )
-
-        self.store.upsert_position(
-            symbol, side, remaining, entry_price,
-            stop_price=stop_price,
-            order_link_id=str(row.get("order_link_id") or ""),
-            # upsert_position REPLACES meta, so the unapportioned entry fee must
-            # be carried explicitly or it vanishes on the first partial exit.
-            meta={"stop_order_link_id": new_stop_id,
-                  "entry_fees": entry_remaining.to_dict(),
-                  "entry_fee_ref": prior_meta.get("entry_fee_ref") or {},
-                  "tp_order_ids": list(prior_meta.get("tp_order_ids") or []),
-                  "booked_exit_orders": sorted(
-                      set(prior_meta.get("booked_exit_orders") or [])
-                      | ({booked_order_id} if booked_order_id else set()))},
-        )
         self.store.journal(symbol, "PARTIAL_EXIT", reason,
                            {"closed": closed_qty, "remaining": remaining,
                             "stop_resized_to": remaining})

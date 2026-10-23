@@ -565,7 +565,12 @@ class TestObserveNakedCallsTheProductionEntrypoint:
         result = report["evidence"]["detect_and_act"]["result"]
         assert result["flattened"] == [SYMBOL]
         assert client.position_size == 0.0
-        assert store.open_position_count() == 0
+        # The flatten's fill could not be confirmed from the order, so the row
+        # is KEPT (with its journal entry) for the venue-truth observer to book
+        # the exit from the position list; it is not silently dropped.
+        assert store.open_position_count() == 1
+        assert store._query("SELECT * FROM decisions WHERE decision = "
+                            "'EMERGENCY_UNCONFIRMED'")
         # The bracket-failure invariant: emergency close trips the kill
         # switch, the same as any other _emergency_close caller.
         engaged, reason = store.is_kill_switch_engaged()

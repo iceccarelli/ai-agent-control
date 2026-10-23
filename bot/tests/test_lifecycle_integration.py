@@ -982,7 +982,8 @@ class TestAnUnconfirmedCloseKeepsTheProtectiveOrders:
         engine._await_fill = lambda symbol, link, timeout_s=10.0: None
         close = engine.close_position(symbol="BTCUSDT", reason="manual")
         assert cancels == [], "the protective orders were cancelled unconfirmed"
-        assert close.ok                        # booked, marked unconfirmed
+        assert not close.ok and close.reason == "CLOSE_UNCONFIRMED"
+        assert store.open_positions()          # the coin is still held: kept
         events = store._query(
             "SELECT * FROM decisions WHERE decision = ?",
             ("CLOSE_UNCONFIRMED_STOPS_KEPT",))

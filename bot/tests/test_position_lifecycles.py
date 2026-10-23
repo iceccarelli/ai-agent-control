@@ -88,12 +88,12 @@ def test_funding_booked_on_an_exit_is_part_of_the_positions_return(store):
         opened_epoch=1000.0, closed_epoch=2000.0,
         meta={"funding_booked": False}))
     _exit(store, opened=1000.0, closed=2001.0, qty=0.005, gross=5.0)
-    base = store.net_returns()[0]
+    assert store.net_returns() == []                 # funding not booked yet
     assert store.book_trade_funding(a, funding_usd=-3.0, payment_ids=["x"],
                                     status="BOOKED_FROM_SETTLEMENTS", evidence={})
     after = store.net_returns()
     assert len(after) == 1
-    assert after[0] == pytest.approx(base - 3.0 / (0.01 * 60_000.0))
+    assert after[0] == pytest.approx((10.0 - 0.4 - 3.0) / (0.01 * 60_000.0))
 
 
 def test_regime_label_is_read_once_per_position(store):
@@ -131,3 +131,21 @@ def test_a_position_that_stays_open_after_an_exit_is_named_not_forgotten(store):
     from performance_analytics import PerformanceAnalytics
     assert any("still open after booking an exit" in n
                for n in PerformanceAnalytics(store).report().notes)
+
+
+def test_a_partial_win_on_a_position_still_open_does_not_end_a_loss_streak(store):
+    for i in range(3):
+        _exit(store, opened=1000.0 + i, closed=2000.0 + i, gross=-5.0)
+    assert store.consecutive_losses() == 3
+    _exit(store, opened=5000.0, closed=6000.0, qty=0.004, gross=9.0)   # TP1 win
+    store._exec("INSERT INTO positions(symbol, side, qty, entry_price, stop_price,"
+                " opened_epoch) VALUES('BTCUSDT','Sell',0.006,60000,61000,5000.0)")
+    assert store.consecutive_losses() == 3            # unfinished: neither win nor loss
+    store._exec("DELETE FROM positions")
+    assert store.consecutive_losses() == 0            # finished as a win: ends it
+
+
+def test_a_position_with_an_unpriced_exit_is_a_loss_for_the_brake_whatever_its_winners(store):
+    _exit(store, opened=1000.0, closed=2000.0, qty=0.004, gross=9.0)          # priced TP
+    _exit(store, opened=1000.0, closed=2001.0, qty=0.006, provisional=True)   # unpriced stop
+    assert store.consecutive_losses() == 1
