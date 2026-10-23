@@ -754,6 +754,9 @@ class LinearSimulatedExchange(SimulatedExchange):
         self.maintenance_margin_rate = float(maintenance_margin_rate)
         self.leverage = float(leverage)
         self.funding_paid = 0.0
+        #: every settlement actually charged to cash: (symbol, settle_ms, paid),
+        #: so a trade can be given the funding of ITS hold.
+        self.funding_log: List[Tuple[str, int, float]] = []
         self.liquidations: List[Dict[str, Any]] = []
         #: Settlements already charged, so a re-resolved bar cannot double-bill.
         self._funded: set = set()
@@ -944,6 +947,7 @@ class LinearSimulatedExchange(SimulatedExchange):
             paid = position.direction * rate * position.size * bar.close
             self._cash(-paid)
             self.funding_paid += paid
+            self.funding_log.append((symbol, int(settle), float(paid)))
 
     def _bar_span_ms(self, symbol: str) -> int:
         series = self.bars[symbol]
@@ -1348,6 +1352,29 @@ class Backtester:
         self.funding = {s: list(r) for s, r in (funding_by_symbol or {}).items()}
 
     def run(self) -> BacktestResult:
+        """Replay the bars. The CLOCK is the replay's: the day boundary, the
+        daily-loss anchor and every stamp follow the bar being replayed. On the
+        wall clock, years of bars run in seconds inside ONE day, so the daily
+        loss brake became a whole-run stop-loss (it never reset) and a run
+        straddling midnight re-anchored at an arbitrary bar."""
+        import persistence
+
+        self._clock_exchange = None
+
+        def replay_now() -> float:
+            exchange = self._clock_exchange
+            if exchange is None:
+                first = self.bars[next(iter(self.bars))][0]
+                return first.start_ms / 1000.0
+            return exchange.current_bar().start_ms / 1000.0
+
+        previous = persistence.set_clock(replay_now)
+        try:
+            return self._replay()
+        finally:
+            persistence.set_clock(previous)
+
+    def _replay(self) -> BacktestResult:
         cfg = self.cfg
         if cfg.category not in ("spot", "linear"):
             # Two categories can be priced: `spot` by SimulatedExchange's cash
@@ -1390,6 +1417,7 @@ class Backtester:
                 taker_fee=cfg.taker_fee, maker_fee=cfg.maker_fee,
                 slippage=cfg.slippage, books_by_symbol=self.books,
             )
+        self._clock_exchange = exchange
         store = StateStore(self.db_path)
         client = BybitClient(config=view, store=store, transport=exchange)
         client.book_feed_required = False      # replay: no recorded book = no feed
@@ -1503,8 +1531,9 @@ class Backtester:
         if abs(result.funding_paid) > 1e-12:
             result.notes.append(
                 f"funding {result.funding_paid:+.4f} is in ending_equity and "
-                "net_pnl but not in the per-trade ledger: win_rate, expectancy "
-                "and the R statistics are BEFORE funding.")
+                "net_pnl, and each trade is given the funding of its own hold, "
+                "so win_rate, expectancy and the R statistics are AFTER "
+                "funding.")
         result.net_pnl = result.ending_equity - result.starting_equity
 
         # ``recent_trades()`` defaults to the newest 200 rows. Reading the
@@ -1513,7 +1542,8 @@ class Backtester:
         # to that ceiling that the next parameter change could have crossed it
         # silently. The ledger is the source of truth for the headline block, so
         # it is read in full.
-        trades = store.lifecycles_funding_excluded(_ALL_TRADES)
+        trades = self._net_of_funding(
+            exchange, store.lifecycles_funding_excluded(_ALL_TRADES))
         result.trades = len(trades)
         if trades:
             nets = [float(t["net_pnl"]) for t in trades]
@@ -1639,6 +1669,29 @@ class Backtester:
             return lowest, highest
         return highest, lowest
 
+    @staticmethod
+    def _net_of_funding(exchange: SimulatedExchange,
+                        rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Give each per-position row the funding its hold paid (positive = paid).
+
+        The simulator charges funding to cash; the trade ledger, being fills,
+        never sees it. A trade's result is its fills AND its funding, so the
+        statistics built from the rows (win rate, expectancy, R, ruin) are
+        computed on ``net_pnl`` after funding, as the runtime's confirmed
+        samples are. Spot has no log and is returned unchanged."""
+        log = getattr(exchange, "funding_log", None)
+        if not log:
+            return rows
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            opened_ms = float(row["opened_epoch"]) * 1000.0
+            closed_ms = float(row["closed_epoch"]) * 1000.0
+            paid = sum(p for sym, ms, p in log
+                       if sym == row["symbol"] and opened_ms < ms <= closed_ms)
+            out.append(dict(row, net_pnl=float(row["net_pnl"]) - paid,
+                            funding_usd=-paid))
+        return out
+
     def _harvest_trades(
         self,
         exchange: SimulatedExchange,
@@ -1656,10 +1709,10 @@ class Backtester:
 
         Returns the highest trade id now accounted for.
         """
-        rows = [
+        rows = self._net_of_funding(exchange, [
             row for row in store.lifecycles_funding_excluded(_TRADE_HARVEST_LIMIT)
             if int(row.get("id") or 0) > last_trade_id
-        ]
+        ])
         if not rows:
             return last_trade_id
         rows.sort(key=lambda row: int(row["id"]))
