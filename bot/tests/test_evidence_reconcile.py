@@ -275,7 +275,8 @@ class TestFunding:
         specs = [dict(path="/v5/execution/list", rows=[fx.exec_row(1)]),
                  dict(path="/v5/order/history", rows=[fx.order_row()]),
                  dict(path="/v5/account/transaction-log",
-                      rows=[row or fx.settlement_row(t=self.T)])]
+                      rows=[row or fx.settlement_row(t=self.T)],
+                      at=self.T + 60_000)]
         cap = er.capture_from_records(fx.chain(specs))
         return er.reconcile(fill_claims=[fx.claim()], funding_claims=funding,
                             captures=[cap], now_ms=fx.NOW + 9 * 3_600_000)
@@ -442,3 +443,156 @@ class TestTheHostCheckInTheCaptureLayerToo:
             ve.validate_environment_claim(
                 declared_environment="testnet",
                 request_url="https://api-testnet.bybit.com.evil.io/v5/x")
+
+
+class TestFindingsFromTheAdversarialReview:
+    """Each of these was reproduced against the first version of the validator."""
+
+    def test_two_environments_do_not_pool_one_order_id(self):
+        specs = [
+            dict(path="/v5/execution/list", rows=[fx.exec_row(1, qty="0.001"),
+                                                  fx.exec_row(2, qty="0.001")]),
+            dict(path="/v5/order/history", rows=[fx.order_row(cum="0.002")]),
+            dict(path="/v5/execution/list", rows=[fx.exec_row(1, qty="0.001"),
+                                                  fx.exec_row(2, qty="0.001")],
+                 env="demo", host="https://api-demo.bybit.com"),
+            dict(path="/v5/order/history", rows=[fx.order_row(cum="0.002")],
+                 env="demo", host="https://api-demo.bybit.com")]
+        claims = [fx.claim(1, qty=0.001), fx.claim(2, qty=0.001, environment="demo")]
+        # claim 2 uses EXEC-2 on demo; each environment's order is half covered
+        r = run(claims, specs)
+        assert [o["complete"] for o in r["orders"]] == [False, False]
+        assert r["pnl_claim_allowed"] is False
+
+    def test_an_unparseable_capture_time_blocks_instead_of_skipping_the_check(self):
+        recs = fx.good_chain()
+        recs[0]["captured_at_utc"] = "garbage"
+        body = {k: v for k, v in recs[0].items() if k != "record_hash"}
+        recs[0]["record_hash"] = ve.content_hash(body)
+        recs[1]["prev_hash"] = recs[0]["record_hash"]
+        body1 = {k: v for k, v in recs[1].items() if k != "record_hash"}
+        recs[1]["record_hash"] = ve.content_hash(body1)
+        r = er.reconcile(fill_claims=[fx.claim()],
+                         captures=[er.capture_from_records(recs)], now_ms=fx.NOW)
+        assert "CAPTURE_TIME_INVALID" in fill(r)["issues"] and not fill(r)["resolved"]
+
+    @pytest.mark.parametrize("kind", ["Funding", "BustTrade", "AdlTrade", ""])
+    def test_only_an_ordinary_trade_row_is_a_fill(self, kind):
+        row = fx.exec_row(1)
+        row["execType"] = kind
+        specs = [dict(path="/v5/execution/list", rows=[row]),
+                 dict(path="/v5/order/history", rows=[fx.order_row()])]
+        r = run([fx.claim()], specs)
+        assert "VENUE_DISAGREES:exec_type" in fill(r)["issues"]
+
+    def test_a_stated_fee_currency_must_match(self):
+        r = run([fx.claim(fee_currency="BTC")])
+        assert "VENUE_DISAGREES:fee_currency" in fill(r)["issues"]
+        assert fill(run([fx.claim(fee_currency="USDT")]))["resolved"]
+
+    def test_a_ws_event_must_restate_the_same_fill(self):
+        base = fx.record("/v5/execution/list", [fx.exec_row(1)],
+                         prev=ve.GENESIS_PREV_HASH)
+        lie = dict(fx.exec_row(1), orderId="OTHER", execQty="999")
+        wsrec = ve.EvidenceRecord(
+            venue="bybit", environment="testnet",
+            captured_at_utc=fx.iso(fx.T0 + 61_000), method="WS_EVENT",
+            request_url="wss://stream-testnet.bybit.com/v5/private",
+            request={"topic": "execution"}, response={"data": [lie]},
+            order_link_id="", git_commit=fx.GIT, prev_hash=base["record_hash"],
+            transport="ws", venue_event_id="e1").to_dict()
+        r = er.reconcile(fill_claims=[fx.claim()],
+                         captures=[er.capture_from_records([base, wsrec])],
+                         now_ms=fx.NOW)
+        assert "NO_CORROBORATION" in fill(r)["issues"] and not fill(r)["resolved"]
+
+    @pytest.mark.parametrize("host", [
+        "https://api-testnet.bybit.com:9999", "https://user@api-testnet.bybit.com",
+        "https://api-testnet.bybit.com:99999"])
+    def test_a_port_or_userinfo_is_not_the_exact_host(self, host):
+        specs = [dict(path="/v5/execution/list", rows=[fx.exec_row(1)], host=host),
+                 dict(path="/v5/order/history", rows=[fx.order_row()], host=host)]
+        assert "NOT_IN_CAPTURE" in fill(run([fx.claim()], specs))["issues"]
+
+    def test_the_default_https_port_is_still_the_exact_host(self):
+        host = "https://api-testnet.bybit.com:443"
+        specs = [dict(path="/v5/execution/list", rows=[fx.exec_row(1)], host=host),
+                 dict(path="/v5/order/history", rows=[fx.order_row()], host=host)]
+        assert fill(run([fx.claim()], specs))["resolved"]
+
+    def test_the_latest_order_snapshot_is_used_for_completeness(self):
+        specs = [dict(path="/v5/execution/list",
+                      rows=[fx.exec_row(1, qty="0.001"), fx.exec_row(2, qty="0.001")]),
+                 dict(path="/v5/order/realtime", rows=[fx.order_row(cum="0.001",
+                                                                    status="PartiallyFilled")]),
+                 dict(path="/v5/order/history", rows=[fx.order_row(cum="0.002")])]
+        r = run([fx.claim(1, qty=0.001), fx.claim(2, qty=0.001)], specs)
+        assert r["orders"][0]["complete"] is True and r["pnl_claim_allowed"]
+
+    def test_one_row_present_in_two_environments_resolves_in_the_claimed_one(self):
+        specs = [dict(path="/v5/execution/list", rows=[fx.exec_row(1)]),
+                 dict(path="/v5/execution/list", rows=[fx.exec_row(1)], env="demo",
+                      host="https://api-demo.bybit.com"),
+                 dict(path="/v5/order/history", rows=[fx.order_row()], env="demo",
+                      host="https://api-demo.bybit.com")]
+        r = run([fx.claim(environment="demo")], specs)
+        assert fill(r)["resolved"]
+
+    def test_a_funding_capture_older_than_the_settlement_is_impossible(self):
+        T = fx.T0 + 8 * 3_600_000
+        specs = [dict(path="/v5/account/transaction-log",
+                      rows=[fx.settlement_row(t=T)], at=T - 3_600_000)]
+        cap = er.capture_from_records(fx.chain(specs))
+        r = er.reconcile(funding_claims=[{
+            "claim_id": "F", "source": "testnet_claim", "environment": "testnet",
+            "symbol": "BTCUSDT", "time_ms": T, "amount": -0.05}],
+            captures=[cap], now_ms=T + 9 * 3_600_000)
+        assert "CAPTURED_BEFORE_EXECUTION" in r["funding"][0]["issues"]
+
+
+class TestMalformedInputNeverRaises:
+    @pytest.mark.parametrize("bad", [None, "x", 7, ["a"], {"claim_id": "c"}])
+    def test_a_non_claim_is_reported_not_raised(self, bad):
+        r = run([bad])
+        assert not fill(r)["resolved"] and r["pnl_claim_allowed"] is False
+
+    @pytest.mark.parametrize("over", [
+        {"side": ["Buy"]}, {"side": {"a": 1}}, {"qty": 10 ** 400},
+        {"exec_time_ms": 10 ** 400}, {"price": "１２"}, {"qty": "1e999"}])
+    def test_hostile_field_values_are_refused_not_raised(self, over):
+        assert not fill(run([fx.claim(**over)]))["resolved"]
+
+    def test_none_inputs_are_empty(self):
+        r = er.reconcile(fill_claims=None, funding_claims=None, now_ms=fx.NOW)
+        assert r["pnl_claim_allowed"] is False
+
+    def test_a_non_mapping_ledger_is_a_malformed_local_record(self):
+        r = er.reconcile(ledgers=["x"], now_ms=fx.NOW)
+        assert "MALFORMED_LEDGER" in r["ledger_summaries"][0]["issues"]
+
+    def test_hash_valid_but_malformed_capture_records_are_skipped(self):
+        def seal(rec, prev):
+            rec["prev_hash"] = prev
+            rec["record_hash"] = ve.content_hash(
+                {k: v for k, v in rec.items() if k != "record_hash"})
+            return rec
+        good = fx.good_chain()
+        weird = [
+            {"environment": "testnet", "request_url": "https://[x/", "response": {},
+             "method": "GET"},
+            {"environment": "testnet", "transport": "ws", "request": "x",
+             "request_url": "wss://stream-testnet.bybit.com/v5/private",
+             "response": {"data": "nope"}},
+            {"environment": "testnet", "request_url": fx.TESTNET_REST +
+             "/v5/execution/list", "method": "GET", "response": "text"}]
+        chain, prev = [], ve.GENESIS_PREV_HASH
+        for rec in weird + good:
+            chain.append(seal(dict(rec), prev))
+            prev = chain[-1]["record_hash"]
+        cap = er.capture_from_records(chain + [None])
+        r = er.reconcile(fill_claims=[fx.claim()], captures=[cap], now_ms=fx.NOW)
+        assert fill(r)["issues"] == ["CAPTURE_CHAIN_BROKEN"] or \
+            "CAPTURE_CHAIN_BROKEN" in fill(r)["issues"]      # the None breaks it
+        cap2 = er.capture_from_records(chain)
+        r2 = er.reconcile(fill_claims=[fx.claim()], captures=[cap2], now_ms=fx.NOW)
+        assert fill(r2)["resolved"]

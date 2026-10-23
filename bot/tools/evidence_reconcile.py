@@ -14,7 +14,15 @@ of four provenance classes and says, per claim, why it is not resolved:
     VENUE_RECONCILED      the claim matches, field for field, a row in a
                           hash-chain-verified capture taken from the exact host
                           of the claimed environment, AND a second, different
-                          kind of venue record corroborates it.
+                          kind of venue record corroborates it. A FILL is
+                          corroborated by an order row (cumExecQty covers it)
+                          or by a private-WS event restating the same fill. A
+                          FUNDING payment has only one venue endpoint in the
+                          capture set (the account transaction log), so its
+                          corroboration is the row's own wallet-change
+                          arithmetic (`change = funding + cashFlow - fee`);
+                          that is weaker, and is stated here rather than
+                          implied.
 
 ONLY VENUE_RECONCILED IS RESOLVED. Everything else is unresolved and carries
 machine-readable issue codes. `pnl_claim_allowed` is False unless every claim in
@@ -81,9 +89,9 @@ def _num(value: Any) -> Optional[float]:
         return None
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return number if math.isfinite(number) else None
+    return number if math.isfinite(number) and abs(number) < 1e18 else None
 
 
 def _int(value: Any) -> Optional[int]:
@@ -153,14 +161,19 @@ def capture_from_records(records: Sequence[Dict[str, Any]]) -> Capture:
     """The same verification for records already in memory (tests, tools)."""
     issues: List[str] = []
     prev = ve.GENESIS_PREV_HASH
+    kept: List[Dict[str, Any]] = []
     for index, record in enumerate(records, start=1):
+        if not isinstance(record, dict):
+            issues.append(f"record {index}: not an object")
+            continue
+        kept.append(record)
         body = {k: v for k, v in record.items() if k != "record_hash"}
         if record.get("record_hash") != ve.content_hash(body):
             issues.append(f"record {index}: record_hash does not match content")
         if record.get("prev_hash") != prev:
             issues.append(f"record {index}: prev_hash does not chain")
         prev = str(record.get("record_hash", ""))
-    return Capture(list(records), issues)
+    return Capture(kept, issues)
 
 
 def _record_environment_ok(record: Mapping[str, Any]) -> Optional[str]:
@@ -168,7 +181,13 @@ def _record_environment_ok(record: Mapping[str, Any]) -> Optional[str]:
     https/wss, else None. Substring matches are not accepted: a look-alike
     host or a path containing the venue name proves nothing."""
     env = str(record.get("environment", ""))
-    parts = urlsplit(str(record.get("request_url", "")))
+    try:
+        parts = urlsplit(str(record.get("request_url", "")))
+        port = parts.port
+    except ValueError:
+        return None
+    if port not in (None, 443) or parts.username or parts.password:
+        return None
     table = ve.WS_VENUE_HOSTS if record.get("transport") == "ws" else ve.VENUE_HOSTS
     expected = table.get(env)
     scheme_ok = parts.scheme == ("wss" if record.get("transport") == "ws"
@@ -205,47 +224,59 @@ def _path(record: Mapping[str, Any]) -> str:
 
 class VenueIndex:
     """The verified rows of a capture, keyed for matching. Rows from records
-    whose host does not prove their environment are not indexed at all."""
+    whose host does not prove their environment are not indexed at all, and a
+    record that cannot be read is skipped rather than allowed to raise."""
 
     def __init__(self, capture: Capture) -> None:
-        self.executions: Dict[str, List[Tuple[str, Dict[str, Any], int]]] = {}
+        #: execId -> [(environment, row, captured_ms or None)]
+        self.executions: Dict[str, List[Tuple[str, Dict[str, Any], Optional[int]]]] = {}
+        #: orderId -> [(environment, row)]
         self.orders: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
-        self.ws_exec_ids: Dict[str, str] = {}
-        self.settlements: Dict[Tuple[str, int], List[Tuple[str, Dict[str, Any]]]] = {}
+        #: execId -> [(environment, row)] from private-WS execution events
+        self.ws_rows: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
+        self.settlements: Dict[Tuple[str, int], List[Tuple[str, Dict[str, Any], Optional[int]]]] = {}
         self.skipped = 0
         for record in capture.records:
-            env = _record_environment_ok(record)
-            response = record.get("response")
-            if env is None or not isinstance(response, dict):
+            try:
+                self._add(record)
+            except Exception:                      # noqa: BLE001 - never raise
                 self.skipped += 1
-                continue
-            if record.get("transport") == "ws":
-                topic = str(((record.get("request") or {}).get("topic")) or "")
-                if topic.startswith("execution"):
-                    for row in _rows({"result": {"list": response.get("data")}}):
-                        if str(row.get("execId", "")):
-                            self.ws_exec_ids[str(row["execId"])] = env
-                continue
-            if record.get("method") != "GET" or not _ret_ok(response):
-                continue
-            stamp = _captured_ms(record) or 0
-            path = _path(record)
-            if path == "/v5/execution/list":
-                for row in _rows(response):
-                    self.executions.setdefault(str(row.get("execId", "")), []) \
-                        .append((env, row, stamp))
-            elif path in ("/v5/order/history", "/v5/order/realtime"):
-                for row in _rows(response):
-                    self.orders.setdefault(str(row.get("orderId", "")), []) \
-                        .append((env, row))
-            elif path == "/v5/account/transaction-log":
-                for row in _rows(response):
-                    if str(row.get("type", "")) == "SETTLEMENT":
-                        t = _int(row.get("transactionTime"))
-                        if t is not None:
-                            self.settlements.setdefault(
-                                (str(row.get("symbol", "")), t), []) \
-                                .append((env, row))
+
+    def _add(self, record: Mapping[str, Any]) -> None:
+        env = _record_environment_ok(record)
+        response = record.get("response")
+        if env is None or not isinstance(response, dict):
+            self.skipped += 1
+            return
+        if record.get("transport") == "ws":
+            request = record.get("request")
+            topic = str(request.get("topic", "")) if isinstance(request, dict) else ""
+            if topic.startswith("execution"):
+                for row in _rows({"result": {"list": response.get("data")}}):
+                    if str(row.get("execId", "")):
+                        self.ws_rows.setdefault(str(row["execId"]), []) \
+                            .append((env, row))
+            return
+        if record.get("method") != "GET" or not _ret_ok(response):
+            return
+        stamp = _captured_ms(record)
+        path = _path(record)
+        if path == "/v5/execution/list":
+            for row in _rows(response):
+                self.executions.setdefault(str(row.get("execId", "")), []) \
+                    .append((env, row, stamp))
+        elif path in ("/v5/order/history", "/v5/order/realtime"):
+            for row in _rows(response):
+                self.orders.setdefault(str(row.get("orderId", "")), []) \
+                    .append((env, row))
+        elif path == "/v5/account/transaction-log":
+            for row in _rows(response):
+                if str(row.get("type", "")) == "SETTLEMENT":
+                    t = _int(row.get("transactionTime"))
+                    if t is not None:
+                        self.settlements.setdefault(
+                            (str(row.get("symbol", "")), t), []) \
+                            .append((env, row, stamp))
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +293,9 @@ def _structural_issues(claim: Mapping[str, Any], now_ms: int) -> List[str]:
         issues.append("BAD_SOURCE")
     if str(claim.get("environment", "")) not in ve.ENVIRONMENTS:
         issues.append("BAD_ENVIRONMENT")
-    if claim.get("side") not in SIDES and "MISSING_FIELD:side" not in issues:
+    side = claim.get("side")
+    if not (isinstance(side, str) and side in SIDES) \
+            and "MISSING_FIELD:side" not in issues:
         issues.append("BAD_SIDE")
     qty, price, fee = _num(claim.get("qty")), _num(claim.get("price")), \
         _num(claim.get("fee"))
@@ -319,11 +352,19 @@ def _match_fill(claim: Mapping[str, Any], row: Mapping[str, Any]) -> List[str]:
             diffs.append(name)
     if _int(row.get("execTime")) != _int(claim.get("exec_time_ms")):
         diffs.append("exec_time_ms")
+    # a funding, liquidation or ADL row is not an ordinary trade fill
+    if str(row.get("execType", "")) != "Trade":
+        diffs.append("exec_type")
+    currency = str(claim.get("fee_currency", "") or "")
+    if currency and str(row.get("feeCurrency", "")) != currency:
+        diffs.append("fee_currency")
     return diffs
 
 
 def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capture],
                     *, now_ms: int) -> List[Dict[str, Any]]:
+    claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
+              for c in (claims or [])]
     indexes = [(c, VenueIndex(c)) for c in captures]
     chain_broken = any(not c.intact for c in captures)
     out: List[Dict[str, Any]] = []
@@ -341,6 +382,8 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
 
     for i, claim in enumerate(claims):
         issues = _structural_issues(claim, now_ms)
+        if "_malformed" in claim:
+            issues.append("MALFORMED_CLAIM")
         provenance = _base_class(claim, issues)
         eid = str(claim.get("exec_id", "") or "").strip()
         group = by_exec.get(eid, []) if eid else []
@@ -379,7 +422,7 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
 
 
 #: Issues that forbid the upgrade, however well the venue rows match.
-_BLOCKING_PREFIXES = ("MISSING_FIELD", "BAD_", "SIMULATION_", "TESTNET_CLAIM_",
+_BLOCKING_PREFIXES = ("MALFORMED", "CAPTURE_TIME", "MISSING_FIELD", "BAD_", "SIMULATION_", "TESTNET_CLAIM_",
                       "MAINNET_", "NO_VENUE", "DUPLICATE", "CONFLICTING",
                       "AMBIGUOUS", "CAPTURE_CHAIN", "VENUE_", "ORDER_",
                       "NO_CORROBORATION", "NOT_IN_CAPTURE", "ENV_MISMATCH",
@@ -393,25 +436,30 @@ def issues_block(issues: Iterable[str]) -> bool:
 def _reconcile_one(claim: Mapping[str, Any], indexes: Sequence[Tuple[Capture, VenueIndex]],
                    issues: List[str]) -> bool:
     eid = str(claim["exec_id"]).strip()
-    found = [(env, row, stamp) for _c, idx in indexes
+    every = [(env, row, stamp) for _c, idx in indexes
              for env, row, stamp in idx.executions.get(eid, [])]
-    if not found:
+    if not every:
         issues.append("NOT_IN_CAPTURE")
+        return False
+    claimed_env = str(claim.get("environment"))
+    found = [f for f in every if f[0] == claimed_env]
+    if not found:
+        issues.append("ENV_MISMATCH")
         return False
     distinct = {json.dumps(r, sort_keys=True) for _e, r, _s in found}
     if len(distinct) > 1:
         issues.append("VENUE_ROWS_CONTRADICT")
         return False
     env, row, stamp = found[0]
-    if env != claim.get("environment"):
-        issues.append("ENV_MISMATCH")
-        return False
     diffs = _match_fill(claim, row)
     if diffs:
         issues.extend(f"VENUE_DISAGREES:{d}" for d in diffs)
         return False
     exec_ms = _int(row.get("execTime")) or 0
-    if stamp and stamp + 1000 < exec_ms:
+    if stamp is None:
+        issues.append("CAPTURE_TIME_INVALID")
+        return False
+    if stamp + 1000 < exec_ms:
         issues.append("CAPTURED_BEFORE_EXECUTION")
         return False
     # corroboration: a DIFFERENT kind of venue record says the same thing
@@ -426,7 +474,9 @@ def _reconcile_one(claim: Mapping[str, Any], indexes: Sequence[Tuple[Capture, Ve
                 and str(order.get("side", "")) == str(claim["side"])
                 and cum is not None and qty is not None and cum + 1e-12 >= qty):
             corroborated = True
-    ws = any(idx.ws_exec_ids.get(eid) == env for _c, idx in indexes)
+    # a WS event corroborates only if it restates the SAME fill, field for field
+    ws = any(e == env and not _match_fill(claim, r)
+             for _c, idx in indexes for e, r in idx.ws_rows.get(eid, []))
     if not (corroborated or ws):
         issues.append("NO_CORROBORATION")
         return False
@@ -436,23 +486,25 @@ def _reconcile_one(claim: Mapping[str, Any], indexes: Sequence[Tuple[Capture, Ve
 def reconcile_order_totals(claims: Sequence[Mapping[str, Any]],
                            fills: Sequence[Dict[str, Any]],
                            captures: Sequence[Capture]) -> List[Dict[str, Any]]:
-    """Per order: do the reconciled fills add up to the venue's cumExecQty?
-    A fill that reconciles on its own is still not the whole order."""
+    """Per (environment, order): do the reconciled fills add up to the venue's
+    cumExecQty? A fill that reconciles on its own is still not the whole order.
+    Snapshots of one order are taken at different times and cumExecQty only
+    grows, so the largest one stated is the venue's latest word."""
     indexes = [VenueIndex(c) for c in captures]
-    totals: Dict[str, float] = {}
+    totals: Dict[Tuple[str, str], float] = {}
     for claim, verdict in zip(claims, fills):
         if verdict["resolved"] and verdict["counted"]:
-            oid = str(claim["order_id"])
-            totals[oid] = totals.get(oid, 0.0) + float(_num(claim["qty"]) or 0.0)
+            key = (str(claim["environment"]), str(claim["order_id"]))
+            totals[key] = totals.get(key, 0.0) + float(_num(claim["qty"]) or 0.0)
     report = []
-    for oid, qty in sorted(totals.items()):
-        cums = {_num(r.get("cumExecQty")) for idx in indexes
-                for _e, r in idx.orders.get(oid, [])}
-        cums.discard(None)
-        complete = bool(cums) and len(cums) == 1 and _close(qty, next(iter(cums)),
-                                                              QTY_REL_TOL, 1e-12)
-        report.append({"order_id": oid, "reconciled_qty": qty,
-                       "venue_cum_exec_qty": sorted(cums),
+    for (env, oid), qty in sorted(totals.items()):
+        cums = [_num(r.get("cumExecQty")) for idx in indexes
+                for e, r in idx.orders.get(oid, []) if e == env]
+        cums = [c for c in cums if c is not None]
+        latest = max(cums) if cums else None
+        complete = latest is not None and _close(qty, latest, QTY_REL_TOL, 1e-12)
+        report.append({"environment": env, "order_id": oid,
+                       "reconciled_qty": qty, "venue_cum_exec_qty": latest,
                        "complete": complete})
     return report
 
@@ -464,12 +516,16 @@ def reconcile_order_totals(claims: Sequence[Mapping[str, Any]],
 def reconcile_funding(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capture],
                       *, now_ms: int) -> List[Dict[str, Any]]:
     from carry_broker import funding_sign_check
+    claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
+              for c in (claims or [])]
     indexes = [VenueIndex(c) for c in captures]
     chain_broken = any(not c.intact for c in captures)
     seen: Dict[Tuple[str, Any], int] = {}
     out = []
     for i, claim in enumerate(claims):
         issues: List[str] = []
+        if "_malformed" in claim:
+            issues.append("MALFORMED_CLAIM")
         for name in ("claim_id", "symbol", "time_ms", "amount"):
             if claim.get(name) is None or str(claim.get(name)).strip() == "":
                 issues.append(f"MISSING_FIELD:{name}")
@@ -500,17 +556,22 @@ def reconcile_funding(claims: Sequence[Mapping[str, Any]], captures: Sequence[Ca
         else:
             provenance = LOCAL_RECORD
         if provenance == CLAIMED_TESTNET_FILL and not issues_block(issues):
-            rows = [(e, r) for idx in indexes
-                    for e, r in idx.settlements.get(key, [])]
-            if not rows:
+            every = [(e, r, st) for idx in indexes
+                     for e, r, st in idx.settlements.get(key, [])]
+            rows = [x for x in every if x[0] == env]
+            if not every:
                 issues.append("NOT_IN_CAPTURE")
-            elif len({json.dumps(r, sort_keys=True) for _e, r in rows}) > 1:
+            elif not rows:
+                issues.append("ENV_MISMATCH")
+            elif len({json.dumps(r, sort_keys=True) for _e, r, _s in rows}) > 1:
                 issues.append("VENUE_ROWS_CONTRADICT")
             else:
-                e, row = rows[0]
+                e, row, cap_ms = rows[0]
                 funding = _num(row.get("funding"))
-                if e != env:
-                    issues.append("ENV_MISMATCH")
+                if cap_ms is None:
+                    issues.append("CAPTURE_TIME_INVALID")
+                elif stamp is not None and cap_ms + 1000 < stamp:
+                    issues.append("CAPTURED_BEFORE_EXECUTION")
                 elif funding is None or amount is None \
                         or not _close(funding, amount, 1e-9, 1e-12):
                     issues.append("VENUE_DISAGREES:amount")
@@ -539,6 +600,10 @@ def summarise_ledger(payload: Mapping[str, Any], fills: Sequence[Dict[str, Any]]
     """A `cash_ledger/*` file is a LOCAL_RECORD, always. It states how many
     fills there were and what they cost but names none of them, so it cannot be
     reconciled by itself; here it is only cross-checked against the claims."""
+    if not isinstance(payload, Mapping):
+        return {"kind": "ledger_summary", "schema": "", "provenance": LOCAL_RECORD,
+                "resolved": False, "issues": ["MALFORMED_LEDGER",
+                                              "UNKNOWN_LEDGER_SCHEMA"]}
     issues: List[str] = ["LEDGER_SUMMARY_HAS_NO_FILL_IDENTIFIERS"]
     schema = str(payload.get("schema", ""))
     if schema not in ("cash_ledger/1", "cash_ledger/2"):
@@ -576,6 +641,8 @@ def reconcile(*, fill_claims: Sequence[Mapping[str, Any]] = (),
               funding_claims: Sequence[Mapping[str, Any]] = (),
               ledgers: Sequence[Mapping[str, Any]] = (),
               captures: Sequence[Capture] = (), now_ms: int) -> Dict[str, Any]:
+    fill_claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
+                   for c in (fill_claims or [])]
     fills = reconcile_fills(fill_claims, captures, now_ms=now_ms)
     funding = reconcile_funding(funding_claims, captures, now_ms=now_ms) \
         if funding_claims else []
@@ -616,7 +683,7 @@ def summaries_block(summaries: Sequence[Mapping[str, Any]]) -> bool:
     return any(i.startswith(("LEDGER_FILL_COUNT_DISAGREES",
                              "LEDGER_FEES_DISAGREE", "LEDGER_FEES_MISSING",
                              "LEDGER_FILL_COUNT_MISSING", "UNKNOWN_LEDGER",
-                             "LEDGER_FEES_UNCONFIRMED", "LEDGER_FUNDING_",
+                             "LEDGER_FEES_UNCONFIRMED", "LEDGER_FUNDING_", "MALFORMED_LEDGER",
                              "LEDGER_DOES_NOT"))
                for s in summaries for i in s["issues"])
 
