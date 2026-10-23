@@ -251,3 +251,16 @@ class TestTheLatencySettingSurvivesTheSearchHarness:
                              c["ewma_alpha"]): c["net"]
                             for c in wf.sweep_cells(rows, base)}
         assert out[0] != out[2]            # the setting reached the native core
+
+
+class TestTheDailyClockSaysItHasNoLatency:
+    def test_the_daily_result_labels_its_fill_model(self):
+        import datetime as dt
+        days = [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(12)]
+        series = {d: 60_000.0 for d in days}
+        ms = [int(dt.datetime.combine(d, dt.time(), dt.timezone.utc).timestamp()
+                  * 1000) for d in days]
+        r = cb.simulate_series(perp=series, spot=series, ftimes=ms,
+                               frates=[HI] * len(ms), notional=NOTIONAL,
+                               borrow_apr=0.0)
+        assert r["fill_model"] == "same_close_zero_latency_upper_bound"

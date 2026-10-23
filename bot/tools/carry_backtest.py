@@ -640,6 +640,10 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
 
     return {
         "clock": "daily_close",
+        # The decision reads the day's closing prints and fills at that same
+        # close: zero latency by construction, an upper bound. The settlement
+        # clock (simulate_settlements_series) is the one with a fill gap.
+        "fill_model": "same_close_zero_latency_upper_bound",
         # D43, and the same pair the settlement sim reports. `borrow_source`
         # says WHICH financing was charged; `borrow_periods_unpriced` how many
         # days the curve could not cover and therefore fell back to the
