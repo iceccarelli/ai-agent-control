@@ -83,9 +83,25 @@ SANDBOXES = frozenset({"testnet", "demo"})
 # numbers
 # ---------------------------------------------------------------------------
 
+def _blank(value: Any) -> bool:
+    try:
+        return value is None or str(value).strip() == ""
+    except (ValueError, TypeError):            # e.g. an int of 10**5000 digits
+        return False
+
+
+def _s(value: Any) -> str:
+    """str() that cannot raise (a 5,000-digit integer refuses to stringify)."""
+    try:
+        return str(value)
+    except (ValueError, TypeError, RecursionError):
+        return "<unreadable>"
+
+
 def _num(value: Any) -> Optional[float]:
-    """A finite float, or None. Booleans and blanks are not numbers."""
-    if value is None or isinstance(value, bool) or str(value).strip() == "":
+    """A finite float, or None. Booleans and blanks are not numbers; neither is
+    anything that cannot be read (huge ints, containers)."""
+    if isinstance(value, bool) or _blank(value):
         return None
     try:
         number = float(value)
@@ -99,6 +115,10 @@ def _int(value: Any) -> Optional[int]:
     if number is None or number != int(number):
         return None
     return int(number)
+
+
+def _is_str_in(value: Any, allowed: Any) -> bool:
+    return isinstance(value, str) and value in allowed
 
 
 def _close(a: float, b: float, rel: float, absolute: float = 0.0) -> bool:
@@ -235,6 +255,11 @@ class VenueIndex:
         #: execId -> [(environment, row)] from private-WS execution events
         self.ws_rows: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
         self.settlements: Dict[Tuple[str, int], List[Tuple[str, Dict[str, Any], Optional[int]]]] = {}
+        #: (environment, orderId) / (environment, orderLinkId) -> {execId: row}
+        self.fills_by_order: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        self.fills_by_link: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
+        #: execIds seen with two different bodies in one environment
+        self.exec_conflicts: set = set()
         self.skipped = 0
         for record in capture.records:
             try:
@@ -263,8 +288,16 @@ class VenueIndex:
         path = _path(record)
         if path == "/v5/execution/list":
             for row in _rows(response):
-                self.executions.setdefault(str(row.get("execId", "")), []) \
-                    .append((env, row, stamp))
+                eid = str(row.get("execId", ""))
+                self.executions.setdefault(eid, []).append((env, row, stamp))
+                for table, key in ((self.fills_by_order, str(row.get("orderId", ""))),
+                                   (self.fills_by_link, str(row.get("orderLinkId", "")))):
+                    if not key:
+                        continue
+                    bucket = table.setdefault((env, key), {})
+                    if eid in bucket and bucket[eid] != row:
+                        self.exec_conflicts.add((env, eid))
+                    bucket[eid] = row
         elif path in ("/v5/order/history", "/v5/order/realtime"):
             for row in _rows(response):
                 self.orders.setdefault(str(row.get("orderId", "")), []) \
@@ -287,11 +320,11 @@ def _structural_issues(claim: Mapping[str, Any], now_ms: int) -> List[str]:
     issues: List[str] = []
     for name in ("claim_id", "symbol", "side", "qty", "price", "fee",
                  "exec_time_ms"):
-        if claim.get(name) is None or str(claim.get(name)).strip() == "":
+        if _blank(claim.get(name)):
             issues.append(f"MISSING_FIELD:{name}")
-    if str(claim.get("source", "")) not in SOURCES:
+    if _s(claim.get("source", "")) not in SOURCES:
         issues.append("BAD_SOURCE")
-    if str(claim.get("environment", "")) not in ve.ENVIRONMENTS:
+    if _s(claim.get("environment", "")) not in ve.ENVIRONMENTS:
         issues.append("BAD_ENVIRONMENT")
     side = claim.get("side")
     if not (isinstance(side, str) and side in SIDES) \
@@ -310,7 +343,7 @@ def _structural_issues(claim: Mapping[str, Any], now_ms: int) -> List[str]:
             stamp is None or stamp < EARLIEST_PLAUSIBLE_MS
             or stamp > now_ms + MAX_FUTURE_SKEW_MS):
         issues.append("BAD_TIMESTAMP")
-    source, env = str(claim.get("source", "")), str(claim.get("environment", ""))
+    source, env = _s(claim.get("source", "")), _s(claim.get("environment", ""))
     if source == "simulation" and env in ve.NETWORKED_ENVIRONMENTS:
         issues.append("SIMULATION_CLAIMS_A_VENUE")
     if source == "testnet_claim" and env not in SANDBOXES:
@@ -321,12 +354,12 @@ def _structural_issues(claim: Mapping[str, Any], now_ms: int) -> List[str]:
 
 
 def _base_class(claim: Mapping[str, Any], issues: List[str]) -> str:
-    source, env = str(claim.get("source", "")), str(claim.get("environment", ""))
+    source, env = _s(claim.get("source", "")), _s(claim.get("environment", ""))
     if source == "simulation" or env == "simulation":
         return SIMULATED
     if source == "testnet_claim" and env in SANDBOXES:
-        if not (str(claim.get("exec_id", "")).strip()
-                and str(claim.get("order_id", "")).strip()):
+        if not (_s(claim.get("exec_id", "")).strip()
+                and _s(claim.get("order_id", "")).strip()):
             issues.append("NO_VENUE_IDENTIFIERS")
             return LOCAL_RECORD
         return CLAIMED_TESTNET_FILL
@@ -335,14 +368,14 @@ def _base_class(claim: Mapping[str, Any], issues: List[str]) -> str:
 
 def _match_fill(claim: Mapping[str, Any], row: Mapping[str, Any]) -> List[str]:
     diffs: List[str] = []
-    if str(row.get("orderId", "")) != str(claim.get("order_id", "")):
+    if str(row.get("orderId", "")) != _s(claim.get("order_id", "")):
         diffs.append("order_id")
-    link = str(claim.get("order_link_id", "") or "")
+    link = _s(claim.get("order_link_id", "") or "")
     if link and str(row.get("orderLinkId", "")) != link:
         diffs.append("order_link_id")
-    if str(row.get("symbol", "")) != str(claim.get("symbol", "")):
+    if str(row.get("symbol", "")) != _s(claim.get("symbol", "")):
         diffs.append("symbol")
-    if str(row.get("side", "")) != str(claim.get("side", "")):
+    if str(row.get("side", "")) != _s(claim.get("side", "")):
         diffs.append("side")
     for name, key, rel, ab in (("qty", "execQty", QTY_REL_TOL, 0.0),
                                ("price", "execPrice", PRICE_REL_TOL, 0.0),
@@ -355,7 +388,7 @@ def _match_fill(claim: Mapping[str, Any], row: Mapping[str, Any]) -> List[str]:
     # a funding, liquidation or ADL row is not an ordinary trade fill
     if str(row.get("execType", "")) != "Trade":
         diffs.append("exec_type")
-    currency = str(claim.get("fee_currency", "") or "")
+    currency = _s(claim.get("fee_currency", "") or "")
     if currency and str(row.get("feeCurrency", "")) != currency:
         diffs.append("fee_currency")
     return diffs
@@ -373,19 +406,21 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
     by_exec: Dict[str, List[int]] = {}
     link_orders: Dict[str, set] = {}
     for i, c in enumerate(claims):
-        eid = str(c.get("exec_id", "") or "").strip()
+        eid = _s(c.get("exec_id", "") or "").strip()
         if eid:
             by_exec.setdefault(eid, []).append(i)
-        link = str(c.get("order_link_id", "") or "").strip()
-        if link and str(c.get("order_id", "") or "").strip():
+        link = _s(c.get("order_link_id", "") or "").strip()
+        if link and _s(c.get("order_id", "") or "").strip():
             link_orders.setdefault(link, set()).add(str(c["order_id"]))
 
     for i, claim in enumerate(claims):
         issues = _structural_issues(claim, now_ms)
         if "_malformed" in claim:
             issues.append("MALFORMED_CLAIM")
+        if _s(claim.get("claim_id")) == "<unreadable>":
+            issues.append("MALFORMED_CLAIM")
         provenance = _base_class(claim, issues)
-        eid = str(claim.get("exec_id", "") or "").strip()
+        eid = _s(claim.get("exec_id", "") or "").strip()
         group = by_exec.get(eid, []) if eid else []
         duplicate_of_earlier = False
         if len(group) > 1:
@@ -401,7 +436,7 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
                 # flagged and not counted (a replayed event is not a 2nd fill)
                 issues.append("DUPLICATE_EXEC_ID")
                 duplicate_of_earlier = True
-        link = str(claim.get("order_link_id", "") or "").strip()
+        link = _s(claim.get("order_link_id", "") or "").strip()
         if link and len(link_orders.get(link, ())) > 1:
             issues.append("AMBIGUOUS_ORDER_LINK_ID")
         if chain_broken:
@@ -412,7 +447,7 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
             reconciled = _reconcile_one(claim, indexes, issues)
         if reconciled and not issues_block(issues):
             provenance = VENUE_RECONCILED
-        out.append({"claim_id": str(claim.get("claim_id", f"#{i}")),
+        out.append({"claim_id": _s(claim.get("claim_id", f"#{i}"))[:80],
                     "kind": "fill", "provenance": provenance,
                     "resolved": provenance == VENUE_RECONCILED
                     and not issues_block(issues),
@@ -422,7 +457,9 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
 
 
 #: Issues that forbid the upgrade, however well the venue rows match.
-_BLOCKING_PREFIXES = ("MALFORMED", "CAPTURE_TIME", "MISSING_FIELD", "BAD_", "SIMULATION_", "TESTNET_CLAIM_",
+_BLOCKING_PREFIXES = ("EXIT_ALLOCATION", "EXIT_OVERCLAIMED", "ENTRY_OVERCLAIMED",
+                      "LOCAL_GROSS", "ORDER_STATUS_CONFLICT", "DUPLICATE_EXCHANGE",
+                      "MALFORMED", "CAPTURE_TIME", "MISSING_FIELD", "BAD_", "SIMULATION_", "TESTNET_CLAIM_",
                       "MAINNET_", "NO_VENUE", "DUPLICATE", "CONFLICTING",
                       "AMBIGUOUS", "CAPTURE_CHAIN", "VENUE_", "ORDER_",
                       "NO_CORROBORATION", "NOT_IN_CAPTURE", "ENV_MISMATCH",
@@ -435,13 +472,13 @@ def issues_block(issues: Iterable[str]) -> bool:
 
 def _reconcile_one(claim: Mapping[str, Any], indexes: Sequence[Tuple[Capture, VenueIndex]],
                    issues: List[str]) -> bool:
-    eid = str(claim["exec_id"]).strip()
+    eid = _s(claim["exec_id"]).strip()
     every = [(env, row, stamp) for _c, idx in indexes
              for env, row, stamp in idx.executions.get(eid, [])]
     if not every:
         issues.append("NOT_IN_CAPTURE")
         return False
-    claimed_env = str(claim.get("environment"))
+    claimed_env = _s(claim.get("environment"))
     found = [f for f in every if f[0] == claimed_env]
     if not found:
         issues.append("ENV_MISMATCH")
@@ -464,14 +501,14 @@ def _reconcile_one(claim: Mapping[str, Any], indexes: Sequence[Tuple[Capture, Ve
         return False
     # corroboration: a DIFFERENT kind of venue record says the same thing
     order_rows = [r for _c, idx in indexes
-                  for e, r in idx.orders.get(str(claim["order_id"]), [])
+                  for e, r in idx.orders.get(_s(claim["order_id"]), [])
                   if e == env]
     corroborated = False
     for order in order_rows:
         cum = _num(order.get("cumExecQty"))
         qty = _num(claim.get("qty"))
-        if (str(order.get("symbol", "")) == str(claim["symbol"])
-                and str(order.get("side", "")) == str(claim["side"])
+        if (str(order.get("symbol", "")) == _s(claim["symbol"])
+                and str(order.get("side", "")) == _s(claim["side"])
                 and cum is not None and qty is not None and cum + 1e-12 >= qty):
             corroborated = True
     # a WS event corroborates only if it restates the SAME fill, field for field
@@ -494,7 +531,7 @@ def reconcile_order_totals(claims: Sequence[Mapping[str, Any]],
     totals: Dict[Tuple[str, str], float] = {}
     for claim, verdict in zip(claims, fills):
         if verdict["resolved"] and verdict["counted"]:
-            key = (str(claim["environment"]), str(claim["order_id"]))
+            key = (_s(claim["environment"]), _s(claim["order_id"]))
             totals[key] = totals.get(key, 0.0) + float(_num(claim["qty"]) or 0.0)
     report = []
     for (env, oid), qty in sorted(totals.items()):
@@ -507,6 +544,415 @@ def reconcile_order_totals(claims: Sequence[Mapping[str, Any]],
                        "reconciled_qty": qty, "venue_cum_exec_qty": latest,
                        "complete": complete})
     return report
+
+
+# ---------------------------------------------------------------------------
+# local orders and trades: what the bot's own database says happened
+# ---------------------------------------------------------------------------
+
+#: local `orders.status` -> the venue `orderStatus` values that agree with it.
+#: Anything not listed (pending, new, unknown, partially_filled...) is a
+#: non-final local belief and is never reconciled to a final outcome.
+_ORDER_STATUS_AGREES = {"filled": {"Filled"}, "cancelled": {"Cancelled"},
+                        "rejected": {"Rejected"}}
+_LONG = {"Buy", "buy", "long", "LONG"}
+_SHORT = {"Sell", "sell", "short", "SHORT"}
+
+
+def _claim_class(claim: Mapping[str, Any], issues: List[str]) -> str:
+    source, env = _s(claim.get("source", "")), _s(claim.get("environment", ""))
+    if source not in SOURCES:
+        issues.append("BAD_SOURCE")
+    if env not in ve.ENVIRONMENTS:
+        issues.append("BAD_ENVIRONMENT")
+    if env == "mainnet":
+        issues.append("MAINNET_EVIDENCE_NOT_ACCEPTED")
+    if source == "simulation" or env == "simulation":
+        return SIMULATED
+    if source == "testnet_claim" and env in SANDBOXES:
+        return CLAIMED_TESTNET_FILL
+    return LOCAL_RECORD
+
+
+def _order_state(indexes: Sequence[VenueIndex], env: str, order_id: str
+                 ) -> Tuple[List[Dict[str, Any]], set, Optional[float]]:
+    """(snapshots, final statuses stated, largest cumExecQty) for one order."""
+    rows = [r for idx in indexes for e, r in idx.orders.get(order_id, []) if e == env]
+    finals = {str(r.get("orderStatus", "")) for r in rows} & {
+        "Filled", "Cancelled", "Rejected", "Deactivated"}
+    cums = [c for c in (_num(r.get("cumExecQty")) for r in rows) if c is not None]
+    return rows, finals, (max(cums) if cums else None)
+
+
+def _order_fills(indexes: Sequence[VenueIndex], env: str, order_id: str
+                 ) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for idx in indexes:
+        out.update(idx.fills_by_order.get((env, order_id), {}))
+    return out
+
+
+def _fills_match(rows: Mapping[str, Mapping[str, Any]], symbol: str, side: str) -> bool:
+    return bool(rows) and all(
+        str(r.get("symbol", "")) == symbol and str(r.get("side", "")) == side
+        and str(r.get("execType", "")) == "Trade" for r in rows.values())
+
+
+def reconcile_orders(claims: Sequence[Mapping[str, Any]],
+                     captures: Sequence[Capture]) -> List[Dict[str, Any]]:
+    """Does each locally recorded order exist at the venue, with the outcome the
+    bot believes? A local `filled` without a venue order id is a belief, not a
+    fill; a status the bot has not settled (pending, unknown) stays unresolved."""
+    claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
+              for c in (claims or [])]
+    indexes = [VenueIndex(c) for c in captures]
+    broken = any(not c.intact for c in captures)
+    ids: Dict[Tuple[str, str], int] = {}
+    for c in claims:
+        key = (_s(c.get("environment")), _s(c.get("exchange_id", "") or "").strip())
+        if key[1]:
+            ids[key] = ids.get(key, 0) + 1
+    out = []
+    for i, claim in enumerate(claims):
+        issues: List[str] = []
+        if "_malformed" in claim:
+            issues.append("MALFORMED_CLAIM")
+        if _s(claim.get("claim_id")) == "<unreadable>":
+            issues.append("MALFORMED_CLAIM")
+        for name in ("claim_id", "order_link_id", "symbol", "side", "status"):
+            if _blank(claim.get(name)):
+                issues.append(f"MISSING_FIELD:{name}")
+        if not (_is_str_in(claim.get("side"), SIDES)) and "MISSING_FIELD:side" not in issues:
+            issues.append("BAD_SIDE")
+        qty = _num(claim.get("qty"))
+        if claim.get("qty") is not None and (qty is None or qty <= 0):
+            issues.append("BAD_QTY")
+        provenance = _claim_class(claim, issues)
+        status = claim.get("status")
+        status = status if isinstance(status, str) else ""
+        if status not in _ORDER_STATUS_AGREES:
+            issues.append(f"ORDER_OUTCOME_UNSETTLED:{status or 'blank'}")
+        order_id = claim.get("exchange_id")
+        order_id = order_id.strip() if isinstance(order_id, str) else ""
+        if provenance == CLAIMED_TESTNET_FILL and not order_id:
+            issues.append("NO_VENUE_IDENTIFIERS")
+            provenance = LOCAL_RECORD
+        if order_id and ids.get((_s(claim.get("environment")), order_id), 0) > 1:
+            issues.append("DUPLICATE_EXCHANGE_ID")
+        if broken:
+            issues.append("CAPTURE_CHAIN_BROKEN")
+        if provenance == CLAIMED_TESTNET_FILL and not issues_block(
+                [x for x in issues if not x.startswith("ORDER_OUTCOME")]):
+            env = _s(claim["environment"])
+            rows, finals, cum = _order_state(indexes, env, order_id)
+            fills = _order_fills(indexes, env, order_id)
+            fill_qty = sum(_num(r.get("execQty")) or 0.0 for r in fills.values())
+            if not rows:
+                issues.append("NOT_IN_CAPTURE")
+            elif not all(str(r.get("symbol", "")) == _s(claim["symbol"])
+                         and str(r.get("side", "")) == _s(claim["side"])
+                         and str(r.get("orderLinkId", "")) == _s(claim["order_link_id"])
+                         for r in rows):
+                issues.append("VENUE_DISAGREES:order_identity")
+            elif len(finals) > 1:
+                issues.append("ORDER_STATUS_CONFLICT")
+            elif status in _ORDER_STATUS_AGREES and finals != _ORDER_STATUS_AGREES[status]:
+                issues.append("VENUE_DISAGREES:order_status")
+            elif status == "filled":
+                if qty is None or cum is None or not _close(cum, qty, QTY_REL_TOL, 1e-12):
+                    issues.append("VENUE_DISAGREES:filled_qty")
+                elif not _fills_match(fills, _s(claim["symbol"]), _s(claim["side"])) \
+                        or not _close(fill_qty, qty, QTY_REL_TOL, 1e-12):
+                    issues.append("NO_CORROBORATION")
+                else:
+                    provenance = VENUE_RECONCILED
+            elif status in ("cancelled", "rejected"):
+                # a cancelled order may be partly filled; the fills must then
+                # account for exactly what the venue says was executed
+                if cum is None or not _close(fill_qty, cum, QTY_REL_TOL, 1e-12) \
+                        or (fills and not _fills_match(
+                            fills, _s(claim["symbol"]), _s(claim["side"]))) \
+                        or (status == "rejected" and cum):
+                    issues.append("VENUE_DISAGREES:cancelled_fills")
+                else:
+                    provenance = VENUE_RECONCILED
+        resolved = provenance == VENUE_RECONCILED and not issues_block(issues) \
+            and not any(x.startswith("ORDER_OUTCOME") for x in issues)
+        out.append({"claim_id": _s(claim.get("claim_id", f"#{i}"))[:80],
+                    "kind": "order", "provenance": provenance,
+                    "resolved": resolved, "counted": True,
+                    "issues": sorted(set(issues))})
+    return out
+
+
+def _leg(idx_list: Sequence[VenueIndex], env: str, *, link: str = "",
+         orders: Sequence[str] = ()) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    rows: Dict[str, Dict[str, Any]] = {}
+    conflict = False
+    for idx in idx_list:
+        buckets = ([idx.fills_by_link.get((env, link), {})] if link else []) + \
+            [idx.fills_by_order.get((env, o), {}) for o in orders]
+        for bucket in buckets:
+            for eid, row in bucket.items():
+                if eid in rows and rows[eid] != row:
+                    conflict = True
+                rows[eid] = row
+        conflict = conflict or any(k[0] == env and k[1] in rows
+                                   for k in idx.exec_conflicts)
+    return rows, conflict
+
+
+def _vwap(rows: Mapping[str, Mapping[str, Any]]) -> Tuple[float, float, float, set]:
+    """(total qty, vwap price, total fee, fee currencies) over venue rows;
+    NaNs when any row is unusable."""
+    qty = price_q = fee = 0.0
+    currencies = set()
+    for r in rows.values():
+        q, p, f = _num(r.get("execQty")), _num(r.get("execPrice")), _num(r.get("execFee"))
+        if q is None or p is None or f is None or q <= 0 or p <= 0:
+            return float("nan"), float("nan"), float("nan"), set()
+        qty += q
+        price_q += q * p
+        fee += f
+        currencies.add(str(r.get("feeCurrency", "")))
+    return qty, (price_q / qty if qty else float("nan")), fee, currencies
+
+
+def _leg_orders_corroborated(indexes: Sequence[VenueIndex], env: str,
+                             rows: Mapping[str, Mapping[str, Any]],
+                             symbol: str, side: str) -> bool:
+    """EVERY order that produced a leg row has an order record, of the same
+    symbol and side, whose cumExecQty covers the executions captured for it."""
+    by_order: Dict[str, float] = {}
+    for r in rows.values():
+        oid = str(r.get("orderId", ""))
+        by_order[oid] = by_order.get(oid, 0.0) + (_num(r.get("execQty")) or 0.0)
+    for oid, executed in by_order.items():
+        snaps = [r for idx in indexes for e, r in idx.orders.get(oid, []) if e == env]
+        if not snaps or not any(
+                str(r.get("symbol", "")) == symbol and str(r.get("side", "")) == side
+                and (_num(r.get("cumExecQty")) or 0.0) + 1e-12 >= executed * (1 - QTY_REL_TOL)
+                for r in snaps):
+            return False
+        statuses = {str(r.get("orderStatus", "")) for r in snaps}
+        if "Rejected" in statuses or len(statuses & {
+                "Filled", "Cancelled", "Deactivated"}) > 1:
+            return False        # a rejected order has no fills; finals conflict
+    return True
+
+
+def _exit_ids(value: Any) -> Optional[List[str]]:
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        return None
+    ids = []
+    for x in value:
+        if not isinstance(x, str):
+            return None
+        if x.strip() and x.strip() not in ids:
+            ids.append(x.strip())
+    return ids
+
+
+def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capture],
+                     *, now_ms: int) -> List[Dict[str, Any]]:
+    """Reconcile the bot's own closed-trade rows against venue executions.
+
+    The local `trades` table keeps prices and fees per leg but no `execId`; it
+    does keep the entry `orderLinkId` and the exit order ids. So each leg is
+    rebuilt from the captured executions of those orders and compared:
+
+    * entry: venue VWAP == the entry price, venue quantity covers the trade, one
+      fee currency, and the entry fee is this trade's pro-rata share.
+    * exit: the exit price is the venue VWAP only when the exit orders filled
+      exactly this trade's quantity; otherwise the split between trade rows is
+      not recorded locally and the trade is unresolved (EXIT_ALLOCATION_UNPROVEN).
+    * venue quantity is CONSUMED: all claims sharing an entry link may not close
+      more than that entry filled, and all claims naming an exit order may not
+      close more than that order filled. Claiming the same fills twice resolves
+      neither.
+    * every order behind a leg needs an order record of the same symbol and
+      side that covers the executions; leg times must be coherent.
+    * a provisional exit price, an unrealised fee, a missing or inconsistent
+      gross P&L is unresolved.
+    """
+    claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
+              for c in (claims or [])]
+    indexes = [VenueIndex(c) for c in captures]
+    broken = any(not c.intact for c in captures)
+
+    # quantity each claim asks the venue to have supplied, per shared leg
+    entry_use: Dict[Tuple[str, str], float] = {}
+    exit_use: Dict[Tuple[str, str], float] = {}
+    exec_use: Dict[Tuple[str, str], int] = {}
+    for c in claims:
+        env, q = _s(c.get("environment")), _num(c.get("qty")) or 0.0
+        link = c.get("entry_order_link_id")
+        if isinstance(link, str) and link.strip():
+            key = (env, link.strip())
+            entry_use[key] = entry_use.get(key, 0.0) + q
+        for oid in _exit_ids(c.get("exit_order_ids")) or []:
+            exit_use[(env, oid)] = exit_use.get((env, oid), 0.0) + q
+        for eid in _exit_ids(c.get("exit_exec_ids")) or []:
+            exec_use[(env, eid)] = exec_use.get((env, eid), 0) + 1
+
+    out = []
+    for i, claim in enumerate(claims):
+        issues: List[str] = []
+        if "_malformed" in claim:
+            issues.append("MALFORMED_CLAIM")
+        if _s(claim.get("claim_id")) == "<unreadable>":
+            issues.append("MALFORMED_CLAIM")
+        for name in ("claim_id", "symbol", "side", "qty", "entry_price",
+                     "exit_price", "gross_pnl", "entry_fee", "exit_fee",
+                     "opened_ms", "closed_ms", "entry_order_link_id"):
+            if _blank(claim.get(name)):
+                issues.append(f"MISSING_FIELD:{name}")
+        qty, entry, exit_ = (_num(claim.get("qty")), _num(claim.get("entry_price")),
+                             _num(claim.get("exit_price")))
+        provisional = claim.get("price_provisional") is True
+        for name, v, bad in (("qty", qty, "BAD_QTY"),
+                             ("entry_price", entry, "BAD_PRICE"),
+                             ("exit_price", exit_, "BAD_PRICE")):
+            if not _blank(claim.get(name)) and (v is None or v <= 0) \
+                    and not (name == "exit_price" and provisional):
+                issues.append(bad)
+        side = claim.get("side")
+        direction = (1.0 if _is_str_in(side, _LONG)
+                     else -1.0 if _is_str_in(side, _SHORT) else 0.0)
+        if direction == 0.0 and "MISSING_FIELD:side" not in issues:
+            issues.append("BAD_SIDE")
+        opened, closed = _int(claim.get("opened_ms")), _int(claim.get("closed_ms"))
+        for name, v in (("opened_ms", opened), ("closed_ms", closed)):
+            if not _blank(claim.get(name)) and (
+                    v is None or v < EARLIEST_PLAUSIBLE_MS
+                    or v > now_ms + MAX_FUTURE_SKEW_MS):
+                issues.append("BAD_TIMESTAMP")
+        if opened is not None and closed is not None and closed < opened:
+            issues.append("BAD_TIMESTAMP")
+        for name in ("entry_fee", "exit_fee", "gross_pnl"):
+            if not _blank(claim.get(name)) and _num(claim.get(name)) is None:
+                issues.append("BAD_FEE" if name != "gross_pnl" else "BAD_GROSS")
+        provenance = _claim_class(claim, issues)
+        if provisional:
+            issues.append("EXIT_PRICE_PROVISIONAL")
+        for leg in ("entry", "exit"):
+            if claim.get(f"{leg}_fee_realized") is not True:
+                issues.append(f"{leg.upper()}_FEE_NOT_REALIZED")
+        exit_ids = _exit_ids(claim.get("exit_order_ids"))
+        exec_sel = _exit_ids(claim.get("exit_exec_ids"))
+        if exit_ids is None or exec_sel is None:
+            issues.append("MALFORMED_CLAIM")
+            exit_ids, exec_sel = exit_ids or [], exec_sel or []
+        link = claim.get("entry_order_link_id")
+        link = link.strip() if isinstance(link, str) else ""
+        env = _s(claim.get("environment"))
+        if provenance == CLAIMED_TESTNET_FILL and not (link and exit_ids):
+            issues.append("NO_VENUE_IDENTIFIERS")
+            provenance = LOCAL_RECORD
+        gross = _num(claim.get("gross_pnl"))
+        if None not in (gross, qty, entry, exit_) and direction and not provisional:
+            if not _close(gross, direction * (exit_ - entry) * qty, 1e-9, 1e-9):
+                issues.append("LOCAL_GROSS_ARITHMETIC")
+        if broken:
+            issues.append("CAPTURE_CHAIN_BROKEN")
+        gate = [x for x in issues if not x.endswith("_NOT_REALIZED")
+                and x != "EXIT_PRICE_PROVISIONAL"]
+        if provenance == CLAIMED_TESTNET_FILL and not issues_block(gate):
+            e_rows, e_conf = _leg(indexes, env, link=link)
+            x_rows, x_conf = _leg(indexes, env, orders=exit_ids)
+            x_all = x_rows
+            if exec_sel and not (e_conf or x_conf):
+                # the store names exactly which executions priced this exit
+                # (a reconciled provisional exit): the allocation is PROVEN, not
+                # inferred from the order total
+                if any(e not in x_all for e in exec_sel):
+                    issues.append("VENUE_DISAGREES:exit_exec_missing")
+                    x_rows = {}
+                else:
+                    x_rows = {e: x_all[e] for e in exec_sel}
+            if e_conf or x_conf:
+                issues.append("VENUE_ROWS_CONTRADICT")
+            elif "VENUE_DISAGREES:exit_exec_missing" in issues:
+                pass
+            elif not e_rows or not x_rows:
+                issues.append("NOT_IN_CAPTURE")
+            elif any(str(r.get("execType", "")) != "Trade" or
+                     str(r.get("symbol", "")) != _s(claim["symbol"])
+                     for r in list(e_rows.values()) + list(x_rows.values())):
+                issues.append("VENUE_DISAGREES:leg_identity")
+            else:
+                eq, ep, ef, e_cur = _vwap(e_rows)
+                xq, xp, xf, x_cur = _vwap(x_rows)
+                e_times = [_int(r.get("execTime")) for r in e_rows.values()]
+                x_times = [_int(r.get("execTime")) for r in x_rows.values()]
+                if any(math.isnan(v) for v in (eq, ep, ef, xq, xp, xf)):
+                    issues.append("VENUE_DISAGREES:leg_rows_unusable")
+                elif None in e_times or None in x_times or not all(
+                        t >= EARLIEST_PLAUSIBLE_MS for t in e_times + x_times):
+                    issues.append("VENUE_DISAGREES:exec_time_unusable")
+                else:
+                    want_e, want_x = (("Buy", "Sell") if direction > 0
+                                      else ("Sell", "Buy"))
+                    if {str(r.get("side")) for r in e_rows.values()} != {want_e} \
+                            or {str(r.get("side")) for r in x_rows.values()} != {want_x}:
+                        issues.append("VENUE_DISAGREES:side")
+                    if eq * (1 + QTY_REL_TOL) + 1e-12 < qty \
+                            or xq * (1 + QTY_REL_TOL) + 1e-12 < qty:
+                        issues.append("VENUE_DISAGREES:leg_qty")
+                    if entry_use.get((env, link), 0.0) > eq * (1 + QTY_REL_TOL) + 1e-12:
+                        issues.append("ENTRY_OVERCLAIMED")
+                    if exec_sel:
+                        if any(exec_use.get((env, e), 0) > 1 for e in exec_sel):
+                            issues.append("EXIT_OVERCLAIMED")
+                    elif any(exit_use.get((env, o), 0.0) > sum(
+                            _num(r.get("execQty")) or 0.0 for r in x_rows.values()
+                            if str(r.get("orderId")) == o) * (1 + QTY_REL_TOL) + 1e-12
+                             for o in exit_ids):
+                        issues.append("EXIT_OVERCLAIMED")
+                    if len(e_cur) != 1 or len(x_cur) != 1:
+                        issues.append("VENUE_DISAGREES:fee_currency")
+                    for leg, cur in (("entry", e_cur), ("exit", x_cur)):
+                        stated = claim.get(f"{leg}_fee_currency")
+                        if isinstance(stated, str) and stated and cur != {stated}:
+                            issues.append("VENUE_DISAGREES:fee_currency")
+                    if not _close(ep, entry, PRICE_REL_TOL):
+                        issues.append("VENUE_DISAGREES:entry_price")
+                    share = qty / eq
+                    e_fee, x_fee = _num(claim.get("entry_fee")), _num(claim.get("exit_fee"))
+                    if e_fee is None or not _close(e_fee, ef * share, 1e-9, FEE_ABS_TOL):
+                        issues.append("VENUE_DISAGREES:entry_fee")
+                    exact_exit = _close(xq, qty, QTY_REL_TOL, 1e-12)
+                    if provisional:
+                        pass
+                    elif not exact_exit:
+                        issues.append("EXIT_ALLOCATION_UNPROVEN")
+                    elif exit_ is None or not _close(xp, exit_, PRICE_REL_TOL):
+                        issues.append("VENUE_DISAGREES:exit_price")
+                    elif x_fee is None or not _close(x_fee, xf, 1e-9, FEE_ABS_TOL):
+                        issues.append("VENUE_DISAGREES:exit_fee")
+                    if max(e_times) > min(x_times):
+                        issues.append("VENUE_DISAGREES:exit_before_entry")
+                    if opened is not None and abs(opened - min(e_times)) > 600_000:
+                        issues.append("VENUE_DISAGREES:opened_time")
+                    if closed is not None and abs(closed - max(x_times)) > 600_000:
+                        issues.append("VENUE_DISAGREES:closed_time")
+                    if not (_leg_orders_corroborated(indexes, env, e_rows,
+                                                     _s(claim["symbol"]), want_e)
+                            and _leg_orders_corroborated(indexes, env, x_rows,
+                                                         _s(claim["symbol"]), want_x)):
+                        issues.append("NO_CORROBORATION")
+        if provenance == CLAIMED_TESTNET_FILL and not issues_block(issues) \
+                and not any(x in issues for x in (
+                    "EXIT_PRICE_PROVISIONAL", "ENTRY_FEE_NOT_REALIZED",
+                    "EXIT_FEE_NOT_REALIZED")):
+            provenance = VENUE_RECONCILED
+        out.append({"claim_id": _s(claim.get("claim_id", f"#{i}"))[:80],
+                    "kind": "trade", "provenance": provenance,
+                    "resolved": provenance == VENUE_RECONCILED, "counted": True,
+                    "issues": sorted(set(issues))})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -526,8 +972,10 @@ def reconcile_funding(claims: Sequence[Mapping[str, Any]], captures: Sequence[Ca
         issues: List[str] = []
         if "_malformed" in claim:
             issues.append("MALFORMED_CLAIM")
+        if _s(claim.get("claim_id")) == "<unreadable>":
+            issues.append("MALFORMED_CLAIM")
         for name in ("claim_id", "symbol", "time_ms", "amount"):
-            if claim.get(name) is None or str(claim.get(name)).strip() == "":
+            if _blank(claim.get(name)):
                 issues.append(f"MISSING_FIELD:{name}")
         amount, stamp = _num(claim.get("amount")), _int(claim.get("time_ms"))
         if claim.get("amount") is not None and amount is None:
@@ -536,14 +984,14 @@ def reconcile_funding(claims: Sequence[Mapping[str, Any]], captures: Sequence[Ca
                 stamp is None or stamp < EARLIEST_PLAUSIBLE_MS
                 or stamp > now_ms + MAX_FUTURE_SKEW_MS):
             issues.append("BAD_TIMESTAMP")
-        source, env = str(claim.get("source", "")), str(claim.get("environment", ""))
+        source, env = _s(claim.get("source", "")), _s(claim.get("environment", ""))
         if source not in SOURCES:
             issues.append("BAD_SOURCE")
         if env not in ve.ENVIRONMENTS:
             issues.append("BAD_ENVIRONMENT")
         if env == "mainnet":
             issues.append("MAINNET_EVIDENCE_NOT_ACCEPTED")
-        key = (str(claim.get("symbol")), stamp)
+        key = (_s(claim.get("symbol")), stamp)
         seen[key] = seen.get(key, 0) + 1
         if seen[key] > 1:
             issues.append("DUPLICATE_SETTLEMENT")
@@ -583,7 +1031,7 @@ def reconcile_funding(claims: Sequence[Mapping[str, Any]], captures: Sequence[Ca
                         provenance = VENUE_RECONCILED
                     else:
                         issues.append(f"VENUE_SIGN_{verdict.upper()}")
-        out.append({"claim_id": str(claim.get("claim_id", f"#{i}")),
+        out.append({"claim_id": _s(claim.get("claim_id", f"#{i}"))[:80],
                     "kind": "funding", "provenance": provenance,
                     "resolved": provenance == VENUE_RECONCILED
                     and not issues_block(issues),
@@ -639,6 +1087,8 @@ def summarise_ledger(payload: Mapping[str, Any], fills: Sequence[Dict[str, Any]]
 
 def reconcile(*, fill_claims: Sequence[Mapping[str, Any]] = (),
               funding_claims: Sequence[Mapping[str, Any]] = (),
+              trade_claims: Sequence[Mapping[str, Any]] = (),
+              order_claims: Sequence[Mapping[str, Any]] = (),
               ledgers: Sequence[Mapping[str, Any]] = (),
               captures: Sequence[Capture] = (), now_ms: int) -> Dict[str, Any]:
     fill_claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
@@ -647,22 +1097,28 @@ def reconcile(*, fill_claims: Sequence[Mapping[str, Any]] = (),
     funding = reconcile_funding(funding_claims, captures, now_ms=now_ms) \
         if funding_claims else []
     orders = reconcile_order_totals(fill_claims, fills, captures)
+    trades = reconcile_trades(trade_claims, captures, now_ms=now_ms) \
+        if trade_claims else []
+    order_claim_verdicts = reconcile_orders(order_claims, captures) \
+        if order_claims else []
     summaries = [summarise_ledger(l, fills, fill_claims) for l in ledgers]
-    everything = fills + funding + summaries
+    everything = fills + funding + trades + order_claim_verdicts + summaries
     counts = {c: sum(1 for v in everything if v["provenance"] == c)
               for c in CLASSES}
     issue_counts: Dict[str, int] = {}
     for v in everything:
         for i in v["issues"]:
             issue_counts[i] = issue_counts.get(i, 0) + 1
-    allowed = bool(everything) and all(v["resolved"] for v in fills + funding) \
-        and bool(fills) and not summaries_block(summaries) \
+    checked = fills + funding + trades + order_claim_verdicts
+    allowed = bool(everything) and all(v["resolved"] for v in checked) \
+        and bool(fills or trades) and not summaries_block(summaries) \
         and all(o["complete"] for o in orders) \
-        and all(not v["issues"] for v in fills + funding) \
+        and all(not v["issues"] for v in checked) \
         and all(c.intact for c in captures)
     return {
         "schema": "evidence_reconciliation/1",
         "fills": fills, "funding": funding, "orders": orders,
+        "trades": trades, "order_claims": order_claim_verdicts,
         "ledger_summaries": summaries,
         "captures": [{"label": c.label, "records": len(c.records),
                       "intact": c.intact, "chain_issues": c.chain_issues[:20]}
@@ -689,6 +1145,95 @@ def summaries_block(summaries: Sequence[Mapping[str, Any]]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# the bot's own database -> claims (read-only)
+# ---------------------------------------------------------------------------
+
+class StoreUnreadable(ValueError):
+    """The database cannot be read as a faithful copy of what it holds."""
+
+
+def claims_from_store(db_path: str, *, environment: str = "unknown",
+                      source: str = "local") -> Dict[str, List[Dict[str, Any]]]:
+    """`order_claims` and `trade_claims` from a `persistence.StateStore` file.
+
+    Opened read-only AND immutable, so SQLite cannot create `-wal`/`-shm`
+    sidecars or touch the file; nothing is written, migrated or repaired. An
+    immutable open would silently ignore committed-but-unmerged WAL content, so
+    a database that still has a non-empty `-wal` is REFUSED: copy it together
+    with its `-wal`, let SQLite checkpoint the COPY, and point this at that.
+
+    The database does not know which venue it traded on, so the OPERATOR states
+    `environment` and `source`: the default `source="local"` makes every row a
+    LOCAL_RECORD, and a row only becomes a testnet claim when the caller
+    asserts `source="testnet_claim"` for a sandbox environment. A row that
+    cannot be read becomes a malformed claim (unresolved), never an exception
+    that hides the other rows.
+    """
+    import sqlite3
+    from urllib.parse import quote
+    path = os.path.abspath(db_path)
+    if not os.path.isfile(path):
+        raise StoreUnreadable(f"no such database file: {os.path.basename(path)}")
+    wal = path + "-wal"
+    if os.path.exists(wal) and os.path.getsize(wal) > 0:
+        raise StoreUnreadable(
+            "the database has an unmerged -wal file; an immutable read would "
+            "silently ignore it. Checkpoint a COPY of the database first")
+    uri = "file:" + quote(path) + "?mode=ro&immutable=1"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+        conn.row_factory = sqlite3.Row
+        try:
+            orders = [dict(r) for r in conn.execute("SELECT * FROM orders")]
+            trades = [dict(r) for r in conn.execute("SELECT * FROM trades ORDER BY id")]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        raise StoreUnreadable(f"not a readable state database: {exc}") from exc
+
+    order_claims: List[Dict[str, Any]] = []
+    for o in orders:
+        try:
+            order_claims.append({
+                "claim_id": f"order:{o['order_link_id']}", "source": source,
+                "environment": environment, "order_link_id": o["order_link_id"],
+                "exchange_id": o["exchange_id"], "symbol": o["symbol"],
+                "side": o["side"], "qty": o["qty"], "status": o["status"]})
+        except (KeyError, TypeError, ValueError):
+            order_claims.append({"_malformed": "unreadable order row"})
+    trade_claims: List[Dict[str, Any]] = []
+    for t in trades:
+        try:
+            try:
+                meta = json.loads(t.get("meta") or "{}")
+            except (ValueError, TypeError):
+                meta = {}
+            ids = meta.get("exit_order_ids") if isinstance(meta, dict) else None
+            recon = meta.get("reconciliation") if isinstance(meta, dict) else None
+            evid = recon.get("evidence") if isinstance(recon, dict) else None
+            exec_ids = evid.get("exec_ids") if isinstance(evid, dict) else None
+            trade_claims.append({
+                "claim_id": f"trade:{t['id']}", "source": source,
+                "environment": environment, "symbol": t["symbol"],
+                "side": t["side"], "qty": t["qty"],
+                "entry_price": t["entry_price"], "exit_price": t["exit_price"],
+                "gross_pnl": t["gross_pnl"], "entry_fee": t["entry_fee"],
+                "exit_fee": t["exit_fee"],
+                "entry_fee_currency": t.get("entry_fee_currency") or "",
+                "exit_fee_currency": t.get("exit_fee_currency") or "",
+                "entry_fee_realized": bool(t.get("entry_fee_realized")),
+                "exit_fee_realized": bool(t.get("exit_fee_realized")),
+                "price_provisional": bool(t.get("price_provisional")),
+                "opened_ms": int(float(t["opened_epoch"]) * 1000),
+                "closed_ms": int(float(t["closed_epoch"]) * 1000),
+                "entry_order_link_id": t.get("order_link_id", ""),
+                "exit_order_ids": ids, "exit_exec_ids": exec_ids})
+        except (KeyError, TypeError, ValueError, OverflowError):
+            trade_claims.append({"_malformed": "unreadable trade row"})
+    return {"order_claims": order_claims, "trade_claims": trade_claims}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -698,6 +1243,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                      "funding_claims:[...]}")
     ap.add_argument("--evidence", action="append", default=[],
                     help="venue_evidence JSONL chain (repeatable, read-only)")
+    ap.add_argument("--store", help="a StateStore SQLite file, opened read-only; "
+                                    "its orders and trades become claims")
+    ap.add_argument("--store-environment", default="unknown",
+                    choices=sorted(ve.ENVIRONMENTS))
+    ap.add_argument("--store-source", default="local", choices=sorted(SOURCES),
+                    help="what the operator asserts about the store; "
+                         "'local' keeps every row a LOCAL_RECORD")
     ap.add_argument("--ledger", action="append", default=[],
                     help="cash_ledger/* JSON (repeatable)")
     ap.add_argument("--now-ms", type=int, required=True,
@@ -715,8 +1267,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         with open(path, encoding="utf-8") as handle:
             ledgers.append(json.load(handle))
     captures = [load_capture(p) for p in args.evidence]
+    order_claims = list(claims.get("order_claims", []))
+    trade_claims = list(claims.get("trade_claims", []))
+    if args.store:
+        try:
+            derived = claims_from_store(args.store,
+                                        environment=args.store_environment,
+                                        source=args.store_source)
+        except StoreUnreadable as exc:
+            print(f"refusing: {exc}", file=sys.stderr)
+            return 3
+        order_claims += derived["order_claims"]
+        trade_claims += derived["trade_claims"]
     report = reconcile(fill_claims=claims.get("fill_claims", []),
                        funding_claims=claims.get("funding_claims", []),
+                       order_claims=order_claims, trade_claims=trade_claims,
                        ledgers=ledgers, captures=captures, now_ms=args.now_ms)
     text = json.dumps(report, indent=2, sort_keys=True)
     if args.json:

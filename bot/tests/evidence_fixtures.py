@@ -39,9 +39,12 @@ def exec_row(i: int = 1, *, order="ORD-1", link="LNK-1", symbol="BTCUSDT",
 
 
 def order_row(order="ORD-1", *, cum="0.002", symbol="BTCUSDT", side="Buy",
-              status="Filled") -> Dict[str, Any]:
-    return {"orderId": order, "symbol": symbol, "side": side,
-            "cumExecQty": cum, "orderStatus": status, "qty": cum}
+              status="Filled", link: Optional[str] = None) -> Dict[str, Any]:
+    row = {"orderId": order, "symbol": symbol, "side": side,
+           "cumExecQty": cum, "orderStatus": status, "qty": cum}
+    if link is not None:
+        row["orderLinkId"] = link
+    return row
 
 
 def settlement_row(*, symbol="BTCUSDT", t=T0 + 8 * 3_600_000, funding="-0.05",
