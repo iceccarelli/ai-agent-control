@@ -422,19 +422,26 @@ class TestASpotStopThatTheBarGapsThrough:
 
 
 class TestFundingIsNotSilentlyOutsideTheTradeStatistics:
-    def test_a_linear_run_reports_its_funding_and_says_the_trade_stats_exclude_it(
+    def test_a_linear_runs_trades_are_net_of_the_funding_their_hold_paid(
             self, permissive_view):
         cfg = permissive_config(category="linear")
         result = bt.Backtester({"BTCUSDT": synthetic_bars(900)}, cfg).run()
         assert result.trades > 0, "the run needs trades to hold through a settlement"
         assert result.funding_paid != 0.0
-        assert any("BEFORE funding" in n for n in result.notes)
+        assert any("AFTER funding" in n for n in result.notes)
+        # the ledger explains the equity change: every position is closed at
+        # the end, so the per-trade nets (fills + funding) add up to net_pnl
+        total = sum(d["net_pnl"] for d in result.trade_details)
+        assert total == pytest.approx(result.net_pnl, abs=0.05)
+        # and WITHOUT the funding it would not have: this run's funding is
+        # larger than the tolerance, so the assertion above means something
+        assert abs(result.funding_paid) > 0.05
 
     def test_a_spot_run_has_no_funding_and_no_note(self, permissive_view):
         result = bt.Backtester({"BTCUSDT": synthetic_bars(600)},
                                permissive_config()).run()
         assert result.funding_paid == 0.0
-        assert not any("BEFORE funding" in n for n in result.notes)
+        assert not any("funding" in n for n in result.notes)
 
 
 class TestTheEquityCurveEndsAtTheEndingEquity:
@@ -479,3 +486,44 @@ class TestASpotBuyPaysItsFeeInTheBaseCoin:
         assert ex.balances["USDT"] == pytest.approx(1_000.0 - 200.0)
         assert ex.balances["BTC"] == pytest.approx(2.0 - 0.002)
         assert ex._as_row(order)["cumFeeDetail"] == {"BTC": "0.0020000000"}
+
+
+class TestTheReplayHasItsOwnClock:
+    """On the wall clock a multi-year replay is ONE day: the daily-loss brake
+    never reset (a whole-run stop-loss that flattered losing strategies) and a
+    run straddling midnight re-anchored at an arbitrary bar."""
+
+    def _run(self, tmp_path, name):
+        import sqlite3
+        db = str(tmp_path / f"{name}.db")
+        result = bt.Backtester({"BTCUSDT": synthetic_bars(900)},
+                               permissive_config(), db_path=db).run()
+        con = sqlite3.connect(db)
+        try:
+            days = [r[0] for r in con.execute(
+                "SELECT day FROM daily_anchor ORDER BY day")]
+        finally:
+            con.close()
+        return result, days
+
+    def test_the_daily_anchor_follows_the_replayed_days(self, tmp_path):
+        result, days = self._run(tmp_path, "a")
+        assert len(days) >= 30                 # 750 replayed hourly bars = 31 days
+        assert days[0] == "2020-09-19"         # the bars' dates, not today's
+
+    def test_two_runs_at_different_wall_clock_times_are_identical(
+            self, tmp_path, monkeypatch):
+        import time as _t
+        first, _ = self._run(tmp_path, "a")
+        real = _t.time
+        monkeypatch.setattr(_t, "time", lambda: real() + 40 * 86400)   # "later"
+        second, _ = self._run(tmp_path, "b")
+        assert first.ending_equity == second.ending_equity
+        assert first.trades == second.trades
+
+    def test_the_real_clock_is_restored_afterwards(self, tmp_path):
+        import persistence
+        before = persistence.utc_now_epoch()
+        self._run(tmp_path, "a")
+        assert abs(persistence.utc_now_epoch() - before) < 3600
+        assert persistence._CLOCK is None

@@ -69,7 +69,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "StateStore",
@@ -121,9 +121,25 @@ class IncompatibleFeeCurrencies(RuntimeError):
     """
 
 
+#: A REPLAY may drive the clock from its bars (``set_clock``). None = real time.
+_CLOCK: Optional[Callable[[], float]] = None
+
+
+def set_clock(fn: Optional[Callable[[], float]]) -> Optional[Callable[[], float]]:
+    """Install (or, with None, remove) a replacement clock; returns the previous
+    one. Only a replay uses this: it makes the day boundary, the daily-loss
+    anchor and every stamp follow the REPLAYED time, not the seconds the replay
+    takes to run on one wall-clock day."""
+    global _CLOCK
+    previous, _CLOCK = _CLOCK, fn
+    return previous
+
+
 def utc_now_epoch() -> float:
-    """Wall-clock epoch seconds (UTC).  Survives restarts, unlike perf_counter."""
-    return time.time()
+    """Epoch seconds (UTC).  Survives restarts, unlike perf_counter.  Real time
+    unless a replay installed its own clock (``set_clock``)."""
+    clock = _CLOCK
+    return clock() if clock is not None else time.time()
 
 
 def utc_day(ts: Optional[float] = None) -> str:
