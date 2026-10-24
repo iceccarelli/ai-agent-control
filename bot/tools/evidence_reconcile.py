@@ -67,7 +67,7 @@ import math
 import os
 import sys
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -377,7 +377,14 @@ class VenueIndex:
         elif path == "/v5/account/transaction-log":
             request = record.get("request")
             params = request.get("params") if isinstance(request, dict) else None
-            params = params if isinstance(params, dict) else {}
+            params = dict(params) if isinstance(params, dict) else {}
+            # The real client sends a GET's parameters in the URL query string
+            # and records `request.params` empty; a hand-built capture may use
+            # either. The query fills what `params` does not state.
+            for key, values in parse_qs(
+                    urlsplit(str(record.get("request_url", ""))).query).items():
+                if values:
+                    params.setdefault(key, values[0])
             result = response.get("result")
             self.txlog_reads.append((
                 env, stamp, _int(params.get("startTime")), _int(params.get("endTime")),

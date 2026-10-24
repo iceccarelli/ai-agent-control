@@ -34,6 +34,11 @@ SETTLE_MS = F.T0 + 4 * H
 CLOSE_MS = F.T0 + 5 * H
 NOW = F.T0 + 10 * H
 OPEN_LINK, CLOSE_LINK = "BB-carr-1-aaaa", "BB-carr-2-bbbb"
+#: The REAL client sends a GET's parameters in the URL query string and records
+#: `request.params` empty (seen in a real testnet capture); the fixture does too.
+TXLOG_PATH = ("/v5/account/transaction-log?accountType=UNIFIED&category=linear"
+              f"&type=SETTLEMENT&startTime={OPEN_MS - 60_000}"
+              f"&endTime={CLOSE_MS + 30_000}")
 OPEN_ORD, CLOSE_ORD = "ord-open", "ord-close"
 
 # 0.001 BTC sold at 80620.4, bought back at 80650.0
@@ -104,14 +109,11 @@ def build(*, drop=(), tweak=None, extra=(), settle=True):
             CLOSE_ORD, CLOSE_LINK, "Buy", "0.001", "80650", "0.04435",
             reduce=True))], prev=prev, at=CLOSE_MS + 6_000))
     add("settlement", lambda prev: F.record(
-        "/v5/account/transaction-log",
+        TXLOG_PATH,
         [tweak("settlement", dict(
             F.settlement_row(t=SETTLE_MS, funding="0.0123", change="0.0123"),
             id="S-1", size="-0.001"))] if settle else [],
-        prev=prev, at=CLOSE_MS + 10_000,
-        request={"params": {"accountType": "UNIFIED", "category": "linear",
-                            "type": "SETTLEMENT", "startTime": OPEN_MS - 60_000,
-                            "endTime": CLOSE_MS + 30_000}}))
+        prev=prev, at=CLOSE_MS + 10_000, request={"params": {}}))
     add("position", lambda prev: F.record(
         "/v5/position/list", [tweak("position", pos("0"))], prev=prev,
         at=CLOSE_MS + 60_000))
@@ -786,27 +788,42 @@ class TestNoSettlementMustMeanNoneWasPaidNotNeverLooked:
 
     def test_a_read_from_before_the_close_does_not_cover_the_hold(self):
         records = build()
-        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
+        rec = next(r for r in records if "transaction-log" in r["request_url"])
         rec["captured_at_utc"] = F.iso(CLOSE_MS - 3_600_000)
         assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
 
     def test_a_read_that_started_after_the_entry_does_not_cover_the_hold(self):
         records = build()
-        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
-        rec["request"]["params"]["startTime"] = CLOSE_MS - 1_000
+        rec = next(r for r in records if "transaction-log" in r["request_url"])
+        rec["request_url"] = rec["request_url"].replace(
+            f"startTime={OPEN_MS - 60_000}", f"startTime={CLOSE_MS - 1_000}")
         assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
 
     def test_a_read_with_a_next_page_pending_does_not_count(self):
         records = build()
-        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
+        rec = next(r for r in records if "transaction-log" in r["request_url"])
         rec["response"]["result"]["nextPageCursor"] = "more"
         assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
 
     def test_a_read_with_no_window_stated_does_not_count(self):
         records = build()
-        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
-        rec["request"]["params"] = {}
+        rec = next(r for r in records if "transaction-log" in r["request_url"])
+        rec["request_url"] = rec["request_url"].split("?")[0]
         assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
+
+    def test_the_window_in_request_params_is_still_read(self):
+        """A hand-built capture may state the window in `params`; that works too."""
+        records = build()
+        rec = next(r for r in records if r["request_url"].endswith("transaction-log")
+                   or "transaction-log?" in r["request_url"])
+        rec["request_url"] = rec["request_url"].split("?")[0]
+        rec["request"]["params"] = {"startTime": OPEN_MS - 60_000,
+                                    "endTime": CLOSE_MS + 30_000}
+        assert "CYCLE_FUNDING_NOT_CAPTURED" not in cycle_issues(_rechain(records))
+
+    def test_the_real_shape_is_a_query_string_with_empty_params(self):
+        rec = next(r for r in build() if "transaction-log" in r["request_url"])
+        assert "?" in rec["request_url"] and rec["request"]["params"] == {}
 
 
 class TestContradictoryRowsAreNotIgnored:
