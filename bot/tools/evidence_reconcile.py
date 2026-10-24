@@ -1241,6 +1241,29 @@ def claims_from_store(db_path: str, *, environment: str = "unknown",
 # CLI
 # ---------------------------------------------------------------------------
 
+def _read_json_input(path: str, flag: str) -> Any:
+    """The parsed JSON object in `path`, or None after saying why on stderr.
+    A missing or malformed input is a refusal (exit 3), not a traceback: a
+    session that wrote no ledger (zero fills) must read as 'no such file', not
+    as a crash that hides what the validator would have said."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            value = json.load(handle)
+    except OSError as exc:
+        print(f"refusing: {flag} {os.path.basename(path)!r} is not readable "
+              f"({exc.strerror or exc.__class__.__name__})", file=sys.stderr)
+        return None
+    except ValueError:
+        print(f"refusing: {flag} {os.path.basename(path)!r} is not valid JSON",
+              file=sys.stderr)
+        return None
+    if not isinstance(value, dict):
+        print(f"refusing: {flag} {os.path.basename(path)!r} is not a JSON object",
+              file=sys.stderr)
+        return None
+    return value
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--claims", help="JSON file: {fill_claims:[...], "
@@ -1264,12 +1287,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = ap.parse_args(argv)
     claims: Dict[str, Any] = {}
     if args.claims:
-        with open(args.claims, encoding="utf-8") as handle:
-            claims = json.load(handle)
+        claims = _read_json_input(args.claims, "--claims")
+        if claims is None:
+            return 3
     ledgers = []
     for path in args.ledger:
-        with open(path, encoding="utf-8") as handle:
-            ledgers.append(json.load(handle))
+        payload = _read_json_input(path, "--ledger")
+        if payload is None:
+            return 3
+        ledgers.append(payload)
     captures = [load_capture(p) for p in args.evidence]
     order_claims = list(claims.get("order_claims", []))
     trade_claims = list(claims.get("trade_claims", []))
