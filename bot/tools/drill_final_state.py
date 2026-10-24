@@ -75,7 +75,11 @@ def run(broker: Any, capture: Any, *, symbol: str, now_ms: int) -> Dict[str, Any
         return {"complete": False, "orders": 0, "reads": 0,
                 "failures": ["the evidence file holds no successful order "
                              "create on the testnet host"]}
-    broker.sent_order_links.extend(orders)
+    adapter = D.unwrap_broker(broker)
+    if not hasattr(adapter, "sent_order_links"):
+        return {"complete": False, "orders": 0, "reads": 0,
+                "failures": ["the broker cannot take the orders to read"]}
+    adapter.sent_order_links.extend(orders)
     result = D.capture_final_venue_state(broker, symbol)
     start = max(0, (first_ms or now_ms) - SETTLEMENT_LEAD_MS)
     try:
@@ -127,7 +131,8 @@ def main(argv: Optional[List[str]] = None) -> int:
               "needs: BOOK_MODE=carry CARRY_BORROW_APR=0.0 "
               "CARRY_EXECUTION_MODE=overlay)", file=sys.stderr)
         return 2
-    why_not = D.session_refusal(bot.cfg, getattr(bot.carry.broker, "client", None))
+    why_not = D.session_refusal(bot.cfg, getattr(
+        D.unwrap_broker(bot.carry.broker), "client", None))
     if why_not:
         print(f"REFUSED: {why_not}", file=sys.stderr)
         return 3
