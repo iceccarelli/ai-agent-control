@@ -116,6 +116,31 @@ FUNDING_PERIODS_PER_DAY = 3
 #: change cannot slip in as a side effect.
 ASSUMED_HOLD_DAYS = 30.0
 
+#: The hold the entry must be able to PAY FOR ITS ROUND TRIP WITHIN, in days.
+#:
+#: `ASSUMED_HOLD_DAYS` (30) amortises the round trip inside `evaluate_entry`,
+#: but nothing in the engine ENFORCES a 30 day hold: the only exit is
+#: FUNDING_INVERTED, so an entry whose funding barely clears the amortised cost
+#: is still admitted although the position is, as measured, usually closed long
+#: before the cost is earned back. The measured median hold is ~5.8 days
+#: (`tools/carry_hold_audit.py`, quoted above and frozen in
+#: `tests/test_carry_hold_audit.py`). `hold_clears_round_trip` below refuses an
+#: entry whose smoothed funding needs MORE than this to earn back the round trip.
+#:
+#: It only ever REFUSES more than `evaluate_entry` does and replaces nothing. It
+#: is a human-owned parameter like ASSUMED_HOLD_DAYS: not tuned until an entry
+#: passes, and not raised without an out-of-sample hold measurement.
+#:
+#: NOT WIRED INTO `CarryEngine` YET, on purpose. Wiring it into the OVERLAY
+#: entry (measured: replay 77 -> 49 trades, net 29,889 -> 33,050 in-sample)
+#: breaks the engine == simulator == C++ core agreement that
+#: `test_carry_replay`, `test_carry_core`, `test_carry_backtest`,
+#: `test_carry_hold_audit` and `test_carry_replay_liquidation` pin, so the
+#: simulator, the C++ core and those pins must move together in one reviewed
+#: change. `tests/test_carry_cost_reality.py` holds a strict xfail that fails
+#: the day it is wired, so the gap cannot be forgotten or half-closed.
+DEMONSTRATED_HOLD_DAYS = 5.8
+
 #: EWMA smoothing over funding prints. 0.5 puts half the weight on the newest
 #: print, a quarter on the one before, and so on: responsive to a turn without
 #: opening on a single spike.
@@ -290,3 +315,124 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
         amortised_round_trip_bps_per_day=round_trip_per_day,
         net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
         basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed)
+
+
+# -- cost reality: what a hold has to earn back ---------------------------------
+
+def _positive_finite(value: Any) -> Optional[float]:
+    number = _usable(value)
+    return number if number is not None and number > 0 else None
+
+
+def breakeven_funding_bps_per_settlement(
+        settlements_held: Any, *, round_trip_bps: Any,
+        borrow_bps_per_day: Any = 0.0) -> float:
+    """Smallest flat funding, in bps per 8h settlement, that earns back the
+    costs after holding `settlements_held` settlements.
+
+        break_even = round_trip_bps / N + borrow_bps_per_day / 3
+
+    Only costs the caller states appear: the round trip (two perp legs for the
+    overlay, 11 bps at 5.5 bps taker, no spot leg) and borrow (0 for a book that
+    already owns the BTC). Basis is NOT a term. An overlay does not trade the
+    spot; basis is a mark-to-market on the hedge that converges to zero, and for
+    short perp / long spot it is `entry_basis - exit_basis` (see
+    `hedge_basis_pnl_bps`). It is a risk to net, never edge to credit.
+
+    Funding is treated as flat and positive. It is variable and can flip sign,
+    which only makes the real break-even longer.
+
+    Raises ValueError for N <= 0, a non-positive round trip or a negative
+    borrow, so a caller cannot price a free or zero-length hold.
+    """
+    n = _positive_finite(settlements_held)
+    rt = _positive_finite(round_trip_bps)
+    borrow = _usable(borrow_bps_per_day)
+    if n is None or rt is None or borrow is None or borrow < 0:
+        raise ValueError(
+            f"break-even undefined for settlements_held={settlements_held!r} "
+            f"round_trip_bps={round_trip_bps!r} "
+            f"borrow_bps_per_day={borrow_bps_per_day!r}")
+    return rt / n + borrow / FUNDING_PERIODS_PER_DAY
+
+
+def min_settlements_to_clear(expected_funding_bps: Any, *,
+                             round_trip_bps: Any,
+                             borrow_bps_per_day: Any = 0.0) -> Optional[int]:
+    """Fewest whole 8h settlements that must be held for flat
+    `expected_funding_bps` per settlement to earn back the round trip.
+
+    None means NEVER: funding at or below borrow (or not a usable number)
+    leaves nothing to amortise against, and None must be read as a refusal.
+    """
+    rt = _positive_finite(round_trip_bps)
+    borrow = _usable(borrow_bps_per_day)
+    funding = _usable(expected_funding_bps)
+    if rt is None or borrow is None or borrow < 0:
+        raise ValueError(
+            f"break-even undefined for round_trip_bps={round_trip_bps!r} "
+            f"borrow_bps_per_day={borrow_bps_per_day!r}")
+    if funding is None:
+        return None
+    net = round(funding - borrow / FUNDING_PERIODS_PER_DAY, 12)
+    if net <= 0:
+        return None
+    # round() first so 11 / 1.0 is 11, not 11.000000000000002 -> 12
+    return max(1, math.ceil(round(rt / net, 9)))
+
+
+def hedge_basis_pnl_bps(entry_basis_bps: float, exit_basis_bps: float) -> float:
+    """PnL in bps of a short-perp / long-spot hedge from the basis moving:
+    `entry_basis - exit_basis`, basis being (perp - spot) / spot.
+
+    Short perp earns (entry_perp - exit_perp), long spot earns
+    (exit_spot - entry_spot); the sum is the basis it SHEDS. At the observed
+    -40 bps (perp BELOW spot) converging to 0 the hedge LOSES 40 bps: the perp
+    rises toward spot and the short pays for it. That is the same sign
+    `evaluate_entry` uses for ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET. It is
+    never counted as edge here.
+    """
+    return float(entry_basis_bps) - float(exit_basis_bps)
+
+
+def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
+                           round_trip_bps: float, borrow_apr: float,
+                           hold_days: float = DEMONSTRATED_HOLD_DAYS
+                           ) -> CarryVerdict:
+    """May this entry open, judged on the hold that has been DEMONSTRATED?
+
+    `evaluate_entry` amortises over ASSUMED_HOLD_DAYS. This asks the harder,
+    unflattering question: does the smoothed funding earn back the round trip
+    (plus borrow) within `hold_days`, by default the measured median hold?
+    Fail-closed on every unusable input, on too little history, and on funding
+    that never clears. Allowed means only "not refused here".
+    """
+    invalid = _invalid_cost_inputs(borrow_apr=borrow_apr,
+                                   round_trip_bps=round_trip_bps,
+                                   hold_days=hold_days)
+    if invalid:
+        return CarryVerdict(False, "COST_INPUT_INVALID",
+                            detail={"fields": invalid})
+    smoothed = ewma_funding_bps(funding_prints_bps)
+    if smoothed is None:
+        return CarryVerdict(False, "INSUFFICIENT_FUNDING_HISTORY",
+                            detail={"required": EWMA_MIN_PRINTS})
+    borrow_per_day = (float(borrow_apr) / 365.0) * 1e4
+    budget = int(math.floor(round(float(hold_days) * FUNDING_PERIODS_PER_DAY, 9)))
+    needed = min_settlements_to_clear(
+        smoothed, round_trip_bps=float(round_trip_bps),
+        borrow_bps_per_day=borrow_per_day)
+    detail = {"settlements_needed": needed, "settlements_budget": budget,
+              "hold_days": float(hold_days),
+              "break_even_funding_bps_at_budget": (
+                  breakeven_funding_bps_per_settlement(
+                      max(budget, 1), round_trip_bps=float(round_trip_bps),
+                      borrow_bps_per_day=borrow_per_day)),
+              "note": "the funding does not earn back the round trip inside "
+                      "the hold that has actually been measured; ASSUMED_HOLD_"
+                      "DAYS is not enforced by anything"}
+    if needed is None or needed > budget:
+        return CarryVerdict(False, "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD",
+                            smoothed_funding_bps=smoothed, detail=detail)
+    return CarryVerdict(True, "HOLD_CLEARS_ROUND_TRIP",
+                        smoothed_funding_bps=smoothed, detail=detail)
