@@ -356,10 +356,11 @@ class TestFindingsFromTheAdversarialReview:
         s[0]["rows"][-1] = dict(s[0]["rows"][-1], execTime="")
         assert "VENUE_DISAGREES:exec_time_unusable" in verdict(go([trade()], s))["issues"]
 
-    def test_mixed_fee_currencies_in_a_leg_are_refused(self):
+    def test_a_fee_in_an_unconvertible_coin_is_refused_not_guessed(self):
         s = specs()
-        s[0]["rows"][1] = dict(s[0]["rows"][1], feeCurrency="BTC")
-        assert "VENUE_DISAGREES:fee_currency" in verdict(go([trade()], s))["issues"]
+        s[0]["rows"][1] = dict(s[0]["rows"][1], feeCurrency="MNT")
+        v = verdict(go([trade()], s))
+        assert "FEE_UNCONVERTIBLE" in v["issues"] and not v["resolved"]
 
     def test_a_stated_fee_currency_must_match(self):
         assert "VENUE_DISAGREES:fee_currency" in verdict(
@@ -606,3 +607,44 @@ class TestFindingsFromTheCloseLinkageReview:
         claim = TestLocalOrders().order(status="cancelled")
         report = er.reconcile(order_claims=[claim], captures=[cap], now_ms=fx.NOW)
         assert report["order_claims"][0]["resolved"] is True
+
+
+class TestFeesInTheBaseCoinAreReconciledByTheEnginesRule:
+    """Bybit charges a spot BUY's fee in the BASE coin (BTC). The engine books
+    it in the quote unit at that leg's own trade price. The first real run
+    refused such a trade because the validator compared the raw BTC amount with
+    the converted USDT figure."""
+
+    def btc_fee_session(self, btc_fee_each="0.0000001"):
+        entry = [dict(r, feeCurrency="BTC", execFee=btc_fee_each)
+                 for r in entry_rows()]
+        return specs(entry=entry)
+
+    def test_a_btc_entry_fee_converted_at_the_entry_price_reconciles(self):
+        # 2 fills x 1e-7 BTC = 2e-7 BTC; at the entry price 60005 -> 0.012001
+        t = trade(entry_fee=2e-7 * 60005.0)
+        v = verdict(go([t], self.btc_fee_session()))
+        assert v["resolved"] and v["issues"] == []
+
+    def test_a_wrongly_converted_figure_is_refused(self):
+        t = trade(entry_fee=2e-7 * 59000.0)
+        v = verdict(go([t], self.btc_fee_session()))
+        assert "VENUE_DISAGREES:entry_fee" in v["issues"] and not v["resolved"]
+
+    def test_the_raw_btc_amount_booked_as_dollars_is_refused(self):
+        t = trade(entry_fee=2e-7)
+        assert "VENUE_DISAGREES:entry_fee" in verdict(
+            go([t], self.btc_fee_session()))["issues"]
+
+    def test_mixed_btc_and_usdt_components_convert_and_add(self):
+        entry = entry_rows()
+        entry[0] = dict(entry[0], feeCurrency="BTC", execFee="0.0000001")
+        entry[1] = dict(entry[1], feeCurrency="USDT", execFee="0.01")
+        t = trade(entry_fee=1e-7 * 60005.0 + 0.01)
+        assert verdict(go([t], specs(entry=entry)))["resolved"]
+
+    def test_a_partial_trade_takes_its_pro_rata_share_of_a_btc_fee(self):
+        t = trade(qty=0.001, gross_pnl=(60100.0 - 60005.0) * 0.001,
+                  entry_fee=2e-7 * 60005.0 * (0.001 / 0.0019998))
+        v = verdict(go([t], self.btc_fee_session()))
+        assert "VENUE_DISAGREES:entry_fee" not in v["issues"]
