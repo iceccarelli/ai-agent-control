@@ -305,3 +305,56 @@ class TestTheValidatorHandlesNonFinalStates:
         issues = report["order_claims"][0]["issues"]
         assert "NO_FINAL_VENUE_STATE" in issues
         assert not any(i.startswith("VENUE_DISAGREES") for i in issues)
+
+
+class VenueLikeFees(FilledOrdersCarryFees):
+    """Spot as Bybit charges it: a BUY pays its fee in the base coin (BTC), a
+    SELL in the quote coin (USDT)."""
+
+    def _create_order(self, body):
+        result = super()._create_order(body)
+        order = self.orders.get(body.get("orderLinkId"))
+        if order and order["orderStatus"] == "Filled":
+            if order["side"] == "Buy":
+                fee, ccy = "0.0000047", "BTC"
+            else:
+                fee, ccy = "0.2", "USDT"
+            order["cumFeeDetail"] = {ccy: fee}
+            for row in self.executions:
+                if row["orderId"] == order["orderId"]:
+                    row["execFee"], row["feeCurrency"] = fee, ccy
+        return result
+
+
+class TestTheRealFeeShape:
+    def test_a_btc_buy_fee_and_a_usdt_sell_fee_reconcile_end_to_end(self, tmp_path):
+        fake = VenueLikeFees()
+        evidence = str(tmp_path / "evidence" / "chain.jsonl")
+        transport = ve.EvidenceCapturingTransport(
+            fake, evidence_path=evidence, venue="bybit", environment="testnet")
+        db = str(tmp_path / "state.db")
+        store = StateStore(db)
+        store.claim_writer()
+        store.update_equity(10_000.0)
+        cfg = SessionCfg()
+        client = bc.BybitClient(config=cfg, store=store, transport=transport)
+        risk = BillionaireRiskManager(config=cfg, store=store)
+        engine = te.TradingEngine(
+            client=client, risk_manager=risk,
+            position_sizer=BillionairePositionSizing(config=cfg, risk_manager=risk),
+            store=store, config=cfg)
+        last = fake_bybit.LAST_PRICE[SYMBOL]
+        assert engine.execute(te.TradeIntent(
+            symbol=SYMBOL, signal_type="BUY", entry_price=last,
+            stop_price=last * 0.98, take_profits=((last * 1.05, 1.0),),
+            confidence=0.8)).ok
+        assert engine.close_position(symbol=SYMBOL, reason="flat").ok
+        sess = {"fake": fake, "store": store, "client": client, "db": db,
+                "evidence": evidence}
+        report, claims = validate(sess, final_state=True)
+        trade = claims["trade_claims"][0]
+        # the books hold USDT: 0.0000047 BTC at the entry price, plus 0.2 USDT
+        assert trade["entry_fee_currency"] == "USDT"
+        assert trade["entry_fee"] == pytest.approx(0.0000047 * trade["entry_price"])
+        assert report["trades"][0]["resolved"] is True, (report["trades"][0]["issues"], trade)
+        assert report["pnl_claim_allowed"] is True

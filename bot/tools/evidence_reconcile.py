@@ -457,7 +457,7 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
 
 
 #: Issues that forbid the upgrade, however well the venue rows match.
-_BLOCKING_PREFIXES = ("LOCAL_CANCELLED", "NO_FINAL", "EXIT_ALLOCATION", "EXIT_OVERCLAIMED", "ENTRY_OVERCLAIMED",
+_BLOCKING_PREFIXES = ("FEE_UNCONVERTIBLE", "LOCAL_CANCELLED", "NO_FINAL", "EXIT_ALLOCATION", "EXIT_OVERCLAIMED", "ENTRY_OVERCLAIMED",
                       "LOCAL_GROSS", "ORDER_STATUS_CONFLICT", "DUPLICATE_EXCHANGE",
                       "MALFORMED", "CAPTURE_TIME", "MISSING_FIELD", "BAD_", "SIMULATION_", "TESTNET_CLAIM_",
                       "MAINNET_", "NO_VENUE", "DUPLICATE", "CONFLICTING",
@@ -716,20 +716,44 @@ def _leg(idx_list: Sequence[VenueIndex], env: str, *, link: str = "",
     return rows, conflict
 
 
-def _vwap(rows: Mapping[str, Mapping[str, Any]]) -> Tuple[float, float, float, set]:
-    """(total qty, vwap price, total fee, fee currencies) over venue rows;
-    NaNs when any row is unusable."""
-    qty = price_q = fee = 0.0
-    currencies = set()
+def _vwap(rows: Mapping[str, Mapping[str, Any]]) -> Tuple[float, float, Dict[str, float]]:
+    """(total qty, vwap price, fees by currency) over venue rows. NaNs and an
+    empty fee map when any row is unusable or names no fee currency."""
+    bad = (float("nan"), float("nan"), {})
+    qty = price_q = 0.0
+    fees: Dict[str, float] = {}
     for r in rows.values():
         q, p, f = _num(r.get("execQty")), _num(r.get("execPrice")), _num(r.get("execFee"))
-        if q is None or p is None or f is None or q <= 0 or p <= 0:
-            return float("nan"), float("nan"), float("nan"), set()
+        currency = r.get("feeCurrency")
+        if q is None or p is None or f is None or q <= 0 or p <= 0 \
+                or not isinstance(currency, str) or not currency.strip():
+            return bad
         qty += q
         price_q += q * p
-        fee += f
-        currencies.add(str(r.get("feeCurrency", "")))
-    return qty, (price_q / qty if qty else float("nan")), fee, currencies
+        key = currency.strip().upper()
+        fees[key] = fees.get(key, 0.0) + f
+    return qty, (price_q / qty if qty else float("nan")), fees
+
+
+def _fee_in_unit(fees: Mapping[str, float], symbol: str,
+                 leg_price: float) -> Optional[float]:
+    """The venue fees expressed in the symbol's quote unit, by the SAME rule
+    the engine books them with (venue_fees.convert_fee_set): the quote coin as
+    it is, the base coin at this leg's own trade price. Any other coin has no
+    recorded basis - None, never a guessed rate."""
+    import venue_fees
+    base, unit = venue_fees.split_symbol_units(symbol)
+    if not unit:
+        return None
+    total = 0.0
+    for currency, amount in fees.items():
+        if currency == unit.upper():
+            total += amount
+        elif currency == base.upper():
+            total += amount * leg_price
+        else:
+            return None
+    return total
 
 
 def _leg_orders_corroborated(indexes: Sequence[VenueIndex], env: str,
@@ -897,11 +921,12 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
                      for r in list(e_rows.values()) + list(x_rows.values())):
                 issues.append("VENUE_DISAGREES:leg_identity")
             else:
-                eq, ep, ef, e_cur = _vwap(e_rows)
-                xq, xp, xf, x_cur = _vwap(x_rows)
+                eq, ep, e_fees = _vwap(e_rows)
+                xq, xp, x_fees = _vwap(x_rows)
                 e_times = [_int(r.get("execTime")) for r in e_rows.values()]
                 x_times = [_int(r.get("execTime")) for r in x_rows.values()]
-                if any(math.isnan(v) for v in (eq, ep, ef, xq, xp, xf)):
+                if any(math.isnan(v) for v in (eq, ep, xq, xp)) \
+                        or not e_fees or not x_fees:
                     issues.append("VENUE_DISAGREES:leg_rows_unusable")
                 elif None in e_times or None in x_times or not all(
                         t >= EARLIEST_PLAUSIBLE_MS for t in e_times + x_times):
@@ -925,17 +950,41 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
                             if str(r.get("orderId")) == o) * (1 + QTY_REL_TOL) + 1e-12
                              for o in exit_ids):
                         issues.append("EXIT_OVERCLAIMED")
-                    if len(e_cur) != 1 or len(x_cur) != 1:
-                        issues.append("VENUE_DISAGREES:fee_currency")
-                    for leg, cur in (("entry", e_cur), ("exit", x_cur)):
+                    # The books hold each fee in the symbol's quote unit; the
+                    # claim's stated fee currency is that accounting unit.
+                    import venue_fees
+                    _base, unit = venue_fees.split_symbol_units(_s(claim["symbol"]))
+                    for leg in ("entry", "exit"):
                         stated = claim.get(f"{leg}_fee_currency")
-                        if isinstance(stated, str) and stated and cur != {stated}:
+                        if isinstance(stated, str) and stated \
+                                and stated.upper() != unit.upper():
                             issues.append("VENUE_DISAGREES:fee_currency")
                     if not _close(ep, entry, PRICE_REL_TOL):
                         issues.append("VENUE_DISAGREES:entry_price")
-                    share = qty / eq
+                    # A spot BUY pays its fee in the BASE coin, so the position
+                    # (and this trade's quantity) is what was received NET of
+                    # that fee. The engine apportions the entry fee by
+                    # qty / position, so the same net quantity is the basis here.
+                    base_coin = venue_fees.split_symbol_units(_s(claim["symbol"]))[0]
+                    eq_net = eq - (e_fees.get(base_coin.upper(), 0.0)
+                                   if want_e == "Buy" else 0.0)
+                    # A trade that closes (all but lot-step dust of) the net
+                    # position carries the WHOLE entry fee, exactly as the
+                    # engine books it (closed_qty / held == 1); a smaller
+                    # trade carries its pro-rata share.
+                    if eq_net <= 0:
+                        share = float("nan")
+                    elif qty >= eq_net * (1.0 - 1e-3):
+                        share = 1.0
+                    else:
+                        share = qty / eq_net
                     e_fee, x_fee = _num(claim.get("entry_fee")), _num(claim.get("exit_fee"))
-                    if e_fee is None or not _close(e_fee, ef * share, 1e-9, FEE_ABS_TOL):
+                    e_venue = _fee_in_unit(e_fees, _s(claim["symbol"]), entry or ep)
+                    x_venue = _fee_in_unit(x_fees, _s(claim["symbol"]), exit_ or xp)
+                    if e_venue is None or x_venue is None:
+                        issues.append("FEE_UNCONVERTIBLE")
+                    if e_venue is not None and (e_fee is None or not _close(
+                            e_fee, e_venue * share, 1e-9, FEE_ABS_TOL)):
                         issues.append("VENUE_DISAGREES:entry_fee")
                     exact_exit = _close(xq, qty, QTY_REL_TOL, 1e-12)
                     if provisional:
@@ -944,7 +993,8 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
                         issues.append("EXIT_ALLOCATION_UNPROVEN")
                     elif exit_ is None or not _close(xp, exit_, PRICE_REL_TOL):
                         issues.append("VENUE_DISAGREES:exit_price")
-                    elif x_fee is None or not _close(x_fee, xf, 1e-9, FEE_ABS_TOL):
+                    elif x_venue is not None and (x_fee is None or not _close(
+                            x_fee, x_venue, 1e-9, FEE_ABS_TOL)):
                         issues.append("VENUE_DISAGREES:exit_fee")
                     if max(e_times) > min(x_times):
                         issues.append("VENUE_DISAGREES:exit_before_entry")
