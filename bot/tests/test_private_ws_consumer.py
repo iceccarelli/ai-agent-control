@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import time
 
 import pytest
 
@@ -1046,7 +1048,10 @@ class TestAQuietStreamIsNotADeadConnection:
         return consumer, transport
 
     def test_a_quiet_stream_is_pinged_and_survives_a_read_timeout(self, monkeypatch):
-        consumer, transport = self._consumer(monkeypatch, timeouts=2)
+        # the receive loop now wakes every STOP_POLL_SECONDS to look for a stop
+        # request, so enough quiet polls must elapse to cross the ping interval
+        polls = int(pwc.PING_INTERVAL_SECONDS / pwc.STOP_POLL_SECONDS) + 3
+        consumer, transport = self._consumer(monkeypatch, timeouts=polls)
         with pytest.raises(wt.WSClosed):              # only the scripted end
             consumer.run_once()
         assert any(m.get("op") == "ping" for m in transport.sent), \
@@ -1097,3 +1102,117 @@ class TestBackoffRestartsAfterAWorkingConnection:
         consumer.run_forever(_Stop())
         assert len(sleeps) >= 3
         assert set(sleeps) == {pwc.RECONNECT_BACKOFF_SECONDS[0]}
+
+
+class TestAHealthyConnectionCanBeStopped:
+    """The conformance run could never go green: run_once looped for as long as
+    the connection stayed up and run_forever only read its stop event between
+    connections, so a shutdown request on a LIVE stream was never honoured and
+    the join timed out ("WS thread did not stop within the shutdown boundary")."""
+
+    class _Live:
+        """A connection that stays up: acks, then an endless quiet stream."""
+
+        def __init__(self, chatty=False):
+            import itertools
+            self.frames = [_text_frame({"op": "auth", "success": True}),
+                           _text_frame({"op": "subscribe", "success": True})]
+            self.chatty = chatty
+            self.closed = False
+            self.sent = []
+            self._n = itertools.count()
+
+        def connect(self):
+            pass
+
+        def send_text(self, text):
+            self.sent.append(text)
+
+        def send_pong(self, payload):
+            pass
+
+        def close(self):
+            self.closed = True
+
+        def recv(self, timeout=None):
+            if self.frames:
+                return self.frames.pop(0)
+            if self.chatty:
+                return (wt.OP_TEXT, json.dumps(
+                    {"topic": "noise", "n": next(self._n)}).encode())
+            import socket
+            time.sleep(min(timeout or 0.05, 0.05))
+            raise socket.timeout("quiet")
+
+    def _consumer(self, chatty=False):
+        transport = self._Live(chatty)
+        consumer = pwc.WSPrivateConsumer(
+            client=_StubClient(_StubStore()), transport_factory=lambda: transport)
+        return consumer, transport
+
+    def test_run_once_returns_and_closes_when_asked_to_stop(self):
+        consumer, transport = self._consumer()
+        thread = threading.Thread(target=consumer.run_once, daemon=True)
+        thread.start()
+        time.sleep(0.3)
+        assert thread.is_alive()                       # it IS a healthy connection
+        started = time.time()
+        consumer.request_stop()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive(), "a healthy connection ignored the stop request"
+        assert time.time() - started < pwc.STOP_POLL_SECONDS + 1.0
+        assert transport.closed is True
+
+    def test_a_chatty_stream_is_stopped_too(self):
+        consumer, transport = self._consumer(chatty=True)
+        thread = threading.Thread(target=consumer.run_once, daemon=True)
+        thread.start()
+        time.sleep(0.2)
+        consumer.request_stop()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive() and transport.closed is True
+
+    def test_run_forever_stops_on_the_event_plus_request(self):
+        consumer, transport = self._consumer()
+        stop = threading.Event()
+        thread = threading.Thread(target=consumer.run_forever, args=(stop,),
+                                  daemon=True)
+        thread.start()
+        time.sleep(0.3)
+        stop.set()
+        consumer.request_stop()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    def test_a_stale_request_does_not_stop_the_next_run(self):
+        consumer, transport = self._consumer()
+        consumer.request_stop()
+        stop = threading.Event()
+        thread = threading.Thread(target=consumer.run_forever, args=(stop,),
+                                  daemon=True)
+        thread.start()
+        time.sleep(0.4)
+        assert thread.is_alive(), "run_forever must clear a request left over from before"
+        stop.set()
+        consumer.request_stop()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
+
+    def test_the_bot_shutdown_actually_stops_a_live_thread(self):
+        """TradingBot._stop_private_ws: event + request_stop, join succeeds."""
+        import main as _main
+        consumer, transport = self._consumer()
+        bot = _main.TradingBot.__new__(_main.TradingBot)
+        bot.ws_consumer = consumer
+        bot.ws_stop_event = threading.Event()
+        bot.ws_thread = threading.Thread(
+            target=consumer.run_forever, args=(bot.ws_stop_event,), daemon=True)
+        bot.ws_shutdown_failed = False
+        bot._observation_state = "HEALTHY"
+        bot.ws_thread.start()
+        time.sleep(0.3)
+        started = time.time()
+        bot._stop_private_ws()
+        assert bot.ws_thread is None and bot.ws_shutdown_failed is False
+        assert bot._observation_state == "HEALTHY"
+        assert time.time() - started < 5.0

@@ -689,6 +689,10 @@ class TradingBot:
         if self.ws_thread is None:
             return
         self.ws_stop_event.set()
+        if self.ws_consumer is not None:
+            # the event alone is only read between connections; this makes a
+            # live receive loop return within STOP_POLL_SECONDS
+            self.ws_consumer.request_stop()
         import private_ws_consumer as _pwc
 
         shutdown_timeout = _pwc.RECV_TIMEOUT_SECONDS + WS_SHUTDOWN_SAFETY_MARGIN_SECONDS
