@@ -53,12 +53,34 @@ import hashlib
 import json
 import logging
 import os
+import threading
 from dataclasses import asdict, dataclass, fields
 from typing import Any, Dict, List, Optional, Tuple
 
 from session_log import NO_EDGE_CLAIM
 
 logger = logging.getLogger(__name__)
+
+#: `cleared_edge_signal_from_artifacts` runs on every status build, and each run
+#: re-read the same artefacts and re-logged the same refusals, drowning the one
+#: line an operator needs. A refusal is now logged at its level ONCE per
+#: (directory, artefact, file mtime, message) per process and at DEBUG after
+#: that. Nothing about the decision changes; only the repeats are quieter, and
+#: an artefact that is edited (new mtime) or a different message logs again.
+_LOGGED_ONCE: set = set()
+_LOGGED_ONCE_CAP = 4096
+_LOGGED_ONCE_LOCK = threading.Lock()
+
+
+def _log_once(level: int, scope: Tuple[Any, ...], message: str, *args: Any) -> None:
+    key = (level, scope, message % args if args else message)
+    with _LOGGED_ONCE_LOCK:
+        first = key not in _LOGGED_ONCE
+        if first:
+            if len(_LOGGED_ONCE) >= _LOGGED_ONCE_CAP:
+                _LOGGED_ONCE.clear()
+            _LOGGED_ONCE.add(key)
+    logger.log(level if first else logging.DEBUG, message, *args)
 
 __all__ = [
     "ProjectStatus",
@@ -530,10 +552,14 @@ def cleared_edge_signal_from_artifacts(
             continue
         path = os.path.join(artifact_dir, name)
         try:
+            scope = (artifact_dir, name, os.stat(path).st_mtime_ns)
+        except OSError:
+            scope = (artifact_dir, name, 0)
+        try:
             with open(path, encoding="utf-8") as handle:
                 summary = json.load(handle)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("unreadable edge artefact %s: %s", name, exc)
+            _log_once(logging.WARNING, scope, "unreadable edge artefact %s: %s", name, exc)
             continue
 
         if not isinstance(summary, dict):
@@ -555,7 +581,8 @@ def cleared_edge_signal_from_artifacts(
         if not bool(m2.get("passed")):
             continue
         if summary.get("control_validated") is not True:
-            logger.warning(
+            _log_once(
+                logging.WARNING, scope,
                 "artefact %s reports %s but carries no validated-control "
                 "attestation; refusing. A number measured with an unchecked "
                 "ruler is not a claim.", name, summary.get("verdict"))
@@ -568,7 +595,8 @@ def cleared_edge_signal_from_artifacts(
             # record, so the artefact is what is wrong. The evidence travels
             # with the refusal: an operator reading the log should not have to
             # go looking for the numbers that closed the signal.
-            logger.error(
+            _log_once(
+                logging.ERROR, scope,
                 "artefact %s claims a cleared edge for %r, which is FROZEN "
                 "(%s): %s. Refusing.",
                 name, signal, FROZEN_STATUS.get(signal, "FROZEN"),
@@ -585,7 +613,8 @@ def cleared_edge_signal_from_artifacts(
         except Exception:  # noqa: BLE001
             _shadow = None
         if _shadow is not None and _shadow.is_revoked(signal):
-            logger.error(
+            _log_once(
+                logging.ERROR, scope,
                 "artefact %s claims a cleared edge for %r, which a human has "
                 "REVOKED. The artefact is not wrong; the claim has been "
                 "withdrawn. Refusing.", name, signal)
@@ -594,7 +623,8 @@ def cleared_edge_signal_from_artifacts(
         if signal in OOS_GATED_REGISTRATION:
             refusal = _oos_gate_refusal(summary, signal)
             if refusal is not None:
-                logger.warning(
+                _log_once(
+                logging.WARNING, scope,
                     "artefact %s claims a cleared edge for %r, whose "
                     "pre-declaration makes an out-of-sample window the only "
                     "registering source, but %s Refusing.",
@@ -621,7 +651,8 @@ def cleared_edge_signal_from_artifacts(
         if required is not None:
             missing = [sym for sym in required if sym not in have]
             if missing:
-                logger.warning(
+                _log_once(
+                    logging.WARNING, (artifact_dir,),
                     "%s cleared on %s but its pre-declaration requires %s; "
                     "missing %s. One symbol passing and another failing is "
                     "ABSENT, not a partial success. Refusing.",
@@ -634,7 +665,8 @@ def cleared_edge_signal_from_artifacts(
             universe, floor = minimum
             passing = sorted(sym for sym in universe if sym in have)
             if len(passing) < int(floor):
-                logger.warning(
+                _log_once(
+                    logging.WARNING, (artifact_dir,),
                     "%s cleared on %s (%d of the %d symbols its "
                     "pre-declaration names: %s), but that pre-declaration "
                     "requires at least %d. A single symbol clearing while its "
@@ -652,7 +684,8 @@ def cleared_edge_signal_from_artifacts(
     if len(set(cleared)) > 1:
         # Two different signals both claiming to have cleared is a state a human
         # must adjudicate, not something to resolve by picking one.
-        logger.error(
+        _log_once(
+            logging.ERROR, (artifact_dir,),
             "multiple signals claim a cleared edge (%s); refusing to choose",
             ", ".join(sorted(set(cleared))),
         )
