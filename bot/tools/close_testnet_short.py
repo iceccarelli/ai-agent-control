@@ -19,8 +19,11 @@ WHAT IT DOES, AND ONLY THIS
 WHAT IT REFUSES
   * anything but the testnet venue (BYBIT_VENUE=testnet, USE_TESTNET, not paper,
     no live acknowledgement, the client's host positively the testnet host);
-  * a position that is not a plain one-way short (a long, a hedge-mode slot):
-    `get_perp_position` raises, and so does this;
+  * a position that is not a plain one-way short (a long, or any hedge-mode
+    slot, positionIdx other than 0): refused;
+  * a short that is not exactly the quantity the operator confirmed when the
+    order is about to go (it changed while waiting);
+  * a venue adapter whose client (hence host) cannot be found;
   * open carry orders (a resting order could fill into the flat book);
   * a quantity it cannot read or that is not positive and finite;
   * `--arm` without the confirmation typed exactly, or without a terminal;
@@ -65,13 +68,19 @@ def read_state(broker: Any, symbol: str) -> dict:
     """The venue's own answer. Raises (refusing) rather than assuming flat."""
     qty = float(broker.get_perp_position(symbol))
     orders = list(broker.get_open_carry_orders(symbol, symbol))
-    return {"short_qty": qty, "open_orders": len(orders)}
+    slots = broker.get_position_slots(symbol)       # no slot read, no close
+    return {"short_qty": qty, "open_orders": len(orders), "slots": slots}
 
 
 def plan_problem(state: dict) -> Optional[str]:
     qty = state["short_qty"]
     if not (isinstance(qty, float) and math.isfinite(qty) and qty >= 0):
         return f"the venue's position size {qty!r} is not usable"
+    for slot in state.get("slots", []):
+        if str(slot.get("positionIdx")) not in ("0", "None", ""):
+            return (f"the position sits in positionIdx {slot.get('positionIdx')!r}"
+                    " (hedge mode); this tool closes a one-way position only "
+                    "and sends no positionIdx")
     if state["open_orders"]:
         return (f"{state['open_orders']} carry order(s) are open at the venue; "
                 "a resting order could fill into the position being closed. "
@@ -79,18 +88,31 @@ def plan_problem(state: dict) -> Optional[str]:
     return None
 
 
-def close_short(broker: Any, symbol: str, *, sleep=time.sleep) -> dict:
-    """Send the one reduce-only Buy for the venue's short, then verify flat."""
+def close_short(broker: Any, symbol: str, *, expected_qty: Optional[float] = None,
+                sleep=time.sleep) -> dict:
+    """Send the one reduce-only Buy for the venue's short, then verify flat.
+
+    ``expected_qty`` is what the operator confirmed: if the venue's short is not
+    exactly that when the order is about to go, nothing is sent."""
     before = read_state(broker, symbol)
     problem = plan_problem(before)
     if problem:
         return {"ok": False, "refused": problem, "before": before}
     qty = before["short_qty"]
+    if expected_qty is not None and abs(qty - float(expected_qty)) > FLAT_DUST:
+        return {"ok": False, "before": before, "refused": (
+            f"the venue's short is {qty}, not the {expected_qty} that was "
+            "confirmed; it changed while waiting. Nothing was sent")}
     if qty <= FLAT_DUST:
         return {"ok": True, "sent": False, "before": before, "after": before,
                 "note": "the venue is already flat; nothing was sent"}
     result = broker.place_market(symbol=symbol, side="Buy", qty=qty,
                                  product="linear")
+    if result is None:
+        # a definite rejection: nothing was filled and no second order follows
+        return {"ok": False, "sent": False, "before": before,
+                "note": "the venue rejected the order; nothing filled. Look at "
+                        "the venue and the reject reason"}
     after: dict = {}
     flat = False
     for attempt in range(VERIFY_TRIES):
@@ -142,8 +164,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     # the venue adapter itself: the ledger wrapper around it books into an
     # in-memory journal nobody reads and hides the adapter's `client`
-    broker = D.unwrap_broker(bot.carry.broker)
-    why_not = D.session_refusal(bot.cfg, getattr(broker, "client", None))
+    try:
+        broker = D.unwrap_broker(bot.carry.broker)
+    except ValueError as exc:
+        print(f"REFUSED: {exc}", file=sys.stderr)
+        return 3
+    if getattr(broker, "client", None) is None:
+        print("REFUSED: the venue adapter has no client, so the testnet host "
+              "cannot be verified.", file=sys.stderr)
+        return 3
+    why_not = D.session_refusal(bot.cfg, broker.client)
     if why_not:
         print(f"REFUSED: {why_not}", file=sys.stderr)
         return 3
@@ -175,7 +205,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("REFUSED: --arm needs an interactive terminal for the typed "
               "confirmation.", file=sys.stderr)
         return 3
-    typed = input(f"Type exactly  {phrase}  and press Enter: ").strip()
+    try:
+        typed = input(f"Type exactly  {phrase}  and press Enter: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("REFUSED: no confirmation was given. Nothing was sent.",
+              file=sys.stderr)
+        return 3
     if typed != phrase:
         print("REFUSED: confirmation did not match. Nothing was sent.",
               file=sys.stderr)
@@ -183,25 +218,34 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     D.InterruptGuard().install()
     try:
-        outcome = close_short(broker, args.symbol)
+        outcome = close_short(broker, args.symbol,
+                              expected_qty=state["short_qty"])
     except KeyboardInterrupt as exc:
         outcome = {"ok": False, "interrupted": str(exc)}
     except Exception as exc:                                   # noqa: BLE001
         outcome = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    # Everything below runs after an order may be on the wire: a signal or an
+    # error here must end in the "look at the venue" message, never a traceback.
     try:
-        outcome["final"] = read_state(broker, args.symbol)
-        # the verdict is the FRESH read after everything, not what an earlier
-        # step believed: an interrupt or an error that still left it flat is flat
-        outcome["ok"] = (outcome["final"]["short_qty"] <= FLAT_DUST
-                         and not outcome["final"]["open_orders"])
-    except Exception as exc:                                   # noqa: BLE001
-        outcome["final"] = {"error": f"{type(exc).__name__}: {exc}"}
+        try:
+            outcome["final"] = read_state(broker, args.symbol)
+            # the verdict is the FRESH read after everything, not what an
+            # earlier step believed: an interrupt or an error that still left
+            # it flat is flat
+            outcome["ok"] = (outcome["final"]["short_qty"] <= FLAT_DUST
+                             and not outcome["final"]["open_orders"])
+        except BaseException as exc:                           # noqa: BLE001
+            outcome["final"] = {"error": f"{type(exc).__name__}: {exc}"}
+            outcome["ok"] = False
+        if args.evidence_path and getattr(broker, "sent_order_links", None):
+            outcome["evidence_capture"] = D.capture_final_venue_state(
+                broker, args.symbol)
+        for key, value in outcome.items():
+            print(f"  {key}: {value}")
+    except BaseException as exc:                               # noqa: BLE001
+        print(f"  report interrupted ({type(exc).__name__}); state so far: "
+              f"{outcome}")
         outcome["ok"] = False
-    if args.evidence_path and getattr(broker, "sent_order_links", None):
-        outcome["evidence_capture"] = D.capture_final_venue_state(
-            broker, args.symbol)
-    for key, value in outcome.items():
-        print(f"  {key}: {value}")
     if outcome["ok"]:
         print("\nFLAT VERIFIED by a fresh venue read.")
         return 0

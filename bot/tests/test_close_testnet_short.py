@@ -16,15 +16,24 @@ sys.path.insert(0, HERE)
 
 import close_testnet_short as C  # noqa: E402
 import drill as D  # noqa: E402
+from bybit_connection import TESTNET_REST  # noqa: E402
 from test_carry_broker import FakeClient, broker as make_broker  # noqa: E402
 
 
 class FakeBroker:
-    def __init__(self, short=0.001, orders=0, closes=True, stuck_reads=0):
+    def __init__(self, short=0.001, orders=0, closes=True, stuck_reads=0,
+                 slot_idx=0, reject=False):
         self.short, self.orders, self.closes = short, orders, closes
         self.stuck_reads = stuck_reads
+        self.slot_idx, self.reject = slot_idx, reject
         self.sent = []
         self.sent_order_links = []
+        self.client = types.SimpleNamespace(base_url=TESTNET_REST)
+
+    def get_position_slots(self, symbol):
+        size = self.get_perp_position(symbol)
+        return [{"positionIdx": self.slot_idx, "side": "Sell", "size": size}] \
+            if size else []
 
     def get_perp_position(self, symbol):
         if isinstance(self.short, Exception):
@@ -41,6 +50,8 @@ class FakeBroker:
     def place_market(self, **kw):
         self.sent.append(kw)
         self.sent_order_links.append(("linear", kw["symbol"], "L1"))
+        if self.reject:
+            return None
         return {"filled_qty": kw["qty"], "avg_price": 80000.0,
                 "order_link_id": "L1"}
 
@@ -249,3 +260,144 @@ class TestMain:
         assert names & {"place_market"} == {"place_market"}
         assert not names & {"place_post_only", "cancel_order", "_request",
                             "trip_kill_switch", "_unwind"}
+
+
+# ---------------------------------------------------------------------------
+# found by independent review
+# ---------------------------------------------------------------------------
+
+class SizeChanges(FakeBroker):
+    """The short is 0.001 when read for the confirmation and 0.005 after."""
+
+    def __init__(self):
+        super().__init__(short=0.001)
+        self.reads = 0
+
+    def get_perp_position(self, symbol):
+        self.reads += 1
+        return 0.001 if self.reads <= 1 else 0.005
+
+
+class TestReviewFindings:
+    def test_the_quantity_sent_is_the_one_confirmed(self, wired, monkeypatch):
+        b = SizeChanges()
+        wired(b)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input",
+                            lambda prompt="": C.confirmation_phrase("BTCUSDT", 0.001))
+        assert C.main(["--arm"]) == 1
+        assert b.sent == []                      # nothing at all went out
+
+    def test_close_short_refuses_a_size_other_than_expected(self):
+        out = C.close_short(FakeBroker(short=0.005), "BTCUSDT",
+                            expected_qty=0.001, sleep=NO_SLEEP)
+        assert out["ok"] is False and "changed while waiting" in out["refused"]
+
+    @pytest.mark.parametrize("idx", [1, 2, "1", "2"])
+    def test_a_hedge_mode_slot_is_refused(self, wired, idx):
+        # unarmed on purpose: with --arm a missing terminal also returns 3
+        b = FakeBroker(slot_idx=idx)
+        wired(b)
+        assert C.main([]) == 3 and b.sent == []
+
+    @pytest.mark.parametrize("idx", [0, "0", None])
+    def test_the_one_way_slot_is_accepted(self, wired, idx):
+        wired(FakeBroker(slot_idx=idx))
+        assert C.main([]) == 0
+
+    def test_a_missing_client_is_a_refusal_not_a_skipped_check(self, wired):
+        b = FakeBroker()
+        del b.client
+        wired(b)
+        assert C.main([]) == 3 and b.sent == []
+
+    def test_a_client_on_another_host_is_refused(self, wired):
+        b = FakeBroker()
+        b.client = types.SimpleNamespace(base_url="https://api.bybit.com")
+        wired(b)
+        assert C.main([]) == 3 and b.sent == []
+
+    def test_a_wrapper_chain_that_never_reaches_the_adapter_is_refused(
+            self, monkeypatch):
+        class Wrap:
+            def __init__(self, inner):
+                self.inner = inner
+        b = FakeBroker()
+        for _ in range(9):
+            b = Wrap(b)
+        monkeypatch.setattr(D, "_load_bot", lambda p="": bot(b))
+        assert C.main([]) == 3
+        with pytest.raises(ValueError):
+            D.unwrap_broker(b)
+
+    def test_end_of_input_at_the_prompt_is_a_refusal(self, wired, monkeypatch):
+        b = FakeBroker()
+        wired(b)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+
+        def eof(prompt=""):
+            raise EOFError
+        monkeypatch.setattr("builtins.input", eof)
+        assert C.main(["--arm"]) == 3 and b.sent == []
+
+    def test_ctrl_c_at_the_prompt_is_a_refusal(self, wired, monkeypatch):
+        b = FakeBroker()
+        wired(b)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+
+        def interrupt(prompt=""):
+            raise KeyboardInterrupt
+        monkeypatch.setattr("builtins.input", interrupt)
+        assert C.main(["--arm"]) == 3 and b.sent == []
+
+    def test_a_signal_during_the_final_read_ends_in_the_look_at_the_venue_message(
+            self, wired, monkeypatch, capsys):
+        class SignalOnFinalRead(FakeBroker):
+            def get_perp_position(self, symbol):
+                if self.sent and getattr(self, "armed", False):
+                    self.armed = False
+                    raise KeyboardInterrupt("signal 15")
+                if self.sent:
+                    self.armed = True
+                return super().get_perp_position(symbol)
+        b = SignalOnFinalRead(closes=False)
+        wired(b)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True, raising=False)
+        monkeypatch.setattr("builtins.input",
+                            lambda prompt="": C.confirmation_phrase("BTCUSDT", 0.001))
+        code = C.main(["--arm"])             # no traceback escapes
+        assert code == 1 and len(b.sent) == 1
+        assert "NOT VERIFIED FLAT" in capsys.readouterr().err
+
+    def test_a_definite_rejection_is_not_reported_as_sent(self):
+        b = FakeBroker(reject=True)
+        out = C.close_short(b, "BTCUSDT", expected_qty=0.001, sleep=NO_SLEEP)
+        assert out["ok"] is False and out["sent"] is False
+        assert "rejected" in out["note"] and len(b.sent) == 1
+
+
+class TestPositionSlots:
+    def test_the_adapter_reports_only_non_empty_rows_with_their_index(self):
+        client = FakeClient(perp_qty=0.001)
+        real = client._request
+
+        def request(method, endpoint, **kw):
+            out = real(method, endpoint, **kw)
+            if endpoint == "/v5/position/list":
+                out["result"]["list"] = [
+                    {"symbol": "BTCUSDT", "size": "0.001", "side": "Sell",
+                     "positionIdx": 2},
+                    {"symbol": "BTCUSDT", "size": "0", "side": "", "positionIdx": 1}]
+            return out
+        client._request = request
+        assert make_broker(client).get_position_slots("BTCUSDT") == [
+            {"positionIdx": 2, "side": "Sell", "size": 0.001}]
+
+    def test_an_unreadable_answer_raises_not_flat(self):
+        client = FakeClient()
+        real = client._request
+        client._request = lambda m, e, **kw: (
+            {"retCode": 0, "result": {}} if e == "/v5/position/list"
+            else real(m, e, **kw))
+        with pytest.raises(Exception, match="cannot read"):
+            make_broker(client).get_position_slots("BTCUSDT")

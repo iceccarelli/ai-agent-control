@@ -156,6 +156,10 @@ def unwrap_broker(broker: Any) -> Any:
         if inner is None or hasattr(broker, "sent_order_links"):
             return broker
         broker = inner
+    if getattr(broker, "inner", None) is not None \
+            and not hasattr(broker, "sent_order_links"):
+        raise ValueError("broker wrapper chain is too deep to reach the venue "
+                         "adapter; refusing to guess")
     return broker
 
 

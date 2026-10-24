@@ -1662,6 +1662,26 @@ class CarryBroker:
             total += size
         return total
 
+    def get_position_slots(self, symbol: str) -> list:
+        """The non-empty position rows of ``symbol`` as ``[{positionIdx, side,
+        size}]`` (read-only). A caller that must not act on a hedge-mode slot
+        asks this; `get_perp_position` accepts the hedge-mode short slot (2)
+        because the book's hedge may sit there. Raises when unreadable."""
+        result = self.client._request(
+            "GET", "/v5/position/list", signed=True,
+            params={"category": LINEAR, "symbol": symbol})
+        rows = self._v5_list(result)
+        if rows is None:
+            raise PairIncident(
+                f"cannot read the {symbol} position; refusing to assume flat")
+        out = []
+        for row in rows:
+            size = self._stated_size(row, symbol)
+            if size != 0.0:
+                out.append({"positionIdx": row.get("positionIdx"),
+                            "side": row.get("side"), "size": size})
+        return out
+
     #: closed-pnl page size; a full page may be truncated and proves nothing.
     _CLOSED_PNL_PAGE = 50
 
