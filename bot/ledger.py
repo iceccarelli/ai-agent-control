@@ -969,6 +969,24 @@ class LedgerBroker:
         #: book the INCREMENT or it records more than the venue holds. The
         #: side lives here because a cancel response does not carry one.
         self._resting: Dict[str, tuple] = {}
+        #: Every fill this broker booked, in order: what the journal alone does
+        #: not keep (the fill PRICE, the order link id as a field, the fee
+        #: currency). A drill reads it to state its own round-trip cost and to
+        #: name the orders a venue capture must be able to reproduce. In
+        #: memory only: the journal stays the book, this is its index.
+        self.fills: List[Dict[str, Any]] = []
+
+    def _note_fill(self, *, ref: str, ms: int, product: str, side: str,
+                   qty: float, price: float, fee_usdt: float, fee_btc: float,
+                   status: str, fee_raw: Dict[str, Any]) -> None:
+        currencies = sorted({str(c.get("currency") or "")
+                             for c in (fee_raw.get("components") or [])
+                             if c.get("amount")})
+        self.fills.append({
+            "ref": ref, "ms": ms, "product": product, "side": side,
+            "qty": qty, "price": price, "fee_usdt": fee_usdt,
+            "fee_btc": fee_btc, "fee_status": status,
+            "fee_currencies": currencies})
 
     def resume_basis(self, *, perp_qty: float = 0.0,
                      perp_price: Optional[float] = None,
@@ -1176,6 +1194,9 @@ class LedgerBroker:
                 spot_buy(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                          fee_btc=fee_btc, fee_usdt=fee_usdt,
                          fee_status=status, fee_raw=fee_raw)
+                self._note_fill(ref=ref, ms=ms, product=product, side=side,
+                                qty=qty, price=price, fee_usdt=fee_usdt,
+                                fee_btc=fee_btc, status=status, fee_raw=fee_raw)
                 if held_qty > 0:
                     filled = self._spot_qty + held_qty
                     self._spot_entry = (
@@ -1209,6 +1230,9 @@ class LedgerBroker:
                 spot_sell(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                           cost_basis=entry, fee_usd=fee_usdt,
                           fee_status=status, fee_raw=fee_raw)
+                self._note_fill(ref=ref, ms=ms, product=product, side=side,
+                                qty=qty, price=price, fee_usdt=fee_usdt,
+                                fee_btc=fee_btc, status=status, fee_raw=fee_raw)
                 self._spot_qty = max(0.0, self._spot_qty - qty)
                 if self._spot_qty <= 0:
                     self._spot_entry = None
@@ -1217,6 +1241,9 @@ class LedgerBroker:
         if side == "Sell":
             perp_open(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                       fee_usd=fee_usdt, fee_status=status, fee_raw=fee_raw)
+            self._note_fill(ref=ref, ms=ms, product=product, side=side,
+                            qty=qty, price=price, fee_usdt=fee_usdt,
+                            fee_btc=fee_btc, status=status, fee_raw=fee_raw)
             filled = self._perp_qty + qty
             self._perp_entry = (
                 price if self._perp_entry is None else
@@ -1227,6 +1254,9 @@ class LedgerBroker:
             perp_close(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                        entry_price=entry, fee_usd=fee_usdt,
                        fee_status=status, fee_raw=fee_raw)
+            self._note_fill(ref=ref, ms=ms, product=product, side=side,
+                            qty=qty, price=price, fee_usdt=fee_usdt,
+                            fee_btc=fee_btc, status=status, fee_raw=fee_raw)
             self._perp_qty = max(0.0, self._perp_qty - qty)
             if self._perp_qty <= 0:
                 self._perp_entry = None

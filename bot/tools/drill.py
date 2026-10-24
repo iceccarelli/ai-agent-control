@@ -87,7 +87,18 @@ is the whole position. Raising the cap is a signed human decision, not a flag.
 Exit 0 only when the drill PASSED, the book is flat and the funding status is
 CONFIRMED_FROM_SETTLEMENTS. 3 = refused (not testnet / paper / live-armed),
 2 = cannot start or zero fills, 4 = flat but funding not confirmed,
-5 = flat, rows booked, reconciliation still inside its grace, 1 = other.
+5 = flat, rows booked, reconciliation still inside its grace, 1 = other,
+6 = would be 0 but `--evidence-path` was given and the final venue state (the
+orders' own rows and their execution rows) could not be captured, 130 = stopped
+by SIGINT/SIGTERM/SIGHUP, the pair closed and the report written (1 instead if
+the book is not flat).
+
+INTERRUPTS. The first SIGINT/SIGTERM/SIGHUP raises KeyboardInterrupt inside the
+drill: the engine's own reduce-only unwind runs, the venue is read, the report
+(and, with `--evidence-path`, the final-state capture) is written, and the
+process exits 130 with a sentence, not a traceback. A SECOND signal while that
+is happening is ignored, because interrupting the unwind would leave the short
+open.
 """
 from __future__ import annotations
 
@@ -125,6 +136,160 @@ NOT_PROVEN = [
 
 #: Flat to within this many base units counts as flat at the venue.
 FLAT_DUST = 1e-8
+
+#: Seconds between re-reads of an order's execution rows when they have not yet
+#: added up to the order's own cumulative quantity.
+FINAL_READ_RETRY_S = 1.0
+FINAL_READ_TRIES = 4
+
+
+def _vwap(rows: List[Dict[str, Any]]) -> Optional[float]:
+    qty = sum(r["qty"] for r in rows)
+    return sum(r["qty"] * r["price"] for r in rows) / qty if qty > 0 else None
+
+
+def round_trip_summary(fills: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """What the PERP leg of this drill cost, from the fills the book booked.
+
+    Entry and exit prices are volume-weighted over the perp fills; fees are the
+    booked USDT fees. Nothing here is estimated: a figure that needs a close
+    that did not happen is None. SCOPE: the perp leg only. In the overlay the
+    long side is the client's own BTC, whose price change is NOT in these
+    numbers, and funding is reported separately (the journal statement).
+    """
+    perp = [f for f in fills if f.get("product") == "linear"]
+    opens = [f for f in perp if f["side"] == "Sell"]
+    closes = [f for f in perp if f["side"] == "Buy"]
+    open_qty = sum(f["qty"] for f in opens)
+    close_qty = sum(f["qty"] for f in closes)
+    entry, exit_ = _vwap(opens), _vwap(closes)
+    entry_fee = sum(f["fee_usdt"] for f in opens)
+    exit_fee = sum(f["fee_usdt"] for f in closes)
+    confirmed = all(f.get("fee_status") == "confirmed" for f in perp) and bool(perp)
+    out: Dict[str, Any] = {
+        "scope": "perp leg only; the spot inventory's price change and "
+                 "funding are not in these numbers",
+        "entry_qty": open_qty, "entry_price": entry, "entry_fee_usdt": entry_fee,
+        "exit_qty": close_qty, "exit_price": exit_, "exit_fee_usdt": exit_fee,
+        "exit_order_link_ids": [f["ref"] for f in closes],
+        "fees_confirmed": confirmed,
+        "closed": bool(opens) and abs(open_qty - close_qty) <= FLAT_DUST,
+        "perp_gross_usdt": None, "fees_usdt": entry_fee + exit_fee,
+        "perp_net_before_funding_usdt": None,
+        "fee_bps_of_entry_notional": None, "price_move_bps": None}
+    if entry and entry > 0 and open_qty > 0:
+        out["fee_bps_of_entry_notional"] = (
+            (entry_fee + exit_fee) / (entry * open_qty) * 1e4)
+    if entry and exit_ and close_qty > 0:
+        gross = (entry - exit_) * close_qty          # a short gains when price falls
+        out["perp_gross_usdt"] = gross
+        out["perp_net_before_funding_usdt"] = gross - entry_fee - exit_fee
+        out["price_move_bps"] = (exit_ / entry - 1.0) * 1e4
+    return out
+
+
+def _exit_fields(fills: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The exit's own price and fee, for the stage that closed the pair."""
+    s = round_trip_summary(fills)
+    return {"exit_qty": s["exit_qty"], "exit_price": s["exit_price"],
+            "exit_fee_usdt": s["exit_fee_usdt"],
+            "exit_order_link_ids": s["exit_order_link_ids"],
+            "round_trip_fees_usdt": s["fees_usdt"]}
+
+
+def drill_claims(fills: List[Dict[str, Any]], journal: Any, *, venue: str,
+                 symbol: str = PERP_SYMBOL) -> Dict[str, Any]:
+    """The drill's own statement of what it did, in the form
+    `tools/evidence_reconcile.py --drill-report` checks against a venue capture.
+
+    These are CLAIMS: every number comes from the book, none from the venue's
+    execution list. A testnet run claims `testnet_claim`; anything else is a
+    local record and can never reconcile.
+    """
+    testnet = str(venue).lower() == "testnet"
+    source, env = ("testnet_claim", "testnet") if testnet else ("local", "unknown")
+    legs = []
+    for f in fills:
+        if f.get("product") != "linear":
+            continue
+        cur = f.get("fee_currencies") or []
+        legs.append({
+            "claim_id": f"leg:{f['ref']}", "source": source, "environment": env,
+            "kind": "perp_open" if f["side"] == "Sell" else "perp_close",
+            "symbol": symbol, "side": f["side"], "qty": f["qty"],
+            "price": f["price"], "fee": f["fee_usdt"],
+            "fee_currency": cur[0] if len(cur) == 1 else ",".join(cur),
+            "fee_status": f.get("fee_status", ""),
+            "order_link_id": f["ref"], "reduce_only": f["side"] == "Buy",
+            "booked_ms": f["ms"]})
+    funding = []
+    for e in (journal.entries if journal is not None else []):
+        if e.kind == "funding" and e.basis == "venue" and "venue_id" in e.fee_raw:
+            r = e.fee_raw
+            funding.append({
+                "claim_id": f"funding:{r['venue_id']}", "source": source,
+                "environment": env, "symbol": r.get("symbol") or symbol,
+                "time_ms": r["venue_ms"], "amount": r["venue_usd"],
+                "venue_id": r["venue_id"], "size": r.get("size")})
+    return {"schema": "drill_claims/1", "carry_leg_claims": legs,
+            "funding_claims": funding}
+
+
+def capture_final_venue_state(broker: Any, symbol: str = PERP_SYMBOL,
+                              sleep: Callable[[float], None] = None
+                              ) -> Dict[str, Any]:
+    """Read, from the venue, the FINAL state and the fills of every perp order
+    this process sent -- so a capture holds them and
+    `tools/evidence_reconcile.py` can reconcile them.
+
+    Mirrors `testnet_conformance_run.capture_final_venue_state`: only GETs, all
+    through the broker's client (hence the evidence-capturing transport), and
+    green only when every sent order was actually read. Per order: the order's
+    own record must exist and be final, and when it executed its execution
+    rows must add up to its cumulative quantity (re-read a few times: the list
+    can lag the fill). Also one position read, as the flat proof. Sends,
+    amends and cancels nothing.
+    """
+    sleep = sleep or time.sleep
+    links = [(p, sym, link) for (p, sym, link)
+             in getattr(broker, "sent_order_links", []) if p == "linear"]
+    failures: List[str] = []
+    reads = 0
+    for _product, sym, link in links:
+        try:
+            state = broker.read_order(sym, link, "linear")
+            reads += 1
+            if state is None:
+                failures.append(f"{link}: the venue returned no order")
+                continue
+            if state.get("resting"):
+                failures.append(f"{link}: still {state.get('status')!r} at the "
+                                "venue, not a final state")
+                continue
+            filled = float(state.get("filled_qty") or 0.0)
+            if filled <= 0:
+                continue
+            total = 0.0
+            for attempt in range(FINAL_READ_TRIES):
+                rows = broker.get_order_executions(sym, order_link_id=link)
+                reads += 1
+                total = sum(float(r.get("execQty") or 0.0) for r in rows)
+                if abs(total - filled) <= max(1e-12, 1e-9 * filled):
+                    break
+                if attempt + 1 < FINAL_READ_TRIES:
+                    sleep(FINAL_READ_RETRY_S)
+            else:
+                failures.append(f"{link}: execution rows add up to {total} but "
+                                f"the order filled {filled}")
+        except Exception as exc:                               # noqa: BLE001
+            failures.append(f"{link}: {type(exc).__name__}: {exc}")
+    try:
+        broker.get_perp_position(symbol)
+        reads += 1
+    except Exception as exc:                                   # noqa: BLE001
+        failures.append(f"position: {type(exc).__name__}: {exc}")
+    return {"complete": not failures, "orders": len(links), "reads": reads,
+            "failures": failures[:20]}
 
 
 def venue_flatness(broker: Any, *, inventory_before: Optional[float]
@@ -237,6 +402,9 @@ class Drill:
         self.orders_sent = 0
         self.failed_stage: Optional[str] = None
         self.still_open = False
+        #: Stopped by SIGINT/SIGTERM/SIGHUP (KeyboardInterrupt): the pair was
+        #: closed through the engine and this report written on the way out.
+        self.interrupted = False
         #: WHICH EXCHANGE this ran against (0046). Defaults to "unknown"
         #: rather than to mainnet: a transcript that does not know where it
         #: ran must not be readable as the strongest possible claim.
@@ -388,8 +556,13 @@ HOLD_AGING_MARGIN_MS = 15_000
 def run_drill(*, broker: Any, notional: Optional[float] = None,
               arm: bool = False, out: str = "", venue: str = "unknown",
               engine_factory: Any = None, hold: Optional[HoldPlan] = None,
-              cash_ledger: str = "") -> Dict[str, Any]:
-    """The whole sequence. Returns the transcript whatever happens."""
+              cash_ledger: str = "", capture_final: bool = False
+              ) -> Dict[str, Any]:
+    """The whole sequence. Returns the transcript whatever happens.
+
+    ``capture_final`` (set by ``--evidence-path``): after the sequence, however
+    it ended, read every order this process sent and its execution rows from
+    the venue, so the evidence file holds what the report claims."""
     import shadow
 
     cap = float(shadow.SHADOW_MAX_NOTIONAL_USD)
@@ -547,6 +720,8 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     engine.warm_funding_history(state["prints"])
     state["engine"] = engine
     state["journal"] = journal
+    state["booked"] = booked
+    state["capture_requested"] = bool(capture_final)
 
     def open_pair(s: Stage) -> None:
         from market_snapshot import take_snapshot
@@ -691,7 +866,8 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                 action=decision.action, reason=decision.reason)
             return
         s.passed(action=decision.action, reason=decision.reason,
-                 detail=dict(decision.detail or {}))
+                 detail=dict(decision.detail or {}),
+                 **_exit_fields(booked.fills))
 
     def final_reconcile(s: Stage) -> None:
         verdict, evidence, why = venue_flatness(
@@ -780,33 +956,69 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                         verdict2, evidence2, why2 = venue_flatness(
                             broker,
                             inventory_before=state.get("inventory_before"))
+                        # the cost of the abort, which the stage used to omit
+                        exit_evidence = _exit_fields(booked.fills)
                         if verdict2 == "FLAT":
                             d.still_open = False
                             abort.passed(action=decision.action,
-                                         verdict=verdict2, **evidence2)
+                                         verdict=verdict2, **evidence2,
+                                         **exit_evidence)
                         else:
                             abort.failed(why2, action=decision.action,
-                                         verdict=verdict2, **evidence2)
+                                         verdict=verdict2, **evidence2,
+                                         **exit_evidence)
                     except Exception as exc:  # noqa: BLE001
                         abort.failed(f"{type(exc).__name__}: {exc}")
+
+    def final_state_capture() -> None:
+        """Read the final state of every order sent. Never changes the verdict:
+        the book's verdict is about the book; whether the venue's own rows were
+        captured is reported (and exit 6) separately."""
+        if not capture_final or not getattr(broker, "sent_order_links", None):
+            return
+        s = d.stage("venue_final_state")
+        try:
+            result = capture_final_venue_state(broker)
+        except Exception as exc:                               # noqa: BLE001
+            result = {"complete": False, "orders": 0, "reads": 0,
+                      "failures": [f"{type(exc).__name__}: {exc}"]}
+        state["evidence_capture"] = result
+        if result["complete"]:
+            s.passed(**result)
+        else:
+            s.failed("the venue's final order/execution rows were not all "
+                     "captured; the evidence file cannot reconcile this run",
+                     **result)
 
     try:
         for name, fn in sequence:
             if not d.run_stage(name, fn):
                 recover(name)
+                final_state_capture()
                 return _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
     except BaseException as exc:
         # Ctrl-C, SIGTERM, anything: the pair may be open. Close it through
         # the engine, say what the venue holds, write the report, and only then
-        # let the interruption continue.
+        # let the interruption continue. A KeyboardInterrupt carries the report
+        # (`drill_report`) so the CLI can print it and exit 130 cleanly.
         d.failed_stage = d.failed_stage or "interrupted"
+        d.interrupted = isinstance(exc, KeyboardInterrupt)
         d.stage("interrupted").failed(f"{type(exc).__name__}: {exc}")
         try:
             recover("hold")
         finally:
-            _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
+            try:
+                final_state_capture()
+            except Exception:                                  # noqa: BLE001
+                pass
+            written = _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
+            try:
+                exc.drill_report = written
+            except Exception:                                  # noqa: BLE001
+                pass
         raise
 
+    final_state_capture()
     return _finish(d, state, out, cap, "PASSED", cash_ledger, venue)
 
 
@@ -876,11 +1088,22 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
         "cap_usd": cap,
         "orders_sent": d.orders_sent,
         "ledger_entries": len(journal.entries) if journal else 0,
+        "interrupted": d.interrupted,
         "stages": [s.as_dict() for s in d.stages],
         "evidence": evidence,
         "not_proven": list(NOT_PROVEN),
         "finished_ms": int(time.time() * 1000),
     }
+    booked = state.get("booked")
+    if booked is not None and booked.fills:
+        report["round_trip"] = round_trip_summary(booked.fills)
+        report["claims"] = drill_claims(booked.fills, journal, venue=d.venue)
+    if state.get("capture_requested") and booked is not None and booked.fills:
+        report["evidence_capture"] = {
+            "requested": True,
+            **(state.get("evidence_capture")
+               or {"complete": False, "orders": 0, "reads": 0,
+                   "failures": ["the final-state capture did not run"]})}
     if out:
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         with open(out, "w", encoding="utf-8") as handle:
@@ -1080,24 +1303,61 @@ def main(argv: Optional[List[str]] = None) -> int:
                   "armed.", file=sys.stderr)
             return 2
 
-    if args.hold_for_settlement:
-        import signal
-
-        def _terminate(signum, frame):            # noqa: ARG001
-            raise KeyboardInterrupt(f"signal {signum}")
-        # an interrupt during the hold closes the pair and writes the report
-        signal.signal(signal.SIGTERM, _terminate)
+    if args.arm:
+        # an interrupt closes the pair and writes the report; a second one
+        # while that happens is ignored (it would leave the short open)
+        InterruptGuard().install()
     plan = (HoldPlan(min_settlements=args.min_settlements,
                      max_hold_s=args.max_hold_hours * 3600.0,
                      poll_s=args.poll_seconds,
                      settle_wait_s=args.settle_wait_hours * 3600.0)
             if args.hold_for_settlement else None)
-    report = run_drill(broker=bot.carry.broker, notional=args.notional,
-                       arm=args.arm, out=args.out, hold=plan,
-                       cash_ledger=args.cash_ledger,
-                       venue=str(getattr(bot.cfg, "BYBIT_VENUE", "unknown")
-                                 if hasattr(bot, "cfg") else "unknown"))
+    try:
+        report = run_drill(broker=bot.carry.broker, notional=args.notional,
+                           arm=args.arm, out=args.out, hold=plan,
+                           cash_ledger=args.cash_ledger,
+                           capture_final=bool(args.evidence_path),
+                           venue=str(getattr(bot.cfg, "BYBIT_VENUE", "unknown")
+                                     if hasattr(bot, "cfg") else "unknown"))
+    except KeyboardInterrupt as exc:
+        report = getattr(exc, "drill_report", None)
+        if report is None:
+            print(f"interrupted ({exc}) before the drill produced a report; "
+                  "nothing was sent that this process knows of.",
+                  file=sys.stderr)
+            return 130
+        print(f"INTERRUPTED ({exc}): the pair was closed through the engine "
+              "and the report written; the venue state is below.",
+              file=sys.stderr)
+    _print_report(report, args)
+    return drill_exit_code(report, hold=plan is not None)
 
+
+class InterruptGuard:
+    """The first SIGINT/SIGTERM/SIGHUP becomes a KeyboardInterrupt (so the
+    drill's own recovery runs); every later one is ignored, because the
+    recovery is the engine's reduce-only unwind and interrupting it would leave
+    the short open."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def handler(self, signum: int, frame: Any) -> None:       # noqa: ARG002
+        self.count += 1
+        if self.count == 1:
+            raise KeyboardInterrupt(f"signal {signum}")
+        sys.stderr.write(f"signal {signum} ignored: the drill is closing the "
+                         "pair and writing its report\n")
+
+    def install(self) -> None:
+        import signal
+        for name in ("SIGINT", "SIGTERM", "SIGHUP"):
+            sig = getattr(signal, name, None)
+            if sig is not None:
+                signal.signal(sig, self.handler)
+
+
+def _print_report(report: Dict[str, Any], args: Any) -> None:
     print("=" * 74)
     print(f"PHASE D DRILL — {report['verdict']}"
           f"   ({'ARMED' if report['armed'] else 'preflight only'})")
@@ -1117,15 +1377,40 @@ def main(argv: Optional[List[str]] = None) -> int:
     print("\n  WHAT A PASS STILL DOES NOT ESTABLISH")
     for line in report["not_proven"]:
         print(f"    - {line}")
+    trip = report.get("round_trip")
+    if trip:
+        print("\n  ROUND TRIP (perp leg, from the booked fills)")
+        for key in ("entry_qty", "entry_price", "exit_qty", "exit_price",
+                    "fees_usdt", "perp_gross_usdt",
+                    "perp_net_before_funding_usdt", "fee_bps_of_entry_notional"):
+            print(f"    {key}: {trip.get(key)}")
+    capture = report.get("evidence_capture")
+    if capture:
+        print(f"\n  venue final-state capture: complete={capture['complete']} "
+              f"orders={capture['orders']} reads={capture['reads']}")
+        for line in capture.get("failures", []):
+            print(f"    - {line}")
     if args.out:
         print(f"\n  transcript: {args.out}")
-    return drill_exit_code(report, hold=plan is not None)
 
 
 def drill_exit_code(report: Dict[str, Any], *, hold: bool) -> int:
     """0 only for a drill that PASSED; with a hold: flat, a cash ledger on disk
     and funding CONFIRMED_FROM_SETTLEMENTS. Zero fills is 2, flat but funding
-    unconfirmed is 4, anything else that failed is 1."""
+    unconfirmed is 4, anything else that failed is 1. An interrupt that left
+    the book flat is 130; one that did not is 1. A result that would be 0 but
+    whose requested venue capture is incomplete is 6."""
+    if report.get("interrupted"):
+        return 1 if report.get("still_open") else 130
+    code = _base_exit_code(report, hold=hold)
+    capture = report.get("evidence_capture")
+    if code == 0 and capture and capture.get("requested") \
+            and not capture.get("complete"):
+        return 6
+    return code
+
+
+def _base_exit_code(report: Dict[str, Any], *, hold: bool) -> int:
     if report["verdict"] == "PREFLIGHT_ONLY":
         return 0
     if not hold:
