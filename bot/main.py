@@ -1032,6 +1032,16 @@ class TradingBot:
             logger.exception("reconcile_provisional_exits failed; "
                              "continuing: %s", exc)
 
+        # Exits booked without their execution ids (a fill list that had not
+        # caught up, an order filled in pieces across cycles) are proven later;
+        # read-only, spaced by doubling back-off, a no-op when nothing is owed.
+        try:
+            proof = self.engine.retry_missed_exit_proofs()
+            if proof.get("proven") or proof.get("given_up"):
+                logger.warning("exit proofs: %s", proof)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("retry_missed_exit_proofs failed; continuing: %s", exc)
+
         # An exit that stays unpriced past the review window is a result nobody
         # can see: alarm once per row (journal) and keep shouting in the log;
         # the risk gate refuses new entries meanwhile.

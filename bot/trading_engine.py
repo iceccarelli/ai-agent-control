@@ -1642,6 +1642,217 @@ class TradingEngine:
             return [], "an execution is already named by another exit"
         return list(evidence["exec_ids"]), ""
 
+    #: Seconds before the first retry of a missed proof; doubles per attempt.
+    EXIT_PROOF_RETRY_BASE_S = 60.0
+
+    def retry_missed_exit_proofs(self, now: Optional[float] = None,
+                                 max_orders: int = 5) -> Dict[str, Any]:
+        """Name the execution ids of exits that were booked without them.
+
+        An exit whose proof could not be made at booking (executions
+        unreadable, not yet listed) used to stay unproven forever, and an order
+        filled in pieces across cycles could never be proven at all: each
+        piece sees the other pieces' fills ("more executions than this exit
+        closed"). Here the exits that name the same venue order(s) are taken
+        together, oldest first: the order's executions, minus those a sibling
+        already names, are cut into consecutive runs whose quantities equal
+        each exit's booked quantity EXACTLY (an execution is never split), and
+        each run must pass `validate_exit_executions` and agree with the
+        exit's booked price. Anything else is counted as an attempt and tried
+        again later with doubling spacing, then left unproven. Read-only
+        against the venue; nothing about how an exit is accounted changes.
+        Never raises.
+        """
+        summary: Dict[str, Any] = {"checked": 0, "proven": 0, "pending": 0,
+                                   "given_up": 0}
+        now = utc_now_epoch() if now is None else float(now)
+        try:
+            candidates = self.store.exit_proof_candidates()
+        except Exception:  # noqa: BLE001
+            logger.exception("exit proof retry: cannot list exits")
+            return summary
+        if not candidates:
+            return summary
+
+        def proof_of(c: Mapping[str, Any]) -> Dict[str, Any]:
+            p = c["_meta"].get("exit_proof")
+            return p if isinstance(p, dict) else {}
+
+        def attempts_of(c: Mapping[str, Any]) -> int:
+            try:
+                return int(proof_of(c).get("attempts", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def is_due(c: Mapping[str, Any]) -> bool:
+            try:
+                last = float(proof_of(c).get("last_attempt_epoch", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0
+            return now >= last + float(self.EXIT_PROOF_RETRY_BASE_S) * (
+                2 ** attempts_of(c))
+
+        groups: Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]] = {}
+        for c in candidates:
+            key = (str(c["symbol"]),
+                   tuple(sorted(str(i) for i in c["_meta"]["exit_order_ids"] if i)))
+            groups.setdefault(key, []).append(c)
+        done_orders = 0
+        for (symbol, order_ids), members in groups.items():
+            # nothing is read from the venue or the table until a member is due
+            if not any(is_due(c) for c in members) or done_orders >= max_orders:
+                summary["pending"] += len(members)
+                continue
+            done_orders += 1
+            summary["checked"] += len(members)
+            try:
+                all_trades = []
+                for r in self.store._query(
+                        "SELECT * FROM trades WHERE symbol = ? "
+                        "ORDER BY closed_epoch ASC, id ASC", (symbol,)):
+                    row = dict(r)          # sqlite3.Row has no .get()
+                    row["_meta"] = self._row_meta(row)
+                    all_trades.append(row)
+                results = self._prove_exit_group(symbol, order_ids, members,
+                                                 all_trades)
+            except Exception as exc:  # noqa: BLE001
+                results = {int(c["id"]): ([], f"proof failed: {type(exc).__name__}")
+                           for c in members}
+            for c in members:
+                ids, why = results.get(int(c["id"]), ([], "not evaluated"))
+                try:
+                    if ids and self.store.record_exit_exec_ids(int(c["id"]), ids, now):
+                        summary["proven"] += 1
+                        continue
+                    if ids:
+                        why = "an execution is already named by another exit"
+                    if not is_due(c):
+                        summary["pending"] += 1      # not its turn: no attempt spent
+                        continue
+                    self.store.note_exit_proof_attempt(int(c["id"]), why, now)
+                    if attempts_of(c) + 1 >= self.store.EXIT_PROOF_MAX_ATTEMPTS:
+                        summary["given_up"] += 1
+                        logger.warning(
+                            "exit proof: trade %s (%s) stays UNPROVEN after %d "
+                            "attempts: %s", c["id"], symbol, attempts_of(c) + 1, why)
+                    else:
+                        summary["pending"] += 1
+                except Exception:  # noqa: BLE001
+                    logger.exception("exit proof retry: could not record %s", c["id"])
+        return summary
+
+    def _prove_exit_group(self, symbol: str, order_ids: Sequence[str],
+                          members: Sequence[Dict[str, Any]],
+                          all_trades: Sequence[Dict[str, Any]]
+                          ) -> Dict[int, Tuple[List[str], str]]:
+        """Per candidate id: (execution ids, "") or ([], why). See the caller."""
+        rows: List[Mapping[str, Any]] = []
+        try:
+            for oid in order_ids:
+                rows.extend(self.client.get_executions(symbol, order_id=str(oid)))
+        except Exception as exc:  # noqa: BLE001
+            why = f"executions unreadable: {type(exc).__name__}"
+            return {int(c["id"]): ([], why) for c in members}
+        norm = self.store.normalize_exec_id
+        unique: Dict[str, Mapping[str, Any]] = {}
+        for ex in rows:
+            raw = ex.get("execId") if isinstance(ex, Mapping) else None
+            n = norm(raw)
+            if n is None:
+                why = "an execution carries no usable id"
+                return {int(c["id"]): ([], why) for c in members}
+            if n in unique and dict(unique[n]) != dict(ex):
+                why = "an execution id appears twice with different content"
+                return {int(c["id"]): ([], why) for c in members}
+            unique[n] = ex
+        # Executions ANY other exit of this symbol already names are spoken for,
+        # and an earlier exit of the same order that names none is a piece whose
+        # fills this run cannot tell apart from the member's: refuse behind it.
+        member_ids = {int(c["id"]) for c in members}
+        order_set = set(order_ids)
+        spoken: set = set()
+        unproven_before: List[Tuple[float, int]] = []
+        for t in all_trades:
+            if int(t["id"]) in member_ids or str(t["symbol"]) != symbol:
+                continue
+            named = self.store._row_exec_ids(t.get("meta"))
+            spoken |= named
+            theirs = {str(i) for i in (t["_meta"].get("exit_order_ids") or []) if i}
+            if not named and theirs & order_set:
+                unproven_before.append((float(t["closed_epoch"]), int(t["id"])))
+        free = sorted((ex for n, ex in unique.items() if n not in spoken),
+                      key=lambda ex: (self._exec_time(ex), str(ex.get("execId"))))
+        out: Dict[int, Tuple[List[str], str]] = {}
+        pos = 0
+        broken = ""
+        for c in sorted(members, key=lambda t: (float(t["closed_epoch"]), int(t["id"]))):
+            cid, want = int(c["id"]), float(c["qty"])
+            if broken:
+                out[cid] = ([], broken)
+                continue
+            if any(k < (float(c["closed_epoch"]), cid) for k in unproven_before):
+                out[cid] = ([], "an earlier exit of the same order has no proven "
+                                "fills, so which fills are this one's is unknown")
+                broken = out[cid][1]
+                continue
+            take: List[Mapping[str, Any]] = []
+            total = 0.0
+            while pos < len(free) and total < want - max(1e-9, want * 1e-9):
+                q = self._finite_pos(free[pos].get("execQty")) or 0.0
+                take.append(free[pos])
+                total += q
+                pos += 1
+            if abs(total - want) > max(1e-9, want * 1e-9):
+                broken = (f"executions cannot be cut into whole fills adding "
+                          f"to {want:.12g} (got {total:.12g})")
+                out[cid] = ([], broken)
+                continue
+            evidence, reason = self.validate_exit_executions(
+                dict(c, meta=json.dumps(c["_meta"])), take)
+            if evidence is None:
+                out[cid] = ([], reason)
+                continue
+            price = float(c.get("exit_price") or 0.0)
+            if price > 0 and abs(float(evidence["vwap"]) - price) > max(
+                    1e-9, 1e-6 * price):
+                out[cid] = ([], (f"executions price {evidence['vwap']:.12g} but "
+                                 f"the exit was booked at {price:.12g}"))
+                continue
+            fee_problem = self._exit_fee_disagreement(symbol, c, evidence)
+            if fee_problem:
+                out[cid] = ([], fee_problem)
+                continue
+            out[cid] = (list(evidence["exec_ids"]), "")
+        return out
+
+    def _exit_fee_disagreement(self, symbol: str, trade: Mapping[str, Any],
+                               evidence: Mapping[str, Any]) -> str:
+        """Why the executions' fees are not the fee this exit was booked with
+        ("" when they are, or when the booked fee was only an estimate). Same
+        tolerance the evidence reconciler applies, so a proof recorded here is
+        not one it would later refuse."""
+        if not trade.get("exit_fee_realized"):
+            return ""                      # an estimate: nothing to compare
+        base, unit = venue_fees.split_symbol_units(symbol)
+        conv = venue_fees.convert_fee_set(
+            evidence["fees"], leg_price=float(evidence["vwap"]),
+            qty=float(evidence["qty"]), accounting_unit=unit, base_coin=base)
+        if not conv.confirmed:
+            return "the executions' fees do not convert to the accounting unit"
+        booked = float(trade.get("exit_fee") or 0.0)
+        got = float(conv.account_unit_amount)
+        if abs(got - booked) > max(1e-9, 1e-9 * max(abs(got), abs(booked))):
+            return (f"executions charged {got:.12g} {unit} but the exit was "
+                    f"booked with {booked:.12g}")
+        return ""
+
+    @staticmethod
+    def _exec_time(ex: Mapping[str, Any]) -> float:
+        try:
+            return float(ex.get("execTime") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     #: An order the venue cannot find is only called never-sent once it is this
     #: old: a create whose reply was lost can take a moment to become visible.
     UNRESOLVED_ENTRY_NEVER_SENT_AFTER_S = 120.0
