@@ -912,11 +912,19 @@ def _scratch_state_db() -> str:
     return os.path.join(folder, "drill_state.db")
 
 
-def _load_bot():
+def _load_bot(evidence_path: str = ""):
     """Import and build the stack. Separated so a missing dependency is a
     sentence rather than a traceback four imports deep (0046) — the same
     lesson as INVENTORY D16, which is why `session_tail` reports UNREADABLE
-    instead of NO."""
+    instead of NO.
+
+    `evidence_path` (testnet only): every REST request the book sends is also
+    captured, redacted and hash-chained there by the same
+    `EvidenceCapturingTransport` the conformance run uses, so the drill's
+    orders, fills and funding settlements can be validated with
+    `tools/evidence_reconcile.py` instead of resting on the drill's own report.
+    The book still receives an ordinary `BybitClient`; only its transport is
+    wrapped."""
     import persistence
 
     import main as _main
@@ -926,6 +934,21 @@ def _load_bot():
     # and a tool that writes to os.environ to steer another module is a second
     # one wearing a disguise.
     store = persistence.StateStore(_scratch_state_db())
+    if evidence_path:
+        import bybit_connection as _bc
+        import config as _config
+        import venue_evidence as _ve
+        cfg = _config.get_config_object()
+        venue = str(getattr(cfg, "BYBIT_VENUE", "") or "").lower()
+        if venue != "testnet":
+            raise RuntimeError(
+                f"evidence capture is for the testnet venue only (BYBIT_VENUE="
+                f"{venue!r}); refusing to label a transcript with another venue")
+        transport = _ve.EvidenceCapturingTransport(
+            _bc.RequestsTransport(), evidence_path=evidence_path,
+            venue="bybit", environment="testnet")
+        client = _bc.BybitClient(config=cfg, store=store, transport=transport)
+        return _main.build_bot(store=store, config=cfg, client=client)
 
     # NOT attach_strategy=False. That flag reads as "attach no signal source",
     # and it does — but the CARRY book is gated behind the same flag, so
@@ -981,6 +1004,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--settle-wait-hours", type=float, default=6.25,
                     help="after the close, keep re-reading the log this long "
                          "(the ledger judges a lifecycle 6 h after its end)")
+    ap.add_argument("--evidence-path", default="",
+                    help="testnet only: capture every REST request/response "
+                         "(redacted, hash-chained) here, for "
+                         "tools/evidence_reconcile.py")
     ap.add_argument("--cash-ledger", default="",
                     help="write cash_ledger/2 here when the book ends flat")
     args = ap.parse_args(argv)
@@ -1010,7 +1037,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 3
 
     try:
-        bot = _load_bot()
+        bot = _load_bot(args.evidence_path) if args.evidence_path else _load_bot()
     except Exception as exc:                                   # noqa: BLE001
         print(f"the trading stack could not be imported: "
               f"{type(exc).__name__}: {exc}\n\n"
