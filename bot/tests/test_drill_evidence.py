@@ -6,8 +6,16 @@ drill reports about itself; with it they can be reconciled by
 """
 from __future__ import annotations
 
-import config as _config
+import os
+import sys
+
 import pytest
+
+_HERE = os.path.dirname(__file__)
+sys.path.insert(0, os.path.join(_HERE, "..", "tools"))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+
+import config as _config  # noqa: E402
 
 
 
