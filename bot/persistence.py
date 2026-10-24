@@ -1822,9 +1822,14 @@ class StateStore:
         are priced from executions by ``reconcile_provisional_exits``).
         """
         out: List[Dict[str, Any]] = []
+        # The meta filter runs BEFORE the limit: a window of the oldest N trades
+        # would fill with proven or given-up rows and hide every newer exit.
         for r in self._query(
                 "SELECT * FROM trades WHERE price_provisional = 0 "
-                "ORDER BY closed_epoch ASC, id ASC LIMIT ?", (int(limit),)):
+                "AND meta LIKE '%\"exit_order_ids\"%' "
+                "ORDER BY closed_epoch ASC, id ASC"):
+            if len(out) >= int(limit):
+                break
             row = dict(r)
             try:
                 meta = json.loads(row.get("meta") or "{}")

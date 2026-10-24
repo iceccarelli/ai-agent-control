@@ -1668,42 +1668,53 @@ class TradingEngine:
         now = utc_now_epoch() if now is None else float(now)
         try:
             candidates = self.store.exit_proof_candidates()
-            if not candidates:
-                return summary
-            siblings = []
-            for r in self.store._query("SELECT * FROM trades ORDER BY "
-                                       "closed_epoch ASC, id ASC"):
-                row = dict(r)          # sqlite3.Row has no .get()
-                row["_meta"] = self._row_meta(row)
-                siblings.append(row)
         except Exception:  # noqa: BLE001
             logger.exception("exit proof retry: cannot list exits")
             return summary
+        if not candidates:
+            return summary
+
+        def proof_of(c: Mapping[str, Any]) -> Dict[str, Any]:
+            p = c["_meta"].get("exit_proof")
+            return p if isinstance(p, dict) else {}
+
+        def attempts_of(c: Mapping[str, Any]) -> int:
+            try:
+                return int(proof_of(c).get("attempts", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        def is_due(c: Mapping[str, Any]) -> bool:
+            try:
+                last = float(proof_of(c).get("last_attempt_epoch", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0
+            return now >= last + float(self.EXIT_PROOF_RETRY_BASE_S) * (
+                2 ** attempts_of(c))
+
         groups: Dict[Tuple[str, Tuple[str, ...]], List[Dict[str, Any]]] = {}
         for c in candidates:
             key = (str(c["symbol"]),
                    tuple(sorted(str(i) for i in c["_meta"]["exit_order_ids"] if i)))
             groups.setdefault(key, []).append(c)
-        base = float(self.EXIT_PROOF_RETRY_BASE_S)
         done_orders = 0
         for (symbol, order_ids), members in groups.items():
-            due = []
-            for c in members:
-                proof = c["_meta"].get("exit_proof") or {}
-                n = int(proof.get("attempts", 0) or 0)
-                if now >= float(proof.get("last_attempt_epoch", 0.0) or 0.0) + base * (2 ** n):
-                    due.append(c)
-            if not due:
-                summary["pending"] += len(members)
-                continue
-            if done_orders >= max_orders:
+            # nothing is read from the venue or the table until a member is due
+            if not any(is_due(c) for c in members) or done_orders >= max_orders:
                 summary["pending"] += len(members)
                 continue
             done_orders += 1
             summary["checked"] += len(members)
             try:
+                all_trades = []
+                for r in self.store._query(
+                        "SELECT * FROM trades WHERE symbol = ? "
+                        "ORDER BY closed_epoch ASC, id ASC", (symbol,)):
+                    row = dict(r)          # sqlite3.Row has no .get()
+                    row["_meta"] = self._row_meta(row)
+                    all_trades.append(row)
                 results = self._prove_exit_group(symbol, order_ids, members,
-                                                 siblings)
+                                                 all_trades)
             except Exception as exc:  # noqa: BLE001
                 results = {int(c["id"]): ([], f"proof failed: {type(exc).__name__}")
                            for c in members}
@@ -1715,14 +1726,15 @@ class TradingEngine:
                         continue
                     if ids:
                         why = "an execution is already named by another exit"
+                    if not is_due(c):
+                        summary["pending"] += 1      # not its turn: no attempt spent
+                        continue
                     self.store.note_exit_proof_attempt(int(c["id"]), why, now)
-                    attempts = int((c["_meta"].get("exit_proof") or {}).get(
-                        "attempts", 0) or 0) + 1
-                    if attempts >= self.store.EXIT_PROOF_MAX_ATTEMPTS:
+                    if attempts_of(c) + 1 >= self.store.EXIT_PROOF_MAX_ATTEMPTS:
                         summary["given_up"] += 1
                         logger.warning(
                             "exit proof: trade %s (%s) stays UNPROVEN after %d "
-                            "attempts: %s", c["id"], symbol, attempts, why)
+                            "attempts: %s", c["id"], symbol, attempts_of(c) + 1, why)
                     else:
                         summary["pending"] += 1
                 except Exception:  # noqa: BLE001
@@ -1753,15 +1765,21 @@ class TradingEngine:
                 why = "an execution id appears twice with different content"
                 return {int(c["id"]): ([], why) for c in members}
             unique[n] = ex
-        # executions a sibling exit of the same order(s) already names are spoken for
+        # Executions ANY other exit of this symbol already names are spoken for,
+        # and an earlier exit of the same order that names none is a piece whose
+        # fills this run cannot tell apart from the member's: refuse behind it.
         member_ids = {int(c["id"]) for c in members}
+        order_set = set(order_ids)
         spoken: set = set()
+        unproven_before: List[Tuple[float, int]] = []
         for t in all_trades:
             if int(t["id"]) in member_ids or str(t["symbol"]) != symbol:
                 continue
-            if tuple(sorted(str(i) for i in (t["_meta"].get("exit_order_ids") or []) if i)) \
-                    == tuple(order_ids):
-                spoken |= self.store._row_exec_ids(t.get("meta"))
+            named = self.store._row_exec_ids(t.get("meta"))
+            spoken |= named
+            theirs = {str(i) for i in (t["_meta"].get("exit_order_ids") or []) if i}
+            if not named and theirs & order_set:
+                unproven_before.append((float(t["closed_epoch"]), int(t["id"])))
         free = sorted((ex for n, ex in unique.items() if n not in spoken),
                       key=lambda ex: (self._exec_time(ex), str(ex.get("execId"))))
         out: Dict[int, Tuple[List[str], str]] = {}
@@ -1771,6 +1789,11 @@ class TradingEngine:
             cid, want = int(c["id"]), float(c["qty"])
             if broken:
                 out[cid] = ([], broken)
+                continue
+            if any(k < (float(c["closed_epoch"]), cid) for k in unproven_before):
+                out[cid] = ([], "an earlier exit of the same order has no proven "
+                                "fills, so which fills are this one's is unknown")
+                broken = out[cid][1]
                 continue
             take: List[Mapping[str, Any]] = []
             total = 0.0
@@ -1795,8 +1818,33 @@ class TradingEngine:
                 out[cid] = ([], (f"executions price {evidence['vwap']:.12g} but "
                                  f"the exit was booked at {price:.12g}"))
                 continue
+            fee_problem = self._exit_fee_disagreement(symbol, c, evidence)
+            if fee_problem:
+                out[cid] = ([], fee_problem)
+                continue
             out[cid] = (list(evidence["exec_ids"]), "")
         return out
+
+    def _exit_fee_disagreement(self, symbol: str, trade: Mapping[str, Any],
+                               evidence: Mapping[str, Any]) -> str:
+        """Why the executions' fees are not the fee this exit was booked with
+        ("" when they are, or when the booked fee was only an estimate). Same
+        tolerance the evidence reconciler applies, so a proof recorded here is
+        not one it would later refuse."""
+        if not trade.get("exit_fee_realized"):
+            return ""                      # an estimate: nothing to compare
+        base, unit = venue_fees.split_symbol_units(symbol)
+        conv = venue_fees.convert_fee_set(
+            evidence["fees"], leg_price=float(evidence["vwap"]),
+            qty=float(evidence["qty"]), accounting_unit=unit, base_coin=base)
+        if not conv.confirmed:
+            return "the executions' fees do not convert to the accounting unit"
+        booked = float(trade.get("exit_fee") or 0.0)
+        got = float(conv.account_unit_amount)
+        if abs(got - booked) > max(1e-9, 1e-9 * max(abs(got), abs(booked))):
+            return (f"executions charged {got:.12g} {unit} but the exit was "
+                    f"booked with {booked:.12g}")
+        return ""
 
     @staticmethod
     def _exec_time(ex: Mapping[str, Any]) -> float:
