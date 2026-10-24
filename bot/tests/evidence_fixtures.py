@@ -59,11 +59,15 @@ def body(rows: List[Dict[str, Any]], ret=0) -> Dict[str, Any]:
 
 
 def record(path: str, rows, *, env="testnet", host=TESTNET_REST, prev: str,
-           at: Optional[int] = None, ret=0) -> Dict[str, Any]:
+           at: Optional[int] = None, ret=0, method="GET",
+           request: Optional[Dict[str, Any]] = None,
+           response: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     r = ve.EvidenceRecord(
         venue="bybit", environment=env, captured_at_utc=iso(at or T0 + 60_000),
-        method="GET", request_url=host + path, request={"params": {}},
-        response=body(rows, ret), order_link_id="", git_commit=GIT,
+        method=method, request_url=host + path,
+        request=request if request is not None else {"params": {}},
+        response=response if response is not None else body(rows, ret),
+        order_link_id="", git_commit=GIT,
         prev_hash=prev).to_dict()
     return r
 

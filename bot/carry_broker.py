@@ -460,6 +460,9 @@ class CarryBroker:
             duplicate_ret_codes = tuple(_bybit_connection.DUPLICATE_LINK_ID_RET_CODES)
         self.duplicate_ret_codes = frozenset(duplicate_ret_codes)
         self._build_link_id = link_id_builder
+        #: (product, symbol, orderLinkId) of every market order this process
+        #: put on the wire, in order. Memory only; see `place_market`.
+        self.sent_order_links: List[Tuple[str, str, str]] = []
 
     # -- the engine's three calls -----------------------------------------
 
@@ -493,6 +496,10 @@ class CarryBroker:
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Market", "qty": qty_text,
                 "orderLinkId": link_id}
+        #: Recorded BEFORE the request goes out: an order whose response is
+        #: lost, or whose booking fails, is still an order the venue may hold,
+        #: and a final-state read must be able to find it.
+        self.sent_order_links.append((product, symbol, link_id))
         if product == SPOT:
             # Without this a spot market BUY is read as a QUOTE (USDT) amount:
             # 0.00125 would buy 0.00125 USDT of BTC. BybitClient has always set
@@ -755,6 +762,8 @@ class CarryBroker:
             symbol=symbol, side=side, qty=qty_text, price=price_text,
             purpose=f"carry-{product}-maker", session_token=self.session_token)
 
+        self.sent_order_links.append((product, symbol, link_id))
+
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": qty_text, "price": price_text,
                 "timeInForce": "PostOnly", "orderLinkId": link_id}
@@ -891,6 +900,55 @@ class CarryBroker:
                 "order_link_id": link_id, "fee": self._fee(row),
                 "fee_detail": self._fee_detail(row),
                 "maker": True, "resting": resting, "status": status}
+
+    def read_order(self, symbol: str, order_link_id: str,
+                   product: str = LINEAR) -> Optional[Dict[str, Any]]:
+        """`_order_state` for callers outside this class (a drill's final-state
+        read): the venue's own record of one order, or None if it has none."""
+        return self._order_state(symbol, order_link_id, product)
+
+    EXECUTION_PAGE_CAP = 20
+
+    def get_order_executions(self, symbol: str, *, order_link_id: str = "",
+                             order_id: str = "", product: str = LINEAR
+                             ) -> List[Dict[str, Any]]:
+        """The venue's own execution rows (fills) of ONE order. Read-only.
+
+        ``GET /v5/execution/list`` for the given product, every page. The
+        engine books from the ORDER's cumulative fields and never reads a fill,
+        so without this read a drill's fills are only what the order row says
+        about itself. Raises ``PairIncident`` when the answer is not a list,
+        a cursor repeats or the page cap is hit: a truncated fill list must
+        never look complete.
+        """
+        if not (order_link_id or order_id):
+            raise PairIncident("get_order_executions needs an order id or link id")
+        if product not in VALID_PRODUCTS:
+            raise ValueError(f"unknown product {product!r}")
+        params: Dict[str, Any] = {"category": product, "symbol": symbol,
+                                  "limit": 100}
+        if order_id:
+            params["orderId"] = order_id
+        else:
+            params["orderLinkId"] = order_link_id
+        out: List[Dict[str, Any]] = []
+        cursors: set = set()
+        for _page in range(self.EXECUTION_PAGE_CAP):
+            result = self.client._request("GET", "/v5/execution/list",
+                                          signed=True, params=dict(params))
+            rows = self._v5_list(result)
+            if rows is None:
+                raise PairIncident("execution list carries no list")
+            out.extend(r for r in rows if isinstance(r, dict))
+            cursor = (self._v5_result(result) or {}).get("nextPageCursor")
+            if not cursor:
+                return out
+            if cursor in cursors:
+                raise PairIncident("execution list cursor repeated")
+            cursors.add(cursor)
+            params["cursor"] = cursor
+        raise PairIncident("execution list did not finish within the page cap; "
+                           "not treating it as complete")
 
     def get_margin_multiple(self, symbol: str) -> float:
         """Maintenance-margin headroom on the SHORT leg. Raises if unreadable.

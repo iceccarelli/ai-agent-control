@@ -92,6 +92,9 @@ jobs:
           tests/test_drill_evidence.py
           tests/test_evidence_reconcile.py
           tests/test_evidence_reconcile_trades.py
+          tests/test_evidence_reconcile_carry.py
+          tests/test_drill_final_state.py
+          tests/test_drill_final_state_tool.py
           tests/test_exit_execution_ids.py
           tests/test_private_ws_consumer.py
           tests/test_conformance_evidence_end_to_end.py
