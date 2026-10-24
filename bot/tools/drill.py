@@ -143,6 +143,22 @@ FINAL_READ_RETRY_S = 1.0
 FINAL_READ_TRIES = 4
 
 
+def unwrap_broker(broker: Any) -> Any:
+    """The venue adapter under any `LedgerBroker` layers.
+
+    In a real stack `bot.carry.broker` is a `LedgerBroker` around the
+    `CarryBroker`, and the ledger delegates EXPLICITLY: it carries none of the
+    adapter's reads (`sent_order_links`, `read_order`, `get_order_executions`)
+    nor its `client`. Anything that needs those must ask the adapter. A fake
+    with no `inner` is its own adapter."""
+    for _ in range(8):
+        inner = getattr(broker, "inner", None)
+        if inner is None or hasattr(broker, "sent_order_links"):
+            return broker
+        broker = inner
+    return broker
+
+
 def _vwap(rows: List[Dict[str, Any]]) -> Optional[float]:
     qty = sum(r["qty"] for r in rows)
     return sum(r["qty"] * r["price"] for r in rows) / qty if qty > 0 else None
@@ -254,8 +270,13 @@ def capture_final_venue_state(broker: Any, symbol: str = PERP_SYMBOL,
     amends and cancels nothing.
     """
     sleep = sleep or time.sleep
+    broker = unwrap_broker(broker)
+    if not hasattr(broker, "sent_order_links"):
+        return {"complete": False, "orders": 0, "reads": 0, "failures": [
+            "the broker cannot say which orders it sent; a capture of nothing "
+            "is not a capture"]}
     links = [(p, sym, link) for (p, sym, link)
-             in getattr(broker, "sent_order_links", []) if p == "linear"]
+             in broker.sent_order_links if p == "linear"]
     failures: List[str] = []
     reads = 0
     for _product, sym, link in links:
@@ -724,7 +745,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     state["engine"] = engine
     state["journal"] = journal
     state["booked"] = booked
-    state["broker"] = broker
+    state["broker"] = unwrap_broker(broker)
     state["capture_requested"] = bool(capture_final)
 
     def open_pair(s: Stage) -> None:
@@ -978,7 +999,8 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         """Read the final state of every order sent. Never changes the verdict:
         the book's verdict is about the book; whether the venue's own rows were
         captured is reported (and exit 6) separately."""
-        if not capture_final or not getattr(broker, "sent_order_links", None):
+        if not capture_final or not getattr(unwrap_broker(broker),
+                                            "sent_order_links", None):
             return
         s = d.stage("venue_final_state")
         try:
@@ -998,7 +1020,8 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         """Write the report BEFORE the capture's network reads (marked pending),
         so a hung read, a kill or a signal leaves what is known on disk; then
         capture, then write the final report."""
-        if capture_final and getattr(broker, "sent_order_links", None):
+        if capture_final and getattr(unwrap_broker(broker),
+                                     "sent_order_links", None):
             state["evidence_capture"] = {
                 "complete": False, "orders": 0, "reads": 0,
                 "failures": ["the final-state capture had not finished when "
@@ -1311,7 +1334,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if args.hold_for_settlement or args.arm:
-        why_not = session_refusal(bot.cfg, getattr(bot.carry.broker, "client", None))
+        why_not = session_refusal(bot.cfg, getattr(
+            unwrap_broker(bot.carry.broker), "client", None))
         if why_not:
             print(f"REFUSED: {why_not}", file=sys.stderr)
             return 3
