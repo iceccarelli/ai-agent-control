@@ -427,6 +427,16 @@ class TestOrderFindings:
         spec = [dict(path="/v5/order/history", rows=[
             fx.order_row(E_ORD, cum="0.5", status="Cancelled", link=E_LINK)])]
         v = self.go([self.order(status="cancelled")], spec)["order_claims"][0]
+        # the venue executed 0.5 of an order the local ledger calls cancelled
+        assert "LOCAL_CANCELLED_BUT_VENUE_EXECUTED" in v["issues"]
+        assert not v["resolved"]
+
+    def test_fills_on_a_zero_executed_cancelled_order_are_a_contradiction(self):
+        spec = [dict(path="/v5/order/history", rows=[
+            fx.order_row(E_ORD, cum="0", status="Cancelled", link=E_LINK)]),
+            dict(path="/v5/execution/list", rows=[fx.exec_row(
+                1, order=E_ORD, link=E_LINK, qty="0.002")])]
+        v = self.go([self.order(status="cancelled")], spec)["order_claims"][0]
         assert "VENUE_DISAGREES:cancelled_fills" in v["issues"]
 
     def test_two_local_orders_cannot_share_one_exchange_id(self):
@@ -577,3 +587,22 @@ class TestProvenExitAllocation:
         conn.close()
         c = er.claims_from_store(path)
         assert c["trade_claims"][0]["exit_exec_ids"] == ["EXEC-3", "EXEC-4"]
+
+
+class TestFindingsFromTheCloseLinkageReview:
+    def test_a_leg_whose_order_is_filled_and_part_filled_cancelled_is_not_corroborated(self):
+        s = specs()
+        s[1]["rows"] = s[1]["rows"] + [fx.order_row(
+            E_ORD, cum="0.002", side="Buy", link=E_LINK,
+            status="PartiallyFilledCanceled")]
+        v = verdict(go([trade()], s))
+        assert "NO_CORROBORATION" in v["issues"] and not v["resolved"]
+
+    def test_cancelled_and_deactivated_snapshots_of_one_order_are_coherent(self):
+        spec = [dict(path="/v5/order/history", rows=[
+            fx.order_row(E_ORD, cum="0", status="Cancelled", link=E_LINK),
+            fx.order_row(E_ORD, cum="0", status="Deactivated", link=E_LINK)])]
+        cap = er.capture_from_records(fx.chain(spec))
+        claim = TestLocalOrders().order(status="cancelled")
+        report = er.reconcile(order_claims=[claim], captures=[cap], now_ms=fx.NOW)
+        assert report["order_claims"][0]["resolved"] is True

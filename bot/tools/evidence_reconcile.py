@@ -457,7 +457,7 @@ def reconcile_fills(claims: Sequence[Mapping[str, Any]], captures: Sequence[Capt
 
 
 #: Issues that forbid the upgrade, however well the venue rows match.
-_BLOCKING_PREFIXES = ("EXIT_ALLOCATION", "EXIT_OVERCLAIMED", "ENTRY_OVERCLAIMED",
+_BLOCKING_PREFIXES = ("LOCAL_CANCELLED", "NO_FINAL", "EXIT_ALLOCATION", "EXIT_OVERCLAIMED", "ENTRY_OVERCLAIMED",
                       "LOCAL_GROSS", "ORDER_STATUS_CONFLICT", "DUPLICATE_EXCHANGE",
                       "MALFORMED", "CAPTURE_TIME", "MISSING_FIELD", "BAD_", "SIMULATION_", "TESTNET_CLAIM_",
                       "MAINNET_", "NO_VENUE", "DUPLICATE", "CONFLICTING",
@@ -553,8 +553,14 @@ def reconcile_order_totals(claims: Sequence[Mapping[str, Any]],
 #: local `orders.status` -> the venue `orderStatus` values that agree with it.
 #: Anything not listed (pending, new, unknown, partially_filled...) is a
 #: non-final local belief and is never reconciled to a final outcome.
-_ORDER_STATUS_AGREES = {"filled": {"Filled"}, "cancelled": {"Cancelled"},
-                        "rejected": {"Rejected"}}
+#: A cancelled conditional (stop) order is reported by Bybit as `Deactivated`,
+#: and a part-filled order that was then cancelled as `PartiallyFilledCanceled`.
+_ORDER_STATUS_AGREES = {
+    "filled": {"Filled"},
+    "cancelled": {"Cancelled", "Deactivated", "PartiallyFilledCanceled"},
+    "rejected": {"Rejected"}}
+_FINAL_VENUE_STATES = {"Filled", "Cancelled", "Rejected", "Deactivated",
+                       "PartiallyFilledCanceled"}
 _LONG = {"Buy", "buy", "long", "LONG"}
 _SHORT = {"Sell", "sell", "short", "SHORT"}
 
@@ -578,8 +584,7 @@ def _order_state(indexes: Sequence[VenueIndex], env: str, order_id: str
                  ) -> Tuple[List[Dict[str, Any]], set, Optional[float]]:
     """(snapshots, final statuses stated, largest cumExecQty) for one order."""
     rows = [r for idx in indexes for e, r in idx.orders.get(order_id, []) if e == env]
-    finals = {str(r.get("orderStatus", "")) for r in rows} & {
-        "Filled", "Cancelled", "Rejected", "Deactivated"}
+    finals = {str(r.get("orderStatus", "")) for r in rows} & _FINAL_VENUE_STATES
     cums = [c for c in (_num(r.get("cumExecQty")) for r in rows) if c is not None]
     return rows, finals, (max(cums) if cums else None)
 
@@ -654,9 +659,16 @@ def reconcile_orders(claims: Sequence[Mapping[str, Any]],
                          and str(r.get("orderLinkId", "")) == _s(claim["order_link_id"])
                          for r in rows):
                 issues.append("VENUE_DISAGREES:order_identity")
-            elif len(finals) > 1:
+            elif len(finals) > 1 and not (
+                    finals <= _ORDER_STATUS_AGREES.get(status, set())):
                 issues.append("ORDER_STATUS_CONFLICT")
-            elif status in _ORDER_STATUS_AGREES and finals != _ORDER_STATUS_AGREES[status]:
+            elif not finals:
+                # the capture only ever saw the order in a live state (e.g. a
+                # stop read before it was cancelled): that is stale, not a
+                # disagreement - a later read of the order is missing
+                issues.append("NO_FINAL_VENUE_STATE")
+            elif status in _ORDER_STATUS_AGREES and not (
+                    finals <= _ORDER_STATUS_AGREES[status]):
                 issues.append("VENUE_DISAGREES:order_status")
             elif status == "filled":
                 if qty is None or cum is None or not _close(cum, qty, QTY_REL_TOL, 1e-12):
@@ -667,9 +679,11 @@ def reconcile_orders(claims: Sequence[Mapping[str, Any]],
                 else:
                     provenance = VENUE_RECONCILED
             elif status in ("cancelled", "rejected"):
-                # a cancelled order may be partly filled; the fills must then
-                # account for exactly what the venue says was executed
-                if cum is None or not _close(fill_qty, cum, QTY_REL_TOL, 1e-12) \
+                if cum:
+                    # the local ledger says nothing executed, the venue says
+                    # something did: a partial fill the books may not hold
+                    issues.append("LOCAL_CANCELLED_BUT_VENUE_EXECUTED")
+                elif cum is None or not _close(fill_qty, cum, QTY_REL_TOL, 1e-12) \
                         or (fills and not _fills_match(
                             fills, _s(claim["symbol"]), _s(claim["side"]))) \
                         or (status == "rejected" and cum):
@@ -734,9 +748,9 @@ def _leg_orders_corroborated(indexes: Sequence[VenueIndex], env: str,
                 and (_num(r.get("cumExecQty")) or 0.0) + 1e-12 >= executed * (1 - QTY_REL_TOL)
                 for r in snaps):
             return False
-        statuses = {str(r.get("orderStatus", "")) for r in snaps}
-        if "Rejected" in statuses or len(statuses & {
-                "Filled", "Cancelled", "Deactivated"}) > 1:
+        finals = {str(r.get("orderStatus", "")) for r in snaps} & _FINAL_VENUE_STATES
+        kinds = {"filled" if f == "Filled" else "cancelled" for f in finals}
+        if "Rejected" in finals or len(kinds) > 1:
             return False        # a rejected order has no fills; finals conflict
     return True
 
@@ -1230,7 +1244,10 @@ def claims_from_store(db_path: str, *, environment: str = "unknown",
                 "price_provisional": bool(t.get("price_provisional")),
                 "opened_ms": int(float(t["opened_epoch"]) * 1000),
                 "closed_ms": int(float(t["closed_epoch"]) * 1000),
-                "entry_order_link_id": t.get("order_link_id", ""),
+                "entry_order_link_id": (
+                    meta.get("entry_order_link_id")
+                    if isinstance(meta, dict) and meta.get("entry_order_link_id")
+                    else t.get("order_link_id", "")),
                 "exit_order_ids": ids, "exit_exec_ids": exec_ids})
         except (KeyError, TypeError, ValueError, OverflowError):
             trade_claims.append({"_malformed": "unreadable trade row"})

@@ -155,6 +155,9 @@ class _StubStore:
     def positions_without_stops(self):
         return self._naked
 
+    def orders_for_symbol(self, symbol):
+        return list(getattr(self, "orders", []))
+
     def update_order_status(self, order_link_id, status, exchange_id="", *, source="rest"):
         self.order_status_updates.append((order_link_id, status, exchange_id))
 
@@ -358,7 +361,8 @@ class TestRunConformanceStageSequencing:
                         "protection_local",
                         "protection_readback", "flatten",
                         "exit_ws_observation", "remote_flat_verification",
-                        "final_reconciliation", "ws_evidence_completeness"]
+                        "final_reconciliation", "venue_state_evidence",
+                        "ws_evidence_completeness"]
         assert all(s["ok"] for s in result["stages"])
         assert engine.closed == [SYMBOL]
         assert result["latencies_ms"], "no latencies computed"
@@ -434,7 +438,8 @@ class TestRunConformanceStageSequencing:
                         "protection_local",
                         "protection_readback", "flatten",
                         "exit_ws_observation", "remote_flat_verification",
-                        "final_reconciliation", "ws_evidence_completeness"]
+                        "final_reconciliation", "venue_state_evidence",
+                        "ws_evidence_completeness"]
         flatten_stage = next(s for s in result["stages"] if s["stage"] == "flatten")
         assert flatten_stage["ok"] is False
 

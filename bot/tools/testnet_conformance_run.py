@@ -654,6 +654,57 @@ def await_ws_observation(*, bot: Any, order_link_id: str,
         time.sleep(poll_interval)
 
 
+def capture_final_venue_state(*, client: Any, store: Any, symbol: str,
+                              since_epoch: float = 0.0) -> Dict[str, Any]:
+    """Read, from the venue, the FINAL state and the fills of the orders this
+    run's database holds - so the evidence file proves them.
+
+    Everything here is a read-only GET through the client, hence through the
+    evidence-capturing transport: `/v5/order/realtime` (or history) for each
+    order's last state, and `/v5/execution/list` for the fills of each order
+    that executed. Without this step the capture holds orders only as they
+    looked mid-run (a stop still `Untriggered`) and no execution rows at all,
+    so `tools/evidence_reconcile.py` correctly refuses to call anything
+    reconciled. Only orders created at or after `since_epoch` (this run's) are
+    read, once each. A read that returns nothing, a failed read, and a filled
+    or cancelled order with no exchange id are all FAILURES: this stage is green
+    only when the final states were actually captured. Places, amends and
+    cancels nothing.
+    """
+    read, failed, seen = 0, [], set()
+    try:
+        orders = list(store.orders_for_symbol(symbol))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "orders": 0, "reads": 0,
+                "failures": [f"orders unreadable: {type(exc).__name__}"]}
+    orders = [r for r in orders
+              if float(r.get("created_epoch") or 0.0) >= since_epoch]
+    for row in orders:
+        oid = str(row.get("exchange_id") or "")
+        status = str(row.get("status") or "")
+        if not oid:
+            if status in ("filled", "cancelled", "partially_filled"):
+                failed.append(f"{row.get('order_link_id', '?')}: "
+                              f"{status} locally but no exchange id")
+            continue
+        if oid in seen:
+            continue
+        seen.add(oid)
+        try:
+            state = client.get_order(symbol=symbol, order_id=oid)
+            if not state:
+                failed.append(f"{oid}: the venue returned no order")
+                continue
+            read += 1
+            if status in ("filled", "cancelled", "partially_filled"):
+                client.get_executions(symbol, order_id=oid)
+                read += 1
+        except Exception as exc:  # noqa: BLE001
+            failed.append(f"{oid}: {type(exc).__name__}")
+    return {"ok": not failed, "orders": len(orders), "reads": read,
+            "failures": failed[:20]}
+
+
 def finalize_ws_lifecycle(*, bot: Any, store: Any) -> Dict[str, Any]:
     """FIX 3 — final WS flush, before the store closes and evidence is
     verified.
@@ -934,6 +985,11 @@ def run_conformance(*, bot: Any, engine: Any, client: Any, store: Any,
     _stage("final_reconciliation",
           summary.get("unknown", 1) == 0 and not summary.get("naked_positions"),
           summary=summary)
+
+    venue_state = capture_final_venue_state(
+        client=client, store=store, symbol=symbol,
+        since_epoch=timestamps["run_started"] - 5.0)
+    _stage("venue_state_evidence", venue_state.pop("ok"), **venue_state)
 
     # ASSURANCE mode fail-closed: a WS evidence-capture failure anywhere
     # in this run, even one that did not block any stage above, still
