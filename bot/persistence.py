@@ -1807,6 +1807,92 @@ class StateStore:
             (str(symbol), float(opened_epoch), float(until_epoch)))]
         return out
 
+    #: Retries of an exit whose execution ids could not be named when it was
+    #: booked (an unreadable endpoint, a fill list that had not caught up, a
+    #: venue order filled in pieces across cycles). After this many it is left
+    #: unproven and stays visibly so; it is never guessed.
+    EXIT_PROOF_MAX_ATTEMPTS = 6
+
+    def exit_proof_candidates(self, limit: int = 200) -> List[Dict[str, Any]]:
+        """Confirmed-price exits that name venue orders but no execution ids.
+
+        Oldest first. A row is a candidate only while it has fewer than
+        ``EXIT_PROOF_MAX_ATTEMPTS`` recorded attempts; the parsed meta is
+        attached as ``_meta``. Provisional exits are not candidates here (they
+        are priced from executions by ``reconcile_provisional_exits``).
+        """
+        out: List[Dict[str, Any]] = []
+        for r in self._query(
+                "SELECT * FROM trades WHERE price_provisional = 0 "
+                "ORDER BY closed_epoch ASC, id ASC LIMIT ?", (int(limit),)):
+            row = dict(r)
+            try:
+                meta = json.loads(row.get("meta") or "{}")
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(meta, dict):
+                continue
+            orders = meta.get("exit_order_ids")
+            if not isinstance(orders, list) or not any(orders):
+                continue
+            if self._row_exec_ids(row.get("meta")):
+                continue
+            proof = meta.get("exit_proof") if isinstance(meta.get("exit_proof"), dict) else {}
+            if int(proof.get("attempts", 0) or 0) >= self.EXIT_PROOF_MAX_ATTEMPTS:
+                continue
+            row["_meta"] = meta
+            out.append(row)
+        return out
+
+    def note_exit_proof_attempt(self, trade_id: int, why: str, now: float) -> None:
+        """Count one failed attempt to name an exit's executions, with why."""
+        self._assert_writer()
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT meta FROM trades WHERE id = ?", (int(trade_id),)).fetchone()
+            if row is None:
+                return
+            meta = json.loads(row["meta"] or "{}")
+            proof = meta.get("exit_proof") if isinstance(meta.get("exit_proof"), dict) else {}
+            meta["exit_proof"] = {"attempts": int(proof.get("attempts", 0) or 0) + 1,
+                                  "last_attempt_epoch": float(now),
+                                  "last_reason": str(why)[:300]}
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+
+    def record_exit_exec_ids(self, trade_id: int, exec_ids: Sequence[str],
+                             now: float) -> bool:
+        """Name the executions that priced a booked exit, after the fact.
+
+        Only an exit that names none yet is changed, and only if no OTHER exit
+        of the symbol already names any of them (one fill prices one exit row).
+        Nothing else about the trade is touched. Returns whether it was written.
+        """
+        self._assert_writer()
+        ids = [str(i) for i in exec_ids if str(i).strip()]
+        if not ids:
+            return False
+        with self.transaction():
+            row = self._conn.execute(
+                "SELECT symbol, meta FROM trades WHERE id = ?",
+                (int(trade_id),)).fetchone()
+            if row is None:
+                return False
+            meta = json.loads(row["meta"] or "{}")
+            if self._row_exec_ids(row["meta"]):
+                return False
+            named = {n for n in (self.normalize_exec_id(i) for i in ids) if n}
+            if len(named) != len(ids) or named & self.claimed_exit_exec_ids(
+                    row["symbol"], exclude_trade_id=int(trade_id)):
+                return False
+            meta["exit_exec_ids"] = ids
+            proof = meta.get("exit_proof") if isinstance(meta.get("exit_proof"), dict) else {}
+            meta["exit_proof"] = {**proof, "proven_epoch": float(now),
+                                  "proven_after_booking": True}
+            self._conn.execute("UPDATE trades SET meta = ? WHERE id = ?",
+                               (json.dumps(meta, default=str), int(trade_id)))
+        return True
+
     def set_trade_funding_status(self, trade_id: int, status: str,
                                  detail: Optional[Mapping[str, Any]] = None
                                  ) -> None:
