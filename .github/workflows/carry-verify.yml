@@ -93,6 +93,7 @@ jobs:
           tests/test_evidence_reconcile_trades.py
           tests/test_exit_execution_ids.py
           tests/test_private_ws_consumer.py
+          tests/test_conformance_evidence_end_to_end.py
           tests/test_venue_evidence.py
           tests/test_linear_simulator.py
           tests/test_backtest.py

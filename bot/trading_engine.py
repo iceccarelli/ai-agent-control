@@ -1077,7 +1077,8 @@ class TradingEngine:
                     else:
                         self._book_full_exit(
                             symbol=symbol, row=row, exit_order=closed, fill=fill,
-                            reason=f"EMERGENCY:{reason}")
+                            reason=f"EMERGENCY:{reason}",
+                            prove_executions=False)
                         self._cancel_protective_orders(symbol)
                 except Exception as exc:  # noqa: BLE001
                     logger.critical(
@@ -1417,8 +1418,14 @@ class TradingEngine:
         fill: Optional[Mapping[str, Any]], reason: str,
         exit_price: Optional[float] = None, caller_entry_fee: float = 0.0,
         caller_exit_fee: float = 0.0,
+        prove_executions: bool = True,
     ) -> Dict[str, Any]:
         """Book the whole of an open position as closed by one market order.
+
+        `prove_executions=False` (the emergency close) skips the read-only
+        execution lookup that records the exit's execution ids: an emergency
+        exit must reach the cancel-all and the booking without waiting on one
+        more venue read. It is then simply unproven.
 
         The ONE place a normal close and an emergency close reach the trades
         table, so neither can drop the economics the other keeps. Both fee legs
@@ -1460,6 +1467,19 @@ class TradingEngine:
         if provisional:
             exit_leg = dict(exit_leg, realized=False, currency=None)
         link = str(exit_order.order_link_id or "")
+        # Identity linkage for the evidence validator: this row's own
+        # `order_link_id` is the EXIT order's, so the ENTRY's link, the exit
+        # order id and (when the executions prove it) the exact execution ids
+        # are recorded in meta, in the same record_trade call below. The
+        # executions are a read-only GET made BEFORE the transaction; any
+        # failure just leaves the exit unproven, never unbooked.
+        exit_order_id = str((fill or {}).get("orderId")
+                            or getattr(exit_order, "order_id", "") or "")
+        exec_ids: List[str] = []
+        if prove_executions and confirmed and exit_order_id:
+            exec_ids, _why = self._exit_execution_ids(
+                symbol=symbol, side=side, order_ids=[exit_order_id],
+                exited=qty, price=realised_exit)
         # dedupe_key ties this trade to the exit order's own durable id, the
         # same identity `find_live_spot_stop`/`orders(order_link_id)` already
         # rely on -- a crash between this `record_trade` and the
@@ -1483,6 +1503,13 @@ class TradingEngine:
                 order_link_id=link,
                 meta={"reason": reason, "exit_fill_confirmed": confirmed,
                       "funding_booked": not getattr(self.client, "is_linear", False),
+                      "entry_order_link_id": str(row.get("order_link_id") or ""),
+                      # a PROVISIONAL exit keeps no order ids here: its price is
+                      # fetched later by the exit's link id, and naming order
+                      # ids would switch that lookup to order-id matching
+                      "exit_order_ids": ([exit_order_id]
+                                         if confirmed and exit_order_id else []),
+                      "exit_exec_ids": exec_ids,
                       "fees": {"entry": entry_leg["raw"], "exit": exit_leg["raw"]}},
                 dedupe_key=f"exit:{link}" if link else "",
             ))
