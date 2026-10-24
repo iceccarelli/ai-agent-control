@@ -307,6 +307,49 @@ class TestTheValidatorHandlesNonFinalStates:
         assert not any(i.startswith("VENUE_DISAGREES") for i in issues)
 
 
+class TestVerifiedEconomics:
+    def test_a_reconciled_trade_is_tallied_net_of_its_venue_fees(self, session):
+        report, claims = validate(session, final_state=True)
+        econ = report["verified_economics"]
+        t = claims["trade_claims"][0]
+        assert econ["reconciled_trades"] == 1 and econ["unit"].startswith("USDT")
+        assert econ["gross_usdt"] == pytest.approx(t["gross_pnl"])
+        assert econ["fees_usdt"] == pytest.approx(t["entry_fee"] + t["exit_fee"])
+        assert econ["net_usdt"] == pytest.approx(
+            t["gross_pnl"] - t["entry_fee"] - t["exit_fee"])
+        assert econ["funding_included"] is False
+
+    def test_one_trade_supports_no_inference_whatever_it_earned(self, session):
+        econ = validate(session, final_state=True)[0]["verified_economics"]
+        assert econ["inference"].startswith("NONE")
+
+    def test_an_unreconciled_trade_contributes_nothing(self, session):
+        report, _ = validate(session, final_state=False)
+        econ = report["verified_economics"]
+        # without the final-state read the trade's legs are unproven
+        assert econ["reconciled_trades"] == 0 and econ["net_usdt"] == 0.0
+        assert econ["excluded"]["unresolved"] == 1
+
+    def test_a_fee_in_another_coin_is_excluded_not_converted(self):
+        verdicts = [{"resolved": True}]
+        claims = [{"gross_pnl": 1.0, "entry_fee": 0.001, "exit_fee": 0.001,
+                   "entry_fee_currency": "BTC", "exit_fee_currency": "BTC"}]
+        econ = er.verified_economics(claims, verdicts)
+        assert econ["reconciled_trades"] == 0 and econ["excluded"]["fee_not_usdt"] == 1
+
+    def test_thirty_trades_still_are_not_a_profitability_claim(self):
+        verdicts = [{"resolved": True}] * 30
+        claims = [{"gross_pnl": 1.0, "entry_fee": 0.1, "exit_fee": 0.1,
+                   "entry_fee_currency": "USDT", "exit_fee_currency": "USDT"}] * 30
+        econ = er.verified_economics(claims, verdicts)
+        assert econ["reconciled_trades"] == 30 and econ["net_usdt"] == pytest.approx(24.0)
+        assert "NOT a profitability claim" in econ["inference"]
+
+    def test_garbage_claims_cannot_raise(self):
+        econ = er.verified_economics([None, "x", 5], [{"resolved": True}] * 3)
+        assert econ["reconciled_trades"] == 0
+
+
 class VenueLikeFees(FilledOrdersCarryFees):
     """Spot as Bybit charges it: a BUY pays its fee in the base coin (BTC), a
     SELL in the quote coin (USDT)."""

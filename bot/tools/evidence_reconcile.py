@@ -1189,11 +1189,71 @@ def reconcile(*, fill_claims: Sequence[Mapping[str, Any]] = (),
                      for c in captures],
         "counts_by_provenance": counts, "issue_counts": issue_counts,
         "pnl_claim_allowed": allowed,
+        "verified_economics": verified_economics(
+            [c if isinstance(c, dict) else {} for c in (trade_claims or [])],
+            trades),
         "pnl_note": ("False unless every fill and funding claim is "
                      "VENUE_RECONCILED with no issue, every order is complete, "
                      "and every capture chain verifies. Even then this reports "
                      "consistency of captured records, not profitability, and "
                      "testnet dollars are not cash."),
+    }
+
+
+#: Below this many reconciled trades no statement about edge is made at all.
+MIN_TRADES_FOR_ANY_INFERENCE = 30
+
+
+def verified_economics(claims: Sequence[Any],
+                       verdicts: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """What the VENUE-RECONCILED trades earned, and nothing else.
+
+    A trade contributes only if its verdict is resolved (its legs matched
+    captured venue executions and its stated gross follows from its prices);
+    everything unresolved is counted and left out, never estimated. Fees are
+    summed only when both legs state USDT; a trade fee-denominated in another
+    coin is excluded and counted, not converted at a guessed rate. Funding is
+    not included. These are TESTNET dollars. Whatever the totals say, no
+    inference about edge is made below MIN_TRADES_FOR_ANY_INFERENCE trades, and
+    above it the figures still carry no uncertainty analysis, no out-of-sample
+    test and no funding, so they are an input to that analysis, not its result.
+    """
+    nets: List[float] = []
+    gross_total = fees_total = 0.0
+    excluded = {"unresolved": 0, "fee_not_usdt": 0}
+    for claim, verdict in zip(claims, verdicts):
+        if not verdict.get("resolved"):
+            excluded["unresolved"] += 1
+            continue
+        gross = _num(claim.get("gross_pnl")) if isinstance(claim, dict) else None
+        e_fee = _num(claim.get("entry_fee")) if isinstance(claim, dict) else None
+        x_fee = _num(claim.get("exit_fee")) if isinstance(claim, dict) else None
+        currencies = ({claim.get("entry_fee_currency"), claim.get("exit_fee_currency")}
+                      if isinstance(claim, dict) else set())
+        if None in (gross, e_fee, x_fee) or currencies != {"USDT"}:
+            excluded["fee_not_usdt"] += 1
+            continue
+        net = gross - e_fee - x_fee
+        nets.append(net)
+        gross_total += gross
+        fees_total += e_fee + x_fee
+    n = len(nets)
+    enough = n >= MIN_TRADES_FOR_ANY_INFERENCE
+    return {
+        "unit": "USDT (testnet dollars, not cash)",
+        "reconciled_trades": n,
+        "excluded": excluded,
+        "gross_usdt": gross_total, "fees_usdt": fees_total,
+        "net_usdt": sum(nets),
+        "mean_net_usdt": (sum(nets) / n) if n else None,
+        "wins": sum(1 for x in nets if x > 0), "losses": sum(1 for x in nets if x < 0),
+        "funding_included": False,
+        "inference": (
+            f"NONE: {n} reconciled trade(s); fewer than "
+            f"{MIN_TRADES_FOR_ANY_INFERENCE} cannot distinguish skill from noise"
+            if not enough else
+            f"{n} reconciled trades: still NOT a profitability claim - no "
+            "uncertainty interval, out-of-sample test or funding is applied here"),
     }
 
 
