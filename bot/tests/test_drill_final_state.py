@@ -251,7 +251,7 @@ class TestAnInterruptIsAnOutcomeNotATraceback:
         code = D.main(["--arm", "--hold-for-settlement", "--poll-seconds", "1",
                        "--out", "/tmp/_unused_d.json", "--cash-ledger", "/tmp/_u.json"])
         assert code == 130
-        assert "before the drill produced a report" in capsys.readouterr().err
+        assert "before any order could have been sent" in capsys.readouterr().err
 
 
 class TestTheInterruptGuard:
@@ -570,3 +570,85 @@ class TestLedgerBrokerKeepsAnIndexOfItsFills:
         with pytest.raises(Exception):          # a fill with no side cannot be booked
             b.place_market(symbol="BTCUSDT", side="", qty=0.001, product="linear")
         assert b.fills == []
+
+
+# ---------------------------------------------------------------------------
+# found by independent review
+# ---------------------------------------------------------------------------
+
+class TestReviewFindings:
+    def test_a_dead_stderr_cannot_make_the_ignore_branch_raise(self, monkeypatch):
+        """The handler runs in the middle of the engine's reduce-only close; a
+        write error after SIGHUP must not escape into it."""
+        class Dead:
+            def write(self, _s):
+                raise OSError(5, "I/O error")
+        g = D.InterruptGuard()
+        with pytest.raises(KeyboardInterrupt):
+            g.handler(1, None)
+        monkeypatch.setattr(sys, "stderr", Dead())
+        g.handler(15, None)
+        g.handler(2, None)
+
+    def test_a_signal_during_the_capture_still_yields_a_report_and_a_file(
+            self, tmp_path):
+        class Tail(CapVenue):
+            def read_order(self, *a, **k):
+                raise KeyboardInterrupt("signal 15")
+        v = Tail()
+        out = str(tmp_path / "d.json")
+        with pytest.raises(KeyboardInterrupt) as caught:
+            D.run_drill(broker=v, arm=True, notional=100.0, venue="testnet",
+                        capture_final=True, out=out)
+        rep = caught.value.drill_report
+        assert rep["interrupted"] is True and rep["still_open"] is False
+        assert rep["orders_sent"] == 2
+        assert json.load(open(out))["interrupted"] is True
+        assert D.drill_exit_code(rep, hold=False) == 130
+
+    def test_the_report_is_on_disk_before_the_capture_reads_anything(self, tmp_path):
+        seen = {}
+        out = str(tmp_path / "d.json")
+
+        class Probe(CapVenue):
+            def read_order(self, *a, **k):
+                if "first" not in seen:
+                    data = json.load(open(out))
+                    seen["first"] = data["evidence_capture"]
+                return super().read_order(*a, **k)
+        run(Probe(), capture_final=True, out=out)
+        assert seen["first"]["complete"] is False
+        assert "had not finished" in seen["first"]["failures"][0]
+        assert json.load(open(out))["evidence_capture"]["complete"] is True
+
+    def test_an_order_accepted_but_never_booked_is_still_counted_as_sent(self):
+        class Lost(CapVenue):
+            def place_market(self, **kw):
+                res = super().place_market(**kw)
+                raise KeyboardInterrupt("signal 15")
+        v = Lost()
+        with pytest.raises(KeyboardInterrupt) as caught:
+            D.run_drill(broker=v, arm=True, notional=100.0, venue="testnet")
+        rep = caught.value.drill_report
+        assert rep["orders_sent"] == 1 and rep["still_open"] is True
+        assert D.drill_exit_code(rep, hold=True) == 1
+
+    def test_unconfirmed_fees_give_no_net_and_no_bps(self):
+        s = D.round_trip_summary([
+            fill("Sell", 0.001, 80000.0, 0.0, "o", status="unresolved"),
+            fill("Buy", 0.001, 79990.0, 0.0, "c", status="unresolved")])
+        assert s["fees_confirmed"] is False
+        assert s["perp_gross_usdt"] == pytest.approx(0.01)
+        assert s["perp_net_before_funding_usdt"] is None
+        assert s["fee_bps_of_entry_notional"] is None
+
+    def test_a_partial_close_gets_no_net(self):
+        s = D.round_trip_summary([fill("Sell", 0.002, 80000.0, 0.088, "o"),
+                                  fill("Buy", 0.001, 80000.0, 0.044, "c")])
+        assert s["closed"] is False and s["perp_net_before_funding_usdt"] is None
+
+    def test_a_post_only_order_is_recorded_too(self):
+        b = make_broker(FakeClient())
+        b.place_post_only(symbol="BTCUSDT", side="Sell", qty=0.001,
+                          price=100000.0, product=LINEAR)
+        assert len(b.sent_order_links) == 1

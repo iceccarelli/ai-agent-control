@@ -177,14 +177,17 @@ def round_trip_summary(fills: List[Dict[str, Any]]) -> Dict[str, Any]:
         "perp_gross_usdt": None, "fees_usdt": entry_fee + exit_fee,
         "perp_net_before_funding_usdt": None,
         "fee_bps_of_entry_notional": None, "price_move_bps": None}
-    if entry and entry > 0 and open_qty > 0:
+    if confirmed and entry and entry > 0 and open_qty > 0:
         out["fee_bps_of_entry_notional"] = (
             (entry_fee + exit_fee) / (entry * open_qty) * 1e4)
     if entry and exit_ and close_qty > 0:
         gross = (entry - exit_) * close_qty          # a short gains when price falls
         out["perp_gross_usdt"] = gross
-        out["perp_net_before_funding_usdt"] = gross - entry_fee - exit_fee
         out["price_move_bps"] = (exit_ / entry - 1.0) * 1e4
+        # a net needs every fee known and the whole entry closed: a partial
+        # close would charge the full entry fee against part of the move
+        if confirmed and out["closed"]:
+            out["perp_net_before_funding_usdt"] = gross - entry_fee - exit_fee
     return out
 
 
@@ -721,6 +724,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     state["engine"] = engine
     state["journal"] = journal
     state["booked"] = booked
+    state["broker"] = broker
     state["capture_requested"] = bool(capture_final)
 
     def open_pair(s: Stage) -> None:
@@ -990,12 +994,28 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
                      "captured; the evidence file cannot reconcile this run",
                      **result)
 
+    def finish(verdict: str) -> Dict[str, Any]:
+        """Write the report BEFORE the capture's network reads (marked pending),
+        so a hung read, a kill or a signal leaves what is known on disk; then
+        capture, then write the final report."""
+        if capture_final and getattr(broker, "sent_order_links", None):
+            state["evidence_capture"] = {
+                "complete": False, "orders": 0, "reads": 0,
+                "failures": ["the final-state capture had not finished when "
+                             "this report was written"]}
+        _finish(d, state, out, cap, verdict, cash_ledger, venue)
+        final_state_capture()
+        return _finish(d, state, out, cap, verdict, cash_ledger, venue)
+
+    # The tail (capture, final report) is inside the guarded region too: a
+    # signal there still produces a report and the clean exit, never a false
+    # "nothing was sent".
     try:
         for name, fn in sequence:
             if not d.run_stage(name, fn):
                 recover(name)
-                final_state_capture()
-                return _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
+                return finish("FAILED")
+        return finish("PASSED")
     except BaseException as exc:
         # Ctrl-C, SIGTERM, anything: the pair may be open. Close it through
         # the engine, say what the venue holds, write the report, and only then
@@ -1004,22 +1024,21 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         d.failed_stage = d.failed_stage or "interrupted"
         d.interrupted = isinstance(exc, KeyboardInterrupt)
         d.stage("interrupted").failed(f"{type(exc).__name__}: {exc}")
+        written = None
         try:
             recover("hold")
         finally:
             try:
-                final_state_capture()
-            except Exception:                                  # noqa: BLE001
-                pass
-            written = _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
+                written = finish("FAILED")
+            except BaseException:                              # noqa: BLE001
+                # the capture itself was interrupted or failed: the report
+                # without it (its capture still marked unfinished) stands
+                written = _finish(d, state, out, cap, "FAILED", cash_ledger, venue)
             try:
                 exc.drill_report = written
             except Exception:                                  # noqa: BLE001
                 pass
         raise
-
-    final_state_capture()
-    return _finish(d, state, out, cap, "PASSED", cash_ledger, venue)
 
 
 def _finish(d: Drill, state: Dict[str, Any], out: str, cap: float,
@@ -1086,7 +1105,11 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
         "next_action": action,
         "notional_usd": d.notional,
         "cap_usd": cap,
-        "orders_sent": d.orders_sent,
+        # the larger of what was booked and what went on the wire: a signal
+        # between the venue accepting an order and the book recording it must
+        # not report zero orders
+        "orders_sent": max(d.orders_sent, len(
+            getattr(state.get("broker"), "sent_order_links", None) or [])),
         "ledger_entries": len(journal.entries) if journal else 0,
         "interrupted": d.interrupted,
         "stages": [s.as_dict() for s in d.stages],
@@ -1322,8 +1345,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt as exc:
         report = getattr(exc, "drill_report", None)
         if report is None:
-            print(f"interrupted ({exc}) before the drill produced a report; "
-                  "nothing was sent that this process knows of.",
+            print(f"interrupted ({exc}) before any order could have been "
+                  "sent (during setup); no report was produced.",
                   file=sys.stderr)
             return 130
         print(f"INTERRUPTED ({exc}): the pair was closed through the engine "
@@ -1346,8 +1369,13 @@ class InterruptGuard:
         self.count += 1
         if self.count == 1:
             raise KeyboardInterrupt(f"signal {signum}")
-        sys.stderr.write(f"signal {signum} ignored: the drill is closing the "
-                         "pair and writing its report\n")
+        # This runs in the middle of the engine's reduce-only close: nothing
+        # here may raise (a dead stderr after SIGHUP would abort the unwind).
+        try:
+            sys.stderr.write(f"signal {signum} ignored: the drill is closing "
+                             "the pair and writing its report\n")
+        except BaseException:                                  # noqa: BLE001
+            pass
 
     def install(self) -> None:
         import signal
@@ -1381,7 +1409,7 @@ def _print_report(report: Dict[str, Any], args: Any) -> None:
     if trip:
         print("\n  ROUND TRIP (perp leg, from the booked fills)")
         for key in ("entry_qty", "entry_price", "exit_qty", "exit_price",
-                    "fees_usdt", "perp_gross_usdt",
+                    "closed", "fees_confirmed", "fees_usdt", "perp_gross_usdt",
                     "perp_net_before_funding_usdt", "fee_bps_of_entry_notional"):
             print(f"    {key}: {trip.get(key)}")
     capture = report.get("evidence_capture")

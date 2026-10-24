@@ -280,10 +280,23 @@ class VenueIndex:
         self.creates: Dict[Tuple[str, str], List[Tuple[Dict[str, Any], Dict[str, Any], Optional[int]]]] = {}
         #: (environment, orderLinkId) -> [order rows]
         self.orders_by_link: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-        #: [(environment, symbol, total |size|, captured_ms)] from position/list
-        self.positions: List[Tuple[str, str, float, Optional[int]]] = []
+        #: [(environment, symbol, total |size|, captured_ms, chain order)] from
+        #: position/list
+        self.positions: List[Tuple[str, str, float, Optional[int], int]] = []
+        #: execId -> chain order of the LAST record that carried it
+        self.exec_seq: Dict[str, int] = {}
+        #: [(environment, path, label)] of every successful POST to an order or
+        #: position endpoint, whether or not it carried an order link id
+        self.order_posts: List[Tuple[str, str, str]] = []
+        #: POSTs to an order/position endpoint whose host proves nothing
+        self.unverified_posts = 0
+        #: [(environment, captured_ms, startTime, endTime, cursor)] of every
+        #: transaction-log read, including ones that returned no row
+        self.txlog_reads: List[Tuple[str, Optional[int], Optional[int], Optional[int], str]] = []
+        self._n = 0
         self.skipped = 0
         for record in capture.records:
+            self._n += 1
             try:
                 self._add(record)
             except Exception:                      # noqa: BLE001 - never raise
@@ -294,6 +307,9 @@ class VenueIndex:
         response = record.get("response")
         if env is None or not isinstance(response, dict):
             self.skipped += 1
+            if record.get("method") == "POST" and _path(record).startswith(
+                    ("/v5/order/", "/v5/position/")):
+                self.unverified_posts += 1
             return
         if record.get("transport") == "ws":
             request = record.get("request")
@@ -304,6 +320,13 @@ class VenueIndex:
                         self.ws_rows.setdefault(str(row["execId"]), []) \
                             .append((env, row))
             return
+        if record.get("method") == "POST" and _path(record).startswith(
+                ("/v5/order/", "/v5/position/")) and _ret_ok(response):
+            result = response.get("result")
+            label = ""
+            if isinstance(result, dict):
+                label = str(result.get("orderId") or result.get("orderLinkId") or "")
+            self.order_posts.append((env, _path(record), label))
         if record.get("method") == "POST" and _path(record) == "/v5/order/create" \
                 and _ret_ok(response):
             request = record.get("request")
@@ -326,6 +349,7 @@ class VenueIndex:
         if path == "/v5/execution/list":
             for row in _rows(response):
                 eid = str(row.get("execId", ""))
+                self.exec_seq[eid] = self._n
                 self.executions.setdefault(eid, []).append((env, row, stamp))
                 for table, key in ((self.fills_by_order, str(row.get("orderId", ""))),
                                    (self.fills_by_link, str(row.get("orderLinkId", "")))):
@@ -349,8 +373,15 @@ class VenueIndex:
             # an empty list says nothing; an unreadable size is not zero
             if rows and None not in sizes and len(symbols) == 1:
                 self.positions.append((env, symbols.pop(),
-                                       sum(abs(x) for x in sizes), stamp))
+                                       sum(abs(x) for x in sizes), stamp, self._n))
         elif path == "/v5/account/transaction-log":
+            request = record.get("request")
+            params = request.get("params") if isinstance(request, dict) else None
+            params = params if isinstance(params, dict) else {}
+            result = response.get("result")
+            self.txlog_reads.append((
+                env, stamp, _int(params.get("startTime")), _int(params.get("endTime")),
+                str(result.get("nextPageCursor") or "") if isinstance(result, dict) else "?"))
             for row in _rows(response):
                 if str(row.get("type", "")) == "SETTLEMENT":
                     t = _int(row.get("transactionTime"))
@@ -1242,24 +1273,34 @@ def _carry_one(claim: Mapping[str, Any], indexes: Sequence[VenueIndex],
     if len({_s(r.get("orderId")) for _b, r, _t in sent}) > 1:
         issues.append("VENUE_ROWS_CONTRADICT")
         return False
-    body, answer, _t = sent[0]
-    order_id = _s(answer.get("orderId")).strip()
+    order_id = _s(sent[0][1].get("orderId")).strip()
     if not order_id:
         issues.append("VENUE_DISAGREES:create_order_id")
         return False
     detail["order_id"] = order_id
-    asked = _num(body.get("qty"))
-    for field, ok in (
-            ("category", str(body.get("category", "")) == "linear"),
-            ("symbol", str(body.get("symbol", "")) == symbol),
-            ("side", str(body.get("side", "")) == side),
-            ("order_type", str(body.get("orderType", "")) == "Market"),
-            ("qty", asked is not None and qty is not None
-             and asked * (1 + QTY_REL_TOL) + 1e-12 >= qty),
-            ("reduce_only", _truthy(body.get("reduceOnly"))
-             == _truthy(claim.get("reduce_only")))):
-        if not ok:
-            issues.append(f"VENUE_DISAGREES:create_{field}")
+    if len({json.dumps(b, sort_keys=True) for b, _a, _t in sent}) > 1:
+        issues.append("VENUE_ROWS_CONTRADICT")      # a replay that differs
+        return False
+    # EVERY captured create for this link must agree (a replay with other
+    # parameters is not "the" create), and the answer must not name another link
+    for body, answer, _t in sent:
+        asked = _num(body.get("qty"))
+        for field, ok in (
+                ("category", str(body.get("category", "")) == "linear"),
+                ("symbol", str(body.get("symbol", "")) == symbol),
+                ("side", str(body.get("side", "")) == side),
+                ("order_type", str(body.get("orderType", "")) == "Market"),
+                ("qty", asked is not None and qty is not None
+                 and asked * (1 + QTY_REL_TOL) + 1e-12 >= qty),
+                ("reduce_only", _truthy(body.get("reduceOnly"))
+                 == _truthy(claim.get("reduce_only"))),
+                ("link", _s(answer.get("orderLinkId", "")) in ("", link))):
+            if not ok:
+                issues.append(f"VENUE_DISAGREES:create_{field}")
+    create_ms = min((t for _b, _a, t in sent if t is not None), default=None)
+    if create_ms is None:
+        issues.append("CAPTURE_TIME_INVALID")
+        return False
 
     # 2. the executions, from the venue's own list
     rows: Dict[str, Dict[str, Any]] = {}
@@ -1295,7 +1336,12 @@ def _carry_one(claim: Mapping[str, Any], indexes: Sequence[VenueIndex],
         issues.append("VENUE_DISAGREES:exec_time_unusable")
         return False
     detail.update(venue_qty=vq, venue_price=vp, venue_fees=fees,
-                  first_exec_ms=min(times), last_exec_ms=max(times))
+                  first_exec_ms=min(times), last_exec_ms=max(times),
+                  exec_ids=sorted(rows))
+    if min(times) + 1000 < create_ms:
+        # captures are stamped to the second; a fill can not precede the
+        # request that created its order
+        issues.append("VENUE_DISAGREES:exec_before_create")
     if not _close(vq, qty, QTY_REL_TOL, 1e-12):
         issues.append("VENUE_DISAGREES:qty")
     if not _close(vp, price, CARRY_PRICE_REL_TOL):
@@ -1327,21 +1373,21 @@ def _carry_one(claim: Mapping[str, Any], indexes: Sequence[VenueIndex],
     if len({str(r.get("orderStatus")) for r in finals}) > 1:
         issues.append("ORDER_STATUS_CONFLICT")
         return False
-    last = finals[-1]
-    if str(last.get("orderStatus")) != "Filled":
-        issues.append("VENUE_DISAGREES:order_status")
-        return False
-    cum, avg = _num(last.get("cumExecQty")), _num(last.get("avgPrice"))
-    if cum is None or not _close(cum, qty, QTY_REL_TOL, 1e-12):
-        issues.append("VENUE_DISAGREES:order_qty")
-    if avg is None or not _close(avg, price, CARRY_PRICE_REL_TOL):
-        issues.append("VENUE_DISAGREES:order_price")
-    order_fee = _num(last.get("cumExecFee"))
-    if order_fee is None or not _close(order_fee, fee, 0.0, CARRY_FEE_ABS_TOL):
-        issues.append("VENUE_DISAGREES:order_fee")
-    if "reduceOnly" in last and _truthy(last.get("reduceOnly")) != _truthy(
-            claim.get("reduce_only")):
-        issues.append("VENUE_DISAGREES:order_reduce_only")
+    for last in finals:                    # every final snapshot, not just the last
+        if str(last.get("orderStatus")) != "Filled":
+            issues.append("VENUE_DISAGREES:order_status")
+            return False
+        cum, avg = _num(last.get("cumExecQty")), _num(last.get("avgPrice"))
+        if cum is None or not _close(cum, qty, QTY_REL_TOL, 1e-12):
+            issues.append("VENUE_DISAGREES:order_qty")
+        if avg is None or not _close(avg, price, CARRY_PRICE_REL_TOL):
+            issues.append("VENUE_DISAGREES:order_price")
+        order_fee = _num(last.get("cumExecFee"))
+        if order_fee is None or not _close(order_fee, fee, 0.0, CARRY_FEE_ABS_TOL):
+            issues.append("VENUE_DISAGREES:order_fee")
+        if "reduceOnly" in last and _truthy(last.get("reduceOnly")) != _truthy(
+                claim.get("reduce_only")):
+            issues.append("VENUE_DISAGREES:order_reduce_only")
     return True
 
 
@@ -1404,18 +1450,27 @@ def reconcile_carry_cycle(claims: Sequence[Mapping[str, Any]],
                           funding_claims: Sequence[Mapping[str, Any]],
                           funding: Sequence[Mapping[str, Any]],
                           captures: Sequence[Capture], *,
-                          funding_window: Optional[Mapping[str, Any]] = None
-                          ) -> Dict[str, Any]:
+                          funding_window: Any = None) -> Dict[str, Any]:
     """Is the whole cycle accounted for, and what did it cost?
 
-    Beyond each leg: every successful order-create in the capture is claimed
-    (an order the books do not know about is an incident, not noise), entry and
-    exit quantities are equal and in that order, a position read AFTER the last
-    exit execution shows the symbol flat, and every SETTLEMENT row paid inside
-    the hold is claimed (and every claim lies inside it). Economics are summed
-    from RESOLVED legs and funding only, and only when nothing is flagged.
+    Beyond each leg: nothing the capture shows the venue doing is unclaimed
+    (every order POST in any environment, every order row and every execution
+    row of the drill's window), entry and exit quantities are equal and in that
+    order, a position read taken AFTER the close's execution list (chain order,
+    not just clock) shows the symbol flat, a transaction-log read covering the
+    hold exists (so "no settlement" is a finding, not an absence of looking),
+    and every SETTLEMENT row paid inside the hold is sign-checked and claimed.
+    Economics are summed from the VENUE's rows of resolved legs only, and only
+    when nothing is flagged.
     """
-    claims = [c if isinstance(c, dict) else {} for c in claims]
+    claims = [c if isinstance(c, Mapping) else {} for c in claims]
+    legs = [v if isinstance(v, Mapping) and "resolved" in v else
+            {"resolved": False, "detail": {}, "issues": ["MALFORMED_VERDICT"]}
+            for v in legs]
+    funding_claims = [c if isinstance(c, Mapping) else {} for c in funding_claims]
+    funding = [v if isinstance(v, Mapping) and "resolved" in v else
+               {"resolved": False, "issues": ["MALFORMED_VERDICT"]}
+               for v in funding]
     indexes = [VenueIndex(c) for c in captures]
     issues: List[str] = []
     by_env: Dict[str, List[Tuple[Mapping[str, Any], Mapping[str, Any]]]] = {}
@@ -1424,21 +1479,59 @@ def reconcile_carry_cycle(claims: Sequence[Mapping[str, Any]],
     envs = [e for e in by_env if e in SANDBOXES]
     if len(envs) != 1 or len(by_env) != 1:
         issues.append("CYCLE_ENVIRONMENT_NOT_ONE_SANDBOX")
-        return _cycle_out(issues, claims, legs, {})
+        return _cycle_out(issues, legs, {})
     env = envs[0]
     pairs = by_env[env]
     symbols = {_s(c.get("symbol")) for c, _v in pairs}
     if len(symbols) != 1:
         issues.append("CYCLE_MIXED_SYMBOLS")
-        return _cycle_out(issues, claims, legs, {})
+        return _cycle_out(issues, legs, {})
     symbol = symbols.pop()
     if any(not v["resolved"] for _c, v in pairs):
         issues.append("LEG_UNRESOLVED")
-    claimed = {_s(c.get("order_link_id")).strip() for c, _v in pairs}
+
+    # ---- nothing happened that the books do not claim ----------------------
+    claimed_links = {_s(c.get("order_link_id")).strip() for c, _v in pairs}
+    claimed_orders = {_s((v.get("detail") or {}).get("order_id")) for _c, v in pairs}
+    claimed_orders.discard("")
+    window_start = None
     for idx in indexes:
         for (e, link), sent in sorted(idx.creates.items()):
-            if e == env and link not in claimed:
+            if e == env and link in claimed_links:
+                for _b, _a, t in sent:
+                    if t is not None and (window_start is None or t < window_start):
+                        window_start = t
+        if idx.unverified_posts:
+            issues.append("UNCLAIMED_ORDER:post_to_an_unverified_host")
+        for e, path, label in idx.order_posts:
+            if e != env:
+                issues.append(f"UNCLAIMED_ORDER:{e}:{path}")
+            elif path != "/v5/order/create":
+                issues.append(f"UNCLAIMED_ORDER:{path}")
+        for (e, link), sent in sorted(idx.creates.items()):
+            if e == env and link not in claimed_links:
                 issues.append(f"UNCLAIMED_ORDER:{link}")
+        n_create = sum(1 for e, path, _l in idx.order_posts
+                       if e == env and path == "/v5/order/create")
+        n_linked = sum(len(v) for (e, _l), v in idx.creates.items() if e == env)
+        if n_create > n_linked:
+            issues.append("UNCLAIMED_ORDER:create_without_a_link_id")
+    floor = (window_start - 60_000) if window_start is not None else None
+    for idx in indexes:
+        for oid, rows in idx.orders.items():
+            for e, row in rows:
+                if e != env or oid in claimed_orders:
+                    continue
+                created = _int(row.get("createdTime"))
+                if floor is None or created is None or created >= floor:
+                    issues.append(f"UNCLAIMED_ORDER:{oid or 'no_id'}")
+        for eid, rows in idx.executions.items():
+            for e, row, _st in rows:
+                if e != env or _s(row.get("orderId")) in claimed_orders:
+                    continue
+                t = _int(row.get("execTime"))
+                if floor is None or t is None or t >= floor:
+                    issues.append(f"UNCLAIMED_EXECUTION:{eid}")
     resolved = [(c, v) for c, v in pairs if v["resolved"]]
     opens = [(c, v) for c, v in resolved if c.get("kind") == "perp_open"]
     closes = [(c, v) for c, v in resolved if c.get("kind") == "perp_close"]
@@ -1458,63 +1551,100 @@ def reconcile_carry_cycle(claims: Sequence[Mapping[str, Any]],
         last_out = max(v["detail"]["last_exec_ms"] for _c, v in closes)
         if first_out < last_in:
             issues.append("CYCLE_EXIT_BEFORE_ENTRY")
-        # flat: a position read taken after the last exit execution
-        reads = [(st, size) for idx in indexes
-                 for e, sym, size, st in idx.positions
-                 if e == env and sym == symbol and st is not None]
-        after = [(st, size) for st, size in reads if st + 1000 >= last_out]
-        if not after:
+
+        # ---- flat: a position read AFTER the close's execution list ---------
+        close_ids = {e for _c, v in closes for e in v["detail"].get("exec_ids", [])}
+        flat_reads: List[Tuple[int, float]] = []
+        for idx in indexes:
+            seen = [idx.exec_seq[e] for e in close_ids if e in idx.exec_seq]
+            if not seen:
+                continue
+            after_seq = max(seen)
+            flat_reads += [(st, size) for e, sym, size, st, seq in idx.positions
+                           if e == env and sym == symbol and st is not None
+                           and seq > after_seq and st + 1000 >= last_out]
+        if not flat_reads:
             issues.append("NO_FINAL_POSITION_READ")
-        elif max(after, key=lambda x: x[0])[1] > FLAT_POSITION_DUST:
+        elif max(flat_reads, key=lambda x: x[0])[1] > FLAT_POSITION_DUST:
             issues.append("CYCLE_NOT_FLAT")
-        # settlements paid while the entry was open
-        rows = [(t, row) for idx in indexes
-                for (sym, t), lst in idx.settlements.items() if sym == symbol
-                for e, row, _st in lst if e == env and last_in < t <= first_out]
-        rows = sorted({(t, json.dumps(row, sort_keys=True)) for t, row in rows})
+
+        # ---- funding: looked at, then sign-checked and claimed --------------
+        from carry_broker import funding_sign_check
+        looked = any(
+            e == env and st is not None and st + 1000 >= first_out
+            and start is not None and start <= last_in
+            and end is not None and end + 1000 >= first_out and not cursor
+            for idx in indexes for e, st, start, end, cursor in idx.txlog_reads)
+        if not looked:
+            issues.append("CYCLE_FUNDING_NOT_CAPTURED")
+        rows = sorted({(t, json.dumps(row, sort_keys=True)) for idx in indexes
+                       for (sym, t), lst in idx.settlements.items() if sym == symbol
+                       for e, row, _st in lst if e == env and last_in < t <= first_out})
         window_rows = [(t, json.loads(r)) for t, r in rows]
         fclaims = [(c, v) for c, v in zip(funding_claims, funding)
                    if _s(c.get("environment")) == env and _s(c.get("symbol")) == symbol]
         if any(not v["resolved"] for _c, v in fclaims):
             issues.append("LEG_UNRESOLVED")
         claimed_t = {_int(c.get("time_ms")) for c, _v in fclaims}
-        for t, _row in window_rows:
+        got = 0.0
+        for t, row in window_rows:
+            amount = _num(row.get("funding"))
+            if amount is None:
+                issues.append("CYCLE_FUNDING_UNREADABLE")
+            else:
+                got += amount
+                verdict, _why = funding_sign_check(
+                    amount, row.get("change"), row.get("cashFlow"), row.get("fee"))
+                if verdict != "confirmed":
+                    issues.append(f"VENUE_SIGN_{verdict.upper()}")
+            size = _num(row.get("size"))
+            if size is None:
+                issues.append("CYCLE_FUNDING_SIZE_UNVERIFIED")
+            elif not _close(abs(size), oq, 1e-6, 1e-9):
+                issues.append("CYCLE_FUNDING_SIZE_MISMATCH")
             if fclaims and t not in claimed_t:
                 issues.append(f"UNCLAIMED_SETTLEMENT:{t}")
         for c, _v in fclaims:
             t = _int(c.get("time_ms"))
             if t is None or not (last_in < t <= first_out):
                 issues.append("FUNDING_OUTSIDE_HOLD")
-        for _t, row in window_rows:
-            size = _num(row.get("size"))
-            if size is not None and not _close(abs(size), oq, 1e-6, 1e-9):
-                issues.append("CYCLE_FUNDING_SIZE_MISMATCH")
-        funding_usd = None
         n_settle = len(window_rows)
+        funding_usd = None
         if fclaims:
             funding_usd = sum(_num(c.get("amount")) or 0.0 for c, _v in fclaims)
         elif funding_window is not None:
-            n_claim = _int(funding_window.get("count"))
-            total = _num(funding_window.get("total_usd"))
-            got = sum(_num(r.get("funding")) or 0.0 for _t, r in window_rows)
-            if n_claim != n_settle or total is None or not _close(
-                    got, total, 1e-9, 1e-9):
-                issues.append("FUNDING_OUTSIDE_HOLD:window_total_disagrees")
+            if not isinstance(funding_window, Mapping):
+                issues.append("CYCLE_FUNDING_WINDOW_MALFORMED")
             else:
-                funding_usd = got
+                n_claim = _int(funding_window.get("count"))
+                total = _num(funding_window.get("total_usd"))
+                if n_claim != n_settle or total is None or not _close(
+                        got, total, 1e-9, 1e-9):
+                    issues.append("FUNDING_OUTSIDE_HOLD:window_total_disagrees")
+                else:
+                    funding_usd = got
         elif n_settle:
             issues.append("UNCLAIMED_SETTLEMENT:all")
         if funding_usd is None:
             funding_usd = 0.0
-        entry = sum(_num(c["qty"]) * _num(c["price"]) for c, _v in opens) / oq
-        exit_ = sum(_num(c["qty"]) * _num(c["price"]) for c, _v in closes) / cq
-        fees = sum(_num(c["fee"]) for c, _v in opens + closes)
-        gross = (entry - exit_) * cq
+
+        # ---- economics: the VENUE's numbers for the resolved legs -----------
+        def side_totals(group):
+            q = sum(v["detail"]["venue_qty"] for _c, v in group)
+            px = sum(v["detail"]["venue_qty"] * v["detail"]["venue_price"]
+                     for _c, v in group) / q
+            fee_ = sum(v["detail"]["venue_fees"].get(CARRY_SETTLE_COIN, 0.0)
+                       for _c, v in group)
+            return q, px, fee_
+        vq_in, entry, fee_in = side_totals(opens)
+        vq_out, exit_, fee_out = side_totals(closes)
+        fees = fee_in + fee_out
+        gross = (entry - exit_) * vq_out
         econ = {
-            "unit": "USDT (testnet dollars, not cash)", "qty": cq,
+            "unit": "USDT (testnet dollars, not cash)", "qty": vq_out,
             "entry_price": entry, "exit_price": exit_,
             "perp_gross_usdt": gross, "fees_usdt": fees,
-            "fee_bps_of_entry_notional": fees / (entry * oq) * 1e4,
+            "fee_bps_of_entry_notional": fees / (entry * vq_in) * 1e4,
             "settlements": n_settle, "funding_usdt": funding_usd,
             "hold_ms": first_out - last_in,
             "net_usdt": gross - fees + funding_usd,
@@ -1523,14 +1653,14 @@ def reconcile_carry_cycle(claims: Sequence[Mapping[str, Any]],
             "inference": "NONE: one round trip cannot distinguish skill from "
                          "noise, and testnet prices and funding are not the "
                          "real ones"}
-    return _cycle_out(issues, claims, legs, econ)
+    return _cycle_out(issues, legs, econ)
 
 
 #: A position read this small is flat.
 FLAT_POSITION_DUST = 1e-8
 
 
-def _cycle_out(issues: List[str], claims: Sequence[Any], legs: Sequence[Any],
+def _cycle_out(issues: List[str], legs: Sequence[Any],
                econ: Dict[str, Any]) -> Dict[str, Any]:
     issues = sorted(set(issues))
     ok = bool(legs) and not issues_block(issues) and all(v["resolved"] for v in legs)
@@ -1562,14 +1692,20 @@ def claims_from_drill_report(report: Any, cash_ledger: Any = None
                 "derivation": "unreadable"}
     claims = report.get("claims")
     if isinstance(claims, Mapping) and claims.get("schema") == "drill_claims/1":
-        return {"carry_leg_claims": list(claims.get("carry_leg_claims") or []),
-                "funding_claims": list(claims.get("funding_claims") or []),
+        legs_, funds_ = (claims.get("carry_leg_claims") or []), \
+            (claims.get("funding_claims") or [])
+        if not isinstance(legs_, list) or not isinstance(funds_, list):
+            return {"carry_leg_claims": [], "funding_claims": [],
+                    "derivation": "unreadable"}
+        return {"carry_leg_claims": list(legs_), "funding_claims": list(funds_),
                 "derivation": "report.claims"}
     venue = _s(report.get("venue", ""))
     source, env = (("testnet_claim", "testnet") if venue == "testnet"
                    else ("local", "unknown"))
-    stages = {st.get("stage"): st for st in report.get("stages", [])
-              if isinstance(st, Mapping)}
+    raw_stages = report.get("stages")
+    stages = {st["stage"]: st for st in (raw_stages if isinstance(raw_stages, list)
+                                         else [])
+              if isinstance(st, Mapping) and isinstance(st.get("stage"), str)}
     legs: List[Dict[str, Any]] = []
     opened = stages.get("open")
     ev = opened.get("evidence") if isinstance(opened, Mapping) and opened.get("ok") else None
@@ -1616,6 +1752,9 @@ def resolve_inferred_links(claims: Sequence[Dict[str, Any]],
     indexes = [VenueIndex(c) for c in captures]
     out = []
     for claim in claims:
+        if not isinstance(claim, Mapping):
+            out.append(claim)
+            continue
         claim = dict(claim)
         if claim.get("link_inferred") and _blank(claim.get("order_link_id")):
             env = _s(claim.get("environment"))
@@ -1701,6 +1840,8 @@ def reconcile(*, fill_claims: Sequence[Mapping[str, Any]] = (),
         if trade_claims else []
     order_claim_verdicts = reconcile_orders(order_claims, captures) \
         if order_claims else []
+    funding_claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
+                      for c in (funding_claims or [])]
     carry_claims = [c if isinstance(c, dict) else {"_malformed": repr(c)[:80]}
                     for c in (carry_claims or [])]
     carry_claims = resolve_inferred_links(carry_claims, captures)
@@ -1994,6 +2135,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return 3
         cash = next((l for l in ledgers if l.get("category") == "carry"), None)
         derived_carry = claims_from_drill_report(drill_report, cash)
+        if derived_carry["derivation"] == "unreadable":
+            print("refusing: --drill-report "
+                  f"{os.path.basename(path)!r} is not a readable drill report",
+                  file=sys.stderr)
+            return 3
         carry_claims += derived_carry["carry_leg_claims"]
         funding_claims += derived_carry["funding_claims"]
         funding_window = derived_carry.get("funding_window") or funding_window

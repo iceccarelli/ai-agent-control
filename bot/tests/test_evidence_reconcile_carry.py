@@ -92,12 +92,6 @@ def build(*, drop=(), tweak=None, extra=(), settle=True):
         "/v5/order/history", [tweak("order_open", order(
             OPEN_ORD, OPEN_LINK, "Sell", "0.001", "80620.4", "0.04434122"))],
         prev=prev, at=OPEN_MS + 6_000))
-    if settle:
-        add("settlement", lambda prev: F.record(
-            "/v5/account/transaction-log",
-            [tweak("settlement", dict(
-                F.settlement_row(t=SETTLE_MS, funding="0.0123", change="0.0123"),
-                id="S-1", size="-0.001"))], prev=prev, at=SETTLE_MS + 60_000))
     add("create_close", lambda prev: create_rec(
         CLOSE_LINK, CLOSE_ORD, "Buy", reduce=True, prev=prev,
         at=CLOSE_MS + 1_000))
@@ -109,6 +103,15 @@ def build(*, drop=(), tweak=None, extra=(), settle=True):
         "/v5/order/history", [tweak("order_close", order(
             CLOSE_ORD, CLOSE_LINK, "Buy", "0.001", "80650", "0.04435",
             reduce=True))], prev=prev, at=CLOSE_MS + 6_000))
+    add("settlement", lambda prev: F.record(
+        "/v5/account/transaction-log",
+        [tweak("settlement", dict(
+            F.settlement_row(t=SETTLE_MS, funding="0.0123", change="0.0123"),
+            id="S-1", size="-0.001"))] if settle else [],
+        prev=prev, at=CLOSE_MS + 10_000,
+        request={"params": {"accountType": "UNIFIED", "category": "linear",
+                            "type": "SETTLEMENT", "startTime": OPEN_MS - 60_000,
+                            "endTime": CLOSE_MS + 30_000}}))
     add("position", lambda prev: F.record(
         "/v5/position/list", [tweak("position", pos("0"))], prev=prev,
         at=CLOSE_MS + 60_000))
@@ -420,10 +423,26 @@ class TestTheCycleMustAddUp:
         assert f"UNCLAIMED_ORDER:{CLOSE_LINK}" in report["carry_cycle"][0]["issues"]
 
     def test_an_exit_before_the_entry_is_refused(self):
+        """The leg checks now also refuse a fill that precedes its own create;
+        the cycle check is exercised directly with leg verdicts whose fills are
+        in the wrong order."""
+        def verdict(first, last, ids):
+            return {"resolved": True, "issues": [], "detail": {
+                "order_id": "o" + ids[0], "first_exec_ms": first,
+                "last_exec_ms": last, "exec_ids": ids, "venue_qty": QTY,
+                "venue_price": P_IN, "venue_fees": {"USDT": FEE_IN}}}
+        legs = [verdict(OPEN_MS + 9_000, OPEN_MS + 9_000, ["EXEC-1"]),
+                verdict(OPEN_MS + 1_000, OPEN_MS + 1_000, ["EXEC-2"])]
+        cycle = R.reconcile_carry_cycle(
+            leg_claims(), legs, [], [], [R.capture_from_records(build())])
+        assert "CYCLE_EXIT_BEFORE_ENTRY" in cycle["issues"]
+        assert cycle["resolved"] is False
+
+    def test_a_fill_that_precedes_its_own_create_is_refused(self):
         records = build(tweak=lambda n, v: (
             dict(v, execTime=str(OPEN_MS - 500)) if n == "exec_close" else v))
         report = run(records)
-        assert "CYCLE_EXIT_BEFORE_ENTRY" in report["carry_cycle"][0]["issues"]
+        assert "VENUE_DISAGREES:exec_before_create" in report["carry_legs"][1]["issues"]
 
     def test_no_position_read_after_the_close_means_no_proof_of_flat(self):
         report = run(build(drop=("position",)))
@@ -639,3 +658,247 @@ class TestTheCommandLine:
         bad = tmp_path / "bad.json"
         bad.write_text("{")
         assert R.main(["--drill-report", str(bad), "--now-ms", str(NOW)]) == 3
+
+
+# ---------------------------------------------------------------------------
+# found by independent review (each reproduced before the fix)
+# ---------------------------------------------------------------------------
+
+def post_rec(path, *, body=None, result=None, prev, at, host=F.TESTNET_REST,
+             env="testnet"):
+    return F.record(path, [], prev=prev, at=at, method="POST", env=env, host=host,
+                    request={"headers": {}, "params": {},
+                             "body": json.dumps(body or {})},
+                    response={"retCode": 0, "retMsg": "OK", "_status_code": 200,
+                              "result": result or {}})
+
+
+def get_rec(path, rows, *, prev, at):
+    return F.record(path, rows, prev=prev, at=at)
+
+
+def cycle_issues(records, **kw):
+    return run(records, **kw)["carry_cycle"][0]["issues"]
+
+
+class TestUnclaimedActivityIsFoundWhereverItHides:
+    @pytest.mark.parametrize("name,make", [
+        ("create with no link id", lambda prev: post_rec(
+            "/v5/order/create", prev=prev, at=CLOSE_MS + 90_000,
+            body={"category": "linear", "symbol": "BTCUSDT", "side": "Sell",
+                  "orderType": "Market", "qty": "0.001"},
+            result={"orderId": "ord-x", "orderLinkId": ""})),
+        ("batch create", lambda prev: post_rec(
+            "/v5/order/create-batch", prev=prev, at=CLOSE_MS + 90_000,
+            result={"list": []})),
+        ("amend", lambda prev: post_rec(
+            "/v5/order/amend", prev=prev, at=CLOSE_MS + 90_000)),
+        ("cancel", lambda prev: post_rec(
+            "/v5/order/cancel", prev=prev, at=CLOSE_MS + 90_000)),
+        ("trading stop", lambda prev: post_rec(
+            "/v5/position/trading-stop", prev=prev, at=CLOSE_MS + 90_000)),
+        ("a create on the mainnet host", lambda prev: post_rec(
+            "/v5/order/create", prev=prev, at=CLOSE_MS + 90_000,
+            host="https://api.bybit.com", env="mainnet",
+            body={"orderLinkId": "m"}, result={"orderId": "m1", "orderLinkId": "m"})),
+        ("a create on a host that proves nothing", lambda prev: post_rec(
+            "/v5/order/create", prev=prev, at=CLOSE_MS + 90_000,
+            host="https://api-testnet.bybit.com.evil.example",
+            body={"orderLinkId": "e"}, result={"orderId": "e1"})),
+    ])
+    def test_a_stray_post_blocks_the_cycle(self, name, make):
+        report = run(build(extra=[make]))
+        cycle = report["carry_cycle"][0]
+        assert any(i.startswith("UNCLAIMED_ORDER") for i in cycle["issues"]), name
+        assert cycle["resolved"] is False and report["pnl_claim_allowed"] is False
+
+    def test_an_execution_row_of_an_order_nobody_claimed(self):
+        stray = dict(F.exec_row(9, order="stray-ord", link="", side="Sell",
+                                qty="0.001", price="1", fee="0"), feeCurrency="USDT",
+                     execTime=str(CLOSE_MS + 50_000))
+        extra = [lambda prev: get_rec("/v5/execution/list", [stray], prev=prev,
+                                      at=CLOSE_MS + 90_000)]
+        assert any(i.startswith("UNCLAIMED_EXECUTION")
+                   for i in cycle_issues(build(extra=extra)))
+
+    def test_an_order_row_nobody_claimed(self):
+        stray = dict(F.order_row("stray-ord", link=""), createdTime=str(OPEN_MS + 5_000))
+        extra = [lambda prev: get_rec("/v5/order/history", [stray], prev=prev,
+                                      at=CLOSE_MS + 90_000)]
+        assert "UNCLAIMED_ORDER:stray-ord" in cycle_issues(build(extra=extra))
+
+    def test_an_old_unrelated_order_before_the_drill_is_not_this_cycles_business(self):
+        old = dict(F.order_row("old-ord", link="x"), createdTime=str(F.T0 - 86_400_000))
+        extra = [lambda prev: get_rec("/v5/order/realtime", [old], prev=prev,
+                                      at=CLOSE_MS + 90_000)]
+        assert cycle_issues(build(extra=extra)) == []
+
+    def test_an_order_row_with_no_creation_time_cannot_be_proved_old(self):
+        stray = F.order_row("stray-ord", link="")
+        extra = [lambda prev: get_rec("/v5/order/realtime", [stray], prev=prev,
+                                      at=CLOSE_MS + 90_000)]
+        assert "UNCLAIMED_ORDER:stray-ord" in cycle_issues(build(extra=extra))
+
+
+class TestFundingWindowIsChecked:
+    def test_a_window_total_with_the_wrong_sign_is_refused(self):
+        records = build(tweak=lambda n, v: dict(v, change="-0.0123")
+                        if n == "settlement" else v)
+        issues = cycle_issues(records, funding=[],
+                              window={"count": 1, "total_usd": 0.0123})
+        assert any(i.startswith("VENUE_SIGN_") for i in issues)
+
+    def test_an_unreadable_funding_value_is_not_zero(self):
+        records = build(tweak=lambda n, v: dict(v, funding="n/a", change="n/a")
+                        if n == "settlement" else v)
+        issues = cycle_issues(records, funding=[],
+                              window={"count": 1, "total_usd": 0.0})
+        assert "CYCLE_FUNDING_UNREADABLE" in issues
+
+    def test_the_legacy_report_path_does_not_skip_it(self):
+        records = build(tweak=lambda n, v: dict(v, change="-0.0123")
+                        if n == "settlement" else v)
+        got = R.claims_from_drill_report(legacy_report(), legacy_ledger())
+        report = R.reconcile(carry_claims=got["carry_leg_claims"],
+                             funding_window=got["funding_window"],
+                             captures=[R.capture_from_records(records)], now_ms=NOW)
+        assert report["carry_cycle"][0]["resolved"] is False
+
+    def test_an_unreadable_position_size_on_the_row_is_unverified(self):
+        records = build(tweak=lambda n, v: dict(v, size="abc")
+                        if n == "settlement" else v)
+        assert "CYCLE_FUNDING_SIZE_UNVERIFIED" in cycle_issues(records)
+
+    def test_a_missing_size_on_the_row_is_unverified(self):
+        def drop_size(n, v):
+            if n == "settlement":
+                v = dict(v)
+                v.pop("size")
+            return v
+        assert "CYCLE_FUNDING_SIZE_UNVERIFIED" in cycle_issues(build(tweak=drop_size))
+
+
+class TestNoSettlementMustMeanNoneWasPaidNotNeverLooked:
+    def test_without_a_transaction_log_read_there_is_no_funding_finding(self):
+        report = run(build(drop=("settlement",)), funding=[])
+        assert "CYCLE_FUNDING_NOT_CAPTURED" in report["carry_cycle"][0]["issues"]
+        assert report["pnl_claim_allowed"] is False
+
+    def test_a_read_from_before_the_close_does_not_cover_the_hold(self):
+        records = build()
+        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
+        rec["captured_at_utc"] = F.iso(CLOSE_MS - 3_600_000)
+        assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
+
+    def test_a_read_that_started_after_the_entry_does_not_cover_the_hold(self):
+        records = build()
+        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
+        rec["request"]["params"]["startTime"] = CLOSE_MS - 1_000
+        assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
+
+    def test_a_read_with_a_next_page_pending_does_not_count(self):
+        records = build()
+        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
+        rec["response"]["result"]["nextPageCursor"] = "more"
+        assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
+
+    def test_a_read_with_no_window_stated_does_not_count(self):
+        records = build()
+        rec = next(r for r in records if r["request_url"].endswith("transaction-log"))
+        rec["request"]["params"] = {}
+        assert "CYCLE_FUNDING_NOT_CAPTURED" in cycle_issues(_rechain(records))
+
+
+class TestContradictoryRowsAreNotIgnored:
+    def test_an_earlier_final_snapshot_that_disagrees_blocks(self):
+        """The disagreeing snapshot comes FIRST in the chain, so a check that
+        only compares the last final row would pass it."""
+        records = build()
+        bad = get_rec("/v5/order/realtime",
+                      [order(OPEN_ORD, OPEN_LINK, "Sell", "0.5", "80620.4", "9")],
+                      prev="x", at=OPEN_MS + 4_000)
+        at = next(i for i, r in enumerate(records)
+                  if r["request_url"].endswith("order/history")
+                  and OPEN_ORD in json.dumps(r["response"]))
+        records.insert(at, bad)
+        issues = run(_rechain(records))["carry_legs"][0]["issues"]
+        assert "VENUE_DISAGREES:order_qty" in issues
+
+    def test_a_create_answer_that_names_another_link_blocks(self):
+        records = build()
+        for r in records:
+            if r["method"] == "POST" and OPEN_LINK in r["request"]["body"]:
+                r["response"]["result"]["orderLinkId"] = "SOMETHING-ELSE"
+        assert "VENUE_DISAGREES:create_link" in run(_rechain(records))["carry_legs"][0]["issues"]
+
+    def test_a_replayed_create_with_other_parameters_blocks(self):
+        replay = lambda prev: create_rec(OPEN_LINK, OPEN_ORD, "Sell", qty="100",
+                                         prev=prev, at=OPEN_MS + 2_000)
+        issues = run(build(extra=[replay]))["carry_legs"][0]["issues"]
+        assert "VENUE_ROWS_CONTRADICT" in issues
+
+
+class TestTheOrderOfEventsIsChecked:
+    def test_a_create_captured_after_its_fills_is_refused(self):
+        records = build()
+        for r in records:
+            if r["method"] == "POST" and OPEN_LINK in r["request"]["body"]:
+                r["captured_at_utc"] = F.iso(OPEN_MS + 3 * H)
+        issues = run(_rechain(records))["carry_legs"][0]["issues"]
+        assert "VENUE_DISAGREES:exec_before_create" in issues
+
+    def test_a_position_read_that_precedes_the_execution_list_in_the_chain(self):
+        """Stamps are whole seconds, so the clock alone cannot order a read and
+        the list it follows; the chain's own order can."""
+        records = build()
+        pos = next(r for r in records if r["request_url"].endswith("position/list"))
+        records.remove(pos)
+        at = next(i for i, r in enumerate(records)
+                  if r["request_url"].endswith("execution/list")
+                  and CLOSE_LINK in json.dumps(r["response"]))
+        records.insert(at, pos)
+        assert "NO_FINAL_POSITION_READ" in cycle_issues(_rechain(records))
+
+
+class TestEconomicsUseTheVenuesNumbers:
+    def test_a_claim_within_tolerance_does_not_set_the_gross(self):
+        venue_in = "80620.4726"            # 9e-7 above the claimed 80620.4
+        records = build(tweak=_alter("exec_open", execPrice=venue_in))
+        report = run(records)
+        econ = report["carry_cycle"][0]["economics"]
+        assert report["carry_cycle"][0]["resolved"] is True
+        assert econ["entry_price"] == pytest.approx(float(venue_in))
+        assert econ["perp_gross_usdt"] == pytest.approx(
+            (float(venue_in) - P_OUT) * QTY)
+
+
+class TestMalformedInputIsRefusedNotRaisedOn:
+    def test_junk_funding_claims_and_windows(self):
+        for funding in (["junk"], [None, 5]):
+            report = run(funding=funding)
+            assert report["carry_cycle"][0]["resolved"] is False
+        for window in ("x", [1], 5):
+            report = run(funding=[], window=window)
+            assert "CYCLE_FUNDING_WINDOW_MALFORMED" in report["carry_cycle"][0]["issues"]
+
+    @pytest.mark.parametrize("report", [
+        {"venue": "testnet", "stages": None}, {"venue": "testnet", "stages": 5},
+        {"venue": "testnet", "stages": [{"stage": ["unhashable"]}, "x", None]},
+        {"claims": {"schema": "drill_claims/1", "carry_leg_claims": 5}},
+        {"claims": {"schema": "drill_claims/1", "funding_claims": 7}}])
+    def test_odd_drill_reports(self, report):
+        got = R.claims_from_drill_report(report, legacy_ledger())
+        assert isinstance(got["carry_leg_claims"], list)
+
+    def test_unreadable_claims_make_the_cli_refuse(self, tmp_path):
+        rp = tmp_path / "r.json"
+        rp.write_text(json.dumps({"claims": {"schema": "drill_claims/1",
+                                             "carry_leg_claims": 5}}))
+        assert R.main(["--drill-report", str(rp), "--now-ms", str(NOW)]) == 3
+
+    def test_resolve_inferred_links_skips_non_dicts(self):
+        assert R.resolve_inferred_links(["x", None], []) == ["x", None]
+
+    def test_the_cycle_called_directly_with_junk_verdicts(self):
+        cycle = R.reconcile_carry_cycle(leg_claims(), [{"x": 1}, "y"], [], [], [])
+        assert cycle["resolved"] is False

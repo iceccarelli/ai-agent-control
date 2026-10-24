@@ -762,6 +762,8 @@ class CarryBroker:
             symbol=symbol, side=side, qty=qty_text, price=price_text,
             purpose=f"carry-{product}-maker", session_token=self.session_token)
 
+        self.sent_order_links.append((product, symbol, link_id))
+
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": qty_text, "price": price_text,
                 "timeInForce": "PostOnly", "orderLinkId": link_id}
