@@ -1,5 +1,5 @@
 {
-  "git_commit": "44e13d5523f94fb3f06946f751af5e13112d7959-dirty",
+  "git_commit": "3aadf2fa335e8932f5b6f4d5abe1faa59ead289f-dirty",
   "schema": "hypothesis_registry/1",
   "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
   "seeded": true,
@@ -208,6 +208,9 @@
       "recorded_utc": "2026-09-11T18:24:13Z",
       "source": "carry_costs.py (0019/0021), tools/carry_backtest.py --gated",
       "status": "measured_in_sample",
+      "superseded_by": "carry_entry_gate_v1@BTCUSDT",
+      "superseded_reason": "Superseded 2026-10-25: CarryEngine no longer runs evaluate_entry alone; since PR #124 it runs carry_costs.entry_gate (evaluate_entry, then the measured-hold check). This entry's note and numbers are historical and unchanged.",
+      "superseded_utc": "2026-10-25T18:33:17Z",
       "trial_id": "carry_cost_gates_v1@BTCUSDT"
     },
     {
@@ -215,6 +218,9 @@
       "recorded_utc": "2026-09-13T18:59:24Z",
       "source": "carry_engine.py execution_mode=overlay (0036), tools/carry_backtest.py --mode overlay",
       "status": "measured_in_sample",
+      "superseded_by": "carry_entry_gate_v1@BTCUSDT",
+      "superseded_reason": "Superseded 2026-10-25: CarryEngine no longer runs evaluate_entry alone; since PR #124 it runs carry_costs.entry_gate (evaluate_entry, then the measured-hold check). This entry's note and numbers are historical and unchanged.",
+      "superseded_utc": "2026-10-25T18:33:17Z",
       "trial_id": "carry_overlay_v1@BTCUSDT"
     },
     {
@@ -237,8 +243,25 @@
       "source": "tools/carry_walkforward.py",
       "status": "search_width_recorded",
       "trial_id": "carry_walkforward@69b08ab2ab84"
+    },
+    {
+      "note": "The rule CarryEngine runs from PR #124 (3aadf2f): carry_costs.entry_gate = evaluate_entry (carry_cost_gates_v1) and THEN hold_clears_round_trip: the smoothed funding must earn back the round trip (plus borrow) within DEMONSTRATED_HOLD_DAYS (5.8 days = 17 settlements). It only ever refuses more than evaluate_entry; ASSUMED_HOLD_DAYS (30), EWMA, funding thresholds, fees, borrow, basis budgets, sizing, risk limits and exits did not move. The engine, carry_backtest.simulate_settlements_series and cpp/carrycore.cpp make the same decision (tests/test_entry_gate_parity.py). IN-SAMPLE ONLY: DEMONSTRATED_HOLD_DAYS was measured by tools/carry_hold_audit.py on the same Bybit 4h corpus (2022-08-01..2026-09-09) this rule is then replayed on, so the replay improvement is not validation. Replay of that corpus, overlay/taker, 0% borrow: 77 -> 49 trades, net USD 29,889 -> 33,050; completed-trade median hold 9.7 days under the gate (5.8 before it); 52% of completed trades still lose money. tools/carry_oos_audit.py (chronological, NOT independent) is INCONCLUSIVE: 41 completed trades < 60. No holdout has been scored (HOLDOUT_SCORED is False). The only admissible evidence for this rule is FORWARD: settlements after the PR #124 merge (2026-10-25) observed by a book created under this rule's configuration fingerprint. carry_cost_gates_v1 and carry_overlay_v1 describe the previous entry rule and are marked superseded; their numbers are unchanged.",
+      "production_rule": true,
+      "recorded_utc": "2026-10-25T18:33:17Z",
+      "rule": {
+        "assumed_hold_days": 30.0,
+        "demonstrated_hold_days": 5.8,
+        "engine_entry_function": "carry_costs.entry_gate",
+        "ewma_alpha": 0.5,
+        "ewma_min_prints": 3,
+        "funding_periods_per_day": 3,
+        "refines": "carry_cost_gates_v1@BTCUSDT"
+      },
+      "source": "carry_costs.entry_gate (PR #124); tools/carry_hold_audit.py, tools/carry_oos_audit.py at 3aadf2f",
+      "status": "measured_in_sample",
+      "trial_id": "carry_entry_gate_v1@BTCUSDT"
     }
   ],
-  "updated_utc": "2026-09-13T23:46:54Z",
+  "updated_utc": "2026-10-25T18:33:17Z",
   "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }

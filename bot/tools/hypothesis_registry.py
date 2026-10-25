@@ -103,6 +103,39 @@ def record(registry: Dict[str, Any], trial_id: str, **fields: Any) -> Dict[str, 
     return entry
 
 
+def supersede(registry: Dict[str, Any], old_id: str, by: str, reason: str
+              ) -> Dict[str, Any]:
+    """Mark a recorded trial as superseded by a LATER trial, touching nothing else.
+
+    The registry is append-only, so when the production rule changes the old
+    entry cannot be edited: its note stays exactly as it was written, with its
+    measurements. What may be added is a pointer from it to the trial that now
+    describes the rule the system runs, so a reader of the old note is not left
+    believing it is current. Adds `superseded_by`, `superseded_reason` and
+    `superseded_utc`; refuses an unknown id, a missing successor, a self-pointer
+    or an entry that was already superseded.
+    """
+    by_id = {t["trial_id"]: t for t in registry.get("trials", [])}
+    if old_id not in by_id:
+        raise ValueError(f"unknown trial_id {old_id!r}")
+    if by not in by_id:
+        raise ValueError(f"successor {by!r} is not a recorded trial; record it "
+                         "first")
+    if old_id == by:
+        raise ValueError("a trial cannot supersede itself")
+    entry = by_id[old_id]
+    if "superseded_by" in entry:
+        raise ValueError(f"{old_id!r} is already superseded by "
+                         f"{entry['superseded_by']!r}")
+    if not str(reason).strip():
+        raise ValueError("a supersession needs a reason")
+    entry["superseded_by"] = by
+    entry["superseded_reason"] = reason
+    entry["superseded_utc"] = dt.datetime.now(dt.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    return entry
+
+
 def seed(registry: Dict[str, Any]) -> int:
     added = 0
     for trial in _seed_trials():
