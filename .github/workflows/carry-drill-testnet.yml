@@ -1,0 +1,186 @@
+# UNATTENDED carry drill on the Bybit TESTNET, across a funding settlement.
+#
+# WHY THIS EXISTS: a drill run from a Codespace dies when the Codespace stops
+# (idle, laptop closed) and leaves a short open - that happened twice. A
+# scheduled GitHub Actions job does not depend on anyone's machine.
+#
+# WHAT IT DOES, per run (only when a settlement is 4-20 minutes away):
+#   1. unarmed preflight (sends nothing; refuses unless the venue is flat);
+#   2. the armed drill (tools/drill.py): open the hedged short, hold across the
+#      settlement, unwind, capture the venue's final order/execution rows;
+#   3. ALWAYS (even if the drill failed, was cancelled or timed out): close any
+#      short left at the venue, reduce-only, testnet only, never more than
+#      0.0015 BTC (tools/close_testnet_short.py --no-prompt --max-qty);
+#   4. reconcile the capture against the drill's own report and write a short
+#      summary; upload the files as an artifact.
+#
+# WHAT IT CANNOT DO: touch mainnet. BYBIT_VENUE is fixed to testnet here, the
+# drill refuses any configuration or client host that is not the testnet host,
+# LIVE_TRADING_ACK is never set, the credentials are TESTNET credentials stored
+# as secrets, and every order is capped by the drill's own $100 cap.
+#
+# OFF BY DEFAULT: nothing runs until the repository VARIABLE
+# CARRY_DRILL_ENABLED is set to "true" (Settings -> Secrets and variables ->
+# Actions -> Variables). Delete or change it to stop all scheduled runs.
+# It never runs on a pull request, on a fork, or from any branch but main, and
+# not on a PUBLIC repository (its artifacts and logs would be world-readable)
+# unless the variable CARRY_DRILL_ALLOW_PUBLIC is also "true".
+#
+# WHAT A GREEN RUN DOES NOT SHOW: a profit. One round trip on testnet costs
+# ~11 bps in fees; it shows whether the evidence path works. Its artifact holds
+# REDACTED testnet account data; keep the repository private or do not enable
+# this on a public repository you do not want that data visible in.
+#
+# The separate carry-verify.yml gate stays secret-free and venue-free; a test
+# pins that. Scheduled workflows run only from the default branch and GitHub
+# may delay them by many minutes, which is why there are two start times per
+# settlement and why a late start simply does nothing.
+name: carry-drill-testnet
+
+on:
+  schedule:
+    # 18 and 10 minutes before the 00:00, 08:00 and 16:00 UTC settlements
+    - cron: "42 23 * * *"
+    - cron: "50 23 * * *"
+    - cron: "42 7 * * *"
+    - cron: "50 7 * * *"
+    - cron: "42 15 * * *"
+    - cron: "50 15 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carry-drill-testnet
+  cancel-in-progress: false
+
+jobs:
+  drill:
+    name: carry drill (testnet, unattended)
+    if: ${{ github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.CARRY_DRILL_ENABLED == 'true' && (github.event.repository.private == true || vars.CARRY_DRILL_ALLOW_PUBLIC == 'true') }}
+    # The testnet credentials live in this GitHub ENVIRONMENT, which is
+    # restricted to the main branch (Settings -> Environments). A branch that
+    # edits this file to drop the checks above still cannot read them.
+    environment: testnet-drill
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    defaults:
+      run:
+        working-directory: bot
+    env:
+      BOOK_MODE: carry
+      CARRY_BORROW_APR: "0.0"
+      CARRY_EXECUTION_MODE: overlay
+      BYBIT_VENUE: testnet
+      USE_TESTNET: "1"
+      PAPER_TRADING: "0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt -c constraints.txt
+
+      - name: Can this runner reach the testnet? (public endpoint, no credentials)
+        run: |
+          code=$(curl -sS -o "$RUNNER_TEMP/time.json" -w '%{http_code}' --max-time 15 https://api-testnet.bybit.com/v5/market/time || echo "curl-failed")
+          { echo "testnet reachability from this runner: HTTP $code"; head -c 200 "$RUNNER_TEMP/time.json" 2>/dev/null; echo; } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Is a settlement 4-20 minutes away?
+        id: window
+        run: |
+          set +e
+          python tools/next_settlement.py --min-lead-minutes 4 --max-lead-minutes 20 | tee window.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" -eq 0 ]; then echo "inside=true" >> "$GITHUB_OUTPUT"; else echo "inside=false" >> "$GITHUB_OUTPUT"; fi
+          # exit 10 is the ONLY "outside the window"; any other code is a broken step
+          if [ "$code" -ne 0 ] && [ "$code" -ne 10 ]; then echo "next_settlement.py failed with exit code $code" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
+          echo "RUN_DIR=$RUNNER_TEMP/drill-run" >> "$GITHUB_ENV"
+          echo "STATE_DB_PATH=$RUNNER_TEMP/no_running_book.db" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/drill-run"
+          {
+            echo "### carry-drill-testnet"
+            if [ "$code" -eq 0 ]; then echo "A settlement is inside the 4-20 minute window: running."; else echo "No settlement 4-20 minutes away: nothing was sent."; fi
+            cat window.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Preflight (unarmed, sends nothing)
+        id: preflight
+        if: steps.window.outputs.inside == 'true'
+        continue-on-error: true
+        env:
+          BYBIT_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
+          BYBIT_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
+        run: python tools/drill.py
+
+      - name: Armed drill across the settlement
+        id: drill
+        if: steps.window.outputs.inside == 'true' && steps.preflight.outcome == 'success'
+        # a step timeout is an ordinary step failure, so the always() steps
+        # after it run with certainty (a job timeout is less clear)
+        timeout-minutes: 34
+        env:
+          BYBIT_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
+          BYBIT_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
+        run: |
+          set +e
+          python tools/drill.py --arm --hold-for-settlement --max-hold-hours 0.5 --poll-seconds 30 --settle-wait-hours 0 --min-settlements 1 \
+            --evidence-path "$RUN_DIR/drill_evidence.jsonl" \
+            --out "$RUN_DIR/drill_out.json" \
+            --cash-ledger "$RUN_DIR/drill_ledger.json"
+          code=$?
+          echo "drill exit code: $code"
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Close anything left open (always; reduce-only, testnet, <= 0.0015 BTC)
+        id: flat
+        if: always() && steps.window.outputs.inside == 'true'
+        env:
+          BYBIT_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
+          BYBIT_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
+        run: python tools/close_testnet_short.py --arm --no-prompt --max-qty 0.0015 --evidence-path "$RUN_DIR/ensure_flat_evidence.jsonl"
+
+      - name: Reconcile the capture against the drill's report
+        id: reconcile
+        if: always() && steps.window.outputs.inside == 'true' && steps.drill.outcome != 'skipped'
+        continue-on-error: true
+        run: |
+          set +e
+          args=(--evidence "$RUN_DIR/drill_evidence.jsonl" --drill-report "$RUN_DIR/drill_out.json" --now-ms "$(date +%s%3N)" --json "$RUN_DIR/reconciliation.json")
+          if [ -f "$RUN_DIR/drill_ledger.json" ]; then args+=(--ledger "$RUN_DIR/drill_ledger.json"); fi
+          python tools/evidence_reconcile.py "${args[@]}"
+          rc=$?
+          echo "reconcile exit code: $rc"
+          # 0 = reconciled; 2 = reconciled with flags (shown below); anything else, or no report, is a failure
+          if [ ! -s "$RUN_DIR/reconciliation.json" ]; then rc=99; fi
+          echo "recon=$rc" >> "$GITHUB_OUTPUT"
+          { echo '```'; python tools/recon_summary.py "$RUN_DIR/reconciliation.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Keep the files (redacted testnet evidence)
+        if: always() && steps.window.outputs.inside == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: carry-drill-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/drill-run
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Verdict
+        if: always() && steps.window.outputs.inside == 'true'
+        run: |
+          code="${{ steps.drill.outputs.exit }}"
+          echo "preflight: ${{ steps.preflight.outcome }}  drill exit: ${code:-not run}  ensure-flat: ${{ steps.flat.outcome }}"
+          if [ "${{ steps.flat.outcome }}" != "success" ]; then echo "THE VENUE COULD NOT BE VERIFIED FLAT: look at the testnet account"; exit 1; fi
+          if [ "${{ steps.preflight.outcome }}" != "success" ]; then echo "preflight failed (not flat, or the venue could not be read): no drill was run"; exit 1; fi
+          case "$code" in 0|5) echo "drill finished (exit $code)";; *) echo "drill exit code $code is not a clean finish"; exit 1;; esac
+          rc="${{ steps.reconcile.outputs.recon }}"
+          case "$rc" in 0|2) echo "reconciliation ran (exit $rc)";; *) echo "reconciliation did not produce a usable report (exit ${rc:-not run}): the evidence path is NOT working"; exit 1;; esac

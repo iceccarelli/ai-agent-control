@@ -480,3 +480,26 @@ class TestWsVenueHosts:
         rest_hosts = set(ve.VENUE_HOSTS.values())
         ws_hosts = set(ve.WS_VENUE_HOSTS.values())
         assert rest_hosts.isdisjoint(ws_hosts)
+
+
+class TestRedactionReachesAJsonStringBody:
+    """A request body is recorded as the JSON TEXT that was sent."""
+
+    def test_a_secret_inside_a_json_text_is_redacted(self):
+        import json as _json
+        out = ve.redact({"body": '{"orderLinkId":"x","apiKey":"LEAK","qty":"1"}'})
+        parsed = _json.loads(out["body"])
+        assert parsed["apiKey"] == "***REDACTED***" and parsed["qty"] == "1"
+        assert "LEAK" not in out["body"]
+
+    def test_a_body_with_nothing_to_redact_is_left_byte_for_byte(self):
+        text = '{"category": "linear", "qty": "0.001", "orderLinkId": "x"}'
+        assert ve.redact({"body": text})["body"] == text
+
+    def test_text_that_is_not_json_is_untouched(self):
+        for text in ("{not json", "[1, 2", "plain", "", "{"):
+            assert ve.redact({"body": text})["body"] == text
+
+    def test_a_nested_secret_in_a_json_array_text_is_redacted(self):
+        out = ve.redact({"body": '[{"secret":"LEAK2"}]'})
+        assert "LEAK2" not in out["body"]
