@@ -95,6 +95,7 @@ jobs:
           tests/test_funding_window.py
           tests/test_carry_latency.py
           tests/test_carry_cost_inputs.py
+          tests/test_registry_matches_production_rule.py
           tests/test_carry_cost_reality.py
           tests/test_venue_isolation.py
           tests/test_drill_evidence.py
