@@ -6,13 +6,15 @@ Static checks (no Docker daemon in CI), like test_dockerfile.py.
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
-ENTRY = ["unattended_drill", "next_settlement", "recon_summary", "drill",
-         "close_testnet_short", "drill_final_state", "evidence_reconcile"]
+ENTRY = ["runner_monitor", "run_outcomes", "carry_preflight", "unattended_drill",
+         "next_settlement", "recon_summary", "drill", "close_testnet_short",
+         "drill_final_state", "evidence_reconcile"]
 
 
 def _read(name):
@@ -81,6 +83,33 @@ def test_image_is_testnet_and_credential_free():
     assert "LIVE_TRADING_ACK" not in text
     assert "BYBIT_API" not in text
     assert "--loop" in text
+
+
+def _cmd(text):
+    line = [l for l in text.splitlines() if l.startswith("CMD ")]
+    assert len(line) == 1
+    return json.loads(line[0][4:])
+
+
+def test_the_default_command_is_the_read_only_monitor():
+    text = _read("Dockerfile.drill")
+    cmd = _cmd(text)
+    assert cmd[:2] == ["python3", "tools/runner_monitor.py"]
+    joined = " ".join(cmd)
+    for forbidden in ("unattended_drill", "--conformance", "--arm", "drill.py",
+                      "close_testnet_short"):
+        assert forbidden not in joined, forbidden
+    assert "--loop" in cmd
+
+
+def test_the_conformance_runner_ships_but_is_never_the_entrypoint_or_default():
+    text = _read("Dockerfile.drill")
+    assert "tools/unattended_drill.py" in text        # available, explicitly
+    entry = [l for l in text.splitlines() if l.startswith("ENTRYPOINT")]
+    assert entry == ['ENTRYPOINT ["/usr/local/bin/drill-entrypoint"]']
+    toml = _read("fly.drill.toml")
+    assert "--conformance" not in toml and "unattended_drill" not in "\n".join(
+        l for l in toml.splitlines() if not l.lstrip().startswith("#"))
 
 
 def test_fly_config_properties():

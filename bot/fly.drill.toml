@@ -1,4 +1,7 @@
-# The unattended TESTNET drill runner. A separate app from carry-book.
+# The unattended TESTNET runner. A separate app from carry-book.
+# Its default command is READ-ONLY (tools/runner_monitor.py: reachability, safety
+# preconditions, venue state, entry economics; it cannot place an order). The
+# order-capable conformance run is a separate, explicitly invoked command.
 # Deploy with `fly deploy -c fly.drill.toml --ha=false` (never `fly launch`,
 # which rewrites config). tests/test_drill_image.py pins these properties.
 #
