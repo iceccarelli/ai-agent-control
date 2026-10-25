@@ -38,6 +38,10 @@ WHAT IT REFUSES
     python3 tools/close_testnet_short.py --arm \\
         --evidence-path /workspaces/ai-agent-control/runs/close_evidence.jsonl
 
+UNATTENDED SAFETY NET (the testnet drill workflow): `--arm --no-prompt
+--max-qty 0.0015` skips the typed confirmation and the terminal check, and is
+refused if the short is larger than --max-qty. Everything else above applies.
+
 Exit codes: 0 nothing to close, or closed and verified flat; 1 sent an order but
 flat is NOT verified (a human must look); 2 cannot start; 3 refused.
 """
@@ -137,11 +141,24 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--arm", action="store_true",
                     help="send the reduce-only close (asks for a typed "
                          "confirmation). Without it nothing is sent.")
+    ap.add_argument("--no-prompt", action="store_true",
+                    help="UNATTENDED safety net (needs --arm and --max-qty): skip "
+                         "the typed confirmation and the terminal check. The "
+                         "close is still one reduce-only Buy, still testnet "
+                         "only, and refused if the short exceeds --max-qty.")
+    ap.add_argument("--max-qty", type=float, default=0.0,
+                    help="with --no-prompt: refuse to close a short larger than "
+                         "this (a position this tool was not expecting)")
     ap.add_argument("--evidence-path", default="",
                     help="capture this run's REST traffic (redacted, "
                          "hash-chained) here; must not already exist")
     args = ap.parse_args(argv)
 
+    if args.no_prompt and not (args.arm and math.isfinite(args.max_qty)
+                               and args.max_qty > 0):
+        print("refusing: --no-prompt needs --arm and a positive --max-qty",
+              file=sys.stderr)
+        return 3
     if args.evidence_path and os.path.exists(args.evidence_path):
         print("refusing: --evidence-path already exists; appending to a file a "
               "drill may still be writing would break its hash chain. Pass a "
@@ -195,26 +212,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     if state["short_qty"] <= FLAT_DUST:
         print("The venue is flat. Nothing to close.")
         return 0
+    if args.no_prompt and state["short_qty"] > args.max_qty + FLAT_DUST:
+        print(f"REFUSED: the short is {state['short_qty']}, above --max-qty "
+              f"{args.max_qty}; this is not the position the safety net was "
+              "written for. Look at the venue.", file=sys.stderr)
+        return 3
     phrase = confirmation_phrase(args.symbol, state["short_qty"])
     print(f"\nWould send ONE reduce-only market Buy of {state['short_qty']} "
           f"{args.symbol} (testnet).")
     if not args.arm:
         print("Nothing was sent (no --arm). To close, re-run with --arm.")
         return 0
-    if not sys.stdin.isatty():
-        print("REFUSED: --arm needs an interactive terminal for the typed "
-              "confirmation.", file=sys.stderr)
-        return 3
-    try:
-        typed = input(f"Type exactly  {phrase}  and press Enter: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("REFUSED: no confirmation was given. Nothing was sent.",
-              file=sys.stderr)
-        return 3
-    if typed != phrase:
-        print("REFUSED: confirmation did not match. Nothing was sent.",
-              file=sys.stderr)
-        return 3
+    if args.no_prompt:
+        print(f"--no-prompt: closing the {state['short_qty']} short "
+              f"(<= --max-qty {args.max_qty}) without a typed confirmation.")
+    else:
+        if not sys.stdin.isatty():
+            print("REFUSED: --arm needs an interactive terminal for the typed "
+                  "confirmation.", file=sys.stderr)
+            return 3
+        try:
+            typed = input(f"Type exactly  {phrase}  and press Enter: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("REFUSED: no confirmation was given. Nothing was sent.",
+                  file=sys.stderr)
+            return 3
+        if typed != phrase:
+            print("REFUSED: confirmation did not match. Nothing was sent.",
+                  file=sys.stderr)
+            return 3
 
     D.InterruptGuard().install()
     try:

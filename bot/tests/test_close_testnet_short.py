@@ -401,3 +401,68 @@ class TestPositionSlots:
             else real(m, e, **kw))
         with pytest.raises(Exception, match="cannot read"):
             make_broker(client).get_position_slots("BTCUSDT")
+
+
+class TestUnattendedSafetyNet:
+    """`--no-prompt --max-qty`: the same single reduce-only Buy, no terminal."""
+
+    def run_unattended(self, wired, monkeypatch, broker, *extra):
+        wired(broker)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))      # no terminal at all
+        monkeypatch.setattr("builtins.input", lambda p="": pytest.fail("prompted"))
+        return C.main(["--arm", "--no-prompt", "--max-qty", "0.0015", *extra])
+
+    def test_it_closes_without_a_prompt_or_a_terminal(self, wired, monkeypatch, capsys):
+        b = FakeBroker()
+        assert self.run_unattended(wired, monkeypatch, b) == 0
+        assert len(b.sent) == 1 and b.sent[0]["side"] == "Buy"
+        assert b.sent[0]["qty"] == 0.001
+        assert "FLAT VERIFIED" in capsys.readouterr().out
+
+    def test_a_flat_venue_is_exit_0_and_sends_nothing(self, wired, monkeypatch):
+        b = FakeBroker(short=0.0)
+        assert self.run_unattended(wired, monkeypatch, b) == 0 and b.sent == []
+
+    def test_a_short_above_max_qty_is_refused(self, wired, monkeypatch):
+        b = FakeBroker(short=0.01)
+        assert self.run_unattended(wired, monkeypatch, b) == 3 and b.sent == []
+
+    def test_a_short_exactly_at_max_qty_is_allowed(self, wired, monkeypatch):
+        b = FakeBroker(short=0.0015)
+        assert self.run_unattended(wired, monkeypatch, b) == 0 and len(b.sent) == 1
+
+    @pytest.mark.parametrize("argv", [
+        ["--no-prompt"], ["--no-prompt", "--max-qty", "0.0015"],
+        ["--arm", "--no-prompt"], ["--arm", "--no-prompt", "--max-qty", "0"],
+        ["--arm", "--no-prompt", "--max-qty", "-1"],
+        ["--arm", "--no-prompt", "--max-qty", "nan"]])
+    def test_it_needs_arm_and_a_positive_finite_max_qty(self, wired, argv):
+        b = FakeBroker()
+        wired(b)
+        assert C.main(argv) == 3 and b.sent == []
+
+    @pytest.mark.parametrize("over", [{"BYBIT_VENUE": "mainnet"},
+                                      {"USE_TESTNET": False},
+                                      {"PAPER_TRADING": True},
+                                      {"LIVE_TRADING_ACK": "yes"}])
+    def test_the_testnet_refusals_still_apply(self, wired, monkeypatch, over):
+        b = FakeBroker()
+        wired(b, **over)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        assert C.main(["--arm", "--no-prompt", "--max-qty", "0.0015"]) == 3
+        assert b.sent == []
+
+    def test_a_hedge_slot_and_open_orders_are_still_refused(self, wired, monkeypatch):
+        for broker in (FakeBroker(slot_idx=2), FakeBroker(orders=1)):
+            assert self.run_unattended(wired, monkeypatch, broker) == 3
+            assert broker.sent == []
+
+    def test_a_close_that_leaves_it_open_exits_1_unattended(self, wired, monkeypatch):
+        b = FakeBroker(closes=False)
+        assert self.run_unattended(wired, monkeypatch, b) == 1 and len(b.sent) == 1
+
+    def test_without_no_prompt_a_missing_terminal_still_refuses(self, wired, monkeypatch):
+        b = FakeBroker()
+        wired(b)
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        assert C.main(["--arm", "--max-qty", "0.0015"]) == 3 and b.sent == []

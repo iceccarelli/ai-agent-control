@@ -100,6 +100,9 @@ jobs:
           tests/test_exit_proof_retry.py
           tests/test_close_testnet_short.py
           tests/test_real_stack_adapter.py
+          tests/test_next_settlement.py
+          tests/test_recon_summary.py
+          tests/test_unattended_workflow.py
           tests/test_exit_execution_ids.py
           tests/test_private_ws_consumer.py
           tests/test_conformance_evidence_end_to_end.py
