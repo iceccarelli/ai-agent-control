@@ -434,6 +434,52 @@ def test_simulators_agree_to_the_cent_with_the_gate_binding(native, latency,
     assert py["trades"] > 0
 
 
+def cycle_rows(cycles=8):
+    """Funding that cycles: a stretch too thin to clear the measured hold, a
+    stretch that clears it, a negative run that ends the position. Exercises
+    refusal, entry, hold, exit and re-entry through the real engine."""
+    rows, i = [], 0
+    plan = ([0.35] * 12 + [1.4] * 22 + [-0.8] * 4 + [0.6] * 3)
+    for _ in range(cycles):
+        for rate in plan:
+            perp = px(4.0 * math.sin(i / 5.0))
+            rows.append(cb.Settlement(ms=i * H8, perp=perp, spot=SPOT,
+                                      rate=rate / 1e4, perp_high=perp * 1.001,
+                                      perp_low=perp * 0.999))
+            i += 1
+    return rows
+
+
+def test_the_real_engine_replay_agrees_with_both_simulators(native):
+    """The engine is driven bar by bar through `carry_replay` (the same code
+    path as production's tick), at the decision-row fill the replay uses
+    (latency 0), and must make the same trades and the same refusals as the
+    Python settlement simulator and the C++ core."""
+    import carry_replay as rp
+    rows = cycle_rows()
+    eng = rp.replay(rows, notional=100_000.0, borrow_apr=0.0, impact_bps=0.0)
+    sim = cb.simulate_settlements_series(
+        rows, notional=100_000.0, borrow_apr=0.0, gated=True, impact_bps=0.0,
+        mode=cb.OVERLAY, latency_rows=0)
+    p = core.params(notional=100_000.0, borrow_apr=0.0, impact_bps=0.0,
+                    round_trip_bps=11.0, gated=True, overlay=True,
+                    latency_rows=0)
+    cpp = core.simulate(rows, p)
+    assert eng["trades"] == sim["trades"] == cpp["trades"]
+    assert eng["trades"] >= 6
+    hold = "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+    assert eng["reasons"].get(hold, 0) == sim["refusals"][hold] \
+        == cpp["refusals_by_reason"][8]
+    assert sim["refusals"][hold] >= 10
+    assert eng["reasons"].get("INSUFFICIENT_FUNDING_HISTORY", 0) \
+        == sim["refusals"].get("INSUFFICIENT_FUNDING_HISTORY", 0) \
+        == cpp["refusals_by_reason"][2]
+    # the engine snaps lots to the venue's step; the residual is that, not a
+    # different decision
+    assert eng["net_usd"] == pytest.approx(sim["net_usd"], rel=0.02)
+    assert cpp["net"] == pytest.approx(sim["net_usd"], abs=0.01)
+
+
 # -- the runtime: refusal reaches no venue, survives a restart -------------------
 
 H = 8 * 3600 * 1000
