@@ -116,7 +116,7 @@ class _Wired(CarryEngine):
                                  funding_print_ms=funding_print_ms)
 
 
-def engine(broker, *, primed=True, **kw):
+def engine(broker, *, primed=True, prime_bps=6.0, **kw):
     """A CarryEngine ready to open.
 
     0021 made two things true that these tests must now respect:
@@ -140,8 +140,19 @@ def engine(broker, *, primed=True, **kw):
     eng = _Wired(broker=broker, **kw)
     eng.pair_risk = CarryRisk(max_notional_usd=kw["max_notional_usd"])
     if primed:
+        # 0051: 6.0, not 3.0. These tests are about EXECUTION mechanics (what is
+        # sent, unwound, halted), not about whether the economics admit an entry,
+        # and they are ACQUIRE mode: a 31 bps round trip plus 5% financing. The
+        # entry gate now also requires the funding to earn back the round trip
+        # inside the measured hold (17 settlements); with primes of 3.0 the
+        # smoothed rate at the opening candle is 2.0 bps/8h, which needs 21 and
+        # is correctly refused. A richer prime keeps these fixtures reaching the
+        # path they test. The refusal itself is pinned in test_entry_gate_parity.
+        # The two basis-budget tests pass prime_bps=3.0: their budget is balanced
+        # on a 3.0 smoothed rate (198 bps against a 200 bps basis) and keep
+        # exactly the conditions they were written for.
         for _ in range(2):
-            eng.on_candle(mark=100_000.0, funding_bps=3.0, spot=SPOT)
+            eng.on_candle(mark=100_000.0, funding_bps=prime_bps, spot=SPOT)
     return eng
 
 
@@ -354,14 +365,14 @@ class TestFundingDrivesEntryAndExit:
 
     def test_a_wide_entry_basis_is_refused(self):
         broker = FakeBroker()
-        eng = engine(broker)
+        eng = engine(broker, prime_bps=3.0)
         decision = eng.on_candle(spot=SPOT, mark=SPOT * 1.02, funding_bps=3.0)
         assert decision.acted is False
         assert decision.reason == "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"
 
     def test_a_perp_discount_beyond_the_budget_is_refused(self):
         broker = FakeBroker()
-        eng = engine(broker)
+        eng = engine(broker, prime_bps=3.0)
         decision = eng.on_candle(spot=SPOT, mark=SPOT * 0.98, funding_bps=3.0)
         assert decision.acted is False
         assert decision.reason == "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET"

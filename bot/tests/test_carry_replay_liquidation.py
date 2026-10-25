@@ -155,7 +155,10 @@ def test_a_gate_that_never_binds_leaves_the_accounting_untouched():
 def test_default_accounting_is_unchanged_on_a_churning_series():
     r = rp.replay(rows(200, cycle=6), notional=100_000.0, borrow_apr=0.0)
     assert r["trades"] == 20 and r["orders"] == 40
-    assert r["net_usd"] == pytest.approx(75.573143, abs=1e-5)
+    # 0051: moved from +75.573143 on purpose. The entry is now `entry_gate`
+    # (evaluate_entry + the measured-hold check), so this synthetic series
+    # re-enters on different prints. A synthetic series; it is not evidence.
+    assert r["net_usd"] == pytest.approx(-1064.341114, abs=1e-5)
 
 
 # -- 3. unusable evidence is a refusal, never a safe value -----------------------

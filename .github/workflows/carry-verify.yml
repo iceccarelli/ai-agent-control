@@ -76,7 +76,14 @@ jobs:
           git rev-parse --verify HEAD^1
           git diff --check HEAD^1 HEAD
 
+      - name: Build the native core (the C++ half of the entry-gate parity)
+        run: make -C ../cpp
+
       - name: Carry correctness tests
+        env:
+          # tests/test_entry_gate_parity.py SKIPS without a compiler locally; here
+          # a missing library must fail the job, never go green on half the parity.
+          REQUIRE_NATIVE_CORE: "1"
         run: >
           python -m pytest -q -p no:cacheprovider
           tests/test_provisional_exit_reconciliation.py
@@ -114,6 +121,7 @@ jobs:
           tests/test_bybit_connection.py
           tests/test_cancel_books_the_increment.py
           tests/test_carry_core.py
+          tests/test_entry_gate_parity.py
           tests/test_carry_costs.py
           tests/test_carry_risk.py
           tests/test_config.py

@@ -131,14 +131,13 @@ ASSUMED_HOLD_DAYS = 30.0
 #: is a human-owned parameter like ASSUMED_HOLD_DAYS: not tuned until an entry
 #: passes, and not raised without an out-of-sample hold measurement.
 #:
-#: NOT WIRED INTO `CarryEngine` YET, on purpose. Wiring it into the OVERLAY
-#: entry (measured: replay 77 -> 49 trades, net 29,889 -> 33,050 in-sample)
-#: breaks the engine == simulator == C++ core agreement that
-#: `test_carry_replay`, `test_carry_core`, `test_carry_backtest`,
-#: `test_carry_hold_audit` and `test_carry_replay_liquidation` pin, so the
-#: simulator, the C++ core and those pins must move together in one reviewed
-#: change. `tests/test_carry_cost_reality.py` holds a strict xfail that fails
-#: the day it is wired, so the gap cannot be forgotten or half-closed.
+#: WIRED: `entry_gate` below runs `evaluate_entry` and then this check, and it
+#: is the one entry decision `CarryEngine.entry_economics` (so the replay and
+#: the preflight), both `carry_backtest` settlement/daily simulators and the C++
+#: core (`carry_entry_gate`) all make. `tests/test_entry_gate_parity.py` feeds
+#: identical inputs to the runtime, the Python simulator and the C++ core and
+#: requires identical accept/refuse and reason codes. The value is frozen by
+#: `tests/test_carry_cost_reality.py`; it was not tuned against any result.
 DEMONSTRATED_HOLD_DAYS = 5.8
 
 #: EWMA smoothing over funding prints. 0.5 puts half the weight on the newest
@@ -187,7 +186,11 @@ def ewma_funding_bps(prints_bps: Sequence[float], *,
 def basis_bps(perp: float, spot: float) -> float:
     """(perp - spot) / spot in bps. Positive means the perp trades RICH, which
     is both why funding is positive and why the basis will cost you."""
-    if not (math.isfinite(perp) and math.isfinite(spot)) or spot <= 0:
+    # A perp of 0 or below is no price. It used to be priced as a -100% basis,
+    # which a large enough smoothed funding could still budget for: an
+    # unreadable mark is refused, not priced (carrycore.cpp does the same).
+    if (not (math.isfinite(perp) and math.isfinite(spot))
+            or spot <= 0 or perp <= 0):
         raise ValueError(f"basis undefined for perp={perp!r} spot={spot!r}")
     return (perp / spot - 1.0) * 1e4
 
@@ -436,3 +439,52 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
                             smoothed_funding_bps=smoothed, detail=detail)
     return CarryVerdict(True, "HOLD_CLEARS_ROUND_TRIP",
                         smoothed_funding_bps=smoothed, detail=detail)
+
+
+# -- the entry gate: what the engine, the simulators and the C++ core all ask ---
+
+#: Reason codes, in the order carrycore.cpp numbers them (index = C++ code).
+#: `tests/test_entry_gate_parity.py` pins this list against the native library.
+GATE_REASONS = (
+    "CARRY_CLEARS_COSTS_AND_BASIS",              # 0  allowed
+    "COST_INPUT_INVALID",                        # 1
+    "INSUFFICIENT_FUNDING_HISTORY",              # 2
+    "FUNDING_NOT_POSITIVE",                      # 3
+    "BASIS_UNREADABLE",                          # 4
+    "CARRY_BELOW_COST_OF_CAPITAL",               # 5
+    "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET",          # 6
+    "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET",  # 7
+    "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD",  # 8
+)
+
+
+def entry_gate(*, funding_prints_bps: Sequence[float], perp: float,
+               spot: float, borrow_apr: float, round_trip_bps: float,
+               hold_days: float = ASSUMED_HOLD_DAYS,
+               demonstrated_hold_days: float = DEMONSTRATED_HOLD_DAYS
+               ) -> CarryVerdict:
+    """May the book open this pair? `evaluate_entry`, then the hold check.
+
+    A pure refinement: every refusal `evaluate_entry` gives is returned
+    unchanged, and only an entry it ALLOWS can be refused here, with
+    BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD (or COST_INPUT_INVALID when the
+    demonstrated hold is not a positive number). Nothing is ever allowed that
+    `evaluate_entry` refused, exits are untouched, and no parameter moves.
+
+    A refused entry carries `evaluate_entry`'s arithmetic (smoothed funding,
+    basis, net edge) so callers log the same fields whichever gate refused.
+    """
+    verdict = evaluate_entry(
+        funding_prints_bps=funding_prints_bps, perp=perp, spot=spot,
+        borrow_apr=borrow_apr, round_trip_bps=round_trip_bps,
+        hold_days=hold_days)
+    if not verdict.allowed:
+        return verdict
+    horizon = hold_clears_round_trip(
+        funding_prints_bps=funding_prints_bps, round_trip_bps=round_trip_bps,
+        borrow_apr=borrow_apr, hold_days=demonstrated_hold_days)
+    if horizon.allowed:
+        return verdict
+    from dataclasses import replace
+    return replace(verdict, allowed=False, reason=horizon.reason,
+                   detail=dict(horizon.detail))

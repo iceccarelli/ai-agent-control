@@ -128,7 +128,12 @@ class _Broker:
                                                "currency": "USDT"}]}}
 
 
-def _bot_with_carry(broker, *, warm_bps=3.0):
+def _bot_with_carry(broker, *, warm_bps=6.0):
+    # 0051: 6.0, was 3.0. ACQUIRE mode (31 bps round trip, 5% financing): the
+    # entry gate now also needs the smoothed funding to earn the round trip back
+    # inside the measured hold (17 settlements). Warmed at 3.0 and ticked at 1.0
+    # the smoothed rate is 2.0 bps/8h, which needs 21 and is refused, so these
+    # tests (about the cycle placing a pair) never reached the path they test.
     from carry_engine import CarryEngine
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.symbols = ["BTCUSDT"]

@@ -90,8 +90,9 @@ MIN_MARGIN_MULTIPLE = 2.0
 
 #: RECORDED, NOT ENFORCED. At 0.2 bps per 8h the annualised gross is ~2.2%,
 #: which does not clear the 31 bps entry cost inside a reasonable hold. The
-#: entry gate that actually decides is `carry_costs.evaluate_entry` (smoothed
-#: funding must be positive AND clear costs and the basis budget); this value
+#: entry gate that actually decides is `carry_costs.entry_gate` (smoothed
+#: funding must be positive AND clear costs, the basis budget AND the measured
+#: hold); this value
 #: is only kept in the shadow runtime's provenance record. There is no
 #: constructor knob for it: one used to exist and nothing read it.
 MIN_ENTRY_FUNDING_BPS = 0.2
@@ -1120,7 +1121,7 @@ class CarryEngine:
                         "note": "the venue would not say what this account "
                                 "pays; the round trip is the biggest cost in "
                                 "the book and is never assumed"}))
-        verdict = _costs().evaluate_entry(
+        verdict = _costs().entry_gate(
             funding_prints_bps=self._funding_history,
             perp=mark, spot=spot, borrow_apr=self.borrow_apr,
             round_trip_bps=round_trip)
