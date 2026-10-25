@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1
+# The TESTNET carry drill runner (tools/unattended_drill.py), NOT the book.
+# Deployed as its own Fly app (fly.drill.toml) so the carry-book app is never
+# touched. Same dependency pins and module closure as Dockerfile; the tools are
+# named one by one, never `COPY tools/`. tests/test_drill_image.py recomputes
+# the import closure of the drill entry points and fails if a file is missing.
+FROM python:3.11-slim AS base
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY requirements.txt constraints.txt ./
+RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
+
+COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
+     carry_risk.py carry_shadow.py config.py directional_funding.py features.py funding_reconcile.py ledger.py main.py \
+     market_data.py \
+     market_snapshot.py memory.py ml_strategy.py persistence.py \
+     policy.py position_sizing.py private_ws_consumer.py project_status.py \
+     promotion_gate.py pure_indicators.py risk_management.py session_log.py \
+     shadow.py shadow_strategy.py technical_analysis.py trading_engine.py \
+     venue_fees.py ws_transport.py ./
+COPY signals/ ./signals/
+COPY tools/unattended_drill.py tools/next_settlement.py tools/recon_summary.py \
+     tools/drill.py tools/close_testnet_short.py tools/drill_final_state.py \
+     tools/evidence_reconcile.py tools/venue_evidence.py tools/provenance.py \
+     ./tools/
+COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
+RUN useradd --create-home --shell /usr/sbin/nologin bot \
+    && mkdir -p /data && chown -R bot:bot /app /data
+
+# Testnet only, stated again here; the orchestrator also forces these for every
+# child and removes LIVE_TRADING_ACK. Credentials arrive as Fly secrets.
+ENV USE_TESTNET=1 PAPER_TRADING=0 BYBIT_VENUE=testnet BOOK_MODE=carry \
+    CARRY_BORROW_APR=0.0 CARRY_EXECUTION_MODE=overlay
+
+# Starts as root only to chown the volume; the entrypoint drops to `bot`.
+ENTRYPOINT ["/usr/local/bin/drill-entrypoint"]
+CMD ["python3", "tools/unattended_drill.py", "--loop", "--run-dir", "/data/runs"]
