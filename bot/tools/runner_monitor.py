@@ -16,6 +16,10 @@ carry order gate refuses every order), the preflight's broker has its own gate
 that refuses every order, and a report that says the gate would allow orders is
 a failure. `tests/test_runner_monitor.py` pins all three.
 
+With `--shadow-db PATH` each cycle also records one public observation in the
+post-gate forward shadow book (carry_shadow.py forward-step): data collection,
+reported beside the outcome and never part of it.
+
 OUTCOMES (stdout and `monitor.json`)
   ENTRY_NOT_ELIGIBLE  readiness good, the production entry gate refuses
   MONITOR_READY       readiness good, the production entry gate passes
@@ -64,6 +68,44 @@ def monitor_env(base: Mapping[str, str], run_dir: str) -> Dict[str, str]:
     return env
 
 
+def shadow_observation(db: Optional[str],
+                       stepper: Optional[Callable[..., Dict[str, Any]]] = None
+                       ) -> Optional[Dict[str, Any]]:
+    """One forward-shadow observation, or None when none is configured.
+
+    The post-gate forward book (`carry_shadow.py forward-init`) is fed public
+    testnet market data only: an unauthenticated GET through the shadow module's
+    own reader, a simulated venue, no exchange client. It is OBSERVATION
+    COLLECTION and is reported next to the monitor outcome, never folded into it:
+    a refused, stale or halted shadow step cannot turn a good monitor reading
+    into a failure, and a good one proves nothing about the monitor.
+    The book is created deliberately, not here: a missing book is SKIPPED.
+    """
+    if not db:
+        return None
+    if not os.path.exists(db):
+        return {"state": "SKIPPED_NOT_INITIALISED", "db": db,
+                "detail": "run carry_shadow.py forward-init first; the monitor "
+                          "never creates a shadow book"}
+    try:
+        if stepper is None:
+            import carry_shadow
+            stepper = carry_shadow.forward_step
+        result = stepper(db)
+        record = result.get("record") or {}
+        out = {"state": result.get("outcome", "UNKNOWN"), "db": db,
+               "seq": result.get("seq"),
+               "decision_reason": (record.get("decision") or {}).get("reason"),
+               "fills_simulated": len(record.get("intents_and_fills") or [])}
+        if result.get("reason"):
+            out["detail"] = str(result["reason"])
+        return out
+    except Exception as exc:                                   # noqa: BLE001
+        code = getattr(exc, "code", None)
+        return {"state": "REFUSED" if code is not None else "FAULT", "db": db,
+                "code": code, "detail": f"{type(exc).__name__}: {exc}"}
+
+
 def _write_json(path: str, obj: Any) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -87,6 +129,10 @@ def _history_line(root: str, record: Dict[str, Any]) -> None:
         "settlements_budget": hold.get("settlements_budget"),
         "newest_print_age_hours": funding.get("newest_print_age_hours"),
     }
+    shadow = record.get("shadow")
+    if isinstance(shadow, dict):
+        line["shadow_state"] = shadow.get("state")
+        line["shadow_decision_reason"] = shadow.get("decision_reason")
     try:
         with open(os.path.join(root, "monitor.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, sort_keys=True, default=str) + "\n")
@@ -98,8 +144,14 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
                  prober: Callable[[], int] = UD.probe,
                  runner: Callable[..., int] = UD.run_child,
                  sleep: Callable[[float], None] = time.sleep,
-                 history_root: Optional[str] = None) -> int:
-    """One read-only cycle. Returns the exit code; writes `monitor.json`."""
+                 history_root: Optional[str] = None,
+                 shadow_db: Optional[str] = None,
+                 shadow_stepper: Optional[Callable[..., Dict[str, Any]]] = None
+                 ) -> int:
+    """One read-only cycle. Returns the exit code; writes `monitor.json`.
+
+    With `shadow_db`, the cycle also feeds one public observation to the
+    post-gate forward shadow book (see `shadow_observation`)."""
     os.makedirs(run_dir, exist_ok=True)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -138,6 +190,9 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
     except Exception:                                          # noqa: BLE001
         report = None                  # unreadable output claims nothing
     result = RO.classify_preflight(report, rc, expect_order_gate_closed=True)
+    shadow = shadow_observation(shadow_db, shadow_stepper)
+    if shadow is not None:
+        result = {**result, "shadow": shadow}
     return finish(result, EXIT_FAILED if result["outcome"] == RO.MONITOR_FAILED
                   else EXIT_OK)
 
@@ -145,13 +200,14 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
 def loop(root: str, *, env: Mapping[str, str], interval_s: float,
          max_runs: int = 0, clock: Callable[[], float] = time.time,
          sleep: Callable[[float], None] = time.sleep,
-         once: Callable[..., int] = monitor_once) -> int:
+         once: Callable[..., int] = monitor_once,
+         shadow_db: Optional[str] = None) -> int:
     """A stop signal ends the loop with 143 wherever it lands, including the
     sleep between cycles where it spends nearly all its time: under the Fly
     on-failure restart policy a deploy or stop must not look like a failure."""
     try:
         return _loop(root, env=env, interval_s=interval_s, max_runs=max_runs,
-                     clock=clock, sleep=sleep, once=once)
+                     clock=clock, sleep=sleep, once=once, shadow_db=shadow_db)
     except UD.Shutdown as exc:
         UD._say(root, f"told to stop ({exc}): monitor loop ends")
         return EXIT_SIGNALLED
@@ -159,7 +215,8 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
 
 def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
           max_runs: int, clock: Callable[[], float],
-          sleep: Callable[[float], None], once: Callable[..., int]) -> int:
+          sleep: Callable[[float], None], once: Callable[..., int],
+          shadow_db: Optional[str] = None) -> int:
     runs = 0
     while True:
         if os.path.exists(os.path.join(root, "STOP")):
@@ -167,8 +224,9 @@ def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
             return EXIT_OK
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(clock()))
         try:
+            extra = {"shadow_db": shadow_db} if shadow_db else {}
             code = once(os.path.join(root, f"run-{stamp}"), env=env,
-                        history_root=root)
+                        history_root=root, **extra)
         except UD.Shutdown as exc:
             UD._say(root, f"told to stop ({exc}): monitor loop ends")
             return EXIT_SIGNALLED
@@ -195,6 +253,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--interval-minutes", type=float,
                     default=DEFAULT_INTERVAL_S / 60.0)
     ap.add_argument("--max-runs", type=int, default=0)
+    ap.add_argument("--shadow-db", default=None,
+                    help="also feed one PUBLIC observation per cycle to this "
+                         "post-gate forward shadow book (created beforehand with "
+                         "carry_shadow.py forward-init; never created here)")
     args = ap.parse_args(argv)
     missing = [k for k in UD.CREDENTIALS if not os.environ.get(k)]
     if missing:
@@ -208,7 +270,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     UD.install_signal_handlers()
     if args.once:
         try:
-            return monitor_once(args.run_dir, env=os.environ)
+            return monitor_once(args.run_dir, env=os.environ,
+                                shadow_db=args.shadow_db)
         except UD.Shutdown as exc:
             print(f"told to stop ({exc})", flush=True)
             return EXIT_SIGNALLED
@@ -220,7 +283,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         return loop(args.run_dir, env=os.environ,
                     interval_s=args.interval_minutes * 60.0,
-                    max_runs=args.max_runs)
+                    max_runs=args.max_runs, shadow_db=args.shadow_db)
     finally:
         lock.close()
 
