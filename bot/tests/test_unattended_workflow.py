@@ -272,4 +272,3 @@ class TestTheProbeFailsClosed:
         script = step_script(text, "Can this runner reach the testnet")
         assert '[ "$code" != "200" ]' in script and "exit 1" in script
         assert "NOT reachable" in script
-
