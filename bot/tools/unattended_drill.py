@@ -28,6 +28,11 @@ database path that does not exist, and LIVE_TRADING_ACK removed. The credentials
 must already be in the environment (BYBIT_API_KEY / BYBIT_API_SECRET) and are
 never printed. The drill itself refuses any non-testnet configuration or host.
 
+SIGNALS: SIGTERM / SIGHUP / SIGINT stop the drill child (its whole process
+group gets SIGTERM, so the drill unwinds; SIGKILL after a grace period), THEN
+run the safety-net close (further signals during it are ignored), then exit 143.
+Give the host a stop timeout of at least ~4 minutes (Fly: kill_timeout).
+
 EXIT CODES: 0 the run finished cleanly (drill exit 0 or 5, venue verified flat,
 reconciliation produced a report); 1 it did not (see verdict.json); 3 refused
 (missing credentials, another loop running, bad arguments); 4 the testnet is
@@ -38,6 +43,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -53,8 +60,13 @@ sys.path.insert(0, HERE)
 import next_settlement as NS  # noqa: E402
 
 PROBE_URL = "https://api-testnet.bybit.com/v5/market/time"
+TOOLS = os.path.join(BOT, "tools")           # where the child tools live
+PROBE_TRIES, PROBE_PAUSE_S = 3, 20.0
+KEEP_RUNS = 60
+EXIT_SIGNALLED = 143
 MIN_LEAD_MIN, MAX_LEAD_MIN = 4.0, 20.0
 DRILL_TIMEOUT_S = 34 * 60
+PREFLIGHT_TIMEOUT_S = 300
 TERM_GRACE_S = 120
 MAX_CLOSE_QTY = "0.0015"
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_UNREACHABLE, EXIT_OUTSIDE = 0, 1, 3, 4, 10
@@ -87,24 +99,70 @@ def probe(opener: Callable[..., Any] = urllib.request.urlopen) -> int:
         return 0
 
 
+class Shutdown(BaseException):
+    """The orchestrator was told to stop (SIGTERM / SIGHUP / SIGINT). A
+    BaseException so that no `except Exception` swallows it."""
+
+
+_SIGNAL = {"count": 0, "protect": False, "pending": 0}
+
+
+def _handler(signum: int, _frame: Any) -> None:
+    """First signal: raise Shutdown (the drill is stopped and the safety net
+    runs). Every later signal is ignored, and while the safety net itself runs
+    the first one is only RECORDED: interrupting the reduce-only close would
+    leave the short open."""
+    _SIGNAL["count"] += 1
+    if _SIGNAL["count"] > 1:
+        return
+    if _SIGNAL["protect"]:
+        _SIGNAL["pending"] = signum
+        return
+    raise Shutdown(f"signal {signum}")
+
+
+def install_signal_handlers() -> None:
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            signal.signal(sig, _handler)
+
+
+def _stop_group(proc: "subprocess.Popen[bytes]") -> None:
+    """SIGTERM the child's whole process group (the drill unwinds on it), wait
+    a grace period, then SIGKILL the group."""
+    for sig, wait_s in ((signal.SIGTERM, TERM_GRACE_S), (signal.SIGKILL, 30)):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.wait(timeout=wait_s)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_child(argv: Sequence[str], env: Mapping[str, str], *, log_path: str,
               timeout_s: Optional[float] = None) -> int:
-    """Run one tool, appending its output to `log_path`. On timeout: SIGTERM
-    (the drill unwinds on it), a grace period, then SIGKILL. Returns the exit
-    code, or 124 for a timeout."""
+    """Run one tool in its OWN process group, appending its output to
+    `log_path`. On a timeout, or when THIS process is told to stop, the child's
+    group gets SIGTERM (the drill unwinds on it), a grace period, then SIGKILL,
+    and only then does control return (or the interruption continue): the
+    safety net must never run beside a live drill. Returns the exit code, or
+    124 for a timeout."""
     with open(log_path, "ab") as log:
         proc = subprocess.Popen(list(argv), env=dict(env), stdout=log,
-                                stderr=subprocess.STDOUT, cwd=BOT)
+                                stderr=subprocess.STDOUT, cwd=BOT,
+                                start_new_session=True)
         try:
             return proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            proc.send_signal(signal.SIGTERM)
-            try:
-                proc.wait(timeout=TERM_GRACE_S)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            _stop_group(proc)
             return 124
+        except BaseException:
+            _stop_group(proc)
+            raise
 
 
 def verdict(*, preflight: Optional[int], drill: Optional[int],
@@ -138,25 +196,41 @@ def _guard(fn: Callable[[], int]) -> int:
 def run_once(run_dir: str, *, env: Mapping[str, str],
              now_ms: Optional[int] = None,
              prober: Callable[[], int] = probe,
-             runner: Callable[..., int] = run_child) -> int:
+             runner: Callable[..., int] = run_child,
+             sleep: Callable[[float], None] = time.sleep) -> int:
     os.makedirs(run_dir, exist_ok=True)
-    status = prober()
+    status = 0
+    for attempt in range(PROBE_TRIES):
+        status = prober()
+        if status == 200:
+            break
+        if attempt + 1 < PROBE_TRIES:
+            sleep(PROBE_PAUSE_S)
     if status != 200:
         _say(run_dir, f"testnet NOT reachable from this host (HTTP {status or 'no answer'}); "
                       "nothing sent")
         return EXIT_UNREACHABLE
-    now = int(time.time() * 1000) if now_ms is None else now_ms
-    inside, lead, _settle = NS.window_status(
-        now, min_lead_s=MIN_LEAD_MIN * 60, max_lead_s=MAX_LEAD_MIN * 60)
+
+    def clock_ms() -> int:
+        return int(time.time() * 1000) if now_ms is None else now_ms
+
+    def in_window() -> tuple:
+        return NS.window_status(clock_ms(), min_lead_s=MIN_LEAD_MIN * 60,
+                                max_lead_s=MAX_LEAD_MIN * 60)
+
+    inside, lead, _settle = in_window()
     if not inside:
         _say(run_dir, f"no settlement {MIN_LEAD_MIN:.0f}-{MAX_LEAD_MIN:.0f} minutes "
                       f"away ({lead} s to the next); nothing sent")
         return EXIT_OUTSIDE
     cenv = child_env(env, run_dir)
     py = sys.executable
-    tools = os.path.join(BOT, "tools")
+    # the evidence files live in their OWN folder: evidence_reconcile.py refuses
+    # to write its report beside the evidence it read
+    evdir = os.path.join(run_dir, "evidence")
+    os.makedirs(evdir, exist_ok=True)
     log = os.path.join(run_dir, "run.log")
-    ev = os.path.join(run_dir, "drill_evidence.jsonl")
+    ev = os.path.join(evdir, "drill_evidence.jsonl")
     out = os.path.join(run_dir, "drill_out.json")
     led = os.path.join(run_dir, "drill_ledger.json")
     rep = os.path.join(run_dir, "reconciliation.json")
@@ -165,38 +239,59 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
     preflight: Optional[int] = None
     drill: Optional[int] = None
     flat: Optional[int] = None
+    window_closed = False
     try:
         preflight = _guard(lambda: runner(
-            [py, os.path.join(tools, "drill.py")], cenv, log_path=log))
+            [py, os.path.join(TOOLS, "drill.py")], cenv, log_path=log,
+            timeout_s=PREFLIGHT_TIMEOUT_S))
         if preflight == 0:
-            drill = _guard(lambda: runner(
-                [py, os.path.join(tools, "drill.py"), "--arm",
-                 "--hold-for-settlement", "--max-hold-hours", "0.5",
-                 "--poll-seconds", "30", "--settle-wait-hours", "0",
-                 "--min-settlements", "1", "--evidence-path", ev, "--out", out,
-                 "--cash-ledger", led],
-                cenv, log_path=log, timeout_s=DRILL_TIMEOUT_S))
+            inside, lead, _settle = in_window()
+            if not inside:
+                # a slow preflight must not push the order past the window
+                window_closed = True
+                _say(run_dir, f"the window closed during the preflight ({lead} s "
+                              "to the next settlement): no drill")
+            else:
+                drill = _guard(lambda: runner(
+                    [py, os.path.join(TOOLS, "drill.py"), "--arm",
+                     "--hold-for-settlement", "--max-hold-hours", "0.5",
+                     "--poll-seconds", "30", "--settle-wait-hours", "0",
+                     "--min-settlements", "1", "--evidence-path", ev,
+                     "--out", out, "--cash-ledger", led],
+                    cenv, log_path=log, timeout_s=DRILL_TIMEOUT_S))
     finally:
-        # ALWAYS, even if this process is itself interrupted or a child could not
-        # be started: leave the venue flat
-        flat = _guard(lambda: runner(
-            [py, os.path.join(tools, "close_testnet_short.py"), "--arm",
-             "--no-prompt", "--max-qty", MAX_CLOSE_QTY, "--evidence-path",
-             os.path.join(run_dir, "ensure_flat_evidence.jsonl")],
-            cenv, log_path=log, timeout_s=300))
+        # ALWAYS, even if this process was told to stop (the child has already
+        # been stopped by run_child) or a child could not be started: leave the
+        # venue flat. A signal arriving NOW is recorded and acted on afterwards.
+        _SIGNAL["protect"] = True
+        try:
+            flat = _guard(lambda: runner(
+                [py, os.path.join(TOOLS, "close_testnet_short.py"), "--arm",
+                 "--no-prompt", "--max-qty", MAX_CLOSE_QTY, "--evidence-path",
+                 os.path.join(evdir, "ensure_flat_evidence.jsonl")],
+                cenv, log_path=log, timeout_s=300))
+        finally:
+            _SIGNAL["protect"] = False
+    if _SIGNAL["pending"]:
+        pending, _SIGNAL["pending"] = _SIGNAL["pending"], 0
+        raise Shutdown(f"signal {pending}")
     recon = None
     if drill is not None:
-        args = [py, os.path.join(tools, "evidence_reconcile.py"), "--evidence", ev,
+        args = [py, os.path.join(TOOLS, "evidence_reconcile.py"), "--evidence", ev,
                 "--drill-report", out, "--now-ms", str(int(time.time() * 1000)),
                 "--json", rep]
         if os.path.isfile(led):
             args += ["--ledger", led]
-        recon = runner(args, cenv, log_path=log, timeout_s=300)
+        recon = _guard(lambda: runner(args, cenv, log_path=log, timeout_s=300))
         if not (os.path.isfile(rep) and os.path.getsize(rep) > 0):
             recon = 99
-        runner([py, os.path.join(tools, "recon_summary.py"), rep], cenv,
-               log_path=os.path.join(run_dir, "summary.txt"), timeout_s=60)
+        _guard(lambda: runner([py, os.path.join(TOOLS, "recon_summary.py"), rep],
+                              cenv, log_path=os.path.join(run_dir, "summary.txt"),
+                              timeout_s=60))
     result = verdict(preflight=preflight, drill=drill, flat=flat, recon=recon)
+    if window_closed:
+        result["problems"].append("the window closed during the preflight: no drill")
+        result["ok"] = False
     with open(os.path.join(run_dir, "verdict.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2, sort_keys=True)
     _say(run_dir, "VERDICT " + json.dumps(result, sort_keys=True))
@@ -225,16 +320,35 @@ def next_start_ms(now_ms: int) -> int:
     return now_ms if inside else NS.next_settlement_ms(settle) - int(MAX_LEAD_MIN * 60_000)
 
 
+def prune_runs(root: str, keep: int = KEEP_RUNS) -> List[str]:
+    """Delete the oldest `run-<time>` folders beyond `keep`. Only folders whose
+    name is exactly that shape, directly under the root, are ever touched."""
+    pat = re.compile(r"^run-\d{8}T\d{6}Z$")
+    try:
+        names = sorted(n for n in os.listdir(root)
+                       if pat.match(n) and os.path.isdir(os.path.join(root, n))
+                       and not os.path.islink(os.path.join(root, n)))
+    except OSError:
+        return []
+    doomed = names[:max(0, len(names) - keep)]
+    for name in doomed:
+        shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+    return doomed
+
+
 def acquire_lock(root: str):
     """An exclusive lock on <root>/loop.lock, or None if another loop holds it."""
     import fcntl
     os.makedirs(root, exist_ok=True)
-    handle = open(os.path.join(root, "loop.lock"), "w")
+    # "a" does not truncate: a refused second loop must not wipe the holder's PID
+    handle = open(os.path.join(root, "loop.lock"), "a")
     try:
         fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         handle.close()
         return None
+    handle.seek(0)
+    handle.truncate()
     handle.write(str(os.getpid()))
     handle.flush()
     return handle
@@ -260,14 +374,21 @@ def loop(root: str, *, env: Mapping[str, str], max_runs: int = 0,
                 sleep(min(30.0, max(0.0, wake / 1000 - clock())))
             continue
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(clock()))
-        code = once(os.path.join(root, f"run-{stamp}"), env=env)
+        try:
+            code = once(os.path.join(root, f"run-{stamp}"), env=env)
+        except Shutdown as exc:
+            _say(root, f"told to stop ({exc}); the safety net has run: loop ends")
+            return EXIT_SIGNALLED
         runs += 1
         _say(root, f"run {stamp} ended with exit {code}")
+        prune_runs(root)
         if max_runs and runs >= max_runs:
             return code
         # step past this window so one window is never run twice
         while NS.window_status(int(clock() * 1000), min_lead_s=MIN_LEAD_MIN * 60,
                                max_lead_s=MAX_LEAD_MIN * 60)[0]:
+            if os.path.exists(os.path.join(root, "STOP")):
+                break
             sleep(30.0)
 
 
@@ -287,8 +408,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.max_runs < 0:
         print("refusing: --max-runs must be >= 0", file=sys.stderr)
         return EXIT_REFUSED
+    install_signal_handlers()
     if not args.loop:
-        return run_once(args.run_dir, env=os.environ)
+        try:
+            return run_once(args.run_dir, env=os.environ)
+        except Shutdown as exc:
+            print(f"told to stop ({exc}); the safety net has run", flush=True)
+            return EXIT_SIGNALLED
     lock = acquire_lock(args.run_dir)
     if lock is None:
         print("refusing: another loop is running on this run root",

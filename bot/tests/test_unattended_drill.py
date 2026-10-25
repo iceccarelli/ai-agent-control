@@ -56,7 +56,7 @@ class Recorder:
 
 def run(tmp_path, rec, *, now=INSIDE, probe=200):
     return U.run_once(str(tmp_path / "r"), env=ENV, now_ms=now,
-                      prober=lambda: probe, runner=rec)
+                      prober=lambda: probe, runner=rec, sleep=lambda s: None)
 
 
 class TestProbe:
@@ -105,6 +105,7 @@ class TestOneRun:
         assert run(tmp_path, rec) == U.EXIT_OK
         assert rec.tools() == ["drill.py", "drill.py", "close_testnet_short.py",
                                "evidence_reconcile.py", "recon_summary.py"]
+        assert rec.calls[0][3] == U.PREFLIGHT_TIMEOUT_S      # the preflight cannot hang forever
         verdict = json.load(open(tmp_path / "r" / "verdict.json"))
         assert verdict["ok"] is True
 
@@ -323,6 +324,265 @@ class TestMain:
     def test_the_credentials_never_appear_in_the_orchestrators_own_output(self, tmp_path, capsys):
         env = dict(ENV, BYBIT_API_KEY="KEYVALUE123", BYBIT_API_SECRET="SECRETVALUE456")
         U.run_once(str(tmp_path / "r"), env=env, now_ms=INSIDE,
-                   prober=lambda: 200, runner=Recorder())
+                   prober=lambda: 200, runner=Recorder(), sleep=lambda s: None)
         text = capsys.readouterr().out + open(tmp_path / "r" / "orchestrator.log").read()
         assert "KEYVALUE123" not in text and "SECRETVALUE456" not in text
+
+
+# ---------------------------------------------------------------------------
+# found by independent review
+# ---------------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+import textwrap  # noqa: E402
+
+
+class TestTheReportIsNotWrittenBesideItsEvidence:
+    def paths(self, tmp_path):
+        rec = Recorder()
+        run(tmp_path, rec)
+        argv = next(c[1] for c in rec.calls if c[0] == "evidence_reconcile.py")
+        return argv[argv.index("--evidence") + 1], argv[argv.index("--json") + 1]
+
+    def test_the_directories_differ(self, tmp_path):
+        ev, rep = self.paths(tmp_path)
+        assert os.path.dirname(ev) != os.path.dirname(rep)
+
+    def test_the_real_reconcile_tool_accepts_this_layout(self, tmp_path, capsys):
+        import evidence_reconcile as R
+        ev, rep = self.paths(tmp_path)
+        os.makedirs(os.path.dirname(ev), exist_ok=True)
+        open(ev, "w").write("")
+        drill = tmp_path / "r" / "drill_out.json"
+        drill.write_text("{}")
+        R.main(["--evidence", ev, "--drill-report", str(drill),
+                "--now-ms", "1", "--json", rep])
+        assert "beside the evidence" not in capsys.readouterr().err
+
+    def test_the_safety_nets_evidence_is_in_the_evidence_folder_too(self, tmp_path):
+        rec = Recorder()
+        run(tmp_path, rec)
+        close = next(c[1] for c in rec.calls if c[0] == "close_testnet_short.py")
+        path = close[close.index("--evidence-path") + 1]
+        assert os.path.basename(os.path.dirname(path)) == "evidence"
+
+
+class TestTheWindowIsCheckedAgainBeforeTheArmedDrill:
+    def test_a_slow_preflight_that_closes_the_window_means_no_order(self, tmp_path, monkeypatch):
+        ticks = iter([INSIDE / 1000.0])
+        later = (INSIDE + 11 * 60_000) / 1000.0     # 16:01, settlement passed
+
+        def clock():
+            return next(ticks, later)
+        monkeypatch.setattr(U.time, "time", clock)
+        rec = Recorder()
+        code = U.run_once(str(tmp_path / "r"), env=ENV, prober=lambda: 200,
+                          runner=rec, sleep=lambda s: None)
+        assert rec.tools() == ["drill.py", "close_testnet_short.py"]
+        assert code == U.EXIT_FAILED
+        assert "window closed" in "".join(
+            json.load(open(tmp_path / "r" / "verdict.json"))["problems"])
+
+
+class TestTheProbeRetries:
+    def test_a_blip_then_ok_runs(self, tmp_path):
+        answers = iter([403, 200])
+        sleeps = []
+        code = U.run_once(str(tmp_path / "r"), env=ENV, now_ms=INSIDE,
+                          prober=lambda: next(answers), runner=Recorder(),
+                          sleep=sleeps.append)
+        assert code == 0 and sleeps == [U.PROBE_PAUSE_S]
+
+    def test_a_persistent_block_stops_after_three_tries(self, tmp_path):
+        calls, sleeps = [], []
+        code = U.run_once(str(tmp_path / "r"), env=ENV, now_ms=INSIDE,
+                          prober=lambda: calls.append(1) or 403,
+                          runner=Recorder(), sleep=sleeps.append)
+        assert code == U.EXIT_UNREACHABLE and len(calls) == U.PROBE_TRIES
+        assert len(sleeps) == U.PROBE_TRIES - 1
+
+
+class TestHousekeeping:
+    def test_prune_keeps_the_newest_and_touches_nothing_else(self, tmp_path):
+        names = [f"run-2026102{d}T154000Z" for d in range(1, 8)]
+        for n in names:
+            (tmp_path / n).mkdir()
+        (tmp_path / "keepme").mkdir()
+        (tmp_path / "run-notadate").mkdir()
+        (tmp_path / "run-20261025T154000Z.txt").write_text("x")
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (tmp_path / "run-20261020T154000Z").symlink_to(target)
+        gone = U.prune_runs(str(tmp_path), keep=3)
+        assert gone == names[:4]
+        left = sorted(os.listdir(tmp_path))
+        assert names[4:] == [n for n in left if n in names]
+        assert {"keepme", "run-notadate", "elsewhere"} <= set(left)
+        assert (tmp_path / "run-20261025T154000Z.txt").exists()
+        assert target.exists()
+
+    def test_a_refused_second_loop_does_not_wipe_the_holders_pid(self, tmp_path):
+        first = U.acquire_lock(str(tmp_path))
+        assert U.acquire_lock(str(tmp_path)) is None
+        assert (tmp_path / "loop.lock").read_text() == str(os.getpid())
+        first.close()
+
+    def test_stop_is_honoured_while_stepping_past_a_window(self, tmp_path):
+        clock = TestTheLoop.Clock(ms(15, 50))
+
+        def sleeper(s):
+            clock.sleep(s)
+            (tmp_path / "STOP").write_text("")
+        runs = []
+        code = U.loop(str(tmp_path), env=ENV, clock=clock.now, sleep=sleeper,
+                      once=lambda *a, **k: runs.append(1) or 4)
+        assert code == 0 and len(runs) == 1 and len(clock.sleeps) <= 2
+
+    def test_a_shutdown_inside_a_run_ends_the_loop_with_143(self, tmp_path):
+        clock = TestTheLoop.Clock(ms(15, 50))
+
+        def once(*a, **k):
+            raise U.Shutdown("signal 15")
+        assert U.loop(str(tmp_path), env=ENV, clock=clock.now, sleep=clock.sleep,
+                      once=once) == U.EXIT_SIGNALLED
+
+    def test_main_turns_a_shutdown_into_143(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("BYBIT_API_KEY", "k")
+        monkeypatch.setenv("BYBIT_API_SECRET", "s")
+        monkeypatch.setattr(U, "install_signal_handlers", lambda: None)
+
+        def boom(*a, **k):
+            raise U.Shutdown("signal 15")
+        monkeypatch.setattr(U, "run_once", boom)
+        assert U.main(["--run-dir", str(tmp_path)]) == U.EXIT_SIGNALLED
+
+
+STUB = textwrap.dedent("""
+    import os, signal, sys, time
+    D = os.environ["STUB_DIR"]
+    name = os.path.basename(sys.argv[0])
+    armed = "--arm" in sys.argv
+    def mark(n, text=""):
+        open(os.path.join(D, n), "w").write(text)
+    if name == "drill.py" and armed:
+        mark("drill_pid", str(os.getpid()))
+        def term(s, f):
+            mark("drill_got_term")
+            time.sleep(1.0)               # the unwind
+            mark("drill_unwound")
+            sys.exit(130)
+        signal.signal(signal.SIGTERM, term)
+        mark("drill_armed")
+        time.sleep(120)
+        sys.exit(0)
+    if name == "close_testnet_short.py":
+        mark("close_started", "drill_unwound=%d" % os.path.exists(os.path.join(D, "drill_unwound")))
+        time.sleep(float(os.environ.get("STUB_CLOSE_SECONDS", "0")))
+        mark("close_done")
+        sys.exit(0)
+    if name == "evidence_reconcile.py":
+        open(sys.argv[sys.argv.index("--json") + 1], "w").write("{}")
+    sys.exit(0)
+""")
+
+DRIVER = textwrap.dedent("""
+    import os, sys
+    sys.path.insert(0, {tools!r})
+    import unattended_drill as U
+    U.TOOLS = {stubs!r}
+    U.TERM_GRACE_S = 20
+    U.install_signal_handlers()
+    try:
+        code = U.run_once({run!r}, env=os.environ, now_ms={now},
+                          prober=lambda: 200, sleep=lambda s: None)
+    except U.Shutdown:
+        code = U.EXIT_SIGNALLED
+    sys.exit(code)
+""")
+
+
+class TestRealSignalsToARealOrchestrator:
+    """The reviewer's reproductions: a signal to the ORCHESTRATOR must stop the
+    drill (not orphan it) and only then run the safety net."""
+
+    def start(self, tmp_path, close_seconds="0"):
+        stubs = tmp_path / "stubs"
+        stubs.mkdir()
+        for n in ("drill.py", "close_testnet_short.py", "evidence_reconcile.py",
+                  "recon_summary.py"):
+            (stubs / n).write_text(STUB)
+        marks = tmp_path / "marks"
+        marks.mkdir()
+        driver = tmp_path / "driver.py"
+        driver.write_text(DRIVER.format(
+            tools=os.path.join(os.path.dirname(HERE), "tools"), stubs=str(stubs),
+            run=str(tmp_path / "run"), now=INSIDE))
+        env = dict(os.environ, STUB_DIR=str(marks), BYBIT_API_KEY="k",
+                   BYBIT_API_SECRET="s", STUB_CLOSE_SECONDS=close_seconds)
+        proc = subprocess.Popen([sys.executable, str(driver)], env=env)
+        for _ in range(100):
+            if (marks / "drill_armed").exists():
+                return proc, marks
+            time.sleep(0.1)
+        proc.kill()
+        pytest.fail("the stub drill never armed")
+
+    @staticmethod
+    def alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
+    def test_the_drill_is_stopped_and_unwound_before_the_safety_net_runs(
+            self, tmp_path, sig):
+        proc, marks = self.start(tmp_path)
+        drill_pid = int((marks / "drill_pid").read_text())
+        proc.send_signal(sig)
+        assert proc.wait(timeout=60) == U.EXIT_SIGNALLED
+        assert (marks / "drill_got_term").exists()
+        assert (marks / "drill_unwound").exists()
+        assert (marks / "close_started").read_text() == "drill_unwound=1"
+        assert (marks / "close_done").exists()
+        assert not self.alive(drill_pid)                  # no orphan
+
+    def test_a_second_signal_while_the_safety_net_runs_does_not_interrupt_it(
+            self, tmp_path):
+        proc, marks = self.start(tmp_path, close_seconds="3")
+        proc.send_signal(signal.SIGTERM)
+        for _ in range(100):
+            if (marks / "close_started").exists():
+                break
+            time.sleep(0.1)
+        proc.send_signal(signal.SIGTERM)
+        proc.send_signal(signal.SIGINT)
+        assert proc.wait(timeout=60) == U.EXIT_SIGNALLED
+        assert (marks / "close_done").exists()
+
+    def test_a_signal_during_the_safety_net_is_acted_on_after_it(self, tmp_path):
+        """No drill running (the stub drill exits at once when the armed branch
+        is skipped by a failing preflight is not used here): the signal lands
+        while the close runs; the close finishes, then the shutdown follows."""
+        stubs = tmp_path / "stubs"
+        stubs.mkdir()
+        for n in ("drill.py", "close_testnet_short.py", "evidence_reconcile.py",
+                  "recon_summary.py"):
+            (stubs / n).write_text(STUB.replace("time.sleep(120)", "sys.exit(0)"))
+        marks = tmp_path / "marks"
+        marks.mkdir()
+        driver = tmp_path / "driver.py"
+        driver.write_text(DRIVER.format(
+            tools=os.path.join(os.path.dirname(HERE), "tools"), stubs=str(stubs),
+            run=str(tmp_path / "run"), now=INSIDE))
+        env = dict(os.environ, STUB_DIR=str(marks), BYBIT_API_KEY="k",
+                   BYBIT_API_SECRET="s", STUB_CLOSE_SECONDS="3")
+        proc = subprocess.Popen([sys.executable, str(driver)], env=env)
+        for _ in range(100):
+            if (marks / "close_started").exists():
+                break
+            time.sleep(0.1)
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(timeout=60) == U.EXIT_SIGNALLED
+        assert (marks / "close_done").exists()
