@@ -40,7 +40,10 @@ class Recorder:
     `elig` is what the (read-only) carry_preflight.py reports about the entry:
     PASS | REFUSED | UNAVAILABLE | None (no readable report)."""
 
-    def __init__(self, codes=None, make=(), elig="PASS", recon=None):
+    def __init__(self, codes=None, make=(), elig="PASS", recon=None,
+                 orders_sent=2, elig_reason=None):
+        self.orders_sent = orders_sent
+        self.elig_reason = elig_reason
         self.calls = []
         self.codes = codes or {}
         self.make = make
@@ -55,7 +58,13 @@ class Recorder:
             raise code
         if tool == "carry_preflight.py" and self.elig:
             with open(log_path, "w") as fh:
-                fh.write(json.dumps(RF.preflight_report(self.elig, order_gate_open=True)))
+                fh.write(json.dumps(RF.preflight_report(
+                    self.elig, order_gate_open=True, reason=self.elig_reason)))
+        if tool == "drill.py" and "--arm" in argv and self.orders_sent is not None \
+                and not os.path.exists(argv[argv.index("--out") + 1]):
+            json.dump({"verdict": "PASSED", "orders_sent": self.orders_sent,
+                       "still_open": False, "stages": []},
+                      open(argv[argv.index("--out") + 1], "w"))
         if tool == "evidence_reconcile.py":
             report = argv[argv.index("--json") + 1]
             if code in (0, 2):
@@ -200,10 +209,18 @@ class TestVerdict:
     @pytest.mark.parametrize("kw,ok", [
         # a usable reconciliation report is no longer enough: the CAPTURED CYCLE
         # must be VENUE_RECONCILED (`reconciled=True`) for a conformance pass
-        (dict(preflight=0, drill=5, flat=0, recon=2, reconciled=True), True),
-        (dict(preflight=0, drill=0, flat=0, recon=0, reconciled=True), True),
-        (dict(preflight=0, drill=5, flat=0, recon=2, reconciled=False), False),
-        (dict(preflight=0, drill=5, flat=0, recon=2, reconciled=None), False),
+        (dict(preflight=0, drill=5, flat=0, recon=2, reconciled=True,
+              orders_placed=True), True),
+        (dict(preflight=0, drill=0, flat=0, recon=0, reconciled=True,
+              orders_placed=True), True),
+        # ...and the drill's own report must show an entry and an exit sent
+        (dict(preflight=0, drill=0, flat=0, recon=0, reconciled=True,
+              orders_placed=False), False),
+        (dict(preflight=0, drill=0, flat=0, recon=0, reconciled=True), False),
+        (dict(preflight=0, drill=5, flat=0, recon=2, reconciled=False,
+              orders_placed=True), False),
+        (dict(preflight=0, drill=5, flat=0, recon=2, reconciled=None,
+              orders_placed=True), False),
         (dict(preflight=0, drill=5, flat=0, recon=2), False),
         # a strategy refusal is not an operational error, if the venue is flat
         (dict(preflight=0, drill=None, flat=0, recon=None,
@@ -721,3 +738,110 @@ class TestWhatTheRunLearned:
         argv = [c[1] for c in rec.calls if c[0] == "carry_preflight.py"][0]
         assert argv[1].endswith(os.path.join("tools", "carry_preflight.py"))
         assert len(argv) == 2                      # no flag that could arm anything
+
+
+# -- review findings: each reproduced, then pinned --------------------------------
+
+class TestReviewFindings:
+    def test_a_refusal_with_an_empty_reason_still_arms_nothing(self, tmp_path):
+        """A REFUSED assessment whose reason code is empty used to read as 'not
+        refused' (an empty string is falsy): the armed drill ran and the run was
+        reported CONFORMANCE_PASSED."""
+        rec = Recorder(elig="REFUSED", elig_reason="")
+        code = run(tmp_path, rec)
+        assert not any("--arm" in c[1] for c in rec.calls if c[0] == "drill.py")
+        assert code != U.EXIT_OK
+        v = _verdict_file(tmp_path)
+        assert v["outcome"] != RO.CONFORMANCE_PASSED
+
+    def test_a_refusal_with_an_unrecognised_reason_is_a_failure_not_a_pass(
+            self, tmp_path):
+        rec = Recorder(elig="REFUSED", elig_reason="SOMETHING_NEW")
+        assert run(tmp_path, rec) == U.EXIT_FAILED
+        assert not any("--arm" in c[1] for c in rec.calls if c[0] == "drill.py")
+        assert _verdict_file(tmp_path)["outcome"] == RO.CONFORMANCE_FAILED
+
+    @pytest.mark.parametrize("reason", [
+        "VENUE_RULES_UNREADABLE", "INVENTORY_UNREADABLE", "FEE_RATES_UNREADABLE",
+        "SNAPSHOT_MISMATCH", "SIZE_BELOW_VENUE_MINIMUM", "NO_SPOT_INVENTORY"])
+    def test_an_engine_stand_aside_on_an_input_is_not_a_strategy_refusal(
+            self, tmp_path, reason):
+        class R(Recorder):
+            def __call__(self, argv, env, **kw):
+                code = super().__call__(argv, env, **kw)
+                if os.path.basename(argv[1]) == "drill.py" and "--arm" in argv:
+                    json.dump({"verdict": "FAILED", "orders_sent": 0, "stages": [
+                        {"stage": "open", "ok": False, "evidence": {
+                            "action": "stand_aside", "reason": reason}}]},
+                        open(argv[argv.index("--out") + 1], "w"))
+                    return 2
+                return code
+        assert run(tmp_path, R()) == U.EXIT_FAILED
+        assert _verdict_file(tmp_path)["outcome"] == RO.CONFORMANCE_FAILED
+
+    def test_a_crashed_drill_is_not_read_through_a_stale_report(self, tmp_path):
+        """A drill_out.json from an earlier run in the same directory, plus a
+        drill that crashed (rc 1, wrote nothing), must not become a refusal."""
+        run_dir = tmp_path / "r"
+        run_dir.mkdir()
+        json.dump({"verdict": "FAILED", "orders_sent": 0, "stages": [
+            {"stage": "open", "ok": False, "evidence": {
+                "action": "stand_aside",
+                "reason": "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"}}]},
+            open(run_dir / "drill_out.json", "w"))
+
+        class Crash(Recorder):
+            def __call__(self, argv, env, **kw):
+                if os.path.basename(argv[1]) == "drill.py" and "--arm" in argv:
+                    self.calls.append(("drill.py", list(argv), dict(env), None))
+                    return 1
+                return super().__call__(argv, env, **kw)
+        assert run(tmp_path, Crash(orders_sent=None)) == U.EXIT_FAILED
+        assert _verdict_file(tmp_path)["outcome"] == RO.CONFORMANCE_FAILED
+
+    def test_only_a_drill_that_exited_two_can_be_a_stand_aside(self, tmp_path):
+        class R(Recorder):
+            def __call__(self, argv, env, **kw):
+                code = super().__call__(argv, env, **kw)
+                if os.path.basename(argv[1]) == "drill.py" and "--arm" in argv:
+                    json.dump({"verdict": "FAILED", "orders_sent": 0, "stages": [
+                        {"stage": "open", "ok": False, "evidence": {
+                            "action": "stand_aside",
+                            "reason": "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"}}]},
+                        open(argv[argv.index("--out") + 1], "w"))
+                    return 1
+                return code
+        assert run(tmp_path, R()) == U.EXIT_FAILED
+
+    def test_a_drill_that_sent_nothing_is_never_a_conformance_pass(self, tmp_path):
+        """Drill exit 0 with a report of zero orders (a PREFLIGHT_ONLY-shaped
+        report) and a reconciled fixture: the child tools were 'fine', and no
+        order was ever sent."""
+        for sent in (0, 1):
+            rec = Recorder(orders_sent=sent)
+            assert run(tmp_path, rec) == U.EXIT_FAILED
+            v = _verdict_file(tmp_path)
+            assert v["outcome"] == RO.CONFORMANCE_FAILED
+            assert v["conformance_passed"] is False
+            assert "sent nothing" in " ".join(v["problems"]) or \
+                "entry and an exit" in " ".join(v["problems"])
+
+    def test_a_pass_needs_the_report_to_say_nothing_is_left_open(self, tmp_path):
+        class R(Recorder):
+            def __call__(self, argv, env, **kw):
+                code = super().__call__(argv, env, **kw)
+                if os.path.basename(argv[1]) == "drill.py" and "--arm" in argv:
+                    json.dump({"verdict": "PASSED", "orders_sent": 2,
+                               "still_open": True, "stages": []},
+                              open(argv[argv.index("--out") + 1], "w"))
+                return code
+        assert run(tmp_path, R()) == U.EXIT_FAILED
+
+    def test_a_stop_signal_in_the_sleep_between_runs_ends_the_loop_with_143(
+            self, tmp_path):
+        clock = TestTheLoop.Clock(ms(11, 0))       # outside a window: it sleeps
+
+        def sleeper(s):
+            raise U.Shutdown("signal 15")
+        assert U.loop(str(tmp_path), env=ENV, clock=clock.now,
+                      sleep=sleeper) == U.EXIT_SIGNALLED

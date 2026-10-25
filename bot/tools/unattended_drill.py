@@ -179,7 +179,8 @@ def verdict(*, preflight: Optional[int], drill: Optional[int],
             flat: Optional[int], recon: Optional[int],
             not_eligible: Optional[str] = None,
             assessment_failed: bool = False,
-            reconciled: Optional[bool] = None) -> Dict[str, Any]:
+            reconciled: Optional[bool] = None,
+            orders_placed: Optional[bool] = None) -> Dict[str, Any]:
     """The run's verdict from the exit codes (None = did not run).
 
     `outcome` says what the run LEARNED (tools/run_outcomes.py):
@@ -204,19 +205,22 @@ def verdict(*, preflight: Optional[int], drill: Optional[int],
         problems.append("the entry economics could not be assessed (an input "
                         "was unreadable, stale or contradictory): no drill "
                         "was run")
-    elif not_eligible:
+    elif not_eligible is not None:
         pass                      # a strategy refusal, not a problem
     elif drill not in (0, 5):
         problems.append(f"drill exit code {drill} is not a clean finish")
     elif recon not in (0, 2):
         problems.append(f"reconciliation did not produce a usable report "
                         f"(exit {recon}): the evidence path is NOT working")
+    elif orders_placed is not True:
+        problems.append("the drill's own report does not show an entry and an "
+                        "exit sent: a run that sent nothing proves nothing")
     elif reconciled is not True:
         problems.append("the captured cycle is not VENUE_RECONCILED: the "
                         "order path is NOT proven")
     if problems:
         outcome = RO.CONFORMANCE_FAILED
-    elif not_eligible:
+    elif not_eligible is not None:
         outcome = RO.ENTRY_NOT_ELIGIBLE
     else:
         outcome = RO.CONFORMANCE_PASSED
@@ -224,6 +228,7 @@ def verdict(*, preflight: Optional[int], drill: Optional[int],
             "conformance_passed": outcome == RO.CONFORMANCE_PASSED,
             "refusal_reason": not_eligible if outcome == RO.ENTRY_NOT_ELIGIBLE
             else None,
+            "orders_placed": orders_placed,
             "problems": problems, "preflight": preflight, "drill": drill,
             "ensure_flat": flat, "reconcile": recon}
 
@@ -307,7 +312,7 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
             except OSError:
                 elig = RO.classify_preflight(None, elig_rc)
             if elig["outcome"] == RO.ENTRY_NOT_ELIGIBLE:
-                not_eligible = (elig["reasons"] or ["ENTRY_NOT_ELIGIBLE"])[0]
+                not_eligible = (elig["reasons"] or [""])[0] or "UNSPECIFIED"
                 _say(run_dir, f"ENTRY_NOT_ELIGIBLE ({not_eligible}): the "
                               "production entry gate refuses; nothing armed, "
                               "no order sent")
@@ -315,7 +320,7 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                 assessment_failed = True
                 _say(run_dir, "the entry economics could not be assessed: "
                               + "; ".join(elig["reasons"]) + " (nothing armed)")
-        if preflight == 0 and not not_eligible and not assessment_failed:
+        if preflight == 0 and not_eligible is None and not assessment_failed:
             inside, lead, _settle = in_window()
             if not inside:
                 # a slow preflight must not push the order past the window
@@ -323,6 +328,11 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                 _say(run_dir, f"the window closed during the preflight ({lead} s "
                               "to the next settlement): no drill")
             else:
+                for stale in (out, ev, led):     # nothing from an earlier run
+                    try:
+                        os.remove(stale)
+                    except OSError:
+                        pass
                 drill = _guard(lambda: runner(
                     [py, os.path.join(TOOLS, "drill.py"), "--arm",
                      "--hold-for-settlement", "--max-hold-hours", "0.5",
@@ -348,20 +358,25 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
         raise Shutdown(f"signal {pending}")
     recon = None
     reconciled: Optional[bool] = None
+    orders_placed: Optional[bool] = None
+    drill_report: Any = None
     if drill is not None:
-        # The armed drill's own engine may stand aside (funding moved between
-        # the assessment and the open): nothing was sent, which is the gate
-        # working, not a drill that failed.
         try:
             with open(out, encoding="utf-8") as fh:
-                aside = RO.stood_aside_without_orders(json.load(fh))
+                drill_report = json.load(fh)
         except (OSError, ValueError):
-            aside = None
+            drill_report = None
+        # The armed drill's own engine may stand aside on the economics (funding
+        # moved between the assessment and the open): nothing was sent, which is
+        # the gate working. Only a drill that EXITED 2 (zero fills) with a
+        # readable report of zero orders counts; a crash is a crash.
+        aside = RO.stood_aside_without_orders(drill_report) if drill == 2 else None
         if aside:
             not_eligible = aside
             _say(run_dir, f"ENTRY_NOT_ELIGIBLE ({aside}): the engine stood "
                           "aside at the open; no order was sent")
-    if drill is not None and not not_eligible:
+        orders_placed = RO.orders_exercised(drill_report)
+    if drill is not None and not_eligible is None:
         args = [py, os.path.join(TOOLS, "evidence_reconcile.py"), "--evidence", ev,
                 "--drill-report", out, "--now-ms", str(int(time.time() * 1000)),
                 "--json", rep]
@@ -380,7 +395,8 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
             reconciled = False
     result = verdict(preflight=preflight, drill=drill, flat=flat, recon=recon,
                      not_eligible=not_eligible,
-                     assessment_failed=assessment_failed, reconciled=reconciled)
+                     assessment_failed=assessment_failed, reconciled=reconciled,
+                     orders_placed=orders_placed)
     if window_closed:
         result["problems"].append("the window closed during the preflight: no drill")
         result.update(ok=False, outcome=RO.CONFORMANCE_FAILED,
@@ -453,6 +469,20 @@ def loop(root: str, *, env: Mapping[str, str], max_runs: int = 0,
          clock: Callable[[], float] = time.time,
          sleep: Callable[[float], None] = time.sleep,
          once: Callable[..., int] = run_once) -> int:
+    """The loop. A stop signal ends it with 143 wherever it lands - inside a run
+    (after the safety net) or in the sleeps between runs, which is where it
+    spends nearly all its time."""
+    try:
+        return _loop(root, env=env, max_runs=max_runs, clock=clock, sleep=sleep,
+                     once=once)
+    except Shutdown as exc:
+        _say(root, f"told to stop ({exc}): loop ends")
+        return EXIT_SIGNALLED
+
+
+def _loop(root: str, *, env: Mapping[str, str], max_runs: int,
+          clock: Callable[[], float], sleep: Callable[[float], None],
+          once: Callable[..., int]) -> int:
     runs = 0
     while True:
         if os.path.exists(os.path.join(root, "STOP")):

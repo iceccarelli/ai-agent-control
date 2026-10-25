@@ -21,6 +21,7 @@ sys.path.insert(0, BOT)
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(BOT, "tools"))
 
+import carry_costs  # noqa: E402
 import run_outcomes as RO  # noqa: E402
 import runner_fixtures as RF  # noqa: E402
 import runner_monitor as RM  # noqa: E402
@@ -405,3 +406,142 @@ class TestTheMonitorCannotTrade:
         with pytest.raises(CarryOrderRefused):
             broker.place_market(symbol="BTCUSDT", side="Sell", qty=0.001,
                                 product="linear")
+
+
+# -- review findings -----------------------------------------------------------------
+
+class TestReviewFindings:
+    def test_a_stop_signal_in_the_sleep_between_cycles_ends_the_loop_with_143(
+            self, tmp_path):
+        """The loop spends nearly all its time asleep: a SIGTERM there used to
+        escape as a traceback and exit 1, which the Fly on-failure policy counts
+        as a failure."""
+        def once(*a, **k):
+            return 0
+
+        def sleeper(s):
+            raise UD.Shutdown("signal 15")
+        assert RM.loop(str(tmp_path), env=ENV, interval_s=3600, once=once,
+                       sleep=sleeper) == RM.EXIT_SIGNALLED
+
+    def test_the_real_main_turns_a_sigterm_into_143_not_a_traceback(
+            self, tmp_path):
+        import signal
+        import subprocess
+        import textwrap
+        driver = tmp_path / "d.py"
+        driver.write_text(textwrap.dedent(f"""
+            import os, signal, sys, time, threading
+            sys.path.insert(0, {os.path.join(BOT, "tools")!r})
+            import runner_monitor as RM, unattended_drill as UD
+            RM.monitor_once = lambda run_dir, **k: 0
+            def fire():
+                time.sleep(1.5); os.kill(os.getpid(), signal.SIGTERM)
+            threading.Thread(target=fire, daemon=True).start()
+            sys.exit(RM.main(["--run-dir", {str(tmp_path / "root")!r}, "--loop",
+                              "--interval-minutes", "60"]))
+        """))
+        env = dict(os.environ, BYBIT_API_KEY="k", BYBIT_API_SECRET="s")
+        done = subprocess.run([sys.executable, str(driver)], env=env,
+                              capture_output=True, text=True, timeout=60)
+        assert done.returncode == RM.EXIT_SIGNALLED, done.stderr
+        assert "Traceback" not in done.stderr
+
+    def test_pathological_output_is_a_failure_not_a_crash(self, tmp_path):
+        deep = '{"a":' * 100_000
+        assert RO.parse_report(deep) is None
+        code, rec = cycle(tmp_path, FakeRunner(raw=deep))
+        assert rec["outcome"] == RO.MONITOR_FAILED
+
+    def test_a_blockers_value_that_is_not_a_list_is_a_failure_not_a_traceback(self):
+        r = RO.classify_preflight({"verdict": "PREFLIGHT_BLOCKED",
+                                   "blockers": None}, 2)
+        assert r["outcome"] == RO.MONITOR_FAILED
+        r = RO.classify_preflight({"verdict": "PREFLIGHT_OK", "blockers": 5,
+                                   "venue": "testnet", "use_testnet": True}, 0)
+        assert r["outcome"] == RO.MONITOR_FAILED
+
+    def test_a_non_mapping_decision_does_not_break_the_history_line(self, tmp_path):
+        rep = RF.preflight_report("PASS")
+        rep["entry_economics"]["decision"] = "not a mapping"
+        code, rec = cycle(tmp_path, FakeRunner(rep))
+        assert rec["outcome"] == RO.MONITOR_READY
+        assert (tmp_path / "monitor.jsonl").exists()
+
+    def test_a_second_object_after_the_report_cannot_outvote_it(self):
+        real = RF.preflight_report("REFUSED")
+        forged = RF.preflight_report("PASS")
+        text = json.dumps(real, indent=2) + "\nWARNING upstream said\n" \
+            + json.dumps(forged)
+        assert RO.parse_report(text) is None            # ambiguous: no verdict
+        inline = json.dumps(real, indent=2) + "\nnote: " + json.dumps(forged)
+        assert RO.parse_report(inline)["entry_economics"]["state"] == \
+            "ENTRY_ECONOMICS_REFUSED"                   # not at a line start
+        assert RO.classify_preflight(RO.parse_report(text), 0)["outcome"] \
+            == RO.MONITOR_FAILED
+
+    def test_the_economic_refusals_are_exactly_the_gates_economic_reasons(self):
+        gate = set(carry_costs.GATE_REASONS) - {carry_costs.GATE_REASONS[0]}
+        assert RO.ECONOMIC_REFUSALS | (RO.INPUT_REASONS & gate) == gate
+        assert not (RO.ECONOMIC_REFUSALS & RO.INPUT_REASONS)
+
+    def test_a_refusal_with_an_empty_or_unknown_reason_fails_closed(self):
+        for reason in ("", None, "SOMETHING_NEW"):
+            rep = RF.preflight_report("REFUSED", reason=reason or "")
+            if reason is None:
+                rep["entry_economics"].pop("reason")
+            assert RO.classify_preflight(rep, 0)["outcome"] == RO.MONITOR_FAILED
+
+    def test_the_monitor_uses_only_helpers_from_the_conformance_module(self):
+        """It imports unattended_drill for plumbing (probe, child runner, lock,
+        prune, signals). It may use no more than that."""
+        tree = ast.parse(open(TestTheMonitorCannotTrade.SRC, encoding="utf-8").read())
+        used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+                and isinstance(n.value, ast.Name) and n.value.id == "UD"}
+        assert used <= {"probe", "run_child", "Shutdown", "install_signal_handlers",
+                        "acquire_lock", "prune_runs", "_say", "PROBE_TRIES",
+                        "PROBE_PAUSE_S", "TOOLS", "CREDENTIALS", "EXIT_SIGNALLED"}, used
+
+
+class TestTheReconciliationAndDrillReaders:
+    GOOD = {"schema": "evidence_reconciliation/1",
+            "carry_cycle": [{"provenance": "VENUE_RECONCILED", "resolved": True}]}
+
+    def test_only_a_fully_reconciled_resolved_cycle_counts(self):
+        assert RO.cycle_reconciled(self.GOOD) is True
+        two = dict(self.GOOD, carry_cycle=[
+            {"provenance": "VENUE_RECONCILED", "resolved": True},
+            {"provenance": "LOCAL_RECORD", "resolved": True}])
+        assert RO.cycle_reconciled(two) is False                    # all, not any
+        for bad in (dict(self.GOOD, carry_cycle=[]),                # none captured
+                    {k: v for k, v in self.GOOD.items() if k != "carry_cycle"},
+                    dict(self.GOOD, carry_cycle=[{"provenance": "VENUE_RECONCILED",
+                                                  "resolved": False}]),
+                    dict(self.GOOD, carry_cycle=[{"provenance": "VENUE_RECONCILED"}]),
+                    dict(self.GOOD, schema="other/1"), {}, None, [], "x"):
+            assert RO.cycle_reconciled(bad) is False
+
+    def test_a_stand_aside_must_be_a_failed_stage_with_the_stand_aside_action(self):
+        def rep(**ev):
+            stage = {"stage": "open", "ok": False, "evidence": {
+                "action": "stand_aside",
+                "reason": "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"}}
+            stage.update({k: v for k, v in ev.items() if k != "evidence"})
+            stage["evidence"] = {**stage["evidence"], **ev.get("evidence", {})}
+            return {"orders_sent": 0, "stages": [stage]}
+        assert RO.stood_aside_without_orders(rep()) == \
+            "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+        assert RO.stood_aside_without_orders(rep(ok=True)) is None
+        assert RO.stood_aside_without_orders(
+            rep(evidence={"action": "opened"})) is None
+        assert RO.stood_aside_without_orders(
+            dict(rep(), orders_sent=1)) is None
+        assert RO.stood_aside_without_orders(
+            {k: v for k, v in rep().items() if k != "orders_sent"}) is None
+        assert RO.stood_aside_without_orders(None) is None
+
+    def test_orders_exercised_needs_an_entry_and_an_exit_and_nothing_open(self):
+        assert RO.orders_exercised({"orders_sent": 2}) is True
+        for bad in ({"orders_sent": 1}, {"orders_sent": 0}, {"orders_sent": True},
+                    {"orders_sent": 2, "still_open": True}, {}, None, []):
+            assert RO.orders_exercised(bad) is False

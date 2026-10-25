@@ -72,13 +72,15 @@ def _write_json(path: str, obj: Any) -> None:
 
 
 def _history_line(root: str, record: Dict[str, Any]) -> None:
-    decision = (record.get("assessment") or {}).get("entry_decision") or {}
-    funding = decision.get("funding") or {}
-    hold = decision.get("hold_gate") or {}
+    def mapping(x: Any) -> Dict[str, Any]:
+        return x if isinstance(x, dict) else {}
+    decision = mapping(mapping(record.get("assessment")).get("entry_decision"))
+    funding = mapping(decision.get("funding"))
+    hold = mapping(decision.get("hold_gate"))
     line = {
         "at": record["at"], "outcome": record["outcome"],
         "reasons": record["reasons"], "order_sent": False,
-        "gate_reason": (decision.get("gate") or {}).get("reason"),
+        "gate_reason": mapping(decision.get("gate")).get("reason"),
         "smoothed_funding_bps": funding.get("smoothed_bps_per_8h_print"),
         "round_trip_bps": decision.get("round_trip_bps_estimate"),
         "settlements_needed": hold.get("settlements_needed"),
@@ -133,8 +135,8 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
     try:
         with open(log, encoding="utf-8", errors="replace") as fh:
             report = RO.parse_report(fh.read())
-    except OSError:
-        report = None
+    except Exception:                                          # noqa: BLE001
+        report = None                  # unreadable output claims nothing
     result = RO.classify_preflight(report, rc, expect_order_gate_closed=True)
     return finish(result, EXIT_FAILED if result["outcome"] == RO.MONITOR_FAILED
                   else EXIT_OK)
@@ -144,6 +146,20 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
          max_runs: int = 0, clock: Callable[[], float] = time.time,
          sleep: Callable[[float], None] = time.sleep,
          once: Callable[..., int] = monitor_once) -> int:
+    """A stop signal ends the loop with 143 wherever it lands, including the
+    sleep between cycles where it spends nearly all its time: under the Fly
+    on-failure restart policy a deploy or stop must not look like a failure."""
+    try:
+        return _loop(root, env=env, interval_s=interval_s, max_runs=max_runs,
+                     clock=clock, sleep=sleep, once=once)
+    except UD.Shutdown as exc:
+        UD._say(root, f"told to stop ({exc}): monitor loop ends")
+        return EXIT_SIGNALLED
+
+
+def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
+          max_runs: int, clock: Callable[[], float],
+          sleep: Callable[[float], None], once: Callable[..., int]) -> int:
     runs = 0
     while True:
         if os.path.exists(os.path.join(root, "STOP")):
