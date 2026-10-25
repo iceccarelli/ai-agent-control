@@ -75,7 +75,7 @@ GATE_REASONS = 9
 #: The struct layouts above only match a library of this ABI. A stale
 #: libcarrycore.so (older struct sizes) would be written past its end, so it is
 #: treated as not built.
-ABI_PREFIX = b"carrycore/4"
+ABI_NAME = b"carrycore/4"
 
 
 class Result(ctypes.Structure):
@@ -100,6 +100,15 @@ class Result(ctypes.Structure):
 _LIB: Optional[ctypes.CDLL] = None
 
 
+def _abi_current() -> bool:
+    try:
+        probe = ctypes.CDLL(LIB_PATH)
+        probe.carrycore_version.restype = ctypes.c_char_p
+        return (probe.carrycore_version() or b"").split(b" ")[0] == ABI_NAME
+    except (OSError, AttributeError):
+        return False
+
+
 def build(quiet: bool = True) -> bool:
     """Compile the core. Returns False when there is no compiler — the caller
     then runs the Python simulator and SAYS SO; it never pretends to be fast."""
@@ -108,6 +117,13 @@ def build(quiet: bool = True) -> bool:
                                 text=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return False
+    if result.returncode == 0 and os.path.exists(LIB_PATH) and not _abi_current():
+        # make only compares mtimes with the sources: a library left by another
+        # branch can be NEWER than carrycore.cpp yet carry an older struct layout.
+        subprocess.run(["make", "-C", CPP_DIR, "clean"], capture_output=True,
+                       text=True, timeout=300)
+        result = subprocess.run(["make", "-C", CPP_DIR], capture_output=True,
+                                text=True, timeout=300)
     if not quiet and result.stdout:
         print(result.stdout.strip())
     if result.returncode != 0:
@@ -125,7 +141,7 @@ def load() -> Optional[ctypes.CDLL]:
         return None
     lib = ctypes.CDLL(LIB_PATH)
     lib.carrycore_version.restype = ctypes.c_char_p
-    if not (lib.carrycore_version() or b"").startswith(ABI_PREFIX):
+    if (lib.carrycore_version() or b"").split(b" ")[0] != ABI_NAME:
         return None          # stale build: `make -C cpp` (or --build) rebuilds it
     lib.carry_entry_gate.argtypes = [
         ctypes.POINTER(ctypes.c_double), ctypes.c_int32, ctypes.c_double,
@@ -197,6 +213,13 @@ def entry_gate(prints_bps: Sequence[float], perp: float, spot: float,
     if lib is None:
         raise RuntimeError("libcarrycore.so is not built (or is a stale ABI)")
     import carry_costs
+    if (p.ewma_alpha != carry_costs.EWMA_ALPHA
+            or p.ewma_min_prints != carry_costs.EWMA_MIN_PRINTS):
+        # carry_costs.entry_gate has no such knobs; a different smoother is a
+        # different gate, not a parity case.
+        raise ValueError("entry_gate parity needs the production EWMA "
+                         f"(alpha {carry_costs.EWMA_ALPHA}, "
+                         f"min prints {carry_costs.EWMA_MIN_PRINTS})")
     n = len(prints_bps)
     arr = (ctypes.c_double * max(n, 1))(*[float(x) for x in prints_bps])
     reason = ctypes.c_int32(-1)

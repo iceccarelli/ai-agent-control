@@ -131,11 +131,68 @@ def test_no_economic_parameter_moved():
 
 
 def test_reason_table_matches_the_native_library(native):
-    # every code the C++ can return maps to the Python name, in order
-    assert len(cc.GATE_REASONS) == core.GATE_REASONS == 9
-    assert cc.GATE_REASONS[0] == "CARRY_CLEARS_COSTS_AND_BASIS"
-    assert cc.GATE_REASONS[8] == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+    # the code numbers are the C++ enum (carrycore.h); a reorder breaks both
+    assert cc.GATE_REASONS == (
+        "CARRY_CLEARS_COSTS_AND_BASIS", "COST_INPUT_INVALID",
+        "INSUFFICIENT_FUNDING_HISTORY", "FUNDING_NOT_POSITIVE",
+        "BASIS_UNREADABLE", "CARRY_BELOW_COST_OF_CAPITAL",
+        "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET",
+        "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET",
+        "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD")
+    assert core.GATE_REASONS == len(cc.GATE_REASONS) == 9
     assert core.version().startswith("carrycore/4")
+    # and each name is what the C++ returns for an input that produces it
+    probes = {
+        "COST_INPUT_INVALID": dict(prints=[5.0] * 5, rt=0.0),
+        "INSUFFICIENT_FUNDING_HISTORY": dict(prints=[5.0]),
+        "FUNDING_NOT_POSITIVE": dict(prints=[-1.0] * 5),
+        "BASIS_UNREADABLE": dict(prints=[5.0] * 5, perp=0.0),
+        "CARRY_BELOW_COST_OF_CAPITAL": dict(prints=[0.1] * 5),
+        "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET": dict(prints=[1.0] * 5, basis=900.0),
+        "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET":
+            dict(prints=[1.0] * 5, basis=-900.0),
+        "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD": dict(prints=[0.3] * 5),
+        "CARRY_CLEARS_COSTS_AND_BASIS": dict(prints=[2.0] * 5),
+    }
+    for want, kw in probes.items():
+        perp = kw.get("perp", px(kw.get("basis", 0.0)))
+        got = cpp_gate(kw["prints"], perp, SPOT, 0.0, kw.get("rt", 11.0))
+        assert got[1] == want, (want, got)
+        assert python_gate(kw["prints"], perp, SPOT, 0.0, kw.get("rt", 11.0)) == got
+
+
+def test_a_demonstrated_hold_with_no_finite_settlement_count_is_refused(native):
+    for demo in (1e308, 6e307, 1.7976931348623157e308):
+        py = python_gate([1.0] * 5, SPOT, SPOT, 0.0, 31.0, demo=demo)
+        cp = cpp_gate([1.0] * 5, SPOT, SPOT, 0.0, 31.0, demo=demo)
+        assert py == cp == (False, "COST_INPUT_INVALID"), (demo, py, cp)
+
+
+def test_the_wrapper_refuses_a_different_smoother(native):
+    p = core.params(gated=True, round_trip_bps=11.0, ewma_min_prints=1)
+    with pytest.raises(ValueError):
+        core.entry_gate([5.0], SPOT, SPOT, p)
+
+
+def test_the_abi_check_tells_a_stale_library_from_the_current_one(native, tmp_path,
+                                                                  monkeypatch):
+    """make compares mtimes only, so an old-ABI .so touched after checkout is
+    left alone; build() therefore asks the library itself and clean-rebuilds.
+    This pins the question it asks: exact name, so carrycore/40 or /3 fail."""
+    import shutil
+    import subprocess
+    if shutil.which("g++") is None:
+        pytest.skip("no compiler")
+    assert core._abi_current() is True
+    for name in ("carrycore/3 (stale)", "carrycore/40 (future)"):
+        src = tmp_path / "v.cpp"
+        src.write_text('extern "C" const char *carrycore_version(void)'
+                       '{return "%s";}\n' % name)
+        lib = tmp_path / ("lib%d.so" % len(name))
+        subprocess.run(["g++", "-shared", "-fPIC", "-o", str(lib), str(src)],
+                       check=True)
+        monkeypatch.setattr(core, "LIB_PATH", str(lib))
+        assert core._abi_current() is False, name
 
 
 # -- the headline case and the boundary ---------------------------------------
@@ -259,10 +316,11 @@ def test_boundary_with_borrow_and_a_fractional_hold(native):
                 a = python_gate(prints, SPOT, SPOT, borrow, 11.0, demo=demo)
                 b = cpp_gate(prints, SPOT, SPOT, borrow, 11.0, demo=demo)
                 assert a == b, (demo, borrow, n, a, b)
-                hold_ok = n <= budget
-                if a[1] in ("BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD",
-                            "CARRY_CLEARS_COSTS_AND_BASIS"):
-                    assert (a[1] == "CARRY_CLEARS_COSTS_AND_BASIS") == hold_ok
+                # n settlements to clear: allowed exactly when n <= budget (the
+                # entry is otherwise unremarkable, so no other reason may appear)
+                assert a[1] == ("CARRY_CLEARS_COSTS_AND_BASIS" if n <= budget
+                                else "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"), \
+                    (demo, borrow, n, a)
 
 
 def _ulps(x, k):

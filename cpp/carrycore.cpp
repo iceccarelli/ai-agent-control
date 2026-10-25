@@ -124,7 +124,8 @@ int gate_reason(const double *history, int count, double perp, double spot,
     /* The hold check. A demonstrated hold that is not a positive number
        refuses (hold_clears_round_trip answers COST_INPUT_INVALID). */
     if (!cost_inputs_valid(p.round_trip_bps, p.demonstrated_hold_days,
-                           p.borrow_apr)) {
+                           p.borrow_apr) ||
+        !std::isfinite(p.demonstrated_hold_days * kFundingPeriodsPerDay)) {
         return CARRY_GATE_COST_INPUT_INVALID;
     }
     if (!hold_clears(smoothed, p)) {

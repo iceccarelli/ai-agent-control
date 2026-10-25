@@ -413,6 +413,10 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
     invalid = _invalid_cost_inputs(borrow_apr=borrow_apr,
                                    round_trip_bps=round_trip_bps,
                                    hold_days=hold_days)
+    # A hold so long that its settlement count is not a finite number is not a
+    # horizon anyone can enforce; refused, not compared (and not an OverflowError).
+    if not invalid and not math.isfinite(float(hold_days) * FUNDING_PERIODS_PER_DAY):
+        invalid = ["hold_days"]
     if invalid:
         return CarryVerdict(False, "COST_INPUT_INVALID",
                             detail={"fields": invalid})
