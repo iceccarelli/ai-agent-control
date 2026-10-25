@@ -80,10 +80,16 @@ class TestTheScalarPathIsUntouched:
         assert b["trades"] == a["trades"]
 
     def test_the_headline_overlay_number_has_not_moved(self, rows):
-        """+7.26%/yr at 0% borrow (7.23 before the perp-discount entry bound), on the
-        ZERO-LATENCY model: an upper bound, see tests/test_carry_latency.py."""
+        """+8.03%/yr at 0% borrow (7.26 before the measured-hold entry gate, 7.23
+        before the perp-discount entry bound), on the ZERO-LATENCY model: an
+        upper bound, see tests/test_carry_latency.py."""
         r = settle(rows, borrow_apr=0.0, latency_rows=0)
-        assert r["net_annualised_pct"] == pytest.approx(7.26, abs=0.01)
+        # 0051: moved from 7.26 ON PURPOSE. The settlement simulator's entry is
+        # now carry_costs.entry_gate, which also refuses funding that cannot earn
+        # the round trip back within the measured hold. IN-SAMPLE and zero
+        # latency: a record of what the changed rule did to this corpus, not
+        # evidence that the gate creates an edge.
+        assert r["net_annualised_pct"] == pytest.approx(8.03, abs=0.01)
 
 
 @needs_corpus

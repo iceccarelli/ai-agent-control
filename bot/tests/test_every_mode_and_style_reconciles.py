@@ -190,8 +190,12 @@ class TestTheProductNumbersDidNotMove:
     def test_overlay_taker_net_is_unchanged(self, runs):
         # Re-pinned (was 29_766.40 / 79 trades) when the entry gate gained its
         # perp-DISCOUNT bound: two entries the old gate took are now refused.
+        # Re-pinned again, 29_889.40 -> 33_049.51, when it gained the
+        # measured-hold check (carry_costs.entry_gate): 28 entries whose funding
+        # could not earn the round trip back within 17 settlements are refused.
+        # IN-SAMPLE. The gate was not tuned; this is what it did to this corpus.
         assert runs[("overlay", "taker")]["net_usd"] == pytest.approx(
-            29_889.40, abs=0.01)
+            33_049.51, abs=0.01)
 
     def test_overlay_taker_trade_count_is_unchanged(self, runs):
-        assert runs[("overlay", "taker")]["trades"] == 77
+        assert runs[("overlay", "taker")]["trades"] == 49

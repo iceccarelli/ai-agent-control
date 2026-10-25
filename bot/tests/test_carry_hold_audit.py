@@ -89,12 +89,17 @@ class TestOnTheRealEngineAndCorpus:
 
     def test_the_gate_reproduces_the_historical_entries_but_the_discount_bound(
             self, audit):
-        # The engine decided on the quote; the trade rows carry the FILL, which
-        # slips the short below the quote. Five fills landed past the new
-        # discount bound (they passed it at decision time), so the gate
-        # re-run on the recorded fill prices refuses exactly those.
-        assert audit["trades"] == 77
-        assert audit["gate_reproduced_entries"] == 72
+        # 0051: the engine's entry is `carry_costs.entry_gate` (evaluate_entry
+        # then the measured-hold check), so the replay takes 49 entries where
+        # the unwired gate took 77: the 28 it now refuses are the funding that
+        # cannot earn back the round trip within 17 settlements. The trade rows
+        # carry the FILL, which slips the short below the quote; every one of
+        # the 49 re-passes the full gate on its recorded fill prices (the 72/77
+        # of the unwired gate lost five fills past the discount bound, which the
+        # hold gate refused at decision time).
+        assert audit["trades"] == 49
+        assert audit["gate_reproduced_entries"] == 49
+        assert audit["gate_reproduces_every_historical_entry"] is True
 
     def test_counts_are_consistent(self, audit):
         assert audit["trades"] >= audit["completed_trades"] > 0
@@ -119,7 +124,11 @@ class TestOnTheRealEngineAndCorpus:
         acquire = ha.run_audit(mode="acquire")
         assert audit["round_trip_bps"] == pytest.approx(11.0)
         assert acquire["round_trip_bps"] == pytest.approx(31.0)
-        assert acquire["totals"]["fees_usd"] < audit["totals"]["fees_usd"]
+        # fees_usd is negative (a cost). With the hold gate wired the 31 bps
+        # acquire round trip admits far fewer entries than the 11 bps overlay
+        # (4 vs 49), so TOTAL fees are no longer the comparison; per trade is.
+        assert (acquire["totals"]["fees_usd"] / acquire["trades"]
+                < audit["totals"]["fees_usd"] / audit["trades"])
         assert acquire["reconciles_with_replay"] is True
 
     def test_the_report_is_json_serialisable_and_carries_its_caveats(self, audit):

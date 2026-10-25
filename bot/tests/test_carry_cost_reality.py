@@ -11,13 +11,14 @@ held it needs more than 11 bps per 8h (0.11%), an order of magnitude above
 typical funding. The carry does NOT clear its costs on a short hold at typical
 funding; it can only pay on a hold that is long AND stays positive.
 
-THE GAP these tests reproduce: `evaluate_entry` amortises the round trip over
-ASSUMED_HOLD_DAYS = 30, but no code holds a position 30 days (the exit is
-FUNDING_INVERTED only; the measured median hold is ~5.8 days). So funding that
-needs 12 days to break even was admitted. `hold_clears_round_trip` refuses it and only
-ever refuses more than evaluate_entry. It is NOT yet wired into the engine (see
-the strict xfail at the bottom): doing so moves the engine/simulator/C++ core
-parity pins and needs one reviewed change.
+THE GAP these tests reproduced, now closed: `evaluate_entry` amortises the round
+trip over ASSUMED_HOLD_DAYS = 30, but no code holds a position 30 days (the exit
+is FUNDING_INVERTED only; the measured median hold was ~5.8 days). So funding
+that needs 12 days to break even was admitted. `carry_costs.entry_gate` now runs
+`hold_clears_round_trip` after `evaluate_entry` and `CarryEngine.entry_economics`
+asks it, so the production entry refuses that funding. It only ever refuses
+more; the simulators and the C++ core make the same decision
+(tests/test_entry_gate_parity.py).
 """
 from __future__ import annotations
 
@@ -222,7 +223,7 @@ def test_the_horizon_is_the_measured_median_and_assumed_hold_is_unchanged():
     assert cc.ASSUMED_HOLD_DAYS == 30.0        # nothing loosened or retuned
 
 
-# -- the engine does NOT use it yet (documented gap) ------------------------
+# -- the engine asks the same gate ---------------------------------------------
 
 def _engine(history):
     from carry_engine import CarryEngine
@@ -239,25 +240,24 @@ def _engine(history):
     return e
 
 
-def test_gap_the_overlay_engine_admits_an_entry_that_needs_twelve_days():
-    """CURRENT BEHAVIOUR, pinned honestly: with 0.3 bps/8h the production entry
-    gate allows an overlay entry although break-even is 37 settlements (~12.3
-    days) against a measured median hold of ~5.8 days. Cost is NOT amortised
-    over any hold the engine enforces. When this test fails, the gap has been
-    closed (or the gate changed): replace it with the strict-xfail below."""
+def test_the_overlay_engine_refuses_what_cannot_clear_in_the_measured_hold():
+    """Was test_gap_... (the engine ADMITTED 0.3 bps/8h, break-even 37
+    settlements = ~12.3 days, against a measured median hold of ~5.8 days) and
+    a strict xfail on the desired behaviour. The semantics changed on purpose:
+    the production entry now refuses it, with the horizon gate's own reason."""
     e = _engine(prints(0.3))
     econ = e.entry_economics(mark=100_000.0, spot=100_000.0, funding_bps=0.3)
     assert econ.round_trip_bps == 11.0
+    # evaluate_entry alone still allows it: the refusal is the horizon gate's
+    assert cc.evaluate_entry(funding_prints_bps=prints(0.3), perp=100_000.0,
+                             spot=100_000.0, borrow_apr=0.0,
+                             round_trip_bps=11.0).allowed
+    assert econ.refusal is not None and not econ.verdict.allowed
+    assert econ.refusal.reason == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+    assert econ.refusal.action == "stand_aside"
+
+
+def test_the_overlay_engine_still_admits_funding_that_clears_both_gates():
+    e = _engine(prints(1.0))
+    econ = e.entry_economics(mark=100_000.0, spot=100_000.0, funding_bps=1.0)
     assert econ.refusal is None and econ.verdict.allowed
-    assert not cc.hold_clears_round_trip(
-        funding_prints_bps=prints(0.3), round_trip_bps=11.0, borrow_apr=0.0)
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN GAP: CarryEngine.entry_economics does not call "
-    "carry_costs.hold_clears_round_trip; wiring it must move the simulator, "
-    "the C++ core and their parity pins in the same change"))
-def test_desired_the_overlay_engine_refuses_what_cannot_clear_in_the_hold():
-    e = _engine(prints(0.3))
-    econ = e.entry_economics(mark=100_000.0, spot=100_000.0, funding_bps=0.3)
-    assert econ.refusal is not None

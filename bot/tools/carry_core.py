@@ -37,6 +37,8 @@ from typing import Any, Dict, List, Optional, Sequence
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)                 # bot/
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)                 # carry_costs
 CPP_DIR = os.path.join(os.path.dirname(ROOT), "cpp")
 LIB_PATH = os.path.join(ROOT, "lib", "libcarrycore.so")
 
@@ -62,7 +64,18 @@ class Params(ctypes.Structure):
                 ("ewma_min_prints", ctypes.c_int),
                 ("negative_exit_prints", ctypes.c_int),
                 ("funding_history", ctypes.c_int),
-                ("latency_rows", ctypes.c_int)]
+                ("latency_rows", ctypes.c_int),
+                ("demonstrated_hold_days", ctypes.c_double)]
+
+
+#: Entry-gate reason codes, carrycore.h CARRY_GATE_*; the order of
+#: carry_costs.GATE_REASONS (tests/test_entry_gate_parity.py pins both).
+GATE_REASONS = 9
+
+#: The struct layouts above only match a library of this ABI. A stale
+#: libcarrycore.so (older struct sizes) would be written past its end, so it is
+#: treated as not built.
+ABI_NAME = b"carrycore/4"
 
 
 class Result(ctypes.Structure):
@@ -75,13 +88,25 @@ class Result(ctypes.Structure):
                 ("losing_trades", ctypes.c_int32),
                 ("refusals", ctypes.c_int32),
                 ("unresolved_entries", ctypes.c_int32),
-                ("unresolved_exits", ctypes.c_int32)]
+                ("unresolved_exits", ctypes.c_int32),
+                ("refusals_by_reason", ctypes.c_int32 * GATE_REASONS)]
 
     def as_dict(self) -> Dict[str, Any]:
-        return {name: getattr(self, name) for name, _t in self._fields_}
+        out = {name: getattr(self, name) for name, _t in self._fields_}
+        out["refusals_by_reason"] = list(out["refusals_by_reason"])
+        return out
 
 
 _LIB: Optional[ctypes.CDLL] = None
+
+
+def _abi_current() -> bool:
+    try:
+        probe = ctypes.CDLL(LIB_PATH)
+        probe.carrycore_version.restype = ctypes.c_char_p
+        return (probe.carrycore_version() or b"").split(b" ")[0] == ABI_NAME
+    except (OSError, AttributeError):
+        return False
 
 
 def build(quiet: bool = True) -> bool:
@@ -92,6 +117,13 @@ def build(quiet: bool = True) -> bool:
                                 text=True, timeout=300)
     except (OSError, subprocess.SubprocessError):
         return False
+    if result.returncode == 0 and os.path.exists(LIB_PATH) and not _abi_current():
+        # make only compares mtimes with the sources: a library left by another
+        # branch can be NEWER than carrycore.cpp yet carry an older struct layout.
+        subprocess.run(["make", "-C", CPP_DIR, "clean"], capture_output=True,
+                       text=True, timeout=300)
+        result = subprocess.run(["make", "-C", CPP_DIR], capture_output=True,
+                                text=True, timeout=300)
     if not quiet and result.stdout:
         print(result.stdout.strip())
     if result.returncode != 0:
@@ -108,6 +140,13 @@ def load() -> Optional[ctypes.CDLL]:
     if not os.path.exists(LIB_PATH):
         return None
     lib = ctypes.CDLL(LIB_PATH)
+    lib.carrycore_version.restype = ctypes.c_char_p
+    if (lib.carrycore_version() or b"").split(b" ")[0] != ABI_NAME:
+        return None          # stale build: `make -C cpp` (or --build) rebuilds it
+    lib.carry_entry_gate.argtypes = [
+        ctypes.POINTER(ctypes.c_double), ctypes.c_int32, ctypes.c_double,
+        ctypes.c_double, ctypes.POINTER(Params), ctypes.POINTER(ctypes.c_int32)]
+    lib.carry_entry_gate.restype = ctypes.c_int
     lib.carry_simulate.argtypes = [ctypes.POINTER(Settlement), ctypes.c_int32,
                                    ctypes.POINTER(Params),
                                    ctypes.POINTER(Result)]
@@ -149,17 +188,45 @@ def params(*, notional: float = 100_000.0, entry_bps: float = 0.2,
            overlay: bool = False, ewma_min_prints: int = 3,
            negative_exit_prints: int = 3,
            funding_history: int = 8,
-           latency_rows: int = LATENCY_ROWS) -> Params:
+           latency_rows: int = LATENCY_ROWS,
+           demonstrated_hold_days: Optional[float] = None) -> Params:
     if int(latency_rows) < 0:
         raise ValueError("latency_rows cannot be negative")
     if int(negative_exit_prints) < 1:
         # A streak is never below 0, so 0 would exit on the first print after
         # entry whatever its sign: a one-print hold at double fees.
         raise ValueError("negative_exit_prints must be at least 1")
+    if demonstrated_hold_days is None:
+        import carry_costs
+        demonstrated_hold_days = carry_costs.DEMONSTRATED_HOLD_DAYS
     return Params(notional, entry_bps, borrow_apr, impact_bps, round_trip_bps,
                   hold_days, taker_spot_bps, taker_perp_bps, ewma_alpha,
                   int(bool(gated)), int(bool(overlay)), ewma_min_prints,
-                  negative_exit_prints, funding_history, int(latency_rows))
+                  negative_exit_prints, funding_history, int(latency_rows),
+                  float(demonstrated_hold_days))
+
+
+def entry_gate(prints_bps: Sequence[float], perp: float, spot: float,
+               p: Params) -> Dict[str, Any]:
+    """carry_costs.entry_gate on the native core: `{allowed, reason}`."""
+    lib = load()
+    if lib is None:
+        raise RuntimeError("libcarrycore.so is not built (or is a stale ABI)")
+    import carry_costs
+    if (p.ewma_alpha != carry_costs.EWMA_ALPHA
+            or p.ewma_min_prints != carry_costs.EWMA_MIN_PRINTS):
+        # carry_costs.entry_gate has no such knobs; a different smoother is a
+        # different gate, not a parity case.
+        raise ValueError("entry_gate parity needs the production EWMA "
+                         f"(alpha {carry_costs.EWMA_ALPHA}, "
+                         f"min prints {carry_costs.EWMA_MIN_PRINTS})")
+    n = len(prints_bps)
+    arr = (ctypes.c_double * max(n, 1))(*[float(x) for x in prints_bps])
+    reason = ctypes.c_int32(-1)
+    allowed = lib.carry_entry_gate(arr, n, float(perp), float(spot),
+                                   ctypes.byref(p), ctypes.byref(reason))
+    return {"allowed": bool(allowed),
+            "reason": carry_costs.GATE_REASONS[reason.value]}
 
 
 def simulate(settlements: Sequence[Any], p: Params) -> Dict[str, Any]:

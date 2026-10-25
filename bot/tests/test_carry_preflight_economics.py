@@ -108,7 +108,9 @@ class TestItIsTheProductionEvaluator:
         src = inspect.getsource(carry_engine.CarryEngine.on_candle)
         assert "entry_economics" in src
         assert "evaluate_entry" not in src          # one path, not a copy
-        assert "evaluate_entry" in inspect.getsource(
+        # 0051: the production entry is carry_costs.entry_gate (evaluate_entry,
+        # then the measured-hold check). Still one path, not a copy.
+        assert "entry_gate" in inspect.getsource(
             carry_engine.CarryEngine.entry_economics)
 
     def test_the_report_equals_a_direct_call_with_the_actual_history_fees_and_mode(
@@ -155,16 +157,31 @@ class TestItIsTheProductionEvaluator:
 
 class TestOverlayAndAcquireAreEconomicallyDistinct:
     def test_same_market_overlay_passes_acquire_is_refused_on_cost(self):
-        # 0.3 bps per print: ~0.9 bps/day of carry. Overlay pays two perp legs
-        # (11 bps), acquire pays the spot round trip too (31 bps).
-        overlay, _ = preflight(Market(rate_bps=0.3), mode="overlay")
-        acquire, _ = preflight(Market(rate_bps=0.3), mode="acquire")
+        # 1.0 bps per print (typical BTC funding). Overlay pays two perp legs
+        # (11 bps: 11 settlements to earn back, inside the 17 measured), acquire
+        # pays the spot round trip too (31 bps: 31 settlements, outside it).
+        overlay, _ = preflight(Market(rate_bps=1.0), mode="overlay")
+        acquire, _ = preflight(Market(rate_bps=1.0), mode="acquire")
         o, a = overlay["entry_economics"], acquire["entry_economics"]
         assert o["state"] == "ENTRY_ECONOMICS_PASS"
         assert a["state"] == "ENTRY_ECONOMICS_REFUSED"
-        assert a["reason"] == "CARRY_BELOW_COST_OF_CAPITAL"
+        assert a["reason"] == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
         assert o["round_trip_bps"] == pytest.approx(11.0)
         assert a["round_trip_bps"] == pytest.approx(31.0)
+
+    def test_funding_that_only_clears_the_thirty_day_amortisation_is_refused(self):
+        # 0.3 bps per print: ~0.9 bps/day. It clears evaluate_entry's 30 day
+        # amortised cost for the overlay (this test used to say PASS: the gap),
+        # but needs 37 settlements to earn the 11 bps back. Refused, as the
+        # engine refuses it. Acquire is refused earlier, on cost of capital.
+        overlay, _ = preflight(Market(rate_bps=0.3), mode="overlay")
+        acquire, _ = preflight(Market(rate_bps=0.3), mode="acquire")
+        o, a = overlay["entry_economics"], acquire["entry_economics"]
+        assert o["state"] == "ENTRY_ECONOMICS_REFUSED"
+        assert o["reason"] == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+        assert o["evaluator"]["detail"]["settlements_needed"] == 37
+        assert a["state"] == "ENTRY_ECONOMICS_REFUSED"
+        assert a["reason"] == "CARRY_BELOW_COST_OF_CAPITAL"
 
     def test_the_account_specific_fee_tier_moves_the_round_trip(self):
         report, _ = preflight(Market(perp_taker=0.0003), mode="overlay")

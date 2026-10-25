@@ -393,6 +393,16 @@ class TestDailyClosesAreNotQuotable:
         why = report["why_not_quotable"].lower()
         assert "settlement" in why and "impact" in why
 
+    def test_the_daily_gated_run_is_not_the_engine_rule(self):
+        """The daily-close study gates on evaluate_entry only (its history is one
+        print a day, so the 17-settlement hold check has no meaning there and
+        PHASE1_DECISION's pinned figure rests on it). The engine also applies the
+        measured-hold check, so a gated DAILY run must not claim to be its rule."""
+        g = cb.simulate(REPO, gated=True)
+        assert g["quotable_conditions"]["rule_is_what_the_engine_runs"] is False
+        assert "measured hold" in g["why_not_quotable"]
+        assert g["is_a_quotable_return"] is False
+
     def test_the_gated_run_is_named_in_sample(self):
         g = cb.simulate(REPO, gated=True)
         assert g["is_a_quotable_return"] is False

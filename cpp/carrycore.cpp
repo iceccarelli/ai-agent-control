@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <thread>
 #include <vector>
 
@@ -53,23 +55,53 @@ bool ewma(const double *prints, int count, double alpha, int min_prints,
     return true;
 }
 
-/* carry_costs.evaluate_entry, gate for gate, in order. */
-bool may_open_gated(const double *history, int count, double perp, double spot,
-                    const CarryParams &p) {
+/* Python's round(x, ndigits): the correctly rounded decimal, ties to even on
+   the exact binary value. snprintf/strtod do the same, which is what keeps the
+   break-even arithmetic below identical to carry_costs.min_settlements_to_clear
+   at the boundary (std::round(x * 1e12) / 1e12 does not). */
+double round_dp(double x, int digits) {
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "%.*f", digits, x);
+    return std::strtod(buf, nullptr);
+}
+
+/* carry_costs._invalid_cost_inputs. */
+bool cost_inputs_valid(double round_trip_bps, double hold_days,
+                       double borrow_apr) {
+    return std::isfinite(round_trip_bps) && round_trip_bps > 0.0 &&
+           std::isfinite(hold_days) && hold_days > 0.0 &&
+           std::isfinite(borrow_apr) && borrow_apr >= 0.0;
+}
+
+/* carry_costs.hold_clears_round_trip, after evaluate_entry has allowed: does
+   the smoothed funding earn back the round trip within the demonstrated hold?
+   `smoothed` is finite and positive here. */
+bool hold_clears(double smoothed, const CarryParams &p) {
+    const double borrow_per_day = (p.borrow_apr / 365.0) * 1e4;
+    const double budget = std::floor(round_dp(
+        p.demonstrated_hold_days * kFundingPeriodsPerDay, 9));
+    const double net =
+        round_dp(smoothed - borrow_per_day / kFundingPeriodsPerDay, 12);
+    if (net <= 0.0) return false;           /* never clears                  */
+    const double needed =
+        std::max(1.0, std::ceil(round_dp(p.round_trip_bps / net, 9)));
+    return needed <= budget;
+}
+
+/* carry_costs.entry_gate: evaluate_entry gate for gate, in its order, then the
+   hold check. Returns a CARRY_GATE_* code (0 = allowed). */
+int gate_reason(const double *history, int count, double perp, double spot,
+                const CarryParams &p) {
     /* carry_costs._invalid_cost_inputs: a NaN, a missing or non-positive
-       round trip / hold / price, or a negative borrow is refused, not priced. */
-    if (!(std::isfinite(perp) && perp > 0.0) ||
-        !(std::isfinite(spot) && spot > 0.0) ||
-        !(std::isfinite(p.round_trip_bps) && p.round_trip_bps > 0.0) ||
-        !(std::isfinite(p.hold_days) && p.hold_days > 0.0) ||
-        !(std::isfinite(p.borrow_apr) && p.borrow_apr >= 0.0)) {
-        return false;                       /* COST_INPUT_INVALID            */
+       round trip / hold, or a negative borrow is refused, not priced. */
+    if (!cost_inputs_valid(p.round_trip_bps, p.hold_days, p.borrow_apr)) {
+        return CARRY_GATE_COST_INPUT_INVALID;
     }
     double smoothed = 0.0;
     if (!ewma(history, count, p.ewma_alpha, p.ewma_min_prints, &smoothed)) {
-        return false;                       /* INSUFFICIENT_FUNDING_HISTORY */
+        return CARRY_GATE_INSUFFICIENT_FUNDING_HISTORY;
     }
-    if (smoothed <= 0.0) return false;      /* FUNDING_NOT_POSITIVE          */
+    if (smoothed <= 0.0) return CARRY_GATE_FUNDING_NOT_POSITIVE;
 
     const double carry_per_day = smoothed * kFundingPeriodsPerDay;
     const double borrow_per_day = (p.borrow_apr / 365.0) * 1e4;
@@ -77,15 +109,29 @@ bool may_open_gated(const double *history, int count, double perp, double spot,
         p.round_trip_bps / std::max(p.hold_days, 1e-9);
     const double net_edge = carry_per_day - borrow_per_day - round_trip_per_day;
 
-    if (!(std::isfinite(perp) && std::isfinite(spot)) || spot <= 0.0) {
-        return false;                       /* BASIS_UNREADABLE              */
+    /* carry_costs.basis_bps raises for a non-finite or non-positive price. */
+    if (!(std::isfinite(perp) && std::isfinite(spot)) || spot <= 0.0 ||
+        perp <= 0.0) {
+        return CARRY_GATE_BASIS_UNREADABLE;
     }
     const double entry_basis = (perp / spot - 1.0) * 1e4;
 
-    if (net_edge <= 0.0) return false;      /* CARRY_BELOW_COST_OF_CAPITAL   */
-    if (entry_basis > net_edge * p.hold_days) return false; /* BASIS_BUDGET  */
-    if (entry_basis < -(net_edge * p.hold_days)) return false; /* DISCOUNT   */
-    return true;
+    if (net_edge <= 0.0) return CARRY_GATE_CARRY_BELOW_COST_OF_CAPITAL;
+    const double basis_budget = net_edge * p.hold_days;
+    if (entry_basis > basis_budget) return CARRY_GATE_BASIS_EXCEEDS_BUDGET;
+    if (entry_basis < -basis_budget) return CARRY_GATE_BASIS_DISCOUNT_EXCEEDS_BUDGET;
+
+    /* The hold check. A demonstrated hold that is not a positive number
+       refuses (hold_clears_round_trip answers COST_INPUT_INVALID). */
+    if (!cost_inputs_valid(p.round_trip_bps, p.demonstrated_hold_days,
+                           p.borrow_apr) ||
+        !std::isfinite(p.demonstrated_hold_days * kFundingPeriodsPerDay)) {
+        return CARRY_GATE_COST_INPUT_INVALID;
+    }
+    if (!hold_clears(smoothed, p)) {
+        return CARRY_GATE_BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED;
+    }
+    return CARRY_GATE_ALLOWED;
 }
 
 }  // namespace
@@ -100,6 +146,7 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
     bool has_live = false;
     int streak = 0;
     int refusals = 0;
+    int32_t by_reason[CARRY_GATE_REASONS] = {0};
     double history[kMaxHistory];
     int history_len = 0;
 
@@ -190,8 +237,13 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
 
         bool may_open;
         if (p.gated) {
-            may_open = may_open_gated(history, history_len, st.perp, st.spot, p);
-            if (!may_open) ++refusals;
+            const int reason =
+                gate_reason(history, history_len, st.perp, st.spot, p);
+            may_open = (reason == CARRY_GATE_ALLOWED);
+            if (!may_open) {
+                ++refusals;
+                ++by_reason[reason];
+            }
         } else {
             may_open = r_bps >= p.entry_bps;
         }
@@ -235,10 +287,23 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
     }
     r.trades = static_cast<int32_t>(trades.size());
     r.refusals = refusals;
+    for (int k = 0; k < CARRY_GATE_REASONS; ++k) r.refusals_by_reason[k] = by_reason[k];
     r.unresolved_entries = unresolved_entries;
     r.unresolved_exits = unresolved_exits;
     *out = r;
     return 0;
+}
+
+extern "C" int carry_entry_gate(const double *prints_bps, int32_t n,
+                                double perp, double spot,
+                                const CarryParams *params, int32_t *reason) {
+    if (!params || !reason || (n > 0 && !prints_bps)) return 0;
+    /* Exactly the prints given, like the Python function: the simulators and
+       the engine pass the newest `funding_history` themselves. */
+    const int code = gate_reason(prints_bps, static_cast<int>(std::max<int32_t>(n, 0)),
+                                 perp, spot, *params);
+    *reason = code;
+    return code == CARRY_GATE_ALLOWED ? 1 : 0;
 }
 
 extern "C" int32_t carry_sweep(const CarrySettlement *rows, int32_t n,
@@ -288,4 +353,4 @@ extern "C" int32_t carry_sweep(const CarrySettlement *rows, int32_t n,
     return total;
 }
 
-extern "C" const char *carrycore_version(void) { return "carrycore/3 (latency, cost-input gate)"; }
+extern "C" const char *carrycore_version(void) { return "carrycore/4 (latency, cost-input gate, hold gate)"; }

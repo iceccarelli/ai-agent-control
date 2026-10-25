@@ -194,7 +194,7 @@ def run_audit(repo: str = ROOT, *, notional: float = 100_000.0,
         expected += (sm * cc.FUNDING_PERIODS_PER_DAY / 1e4) * (
             t["qty"] * t["entry_perp"]) * d
         realised += float(t["funding"])
-        v = cc.evaluate_entry(
+        v = cc.entry_gate(
             funding_prints_bps=prints_at(i0), perp=t["entry_perp"],
             spot=t["entry_spot"], borrow_apr=borrow_apr,
             round_trip_bps=round_trip)

@@ -477,19 +477,33 @@ _WHY = {
 }
 
 
+_WHY_LEGACY_DAILY_GATE = (
+    "this daily-close study gates on carry_costs.evaluate_entry only; "
+    "CarryEngine also refuses an entry whose funding cannot earn back the round "
+    "trip within the measured hold (carry_costs.entry_gate), so this is not the "
+    "rule the engine runs")
+
+
 def quotability(*, same_venue: bool, settlement_clock: bool,
-                impact_applied: bool, gated: bool) -> Dict[str, Any]:
+                impact_applied: bool, gated: bool,
+                legacy_daily_gate: bool = False) -> Dict[str, Any]:
     conditions = {
         "same_venue_same_quote_spot": bool(same_venue),
         "settlement_clock_basis": bool(settlement_clock),
         "impact_haircut_applied": bool(impact_applied),
-        "rule_is_what_the_engine_runs": bool(gated),
+        # the daily-close study gates on evaluate_entry only: the engine's rule
+        # also needs the funding to earn the round trip back within the
+        # measured hold, so a gated DAILY run is not the engine's rule
+        "rule_is_what_the_engine_runs": bool(gated) and not legacy_daily_gate,
         "rule_scored_on_an_untouched_window": bool(HOLDOUT_SCORED),
     }
     unmet = [k for k in QUOTABLE_CONDITIONS if not conditions[k]]
+    why = {**_WHY}
+    if legacy_daily_gate and gated:
+        why["rule_is_what_the_engine_runs"] = _WHY_LEGACY_DAILY_GATE
     return {"quotable_conditions": conditions,
             "is_a_quotable_return": not unmet,
-            "why_not_quotable": "; ".join(_WHY[k] for k in unmet)}
+            "why_not_quotable": "; ".join(why[k] for k in unmet)}
 
 
 #: The identity must hold to this many dollars or the tool refuses to print.
@@ -604,6 +618,13 @@ def simulate_series(*, perp: Dict[dt.date, float], spot: Dict[dt.date, float],
 
         if gated:
             history.append(last_bps)
+            # LEGACY DAILY STUDY: `evaluate_entry` alone, deliberately. This
+            # series samples one funding print a DAY, so "the last eight prints"
+            # is eight days and the measured-hold check (17 settlements of 8h)
+            # has no meaning here; PHASE1_DECISION and its pinned figure rest on
+            # this path. The engine, the replay and the settlement simulator
+            # below all ask `entry_gate`. `simulate()` therefore does not claim
+            # this is the engine's rule (rule_is_what_the_engine_runs False).
             verdict = _carry_costs().evaluate_entry(
                 funding_prints_bps=history[-8:], perp=p, spot=s,
                 borrow_apr=borrow_apr,
@@ -706,7 +727,9 @@ def simulate(repo: str, *, notional: float = 100_000.0,
     """Daily-close simulation over the committed Binance corpora.
 
     `gated=True` routes every entry through carry_costs.evaluate_entry — the
-    rule CarryEngine actually runs. Run both. The difference between them is
+    daily-close study's gate, WITHOUT the measured-hold check the engine now
+    also applies (see simulate_series), so it is not the rule CarryEngine runs.
+    Run both. The difference between them is
     the only evidence that the gates are worth having: a gate that changes no
     trade is decoration, and a gate that refuses everything is a way of not
     trading dressed as risk management.
@@ -758,7 +781,8 @@ def simulate(repo: str, *, notional: float = 100_000.0,
     _record(f"BINANCE_LINEAR_{key}_USDT_FUNDING", _iso_ms(ftimes[0]),
             _iso_ms(ftimes[-1]), "daily carry backtest (funding)")
     r.update(quotability(same_venue=same_venue, settlement_clock=False,
-                         impact_applied=False, gated=gated))
+                         impact_applied=False, gated=gated,
+                         legacy_daily_gate=True))
     r.update({
         "asset": key,
         "corpus": str(corpus).lower(),
@@ -1137,7 +1161,7 @@ def simulate_settlements_series(rows: List[Settlement], *,
             continue
 
         if gated:
-            verdict = _carry_costs().evaluate_entry(
+            verdict = _carry_costs().entry_gate(
                 funding_prints_bps=history[-8:], perp=st.perp, spot=st.spot,
                 borrow_apr=borrow_apr,
                 round_trip_bps=round_trip_bps_for(mode))
@@ -1465,7 +1489,7 @@ def main(argv=None) -> int:
                         help="0.0 models a book that ALREADY OWNS the BTC and "
                              "is monetising it rather than financing it")
     parser.add_argument("--gated", action="store_true",
-                        help="route entries through carry_costs.evaluate_entry")
+                        help="route entries through the cost gate (daily study: evaluate_entry)")
     parser.add_argument("--matrix", action="store_true",
                         help="borrow x gate sweep — the table PHASE1_DECISION needs")
     parser.add_argument("--clock", choices=("daily", "8h"), default="daily",

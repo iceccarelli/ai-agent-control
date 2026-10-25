@@ -204,6 +204,7 @@ def build_config(*, origin: str, venue: str, borrow_apr: float,
             "NEGATIVE_FUNDING_EXIT_PRINTS":
                 getattr(carry_engine, "NEGATIVE_FUNDING_EXIT_PRINTS", None),
             "ASSUMED_HOLD_DAYS": carry_costs.ASSUMED_HOLD_DAYS,
+            "DEMONSTRATED_HOLD_DAYS": carry_costs.DEMONSTRATED_HOLD_DAYS,
             "EWMA_ALPHA": carry_costs.EWMA_ALPHA,
             "EWMA_MIN_PRINTS": carry_costs.EWMA_MIN_PRINTS,
             "MAX_ENTRIES_PER_UTC_DAY": carry_risk.MAX_ENTRIES_PER_UTC_DAY,

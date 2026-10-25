@@ -59,7 +59,25 @@ typedef struct {
     int funding_history;         /* prints the EWMA may see */
     int latency_rows;            /* rows between a decision and its fill; 0 is
                                     the old zero-latency upper bound */
+    double demonstrated_hold_days; /* carry_costs.DEMONSTRATED_HOLD_DAYS: the
+                                    hold an entry must clear its round trip
+                                    inside. Not a switch: a non-positive or
+                                    non-finite value REFUSES every entry. */
 } CarryParams;
+
+/* Entry-gate reason codes, in carry_costs.GATE_REASONS order. */
+enum {
+    CARRY_GATE_ALLOWED = 0,
+    CARRY_GATE_COST_INPUT_INVALID = 1,
+    CARRY_GATE_INSUFFICIENT_FUNDING_HISTORY = 2,
+    CARRY_GATE_FUNDING_NOT_POSITIVE = 3,
+    CARRY_GATE_BASIS_UNREADABLE = 4,
+    CARRY_GATE_CARRY_BELOW_COST_OF_CAPITAL = 5,
+    CARRY_GATE_BASIS_EXCEEDS_BUDGET = 6,
+    CARRY_GATE_BASIS_DISCOUNT_EXCEEDS_BUDGET = 7,
+    CARRY_GATE_BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED = 8,
+    CARRY_GATE_REASONS = 9
+};
 
 typedef struct {
     double funding;
@@ -76,7 +94,13 @@ typedef struct {
     int32_t refusals;            /* gated entries the cost gate refused */
     int32_t unresolved_entries;  /* decided, but the fill row is past the data */
     int32_t unresolved_exits;    /* decided, but the fill row is past the data */
+    int32_t refusals_by_reason[CARRY_GATE_REASONS]; /* gated refusals, by code */
 } CarryResult;
+
+/* carry_costs.entry_gate: may the book open on these prints at these prices?
+ * Returns 1 allowed / 0 refused and writes the reason code. Pure arithmetic. */
+int carry_entry_gate(const double *prints_bps, int32_t n, double perp,
+                     double spot, const CarryParams *params, int32_t *reason);
 
 /* One simulation. Returns 0 on success, non-zero on bad input. */
 int carry_simulate(const CarrySettlement *rows, int32_t n,
