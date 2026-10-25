@@ -44,6 +44,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
+sys.path.insert(0, HERE)                     # next_settlement
 
 #: Flat to within this many base units counts as flat.
 FLAT_DUST = 1e-9
@@ -169,6 +170,11 @@ def assess_entry_economics(*, broker: Any, spot_symbol: str, perp_symbol: str,
             "entry_basis_bps": v.entry_basis_bps,
             "basis_budget_bps": v.basis_budget_bps, "detail": v.detail,
         }
+    out["decision"] = build_decision_audit(
+        broker=broker, engine=engine, econ=econ, view=view, history=out["history"],
+        execution_mode=execution_mode, execution_style=execution_style,
+        borrow_apr=float(borrow_apr), perp_symbol=perp_symbol,
+        spot_symbol=spot_symbol, now_s=now)
     if econ.refusal is None:
         out["state"], out["reason"] = (
             "ENTRY_ECONOMICS_PASS", v.reason if v is not None else "")
@@ -179,6 +185,117 @@ def assess_entry_economics(*, broker: Any, spot_symbol: str, perp_symbol: str,
     else:
         out["state"], out["reason"] = "ENTRY_ECONOMICS_REFUSED", v.reason
     return out
+
+
+def build_decision_audit(*, broker: Any, engine: Any, econ: Any, view: Any,
+                         history: Dict[str, Any], execution_mode: str,
+                         execution_style: Optional[str], borrow_apr: float,
+                         perp_symbol: str, spot_symbol: str,
+                         now_s: float) -> Dict[str, Any]:
+    """Every input the entry decision rests on, and what each one IS.
+
+    Nothing is decided here: the verdict comes from `engine.entry_economics`
+    (carry_costs.entry_gate). This lays out the inputs next to it, using the
+    public functions of `carry_costs` for the break-even numbers, so a reader
+    can see WHY the gate answered as it did and how much of the answer is
+    measured, estimated or assumed. Read-only: the fee tables are venue reads.
+    """
+    import carry_costs
+    import next_settlement
+
+    def read(fn: Callable[[], Any]) -> Any:
+        try:
+            return {"ok": True, "value": fn()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    perp_fee = read(lambda: broker.get_fee_rates(perp_symbol, "linear"))
+    fees: Dict[str, Any] = {
+        "perp_taker_bps": perp_fee["value"]["taker_bps"] if perp_fee["ok"] else None,
+        "perp_maker_bps": perp_fee["value"].get("maker_bps") if perp_fee["ok"] else None,
+        "source": "broker.get_fee_rates (read from the venue for this account)"
+        if perp_fee["ok"] else f"UNREADABLE: {perp_fee['error']}",
+    }
+    if execution_mode != "overlay":
+        spot_fee = read(lambda: broker.get_fee_rates(spot_symbol, "spot"))
+        fees["spot_taker_bps"] = spot_fee["value"]["taker_bps"] if spot_fee["ok"] else None
+    verdict = econ.verdict
+    smoothed = verdict.smoothed_funding_bps if verdict is not None else None
+    round_trip = econ.round_trip_bps
+    borrow_bps_per_day = borrow_apr / 365.0 * 1e4
+    horizon = None
+    if verdict is not None and round_trip:
+        horizon = carry_costs.hold_clears_round_trip(
+            funding_prints_bps=list(getattr(engine, "_funding_history", [])),
+            round_trip_bps=round_trip, borrow_apr=borrow_apr)
+    now_ms = int(now_s * 1000)
+    settle_ms = next_settlement.next_settlement_ms(now_ms)
+    state = ("PASS" if econ.refusal is None
+             else "REFUSED" if verdict is not None else "UNAVAILABLE")
+    return {
+        "schema": "entry_decision/1",
+        "execution_mode": execution_mode,
+        "execution_style": execution_style,
+        "execution_style_note": (
+            "the round trip below is priced at TAKER rates for both styles "
+            "(a maker fill would cost less; the gate does not assume one)"),
+        "fee_rates": fees,
+        "round_trip_bps_estimate": round_trip,
+        "funding": {
+            "smoothed_bps_per_8h_print": smoothed,
+            "prints_in_history": history.get("prints") if history else None,
+            "newest_print_age_hours": history.get("newest_age_hours") if history else None,
+            "last_settled_bps": getattr(view, "funding_print_bps", None),
+            "last_settled_age_hours": (
+                None if getattr(view, "funding_print_ms", None) is None else
+                round((now_ms - view.funding_print_ms) / 3_600_000, 2)),
+            "next_settlement_utc_ms": settle_ms,
+            "minutes_to_next_settlement": round((settle_ms - now_ms) / 60_000, 1),
+        },
+        "basis_bps": getattr(verdict, "entry_basis_bps", None),
+        "basis_budget_bps": getattr(verdict, "basis_budget_bps", None),
+        "borrow": {"apr": borrow_apr, "bps_per_day": borrow_bps_per_day},
+        "gate": {
+            "state": state,
+            "reason": (verdict.reason if verdict is not None
+                       else econ.refusal.reason if econ.refusal else ""),
+            "rule": "carry_costs.entry_gate = evaluate_entry, then the "
+                    "measured-hold check",
+        },
+        "hold_gate": None if horizon is None else {
+            "reason": horizon.reason,
+            "demonstrated_hold_days": carry_costs.DEMONSTRATED_HOLD_DAYS,
+            "settlements_needed": horizon.detail.get("settlements_needed"),
+            "settlements_budget": horizon.detail.get("settlements_budget"),
+            "break_even_funding_bps_at_budget":
+                horizon.detail.get("break_even_funding_bps_at_budget"),
+        },
+        "input_provenance": {
+            "fee_rates": "read from the venue (this account's current tier)",
+            "round_trip": "ESTIMATE: taker fees only; no slippage or impact",
+            "funding": "ESTIMATE: EWMA of settled prints; funding can turn",
+            "assumed_hold_days": carry_costs.ASSUMED_HOLD_DAYS,
+            "demonstrated_hold_days": carry_costs.DEMONSTRATED_HOLD_DAYS,
+            "demonstrated_hold_note": (
+                "ASSUMED: measured on the same historical corpus the rule was "
+                "built on, so it is not independent validation"),
+        },
+        "interpretation": {
+            "economic_eligibility": (
+                "a model output on estimated costs and a smoothed funding "
+                "rate: " + state),
+            "permission_to_execute": (
+                "separate: only the carry order gate and the runtime risk "
+                "checks decide, and neither is decided by this report"),
+            "profitability": (
+                "NOT established. Passing the gate means the funding is "
+                "estimated to earn back the round trip inside the measured "
+                "hold, not that it will: funding can turn, the basis can move "
+                "against the hold, and the modelled costs can be wrong. "
+                "pnl_claim_allowed stays false until independent evidence "
+                "says otherwise"),
+        },
+    }
 
 
 def run_preflight(*, broker: Any, client: Any, cfg: Any, spot_symbol: str,

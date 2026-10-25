@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Run the TESTNET carry drill unattended, on any host that can reach Bybit.
 
+ORDER-CAPABLE: invoke it only with --conformance. The unattended DEFAULT is the
+read-only tools/runner_monitor.py. A run here ends in one of ENTRY_NOT_ELIGIBLE
+(the entry gate refused before anything was armed or at the open; exit 11, no
+order sent), CONFORMANCE_PASSED (an order was placed, exited, captured and
+reconciled, venue flat; exit 0) or CONFORMANCE_FAILED (exit 1).
+
 WHY: a drill run from a laptop-bound Codespace dies when the Codespace stops,
 and GitHub-hosted runners are blocked by Bybit (HTTP 403 from CloudFront). This
 is the same procedure as `.github/workflows/carry-drill-testnet.yml`, as one
@@ -58,6 +64,7 @@ BOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import next_settlement as NS  # noqa: E402
+import run_outcomes as RO  # noqa: E402
 
 PROBE_URL = "https://api-testnet.bybit.com/v5/market/time"
 TOOLS = os.path.join(BOT, "tools")           # where the child tools live
@@ -70,6 +77,9 @@ PREFLIGHT_TIMEOUT_S = 300
 TERM_GRACE_S = 120
 MAX_CLOSE_QTY = "0.0015"
 EXIT_OK, EXIT_FAILED, EXIT_REFUSED, EXIT_UNREACHABLE, EXIT_OUTSIDE = 0, 1, 3, 4, 10
+#: A correct strategy refusal: the run was sound, no order was sent, and it is
+#: NOT a conformance pass. Non-zero on purpose, so no caller reads it as one.
+EXIT_NOT_ELIGIBLE = 11
 
 #: What every child sees, whatever the parent's environment says.
 FIXED_ENV = {
@@ -166,8 +176,23 @@ def run_child(argv: Sequence[str], env: Mapping[str, str], *, log_path: str,
 
 
 def verdict(*, preflight: Optional[int], drill: Optional[int],
-            flat: Optional[int], recon: Optional[int]) -> Dict[str, Any]:
-    """The run's verdict from the four exit codes (None = did not run)."""
+            flat: Optional[int], recon: Optional[int],
+            not_eligible: Optional[str] = None,
+            assessment_failed: bool = False,
+            reconciled: Optional[bool] = None) -> Dict[str, Any]:
+    """The run's verdict from the exit codes (None = did not run).
+
+    `outcome` says what the run LEARNED (tools/run_outcomes.py):
+      ENTRY_NOT_ELIGIBLE  `not_eligible` is the reason code: the production
+                          entry gate refused, before arming or from the armed
+                          drill's own engine, and nothing was sent. A correct
+                          strategy decision, so `ok` stays True - and it is not
+                          a conformance pass;
+      CONFORMANCE_PASSED  an order was placed, exited, captured and reconciled
+                          (`reconciled`: the cycle is VENUE_RECONCILED) and the
+                          venue ended flat - only this;
+      CONFORMANCE_FAILED  anything else.
+    """
     problems: List[str] = []
     if flat != 0:
         problems.append("the venue could not be verified flat: look at the "
@@ -175,13 +200,32 @@ def verdict(*, preflight: Optional[int], drill: Optional[int],
     if preflight != 0:
         problems.append("preflight failed (not flat, or the venue could not "
                         "be read): no drill was run")
+    elif assessment_failed:
+        problems.append("the entry economics could not be assessed (an input "
+                        "was unreadable, stale or contradictory): no drill "
+                        "was run")
+    elif not_eligible:
+        pass                      # a strategy refusal, not a problem
     elif drill not in (0, 5):
         problems.append(f"drill exit code {drill} is not a clean finish")
     elif recon not in (0, 2):
         problems.append(f"reconciliation did not produce a usable report "
                         f"(exit {recon}): the evidence path is NOT working")
-    return {"ok": not problems, "problems": problems, "preflight": preflight,
-            "drill": drill, "ensure_flat": flat, "reconcile": recon}
+    elif reconciled is not True:
+        problems.append("the captured cycle is not VENUE_RECONCILED: the "
+                        "order path is NOT proven")
+    if problems:
+        outcome = RO.CONFORMANCE_FAILED
+    elif not_eligible:
+        outcome = RO.ENTRY_NOT_ELIGIBLE
+    else:
+        outcome = RO.CONFORMANCE_PASSED
+    return {"ok": not problems, "outcome": outcome,
+            "conformance_passed": outcome == RO.CONFORMANCE_PASSED,
+            "refusal_reason": not_eligible if outcome == RO.ENTRY_NOT_ELIGIBLE
+            else None,
+            "problems": problems, "preflight": preflight, "drill": drill,
+            "ensure_flat": flat, "reconcile": recon}
 
 
 def _guard(fn: Callable[[], int]) -> int:
@@ -240,11 +284,38 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
     drill: Optional[int] = None
     flat: Optional[int] = None
     window_closed = False
+    not_eligible: Optional[str] = None
+    assessment_failed = False
     try:
         preflight = _guard(lambda: runner(
             [py, os.path.join(TOOLS, "drill.py")], cenv, log_path=log,
             timeout_s=PREFLIGHT_TIMEOUT_S))
         if preflight == 0:
+            # Is the entry ELIGIBLE? Asked of the existing read-only preflight
+            # (CarryEngine.entry_economics = carry_costs.entry_gate), never
+            # re-derived here, and BEFORE anything is armed: a refusal is a
+            # strategy decision, not a failed drill.
+            elig_log = os.path.join(run_dir, "eligibility.log")
+            elig_rc = _guard(lambda: runner(
+                [py, os.path.join(TOOLS, "carry_preflight.py")], cenv,
+                log_path=elig_log, timeout_s=PREFLIGHT_TIMEOUT_S))
+            try:
+                with open(elig_log, encoding="utf-8", errors="replace") as fh:
+                    elig = RO.classify_preflight(
+                        RO.parse_report(fh.read()), elig_rc,
+                        expect_order_gate_closed=False)
+            except OSError:
+                elig = RO.classify_preflight(None, elig_rc)
+            if elig["outcome"] == RO.ENTRY_NOT_ELIGIBLE:
+                not_eligible = (elig["reasons"] or ["ENTRY_NOT_ELIGIBLE"])[0]
+                _say(run_dir, f"ENTRY_NOT_ELIGIBLE ({not_eligible}): the "
+                              "production entry gate refuses; nothing armed, "
+                              "no order sent")
+            elif elig["outcome"] != RO.MONITOR_READY:
+                assessment_failed = True
+                _say(run_dir, "the entry economics could not be assessed: "
+                              + "; ".join(elig["reasons"]) + " (nothing armed)")
+        if preflight == 0 and not not_eligible and not assessment_failed:
             inside, lead, _settle = in_window()
             if not inside:
                 # a slow preflight must not push the order past the window
@@ -276,7 +347,21 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
         pending, _SIGNAL["pending"] = _SIGNAL["pending"], 0
         raise Shutdown(f"signal {pending}")
     recon = None
+    reconciled: Optional[bool] = None
     if drill is not None:
+        # The armed drill's own engine may stand aside (funding moved between
+        # the assessment and the open): nothing was sent, which is the gate
+        # working, not a drill that failed.
+        try:
+            with open(out, encoding="utf-8") as fh:
+                aside = RO.stood_aside_without_orders(json.load(fh))
+        except (OSError, ValueError):
+            aside = None
+        if aside:
+            not_eligible = aside
+            _say(run_dir, f"ENTRY_NOT_ELIGIBLE ({aside}): the engine stood "
+                          "aside at the open; no order was sent")
+    if drill is not None and not not_eligible:
         args = [py, os.path.join(TOOLS, "evidence_reconcile.py"), "--evidence", ev,
                 "--drill-report", out, "--now-ms", str(int(time.time() * 1000)),
                 "--json", rep]
@@ -288,13 +373,23 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
         _guard(lambda: runner([py, os.path.join(TOOLS, "recon_summary.py"), rep],
                               cenv, log_path=os.path.join(run_dir, "summary.txt"),
                               timeout_s=60))
-    result = verdict(preflight=preflight, drill=drill, flat=flat, recon=recon)
+        try:
+            with open(rep, encoding="utf-8") as fh:
+                reconciled = RO.cycle_reconciled(json.load(fh))
+        except (OSError, ValueError):
+            reconciled = False
+    result = verdict(preflight=preflight, drill=drill, flat=flat, recon=recon,
+                     not_eligible=not_eligible,
+                     assessment_failed=assessment_failed, reconciled=reconciled)
     if window_closed:
         result["problems"].append("the window closed during the preflight: no drill")
-        result["ok"] = False
+        result.update(ok=False, outcome=RO.CONFORMANCE_FAILED,
+                      conformance_passed=False, refusal_reason=None)
     with open(os.path.join(run_dir, "verdict.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh, indent=2, sort_keys=True)
     _say(run_dir, "VERDICT " + json.dumps(result, sort_keys=True))
+    if result["outcome"] == RO.ENTRY_NOT_ELIGIBLE:
+        return EXIT_NOT_ELIGIBLE
     return EXIT_OK if result["ok"] else EXIT_FAILED
 
 
@@ -394,12 +489,23 @@ def loop(root: str, *, env: Mapping[str, str], max_runs: int = 0,
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--conformance", action="store_true",
+                    help="REQUIRED. This runner places TESTNET orders (capped, "
+                         "reduce-only safety net). The deployed default is the "
+                         "read-only tools/runner_monitor.py; this is the "
+                         "explicitly invoked order-path conformance run")
     ap.add_argument("--run-dir", required=True,
                     help="one run: files go here. With --loop: the run ROOT "
                          "(a run-<time> folder is made per run)")
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--max-runs", type=int, default=0)
     args = ap.parse_args(argv)
+    if not args.conformance:
+        print("refusing: this runner can place testnet orders and must be "
+              "invoked explicitly with --conformance. For unattended "
+              "monitoring use tools/runner_monitor.py, which cannot trade.",
+              file=sys.stderr)
+        return EXIT_REFUSED
     missing = [k for k in CREDENTIALS if not os.environ.get(k)]
     if missing:
         print(f"refusing: {', '.join(missing)} not set in the environment "
