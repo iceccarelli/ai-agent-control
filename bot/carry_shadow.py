@@ -48,6 +48,16 @@ EXIT CODES
         --venue testnet --live --borrow-apr 0.0 --execution-mode overlay \\
         --inventory-btc 0.01 --margin-multiple 5
     python3 carry_shadow.py report --db state/carry_shadow.db
+
+THE POST-GATE FORWARD BOOK (a new identity; the previous book is never touched)
+    python3 carry_shadow.py forward-init --db state/shadow_post_gate_v1.db \\
+        --book-id post_gate_v1 --inventory-btc 0.01 --margin-multiple 5
+    python3 carry_shadow.py forward-step   --db state/shadow_post_gate_v1.db
+    python3 carry_shadow.py forward-report --db state/shadow_post_gate_v1.db
+`forward-init` refuses any path that exists. `forward-step` / `forward-report`
+rebuild the book's configuration from today's code, so a book whose gate or
+constants changed refuses to resume. Only live public testnet observations are
+accepted, under a protocol frozen in `FORWARD_PROTOCOL`.
 """
 from __future__ import annotations
 
@@ -160,7 +170,8 @@ def code_revision() -> Dict[str, Any]:
 def build_config(*, origin: str, venue: str, borrow_apr: float,
                  execution_mode: str, inventory_btc: Optional[float],
                  margin_multiple: Optional[float],
-                 notional_usd: Optional[float] = None) -> Dict[str, Any]:
+                 notional_usd: Optional[float] = None,
+                 book: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Everything that defines the strategy and the model, as one dict.
 
     The fingerprint of this dict is stored with the book; a later step with a
@@ -185,7 +196,7 @@ def build_config(*, origin: str, venue: str, borrow_apr: float,
         raise ShadowRefusal(
             EXIT_USAGE, "overlay needs --inventory-btc (the modelled client "
                         "BTC being hedged; an assumption, recorded as one)")
-    return {
+    config = {
         "schema": SCHEMA, "origin": origin, "venue": venue,
         "execution_mode": execution_mode, "execution_style": "taker",
         "borrow_apr": float(borrow_apr), "notional_usd": notional,
@@ -211,6 +222,12 @@ def build_config(*, origin: str, venue: str, borrow_apr: float,
             "PAIR_MIN_MARGIN_MULTIPLE": carry_risk.MIN_MARGIN_MULTIPLE,
         },
     }
+    if book is not None:
+        # A forward book's identity is part of what it measures, so it is part
+        # of the fingerprint: the same strategy under another book id, rule or
+        # protocol is a different book, never a continuation.
+        config["book"] = dict(book)
+    return config
 
 
 def config_fingerprint(config: Dict[str, Any]) -> str:
@@ -696,6 +713,12 @@ class ShadowRuntime:
             s.set_meta("origin", self.config["origin"])
             s.set_meta("created_ms", str(int(time.time() * 1000)))
             s.set_meta("code_revision_at_creation", _canon(rev))
+            book = self.config.get("book")
+            if book is not None:
+                s.set_meta("book_id", str(book["book_id"]))
+                s.set_meta("rule_id", str(book["rule_id"]))
+                s.set_meta("protocol_sha", str(book["protocol_sha"]))
+                s.set_meta("boundary_utc", str(book["boundary_utc"]))
             s.event("book_created", {"config_fingerprint": self.fingerprint,
                                      "origin": self.config["origin"],
                                      "code": rev})
@@ -1030,6 +1053,241 @@ def compute_economics(con: sqlite3.Connection,
 
 
 # ---------------------------------------------------------------------------
+# the post-gate FORWARD book: explicit identity, a frozen protocol
+# ---------------------------------------------------------------------------
+
+#: The registry trial (artifacts/hypothesis_registry.json) this book measures.
+POST_GATE_RULE_ID = "carry_entry_gate_v1@BTCUSDT"
+
+#: The provenance boundary: PR #124 (the measured-hold entry gate) merged here.
+#: Nothing observed before it is part of this book, and the history before it is
+#: in-sample for the rule (the hold constant was measured on that corpus).
+POST_GATE_BOUNDARY = {
+    "merge_commit": "3aadf2fa335e8932f5b6f4d5abe1faa59ead289f",
+    "merged_utc": "2026-10-25T18:06:27Z",
+    "merged_ms": 1792951587000,
+}
+
+#: Declared BEFORE any forward observation exists, and hashed into the book at
+#: creation. Reporting cannot be re-cut afterwards without the hash changing;
+#: `forward-report` refuses a book whose protocol hash differs from this code's.
+#: No threshold below may be tuned after the data is seen: that would be a new
+#: book under a new protocol.
+FORWARD_PROTOCOL = {
+    "schema": "carry_shadow_forward_protocol/1",
+    "declared": "2026-10-25, before the first forward observation",
+    "evidence_class": "live_public",
+    "venue": "testnet",
+    "unit": "one public observation per forward-step; a duplicate is a no-op",
+    "reports": ["observations", "window_days", "decisions_by_reason",
+                "entry_gate_refusals", "simulated_entries", "closed_trades",
+                "modelled_net_usd", "unavailable_or_assumed_inputs"],
+    "adequacy": {"min_closed_trades": 60, "min_window_days": 90,
+                 "origin_of_min_closed_trades":
+                     "tools/carry_oos_audit.py min_total_completed"},
+    "verdicts": ["INSUFFICIENT_FORWARD_SAMPLE",
+                 "FORWARD_SAMPLE_ADEQUATE_FOR_HUMAN_REVIEW"],
+    "never": ["a profitability claim", "a parameter change", "selecting a "
+              "symbol or window after the fact", "mixing another evidence "
+              "class into this book"],
+    "pnl_claim_allowed": False,
+}
+
+
+def protocol_hash() -> str:
+    return _sha(FORWARD_PROTOCOL)
+
+
+def forward_book_identity(book_id: str) -> Dict[str, Any]:
+    if not isinstance(book_id, str) or not book_id.strip() \
+            or not all(c.isalnum() or c in "_-." for c in book_id):
+        raise ShadowRefusal(EXIT_USAGE, "--book-id must be a short name of "
+                                        "letters, digits and _-.")
+    return {"book_id": book_id, "rule_id": POST_GATE_RULE_ID,
+            "protocol_sha": protocol_hash(),
+            "boundary_utc": POST_GATE_BOUNDARY["merged_utc"],
+            "boundary_commit": POST_GATE_BOUNDARY["merge_commit"]}
+
+
+def forward_config(*, book_id: str, inventory_btc: float, margin_multiple: float,
+                   borrow_apr: float = 0.0,
+                   execution_mode: str = "overlay") -> Dict[str, Any]:
+    """The only configuration a forward book can have: live public testnet
+    observations, taker, the production gate. Everything else is declared."""
+    return build_config(
+        origin="live_public", venue="testnet", borrow_apr=borrow_apr,
+        execution_mode=execution_mode, inventory_btc=inventory_btc,
+        margin_multiple=margin_multiple,
+        book=forward_book_identity(book_id))
+
+
+def _stored_meta(db: str) -> Dict[str, str]:
+    """The book's own meta, read-only. Never creates or changes a file."""
+    if not os.path.exists(db):
+        raise ShadowRefusal(EXIT_USAGE, f"{db} does not exist; run "
+                                        "forward-init first (a book is never "
+                                        "created by a step or a report)")
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        try:
+            return dict(con.execute("SELECT key, value FROM shadow_meta"))
+        except sqlite3.DatabaseError as exc:
+            raise ShadowRefusal(EXIT_CONFIG, f"{db} is not a shadow book: {exc}")
+    finally:
+        con.close()
+
+
+def _config_of_forward_book(db: str, book_id: Optional[str]) -> Dict[str, Any]:
+    """Rebuild the book's configuration from its stored parameters and TODAY's
+    code constants. If the code moved since the book was made, the fingerprint
+    no longer matches and the book refuses to resume (never migrated)."""
+    meta = _stored_meta(db)
+    if "book_id" not in meta:
+        raise ShadowRefusal(
+            EXIT_CONFIG, f"{db} is not a forward book (no book identity): it "
+                         "was created under another rule or command and is "
+                         "left exactly as it is")
+    if book_id is not None and meta["book_id"] != book_id:
+        raise ShadowRefusal(EXIT_CONFIG, f"{db} is book {meta['book_id']!r}, "
+                                         f"not {book_id!r}")
+    if meta.get("origin") != "live_public":
+        raise ShadowRefusal(EXIT_CONFIG, "a forward book holds only live_public "
+                                         "observations")
+    try:
+        stored = json.loads(meta["config"])
+    except (KeyError, ValueError):
+        raise ShadowRefusal(EXIT_CONFIG, f"{db}: unreadable stored config")
+    return forward_config(
+        book_id=meta["book_id"], inventory_btc=stored["inventory_btc"],
+        margin_multiple=stored["margin_multiple_assumed"],
+        borrow_apr=stored["borrow_apr"],
+        execution_mode=stored["execution_mode"])
+
+
+def forward_init(db: str, config: Dict[str, Any], *,
+                 now_s: Optional[float] = None) -> Dict[str, Any]:
+    """Create the new book. Refuses ANY existing path: a previous shadow book is
+    never reused, reset, migrated or overwritten."""
+    if os.path.exists(db):
+        raise ShadowRefusal(
+            EXIT_CONFIG, f"{db} already exists. A forward book is created once, "
+                         "at a path that does not exist; an existing database "
+                         "(including the previous shadow book) is left exactly "
+                         "as it is")
+    if (time.time() if now_s is None else now_s) \
+            < POST_GATE_BOUNDARY["merged_ms"] / 1000.0:
+        raise ShadowRefusal(EXIT_CONFIG, "the clock is before the provenance "
+                                         "boundary; refusing to create the book")
+    rt = ShadowRuntime(db, config)
+    try:
+        return {"created": db, "book": config["book"],
+                "config_fingerprint": rt.fingerprint,
+                "evidence_class": "live_public",
+                "orders": "none: this book has no exchange client"}
+    finally:
+        rt.close()
+
+
+def forward_step(db: str, *, book_id: Optional[str] = None,
+                 observer: Any = None) -> Dict[str, Any]:
+    """One live public observation into an existing forward book."""
+    config = _config_of_forward_book(db, book_id)
+    obs = (observer or PublicVenueReader("testnet")).observe()
+    precheck_observation(config, obs)
+    rt = ShadowRuntime(db, config)
+    try:
+        return rt.step(obs, source="forward-step")
+    finally:
+        rt.close()
+
+
+def forward_summary(con: sqlite3.Connection) -> Dict[str, Any]:
+    """The frozen protocol's readings of what the book holds. No selection."""
+    steps = [json.loads(r[0]) for r in con.execute(
+        "SELECT record FROM shadow_steps ORDER BY seq")]
+    by_reason: Dict[str, int] = {}
+    for st in steps:
+        r = st["decision"]["reason"]
+        by_reason[r] = by_reason.get(r, 0) + 1
+    gate_refusals = {k: v for k, v in by_reason.items()
+                     if k in _GATE_REFUSALS}
+    obs_s = [st["source_ts"]["observed_at_s"] for st in steps]
+    window_days = ((max(obs_s) - min(obs_s)) / 86400.0) if len(obs_s) > 1 else 0.0
+    opens = con.execute("SELECT COUNT(*) FROM shadow_fills WHERE product='linear' "
+                        "AND side='Sell'").fetchone()[0]
+    closes = con.execute("SELECT COUNT(*) FROM shadow_fills WHERE "
+                         "product='linear' AND side='Buy'").fetchone()[0]
+    unavailable = sum(1 for st in steps
+                      if st["assumptions"].get("slippage") == UNAVAILABLE)
+    adequacy = FORWARD_PROTOCOL["adequacy"]
+    short = []
+    if closes < adequacy["min_closed_trades"]:
+        short.append(f"{closes} closed trades < {adequacy['min_closed_trades']}")
+    if window_days < adequacy["min_window_days"]:
+        short.append(f"{window_days:.1f} days < {adequacy['min_window_days']}")
+    return {
+        "observations": len(steps), "window_days": round(window_days, 3),
+        "decisions_by_reason": dict(sorted(by_reason.items())),
+        "entry_gate_refusals": dict(sorted(gate_refusals.items())),
+        "simulated_entries": opens, "closed_trades": closes,
+        "steps_with_unavailable_slippage": unavailable,
+        "verdict": ("INSUFFICIENT_FORWARD_SAMPLE" if short else
+                    "FORWARD_SAMPLE_ADEQUATE_FOR_HUMAN_REVIEW"),
+        "shortfalls": short,
+        "pnl_claim_allowed": False,
+    }
+
+
+#: Decision reasons that are the entry gate refusing (carry_costs.GATE_REASONS
+#: minus the allow): counted apart from every other reason.
+_GATE_REFUSALS = frozenset({
+    "COST_INPUT_INVALID", "INSUFFICIENT_FUNDING_HISTORY", "FUNDING_NOT_POSITIVE",
+    "BASIS_UNREADABLE", "CARRY_BELOW_COST_OF_CAPITAL",
+    "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET",
+    "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET",
+    "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"})
+
+
+def forward_report(db: str, *, book_id: Optional[str] = None) -> Dict[str, Any]:
+    config = _config_of_forward_book(db, book_id)
+    meta = _stored_meta(db)
+    if meta.get("protocol_sha") != protocol_hash():
+        raise ShadowRefusal(
+            EXIT_CONFIG, "this book was created under a different evaluation "
+                         "protocol than this code's; the protocol cannot be "
+                         "re-cut after data exists")
+    rt = ShadowRuntime(db, config)
+    try:
+        summary = forward_summary(rt.store.con)
+        return {
+            "book": {"book_id": meta["book_id"], "rule_id": meta["rule_id"],
+                     "origin": meta["origin"], "boundary_utc": meta["boundary_utc"],
+                     "config_fingerprint": rt.fingerprint,
+                     "created_ms": meta.get("created_ms"),
+                     "code_revision_at_creation": json.loads(
+                         meta["code_revision_at_creation"]),
+                     "halted": meta.get("halted")},
+            "protocol": {"sha": meta["protocol_sha"],
+                         "adequacy": FORWARD_PROTOCOL["adequacy"],
+                         "never": FORWARD_PROTOCOL["never"]},
+            "summary": summary,
+            "economics": rt.economics(),
+            "evidence": {
+                "class": "live_public",
+                "what_it_is": "public testnet observations collected by this "
+                              "process, fed to the production CarryEngine; "
+                              "fills are SIMULATED at the observed mark",
+                "what_it_is_not": "no order was ever sent; fees are assumed "
+                                  "(base public tier), slippage estimated or "
+                                  "unavailable, market impact and liquidation "
+                                  "distance unavailable; the net is partial",
+                "pnl_claim_allowed": False},
+        }
+    finally:
+        rt.close()
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1069,6 +1327,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    fi = sub.add_parser("forward-init", help="create the post-gate forward book "
+                        "(refuses any existing path)")
+    fi.add_argument("--db", required=True)
+    fi.add_argument("--book-id", required=True)
+    fi.add_argument("--inventory-btc", type=float, required=True)
+    fi.add_argument("--margin-multiple", type=float, required=True)
+    for name in ("forward-step", "forward-report"):
+        fp = sub.add_parser(name)
+        fp.add_argument("--db", required=True)
+        fp.add_argument("--book-id", default=None)
     for name in ("step", "replay", "report"):
         p = sub.add_parser(name)
         p.add_argument("--db", required=True,
@@ -1090,6 +1358,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.add_argument("--observations", required=True,
                            help="JSONL, one observation per line")
     args = ap.parse_args(argv)
+
+    if args.cmd in ("forward-init", "forward-step", "forward-report"):
+        try:
+            if args.cmd == "forward-init":
+                _print(forward_init(args.db, forward_config(
+                    book_id=args.book_id, inventory_btc=args.inventory_btc,
+                    margin_multiple=args.margin_multiple)))
+                return EXIT_OK
+            if args.cmd == "forward-step":
+                result = forward_step(args.db, book_id=args.book_id)
+                _print(_summarise(result))
+                return result["exit"]
+            _print(forward_report(args.db, book_id=args.book_id))
+            return EXIT_OK
+        except ShadowRefusal as exc:
+            print(f"REFUSED ({exc.code}): {exc}", file=sys.stderr)
+            return exc.code
+        except Exception as exc:  # noqa: BLE001
+            print(f"FAULT: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return EXIT_FAULT
 
     rt: Optional[ShadowRuntime] = None
     try:
