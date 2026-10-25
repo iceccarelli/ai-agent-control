@@ -1,5 +1,10 @@
 # UNATTENDED carry drill on the Bybit TESTNET, across a funding settlement.
 #
+# NOTE (2026-10-25): Bybit's CloudFront blocks GitHub-hosted runners (HTTP 403,
+# "block access from your country"), so this workflow cannot trade from
+# GitHub's own machines. It fails closed at the probe. bot/tools/unattended_drill.py
+# is the same procedure for a host that CAN reach the venue.
+#
 # WHY THIS EXISTS: a drill run from a Codespace dies when the Codespace stops
 # (idle, laptop closed) and leaves a short open - that happened twice. A
 # scheduled GitHub Actions job does not depend on anyone's machine.
@@ -91,6 +96,10 @@ jobs:
         run: |
           code=$(curl -sS -o "$RUNNER_TEMP/time.json" -w '%{http_code}' --max-time 15 https://api-testnet.bybit.com/v5/market/time || echo "curl-failed")
           { echo "testnet reachability from this runner: HTTP $code"; head -c 200 "$RUNNER_TEMP/time.json" 2>/dev/null; echo; } | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$code" != "200" ]; then
+            echo "The testnet is NOT reachable from GitHub-hosted runners (HTTP $code; Bybit blocks their region). Run tools/unattended_drill.py on a host that can reach it instead." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
       - name: Is a settlement 4-20 minutes away?
         id: window

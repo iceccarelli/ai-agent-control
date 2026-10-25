@@ -265,3 +265,11 @@ class TestTheReconcileStepReportsItsExit:
         script = step_script(text, "Reconcile the capture")
         assert 'echo "recon=$rc" >> "$GITHUB_OUTPUT"' in script
         assert "rc=99" in script
+
+
+class TestTheProbeFailsClosed:
+    def test_a_non_200_stops_the_job_instead_of_carrying_on(self, text):
+        script = step_script(text, "Can this runner reach the testnet")
+        assert '[ "$code" != "200" ]' in script and "exit 1" in script
+        assert "NOT reachable" in script
+
