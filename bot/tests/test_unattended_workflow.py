@@ -160,3 +160,108 @@ class TestTheReachabilityProbe:
         assert "-X POST" not in step and "--data" not in step
         assert "steps.window" not in step           # it runs on every dispatch
 
+
+
+# ---------------------------------------------------------------------------
+# found by independent review
+# ---------------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+import sys as _sys  # noqa: E402
+
+
+def step_script(text, name_start):
+    """The `run:` script of the step whose name starts with `name_start`."""
+    step = re.search(r"- name: " + re.escape(name_start) + r".*?(?=\n      - |\Z)",
+                     code(text), re.S).group(0)
+    block = re.search(r"run: \|\n((?:          .*\n?)+)", step).group(1)
+    return "\n".join(l[10:] for l in block.split("\n"))
+
+
+class TestEnvironmentAndGuards:
+    def test_the_credentials_live_in_a_branch_restricted_environment(self, text):
+        assert re.search(r"^    environment: testnet-drill$", code(text), re.M)
+
+    def test_a_public_repository_is_refused_unless_explicitly_allowed(self, text):
+        job_if = re.search(r"^    if: (.+)$", code(text), re.M).group(1)
+        assert "github.event.repository.private == true" in job_if
+        assert "vars.CARRY_DRILL_ALLOW_PUBLIC == 'true'" in job_if
+
+    def test_dependencies_are_installed_against_the_tested_pins(self, text):
+        assert "pip install -r requirements.txt -c constraints.txt" in text
+
+    def test_the_armed_step_has_its_own_timeout_below_the_jobs(self, text):
+        step = re.search(r"- name: Armed drill.*?(?=\n      - )", code(text), re.S).group(0)
+        step_t = int(re.search(r"timeout-minutes: (\d+)", step).group(1))
+        job_t = int(re.search(r"^    timeout-minutes: (\d+)", code(text), re.M).group(1))
+        assert 30 <= step_t <= job_t - 10
+
+    def test_a_rerun_gets_its_own_artifact_name(self, text):
+        assert "${{ github.run_id }}-${{ github.run_attempt }}" in text
+
+
+class TestTheWindowStepAsShell:
+    def run(self, tmp_path, exit_code):
+        (tmp_path / "tools").mkdir()
+        (tmp_path / "tools" / "next_settlement.py").write_text(
+            f"import sys\nprint('seconds_to_settlement=600')\nsys.exit({exit_code})\n")
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        (bindir / "python").symlink_to(_sys.executable)
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "GITHUB_OUTPUT": str(tmp_path / "out"),
+               "GITHUB_ENV": str(tmp_path / "env"), "GITHUB_STEP_SUMMARY": str(tmp_path / "sum"),
+               "RUNNER_TEMP": str(tmp_path / "tmp")}
+        script = step_script(open(WF, encoding="utf-8").read(), "Is a settlement")
+        done = subprocess.run(["bash", "-e", "-c", script], cwd=tmp_path, env=env,
+                              capture_output=True, text=True)
+        out = (tmp_path / "out").read_text() if (tmp_path / "out").exists() else ""
+        return done.returncode, out
+
+    def test_inside_is_true(self, tmp_path):
+        rc, out = self.run(tmp_path, 0)
+        assert rc == 0 and "inside=true" in out
+
+    def test_exit_10_is_outside_and_not_an_error(self, tmp_path):
+        rc, out = self.run(tmp_path, 10)
+        assert rc == 0 and "inside=false" in out
+
+    @pytest.mark.parametrize("code_", [1, 3, 127])
+    def test_any_other_exit_is_a_broken_step_not_a_quiet_green(self, tmp_path, code_):
+        rc, out = self.run(tmp_path, code_)
+        assert rc == 1 and "inside=false" in out
+
+
+class TestTheVerdictAsShell:
+    def verdict(self, drill, preflight, flat, recon):
+        script = step_script(open(WF, encoding="utf-8").read(), "Verdict")
+        script = (script.replace("${{ steps.drill.outputs.exit }}", drill)
+                  .replace("${{ steps.preflight.outcome }}", preflight)
+                  .replace("${{ steps.flat.outcome }}", flat)
+                  .replace("${{ steps.reconcile.outputs.recon }}", recon))
+        assert "${{" not in script
+        return subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                              text=True).returncode
+
+    def test_a_clean_run_is_green(self):
+        assert self.verdict("5", "success", "success", "2") == 0
+        assert self.verdict("0", "success", "success", "0") == 0
+
+    @pytest.mark.parametrize("args", [
+        ("5", "success", "failure", "2"),      # could not verify flat
+        ("5", "failure", "success", "2"),      # preflight failed
+        ("130", "success", "success", "2"),    # interrupted
+        ("", "success", "success", "2"),       # cancelled / timed out
+        ("4", "success", "success", "2"),
+        ("5", "success", "success", "3"),      # reconcile crashed
+        ("5", "success", "success", "99"),     # no usable report
+        ("5", "success", "success", ""),       # reconcile never ran
+    ])
+    def test_everything_else_is_red(self, args):
+        assert self.verdict(*args) == 1
+
+
+class TestTheReconcileStepReportsItsExit:
+    def test_it_writes_recon_to_the_outputs_and_flags_a_missing_report(self, text):
+        script = step_script(text, "Reconcile the capture")
+        assert 'echo "recon=$rc" >> "$GITHUB_OUTPUT"' in script
+        assert "rc=99" in script

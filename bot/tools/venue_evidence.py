@@ -211,6 +211,17 @@ def redact(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [redact(v) for v in value]
+    if isinstance(value, str) and value[:1] in "{[":
+        # a request body is recorded as the JSON TEXT that was sent; a secret
+        # inside it is under a key just like in a dict. The text is replaced
+        # only when something in it was actually redacted.
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return value
+        cleaned = redact(parsed)
+        if cleaned != parsed:
+            return json.dumps(cleaned, separators=(",", ":"))
     return value
 
 

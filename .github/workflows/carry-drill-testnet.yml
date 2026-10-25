@@ -22,7 +22,9 @@
 # OFF BY DEFAULT: nothing runs until the repository VARIABLE
 # CARRY_DRILL_ENABLED is set to "true" (Settings -> Secrets and variables ->
 # Actions -> Variables). Delete or change it to stop all scheduled runs.
-# It never runs on a pull request, on a fork, or from any branch but main.
+# It never runs on a pull request, on a fork, or from any branch but main, and
+# not on a PUBLIC repository (its artifacts and logs would be world-readable)
+# unless the variable CARRY_DRILL_ALLOW_PUBLIC is also "true".
 #
 # WHAT A GREEN RUN DOES NOT SHOW: a profit. One round trip on testnet costs
 # ~11 bps in fees; it shows whether the evidence path works. Its artifact holds
@@ -56,9 +58,13 @@ concurrency:
 jobs:
   drill:
     name: carry drill (testnet, unattended)
-    if: ${{ github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.CARRY_DRILL_ENABLED == 'true' }}
+    if: ${{ github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.CARRY_DRILL_ENABLED == 'true' && (github.event.repository.private == true || vars.CARRY_DRILL_ALLOW_PUBLIC == 'true') }}
+    # The testnet credentials live in this GitHub ENVIRONMENT, which is
+    # restricted to the main branch (Settings -> Environments). A branch that
+    # edits this file to drop the checks above still cannot read them.
+    environment: testnet-drill
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 50
     defaults:
       run:
         working-directory: bot
@@ -79,7 +85,7 @@ jobs:
           cache-dependency-path: bot/requirements.txt
 
       - name: Install dependencies
-        run: python -m pip install -r requirements.txt
+        run: python -m pip install -r requirements.txt -c constraints.txt
 
       - name: Can this runner reach the testnet? (public endpoint, no credentials)
         run: |
@@ -93,6 +99,8 @@ jobs:
           python tools/next_settlement.py --min-lead-minutes 4 --max-lead-minutes 20 | tee window.txt
           code=${PIPESTATUS[0]}
           if [ "$code" -eq 0 ]; then echo "inside=true" >> "$GITHUB_OUTPUT"; else echo "inside=false" >> "$GITHUB_OUTPUT"; fi
+          # exit 10 is the ONLY "outside the window"; any other code is a broken step
+          if [ "$code" -ne 0 ] && [ "$code" -ne 10 ]; then echo "next_settlement.py failed with exit code $code" | tee -a "$GITHUB_STEP_SUMMARY"; exit 1; fi
           echo "RUN_DIR=$RUNNER_TEMP/drill-run" >> "$GITHUB_ENV"
           echo "STATE_DB_PATH=$RUNNER_TEMP/no_running_book.db" >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/drill-run"
@@ -115,6 +123,9 @@ jobs:
       - name: Armed drill across the settlement
         id: drill
         if: steps.window.outputs.inside == 'true' && steps.preflight.outcome == 'success'
+        # a step timeout is an ordinary step failure, so the always() steps
+        # after it run with certainty (a job timeout is less clear)
+        timeout-minutes: 34
         env:
           BYBIT_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
           BYBIT_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
@@ -146,7 +157,11 @@ jobs:
           args=(--evidence "$RUN_DIR/drill_evidence.jsonl" --drill-report "$RUN_DIR/drill_out.json" --now-ms "$(date +%s%3N)" --json "$RUN_DIR/reconciliation.json")
           if [ -f "$RUN_DIR/drill_ledger.json" ]; then args+=(--ledger "$RUN_DIR/drill_ledger.json"); fi
           python tools/evidence_reconcile.py "${args[@]}"
-          echo "reconcile exit code: $?"
+          rc=$?
+          echo "reconcile exit code: $rc"
+          # 0 = reconciled; 2 = reconciled with flags (shown below); anything else, or no report, is a failure
+          if [ ! -s "$RUN_DIR/reconciliation.json" ]; then rc=99; fi
+          echo "recon=$rc" >> "$GITHUB_OUTPUT"
           { echo '```'; python tools/recon_summary.py "$RUN_DIR/reconciliation.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
@@ -154,7 +169,7 @@ jobs:
         if: always() && steps.window.outputs.inside == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: carry-drill-${{ github.run_id }}
+          name: carry-drill-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/drill-run
           retention-days: 14
           if-no-files-found: warn
@@ -167,3 +182,5 @@ jobs:
           if [ "${{ steps.flat.outcome }}" != "success" ]; then echo "THE VENUE COULD NOT BE VERIFIED FLAT: look at the testnet account"; exit 1; fi
           if [ "${{ steps.preflight.outcome }}" != "success" ]; then echo "preflight failed (not flat, or the venue could not be read): no drill was run"; exit 1; fi
           case "$code" in 0|5) echo "drill finished (exit $code)";; *) echo "drill exit code $code is not a clean finish"; exit 1;; esac
+          rc="${{ steps.reconcile.outputs.recon }}"
+          case "$rc" in 0|2) echo "reconciliation ran (exit $rc)";; *) echo "reconciliation did not produce a usable report (exit ${rc:-not run}): the evidence path is NOT working"; exit 1;; esac

@@ -12,9 +12,20 @@ import sys
 from typing import Any, List, Optional, Sequence
 
 
+UNREADABLE = "reconciliation report missing or unreadable: nothing is claimed"
+
+
 def summarise(report: Any) -> List[str]:
+    """Never raises: a report this module cannot read claims nothing."""
     if not isinstance(report, dict) or report.get("schema") != "evidence_reconciliation/1":
-        return ["reconciliation report missing or unreadable: nothing is claimed"]
+        return [UNREADABLE]
+    try:
+        return _summarise(report)
+    except Exception:                                          # noqa: BLE001
+        return [UNREADABLE]
+
+
+def _summarise(report: dict) -> List[str]:
     lines: List[str] = []
     for leg in report.get("carry_legs", []):
         lines.append(f"leg {leg.get('claim_id')}: {leg.get('provenance')}"

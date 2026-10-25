@@ -45,3 +45,23 @@ class TestSummarise:
         assert S.main([str(tmp_path / "nope.json")]) == 0
         assert "nothing is claimed" in capsys.readouterr().out
         assert S.main([]) == 3
+
+
+class TestMalformedReportsNeverRaise:
+    import pytest as _pytest
+
+    @_pytest.mark.parametrize("patch", [
+        {"carry_legs": None}, {"carry_legs": ["x"]}, {"carry_legs": [None]},
+        {"carry_cycle": [{"economics": {"net_usdt": 1}}]},
+        {"carry_cycle": [{"economics": {"net_usdt": 1, "entry_price": None,
+                                        "exit_price": 1, "qty": 1,
+                                        "perp_gross_usdt": None, "fees_usdt": 1,
+                                        "fee_bps_of_entry_notional": 1,
+                                        "funding_usdt": 0, "settlements": 0,
+                                        "hold_ms": 1}}]},
+        {"carry_cycle": [{"issues": 5}]}, {"funding": [None]},
+        {"funding": "x"}, {"carry_cycle": "x"}])
+    def test_a_report_it_cannot_read_claims_nothing(self, patch):
+        report = dict(C.run(), **patch)
+        out = "\n".join(S.summarise(report))
+        assert "nothing is claimed" in out and "NET " not in out
