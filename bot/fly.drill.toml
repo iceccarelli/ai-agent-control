@@ -1,0 +1,38 @@
+# The unattended TESTNET drill runner. A separate app from carry-book.
+# Deploy with `fly deploy -c fly.drill.toml --ha=false` (never `fly launch`,
+# which rewrites config). tests/test_drill_image.py pins these properties.
+#
+#   one machine, one volume     two runners would be two hedges
+#   no [http_service]           nothing to serve
+#   kill_timeout 300s           the SIGTERM path unwinds the drill and runs the
+#                               reduce-only close; it needs ~4 minutes
+#   no secrets in this file     `fly secrets set BYBIT_API_KEY BYBIT_API_SECRET`
+
+app = "carry-drill"
+primary_region = "fra"
+kill_signal = "SIGTERM"
+kill_timeout = "300s"
+
+[build]
+dockerfile = "Dockerfile.drill"
+
+[deploy]
+strategy = "immediate"
+
+[[restart]]
+policy = "on-failure"
+retries = 10
+
+[env]
+USE_TESTNET = "1"
+PAPER_TRADING = "0"
+BYBIT_VENUE = "testnet"
+
+[[mounts]]
+source = "drill_runs"
+destination = "/data"
+
+[[vm]]
+size = "shared-cpu-1x"
+memory = "512mb"
+cpus = 1
