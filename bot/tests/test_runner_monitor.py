@@ -306,6 +306,7 @@ class TestOneMonitorCycle:
         assert lines[0]["outcome"] == RO.ENTRY_NOT_ELIGIBLE
         assert lines[0]["gate_reason"] == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
         assert lines[0]["settlements_needed"] == 11 and lines[0]["round_trip_bps"] == 11.0
+        assert "basis_bps" in lines[0] and "basis_budget_bps" in lines[0]
 
     def test_credentials_never_reach_the_record(self, tmp_path):
         env = dict(ENV, BYBIT_API_KEY="KEYVALUE123", BYBIT_API_SECRET="SECRETVALUE456")

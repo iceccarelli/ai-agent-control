@@ -134,6 +134,8 @@ def _history_line(root: str, record: Dict[str, Any]) -> None:
         "settlements_needed": hold.get("settlements_needed"),
         "settlements_budget": hold.get("settlements_budget"),
         "newest_print_age_hours": funding.get("newest_print_age_hours"),
+        "basis_bps": decision.get("basis_bps"),
+        "basis_budget_bps": decision.get("basis_budget_bps"),
     }
     shadow = record.get("shadow")
     if isinstance(shadow, dict):
