@@ -556,9 +556,19 @@ class TestTheReconciliationAndDrillReaders:
         assert RO.stood_aside_without_orders(None) is None
 
     def test_orders_exercised_needs_an_entry_and_an_exit_and_nothing_open(self):
-        assert RO.orders_exercised({"orders_sent": 2}) is True
-        for bad in ({"orders_sent": 1}, {"orders_sent": 0}, {"orders_sent": True},
-                    {"orders_sent": 2, "still_open": True}, {}, None, []):
+        # SEMANTICS DELIBERATELY CHANGED: this used to assert that
+        # {"orders_sent": 2} alone is True, i.e. a report with no `still_open`
+        # key counted as "nothing is open". A report that does not SAY nothing is
+        # open is not evidence of it. drill.py always writes the key, so only a
+        # malformed report is refused.
+        assert RO.orders_exercised({"orders_sent": 2, "still_open": False}) is True
+        for bad in ({"orders_sent": 1, "still_open": False},
+                    {"orders_sent": 0, "still_open": False},
+                    {"orders_sent": True, "still_open": False},
+                    {"orders_sent": 2, "still_open": True},
+                    {"orders_sent": 2}, {"orders_sent": 2, "still_open": None},
+                    {"orders_sent": 2, "still_open": 0},
+                    {"orders_sent": 2, "still_open": []}, {}, None, []):
             assert RO.orders_exercised(bad) is False
 
 
