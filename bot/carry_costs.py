@@ -366,7 +366,8 @@ def min_settlements_to_clear(expected_funding_bps: Any, *,
     `expected_funding_bps` per settlement to earn back the round trip.
 
     None means NEVER: funding at or below borrow (or not a usable number)
-    leaves nothing to amortise against, and None must be read as a refusal.
+    leaves nothing to amortise against, or the break-even is too many
+    settlements to count at all; None must be read as a refusal.
     """
     rt = _positive_finite(round_trip_bps)
     borrow = _usable(borrow_bps_per_day)
@@ -380,8 +381,13 @@ def min_settlements_to_clear(expected_funding_bps: Any, *,
     net = round(funding - borrow / FUNDING_PERIODS_PER_DAY, 12)
     if net <= 0:
         return None
+    ratio = round(rt / net, 9)
+    if not math.isfinite(ratio):
+        # rt / net overflowed: no horizon anyone could hold covers it, which is
+        # NEVER, not an OverflowError out of ceil (the native core refuses it).
+        return None
     # round() first so 11 / 1.0 is 11, not 11.000000000000002 -> 12
-    return max(1, math.ceil(round(rt / net, 9)))
+    return max(1, math.ceil(ratio))
 
 
 def hedge_basis_pnl_bps(entry_basis_bps: float, exit_basis_bps: float) -> float:
