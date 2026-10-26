@@ -389,7 +389,8 @@ class TestTheMonitorCannotTrade:
             elif isinstance(n, ast.ImportFrom) and n.module:
                 names.add(n.module.split(".")[0])
         assert names <= {"argparse", "json", "os", "sys", "time", "typing",
-                         "__future__", "run_outcomes", "unattended_drill"}
+                         "__future__", "run_outcomes", "unattended_drill",
+                         "carry_shadow"}   # lazy: public-data shadow book, no client
 
     def test_a_full_preflight_flow_sends_no_non_get_request(self):
         for market in (Market(), Market(rate_bps=0.3), Market(newest_age_h=20.0),
@@ -545,3 +546,186 @@ class TestTheReconciliationAndDrillReaders:
         for bad in ({"orders_sent": 1}, {"orders_sent": 0}, {"orders_sent": True},
                     {"orders_sent": 2, "still_open": True}, {}, None, []):
             assert RO.orders_exercised(bad) is False
+
+
+# -- the forward shadow observation rides along, apart from the outcome ---------------
+
+class TestShadowObservation:
+    def fake_step(self, outcome="STEP_RECORDED", reason="BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD",
+                  exc=None):
+        calls = []
+
+        def step(db, **kw):
+            calls.append(db)
+            if exc:
+                raise exc
+            return {"outcome": outcome, "seq": 7, "exit": 0, "record": {
+                "decision": {"reason": reason}, "intents_and_fills": []}}
+        step.calls = calls
+        return step
+
+    def cycle(self, tmp_path, runner, *, db, stepper, probe=200):
+        code = RM.monitor_once(str(tmp_path / "run"), env=ENV, prober=lambda: probe,
+                               runner=runner, sleep=lambda s: None,
+                               history_root=str(tmp_path), shadow_db=db,
+                               shadow_stepper=stepper)
+        return code, json.load(open(tmp_path / "run" / "monitor.json"))
+
+    def test_without_a_shadow_db_nothing_is_recorded_about_one(self, tmp_path):
+        code, rec = cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")))
+        assert "shadow" not in rec
+
+    def test_a_missing_book_is_skipped_and_never_created(self, tmp_path):
+        db = str(tmp_path / "shadow" / "b.db")
+        step = self.fake_step()
+        code, rec = self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")),
+                               db=db, stepper=step)
+        assert rec["shadow"]["state"] == "SKIPPED_NOT_INITIALISED"
+        assert "forward-init" in rec["shadow"]["detail"]
+        assert step.calls == [] and not os.path.exists(db)
+        assert rec["outcome"] == RO.MONITOR_READY and code == 0
+
+    def test_an_existing_book_gets_one_observation_recorded_beside_the_outcome(
+            self, tmp_path):
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        step = self.fake_step()
+        code, rec = self.cycle(tmp_path, FakeRunner(RF.preflight_report("REFUSED")),
+                               db=str(db), stepper=step)
+        assert step.calls == [str(db)]
+        sh = rec["shadow"]
+        assert sh["state"] == "STEP_RECORDED" and sh["seq"] == 7
+        assert sh["decision_reason"] == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+        assert rec["outcome"] == RO.ENTRY_NOT_ELIGIBLE
+        line = json.loads(open(tmp_path / "monitor.jsonl").read().splitlines()[-1])
+        assert line["shadow_state"] == "STEP_RECORDED"
+
+    @pytest.mark.parametrize("exc,state", [
+        (RuntimeError("boom"), "FAULT"),
+        (OSError("disk"), "FAULT")])
+    def test_a_shadow_fault_never_changes_the_monitor_outcome(
+            self, tmp_path, exc, state):
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        code, rec = self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")),
+                               db=str(db), stepper=self.fake_step(exc=exc))
+        assert rec["shadow"]["state"] == state
+        assert rec["outcome"] == RO.MONITOR_READY and code == 0
+
+    def test_a_shadow_refusal_is_reported_with_its_code(self, tmp_path):
+        import carry_shadow as cs
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        exc = cs.ShadowRefusal(cs.EXIT_CONFIG, "frozen configuration mismatch")
+        code, rec = self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")),
+                               db=str(db), stepper=self.fake_step(exc=exc))
+        assert rec["shadow"]["state"] == "REFUSED"
+        assert rec["shadow"]["code"] == cs.EXIT_CONFIG
+        assert "frozen configuration mismatch" in rec["shadow"]["detail"]
+        assert rec["outcome"] == RO.MONITOR_READY
+
+    def test_a_failed_monitor_cycle_still_collects_the_observation(self, tmp_path):
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        step = self.fake_step()
+        code, rec = self.cycle(tmp_path, FakeRunner(rc=1, raw="garbage"),
+                               db=str(db), stepper=step)
+        assert rec["outcome"] == RO.MONITOR_FAILED and step.calls == [str(db)]
+
+    def test_an_unreachable_testnet_collects_nothing(self, tmp_path):
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        step = self.fake_step()
+        code, rec = self.cycle(tmp_path, FakeRunner(), db=str(db), stepper=step,
+                               probe=403)
+        assert step.calls == [] and "shadow" not in rec
+
+    def test_a_stop_signal_during_the_shadow_step_propagates(self, tmp_path):
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        with pytest.raises(UD.Shutdown):
+            self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")),
+                       db=str(db), stepper=self.fake_step(exc=UD.Shutdown("s")))
+
+    def test_the_loop_and_main_hand_the_book_to_every_cycle(self, tmp_path, monkeypatch):
+        seen = []
+
+        def once(run_dir, *, env, history_root, shadow_db=None):
+            seen.append(shadow_db)
+            return 0
+        RM.loop(str(tmp_path), env=ENV, interval_s=3600, max_runs=2, once=once,
+                sleep=lambda s: None, shadow_db="/data/shadow/x.db")
+        assert seen == ["/data/shadow/x.db"] * 2
+        monkeypatch.setenv("BYBIT_API_KEY", "k")
+        monkeypatch.setenv("BYBIT_API_SECRET", "s")
+        got = {}
+        monkeypatch.setattr(RM, "monitor_once",
+                            lambda run_dir, **kw: got.update(kw) or 0)
+        monkeypatch.setattr(RM.UD, "install_signal_handlers", lambda: None)
+        assert RM.main(["--run-dir", str(tmp_path / "o"), "--once",
+                        "--shadow-db", "/data/shadow/x.db"]) == 0
+        assert got["shadow_db"] == "/data/shadow/x.db"
+
+    def test_the_image_default_feeds_the_post_gate_book_and_creates_nothing(self):
+        text = open(os.path.join(BOT, "Dockerfile.drill")).read()
+        cmd = [l for l in text.splitlines() if l.startswith("CMD ")][0]
+        assert "--shadow-db" in cmd and "/data/shadow/post_gate_v1.db" in cmd
+        assert "forward-init" not in text            # created deliberately, by hand
+        sh = open(os.path.join(BOT, "deploy", "drill-entrypoint.sh")).read()
+        assert "/data/shadow" in sh and "/data/monitor" in sh
+
+
+class TestWithTheRealShadowBook:
+    """The real forward book and the real step, with only the public REST faked."""
+
+    def test_a_monitor_cycle_collects_into_the_real_book(self, tmp_path, monkeypatch):
+        import carry_shadow as cs
+        from test_carry_shadow_forward import fake_http
+        db = str(tmp_path / "post_gate.db")
+        cs.forward_init(db, cs.forward_config(book_id="post_gate_v1",
+                                              inventory_btc=0.01, margin_multiple=5.0))
+        monkeypatch.setattr(cs, "PublicVenueReader",
+                            lambda venue: _Reader(venue, fake_http(0.3)))
+        code = RM.monitor_once(str(tmp_path / "run"), env=ENV, prober=lambda: 200,
+                               runner=FakeRunner(RF.preflight_report("REFUSED")),
+                               sleep=lambda s: None, history_root=str(tmp_path),
+                               shadow_db=db)
+        rec = json.load(open(tmp_path / "run" / "monitor.json"))
+        assert rec["shadow"]["state"] == "STEP_RECORDED"
+        assert rec["shadow"]["decision_reason"] == \
+            "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+        assert rec["shadow"]["fills_simulated"] == 0
+        report = cs.forward_report(db)
+        assert report["summary"]["observations"] == 1
+        assert report["summary"]["entry_gate_refusals"] == {
+            "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD": 1}
+        assert report["summary"]["pnl_claim_allowed"] is False
+        assert rec["outcome"] == RO.ENTRY_NOT_ELIGIBLE and code == 0
+
+    def test_a_book_the_rule_has_left_behind_is_reported_not_resumed(
+            self, tmp_path, monkeypatch):
+        import carry_costs
+        import carry_shadow as cs
+        from test_carry_shadow_forward import fake_http
+        db = str(tmp_path / "post_gate.db")
+        cs.forward_init(db, cs.forward_config(book_id="post_gate_v1",
+                                              inventory_btc=0.01, margin_multiple=5.0))
+        monkeypatch.setattr(carry_costs, "DEMONSTRATED_HOLD_DAYS", 6.0)
+        monkeypatch.setattr(cs, "PublicVenueReader",
+                            lambda venue: _Reader(venue, fake_http(3.0)))
+        RM.monitor_once(str(tmp_path / "run"), env=ENV, prober=lambda: 200,
+                        runner=FakeRunner(RF.preflight_report("PASS")),
+                        sleep=lambda s: None, history_root=str(tmp_path),
+                        shadow_db=db)
+        rec = json.load(open(tmp_path / "run" / "monitor.json"))
+        assert rec["shadow"]["state"] == "REFUSED"
+        assert "frozen configuration mismatch" in rec["shadow"]["detail"]
+
+
+def _Reader(venue, http_get):
+    import carry_shadow as cs
+    return _REAL_READER(venue, http_get=http_get)
+
+
+import carry_shadow as _cs  # noqa: E402
+_REAL_READER = _cs.PublicVenueReader

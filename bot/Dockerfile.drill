@@ -42,4 +42,4 @@ ENTRYPOINT ["/usr/local/bin/drill-entrypoint"]
 # (tools/unattended_drill.py --conformance) ships in the image but is never the
 # default; it must be invoked explicitly, e.g. `fly machine run ... -- python3
 # tools/unattended_drill.py --conformance --loop --run-dir /data/runs`.
-CMD ["python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor"]
+CMD ["python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor", "--shadow-db", "/data/shadow/post_gate_v1.db"]

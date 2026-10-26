@@ -2,6 +2,9 @@
 # Its default command is READ-ONLY (tools/runner_monitor.py: reachability, safety
 # preconditions, venue state, entry economics; it cannot place an order). The
 # order-capable conformance run is a separate, explicitly invoked command.
+# Each cycle also records one PUBLIC observation in the post-gate forward shadow
+# book at /data/shadow/post_gate_v1.db once that book has been created by hand
+# (carry_shadow.py forward-init); the monitor never creates it.
 # Deploy with `fly deploy -c fly.drill.toml --ha=false` (never `fly launch`,
 # which rewrites config). tests/test_drill_image.py pins these properties.
 #
