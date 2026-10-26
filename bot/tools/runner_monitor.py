@@ -274,7 +274,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"refusing: {', '.join(missing)} not set in the environment "
               "(testnet credentials; never printed)", file=sys.stderr)
         return EXIT_REFUSED
-    if args.max_runs < 0 or args.interval_minutes < 1.0:
+    # `not (x >= 1.0)`, not `x < 1.0`: NaN fails both comparisons, and a NaN
+    # interval never sleeps (`waited < nan` is false), an infinite one never
+    # starts a second cycle.
+    if args.max_runs < 0 or not (1.0 <= args.interval_minutes < float("inf")):
         print("refusing: --max-runs must be >= 0 and --interval-minutes >= 1",
               file=sys.stderr)
         return EXIT_REFUSED

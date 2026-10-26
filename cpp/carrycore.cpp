@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -317,14 +319,23 @@ extern "C" int32_t carry_sweep(const CarrySettlement *rows, int32_t n,
                                CarryResult *out, int32_t threads) {
     if (!rows || !base || !out || n <= 0) return 0;
     if (n_entry <= 0 || n_hold <= 0 || n_exit <= 0) return 0;
-    const int32_t total = n_entry * n_hold * n_exit;
+    /* The product is taken in 64 bits: in int32 a grid of 2**32 wraps to 0 (a
+       division by zero below) and one of 2**31 wraps negative. A grid the
+       return type cannot count is refused, not wrapped. */
+    const int64_t total64 = static_cast<int64_t>(n_entry) * n_hold * n_exit;
+    if (total64 > INT32_MAX) return 0;
+    const int32_t total = static_cast<int32_t>(total64);
 
     int32_t workers = threads;
     if (workers <= 0) {
         workers = static_cast<int32_t>(std::thread::hardware_concurrency());
         if (workers <= 0) workers = 1;
     }
-    workers = std::min(workers, total);
+    /* More threads than this buys nothing on any machine, and asking the OS
+       for 100,000 of them ends in std::system_error, which nothing catches
+       across extern "C": the process aborts and every result is lost. */
+    constexpr int32_t kMaxWorkers = 256;
+    workers = std::min({workers, total, kMaxWorkers});
 
     auto run_range = [&](int32_t from, int32_t to) {
         for (int32_t index = from; index < to; ++index) {
@@ -350,7 +361,11 @@ extern "C" int32_t carry_sweep(const CarrySettlement *rows, int32_t n,
         const int32_t from = w * chunk;
         const int32_t to = std::min(total, from + chunk);
         if (from >= to) break;
-        pool.emplace_back(run_range, from, to);
+        try {
+            pool.emplace_back(run_range, from, to);
+        } catch (const std::system_error &) {
+            run_range(from, to);        /* no thread available: do it here */
+        }
     }
     for (std::thread &t : pool) t.join();
     return total;

@@ -93,6 +93,7 @@ jobs:
           tests/test_carry_hold_session.py
           tests/test_simulator_fill_contract.py
           tests/test_funding_window.py
+          tests/test_sweep_abi.py
           tests/test_carry_latency.py
           tests/test_carry_cost_inputs.py
           tests/test_carry_shadow_forward.py
@@ -116,6 +117,8 @@ jobs:
           tests/test_unattended_drill.py
           tests/test_runner_monitor.py
           tests/test_monitor_summary.py
+          tests/test_monitor_fail_closed.py
+          tests/test_liquidation_gate_fail_closed.py
           tests/test_drill_image.py
           tests/test_fly_machines.py
           tests/test_exit_execution_ids.py
@@ -128,12 +131,14 @@ jobs:
           tests/test_cancel_books_the_increment.py
           tests/test_carry_core.py
           tests/test_entry_gate_parity.py
+          tests/test_gate_boundary_equality.py
           tests/test_carry_backtest.py
           tests/test_carry_walkforward.py
           tests/test_multi_asset_carry.py
           tests/test_fly_runtime.py
           tests/test_carry_costs.py
           tests/test_carry_risk.py
+          tests/test_margin_nan_fail_closed.py
           tests/test_config.py
           tests/test_directional_close_unconfirmed.py
           tests/test_fee_truthfulness.py

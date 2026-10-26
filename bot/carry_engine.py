@@ -2424,12 +2424,17 @@ class CarryEngine:
         elif mode == _MARGIN_ISOLATED:
             # Per-position liquidation: the account rate does not describe it.
             # The distance below is the gate, and it is mandatory.
+            # A missing distance halts whatever the view says about why, or
+            # nothing at all. Only NO_POSITION is the broker stating that
+            # nothing is held, which the venue-vs-book size check judges next;
+            # a reason this code does not know is not "unreachable".
             if view.get("distance_pct") is None \
-                    and view.get("reason") == "BEYOND_VENUE_PRICE_BOUNDS":
+                    and view.get("reason") != "NO_POSITION":
                 return self._halt(
                     "LIQUIDATION_DISTANCE_UNUSABLE",
-                    "isolated margin has no account-level cover and the venue "
-                    "stated no liquidation price for the held position")
+                    "isolated margin has no account-level cover and the view "
+                    "carries no liquidation distance for the held position "
+                    f"(reason {view.get('reason')!r})")
         else:
             return self._halt(
                 "MARGIN_MODE_UNKNOWN",
