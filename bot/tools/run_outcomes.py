@@ -204,7 +204,7 @@ def orders_exercised(drill_report: Any) -> bool:
     return (isinstance(drill_report, dict)
             and isinstance(drill_report.get("orders_sent"), int)
             and drill_report["orders_sent"] >= 2
-            and not drill_report.get("still_open"))
+            and drill_report.get("still_open") is False)
 
 
 def cycle_reconciled(recon_report: Any) -> bool:
