@@ -136,9 +136,17 @@ def _classify(report, rc, expect_order_gate_closed, failed, reasons):
         return failed("the report does not say venue=testnet use_testnet=true "
                       f"(venue={report.get('venue')!r} "
                       f"use_testnet={report.get('use_testnet')!r})")
-    if expect_order_gate_closed and report.get("order_gate_would_allow_orders"):
-        return failed("the carry order gate would ALLOW orders although this "
-                      "run set PAPER_TRADING=1")
+    if expect_order_gate_closed:
+        gate = report.get("order_gate_would_allow_orders")
+        if gate is True or (gate is not False and gate):
+            return failed("the carry order gate would ALLOW orders although "
+                          "this run set PAPER_TRADING=1")
+        if gate is not False:
+            # Absent, null or not a boolean: the report does not SAY the gate
+            # is closed, and a safety claim nobody made is not a closed gate.
+            return failed("the report does not state "
+                          "order_gate_would_allow_orders=false (found "
+                          f"{gate!r}): an unstated gate is not a closed one")
     econ = report.get("entry_economics")
     if not isinstance(econ, dict) or "state" not in econ:
         return failed("the report carries no entry-economics assessment")
@@ -206,6 +214,11 @@ def cycle_reconciled(recon_report: Any) -> bool:
             or recon_report.get("schema") != "evidence_reconciliation/1":
         return False
     cycles = recon_report.get("carry_cycle") or []
+    if not isinstance(cycles, list):
+        return False
+    # A row that is not an object is unreadable, hence not reconciled: it must
+    # not raise out of the caller, which has already flattened the venue and
+    # still owes the run a verdict.
     return bool(cycles) and all(
-        c.get("provenance") == "VENUE_RECONCILED" and c.get("resolved") is True
-        for c in cycles)
+        isinstance(c, dict) and c.get("provenance") == "VENUE_RECONCILED"
+        and c.get("resolved") is True for c in cycles)
