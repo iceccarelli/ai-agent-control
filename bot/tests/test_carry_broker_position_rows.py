@@ -87,24 +87,21 @@ class TestTheShortIsJudgedNotTheFirstRow:
         assert broker(Venue(rows))._holding("BTCUSDT", LINEAR) == pytest.approx(0.001)
 
 
-class TestAmbiguityRefuses:
-    @pytest.mark.parametrize("rows", orders(long_(), short()))
-    def test_a_long_and_a_short_both_held_is_refused_everywhere(self, rows):
-        b = broker(Venue(rows))
-        with pytest.raises(PairIncident):
-            b.get_margin_multiple("BTCUSDT")
-        with pytest.raises(PairIncident):
-            b.get_liquidation_view("BTCUSDT")
-        with pytest.raises(PairIncident):
-            b._holding("BTCUSDT", LINEAR)
+class TestSeveralSizedRowsAreLeftToTheDirectionCheck:
+    """Two or more sized rows behave exactly as before (`rows[0]`): the venue
+    position check halts on a long and sums two shorts, and its halt reasons
+    depend on this read not refusing first (test_carry_venue_direction_integration)."""
 
-    def test_two_sized_shorts_are_refused(self):
-        rows = [short(), short(positionIdx=0)]
+    @pytest.mark.parametrize("rows", orders(long_(), short()))
+    def test_the_first_row_is_read_as_before(self, rows):
         b = broker(Venue(rows))
-        with pytest.raises(PairIncident):
-            b.get_margin_multiple("BTCUSDT")
-        with pytest.raises(PairIncident):
-            b._holding("BTCUSDT", LINEAR)
+        assert b.get_margin_multiple("BTCUSDT") == pytest.approx(4.0)   # both IM 40 / MM 10
+        assert b.get_liquidation_view("BTCUSDT")["side"] == rows[0]["side"]
+        assert b._holding("BTCUSDT", LINEAR) == pytest.approx(0.001)
+
+    def test_two_sized_shorts_are_read_as_before(self):
+        rows = [short(size="0.0005"), short(positionIdx=0, size="0.0005")]
+        assert broker(Venue(rows))._holding("BTCUSDT", LINEAR) == pytest.approx(0.0005)
 
     def test_a_size_that_is_not_stated_is_refused_not_skipped(self):
         rows = [flat_long(), short(size="")]

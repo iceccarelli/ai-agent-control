@@ -1844,21 +1844,19 @@ class CarryBroker:
         order): the single row that carries size. `rows[0]` used to be taken
         blindly, so a comfortable flat slot listed first made a short 1% from
         liquidation read as safe, and a flat slot with zero maintenance margin
-        made a readable short unreadable (a halt does not close it). Every row
-        must STATE its size; none sized is flat (the first row, as before); two
-        or more sized is refused, because choosing one would hide the other.
+        made a readable short unreadable (a halt does not close it).
+
+        Every row must STATE its size (an unstated one is refused). None sized
+        is flat: the first row, as before. TWO OR MORE sized rows are left
+        exactly as they were, `rows[0]`: which direction each holds, and
+        whether they sum to the book, is the job of `get_perp_position` and the
+        venue-position check, which halt on a long and sum two shorts; making
+        this read refuse would change those halts' reasons.
         """
         if len(rows) == 1:
             return rows[0]
         sized = [r for r in rows if self._stated_size(r, symbol) > 0.0]
-        if not sized:
-            return rows[0]
-        if len(sized) > 1:
-            raise PairIncident(
-                f"{symbol} carries size in {len(sized)} position rows; which "
-                "one is the hedge cannot be decided from here, so none is "
-                "judged")
-        return sized[0]
+        return sized[0] if len(sized) == 1 else rows[0]
 
     # -- Bybit v5 envelope --------------------------------------------------
     #
