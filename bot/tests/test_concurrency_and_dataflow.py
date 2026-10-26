@@ -419,7 +419,7 @@ class TestConservation:
             "the protective stop does not cover the whole position"
         )
 
-    def test_ledger_explains_the_entire_equity_change(self):
+    def test_ledger_explains_the_entire_equity_change(self, tmp_path):
         """The strongest data-flow assertion available: after a full backtest,
         the sum of recorded trade PnL must equal the change in equity.
 
@@ -431,9 +431,7 @@ class TestConservation:
         import persistence
 
         rng_bars = _regime_bars(700, seed=17)
-        path = "/tmp/dataflow_conservation.db"
-        if os.path.exists(path):
-            os.remove(path)
+        path = str(tmp_path / "dataflow_conservation.db")
         result = bt.Backtester(
             {"BTCUSDT": rng_bars},
             bt.BacktestConfig(starting_cash=10_000.0, warmup_bars=150,
@@ -544,3 +542,23 @@ class TestConcurrencyStructure:
         assert globals_assigned == [], (
             f"main.py has mutable module-level state: {globals_assigned}"
         )
+
+
+def test_no_test_writes_a_database_to_a_fixed_shared_path():
+    """A database at a fixed absolute path is shared by every concurrent run of
+    the suite on the machine (Python 3.11 and 3.12 side by side, pytest-xdist,
+    two checkouts): each run deletes and rewrites the other's file mid-test.
+    `test_ledger_explains_the_entire_equity_change` did exactly that and failed
+    on both interpreters at once, while passing alone. Tests take `tmp_path`."""
+    import glob
+    import re
+    hits = []
+    for path in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(
+            __file__)), "test_*.py"))):
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and re.match(r"^/(tmp|var/tmp)/[^ ]+\.(db|sqlite3?)$",
+                                 node.value)):
+                hits.append(f"{os.path.basename(path)}:{node.lineno} {node.value}")
+    assert hits == [], hits
