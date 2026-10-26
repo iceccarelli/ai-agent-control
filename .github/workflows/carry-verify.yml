@@ -116,6 +116,7 @@ jobs:
           tests/test_unattended_workflow.py
           tests/test_unattended_drill.py
           tests/test_runner_monitor.py
+          tests/test_runner_alerts.py
           tests/test_monitor_summary.py
           tests/test_monitor_fail_closed.py
           tests/test_liquidation_gate_fail_closed.py
