@@ -2013,23 +2013,28 @@ class TestRealExitWsEvidenceClosesTheRace:
         consumer.auth_ok = True
         consumer.subscribe_ok = True
 
-        # Entry evidence exists up front (this test is about the EXIT
-        # race specifically).
+        # The ENTRY event arrives just after the run starts, then the EXIT event
+        # after the flatten (this test is about the EXIT race specifically).
+        # Both are delivered DURING the run on purpose: the production rule
+        # (`_is_valid_ws_observation`) refuses evidence stamped before the run
+        # started - to the second - as stale. This test used to record the entry
+        # evidence in its own setup, so whenever that setup straddled a second
+        # boundary the entry looked stale and the run aborted (about 3% of runs,
+        # one red CI run on main). The rule was right; the test was not.
         entry_msg = json.dumps({"topic": "order", "data": [{
             "symbol": SYMBOL, "orderId": "V-ENTRY-1", "orderLinkId": entry_link_id,
             "orderStatus": "Filled", "updatedTime": "1"}]})
-        consumer.handle_raw_message(entry_msg)
-        consumer.drain_and_apply(_StubStore())
-
         exit_msg = json.dumps({"topic": "order", "data": [{
             "symbol": SYMBOL, "orderId": "V-EXIT-1", "orderLinkId": exit_link_id,
             "orderStatus": "Filled", "updatedTime": "2"}]})
 
-        def _deliver_exit_event_late():
-            time_mod.sleep(0.3)
+        def _deliver_events_during_the_run():
+            time_mod.sleep(0.05)
+            consumer.handle_raw_message(entry_msg)
+            time_mod.sleep(0.35)       # after the entry stage has seen its event
             consumer.handle_raw_message(exit_msg)
 
-        threading.Thread(target=_deliver_exit_event_late).start()
+        threading.Thread(target=_deliver_events_during_the_run).start()
 
         row = {"symbol": SYMBOL, "qty": 0.01, "order_link_id": entry_link_id,
               "meta": "{}"}
