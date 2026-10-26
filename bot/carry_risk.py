@@ -129,7 +129,16 @@ class CarryRisk:
         # this gate must agree, not re-block (or, before this fix, crash on
         # `float(None)`) the one open that would establish the ratio.
         raw_margin = getattr(snapshot, "margin_multiple", None)
-        margin = None if raw_margin is None else float(raw_margin)
+        try:
+            margin = None if raw_margin is None else float(raw_margin)
+        except (TypeError, ValueError):
+            margin = math.nan
+        # NaN is below no floor, so `margin < floor` alone APPROVED a margin
+        # this gate could not read; it leaned on MarketSnapshot.assert_fresh
+        # for the one check it names. A margin that is present but unreadable
+        # is refused here, with a reason, whatever the snapshot said.
+        if margin is not None and not math.isfinite(margin):
+            return _block("MARGIN_UNREADABLE", margin_multiple=repr(raw_margin))
         if margin is not None and margin < self.min_margin_multiple:
             return _block("MARGIN_HEADROOM_TOO_THIN",
                           margin_multiple=margin,
