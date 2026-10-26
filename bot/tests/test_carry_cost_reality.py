@@ -261,3 +261,24 @@ def test_the_overlay_engine_still_admits_funding_that_clears_both_gates():
     e = _engine(prints(1.0))
     econ = e.entry_economics(mark=100_000.0, spot=100_000.0, funding_bps=1.0)
     assert econ.refusal is None and econ.verdict.allowed
+
+
+def test_a_break_even_too_large_to_count_is_never_not_an_overflow():
+    """`hold_clears_round_trip` promises to fail closed on every unusable input.
+    A round trip so large that round_trip / net funding overflows to infinity
+    used to raise OverflowError out of math.ceil (carry_preflight calls it
+    directly, unguarded), while the native core answers "refused" for the same
+    arithmetic. It is a refusal in both."""
+    huge = 1.7e308
+    assert cc.min_settlements_to_clear(1e-3, round_trip_bps=huge) is None
+    v = cc.hold_clears_round_trip(funding_prints_bps=[1e-3] * 5,
+                                  round_trip_bps=huge, borrow_apr=0.0)
+    assert v.allowed is False
+    assert v.reason == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+    assert v.detail["settlements_needed"] is None
+    # a large but countable break-even is unchanged: counted, then over budget
+    assert cc.min_settlements_to_clear(1.0, round_trip_bps=1e300) == int(1e300)
+    # and the combined entry gate never reaches it with an absurd round trip
+    gate = cc.entry_gate(funding_prints_bps=[1.0] * 5, perp=100_000.0,
+                         spot=100_000.0, borrow_apr=0.0, round_trip_bps=huge)
+    assert gate.allowed is False
