@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import math
 import re
 import statistics
 import sys
@@ -35,6 +36,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_NOTE = ("every figure is a model reading of public testnet data; none is "
                "evidence of profit")
+
+#: The only outcomes the read-only monitor writes (tools/run_outcomes.py). A row
+#: saying anything else (CONFORMANCE_PASSED belongs to the order-capable drill,
+#: which never writes this file) was not produced by this monitor.
+KNOWN_OUTCOMES = ("ENTRY_NOT_ELIGIBLE", "MONITOR_READY", "MONITOR_FAILED")
 
 
 #: How far ahead of this machine's clock a line may be stamped before the
@@ -141,6 +147,13 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
                         f"this machine's clock (first {ahead[0]}): a broken "
                         "clock or a forged line, so the age of the last cycle "
                         "cannot be trusted")
+    foreign = sorted({str(r["outcome"]) for r in rows
+                      if r["outcome"] not in KNOWN_OUTCOMES})
+    if foreign:
+        problems.append(f"OUTCOME: {len(foreign)} outcome value(s) the monitor "
+                        f"cannot produce ({', '.join(map(repr, foreign[:3]))}): "
+                        "a hand-edited or foreign history is not a healthy "
+                        "runner")
     if last["outcome"] == "MONITOR_FAILED":
         problems.append("the last cycle was MONITOR_FAILED: "
                         + "; ".join(map(str, last.get("reasons") or [])))
@@ -230,6 +243,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--now", type=float, default=None, help="epoch seconds (tests)")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
+    if not (math.isfinite(args.stale_minutes) and args.stale_minutes > 0):
+        # NaN and +inf make `age > limit` false for every age, so no runner
+        # could ever be stale; zero and below are always stale. None is a limit.
+        print(f"--stale-minutes must be a finite number above zero, not "
+              f"{args.stale_minutes!r}", file=sys.stderr)
+        return 2
     try:
         text = sys.stdin.read() if args.path == "-" else open(args.path, encoding="utf-8").read()
     except OSError as exc:
