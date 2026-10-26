@@ -119,7 +119,8 @@ def _write_json(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
-def _history_line(root: str, record: Dict[str, Any]) -> None:
+def _history_line(root: str, record: Dict[str, Any]) -> bool:
+    """Append the cycle to monitor.jsonl. False when it could not be written."""
     def mapping(x: Any) -> Dict[str, Any]:
         return x if isinstance(x, dict) else {}
     decision = mapping(mapping(record.get("assessment")).get("entry_decision"))
@@ -148,7 +149,8 @@ def _history_line(root: str, record: Dict[str, Any]) -> None:
         with open(os.path.join(root, "monitor.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, sort_keys=True, default=str) + "\n")
     except OSError:
-        pass
+        return False
+    return True
 
 
 def monitor_once(run_dir: str, *, env: Mapping[str, str],
@@ -169,7 +171,11 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
     def finish(result: Dict[str, Any], code: int) -> int:
         record = {"at": stamp, "schema": "monitor/1", **result}
         _write_json(os.path.join(run_dir, "monitor.json"), record)
-        _history_line(history_root or run_dir, record)
+        if not _history_line(history_root or run_dir, record):
+            # The history is the operator's only view of the runner; a lost line
+            # is survivable (staleness will show it) but never silent.
+            UD._say(run_dir, "WARNING: the monitor.jsonl history line could "
+                             "not be written for this cycle")
         UD._say(run_dir, f"{record['outcome']}: " + "; ".join(record["reasons"]))
         return code
 
@@ -188,6 +194,20 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
             "assessment": RO._assessment(None)}, EXIT_UNREACHABLE)
 
     log = os.path.join(run_dir, "preflight.log")
+    # THIS cycle's evidence only. The child appends to the log, and the report is
+    # read back from it: an earlier cycle's report left in a reused run
+    # directory (`--once`) would be classified as this cycle's when the child
+    # cannot start, and would make a second report (ambiguous, refused) when it
+    # can. A log that cannot be emptied cannot be trusted either.
+    try:
+        open(log, "wb").close()
+    except OSError as exc:
+        return finish({
+            "outcome": RO.MONITOR_FAILED, "order_sent": False,
+            "reasons": [f"the preflight log could not be emptied "
+                        f"({type(exc).__name__}): an earlier report cannot "
+                        "be ruled out as this cycle's"],
+            "assessment": RO._assessment(None)}, EXIT_FAILED)
     cenv = monitor_env(env, run_dir)
     try:
         rc: Optional[int] = int(runner(
