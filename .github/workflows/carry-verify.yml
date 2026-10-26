@@ -133,6 +133,7 @@ jobs:
           tests/test_fly_runtime.py
           tests/test_carry_costs.py
           tests/test_carry_risk.py
+          tests/test_margin_nan_fail_closed.py
           tests/test_config.py
           tests/test_directional_close_unconfirmed.py
           tests/test_fee_truthfulness.py
