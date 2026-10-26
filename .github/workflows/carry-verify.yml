@@ -114,6 +114,7 @@ jobs:
           tests/test_next_settlement.py
           tests/test_recon_summary.py
           tests/test_mainnet_public.py
+          tests/test_records_consistent_alias.py
           tests/test_unattended_workflow.py
           tests/test_unattended_drill.py
           tests/test_runner_monitor.py
