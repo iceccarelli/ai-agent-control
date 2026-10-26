@@ -96,7 +96,20 @@ def redact(text: str, secret: Optional[str] = None) -> str:
     return _ANY_SLACK_URL.sub("[redacted]", out)
 
 
+_PATH = re.compile(r"/services/[A-Za-z0-9]+/[A-Za-z0-9]+/[A-Za-z0-9]+")
+
+
+def slack_escape(text: str) -> str:
+    """Slack's documented escaping. History text (reasons, shadow detail) is
+    only indirectly under anyone's control, but `<!channel>` and `<url|label>`
+    in it must not become a workspace ping or a fake link."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def valid_webhook(url: str) -> bool:
+    """Exactly https://hooks.slack.com/services/<A>/<B>/<C> with plain
+    alphanumeric segments: no query, fragment, userinfo, port, dot-segments,
+    percent-escapes, empty segments or whitespace."""
     try:
         parts = urllib.parse.urlsplit(url)
         port = parts.port
@@ -104,8 +117,9 @@ def valid_webhook(url: str) -> bool:
         return False
     return (parts.scheme == "https" and parts.hostname == ALLOWED_HOST
             and port is None and not parts.username and not parts.password
-            and parts.path.startswith(ALLOWED_PATH_PREFIX)
-            and len(parts.path.strip("/").split("/")) >= 4)
+            and not parts.query and not parts.fragment
+            and _PATH.fullmatch(parts.path) is not None
+            and "?" not in url and "#" not in url)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -166,7 +180,7 @@ class Notifier:
         if self._url is None:
             return "disabled"
         head = f"[{alert.severity}]" + (f" {self._app}" if self._app else "")
-        text = redact(f"{head} {alert.text}", self._url)[:MAX_TEXT]
+        text = slack_escape(redact(f"{head} {alert.text}", self._url))[:MAX_TEXT]
         body = json.dumps({"text": text}).encode("utf-8")
         try:
             status = self._transport(self._url, body, TIMEOUT_S)
@@ -219,7 +233,8 @@ def _evaluate(history_text, now, stale_minutes, failed_streak):
         elif problem.startswith("the last shadow step"):
             alerts.append(Alert("shadow", WARNING, problem))
         else:
-            alerts.append(Alert("problem", WARNING, problem))
+            alerts.append(Alert("problem:" + re.sub(r"\W+", "_", problem[:20]).strip("_"),
+                                WARNING, problem))
     streak = _failed_streak(rows)
     if rows and streak >= failed_streak:
         why = "; ".join(map(str, rows[-1].get("reasons") or [])) or "no reason recorded"

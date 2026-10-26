@@ -231,6 +231,11 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
                   else EXIT_OK)
 
 
+#: A cycle interval above this makes the 150-minute stale and hung limits fire
+#: on a healthy runner.
+MAX_INTERVAL_MINUTES = 120.0
+
+
 class _Alerts:
     """Slack alerts around the loop. Everything here is contained: it cannot
     change a cycle's outcome, the loop's exit code or any gate. A stop signal is
@@ -240,6 +245,8 @@ class _Alerts:
                  clock: Callable[[], float]) -> None:
         self.root, self.notifier, self.clock = root, notifier, clock
         self.throttle = RA.Throttle()
+        self.watchdog_throttle = RA.Throttle()   # its own: one shared set of
+        # 'active' keys made the watchdog's [hung] look like `stale` clearing
         self.watchdog = RA.Watchdog(clock=clock)
 
     def after_cycle(self) -> None:
@@ -279,7 +286,7 @@ class _Alerts:
                 try:
                     hung = self.watchdog.tick()
                     if hung is not None:
-                        for a in self.throttle.plan([hung], self.clock()):
+                        for a in self.watchdog_throttle.plan([hung], self.clock()):
                             UD._say(self.root, f"alert {a.key} {a.severity}: {n.send(a)}")
                 except Exception as exc:                       # noqa: BLE001
                     UD._say(self.root, f"watchdog failed ({type(exc).__name__})")
@@ -367,8 +374,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # `not (x >= 1.0)`, not `x < 1.0`: NaN fails both comparisons, and a NaN
     # interval never sleeps (`waited < nan` is false), an infinite one never
     # starts a second cycle.
-    if args.max_runs < 0 or not (1.0 <= args.interval_minutes < float("inf")):
-        print("refusing: --max-runs must be >= 0 and --interval-minutes >= 1",
+    if args.max_runs < 0 or not (1.0 <= args.interval_minutes <= MAX_INTERVAL_MINUTES):
+        print("refusing: --max-runs must be >= 0 and --interval-minutes between 1 "
+              f"and {MAX_INTERVAL_MINUTES:g} (the stale and hung alerts fire at "
+              f"{RA.STALE_MINUTES:g} min)",
               file=sys.stderr)
         return EXIT_REFUSED
     UD.install_signal_handlers()

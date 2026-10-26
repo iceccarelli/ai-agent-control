@@ -99,6 +99,23 @@ class TestTheWebhookComesFromTheEnvironmentOnly:
         assert not n.enabled
         assert bad not in n.disabled_reason and "hooks.slack.com" in n.disabled_reason
 
+    @pytest.mark.parametrize("bad", [
+        "https://hooks.slack.com/services/T/B/x?x=1",
+        "https://hooks.slack.com/services/T/B/x#frag",
+        "https://hooks.slack.com/services/../../T/B/x",
+        "https://hooks.slack.com/services/%2e%2e/T/B/x",
+        "https://hooks.slack.com/services//T/B/x",
+        "https://hooks.slack.com/services/T/B/x y",
+        "https://hooks.slack.com/services/T/B/x@evil.com",
+        "https://hooks.slack.com/services/T/B",
+    ])
+    def test_the_path_must_be_exactly_three_plain_segments(self, bad):
+        assert not RA.valid_webhook(bad)
+        assert not RA.Notifier({RA.ENV_VAR: bad}, transport=Wire()).enabled
+
+    def test_the_shape_of_a_real_slack_webhook_is_accepted(self):
+        assert RA.valid_webhook(FAKE_URL)
+
     def test_the_url_is_never_in_the_repr_or_str_of_the_notifier(self):
         n = RA.Notifier(ENV, transport=Wire())
         assert TOKEN not in repr(n) and TOKEN not in str(n)
@@ -126,6 +143,15 @@ class TestSending:
         n.send(RA.Alert("k", RA.WARNING, f"history said {FAKE_URL} and {TOKEN}"))
         body = json.dumps(wire.sent[0][1])
         assert TOKEN not in body and FAKE_URL not in body and "T0FAKE" not in body
+
+    def test_slack_control_syntax_in_history_text_cannot_ping_or_link(self):
+        wire = Wire()
+        n = RA.Notifier(ENV, transport=wire)
+        n.send(RA.Alert("k", RA.WARNING,
+                        "x <!channel> <!here> <@U123> <https://evil.example|click> & y"))
+        text = wire.sent[0][1]["text"]
+        assert "<" not in text and ">" not in text
+        assert "&lt;!channel&gt;" in text and "&amp;" in text
 
     def test_text_is_truncated(self):
         wire = Wire()
@@ -204,6 +230,17 @@ class TestEvaluate:
         assert [x.key for x in a] == ["no_data"]
 
 
+class TestProblemsAreKeyedByWhatTheySay:
+    def test_two_different_generic_problems_are_two_alerts(self):
+        rows = [row(120), row(5, outcome="SOMETHING_ELSE")]
+        future = row(-60 * 24 * 400)
+        a = RA.evaluate(text(row(120), future), NOW)
+        assert len({x.key for x in a if x.key.startswith("problem")}) >= 1
+        both = RA.evaluate(text(row(60, outcome="SOMETHING_ELSE"), future), NOW)
+        keys = [x.key for x in both if x.key.startswith("problem")]
+        assert len(keys) == len(set(keys)) and len(keys) >= 2
+
+
 # -- not nagging, and saying when it is over ----------------------------------
 
 class TestThrottle:
@@ -235,6 +272,24 @@ class TestThrottle:
 
 
 # -- a hung cycle -------------------------------------------------------------
+
+class TestTheWatchdogHasItsOwnThrottle:
+    """One shared throttle treated each caller's list as the whole active set:
+    the watchdog's [hung] made the main loop's `stale` look cleared."""
+
+    def test_a_hung_alert_does_not_clear_a_stale_one(self, tmp_path):
+        root = str(tmp_path)
+        os.makedirs(root, exist_ok=True)
+        a = RM._Alerts(root, RA.Notifier(ENV, transport=Wire(), say=Log()),
+                       lambda: NOW)
+        assert a.throttle is not a.watchdog_throttle
+        stale = RA.Alert("stale", RA.CRITICAL, "x")
+        assert a.throttle.plan([stale], 0.0) == [stale]
+        hung = RA.Alert("hung", RA.CRITICAL, "y")
+        assert a.watchdog_throttle.plan([hung], 1.0) == [hung]
+        # the loop's throttle still knows `stale` is active and not yet due again
+        assert a.throttle.plan([stale], 2.0) == []
+
 
 class TestWatchdog:
     def test_a_cycle_that_never_finishes_is_reported(self):
@@ -321,6 +376,25 @@ class TestTheLoop:
         n = RA.Notifier(ENV, transport=wire, say=Log())
         _loop(tmp_path, n, ["ENTRY_NOT_ELIGIBLE", "MONITOR_READY", "ENTRY_NOT_ELIGIBLE"])
         assert wire.sent == []
+
+
+def test_an_interval_that_would_make_a_healthy_runner_look_dead_is_refused(
+        tmp_path, monkeypatch, capsys):
+    """`loop` is replaced, so if the guard were broken this would fail instead of
+    starting a real monitor loop."""
+    for name in UD.CREDENTIALS:
+        monkeypatch.setenv(name, "x")
+    started = []
+    monkeypatch.setattr(RM, "loop", lambda *a, **k: started.append(k) or 0)
+    for minutes in ("200", "inf", "nan", "0.5"):
+        code = RM.main(["--loop", "--run-dir", str(tmp_path / "r"),
+                        "--interval-minutes", minutes])
+        assert code == RM.EXIT_REFUSED, minutes
+    assert started == []
+    assert "between 1 and 120" in capsys.readouterr().err
+    assert RM.main(["--loop", "--run-dir", str(tmp_path / "r2"),
+                    "--interval-minutes", "60"]) == 0
+    assert len(started) == 1
 
 
 def test_the_webhook_never_reaches_the_preflight_child():
