@@ -284,6 +284,20 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
     # out of money that is already spoken for by borrow and fees is how a
     # positive-carry trade closes negative.
     basis_budget = net_edge * hold_days
+    # AN EDGE THAT OVERFLOWED IS NOT AN EDGE. carry = inf and borrow = inf make
+    # `net_edge` NaN, which fails `net_edge <= 0` and every comparison below and
+    # so ALLOWED the entry; carry = inf alone makes the budget infinite and
+    # admits any basis. Neither is a number anyone measured, so the gate refuses
+    # and names it (carrycore.cpp mirrors this point;
+    # tests/test_gate_arithmetic_overflow.py pins both).
+    if not math.isfinite(basis_budget):
+        return CarryVerdict(
+            False, "COST_INPUT_INVALID", smoothed_funding_bps=smoothed,
+            entry_basis_bps=entry_basis,
+            detail={"fields": ["arithmetic_overflow"],
+                    "note": "the carry, borrow or basis budget is not a finite "
+                            "number; an overflowed edge is refused, never "
+                            "compared"})
     if entry_basis > basis_budget:
         return CarryVerdict(
             False, "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET",
@@ -423,6 +437,10 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
     # horizon anyone can enforce; refused, not compared (and not an OverflowError).
     if not invalid and not math.isfinite(float(hold_days) * FUNDING_PERIODS_PER_DAY):
         invalid = ["hold_days"]
+    # Likewise a borrow rate whose per-day figure overflows: it used to raise
+    # ValueError out of min_settlements_to_clear instead of refusing.
+    if not invalid and not math.isfinite((float(borrow_apr) / 365.0) * 1e4):
+        invalid = ["borrow_apr"]
     if invalid:
         return CarryVerdict(False, "COST_INPUT_INVALID",
                             detail={"fields": invalid})

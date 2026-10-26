@@ -98,6 +98,7 @@ jobs:
           tests/test_carry_shadow_forward.py
           tests/test_registry_matches_production_rule.py
           tests/test_carry_cost_reality.py
+          tests/test_gate_arithmetic_overflow.py
           tests/test_venue_isolation.py
           tests/test_drill_evidence.py
           tests/test_evidence_reconcile.py

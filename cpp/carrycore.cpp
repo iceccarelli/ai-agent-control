@@ -118,6 +118,9 @@ int gate_reason(const double *history, int count, double perp, double spot,
 
     if (net_edge <= 0.0) return CARRY_GATE_CARRY_BELOW_COST_OF_CAPITAL;
     const double basis_budget = net_edge * p.hold_days;
+    /* carry_costs.evaluate_entry: a budget that overflowed (inf - inf is NaN,
+       inf carry is an unbounded budget) is refused, not compared. */
+    if (!std::isfinite(basis_budget)) return CARRY_GATE_COST_INPUT_INVALID;
     if (entry_basis > basis_budget) return CARRY_GATE_BASIS_EXCEEDS_BUDGET;
     if (entry_basis < -basis_budget) return CARRY_GATE_BASIS_DISCOUNT_EXCEEDS_BUDGET;
 
