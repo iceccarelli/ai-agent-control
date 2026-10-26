@@ -113,6 +113,7 @@ jobs:
           tests/test_real_stack_adapter.py
           tests/test_next_settlement.py
           tests/test_recon_summary.py
+          tests/test_carry_broker_position_rows.py
           tests/test_unattended_workflow.py
           tests/test_unattended_drill.py
           tests/test_runner_monitor.py
