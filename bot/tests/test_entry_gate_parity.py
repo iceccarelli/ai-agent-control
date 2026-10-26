@@ -651,3 +651,33 @@ def test_stale_or_unusable_inputs_still_refuse_before_the_gate_is_asked():
     e._funding_history = [50.0] * 5
     econ = e.entry_economics(mark=SPOT, spot=SPOT, funding_bps=50.0)
     assert econ.refusal.reason == "FEE_RATES_UNREADABLE"
+
+
+def test_the_basis_budget_boundary_agrees_on_both_sides_of_both_signs(native):
+    """The basis budget (net edge x hold) is where a RELATIVE slip in either
+    implementation hides: the random fuzz almost never lands within 1e-4 of it.
+    Put entries a hair inside and a hair outside the budget, on the premium and
+    the discount side, and require Python, the runtime engine and the C++ core to
+    give the same answer, with the two sides giving DIFFERENT answers."""
+    for funding in (1.0, 1.5, 2.0, 3.0):
+        for borrow in (0.0, 0.05):
+            prints = [funding] * 8
+            v = cc.entry_gate(funding_prints_bps=prints, perp=SPOT, spot=SPOT,
+                              borrow_apr=borrow, round_trip_bps=11.0)
+            if not v.allowed:
+                continue                      # no budget to probe at this rate
+            budget = v.basis_budget_bps
+            for sign, refused in ((1.0, "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET"),
+                                  (-1.0, "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET")):
+                answers = {}
+                for rel in (-1e-3, -1e-5, -1e-7, 1e-7, 1e-5, 1e-3):
+                    perp = px(sign * budget * (1.0 + rel))
+                    got = {python_gate(prints, perp, SPOT, borrow, 11.0),
+                           runtime(prints, perp, SPOT, borrow, 11.0),
+                           cpp_gate(prints, perp, SPOT, borrow, 11.0)}
+                    assert len(got) == 1, (funding, borrow, sign, rel, got)
+                    answers[rel] = got.pop()
+                # the probe is sensitive: just inside admits, just outside refuses
+                assert answers[-1e-5][0] is True or \
+                    answers[-1e-5][1] == "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+                assert answers[1e-5] == (False, refused), (funding, borrow, sign)
