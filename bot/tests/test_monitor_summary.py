@@ -245,3 +245,56 @@ class TestTheStatusScript:
                      "machine restart", "secrets set", "volumes create", "touch ",
                      "rm ", "kill", "forward-init", "forward-step", "--arm"):
             assert verb not in code, verb
+
+
+class TestTheAlarmCannotBeHiddenByTheShapeOfTheLine:
+    """`order_sent` is the one safety field in the history. A line that carries
+    it must never be dropped just because it lacks `outcome`, is torn, or sits
+    behind a forged timestamp; each of these used to read HEALTH OK."""
+
+    def scan(self, raw):
+        rows, unreadable = MS.scan_lines(raw)
+        return MS.summarise(rows, now=NOW, unreadable=unreadable)
+
+    def test_order_sent_true_without_an_outcome_is_an_alarm(self):
+        raw = text(line(30)) + json.dumps({"at": stamp(10), "order_sent": True}) + "\n"
+        s = self.scan(raw)
+        assert s["health"] == "ALARM" and s["exit"] == 3
+
+    def test_a_torn_line_that_was_saying_order_sent_true_is_an_alarm(self):
+        raw = (text(line(60)) + '{"at": "%s", "outcome": "X", "order_sent": tr\n'
+               % stamp(40) + text(line(10)))
+        s = self.scan(raw)
+        assert s["health"] == "ALARM" and s["exit"] == 3
+
+    def test_an_unreadable_line_in_the_middle_is_a_problem_not_silence(self):
+        raw = text(line(60)) + "not json at all\n" + text(line(10))
+        s = self.scan(raw)
+        assert s["health"] == "PROBLEM" and s["exit"] == 1
+        assert any("unreadable" in p for p in s["problems"])
+
+    def test_a_torn_final_line_alone_is_tolerated(self):
+        # a crash mid-write is the one expected way to end a file; it says
+        # nothing about orders and must not turn a healthy runner red
+        raw = text(line(60), line(10)) + '{"at": "2026-10-26T11:5'
+        s = self.scan(raw)
+        assert s["health"] == "OK" and s["exit"] == 0
+
+    def test_a_future_dated_last_line_does_not_hide_a_dead_runner(self):
+        forged = line(0, at="2099-01-01T00:00:00Z")
+        s = summary(line(900), forged)
+        assert s["health"] == "PROBLEM" and s["exit"] == 1
+        assert any("future" in p.lower() for p in s["problems"])
+
+    def test_small_clock_skew_is_not_a_problem(self):
+        s = summary(line(60), line(-2))
+        assert s["health"] == "OK"
+
+    def test_an_alarm_with_no_readable_cycle_still_renders_and_exits_3(self, tmp_path):
+        path = tmp_path / "m.jsonl"
+        path.write_text('{"order_sent": true}\n', encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, os.path.join(BOT, "tools", "monitor_summary.py"),
+             str(path), "--now", str(NOW)], capture_output=True, text=True)
+        assert proc.returncode == 3, proc.stderr
+        assert "ALARM" in proc.stdout and "order_sent" in proc.stdout

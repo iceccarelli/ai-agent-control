@@ -136,9 +136,16 @@ def _classify(report, rc, expect_order_gate_closed, failed, reasons):
         return failed("the report does not say venue=testnet use_testnet=true "
                       f"(venue={report.get('venue')!r} "
                       f"use_testnet={report.get('use_testnet')!r})")
-    if expect_order_gate_closed and report.get("order_gate_would_allow_orders"):
-        return failed("the carry order gate would ALLOW orders although this "
-                      "run set PAPER_TRADING=1")
+    # Only a literal False is a closed gate. A missing key, None or 0 says
+    # nothing about the gate and must not read as "closed".
+    gate = report.get("order_gate_would_allow_orders")
+    if expect_order_gate_closed and gate is not False:
+        if gate is True:
+            return failed("the carry order gate would ALLOW orders although "
+                          "this run set PAPER_TRADING=1")
+        return failed("the carry order gate is not reported closed "
+                      f"(order_gate_would_allow_orders={gate!r}): a missing "
+                      "answer is not a closed gate")
     econ = report.get("entry_economics")
     if not isinstance(econ, dict) or "state" not in econ:
         return failed("the report carries no entry-economics assessment")
@@ -196,7 +203,7 @@ def orders_exercised(drill_report: Any) -> bool:
     return (isinstance(drill_report, dict)
             and isinstance(drill_report.get("orders_sent"), int)
             and drill_report["orders_sent"] >= 2
-            and not drill_report.get("still_open"))
+            and drill_report.get("still_open") is False)
 
 
 def cycle_reconciled(recon_report: Any) -> bool:

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import re
 import statistics
 import sys
 import time
@@ -54,6 +55,44 @@ def parse_lines(text: str) -> List[Dict[str, Any]]:
     return rows
 
 
+#: A line that merely MENTIONS `order_sent` with anything but false (a torn
+#: `"order_sent": tr`, a hand-edited true) is an alarm even when it cannot be read.
+_ORDER_SENT_NOT_FALSE = re.compile(r'"order_sent"\s*:\s*(?!false\b)')
+
+#: A last cycle stamped further ahead of this host's clock than this is not a
+#: recent cycle; it is a skewed or forged stamp, and would otherwise read as
+#: fresher than any real one.
+FUTURE_TOLERANCE_MINUTES = 5.0
+
+
+def scan_lines(text: str) -> "tuple[List[Dict[str, Any]], List[Dict[str, Any]]]":
+    """`(rows, unreadable)`. `rows` is exactly what `parse_lines` returns.
+    `unreadable` is every other non-blank line, as `{"line": n, "last": bool,
+    "order_sent_not_false": bool}`: a line that is not a cycle row is never
+    dropped silently, because the safety field may be sitting in it."""
+    lines = [(n, raw.strip()) for n, raw in enumerate(text.splitlines(), 1)
+             if raw.strip()]
+    rows: List[Dict[str, Any]] = []
+    unreadable: List[Dict[str, Any]] = []
+    for index, (n, raw) in enumerate(lines):
+        obj: Any = None
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            pass
+        if isinstance(obj, dict) and isinstance(obj.get("at"), str) \
+                and isinstance(obj.get("outcome"), str):
+            rows.append(obj)
+            continue
+        if isinstance(obj, dict):
+            flagged = "order_sent" in obj and obj["order_sent"] is not False
+        else:
+            flagged = bool(_ORDER_SENT_NOT_FALSE.search(raw))
+        unreadable.append({"line": n, "last": index == len(lines) - 1,
+                           "order_sent_not_false": flagged})
+    return rows, unreadable
+
+
 def _epoch(stamp: str) -> Optional[float]:
     try:
         return float(calendar.timegm(time.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ")))
@@ -71,9 +110,19 @@ def _stat(values: Sequence[float]) -> Optional[Dict[str, float]]:
 
 
 def summarise(rows: List[Dict[str, Any]], *, now: float,
-              stale_minutes: float = 150.0, last_n: int = 0) -> Dict[str, Any]:
-    if not rows:
+              stale_minutes: float = 150.0, last_n: int = 0,
+              unreadable: Optional[List[Dict[str, Any]]] = None
+              ) -> Dict[str, Any]:
+    unreadable = unreadable or []
+    hidden = [u for u in unreadable if u["order_sent_not_false"]]
+    if not rows and not hidden:
         return {"health": "NO_DATA", "exit": 2, "problems": ["no readable cycles"]}
+    if not rows:
+        return {"health": "ALARM", "exit": 3, "problems": [],
+                "alarms": [f"{len(hidden)} unreadable line(s) mention order_sent "
+                           "other than false (first at line "
+                           f"{hidden[0]['line']}): investigate"],
+                "cycles_total": 0}
     window = rows[-last_n:] if last_n else rows
     last = rows[-1]
     problems: List[str] = []
@@ -85,12 +134,26 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
     elif age_min > stale_minutes:
         problems.append(f"STALE: the last cycle was {age_min:.0f} min ago "
                         f"(limit {stale_minutes:.0f}); the runner is down or stuck")
+    if any(t is not None and (t - now) / 60.0 > FUTURE_TOLERANCE_MINUTES
+           for t in (_epoch(r["at"]) for r in rows)):
+        problems.append("a cycle is stamped in the FUTURE (clock skew or a "
+                        "forged line): staleness cannot be trusted")
+    # a torn FINAL line is how a crash mid-write ends a file; any other line
+    # that is not a cycle row is damage to the history
+    damaged = [u for u in unreadable if not u["last"] and not u["order_sent_not_false"]]
+    if damaged:
+        problems.append(f"{len(damaged)} unreadable line(s) in the history "
+                        f"(first at line {damaged[0]['line']})")
     if last["outcome"] == "MONITOR_FAILED":
         problems.append("the last cycle was MONITOR_FAILED: "
                         + "; ".join(map(str, last.get("reasons") or [])))
     if last.get("shadow_state") in ("FAULT", "REFUSED"):
         problems.append(f"the last shadow step was {last['shadow_state']}: "
                         f"{last.get('shadow_detail', 'no detail recorded')}")
+    if hidden:
+        alarms.append(f"{len(hidden)} unreadable line(s) mention order_sent "
+                      f"other than false (first at line {hidden[0]['line']}): "
+                      "the monitor cannot send orders")
     sent = [r["at"] for r in rows if r.get("order_sent") is not False]
     if sent:
         alarms.append(f"{len(sent)} line(s) do not say order_sent=false "
@@ -126,7 +189,9 @@ def render(s: Dict[str, Any]) -> str:
         return "NO DATA: no readable cycles in the input"
     lines = [f"HEALTH {s['health']}"]
     for key in ("alarms", "problems"):
-        lines += [f"  !! {x}" for x in s[key]]
+        lines += [f"  !! {x}" for x in s.get(key, [])]
+    if "cycles_in_window" not in s:        # alarm raised with no readable cycle
+        return "\n".join(lines)
     lines.append(f"cycles {s['cycles_in_window']} of {s['cycles_total']}  "
                  f"{s['first']} .. {s['last']}  (last {s['last_cycle_age_minutes']} min ago)")
     lines.append("outcomes   " + ", ".join(f"{k} x{v}" for k, v in sorted(s["outcomes"].items())))
@@ -166,7 +231,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except OSError as exc:
         print(f"cannot read {args.path}: {exc}", file=sys.stderr)
         return 2
-    summary = summarise(parse_lines(text), now=time.time() if args.now is None else args.now,
+    rows, unreadable = scan_lines(text)
+    summary = summarise(rows, unreadable=unreadable, now=time.time() if args.now is None else args.now,
                         stale_minutes=args.stale_minutes, last_n=args.last)
     print(json.dumps(summary, indent=2, sort_keys=True) if args.json else render(summary))
     return int(summary["exit"])
