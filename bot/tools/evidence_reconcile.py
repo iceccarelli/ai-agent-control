@@ -25,8 +25,10 @@ of four provenance classes and says, per claim, why it is not resolved:
                           implied.
 
 ONLY VENUE_RECONCILED IS RESOLVED. Everything else is unresolved and carries
-machine-readable issue codes. `pnl_claim_allowed` is False unless every claim in
-the input is resolved and nothing is flagged; this module never computes a
+machine-readable issue codes. `records_consistent` (deprecated alias:
+`pnl_claim_allowed`, same value) is False unless every claim in
+the input is resolved and nothing is flagged; it says the captured records agree,
+not that anything made money; this module never computes a
 final PnL, and a local ledger entry alone can never produce one.
 
 WHAT A CAPTURE CAN AND CANNOT PROVE
@@ -1892,15 +1894,19 @@ def reconcile(*, fill_claims: Sequence[Mapping[str, Any]] = (),
                       "intact": c.intact, "chain_issues": c.chain_issues[:20]}
                      for c in captures],
         "counts_by_provenance": counts, "issue_counts": issue_counts,
+        "records_consistent": allowed,
+        # DEPRECATED ALIAS of records_consistent, kept with the identical value
+        # so no consumer breaks. It was never permission to claim profit.
         "pnl_claim_allowed": allowed,
         "verified_economics": verified_economics(
             [c if isinstance(c, dict) else {} for c in (trade_claims or [])],
             trades),
-        "pnl_note": ("False unless every fill and funding claim is "
-                     "VENUE_RECONCILED with no issue, every order is complete, "
-                     "and every capture chain verifies. Even then this reports "
-                     "consistency of captured records, not profitability, and "
-                     "testnet dollars are not cash."),
+        "pnl_note": ("records_consistent (alias pnl_claim_allowed) is False "
+                     "unless every fill and funding claim is VENUE_RECONCILED "
+                     "with no issue, every order is complete, and every capture "
+                     "chain verifies. Even then this reports consistency of "
+                     "captured records, not profitability, and testnet dollars "
+                     "are not cash."),
     }
 
 
@@ -2180,7 +2186,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             handle.write(text + "\n")
     else:
         print(text)
-    return 0 if report["pnl_claim_allowed"] else 2
+    return 0 if report["records_consistent"] else 2
 
 
 if __name__ == "__main__":
