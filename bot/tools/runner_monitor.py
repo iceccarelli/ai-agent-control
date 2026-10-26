@@ -41,7 +41,13 @@ import time
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+BOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+#: Launched as `python3 tools/runner_monitor.py`, sys.path[0] is tools/, so the
+#: application modules one level up (carry_shadow, the engine) are not importable
+#: unless the root is added. The first deployed cycle failed on exactly this.
+if BOT not in sys.path:
+    sys.path.insert(1, BOT)
 
 import run_outcomes as RO  # noqa: E402
 import unattended_drill as UD  # noqa: E402  (probe, child runner, lock, prune)
