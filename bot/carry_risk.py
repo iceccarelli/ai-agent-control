@@ -128,8 +128,27 @@ class CarryRisk:
         # tolerates this exact case (`margin is not None and margin < floor`);
         # this gate must agree, not re-block (or, before this fix, crash on
         # `float(None)`) the one open that would establish the ratio.
+        # Every comparison against NaN is False, so a NaN floor, a NaN cap or a
+        # NaN margin would each fall through to "approved". A gate whose own
+        # limits are unusable refuses.
+        if not (math.isfinite(self.min_margin_multiple)
+                and self.min_margin_multiple > 0
+                and math.isfinite(self.max_notional_usd)
+                and self.max_notional_usd > 0):
+            return _block("GATE_CONFIG_INVALID",
+                          max_notional_usd=self.max_notional_usd,
+                          min_margin_multiple=self.min_margin_multiple)
+
         raw_margin = getattr(snapshot, "margin_multiple", None)
-        margin = None if raw_margin is None else float(raw_margin)
+        if raw_margin is None:
+            margin = None
+        else:
+            try:
+                margin = float(raw_margin)
+            except (TypeError, ValueError):
+                return _block("MARGIN_UNUSABLE", margin_multiple=repr(raw_margin))
+            if not math.isfinite(margin):
+                return _block("MARGIN_UNUSABLE", margin_multiple=repr(raw_margin))
         if margin is not None and margin < self.min_margin_multiple:
             return _block("MARGIN_HEADROOM_TOO_THIN",
                           margin_multiple=margin,

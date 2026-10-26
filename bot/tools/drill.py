@@ -104,6 +104,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -384,6 +385,10 @@ def margin_stage_evidence(*, broker: Any, symbol: str, venue_perp_qty: float,
                     "not required by preflight",
         }, ""
     multiple = float(broker.get_margin_multiple(symbol))
+    if not math.isfinite(multiple):
+        # NaN fails every comparison, so `multiple < floor` alone would pass it.
+        return False, {"margin_multiple": multiple}, (
+            f"margin multiple {multiple} is not a finite number")
     if multiple < min_margin_multiple:
         return False, {"margin_multiple": multiple}, (
             f"margin multiple {multiple} is below the "
