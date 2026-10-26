@@ -133,6 +133,9 @@ def _history_line(root: str, record: Dict[str, Any]) -> None:
     if isinstance(shadow, dict):
         line["shadow_state"] = shadow.get("state")
         line["shadow_decision_reason"] = shadow.get("decision_reason")
+        if shadow.get("detail"):
+            # a FAULT or REFUSED with no reason in the history is a dead end
+            line["shadow_detail"] = str(shadow["detail"])[:300]
     try:
         with open(os.path.join(root, "monitor.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, sort_keys=True, default=str) + "\n")

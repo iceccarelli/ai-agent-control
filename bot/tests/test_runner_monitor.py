@@ -612,6 +612,20 @@ class TestShadowObservation:
         assert rec["shadow"]["state"] == state
         assert rec["outcome"] == RO.MONITOR_READY and code == 0
 
+    def test_a_fault_leaves_its_reason_in_the_history_line(self, tmp_path):
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")), db=str(db),
+                   stepper=self.fake_step(exc=RuntimeError("database is locked")))
+        line = json.loads(open(tmp_path / "monitor.jsonl").read().splitlines()[-1])
+        assert line["shadow_state"] == "FAULT"
+        assert "database is locked" in line["shadow_detail"]
+        long = self.fake_step(exc=RuntimeError("x" * 5000))
+        self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")), db=str(db),
+                   stepper=long)
+        line = json.loads(open(tmp_path / "monitor.jsonl").read().splitlines()[-1])
+        assert len(line["shadow_detail"]) <= 300
+
     def test_a_shadow_refusal_is_reported_with_its_code(self, tmp_path):
         import carry_shadow as cs
         db = tmp_path / "b.db"
