@@ -89,7 +89,70 @@ class TestHealth:
         assert len(rows) == 2
 
 
+class TestAnUnreadableLineCannotHideAnOrder:
+    """`order_sent` is the monitor's one safety claim. A line that cannot be
+    parsed into a full cycle row must not be able to hide a contrary claim, and
+    the operator is told how many lines were not read."""
+
+    def raw(self, *rows, extra=""):
+        return MS.summarise(MS.parse_lines(text(*rows) + extra), now=NOW,
+                            raw_text=text(*rows) + extra)
+
+    def test_an_order_sent_true_line_without_at_or_outcome_is_an_alarm(self):
+        for forged in ({"order_sent": True}, {"outcome": "MONITOR_READY",
+                                              "order_sent": True},
+                       {"at": stamp(5), "order_sent": True}):
+            s = self.raw(line(70), line(10), extra=json.dumps(forged) + "\n")
+            assert s["exit"] == 3 and s["health"] == "ALARM", forged
+
+    def test_a_non_json_line_that_claims_an_order_was_sent_is_an_alarm(self):
+        torn = '{"at": "%s", "outcome": "MONITOR_READY", "order_sent": true, "rea' % stamp(5)
+        s = self.raw(line(70), extra=torn)
+        assert s["exit"] == 3
+
+    def test_an_order_sent_false_line_that_is_merely_torn_is_counted_not_alarmed(self):
+        torn = '{"at": "%s", "outcome": "MONITOR_READY", "order_sent": false, "rea' % stamp(5)
+        s = self.raw(line(70), line(10), extra=torn)
+        assert s["exit"] == 0 and s["unreadable_lines"] == 1
+        assert "1 line(s) could not be read" in MS.render(s)
+
+    def test_a_clean_history_reports_no_unreadable_lines(self):
+        s = self.raw(line(70), line(10))
+        assert s["unreadable_lines"] == 0
+        assert "could not be read" not in MS.render(s)
+
+    def test_a_blank_line_is_not_an_unreadable_line(self):
+        assert self.raw(line(10), extra="\n\n")["unreadable_lines"] == 0
+
+    def test_without_the_raw_text_the_old_call_still_works(self):
+        s = MS.summarise(MS.parse_lines(text(line(10))), now=NOW)
+        assert s["exit"] == 0 and s["unreadable_lines"] == 0
+
+    def test_main_passes_the_raw_text_so_the_command_line_cannot_miss_it(self, tmp_path, capsys):
+        path = tmp_path / "monitor.jsonl"
+        path.write_text(text(line(10)) + json.dumps({"order_sent": True}) + "\n")
+        assert MS.main([str(path), "--now", str(NOW)]) == 3
+
+
+class TestAClockThatDisagreesWithTheHistory:
+    def test_a_last_line_stamped_in_the_future_is_not_a_healthy_runner(self):
+        s = summary(line(70), line(-60 * 24 * 365))          # a year ahead
+        assert s["exit"] == 1 and "FUTURE" in " ".join(s["problems"])
+
+    def test_a_future_stamp_anywhere_in_the_history_is_a_problem(self):
+        s = summary(line(-120), line(5))
+        assert s["exit"] == 1 and "FUTURE" in " ".join(s["problems"])
+
+    def test_a_little_clock_skew_is_tolerated(self):
+        assert summary(line(70), line(-2))["exit"] == 0       # 2 min ahead
+
+    def test_the_tolerance_is_five_minutes(self):
+        assert summary(line(-4.9))["exit"] == 0
+        assert summary(line(-5.5))["exit"] == 1
+
+
 class TestWhatItReports:
+
     def test_the_gate_open_fraction_ignores_failed_cycles(self):
         s = summary(line(300, "MONITOR_READY", gate_reason="CARRY_CLEARS_COSTS_AND_BASIS"),
                     line(240), line(180, "MONITOR_FAILED"), line(120), line(5))
@@ -106,6 +169,13 @@ class TestWhatItReports:
         assert s["basis_bps"] == {"n": 3, "min": 50.0, "median": 100.0, "max": 150.0}
         assert s["smoothed_funding_bps"]["median"] == 1.0
         assert s["shadow_states"] == {"STEP_RECORDED": 3}
+
+    def test_a_cycle_that_passed_the_gate_is_not_listed_as_a_refusal(self):
+        s = summary(line(130, "MONITOR_READY", gate_reason="CARRY_CLEARS_COSTS_AND_BASIS"),
+                    line(70), line(10))
+        assert s["refusal_reasons"] == {"ENTRY_BASIS_EXCEEDS_CARRY_BUDGET": 2}
+        assert "refused by ENTRY_BASIS_EXCEEDS_CARRY_BUDGET x2" in MS.render(s)
+        assert "CARRY_CLEARS_COSTS_AND_BASIS" not in MS.render(s).split("refused by")[-1]
 
     def test_the_window_limits_the_statistics_but_not_the_health(self):
         rows = [line(1000 - 10 * i) for i in range(50)] + [line(5)]

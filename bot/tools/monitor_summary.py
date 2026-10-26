@@ -26,20 +26,38 @@ from __future__ import annotations
 import argparse
 import calendar
 import json
+import re
 import statistics
 import sys
 import time
 from collections import Counter
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_NOTE = ("every figure is a model reading of public testnet data; none is "
                "evidence of profit")
 
 
-def parse_lines(text: str) -> List[Dict[str, Any]]:
-    """Every line that is a JSON object with an `at` and an `outcome`; anything
-    else (a torn last line, a blank) is skipped, never guessed at."""
+#: How far ahead of this machine's clock a line may be stamped before the
+#: history is called inconsistent. A runner's clock and the operator's differ by
+#: seconds; a stamp hours or years ahead is a forged line or a broken clock, and
+#: either way "how long since the last cycle" cannot be answered.
+FUTURE_TOLERANCE_MINUTES = 5.0
+
+#: An unparseable line that still CLAIMS an order was sent (a torn write cut
+#: after the field, say). Matched on text because it cannot be parsed.
+_ORDER_SENT_TRUE = re.compile(
+    r"""["']?order_sent["']?\s*:\s*(?:true|1|["']true["'])""", re.IGNORECASE)
+
+
+def scan(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """(cycle rows, non-blank lines that were NOT read as a cycle row).
+
+    A row is a JSON object with an `at` and an `outcome`. Everything else (a torn
+    last line, a forged fragment) is skipped, never guessed at, but it is
+    returned so the caller can count it and refuse to let it hide an
+    `order_sent` claim."""
     rows: List[Dict[str, Any]] = []
+    unread: List[str] = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -47,11 +65,30 @@ def parse_lines(text: str) -> List[Dict[str, Any]]:
         try:
             obj = json.loads(line)
         except ValueError:
+            unread.append(line)
             continue
         if isinstance(obj, dict) and isinstance(obj.get("at"), str) \
                 and isinstance(obj.get("outcome"), str):
             rows.append(obj)
-    return rows
+        else:
+            unread.append(line)
+    return rows, unread
+
+
+def parse_lines(text: str) -> List[Dict[str, Any]]:
+    """Every line that is a JSON object with an `at` and an `outcome`; anything
+    else (a torn last line, a blank) is skipped, never guessed at."""
+    return scan(text)[0]
+
+
+def _claims_an_order(line: str) -> bool:
+    """True when an unreadable line says an order was sent (or is not false)."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return bool(_ORDER_SENT_TRUE.search(line))
+    return isinstance(obj, dict) and "order_sent" in obj \
+        and obj["order_sent"] is not False
 
 
 def _epoch(stamp: str) -> Optional[float]:
@@ -71,9 +108,21 @@ def _stat(values: Sequence[float]) -> Optional[Dict[str, float]]:
 
 
 def summarise(rows: List[Dict[str, Any]], *, now: float,
-              stale_minutes: float = 150.0, last_n: int = 0) -> Dict[str, Any]:
+              stale_minutes: float = 150.0, last_n: int = 0,
+              raw_text: Optional[str] = None) -> Dict[str, Any]:
+    """`raw_text` is the file the rows came from. With it, lines that were not
+    read as cycle rows are counted and any that claim an order was sent raise the
+    alarm; without it only the rows are judged (the old call)."""
+    unread = scan(raw_text)[1] if raw_text is not None else []
+    forged = [u for u in unread if _claims_an_order(u)]
     if not rows:
-        return {"health": "NO_DATA", "exit": 2, "problems": ["no readable cycles"]}
+        if forged:
+            return {"health": "ALARM", "exit": 3, "problems": [],
+                    "alarms": [f"{len(forged)} unreadable line(s) claim an "
+                               "order was sent; no cycle row could be read"],
+                    "unreadable_lines": len(unread)}
+        return {"health": "NO_DATA", "exit": 2, "problems": ["no readable cycles"],
+                "unreadable_lines": len(unread)}
     window = rows[-last_n:] if last_n else rows
     last = rows[-1]
     problems: List[str] = []
@@ -85,6 +134,13 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
     elif age_min > stale_minutes:
         problems.append(f"STALE: the last cycle was {age_min:.0f} min ago "
                         f"(limit {stale_minutes:.0f}); the runner is down or stuck")
+    ahead = [r["at"] for r in rows
+             if (_epoch(r["at"]) or 0.0) - now > FUTURE_TOLERANCE_MINUTES * 60.0]
+    if ahead:
+        problems.append(f"FUTURE: {len(ahead)} line(s) are stamped later than "
+                        f"this machine's clock (first {ahead[0]}): a broken "
+                        "clock or a forged line, so the age of the last cycle "
+                        "cannot be trusted")
     if last["outcome"] == "MONITOR_FAILED":
         problems.append("the last cycle was MONITOR_FAILED: "
                         + "; ".join(map(str, last.get("reasons") or [])))
@@ -95,17 +151,24 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
     if sent:
         alarms.append(f"{len(sent)} line(s) do not say order_sent=false "
                       f"(first {sent[0]}): the monitor cannot send orders")
+    if forged:
+        alarms.append(f"{len(forged)} line(s) that could not be read as a cycle "
+                      "claim an order was sent (or carry order_sent other than "
+                      "false): the monitor cannot send orders")
     outcomes = Counter(r["outcome"] for r in window)
     judged = [r for r in window if r["outcome"] != "MONITOR_FAILED"]
     open_n = sum(1 for r in judged if r["outcome"] == "MONITOR_READY")
-    reasons = Counter(r.get("gate_reason") for r in judged if r.get("gate_reason")
-                      or r["outcome"] == "ENTRY_NOT_ELIGIBLE")
+    # Only a REFUSED cycle has a refusal reason. A cycle that passed carries
+    # the gate's allow code (CARRY_CLEARS_COSTS_AND_BASIS), which is not one.
+    reasons = Counter(r.get("gate_reason") or "UNRECORDED" for r in judged
+                      if r["outcome"] == "ENTRY_NOT_ELIGIBLE")
     basis = _stat([r.get("basis_bps") for r in window])
     budget = _stat([r.get("basis_budget_bps") for r in window])
     out = {
         "health": "ALARM" if alarms else "PROBLEM" if problems else "OK",
         "exit": 3 if alarms else 1 if problems else 0,
         "problems": problems, "alarms": alarms,
+        "unreadable_lines": len(unread),
         "cycles_total": len(rows), "cycles_in_window": len(window),
         "first": window[0]["at"], "last": last["at"],
         "last_cycle_age_minutes": None if age_min is None else round(age_min, 1),
@@ -124,9 +187,15 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
 def render(s: Dict[str, Any]) -> str:
     if s["health"] == "NO_DATA":
         return "NO DATA: no readable cycles in the input"
+    if "cycles_total" not in s:                    # an alarm raised with no rows
+        return "\n".join([f"HEALTH {s['health']}"]
+                          + [f"  !! {x}" for x in s["alarms"]])
     lines = [f"HEALTH {s['health']}"]
     for key in ("alarms", "problems"):
         lines += [f"  !! {x}" for x in s[key]]
+    if s.get("unreadable_lines"):
+        lines.append(f"  note: {s['unreadable_lines']} line(s) could not be read "
+                     "as a cycle row and were skipped")
     lines.append(f"cycles {s['cycles_in_window']} of {s['cycles_total']}  "
                  f"{s['first']} .. {s['last']}  (last {s['last_cycle_age_minutes']} min ago)")
     lines.append("outcomes   " + ", ".join(f"{k} x{v}" for k, v in sorted(s["outcomes"].items())))
@@ -167,7 +236,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"cannot read {args.path}: {exc}", file=sys.stderr)
         return 2
     summary = summarise(parse_lines(text), now=time.time() if args.now is None else args.now,
-                        stale_minutes=args.stale_minutes, last_n=args.last)
+                        stale_minutes=args.stale_minutes, last_n=args.last,
+                        raw_text=text)
     print(json.dumps(summary, indent=2, sort_keys=True) if args.json else render(summary))
     return int(summary["exit"])
 

@@ -133,6 +133,10 @@ class TestEveryOutcomeSaysWhatWasLearned:
         lambda r: r.update(venue="mainnet"),
         lambda r: r.update(use_testnet=False),
         lambda r: r.update(order_gate_would_allow_orders=True),
+        # the safety claim must be STATED closed: absent or null is not closed
+        lambda r: r.pop("order_gate_would_allow_orders"),
+        lambda r: r.update(order_gate_would_allow_orders=None),
+        lambda r: r.update(order_gate_would_allow_orders="no"),
         lambda r: r.update(blockers=["something"]),
         lambda r: r.pop("entry_economics"),
         lambda r: r["entry_economics"].update(state="ENTRY_ECONOMICS_MAYBE"),
@@ -522,6 +526,15 @@ class TestTheReconciliationAndDrillReaders:
                     dict(self.GOOD, carry_cycle=[{"provenance": "VENUE_RECONCILED"}]),
                     dict(self.GOOD, schema="other/1"), {}, None, [], "x"):
             assert RO.cycle_reconciled(bad) is False
+
+    def test_a_malformed_cycle_row_is_unreconciled_not_an_exception(self):
+        # "anything unreadable is False": a row that is not an object used to
+        # raise AttributeError out of unattended_drill.run_once after the venue
+        # had been flattened, so no verdict.json was written at all
+        for bad in (["x"], [None], [1, 2], ["x", {"provenance": "VENUE_RECONCILED",
+                                                  "resolved": True}],
+                    "VENUE_RECONCILED", {"provenance": "VENUE_RECONCILED"}):
+            assert RO.cycle_reconciled(dict(self.GOOD, carry_cycle=bad)) is False
 
     def test_a_stand_aside_must_be_a_failed_stage_with_the_stand_aside_action(self):
         def rep(**ev):
