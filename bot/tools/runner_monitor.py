@@ -41,7 +41,13 @@ import time
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+BOT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
+#: Launched as `python3 tools/runner_monitor.py`, sys.path[0] is tools/, so the
+#: application modules one level up (carry_shadow, the engine) are not importable
+#: unless the root is added. The first deployed cycle failed on exactly this.
+if BOT not in sys.path:
+    sys.path.insert(1, BOT)
 
 import run_outcomes as RO  # noqa: E402
 import unattended_drill as UD  # noqa: E402  (probe, child runner, lock, prune)
@@ -133,6 +139,9 @@ def _history_line(root: str, record: Dict[str, Any]) -> None:
     if isinstance(shadow, dict):
         line["shadow_state"] = shadow.get("state")
         line["shadow_decision_reason"] = shadow.get("decision_reason")
+        if shadow.get("detail"):
+            # a FAULT or REFUSED with no reason in the history is a dead end
+            line["shadow_detail"] = str(shadow["detail"])[:300]
     try:
         with open(os.path.join(root, "monitor.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, sort_keys=True, default=str) + "\n")

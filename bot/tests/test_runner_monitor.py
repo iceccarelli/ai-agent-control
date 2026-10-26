@@ -612,6 +612,20 @@ class TestShadowObservation:
         assert rec["shadow"]["state"] == state
         assert rec["outcome"] == RO.MONITOR_READY and code == 0
 
+    def test_a_fault_leaves_its_reason_in_the_history_line(self, tmp_path):
+        db = tmp_path / "b.db"
+        db.write_bytes(b"x")
+        self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")), db=str(db),
+                   stepper=self.fake_step(exc=RuntimeError("database is locked")))
+        line = json.loads(open(tmp_path / "monitor.jsonl").read().splitlines()[-1])
+        assert line["shadow_state"] == "FAULT"
+        assert "database is locked" in line["shadow_detail"]
+        long = self.fake_step(exc=RuntimeError("x" * 5000))
+        self.cycle(tmp_path, FakeRunner(RF.preflight_report("PASS")), db=str(db),
+                   stepper=long)
+        line = json.loads(open(tmp_path / "monitor.jsonl").read().splitlines()[-1])
+        assert len(line["shadow_detail"]) <= 300
+
     def test_a_shadow_refusal_is_reported_with_its_code(self, tmp_path):
         import carry_shadow as cs
         db = tmp_path / "b.db"
@@ -729,3 +743,56 @@ def _Reader(venue, http_get):
 
 import carry_shadow as _cs  # noqa: E402
 _REAL_READER = _cs.PublicVenueReader
+
+
+class TestItImportsWhatItNeedsWhenLaunchedAsAScript:
+    def test_the_shadow_import_works_with_only_tools_on_the_path(self, tmp_path):
+        """`python3 tools/runner_monitor.py` puts tools/ (not the app root) on
+        sys.path. The first deployed cycle logged FAULT: No module named
+        'carry_shadow'. This reproduces that launch: cwd elsewhere, the app root
+        absent from the path, a real (non-book) file as the shadow db."""
+        import subprocess
+        junk = tmp_path / "not_a_book.db"
+        junk.write_bytes(b"not a database")
+        code = (
+            "import json, os, sys\n"
+            f"sys.path[:] = [p for p in sys.path if os.path.abspath(p or '.') != {BOT!r}]\n"
+            f"sys.path.insert(0, {os.path.join(BOT, 'tools')!r})\n"
+            "assert 'carry_shadow' not in sys.modules\n"
+            "import runner_monitor as RM\n"
+            f"print(json.dumps(RM.shadow_observation({str(junk)!r})))\n")
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PYTHONPATH"] = os.environ.get("PYTHONPATH", "")
+        done = subprocess.run([sys.executable, "-c", code], cwd=str(tmp_path),
+                              capture_output=True, text=True, timeout=120, env=env)
+        assert done.returncode == 0, done.stderr
+        out = json.loads(done.stdout.strip().splitlines()[-1])
+        assert "ModuleNotFoundError" not in out.get("detail", ""), out
+        assert out["state"] == "REFUSED", out      # reached the book check
+
+    def test_every_lazy_import_in_the_monitor_resolves_from_the_image_layout(self):
+        """The image copies the app modules to /app and the tools to /app/tools.
+        Mirror that layout and import the monitor and its lazy dependencies."""
+        import shutil
+        import subprocess
+        import tempfile
+        root = tempfile.mkdtemp()
+        try:
+            os.makedirs(os.path.join(root, "tools"))
+            for f in os.listdir(BOT):
+                if f.endswith(".py"):
+                    shutil.copy(os.path.join(BOT, f), root)
+            for f in ("runner_monitor.py", "run_outcomes.py", "carry_preflight.py",
+                      "unattended_drill.py", "next_settlement.py"):
+                shutil.copy(os.path.join(BOT, "tools", f), os.path.join(root, "tools"))
+            shutil.copytree(os.path.join(BOT, "signals"), os.path.join(root, "signals"))
+            # `-c` puts '' (the app root) first; replace it with tools/ to mimic
+            # a script launch, where the app root is NOT on the path
+            code = ("import sys\nsys.path[0:1] = ['tools']\n"
+                    "import runner_monitor, carry_shadow, carry_costs\n"
+                    "print('ok')\n")
+            done = subprocess.run([sys.executable, "-c", code], cwd=root,
+                                  capture_output=True, text=True, timeout=120)
+            assert done.returncode == 0 and "ok" in done.stdout, done.stderr
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
