@@ -127,6 +127,10 @@ jobs:
           tests/test_cancel_books_the_increment.py
           tests/test_carry_core.py
           tests/test_entry_gate_parity.py
+          tests/test_carry_backtest.py
+          tests/test_carry_walkforward.py
+          tests/test_multi_asset_carry.py
+          tests/test_fly_runtime.py
           tests/test_carry_costs.py
           tests/test_carry_risk.py
           tests/test_config.py
