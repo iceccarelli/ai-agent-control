@@ -25,6 +25,13 @@ def summarise(report: Any) -> List[str]:
         return [UNREADABLE]
 
 
+def _consistent(report: dict) -> Any:
+    """The new field, or the deprecated alias for a report written before the rename."""
+    if "records_consistent" in report:
+        return report["records_consistent"]
+    return report.get("pnl_claim_allowed")
+
+
 def _summarise(report: dict) -> List[str]:
     lines: List[str] = []
     for leg in report.get("carry_legs", []):
@@ -46,7 +53,8 @@ def _summarise(report: dict) -> List[str]:
     for f in report.get("funding", []):
         lines.append(f"funding {f.get('claim_id')}: {f.get('provenance')}"
                      f"{' ' + ','.join(f['issues']) if f.get('issues') else ''}")
-    lines.append(f"pnl_claim_allowed: {report.get('pnl_claim_allowed')}")
+    lines.append(f"records_consistent: {_consistent(report)} "
+                 "(the captured records agree; this is not profit)")
     lines.append("This says the captured testnet rows agree with the drill's "
                  "books. It is one round trip on testnet: it says nothing "
                  "about edge, and spot BTC's own price change is not included.")
