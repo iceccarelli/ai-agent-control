@@ -250,7 +250,84 @@ def _stat(values: Sequence[float]) -> Optional[Dict[str, float]]:
             "max": max(vals)}
 
 
+#: The question, the thresholds and the meaning of each answer, written on
+#: 2026-10-27 BEFORE any mainnet observation was read, and frozen: the hash is
+#: pinned by tests/test_mainnet_protocol.py. Changing a threshold after seeing the
+#: data is how a weak result becomes a strong one, and this module will not do it.
+MAINNET_PROTOCOL = {
+    "schema": "mainnet_public_protocol/1",
+    "declared": "2026-10-27, before the first mainnet observation was read",
+    "evidence_class": ORIGIN,
+    "venue": VENUE,
+    "question": ("How often would the production entry gate have been open on "
+                 "the REAL market? An opportunity count, not a P&L."),
+    "adequacy": {"min_observations": 500, "min_span_days": 30},
+    "thresholds": {"rarely_open_below": 0.05},
+    "verdicts": ["INSUFFICIENT_REAL_MARKET_SAMPLE",
+                 "EVIDENCE_UNREADABLE",
+                 "GATE_RARELY_OPEN_ON_REAL_MARKET",
+                 "GATE_OPEN_ON_REAL_MARKET_WORTH_A_FORWARD_BOOK"],
+    "meaning": {
+        "INSUFFICIENT_REAL_MARKET_SAMPLE":
+            "Not enough real-market data yet: no conclusion in either direction.",
+        "EVIDENCE_UNREADABLE":
+            "The evidence file does not verify: no conclusion about the market.",
+        "GATE_RARELY_OPEN_ON_REAL_MARKET":
+            "At this configuration the gate would almost never trade the real "
+            "market: there is nothing to tune toward, and loosening the gate to "
+            "make it open more is exactly what this protocol forbids.",
+        "GATE_OPEN_ON_REAL_MARKET_WORTH_A_FORWARD_BOOK":
+            "The gate does open on the real market. That justifies running a "
+            "real-market forward paper book under its own pre-registered "
+            "protocol. It is not an edge and not a profit claim: no fills, fees "
+            "paid, slippage or liquidation are modelled here.",
+    },
+    "never": ["a profitability claim from this evidence",
+              "a change to the gate, its constants or these thresholds after "
+              "looking at the data",
+              "selecting a window, symbol or subset after the fact",
+              "mixing in testnet observations or any other evidence class"],
+    "pnl_claim_allowed": False,
+}
+
+
+def protocol_hash() -> str:
+    return hashlib.sha256(json.dumps(MAINNET_PROTOCOL, sort_keys=True,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def protocol_verdict(rep: Dict[str, Any]) -> str:
+    """The protocol's answer for a report. Reads only the observation count, the
+    span, the chain issues and the gate-open fraction; nothing else in the report
+    (a `verdict` or `pnl_claim_allowed` field, say) can change it."""
+    if not isinstance(rep, dict):
+        return "INSUFFICIENT_REAL_MARKET_SAMPLE"
+    if rep.get("chain_issues"):
+        return "EVIDENCE_UNREADABLE"
+    adequacy = MAINNET_PROTOCOL["adequacy"]
+    n = rep.get("observations") or 0
+    days = (rep.get("span_hours") or 0.0) / 24.0
+    gate = rep.get("gate")
+    if (n < adequacy["min_observations"] or days < adequacy["min_span_days"]
+            or not isinstance(gate, dict) or "open_fraction" not in gate):
+        return "INSUFFICIENT_REAL_MARKET_SAMPLE"
+    if gate["open_fraction"] < MAINNET_PROTOCOL["thresholds"]["rarely_open_below"]:
+        return "GATE_RARELY_OPEN_ON_REAL_MARKET"
+    return "GATE_OPEN_ON_REAL_MARKET_WORTH_A_FORWARD_BOOK"
+
+
 def report(db: str) -> Dict[str, Any]:
+    out = _report(db)
+    verdict = protocol_verdict(out)
+    out["protocol"] = {"id": MAINNET_PROTOCOL["schema"], "hash": protocol_hash(),
+                       "verdict": verdict,
+                       "meaning": MAINNET_PROTOCOL["meaning"][verdict],
+                       "adequacy": MAINNET_PROTOCOL["adequacy"],
+                       "thresholds": MAINNET_PROTOCOL["thresholds"]}
+    return out
+
+
+def _report(db: str) -> Dict[str, Any]:
     rows, issues = read(db)
     out: Dict[str, Any] = {
         "origin": ORIGIN, "venue": VENUE, "observations": len(rows),
