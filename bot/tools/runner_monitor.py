@@ -37,6 +37,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
@@ -49,7 +50,8 @@ sys.path.insert(0, HERE)
 if BOT not in sys.path:
     sys.path.insert(1, BOT)
 
-import run_outcomes as RO  # noqa: E402
+import run_outcomes as RO
+import runner_alerts as RA  # noqa: E402
 import unattended_drill as UD  # noqa: E402  (probe, child runner, lock, prune)
 
 PREFLIGHT_TIMEOUT_S = 300
@@ -69,6 +71,7 @@ MONITOR_ENV = {
 def monitor_env(base: Mapping[str, str], run_dir: str) -> Dict[str, str]:
     env = dict(base)
     env.pop("LIVE_TRADING_ACK", None)
+    env.pop(RA.ENV_VAR, None)          # the Slack webhook is the parent's, not the child's
     env.update(MONITOR_ENV)
     env["STATE_DB_PATH"] = os.path.join(run_dir, "no_running_book.db")
     return env
@@ -228,26 +231,99 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
                   else EXIT_OK)
 
 
+#: A cycle interval above this makes the 150-minute stale and hung limits fire
+#: on a healthy runner.
+MAX_INTERVAL_MINUTES = 120.0
+
+
+class _Alerts:
+    """Slack alerts around the loop. Everything here is contained: it cannot
+    change a cycle's outcome, the loop's exit code or any gate. A stop signal is
+    a BaseException and still passes through."""
+
+    def __init__(self, root: str, notifier: Optional[RA.Notifier],
+                 clock: Callable[[], float]) -> None:
+        self.root, self.notifier, self.clock = root, notifier, clock
+        self.throttle = RA.Throttle()
+        self.watchdog_throttle = RA.Throttle()   # its own: one shared set of
+        # 'active' keys made the watchdog's [hung] look like `stale` clearing
+        self.watchdog = RA.Watchdog(clock=clock)
+
+    def after_cycle(self) -> None:
+        try:
+            self.watchdog.beat()
+            n = self.notifier
+            if n is None or not n.enabled:
+                # Loud, every cycle: a runner that cannot page anyone must say so.
+                UD._say(self.root, "ALERTS DISABLED: "
+                        + (n.disabled_reason if n is not None else
+                           f"no notifier configured ({RA.ENV_VAR} unread)")
+                        + "; a dead or failing runner will not page anyone")
+                return
+            try:
+                with open(os.path.join(self.root, "monitor.jsonl"),
+                          encoding="utf-8", errors="replace") as fh:
+                    raw = fh.read()
+            except OSError:
+                raw = ""
+            now = self.clock()
+            for alert in self.throttle.plan(RA.evaluate(raw, now), now):
+                UD._say(self.root, f"alert {alert.key} {alert.severity}: "
+                                   f"{n.send(alert)}")
+        except Exception as exc:                               # noqa: BLE001
+            UD._say(self.root, f"alert step failed ({type(exc).__name__}); "
+                               "the monitor is unaffected")
+
+    def start_watchdog(self) -> Callable[[], None]:
+        """A thread that reports a loop stuck INSIDE a cycle. Returns its stop."""
+        n = self.notifier
+        if n is None or not n.enabled:
+            return lambda: None
+        stop = threading.Event()
+
+        def run() -> None:
+            while not stop.wait(RA.WATCHDOG_POLL_S):
+                try:
+                    hung = self.watchdog.tick()
+                    if hung is not None:
+                        for a in self.watchdog_throttle.plan([hung], self.clock()):
+                            UD._say(self.root, f"alert {a.key} {a.severity}: {n.send(a)}")
+                except Exception as exc:                       # noqa: BLE001
+                    UD._say(self.root, f"watchdog failed ({type(exc).__name__})")
+
+        t = threading.Thread(target=run, name="alert-watchdog", daemon=True)
+        t.start()
+        return stop.set
+
+
 def loop(root: str, *, env: Mapping[str, str], interval_s: float,
          max_runs: int = 0, clock: Callable[[], float] = time.time,
          sleep: Callable[[float], None] = time.sleep,
          once: Callable[..., int] = monitor_once,
-         shadow_db: Optional[str] = None) -> int:
+         shadow_db: Optional[str] = None,
+         notifier: Optional[RA.Notifier] = None) -> int:
     """A stop signal ends the loop with 143 wherever it lands, including the
     sleep between cycles where it spends nearly all its time: under the Fly
     on-failure restart policy a deploy or stop must not look like a failure."""
+    alerts = _Alerts(root, notifier, clock)
+    stop_watchdog = alerts.start_watchdog()
     try:
         return _loop(root, env=env, interval_s=interval_s, max_runs=max_runs,
-                     clock=clock, sleep=sleep, once=once, shadow_db=shadow_db)
+                     clock=clock, sleep=sleep, once=once, shadow_db=shadow_db,
+                     alerts=alerts)
     except UD.Shutdown as exc:
         UD._say(root, f"told to stop ({exc}): monitor loop ends")
         return EXIT_SIGNALLED
+    finally:
+        stop_watchdog()
 
 
 def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
           max_runs: int, clock: Callable[[], float],
           sleep: Callable[[float], None], once: Callable[..., int],
-          shadow_db: Optional[str] = None) -> int:
+          shadow_db: Optional[str] = None,
+          alerts: Optional["_Alerts"] = None) -> int:
+    alerts = alerts or _Alerts(root, None, clock)
     runs = 0
     while True:
         if os.path.exists(os.path.join(root, "STOP")):
@@ -262,6 +338,7 @@ def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
             UD._say(root, f"told to stop ({exc}): monitor loop ends")
             return EXIT_SIGNALLED
         runs += 1
+        alerts.after_cycle()
         UD.prune_runs(root)
         if max_runs and runs >= max_runs:
             return code
@@ -297,8 +374,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # `not (x >= 1.0)`, not `x < 1.0`: NaN fails both comparisons, and a NaN
     # interval never sleeps (`waited < nan` is false), an infinite one never
     # starts a second cycle.
-    if args.max_runs < 0 or not (1.0 <= args.interval_minutes < float("inf")):
-        print("refusing: --max-runs must be >= 0 and --interval-minutes >= 1",
+    if args.max_runs < 0 or not (1.0 <= args.interval_minutes <= MAX_INTERVAL_MINUTES):
+        print("refusing: --max-runs must be >= 0 and --interval-minutes between 1 "
+              f"and {MAX_INTERVAL_MINUTES:g} (the stale and hung alerts fire at "
+              f"{RA.STALE_MINUTES:g} min)",
               file=sys.stderr)
         return EXIT_REFUSED
     UD.install_signal_handlers()
@@ -315,7 +394,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               file=sys.stderr)
         return EXIT_REFUSED
     try:
-        return loop(args.run_dir, env=os.environ,
+        notifier = RA.Notifier(os.environ,
+                               say=lambda line: UD._say(args.run_dir, line))
+        return loop(args.run_dir, env=os.environ, notifier=notifier,
                     interval_s=args.interval_minutes * 60.0,
                     max_runs=args.max_runs, shadow_db=args.shadow_db)
     finally:
