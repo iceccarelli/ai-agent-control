@@ -245,9 +245,43 @@ class _Alerts:
                  clock: Callable[[], float]) -> None:
         self.root, self.notifier, self.clock = root, notifier, clock
         self.throttle = RA.Throttle()
+        self._digest_last = clock()
         self.watchdog_throttle = RA.Throttle()   # its own: one shared set of
         # 'active' keys made the watchdog's [hung] look like `stale` clearing
         self.watchdog = RA.Watchdog(clock=clock)
+
+    def _deliver(self, throttle: "RA.Throttle", alert: "RA.Alert") -> str:
+        """Send one alert. An alert Slack did not accept stays OWED: the throttle
+        forgets it was sent, so the next cycle tries again."""
+        result = self.notifier.send(alert)
+        if result == "sent":
+            throttle.delivered(alert)
+        else:
+            throttle.unsent(alert)
+        UD._say(self.root, f"alert {alert.key} {alert.severity}: {result}")
+        return result
+
+    def announce(self) -> None:
+        """One INFO message per process start: proof the secret is wired and the
+        connection works, after every deploy, restart and crash-restart."""
+        try:
+            n = self.notifier
+            if n is None or not n.enabled:
+                UD._say(self.root, "ALERTS DISABLED: "
+                        + (n.disabled_reason if n is not None else
+                           f"no notifier configured ({RA.ENV_VAR} unread)")
+                        + "; a dead or failing runner will not page anyone")
+                return
+            result = n.send(RA.Alert(
+                "startup", RA.INFO,
+                f"alerts are ON: the monitor started. Pages: no cycle within "
+                f"{RA.STALE_MINUTES:g} min, a MONITOR_FAILED streak, a shadow "
+                "fault, any order_sent other than false. One digest a day; "
+                "silence otherwise means healthy."))
+            UD._say(self.root, f"alert startup {RA.INFO}: {result}")
+        except Exception as exc:                               # noqa: BLE001
+            UD._say(self.root, f"alert startup failed ({type(exc).__name__}); "
+                               "the monitor is unaffected")
 
     def after_cycle(self) -> None:
         try:
@@ -268,8 +302,11 @@ class _Alerts:
                 raw = ""
             now = self.clock()
             for alert in self.throttle.plan(RA.evaluate(raw, now), now):
-                UD._say(self.root, f"alert {alert.key} {alert.severity}: "
-                                   f"{n.send(alert)}")
+                self._deliver(self.throttle, alert)
+            if now - self._digest_last >= RA.DIGEST_INTERVAL_S:
+                # the clock only advances when the digest was DELIVERED
+                if self._deliver(self.throttle, RA.build_digest(raw, now)) == "sent":
+                    self._digest_last = now
         except Exception as exc:                               # noqa: BLE001
             UD._say(self.root, f"alert step failed ({type(exc).__name__}); "
                                "the monitor is unaffected")
@@ -287,7 +324,7 @@ class _Alerts:
                     hung = self.watchdog.tick()
                     if hung is not None:
                         for a in self.watchdog_throttle.plan([hung], self.clock()):
-                            UD._say(self.root, f"alert {a.key} {a.severity}: {n.send(a)}")
+                            self._deliver(self.watchdog_throttle, a)
                 except Exception as exc:                       # noqa: BLE001
                     UD._say(self.root, f"watchdog failed ({type(exc).__name__})")
 
@@ -306,6 +343,7 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
     sleep between cycles where it spends nearly all its time: under the Fly
     on-failure restart policy a deploy or stop must not look like a failure."""
     alerts = _Alerts(root, notifier, clock)
+    alerts.announce()
     stop_watchdog = alerts.start_watchdog()
     try:
         return _loop(root, env=env, interval_s=interval_s, max_runs=max_runs,

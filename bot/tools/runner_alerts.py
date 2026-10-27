@@ -67,6 +67,17 @@ WATCHDOG_POLL_S = 60.0
 CRITICAL = "CRITICAL"
 WARNING = "WARNING"
 RECOVERED = "RECOVERED"
+INFO = "INFO"
+
+#: A send is tried this many times. A timeout, a 5xx or a 429 is transient and
+#: is retried after a short wait; a rejection (the webhook is wrong, revoked or
+#: deleted) is not, and says so. The wait is short because the send runs on the
+#: monitor's own thread: 3 x TIMEOUT_S + the waits stays under 30 s.
+ATTEMPTS = 3
+RETRY_BACKOFF_S_DEFAULT = (0.5, 1.5)
+RETRY_BACKOFF_S = RETRY_BACKOFF_S_DEFAULT        # tests shorten this
+PERMANENT_STATUSES = frozenset({400, 401, 403, 404, 410})
+DIGEST_INTERVAL_S = 24 * 3600.0
 
 #: Never throttled: a line that is not order_sent=false pages every time.
 UNTHROTTLED = frozenset({"order_sent"})
@@ -151,8 +162,10 @@ def _default_transport(url: str, body: bytes, timeout: float) -> int:
 class Notifier:
     def __init__(self, env: Mapping[str, str],
                  transport: Optional[Callable[[str, bytes, float], int]] = None,
-                 say: Callable[[str], None] = print) -> None:
+                 say: Callable[[str], None] = print,
+                 sleep: Callable[[float], None] = time.sleep) -> None:
         self._say = say
+        self._sleep = sleep
         self._transport = transport or _default_transport
         raw = (env.get(ENV_VAR) or "").strip()
         self._url: Optional[str] = None
@@ -182,17 +195,27 @@ class Notifier:
         head = f"[{alert.severity}]" + (f" {self._app}" if self._app else "")
         text = slack_escape(redact(f"{head} {alert.text}", self._url))[:MAX_TEXT]
         body = json.dumps({"text": text}).encode("utf-8")
-        try:
-            status = self._transport(self._url, body, TIMEOUT_S)
-        except Exception as exc:                               # noqa: BLE001
-            self._say("alert send failed ("
-                      + redact(f"{type(exc).__name__}", self._url)
-                      + "); the monitor is unaffected")
-            return f"failed: {type(exc).__name__}"
-        if status != 200:
-            self._say(f"alert send failed (HTTP {status}); the monitor is unaffected")
-            return f"failed: HTTP {status}"
-        return "sent"
+        last = "failed"
+        for attempt in range(ATTEMPTS):
+            try:
+                status = self._transport(self._url, body, TIMEOUT_S)
+            except Exception as exc:                           # noqa: BLE001
+                last = f"failed: {type(exc).__name__}"
+            else:
+                if status == 200:
+                    return "sent"
+                last = f"failed: HTTP {status}"
+                if status in PERMANENT_STATUSES:
+                    self._say(f"alert send REJECTED by Slack (HTTP {status}): the "
+                              f"{ENV_VAR} webhook is wrong, revoked or deleted; "
+                              "create a new one and set the secret again. "
+                              "The monitor is unaffected")
+                    return last
+            if attempt + 1 < ATTEMPTS:
+                self._sleep(RETRY_BACKOFF_S[min(attempt, len(RETRY_BACKOFF_S) - 1)])
+        self._say(f"alert send failed after {ATTEMPTS} attempts ({last}); "
+                  "it will be tried again next cycle. The monitor is unaffected")
+        return last
 
 
 # -- what is worth an alert ---------------------------------------------------
@@ -243,6 +266,14 @@ def _evaluate(history_text, now, stale_minutes, failed_streak):
     return alerts, s
 
 
+def build_digest(history_text: str, now: float) -> Alert:
+    """The once-a-day heartbeat: proof the runner AND the connection are alive."""
+    rows, _ = MS.scan(history_text)
+    summary = MS.summarise(rows, now=now, raw_text=history_text)
+    body = MS.render(summary)
+    return Alert("digest", INFO, "daily digest\n" + body)
+
+
 class Throttle:
     """Don't repeat an unchanged alert inside `resend_s`, and say once when a
     condition clears. `order_sent` is never throttled."""
@@ -251,6 +282,7 @@ class Throttle:
         self._resend_s = float(resend_s)
         self._last: Dict[str, float] = {}
         self._active: Dict[str, Alert] = {}
+        self._recovering: Dict[str, Alert] = {}
         self._lock = threading.Lock()
 
     def plan(self, alerts: Sequence[Alert], now: float) -> List[Alert]:
@@ -266,9 +298,28 @@ class Throttle:
                 if key not in current:
                     out.append(Alert(f"{key}:recovered", RECOVERED,
                                      f"{key} has cleared"))
+                    self._recovering[key] = self._active[key]
                     self._last.pop(key, None)
             self._active = current
         return out
+
+    def unsent(self, alert: Alert) -> None:
+        """`alert` was planned but Slack never accepted it. Forget that it was
+        sent, so the next cycle tries again instead of waiting out the window
+        (or, for a recovery, so the recovery is still owed)."""
+        with self._lock:
+            if alert.severity == RECOVERED:
+                key = alert.key[: -len(":recovered")]
+                original = self._recovering.pop(key, None)
+                if original is not None:
+                    self._active[key] = original
+            else:
+                self._last.pop(alert.key, None)
+
+    def delivered(self, alert: Alert) -> None:
+        with self._lock:
+            if alert.severity == RECOVERED:
+                self._recovering.pop(alert.key[: -len(":recovered")], None)
 
 
 class Watchdog:
@@ -298,13 +349,29 @@ def main(argv: Optional[Sequence[str]] = None,
          env: Optional[Mapping[str, str]] = None) -> int:
     env = os.environ if env is None else env
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("history", help="monitor.jsonl, or - for stdin")
+    ap.add_argument("history", nargs="?",
+                    help="monitor.jsonl, or - for stdin (not needed with --test)")
+    ap.add_argument("--test", action="store_true",
+                    help="send ONE labelled test message and report the result; "
+                         "exit 0 sent, 1 failed or rejected, 2 no webhook set")
     ap.add_argument("--stale-minutes", type=float, default=STALE_MINUTES)
     ap.add_argument("--failed-streak", type=int, default=FAILED_STREAK)
     ap.add_argument("--now", type=float, default=None)
     ap.add_argument("--dry-run", action="store_true",
                     help="print the alerts; send nothing")
     args = ap.parse_args(argv)
+    if args.test:
+        notifier = Notifier(env, say=lambda line: print(line, file=sys.stderr))
+        if not notifier.enabled:
+            print(f"ALERTS DISABLED: {notifier.disabled_reason}", file=sys.stderr)
+            return 2
+        result = notifier.send(Alert("test", INFO,
+                                     "TEST message from tools/runner_alerts.py "
+                                     "--test: the Slack connection works"))
+        print(f"test message: {result}")
+        return 0 if result == "sent" else 1
+    if not args.history:
+        ap.error("a history file (or -) is required unless --test is given")
     try:
         raw = sys.stdin.read() if args.history == "-" else \
             open(args.history, encoding="utf-8", errors="replace").read()
