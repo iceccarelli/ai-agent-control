@@ -717,6 +717,7 @@ class CarryBroker:
         if not rows:
             raise PairIncident(f"no ticker for {symbol} on {product}")
         row = rows[0]
+        self._assert_ticker_symbol(row, symbol)
         try:
             bid = float(row["bid1Price"])
             ask = float(row["ask1Price"])
@@ -979,8 +980,16 @@ class CarryBroker:
             raise PairIncident(
                 f"no linear position row for {symbol}; margin headroom unknown")
         row = self._held_row(rows, symbol)
-        margin = float(row.get("positionIM", 0) or 0)
-        maintenance = float(row.get("positionMM", 0) or 0)
+        # Both numbers must be STATED. An absent / null / blank / NaN field is
+        # an unreadable margin call, not the 0 that `or 0` used to make of it
+        # (a NaN maintenance margin slipped past `<= 0` and became a NaN ratio).
+        margin = self._stated(row, "positionIM", f"position row for {symbol}")
+        maintenance = self._stated(row, "positionMM",
+                                   f"position row for {symbol}")
+        if margin < 0:
+            raise PairIncident(
+                f"initial margin for {symbol} is {margin}; a negative margin "
+                "is not a readable one")
         if maintenance <= 0:
             size = row.get("size", "?")
             raise PairIncident(
@@ -998,7 +1007,8 @@ class CarryBroker:
         rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol}")
-        mark = float(rows[0].get("markPrice", 0) or 0)
+        self._assert_ticker_symbol(rows[0], symbol)
+        mark = self._stated(rows[0], "markPrice", f"ticker for {symbol}")
         if not self._positive_finite(mark):
             raise PairIncident(f"mark for {symbol} is {mark!r}")
         return mark
@@ -1017,10 +1027,22 @@ class CarryBroker:
         rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no spot ticker for {symbol}")
-        price = float(rows[0].get("lastPrice", 0) or 0)
+        self._assert_ticker_symbol(rows[0], symbol)
+        price = self._stated(rows[0], "lastPrice", f"spot ticker for {symbol}")
         if not self._positive_finite(price):
             raise PairIncident(f"spot mark for {symbol} is {price!r}")
         return price
+
+    @staticmethod
+    def _assert_ticker_symbol(row: Any, symbol: str) -> None:
+        """A ticker row that names another instrument prices the wrong market.
+        A row that names none is the venue's usual silence on a filtered
+        request and is accepted; a stated mismatch is refused."""
+        named = row.get("symbol") if isinstance(row, dict) else None
+        if named is not None and str(named) != symbol:
+            raise PairIncident(
+                f"ticker row is for {named!r}, not {symbol!r}; refusing to "
+                "price one instrument from another's row")
 
     def get_funding_bps(self, symbol: str) -> float:
         """Current 8h funding on the perp, in basis points.
@@ -1039,6 +1061,7 @@ class CarryBroker:
         rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol}; funding unknown")
+        self._assert_ticker_symbol(rows[0], symbol)
         raw = rows[0].get("fundingRate")
         if raw is None:
             raise PairIncident(f"ticker for {symbol} carries no fundingRate")
@@ -1077,15 +1100,21 @@ class CarryBroker:
                          "min_qty": float(lot["minOrderQty"]),
                          "min_notional": float(lot["minOrderAmt"])}
             else:
+                # The venue's minimum order VALUE is stated on every linear
+                # instrument. Absent / null / blank is not "no minimum".
                 rules = {"qty_step": float(lot["qtyStep"]),
                          "min_qty": float(lot["minOrderQty"]),
-                         "min_notional": float(lot.get("minNotionalValue", 0)
-                                                or 0)}
+                         "min_notional": self._stated(
+                             lot, "minNotionalValue",
+                             f"instrument rules for {symbol}")}
         except (KeyError, TypeError, ValueError) as exc:
             raise PairIncident(
                 f"instrument rules for {symbol}/{product} are malformed: "
                 f"{lot!r}") from exc
-        if rules["qty_step"] <= 0 or rules["min_qty"] <= 0:
+        # NaN compares False with everything, so `<= 0` alone lets it through.
+        if not all(math.isfinite(v) for v in rules.values()) \
+                or rules["qty_step"] <= 0 or rules["min_qty"] <= 0 \
+                or rules["min_notional"] < 0:
             raise PairIncident(
                 f"instrument rules for {symbol}/{product} are unusable: {rules}")
         self._lot_rules[key] = dict(rules)
@@ -1148,11 +1177,14 @@ class CarryBroker:
                 continue
             balance = self._stated(entry, "walletBalance",
                                    f"wallet row for {coin}")
-            try:
-                locked = float(entry.get("locked", 0) or 0)
-            except (TypeError, ValueError) as exc:
+            # `locked` is what is committed to open orders and is not the
+            # book's to hedge. Unstated is not 0: that would overstate the
+            # inventory the hedge is sized from.
+            locked = self._stated(entry, "locked", f"wallet row for {coin}")
+            if locked < 0:
                 raise PairIncident(
-                    f"wallet row for {coin} is malformed: {entry!r}") from exc
+                    f"wallet row for {coin} locks {locked}; a negative lock "
+                    "is not a readable one")
             free = balance - locked
             if not math.isfinite(free):
                 raise PairIncident(f"inventory for {coin} is {free!r}")
@@ -1289,13 +1321,27 @@ class CarryBroker:
         # `not rows` branch above; this just catches the other way Bybit
         # spells "nothing is open".
         if size <= 0:
+            if not math.isfinite(mark):
+                mark = 0.0      # a flat row's mark is informational only
             return {"size": 0.0, "side": "", "mark": mark, "liq_price": None,
                     "distance_pct": None, "account_mm_rate": account_mm,
                     "margin_mode": margin_mode,
                     "reason": "NO_POSITION"}
 
+        if not self._positive_finite(mark):
+            raise PairIncident(
+                f"position row for {symbol} holds {size:.10g} with mark "
+                f"{mark!r}; a held position with no usable mark cannot be "
+                "judged unreachable")
+        # Only the venue's own empty string means "no reachable liquidation
+        # price". A key that is absent or null is a row that did not state it
+        # (truncated, renamed, partial): unreadable, never the safest state.
         raw_liq = row.get("liqPrice")
-        if raw_liq is None or str(raw_liq).strip() == "":
+        if raw_liq is None:
+            raise PairIncident(
+                f"position row for {symbol} does not state 'liqPrice': "
+                f"{row!r}; only an empty string means unreachable")
+        if str(raw_liq).strip() == "":
             return {"size": size, "side": side, "mark": mark,
                     "liq_price": None, "distance_pct": None,
                     "account_mm_rate": account_mm,
@@ -1826,9 +1872,19 @@ class CarryBroker:
             if not rows:
                 return 0.0
             coins = rows[0].get("coin") or []
-            return (self._stated(coins[0], "walletBalance",
-                                 f"wallet row for {symbol[:-4]}")
-                    if coins else 0.0)
+            if not coins:
+                return 0.0
+            # The request is filtered by coin, but a reply that lists another
+            # asset first must not be read as this one's balance.
+            mine = [c for c in coins if isinstance(c, dict)
+                    and str(c.get("coin", "")).upper() == symbol[:-4].upper()]
+            if len(mine) != 1:
+                raise PairIncident(
+                    f"wallet reply holds {len(mine)} rows for "
+                    f"{symbol[:-4]} among {len(coins)}; the balance is "
+                    "not readable")
+            return self._stated(mine[0], "walletBalance",
+                                f"wallet row for {symbol[:-4]}")
         result = self.client._request(
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})

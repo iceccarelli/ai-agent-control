@@ -130,6 +130,9 @@ jobs:
           tests/test_monitor_summary.py
           tests/test_monitor_fail_closed.py
           tests/test_liquidation_gate_fail_closed.py
+          tests/test_liquidation_view_absent_fields.py
+          tests/test_broker_unstated_fields_fail_closed.py
+          tests/test_snapshot_nonfinite_fail_closed.py
           tests/test_monitor_cycle_fail_closed.py
           tests/test_carry_risk_boundaries.py
           tests/test_carry_engine_boundaries.py
