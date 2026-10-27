@@ -393,8 +393,13 @@ class TestTheMonitorCannotTrade:
                 names.update(a.name.split(".")[0] for a in n.names)
             elif isinstance(n, ast.ImportFrom) and n.module:
                 names.add(n.module.split(".")[0])
+        # `threading` and `runner_alerts` are DELIBERATELY allowed (Slack alerts:
+        # a watchdog thread and a notifier that reads history and POSTs to a
+        # Slack webhook; tests/test_runner_alerts.py pins that runner_alerts has
+        # no order-capable import and no exchange credential).
         assert names <= {"argparse", "json", "os", "sys", "time", "typing",
-                         "__future__", "run_outcomes", "unattended_drill",
+                         "threading", "__future__", "run_outcomes",
+                         "runner_alerts", "unattended_drill",
                          "carry_shadow"}   # lazy: public-data shadow book, no client
 
     def test_a_full_preflight_flow_sends_no_non_get_request(self):
@@ -807,7 +812,8 @@ class TestItImportsWhatItNeedsWhenLaunchedAsAScript:
                 if f.endswith(".py"):
                     shutil.copy(os.path.join(BOT, f), root)
             for f in ("runner_monitor.py", "run_outcomes.py", "carry_preflight.py",
-                      "unattended_drill.py", "next_settlement.py"):
+                      "unattended_drill.py", "next_settlement.py",
+                      "runner_alerts.py", "monitor_summary.py"):
                 shutil.copy(os.path.join(BOT, "tools", f), os.path.join(root, "tools"))
             shutil.copytree(os.path.join(BOT, "signals"), os.path.join(root, "signals"))
             # `-c` puts '' (the app root) first; replace it with tools/ to mimic

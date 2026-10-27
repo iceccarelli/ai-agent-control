@@ -14,7 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 ENTRY = ["runner_monitor", "run_outcomes", "carry_preflight", "unattended_drill",
          "next_settlement", "recon_summary", "drill", "close_testnet_short",
-         "drill_final_state", "evidence_reconcile"]
+         "drill_final_state", "evidence_reconcile", "runner_alerts"]
 
 
 def _read(name):

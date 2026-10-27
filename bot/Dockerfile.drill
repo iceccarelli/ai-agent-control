@@ -24,6 +24,7 @@ COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/unattended_drill.py tools/next_settlement.py tools/recon_summary.py \
      tools/drill.py tools/close_testnet_short.py tools/drill_final_state.py \
      tools/evidence_reconcile.py tools/venue_evidence.py tools/provenance.py \
+     tools/runner_alerts.py tools/monitor_summary.py \
      ./tools/
 COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
