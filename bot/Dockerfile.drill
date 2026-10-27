@@ -24,7 +24,7 @@ COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/unattended_drill.py tools/next_settlement.py tools/recon_summary.py \
      tools/drill.py tools/close_testnet_short.py tools/drill_final_state.py \
      tools/evidence_reconcile.py tools/venue_evidence.py tools/provenance.py \
-     tools/runner_alerts.py tools/monitor_summary.py \
+     tools/runner_alerts.py tools/monitor_summary.py tools/mainnet_public.py \
      ./tools/
 COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
@@ -43,4 +43,4 @@ ENTRYPOINT ["/usr/local/bin/drill-entrypoint"]
 # (tools/unattended_drill.py --conformance) ships in the image but is never the
 # default; it must be invoked explicitly, e.g. `fly machine run ... -- python3
 # tools/unattended_drill.py --conformance --loop --run-dir /data/runs`.
-CMD ["python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor", "--shadow-db", "/data/shadow/post_gate_v1.db"]
+CMD ["python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor", "--shadow-db", "/data/shadow/post_gate_v1.db", "--mainnet-db", "/data/mainnet/mainnet_public.jsonl"]

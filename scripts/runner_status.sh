@@ -52,5 +52,27 @@ print("  simulated entries %s, closed trades %s; verdict %s" % (
 print("  pnl_claim_allowed: %s (the net is a partial model, never account P&L)" % s["pnl_claim_allowed"])
 '
 echo
+echo "== mainnet public evidence (the real market; observations, not profit)"
+mrep="$($FLY ssh console -a "$APP" -C "setpriv --reuid=bot --regid=bot --init-groups python3 tools/mainnet_public.py report --db /data/mainnet/mainnet_public.jsonl" 2>/dev/null)"
+printf '%s\n' "$mrep" | $PY -c '
+import json, sys
+try:
+    r = json.loads(sys.stdin.read())
+except ValueError:
+    print("  mainnet report unavailable (the runner has no mainnet file yet, or it is down)")
+    sys.exit(0)
+if r.get("chain_issues"):
+    print("  !! the evidence file chain is broken: %s" % r["chain_issues"]); sys.exit(0)
+n = r.get("observations", 0)
+if not n:
+    print("  no observations yet"); sys.exit(0)
+b, g = r["basis_bps"], r["gate"]
+print("  observations %s over %s hours" % (n, r["span_hours"]))
+print("  basis bps min %+.0f median %+.0f max %+.0f" % (b["min"], b["median"], b["max"]))
+print("  entry gate open on %s of %s observations (%.0f%%); refusals %s" % (
+    g["allowed"], n, 100 * g["open_fraction"], g["refusals"] or "none"))
+print("  pnl_claim_allowed: %s (no fills, fees, slippage or liquidation are modelled)" % r["pnl_claim_allowed"])
+'
+echo
 [ "$rc" = 0 ] && echo "STATUS OK" || echo "STATUS NOT OK (exit $rc): read the lines marked !! or FAIL"
 exit "$rc"

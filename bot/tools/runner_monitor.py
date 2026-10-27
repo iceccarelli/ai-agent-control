@@ -115,6 +115,33 @@ def shadow_observation(db: Optional[str],
                 "code": code, "detail": f"{type(exc).__name__}: {exc}"}
 
 
+def mainnet_observation(db: Optional[str],
+                        observer: Optional[Callable[[], Dict[str, Any]]] = None
+                        ) -> Optional[Dict[str, Any]]:
+    """One observation of Bybit's PUBLIC MAINNET market, or None when none is
+    configured (`tools/mainnet_public.py`: unauthenticated GETs on three
+    market-data paths, its own append-only evidence file, never the testnet one).
+
+    OBSERVATION COLLECTION, reported next to the cycle outcome and never folded
+    into it: a refused, geo-blocked or broken read cannot fail a good cycle, and
+    a good one proves nothing about the monitor. It never raises an Exception.
+    """
+    if not db:
+        return None
+    try:
+        import mainnet_public as MPUB
+        if observer is None:
+            observer = MPUB.MainnetPublicReader().observe
+        row = MPUB.append(db, observer())
+        o = row["obs"]
+        return {"state": "RECORDED", "db": db, "seq": row["seq"],
+                "basis_bps": (o["perp_mark"] - o["spot_mark"]) / o["spot_mark"] * 1e4}
+    except Exception as exc:                                   # noqa: BLE001
+        refused = type(exc).__name__ == "MainnetRefusal"
+        return {"state": "REFUSED" if refused else "FAULT", "db": db,
+                "detail": f"{type(exc).__name__}: {exc}"[:300]}
+
+
 def _write_json(path: str, obj: Any) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -141,6 +168,13 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
         "basis_bps": decision.get("basis_bps"),
         "basis_budget_bps": decision.get("basis_budget_bps"),
     }
+    mainnet = record.get("mainnet")
+    if isinstance(mainnet, dict):
+        line["mainnet_state"] = mainnet.get("state")
+        if isinstance(mainnet.get("basis_bps"), (int, float)):
+            line["mainnet_basis_bps"] = mainnet["basis_bps"]
+        if mainnet.get("detail"):
+            line["mainnet_detail"] = str(mainnet["detail"])[:300]
     shadow = record.get("shadow")
     if isinstance(shadow, dict):
         line["shadow_state"] = shadow.get("state")
@@ -162,7 +196,9 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
                  sleep: Callable[[float], None] = time.sleep,
                  history_root: Optional[str] = None,
                  shadow_db: Optional[str] = None,
-                 shadow_stepper: Optional[Callable[..., Dict[str, Any]]] = None
+                 shadow_stepper: Optional[Callable[..., Dict[str, Any]]] = None,
+                 mainnet_db: Optional[str] = None,
+                 mainnet_observer: Optional[Callable[[], Dict[str, Any]]] = None
                  ) -> int:
     """One read-only cycle. Returns the exit code; writes `monitor.json`.
 
@@ -171,8 +207,14 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
     os.makedirs(run_dir, exist_ok=True)
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+    # Taken first and recorded whatever else happens: a day on which testnet is
+    # unreachable is still a day on which the real market had a basis.
+    mainnet = mainnet_observation(mainnet_db, mainnet_observer)
+
     def finish(result: Dict[str, Any], code: int) -> int:
         record = {"at": stamp, "schema": "monitor/1", **result}
+        if mainnet is not None:
+            record["mainnet"] = mainnet
         _write_json(os.path.join(run_dir, "monitor.json"), record)
         if not _history_line(history_root or run_dir, record):
             # The history is the operator's only view of the runner; a lost line
@@ -338,7 +380,8 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
          sleep: Callable[[float], None] = time.sleep,
          once: Callable[..., int] = monitor_once,
          shadow_db: Optional[str] = None,
-         notifier: Optional[RA.Notifier] = None) -> int:
+         notifier: Optional[RA.Notifier] = None,
+         mainnet_db: Optional[str] = None) -> int:
     """A stop signal ends the loop with 143 wherever it lands, including the
     sleep between cycles where it spends nearly all its time: under the Fly
     on-failure restart policy a deploy or stop must not look like a failure."""
@@ -348,7 +391,7 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
     try:
         return _loop(root, env=env, interval_s=interval_s, max_runs=max_runs,
                      clock=clock, sleep=sleep, once=once, shadow_db=shadow_db,
-                     alerts=alerts)
+                     alerts=alerts, mainnet_db=mainnet_db)
     except UD.Shutdown as exc:
         UD._say(root, f"told to stop ({exc}): monitor loop ends")
         return EXIT_SIGNALLED
@@ -360,7 +403,8 @@ def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
           max_runs: int, clock: Callable[[], float],
           sleep: Callable[[float], None], once: Callable[..., int],
           shadow_db: Optional[str] = None,
-          alerts: Optional["_Alerts"] = None) -> int:
+          alerts: Optional["_Alerts"] = None,
+          mainnet_db: Optional[str] = None) -> int:
     alerts = alerts or _Alerts(root, None, clock)
     runs = 0
     while True:
@@ -370,6 +414,8 @@ def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(clock()))
         try:
             extra = {"shadow_db": shadow_db} if shadow_db else {}
+            if mainnet_db:
+                extra["mainnet_db"] = mainnet_db
             code = once(os.path.join(root, f"run-{stamp}"), env=env,
                         history_root=root, **extra)
         except UD.Shutdown as exc:
@@ -403,6 +449,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="also feed one PUBLIC observation per cycle to this "
                          "post-gate forward shadow book (created beforehand with "
                          "carry_shadow.py forward-init; never created here)")
+    ap.add_argument("--mainnet-db", default=None,
+                    help="also append one observation per cycle of Bybit's PUBLIC "
+                         "MAINNET market (unauthenticated GETs, read-only) to this "
+                         "JSONL evidence file; never the testnet shadow book")
     args = ap.parse_args(argv)
     missing = [k for k in UD.CREDENTIALS if not os.environ.get(k)]
     if missing:
@@ -431,12 +481,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("refusing: another loop is running on this run root",
               file=sys.stderr)
         return EXIT_REFUSED
+    if args.mainnet_db and (
+            args.mainnet_db == args.shadow_db
+            or args.mainnet_db.lower().endswith((".db", ".sqlite", ".sqlite3"))):
+        print("refusing: --mainnet-db is its own JSONL evidence file, never the "
+              "shadow book or a SQLite database", file=sys.stderr)
+        return EXIT_REFUSED
     try:
         notifier = RA.Notifier(os.environ,
                                say=lambda line: UD._say(args.run_dir, line))
         return loop(args.run_dir, env=os.environ, notifier=notifier,
                     interval_s=args.interval_minutes * 60.0,
-                    max_runs=args.max_runs, shadow_db=args.shadow_db)
+                    max_runs=args.max_runs, shadow_db=args.shadow_db,
+                    mainnet_db=args.mainnet_db)
     finally:
         lock.close()
 
