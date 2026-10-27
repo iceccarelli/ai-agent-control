@@ -72,6 +72,18 @@ print("  observations %s over %s hours" % (n, r["span_hours"]))
 print("  basis bps min %+.0f median %+.0f max %+.0f" % (b["min"], b["median"], b["max"]))
 print("  entry gate open on %s of %s observations (%.0f%%); refusals %s" % (
     g["allowed"], n, 100 * g["open_fraction"], g["refusals"] or "none"))
+sl = r.get("slippage") or {}
+if sl.get("observations_with_book"):
+    f = lambda x: "n/a" if x is None else "%.2f" % x
+    print("  measured slippage on %s public order books (impact per leg vs mid; assumed %.1f bps per leg):" % (
+        sl["observations_with_book"], sl["assumed_bps_per_leg"]))
+    for k, legs in sorted(sl["per_leg"].items(), key=lambda kv: int(kv[0])):
+        ps, sb = legs.get("linear_sell") or {}, legs.get("spot_buy") or {}
+        rt = (sl["round_trip_bps"].get(k) or {})
+        print("    $%s order: perp sell median %s p95 %s | spot buy median %s p95 %s | round trip median %s bps" % (
+            k, f(ps.get("median")), f(ps.get("p95")), f(sb.get("median")), f(sb.get("p95")), f(rt.get("median"))))
+    print("    %.0f%% of legs at $%s cost more than assumed; a measurement of one assumption, not a verdict" % (
+        100 * sl["share_of_legs_above_assumption"], sl["largest_declared_notional_usd"]))
 print("  protocol verdict: %s" % pr.get("verdict", "?"))
 print("    %s" % pr.get("meaning", ""))
 print("    needs %s observations over %s days before any verdict but INSUFFICIENT (declared 2026-10-27, frozen)" % (
