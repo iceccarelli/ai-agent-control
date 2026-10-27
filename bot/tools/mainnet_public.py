@@ -57,7 +57,16 @@ HOST = "api.bybit.com"
 BASE = f"https://{HOST}"
 SYMBOL = "BTCUSDT"
 #: Public market-data paths, and nothing else, that this module may touch.
-PUBLIC_PATHS = ("/v5/market/time", "/v5/market/tickers", "/v5/market/funding/history")
+PUBLIC_PATHS = ("/v5/market/time", "/v5/market/tickers", "/v5/market/funding/history",
+                "/v5/market/orderbook")
+
+#: What a market order costs, MEASURED from the public order book instead of
+#: assumed. The cost model charges ASSUMED_IMPACT_BPS_PER_LEG per leg ("declared
+#: before the run, not measured": carry_backtest.IMPACT_FLOOR_BPS_PER_LEG, which a
+#: test pins this to). The sizes are declared here, before any book was read.
+BOOK_LEVELS = 50
+BOOK_NOTIONALS_USD = (10_000, 100_000)
+ASSUMED_IMPACT_BPS_PER_LEG = 1.0
 
 #: What the gate is replayed with: the monitor's own overlay settings.
 GATE_ROUND_TRIP_BPS = 11.0
@@ -114,6 +123,69 @@ def default_get(url: str, params: Dict[str, Any], timeout: float) -> _Resp:
         return _Resp({}, int(exc.code))
 
 
+def _levels(raw: Any, descending: bool) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    try:
+        for price, size in raw:
+            p, q = float(price), float(size)
+            if not (math.isfinite(p) and math.isfinite(q) and p > 0 and q > 0):
+                raise ValueError
+            out.append((p, q))
+    except (TypeError, ValueError):
+        raise MainnetRefusal("an order-book level is not a positive finite "
+                             "[price, size] pair")
+    if not out:
+        raise MainnetRefusal("an order-book side is empty")
+    return sorted(out, key=lambda lv: lv[0], reverse=descending)
+
+
+def walk_impact_bps(levels: Sequence[Tuple[float, float]], mid: float,
+                    notional: float, side: str) -> Optional[float]:
+    """The cost, in bps of `mid`, of a MARKET order of `notional` USD walking
+    `levels` (best first): the volume-weighted fill price against the mid. None
+    when the order cannot be priced (no mid, a nonsense size, the book is too thin
+    to fill it): never a guess."""
+    if side not in ("buy", "sell"):
+        raise ValueError(f"side must be buy or sell, not {side!r}")
+    if not (isinstance(mid, (int, float)) and math.isfinite(mid) and mid > 0):
+        return None
+    if not (isinstance(notional, (int, float)) and math.isfinite(notional)
+            and notional > 0) or not levels:
+        return None
+    remaining, spent, qty = float(notional), 0.0, 0.0
+    for price, size in levels:
+        take = min(remaining, price * size)
+        spent += take
+        qty += take / price
+        remaining -= take
+        if remaining <= 1e-9:
+            break
+    if remaining > 1e-6 or qty <= 0:
+        return None
+    vwap = spent / qty
+    return ((vwap - mid) if side == "buy" else (mid - vwap)) / mid * 1e4
+
+
+def book_snapshot(raw: Dict[str, Any],
+                  notionals: Sequence[float] = BOOK_NOTIONALS_USD) -> Dict[str, Any]:
+    """The top of one public order book and what a market order of each declared
+    size would cost against it. A broken or crossed book is refused."""
+    if not isinstance(raw, dict):
+        raise MainnetRefusal("the order book is not an object")
+    bids = _levels(raw.get("b"), descending=True)
+    asks = _levels(raw.get("a"), descending=False)
+    best_bid, best_ask = bids[0][0], asks[0][0]
+    if best_bid >= best_ask:
+        raise MainnetRefusal("the order book is crossed")
+    mid = (best_bid + best_ask) / 2.0
+    return {"best_bid": best_bid, "best_ask": best_ask, "mid": mid,
+            "spread_bps": (best_ask - best_bid) / mid * 1e4,
+            "levels": {"bids": len(bids), "asks": len(asks)},
+            "impact_bps": {str(int(n)): {
+                "buy": walk_impact_bps(asks, mid, n, "buy"),
+                "sell": walk_impact_bps(bids, mid, n, "sell")} for n in notionals}}
+
+
 class MainnetPublicReader:
     def __init__(self, *, timeout_s: float = 10.0,
                  http_get: Optional[Callable[..., Any]] = None) -> None:
@@ -152,6 +224,14 @@ class MainnetPublicReader:
             raise MainnetRefusal("venue returned an empty market view")
         rows = sorted(((float(r["fundingRate"]) * 1e4, int(r["fundingRateTimestamp"]))
                        for r in hist), key=lambda p: p[1])
+        book: Optional[Dict[str, Any]] = None
+        book_error: Optional[str] = None
+        try:           # auxiliary: a failed book read must not cost the observation
+            book = {cat: book_snapshot(self._fetch("/v5/market/orderbook", {
+                "category": cat, "symbol": SYMBOL, "limit": BOOK_LEVELS}))
+                    for cat in ("linear", "spot")}
+        except Exception as exc:                               # noqa: BLE001
+            book, book_error = None, type(exc).__name__
         obs = {
             "origin": ORIGIN, "venue": VENUE,
             "source": f"bybit-public-rest:{BASE}",
@@ -164,7 +244,10 @@ class MainnetPublicReader:
             "venue_time_s": int(server.get("timeSecond", 0)) or None,
             "observed_at_s": time.time(), "fetch_started_s": t0,
             "settled_prints": [[bps, ms] for bps, ms in rows],
+            "book": book,
         }
+        if book_error:
+            obs["book_error"] = book_error
         for k in ("perp_mark", "spot_mark"):
             if not (math.isfinite(obs[k]) and obs[k] > 0):
                 raise MainnetRefusal(f"{k} is not a positive finite number")
@@ -327,6 +410,60 @@ def report(db: str) -> Dict[str, Any]:
     return out
 
 
+def _pct(values: Sequence[float], q: float) -> float:
+    vs = sorted(values)
+    return vs[min(len(vs) - 1, max(0, math.ceil(q * len(vs)) - 1))]
+
+
+def _impact_stats(values: Sequence[float]) -> Optional[Dict[str, float]]:
+    vals = [float(v) for v in values if isinstance(v, (int, float)) and math.isfinite(v)]
+    if not vals:
+        return None
+    return {"n": len(vals), "median": statistics.median(vals),
+            "p95": _pct(vals, 0.95), "max": max(vals)}
+
+
+SLIPPAGE_NOTE = (
+    "A measurement of one cost assumption (the per-leg impact haircut) against "
+    "the real public order book at the declared sizes: not a verdict, not profit. "
+    "Each figure is a snapshot's cost of a market order walking the book; no "
+    "fills, queue position, partial fills or latency are modelled.")
+
+
+def _slippage(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"assumed_bps_per_leg": ASSUMED_IMPACT_BPS_PER_LEG,
+                           "what_it_is": SLIPPAGE_NOTE}
+    booked = [r["obs"]["book"] for r in rows
+              if isinstance(r["obs"].get("book"), dict)
+              and {"linear", "spot"} <= set(r["obs"]["book"])]
+    out["observations_with_book"] = len(booked)
+    out["observations_without_book"] = len(rows) - len(booked)
+    if not booked:
+        return out
+    legs = {"linear_sell": ("linear", "sell"), "spot_buy": ("spot", "buy"),
+            "linear_buy": ("linear", "buy"), "spot_sell": ("spot", "sell")}
+    keys = sorted({k for b in booked for k in b["linear"]["impact_bps"]}, key=int)
+    per_leg: Dict[str, Any] = {}
+    round_trip: Dict[str, Any] = {}
+    above: Dict[str, float] = {}
+    for k in keys:
+        cols = {name: [b[cat]["impact_bps"].get(k, {}).get(side) for b in booked]
+                for name, (cat, side) in legs.items()}
+        per_leg[k] = {name: _impact_stats(v) for name, v in cols.items()}
+        flat = [x for v in cols.values() for x in v
+                if isinstance(x, (int, float)) and math.isfinite(x)]
+        above[k] = (sum(1 for x in flat if x > ASSUMED_IMPACT_BPS_PER_LEG) / len(flat)
+                    if flat else 0.0)
+        sums = [sum(cols[n][i] for n in legs) for i in range(len(booked))
+                if all(isinstance(cols[n][i], (int, float)) for n in legs)]
+        round_trip[k] = _impact_stats(sums)
+    out.update({"per_leg": per_leg, "round_trip_bps": round_trip,
+                "share_above_assumption_by_notional": above,
+                "share_of_legs_above_assumption": above[keys[-1]],
+                "largest_declared_notional_usd": int(keys[-1])})
+    return out
+
+
 def _report(db: str) -> Dict[str, Any]:
     rows, issues = read(db)
     out: Dict[str, Any] = {
@@ -357,6 +494,7 @@ def _report(db: str) -> Dict[str, Any]:
                  "refusals": dict(refusals),
                  "replayed_with": {"round_trip_bps": GATE_ROUND_TRIP_BPS,
                                    "borrow_apr": GATE_BORROW_APR}}})
+    out["slippage"] = _slippage(rows)
     return out
 
 

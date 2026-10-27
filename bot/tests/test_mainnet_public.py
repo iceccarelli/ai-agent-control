@@ -59,6 +59,11 @@ def market(perp=100_000.0, spot=100_000.0, funding_bps=1.0, rate_bps=1.0, n=8):
             return Resp({"retCode": 0, "result": {"list": [{"lastPrice": str(spot)}]}})
         if path == "/v5/market/funding/history":
             return Resp({"retCode": 0, "result": {"list": hist}})
+        if path == "/v5/market/orderbook":
+            return Resp({"retCode": 0, "result": {
+                "s": "BTCUSDT", "ts": 1700000000000,
+                "b": [[str(perp - 0.5 - i), "5"] for i in range(50)],
+                "a": [[str(perp + 0.5 + i), "5"] for i in range(50)]}})
         raise AssertionError(f"unexpected request {url} {params}")
     get.calls = []
     return get
@@ -71,8 +76,10 @@ class TestItOnlyReadsPublicMainnetMarketData:
         get = market()
         obs = MP.MainnetPublicReader(http_get=get).observe()
         paths = {u.split("api.bybit.com", 1)[1] for u, _, _ in get.calls}
+        # DELIBERATELY WIDENED from three to four: the public order book, to
+        # measure the cost model's slippage assumption (tests/test_mainnet_book.py)
         assert paths == {"/v5/market/time", "/v5/market/tickers",
-                         "/v5/market/funding/history"}
+                         "/v5/market/funding/history", "/v5/market/orderbook"}
         assert all(u.startswith("https://api.bybit.com/") for u, _, _ in get.calls)
         for _, params, _ in get.calls:                  # nothing signed, no key
             assert not {k.lower() for k in params} & {
