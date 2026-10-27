@@ -117,6 +117,7 @@ jobs:
           tests/test_mainnet_public.py
           tests/test_mainnet_collect.py
           tests/test_mainnet_protocol.py
+          tests/test_registry_search_width.py
           tests/test_records_consistent_alias.py
           tests/test_unattended_workflow.py
           tests/test_unattended_drill.py

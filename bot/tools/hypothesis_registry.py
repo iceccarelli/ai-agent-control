@@ -176,7 +176,43 @@ def summary(registry: Dict[str, Any], alpha: float = 0.05) -> Dict[str, Any]:
             + ("A single clear at this width is not evidence of edge."
                if out["family_wise_false_positive_rate"] > alpha
                else "A single clear at this width is meaningful."))
+        out.update(_search_width(registry, trials, n, alpha))
     return out
+
+
+def _search_width(registry: Dict[str, Any], trials: List[Dict[str, Any]],
+                  n: int, alpha: float) -> Dict[str, Any]:
+    """The WORKING width, when the registry states one.
+
+    `n_trials_recorded` counts a rule sweep as ONE trial, which understates the
+    search; the raw sum of the sweeps' printed counts double-counts (duplicate
+    cells, and one rule space scored in many refit windows). The registry's
+    `search_width` block states the number of DISTINCT rules the sweeps scored;
+    the working width swaps the sweeps' entries for that number and adds nothing
+    for a sweep that is not recorded. Absent the block, nothing changes.
+    """
+    block = registry.get("search_width")
+    if not isinstance(block, dict):
+        return {}
+    sweeps = set(block.get("sweep_trial_ids") or [])
+    present = sum(1 for t in trials if t.get("trial_id") in sweeps)
+    rules = int(block.get("distinct_gated_rules_scored", 0))
+    n_working = (n - present) + rules
+    fwer = ds.family_wise_false_positive_rate(n_working, alpha)
+    return {"search_width": {
+        "n_recorded": n, "n_working": n_working,
+        "distinct_gated_rules_scored": rules,
+        "family_wise_false_positive_rate_working": fwer,
+        "expected_max_sharpe_under_null_working":
+            ds.expected_max_sharpe_under_null(n_working),
+        "reading": (
+            f"{n} recorded trials count the rule sweeps as {present}. They scored "
+            f"{rules} distinct rules in-sample, so the working width is "
+            f"{n_working}: under a global null the chance that at least one "
+            f"clears a {1 - alpha:.0%} bar is {fwer:.1%}. A single in-sample "
+            "clear at this width is not evidence of edge. The effective "
+            "independent count is lower (the rules are correlated) and is not "
+            "estimated here, so read the correction at the harsh end.")}}
 
 
 def main(argv: Optional[List[str]] = None) -> int:

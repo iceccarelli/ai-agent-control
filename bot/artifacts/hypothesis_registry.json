@@ -1,6 +1,23 @@
 {
-  "git_commit": "3aadf2fa335e8932f5b6f4d5abe1faa59ead289f-dirty",
+  "git_commit": "348404ef276ff6fb5eb819a676e3e159ced93469-dirty",
   "schema": "hypothesis_registry/1",
+  "search_width": {
+    "basis": "The gated rule never reads entry_bps (it decides on the EWMA of funding, the cost of capital and the basis budget), so carry_rule_sweep@59feb30d2328's 1,440 cells are 60 distinct rules printed 24 times. carry_rule_sweep@d7d7d4141a05 (540 cells) and carry_walkforward@69b08ab2ab84 range over the same axes (hold_days x negative_exit_prints x ewma_alpha): 540 distinct rules, which the walk-forward scored in 38 refit windows, so its 20,520 is 540 x 38 SCORINGS, not 20,520 rules. Source: the 'THE DEFECT THIS ALSO FIXES' section of tools/carry_walkforward.py.",
+    "breakdown": {
+      "first_sweep_distinct_rules": 60,
+      "overlap_between_them": "not established; counted separately, which can only over-count",
+      "second_sweep_and_walkforward_rule_space": 540
+    },
+    "declared": "2026-10-27",
+    "distinct_gated_rules_scored": 600,
+    "do_not_use": "The raw sum of the three entries' printed counts (about 22,500) double counts and is not a search width: it must not be quoted as one.",
+    "still_a_floor": "Abandoned variants left no artefact, so this is still a floor on the number of distinct things tried. The rules are correlated, so the effective independent N is lower than the count; nothing here estimates that, and the correction should be read at the harsh end of the range.",
+    "sweep_trial_ids": [
+      "carry_rule_sweep@59feb30d2328",
+      "carry_rule_sweep@d7d7d4141a05",
+      "carry_walkforward@69b08ab2ab84"
+    ]
+  },
   "seed_is_a_floor_not_a_census": "Abandoned parameter grids, one-off variants and re-runs over different windows are trials too and are NOT counted here. The true search width is larger than this count, so the true multiple-testing correction is harsher than what this registry currently supports.",
   "seeded": true,
   "trials": [
@@ -260,8 +277,15 @@
       "source": "carry_costs.entry_gate (PR #124); tools/carry_hold_audit.py, tools/carry_oos_audit.py at 3aadf2f",
       "status": "measured_in_sample",
       "trial_id": "carry_entry_gate_v1@BTCUSDT"
+    },
+    {
+      "note": "Declared 2026-10-27, BEFORE the first real-market observation was read, in tools/mainnet_public.py (MAINNET_PROTOCOL): how often would the production entry gate (carry_entry_gate_v1@BTCUSDT) have been open on Bybit's real mainnet public market, with an adequacy floor of 500 observations over 30 days and a 'rarely open' threshold of 5%. An opportunity count, not a P&L: no fills, fees paid, slippage or liquidation are modelled. Not yet evaluated. It adds one question and one trial; changing its thresholds, the gate, or the window after looking at the data is forbidden by the protocol, and a changed protocol needs a NEW entry here. Not a profit claim.",
+      "protocol_sha256": "e17aae5111e381359e6909d01a1ce5795b2a4551279fbcfe2ae9dc37fc0b8891",
+      "recorded_utc": "2026-10-27T06:53:10Z",
+      "status": "protocol_declared",
+      "trial_id": "mainnet_public_protocol_v1"
     }
   ],
-  "updated_utc": "2026-10-25T18:33:17Z",
+  "updated_utc": "2026-10-27T06:53:10Z",
   "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }
