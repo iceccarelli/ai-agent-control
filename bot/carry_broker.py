@@ -978,7 +978,7 @@ class CarryBroker:
         if not rows:
             raise PairIncident(
                 f"no linear position row for {symbol}; margin headroom unknown")
-        row = rows[0]
+        row = self._held_row(rows, symbol)
         margin = float(row.get("positionIM", 0) or 0)
         maintenance = float(row.get("positionMM", 0) or 0)
         if maintenance <= 0:
@@ -1271,7 +1271,7 @@ class CarryBroker:
                     "margin_mode": margin_mode,
                     "reason": "NO_POSITION"}
 
-        row = rows[0]
+        row = self._held_row(rows, symbol)
         size = self._stated_size(row, symbol)
         try:
             mark = float(row.get("markPrice", 0) or 0)
@@ -1833,7 +1833,30 @@ class CarryBroker:
             "GET", "/v5/position/list", signed=True,
             params={"category": LINEAR, "symbol": symbol})
         rows = self._v5_list(result) or []
-        return self._stated_size(rows[0], symbol) if rows else 0.0
+        return (self._stated_size(self._held_row(rows, symbol), symbol)
+                if rows else 0.0)
+
+    def _held_row(self, rows: list, symbol: str) -> Any:
+        """The position row the book is actually holding.
+
+        One row (one-way mode): that row, as always. Several (hedge mode lists
+        a slot per direction for a symbol, flat ones included, in either
+        order): the single row that carries size. `rows[0]` used to be taken
+        blindly, so a comfortable flat slot listed first made a short 1% from
+        liquidation read as safe, and a flat slot with zero maintenance margin
+        made a readable short unreadable (a halt does not close it).
+
+        Every row must STATE its size (an unstated one is refused). None sized
+        is flat: the first row, as before. TWO OR MORE sized rows are left
+        exactly as they were, `rows[0]`: which direction each holds, and
+        whether they sum to the book, is the job of `get_perp_position` and the
+        venue-position check, which halt on a long and sum two shorts; making
+        this read refuse would change those halts' reasons.
+        """
+        if len(rows) == 1:
+            return rows[0]
+        sized = [r for r in rows if self._stated_size(r, symbol) > 0.0]
+        return sized[0] if len(sized) == 1 else rows[0]
 
     # -- Bybit v5 envelope --------------------------------------------------
     #
