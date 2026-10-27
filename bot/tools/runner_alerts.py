@@ -20,6 +20,8 @@ WHAT IT ALERTS ON
   hung          the running loop itself has finished no cycle within the limit
                 (CRITICAL; a watchdog thread inside the monitor)
   failed_streak MONITOR_FAILED on the last N cycles in a row (WARNING)
+  mainnet_stalled  the last 6 cycles that collect real-market data recorded none
+                (WARNING: the protocol's 30-day clock is not accumulating)
   shadow        the last forward-shadow step was FAULT or REFUSED (WARNING)
   no_data       the history has no readable cycle (WARNING)
 
@@ -61,6 +63,9 @@ TIMEOUT_S = 5.0
 MAX_TEXT = 1500
 STALE_MINUTES = 150.0
 FAILED_STREAK = 2
+#: Cycles in a row, among those that try to collect real-market data, with no
+#: recorded observation before the stream is called stalled.
+MAINNET_STALL_CYCLES = 6
 RESEND_S = 6 * 3600.0
 WATCHDOG_POLL_S = 60.0
 
@@ -220,6 +225,17 @@ class Notifier:
 
 # -- what is worth an alert ---------------------------------------------------
 
+def _mainnet_stall(rows: Sequence[Mapping[str, object]], n: int):
+    """The last `n` rows that carry a `mainnet_state`, when none of them recorded
+    an observation; else None. Rows without the field (a runner that does not
+    collect, or a cycle from before it did) are not counted either way."""
+    with_state = [r for r in rows if isinstance(r.get("mainnet_state"), str)]
+    tail = with_state[-n:]
+    if len(tail) == n and all(r["mainnet_state"] != "RECORDED" for r in tail):
+        return tail
+    return None
+
+
 def _failed_streak(rows: Sequence[Mapping[str, object]]) -> int:
     n = 0
     for r in reversed(rows):
@@ -263,6 +279,15 @@ def _evaluate(history_text, now, stale_minutes, failed_streak):
         why = "; ".join(map(str, rows[-1].get("reasons") or [])) or "no reason recorded"
         alerts.append(Alert("failed_streak", WARNING,
                             f"{streak} monitor cycles in a row ended MONITOR_FAILED: {why}"))
+    stalled = _mainnet_stall(rows, MAINNET_STALL_CYCLES)
+    if stalled:
+        last = stalled[-1]
+        why = str(last.get("mainnet_detail") or "no detail recorded")[:300]
+        alerts.append(Alert(
+            "mainnet_stalled", WARNING,
+            f"the last {MAINNET_STALL_CYCLES} cycles recorded no real-market "
+            f"observation (last state {last['mainnet_state']}: {why}). The "
+            "30-day protocol clock is not accumulating evidence."))
     return alerts, s
 
 
