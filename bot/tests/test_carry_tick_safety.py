@@ -310,8 +310,12 @@ class TestRestartWithAnOpenPositionThroughTheRealStartupPath:
         def wallet(method, endpoint, **kw):
             if endpoint == "/v5/account/wallet-balance":
                 from test_carry_broker import envelope
+                # Semantics deliberately changed (broker hardening): a wallet
+                # coin row must STATE `locked`, as Bybit's does; an absent one
+                # is unreadable, no longer 0.
                 return envelope({"list": [{"coin": [
-                    {"coin": "BTC", "walletBalance": str(btc)}]}]})
+                    {"coin": "BTC", "walletBalance": str(btc),
+                     "locked": "0"}]}]})
             return real(method, endpoint, **kw)
 
         venue2._request = wallet
