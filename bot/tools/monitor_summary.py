@@ -191,6 +191,9 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
         "refusal_reasons": dict(reasons),
         "shadow_states": dict(Counter(r.get("shadow_state") or "none" for r in window)),
         "basis_bps": basis, "basis_budget_bps": budget,
+        "mainnet_states": dict(Counter(r["mainnet_state"] for r in window
+                                       if r.get("mainnet_state"))),
+        "mainnet_basis_bps": _stat([r.get("mainnet_basis_bps") for r in window]),
         "smoothed_funding_bps": _stat([r.get("smoothed_funding_bps") for r in window]),
         "note": SCHEMA_NOTE,
     }
@@ -230,6 +233,11 @@ def render(s: Dict[str, Any]) -> str:
         f = s["smoothed_funding_bps"]
         lines.append(f"funding    smoothed bps/8h min {f['min']:.2f} median "
                      f"{f['median']:.2f} max {f['max']:.2f}")
+    if s.get("mainnet_states"):
+        mb = s.get("mainnet_basis_bps")
+        latest = f"  basis min {mb['min']:+.0f} median {mb['median']:+.0f} max {mb['max']:+.0f} bps" if mb else ""
+        lines.append("mainnet    " + ", ".join(f"{k} x{v}" for k, v in sorted(s["mainnet_states"].items()))
+                     + latest + "  (the real market's public numbers; observations, not profit)")
     lines.append("shadow     " + ", ".join(f"{k} x{v}" for k, v in sorted(s["shadow_states"].items())))
     lines.append(s["note"])
     return "\n".join(lines)

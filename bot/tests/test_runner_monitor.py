@@ -399,7 +399,7 @@ class TestTheMonitorCannotTrade:
         # no order-capable import and no exchange credential).
         assert names <= {"argparse", "json", "os", "sys", "time", "typing",
                          "threading", "__future__", "run_outcomes",
-                         "runner_alerts", "unattended_drill",
+                         "runner_alerts", "mainnet_public", "unattended_drill",
                          "carry_shadow"}   # lazy: public-data shadow book, no client
 
     def test_a_full_preflight_flow_sends_no_non_get_request(self):
@@ -813,7 +813,8 @@ class TestItImportsWhatItNeedsWhenLaunchedAsAScript:
                     shutil.copy(os.path.join(BOT, f), root)
             for f in ("runner_monitor.py", "run_outcomes.py", "carry_preflight.py",
                       "unattended_drill.py", "next_settlement.py",
-                      "runner_alerts.py", "monitor_summary.py"):
+                      "runner_alerts.py", "monitor_summary.py",
+                      "mainnet_public.py"):
                 shutil.copy(os.path.join(BOT, "tools", f), os.path.join(root, "tools"))
             shutil.copytree(os.path.join(BOT, "signals"), os.path.join(root, "signals"))
             # `-c` puts '' (the app root) first; replace it with tools/ to mimic
