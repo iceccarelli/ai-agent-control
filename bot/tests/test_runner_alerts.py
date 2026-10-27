@@ -49,6 +49,11 @@ def text(*rows):
     return "".join(json.dumps(r) + "\n" for r in rows)
 
 
+@pytest.fixture(autouse=True)
+def no_real_sleep(monkeypatch):
+    monkeypatch.setattr(RA, "RETRY_BACKOFF_S", (0.0, 0.0))
+
+
 class Wire:
     """An injected transport that records what would have been posted."""
 
@@ -341,7 +346,10 @@ class TestTheLoop:
         code, _ = _loop(tmp_path / "with", n, ["MONITOR_FAILED", "MONITOR_FAILED"])
         baseline, _ = _loop(tmp_path / "without", None, ["MONITOR_FAILED", "MONITOR_FAILED"])
         assert code == baseline == RM.EXIT_FAILED
-        assert len(wire.sent) == 1 and "FAILED" in wire.sent[0][1]["text"]
+        # DELIBERATELY CHANGED: the loop now also sends one INFO startup message,
+        # so the alert count excludes INFO
+        pages = [m for m in wire.sent if "[INFO]" not in m[1]["text"]]
+        assert len(pages) == 1 and "FAILED" in pages[0][1]["text"]
 
     def test_a_broken_notifier_cannot_change_the_outcome(self, tmp_path):
         n = RA.Notifier(ENV, transport=Wire(boom=RuntimeError(FAKE_URL)), say=Log())
@@ -375,7 +383,10 @@ class TestTheLoop:
         wire = Wire()
         n = RA.Notifier(ENV, transport=wire, say=Log())
         _loop(tmp_path, n, ["ENTRY_NOT_ELIGIBLE", "MONITOR_READY", "ENTRY_NOT_ELIGIBLE"])
-        assert wire.sent == []
+        # DELIBERATELY CHANGED: the loop now sends one INFO startup message
+        # ("alerts are ON"); a healthy run sends no WARNING or CRITICAL
+        assert all("[INFO]" in m[1]["text"] for m in wire.sent)
+        assert len(wire.sent) == 1
 
 
 def test_an_interval_that_would_make_a_healthy_runner_look_dead_is_refused(
