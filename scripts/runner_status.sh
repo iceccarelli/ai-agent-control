@@ -61,16 +61,21 @@ try:
 except ValueError:
     print("  mainnet report unavailable (the runner has no mainnet file yet, or it is down)")
     sys.exit(0)
+pr = r.get("protocol") or {}
 if r.get("chain_issues"):
     print("  !! the evidence file chain is broken: %s" % r["chain_issues"]); sys.exit(0)
 n = r.get("observations", 0)
 if not n:
-    print("  no observations yet"); sys.exit(0)
+    print("  no observations yet"); print("  protocol verdict: %s" % pr.get("verdict", "?")); sys.exit(0)
 b, g = r["basis_bps"], r["gate"]
 print("  observations %s over %s hours" % (n, r["span_hours"]))
 print("  basis bps min %+.0f median %+.0f max %+.0f" % (b["min"], b["median"], b["max"]))
 print("  entry gate open on %s of %s observations (%.0f%%); refusals %s" % (
     g["allowed"], n, 100 * g["open_fraction"], g["refusals"] or "none"))
+print("  protocol verdict: %s" % pr.get("verdict", "?"))
+print("    %s" % pr.get("meaning", ""))
+print("    needs %s observations over %s days before any verdict but INSUFFICIENT (declared 2026-10-27, frozen)" % (
+    (pr.get("adequacy") or {}).get("min_observations", "?"), (pr.get("adequacy") or {}).get("min_span_days", "?")))
 print("  pnl_claim_allowed: %s (no fills, fees, slippage or liquidation are modelled)" % r["pnl_claim_allowed"])
 '
 echo
