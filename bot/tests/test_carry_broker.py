@@ -99,9 +99,14 @@ class FakeClient:
             # Unified wallet rows nest per-coin balances under "coin" - see
             # BybitClient.get_wallet/get_coin_balance in bybit_connection.py,
             # which this fixture mirrors rather than inventing a shape.
+            # Semantics deliberately changed (broker hardening): a real coin
+            # row NAMES its coin and states `locked`; the broker now reads the
+            # row of the coin it asked for and refuses an unstated lock.
+            coin = (params or {}).get("coin") or "BTC"
             return envelope({"list": [
                 {"accountMMRate": self.account_mm_rate,
-                 "coin": [{"walletBalance": str(self.spot_qty)}]}]})
+                 "coin": [{"coin": coin, "walletBalance": str(self.spot_qty),
+                           "locked": "0"}]}]})
         return envelope({})
 
 

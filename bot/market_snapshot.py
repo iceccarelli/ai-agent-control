@@ -62,6 +62,16 @@ MAX_CLOCK_SKEW_S = 30.0
 FUNDING_INTERVAL_MS = 8 * 3600 * 1000
 
 
+def _finite_number(value: Any, *, minimum: float, strict: bool = False) -> bool:
+    """A real, finite number (not a bool) at or above `minimum` (above it when
+    `strict`). NaN, inf, text and None are all False."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value > minimum if strict else value >= minimum
+
+
 class StaleMarket(RuntimeError):
     """The view is too old, internally inconsistent, or unreadable."""
 
@@ -135,6 +145,18 @@ class MarketSnapshot:
                 raise StaleMarket(f"margin_multiple is {self.margin_multiple!r}")
         if not math.isfinite(self.funding_bps):
             raise StaleMarket(f"funding_bps is {self.funding_bps!r}")
+        # "Is anything open" decided margin: a NaN size compares False with
+        # every threshold and used to read as flat. Size is a finite, unsigned
+        # quantity or the view is unreadable.
+        if self.perp_held is not None and not _finite_number(
+                self.perp_held, minimum=0.0):
+            raise StaleMarket(f"perp_held is {self.perp_held!r}")
+        # A venue clock that is present but not a time is not "unchecked": NaN
+        # makes the skew comparison False and the gate would pass silently.
+        # (An ABSENT clock is the recorded, deliberate "not checked".)
+        if self.venue_time_s is not None and not _finite_number(
+                self.venue_time_s, minimum=0.0, strict=True):
+            raise StaleMarket(f"venue_time_s is {self.venue_time_s!r}")
 
         age = self.age_s
         if age > max_age_s:
@@ -200,6 +222,10 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     # a position exists, so an unreadable margin on a live position still
     # propagates exactly as before.
     held = abs(float(broker.get_perp_position(perp_symbol)))
+    if not math.isfinite(held):
+        # Raised here as well as in assert_fresh: `held > 0` below would
+        # otherwise read NaN as flat and skip the margin read on a live book.
+        raise StaleMarket(f"perp position for {perp_symbol} is {held!r}")
     margin = float(broker.get_margin_multiple(perp_symbol)) if held > 0 else None
 
     venue_time = None
