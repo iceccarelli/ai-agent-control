@@ -398,7 +398,7 @@ class TestTheMonitorCannotTrade:
         # Slack webhook; tests/test_runner_alerts.py pins that runner_alerts has
         # no order-capable import and no exchange credential).
         assert names <= {"argparse", "json", "os", "sys", "time", "typing",
-                         "threading", "__future__", "run_outcomes",
+                         "threading", "traceback", "__future__", "run_outcomes",
                          "runner_alerts", "mainnet_public", "unattended_drill",
                          "carry_shadow"}   # lazy: public-data shadow book, no client
 

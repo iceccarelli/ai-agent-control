@@ -39,6 +39,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -399,6 +400,31 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
         stop_watchdog()
 
 
+def _record_crash(root: str, exc: BaseException,
+                  clock: Callable[[], float]) -> int:
+    """A cycle raised something unexpected. Say so in the history and the log and
+    return the failing exit code; the loop goes on to its next cycle.
+
+    Only the exception TYPE and where it was raised are recorded, never its text:
+    an exception message can carry whatever the failing call was handling. The
+    history line is a MONITOR_FAILED, so the existing failed-streak alert pages on
+    two in a row, and `order_sent` is False, as it always is for this monitor.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    where = (f"{os.path.basename(frames[-1].filename)}:{frames[-1].lineno}"
+             if frames else "unknown")
+    kind = type(exc).__name__
+    UD._say(root, f"cycle crashed ({kind}) at {where}; recorded as MONITOR_FAILED, "
+                  "the loop continues")
+    record = {"at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock())),
+              "outcome": RO.MONITOR_FAILED, "order_sent": False,
+              "reasons": [f"the monitor cycle crashed: {kind} ({where})"]}
+    if not _history_line(root, record):
+        UD._say(root, "WARNING: the monitor.jsonl history line could not be "
+                      "written for this crashed cycle")
+    return EXIT_FAILED
+
+
 def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
           max_runs: int, clock: Callable[[], float],
           sleep: Callable[[float], None], once: Callable[..., int],
@@ -421,9 +447,14 @@ def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
         except UD.Shutdown as exc:
             UD._say(root, f"told to stop ({exc}): monitor loop ends")
             return EXIT_SIGNALLED
+        except Exception as exc:                               # noqa: BLE001
+            code = _record_crash(root, exc, clock)
         runs += 1
         alerts.after_cycle()
-        UD.prune_runs(root)
+        try:
+            UD.prune_runs(root)
+        except Exception as exc:                               # noqa: BLE001
+            UD._say(root, f"prune failed ({type(exc).__name__}); the loop continues")
         if max_runs and runs >= max_runs:
             return code
         waited = 0.0
