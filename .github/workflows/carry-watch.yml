@@ -1,0 +1,55 @@
+# EXTERNAL WATCHER for the read-only runner on Fly (app carry-drill).
+#
+# WHY: the runner pages Slack itself, but a dead machine cannot report its own
+# death. This job runs on GitHub's machines, reads the runner's monitor history
+# over `fly ssh`, and runs the same alert rules (tools/runner_alerts.py). A
+# machine that is down or silent gives no history, which is itself an alert.
+#
+# WHAT IT CANNOT DO: collect market data (Bybit's CloudFront blocks GitHub-
+# hosted runners, see carry-drill-testnet.yml, and the real-market evidence is
+# one hash-chained file on the Fly volume), place an order, or change the app.
+# It only reads one file. No venue key is ever present; LIVE_TRADING_ACK is
+# never set.
+#
+# OFF BY DEFAULT: runs only when the repository VARIABLE CARRY_WATCH_ENABLED is
+# "true", from main, in this repository. Two repository SECRETS are needed:
+#   FLY_API_TOKEN     fly tokens create deploy -a carry-drill -x 720h
+#                     (expires in 30 days; renew it, a dead token alerts too)
+#   SLACK_WEBHOOK_URL the same incoming webhook the runner uses
+# A red run means there is something to look at: the job fails when an alert
+# fires, and the alert is posted to Slack.
+name: carry-watch
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: carry-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    name: external watcher (read-only)
+    if: ${{ github.repository == 'iceccarelli/ai-agent-control' && github.ref == 'refs/heads/main' && vars.CARRY_WATCH_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: read the runner history (read-only)
+        run: |
+          flyctl ssh console -a carry-drill -C "cat /data/monitor/monitor.jsonl" > history.jsonl 2> fly.err || echo "history unreadable (fly exit $?)"
+          wc -c < history.jsonl
+      - name: run the alert rules
+        run: python bot/tools/runner_alerts.py history.jsonl
