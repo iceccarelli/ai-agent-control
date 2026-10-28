@@ -48,33 +48,38 @@ def report(tmp_path, *observations):
 
 
 class TestTheCount:
-    def test_repeated_observations_of_one_settlement_count_once_per_print(self, tmp_path):
+    def test_repeated_observations_of_one_print_count_once(self, tmp_path):
         o = base_obs()
         r = report(tmp_path, o, copy.deepcopy(o), copy.deepcopy(o))
         assert r["observations"] == 3
-        assert r["distinct_funding_settlements"] == len({ms for _, ms in o["settled_prints"]})
+        assert r["distinct_latest_funding_prints"] == 1
+
+    def test_past_prints_an_observation_carries_as_history_are_not_counted(self, tmp_path):
+        o = base_obs()
+        assert len(o["settled_prints"]) > 1
+        assert report(tmp_path, o)["distinct_latest_funding_prints"] == 1
 
     def test_each_new_settlement_adds_exactly_one(self, tmp_path):
         o = base_obs()
         (tmp_path / "a").mkdir()
         (tmp_path / "b").mkdir()
-        one = report(tmp_path / "a", o)["distinct_funding_settlements"]
-        two = report(tmp_path / "b", o, shifted(o, 1))["distinct_funding_settlements"]
+        one = report(tmp_path / "a", o)["distinct_latest_funding_prints"]
+        two = report(tmp_path / "b", o, shifted(o, 1))["distinct_latest_funding_prints"]
         assert two == one + 1
 
-    def test_the_count_is_never_above_the_observations_times_prints(self, tmp_path):
+    def test_the_count_is_never_above_the_number_of_observations(self, tmp_path):
         o = base_obs()
-        r = report(tmp_path, o, shifted(o, 3))
-        assert r["distinct_funding_settlements"] <= 2 * len(o["settled_prints"])
+        r = report(tmp_path, o, shifted(o, 1), shifted(o, 1), shifted(o, 2))
+        assert r["distinct_latest_funding_prints"] == 3 <= r["observations"]
 
     def test_it_is_absent_when_the_file_cannot_be_read(self, tmp_path):
         db = str(tmp_path / "m.jsonl")
         MP.append(db, base_obs())
         open(db, "a").write("garbage\n")
-        assert "distinct_funding_settlements" not in MP.report(db)
+        assert "distinct_latest_funding_prints" not in MP.report(db)
 
     def test_an_empty_file_does_not_crash_the_report(self, tmp_path):
-        assert "distinct_funding_settlements" not in MP.report(str(tmp_path / "none.jsonl"))
+        assert "distinct_latest_funding_prints" not in MP.report(str(tmp_path / "none.jsonl"))
 
 
 class TestItChangesNothingElse:
@@ -86,7 +91,7 @@ class TestItChangesNothingElse:
     def test_the_verdict_does_not_read_the_new_field(self):
         rep = {"observations": 1000, "span_hours": 40 * 24.0, "chain_issues": [],
                "gate": {"allowed": 0, "refused": 1000, "open_fraction": 0.0, "refusals": {}},
-               "distinct_funding_settlements": 10_000}
+               "distinct_latest_funding_prints": 10_000}
         assert MP.protocol_verdict(rep) == "GATE_RARELY_OPEN_ON_REAL_MARKET"
 
     def test_the_report_is_json_serialisable(self, tmp_path):
@@ -103,14 +108,14 @@ class TestTheStatusScriptShowsIt:
         rep = report(tmp_path, o, copy.deepcopy(o))
         r = self.run(tmp_path, rep)
         assert r.returncode == 0, r.stdout + r.stderr
-        n = rep["distinct_funding_settlements"]
-        assert f"covering {n} distinct funding settlements" in r.stdout
+        n = rep["distinct_latest_funding_prints"]
+        assert f"covering only {n} distinct latest funding prints" in r.stdout
         assert "hourly observations repeat" in r.stdout
 
     def test_an_older_report_without_the_field_still_prints(self, tmp_path):
         o = base_obs()
         rep = report(tmp_path, o)
-        rep.pop("distinct_funding_settlements")
+        rep.pop("distinct_latest_funding_prints")
         r = self.run(tmp_path, rep)
-        assert r.returncode == 0 and "distinct funding settlements" not in r.stdout
+        assert r.returncode == 0 and "distinct latest funding prints" not in r.stdout
         assert "protocol verdict:" in r.stdout
