@@ -120,6 +120,7 @@ jobs:
           tests/test_monitor_self_heal.py
           tests/test_mainnet_stall_alert.py
           tests/test_watch_workflow.py
+          tests/test_mainnet_independent_prints.py
           tests/test_mainnet_book.py
           tests/test_registry_search_width.py
           tests/test_records_consistent_alias.py

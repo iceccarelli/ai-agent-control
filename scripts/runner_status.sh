@@ -69,6 +69,9 @@ if not n:
     print("  no observations yet"); print("  protocol verdict: %s" % pr.get("verdict", "?")); sys.exit(0)
 b, g = r["basis_bps"], r["gate"]
 print("  observations %s over %s hours" % (n, r["span_hours"]))
+ds = r.get("distinct_funding_settlements")
+if ds:
+    print("    covering %s distinct funding settlements (hourly observations repeat the same 8-hourly print, so the shares below are far less independent than the count)" % ds)
 print("  basis bps min %+.0f median %+.0f max %+.0f" % (b["min"], b["median"], b["max"]))
 print("  entry gate open on %s of %s observations (%.0f%%); refusals %s" % (
     g["allowed"], n, 100 * g["open_fraction"], g["refusals"] or "none"))
