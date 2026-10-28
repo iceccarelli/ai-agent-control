@@ -487,12 +487,15 @@ def _report(db: str) -> Dict[str, Any]:
             refusals[v.reason] += 1
     first, last = rows[0]["obs"]["observed_at_s"], rows[-1]["obs"]["observed_at_s"]
     # Funding settles every 8 hours and the runner observes every hour, so up to
-    # eight observations share one print. This is the honest denominator beside
-    # the observation count; the frozen protocol does not read it.
-    settlements = {ms for row in rows
-                   for _, ms in row["obs"].get("settled_prints", [])}
+    # eight observations share one latest print (and a gate answer built from the
+    # same eight-print window). Each observation also carries ~8 PAST prints, so
+    # counting those would credit history the runner never watched. The number of
+    # distinct LATEST prints is the honest denominator beside the observation
+    # count; the frozen protocol does not read it.
+    latest = {row["obs"]["funding_print_ms"] for row in rows
+              if isinstance(row["obs"].get("funding_print_ms"), (int, float))}
     out.update({
-        "distinct_funding_settlements": len(settlements),
+        "distinct_latest_funding_prints": len(latest),
         "span_hours": round((last - first) / 3600.0, 3),
         "basis_bps": _stat(basis), "funding_bps": _stat(funding),
         "gate": {"allowed": allowed, "refused": len(rows) - allowed,
