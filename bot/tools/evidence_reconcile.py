@@ -846,6 +846,21 @@ def _fee_in_unit(fees: Mapping[str, float], symbol: str,
     return total
 
 
+def _capture_before_execution(indexes: Sequence[VenueIndex], env: str,
+                              rows: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
+    """CAPTURE_TIME_INVALID / CAPTURED_BEFORE_EXECUTION when the earliest
+    capture of any execution row is unstamped or predates the fill itself (the
+    same rule `_carry_one` and `_reconcile_one` apply to their own legs)."""
+    for eid, row in rows.items():
+        stamps = [st for idx in indexes for e, _r, st in idx.executions.get(eid, [])
+                  if e == env]
+        if not stamps or None in stamps:
+            return "CAPTURE_TIME_INVALID"
+        if min(stamps) + 1000 < (_int(row.get("execTime")) or 0):
+            return "CAPTURED_BEFORE_EXECUTION"
+    return None
+
+
 def _leg_orders_corroborated(indexes: Sequence[VenueIndex], env: str,
                              rows: Mapping[str, Mapping[str, Any]],
                              symbol: str, side: str) -> bool:
@@ -863,6 +878,8 @@ def _leg_orders_corroborated(indexes: Sequence[VenueIndex], env: str,
                 for r in snaps):
             return False
         finals = {str(r.get("orderStatus", "")) for r in snaps} & _FINAL_VENUE_STATES
+        if not finals:
+            return False        # an order with no final venue state is unfinished
         kinds = {"filled" if f == "Filled" else "cancelled" for f in finals}
         if "Rejected" in finals or len(kinds) > 1:
             return False        # a rejected order has no fills; finals conflict
@@ -1021,6 +1038,10 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
                 elif None in e_times or None in x_times or not all(
                         t >= EARLIEST_PLAUSIBLE_MS for t in e_times + x_times):
                     issues.append("VENUE_DISAGREES:exec_time_unusable")
+                elif _capture_before_execution(
+                        indexes, env, {**e_rows, **x_rows}):
+                    issues.append(_capture_before_execution(
+                        indexes, env, {**e_rows, **x_rows}))
                 else:
                     want_e, want_x = (("Buy", "Sell") if direction > 0
                                       else ("Sell", "Buy"))
