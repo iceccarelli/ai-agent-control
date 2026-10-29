@@ -1563,18 +1563,18 @@ def reconcile_carry_cycle(claims: Sequence[Mapping[str, Any]],
 
         # ---- flat: a position read AFTER the close's execution list ---------
         close_ids = {e for _c, v in closes for e in v["detail"].get("exec_ids", [])}
-        flat_reads: List[Tuple[int, float]] = []
+        flat_reads: List[Tuple[int, float, int]] = []
         for idx in indexes:
             seen = [idx.exec_seq[e] for e in close_ids if e in idx.exec_seq]
             if not seen:
                 continue
             after_seq = max(seen)
-            flat_reads += [(st, size) for e, sym, size, st, seq in idx.positions
+            flat_reads += [(st, size, seq) for e, sym, size, st, seq in idx.positions
                            if e == env and sym == symbol and st is not None
                            and seq > after_seq and st + 1000 >= last_out]
         if not flat_reads:
             issues.append("NO_FINAL_POSITION_READ")
-        elif max(flat_reads, key=lambda x: x[0])[1] > FLAT_POSITION_DUST:
+        elif max(flat_reads, key=lambda x: (x[0], x[2]))[1] > FLAT_POSITION_DUST:
             issues.append("CYCLE_NOT_FLAT")
 
         # ---- funding: looked at, then sign-checked and claimed --------------

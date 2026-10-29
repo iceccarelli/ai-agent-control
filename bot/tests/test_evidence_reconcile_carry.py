@@ -919,3 +919,23 @@ class TestMalformedInputIsRefusedNotRaisedOn:
     def test_the_cycle_called_directly_with_junk_verdicts(self):
         cycle = R.reconcile_carry_cycle(leg_claims(), [{"x": 1}, "y"], [], [], [])
         assert cycle["resolved"] is False
+
+
+class TestTheLatestPositionReadWinsEvenWithinTheSameSecond:
+    """Captures are stamped to the second; the chain order breaks the tie. A
+    non-flat read captured AFTER the flat one is the later fact."""
+
+    def _later_read(self, size):
+        return [lambda prev: F.record(
+            "/v5/position/list", [pos(size)], prev=prev, at=CLOSE_MS + 60_000)]
+
+    def test_a_non_flat_read_after_the_flat_read_in_the_same_second_is_not_flat(self):
+        report = run(build(extra=self._later_read("0.001")))
+        cycle = report["carry_cycle"][0]
+        assert "CYCLE_NOT_FLAT" in cycle["issues"]
+        assert cycle["resolved"] is False
+
+    def test_a_flat_read_after_a_non_flat_read_in_the_same_second_is_flat(self):
+        records = build(extra=self._later_read("0"),
+                        tweak=_alter_pos("0.001"))
+        assert "CYCLE_NOT_FLAT" not in run(records)["carry_cycle"][0]["issues"]
