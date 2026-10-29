@@ -53,6 +53,13 @@ def _summarise(report: dict) -> List[str]:
     for f in report.get("funding", []):
         lines.append(f"funding {f.get('claim_id')}: {f.get('provenance')}"
                      f"{' ' + ','.join(f['issues']) if f.get('issues') else ''}")
+    for led in report.get("ledger_summaries", []):
+        # the "summary has no fill identifiers" note is on every ledger by
+        # design; anything else is a reason the reconciliation did not pass
+        why = [i for i in led.get("issues", [])
+               if i != "LEDGER_SUMMARY_HAS_NO_FILL_IDENTIFIERS"]
+        if why:
+            lines.append(f"ledger {led.get('schema') or '?'}: {','.join(why)}")
     consistent = _consistent(report)
     if consistent is True:
         lines.append(f"records_consistent: {consistent} "
