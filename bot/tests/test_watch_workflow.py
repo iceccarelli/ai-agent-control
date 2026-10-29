@@ -41,3 +41,31 @@ def test_a_firing_alert_fails_the_job_and_nothing_hides_it():
 def test_it_is_in_the_ci_lists():
     wf = open(os.path.join(ROOT, ".github", "workflows", "carry-verify.yml"), encoding="utf-8").read()
     assert "tests/test_watch_workflow.py" in wf
+
+
+def _steps(code):
+    """The workflow's steps as (name-or-uses, block-text), split on '- ' items."""
+    body = code.split("steps:", 1)[1]
+    return [b for b in re.split(r"\n      - ", "\n" + body) if b.strip()]
+
+
+def test_no_secret_is_visible_to_a_third_party_action():
+    # a job-level env hands every secret to every step's action, including the
+    # unpinned setup-flyctl: each secret must sit only on the step that uses it
+    job_head = CODE.split("steps:", 1)[0]
+    assert "secrets." not in job_head, "a secret is exposed at job level"
+    steps = _steps(CODE)
+    holders = {s: [m for m in re.findall(r"secrets\.([A-Z_]+)", s)] for s in steps}
+    for block, names in holders.items():
+        if "uses:" in block.split("\n", 1)[0] or block.lstrip().startswith("uses:"):
+            assert not names, f"an action step receives a secret: {block[:60]!r}"
+    assert sorted(n for names in holders.values() for n in names) == [
+        "FLY_API_TOKEN", "SLACK_WEBHOOK_URL"]
+
+
+def test_each_secret_is_on_exactly_the_step_that_needs_it():
+    steps = _steps(CODE)
+    fly = [s for s in steps if "secrets.FLY_API_TOKEN" in s]
+    slack = [s for s in steps if "secrets.SLACK_WEBHOOK_URL" in s]
+    assert len(fly) == 1 and "flyctl ssh console" in fly[0]
+    assert len(slack) == 1 and "runner_alerts.py" in slack[0]
