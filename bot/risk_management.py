@@ -127,6 +127,15 @@ class GateOutcome:
         return self.ok
 
 
+def _finite(value: Any) -> Optional[float]:
+    """``float(value)`` when it is a finite number, else None (never raises)."""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def _block(reason: str, **detail: Any) -> RiskDecision:
     return RiskDecision(ok=False, reason=reason, detail=detail)
 
@@ -663,8 +672,10 @@ class BillionaireRiskManager:
     def _gate_position_notional(
         self, *, qty: float, entry_price: float, equity: float
     ) -> RiskDecision:
-        if equity <= 0.0:
+        if _finite(equity) is None or equity <= 0.0:
             return _block("EQUITY_UNKNOWN", equity=equity)
+        if _finite(qty) is None or _finite(entry_price) is None or entry_price <= 0.0:
+            return _block("ORDER_NUMBERS_UNREADABLE", qty=qty, entry_price=entry_price)
         notional = abs(float(qty) * float(entry_price))
         frac = notional / float(equity)
         if frac > self.max_position_size_pct:
@@ -702,8 +713,10 @@ class BillionaireRiskManager:
     def _gate_aggregate_exposure(
         self, *, qty: float, entry_price: float, equity: float
     ) -> RiskDecision:
-        if equity <= 0.0:
+        if _finite(equity) is None or equity <= 0.0:
             return _block("EQUITY_UNKNOWN", equity=equity)
+        if _finite(qty) is None or _finite(entry_price) is None or entry_price <= 0.0:
+            return _block("ORDER_NUMBERS_UNREADABLE", qty=qty, entry_price=entry_price)
         try:
             positions = self.store.open_positions()
             pending = self._unresolved_entry_exposure(positions)
@@ -712,9 +725,16 @@ class BillionaireRiskManager:
         if pending is None:
             return _block("EXPOSURE_UNRESOLVED_ENTRY")
         positions = list(positions) + pending
+        # A held position with no readable quantity or price is exposure we
+        # cannot count; reading it as 0.0 would approve the order on top of it.
+        for p in positions:
+            held_qty, held_px = _finite(p.get("qty")), _finite(p.get("entry_price"))
+            if held_qty is None or held_px is None or held_px <= 0.0:
+                return _block("EXPOSURE_UNREADABLE",
+                              symbol=str(p.get("symbol")),
+                              error="held position has no usable qty/entry_price")
         current = sum(
-            abs(float(p.get("qty", 0.0)) * float(p.get("entry_price", 0.0)))
-            for p in positions
+            abs(float(p["qty"]) * float(p["entry_price"])) for p in positions
         )
         proposed = current + abs(float(qty) * float(entry_price))
         frac = proposed / float(equity)
