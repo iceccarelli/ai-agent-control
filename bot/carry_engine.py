@@ -2452,8 +2452,16 @@ class CarryEngine:
         if distance is None:
             # Bybit returns "" for liqPrice when it lies outside the venue's
             # price bounds: there is no reachable liquidation price, which is
-            # the safest state there is. Not missing data.
-            return None
+            # the safest state there is. Not missing data. NO_POSITION is the
+            # broker stating nothing is held (the venue-vs-book check judges
+            # that). Any other reason, or none, is an unread distance.
+            if view.get("reason") in ("BEYOND_VENUE_PRICE_BOUNDS", "NO_POSITION"):
+                return None
+            return self._halt(
+                "LIQUIDATION_DISTANCE_UNUSABLE",
+                "the liquidation view carries no distance and no stated reason "
+                f"for its absence (reason {view.get('reason')!r}); an unread "
+                "distance is not an unreachable liquidation price")
         if not self._finite(distance):
             return self._halt(
                 "LIQUIDATION_DISTANCE_UNUSABLE",

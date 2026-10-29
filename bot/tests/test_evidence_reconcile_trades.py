@@ -35,7 +35,7 @@ def exit_rows(side="Sell", qty="0.002", price="60100", fee="0.00012"):
 
 
 def specs(entry=None, exit_=None, orders=True, side="Buy"):
-    out = [dict(path="/v5/execution/list",
+    out = [dict(path="/v5/execution/list", at=fx.T0 + 700_000,
                 rows=(entry if entry is not None else entry_rows(side))
                 + (exit_ if exit_ is not None else exit_rows(
                     "Sell" if side == "Buy" else "Buy")))]
@@ -648,3 +648,25 @@ class TestFeesInTheBaseCoinAreReconciledByTheEnginesRule:
                   entry_fee=2e-7 * 60005.0 * (0.001 / 0.0019998))
         v = verdict(go([t], self.btc_fee_session()))
         assert "VENUE_DISAGREES:entry_fee" not in v["issues"]
+
+
+class TestTradeEvidenceMustPostdateTheFillsAndBeFinal:
+    """The fills and carry paths refuse a capture taken before the execution
+    and an order with no final venue state. The closed-trade path must too."""
+
+    def test_executions_captured_an_hour_before_they_happened_do_not_reconcile(self):
+        s = specs()
+        s[0] = dict(s[0], at=fx.T0 - 3_600_000)
+        v = verdict(go([trade()], s))
+        assert "CAPTURED_BEFORE_EXECUTION" in v["issues"]
+        assert not v["resolved"] and v["provenance"] != er.VENUE_RECONCILED
+
+    @pytest.mark.parametrize("status", ["New", "PartiallyFilled", "Untriggered"])
+    def test_orders_with_no_final_venue_state_do_not_corroborate(self, status):
+        s = specs()
+        s[1] = dict(s[1], rows=[
+            fx.order_row(E_ORD, cum="0.002", side="Buy", link=E_LINK, status=status),
+            fx.order_row(X_ORD, cum="0.002", link="EXT-1", side="Sell",
+                         status=status)])
+        v = verdict(go([trade()], s))
+        assert "NO_CORROBORATION" in v["issues"] and not v["resolved"]

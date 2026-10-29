@@ -846,6 +846,21 @@ def _fee_in_unit(fees: Mapping[str, float], symbol: str,
     return total
 
 
+def _capture_before_execution(indexes: Sequence[VenueIndex], env: str,
+                              rows: Mapping[str, Mapping[str, Any]]) -> Optional[str]:
+    """CAPTURE_TIME_INVALID / CAPTURED_BEFORE_EXECUTION when the earliest
+    capture of any execution row is unstamped or predates the fill itself (the
+    same rule `_carry_one` and `_reconcile_one` apply to their own legs)."""
+    for eid, row in rows.items():
+        stamps = [st for idx in indexes for e, _r, st in idx.executions.get(eid, [])
+                  if e == env]
+        if not stamps or None in stamps:
+            return "CAPTURE_TIME_INVALID"
+        if min(stamps) + 1000 < (_int(row.get("execTime")) or 0):
+            return "CAPTURED_BEFORE_EXECUTION"
+    return None
+
+
 def _leg_orders_corroborated(indexes: Sequence[VenueIndex], env: str,
                              rows: Mapping[str, Mapping[str, Any]],
                              symbol: str, side: str) -> bool:
@@ -863,6 +878,8 @@ def _leg_orders_corroborated(indexes: Sequence[VenueIndex], env: str,
                 for r in snaps):
             return False
         finals = {str(r.get("orderStatus", "")) for r in snaps} & _FINAL_VENUE_STATES
+        if not finals:
+            return False        # an order with no final venue state is unfinished
         kinds = {"filled" if f == "Filled" else "cancelled" for f in finals}
         if "Rejected" in finals or len(kinds) > 1:
             return False        # a rejected order has no fills; finals conflict
@@ -1021,6 +1038,10 @@ def reconcile_trades(claims: Sequence[Mapping[str, Any]], captures: Sequence[Cap
                 elif None in e_times or None in x_times or not all(
                         t >= EARLIEST_PLAUSIBLE_MS for t in e_times + x_times):
                     issues.append("VENUE_DISAGREES:exec_time_unusable")
+                elif _capture_before_execution(
+                        indexes, env, {**e_rows, **x_rows}):
+                    issues.append(_capture_before_execution(
+                        indexes, env, {**e_rows, **x_rows}))
                 else:
                     want_e, want_x = (("Buy", "Sell") if direction > 0
                                       else ("Sell", "Buy"))
@@ -1563,18 +1584,18 @@ def reconcile_carry_cycle(claims: Sequence[Mapping[str, Any]],
 
         # ---- flat: a position read AFTER the close's execution list ---------
         close_ids = {e for _c, v in closes for e in v["detail"].get("exec_ids", [])}
-        flat_reads: List[Tuple[int, float]] = []
+        flat_reads: List[Tuple[int, float, int]] = []
         for idx in indexes:
             seen = [idx.exec_seq[e] for e in close_ids if e in idx.exec_seq]
             if not seen:
                 continue
             after_seq = max(seen)
-            flat_reads += [(st, size) for e, sym, size, st, seq in idx.positions
+            flat_reads += [(st, size, seq) for e, sym, size, st, seq in idx.positions
                            if e == env and sym == symbol and st is not None
                            and seq > after_seq and st + 1000 >= last_out]
         if not flat_reads:
             issues.append("NO_FINAL_POSITION_READ")
-        elif max(flat_reads, key=lambda x: x[0])[1] > FLAT_POSITION_DUST:
+        elif max(flat_reads, key=lambda x: (x[0], x[2]))[1] > FLAT_POSITION_DUST:
             issues.append("CYCLE_NOT_FLAT")
 
         # ---- funding: looked at, then sign-checked and claimed --------------
@@ -1807,11 +1828,21 @@ def summarise_ledger(payload: Mapping[str, Any], fills: Sequence[Dict[str, Any]]
         issues.append("LEDGER_FILL_COUNT_MISSING")
     elif stated != len(counted):
         issues.append("LEDGER_FILL_COUNT_DISAGREES")
-    if payload.get("fees_confirmed") is False:
+    carry = schema == "cash_ledger/2"
+    # A carry ledger states these four facts itself; omitting or contradicting
+    # one (absent, a string "false", False) is not a pass.
+    if payload.get("fees_confirmed") is False or (
+            carry and payload.get("fees_confirmed") is not True):
         issues.append("LEDGER_FEES_UNCONFIRMED")
+    if carry and payload.get("flat") is not True:
+        issues.append("LEDGER_NOT_FLAT")
     status = str(payload.get("funding_status", ""))
     if status and status not in ("CONFIRMED_FROM_SETTLEMENTS",):
         issues.append(f"LEDGER_FUNDING_{status}")
+    elif carry and not status:
+        issues.append("LEDGER_FUNDING_MISSING")
+    if carry and payload.get("funding_confirmed") is False:
+        issues.append("LEDGER_FUNDING_NOT_CONFIRMED")
     ledger_fee = _num(payload.get("fees_usd"))
     claimed_fee = sum(_num(c.get("fee")) or 0.0
                       for c, v in zip(fill_claims, fills) if v["counted"]) + \
@@ -1974,6 +2005,7 @@ def summaries_block(summaries: Sequence[Mapping[str, Any]]) -> bool:
                              "LEDGER_FEES_DISAGREE", "LEDGER_FEES_MISSING",
                              "LEDGER_FILL_COUNT_MISSING", "UNKNOWN_LEDGER",
                              "LEDGER_FEES_UNCONFIRMED", "LEDGER_FUNDING_", "MALFORMED_LEDGER",
+                             "LEDGER_NOT_FLAT",
                              "LEDGER_DOES_NOT"))
                for s in summaries for i in s["issues"])
 
