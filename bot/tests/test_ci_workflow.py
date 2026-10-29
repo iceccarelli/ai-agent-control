@@ -84,7 +84,11 @@ def test_it_hides_no_failure(text):
 
 def test_it_does_not_pretend_to_be_the_full_suite(text):
     assert "pytest -q -p no:cacheprovider tests\n" not in text
-    assert "61 failures" in text and "NOT run or hidden" in text
+    # the gate says plainly it is not the full suite, and the job that runs the
+    # other files exists; the old 61-failure baseline is recorded as NOT
+    # reproduced rather than silently dropped
+    assert "WHAT THIS IS NOT: the repository's full suite" in text
+    assert "rest-of-suite" in text and "NOT reproduced" in text
 
 
 # ---------------------------------------------------------------------------
@@ -195,3 +199,41 @@ def test_the_image_properties_the_smoke_relies_on_are_in_the_dockerfile():
     assert not re.search(r"^COPY \.\s", d, re.M)
     assert "COPY tools/ " not in d
     assert re.search(r"^ENV USE_TESTNET=1 \\\n\s+PAPER_TRADING=1", d, re.M)
+
+
+# ---------------------------------------------------------------------------
+# the rest-of-suite job: every test file the correctness gate does not name
+# ---------------------------------------------------------------------------
+
+def _rest_job(text):
+    m = re.search(r"^  rest-of-suite:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                  text, re.M | re.S)
+    assert m, "the workflow has no rest-of-suite job"
+    return m.group(1)
+
+
+def test_the_rest_of_the_suite_is_derived_not_listed(text):
+    job = _rest_job(text)
+    # the file list is a set difference against what the gate names, so a new
+    # test file is covered by one job or the other and cannot fall between them
+    assert "comm -23" in job and "tests/test_*.py" in job
+    assert "carry-verify.yml" in job
+    # no hand-maintained list of test files inside this job
+    assert not re.search(r"^\s+tests/test_[A-Za-z0-9_]+\.py\s*$", job, re.M)
+
+
+def test_the_rest_of_the_suite_is_offline_and_holds_no_secret(text):
+    job = _rest_job(text)
+    assert "secrets." not in job and "FLY_" not in job and "BYBIT" not in job
+    assert "REQUIRE_NATIVE_CORE" in job and "make -C ../cpp" in job
+    assert re.search(r"timeout-minutes: \d+", job)
+    # a full history: some tests read git history (repo shape, provenance)
+    assert "fetch-depth: 0" in job
+
+
+def test_the_rest_of_the_suite_excludes_only_the_documented_freshness_marker(text):
+    job = _rest_job(text)
+    assert '-m "not data_freshness"' in job
+    for hidden in ("continue-on-error", "|| true", "--deselect", "--ignore",
+                   "-k "):
+        assert hidden not in job, hidden
