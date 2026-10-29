@@ -108,6 +108,7 @@ jobs:
           tests/test_evidence_reconcile.py
           tests/test_evidence_reconcile_trades.py
           tests/test_evidence_reconcile_carry.py
+          tests/test_evidence_chain_tail.py
           tests/test_drill_final_state.py
           tests/test_drill_final_state_tool.py
           tests/test_artefact_log_dedupe.py
