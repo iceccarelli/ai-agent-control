@@ -120,3 +120,26 @@ class TestTheCaptionSaysWhatWasCharged:
     def test_with_borrow_it_says_the_rate_that_was_charged(self):
         assert "after 5% borrow" in self._lines(0.05)
         assert "before financing" not in self._lines(0.05)
+
+
+class TestReturnOnTotalCapital:
+    """The headline is a return on NOTIONAL. A hedged book also posts margin for
+    the short perp, so the money tied up is the spot leg plus that margin. The
+    margin fraction is a stated assumption, never a venue figure."""
+
+    def test_total_capital_is_spot_notional_plus_assumed_margin(self):
+        out = rp.return_on_total_capital(net_annualised_pct=8.0, margin_fractions=(0.10, 0.25))
+        assert out[0.10] == pytest.approx(8.0 / 1.10)
+        assert out[0.25] == pytest.approx(8.0 / 1.25)
+
+    def test_a_negative_return_stays_negative(self):
+        assert rp.return_on_total_capital(-2.0, (0.2,))[0.2] == pytest.approx(-2.0 / 1.2)
+
+    def test_the_lines_name_the_assumption_and_say_it_is_not_the_venues(self):
+        text = "\n".join(rp.capital_lines(8.05))
+        assert "10%" in text and "20%" in text and "33%" in text
+        assert "assumed" in text and "not the venue" in text.lower()
+
+    def test_an_unusable_fraction_is_refused(self):
+        with pytest.raises(ValueError):
+            rp.return_on_total_capital(8.0, (-0.1,))
