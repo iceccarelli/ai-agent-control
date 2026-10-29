@@ -695,7 +695,23 @@ def is_live_authorized(cfg: Any = None) -> Tuple[bool, str]:
     """``(live_allowed, reason)`` — is real money armed?"""
     cfg = _CFG if cfg is None else cfg
     if isinstance(cfg, Config):
-        return cfg.LIVE_AUTHORIZED, cfg.LIVE_BLOCK_REASON
+        # LIVE_AUTHORIZED is computed once in load() and dataclasses.replace
+        # copies it unchanged, so re-derive the verdict from the fields the
+        # four-part rule is made of. Both must agree: a replaced config can
+        # lose authorisation, and no replace can grant it.
+        _, derived, why = _resolve_live_gate(
+            use_testnet=cfg.USE_TESTNET, paper_trading=cfg.PAPER_TRADING,
+            ack=cfg.LIVE_TRADING_ACK, api_key=cfg.BYBIT_API_KEY,
+            api_secret=cfg.BYBIT_API_SECRET)
+        if cfg.LIVE_AUTHORIZED is True and derived is True:
+            return True, cfg.LIVE_BLOCK_REASON
+        if cfg.LIVE_AUTHORIZED is not True:
+            # Never authorised: load()'s own reason (e.g. LIVE_BLOCKED: ...) is
+            # the specific one an operator needs; keep it.
+            return False, cfg.LIVE_BLOCK_REASON
+        # Stored as authorised but the fields no longer say so (a replace):
+        # revoke, and say why from the fields.
+        return False, why or "LIVE_BLOCKED: live authorisation not established"
     get = (cfg.get if isinstance(cfg, Mapping) else lambda k, d=None: getattr(cfg, k, d))
     try:
         use_testnet = parse_safety_bool(get("USE_TESTNET", True), "USE_TESTNET", True)

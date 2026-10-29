@@ -183,7 +183,14 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         exit_fill_at = -1;
         exit_signalled = false;
     };
-    auto open_live = [&](const CarrySettlement &st) {
+    /* False (and no position) when either leg's price on the fill row is
+       unusable: the decision row was gated, the fill row was not. */
+    auto open_live = [&](const CarrySettlement &st) -> bool {
+        if (!(std::isfinite(st.perp) && st.perp > 0.0 &&
+              std::isfinite(st.spot) && st.spot > 0.0)) {
+            streak = 0;
+            return false;
+        }
         live = Trade();
         live.qty = p.notional / st.perp;
         live.entry_spot = st.spot;
@@ -192,6 +199,7 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         charge(live, st.spot, st.perp);
         has_live = true;
         streak = 0;
+        return true;
     };
 
     for (int32_t i = 0; i < n; ++i) {
@@ -207,7 +215,7 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
 
         if (entry_fill_at >= 0) {
             if (i < entry_fill_at) continue;       /* decided, not yet filled */
-            open_live(st);                         /* this row's print is not ours */
+            if (!open_live(st)) ++unresolved_entries;  /* this row's print is not ours */
             entry_fill_at = -1;
             continue;
         }
@@ -259,7 +267,7 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         if (fill_row >= n - 1) {
             ++unresolved_entries;
         } else if (latency == 0) {
-            open_live(st);
+            if (!open_live(st)) ++unresolved_entries;
         } else {
             entry_fill_at = fill_row;
         }

@@ -165,6 +165,10 @@ jobs:
           set +e
           args=(--evidence "$RUN_DIR/drill_evidence.jsonl" --drill-report "$RUN_DIR/drill_out.json" --now-ms "$(date +%s%3N)" --json "$RUN_DIR/reconciliation.json")
           if [ -f "$RUN_DIR/drill_ledger.json" ]; then args+=(--ledger "$RUN_DIR/drill_ledger.json"); fi
+          # Where the drill says its evidence chain ENDS: a deleted tail is otherwise undetectable.
+          tail_args=$(python -c 'import json,sys; c=(json.load(open(sys.argv[1])).get("evidence_capture") or {}); h=c.get("head_hash"); n=c.get("records"); print(h or "", n if n is not None else "")' "$RUN_DIR/drill_out.json" 2>/dev/null || true)
+          set -- $tail_args
+          if [ -n "$1" ] && [ -n "$2" ]; then args+=(--expect-head-hash "$1" --expect-records "$2"); fi
           python tools/evidence_reconcile.py "${args[@]}"
           rc=$?
           echo "reconcile exit code: $rc"

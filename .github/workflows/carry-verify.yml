@@ -94,6 +94,8 @@ jobs:
           tests/test_simulator_fill_contract.py
           tests/test_funding_window.py
           tests/test_sweep_abi.py
+          tests/test_carry_core_input_guards.py
+          tests/test_fill_row_invalid_price_parity.py
           tests/test_carry_latency.py
           tests/test_carry_cost_inputs.py
           tests/test_carry_shadow_forward.py
@@ -101,10 +103,14 @@ jobs:
           tests/test_carry_cost_reality.py
           tests/test_gate_arithmetic_overflow.py
           tests/test_venue_isolation.py
+          tests/test_live_gate_recomputed.py
+          tests/test_paper_agent_certification.py
           tests/test_drill_evidence.py
           tests/test_evidence_reconcile.py
           tests/test_evidence_reconcile_trades.py
           tests/test_evidence_reconcile_carry.py
+          tests/test_evidence_chain_tail.py
+          tests/test_drill_records_capture_tail.py
           tests/test_drill_final_state.py
           tests/test_drill_final_state_tool.py
           tests/test_artefact_log_dedupe.py
@@ -139,6 +145,7 @@ jobs:
           tests/test_snapshot_nonfinite_fail_closed.py
           tests/test_monitor_cycle_fail_closed.py
           tests/test_carry_risk_boundaries.py
+          tests/test_carry_risk_utc_day.py
           tests/test_carry_engine_boundaries.py
           tests/test_carry_unwind_partial.py
           tests/test_drill_image.py

@@ -1092,3 +1092,39 @@ class TestTheLoopCanResumeAfterALossStreakHalt:
         store.trip_breaker("daily loss 6%", 0.0)
         store._exec("UPDATE breaker SET cooldown_until_epoch = 1.0 WHERE id = 1")
         assert manager.should_halt_trading() is False
+
+
+class TestSizeAndExposureGatesRefuseUnreadableNumbers:
+    """Every comparison against NaN is False, and a missing entry_price read
+    as 0.0, so an unreadable quantity, price, equity or stored position used to
+    fall through to 'OK' with zero exposure counted."""
+
+    @pytest.mark.parametrize("over", [
+        {"qty": float("nan")}, {"qty": float("inf")},
+        {"entry_price": float("nan")}, {"entry_price": 0.0},
+        {"equity": float("nan")}, {"equity": float("inf")}])
+    def test_the_position_size_gate_blocks(self, manager, over):
+        kw = dict(qty=0.001, entry_price=50_000.0, equity=EQUITY)
+        kw.update(over)
+        assert manager._gate_position_notional(**kw).ok is False
+
+    @pytest.mark.parametrize("over", [
+        {"qty": float("nan")}, {"entry_price": float("nan")},
+        {"entry_price": 0.0}, {"equity": float("nan")}])
+    def test_the_aggregate_gate_blocks_an_unreadable_order(self, manager, over):
+        kw = dict(qty=0.001, entry_price=50_000.0, equity=EQUITY)
+        kw.update(over)
+        assert manager._gate_aggregate_exposure(**kw).ok is False
+
+    @pytest.mark.parametrize("held", [
+        {"symbol": "BTCUSDT", "qty": 10},                        # no price
+        {"symbol": "BTCUSDT", "qty": 10, "entry_price": None},
+        {"symbol": "BTCUSDT", "qty": float("nan"), "entry_price": 50_000.0},
+        {"symbol": "BTCUSDT", "qty": None, "entry_price": 50_000.0},
+        {"symbol": "BTCUSDT", "qty": 10, "entry_price": 0.0}])
+    def test_the_aggregate_gate_blocks_an_unreadable_stored_position(
+            self, manager, store, monkeypatch, held):
+        monkeypatch.setattr(store, "open_positions", lambda: [held])
+        d = manager._gate_aggregate_exposure(
+            qty=0.001, entry_price=50_000.0, equity=EQUITY)
+        assert d.ok is False and d.reason == "EXPOSURE_UNREADABLE"

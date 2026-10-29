@@ -160,10 +160,28 @@ class Capture:
         return not self.chain_issues
 
 
-def load_capture(path: str) -> Capture:
+def _check_tail(issues: List[str], count: int, head: str,
+                expect_head_hash: Optional[str],
+                expect_records: Optional[int]) -> None:
+    """A hash chain cannot show its END was cut off; only a head hash or a
+    record count recorded by the producer can. Absent an expectation, nothing
+    is claimed about the tail."""
+    if expect_head_hash is not None and head != expect_head_hash:
+        issues.append("tail: the chain head hash is not the recorded one "
+                      "(records at the end are missing, added or altered)")
+    if expect_records is not None and count != expect_records:
+        issues.append(f"tail: the capture holds {count} records, "
+                      f"{expect_records} were recorded")
+
+
+def load_capture(path: str, *, expect_head_hash: Optional[str] = None,
+                 expect_records: Optional[int] = None) -> Capture:
     """Read an evidence JSONL file WITHOUT trusting it, and never raise on a
     bad line: a corrupt file is reported as a broken chain, not a crash.
-    The file is opened read-only and never modified."""
+    The file is opened read-only and never modified.
+
+    ``expect_head_hash`` / ``expect_records``: what the producer recorded about
+    the END of the chain. Without them a deleted tail is undetectable."""
     records: List[Dict[str, Any]] = []
     issues: List[str] = []
     prev = ve.GENESIS_PREV_HASH
@@ -191,6 +209,7 @@ def load_capture(path: str) -> Capture:
                 issues.append(f"line {lineno}: prev_hash does not chain")
             prev = str(record.get("record_hash", ""))
             records.append(record)
+    _check_tail(issues, len(records), prev, expect_head_hash, expect_records)
     return Capture(records, issues, os.path.basename(path))
 
 
@@ -2153,6 +2172,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "--ledger <cash_ledger/2>)")
     ap.add_argument("--ledger", action="append", default=[],
                     help="cash_ledger/* JSON (repeatable)")
+    ap.add_argument("--expect-head-hash", action="append", default=[],
+                    help="the final record_hash the producer recorded for the "
+                         "matching --evidence file (same order, one per file); "
+                         "without it a deleted tail is undetectable")
+    ap.add_argument("--expect-records", action="append", type=int, default=[],
+                    help="the record count the producer recorded for the "
+                         "matching --evidence file (same order, one per file)")
     ap.add_argument("--now-ms", type=int, required=True,
                     help="reference time in epoch ms (explicit, so a report is "
                          "reproducible)")
@@ -2170,7 +2196,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if payload is None:
             return 3
         ledgers.append(payload)
-    captures = [load_capture(p) for p in args.evidence]
+    for flag, given in (("--expect-head-hash", args.expect_head_hash),
+                        ("--expect-records", args.expect_records)):
+        if given and len(given) != len(args.evidence):
+            print(f"refusing: {flag} must be given once per --evidence file "
+                  f"({len(given)} for {len(args.evidence)})", file=sys.stderr)
+            return 3
+    heads = args.expect_head_hash or [None] * len(args.evidence)
+    counts = args.expect_records or [None] * len(args.evidence)
+    captures = [load_capture(p, expect_head_hash=h, expect_records=n)
+                for p, h, n in zip(args.evidence, heads, counts)]
     carry_claims = list(claims.get("carry_leg_claims", []))
     funding_claims = list(claims.get("funding_claims", []))
     funding_window = claims.get("funding_window")
