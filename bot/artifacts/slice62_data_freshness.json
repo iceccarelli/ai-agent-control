@@ -1,0 +1,226 @@
+{
+  "schema": "data_freshness/3",
+  "slice": 62,
+  "symbol": "BTCUSDT",
+  "checked_at_utc": "2026-08-11T16:36:23Z",
+  "extension_present": true,
+  "new_bars_available": true,
+  "after_t1_linear": 1,
+  "after_t1_funding": 5,
+  "bars_fabricated": 0,
+  "corpus_appended_to_by_this_tool": false,
+  "fetch_attempted": false,
+  "why_no_fetch": "The data arrived on disk in the human pack, which is the sanctioned path. Slice 60 recorded a ProxyError against the venue from this environment and nothing about that has changed; there is nothing a fetch could add here except a log line.",
+  "t1": "2026-08-09T00:00:00Z",
+  "t1_ms": 1786233600000,
+  "t1_source": "artifacts/funding_carry_fade_btc_v1_folds.json",
+  "folds_sha256": "ff5cc8a2bb92362058b376659ff12f314c10f71a101d1f581f69da31f025013c",
+  "folds_unmodified": true,
+  "human_note_present": true,
+  "human_note_path": "docs/human/HUMAN_DATA_NOTE_SLICE62.md",
+  "human_note_is_evidence": false,
+  "human_note_claims_checked": {
+    "closed bars after t1 = 1": true,
+    "history before t1 untouched": true,
+    "linear sha256 227e5f04...": true,
+    "synthetic false": true
+  },
+  "human_note_verdict": "Every substantive claim in the note is INDEPENDENTLY TRUE, established by hashing the files rather than by reading the note. The note's sha256 is of the COMPRESSED file; every digest this repository pins is of the uncompressed stream, so the note's figure corroborates but is not the check. Had the note been false, the same arithmetic would have said so — as it did in slice 61, where the same two promises resolved in opposite directions. EDGE.md §45a.",
+  "prefix_invariant": {
+    "rule": "a pinned digest is asserted against the PREFIX of the file at the pinned row count; growth is permitted only as an append, and every appended row must be strictly after t1",
+    "pins_from": "artifacts/slice55_data_eligibility.json",
+    "pinned_digests_agree_across_two_records": {
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz": true,
+      "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz": true
+    },
+    "all_corpora_append_only": true,
+    "checks": {
+      "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz": {
+        "path": "data/real_funding/funding/BINANCE_LINEAR_BTC_USDT_FUNDING.csv.gz",
+        "pinned_rows": 4383,
+        "pinned_sha256_uncompressed": "9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145",
+        "rows_on_disk": 4388,
+        "whole_file_sha256_uncompressed": "e0619f2c5c58b84d15d2bedbd4e011c22ab51046f96e4c10458260686598367d",
+        "prefix_sha256_uncompressed": "9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 5,
+        "appended_timestamps": [
+          "2026-08-10T00:00:00+00:00",
+          "2026-08-10T08:00:00+00:00",
+          "2026-08-10T16:00:00+00:00",
+          "2026-08-11T00:00:00+00:00",
+          "2026-08-11T08:00:00+00:00"
+        ],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": true,
+        "why_not": ""
+      },
+      "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz": {
+        "path": "data/real_funding/funding/BINANCE_LINEAR_ETH_USDT_FUNDING.csv.gz",
+        "pinned_rows": 4383,
+        "pinned_sha256_uncompressed": "695513e27cda0311fdb2940d8aff8c46d7f2251fccb47ffdcbc71c0bb208bf5d",
+        "rows_on_disk": 4383,
+        "whole_file_sha256_uncompressed": "695513e27cda0311fdb2940d8aff8c46d7f2251fccb47ffdcbc71c0bb208bf5d",
+        "prefix_sha256_uncompressed": "695513e27cda0311fdb2940d8aff8c46d7f2251fccb47ffdcbc71c0bb208bf5d",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      },
+      "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz": {
+        "path": "data/real_funding/funding/BINANCE_LINEAR_SOL_USDT_FUNDING.csv.gz",
+        "pinned_rows": 4458,
+        "pinned_sha256_uncompressed": "892edd2b80a5a2c445809d3ca805c5058dc39b21bb6af19c57d729f1a125853c",
+        "rows_on_disk": 4458,
+        "whole_file_sha256_uncompressed": "892edd2b80a5a2c445809d3ca805c5058dc39b21bb6af19c57d729f1a125853c",
+        "prefix_sha256_uncompressed": "892edd2b80a5a2c445809d3ca805c5058dc39b21bb6af19c57d729f1a125853c",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz": {
+        "path": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz",
+        "pinned_rows": 1461,
+        "pinned_sha256_uncompressed": "3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55",
+        "rows_on_disk": 1462,
+        "whole_file_sha256_uncompressed": "32ca5971229f07ed866627d939ed07768f7e0e0d299a3d4c07d440c0b43bab22",
+        "prefix_sha256_uncompressed": "3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 1,
+        "appended_timestamps": [
+          "2026-08-10T00:00:00+00:00"
+        ],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": true,
+        "why_not": ""
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz": {
+        "path": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_ETH_USDT_1D.csv.gz",
+        "pinned_rows": 1461,
+        "pinned_sha256_uncompressed": "086b231cef04ce58bf5ae0d98f02b0a614f102233b20435ee00ab0f83923ed80",
+        "rows_on_disk": 1461,
+        "whole_file_sha256_uncompressed": "086b231cef04ce58bf5ae0d98f02b0a614f102233b20435ee00ab0f83923ed80",
+        "prefix_sha256_uncompressed": "086b231cef04ce58bf5ae0d98f02b0a614f102233b20435ee00ab0f83923ed80",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      },
+      "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz": {
+        "path": "data/real_linear_1d/ohlcv/BINANCE_LINEAR_SOL_USDT_1D.csv.gz",
+        "pinned_rows": 1461,
+        "pinned_sha256_uncompressed": "35c557d1f073b93bef07bb254e3308c471d2381a15ca6b73dfb0a7481c7f3220",
+        "rows_on_disk": 1461,
+        "whole_file_sha256_uncompressed": "35c557d1f073b93bef07bb254e3308c471d2381a15ca6b73dfb0a7481c7f3220",
+        "prefix_sha256_uncompressed": "35c557d1f073b93bef07bb254e3308c471d2381a15ca6b73dfb0a7481c7f3220",
+        "history_unchanged": true,
+        "never_shrank": true,
+        "appended_rows": 0,
+        "appended_timestamps": [],
+        "appended_all_strictly_after_t1": true,
+        "appended_before_or_at_t1": [],
+        "append_only": true,
+        "extended": false,
+        "why_not": ""
+      }
+    },
+    "what_this_proves": "NOT ONE BYTE OF MEASURED HISTORY HAS MOVED. The digest locked in slice 57 — before funding_carry_fade_btc_v1 existed as a module — is still the digest of the corpus the cleared measurement was taken over. It is now the digest of a PREFIX of a longer file rather than of the whole file, and that is the only thing that changed. The 41 OOS trades, M1 95.13, M2 96.0 and mean net R +0.1736 all still describe exactly the bytes they described.",
+    "what_this_does_not_prove": "It does not prove no extension exists. That was never an invariant — it was slice 61's dated finding, which artifacts/slice61_data_freshness.json continues to record and which this slice does not rewrite."
+  },
+  "appended_linear_bars": [
+    {
+      "time_period_start": "2026-08-10T00:00:00+00:00",
+      "time_period_end": "2026-08-10T23:59:59+00:00",
+      "closes_at_utc": "2026-08-11T00:00:00+00:00",
+      "closed": true,
+      "seconds_since_close": 59783,
+      "recorded_end_is_inclusive_convention": true
+    }
+  ],
+  "closed_rule": "A daily bar stamped D closes at D+1T00:00Z. Only closed bars count. The bar for the check date is correctly ABSENT from the corpus and is not required.",
+  "open_bar_absent_as_expected": true,
+  "funding_seam": {
+    "appended_prints": [
+      "2026-08-10T00:00:00+00:00",
+      "2026-08-10T08:00:00+00:00",
+      "2026-08-10T16:00:00+00:00",
+      "2026-08-11T00:00:00+00:00",
+      "2026-08-11T08:00:00+00:00"
+    ],
+    "cadence_hours_across_pinned_prefix": {
+      "min": 8.0,
+      "max": 8.0
+    },
+    "missing_prints": [
+      "2026-08-09T16:00:00+00:00"
+    ],
+    "finding": "The extension began at the next DAY boundary rather than the next PRINT, leaving exactly one hole at 2026-08-09T16:00Z. The hole is AFTER t1, in the forward region, so measured history is unaffected and the pinned prefix's own cadence is still a flat 8.0 hours throughout. It changes no number in this slice. It is named rather than absorbed into a widened bound because 'fail closed on missing data' is a standing rule, and a hole tolerated silently today is a hole that silently feeds a stale rate to a decision in a later slice with more bars.",
+    "affects_any_number_this_slice": false,
+    "carried_forward_for_the_human_to_fill": true
+  },
+  "manifests": {
+    "linear": {
+      "manifest": "data/real_linear_1d/MANIFEST.json",
+      "manifest_synthetic": false,
+      "declared_rows": 1461,
+      "declared_end": "2026-08-09",
+      "rows_on_disk": 1462,
+      "last_on_disk": "2026-08-10T00:00:00+00:00",
+      "manifest_describes_the_file_beside_it": false,
+      "manifest_describes_the_pinned_prefix": true
+    },
+    "funding": {
+      "manifest": "data/real_funding/MANIFEST.json",
+      "manifest_synthetic": false,
+      "declared_rows": 4383,
+      "declared_end": "2026-08-09",
+      "rows_on_disk": 4388,
+      "last_on_disk": "2026-08-11T08:00:00+00:00",
+      "manifest_describes_the_file_beside_it": false,
+      "manifest_describes_the_pinned_prefix": true
+    },
+    "edited_by_this_slice": false,
+    "why_not_edited": "The MANIFESTs still declare the pinned prefix and are now wrong about the files beside them. They are left BYTE-VERBATIM: editing the pack's own provenance records would make the delivery look internally consistent when it is not, and the disagreement is itself a finding worth shipping. The repaired tests read a manifest as a description of the PINNED PREFIX, which is what it accurately is, and account for the remainder separately."
+  },
+  "plausibility": {
+    "appended_bar_volume": 128825.728,
+    "appended_bar_volume_percentile_vs_history": 19.3,
+    "appended_bar_trades": 2286748.0,
+    "appended_bar_trades_percentile_vs_history": 24.98,
+    "trailing_30_bar_mean_volume": 115254.4,
+    "trailing_30_bar_mean_trades": 2396862.8,
+    "verdict": "ORDINARY — the appended bar sits inside the body of the corpus distribution and in line with the trailing 30 bars. This is evidence about SHAPE only; no arithmetic can prove a bar real.",
+    "note_on_formatting": "The appended row is the only row in the file whose four price fields all carry exactly two decimals; every historical row uses the producer's variable precision. The extension was serialised by a different writer than the original corpus. Numerically this changes nothing, and it is recorded rather than insinuated about."
+  },
+  "what_would_count_as_a_forward_observation": {
+    "rule": "a shadow trade that both ENTERS and EXITS on closed bars strictly after t1",
+    "not_this": "a bar arriving. Not a flagged bar. Not an entry. A trade is an observation only when it CLOSES.",
+    "closed_forward_bars_available": 1,
+    "closed_forward_bars_needed": 6,
+    "maximum_possible_forward_trades_today": 0,
+    "ceiling_declared_before_scoring": "EDGE.md §45e"
+  },
+  "git_commit": "5dbd0c5e74f4189482eefdb3cdce81f077f45e24"
+}

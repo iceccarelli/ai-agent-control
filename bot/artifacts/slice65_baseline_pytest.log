@@ -1,0 +1,296 @@
+........................................................................ [  1%]
+........................................................................ [  3%]
+........................................................................ [  5%]
+........................................................................ [  7%]
+........................................................................ [  8%]
+........................................................................ [ 10%]
+........................................................................ [ 12%]
+........................................................................ [ 14%]
+........................................................................ [ 16%]
+........................................................................ [ 17%]
+........................................................................ [ 19%]
+........................................................................ [ 21%]
+...........................................................F..s......... [ 23%]
+........................................................................ [ 24%]
+........................................................................ [ 26%]
+........................................................................ [ 28%]
+........................................................................ [ 30%]
+........................................................................ [ 32%]
+........................................................................ [ 33%]
+........................................................................ [ 35%]
+........................................................................ [ 37%]
+........................................................................ [ 39%]
+........................................................................ [ 40%]
+...............................................................s........ [ 42%]
+........................................................................ [ 44%]
+........................................................................ [ 46%]
+........................................................................ [ 48%]
+........................................................................ [ 49%]
+........................................................................ [ 51%]
+........................................................................ [ 53%]
+........................................................................ [ 55%]
+........................................................................ [ 56%]
+........................................................................ [ 58%]
+........................................................................ [ 60%]
+........................................................................ [ 62%]
+........................................................................ [ 64%]
+........................................................................ [ 65%]
+........................................................................ [ 67%]
+........................................................................ [ 69%]
+........................................................................ [ 71%]
+........................................................................ [ 72%]
+........................................................................ [ 74%]
+........................................................................ [ 76%]
+........................................................................ [ 78%]
+........................................................................ [ 80%]
+........................................................................ [ 81%]
+...........FF......FFFFF...................FF........................... [ 83%]
+........................................................................ [ 85%]
+...................................F...F................................ [ 87%]
+........................................................................ [ 88%]
+........................................................................ [ 90%]
+........................................................................ [ 92%]
+........................................................................ [ 94%]
+........................................................................ [ 96%]
+........................................................................ [ 97%]
+........................................................................ [ 99%]
+..............                                                           [100%]
+=================================== FAILURES ===================================
+_ TestTheFoldCalendarWasLockedBeforeAnythingWasScored.test_the_pinned_hashes_still_match_the_files_on_disk _
+
+self = <test_funding_carry_fade_btc_v1.TestTheFoldCalendarWasLockedBeforeAnythingWasScored object at 0x7f3d88f66890>
+
+    def test_the_pinned_hashes_still_match_the_files_on_disk(self):
+        """If a corpus were swapped, the locked cut would no longer be a cut of
+        the data being measured — and that must be loud, not silent."""
+        import tools.lock_btc_folds as lock  # noqa: PLC0415
+        folds = self._folds()
+        for key in ("linear_bars", "funding"):
+            entry = folds["sources"][key]
+            actual = lock.sha256_uncompressed(os.path.join(REPO, entry["path"]))
+>           assert actual == entry["sha256_uncompressed"], entry["path"]
+E           AssertionError: data/real_linear_1d/ohlcv/BINANCE_LINEAR_BTC_USDT_1D.csv.gz
+E           assert 'ec4cfcf8bfee...b550a809732d3' == '3c2e8601114c...7cb259babed55'
+E             
+E             - 3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55
+E             + ec4cfcf8bfee47eec33d8a334be762cb603831a3690c50939b0b550a809732d3
+
+tests/test_funding_carry_fade_btc_v1.py:308: AssertionError
+_ TestTheFilesMatchWhatTheManifestClaims.test_funding_row_counts_and_ranges_match[ETHUSDT] _
+
+self = <test_slice55_data_eligibility.TestTheFilesMatchWhatTheManifestClaims object at 0x7f3d8446df90>
+symbol = 'ETHUSDT'
+
+    @pytest.mark.parametrize("symbol", SYMBOLS)
+    def test_funding_row_counts_and_ranges_match(self, symbol):
+        rows = self._rows(FUNDING_DIR, "funding",
+                          f"BINANCE_LINEAR_{symbol[:3]}_USDT_FUNDING.csv.gz")
+        declared = _manifest(FUNDING_DIR)["date_range_utc"][symbol]
+>       assert len(rows) == declared["rows"]
+E       AssertionError: assert 4383 == 4394
+E        +  where 4383 = len([{'funding_time': '2022-08-09T16:00:00+00:00', 'funding_time_ms': '1660060800000', 'symbol': 'ETHUSDT', 'funding_rate'...08-11T08:00:00+00:00', 'funding_time_ms': '1660204800000', 'symbol': 'ETHUSDT', 'funding_rate': '4.392e-05', ...}, ...])
+
+tests/test_slice55_data_eligibility.py:95: AssertionError
+_ TestTheFilesMatchWhatTheManifestClaims.test_funding_row_counts_and_ranges_match[SOLUSDT] _
+
+self = <test_slice55_data_eligibility.TestTheFilesMatchWhatTheManifestClaims object at 0x7f3d8446fd10>
+symbol = 'SOLUSDT'
+
+    @pytest.mark.parametrize("symbol", SYMBOLS)
+    def test_funding_row_counts_and_ranges_match(self, symbol):
+        rows = self._rows(FUNDING_DIR, "funding",
+                          f"BINANCE_LINEAR_{symbol[:3]}_USDT_FUNDING.csv.gz")
+        declared = _manifest(FUNDING_DIR)["date_range_utc"][symbol]
+>       assert len(rows) == declared["rows"]
+E       AssertionError: assert 4458 == 4394
+E        +  where 4458 = len([{'funding_time': '2022-08-09T16:00:00+00:00', 'funding_time_ms': '1660060800000', 'symbol': 'SOLUSDT', 'funding_rate'...22-08-11T08:00:00+00:00', 'funding_time_ms': '1660204800000', 'symbol': 'SOLUSDT', 'funding_rate': '0.0001', ...}, ...])
+
+tests/test_slice55_data_eligibility.py:95: AssertionError
+_ TestTheFilesMatchWhatTheManifestClaims.test_the_funding_cadence_is_not_assumed_to_be_uniform _
+
+self = <test_slice55_data_eligibility.TestTheFilesMatchWhatTheManifestClaims object at 0x7f3d8360e250>
+
+    def test_the_funding_cadence_is_not_assumed_to_be_uniform(self):
+        """SOLUSDT changed cadence inside the sample, and that is a venue fact.
+    
+        Its minimum gap is 2 hours where BTC's and ETH's are a flat 8. Nothing
+        in the join policy assumes a fixed spacing — it takes the LAST print at
+        or before the decision time, whatever the cadence — and this test
+        records the irregularity so a future reader does not treat it as
+        corruption.
+        """
+        gaps = {}
+        for symbol in SYMBOLS:
+            rows = self._rows(FUNDING_DIR, "funding",
+                              f"BINANCE_LINEAR_{symbol[:3]}_USDT_FUNDING.csv.gz")
+            stamps = [dt.datetime.fromisoformat(r["funding_time"]) for r in rows]
+            hours = [(b - a).total_seconds() / 3600.0
+                     for a, b in zip(stamps, stamps[1:])]
+            gaps[symbol] = (min(hours), max(hours))
+>       assert gaps["BTCUSDT"] == (8.0, 8.0)
+E       assert (8.0, 16.0) == (8.0, 8.0)
+E         
+E         At index 1 diff: 16.0 != 8.0
+E         Use -v to get more diff
+
+tests/test_slice55_data_eligibility.py:137: AssertionError
+_ TestTheFilesMatchWhatTheManifestClaims.test_linear_bars_match_and_are_sane[BTCUSDT] _
+
+self = <test_slice55_data_eligibility.TestTheFilesMatchWhatTheManifestClaims object at 0x7f3d8360f3d0>
+symbol = 'BTCUSDT'
+
+    @pytest.mark.parametrize("symbol", SYMBOLS)
+    def test_linear_bars_match_and_are_sane(self, symbol):
+        rows = self._rows(LINEAR_DIR, "ohlcv",
+                          f"BINANCE_LINEAR_{symbol[:3]}_USDT_1D.csv.gz")
+        declared = _manifest(LINEAR_DIR)["date_range_utc"][symbol]
+>       assert len(rows) == declared["rows"] == 1461
+E       assert 1464 == 1461
+
+tests/test_slice55_data_eligibility.py:146: AssertionError
+_ TestTheFilesMatchWhatTheManifestClaims.test_linear_bars_match_and_are_sane[ETHUSDT] _
+
+self = <test_slice55_data_eligibility.TestTheFilesMatchWhatTheManifestClaims object at 0x7f3d8360dd50>
+symbol = 'ETHUSDT'
+
+    @pytest.mark.parametrize("symbol", SYMBOLS)
+    def test_linear_bars_match_and_are_sane(self, symbol):
+        rows = self._rows(LINEAR_DIR, "ohlcv",
+                          f"BINANCE_LINEAR_{symbol[:3]}_USDT_1D.csv.gz")
+        declared = _manifest(LINEAR_DIR)["date_range_utc"][symbol]
+>       assert len(rows) == declared["rows"] == 1461
+E       AssertionError: assert 1461 == 1464
+E        +  where 1461 = len([{'time_period_start': '2022-08-10T00:00:00+00:00', 'time_period_end': '2022-08-10T23:59:59+00:00', 'time_open': '2022...-08-15T23:59:59+00:00', 'time_open': '2022-08-15T00:00:00+00:00', 'time_close': '2022-08-15T23:59:59+00:00', ...}, ...])
+
+tests/test_slice55_data_eligibility.py:146: AssertionError
+_ TestTheFilesMatchWhatTheManifestClaims.test_linear_bars_match_and_are_sane[SOLUSDT] _
+
+self = <test_slice55_data_eligibility.TestTheFilesMatchWhatTheManifestClaims object at 0x7f3d8360e0d0>
+symbol = 'SOLUSDT'
+
+    @pytest.mark.parametrize("symbol", SYMBOLS)
+    def test_linear_bars_match_and_are_sane(self, symbol):
+        rows = self._rows(LINEAR_DIR, "ohlcv",
+                          f"BINANCE_LINEAR_{symbol[:3]}_USDT_1D.csv.gz")
+        declared = _manifest(LINEAR_DIR)["date_range_utc"][symbol]
+>       assert len(rows) == declared["rows"] == 1461
+E       AssertionError: assert 1461 == 1464
+E        +  where 1461 = len([{'time_period_start': '2022-08-10T00:00:00+00:00', 'time_period_end': '2022-08-10T23:59:59+00:00', 'time_open': '2022...-08-15T23:59:59+00:00', 'time_open': '2022-08-15T00:00:00+00:00', 'time_close': '2022-08-15T23:59:59+00:00', ...}, ...])
+
+tests/test_slice55_data_eligibility.py:146: AssertionError
+_ TestTheFilesMatchWhatTheManifestClaims.test_linear_bars_load_through_the_production_loader[BTCUSDT] _
+
+self = <test_slice55_data_eligibility.TestTheFilesMatchWhatTheManifestClaims object at 0x7f3d8484c4d0>
+symbol = 'BTCUSDT'
+
+    @pytest.mark.parametrize("symbol", SYMBOLS)
+    def test_linear_bars_load_through_the_production_loader(self, symbol):
+        """Eligibility means nothing if the loader cannot read the corpus.
+    
+        Slice 38's lesson: `data_contract` once certified a corpus whose rows
+        the loader silently dropped.
+    
+        `verify=False` is deliberate and is the reason
+        `tools/verify_slice55_corpora.py` exists. This MANIFEST carries no
+        per-file checksum block, so `verify_manifest` refuses it — and
+        weakening `verify_manifest` to accept a missing block would have
+        removed a real integrity check from every corpus in the repository.
+        The integrity claim for this corpus is carried instead by the pinned
+        hashes in `artifacts/slice55_data_eligibility.json`, asserted below.
+        """
+        import backtest as bt
+        import market_data as md
+        loaded, _b, _n = md.load_corpus(os.path.join(REPO, LINEAR_DIR),
+                                        verify=False)
+        # The loader keys by `symbol_from_filename`, which joins base and
+        # quote without a separator: BINANCE_LINEAR_BTC_USDT_1D -> BTCUSDT.
+        assert symbol in loaded, sorted(loaded)
+        bars = [bt.Bar(b.start_ms, b.open, b.high, b.low, b.close, b.volume)
+                for b in loaded[symbol]]
+>       assert len(bars) == 1461
+E       assert 1464 == 1461
+E        +  where 1464 = len([Bar(start_ms=1660089600000, open=23140.1, high=24235.2, low=22608.0, close=23940.9, volume=760738.204), Bar(start_ms=...37314.32), Bar(start_ms=1660521600000, open=24294.1, high=25200.0, low=23762.0, close=24085.2, volume=739390.721), ...])
+
+tests/test_slice55_data_eligibility.py:178: AssertionError
+_ TestTheEligibilityArtefactPinsWhatIsOnDisk.test_the_recorded_hashes_match_the_files_today _
+
+self = <test_slice55_data_eligibility.TestTheEligibilityArtefactPinsWhatIsOnDisk object at 0x7f3d834818d0>
+
+    def test_the_recorded_hashes_match_the_files_today(self):
+        """Decisive: recompute, do not trust the record."""
+        from tools.verify_slice55_corpora import sha256_uncompressed
+        payload = self._payload()
+        for directory, block in payload["corpora"].items():
+            for symbol, info in block["symbols"].items():
+                path = os.path.join(REPO, info["file"])
+                assert os.path.exists(path), path
+>               assert sha256_uncompressed(path) == \
+                    info["sha256_uncompressed"], (directory, symbol)
+E               AssertionError: ('data/real_funding', 'BTCUSDT')
+E               assert 'a2a7a8775f04...ae109046f2372' == '9f5ceefce6ad...dad1f2f266145'
+E                 
+E                 - 9f5ceefce6adcc2c396f7b15c83ae64125439c41773fbc48cf4dad1f2f266145
+E                 + a2a7a8775f0493b5ce865efc11cede34dfc400810c228ab12a6ae109046f2372
+
+tests/test_slice55_data_eligibility.py:375: AssertionError
+_ TestTheEligibilityArtefactPinsWhatIsOnDisk.test_the_recorded_row_counts_match_the_manifests _
+
+self = <test_slice55_data_eligibility.TestTheEligibilityArtefactPinsWhatIsOnDisk object at 0x7f3d833eca50>
+
+    def test_the_recorded_row_counts_match_the_manifests(self):
+        payload = self._payload()
+        for directory in (FUNDING_DIR, LINEAR_DIR):
+            declared = _manifest(directory)["date_range_utc"]
+            for symbol, info in payload["corpora"][directory]["symbols"].items():
+>               assert info["rows"] == declared[symbol]["rows"], symbol
+E               AssertionError: BTCUSDT
+E               assert 4383 == 4394
+
+tests/test_slice55_data_eligibility.py:383: AssertionError
+_ TestTheCorpusIsCheckedByHashNotByDescription.test_both_files_still_hash_to_their_slice57_pins _
+
+self = <test_slice61_extension_claim.TestTheCorpusIsCheckedByHashNotByDescription object at 0x7f3d8431af90>
+
+    def test_both_files_still_hash_to_their_slice57_pins(self):
+        """The single most informative assertion in this file.
+    
+        Identical hashes prove BOTH that no history was rewritten (the note's
+        more important promise) AND that no extension exists (identical files
+        cannot contain new rows).
+        """
+        folds = fb.load_folds()
+>       assert gz_sha256(LINEAR) == \
+            folds["sources"]["linear_bars"]["sha256_uncompressed"]
+E       AssertionError: assert 'ec4cfcf8bfee...b550a809732d3' == '3c2e8601114c...7cb259babed55'
+E         
+E         - 3c2e8601114c10135efc8f0e6e58e097de11beeb5e084d6e5827cb259babed55
+E         + ec4cfcf8bfee47eec33d8a334be762cb603831a3690c50939b0b550a809732d3
+
+tests/test_slice61_extension_claim.py:80: AssertionError
+__ TestTheCorpusIsCheckedByHashNotByDescription.test_the_last_bar_is_still_t1 __
+
+self = <test_slice61_extension_claim.TestTheCorpusIsCheckedByHashNotByDescription object at 0x7f3d83656310>
+
+    def test_the_last_bar_is_still_t1(self):
+        folds = fb.load_folds()
+        last = rows(LINEAR)[-1]["time_period_start"]
+>       assert last.startswith(folds["t1"][:10])
+E       AssertionError: assert False
+E        +  where False = <built-in method startswith of str object at 0x7f3d48439b60>('2026-08-09')
+E        +    where <built-in method startswith of str object at 0x7f3d48439b60> = '2026-08-12T00:00:00+00:00'.startswith
+
+tests/test_slice61_extension_claim.py:104: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_funding_carry_fade_btc_v1.py::TestTheFoldCalendarWasLockedBeforeAnythingWasScored::test_the_pinned_hashes_still_match_the_files_on_disk
+FAILED tests/test_slice55_data_eligibility.py::TestTheFilesMatchWhatTheManifestClaims::test_funding_row_counts_and_ranges_match[ETHUSDT]
+FAILED tests/test_slice55_data_eligibility.py::TestTheFilesMatchWhatTheManifestClaims::test_funding_row_counts_and_ranges_match[SOLUSDT]
+FAILED tests/test_slice55_data_eligibility.py::TestTheFilesMatchWhatTheManifestClaims::test_the_funding_cadence_is_not_assumed_to_be_uniform
+FAILED tests/test_slice55_data_eligibility.py::TestTheFilesMatchWhatTheManifestClaims::test_linear_bars_match_and_are_sane[BTCUSDT]
+FAILED tests/test_slice55_data_eligibility.py::TestTheFilesMatchWhatTheManifestClaims::test_linear_bars_match_and_are_sane[ETHUSDT]
+FAILED tests/test_slice55_data_eligibility.py::TestTheFilesMatchWhatTheManifestClaims::test_linear_bars_match_and_are_sane[SOLUSDT]
+FAILED tests/test_slice55_data_eligibility.py::TestTheFilesMatchWhatTheManifestClaims::test_linear_bars_load_through_the_production_loader[BTCUSDT]
+FAILED tests/test_slice55_data_eligibility.py::TestTheEligibilityArtefactPinsWhatIsOnDisk::test_the_recorded_hashes_match_the_files_today
+FAILED tests/test_slice55_data_eligibility.py::TestTheEligibilityArtefactPinsWhatIsOnDisk::test_the_recorded_row_counts_match_the_manifests
+FAILED tests/test_slice61_extension_claim.py::TestTheCorpusIsCheckedByHashNotByDescription::test_both_files_still_hash_to_their_slice57_pins
+FAILED tests/test_slice61_extension_claim.py::TestTheCorpusIsCheckedByHashNotByDescription::test_the_last_bar_is_still_t1
+12 failed, 4032 passed, 2 skipped in 205.22s (0:03:25)
