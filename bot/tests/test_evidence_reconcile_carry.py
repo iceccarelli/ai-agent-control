@@ -969,3 +969,46 @@ class TestACarryLedgerMustStateItIsFlatAndConfirmed:
     def test_a_complete_ledger_still_passes(self):
         assert run(ledgers=[legacy_ledger(funding_confirmed=True)])[
             "pnl_claim_allowed"] is True
+
+
+class TestACarryLedgersFundingMustMatchWhatTheVenuePaid:
+    """The cash ledger's funding total is the money line of a carry cycle. It
+    was never compared with the settlements the capture holds: a ledger stating
+    7 settlements and $999 reconciled as consistent beside a capture with one
+    settlement of $0.0123."""
+
+    @pytest.mark.parametrize("over,code", [
+        ({"funding_settlements": 7}, "LEDGER_FUNDING_COUNT_DISAGREES"),
+        ({"funding_venue_usd": 999.0}, "LEDGER_FUNDING_TOTAL_DISAGREES"),
+        ({"funding_settlements": 7, "funding_venue_usd": 999.0},
+         "LEDGER_FUNDING_TOTAL_DISAGREES"),
+    ])
+    def test_a_ledger_that_misstates_funding_blocks(self, over, code):
+        report = run(ledgers=[legacy_ledger(**over)])
+        assert code in report["ledger_summaries"][0]["issues"]
+        assert report["pnl_claim_allowed"] is False
+
+    def test_a_ledger_that_matches_the_captured_settlement_passes(self):
+        report = run(ledgers=[legacy_ledger()])
+        issues = report["ledger_summaries"][0]["issues"]
+        assert not [i for i in issues if i.startswith("LEDGER_FUNDING_")]
+        assert report["pnl_claim_allowed"] is True
+
+    def test_funding_claimed_where_the_capture_holds_none_blocks(self):
+        records = build(settle=False)
+        report = run(records, ledgers=[legacy_ledger()], funding=[])
+        issues = report["ledger_summaries"][0]["issues"]
+        assert "LEDGER_FUNDING_COUNT_DISAGREES" in issues
+        assert "LEDGER_FUNDING_TOTAL_DISAGREES" in issues
+        assert report["pnl_claim_allowed"] is False
+
+    def test_funding_claimed_with_no_reconciled_cycle_at_all_blocks(self):
+        report = R.reconcile(ledgers=[legacy_ledger()], captures=[], now_ms=NOW)
+        assert "LEDGER_FUNDING_NOT_IN_CAPTURE" in report["ledger_summaries"][0]["issues"]
+        assert report["pnl_claim_allowed"] is False
+
+    def test_a_ledger_that_states_no_funding_is_not_asked_to_match(self):
+        led = legacy_ledger()
+        led.pop("funding_settlements"); led.pop("funding_venue_usd")
+        issues = run(ledgers=[led])["ledger_summaries"][0]["issues"]
+        assert not [i for i in issues if i.startswith("LEDGER_FUNDING_")]
