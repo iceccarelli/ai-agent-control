@@ -54,6 +54,18 @@ MAX_ENTRIES_PER_UTC_DAY = 1
 MIN_MARGIN_MULTIPLE = 2.0
 
 
+def _utc_day(now: Optional[dt.datetime]) -> dt.date:
+    """The UTC calendar day of ``now`` (a naive datetime is read as UTC).
+
+    ``now.date()`` is the day in the datetime's OWN zone, so one instant could
+    spend or miss two different days' allowances."""
+    if now is None:
+        return dt.datetime.now(dt.timezone.utc).date()
+    if now.tzinfo is None:
+        return now.date()
+    return now.astimezone(dt.timezone.utc).date()
+
+
 @dataclass(frozen=True)
 class PairDecision:
     ok: bool
@@ -162,7 +174,7 @@ class CarryRisk:
             return _block("NOTIONAL_ABOVE_CAP", requested=float(notional_usd),
                           cap=self.max_notional_usd)
 
-        today = (now or dt.datetime.now(dt.timezone.utc)).date()
+        today = _utc_day(now)
         landed = sum(1 for d in self._entries if d == today)
         broken = sum(1 for d in self._broken if d == today)
         used = landed + broken
@@ -241,7 +253,7 @@ class CarryRisk:
         not forget it. Adds only the shortfall, so repeating it never
         inflates the count.
         """
-        today = (now or dt.datetime.now(dt.timezone.utc)).date()
+        today = _utc_day(now)
         used = (sum(1 for d in self._entries if d == today)
                 + sum(1 for d in self._broken if d == today))
         missing = max(0, self.max_entries_per_day - used)
@@ -254,7 +266,7 @@ class CarryRisk:
         """Called only after BOTH legs land. A REFUSED pair (no leg sent) did
         not consume the day's entry. A half-filled one is recorded separately,
         by record_broken_pair."""
-        today = (now or dt.datetime.now(dt.timezone.utc)).date()
+        today = _utc_day(now)
         self._entries.append(today)
         del self._entries[:-32]
 
@@ -262,6 +274,6 @@ class CarryRisk:
         """One leg landed alone and was unwound. It is not an entry; it did
         cost a round trip, so it spends the day's allowance exactly as an
         entry would. No new threshold: the same MAX_ENTRIES_PER_UTC_DAY."""
-        today = (now or dt.datetime.now(dt.timezone.utc)).date()
+        today = _utc_day(now)
         self._broken.append(today)
         del self._broken[:-32]
