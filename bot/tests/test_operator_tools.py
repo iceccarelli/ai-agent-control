@@ -47,24 +47,38 @@ def test_operator_sandbox_ok_reports_gate_false_and_ladder_from_newest_artifact(
     assert report["live_authorized"] is False
 
 
-def test_operator_refuses_when_the_shipped_kill_switch_is_engaged(tmp_path):
-    """The shipped DB is a FIXTURE and is opened through a COPY.
-
-    It used to be opened in place. Opening a tracked sqlite file read-only is
-    not a thing sqlite does: it writes journal pages, and the file came back
-    dirty after every run. `git checkout` then refused to switch branches with
-    "local changes would be overwritten", which is a test corrupting the
-    repository it is testing.
-
-    Copying costs a millisecond and makes the run idempotent.
-    """
-    source = os.path.join(ROOT, "state", "trading_state.db")
-    if not os.path.isfile(source):
-        pytest.skip("fixture db not present")
+def test_operator_refuses_when_a_kill_switch_is_engaged(tmp_path):
+    """Hermetic: the engaged state is built here, not read from the tracked
+    file. That file is also an operator's working database wherever someone
+    keeps it skip-worktree'd, so a test that opened it measured their runtime
+    state instead of the shipped fixture."""
+    import persistence
     db = str(tmp_path / "trading_state.db")
-    shutil.copy(source, db)
+    store = persistence.StateStore(db)
+    store.trip_kill_switch("test: operator halt")
+    store._conn.close()
     code, report = opd.run(ROOT, {"USE_TESTNET": "1", "PAPER_TRADING": "1",
                                   "STATE_DB_PATH": db})
+    assert code == 3 and any("kill switch" in r for r in report["preflight_reasons"])
+
+
+def test_the_committed_fixture_ships_with_the_kill_switch_engaged(tmp_path):
+    """What a fresh clone starts with. Read from the COMMITTED blob via git, so
+    it does not depend on the working-tree file (which may be an operator's own
+    database), and opened through a copy so nothing is written in place."""
+    import subprocess
+    try:
+        blob = subprocess.run(
+            ["git", "-C", ROOT, "show", "HEAD:bot/state/trading_state.db"],
+            capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pytest.skip("git is not available")
+    if blob.returncode != 0 or not blob.stdout:
+        pytest.skip("no committed fixture db at HEAD")
+    db = tmp_path / "trading_state.db"
+    db.write_bytes(blob.stdout)
+    code, report = opd.run(ROOT, {"USE_TESTNET": "1", "PAPER_TRADING": "1",
+                                  "STATE_DB_PATH": str(db)})
     assert code == 3 and any("kill switch" in r for r in report["preflight_reasons"])
 
 

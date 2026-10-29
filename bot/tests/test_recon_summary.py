@@ -5,6 +5,8 @@ import json
 import os
 import sys
 
+import pytest
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
@@ -65,3 +67,34 @@ class TestMalformedReportsNeverRaise:
         report = dict(C.run(), **patch)
         out = "\n".join(S.summarise(report))
         assert "nothing is claimed" in out and "NET " not in out
+
+
+class TestAnInconsistentReportIsNeverSummarisedAsAgreement:
+    """`records_consistent: False` used to print the same 'the captured records
+    agree' lines as a consistent report, so a failed reconciliation read as a
+    pass in a job summary."""
+
+    def _report(self, consistent):
+        return {"schema": "evidence_reconciliation/1",
+                "records_consistent": consistent,
+                "carry_legs": [], "funding": [],
+                "carry_cycle": [{"provenance": "CLAIMED_TESTNET_FILL",
+                                 "resolved": False,
+                                 "issues": ["CYCLE_NO_ENTRY"]}]}
+
+    def test_a_failed_reconciliation_does_not_claim_agreement(self):
+        text = "\n".join(S.summarise(self._report(False)))
+        assert "records_consistent: False" in text
+        assert "do NOT" in text
+        assert "rows agree with the drill's books" not in text
+        assert "records agree" not in text
+
+    def test_a_consistent_report_keeps_its_wording(self):
+        text = "\n".join(S.summarise(self._report(True)))
+        assert "records_consistent: True (the captured records agree" in text
+        assert "rows agree with the drill's books" in text
+
+    @pytest.mark.parametrize("value", [None, "true", 1, "yes"])
+    def test_only_a_literal_true_counts_as_consistent(self, value):
+        text = "\n".join(S.summarise(self._report(value)))
+        assert "rows agree with the drill's books" not in text
