@@ -255,7 +255,7 @@ the process is intentional. Allow ≥30 s for graceful termination.
 - [ ] `.env.production.ORIGINAL_DO_NOT_DEPLOY` deleted wherever the original source lives; images purged
 - [ ] New keys: spot trade + read only, **no withdrawal**, IP-bound
 - [ ] `.dockerignore` excludes `.env*`, `state/`, `_dead/`
-- [ ] Gate 1: 618 tests green
+- [ ] Gate 1: the whole suite green: the `carry-verify` correctness gate and its `rest-of-suite` job
 - [ ] Gate 2: real-data backtest passes **every** criterion
 - [ ] Gate 3: 48 h paper run clean, including a `kill -9` restart
 - [ ] Gate 4: one week on testnet; brackets verified **on the exchange**

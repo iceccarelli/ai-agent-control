@@ -262,6 +262,5 @@ half of that sentence is worth being able to demonstrate rather than assert.
 **Headline, unchanged: NOT READY for live capital. There is no measured timing
 edge to deploy.**
 
-*Records: `EDGE.md` §4a–§10e, `STAGE1_VERDICT.md`, `GEOMETRY.md`,
-`artifacts/slice23_*`, `artifacts/slice24_*`, `artifacts/slice25_*`,
+*Records: `artifacts/slice23_*`, `artifacts/slice24_*`, `artifacts/slice25_*`,
 `artifacts/slice28_*`.*
