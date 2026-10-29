@@ -636,6 +636,82 @@ def replay_snapshot(perp: float = 30_000.0, spot: float = 29_988.0,
                           funding_print_ms=int(now * 1000))
 
 
+def trade_concentration(trade_rows: Sequence[Dict[str, Any]], *, notional: float,
+                        fee_events: Sequence[Any] = (),
+                        borrow_events: Sequence[Any] = (),
+                        net_usd: Optional[float] = None) -> Dict[str, Any]:
+    """How the return was earned, not just how big it is.
+
+    Per-trade net is the engine's funding, plus BOTH legs' price move, minus the
+    fees and borrow booked at ticks inside the trade (``fee_events`` and
+    ``borrow_events`` are ``(ms, usd)`` pairs, so nothing is allocated by a
+    guess). A headline that one trade supplied, or that came with a deep fall on
+    the way, is a different claim from one spread evenly, and the headline alone
+    hides both. ``reconciles_to_net`` says whether the per-trade numbers add
+    back to the headline; when they do not, say so rather than trust either.
+    """
+    trades = sorted(trade_rows, key=lambda t: (int(t["closed_ms"]), int(t["opened_ms"])))
+    nets: List[float] = []
+    for t in trades:
+        lo, hi = int(t["opened_ms"]), int(t["closed_ms"])
+        basis = (-t["qty"] * (t["exit_perp"] - t["entry_perp"])
+                 + t["spot_qty"] * (t["exit_spot"] - t["entry_spot"]))
+        fees = sum(u for ms, u in fee_events if lo <= int(ms) <= hi)
+        borrow = sum(u for ms, u in borrow_events if lo <= int(ms) <= hi)
+        nets.append(float(t["funding"]) + basis - fees - borrow)
+    total = sum(nets)
+    peak = cum = worst = 0.0
+    for n in nets:
+        cum += n
+        peak = max(peak, cum)
+        worst = max(worst, peak - cum)
+    ranked = sorted(nets, reverse=True)
+    positive = total > 0
+    return {
+        "trades": len(nets),
+        "trade_nets_usd": nets,
+        "net_usd": total,
+        "best_trade_usd": ranked[0] if ranked else None,
+        "best_trade_share_of_net": (ranked[0] / total) if (ranked and positive) else None,
+        "top5_share_of_net": (sum(ranked[:5]) / total) if (ranked and positive) else None,
+        "losing_trade_pct": (100.0 * sum(1 for n in nets if n < 0) / len(nets)
+                             if nets else None),
+        "max_drawdown_usd": worst,
+        "max_drawdown_pct_of_notional": 100.0 * worst / notional if notional else None,
+        "reconciles_to_net": (None if net_usd is None
+                              else abs(total - net_usd) < max(0.01, 1e-6 * abs(net_usd))),
+    }
+
+
+def concentration_lines(c: Dict[str, Any], *, years: float,
+                        notional: float) -> List[str]:
+    """The printed form of :func:`trade_concentration`. Empty when there is
+    nothing to say. The 'without the best trade' figure is the point: a headline
+    one trade supplied is a different claim from one spread across many."""
+    if not c.get("trades"):
+        return []
+    out: List[str] = []
+    if c.get("best_trade_share_of_net") is not None:
+        nets = sorted(c["trade_nets_usd"], reverse=True)
+        without = c["net_usd"] - nets[0]
+        out.append(
+            f"  best trade ${c['best_trade_usd']:,.0f} = "
+            f"{100.0 * c['best_trade_share_of_net']:.1f}% of net; best five = "
+            f"{100.0 * c['top5_share_of_net']:.1f}%")
+        if years > 0 and notional:
+            out.append(
+                f"  without the best trade ${without:,.0f} = "
+                f"{100.0 * without / notional / years:+.2f}%/yr on notional "
+                "(before financing)")
+    out.append(
+        f"  {c['losing_trade_pct']:.0f}% of trades lose money; max drawdown of "
+        f"closed trades ${c['max_drawdown_usd']:,.0f} "
+        f"({c['max_drawdown_pct_of_notional']:.2f}% of notional)")
+    if c.get("reconciles_to_net") is False:
+        out.append("  WARNING: per-trade nets do NOT add back to the headline net")
+    return out
+
+
 def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
            execution_mode: str = "overlay", execution_style: str = "taker",
            impact_bps: float = 0.0, margin_multiple: float = INERT_MARGIN,
@@ -712,6 +788,8 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     reasons: Dict[str, int] = {}
     per_print_borrow = borrow_apr / (365.0 * cb.FUNDING_PERIODS_PER_DAY)
     funding_usd = basis_usd = fees_usd = borrow_usd = 0.0
+    fee_events: List[Any] = []        # (ms, usd) per tick, for per-trade fees
+    borrow_events: List[Any] = []     # (ms, usd) per tick, for per-trade borrow
     last_collected = 0.0
     halted_at: Optional[int] = None
 
@@ -762,6 +840,8 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         tick_fills = raw_broker.fills[before:]
         for fill in tick_fills:
             fees_usd += fill.fee
+        if tick_fills:
+            fee_events.append((int(row.ms), sum(f.fee for f in tick_fills)))
         # THE PRICE THE VENUE ACTUALLY GAVE US, not the bar's close. Taking
         # the exit from the bar drops the impact haircut on the closing leg —
         # exactly half the total impact, which is how this harness first
@@ -791,6 +871,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             # settlement stamp. Recomputing it here booked that print anyway
             # and made the replay $891 richer than the truth over 79 trades.
             borrow_usd += per_print_borrow * position.perp.filled_qty * row.spot
+            borrow_events.append((int(row.ms), per_print_borrow * position.perp.filled_qty * row.spot))
         if position is None and open_trade is not None:
             # THE ENGINE'S OWN NUMBER, taken from the decision that closed the
             # position. Reading `funding_collected` off the position after the
@@ -943,6 +1024,9 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
                 0.01, 1e-6 * abs(net)),
         "halted_at_ms": halted_at,
         "trade_rows": trades,
+        "concentration": trade_concentration(
+            trades, notional=notional, fee_events=fee_events,
+            borrow_events=borrow_events, net_usd=net),
         "not_modelled": [
             "latency: a fill happens at the price the decision was made on",
             "fill probability for post-only orders (every rest fills)",
@@ -1126,6 +1210,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  trades {r['trades']}, orders {r['orders']} "
           f"({r['maker_fills']} maker), in market "
           f"{r['market_exposure_pct']:.1f}%")
+    for line in concentration_lines(r["concentration"], years=r["years"],
+                                    notional=r["notional_usd"]):
+        print(line)
     if r["halted_at_ms"]:
         print(f"  HALTED at {cb._iso_ms(r['halted_at_ms'])} — the replay "
               "stopped there, as the process would")

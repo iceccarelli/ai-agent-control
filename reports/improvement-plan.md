@@ -7,7 +7,7 @@ Only what is still open. History is in `git log`. Nothing here retunes a signal 
 - Forward shadow book `post_gate_v1`: 91 observations over 3.4 days, 1 simulated entry, **0 closed trades**. Verdict `INSUFFICIENT_FORWARD_SAMPLE`.
 - Public-market protocol: 66 observations over 60.3 hours, but only **9 distinct funding prints**. Gate open on 46 of 66 observations, so the share is far less independent than the count. The frozen verdict needs 500 observations over 30 days (earliest about 2026-11-26).
 - Measured slippage on 64 public order books: round trip median 0.85 bps at $100k, against 1.0 bps assumed per leg. 4% of legs at $100k cost more than assumed.
-- Historical replay (`tools/carry_replay.py`, defaults): +$33,049.51, +8.05%/yr on a fixed $100,000 notional. It reproduces exactly. It is in-sample, assumes zero financing and zero-latency fills, trades only the perp leg, and is not evidence of profit. With 5% borrow the same engine gives about +3.5%/yr.
+- Historical replay (`tools/carry_replay.py`, defaults): +$33,049.51, +8.05%/yr on a fixed $100,000 notional. It reproduces exactly. It is in-sample, assumes zero financing and zero-latency fills, trades only the perp leg, and is not evidence of profit. With 5% borrow the same engine gives about +3.5%/yr. It is also concentrated: one 190-day hold (2023-10 to 2024-04, a bull-market funding regime) supplied 56.9% of the net, the best five trades 90.0%, and 51% of the 49 trades lose money. Without the best trade it is +3.47%/yr, without the best five +0.81%/yr, both before financing (`tools/carry_replay.py` now prints this on every run).
 - Nothing is established about forward profitability, liquidation behaviour of a long-held short, or venue-confirmed fees over a full lifecycle.
 
 ## Needs a decision from the owner
@@ -26,7 +26,6 @@ Only what is still open. History is in `git log`. Nothing here retunes a signal 
 |---|---|---|
 | E1 | Capture `liqPrice` and `accountMMRate` at every open pair and replay them, so the liquidation gate is evaluated and not `NOT_EVALUATED` | Holds are long (mean 16.9 days, 15% at least 30 days in the audited replay) and a short perp's liquidation risk grows with time held |
 | E2 | Report return on total capital (spot inventory plus perp margin), not only on notional | Decides whether the yield is worth running |
-| E3 | Add max drawdown and best-trade share of net to every report | Needed to judge whether returns are spike-driven; the forward plan already requires both (P4, P5) |
 | E6 | Promotion-gate human items are booleans in a JSON file in the same repo, with no signature | A PR could flip them; the live-chain predicate still has to pass |
 | E7 | Kill switch is checked in the risk gate and the carry tick, not at the transport | Deliberate: exits and unwinds share `/v5/order/create`. A new caller that bypasses the gate also bypasses the switch |
 | E8 | `simulate()` in the Python simulator hard-codes the funding window and EWMA constants that the C++ core takes as parameters | A sweep with non-default values is not Python-equivalent |
