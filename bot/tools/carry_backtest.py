@@ -880,6 +880,12 @@ class Settlement:
     perp_low: float
 
 
+def _fillable(st: "Settlement") -> bool:
+    """Both legs have a finite, positive price on the row an entry fills on."""
+    return (math.isfinite(st.perp) and st.perp > 0
+            and math.isfinite(st.spot) and st.spot > 0)
+
+
 def _when(ms: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(ms / 1000.0, dt.timezone.utc)
 
@@ -1117,6 +1123,12 @@ def simulate_settlements_series(rows: List[Settlement], *,
             if index < entry_fill_at:
                 continue                       # decided, not yet filled
             # The fill. The print stamped on this row is not this position's.
+            if not _fillable(st):
+                # The decision row's price was gated; this row's was not. An
+                # unusable price is no fill, never a crash or an infinite qty.
+                unresolved_entries += 1
+                streak, entry_fill_at = 0, None
+                continue
             qty = notional / st.perp
             live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
                          entry_perp=st.perp)
@@ -1180,11 +1192,14 @@ def simulate_settlements_series(rows: List[Settlement], *,
         if fill_row >= last_index:
             unresolved_entries += 1
         elif latency_rows == 0:
-            qty = notional / st.perp
-            live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
-                         entry_perp=st.perp)
-            charge(live, st.spot, st.perp)
-            streak = 0
+            if not _fillable(st):
+                unresolved_entries += 1
+            else:
+                qty = notional / st.perp
+                live = Trade(opened=_when(st.ms), qty=qty, entry_spot=st.spot,
+                             entry_perp=st.perp)
+                charge(live, st.spot, st.perp)
+                streak = 0
         else:
             entry_fill_at = fill_row
 

@@ -95,6 +95,7 @@ jobs:
           tests/test_funding_window.py
           tests/test_sweep_abi.py
           tests/test_carry_core_input_guards.py
+          tests/test_fill_row_invalid_price_parity.py
           tests/test_carry_latency.py
           tests/test_carry_cost_inputs.py
           tests/test_carry_shadow_forward.py
