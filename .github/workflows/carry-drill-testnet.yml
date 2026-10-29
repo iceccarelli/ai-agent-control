@@ -168,7 +168,8 @@ jobs:
           python tools/evidence_reconcile.py "${args[@]}"
           rc=$?
           echo "reconcile exit code: $rc"
-          # 0 = reconciled; 2 = reconciled with flags (shown below); anything else, or no report, is a failure
+          # 0 = records consistent; 2 = records INCONSISTENT (NOT reconciled; shown below); anything else, or no report, is a failure.
+          # This job proves the evidence PATH works; a green job is not a reconciled trade.
           if [ ! -s "$RUN_DIR/reconciliation.json" ]; then rc=99; fi
           echo "recon=$rc" >> "$GITHUB_OUTPUT"
           { echo '```'; python tools/recon_summary.py "$RUN_DIR/reconciliation.json"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
@@ -192,4 +193,4 @@ jobs:
           if [ "${{ steps.preflight.outcome }}" != "success" ]; then echo "preflight failed (not flat, or the venue could not be read): no drill was run"; exit 1; fi
           case "$code" in 0|5) echo "drill finished (exit $code)";; *) echo "drill exit code $code is not a clean finish"; exit 1;; esac
           rc="${{ steps.reconcile.outputs.recon }}"
-          case "$rc" in 0|2) echo "reconciliation ran (exit $rc)";; *) echo "reconciliation did not produce a usable report (exit ${rc:-not run}): the evidence path is NOT working"; exit 1;; esac
+          case "$rc" in 0) echo "reconciliation ran: records consistent";; 2) echo "reconciliation ran: RECORDS INCONSISTENT, not reconciled (the path works; the evidence does not support a claim)";; *) echo "reconciliation did not produce a usable report (exit ${rc:-not run}): the evidence path is NOT working"; exit 1;; esac
