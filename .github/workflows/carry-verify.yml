@@ -98,6 +98,7 @@ jobs:
           tests/test_sweep_abi.py
           tests/test_carry_core_input_guards.py
           tests/test_fill_row_invalid_price_parity.py
+          tests/test_native_build_fp_contract.py
           tests/test_carry_latency.py
           tests/test_carry_cost_inputs.py
           tests/test_carry_shadow_forward.py
@@ -255,7 +256,7 @@ jobs:
         if: always()
         run: |
           echo "### carry-verify (python ${{ matrix.python }})" >> "$GITHUB_STEP_SUMMARY"
-          echo "Targeted carry correctness gate only. The repository's full suite has a known baseline of 61 failures (deleted documentation, date-relative corpus fixtures); it is deliberately not run or claimed fixed here." >> "$GITHUB_STEP_SUMMARY"
+          echo "Targeted carry correctness gate. Every other test file runs in the rest-of-suite job; together they cover the whole suite. Green means the code is internally consistent, not that the strategy makes money." >> "$GITHUB_STEP_SUMMARY"
 
   production-image:
     name: production image builds and imports offline
