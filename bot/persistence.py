@@ -580,7 +580,15 @@ class StateStore:
     point leaves a consistent store.
     """
 
-    def __init__(self, path: str = DEFAULT_DB_PATH) -> None:
+    def __init__(self, path: str = DEFAULT_DB_PATH, *,
+                 engage_if_new: bool = False) -> None:
+        """``engage_if_new``: a database that had never been initialised (no
+        file, a zero-byte file, or a wiped volume) is seeded with the kill
+        switch ENGAGED, so losing the state file cannot read as "cleared".
+        Off by default so paper runs and scratch databases start clear; a
+        live-armed process turns it on. Independently of the flag, a kill
+        switch row that is missing from an already-initialised database is
+        always re-seeded engaged, never clear."""
         if not str(path).strip():
             # sqlite3.connect("") opens a private temporary database: the kill
             # switch, peak equity and daily anchors would silently vanish on
@@ -605,6 +613,9 @@ class StateStore:
             if path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=FULL")
+            was_initialised = self._conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+            ).fetchone() is not None
             self._conn.executescript(_DDL)
             self._conn.execute(
                 "INSERT OR IGNORE INTO meta(key, value) VALUES('schema_version', ?)",
@@ -624,10 +635,21 @@ class StateStore:
             for stmt in (
                 "INSERT OR IGNORE INTO equity_state(id) VALUES(1)",
                 "INSERT OR IGNORE INTO breaker(id) VALUES(1)",
-                "INSERT OR IGNORE INTO kill_switch(id) VALUES(1)",
                 "INSERT OR IGNORE INTO order_seq(id, next_id) VALUES(1, 1)",
             ):
                 self._conn.execute(stmt)
+            seed_reason = None
+            if not was_initialised and engage_if_new:
+                seed_reason = "state DB newly created; a human must clear the kill switch"
+            elif was_initialised and self._conn.execute(
+                    "SELECT 1 FROM kill_switch WHERE id = 1").fetchone() is None:
+                seed_reason = ("kill_switch row missing from an initialised state DB; "
+                               "a human must clear the kill switch")
+            if seed_reason is not None:
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO kill_switch(id, engaged, reason, engaged_epoch) "
+                    "VALUES(1, 1, ?, ?)", (seed_reason, utc_now_epoch()))
+            self._conn.execute("INSERT OR IGNORE INTO kill_switch(id) VALUES(1)")
             # OR IGNORE: a token already present (this database file has been
             # opened before) is kept; only a brand-new file gets a fresh one.
             self._conn.execute(

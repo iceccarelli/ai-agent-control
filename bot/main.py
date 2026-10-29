@@ -205,9 +205,12 @@ class TradingBot:
             # different database (and with it a cleared kill switch and an
             # unbounded daily-loss anchor).
             db_path = getattr(self.cfg, "STATE_DB_PATH", None)
-            store = (StateStore(db_path.strip())
+            # A live-armed process must not mistake a wiped or missing state
+            # file for a first run: a new database then starts engaged.
+            armed = getattr(self.cfg, "LIVE_AUTHORIZED", False) is True
+            store = (StateStore(db_path.strip(), engage_if_new=armed)
                      if isinstance(db_path, str) and db_path.strip()
-                     else StateStore())
+                     else StateStore(engage_if_new=armed))
         self.store = store
         self.client = client if client is not None else BybitClient(
             config=self.cfg, store=self.store
