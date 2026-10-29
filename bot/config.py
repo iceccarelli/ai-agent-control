@@ -863,7 +863,6 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         # take-profit and stop ratios completely unchanged.
         #
         # The geometry parameters were never the problem. The timeframe was.
-        # See GEOMETRY.md.
         PRIMARY_TIMEFRAME=parse_timeframes(env, "PRIMARY_TIMEFRAME", "D")[0],
         SECONDARY_TIMEFRAMES=parse_timeframes(env, "SECONDARY_TIMEFRAMES", "W"),
         KLINE_LOOKBACK=parse_int(env, "KLINE_LOOKBACK", 300, low=100, high=1000),
@@ -1043,7 +1042,7 @@ def _validate(cfg: Config) -> None:
             "short the ATR risk unit is of the same order as the cost, so most "
             "of every R is spent on execution. Measured on seven years of real "
             "BTC data, ZERO of 84 hourly geometries had positive net "
-            "expectancy and 72 of 84 daily ones did. See GEOMETRY.md.",
+            "expectancy and 72 of 84 daily ones did.",
             cfg.PRIMARY_TIMEFRAME, cfg.ROUND_TRIP_COST_BPS,
         )
     if cfg.PRIMARY_TIMEFRAME in cfg.SECONDARY_TIMEFRAMES:

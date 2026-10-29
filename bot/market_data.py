@@ -51,8 +51,8 @@ stack. In particular this module does **not** import ``backtest``, even though
 :class:`Bar` is deliberately field-compatible with ``backtest.Bar`` — importing
 it would drag in ``persistence``, ``risk_management``, ``position_sizing``,
 ``bybit_connection``, ``technical_analysis`` and ``trading_engine`` through
-that one line, and the arrows in INTEGRATION_MAP §1 would stop pointing
-downward. Compatibility here is structural, not inherited:
+that one line, and the module dependencies would stop pointing
+downward only. Compatibility here is structural, not inherited:
 ``Bar(start_ms, open, high, low, close, volume)`` positionally matches
 ``backtest.Bar``, so bars loaded here feed the backtester directly, and
 ``tests/test_market_data.py`` asserts the field order still matches so the
@@ -1946,7 +1946,7 @@ def load_corpus(
     # contamination happened by relying on a human to notice that a window had
     # already been looked at, and humans stop noticing.
     #
-    # But INTEGRATION_MAP §1 says dependencies point downward only, and
+    # But dependencies point downward only, and
     # test_the_module_imports_only_stdlib_numpy_and_config enforces it. So
     # market_data does NOT import the ledger. It publishes raw facts to an
     # observer that defaults to None, and reserved_holdout.install() sets it.

@@ -1237,7 +1237,7 @@ class TestProvenanceAndStructure:
             assert reason in text
 
     def test_the_module_imports_only_stdlib_numpy_and_config(self):
-        """Dependencies point downward only (INTEGRATION_MAP §1).
+        """Dependencies point downward only.
 
         Importing `backtest` to reuse its `Bar` would drag persistence, risk,
         sizing, the client, the strategy and the engine in through one line.

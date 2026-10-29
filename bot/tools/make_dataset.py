@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS
 ===============
-INTEGRATION_MAP §7 says it plainly: *"No real market data has been used."*
+The original test report used no real market data.
 Bybit is unreachable from this sandbox, so every number in the original test report came
 from a random walk with no microstructure at all — no book, no spread, no
 depth, no latency. That is fine for exercising the order lifecycle and useless

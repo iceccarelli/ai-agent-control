@@ -263,7 +263,7 @@ def install(market_data_module=None, *, reader: str = "",
 
     The arrow points UP: market_data knows nothing about the ledger, publishes
     raw epoch-ms facts to an observer that defaults to None, and this function
-    is what sets it. INTEGRATION_MAP §1 stays satisfied and the recording still
+    is what sets it. The downward-only dependency rule stays satisfied and the recording still
     happens at the single chokepoint every measurement tool routes through.
 
     Every tool that calls `market_data.load_corpus` must call this first.

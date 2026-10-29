@@ -182,7 +182,7 @@ def main(argv) -> int:
     # The bar size the corpus is in. It matters more than any other single
     # setting: the round-trip cost is fixed in bps while the ATR risk unit
     # scales with the bar, so the SAME geometry that loses 0.60R per trade on
-    # hourly bars loses 0.08R on daily ones. See GEOMETRY.md.
+    # hourly bars loses 0.08R on daily ones.
     parser.add_argument("--interval", default="60",
                         help="Bybit interval code of the corpus (60, 240, D)")
     parser.add_argument("--stop-atr", type=float, default=None)
