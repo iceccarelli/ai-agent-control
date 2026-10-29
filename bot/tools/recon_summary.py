@@ -53,11 +53,22 @@ def _summarise(report: dict) -> List[str]:
     for f in report.get("funding", []):
         lines.append(f"funding {f.get('claim_id')}: {f.get('provenance')}"
                      f"{' ' + ','.join(f['issues']) if f.get('issues') else ''}")
-    lines.append(f"records_consistent: {_consistent(report)} "
-                 "(the captured records agree; this is not profit)")
-    lines.append("This says the captured testnet rows agree with the drill's "
-                 "books. It is one round trip on testnet: it says nothing "
-                 "about edge, and spot BTC's own price change is not included.")
+    consistent = _consistent(report)
+    if consistent is True:
+        lines.append(f"records_consistent: {consistent} "
+                     "(the captured records agree; this is not profit)")
+        lines.append("This says the captured testnet rows agree with the "
+                     "drill's books. It is one round trip on testnet: it says "
+                     "nothing about edge, and spot BTC's own price change is "
+                     "not included.")
+    else:
+        # Only a literal True is agreement. False, absent or a truthy string
+        # must never read as a pass.
+        lines.append(f"records_consistent: {consistent} (the captured records "
+                     "do NOT all agree with the claims; see the issues above; "
+                     "this is not profit)")
+        lines.append("This reconciliation did not succeed. Nothing here is "
+                     "evidence of a fill, a close or a P&L figure.")
     return lines
 
 
