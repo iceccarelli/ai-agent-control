@@ -52,3 +52,14 @@ def test_a_config_loaded_unarmed_cannot_be_armed_by_replace_of_its_fields():
                                  LIVE_TRADING_ACK="I_UNDERSTAND",
                                  BYBIT_API_KEY="k", BYBIT_API_SECRET="s")
     assert config.is_live_authorized(forged)[0] is False   # stored flag False
+
+
+@pytest.mark.parametrize("env,needle", [
+    ({"USE_TESTNET": "0", "PAPER_TRADING": "0"}, "LIVE_TRADING_ACK"),
+    ({"USE_TESTNET": "0", "PAPER_TRADING": "0",
+      "LIVE_TRADING_ACK": "I_UNDERSTAND", "BYBIT_API_KEY": "k"}, "BYBIT_API_KEY"),
+])
+def test_a_config_that_load_blocked_keeps_its_specific_reason(env, needle):
+    cfg = config.load(dict(env, BYBIT_VENUE="mainnet"))
+    allowed, why = config.is_live_authorized(cfg)
+    assert allowed is False and "LIVE_BLOCKED" in why and needle in why

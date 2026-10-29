@@ -705,8 +705,13 @@ def is_live_authorized(cfg: Any = None) -> Tuple[bool, str]:
             api_secret=cfg.BYBIT_API_SECRET)
         if cfg.LIVE_AUTHORIZED is True and derived is True:
             return True, cfg.LIVE_BLOCK_REASON
-        reason = why if derived is not True else cfg.LIVE_BLOCK_REASON
-        return False, reason or "LIVE_BLOCKED: live authorisation not established"
+        if cfg.LIVE_AUTHORIZED is not True:
+            # Never authorised: load()'s own reason (e.g. LIVE_BLOCKED: ...) is
+            # the specific one an operator needs; keep it.
+            return False, cfg.LIVE_BLOCK_REASON
+        # Stored as authorised but the fields no longer say so (a replace):
+        # revoke, and say why from the fields.
+        return False, why or "LIVE_BLOCKED: live authorisation not established"
     get = (cfg.get if isinstance(cfg, Mapping) else lambda k, d=None: getattr(cfg, k, d))
     try:
         use_testnet = parse_safety_bool(get("USE_TESTNET", True), "USE_TESTNET", True)

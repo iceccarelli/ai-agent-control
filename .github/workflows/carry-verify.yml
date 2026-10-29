@@ -104,6 +104,7 @@ jobs:
           tests/test_gate_arithmetic_overflow.py
           tests/test_venue_isolation.py
           tests/test_live_gate_recomputed.py
+          tests/test_paper_agent_certification.py
           tests/test_drill_evidence.py
           tests/test_evidence_reconcile.py
           tests/test_evidence_reconcile_trades.py
