@@ -1829,7 +1829,8 @@ def resolve_inferred_links(claims: Sequence[Dict[str, Any]],
 def summarise_ledger(payload: Mapping[str, Any], fills: Sequence[Dict[str, Any]],
                      fill_claims: Sequence[Mapping[str, Any]],
                      carry_claims: Sequence[Mapping[str, Any]] = (),
-                     carry_legs: Sequence[Dict[str, Any]] = ()) -> Dict[str, Any]:
+                     carry_legs: Sequence[Dict[str, Any]] = (),
+                     carry_cycle: Sequence[Mapping[str, Any]] = ()) -> Dict[str, Any]:
     """A `cash_ledger/*` file is a LOCAL_RECORD, always. It states how many
     fills there were and what they cost but names none of them, so it cannot be
     reconciled by itself; here it is only cross-checked against the claims."""
@@ -1870,6 +1871,23 @@ def summarise_ledger(payload: Mapping[str, Any], fills: Sequence[Dict[str, Any]]
         issues.append("LEDGER_FEES_MISSING")
     elif counted and not _close(ledger_fee, claimed_fee, 1e-6, 1e-9):
         issues.append("LEDGER_FEES_DISAGREE_WITH_FILLS")
+    # The funding line is the money line of a carry cycle: what the ledger says
+    # the venue paid must be what the reconciled capture says it paid.
+    stated_n = _int(payload.get("funding_settlements"))
+    stated_usd = _num(payload.get("funding_venue_usd"))
+    if carry and (stated_n is not None or stated_usd is not None):
+        econ = next((c.get("economics") for c in carry_cycle
+                     if isinstance(c.get("economics"), Mapping)
+                     and "funding_usdt" in c["economics"]), None)
+        if econ is None:
+            if (stated_n or 0) > 0 or abs(stated_usd or 0.0) > 1e-9:
+                issues.append("LEDGER_FUNDING_NOT_IN_CAPTURE")
+        else:
+            if stated_n is not None and stated_n != _int(econ.get("settlements")):
+                issues.append("LEDGER_FUNDING_COUNT_DISAGREES")
+            if stated_usd is not None and not _close(
+                    stated_usd, _num(econ.get("funding_usdt")) or 0.0, 1e-6, 1e-6):
+                issues.append("LEDGER_FUNDING_TOTAL_DISAGREES")
     if payload.get("allows_live") is not False:
         issues.append("LEDGER_DOES_NOT_STATE_ALLOWS_LIVE_FALSE")
     return {"kind": "ledger_summary", "schema": schema,
@@ -1916,8 +1934,8 @@ def reconcile(*, fill_claims: Sequence[Mapping[str, Any]] = (),
     carry_cycle = [reconcile_carry_cycle(
         carry_claims, carry_legs, list(funding_claims or []), funding,
         captures, funding_window=funding_window)] if carry_claims else []
-    summaries = [summarise_ledger(l, fills, fill_claims, carry_claims, carry_legs)
-                 for l in ledgers]
+    summaries = [summarise_ledger(l, fills, fill_claims, carry_claims, carry_legs,
+                                    carry_cycle) for l in ledgers]
     everything = fills + funding + trades + order_claim_verdicts + summaries \
         + carry_legs + carry_cycle
     counts = {c: sum(1 for v in everything if v["provenance"] == c)

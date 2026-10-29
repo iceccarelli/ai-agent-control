@@ -69,3 +69,22 @@ def test_each_secret_is_on_exactly_the_step_that_needs_it():
     slack = [s for s in steps if "secrets.SLACK_WEBHOOK_URL" in s]
     assert len(fly) == 1 and "flyctl ssh console" in fly[0]
     assert len(slack) == 1 and "runner_alerts.py" in slack[0]
+
+
+def test_an_unreadable_history_is_retried_once_and_its_cause_is_shown():
+    # one transient `fly ssh` failure used to page "no_data" with no reason at
+    # all (stderr went to a file nobody printed)
+    step = [s for s in _steps(CODE) if "flyctl ssh console" in s]
+    assert len(step) == 1
+    s = step[0]
+    assert "for attempt in 1 2" in s
+    assert re.search(r"tail -n \d+ fly\.err", s), "the failure cause is never printed"
+    assert s.count("flyctl ssh console") == 1       # still one read, in a loop
+    # persistent failure is still not hidden: the history ends up empty and the
+    # alert rules run on it
+    assert ": > history.jsonl" in s
+
+
+def test_the_retry_does_not_become_a_mutating_or_hiding_command():
+    assert "|| true" not in CODE and "continue-on-error" not in CODE
+    assert [m for m in re.findall(r'-C "([^"]*)"', CODE)] == ["cat /data/monitor/monitor.jsonl"]

@@ -50,7 +50,18 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
         run: |
-          flyctl ssh console -a carry-drill -C "cat /data/monitor/monitor.jsonl" > history.jsonl 2> fly.err || echo "history unreadable (fly exit $?)"
+          # One read, tried twice: a single transient `fly ssh` failure should not
+          # page "no_data". A persistent failure still ends with an empty history,
+          # which the alert rules below report. The cause is printed, never hidden.
+          for attempt in 1 2; do
+            if flyctl ssh console -a carry-drill -C "cat /data/monitor/monitor.jsonl" > history.jsonl 2> fly.err; then
+              break
+            fi
+            echo "history unreadable (attempt $attempt of 2)"
+            tail -n 20 fly.err
+            : > history.jsonl
+            if [ "$attempt" = 1 ]; then sleep 30; fi
+          done
           wc -c < history.jsonl
       - name: run the alert rules
         env:

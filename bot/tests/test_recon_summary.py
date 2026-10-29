@@ -98,3 +98,26 @@ class TestAnInconsistentReportIsNeverSummarisedAsAgreement:
     def test_only_a_literal_true_counts_as_consistent(self, value):
         text = "\n".join(S.summarise(self._report(value)))
         assert "rows agree with the drill's books" not in text
+
+
+class TestALedgerThatBlocksIsNamedInTheSummary:
+    """records_consistent=False used to print with no reason when the blocker
+    was a cash ledger, because the summary showed legs, cycle and funding but
+    never the ledger's own issues."""
+
+    def test_the_ledger_issues_are_listed(self):
+        report = C.run(ledgers=[C.legacy_ledger(fees_usd=0.5)])
+        out = text(S.summarise(report))
+        assert "ledger cash_ledger/2:" in out
+        assert "LEDGER_FEES_DISAGREE_WITH_FILLS" in out
+
+    def test_the_always_present_no_identifiers_note_is_not_noise(self):
+        out = text(S.summarise(C.run(ledgers=[C.legacy_ledger()])))
+        assert "LEDGER_SUMMARY_HAS_NO_FILL_IDENTIFIERS" not in out
+
+    def test_a_clean_ledger_adds_no_ledger_line(self):
+        assert "ledger cash_ledger" not in text(S.summarise(C.run(ledgers=[C.legacy_ledger()])))
+
+    def test_a_ledger_that_misstates_funding_is_named(self):
+        report = C.run(ledgers=[C.legacy_ledger(funding_settlements=7, funding_venue_usd=999.0)])
+        assert "LEDGER_FUNDING_TOTAL_DISAGREES" in text(S.summarise(report))

@@ -27,12 +27,9 @@ Only what is still open. History is in `git log`. Nothing here retunes a signal 
 | E1 | Capture `liqPrice` and `accountMMRate` at every open pair and replay them, so the liquidation gate is evaluated and not `NOT_EVALUATED` | Holds are long (mean 16.9 days, 15% at least 30 days in the audited replay) and a short perp's liquidation risk grows with time held |
 | E2 | Report return on total capital (spot inventory plus perp margin), not only on notional | Decides whether the yield is worth running |
 | E3 | Add max drawdown and best-trade share of net to every report | Needed to judge whether returns are spike-driven; the forward plan already requires both (P4, P5) |
-| E4 | Ledger cross-check: compare `funding_venue_usd` and `funding_settlements` with the reconciled settlements | Today a ledger may state a funding total the captured settlements do not support |
-| E5 | `statement()` is called without `now_ms`, so the stale-record age-out never runs for an open lifecycle | Unverified end to end; reproduce before fixing |
 | E6 | Promotion-gate human items are booleans in a JSON file in the same repo, with no signature | A PR could flip them; the live-chain predicate still has to pass |
 | E7 | Kill switch is checked in the risk gate and the carry tick, not at the transport | Deliberate: exits and unwinds share `/v5/order/create`. A new caller that bypasses the gate also bypasses the switch |
 | E8 | `simulate()` in the Python simulator hard-codes the funding window and EWMA constants that the C++ core takes as parameters | A sweep with non-default values is not Python-equivalent |
-| E9 | Environment is read outside `config.py` in several modules (`persistence.py`, `carry_shadow.py`, `tools/testnet_session.py`, `tools/reserved_holdout.py`, runner tools) | The "config.py is the only reader" claim is false; add an allowlist test |
 | E10 | Referenced documents are absent (`EDGE.md`, `AGENT_CONTROL_PLANE.md`, `PROMOTION_GATE_MICRO_LIVE.md`, `PAPER_AGENT_CERTIFICATION.md`) | Code and artifacts cite them; restore the originals or remove the citations |
 | E11 | The reconciliation stack is Bybit-specific and unpackaged (field names `cumExecQty`, `execId`, `orderLinkId`; `sys.path` inserts) | Only worth doing once someone outside the project says they would run it |
 

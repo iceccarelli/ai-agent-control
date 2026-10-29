@@ -12,6 +12,7 @@ Status as of 2026-10-29, `main` at `2f8a29a`. Basis: static reading of the order
 | Size, exposure, liquidation and margin gates refuse NaN, missing or unreadable numbers instead of counting them as zero or safe | `bot/risk_management.py`, `bot/carry_engine.py`, `tests/test_risk_management.py`, `tests/test_liquidation_unknown_reason_fail_closed.py` |
 | No LLM module is importable on the order path | `tests/test_control_plane_boundary.py` |
 | CI holds no trading credential; the production image is built and imported offline, read-only, non-root | `.github/workflows/carry-verify.yml` |
+| The set of files that may read the process environment is pinned by an AST test, and no order-path module may read it at all | `tests/test_environment_read_surface.py` |
 | `carry-watch.yml` is off unless a repository variable is set, runs only from `main`, reads one file, and each secret is set only on the one step that uses it (never at job level) | `.github/workflows/carry-watch.yml`, `tests/test_watch_workflow.py` |
 
 ## Open findings
@@ -24,7 +25,6 @@ Status as of 2026-10-29, `main` at `2f8a29a`. Basis: static reading of the order
 | S4 | The human promotion-gate items are booleans in a JSON file in the same repository, with no signature | Medium | Require a signature or a hash recorded outside the repo |
 | S5 | The kill switch is enforced in the risk gate and the carry tick, not at the transport. A new caller that goes straight to `client.place_order` bypasses it. It cannot simply be added at the transport, because exits and the market close after a bracket failure share `/v5/order/create` | Medium by design | Distinguish entries from reduce-only exits before adding a transport check |
 | S6 | On a mainnet-pointed but unarmed process, cancel, cancel-all and `/v5/position/trading-stop` are not in `EXPOSURE_ENDPOINTS`. Refusing a cancel would be unsafe, so this is deliberate | Low | Keep, and state it |
-| S7 | `config.py` is not the only environment reader (`persistence.py`, `carry_shadow.py`, `tools/testnet_session.py`, `tools/reserved_holdout.py`, runner tools). None can arm live | Low | Add an allowlist test |
 | S8 | `Config.BYBIT_BASE_URL` maps the demo venue to the testnet URL and nothing reads it today | Low | Delete it or derive it from `bybit_connection.VENUE_REST` |
 | S9 | Safety claims cite documents that are absent (`AGENT_CONTROL_PLANE.md`, `EDGE.md`, the certification document) | Medium | Restore or remove the citations |
 | S10 | The drill's evidence hash chain cannot show a cut tail unless the producer's head hash and record count are supplied. The drill now records them and the testnet workflow passes them; other producers do not yet | Medium | Record head hash and count wherever a capture is produced |
