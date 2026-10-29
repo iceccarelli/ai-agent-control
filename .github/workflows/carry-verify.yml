@@ -8,11 +8,13 @@
 # out-of-sample audit and operator-verdict tests, the Fly build-context check and a
 # checkout-safe whitespace check.
 #
-# WHAT THIS IS NOT: the repository's full suite. The full suite carries a known
-# baseline of 61 failures (documentation, corpus and date-relative fixtures). The 3 files that failed to import on deleted
-# modules were removed together with the tools they tested. Those are NOT run or hidden
-# here and are NOT claimed fixed; they are a separate, pre-existing matter. This
-# job is green only when the carry correctness tests are green.
+# WHAT THIS IS NOT: the repository's full suite. This job runs only the files
+# listed below; the job `rest-of-suite` runs every other test file. The 61-failure
+# baseline once recorded here was NOT reproduced on 2026-10-29: in a clean
+# Python 3.11 and 3.13 environment every discovered file passed (see
+# `rest-of-suite`). The 3 files that failed to import on deleted modules were
+# removed together with the tools they tested. This job is green only when the
+# carry correctness tests are green.
 #
 # THE PRODUCTION IMAGE (job `production-image`): the unit tests above run Python
 # in the checkout, which has every module. They cannot see a module that
@@ -362,3 +364,46 @@ jobs:
         run: |
           echo "### shadow-runtime-image" >> "$GITHUB_STEP_SUMMARY"
           echo "Ran the shipped carry_shadow.py CLI inside the image built from this commit: a synthetic fixture observation, then the same observation again (duplicate no-op). Modelled economics only; no network, no credential, no order path." >> "$GITHUB_STEP_SUMMARY"
+
+  # Every test file the correctness gate above does NOT name. The gate is a
+  # hand-maintained list; a regression in an unlisted file (one was found this
+  # way: the paper-only certification file) is invisible to it. The file list
+  # here is DERIVED by set difference against the gate's own list, so a new test
+  # file is covered by exactly one of the two jobs. It excludes only tests
+  # carrying the documented `data_freshness` marker (pytest.ini), which are
+  # supposed to go red as real time passes. Offline: no secret, no network
+  # trading, no order path.
+  rest-of-suite:
+    name: rest of the suite (files the correctness gate does not name)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: bot/requirements.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pytest
+
+      - name: Build the native core
+        run: make -C ../cpp
+
+      - name: Every test file the correctness gate does not name
+        env:
+          REQUIRE_NATIVE_CORE: "1"
+        run: |
+          set -eu
+          grep -oE 'tests/test_[A-Za-z0-9_]+\.py' ../.github/workflows/carry-verify.yml | sort -u > "$RUNNER_TEMP/named.txt"
+          ls tests/test_*.py | sort > "$RUNNER_TEMP/all.txt"
+          comm -23 "$RUNNER_TEMP/all.txt" "$RUNNER_TEMP/named.txt" > "$RUNNER_TEMP/rest.txt"
+          echo "test files the correctness gate does not name: $(wc -l < "$RUNNER_TEMP/rest.txt")"
+          python -m pytest -q -rs -p no:cacheprovider -m "not data_freshness" $(cat "$RUNNER_TEMP/rest.txt")
