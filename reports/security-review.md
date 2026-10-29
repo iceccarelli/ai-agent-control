@@ -1,32 +1,34 @@
 # Security and safety review
 
-Date: 2026-10-28. Scope: what I actually read (see `repository-audit.md` section 0). No exploits attempted, no external systems contacted, no secrets printed. A regex scan for hard-coded `api_key|secret = "<16+ chars>"` in `bot/**/*.py` returned nothing [V]; this is a weak check, not a secret audit. `mcp__github__run_secret_scanning` was not run.
+Status as of 2026-10-29, `main` at `2f8a29a`. Basis: static reading of the order path from process start to order placement, plus offline tests. No exchange or deployed service was contacted, no secret was read, and no database contents were inspected. This is not a third-party audit.
 
-## Code-verified controls (strengths)
+## Controls verified in code and by tests
 
-| Control | Evidence |
+| Control | Where |
 |---|---|
-| Live trading requires testnet=false, paper=false, exact `LIVE_TRADING_ACK="I_UNDERSTAND"`, and both credentials; a typo in a safety flag is read as *not live* | `bot/config.py:63`, `694-760` |
-| Kill switch read failure blocks (`KILL_SWITCH_UNREADABLE`), engaged blocks; trip API exists, clear is human-only by documented contract | `bot/risk_management.py:454-461`, `1495-1498` |
-| Promotion gate is a predicate that cannot arm; missing/unreadable file refuses; flipping JSON bools does not open it because two items are re-derived | `bot/promotion_gate.py:1-60` |
-| No LLM module is importable on the order path (AST walk plus dynamic-import scan) | `bot/tests/test_control_plane_boundary.py:1-80` |
-| Tiny dependency set, pinned test versions | `bot/requirements.txt`, `bot/constraints.txt` |
-| Many negative tests: NaN margin, negative quantity, unstated venue fields, hedge-mode refusal, late-landing orders | file names under `bot/tests/` (all passed except the 18 environmental failures) |
+| Live trading needs `USE_TESTNET=0`, `PAPER_TRADING=0`, `LIVE_TRADING_ACK="I_UNDERSTAND"` and both credentials; a typo in a safety flag is read as not live. `is_live_authorized` re-derives the verdict from those fields and requires it to agree with the stored flag, so a `dataclasses.replace` cannot leave a stale "armed" | `bot/config.py` (`_resolve_live_gate`, `is_live_authorized`), `tests/test_live_gate_recomputed.py` |
+| Mainnet exposure endpoints (`/v5/order/create`, `/v5/position/set-leverage`) refuse at the transport unless live is authorised; carry orders also pass `carry_orders_permitted_for` and the promotion gate | `bot/bybit_connection.py` `_request`, `bot/main.py` |
+| A kill switch that is unreadable blocks; an engaged one blocks; clearing needs a human token. A state DB that loses its kill-switch row reopens **engaged**, and a live-armed process opens a new or zero-byte DB engaged | `bot/persistence.py` `StateStore`, `tests/test_state_store_fail_closed_reopen.py` |
+| Size, exposure, liquidation and margin gates refuse NaN, missing or unreadable numbers instead of counting them as zero or safe | `bot/risk_management.py`, `bot/carry_engine.py`, `tests/test_risk_management.py`, `tests/test_liquidation_unknown_reason_fail_closed.py` |
+| No LLM module is importable on the order path | `tests/test_control_plane_boundary.py` |
+| CI holds no trading credential; the production image is built and imported offline, read-only, non-root | `.github/workflows/carry-verify.yml` |
+| `carry-watch.yml` is off unless a repository variable is set, runs only from `main`, reads one file, and each secret is set only on the one step that uses it (never at job level) | `.github/workflows/carry-watch.yml`, `tests/test_watch_workflow.py` |
 
-## Findings
+## Open findings
 
-| # | Finding | Type | Severity | Evidence |
-|---|---|---|---|---|
-| S1 | Original Bybit credentials were in the source this repo was imported from; the doc says treat as compromised. The tree cannot show rotation. | Verified statement, unknown outcome | High until confirmed rotated | `bot/DEPLOYMENT.md:7-25` |
-| S2 | Mutable runtime state (`bot/state/trading_state.db`, includes the kill-switch table and 87 decision rows) is tracked in git and not ignored. I counted rows only; I did not inspect values for secrets. | Verified | Low-Medium | `git ls-files bot/state`, `.gitignore` |
-| S3 | Safety claims depend on documents that are absent (`AGENT_CONTROL_PLANE.md`, `EDGE.md`, certification doc). A reviewer cannot confirm the stated role matrix. | Verified | Medium | test docstring line 3 |
-| S4 | CI runs a subset and admits a failing baseline; no evidence the whole suite gates merges. | Verified | Medium | `.github/workflows/carry-verify.yml:1-12` |
-| S5 | `carry-watch.yml` and the drill workflow use `FLY_API_TOKEN` and `SLACK_WEBHOOK_URL`; token scope/lifetime (`-x 720h` appears in a comment) not reviewed. | Verified existence, scope unknown | Low-Medium | `.github/workflows/carry-watch.yml:16-18` |
-| S6 | Single-process SQLite store is the sole source of kill-switch truth ("one writer, many readers"). A second process, restored backup, or corrupted DB could change the state; no external attestation. | Inference | Medium for any multi-tenant use | `persistence.py` (not read) |
-| S7 | No third-party security audit, no threat model document in tree. | Verified absence | Medium | file list |
+| # | Finding | Severity | Next step |
+|---|---|---|---|
+| S1 | The original Bybit credentials were in the imported source; `bot/DEPLOYMENT.md` says treat them as compromised. The repository cannot show whether they were rotated | High until confirmed | Owner confirms in the Bybit console |
+| S2 | `bot/state/trading_state.db` (which holds the kill-switch table) is tracked in git and is also an operator's working database. A checkout, revert or rebase of that file can rewind or reset kill-switch state | Medium | See D1 in `improvement-plan.md` |
+| S3 | `setup-flyctl@master` in `carry-watch.yml` is not pinned to a commit. It no longer sees either secret, but it can still change under you | Low | Pin to a commit SHA |
+| S4 | The human promotion-gate items are booleans in a JSON file in the same repository, with no signature | Medium | Require a signature or a hash recorded outside the repo |
+| S5 | The kill switch is enforced in the risk gate and the carry tick, not at the transport. A new caller that goes straight to `client.place_order` bypasses it. It cannot simply be added at the transport, because exits and the market close after a bracket failure share `/v5/order/create` | Medium by design | Distinguish entries from reduce-only exits before adding a transport check |
+| S6 | On a mainnet-pointed but unarmed process, cancel, cancel-all and `/v5/position/trading-stop` are not in `EXPOSURE_ENDPOINTS`. Refusing a cancel would be unsafe, so this is deliberate | Low | Keep, and state it |
+| S7 | `config.py` is not the only environment reader (`persistence.py`, `carry_shadow.py`, `tools/testnet_session.py`, `tools/reserved_holdout.py`, runner tools). None can arm live | Low | Add an allowlist test |
+| S8 | `Config.BYBIT_BASE_URL` maps the demo venue to the testnet URL and nothing reads it today | Low | Delete it or derive it from `bybit_connection.VENUE_REST` |
+| S9 | Safety claims cite documents that are absent (`AGENT_CONTROL_PLANE.md`, `EDGE.md`, the certification document) | Medium | Restore or remove the citations |
+| S10 | The drill's evidence hash chain cannot show a cut tail unless the producer's head hash and record count are supplied. The drill now records them and the testnet workflow passes them; other producers do not yet | Medium | Record head hash and count wherever a capture is produced |
 
-Not assessed: prompt injection (no LLM on the order path by design), wallet/signing/nonce/chain-selection/bridge risks (no such code exists), RPC trust (not applicable), authentication/authorization (no service API), insecure deserialisation, shell execution paths in `tools/` and `scripts/*.sh`. These need a read of the unread modules.
+## Not assessed
 
-## Relevance to a pivot
-
-The *pattern* here (fail-closed gates, human-only kill-switch clear, predicate-not-actuator promotion gate, AST proof that the model cannot reach the venue) is the most reusable asset. External evidence that the problem is real: the Bybit exchange hack (~$1.5B, Feb 2025), the Drift (~$285M, Apr 2026) and KelpDAO (~$292M, Apr 2026) losses attributed to key/admin/verifier failures rather than contract bugs, and a reported prompt-injection drain of an agent wallet (~$150-200K, May 2026). All of these come from secondary sources via the research subagents; see `appendix/raw-ecosystems.md` and `appendix/raw-competitors.md` for URLs and caveats. Do not treat the dollar figures as verified.
+Shell execution paths in `tools/` and `scripts/*.sh`, deserialisation of untrusted files, a hard-coded secret scan beyond a regex, and any threat model. Wallet, signing and chain risks do not apply: the codebase has no such code.

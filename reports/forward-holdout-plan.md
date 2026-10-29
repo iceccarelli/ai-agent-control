@@ -4,7 +4,7 @@ Status: **DRAFT for human sign-off.** It binds nothing until the owner signs the
 
 ## 0. Disclosure of what has been seen (so the plan cannot be accused of hindsight)
 
-- Read before drafting: the repo's modelled historical results (replay, OOS audit, walk-forward, hold audit) and the runner summary of 2026-10-29: forward shadow book `post_gate_v1`, boundary `2026-10-25T18:06:27Z`, 88 observations over 3.3 days, **1 simulated entry, 0 closed trades**; mainnet-public protocol: 63 observations over 57 hours, 8 distinct funding prints, gate open on 73% of observations.
+- Read before drafting: the repo's modelled historical results (replay, OOS audit, walk-forward, hold audit). Runner summary of 2026-10-29: forward shadow book `post_gate_v1`, boundary `2026-10-25T18:06:27Z`, 91 observations over 3.4 days, **1 simulated entry, 0 closed trades**; mainnet-public protocol: 66 observations over 60.3 hours covering 9 distinct funding prints, gate open on 46 of 66 observations (70%).
 - No closed forward trade outcome has been seen. Therefore the thresholds below do not depend on forward outcomes.
 - The historical numbers are in-sample: constants were fixed with the whole 2022-08..2026-09 corpus visible (`carry_oos_audit.py`, `carry_walkforward.py` docstrings). They are used here only to size the test, never to claim edge.
 
@@ -78,6 +78,7 @@ Weekly (read-only): `scripts/runner_status.sh`, `carry_shadow.py forward-report`
 
 | Date | Change | Restarts clock? | Signed |
 |---|---|---|---|
+| 2026-10-29 | Changes since `84ba866` to `carry_engine.py` (hold-time liquidation gate halts on an unreadable distance; off for the shadow book, `require_liquidation_check=False`), `carry_risk.py` (daily allowance bucketed by UTC day; the engine already passes UTC), `main.py` (a live-armed process opens a new state DB with the kill switch engaged) and `config.py` (`is_live_authorized` re-derives the verdict). `carry_costs.py` (the frozen entry rule), `carry_shadow.py`, `carry_broker.py` and `promotion_gate.py` are byte-for-byte unchanged | No: no entry or exit decision of the frozen rule in the shadow book changed | Unsigned (draft) |
 
 ## 9. Sign-off
 

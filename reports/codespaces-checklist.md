@@ -1,89 +1,66 @@
-# Codespaces checklist: bring the bot to life on testnet and send me the evidence
+# Codespaces runbook
 
-Every command below was found in the repo (docstrings, README, scripts) on 2026-10-29. I have **not** run the ones that need Bybit testnet, because this cloud session has no testnet keys and no confirmed route to `api-testnet.bybit.com`. I have not checked every flag of every tool, so use each tool's `--help` if a flag is rejected.
+Every command here has been run and its result recorded. Nothing contacts an exchange except `scripts/runner_status.sh`, which reads your own Fly runner. Do not source or print `runs/env.sh`, and never run a command here against `bot/state/trading_state.db`.
 
-## What this can and cannot prove (read first)
-
-- **Testnet money is fake.** The repo's own ledger says so (`bot/artifacts/cash_ledger.json`, field `note`). A testnet run proves *execution mechanics*: orders fill, fees are booked correctly, stops are attached, positions reconcile, the kill switch works. It does **not** prove profitability.
-- **Profit evidence** in this repo comes only from the promotion gate's forward shadow window: 20 closed forward trades over 180 days (`bot/promotion_gate.py`, `MIN_FORWARD_TRADES`, `MIN_FORWARD_DAYS`), currently 4 of 20 trades and 48 of 180 days. After that, a human-signed risk memo and a capped micro-live step (gate cap is $100 notional, `slice76_promotion_gate.json`). No shortcut exists, and I will not build one.
-- **What I will not do**: retune shock/stop/take-profit/horizon/cost to chase the 95.0 bar, call any signal "profitable", arm live trading, or clear the kill switch from code. These are the repo's own invariants and they protect your money.
-- **Honest expectation**: every directional signal tested so far came back absent. The carry book (delta-neutral spot + perp, earns funding) is the only line with a mechanism that does not depend on predicting price, so it is the right thing to bring to life first. Its yield is not guaranteed and compresses when funding rates fall.
-
-## Step 0: safety (do this before anything)
-
-1. In the Bybit console, confirm the **old live API keys are revoked** (`bot/DEPLOYMENT.md:7-25`).
-2. New testnet keys only: trade + read, **no withdrawal**, IP-bound if possible. Put them in Codespaces **secrets** (`BYBIT_API_KEY`, `BYBIT_API_SECRET`), never in a file, never in chat.
-3. Do **not** set `LIVE_TRADING_ACK`. Keep `BYBIT_VENUE=testnet`.
-
-## Step 1: environment and baseline (read-only, no keys)
+## 1. Sync and confirm your state is untouched
 
 ```bash
-cd /workspaces/ai-agent-control        # your Codespace path may differ
-git fetch origin && git checkout claude/audit-reports-20261029   # optional: the reports
-git rev-parse HEAD
-python3 --version
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r bot/requirements.txt -c bot/constraints.txt pytest
-cd bot
-python3 -m pytest tests -q -p no:cacheprovider 2>&1 | tail -15     # ~9 min; I saw 18 failures without scipy
-python3 tools/print_project_status.py                              # read-only; mode, edge status, live armed?
+cd /workspaces/ai-agent-control && git pull --ff-only origin main
 ```
-Paste back: the last 15 test lines and the full JSON from `print_project_status.py`.
+```bash
+sha256sum bot/state/trading_state.db && git ls-files -v | grep '^S'
+```
+Your working database hash must not change as a result of a pull or a test run.
 
-## Step 2: connectivity (no keys, no orders)
+## 2. Environment (outside the repo)
 
 ```bash
-cd bot
-python3 tools/connector_check.py --require-bybit-testnet --out /tmp/connector_check.json
-cat /tmp/connector_check.json
+python3 -m venv ~/venv-bot && ~/venv-bot/bin/pip install -q -r bot/requirements.txt pytest
 ```
-Paste back the verdict (`CARRY_READS_OK` is what we want; `BYBIT_TESTNET_BLOCKED` means run from another host, e.g. the Fly runner).
+```bash
+make -C cpp
+```
+`make` writes only the git-ignored `bot/lib/libcarrycore.so`.
 
-## Step 3: read-only preflight with testnet keys (cannot send an order)
+## 3. Verify the code (zero failures means ready)
+
+The correctness gate, exactly as CI runs it:
+```bash
+cd /workspaces/ai-agent-control/bot && REQUIRE_NATIVE_CORE=1 ~/venv-bot/bin/python -m pytest -q -rs -p no:cacheprovider $(grep -oE 'tests/test_[A-Za-z0-9_]+\.py' ../.github/workflows/carry-verify.yml | sort -u)
+```
+Every other test file (the `rest-of-suite` job):
+```bash
+cd /workspaces/ai-agent-control/bot && ~/venv-bot/bin/python -m pytest -q -rs -p no:cacheprovider -m "not data_freshness" $(comm -23 <(ls tests/test_*.py | sort) <(grep -oE 'tests/test_[A-Za-z0-9_]+\.py' ../.github/workflows/carry-verify.yml | sort -u))
+```
+Date-pinned tests, which are meant to go red as time passes:
+```bash
+cd /workspaces/ai-agent-control/bot && ~/venv-bot/bin/python -m pytest -q -p no:cacheprovider -m data_freshness tests
+```
+Last verified (2026-10-29): the gate passes on Python 3.11 and 3.13 (5255 passed, 2 skipped) and on 3.12 (5257 passed, 2 skipped, with the one failing operator test fixed and re-run afterwards); the other files give 3753 passed, 2 skipped, 15 xpassed; the date-pinned tests give 13 passed. The two gate skips are `test_control_plane_boundary.py` ("no reviewer module yet").
+
+## 4. Reconcile your real drill evidence (read-only, writes to /tmp)
 
 ```bash
-cd bot
-BYBIT_VENUE=testnet python3 tools/carry_preflight.py --require-economics-pass
+cd /workspaces/ai-agent-control/bot && python3 tools/evidence_reconcile.py --evidence ../runs/drill3_evidence.jsonl --drill-report ../runs/drill3_out.json --now-ms $(date +%s%3N) --json /tmp/r.json; python3 tools/recon_summary.py /tmp/r.json
 ```
-It states whether the venue is readable, whether safety preconditions hold, and whether the entry-cost gate would open (`carry_costs.entry_gate`). **Paste the full output, with any key/secret lines redacted** (the tool prints none by design). This single output tells me whether the carry book is economically viable at today's funding rates.
+Exit 0 with `VENUE_RECONCILED` is the expected result for `drill3`. Exit 2 means the records do not all agree. Exit 3 means the tool refused. `runs/close_evidence.jsonl` with `close_claims.json` exits 2 with `CYCLE_NO_ENTRY` by design: that claim file covers the closing leg only.
 
-## Step 4: the deployed runner's history (if the Fly app `carry-drill` exists)
+To detect a truncated evidence file, record where a chain ends once, then pass it back later:
+```bash
+wc -l <file>.jsonl && tail -n 1 <file>.jsonl | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['record_hash'])"
+```
+```bash
+cd /workspaces/ai-agent-control/bot && python3 tools/evidence_reconcile.py --evidence <file>.jsonl --expect-records <N> --expect-head-hash <HASH> --now-ms $(date +%s%3N) --json /tmp/r.json
+```
+The drill now records both values in its report (`evidence_capture.head_hash`, `evidence_capture.records`), and the testnet drill workflow passes them automatically.
+
+## 5. Weekly health check of the forward clock
 
 ```bash
-scripts/runner_status.sh          # read-only; last 48 monitor cycles
-LAST=0 scripts/runner_status.sh   # all cycles
+cd /workspaces/ai-agent-control && scripts/runner_status.sh
 ```
-Paste back: how often the entry gate was open and why not.
+Read-only. Never re-initialise the forward book and never change a frozen constant. The forward book and the public-market data live on the Fly runner, not in Codespaces.
 
-## Step 5: offline replay of the real engine (no keys)
+## What "ready" means
 
-```bash
-cd bot
-python3 tools/carry_replay.py --help
-python3 tools/carry_replay.py --notional 100000 --mode overlay --style maker_first
-```
-`carry_replay.py` replays the actual `CarryEngine` class (its docstring explains earlier backtests used a separate loop). Paste back the full output. Treat results as research evidence on historical data, not as a promise.
-
-## Step 6: mechanics proof on testnet (this is the README's own session; fake dollars)
-
-Run only after Steps 1-3 look sane and you are in the Codespace that holds the testnet secrets:
-```bash
-BYBIT_VENUE=testnet python3 bot/tools/testnet_session.py     # README: exit 0 only if flat and cash_ledger.json exists; exit 2 = zero fills
-cat bot/artifacts/cash_ledger.json
-```
-Then, for any carry state database that run produced:
-```bash
-cd bot && python3 tools/carry_report.py <path-to-state.db>   # read-only; says REALISED vs PROVISIONAL
-```
-Paste back: exit code, `cash_ledger.json`, and the `carry_report` output. `carry_report` will call a number PROVISIONAL unless every fee was venue-confirmed; I will quote only what it calls REALISED.
-
-## Step 7: the human gates only you can do
-
-From `slice76_promotion_gate.json`, 6 of 8 items need you: signed risk memo, kill-switch drill (`tools/kill_switch_drill.py`), linear protective-stop verification (`tools/linear_stop_venue_drill.py`), M-4 acceptance, `LIVE_TRADING_ACK`, and the forward shadow window. The kill-switch drill is safe to run first and takes minutes.
-
-## What I will do with what you paste
-
-1. Tell you whether the carry entry gate is open at current funding and what yield after fees it implies, labelled as an estimate.
-2. Diagnose any failing test or venue error (the 18 failures should disappear once scipy is installed).
-3. Prepare the licensing, docs and CI fixes from `product-roadmap.md` Stage 1 on a branch.
-4. Draft the forward-shadow monitoring plan so the 20-trade/180-day clock keeps ticking without manual work.
+Ready is steps 1-4 passing. It does not mean profitable. Live trading, any profit claim and any real capital stay blocked until the frozen protocol has venue-reconciled closed forward trades (see `forward-holdout-plan.md`).
