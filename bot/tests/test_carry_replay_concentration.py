@@ -100,3 +100,23 @@ class TestThePrintedReportShowsIt:
     def test_nothing_is_printed_for_a_replay_with_no_trades(self):
         c = rp.trade_concentration([], notional=1000.0)
         assert rp.concentration_lines(c, years=1.0, notional=1000.0) == []
+
+
+class TestTheCaptionSaysWhatWasCharged:
+    """The 'without the best trade' figure comes from per-trade nets that already
+    include whatever borrow the run charged. The caption used to say 'before
+    financing' on every run, which is false the moment a borrow rate is set."""
+
+    def _lines(self, borrow_apr):
+        trades = [trade(0, 5, 100.0), trade(10, 15, 10.0)]
+        c = rp.trade_concentration(trades, notional=1000.0)
+        return "\n".join(rp.concentration_lines(
+            c, years=1.0, notional=1000.0, borrow_apr=borrow_apr))
+
+    def test_with_no_borrow_it_says_none_was_charged(self):
+        assert "0% borrow" in self._lines(0.0)
+        assert "before financing" not in self._lines(0.0)
+
+    def test_with_borrow_it_says_the_rate_that_was_charged(self):
+        assert "after 5% borrow" in self._lines(0.05)
+        assert "before financing" not in self._lines(0.05)

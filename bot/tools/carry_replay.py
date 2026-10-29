@@ -684,7 +684,7 @@ def trade_concentration(trade_rows: Sequence[Dict[str, Any]], *, notional: float
 
 
 def concentration_lines(c: Dict[str, Any], *, years: float,
-                        notional: float) -> List[str]:
+                        notional: float, borrow_apr: float = 0.0) -> List[str]:
     """The printed form of :func:`trade_concentration`. Empty when there is
     nothing to say. The 'without the best trade' figure is the point: a headline
     one trade supplied is a different claim from one spread across many."""
@@ -699,10 +699,12 @@ def concentration_lines(c: Dict[str, Any], *, years: float,
             f"{100.0 * c['best_trade_share_of_net']:.1f}% of net; best five = "
             f"{100.0 * c['top5_share_of_net']:.1f}%")
         if years > 0 and notional:
+            charged = (f"after {100.0 * borrow_apr:g}% borrow" if borrow_apr
+                       else "at 0% borrow charged")
             out.append(
                 f"  without the best trade ${without:,.0f} = "
                 f"{100.0 * without / notional / years:+.2f}%/yr on notional "
-                "(before financing)")
+                f"({charged}; fees included)")
     out.append(
         f"  {c['losing_trade_pct']:.0f}% of trades lose money; max drawdown of "
         f"closed trades ${c['max_drawdown_usd']:,.0f} "
@@ -1211,7 +1213,8 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"({r['maker_fills']} maker), in market "
           f"{r['market_exposure_pct']:.1f}%")
     for line in concentration_lines(r["concentration"], years=r["years"],
-                                    notional=r["notional_usd"]):
+                                    notional=r["notional_usd"],
+                                    borrow_apr=r["borrow_apr"]):
         print(line)
     if r["halted_at_ms"]:
         print(f"  HALTED at {cb._iso_ms(r['halted_at_ms'])} — the replay "
