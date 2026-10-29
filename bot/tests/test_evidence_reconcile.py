@@ -320,7 +320,7 @@ class TestFunding:
 class TestLocalLedgerSummaries:
     def ledger(self, **over):
         d = {"schema": "cash_ledger/2", "allows_live": False, "fills": 1,
-             "fees_usd": 0.00012, "fees_confirmed": True,
+             "flat": True, "fees_usd": 0.00012, "fees_confirmed": True,
              "funding_status": "CONFIRMED_FROM_SETTLEMENTS"}
         d.update(over)
         return d

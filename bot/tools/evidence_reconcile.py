@@ -1828,11 +1828,21 @@ def summarise_ledger(payload: Mapping[str, Any], fills: Sequence[Dict[str, Any]]
         issues.append("LEDGER_FILL_COUNT_MISSING")
     elif stated != len(counted):
         issues.append("LEDGER_FILL_COUNT_DISAGREES")
-    if payload.get("fees_confirmed") is False:
+    carry = schema == "cash_ledger/2"
+    # A carry ledger states these four facts itself; omitting or contradicting
+    # one (absent, a string "false", False) is not a pass.
+    if payload.get("fees_confirmed") is False or (
+            carry and payload.get("fees_confirmed") is not True):
         issues.append("LEDGER_FEES_UNCONFIRMED")
+    if carry and payload.get("flat") is not True:
+        issues.append("LEDGER_NOT_FLAT")
     status = str(payload.get("funding_status", ""))
     if status and status not in ("CONFIRMED_FROM_SETTLEMENTS",):
         issues.append(f"LEDGER_FUNDING_{status}")
+    elif carry and not status:
+        issues.append("LEDGER_FUNDING_MISSING")
+    if carry and payload.get("funding_confirmed") is False:
+        issues.append("LEDGER_FUNDING_NOT_CONFIRMED")
     ledger_fee = _num(payload.get("fees_usd"))
     claimed_fee = sum(_num(c.get("fee")) or 0.0
                       for c, v in zip(fill_claims, fills) if v["counted"]) + \
@@ -1995,6 +2005,7 @@ def summaries_block(summaries: Sequence[Mapping[str, Any]]) -> bool:
                              "LEDGER_FEES_DISAGREE", "LEDGER_FEES_MISSING",
                              "LEDGER_FILL_COUNT_MISSING", "UNKNOWN_LEDGER",
                              "LEDGER_FEES_UNCONFIRMED", "LEDGER_FUNDING_", "MALFORMED_LEDGER",
+                             "LEDGER_NOT_FLAT",
                              "LEDGER_DOES_NOT"))
                for s in summaries for i in s["issues"])
 
