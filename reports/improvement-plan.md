@@ -32,7 +32,6 @@ Only what is still open. History is in `git log`. Nothing here retunes a signal 
 | E6 | Promotion-gate human items are booleans in a JSON file in the same repo, with no signature | A PR could flip them; the live-chain predicate still has to pass |
 | E7 | Kill switch is checked in the risk gate and the carry tick, not at the transport | Deliberate: exits and unwinds share `/v5/order/create`. A new caller that bypasses the gate also bypasses the switch |
 | E8 | `simulate()` in the Python simulator hard-codes the funding window and EWMA constants that the C++ core takes as parameters | A sweep with non-default values is not Python-equivalent |
-| E9 | Environment is read outside `config.py` in several modules (`persistence.py`, `carry_shadow.py`, `tools/testnet_session.py`, `tools/reserved_holdout.py`, runner tools) | The "config.py is the only reader" claim is false; add an allowlist test |
 | E10 | Referenced documents are absent (`EDGE.md`, `AGENT_CONTROL_PLANE.md`, `PROMOTION_GATE_MICRO_LIVE.md`, `PAPER_AGENT_CERTIFICATION.md`) | Code and artifacts cite them; restore the originals or remove the citations |
 | E11 | The reconciliation stack is Bybit-specific and unpackaged (field names `cumExecQty`, `execId`, `orderLinkId`; `sys.path` inserts) | Only worth doing once someone outside the project says they would run it |
 
