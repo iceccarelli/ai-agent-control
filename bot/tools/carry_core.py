@@ -97,6 +97,7 @@ class Result(ctypes.Structure):
         return out
 
 
+_INT32_MAX = 2**31 - 1
 _LIB: Optional[ctypes.CDLL] = None
 
 
@@ -139,9 +140,13 @@ def load() -> Optional[ctypes.CDLL]:
         return _LIB
     if not os.path.exists(LIB_PATH):
         return None
-    lib = ctypes.CDLL(LIB_PATH)
-    lib.carrycore_version.restype = ctypes.c_char_p
-    if (lib.carrycore_version() or b"").split(b" ")[0] != ABI_NAME:
+    try:
+        lib = ctypes.CDLL(LIB_PATH)
+        lib.carrycore_version.restype = ctypes.c_char_p
+        stale = (lib.carrycore_version() or b"").split(b" ")[0] != ABI_NAME
+    except (OSError, AttributeError):
+        return None          # corrupt or non-library file: same as not built
+    if stale:
         return None          # stale build: `make -C cpp` (or --build) rebuilds it
     lib.carry_entry_gate.argtypes = [
         ctypes.POINTER(ctypes.c_double), ctypes.c_int32, ctypes.c_double,
@@ -190,6 +195,14 @@ def params(*, notional: float = 100_000.0, entry_bps: float = 0.2,
            funding_history: int = 8,
            latency_rows: int = LATENCY_ROWS,
            demonstrated_hold_days: Optional[float] = None) -> Params:
+    for name, value in (("latency_rows", latency_rows),
+                        ("negative_exit_prints", negative_exit_prints),
+                        ("funding_history", funding_history),
+                        ("ewma_min_prints", ewma_min_prints)):
+        # ctypes wraps an out-of-range int into the C int32 without an error,
+        # silently turning the rule into a different one (2**32 -> 0).
+        if int(value) > _INT32_MAX:
+            raise ValueError(f"{name} {value} does not fit the core's int32")
     if int(latency_rows) < 0:
         raise ValueError("latency_rows cannot be negative")
     if int(negative_exit_prints) < 1:
@@ -249,6 +262,8 @@ def sweep(settlements: Sequence[Any], base: Params, *,
           entry_grid: Sequence[float], hold_grid: Sequence[float],
           exit_grid: Sequence[int], threads: int = 0) -> List[Dict[str, Any]]:
     """Every combination, in (entry, hold, exit) order. One call, all cores."""
+    if any(int(x) > _INT32_MAX for x in exit_grid):
+        raise ValueError("every negative_exit_prints in the grid must fit int32")
     lib = load()
     if lib is None:
         raise RuntimeError("libcarrycore.so is not built")
