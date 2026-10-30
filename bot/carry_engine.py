@@ -1534,6 +1534,7 @@ class CarryEngine:
         if failed is not None:
             return failed
         self._confirm_venue_after_open(perp.filled_qty)
+        self._record_opening_liquidation_evidence()
         return CarryDecision(
             "opened", acted=True, reason="PAIR_LANDED", state=BookState.HEDGED,
             detail={"qty": spot.filled_qty, "spot_price": spot.avg_price,
@@ -1621,6 +1622,7 @@ class CarryEngine:
         failed = self._record()
         if failed is not None:
             return failed
+        self._record_opening_liquidation_evidence()
         return CarryDecision(
             "opened", acted=True, reason="PERP_HEDGE_LANDED",
             state=BookState.HEDGED,
@@ -2412,6 +2414,7 @@ class CarryEngine:
         try:
             view = self.broker.get_liquidation_view(self.perp_symbol)
         except Exception as exc:  # noqa: BLE001
+            self._observe_unreadable(exc)
             return self._halt(
                 "LIQUIDATION_PRICE_UNREADABLE",
                 f"the venue would not say how close this position is to "
@@ -2419,6 +2422,7 @@ class CarryEngine:
                 "liquidation price is a margin call you cannot see")
 
         if not isinstance(view, dict):
+            self._observe_unreadable(view)
             return self._halt(
                 "LIQUIDATION_PRICE_UNREADABLE",
                 f"the liquidation view is {type(view).__name__}, not a mapping")
@@ -2523,7 +2527,7 @@ class CarryEngine:
         self._liq_read_ok_for = opened_ms
         return None
 
-    def _observe_risk(self, view: Dict[str, Any]) -> None:
+    def _observe_risk(self, view: Dict[str, Any], prefix: str = "") -> None:
         """Hand the gate's read to the observer. Observation only: whatever
         goes wrong here is logged and ignored, never a trading decision."""
         observer = self.risk_observer
@@ -2538,10 +2542,35 @@ class CarryEngine:
                 "distance_pct": view.get("distance_pct"),
                 "account_mm_rate": view.get("account_mm_rate"),
                 "margin_multiple": self._last_margin,
-                "reason": view.get("reason", "")})
+                "reason": f"{prefix}{view.get('reason', '')}"})
         except Exception as exc:  # noqa: BLE001
             logger.warning("carry: risk observation not recorded (%s: %s)",
                            type(exc).__name__, exc)
+
+    def _observe_unreadable(self, what: Any, prefix: str = "") -> None:
+        """A liquidation view the venue would not give is evidence too: leave
+        a row that says so (no numbers), so the record shows a gap as a gap.
+        `what` is the exception, or the non-mapping value that came back."""
+        name = type(what).__name__
+        self._observe_risk({"reason": f"VIEW_UNREADABLE:{name}"}, prefix)
+
+    def _record_opening_liquidation_evidence(self) -> None:
+        """One liquidation read right after both legs land, recorded under
+        reason AT_OPEN:. Evidence only: it never halts, unwinds or changes the
+        open. The next held tick's gate still decides, exactly as before, so
+        the pair's first liquidation evidence no longer waits a tick. Off when
+        the gate is off (the shadow book reads nothing it did not read)."""
+        if not self.require_liquidation_check or self.risk_observer is None:
+            return
+        try:
+            view = self.broker.get_liquidation_view(self.perp_symbol)
+        except Exception as exc:  # noqa: BLE001
+            self._observe_unreadable(exc, "AT_OPEN:")
+            return
+        if not isinstance(view, dict):
+            self._observe_unreadable(view, "AT_OPEN:")
+            return
+        self._observe_risk(view, "AT_OPEN:")
 
     HALTED_WATCH_EVERY_MS = 60_000
 
