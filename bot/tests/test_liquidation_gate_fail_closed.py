@@ -219,8 +219,14 @@ def test_the_distance_floor_is_exclusive():
     on, _ = verdict_for(view=healthy_view(
         distance_pct=MIN_LIQUIDATION_DISTANCE_PCT))
     assert on.action == "hold"
-    below, venue = verdict_for(view=healthy_view(
-        distance_pct=math.nextafter(MIN_LIQUIDATION_DISTANCE_PCT, 0.0)))
+    # a breach AFTER a healthy read is a mid-hold risk exit and is a plain
+    # unwind (a breach on the first read halts: test_liquidation_breach_on_first_read)
+    e, venue = opened()
+    assert tick(e).action == "hold"
+    venue.view = healthy_view(
+        distance_pct=math.nextafter(MIN_LIQUIDATION_DISTANCE_PCT, 0.0))
+    below = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=5 * H8, timestamp_ms=5 * H8)
     assert below.action == "unwound" and venue.orders
 
 
