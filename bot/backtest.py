@@ -40,10 +40,16 @@ WHAT IS NOT MODELLED
 Stated plainly, because the gap between these and reality is where over-optimism
 lives:
 
-* partial fills and queue position for limit orders (legs fill fully or not at all)
+* partial fills and queue position for limit orders on SPOT (legs fill fully or
+  not at all). ``LinearSimulatedExchange(max_participation=...)`` caps fills at
+  a share of bar volume (partial fills, IOC market remainders); queue position
+  is still not modelled anywhere.
 * borrow interest and exchange downtime. **Funding and liquidation ARE modelled
   on ``category="linear"``** (``LinearSimulatedExchange``) and are absent on
-  spot because a spot account has neither.
+  spot because a spot account has neither. The linear simulator also keeps
+  initial/maintenance margin, a declared bid/ask spread, the stop-verification
+  state of every position, a resumable JSON state (``to_state``/``from_state``)
+  and a raising book-vs-venue reconciliation (``reconcile``).
 * market impact — size is assumed not to move the book
 * latency between signal and submission
 
@@ -76,6 +82,7 @@ __all__ = [
     "Bar",
     "SimulatedExchange",
     "LinearSimulatedExchange",
+    "PositionReconciliationError",
     "BacktestConfig",
     "BacktestResult",
     "Backtester",
@@ -562,7 +569,7 @@ class SimulatedExchange(Transport):
             elif not oid:
                 rows = [
                     self._as_row(o) for o in self.orders.values()
-                    if o.status in ("New", "Untriggered")
+                    if o.status in ("New", "Untriggered", "PartiallyFilled")
                 ]
             if path.endswith("realtime"):
                 rows = [r for r in rows
@@ -575,7 +582,7 @@ class SimulatedExchange(Transport):
             order = self.orders.get(oid)
             if order is None:
                 return err(110001, "order not exists")
-            if order.status in ("New", "Untriggered"):
+            if order.status in ("New", "Untriggered", "PartiallyFilled"):
                 order.status = "Cancelled"
             return ok({"orderLinkId": oid})
 
@@ -585,7 +592,7 @@ class SimulatedExchange(Transport):
             for order in self.orders.values():
                 if symbol and order.symbol != symbol:
                     continue
-                if order.status in ("New", "Untriggered"):
+                if order.status in ("New", "Untriggered", "PartiallyFilled"):
                     order.status = "Cancelled"
             return ok({"list": []})
 
@@ -652,6 +659,19 @@ class SimulatedExchange(Transport):
 # ---------------------------------------------------------------------------
 
 
+#: Perpetual fee tier, in bps per leg. NOT invented here: the taker figure is
+#: `carry_costs.TAKER_BPS_PERP` (the constant every carry backtest charged) and
+#: the maker figure is config.py's linear default ``MAKER_FEE_BPS`` (the
+#: "5.5 bps taker and 2.0 bps maker per perp leg" of carry_engine.py's fee-tier
+#: note). `tests/test_linear_mechanics.py` asserts both still agree with config.
+from carry_costs import TAKER_BPS_PERP as PERP_TAKER_FEE_BPS  # noqa: E402
+PERP_MAKER_FEE_BPS = 2.0
+
+
+class PositionReconciliationError(RuntimeError):
+    """The simulated venue's position and the caller's book disagree."""
+
+
 @dataclass
 class _SimPosition:
     """A USDT-margined perpetual position. No base coin ever changes hands."""
@@ -667,6 +687,10 @@ class _SimPosition:
     #: quantity ADDED at a bar close whose next bar starts on a settlement: it
     #: was bought after that settlement, so it does not pay or receive it.
     late_adds: Dict[int, float] = field(default_factory=dict)
+    #: True only once ``/v5/position/list`` has served the CURRENT stopLoss
+    #: back to a reader. Writing a stop resets it: a stop that has been sent
+    #: but not read back is not a verified stop.
+    stop_verified: bool = False
 
     @property
     def direction(self) -> float:
@@ -755,14 +779,18 @@ class LinearSimulatedExchange(SimulatedExchange):
     #: Bybit settles funding at 00:00, 08:00 and 16:00 UTC.
     FUNDING_INTERVAL_MS = 8 * 3_600_000
 
+    #: Schema tag of :meth:`to_state`. Bumped whenever a field is added, so a
+    #: state written by an older simulator is refused rather than half-loaded.
+    STATE_SCHEMA = "linear_sim_state/1"
+
     def __init__(
         self,
         bars_by_symbol: Mapping[str, Sequence[Bar]],
         *,
         starting_cash: float = 10_000.0,
         quote_asset: Optional[str] = None,
-        taker_fee: float = 0.00055,
-        maker_fee: float = 0.0002,
+        taker_fee: float = PERP_TAKER_FEE_BPS / 10_000.0,
+        maker_fee: float = PERP_MAKER_FEE_BPS / 10_000.0,
         slippage: float = 0.0005,
         instrument_filters: Optional[Mapping[str, Mapping[str, str]]] = None,
         books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
@@ -771,6 +799,9 @@ class LinearSimulatedExchange(SimulatedExchange):
         funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
         maintenance_margin_rate: float = 0.005,
         leverage: float = 1.0,
+        spread_bps: Optional[float] = None,
+        max_participation: Optional[float] = None,
+        forfeit_maintenance_on_liquidation: bool = True,
     ) -> None:
         super().__init__(
             bars_by_symbol, starting_cash=starting_cash, quote_asset=quote_asset,
@@ -778,6 +809,34 @@ class LinearSimulatedExchange(SimulatedExchange):
             instrument_filters=instrument_filters, books_by_symbol=books_by_symbol,
             touch_fills=touch_fills,
         )
+        self.starting_cash = float(starting_cash)
+        #: Full quoted bid/ask spread in bps of the mark. ``None`` means the
+        #: caller DECLARED NOTHING: it is priced as zero (the behaviour before
+        #: this parameter existed) and :attr:`costs_declared` is False, so a
+        #: run that relied on it can say so. A taker fill pays HALF of it (it
+        #: crosses from the mid to the far touch); a resting maker fill pays
+        #: none. The repository holds no measured linear spread series; the
+        #: one stated figure is carry_engine.py's "BTCUSDT touch is 0.1 USDT".
+        self.spread_bps = None if spread_bps is None else float(spread_bps)
+        if self.spread_bps is not None and self.spread_bps < 0:
+            raise ValueError("spread_bps cannot be negative")
+        #: Partial fills. ``None`` == every order fills in full (the previous
+        #: behaviour). A fraction in (0, 1] caps the quantity ALL orders on a
+        #: symbol may take from one bar at ``max_participation * bar.volume``
+        #: (bar volume in base units). A market order that hits the cap fills
+        #: what it can and the rest is CANCELLED (immediate-or-cancel, as a
+        #: venue market order is); a resting limit fills what it can, reports
+        #: ``PartiallyFilled`` and keeps resting for the next bar.
+        if max_participation is not None and not (0.0 < float(max_participation) <= 1.0):
+            raise ValueError("max_participation must be in (0, 1]")
+        self.max_participation = (None if max_participation is None
+                                  else float(max_participation))
+        #: Conservative liquidation: besides the taker fee, the maintenance
+        #: margin still standing at the liquidation price is forfeited (the
+        #: venue keeps it as the liquidation's cost, the insurance-fund
+        #: contribution). False == only the taker fee, which is optimistic.
+        self.forfeit_maintenance_on_liquidation = bool(
+            forfeit_maintenance_on_liquidation)
         self.positions: Dict[str, _SimPosition] = {}
         self.funding_rate_per_8h = float(funding_rate_per_8h)
         #: ``{symbol: [(settlement_ms, rate), ...]}``, ascending. A REAL series
@@ -803,6 +862,210 @@ class LinearSimulatedExchange(SimulatedExchange):
         #: INSIDE the bar. Outside it, an order is the engine's, filled at the
         #: close of the bar it has just observed.
         self._resolving = False
+        #: Every bar a position was carried WITHOUT a stop that had been read
+        #: back off ``/v5/position/list`` since it was last written. One row
+        #: per (symbol, bar): ``{"symbol", "bar", "start_ms", "reason"}``,
+        #: reason ``"no_stop"`` or ``"stop_not_verified"``. A run whose log is
+        #: non-empty carried an unprotected position and must say so.
+        self.unprotected_log: List[Dict[str, Any]] = []
+        #: Every venue-initiated exit (stop, take-profit, liquidation), kept
+        #: for the run: ``fill_log`` is drained by consumers, this is not.
+        self.exit_events: List[Dict[str, Any]] = []
+        #: Failure injection for the protection path: the next N
+        #: ``/v5/position/trading-stop`` calls are refused by the "venue".
+        self.fail_next_trading_stops = 0
+        #: Maintenance margin lost to liquidations (inside ``fees_paid`` too).
+        self.liquidation_forfeited = 0.0
+        #: Settlements charged with no print stamped at them (see
+        #: ``_funding_rate_at``). Non-zero == part of the funding is a guess.
+        self.funding_settlements_without_print = 0
+        #: ``{symbol: [bar_index, base_qty_taken]}`` for the participation cap.
+        self._bar_volume_used: Dict[str, List[float]] = {}
+
+    # -- costs -------------------------------------------------------------
+
+    @property
+    def half_spread(self) -> float:
+        """Half the declared spread, as a fraction of price (0 if undeclared)."""
+        return 0.0 if self.spread_bps is None else self.spread_bps / 20_000.0
+
+    @property
+    def costs_declared(self) -> bool:
+        """Whether the caller stated a spread. Slippage and fees always have a
+        value; the spread is the one cost that can be silently zero."""
+        return self.spread_bps is not None
+
+    def _taker_fill_price(self, side: str, price: float) -> float:
+        """A crossing fill: half the spread and the slippage, both against us."""
+        cost = self.slippage + self.half_spread
+        return price * ((1 + cost) if normalize_side(side) == "Buy" else (1 - cost))
+
+    # -- margin ------------------------------------------------------------
+
+    def initial_margin(self, symbol: Optional[str] = None) -> float:
+        """Initial margin held: ``size * entry / leverage`` per position."""
+        return sum(p.size * p.entry_price / max(1e-9, p.leverage)
+                   for s, p in self.positions.items()
+                   if symbol is None or s == symbol)
+
+    def maintenance_margin(self, symbol: Optional[str] = None) -> float:
+        """Maintenance margin at the current mark: ``mmr * size * mark``."""
+        return sum(self.maintenance_margin_rate * p.size
+                   * self.bars[s][self.index].close
+                   for s, p in self.positions.items()
+                   if symbol is None or s == symbol)
+
+    def available_balance(self) -> float:
+        """Equity not already committed as initial margin. What a new order's
+        margin and fee must fit inside."""
+        return self.equity() - self.initial_margin()
+
+    # -- invariants --------------------------------------------------------
+
+    def _assert_no_spot_inventory(self) -> None:
+        """A perp account holds ONE coin, the margin coin. Any other balance
+        means a perpetual fill went through spot cash accounting."""
+        stray = {c: v for c, v in self.balances.items()
+                 if c != self.quote_asset and abs(v) > 0.0}
+        if stray:
+            raise RuntimeError(
+                f"linear simulator holds a non-margin balance {stray}: a "
+                "perpetual fill went through spot cash accounting")
+
+    def reconcile(self, book: Mapping[str, float], *, tol: float = 1e-9) -> None:
+        """Compare a caller's book (``{symbol: signed size}``, long > 0) with
+        the simulated venue's positions and RAISE on any difference."""
+        venue = {s: p.direction * p.size for s, p in self.positions.items()
+                 if p.size > 0}
+        for symbol in sorted(set(venue) | set(book)):
+            have = float(venue.get(symbol, 0.0))
+            want = float(book.get(symbol, 0.0))
+            if abs(have - want) > tol:
+                raise PositionReconciliationError(
+                    f"bar {self.index}: {symbol} venue position {have!r} != "
+                    f"book {want!r}")
+
+    def step(self) -> bool:
+        advanced = super().step()
+        self._assert_no_spot_inventory()
+        return advanced
+
+    # -- restart / recovery ------------------------------------------------
+
+    def data_fingerprint(self) -> str:
+        """SHA-256 of the bars and funding rows the run is priced on. A saved
+        state is only resumable against the very data it was written on."""
+        import hashlib
+
+        payload = {
+            "bars": {s: [[b.start_ms, b.open, b.high, b.low, b.close, b.volume]
+                         for b in series] for s, series in sorted(self.bars.items())},
+            "funding": {s: [[t, r] for t, r in rows]
+                        for s, rows in sorted(self.funding_by_symbol.items())},
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _params(self) -> Dict[str, Any]:
+        return {
+            "starting_cash": self.starting_cash, "quote_asset": self.quote_asset,
+            "taker_fee": self.taker_fee, "maker_fee": self.maker_fee,
+            "slippage": self.slippage, "touch_fills": self.touch_fills,
+            "funding_rate_per_8h": self.funding_rate_per_8h,
+            "maintenance_margin_rate": self.maintenance_margin_rate,
+            "spread_bps": self.spread_bps,
+            "max_participation": self.max_participation,
+            "forfeit_maintenance_on_liquidation":
+                self.forfeit_maintenance_on_liquidation,
+            "instrument_filters": {s: dict(f) for s, f in self.filters.items()},
+        }
+
+    def to_state(self) -> Dict[str, Any]:
+        """Everything that changes as the run proceeds, JSON-serialisable.
+
+        Data (bars, funding) is NOT in the state: it is an input, identified by
+        :meth:`data_fingerprint`, and :meth:`from_state` refuses other data.
+        Floats survive a JSON round trip exactly (``repr`` is shortest-exact),
+        so a resumed run is bit-identical to an uninterrupted one."""
+        from dataclasses import asdict
+
+        positions = []
+        for p in self.positions.values():
+            row = asdict(p)
+            row["late_adds"] = sorted([int(k), float(v)]
+                                      for k, v in p.late_adds.items())
+            positions.append(row)
+        return {
+            "schema": self.STATE_SCHEMA,
+            "data_fingerprint": self.data_fingerprint(),
+            "params": self._params(),
+            "index": self.index,
+            "leverage": self.leverage,
+            "balances": dict(self.balances),
+            "order_seq": self._order_seq,
+            "orders": [asdict(o) for o in self.orders.values()],
+            "positions": positions,
+            "fees_paid": self.fees_paid,
+            "funding_paid": self.funding_paid,
+            "fill_log": [dict(f) for f in self.fill_log],
+            "funding_log": [list(row) for row in self.funding_log],
+            "liquidations": [dict(x) for x in self.liquidations],
+            "funded": sorted([list(k) for k in self._funded],
+                             key=lambda k: json.dumps(k)),
+            "unprotected_log": [dict(x) for x in self.unprotected_log],
+            "exit_events": [dict(x) for x in self.exit_events],
+            "fail_next_trading_stops": self.fail_next_trading_stops,
+            "liquidation_forfeited": self.liquidation_forfeited,
+            "funding_settlements_without_print":
+                self.funding_settlements_without_print,
+            "bar_volume_used": {s: list(v) for s, v in self._bar_volume_used.items()},
+        }
+
+    @classmethod
+    def from_state(
+        cls,
+        bars_by_symbol: Mapping[str, Sequence[Bar]],
+        state: Mapping[str, Any],
+        *,
+        funding_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
+        books_by_symbol: Optional[Mapping[str, Sequence[Any]]] = None,
+    ) -> "LinearSimulatedExchange":
+        """Rebuild a simulator from :meth:`to_state` over the SAME data."""
+        if state.get("schema") != cls.STATE_SCHEMA:
+            raise ValueError(f"unsupported simulator state schema "
+                             f"{state.get('schema')!r}")
+        params = dict(state["params"])
+        ex = cls(bars_by_symbol, funding_by_symbol=funding_by_symbol,
+                 books_by_symbol=books_by_symbol, leverage=state["leverage"],
+                 **params)
+        if ex.data_fingerprint() != state["data_fingerprint"]:
+            raise ValueError("simulator state was written on different bars "
+                             "or funding; refusing to resume on this data")
+        ex.index = int(state["index"])
+        ex.balances = {str(k): float(v) for k, v in state["balances"].items()}
+        ex._order_seq = int(state["order_seq"])
+        ex.orders = {o["order_link_id"]: _SimOrder(**o) for o in state["orders"]}
+        ex.positions = {}
+        for row in state["positions"]:
+            row = dict(row)
+            late = {int(k): float(v) for k, v in row.pop("late_adds")}
+            ex.positions[row["symbol"]] = _SimPosition(late_adds=late, **row)
+        ex.fees_paid = float(state["fees_paid"])
+        ex.funding_paid = float(state["funding_paid"])
+        ex.fill_log = [dict(f) for f in state["fill_log"]]
+        ex.funding_log = [(str(a), int(b), float(c), int(d))
+                          for a, b, c, d in state["funding_log"]]
+        ex.liquidations = [dict(x) for x in state["liquidations"]]
+        ex._funded = {(str(k[0]), int(k[1]), int(k[2]), str(k[3]))
+                      for k in state["funded"]}
+        ex.unprotected_log = [dict(x) for x in state["unprotected_log"]]
+        ex.exit_events = [dict(x) for x in state["exit_events"]]
+        ex.fail_next_trading_stops = int(state["fail_next_trading_stops"])
+        ex.liquidation_forfeited = float(state["liquidation_forfeited"])
+        ex.funding_settlements_without_print = int(
+            state["funding_settlements_without_print"])
+        ex._bar_volume_used = {s: [int(v[0]), float(v[1])]
+                               for s, v in state["bar_volume_used"].items()}
+        return ex
 
     # -- accounting --------------------------------------------------------
 
@@ -852,12 +1115,11 @@ class LinearSimulatedExchange(SimulatedExchange):
         """Open, add to, reduce or flip a position. Nothing credits a base coin."""
         symbol = order.symbol
         fee_rate = self.taker_fee if taker else self.maker_fee
-        fill_price = price * (
-            (1 + self.slippage) if (taker and order.side == "Buy")
-            else (1 - self.slippage) if taker else 1.0
-        )
-        qty = float(order.qty)
-        if qty <= 0:
+        fill_price = (self._taker_fill_price(order.side, price) if taker
+                      else float(price))
+        is_market = order.order_type == "Market" and not self._resolving
+        remaining = float(order.qty) - float(order.cum_qty)
+        if float(order.qty) <= 0 or remaining <= 1e-12:
             order.status = "Rejected"
             return
         position = self.positions.get(symbol)
@@ -870,14 +1132,31 @@ class LinearSimulatedExchange(SimulatedExchange):
                     or position.direction == incoming):
                 order.status = "Rejected"
                 return
-            qty = min(qty, position.size)
-            order.qty = qty
+            if remaining > position.size:
+                remaining = position.size
+                order.qty = float(order.cum_qty) + remaining
+        qty = remaining
+        if self.max_participation is not None:
+            # PARTIAL FILLS: one bar can only give what traded in it, shared by
+            # every order on the symbol.
+            bar = self.bars[symbol][self.index]
+            used = self._bar_volume_used.get(symbol)
+            taken = used[1] if used and int(used[0]) == self.index else 0.0
+            room = max(0.0, self.max_participation * float(bar.volume) - taken)
+            qty = min(remaining, room)
+            if qty <= 1e-12:
+                if is_market:
+                    # Immediate-or-cancel: nothing could fill now, so nothing
+                    # rests. With some quantity already done it stays done.
+                    order.status = "Cancelled"
+                return
         fee = qty * fill_price * fee_rate
 
         if position is None or position.size <= 1e-12:
-            # Opening. Initial margin must be affordable from cash.
+            # Opening. Initial margin (and the fee) must fit in what is not
+            # already committed to another position.
             margin = qty * fill_price / max(1e-9, self.leverage)
-            if self.balances.get(self.quote_asset, 0.0) < margin + fee:
+            if self.available_balance() < margin + fee:
                 order.status = "Rejected"
                 return
             self.positions[symbol] = _SimPosition(
@@ -886,7 +1165,7 @@ class LinearSimulatedExchange(SimulatedExchange):
                 opened_index=self.index)
         elif position.direction == incoming:
             margin = qty * fill_price / max(1e-9, self.leverage)
-            if self.balances.get(self.quote_asset, 0.0) < margin + fee:
+            if self.available_balance() < margin + fee:
                 order.status = "Rejected"
                 return
             notional = position.size * position.entry_price + qty * fill_price
@@ -921,14 +1200,28 @@ class LinearSimulatedExchange(SimulatedExchange):
 
         self._cash(-fee)
         self.fees_paid += fee
-        order.status = "Filled"
-        order.avg_price = fill_price
-        order.cum_qty = qty
+        if self.max_participation is not None:
+            used = self._bar_volume_used.get(symbol)
+            taken = used[1] if used and int(used[0]) == self.index else 0.0
+            self._bar_volume_used[symbol] = [self.index, taken + qty]
+        before = float(order.cum_qty)
+        order.cum_qty = before + qty
+        order.avg_price = ((before * float(order.avg_price) + qty * fill_price)
+                           / order.cum_qty)
+        order.fee_coin = self.quote_asset
+        order.fee_amount = float(order.fee_amount) + fee
+        if order.cum_qty >= float(order.qty) - 1e-12:
+            order.status = "Filled"
+        elif is_market:
+            order.status = "Cancelled"         # IOC: the rest does not rest
+        else:
+            order.status = "PartiallyFilled"
         self.fill_log.append({
             "order_link_id": order.order_link_id, "symbol": symbol,
             "side": order.side, "qty": qty, "price": fill_price,
             "fee": fee, "purpose": order.purpose, "bar": self.index,
         })
+        self._assert_no_spot_inventory()
 
     @staticmethod
     def _gap_through(long: bool, stop: float, bar: Any) -> float:
@@ -951,33 +1244,78 @@ class LinearSimulatedExchange(SimulatedExchange):
         exit_side = "Sell" if normalize_side(position.side) == "Buy" else "Buy"
         qty = position.size
         if purpose == "stop":
-            # A triggered stop is a market order: slippage against us, as on
-            # spot. (A resting take-profit limit is not slipped.)
-            price = price * ((1 - self.slippage) if exit_side == "Sell"
-                             else (1 + self.slippage))
+            # A triggered stop is a market order: slippage AND half the
+            # declared spread against us.
+            price = self._taker_fill_price(exit_side, price)
+        elif purpose == "tp":
+            # The position-attached target is a market order on trigger too;
+            # it crosses the spread. (It is not slipped: the contract tested in
+            # test_simulator_fill_contract.py, kept as it was.)
+            half = self.half_spread
+            price = price * ((1 - half) if exit_side == "Sell" else (1 + half))
         fee = qty * price * self.taker_fee
+        if purpose == "liquidation" and self.forfeit_maintenance_on_liquidation:
+            # The maintenance margin still standing at the liquidation price
+            # is lost with the position. Booked in the fill's fee so the trade
+            # ledger, which is built from fills, explains the whole loss, and
+            # counted separately so a report can split it from venue fees.
+            forfeit = self.maintenance_margin_rate * qty * price
+            fee += forfeit
+            self.liquidation_forfeited += forfeit
         self._cash(position.direction * qty * (price - position.entry_price) - fee)
         self.fees_paid += fee
         self.positions.pop(symbol, None)
-        self.fill_log.append({
+        fill = {
             "order_link_id": "", "symbol": symbol, "side": exit_side,
             "qty": qty, "price": price, "fee": fee,
             "purpose": purpose, "bar": self.index,
-        })
+        }
+        self.fill_log.append(fill)
+        self.exit_events.append(dict(fill, start_ms=int(
+            self.bars[symbol][self.index].start_ms)))
 
     # -- the bar -----------------------------------------------------------
 
-    def _funding_rate_at(self, symbol: str, stamp_ms: int) -> float:
+    #: A venue stamps a settlement a few milliseconds AFTER the nominal
+    #: 00:00/08:00/16:00 instant: 1,771 of the 4,536 BTCUSDT prints in
+    #: data/real_funding are 1..~60 ms late. A strict "last print at or before
+    #: the settlement" lookup therefore charged ~39% of settlements the
+    #: PREVIOUS print's rate. The print that belongs to a settlement is the
+    #: last one at or before ``settle + FUNDING_STAMP_TOLERANCE_MS``.
+    FUNDING_STAMP_TOLERANCE_MS = 60_000
+
+    def _funding_times(self, symbol: str) -> List[int]:
+        cache = self.__dict__.setdefault("_funding_times_cache", {})
+        times = cache.get(symbol)
+        if times is None:
+            times = [t for t, _r in self.funding_by_symbol.get(symbol, [])]
+            cache[symbol] = times
+        return times
+
+    def _funding_rate_at(self, symbol: str, stamp_ms: int, *,
+                         settlement: bool = False, count: bool = True) -> float:
+        """The funding rate in force at ``stamp_ms``.
+
+        ``settlement=True`` asks for the rate SETTLED at a nominal settlement
+        instant: the print stamped within the tolerance after it counts. A
+        settlement with no print inside ``[settle - tol, settle + tol]`` falls
+        back to the last earlier print and is COUNTED in
+        :attr:`funding_settlements_without_print`, never silently."""
         rows = self.funding_by_symbol.get(symbol)
         if not rows:
             return self.funding_rate_per_8h
-        best = None
-        for settle_ms, rate in rows:
-            if settle_ms <= stamp_ms:
-                best = rate
-            else:
-                break
-        return self.funding_rate_per_8h if best is None else best
+        import bisect
+
+        times = self._funding_times(symbol)
+        tol = self.FUNDING_STAMP_TOLERANCE_MS if settlement else 0
+        at = bisect.bisect_right(times, int(stamp_ms) + tol) - 1
+        if at < 0:
+            if settlement and count:
+                self.funding_settlements_without_print += 1
+            return self.funding_rate_per_8h
+        if settlement and count and times[at] < int(stamp_ms) - tol:
+            self.funding_settlements_without_print += 1
+        return rows[at][1]
 
     def _charge_settlement(self, symbol: str, settle: int, snapshot: Tuple,
                            size: float, mark: float, tag: str = "") -> None:
@@ -988,7 +1326,7 @@ class LinearSimulatedExchange(SimulatedExchange):
         if key in self._funded or size <= 0.0:
             return
         self._funded.add(key)
-        rate = self._funding_rate_at(symbol, settle)
+        rate = self._funding_rate_at(symbol, settle, settlement=True)
         paid = direction * rate * size * mark
         self._cash(-paid)
         self.funding_paid += paid
@@ -1068,7 +1406,8 @@ class LinearSimulatedExchange(SimulatedExchange):
         for settle in self._settlements_in(symbol, bar):
             if settle <= bar.start_ms:
                 continue
-            rate = self._funding_rate_at(symbol, settle)
+            rate = self._funding_rate_at(symbol, settle, settlement=True,
+                                         count=False)
             if direction * rate > 0:                       # it PAYS
                 self._charge_settlement(symbol, settle, snapshot, size_start,
                                         max(bar.open, bar.close))
@@ -1118,6 +1457,14 @@ class LinearSimulatedExchange(SimulatedExchange):
     def _resolve_prices(self, symbol: str, bar: Bar) -> None:
         position = self.positions.get(symbol)
         if position is not None and position.size > 0:
+            if position.stop_loss <= 0 or not position.stop_verified:
+                # Carried through this bar without a verified protective stop.
+                self.unprotected_log.append({
+                    "symbol": symbol, "bar": self.index,
+                    "start_ms": int(bar.start_ms),
+                    "reason": ("no_stop" if position.stop_loss <= 0
+                               else "stop_not_verified"),
+                })
             long = normalize_side(position.side) == "Buy"
             adverse = bar.low if long else bar.high
             stop = position.stop_loss if position.stop_loss > 0 else None
@@ -1151,13 +1498,16 @@ class LinearSimulatedExchange(SimulatedExchange):
             del adverse
 
         # Resting orders: take-profit legs are ordinary reduce orders on linear.
+        # A partially filled limit keeps resting. A reduce-only leg needs a
+        # position to reduce; an opening limit does not.
         for order in list(self.orders.values()):
-            if order.symbol != symbol or order.status != "New":
+            if (order.symbol != symbol
+                    or order.status not in ("New", "PartiallyFilled")):
                 continue
             if order.order_type != "Limit":
                 continue
             if (self._limit_reached(order.side, order.price, bar)
-                    and symbol in self.positions):
+                    and (symbol in self.positions or not order.reduce_only)):
                 self._execute(order, order.price, taker=False)
 
         # A reduce-only leg belongs to the position it was placed against: when
@@ -1166,7 +1516,8 @@ class LinearSimulatedExchange(SimulatedExchange):
         # reduce whatever position is opened next.
         if symbol not in self.positions:
             for order in self.orders.values():
-                if (order.symbol == symbol and order.status == "New"
+                if (order.symbol == symbol
+                        and order.status in ("New", "PartiallyFilled")
                         and order.reduce_only):
                     order.status = "Cancelled"
 
@@ -1234,7 +1585,13 @@ class LinearSimulatedExchange(SimulatedExchange):
             return 200, json.dumps({"retCode": code, "retMsg": msg, "result": {}})
 
         if path == "/v5/position/list":
-            row = self._position_row(str(merged.get("symbol", "")))
+            symbol = str(merged.get("symbol", ""))
+            row = self._position_row(symbol)
+            position = self.positions.get(symbol)
+            if row and position is not None and position.stop_loss > 0:
+                # The reader has now SEEN the stop the venue holds: that is
+                # what verification means on this instrument.
+                position.stop_verified = True
             return ok({"list": [row] if row else []})
 
         if path == "/v5/position/trading-stop":
@@ -1243,8 +1600,12 @@ class LinearSimulatedExchange(SimulatedExchange):
             position = self.positions.get(symbol)
             if position is None or position.size <= 0:
                 return err(110017, "position idx not match position mode")
+            if self.fail_next_trading_stops > 0:
+                self.fail_next_trading_stops -= 1
+                return err(10016, "simulated trading-stop failure")
             if "stopLoss" in payload:
                 position.stop_loss = float(payload.get("stopLoss") or 0.0)
+                position.stop_verified = False     # written, not yet read back
             if payload.get("takeProfit"):
                 position.take_profit = float(payload["takeProfit"])
             return ok({})
@@ -1262,10 +1623,18 @@ class LinearSimulatedExchange(SimulatedExchange):
             if symbol not in self.bars:
                 return ok({"list": []})
             bar = self.bars[symbol][self.index]
-            return _sim_ticker_reply({
+            status, text = _sim_ticker_reply({
                 "symbol": symbol, "lastPrice": str(bar.close),
                 "fundingRate": str(self._funding_rate_at(symbol, bar.start_ms)),
             })
+            if self.half_spread > 0:
+                # The declared spread, around the close as mid.
+                reply = json.loads(text)
+                row = reply["result"]["list"][0]
+                row["bid1Price"] = str(bar.close * (1 - self.half_spread))
+                row["ask1Price"] = str(bar.close * (1 + self.half_spread))
+                text = json.dumps(reply)
+            return status, text
 
         return super().request(method, url, headers=headers, params=params,
                                body=body, timeout=timeout)
