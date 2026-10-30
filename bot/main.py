@@ -512,6 +512,14 @@ class TradingBot:
                                "equity will not seed today's anchor", scope)
         except Exception:  # noqa: BLE001
             logger.exception("could not record the equity scope")
+        try:
+            # What kind of money this database's execution records are. The
+            # performance report refuses to call anything realised cash unless
+            # this says mainnet (carry_performance --environment).
+            self.store.record_execution_environment(
+                execution_environment_of(self.cfg))
+        except Exception:  # noqa: BLE001
+            logger.exception("could not record the execution environment")
         live_armed, live_why = _config.is_live_authorized(self.cfg)
         logger.warning(
             "mode: %s | testnet=%s paper=%s | %s",
@@ -1813,6 +1821,50 @@ def carry_entries_permitted_from(store: Any) -> Callable[[], Tuple[bool, str]]:
     return gate
 
 
+def execution_environment_of(cfg: Any) -> str:
+    """What kind of money this process's execution records are. Sandbox
+    flags default to the safe answer when absent; only an explicit
+    USE_TESTNET=0 and PAPER_TRADING=0 is mainnet."""
+    if bool(getattr(cfg, "USE_TESTNET", True)):
+        return "testnet"
+    if bool(getattr(cfg, "PAPER_TRADING", True)):
+        return "paper"
+    return "mainnet"
+
+
+def _attach_portfolio_authority(bot: Any, cfg: Any) -> None:
+    """Give the carry engine its seat at the portfolio table (carry_capital).
+
+    Wired only onto the real StateStore: the authority and its reservations
+    persist through it, and a test double that is not one cannot hold them. The
+    reading freshness limit is the one the market snapshot already enforces; no
+    new tunable is invented for it. Exits never consult the authority."""
+    from persistence import StateStore
+    if not isinstance(bot.store, StateStore):
+        return
+    import capital_reservations as _capres
+    import portfolio_state as _ps
+    from carry_capital import CarryCapitalAuthority
+    from market_snapshot import MAX_SNAPSHOT_AGE_S
+
+    adapter = getattr(bot.carry.broker, "inner", bot.carry.broker)
+    # The fee reserve is part of every reservation's amount (CarryEngine adds it),
+    # so no separate buffer is held back.
+    reservations = _capres.CapitalReservations(
+        bot.store, buffer_usd=0.0, max_available_age_s=float(MAX_SNAPSHOT_AGE_S))
+    limits = _ps.PortfolioLimits(
+        max_daily_loss_fraction=float(cfg.MAX_DAILY_LOSS_PCT),
+        max_drawdown_fraction=float(cfg.MAX_DRAWDOWN_PCT),
+        max_state_age_s=float(MAX_SNAPSHOT_AGE_S), max_total_capital_usd=None)
+    scope = (f"venue={str(getattr(cfg, 'BYBIT_VENUE', '')).lower()};"
+             f"testnet={bool(getattr(cfg, 'USE_TESTNET', True))};UNIFIED")
+    bot.carry.capital_authority = CarryCapitalAuthority(
+        store=bot.store, broker=adapter, spot_symbol=cfg.CARRY_SPOT_SYMBOL,
+        perp_symbol=cfg.CARRY_PERP_SYMBOL, reservations=reservations,
+        limits=limits, account_scope=scope,
+        ttl_s=float(cfg.CAPITAL_RESERVATION_TTL_S))
+
+
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
     """Construct the stack in dependency order.
 
@@ -1884,7 +1936,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         raise ValueError(
             f"BOOK_MODE={cfg.BOOK_MODE!r} is not a book. Refusing rather than "
             "falling back: a typo must not silently select a strategy.")
-    if book_mode == "carry" and attach_strategy and bot.carry is None:
+    # The carry ENGINE is attached whenever the book is carry, whatever
+    # ENTRIES_ENABLED says: it is what watches a held pair. ENTRIES_ENABLED only
+    # stops new pairs (CarryEngine.entries_enabled).
+    if book_mode == "carry" and bot.carry is None:
         from carry_broker import CarryBroker
         from carry_engine import CarryEngine
 
@@ -1995,6 +2050,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # The account must be able to fund the pair before any leg leaves.
             require_capital_check=True,
             leverage=float(cfg.DEFAULT_LEVERAGE),
+            # What the capital behind the hedge could earn elsewhere; 0.0
+            # unless an operator supplies a rate (none is invented).
+            opportunity_cost_apr=float(cfg.CARRY_OPPORTUNITY_COST_APR),
+            entries_enabled=bool(attach_strategy),
             # What that gate reads each held tick is kept (additive table, no
             # new venue request) so a later replay can run on the venue's own
             # numbers. A store without the method records nothing and says so.
@@ -2014,6 +2073,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         bot.carry.pair_risk = CarryRisk(
             store=bot.store,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
+        _attach_portfolio_authority(bot, cfg)
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
             "%.4f/yr, execution %s/%s, orders: %s. The directional strategy is "

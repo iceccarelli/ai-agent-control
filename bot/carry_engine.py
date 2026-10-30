@@ -610,6 +610,7 @@ class CarryEngine:
                  leverage: Any = 1.0,
                  require_capital_check: bool = False,
                  capital_authority: Any = None,
+                 entries_enabled: bool = True,
                  opportunity_cost_apr: Any = 0.0) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
@@ -665,6 +666,10 @@ class CarryEngine:
         #: before every ENTRY, never for an exit. None = not wired (a bare
         #: engine, the shadow book).
         self.capital_authority = capital_authority
+        #: ENTRIES_ENABLED=0 stops NEW pairs and nothing else: a held pair is
+        #: still watched, margin-checked and exited. (It used to detach the
+        #: whole engine, leaving a held short with nobody looking at it.)
+        self.entries_enabled = bool(entries_enabled)
         self._last_margin: Optional[float] = None
         self.persist = persist
         self.execution_mode = execution_mode
@@ -1416,6 +1421,11 @@ class CarryEngine:
     def _open(self, mark: float, spot_mark: float, funding_bps: float,
               timestamp_ms: int) -> CarryDecision:
         """Both legs, or neither. There is no partially-open carry position."""
+        if not self.entries_enabled:
+            return CarryDecision(
+                "stand_aside", reason="ENTRIES_DISABLED", state=BookState.FLAT,
+                detail={"note": "ENTRIES_ENABLED is off: no new pair is opened; "
+                                "a held pair is still managed"})
         # THE PRECONDITIONS (0033, INVENTORY D8). Until 0033 the pair gate ran
         # only "if self.pair_risk is not None and self.snapshot is not None",
         # so an engine built without either opened on the cost gates alone. No
