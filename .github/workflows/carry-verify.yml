@@ -156,6 +156,7 @@ jobs:
           tests/test_order_lifecycle.py
           tests/test_order_lookup_unanswered.py
           tests/test_exit_gate.py
+          tests/test_resolve_order_contradiction_tool.py
           tests/test_database_environment_scope.py
           tests/test_unresolved_status_agreement.py
           tests/test_carry_orders_belong_to_the_carry_resolver.py
