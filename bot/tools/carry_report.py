@@ -29,7 +29,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 
-def build_report(db_path: str) -> Dict[str, Any]:
+def _evidence(db_path: str, environment: Optional[str]) -> Dict[str, Any]:
+    """Whose orders this ledger booked, from the operator's EXPLICIT
+    declaration, checked against what the database recorded. The accounting
+    status below ("REALISED") is about completeness of fees and funding; it is
+    cash only when this block says ACTUAL_RECONCILED is possible."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import carry_performance as _perf
+    env = _perf.classify_environment(
+        environment, _perf.load_environment_record(db_path))
+    return env
+
+
+def build_report(db_path: str,
+                 environment: Optional[str] = None) -> Dict[str, Any]:
     import ledger as _ledger
 
     if not os.path.exists(db_path):
@@ -38,6 +52,8 @@ def build_report(db_path: str) -> Dict[str, Any]:
     conn.row_factory = sqlite3.Row
     try:
         out: Dict[str, Any] = {"db": db_path}
+        env = _evidence(db_path, environment)
+        out["environment"] = env
         row = conn.execute(
             "SELECT payload FROM carry_ledger WHERE id = 1").fetchone() \
             if _has(conn, "carry_ledger") else None
@@ -83,6 +99,23 @@ def build_report(db_path: str) -> Dict[str, Any]:
                            "fee_status": e.fee_status}
                           for e in journal.entries if e.fee_status],
             }
+            # "REALISED" above is accounting completeness. Whether the figure is
+            # money is a separate question: only a corroborated mainnet ledger
+            # can be ACTUAL_RECONCILED (tools/carry_performance.py --json is the
+            # full evidence report).
+            import carry_performance as _perf
+            invariants = _perf.check_invariants(
+                journal, _perf.cycles_from_journal(journal), st)
+            unresolved = _perf.load_unresolved_carry_orders(db_path)
+            out["carry"]["invariants_hold"] = all(i["ok"] for i in invariants)
+            out["carry"]["unresolved_carry_orders"] = unresolved
+            out["carry"]["evidence_class"] = (
+                "ACTUAL_RECONCILED"
+                if env["actual_reconciled_eligible"]
+                and out["carry"]["status"] == "REALISED"
+                and out["carry"]["invariants_hold"] and unresolved == 0
+                and abs(st["open_perp_qty"]) <= _ledger.DUST[_ledger.PERP]
+                else env["booked_figures_class"])
         all_trades: List[sqlite3.Row] = conn.execute(
             "SELECT * FROM trades").fetchall() if _has(conn, "trades") else []
         # An exit booked WITHOUT an authoritative price carries no price and
@@ -117,6 +150,9 @@ def build_report(db_path: str) -> Dict[str, Any]:
             "realised_net_pnl": sum(t["net_pnl"] for t in confirmed),
             "unconfirmed_net_pnl": sum(
                 t["net_pnl"] for t in trades if t not in confirmed),
+            # "realised" above means fee-confirmed on the trade record; it is
+            # never cash unless the environment is a corroborated mainnet.
+            "evidence_class": env["booked_figures_class"],
         }
         return out
     finally:
@@ -188,9 +224,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("db", help="path to the state database")
+    ap.add_argument("--environment", default=None,
+                    choices=("mainnet", "testnet", "paper",
+                             "historical_simulation", "forward_simulation"),
+                    help="whose orders the ledger booked; omitted, nothing is "
+                         "classed as cash (UNDECLARED_ENVIRONMENT)")
     args = ap.parse_args(argv)
     try:
-        report = build_report(args.db)
+        report = build_report(args.db, environment=args.environment)
     except FileNotFoundError as exc:
         print(json.dumps({"error": f"no such database: {exc}"}))
         return 2

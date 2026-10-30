@@ -48,6 +48,7 @@ __all__ = [
     "get_perf",
     "MIN_TRADES_FOR_RATIOS",
     "TRADING_DAYS_PER_YEAR",
+    "overlay_opportunity_cost",
 ]
 
 #: Crypto trades every day, so the annualisation factor is 365, not 252.
@@ -359,6 +360,170 @@ class PerformanceAnalytics:
         if decay is None:
             return 1.0
         return max(0.0, min(1.0, decay))
+
+
+# ---------------------------------------------------------------------------
+# incremental economics of one overlay cycle (opportunity cost)
+# ---------------------------------------------------------------------------
+
+#: Every figure below is over the cycle's own holding period (first perp open
+#: to last perp close), simple, not annualised and not compounded.
+OPPORTUNITY_TIME_BASIS = ("the cycle's holding period (first perp open to last "
+                          "perp close), simple interest, not annualised, not "
+                          "compounded")
+
+#: The counterfactual BTC leg is valued at the cycle's own perp fill prices: the
+#: journal records no spot mark at those instants. The spot price differed by
+#: the basis, which is therefore NOT in the counterfactual.
+UNHEDGED_PRICE_BASIS = ("the cycle's volume-weighted perp entry and exit fill "
+                        "prices; no spot mark is journalled at those instants, "
+                        "so the perp-spot basis is not in this counterfactual")
+
+
+def _finite(x: Any) -> Optional[float]:
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) else None
+
+
+def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
+                             benchmark_apr_pct: Optional[float],
+                             benchmark_source: str = "") -> Dict[str, Any]:
+    """What one closed hedged cycle earned against two alternatives.
+
+    (a) the same BTC held UNHEDGED over the same period, and (b) the capital
+    the hedged pair committed held at a cash benchmark rate the OPERATOR
+    supplies. No benchmark is ever invented or defaulted: without one, (b) is
+    UNAVAILABLE with the reason. Every figure names its denominator and time
+    basis. The figures are counterfactuals computed from the cycle's booked
+    prices, so the comparison is HISTORICAL_SIMULATION evidence; the overlay's
+    own result keeps the evidence class the caller assigned it
+    (``cycle["evidence_class"]``) and is never upgraded here.
+
+    ``cycle`` keys read: cycle_id, outcome, evidence_class, overlay,
+    hedged_qty, perp_entry_price, perp_exit_price, hold_days, net_usd,
+    revalue_usd, capital_committed_usd, fees_complete, funding_complete.
+    """
+    cid = cycle.get("cycle_id")
+    leg_class = str(cycle.get("evidence_class") or "UNAVAILABLE")
+    out: Dict[str, Any] = {"cycle_id": cid,
+                           "overlay_leg_evidence_class": leg_class,
+                           "time_basis": OPPORTUNITY_TIME_BASIS}
+    if cycle.get("outcome") != "CLOSED":
+        out.update(evidence_class="UNAVAILABLE",
+                   why=f"cycle outcome {cycle.get('outcome')!r}: only a "
+                       "closed hedged cycle has a holding period to compare")
+        return out
+    days = _finite(cycle.get("hold_days"))
+    net = _finite(cycle.get("net_usd"))
+    reval = _finite(cycle.get("revalue_usd")) or 0.0
+    incomplete = [name for name, ok in (
+        ("fees", cycle.get("fees_complete")),
+        ("funding", cycle.get("funding_complete"))) if not ok]
+    if days is None or days <= 0 or net is None:
+        out.update(evidence_class="UNAVAILABLE",
+                   why="no positive holding period or no booked net for this "
+                       "cycle")
+        return out
+    # The overlay's increment: what the hedge (short perp, its funding and its
+    # costs) added, with any inventory revaluation taken back out so the BTC
+    # leg is not counted twice.
+    increment = net - reval
+    out["overlay_increment_usd"] = increment
+    out["overlay_increment_basis"] = (
+        "booked cycle net (funding - fees - financing + realised price legs) "
+        "minus any inventory revaluation entries")
+    if incomplete:
+        out["overlay_increment_incomplete"] = incomplete
+        out["overlay_increment_note"] = (
+            "not complete for this cycle: " + ", ".join(incomplete) + "; the "
+            "increment is the BOOKED figure, not a final one")
+    qty = _finite(cycle.get("hedged_qty"))
+    p0 = _finite(cycle.get("perp_entry_price"))
+    p1 = _finite(cycle.get("perp_exit_price"))
+    prices_ok = qty is not None and qty > 0 and p0 and p1 and p0 > 0 and p1 > 0
+
+    # (a) the same BTC, unhedged
+    if not cycle.get("overlay"):
+        out["vs_unhedged_btc"] = {
+            "available": False, "evidence_class": "UNAVAILABLE",
+            "why": ("not an overlay cycle: the book bought its spot leg, so the "
+                    "unhedged alternative would need a purchase whose fee and "
+                    "price were never observed")}
+        pair = increment
+    elif not prices_ok:
+        out["vs_unhedged_btc"] = {
+            "available": False, "evidence_class": "UNAVAILABLE",
+            "why": "the hedged quantity or a perp fill price is not in the "
+                   "journal for this cycle"}
+        pair = None
+    else:
+        unhedged = qty * (p1 - p0)
+        pair = unhedged + increment
+        notional = qty * p0
+        out["vs_unhedged_btc"] = {
+            "available": True, "evidence_class": "HISTORICAL_SIMULATION",
+            "hedged_qty_btc": qty, "price_basis": UNHEDGED_PRICE_BASIS,
+            "unhedged_btc_pnl_usd": unhedged,
+            "hedged_pair_pnl_usd": pair,
+            "incremental_vs_unhedged_usd": increment,
+            "denominator": "hedged notional at entry = hedged_qty_btc x perp "
+                           "entry price",
+            "denominator_usd": notional,
+            "unhedged_return_pct": 100.0 * unhedged / notional,
+            "hedged_pair_return_pct": 100.0 * pair / notional,
+            "time_basis": OPPORTUNITY_TIME_BASIS,
+            "note": ("the overlay gives up the BTC's price move in exchange "
+                     "for funding; this is the size of that trade over the "
+                     "period, not a risk-adjusted comparison")}
+
+    # (b) the committed capital at an operator-supplied benchmark rate
+    apr = _finite(benchmark_apr_pct)
+    capital = _finite(cycle.get("capital_committed_usd"))
+    if benchmark_apr_pct is None:
+        out["vs_benchmark_rate"] = {
+            "available": False, "evidence_class": "UNAVAILABLE",
+            "why": ("no benchmark rate was supplied by the operator "
+                    "(--cash-apr); none is assumed and none is defaulted")}
+    elif apr is None or apr <= -100.0 or apr > 100.0:
+        out["vs_benchmark_rate"] = {
+            "available": False, "evidence_class": "UNAVAILABLE",
+            "why": f"benchmark rate {benchmark_apr_pct!r} is not a finite "
+                   "annual percentage in (-100, 100]"}
+    elif capital is None or capital <= 0:
+        out["vs_benchmark_rate"] = {
+            "available": False, "evidence_class": "UNAVAILABLE",
+            "why": "no committed capital for this cycle (no observed venue "
+                   "margin, or no spot leg value), so no denominator"}
+    elif pair is None:
+        out["vs_benchmark_rate"] = {
+            "available": False, "evidence_class": "UNAVAILABLE",
+            "why": "the hedged pair's result is not computable for this cycle"}
+    else:
+        bench = capital * apr / 100.0 * days / 365.0
+        out["vs_benchmark_rate"] = {
+            "available": True, "evidence_class": "HISTORICAL_SIMULATION",
+            "benchmark_apr_pct": apr,
+            "benchmark_source": benchmark_source or "operator-supplied",
+            "denominator": ("committed capital = observed venue initial margin "
+                            "+ spot leg (cost if bought, hedged inventory at "
+                            "entry if the client's)"),
+            "denominator_usd": capital,
+            "hold_days": days,
+            "benchmark_alternative_usd": bench,
+            "hedged_pair_pnl_usd": pair,
+            "incremental_vs_benchmark_usd": pair - bench,
+            "hedged_pair_return_pct": 100.0 * pair / capital,
+            "benchmark_return_pct": apr * days / 365.0,
+            "time_basis": OPPORTUNITY_TIME_BASIS}
+    avail = [k for k in ("vs_unhedged_btc", "vs_benchmark_rate")
+             if out[k]["available"]]
+    out["evidence_class"] = "HISTORICAL_SIMULATION" if avail else "UNAVAILABLE"
+    if not avail:
+        out["why"] = "neither alternative is computable for this cycle"
+    return out
 
 
 # ---------------------------------------------------------------------------
