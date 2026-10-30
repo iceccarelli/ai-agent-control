@@ -1388,6 +1388,9 @@ class LedgerBroker:
     def get_available_margin_usd(self):
         return self.inner.get_available_margin_usd()
 
+    def get_quote_free_usd(self, coin="USDT"):
+        return self.inner.get_quote_free_usd(coin)
+
     def get_closed_short_qty_since(self, symbol, since_ms):
         return self.inner.get_closed_short_qty_since(symbol, since_ms)
 

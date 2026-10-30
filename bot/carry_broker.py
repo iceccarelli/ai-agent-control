@@ -1636,6 +1636,30 @@ class CarryBroker:
                 "a readable one")
         return value
 
+    def get_quote_free_usd(self, coin: str = "USDT") -> float:
+        """Free balance of the quote coin a spot purchase pays in:
+        `walletBalance - locked`, both STATED. `totalAvailableBalance` is the
+        whole account's collateral value and says nothing about whether the
+        coin the purchase is settled in is there. Raises on a missing row, an
+        unstated, non-finite or negative lock or balance."""
+        result = self.client._request(
+            "GET", "/v5/account/wallet-balance", signed=True,
+            params={"accountType": "UNIFIED", "coin": coin})
+        rows = self._v5_list(result) or []
+        coins = (rows[0].get("coin") if rows and isinstance(rows[0], dict)
+                 else None) or []
+        for entry in coins:
+            if str(entry.get("coin", "")).upper() != coin.upper():
+                continue
+            balance = self._stated(entry, "walletBalance", f"wallet row for {coin}")
+            locked = self._stated(entry, "locked", f"wallet row for {coin}")
+            if balance < 0 or locked < 0:
+                raise PairIncident(
+                    f"wallet row for {coin} states balance {balance} / locked "
+                    f"{locked}; a negative figure is not a readable one")
+            return max(0.0, balance - locked)
+        raise PairIncident(f"no wallet row for {coin}; the free balance is unknown")
+
     @staticmethod
     def _optional_margin(row: Dict[str, Any]) -> Optional[float]:
         """The venue's initial margin for the position, for the RECORD only.
