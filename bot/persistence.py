@@ -380,6 +380,23 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 
+-- Append-only record of everything that happened to an order, written in the
+-- same transaction as the status change it explains. event_key (optional) makes
+-- a re-delivered event a no-op. See order_lifecycle.py for the states.
+CREATE TABLE IF NOT EXISTS order_events (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key      TEXT UNIQUE,
+    order_link_id  TEXT NOT NULL,
+    kind           TEXT NOT NULL,
+    status_before  TEXT NOT NULL,
+    status_after   TEXT NOT NULL,
+    filled_qty     REAL NOT NULL DEFAULT 0.0,
+    avg_price      REAL NOT NULL DEFAULT 0.0,
+    epoch          REAL NOT NULL,
+    detail         TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_order_events_link ON order_events(order_link_id);
+
 CREATE TABLE IF NOT EXISTS order_seq (
     id      INTEGER PRIMARY KEY CHECK (id = 1),
     next_id INTEGER NOT NULL DEFAULT 1
@@ -527,7 +544,17 @@ EXECUTION_OUTCOMES = ("filled", "partial", "rejected", "cancelled", "unfilled")
 #: ``never_sent``; a replayed WS event must not revive those either.
 LOCAL_TERMINAL_ORDER_STATUS = frozenset({
     "filled", "cancelled", "rejected",
-    "partiallyfilledcanceled", "deactivated", "never_sent"})
+    "partiallyfilledcanceled", "deactivated", "never_sent", "abandoned"})
+
+
+@dataclass(frozen=True)
+class OrderEventResult:
+    """What applying one order event did. `applied` False means the record is
+    unchanged and `reason` says why (duplicate, stale, illegal, ...)."""
+    applied: bool
+    status: str
+    previous: str
+    reason: str = ""
 
 
 def slippage_bps(side: str, intended_price: float, fill_price: float) -> float:
@@ -701,6 +728,13 @@ class StateStore:
     #: migration: a database created by a build that had the table but not a
     #: later column is repaired in place rather than rejected.
     _MEMORY_COLUMNS: Dict[str, Dict[str, str]] = {
+        # Per-order lifecycle facts (order_lifecycle.py). Defaults make an older
+        # row read as "nothing filled, no cycle", which is what it always meant.
+        "orders": {"filled_qty": "REAL NOT NULL DEFAULT 0.0",
+                   "avg_price": "REAL NOT NULL DEFAULT 0.0",
+                   "cycle_id": "TEXT NOT NULL DEFAULT ''",
+                   "leg": "TEXT NOT NULL DEFAULT ''",
+                   "last_event": "TEXT NOT NULL DEFAULT ''"},
         # Which cycle (the position's opened_ms) a liquidation read belongs to.
         # NULL on rows written before the column existed.
         "carry_risk_observation": {"cycle_opened_ms": "INTEGER",
@@ -2403,7 +2437,8 @@ class StateStore:
         return [
             dict(r)
             for r in self._query(
-                "SELECT * FROM orders WHERE status IN ('pending','submitted','partial')"
+                "SELECT * FROM orders WHERE status IN ('pending','submitted',"
+                "'partial','acknowledged','cancel_requested')"
             )
         ]
 
@@ -2445,9 +2480,99 @@ class StateStore:
             dict(r)
             for r in self._query(
                 "SELECT * FROM orders WHERE status IN "
-                "('pending','submitted','partial','unknown')"
+                "('pending','submitted','partial','unknown','acknowledged',"
+                "'cancel_requested','timed_out','reconciliation_required')"
             )
         ]
+
+    # -- the order lifecycle (order_lifecycle.py) --------------------------
+
+    def record_order_intent(
+        self, order_link_id: str, symbol: str, side: str, qty: float, *,
+        leg: str, cycle_id: str, order_type: str = "Market", price: float = 0.0,
+        purpose: Optional[str] = None,
+    ) -> bool:
+        """Write a carry order's intent BEFORE anything is sent. True for a new
+        id; False when the id exists (a retry: ask the venue, do not resend)."""
+        with self.transaction():
+            new = self.record_order(
+                order_link_id, symbol, side, order_type, qty, price,
+                purpose=purpose or f"carry-{leg}", status="pending",
+                meta={"leg": leg, "cycle_id": cycle_id})
+            if new:
+                self._exec("UPDATE orders SET leg = ?, cycle_id = ? "
+                           "WHERE order_link_id = ?",
+                           (str(leg), str(cycle_id), order_link_id))
+        return new
+
+    def apply_order_event(
+        self, order_link_id: str, kind: str, *,
+        event_key: Optional[str] = None, filled_qty: Optional[float] = None,
+        avg_price: Optional[float] = None, exchange_id: str = "",
+        detail: Optional[Mapping[str, Any]] = None,
+    ) -> "OrderEventResult":
+        """Move one order through its lifecycle, atomically.
+
+        The read, the legality decision, the status/fill update and the event
+        row happen in ONE transaction, so a kill cannot leave the status changed
+        and the log silent (or the reverse). A re-delivered `event_key` is a
+        no-op. An illegal or stale event changes nothing and is journalled."""
+        import order_lifecycle as _ol
+        with self.transaction():
+            row = self.get_order(order_link_id)
+            if row is None:
+                return OrderEventResult(False, "", "", "NO_SUCH_ORDER")
+            before = str(row["status"])
+            if event_key is not None and self._query(
+                    "SELECT 1 FROM order_events WHERE event_key = ?",
+                    (event_key,)):
+                return OrderEventResult(False, before, before, "DUPLICATE_EVENT")
+            recorded = float(row.get("filled_qty") or 0.0)
+            requested = float(row["qty"])
+            t = _ol.decide(before, kind, recorded_qty=recorded,
+                           requested_qty=requested, filled_qty=filled_qty)
+            if not t.applied:
+                if t.reason.startswith("ILLEGAL_TRANSITION"):
+                    self.journal(str(row.get("symbol", "")),
+                                 "ORDER_TRANSITION_REFUSED", t.reason,
+                                 {"order_link_id": order_link_id,
+                                  "status": before, "event": kind})
+                return OrderEventResult(False, before, before, t.reason)
+            after = t.new_status or before
+            cum = recorded if t.new_filled_qty is None else max(
+                recorded, float(t.new_filled_qty))
+            price = float(row.get("avg_price") or 0.0)
+            if avg_price is not None and cum > recorded:
+                price = float(avg_price)
+            self._exec(
+                "UPDATE orders SET status = ?, filled_qty = ?, avg_price = ?, "
+                "last_event = ?, updated_epoch = ?, "
+                "exchange_id = COALESCE(NULLIF(?, ''), exchange_id) "
+                "WHERE order_link_id = ?",
+                (after, cum, price, kind, utc_now_epoch(), exchange_id,
+                 order_link_id))
+            self._exec(
+                "INSERT INTO order_events(event_key, order_link_id, kind, "
+                "status_before, status_after, filled_qty, avg_price, epoch, "
+                "detail) VALUES(?,?,?,?,?,?,?,?,?)",
+                (event_key, order_link_id, kind, before, after, cum, price,
+                 utc_now_epoch(), json.dumps(dict(detail or {}), default=str)))
+            if t.reason.startswith("CONTRADICTION"):
+                self.journal(str(row.get("symbol", "")),
+                             "ORDER_EVIDENCE_CONTRADICTS_RECORD", t.reason,
+                             {"order_link_id": order_link_id,
+                              "from_status": before, "filled_qty": cum})
+            return OrderEventResult(True, after, before, t.reason)
+
+    def order_events(self, order_link_id: str) -> List[Dict[str, Any]]:
+        return [dict(r) for r in self._query(
+            "SELECT * FROM order_events WHERE order_link_id = ? ORDER BY id",
+            (order_link_id,))]
+
+    def unresolved_carry_orders(self) -> List[Dict[str, Any]]:
+        """Carry-leg orders that have not reached a terminal state."""
+        return [o for o in self.unresolved_orders()
+                if str(o.get("purpose", "")).startswith("carry-")]
 
     # -- decision journal --------------------------------------------------
 
