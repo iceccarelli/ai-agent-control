@@ -429,6 +429,11 @@ class BybitClient:
         #: A stand-down run (`ENTRIES_ENABLED=0`) must end with this at 0, and
         #: `session_log.PaperSessionLog` reports it verbatim.
         self.orders_submitted = 0
+        #: Asked before any order that can ADD exposure; never for an exit.
+        #: `build_bot` wires it to the store's kill switch. None = no extra
+        #: gate (tools that build their own client). A value that is not
+        #: callable refuses every entry.
+        self.entry_gate: Optional[Callable[[], Tuple[bool, str]]] = None
 
         # The venue is resolved ONCE, centrally, and refused when the config
         # contradicts itself or states nothing (resolve_client_venue). USE_TESTNET
@@ -1039,6 +1044,23 @@ class BybitClient:
             prefix=str(getattr(self.cfg, "ORDERLINK_PREFIX", "BB")),
         )
 
+    def _entry_refusal(self, direction: str, reduce_only: bool) -> Optional[str]:
+        """A reason string when this order may not go, else None.
+
+        Exits are never asked: a reduce-only order, and on spot a SELL (spot
+        has no short, so a sell can only reduce a held long)."""
+        if self.entry_gate is None or reduce_only:
+            return None
+        if self.is_spot and direction == "Sell":
+            return None
+        try:
+            allowed, reason = self.entry_gate()
+        except Exception as exc:  # noqa: BLE001 - an unreadable gate is closed
+            return f"ENTRY_GATE_REFUSED: gate unreadable ({exc!r})"
+        if allowed is not True:
+            return f"ENTRY_GATE_REFUSED: {reason}"
+        return None
+
     def place_order(
         self,
         *,
@@ -1061,6 +1083,9 @@ class BybitClient:
         direction = normalize_side(side)
         if direction is None:
             return OrderResult(reason=f"UNKNOWN_SIDE:{side!r}")
+        refused = self._entry_refusal(direction, reduce_only)
+        if refused is not None:
+            return OrderResult(reason=refused)
 
         try:
             filters = filters or self.get_instrument_filters(symbol)

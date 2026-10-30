@@ -118,3 +118,59 @@ def test_a_breach_at_open_is_recorded_and_the_next_tick_still_decides(store):
     eng._last_tick_ms = 1_700_000_100_000
     d2 = eng._check_liquidation_distance()
     assert d2 is not None and d2.reason.startswith("LIQUIDATION_")
+
+
+# -- rows are keyed to the cycle that produced them ---------------------------
+
+def test_every_row_carries_the_cycle_it_belongs_to(store):
+    broker = ViewBroker(view=dict(GOOD))
+    eng, _ = opened(broker, store.record_risk_observation)
+    cycle = eng.position.opened_ms
+    assert cycle is not None
+    eng._last_tick_ms = 1_700_000_100_000
+    eng._check_liquidation_distance()
+    broker.raises = ConnectionError("down")
+    eng._last_tick_ms = 1_700_000_200_000
+    eng._check_liquidation_distance()                 # unreadable row too
+    rows = store.load_risk_observations()
+    assert len(rows) == 3
+    assert {r["cycle_opened_ms"] for r in rows} == {cycle}
+
+
+def test_a_database_from_before_the_column_gains_it_additively(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    StateStore(path).close()
+    con = sqlite3.connect(path)
+    con.execute("DROP TABLE carry_risk_observation")
+    con.execute("CREATE TABLE carry_risk_observation (ms INTEGER PRIMARY KEY, "
+                "symbol TEXT NOT NULL, side TEXT NOT NULL DEFAULT '', "
+                "size REAL NOT NULL DEFAULT 0.0, mark REAL NOT NULL DEFAULT 0.0,"
+                " liq_price REAL, distance_pct REAL, account_mm_rate REAL, "
+                "margin_multiple REAL, reason TEXT NOT NULL DEFAULT '', "
+                "recorded_epoch REAL NOT NULL DEFAULT 0.0)")
+    con.execute("INSERT INTO carry_risk_observation(ms, symbol) VALUES(1, 'X')")
+    con.commit()
+    con.close()
+    s = StateStore(path)
+    try:
+        s.record_risk_observation({"ms": 2, "symbol": "BTCUSDT",
+                                   "cycle_opened_ms": 77})
+        rows = s.load_risk_observations()
+        assert [r["cycle_opened_ms"] for r in rows] == [None, 77]
+    finally:
+        s.close()
+
+
+def test_the_venues_initial_margin_is_recorded_when_stated(store):
+    broker = ViewBroker(view=dict(GOOD, position_im_usd=12_345.0))
+    opened(broker, store.record_risk_observation)
+    (o,) = store.load_risk_observations()
+    assert o["position_im_usd"] == pytest.approx(12_345.0)
+
+
+def test_an_unstated_initial_margin_stays_null_not_zero(store):
+    broker = ViewBroker(view=dict(GOOD))
+    opened(broker, store.record_risk_observation)
+    (o,) = store.load_risk_observations()
+    assert o["position_im_usd"] is None

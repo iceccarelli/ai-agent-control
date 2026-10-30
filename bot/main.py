@@ -1817,6 +1817,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                 "live; no new entry will be proposed."
             )
     bot = TradingBot(config=cfg, **overrides)
+    # No exposure-increasing order may leave the client while the kill switch
+    # is engaged or unreadable. Exits are never asked (see BybitClient).
+    bot.client.entry_gate = carry_entries_permitted_from(bot.store)
 
     # ---- BOOK_MODE -------------------------------------------------------
     # "carry"       delta-neutral: long spot + short perp, collect funding.
@@ -1957,6 +1960,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # never asked to model a liquidation price are unaffected; ON
             # here, because this is the one that loses the position.
             require_liquidation_check=True,
+            # The account must be able to fund the pair before any leg leaves.
+            require_capital_check=True,
+            leverage=float(cfg.DEFAULT_LEVERAGE),
             # What that gate reads each held tick is kept (additive table, no
             # new venue request) so a later replay can run on the venue's own
             # numbers. A store without the method records nothing and says so.

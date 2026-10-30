@@ -86,7 +86,7 @@ def test_the_summary_figures(journal):
         100 * 490 / 680, rel=1e-6)
     assert s["mean_hold_days"] == pytest.approx(32 / 3)
     assert s["margin_committed_usd"] is None
-    assert "not recorded" in s["margin_note"]
+    assert "observed" in s["margin_note"]
 
 
 def test_an_unconfirmed_cycle_is_provisional_and_kept_out_of_confirmed_net():
@@ -157,7 +157,7 @@ def test_the_cli_reads_a_state_database_read_only(tmp_path, journal, capsys):
     assert perf.main(["--db", db]) == 0
     out = capsys.readouterr().out
     assert "confirmed net" in out and "-450.00" in out
-    assert "margin" in out and "not recorded" in out
+    assert "margin" in out and "not available" in out
     assert os.path.getmtime(db) == before
     con = sqlite3.connect(db)
     con.close()
@@ -165,3 +165,99 @@ def test_the_cli_reads_a_state_database_read_only(tmp_path, journal, capsys):
 
 def test_the_cli_refuses_a_missing_database(tmp_path):
     assert perf.main(["--db", str(tmp_path / "nope.db")]) == 2
+
+
+# -- committed capital: venue margin + spot leg, only when observed -------------
+
+def obs_row(cycle_ms, im, ms=None):
+    return {"ms": ms or cycle_ms + 1, "cycle_opened_ms": cycle_ms,
+            "position_im_usd": im}
+
+
+def test_committed_capital_needs_an_observed_margin(journal):
+    cycles = perf.cycles_from_journal(journal)
+    perf.attach_capital(cycles, observations=[])
+    assert all(c["margin_committed_usd"] is None for c in cycles)
+    assert all(c["capital_committed_usd"] is None for c in cycles)
+    s = perf.summarise(cycles)
+    assert s["return_on_committed_capital_pct"] is None
+    assert s["margin_committed_usd"] is None
+
+
+def test_return_on_committed_capital_uses_the_peak_venue_margin_plus_the_spot_leg(journal):
+    cycles = perf.cycles_from_journal(journal)
+    ids = [int(c["cycle_id"].split("-")[1]) for c in cycles]
+    perf.attach_capital(cycles, observations=[
+        obs_row(ids[0], 9_000.0), obs_row(ids[0], 12_000.0, ms=ids[0] + 5),
+        obs_row(ids[1], 10_000.0), obs_row(ids[2], 11_000.0)])
+    assert cycles[0]["margin_committed_usd"] == pytest.approx(12_000.0)
+    # overlay fixture (no spot_buy): the hedged inventory is valued at entry
+    assert cycles[0]["spot_leg_usd"] == pytest.approx(100_000.0)
+    assert cycles[0]["spot_leg_basis"] == "client_inventory_at_entry"
+    assert cycles[0]["capital_committed_usd"] == pytest.approx(112_000.0)
+    s = perf.summarise(cycles)
+    assert s["margin_committed_usd"] == pytest.approx(12_000.0)
+    assert s["peak_capital_committed_usd"] == pytest.approx(112_000.0)
+    assert s["return_on_committed_capital_pct"] == pytest.approx(
+        -450.0 / 112_000.0 * 100, rel=1e-6)
+    assert "margin_note" in s and "observed" in s["margin_note"]
+
+
+def test_a_bought_spot_leg_counts_at_its_cost():
+    j = L.Journal()
+    L.spot_buy(j, ms=T0, ref="s", qty=1.0, price=100_000.0, fee_btc=0.001,
+               fee_status="confirmed")
+    L.perp_open(j, ms=T0 + 1, ref="o", qty=0.999, price=100_000.0, fee_usd=55.0,
+                fee_status="confirmed")
+    L.perp_close(j, ms=T0 + DAY, ref="c", qty=0.999, price=100_000.0,
+                 entry_price=100_000.0, fee_usd=55.0, fee_status="confirmed")
+    L.spot_sell(j, ms=T0 + DAY + 1, ref="ss", qty=0.999, price=100_000.0,
+                cost_basis=100_000.0, fee_usd=55.0, fee_status="confirmed")
+    cycles = perf.cycles_from_journal(j)
+    perf.attach_capital(cycles, observations=[obs_row(T0, 20_000.0)])
+    assert len(cycles) == 1
+    c = cycles[0]
+    assert c["spot_leg_basis"] == "bought_at_cost"
+    assert c["spot_leg_usd"] == pytest.approx(100_000.0)
+    assert c["capital_committed_usd"] == pytest.approx(120_000.0)
+
+
+def test_a_non_finite_or_missing_margin_is_ignored_not_zeroed(journal):
+    cycles = perf.cycles_from_journal(journal)
+    cid = int(cycles[0]["cycle_id"].split("-")[1])
+    perf.attach_capital(cycles, observations=[
+        obs_row(cid, float("nan")), obs_row(cid, None), obs_row(cid, -5.0)])
+    assert cycles[0]["margin_committed_usd"] is None
+
+
+def test_the_cli_reads_the_margin_observations_from_the_same_database(tmp_path, journal, capsys):
+    from persistence import StateStore
+    cycles = perf.cycles_from_journal(journal)
+    ids = [int(c["cycle_id"].split("-")[1]) for c in cycles]
+    db = str(tmp_path / "s.db")
+    store = StateStore(db)
+    store.save_ledger(journal.to_rows())
+    for n, cid in enumerate(ids):                 # every closed cycle observed
+        store.record_risk_observation({"ms": cid + 1, "symbol": "BTCUSDT",
+                                       "cycle_opened_ms": cid,
+                                       "position_im_usd": 15_000.0 + n})
+    store.close()
+    assert perf.main(["--db", db]) == 0
+    out = capsys.readouterr().out
+    assert "committed capital (venue margin + spot leg)" in out
+    assert "15,002.00" in out                     # peak margin of the third cycle
+
+
+def test_one_unobserved_cycle_withholds_the_return_on_capital(tmp_path, journal, capsys):
+    from persistence import StateStore
+    cycles = perf.cycles_from_journal(journal)
+    cid = int(cycles[0]["cycle_id"].split("-")[1])
+    db = str(tmp_path / "s.db")
+    store = StateStore(db)
+    store.save_ledger(journal.to_rows())
+    store.record_risk_observation({"ms": cid + 1, "symbol": "BTCUSDT",
+                                   "cycle_opened_ms": cid,
+                                   "position_im_usd": 15_000.0})
+    store.close()
+    assert perf.main(["--db", db]) == 0
+    assert "committed capital: not available" in capsys.readouterr().out

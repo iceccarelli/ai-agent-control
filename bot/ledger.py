@@ -124,6 +124,10 @@ class Entry:
     #:                     booked at $0 and flagged for a human
     #:   unread          - the venue could not be read while a position was open
     basis: str = ""
+    #: The position cycle (flat -> opened -> flat) this entry belongs to. Set by
+    #: `Journal.post`, persisted, and re-derived identically for older rows.
+    #: "" for an entry before any cycle (the opening balance).
+    cycle: str = ""
 
 
 @dataclass
@@ -151,6 +155,38 @@ class Journal:
 
     def __init__(self) -> None:
         self.entries: List[Entry] = []
+        self._cycle = ""            # the cycle new entries belong to
+        self._pending_cycle = ""    # a name given for the NEXT cycle
+        self._cycle_perp = 0.0      # running perp quantity
+        self._cycle_closed = False  # a perp close has taken the cycle flat
+
+    def begin_cycle(self, cycle_id: str) -> None:
+        """Name the cycle the next opening fill will start. A name that is
+        never used (the order never filled) is replaced by the next call."""
+        if not isinstance(cycle_id, str) or not cycle_id.strip():
+            raise LedgerError("a cycle id must be a non-empty string")
+        self._pending_cycle = cycle_id
+
+    def _assign_cycle(self, entry: Entry) -> None:
+        flat = abs(self._cycle_perp) <= DUST[PERP]
+        if entry.cycle:                       # restored from a stored row
+            self._cycle = entry.cycle
+            self._pending_cycle = ""
+            self._cycle_closed = False
+        elif entry.kind in ("spot_buy", "perp_open") and flat and (
+                not self._cycle or self._cycle_closed
+                or (self._pending_cycle and self._pending_cycle != self._cycle)):
+            self._cycle = self._pending_cycle or f"cyc-{entry.ms}"
+            self._pending_cycle = ""
+            self._cycle_closed = False
+            entry.cycle = self._cycle
+        elif self._cycle:
+            entry.cycle = self._cycle
+        for line in entry.lines:
+            if line.account == PERP:
+                self._cycle_perp += line.qty
+        if entry.kind == "perp_close" and abs(self._cycle_perp) <= DUST[PERP]:
+            self._cycle_closed = True
 
     @property
     def unknown_fees(self) -> int:
@@ -195,6 +231,7 @@ class Journal:
                 f"entry at {self.entries[-1].ms}. A journal whose stamps go "
                 "backwards cannot be cut into periods, and a period is what a "
                 "statement is.")
+        self._assign_cycle(entry)
         self.entries.append(entry)
         return entry
 
@@ -324,7 +361,7 @@ class Journal:
     def to_rows(self) -> List[Dict[str, Any]]:
         return [{"ms": e.ms, "kind": e.kind, "ref": e.ref, "memo": e.memo,
                  "fee_status": e.fee_status, "fee_raw": e.fee_raw,
-                 "basis": e.basis,
+                 "basis": e.basis, "cycle": e.cycle,
                  "lines": [{"account": l.account, "usd": l.usd, "qty": l.qty}
                            for l in e.lines]} for e in self.entries]
 
@@ -348,6 +385,7 @@ class Journal:
                 # engine's own number: never "venue" by default.
                 basis=str(row["basis"] if "basis" in row else
                           ("engine_estimate" if kind == "funding" else "")),
+                cycle=str(row.get("cycle") or ""),
                 lines=[Line(str(l["account"]), float(l["usd"]),
                             float(l.get("qty", 0.0)))
                        for l in row["lines"]]))
@@ -947,6 +985,11 @@ class LedgerBroker:
     money? A wrapper that guesses would answer it silently and wrongly.
     """
 
+    def begin_cycle(self, cycle_id: str) -> None:
+        """Name the cycle the engine is about to open (explicit delegation to
+        the journal; it moves no money)."""
+        self.journal.begin_cycle(cycle_id)
+
     def __init__(self, inner: Any, journal: Journal,
                  ms: Optional[Callable[[], int]] = None,
                  spot_symbol: str = "BTCUSDT") -> None:
@@ -1312,6 +1355,9 @@ class LedgerBroker:
 
     def get_liquidation_view(self, symbol):
         return self.inner.get_liquidation_view(symbol)
+
+    def get_available_margin_usd(self):
+        return self.inner.get_available_margin_usd()
 
     def get_closed_short_qty_since(self, symbol, since_ms):
         return self.inner.get_closed_short_qty_since(symbol, since_ms)
