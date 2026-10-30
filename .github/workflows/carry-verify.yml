@@ -148,6 +148,7 @@ jobs:
           tests/test_liquidation_breach_on_first_read.py
           tests/test_liquidation_evidence_at_open.py
           tests/test_kill_switch_entry_gate.py
+          tests/test_client_entry_gate.py
           tests/test_simulator_parameter_parity.py
           tests/test_integration_acceptance.py
           tests/test_promotion_approvals.py

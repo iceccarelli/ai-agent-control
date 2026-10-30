@@ -1817,6 +1817,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                 "live; no new entry will be proposed."
             )
     bot = TradingBot(config=cfg, **overrides)
+    # No exposure-increasing order may leave the client while the kill switch
+    # is engaged or unreadable. Exits are never asked (see BybitClient).
+    bot.client.entry_gate = carry_entries_permitted_from(bot.store)
 
     # ---- BOOK_MODE -------------------------------------------------------
     # "carry"       delta-neutral: long spot + short perp, collect funding.
