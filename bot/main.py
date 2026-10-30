@@ -512,12 +512,19 @@ class TradingBot:
                                "equity will not seed today's anchor", scope)
         except Exception:  # noqa: BLE001
             logger.exception("could not record the equity scope")
+        environment = execution_environment_of(self.cfg)
+        try:
+            conflict = environment_conflict(self.store, environment)
+        except Exception as exc:  # noqa: BLE001 - an unreadable scope refuses
+            conflict = f"the database's environment could not be read ({exc})"
+        if conflict is not None:
+            logger.critical("startup blocked: %s", conflict)
+            return False
         try:
             # What kind of money this database's execution records are. The
             # performance report refuses to call anything realised cash unless
             # this says mainnet (carry_performance --environment).
-            self.store.record_execution_environment(
-                execution_environment_of(self.cfg))
+            self.store.record_execution_environment(environment)
         except Exception:  # noqa: BLE001
             logger.exception("could not record the execution environment")
         live_armed, live_why = _config.is_live_authorized(self.cfg)
@@ -868,8 +875,17 @@ class TradingBot:
             import order_recovery as _recovery
             # The ledger wrapper hides the adapter's order reads on purpose
             # (tests/test_real_stack_adapter.py); recovery reads through `.inner`.
+            from bybit_connection import BybitClient as _BC
+            window = _recovery.absence_window_s(
+                request_timeout_s=float(getattr(
+                    getattr(self, "cfg", None), "REQUEST_TIMEOUT_SECONDS", 10.0)),
+                recv_window_ms=float(getattr(
+                    getattr(self, "cfg", None), "BYBIT_RECV_WINDOW_MS", 5000)),
+                attempts=4,                         # _request(retries=3) + the first
+                max_wait_s=max(2.0, float(_BC.RATE_LIMIT_MAX_WAIT_S)))
             recovery = _recovery.resolve_unresolved_orders(
-                getattr(broker, "inner", broker), self.store)
+                getattr(broker, "inner", broker), self.store,
+                absence_proof_s=window)
             if not isinstance(recovery, _recovery.RecoveryReport):
                 raise TypeError(f"recovery returned {type(recovery).__name__}")
         except Exception as exc:  # noqa: BLE001
@@ -1841,6 +1857,35 @@ def execution_environment_of(cfg: Any) -> str:
     if bool(getattr(cfg, "PAPER_TRADING", True)):
         return "paper"
     return "mainnet"
+
+
+def environment_conflict(store: Any, environment: str) -> Optional[str]:
+    """Why this database may not be used as `environment`, or None.
+
+    A database holds ONE kind of money. The carry journal, position and order
+    rows carry no venue scope of their own, so the recorded environments are the
+    scope: a database that has recorded anything other than `environment` is
+    refused (a testnet journal with venue funding in it must never be resumed as
+    mainnet cash). A mainnet process also refuses a ledger of UNKNOWN origin - it
+    holds rows but no recorded environment - because it cannot show they are not
+    testnet's. A sandbox may adopt such a ledger."""
+    seen = list(store.execution_environments_seen())
+    others = [e for e in seen if e != environment]
+    if others:
+        return (f"this database has recorded {sorted(set(seen))} and this "
+                f"process is {environment!r}; its ledger, position and orders "
+                "are not scoped by venue, so they must not be resumed as "
+                f"{environment}. Use a separate database")
+    if environment == "mainnet" and not seen:
+        try:
+            has_rows = bool(store.load_ledger())
+        except Exception as exc:  # noqa: BLE001
+            return (f"the ledger could not be read ({type(exc).__name__}); its "
+                    "origin is unknown")
+        if has_rows:
+            return ("the ledger holds rows but no recorded environment: its "
+                    "origin is unknown and cannot be shown not to be testnet's")
+    return None
 
 
 def _attach_portfolio_authority(bot: Any, cfg: Any) -> None:

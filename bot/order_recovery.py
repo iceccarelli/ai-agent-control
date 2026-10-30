@@ -38,6 +38,30 @@ logger = logging.getLogger(__name__)
 ABSENCE_PROOF_S = 60.0
 
 
+def absence_window_s(*, request_timeout_s: float, recv_window_ms: float,
+                     attempts: int, max_wait_s: float) -> float:
+    """How long after a request left before the venue's silence proves it never
+    landed: the transport's WORST CASE for one POST - `attempts` tries each up
+    to the request timeout, the capped waits between them, then the receive
+    window within which the venue still accepts the signature - and never less
+    than `ABSENCE_PROOF_S`. Derived, so raising a timeout widens the window
+    instead of silently outrunning it."""
+    for name, value in (("request_timeout_s", request_timeout_s),
+                        ("recv_window_ms", recv_window_ms),
+                        ("max_wait_s", max_wait_s)):
+        if not isinstance(value, (int, float)) or isinstance(value, bool) \
+                or value != value or value in (float("inf"), float("-inf")):
+            raise ValueError(f"{name} must be a finite number, got {value!r}")
+    if request_timeout_s <= 0 or recv_window_ms < 0 or max_wait_s < 0:
+        raise ValueError("transport timings must be positive")
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+        raise ValueError("attempts must be a whole number of at least 1")
+    worst = (attempts * float(request_timeout_s)
+             + (attempts - 1) * float(max_wait_s)
+             + float(recv_window_ms) / 1000.0)
+    return max(ABSENCE_PROOF_S, worst)
+
+
 @dataclass(frozen=True)
 class Resolution:
     order_link_id: str
@@ -60,9 +84,12 @@ class RecoveryReport:
 
 def resolve_unresolved_orders(broker: Any, store: Any, *,
                               now_epoch: Optional[float] = None,
-                              cancel_resting: bool = False) -> RecoveryReport:
+                              cancel_resting: bool = False,
+                              absence_proof_s: Optional[float] = None
+                              ) -> RecoveryReport:
     report = RecoveryReport()
     now = time.time() if now_epoch is None else float(now_epoch)
+    window = ABSENCE_PROOF_S if absence_proof_s is None else float(absence_proof_s)
 
     def apply(link: str, kind: str, **kw: Any) -> None:
         store.apply_order_event(link, kind, **kw)
@@ -93,10 +120,17 @@ def resolve_unresolved_orders(broker: Any, store: Any, *,
 
         if state is None:
             recorded = float(row.get("filled_qty") or 0.0)
-            age = now - float(row.get("created_epoch") or now)
+            # Measured from the moment the request LEFT (the submit marker),
+            # not from when the intent was written: an intent can sit for a
+            # while before its request goes.
+            sent = [e for e in store.order_events(link)
+                    if e.get("kind") == ol.SUBMIT_ATTEMPT]
+            sent_epoch = float(sent[-1]["epoch"]) if sent else float(
+                row.get("created_epoch") or now)
+            age = now - sent_epoch
             if (status in (ol.SUBMITTED, ol.TIMED_OUT, ol.UNKNOWN,
                            ol.RECONCILIATION_REQUIRED)
-                    and recorded <= 0 and age >= ABSENCE_PROOF_S):
+                    and recorded <= 0 and age >= window):
                 apply(link, ol.NEVER_SENT, detail={
                     "proof": f"no such order at the venue {age:.0f}s after "
                              "the request; a signed request cannot be "
