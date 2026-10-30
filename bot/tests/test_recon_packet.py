@@ -108,6 +108,10 @@ def _open_spot_position(client, store, *, qty=0.01, entry_price=50_000.0,
     # this unit test does not exercise -- reflect that confirmation the
     # same way `TradingEngine` would, directly.
     store.update_order_status(entry.order_link_id, "filled", exchange_id=entry.order_id)
+    # A real fill credits the wallet, and a spot stop is only placed against coin
+    # that is held (a stop with nothing behind it is refused).
+    wallet = client.transport.balances
+    wallet["BTC"] = max(wallet.get("BTC", 0.0), qty)
     stop = client.place_stop_order(symbol=SYMBOL, side="Sell", qty=qty,
                                    trigger_price=stop_price)
     assert stop.ok, stop
