@@ -47,13 +47,13 @@ def test_dry_run_writes_nothing(db, capsys):
 
 
 def test_apply_with_evidence_sets_the_verified_quantity(db):
-    assert run(db, "--evidence", "execution list", "--apply") == 0
+    assert run(db, "--evidence", "execution list", "--apply", "--confirm-not-resting") == 0
     row = state(db)
     assert row["status"] == "filled" and row["filled_qty"] == 1.0
 
 
 def test_blank_evidence_is_refused(db):
-    assert run(db, "--evidence", "  ", "--apply") == 2
+    assert run(db, "--evidence", "  ", "--apply", "--confirm-not-resting") == 2
     assert state(db)["status"] == "contradicted"
 
 
@@ -62,9 +62,14 @@ def test_only_a_contradicted_order_is_resolved(tmp_path):
     s = StateStore(p)
     intent(s)
     s.close()
-    assert run(p, "--evidence", "x", "--apply") == 2
+    assert run(p, "--evidence", "x", "--apply", "--confirm-not-resting") == 2
     assert state(p)["status"] == "pending"
 
 
 def test_a_missing_database_is_refused(tmp_path):
     assert run(str(tmp_path / "nope.db"), "--evidence", "x") == 2
+
+
+def test_apply_without_confirming_the_order_is_not_resting_is_refused(db):
+    assert run(db, "--evidence", "execution list", "--apply") == 2
+    assert state(db)["status"] == "contradicted"

@@ -10,7 +10,8 @@ IT TALKS TO NO VENUE. It opens the local database only, reads no credential and
 sends no order. Without `--apply` it prints what it would record and stops.
 
     python3 tools/resolve_order_contradiction.py --db PATH --order-link-id ID \\
-        --verified-qty 0.012 --avg-price 64000 --evidence "execution list 2026-.."
+        --verified-qty 0.012 --avg-price 64000 --evidence "execution list 2026-.." \\
+        --confirm-not-resting
     ... add --apply to write the event.
 """
 from __future__ import annotations
@@ -34,13 +35,16 @@ def main(argv=None) -> int:
     ap.add_argument("--avg-price", type=float, default=None)
     ap.add_argument("--evidence", required=True,
                     help="what verified the quantity, in words")
+    ap.add_argument("--confirm-not-resting", action="store_true",
+                    help="you verified at the venue that the order is no longer "
+                         "live (a cancelled/filled lookup), not merely unfilled")
     ap.add_argument("--apply", action="store_true")
     args = ap.parse_args(argv)
 
     if not args.evidence.strip():
         print("REFUSED: --evidence must say what verified the quantity")
         return 2
-    if not (args.verified_qty >= 0 and args.verified_qty == args.verified_qty):
+    if not (0 <= args.verified_qty < float("inf")):
         print("REFUSED: --verified-qty must be a finite number >= 0")
         return 2
     if not os.path.exists(args.db):
@@ -61,6 +65,10 @@ def main(argv=None) -> int:
             return 2
         print(f"would record verified fill {args.verified_qty} "
               f"(evidence: {args.evidence})")
+        if args.apply and not args.confirm_not_resting:
+            print("REFUSED: --apply needs --confirm-not-resting; a resolved "
+                  "order stops blocking entries, so it must not still be live")
+            return 2
         if not args.apply:
             print("DRY RUN: nothing written (add --apply)")
             return 0
