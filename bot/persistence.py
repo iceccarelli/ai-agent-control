@@ -502,7 +502,8 @@ CREATE TABLE IF NOT EXISTS carry_risk_observation (
     margin_multiple REAL,
     reason          TEXT NOT NULL DEFAULT '',
     recorded_epoch  REAL NOT NULL DEFAULT 0.0,
-    cycle_opened_ms INTEGER
+    cycle_opened_ms INTEGER,
+    position_im_usd REAL
 );
 
 -- Additive indexes for the memory reads.  Both are over existing tables and
@@ -702,7 +703,10 @@ class StateStore:
     _MEMORY_COLUMNS: Dict[str, Dict[str, str]] = {
         # Which cycle (the position's opened_ms) a liquidation read belongs to.
         # NULL on rows written before the column existed.
-        "carry_risk_observation": {"cycle_opened_ms": "INTEGER"},
+        "carry_risk_observation": {"cycle_opened_ms": "INTEGER",
+                                   # The venue's initial margin for the position
+                                   # (USD), when it stated one; NULL otherwise.
+                                   "position_im_usd": "REAL"},
         "execution_quality": {
             "order_link_id": "TEXT NOT NULL DEFAULT ''",
             "order_type": "TEXT NOT NULL DEFAULT ''",
@@ -1139,8 +1143,8 @@ class StateStore:
         self._exec(
             "INSERT OR IGNORE INTO carry_risk_observation(ms, symbol, side, "
             "size, mark, liq_price, distance_pct, account_mm_rate, "
-            "margin_multiple, reason, recorded_epoch, cycle_opened_ms) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            "margin_multiple, reason, recorded_epoch, cycle_opened_ms, "
+            "position_im_usd) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (int(obs["ms"]), str(obs.get("symbol", "")),
              str(obs.get("side", "")), float(obs.get("size") or 0.0),
              float(obs.get("mark") or 0.0), num("liq_price"),
@@ -1148,7 +1152,9 @@ class StateStore:
              num("margin_multiple"), str(obs.get("reason", "")),
              utc_now_epoch(),
              None if obs.get("cycle_opened_ms") is None
-             else int(obs["cycle_opened_ms"])))
+             else int(obs["cycle_opened_ms"]),
+             (lambda im: im if im is not None and im >= 0 else None)(
+                 num("position_im_usd"))))
 
     def load_risk_observations(self, since_ms: Optional[int] = None,
                                until_ms: Optional[int] = None

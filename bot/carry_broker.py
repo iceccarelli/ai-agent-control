@@ -1320,6 +1320,7 @@ class CarryBroker:
             raise PairIncident(
                 f"position row for {symbol} is malformed: {row!r}") from exc
         side = str(row.get("side", ""))
+        im_usd = self._optional_margin(row)
 
         # Bybit returns a position/list row even while FLAT - size 0,
         # liqPrice "" (proven live, Bybit testnet) - not only an empty `list`.
@@ -1354,7 +1355,7 @@ class CarryBroker:
             return {"size": size, "side": side, "mark": mark,
                     "liq_price": None, "distance_pct": None,
                     "account_mm_rate": account_mm,
-                    "margin_mode": margin_mode,
+                    "margin_mode": margin_mode, "position_im_usd": im_usd,
                     "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
         try:
             liq = float(raw_liq)
@@ -1378,7 +1379,20 @@ class CarryBroker:
                     else 100.0 * (mark - liq) / mark)
         return {"size": size, "side": side, "mark": mark, "liq_price": liq,
                 "distance_pct": distance, "account_mm_rate": account_mm,
-                "margin_mode": margin_mode, "reason": ""}
+                "margin_mode": margin_mode, "position_im_usd": im_usd,
+                "reason": ""}
+
+    @staticmethod
+    def _optional_margin(row: Dict[str, Any]) -> Optional[float]:
+        """The venue's initial margin for the position, for the RECORD only.
+        None unless it is stated, finite and non-negative; this never blocks
+        or alters the liquidation view (the margin gate reads it separately
+        and halts on an unstated value)."""
+        try:
+            value = float(row.get("positionIM"))
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value >= 0 else None
 
     def get_funding_history(self, symbol: str,
                             limit: int = 8) -> List[Tuple[float, int]]:

@@ -39,9 +39,10 @@ import ledger as L  # noqa: E402
 
 DAY_MS = 86_400_000
 _SHORT_MEMO = re.compile(r"^short (\S+) @ (\S+)$")
-MARGIN_NOTE = ("margin committed is not recorded by the ledger (the venue's "
-               "initial margin is not journalled), so no return on margin is "
-               "computed; returns are on notional")
+MARGIN_NOTE = ("margin committed comes from the venue's initial margin as "
+               "observed on the liquidation reads; a cycle with no observed "
+               "margin gets none, and no return on committed capital is "
+               "computed from a guess; returns are on notional")
 
 
 def _notional_of(entry: Any) -> Optional[float]:
@@ -93,7 +94,8 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 "cycle_id": e.cycle, "start_ms": e.ms, "funding_usd": 0.0,
                 "fees_usd": 0.0, "borrow_usd": 0.0, "realised_usd": 0.0,
                 "notional_usd": 0.0, "notional_unknown": False,
-                "perp_closed": False, "perp_qty": 0.0, "first_open_ms": None,
+                "perp_closed": False, "perp_qty": 0.0, "spot_cost_usd": 0.0,
+                "first_open_ms": None,
                 "last_close_ms": None, "_fee_statuses": [], "_bases": []}
             order.append(e.cycle)
         for line in e.lines:
@@ -111,6 +113,9 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
             cur["_fee_statuses"].append(e.fee_status)
         if e.basis:
             cur["_bases"].append(e.basis)
+        if e.kind == "spot_buy":
+            cur["spot_cost_usd"] += sum(
+                l.usd for l in e.lines if l.account == L.BTC and l.usd > 0)
         if e.kind == "perp_open":
             if cur["first_open_ms"] is None:
                 cur["first_open_ms"] = e.ms
@@ -125,12 +130,51 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
     return [_finish(by_id[c]) for c in order]
 
 
+def _cycle_ms(cycle_id: str) -> Optional[int]:
+    prefix, _, tail = str(cycle_id).partition("-")
+    return int(tail) if prefix == "cyc" and tail.isdigit() else None
+
+
+def attach_capital(cycles: Sequence[Dict[str, Any]],
+                   observations: Sequence[Dict[str, Any]]) -> None:
+    """Add committed capital to each cycle from what was OBSERVED.
+
+    Margin is the peak initial margin the venue stated for the cycle's position
+    (liquidation observations keyed by the cycle). The spot leg is its purchase
+    cost when the book bought it, else the hedged inventory valued at entry.
+    With no observed margin the cycle gets None for margin and for committed
+    capital: a return on capital is never computed from a guess."""
+    peaks: Dict[int, float] = {}
+    for o in observations:
+        ms, im = o.get("cycle_opened_ms"), o.get("position_im_usd")
+        try:
+            ms, im = int(ms), float(im)
+        except (TypeError, ValueError):
+            continue
+        if im == im and abs(im) != float("inf") and im >= 0:
+            peaks[ms] = max(peaks.get(ms, 0.0), im)
+    for c in cycles:
+        c["margin_committed_usd"] = peaks.get(_cycle_ms(c["cycle_id"]))
+        if c.get("spot_cost_usd", 0.0) > 0:
+            c["spot_leg_usd"], c["spot_leg_basis"] = c["spot_cost_usd"], "bought_at_cost"
+        elif c.get("notional_usd"):
+            c["spot_leg_usd"] = c["notional_usd"]
+            c["spot_leg_basis"] = "client_inventory_at_entry"
+        else:
+            c["spot_leg_usd"], c["spot_leg_basis"] = None, "unknown"
+        c["capital_committed_usd"] = (
+            None if c["margin_committed_usd"] is None or c["spot_leg_usd"] is None
+            else c["margin_committed_usd"] + c["spot_leg_usd"])
+
+
 def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     closed = [c for c in cycles if c["closed"]]
     s: Dict[str, Any] = {
         "closed_cycles": len(closed),
         "open_cycles": len(cycles) - len(closed),
         "margin_committed_usd": None, "margin_note": MARGIN_NOTE,
+        "peak_capital_committed_usd": None,
+        "return_on_committed_capital_pct": None,
         "slippage_note": ("decision-time marks are not journalled, so fill "
                           "slippage is not computed here; fees are the venue's"),
     }
@@ -179,6 +223,13 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     s["best_cycle_share_of_winning_net_pct"] = (
         100.0 * wins[0] / sum(wins) if wins else None)
     s["mean_hold_days"] = days / len(closed)
+    margins = [c["margin_committed_usd"] for c in closed
+               if c.get("margin_committed_usd") is not None]
+    s["margin_committed_usd"] = max(margins) if margins else None
+    caps = [c.get("capital_committed_usd") for c in closed]
+    if caps and all(c is not None for c in caps):
+        s["peak_capital_committed_usd"] = max(caps)
+        s["return_on_committed_capital_pct"] = 100.0 * total_net / max(caps)
     return s
 
 
@@ -194,6 +245,22 @@ def load_journal(db_path: str) -> Any:
     if row is None:
         raise LookupError("no carry ledger in this database")
     return L.Journal.from_rows(json.loads(row[0] or "[]"))
+
+
+def load_observations(db_path: str) -> List[Dict[str, Any]]:
+    """The liquidation observations, read-only; [] when the table or columns
+    are not there (an older database)."""
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT cycle_opened_ms, position_im_usd FROM "
+            "carry_risk_observation").fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
 
 
 def report_lines(cycles: Sequence[Dict[str, Any]], s: Dict[str, Any]) -> List[str]:
@@ -218,6 +285,15 @@ def report_lines(cycles: Sequence[Dict[str, Any]], s: Dict[str, Any]) -> List[st
             f"rate {f(100 * s['win_rate'], '{:.0f}')}%  best winner = "
             f"{f(s['best_cycle_share_of_winning_net_pct'], '{:.1f}')}% of "
             f"winning net  mean hold {f(s['mean_hold_days'], '{:.1f}')} days"]
+    if s.get("return_on_committed_capital_pct") is not None:
+        lines.append(
+            f"committed capital (venue margin + spot leg), peak "
+            f"${f(s['peak_capital_committed_usd'])}; return on it "
+            f"{f(s['return_on_committed_capital_pct'])}% (peak margin "
+            f"${f(s['margin_committed_usd'])})")
+    else:
+        lines.append("committed capital: not available (no observed venue margin "
+                     "for every closed cycle); no return on capital is shown")
     lines.append(s["margin_note"])
     lines.append(s["slippage_note"])
     lines.append("confirmed = every fee venue-stated and every funding entry "
@@ -237,6 +313,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"refusing: {exc}", file=sys.stderr)
         return 2
     cycles = cycles_from_journal(journal)
+    attach_capital(cycles, load_observations(args.db))
     summary = summarise(cycles)
     if args.json:
         print(json.dumps({"cycles": cycles, "summary": summary}, indent=2,

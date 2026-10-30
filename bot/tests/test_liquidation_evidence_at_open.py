@@ -160,3 +160,17 @@ def test_a_database_from_before_the_column_gains_it_additively(tmp_path):
         assert [r["cycle_opened_ms"] for r in rows] == [None, 77]
     finally:
         s.close()
+
+
+def test_the_venues_initial_margin_is_recorded_when_stated(store):
+    broker = ViewBroker(view=dict(GOOD, position_im_usd=12_345.0))
+    opened(broker, store.record_risk_observation)
+    (o,) = store.load_risk_observations()
+    assert o["position_im_usd"] == pytest.approx(12_345.0)
+
+
+def test_an_unstated_initial_margin_stays_null_not_zero(store):
+    broker = ViewBroker(view=dict(GOOD))
+    opened(broker, store.record_risk_observation)
+    (o,) = store.load_risk_observations()
+    assert o["position_im_usd"] is None

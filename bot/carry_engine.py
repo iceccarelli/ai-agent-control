@@ -2561,6 +2561,7 @@ class CarryEngine:
                 "liq_price": view.get("liq_price"),
                 "distance_pct": view.get("distance_pct"),
                 "account_mm_rate": view.get("account_mm_rate"),
+                "position_im_usd": view.get("position_im_usd"),
                 "margin_multiple": self._last_margin,
                 "cycle_opened_ms": (None if self.position is None
                                     else self.position.opened_ms),
