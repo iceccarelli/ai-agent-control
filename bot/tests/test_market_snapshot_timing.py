@@ -112,7 +112,10 @@ def test_legs_read_too_far_apart_are_not_one_instant(monkeypatch):
     view = take_snapshot(Broker(stall_s=MAX_LEG_SPAN_S + 1, clock=mono),
                          perp_symbol="BTCUSDT", spot_symbol="BTCUSDT")
     with pytest.raises(StaleMarket, match="legs were read"):
-        view.assert_fresh()
+        view.assert_legs_coherent()          # the ENTRY question
+    view.assert_fresh()                      # management of a held pair is not blocked
+    with pytest.raises(StaleMarket, match="legs were read"):
+        view.assert_fresh(max_leg_span_s=MAX_LEG_SPAN_S)
 
 
 @pytest.mark.parametrize("bad", [math.nan, -1.0, math.inf])
@@ -123,3 +126,31 @@ def test_a_garbage_leg_span_is_refused(bad):
 
 def test_a_hand_built_snapshot_without_a_span_is_not_checked_for_one():
     snap().assert_fresh()
+
+
+# -- the leg-span limit judges ENTRIES, never the management of a held pair ----------
+
+def _snap_with_span(span):
+    import time as _t
+    import market_snapshot as MS
+    return MS.MarketSnapshot(perp_mark=100.0, spot_mark=100.0, funding_bps=1.0,
+                             margin_multiple=5.0, observed_at_s=_t.time(),
+                             leg_span_s=span)
+
+
+def test_a_wide_leg_span_does_not_make_a_snapshot_stale_for_management():
+    _snap_with_span(60.0).assert_fresh()                  # held-pair path: passes
+
+
+def test_a_wide_leg_span_is_refused_when_the_entry_asks():
+    import market_snapshot as MS
+    with pytest.raises(MS.StaleMarket):
+        _snap_with_span(60.0).assert_legs_coherent()
+    _snap_with_span(2.0).assert_legs_coherent()
+
+
+def test_the_entry_gate_refuses_a_wide_span_but_a_held_pair_is_unaffected():
+    from carry_risk import CarryRisk
+    gate = CarryRisk(max_notional_usd=100.0).gate_open(
+        notional_usd=100.0, snapshot=_snap_with_span(60.0), has_open_pair=False)
+    assert not gate and gate.reason == "MARKET_VIEW_STALE"

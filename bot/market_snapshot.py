@@ -134,9 +134,27 @@ class MarketSnapshot:
             return None
         return abs(self.venue_time_s - self.observed_at_s)
 
+    def assert_legs_coherent(self, max_leg_span_s: float = MAX_LEG_SPAN_S) -> None:
+        """The legs of this snapshot were read close enough together to describe
+        one instant. A hand-built snapshot has no span and passes.
+
+        This is a limit on the QUALITY OF AN ENTRY DECISION (the basis between
+        legs read far apart is drift). `assert_fresh` does not apply it unless
+        asked, so a slow feed cannot suspend the management of a held pair; only
+        the entry gate (`CarryRisk.gate_open`) asks."""
+        if self.leg_span_s is None:
+            return
+        if not _finite_number(self.leg_span_s, minimum=0.0):
+            raise StaleMarket(f"leg_span_s is {self.leg_span_s!r}")
+        if self.leg_span_s > max_leg_span_s:
+            raise StaleMarket(
+                f"the snapshot's legs were read {self.leg_span_s:.1f}s apart "
+                f"(limit {max_leg_span_s:.0f}s); they do not describe one "
+                "instant and the basis between them is drift")
+
     def assert_fresh(self, *, max_age_s: float = MAX_SNAPSHOT_AGE_S,
                      max_skew_s: float = MAX_CLOCK_SKEW_S,
-                     max_leg_span_s: float = MAX_LEG_SPAN_S) -> None:
+                     max_leg_span_s: Optional[float] = None) -> None:
         """Raise unless this view is safe to act on.
 
         Raises rather than returning a flag. A flag is a thing a caller can
@@ -188,14 +206,13 @@ class MarketSnapshot:
                 f"snapshot is stamped {-raw_age:.1f}s in the future (limit "
                 f"{max_skew_s:.0f}s); this host's clock and the observation's "
                 "disagree, so its age cannot be known")
-        if self.leg_span_s is not None:
-            if not _finite_number(self.leg_span_s, minimum=0.0):
-                raise StaleMarket(f"leg_span_s is {self.leg_span_s!r}")
-            if self.leg_span_s > max_leg_span_s:
-                raise StaleMarket(
-                    f"the snapshot's legs were read {self.leg_span_s:.1f}s "
-                    f"apart (limit {max_leg_span_s:.0f}s); they do not "
-                    "describe one instant and the basis between them is drift")
+        if self.leg_span_s is not None \
+                and not _finite_number(self.leg_span_s, minimum=0.0):
+            # A corrupt span is a data defect on EVERY path; only the "too wide"
+            # comparison is reserved for entries.
+            raise StaleMarket(f"leg_span_s is {self.leg_span_s!r}")
+        if max_leg_span_s is not None:
+            self.assert_legs_coherent(max_leg_span_s)
 
         age = self.age_s
         if age > max_age_s:

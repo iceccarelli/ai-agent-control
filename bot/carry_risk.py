@@ -44,6 +44,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from market_snapshot import MAX_LEG_SPAN_S
+
 #: The backtest opened 18 pairs across 1,447 days. One entry per UTC day is
 #: already an order of magnitude more permissive than the strategy needs, and it
 #: is a hard ceiling on how much the round trip can cost you in a bad loop.
@@ -135,6 +137,13 @@ class CarryRisk:
 
         try:
             snapshot.assert_fresh()
+            # The legs of an ENTRY decision must describe one instant. (A held
+            # pair's management does not get this limit: a slow feed must not
+            # suspend its exits.) Snapshots without the check (test doubles)
+            # are judged by assert_fresh alone.
+            coherent = getattr(snapshot, "assert_legs_coherent", None)
+            if callable(coherent):
+                coherent(MAX_LEG_SPAN_S)
         except Exception as exc:  # noqa: BLE001
             return _block("MARKET_VIEW_STALE", error=str(exc))
 

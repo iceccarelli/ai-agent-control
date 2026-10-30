@@ -66,6 +66,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
 import ledger as L  # noqa: E402
+import order_lifecycle as _order_lifecycle  # noqa: E402
 
 DAY_MS = 86_400_000
 _SHORT_MEMO = re.compile(r"^short (\S+) @ (\S+)$")
@@ -108,10 +109,10 @@ CASH_KEY = re.compile(r"reali[sz]ed|cash", re.IGNORECASE)
 
 REPORT_SCHEMA = "carry_performance/2"
 
-#: `orders.status` values that are not terminal (persistence.unresolved_orders).
-_UNRESOLVED_ORDER_STATUSES = ("pending", "submitted", "partial", "unknown",
-                              "acknowledged", "cancel_requested", "timed_out",
-                              "reconciliation_required")
+#: `orders.status` values that are not terminal. The state machine owns the
+#: set (order_lifecycle.UNRESOLVED); a hand-written copy here missed the
+#: 'contradicted' state and let a contradicted fill sit under "realised cash".
+_UNRESOLVED_ORDER_STATUSES = tuple(sorted(_order_lifecycle.UNRESOLVED))
 
 RETURN_BASES = {
     "return_on_peak_notional_pct": {
