@@ -97,6 +97,7 @@ TAKER_BPS_PERP = 5.5         # Binance USDT-M taker, no VIP
 BORROW_APR = 0.05            # financing on the spot leg, 5%/yr
 ENTRY_FUNDING_BPS = 0.2      # do not open below this 8h rate
 NEGATIVE_EXIT_PRINTS = 3     # consecutive negative prints before unwinding
+_CORE_MAX_HISTORY = 64       # carrycore.cpp kMaxHistory
 #: Funding rows between a decision and its fill. One row is one 8 h funding
 #: interval, so 1 is a coarse stress bound, NOT a measured latency; 0 is the old
 #: zero-latency model and is an upper bound on what the rules can earn.
@@ -1037,7 +1038,13 @@ def simulate_settlements_series(rows: List[Settlement], *,
                                 mode: str = ACQUIRE,
                                 exec_fee_bps: Optional[float] = None,
                                 borrow_curve: Any = None,
-                                latency_rows: int = LATENCY_ROWS
+                                latency_rows: int = LATENCY_ROWS,
+                                funding_history: int = 8,
+                                ewma_alpha: Optional[float] = None,
+                                ewma_min_prints: Optional[int] = None,
+                                negative_exit_prints: int = NEGATIVE_EXIT_PRINTS,
+                                hold_days: Optional[float] = None,
+                                demonstrated_hold_days: Optional[float] = None
                                 ) -> Dict[str, Any]:
     """One step per funding print. The rules are the engine's, in its units:
     a print is a print (not a day, not a tick), three consecutive negative
@@ -1065,6 +1072,29 @@ def simulate_settlements_series(rows: List[Settlement], *,
     if int(latency_rows) < 0:
         raise ValueError("latency_rows cannot be negative")
     latency_rows = int(latency_rows)
+    cc = _carry_costs()
+    ewma_alpha = cc.EWMA_ALPHA if ewma_alpha is None else ewma_alpha
+    ewma_min_prints = (cc.EWMA_MIN_PRINTS if ewma_min_prints is None
+                       else ewma_min_prints)
+    hold_days = cc.ASSUMED_HOLD_DAYS if hold_days is None else hold_days
+    demonstrated_hold_days = (cc.DEMONSTRATED_HOLD_DAYS
+                              if demonstrated_hold_days is None
+                              else demonstrated_hold_days)
+    # The six rule parameters carrycore.cpp takes, with the same meaning and
+    # the same refusals (tests/test_simulator_parameter_parity.py). The core
+    # clamps the window to its 64-slot buffer; so does this.
+    for name, value in (("funding_history", funding_history),
+                        ("ewma_min_prints", ewma_min_prints),
+                        ("negative_exit_prints", negative_exit_prints)):
+        if int(value) < 1:
+            raise ValueError(f"{name} must be at least 1")
+    if not math.isfinite(float(ewma_alpha)):
+        raise ValueError("ewma_alpha must be finite")
+    for name, value in (("hold_days", hold_days),
+                        ("demonstrated_hold_days", demonstrated_hold_days)):
+        if not (math.isfinite(float(value)) and float(value) > 0):
+            raise ValueError(f"{name} must be a positive number")
+    window = min(int(funding_history), _CORE_MAX_HISTORY)
     trades: List[Trade] = []
     live: Optional[Trade] = None
     streak = 0
@@ -1162,7 +1192,7 @@ def simulate_settlements_series(rows: List[Settlement], *,
             if exit_signalled:
                 continue
             streak = streak + 1 if r_bps < 0 else 0
-            if streak >= NEGATIVE_EXIT_PRINTS:
+            if streak >= int(negative_exit_prints):
                 if latency_rows == 0:
                     close_live(st, "FUNDING_INVERTED")
                 elif index + latency_rows <= last_index:
@@ -1174,9 +1204,11 @@ def simulate_settlements_series(rows: List[Settlement], *,
 
         if gated:
             verdict = _carry_costs().entry_gate(
-                funding_prints_bps=history[-8:], perp=st.perp, spot=st.spot,
-                borrow_apr=borrow_apr,
-                round_trip_bps=round_trip_bps_for(mode))
+                funding_prints_bps=history[-window:], perp=st.perp,
+                spot=st.spot, borrow_apr=borrow_apr,
+                round_trip_bps=round_trip_bps_for(mode), hold_days=hold_days,
+                demonstrated_hold_days=demonstrated_hold_days,
+                ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints)
             may_open = bool(verdict)
             if not may_open:
                 refusals[verdict.reason] = refusals.get(verdict.reason, 0) + 1

@@ -1770,6 +1770,20 @@ def carry_orders_permitted_for(cfg: Any, client: Any) -> Tuple[bool, str]:
     return (True, why)
 
 
+def carry_entries_permitted_from(store: Any) -> Callable[[], Tuple[bool, str]]:
+    """The carry broker's entry gate: an engaged or unreadable kill switch
+    refuses every new entry. Read fresh on each order; exits never ask it."""
+    def gate() -> Tuple[bool, str]:
+        try:
+            engaged, why = store.is_kill_switch_engaged()
+        except Exception as exc:  # noqa: BLE001 - unreadable is closed
+            return (False, f"KILL_SWITCH_UNREADABLE ({type(exc).__name__})")
+        if engaged:
+            return (False, f"KILL_SWITCH_ENGAGED: {why}")
+        return (True, "kill switch clear")
+    return gate
+
+
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
     """Construct the stack in dependency order.
 
@@ -1921,7 +1935,8 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                     sequence_source=lambda product, symbol, purpose:
                         bot.store.next_order_seq(),
                     session_token=bot.store.session_boot_token(),
-                    order_gate=_carry_orders_permitted),
+                    order_gate=_carry_orders_permitted,
+                    entry_gate=carry_entries_permitted_from(bot.store)),
                 bot.carry_journal,
                 ms=lambda: int(time.time() * 1000),
                 spot_symbol=cfg.CARRY_SPOT_SYMBOL),

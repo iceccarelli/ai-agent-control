@@ -27,10 +27,8 @@ Only what is still open. History is in `git log`. Nothing here retunes a signal 
 
 | # | Item | Notes |
 |---|---|---|
-| E1 | Capture `liqPrice` and `accountMMRate` at every open pair and replay them, so the liquidation gate is evaluated and not `NOT_EVALUATED` | Holds are long (mean 16.9 days, 15% at least 30 days in the audited replay) and a short perp's liquidation risk grows with time held |
-| E6 | Promotion-gate human items are booleans in a JSON file in the same repo, with no signature | A PR could flip them; the live-chain predicate still has to pass |
-| E7 | Kill switch is checked in the risk gate and the carry tick, not at the transport | Deliberate: exits and unwinds share `/v5/order/create`. A new caller that bypasses the gate also bypasses the switch |
-| E8 | `simulate()` in the Python simulator hard-codes the funding window and EWMA constants that the C++ core takes as parameters | A sweep with non-default values is not Python-equivalent |
+| E1 | Liquidation evidence is now read and recorded at the opening itself (`AT_OPEN:` rows) and an unreadable view leaves a `VIEW_UNREADABLE:` row, on every production open. Still open: rows are not keyed to a cycle id, and the shadow book (gate off by design) records none | Holds are long (mean 16.9 days, 15% at least 30 days in the audited replay) and a short perp's liquidation risk grows with time held |
+| E7 | `CarryBroker` takes an `entry_gate`, wired in `main.build_bot` to the store's kill switch, asked before every entry-side order (spot BUY, perp SELL, market or post-only) and never for an exit (spot SELL, reduce-only perp BUY). Unreadable or non-`True` refuses. Still open: `BybitClient.place_order` (the directional book and `tools/linear_stop_venue_drill.py`) is not behind this gate; the directional book is separately gated by the risk manager | A new caller that builds its own client order still bypasses it |
 | E10 | Referenced documents are absent (`EDGE.md`, `AGENT_CONTROL_PLANE.md`, `PROMOTION_GATE_MICRO_LIVE.md`, `PAPER_AGENT_CERTIFICATION.md`) | Code and artifacts cite them; restore the originals or remove the citations |
 | E11 | The reconciliation stack is Bybit-specific and unpackaged (field names `cumExecQty`, `execId`, `orderLinkId`; `sys.path` inserts) | Only worth doing once someone outside the project says they would run it |
 

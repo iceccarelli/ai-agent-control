@@ -400,6 +400,9 @@ class Config:
     LIVE_AUTHORIZED: bool
     LIVE_REQUESTED: bool
     LIVE_BLOCK_REASON: str
+    #: Path (outside the repository) of the human promotion approvals; see
+    #: promotion_gate.approval_digest. Empty = nothing is approved.
+    PROMOTION_APPROVALS_FILE: str
 
     # -- credentials --------------------------------------------------------
     BYBIT_API_KEY: str
@@ -830,6 +833,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         LIVE_AUTHORIZED=authorized,
         LIVE_REQUESTED=requested,
         LIVE_BLOCK_REASON=reason,
+        PROMOTION_APPROVALS_FILE=parse_str(env, "PROMOTION_APPROVALS_FILE", ""),
 
         BYBIT_API_KEY=api_key,
         BYBIT_API_SECRET=api_secret,

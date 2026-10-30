@@ -428,9 +428,16 @@ class CarryBroker:
     def __init__(self, *, client: Any, sequence_source: Any, order_gate: Any,
                  link_id_builder: Any = None,
                  duplicate_ret_codes: Optional[Tuple[int, ...]] = None,
-                 session_token: str = "") -> None:
+                 session_token: str = "",
+                 entry_gate: Any = None) -> None:
         if not callable(order_gate):
             raise TypeError("order_gate must be callable -> (may_send, reason)")
+        if entry_gate is not None and not callable(entry_gate):
+            raise TypeError("entry_gate must be callable -> (may_send, reason)")
+        #: Asked before every ENTRY-side order only (spot BUY, perp SELL) and
+        #: never for an exit, so a switched-off book can always flatten.
+        #: Anything but an explicit (True, reason) refuses the entry.
+        self.entry_gate = entry_gate
         self.client = client
         self.sequence_source = sequence_source
         self.order_gate = order_gate
@@ -479,6 +486,7 @@ class CarryBroker:
                      product: str) -> Optional[Dict[str, Any]]:
         """One leg. Deterministic id, so a retry cannot double it."""
         self._assert_orders_permitted()
+        self._assert_entry_permitted(product, side)
         if product not in VALID_PRODUCTS:
             raise ValueError(
                 f"unknown product {product!r}; routing a spot order to the "
@@ -748,6 +756,7 @@ class CarryBroker:
         would send next, is two legs where one was intended.
         """
         self._assert_orders_permitted()
+        self._assert_entry_permitted(product, side)
         if product not in VALID_PRODUCTS:
             raise ValueError(
                 f"unknown product {product!r}; routing a spot order to the "
@@ -2020,6 +2029,23 @@ class CarryBroker:
                 f"order gate unreadable ({exc!r}); no carry order sent") from exc
         if allowed is not True:
             raise CarryOrderRefused(f"{reason}; no carry order sent")
+
+    def _assert_entry_permitted(self, product: str, side: str) -> None:
+        """The entry gate, for orders that open or add exposure: a spot BUY
+        or a perp SELL. A spot SELL and a perp BUY (always reduce-only, see
+        `_short_only_guard`) leave exposure and are never gated here."""
+        if self.entry_gate is None:
+            return
+        if not ((product == SPOT and side == "Buy")
+                or (product == LINEAR and side == "Sell")):
+            return
+        try:
+            allowed, reason = self.entry_gate()
+        except Exception as exc:  # noqa: BLE001 - an unreadable gate is closed
+            raise CarryOrderRefused(
+                f"entry gate unreadable ({exc!r}); no carry entry sent") from exc
+        if allowed is not True:
+            raise CarryOrderRefused(f"{reason}; no carry entry sent")
 
     @staticmethod
     def _format_qty(qty: float) -> str:
