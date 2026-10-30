@@ -154,6 +154,24 @@ jobs:
           tests/test_carry_broker_liquidation_view_im.py
           tests/test_pretrade_capital_check.py
           tests/test_order_lifecycle.py
+          tests/test_order_lookup_unanswered.py
+          tests/test_carry_orders_belong_to_the_carry_resolver.py
+          tests/test_portfolio_authority_integration.py
+          tests/test_capital_engine_wiring.py
+          tests/test_promotion_forward_evidence.py
+          tests/test_performance_evidence.py
+          tests/test_forward_status.py
+          tests/test_portfolio_state.py
+          tests/test_capital_reservations.py
+          tests/test_capital_allocator.py
+          tests/test_opportunity_cost_parity.py
+          tests/test_entry_decision_audit.py
+          tests/test_carry_hold_exit_audit.py
+          tests/test_execution_economics.py
+          tests/test_linear_mechanics.py
+          tests/test_linear_candidate_replay.py
+          tests/test_market_snapshot_timing.py
+          tests/test_ops_forward_alerts.py
           tests/test_paired_leg_recovery.py
           tests/test_simulator_parameter_parity.py
           tests/test_integration_acceptance.py

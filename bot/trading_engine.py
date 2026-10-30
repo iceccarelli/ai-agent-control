@@ -216,6 +216,15 @@ class ExitPlan:
 # ---------------------------------------------------------------------------
 
 
+def orders_for_client_shutdown(store: Any) -> List[Dict[str, Any]]:
+    """The pending orders THIS client may cancel at shutdown: everything but the
+    carry book's, whose fate only the carry resolver and CarryBroker may write
+    (this client cancels in its own category and would record a live linear
+    order as cancelled with no lifecycle event)."""
+    return [row for row in store.pending_orders()
+            if not str(row.get("purpose", "")).startswith("carry-")]
+
+
 class TradingEngine:
     """Signal -> gate -> size -> entry -> verified bracket -> managed exit.
 
@@ -3333,7 +3342,7 @@ class TradingEngine:
             self.resolve_unresolved_entries()
         except Exception:  # noqa: BLE001
             logger.exception("could not settle unresolved entries at shutdown")
-        for row in self.store.pending_orders():
+        for row in orders_for_client_shutdown(self.store):
             purpose = str(row.get("purpose", ""))
             if purpose == "stop" and not cancel_protective:
                 continue

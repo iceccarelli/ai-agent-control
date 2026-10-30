@@ -61,7 +61,8 @@ def test_the_unresolved_and_terminal_sets_partition_the_states():
     assert ol.TERMINAL | ol.UNRESOLVED == set(ol.ALL_STATES)
     assert {"filled", "cancelled", "rejected", "never_sent", "abandoned"} == ol.TERMINAL
     assert {"pending", "submitted", "acknowledged", "partial", "cancel_requested",
-            "timed_out", "unknown", "reconciliation_required"} == ol.UNRESOLVED
+            "timed_out", "unknown", "reconciliation_required",
+            "contradicted"} == ol.UNRESOLVED
 
 
 @pytest.mark.parametrize("state", sorted(ol.TERMINAL))
@@ -146,7 +147,7 @@ def test_an_overfill_is_not_absorbed(store):
     intent(store)
     ev(store, ol.SUBMIT_ATTEMPT)
     r = ev(store, ol.FILL_REPORT, filled_qty=1.5, avg_price=100.0)
-    assert r.status == "reconciliation_required"
+    assert r.status == "contradicted"
     assert store.get_order(LINK)["filled_qty"] == pytest.approx(1.5)   # kept, not hidden
 
 
@@ -224,7 +225,7 @@ def test_a_fill_after_a_confirmed_cancel_is_a_contradiction_not_a_fact(store):
     ev(store, ol.SUBMIT_ATTEMPT); ev(store, ol.ACK, exchange_id="x")
     ev(store, ol.CANCEL_REQUEST); ev(store, ol.CANCEL_CONFIRM, filled_qty=0.0)
     r = ev(store, ol.FILL_REPORT, filled_qty=0.6, avg_price=100.0)
-    assert r.applied and r.status == "reconciliation_required"
+    assert r.applied and r.status == "contradicted"
     assert store.get_order(LINK)["filled_qty"] == pytest.approx(0.6)
 
 
@@ -241,7 +242,7 @@ def test_a_rejection_with_fills_is_a_contradiction(store):
     ev(store, ol.SUBMIT_ATTEMPT)
     ev(store, ol.FILL_REPORT, filled_qty=0.5, avg_price=100.0)
     r = ev(store, ol.REJECT)
-    assert r.status == "reconciliation_required"
+    assert r.status == "contradicted"
 
 
 def test_exposure_cannot_be_abandoned(store):
@@ -336,3 +337,123 @@ def test_two_threads_claiming_one_id_get_exactly_one_intent(path):
     [t.start() for t in threads]; [t.join() for t in threads]
     s.close()
     assert wins.count(True) == 1 and wins.count(False) == 7
+
+
+# -- a contradiction is not an uncertainty (independent review, finding 6) ---------------
+
+def overfilled(store, link=LINK):
+    intent(store, link=link)
+    ev(store, ol.SUBMIT_ATTEMPT, link=link)
+    return ev(store, ol.FILL_REPORT, link=link, filled_qty=1.5, avg_price=100.0)
+
+
+def test_an_overfill_is_contradicted_not_merely_uncertain(store):
+    assert overfilled(store).status == "contradicted"
+
+
+@pytest.mark.parametrize("kind,kw", [
+    (ol.CANCEL_CONFIRM, {"filled_qty": 1.5}),
+    (ol.CANCEL_CONFIRM, {}),
+    (ol.ACK, {"exchange_id": "x"}),
+    (ol.REJECT, {}),
+    (ol.RECONCILE_REQUIRED, {}),
+    (ol.NEVER_SENT, {}),
+    (ol.ABANDON, {}),
+    (ol.TIMEOUT, {}),
+    (ol.UNKNOWN_OUTCOME, {}),
+    (ol.CANCEL_REQUEST, {}),
+])
+def test_no_ordinary_event_clears_a_contradiction(store, kind, kw):
+    overfilled(store)
+    ev(store, kind, **kw)
+    assert status(store) == "contradicted"
+    assert store.unresolved_carry_orders()
+
+
+def test_a_repeat_of_the_fill_does_not_clear_it_either(store):
+    overfilled(store)
+    ev(store, ol.FILL_REPORT, filled_qty=1.5, avg_price=100.0)
+    assert status(store) == "contradicted"
+
+
+def test_more_fill_on_a_contradicted_order_is_kept_not_dropped(store):
+    overfilled(store)
+    r = ev(store, ol.FILL_REPORT, filled_qty=2.0, avg_price=100.0)
+    assert r.applied and status(store) == "contradicted"
+    assert store.get_order(LINK)["filled_qty"] == pytest.approx(2.0)
+
+
+def test_only_an_explicit_resolution_with_a_quantity_clears_it(store):
+    overfilled(store)
+    assert not ev(store, ol.RESOLVE_CONTRADICTION).applied      # needs the quantity
+    assert status(store) == "contradicted"
+    r = ev(store, ol.RESOLVE_CONTRADICTION, filled_qty=1.0,
+           detail={"evidence": "venue execution list reviewed"})
+    assert r.applied and r.status == "filled"
+    assert store.get_order(LINK)["filled_qty"] == pytest.approx(1.0)
+    assert store.unresolved_carry_orders() == []
+
+
+def test_a_resolution_without_written_evidence_is_refused(store):
+    overfilled(store)
+    r = ev(store, ol.RESOLVE_CONTRADICTION, filled_qty=1.0)
+    assert not r.applied and "evidence" in r.reason
+    assert status(store) == "contradicted"
+    r = ev(store, ol.RESOLVE_CONTRADICTION, filled_qty=1.0, detail={"evidence": "  "})
+    assert not r.applied and status(store) == "contradicted"
+
+
+def test_a_resolution_may_correct_an_overfill_down_and_is_logged(store):
+    overfilled(store)                                   # recorded 1.5 on a 1.0 order
+    r = ev(store, ol.RESOLVE_CONTRADICTION, filled_qty=1.0,
+           detail={"evidence": "executions list shows one fill of 1.0"})
+    assert r.applied and r.status == "filled"
+    assert store.get_order(LINK)["filled_qty"] == pytest.approx(1.0)
+    logged = store.order_events(LINK)[-1]
+    assert logged["kind"] == "resolve_contradiction"
+    assert logged["status_before"] == "contradicted" and "executions list" in logged["detail"]
+
+
+def test_a_resolution_is_only_for_a_contradicted_order(store):
+    intent(store)
+    ev(store, ol.SUBMIT_ATTEMPT)
+    assert not ev(store, ol.RESOLVE_CONTRADICTION, filled_qty=1.0).applied
+    assert status(store) == "submitted"
+
+
+def test_extra_fill_reported_by_a_cancel_confirm_on_a_finished_order_is_a_contradiction(store):
+    intent(store)
+    ev(store, ol.SUBMIT_ATTEMPT); ev(store, ol.ACK, exchange_id="x")
+    ev(store, ol.CANCEL_REQUEST); ev(store, ol.CANCEL_CONFIRM, filled_qty=0.0)
+    assert status(store) == "cancelled"
+    r = ev(store, ol.CANCEL_CONFIRM, filled_qty=0.6)
+    assert r.applied and status(store) == "contradicted"
+    assert store.get_order(LINK)["filled_qty"] == pytest.approx(0.6)
+
+
+def test_an_uncertain_order_is_still_resolved_by_the_venues_word(store):
+    """reconciliation_required means 'could not be read', not 'contradicted'."""
+    intent(store)
+    ev(store, ol.SUBMIT_ATTEMPT); ev(store, ol.RECONCILE_REQUIRED)
+    assert status(store) == "reconciliation_required"
+    assert ev(store, ol.FILL_REPORT, filled_qty=1.0, avg_price=100.0).status == "filled"
+    intent(store, link="b")
+    ev(store, ol.SUBMIT_ATTEMPT, link="b"); ev(store, ol.RECONCILE_REQUIRED, link="b")
+    assert ev(store, ol.ACK, link="b", exchange_id="y").status == "acknowledged"
+
+
+def test_the_resolver_cannot_clear_a_contradiction(tmp_path):
+    import order_recovery as rec
+    from carry_broker import CarryBroker
+    from test_carry_fee_truth import FeeVenue, modern
+    s = StateStore(str(tmp_path / "c.db"))
+    try:
+        overfilled(s)
+        venue = FeeVenue(modern)
+        broker = CarryBroker(client=venue, order_gate=lambda: (True, "T"),
+                             sequence_source=lambda *a: 1, order_log=s)
+        report = rec.resolve_unresolved_orders(broker, s)
+        assert [u.order_link_id for u in report.unresolved] == [LINK]
+        assert s.get_order(LINK)["status"] == "contradicted"
+    finally:
+        s.close()

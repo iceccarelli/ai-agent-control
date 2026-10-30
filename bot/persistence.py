@@ -2420,6 +2420,20 @@ class StateStore:
         """
         if source == "ws":
             current = self.get_order(order_link_id)
+            if current is not None and str(
+                    current.get("purpose", "")).startswith("carry-"):
+                # A carry order has ONE writer: apply_order_event, fed by
+                # CarryBroker's REST readback and the restart resolver. A
+                # websocket status carries no cumulative fill and no event
+                # identity; letting it set a terminal status hid the real fill
+                # and removed the order from the unresolved set.
+                self.journal(
+                    str(current.get("symbol", "")), "WS_CARRY_EVENT_IGNORED",
+                    "a websocket status for a carry order is not applied; its "
+                    "lifecycle is written only from the REST readback",
+                    {"order_link_id": order_link_id, "ws_status": status,
+                     "status": str(current.get("status", ""))})
+                return
             current_status = str(current["status"]) if current else ""
             if (
                 current is not None
@@ -2522,7 +2536,8 @@ class StateStore:
             for r in self._query(
                 "SELECT * FROM orders WHERE status IN "
                 "('pending','submitted','partial','unknown','acknowledged',"
-                "'cancel_requested','timed_out','reconciliation_required')"
+                "'cancel_requested','timed_out','reconciliation_required',"
+                "'contradicted')"
             )
         ]
 
@@ -2570,6 +2585,17 @@ class StateStore:
                 return OrderEventResult(False, before, before, "DUPLICATE_EVENT")
             recorded = float(row.get("filled_qty") or 0.0)
             requested = float(row["qty"])
+            if kind == _ol.RESOLVE_CONTRADICTION and not str(
+                    (detail or {}).get("evidence", "")).strip():
+                # The one event that can lower a recorded fill must say, in
+                # writing, what verified the quantity.
+                self.journal(str(row.get("symbol", "")),
+                             "ORDER_TRANSITION_REFUSED",
+                             "ILLEGAL_TRANSITION: a resolution needs written "
+                             "evidence", {"order_link_id": order_link_id})
+                return OrderEventResult(
+                    False, before, before,
+                    "ILLEGAL_TRANSITION: a resolution needs written evidence")
             t = _ol.decide(before, kind, recorded_qty=recorded,
                            requested_qty=requested, filled_qty=filled_qty)
             if not t.applied:
@@ -2580,10 +2606,14 @@ class StateStore:
                                   "status": before, "event": kind})
                 return OrderEventResult(False, before, before, t.reason)
             after = t.new_status or before
-            cum = recorded if t.new_filled_qty is None else max(
-                recorded, float(t.new_filled_qty))
+            if kind == _ol.RESOLVE_CONTRADICTION:
+                cum = float(t.new_filled_qty)       # the verified quantity, exactly
+            else:
+                cum = recorded if t.new_filled_qty is None else max(
+                    recorded, float(t.new_filled_qty))
             price = float(row.get("avg_price") or 0.0)
-            if avg_price is not None and cum > recorded:
+            if avg_price is not None and (cum > recorded
+                                          or kind == _ol.RESOLVE_CONTRADICTION):
                 price = float(avg_price)
             self._exec(
                 "UPDATE orders SET status = ?, filled_qty = ?, avg_price = ?, "

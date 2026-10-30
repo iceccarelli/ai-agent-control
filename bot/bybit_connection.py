@@ -200,6 +200,16 @@ UNKNOWN_OUTCOME_RET_CODES = frozenset({0, 10000, 170007})
 #: proxy body - is NOT an answer about the order, and must never be read as one.
 ORDER_NOT_FOUND_RET_CODES = frozenset({110001, 170213})
 
+
+def is_carry_order(row: Any) -> bool:
+    """A carry-leg order (purpose `carry-...`). Its lifecycle belongs to
+    order_lifecycle / CarryBroker / order_recovery; the directional client must
+    never settle, cancel or re-mark it."""
+    try:
+        return str(row.get("purpose", "")).startswith("carry-")
+    except AttributeError:
+        return False
+
 #: HTTP statuses worth retrying.
 TRANSIENT_HTTP = frozenset({408, 429, 500, 502, 503, 504,
                             520, 521, 522, 523, 524})
@@ -1479,7 +1489,8 @@ class BybitClient:
         entry row is left for the fill path / resolver / reconcile to settle
         from that record, after anything it executed has been put in the book."""
         row = self.store.get_order(order_link_id) if order_link_id else None
-        if row is not None and str(row.get("purpose")) == "entry":
+        if row is not None and (str(row.get("purpose")) == "entry"
+                                or is_carry_order(row)):
             return
         self.store.update_order_status(order_link_id, "cancelled")
 
@@ -2175,6 +2186,12 @@ class BybitClient:
         # not try to cancel an order that may not exist). Reconciliation is
         # exactly the place they must be chased.
         for row in self.store.unresolved_orders():
+            if is_carry_order(row):
+                # Carry orders live in the CARRY product (linear for the perp
+                # leg) and are settled only by order_recovery / CarryBroker. This
+                # client looks in its own category: a live linear carry order is
+                # not there, and "not found" was being written as never_sent.
+                continue
             summary["checked"] += 1
             oid = str(row["order_link_id"])
             try:
