@@ -559,3 +559,44 @@ def test_carry_report_withholds_actual_with_an_unresolved_order(tmp_path, clean)
     rep = carry_report.build_report(db, environment="mainnet")
     assert rep["carry"]["unresolved_carry_orders"] == 1
     assert rep["carry"]["evidence_class"] == "UNAVAILABLE"
+
+
+def _journal_with_perp_fill(link="carry-x-perp-open", qty=0.01):
+    import ledger as L
+    j = L.Journal()
+    L.perp_open(j, ms=1, ref=link, qty=qty, price=60000.0, fee_usd=0.1,
+                fee_status="confirmed")
+    return j
+
+
+def test_order_fill_equal_to_ledger_fill_holds():
+    j = _journal_with_perp_fill()
+    inv = perf.order_fills_match_ledger(
+        j, [{"link": "carry-x-perp-open", "status": "filled",
+             "filled_qty": 0.01}])
+    assert inv["ok"], inv
+
+
+def test_resolved_quantity_that_differs_from_the_ledger_breaks_the_invariant():
+    j = _journal_with_perp_fill(qty=0.01)
+    inv = perf.order_fills_match_ledger(
+        j, [{"link": "carry-x-perp-open", "status": "filled",
+             "filled_qty": 0.012}])
+    assert not inv["ok"]
+    assert inv["detail"]["mismatched"][0]["ledger_filled_qty"] == 0.01
+
+
+def test_an_order_fill_the_ledger_never_booked_breaks_it():
+    import ledger as L
+    inv = perf.order_fills_match_ledger(
+        L.Journal(), [{"link": "carry-y", "status": "filled",
+                       "filled_qty": 0.01}])
+    assert not inv["ok"]
+
+
+def test_unfinished_orders_are_left_to_the_unresolved_blocker():
+    import ledger as L
+    inv = perf.order_fills_match_ledger(
+        L.Journal(), [{"link": "carry-y", "status": "partial",
+                       "filled_qty": 0.01}])
+    assert inv["ok"]
