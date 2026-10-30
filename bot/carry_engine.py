@@ -1858,19 +1858,53 @@ class CarryEngine:
         spot_leg = float(notional_usd) if self.execution_mode == ACQUIRE else 0.0
         return float(notional_usd) / self.leverage + spot_leg
 
+    def fee_reserve_usd(self, notional_usd: float) -> float:
+        """Fees for a full cycle at THIS account's own rates (the same
+        `round_trip_bps` the cost gate prices with), held back so the pair is
+        not opened with nothing left to pay its exit. Raises if the venue
+        will not state the rates."""
+        return float(notional_usd) * self.round_trip_bps() / 1e4
+
+    def spot_cost_usd(self, notional_usd: float) -> float:
+        """What the spot purchase takes out of the quote coin: principal plus
+        its taker fee. Zero in overlay, where the client's coin is hedged."""
+        if self.execution_mode != ACQUIRE:
+            return 0.0
+        taker = float(self.broker.get_fee_rates(self.spot_symbol,
+                                                "spot")["taker_bps"])
+        return float(notional_usd) * (1.0 + taker / 1e4)
+
     def _capital_refusal(self, notional_usd: float) -> Optional[CarryDecision]:
         """None when the account can fund the pair (or the check is off), else
         the stand-aside that names why. No leg has been sent at this point, so
-        a refusal costs nothing; an unreadable balance refuses too."""
+        a refusal costs nothing. Refuses on any figure that is unreadable,
+        non-finite, negative or contradicts another (the quote coin cannot be
+        worth more than the whole account's availability).
+
+        Two separate questions: does the ACCOUNT have the collateral for the
+        perp's margin, the spot leg and a fee reserve (totalAvailableBalance);
+        and, in acquire, does the QUOTE COIN the purchase settles in exist in
+        that amount (the account can be rich in other collateral)."""
         if not self.require_capital_check:
             return None
-        reader = getattr(self.broker, "get_available_margin_usd", None)
+        quote_free: Optional[float] = None
         try:
+            reader = getattr(self.broker, "get_available_margin_usd", None)
             if not callable(reader):
                 raise RuntimeError("the broker cannot state the available balance")
             available = float(reader())
             if not self._finite(available) or available < 0:
                 raise ValueError(f"available balance {available!r}")
+            spot_cost = self.spot_cost_usd(notional_usd)
+            if self.execution_mode == ACQUIRE:
+                quote_reader = getattr(self.broker, "get_quote_free_usd", None)
+                if not callable(quote_reader):
+                    raise RuntimeError(
+                        "the broker cannot state the free quote balance")
+                quote_free = float(quote_reader("USDT"))
+                if not self._finite(quote_free) or quote_free < 0:
+                    raise ValueError(f"free quote balance {quote_free!r}")
+            reserve = self.fee_reserve_usd(notional_usd)
         except Exception as exc:  # noqa: BLE001 - unreadable is a refusal
             return CarryDecision(
                 "stand_aside", reason="AVAILABLE_MARGIN_UNREADABLE",
@@ -1878,12 +1912,30 @@ class CarryEngine:
                 detail={"error": f"{type(exc).__name__}: {exc}",
                         "note": "the account's free balance is unknown; a pair "
                                 "that may not be fundable is not started"})
+        if quote_free is not None and quote_free > available * (1 + 1e-9) + 1e-6:
+            return CarryDecision(
+                "stand_aside", reason="AVAILABLE_MARGIN_INCONSISTENT",
+                state=BookState.FLAT,
+                detail={"quote_free_usd": quote_free,
+                        "available_usd": available,
+                        "note": "the quote coin cannot exceed the account's "
+                                "total availability; one of the two reads is "
+                                "wrong or stale"})
+        if quote_free is not None and quote_free < spot_cost:
+            return CarryDecision(
+                "stand_aside", reason="INSUFFICIENT_QUOTE_FUNDS",
+                state=BookState.FLAT,
+                detail={"quote_free_usd": quote_free, "spot_cost_usd": spot_cost,
+                        "available_usd": available,
+                        "note": "the account may hold value in other coins, but "
+                                "the spot purchase settles in USDT"})
         required = self.required_capital_usd(notional_usd)
-        if available < required:
+        if available < required + reserve:
             return CarryDecision(
                 "stand_aside", reason="INSUFFICIENT_AVAILABLE_MARGIN",
                 state=BookState.FLAT,
-                detail={"required_usd": required, "available_usd": available,
+                detail={"required_usd": required, "fee_reserve_usd": reserve,
+                        "available_usd": available,
                         "notional_usd": float(notional_usd),
                         "leverage": self.leverage,
                         "execution_mode": self.execution_mode})

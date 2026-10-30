@@ -354,6 +354,7 @@ class TestTheProcessRefusesToStartOnAMismatch:
              perp_symbol="BTCUSDT"):
         bot = _main.TradingBot.__new__(_main.TradingBot)
         store = mock.Mock()
+        store.unresolved_carry_orders.return_value = []
         store.load_carry_position.return_value = ledger
         store.is_kill_switch_engaged.return_value = (False, "")
         bot.store = store

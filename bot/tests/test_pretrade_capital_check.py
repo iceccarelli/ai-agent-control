@@ -29,10 +29,12 @@ from test_carry_fee_truth import (                          # noqa: E402
     H8, MARK, build, modern, open_the_hedge)
 
 
-def with_available(venue, available):
+def with_available(venue, available, usdt_free="auto"):
     """Answer the account-level wallet read with `available` (None = absent,
-    an Exception = the read fails)."""
+    an Exception = the read fails) and the USDT coin row with `usdt_free`
+    ("auto" = the same amount, a consistent wallet)."""
     real = venue._request
+    quote = available if usdt_free == "auto" else usdt_free
 
     def request(method, endpoint, **kw):
         params = kw.get("params") or {}
@@ -43,6 +45,13 @@ def with_available(venue, available):
             if available is not None:
                 row["totalAvailableBalance"] = available
             return envelope({"list": [row]})
+        if endpoint == "/v5/account/wallet-balance" and params.get("coin") == "USDT":
+            try:
+                free = float(quote)
+            except (TypeError, ValueError):
+                free = 1e12
+            return envelope({"list": [{"coin": [{
+                "coin": "USDT", "walletBalance": str(free), "locked": "0"}]}]})
         return real(method, endpoint, **kw)
     venue._request = request
 
@@ -162,3 +171,104 @@ def test_build_bot_turns_the_check_on_with_the_configured_leverage():
                           risk_manager=mock.Mock(), engine=mock.Mock())
     assert bot.carry.require_capital_check is True
     assert bot.carry.leverage == pytest.approx(float(cfg.DEFAULT_LEVERAGE))
+
+
+# -- the refinement: the quote funds a spot purchase needs, and fee reserves ---------------
+
+def with_wallet(venue, total, usdt_free=None, usdt_locked="0"):
+    """Answer the account read with `total` and the USDT coin row with
+    `usdt_free` (walletBalance - locked)."""
+    real = venue._request
+
+    def request(method, endpoint, **kw):
+        params = kw.get("params") or {}
+        if endpoint == "/v5/account/wallet-balance":
+            if params.get("coin") == "USDT":
+                if usdt_free is None:
+                    return envelope({"list": [{"coin": []}]})
+                return envelope({"list": [{"coin": [{
+                    "coin": "USDT", "walletBalance": str(usdt_free),
+                    "locked": usdt_locked}]}]})
+            if "coin" not in params:
+                return envelope({"list": [{"totalAvailableBalance": total,
+                                           "accountMMRate": "0.05"}]})
+        return real(method, endpoint, **kw)
+    venue._request = request
+
+
+def test_the_fee_reserve_comes_from_the_accounts_own_round_trip():
+    venue, journal, engine = build(modern)
+    engine.require_capital_check = True
+    rt = engine.round_trip_bps()
+    assert rt > 0
+    assert engine.fee_reserve_usd(100_000.0) == pytest.approx(100_000.0 * rt / 1e4)
+
+
+def test_total_available_alone_is_not_enough_to_buy_the_spot_leg():
+    """Plenty of account value, but not in the currency the spot purchase pays in."""
+    venue, journal, engine = build(modern)
+    with_wallet(venue, total="1000000", usdt_free="50000")     # 50k USDT, needs 100k
+    engine.require_capital_check = True
+    d = open_the_hedge(engine)
+    assert d.reason == "INSUFFICIENT_QUOTE_FUNDS"
+    assert d.detail["quote_free_usd"] == pytest.approx(50_000.0)
+    assert d.detail["spot_cost_usd"] >= 100_000.0
+    assert venue.created == []
+
+
+def test_the_reserve_for_fees_is_part_of_the_requirement():
+    venue, journal, engine = build(modern)
+    need = engine.required_capital_usd(100_000.0)
+    reserve = engine.fee_reserve_usd(100_000.0)
+    with_wallet(venue, total=str(need + reserve - 1.0), usdt_free="150000")
+    engine.require_capital_check = True
+    d = open_the_hedge(engine)
+    assert d.reason == "INSUFFICIENT_AVAILABLE_MARGIN"
+    assert d.detail["fee_reserve_usd"] == pytest.approx(reserve)
+    venue2, _j, engine2 = build(modern)
+    with_wallet(venue2, total=str(need + reserve + 1.0), usdt_free="150000")
+    engine2.require_capital_check = True
+    assert open_the_hedge(engine2).action == "opened"
+
+
+def test_a_quote_balance_above_the_account_total_is_inconsistent_and_refused():
+    venue, journal, engine = build(modern)
+    with_wallet(venue, total="100000", usdt_free="900000")
+    engine.require_capital_check = True
+    d = open_the_hedge(engine)
+    assert d.reason == "AVAILABLE_MARGIN_INCONSISTENT" and venue.created == []
+
+
+@pytest.mark.parametrize("bad", [None])
+def test_a_missing_quote_row_refuses_an_acquire_pair(bad):
+    venue, journal, engine = build(modern)
+    with_wallet(venue, total="1000000", usdt_free=bad)
+    engine.require_capital_check = True
+    d = open_the_hedge(engine)
+    assert d.reason == "AVAILABLE_MARGIN_UNREADABLE" and venue.created == []
+
+
+def test_an_overlay_pair_never_asks_for_the_quote_balance():
+    engine = CarryEngine(broker=mock.Mock(), max_notional_usd=100_000.0,
+                         borrow_apr=0.0, execution_mode="overlay",
+                         persist=lambda s: None, leverage=2.0,
+                         require_capital_check=True)
+    assert engine.spot_cost_usd(100_000.0) == 0.0
+
+
+def test_the_broker_states_the_free_quote_balance():
+    client = FakeClient()
+    with_wallet(client, total="1", usdt_free="1234.5", usdt_locked="34.5")
+    b = CarryBroker(client=client, order_gate=lambda: (True, "T"),
+                    sequence_source=lambda *a: 1)
+    assert b.get_quote_free_usd("USDT") == pytest.approx(1200.0)
+
+
+@pytest.mark.parametrize("bad_locked", ["", "nan", "-1"])
+def test_an_unusable_lock_makes_the_quote_balance_unreadable(bad_locked):
+    client = FakeClient()
+    with_wallet(client, total="1", usdt_free="1000", usdt_locked=bad_locked)
+    b = CarryBroker(client=client, order_gate=lambda: (True, "T"),
+                    sequence_source=lambda *a: 1)
+    with pytest.raises(PairIncident):
+        b.get_quote_free_usd("USDT")

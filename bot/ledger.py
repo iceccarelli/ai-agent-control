@@ -158,7 +158,10 @@ class Journal:
         self._cycle = ""            # the cycle new entries belong to
         self._pending_cycle = ""    # a name given for the NEXT cycle
         self._cycle_perp = 0.0      # running perp quantity
-        self._cycle_closed = False  # a perp close has taken the cycle flat
+        self._cycle_spot = 0.0      # running spot quantity bought/sold by the book
+        self._cycle_closed = False  # the cycle has gone flat (perp closed, or an
+                                    # attempt that never hedged was sold back)
+        self._seen_cycles: set = set()
 
     def begin_cycle(self, cycle_id: str) -> None:
         """Name the cycle the next opening fill will start. A name that is
@@ -167,25 +170,47 @@ class Journal:
             raise LedgerError("a cycle id must be a non-empty string")
         self._pending_cycle = cycle_id
 
+    def _unique_cycle_id(self, candidate: str) -> str:
+        """A cycle id nobody has used. Two cycles opened in the same millisecond
+        (or named alike) must stay two cycles, so a repeat gets -2, -3, ...
+        The same rule runs on a replay, so ids are reproducible."""
+        cid, n = candidate, 1
+        while cid in self._seen_cycles:
+            n += 1
+            cid = f"{candidate}-{n}"
+        return cid
+
     def _assign_cycle(self, entry: Entry) -> None:
         flat = abs(self._cycle_perp) <= DUST[PERP]
         if entry.cycle:                       # restored from a stored row
+            if entry.cycle != self._cycle:
+                self._cycle_perp = self._cycle_spot = 0.0
             self._cycle = entry.cycle
+            self._seen_cycles.add(entry.cycle)
             self._pending_cycle = ""
             self._cycle_closed = False
         elif entry.kind in ("spot_buy", "perp_open") and flat and (
                 not self._cycle or self._cycle_closed
                 or (self._pending_cycle and self._pending_cycle != self._cycle)):
-            self._cycle = self._pending_cycle or f"cyc-{entry.ms}"
+            self._cycle = self._unique_cycle_id(
+                self._pending_cycle or f"cyc-{entry.ms}")
+            self._seen_cycles.add(self._cycle)
             self._pending_cycle = ""
             self._cycle_closed = False
+            self._cycle_spot = 0.0
             entry.cycle = self._cycle
         elif self._cycle:
             entry.cycle = self._cycle
         for line in entry.lines:
             if line.account == PERP:
                 self._cycle_perp += line.qty
+            elif line.account == BTC and entry.kind in ("spot_buy", "spot_sell"):
+                self._cycle_spot += line.qty
         if entry.kind == "perp_close" and abs(self._cycle_perp) <= DUST[PERP]:
+            self._cycle_closed = True
+        elif (entry.kind == "spot_sell" and abs(self._cycle_perp) <= DUST[PERP]
+              and abs(self._cycle_spot) <= DUST[BTC]):
+            # An attempt whose perp leg never landed, sold back to flat.
             self._cycle_closed = True
 
     @property
@@ -987,8 +1012,12 @@ class LedgerBroker:
 
     def begin_cycle(self, cycle_id: str) -> None:
         """Name the cycle the engine is about to open (explicit delegation to
-        the journal; it moves no money)."""
+        the journal and, when it keeps an order log, the venue adapter; it
+        moves no money)."""
         self.journal.begin_cycle(cycle_id)
+        inner_naming = getattr(self.inner, "begin_cycle", None)
+        if callable(inner_naming):
+            inner_naming(cycle_id)
 
     def __init__(self, inner: Any, journal: Journal,
                  ms: Optional[Callable[[], int]] = None,
@@ -1358,6 +1387,9 @@ class LedgerBroker:
 
     def get_available_margin_usd(self):
         return self.inner.get_available_margin_usd()
+
+    def get_quote_free_usd(self, coin="USDT"):
+        return self.inner.get_quote_free_usd(coin)
 
     def get_closed_short_qty_since(self, symbol, since_ms):
         return self.inner.get_closed_short_qty_since(symbol, since_ms)

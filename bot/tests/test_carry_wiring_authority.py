@@ -35,12 +35,13 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import config as _config  # noqa: E402
+from order_log_stub import InMemoryOrderLog  # noqa: E402
 import main as _main  # noqa: E402
 import persistence  # noqa: E402
 import shadow  # noqa: E402
 
 
-class _Store:
+class _Store(InMemoryOrderLog):
     def __init__(self):
         self.tripped = []
         self.seq = 0
@@ -51,6 +52,7 @@ class _Store:
 
     def session_boot_token(self):
         return "test-session-token"
+
 
     def trip_kill_switch(self, reason):
         self.tripped.append(reason)

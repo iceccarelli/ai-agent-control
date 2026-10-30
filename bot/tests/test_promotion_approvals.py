@@ -224,3 +224,124 @@ def test_the_approve_tool_writes_a_private_file(tmp_path):
                     "kill_switch_drill_recorded", "--out", str(out)],
                    capture_output=True, text=True, check=True)
     assert (os.stat(out).st_mode & 0o777) == 0o600
+
+
+# -- the file is validated and read through ONE descriptor ---------------------------
+
+def _good_approvals(tmp_path):
+    gate, entries = write_gate(tmp_path)
+    return gate, entries, write_approvals(tmp_path, entries)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX files")
+def test_a_symlink_as_the_approvals_file_is_refused_even_outside_the_repo(tmp_path):
+    gate, entries, real = _good_approvals(tmp_path)
+    link = tmp_path / "link.json"
+    os.symlink(real, link)
+    v = pg.evaluate_promotion_gate(path=gate, approvals_path=str(link))
+    assert completed(v).isdisjoint(NON_MACHINE)
+    assert any("symbolic link" in r for r in v.reasons)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX files")
+def test_a_parent_directory_others_can_write_is_refused(tmp_path):
+    d = tmp_path / "shared"
+    d.mkdir()
+    gate, entries = write_gate(tmp_path)
+    approved = {k: pg.approval_digest(k, entries[k]) for k in entries}
+    f = d / "a.json"
+    f.write_text(json.dumps({"approved": approved}))
+    os.chmod(f, 0o600)
+    os.chmod(d, 0o777)
+    v = pg.evaluate_promotion_gate(path=gate, approvals_path=str(f))
+    assert completed(v).isdisjoint(NON_MACHINE)
+    assert any("parent directory" in r for r in v.reasons)
+    os.chmod(d, 0o700)
+    v = pg.evaluate_promotion_gate(path=gate, approvals_path=str(f))
+    assert set(NON_MACHINE) <= completed(v)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX files")
+def test_a_file_owned_by_someone_else_is_refused(tmp_path, monkeypatch):
+    gate, entries, ap = _good_approvals(tmp_path)
+    real_euid = os.geteuid()
+    monkeypatch.setattr(pg.os, "geteuid", lambda: real_euid + 4242)
+    v = pg.evaluate_promotion_gate(path=gate, approvals_path=ap)
+    assert completed(v).isdisjoint(NON_MACHINE)
+    assert any("owned by" in r for r in v.reasons)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX files")
+def test_a_file_swapped_in_after_it_was_opened_is_never_honoured(tmp_path, monkeypatch):
+    gate, entries = write_gate(tmp_path)
+    approved = {k: pg.approval_digest(k, entries[k]) for k in entries}
+    target = tmp_path / "approvals.json"
+    target.write_text(json.dumps({"approved": {}}))          # grants nothing
+    os.chmod(target, 0o600)
+    evil = tmp_path / "evil.json"
+    evil.write_text(json.dumps({"approved": approved}))      # grants everything
+    os.chmod(evil, 0o600)
+    real_open = pg.os.open
+    swapped = []
+
+    def swap_after_open(path, flags, *a, **k):
+        fd = real_open(path, flags, *a, **k)
+        if str(path) == str(target) and not swapped:
+            swapped.append(1)
+            os.replace(evil, target)         # replaced between check and read
+        return fd
+    monkeypatch.setattr(pg.os, "open", swap_after_open)
+    v = pg.evaluate_promotion_gate(path=gate, approvals_path=str(target))
+    assert swapped, "the test did not exercise the swap"
+    assert completed(v).isdisjoint(NON_MACHINE)
+
+
+def test_an_approval_does_not_survive_a_change_of_any_field(tmp_path):
+    gate, entries, ap = _good_approvals(tmp_path)
+    for field, value in (("evidence", "changed"), ("complete", True),
+                         ("owner", "someone-else"), ("extra", "new field")):
+        changed = dict(entries["kill_switch_drill_recorded"], **{field: value})
+        if changed == entries["kill_switch_drill_recorded"]:
+            continue
+        gate2, _ = write_gate(tmp_path, kill_switch_drill_recorded=changed)
+        v = pg.evaluate_promotion_gate(path=gate2, approvals_path=ap)
+        assert "kill_switch_drill_recorded" not in completed(v), field
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_the_approve_tool_creates_the_file_private_from_the_start(tmp_path, monkeypatch):
+    """No window in which the file exists with looser permissions."""
+    import importlib
+    gate, _ = write_gate(tmp_path)
+    tool = importlib.import_module("tools.promotion_approve") if False else None
+    import runpy
+    modes = []
+    real_open = os.open
+
+    def spy(path, flags, mode=0o777, *a, **k):
+        fd = real_open(path, flags, mode, *a, **k)
+        if str(path).endswith(".tmp"):
+            modes.append(os.fstat(fd).st_mode & 0o777)
+        return fd
+    monkeypatch.setattr(os, "open", spy)
+    sys.argv = ["promotion_approve", "--gate", gate, "--key",
+                "kill_switch_drill_recorded", "--out", str(tmp_path / "o.json")]
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_path(os.path.join(os.path.dirname(HERE), "tools",
+                                    "promotion_approve.py"), run_name="__main__")
+    assert exc.value.code == 0
+    assert modes and all(m == 0o600 for m in modes), modes
+
+
+def test_a_failed_write_leaves_no_partial_file_and_keeps_the_old_one(tmp_path, monkeypatch):
+    gate, entries, ap = _good_approvals(tmp_path)
+    before = open(ap).read()
+    tool = os.path.join(os.path.dirname(HERE), "tools", "promotion_approve.py")
+    # an --out in a directory that does not exist: nothing is created anywhere
+    r = subprocess.run([sys.executable, tool, "--gate", gate, "--key",
+                        "kill_switch_drill_recorded", "--out",
+                        str(tmp_path / "missing_dir" / "o.json")],
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    assert open(ap).read() == before
+    assert not list(tmp_path.glob("**/*.tmp"))

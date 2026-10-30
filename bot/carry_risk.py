@@ -123,6 +123,10 @@ class CarryRisk:
             if engaged:
                 return _block("KILL_SWITCH_ENGAGED", why=why)
 
+        blocked = self._unresolved_orders_block()
+        if blocked is not None:
+            return blocked
+
         if has_open_pair:
             return _block(
                 "PAIR_ALREADY_OPEN",
@@ -192,6 +196,34 @@ class CarryRisk:
                              "cap": self.max_notional_usd,
                              "margin_multiple": margin,
                              "basis_bps": getattr(snapshot, "basis_bps", None)})
+
+    def _unresolved_orders_block(self) -> Optional["PairDecision"]:
+        """No new cycle while an earlier carry order has no final state: its
+        fill, or its absence, is still unknown, and a new pair on top of
+        possible hidden exposure is how a naked leg doubles. Reads the order log
+        fresh; an unreadable log refuses. A store with no order log (the
+        tests' fakes) is not asked."""
+        if self.store is None:
+            return None
+        reader = getattr(self.store, "unresolved_carry_orders", None)
+        if not callable(reader):
+            return None
+        try:
+            pending = reader()
+        except Exception as exc:  # noqa: BLE001
+            return _block("UNRESOLVED_ORDERS_UNREADABLE", error=str(exc))
+        if not isinstance(pending, list):
+            return _block("UNRESOLVED_ORDERS_UNREADABLE",
+                          error=f"the order log returned {type(pending).__name__}")
+        if pending:
+            return _block(
+                "UNRESOLVED_ORDERS", count=len(pending),
+                orders=[{"order_link_id": o.get("order_link_id"),
+                         "status": o.get("status"), "leg": o.get("leg"),
+                         "filled_qty": o.get("filled_qty")} for o in pending[:5]],
+                note="an earlier order has no final state; the book opens "
+                     "nothing until it is resolved")
+        return None
 
     def export_days(self) -> Dict[str, List[str]]:
         """The allowance as plain data, so it survives the process."""

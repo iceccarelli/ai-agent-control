@@ -62,6 +62,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import venue_fees
 
+import order_lifecycle as _ol
+
 logger = logging.getLogger(__name__)
 
 #: Quantity differences below this fraction of the leg are venue rounding, not
@@ -411,6 +413,143 @@ class SettlementEvidence:
                 "errors": list(self.errors), "complete": self.complete}
 
 
+#: Returned by `_OrderTrail.intent` when the order is new (or was recorded and
+#: never sent): go ahead and send it. Anything else is the final answer for a
+#: retry of an order that had already been sent once.
+_SEND = object()
+
+
+class _OrderTrail:
+    """One carry order's trip through the durable lifecycle log.
+
+    Strict BEFORE the request leaves: the intent and the submit marker must be
+    written or the order is not sent (an order the book cannot remember is the
+    one that becomes hidden exposure after a crash). Best effort AFTER: the
+    order exists whatever the log says, so later writes shout on failure but
+    never unwind a leg the engine still has to book; the restart resolver
+    reads the venue for anything the log missed."""
+
+    def __init__(self, broker: "CarryBroker", requested_qty: float) -> None:
+        self.b = broker
+        self.requested = float(requested_qty)
+        self.link: Optional[str] = None
+        self.submitted = False
+        self.acked = False
+
+    def intent(self, link: str, product: str, symbol: str, side: str,
+               qty_text: str, price: float, qty: float, *,
+               maker: bool = False) -> Any:
+        self.link = link
+        self.requested = float(qty_text)
+        log = self.b.order_log
+        if log is None:
+            return _SEND
+        try:
+            new = log.record_order_intent(
+                link, symbol, side, float(qty_text), leg=product,
+                cycle_id=self.b._cycle_id,
+                order_type="Limit" if maker else "Market", price=price)
+        except Exception as exc:  # noqa: BLE001
+            raise CarryOrderRefused(
+                f"order log unwritable ({type(exc).__name__}: {exc}); no "
+                "carry order sent") from exc
+        if new:
+            return _SEND
+        return self._resume(log.get_order(link), link, product, symbol, qty)
+
+    def _resume(self, row: Optional[Dict[str, Any]], link: str, product: str,
+                symbol: str, qty: float) -> Any:
+        """The id was already recorded: this is a retry. Recorded but never
+        sent -> send it now. Anything else -> ask the venue; never send again."""
+        status = str((row or {}).get("status", ""))
+        if status == _ol.PENDING:
+            return _SEND
+        self.submitted = True
+        self.acked = status in (_ol.ACKNOWLEDGED, _ol.PARTIAL,
+                                _ol.CANCEL_REQUESTED)
+        state = self.b._order_state(symbol, link, product)
+        if state is None:
+            raise OrderOutcomeUnknown(
+                f"{link} was already recorded as {status!r} and the venue "
+                "shows no row for it; it is not sent again")
+        if state["resting"]:
+            raise OrderOutcomeUnknown(
+                f"{link} was already recorded as {status!r} and is "
+                f"{state['status']} at the venue; it is not sent again")
+        if self.b._rejected(state):
+            return None
+        return self.b._engine_result_from_state(state, qty)
+
+    def submitting(self) -> None:
+        log = self.b.order_log
+        if log is None or self.link is None:
+            return
+        try:
+            res = log.apply_order_event(self.link, _ol.SUBMIT_ATTEMPT)
+        except Exception as exc:  # noqa: BLE001
+            raise CarryOrderRefused(
+                f"order log unwritable ({type(exc).__name__}: {exc}); no "
+                "carry order sent") from exc
+        if not res.applied:
+            raise CarryOrderRefused(
+                f"order log refused the submit marker for {self.link} "
+                f"({res.reason}); no carry order sent")
+        self.submitted = True
+
+    def acknowledged(self, response: Any) -> None:
+        if self.b.order_log is None or self.link is None:
+            return
+        self.acked = True
+        order_id = ""
+        try:
+            order_id = str(((response or {}).get("result") or {})
+                           .get("orderId") or "")
+        except AttributeError:
+            pass
+        self.b._log_event(self.link, _ol.ACK, exchange_id=order_id)
+
+    def unresolved(self, exc: BaseException) -> None:
+        """The outcome is in doubt. A timeout is recorded as one, never as a
+        rejection; an order that was acknowledged but cannot be read becomes
+        reconciliation_required."""
+        if self.b.order_log is None or self.link is None or not self.submitted:
+            return
+        timeout = isinstance(exc, TimeoutError) or isinstance(
+            getattr(exc, "__cause__", None), TimeoutError)
+        kind = _ol.TIMEOUT if (timeout and not self.acked) else _ol.UNKNOWN_OUTCOME
+        self.b._log_event(self.link, kind)
+
+    def finish(self, result: Optional[Dict[str, Any]]) -> None:
+        """A market order that returned: a fill, or terminal with nothing."""
+        if self.b.order_log is None or self.link is None or not self.submitted:
+            return
+        if result is None:
+            self.b._log_event(self.link,
+                              _ol.CANCEL_CONFIRM if self.acked else _ol.REJECT,
+                              **({"filled_qty": 0.0} if self.acked else {}))
+            return
+        cum = float(result.get("filled_qty") or 0.0)
+        self.b._log_fill(self.link, cum, float(result.get("avg_price") or 0.0))
+        if cum < self.requested * (1.0 - 1e-9):
+            # Final at the venue with less than asked: the rest will not fill.
+            self.b._log_event(self.link, _ol.CANCEL_CONFIRM, filled_qty=cum)
+
+    def finish_resting(self, state: Optional[Dict[str, Any]]) -> None:
+        """A post-only order that returned: nothing (it never rested, or was
+        cancelled by the post-only rule) or what it has done so far."""
+        if self.b.order_log is None or self.link is None or not self.submitted:
+            return
+        if state is None:
+            self.b._log_event(self.link,
+                              _ol.CANCEL_CONFIRM if self.acked else _ol.REJECT,
+                              **({"filled_qty": 0.0} if self.acked else {}))
+            return
+        cum = float(state.get("filled_qty") or 0.0)
+        self.b._log_fill(self.link, cum, float(state.get("avg_price") or 0.0))
+        if not state.get("resting") and cum < self.requested * (1.0 - 1e-9):
+            self.b._log_event(self.link, _ol.CANCEL_CONFIRM, filled_qty=cum)
+
+
 class CarryBroker:
     """Places paired legs. Idempotent. Reports incidents rather than papering.
 
@@ -429,7 +568,8 @@ class CarryBroker:
                  link_id_builder: Any = None,
                  duplicate_ret_codes: Optional[Tuple[int, ...]] = None,
                  session_token: str = "",
-                 entry_gate: Any = None) -> None:
+                 entry_gate: Any = None,
+                 order_log: Any = None) -> None:
         if not callable(order_gate):
             raise TypeError("order_gate must be callable -> (may_send, reason)")
         if entry_gate is not None and not callable(entry_gate):
@@ -438,6 +578,13 @@ class CarryBroker:
         #: never for an exit, so a switched-off book can always flatten.
         #: Anything but an explicit (True, reason) refuses the entry.
         self.entry_gate = entry_gate
+        #: The durable order record (a StateStore). With it, every carry order
+        #: is written BEFORE it can leave and moved through its lifecycle
+        #: (order_lifecycle.py) as the venue answers; None = no record (tests,
+        #: tools). An order whose intent cannot be written is not sent.
+        self.order_log = order_log
+        #: The cycle the engine named (via the ledger broker) for new intents.
+        self._cycle_id = ""
         self.client = client
         self.sequence_source = sequence_source
         self.order_gate = order_gate
@@ -484,7 +631,24 @@ class CarryBroker:
 
     def place_market(self, *, symbol: str, side: str, qty: float,
                      product: str) -> Optional[Dict[str, Any]]:
-        """One leg. Deterministic id, so a retry cannot double it."""
+        """One leg. Deterministic id, so a retry cannot double it. Its fate is
+        written down as it unfolds (`_OrderTrail`)."""
+        trail = _OrderTrail(self, requested_qty=float(qty)
+                            if self._positive_finite(qty) else 0.0)
+        try:
+            result = self._place_market_core(symbol=symbol, side=side, qty=qty,
+                                             product=product, trail=trail)
+        except (CarryOrderRefused, ValueError):
+            raise
+        except Exception as exc:  # noqa: BLE001 - the outcome is now in doubt
+            trail.unresolved(exc)
+            raise
+        trail.finish(result)
+        return result
+
+    def _place_market_core(self, *, symbol: str, side: str, qty: float,
+                           product: str, trail: "_OrderTrail"
+                           ) -> Optional[Dict[str, Any]]:
         self._assert_orders_permitted()
         self._assert_entry_permitted(product, side)
         if product not in VALID_PRODUCTS:
@@ -504,6 +668,10 @@ class CarryBroker:
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Market", "qty": qty_text,
                 "orderLinkId": link_id}
+        resumed = trail.intent(link_id, product, symbol, side, qty_text, 0.0,
+                               qty)
+        if resumed is not _SEND:
+            return resumed
         #: Recorded BEFORE the request goes out: an order whose response is
         #: lost, or whose booking fails, is still an order the venue may hold,
         #: and a final-state read must be able to find it.
@@ -516,6 +684,7 @@ class CarryBroker:
             # of every spot qty this module sends is explicit.
             body["marketUnit"] = "baseCoin"
         self._short_only_guard(body)
+        trail.submitting()
         try:
             response = self.client._request(
                 "POST", "/v5/order/create", signed=True, body=body)
@@ -582,6 +751,7 @@ class CarryBroker:
                     "failed submission; what it will fill is unknown") from exc
             return self._engine_result_from_state(state, qty)
 
+        trail.acknowledged(response)
         # The create call returned, so the order EXISTS. Whatever the response
         # says about its fill is a claim to check, not a fact: text that is
         # not a number, NaN/inf (every comparison against which is False), a
@@ -741,8 +911,27 @@ class CarryBroker:
         return {"bid": bid, "ask": ask}
 
     def place_post_only(self, *, symbol: str, side: str, qty: float,
-                        price: float,
-                        product: str) -> Optional[Dict[str, Any]]:
+                        price: float, product: str) -> Optional[Dict[str, Any]]:
+        """PostOnly limit leg; see `_place_post_only_core`. Its fate is written
+        down as it unfolds (`_OrderTrail`)."""
+        trail = _OrderTrail(self, requested_qty=float(qty)
+                            if self._positive_finite(qty) else 0.0)
+        try:
+            result = self._place_post_only_core(
+                symbol=symbol, side=side, qty=qty, price=price,
+                product=product, trail=trail)
+        except (CarryOrderRefused, ValueError):
+            raise
+        except Exception as exc:  # noqa: BLE001
+            trail.unresolved(exc)
+            raise
+        trail.finish_resting(result)
+        return result
+
+    def _place_post_only_core(self, *, symbol: str, side: str, qty: float,
+                              price: float, product: str,
+                              trail: "_OrderTrail"
+                              ) -> Optional[Dict[str, Any]]:
         """One PostOnly limit order. Maker or nothing — it never crosses.
 
         Returns what the order has done so far plus `resting`, or **None**
@@ -772,16 +961,20 @@ class CarryBroker:
             symbol=symbol, side=side, qty=qty_text, price=price_text,
             purpose=f"carry-{product}-maker", session_token=self.session_token)
 
-        self.sent_order_links.append((product, symbol, link_id))
-
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Limit", "qty": qty_text, "price": price_text,
                 "timeInForce": "PostOnly", "orderLinkId": link_id}
+        resumed = trail.intent(link_id, product, symbol, side, qty_text,
+                               float(price_text), qty, maker=True)
+        if resumed is not _SEND:
+            return resumed
+        self.sent_order_links.append((product, symbol, link_id))
         # No marketUnit on a LIMIT order: its qty is base coin by definition,
         # the field belongs to market orders, and the spot limit orders this
         # repo has actually sent to testnet (artifacts/testnet_conformance_
         # evidence.jsonl, the take-profit legs) carry none and were accepted.
         self._short_only_guard(body)
+        trail.submitting()
         try:
             self.client._request("POST", "/v5/order/create", signed=True,
                                  body=body)
@@ -803,6 +996,7 @@ class CarryBroker:
                     side, symbol, product, exc)
                 return None
             return state
+        trail.acknowledged(None)
         state = self._order_state(symbol, link_id, product)
         if state is None:
             raise PairIncident(
@@ -830,6 +1024,7 @@ class CarryBroker:
         """
         if product not in VALID_PRODUCTS:
             raise ValueError(f"unknown product {product!r}")
+        self._log_event(order_link_id, _ol.CANCEL_REQUEST)
         try:
             self.client._request(
                 "POST", "/v5/order/cancel", signed=True,
@@ -838,15 +1033,53 @@ class CarryBroker:
         except Exception as exc:  # noqa: BLE001
             logger.info("cancel of %s did not take (%s); reading it back",
                         order_link_id, exc)
-        state = self._order_state(symbol, order_link_id, product)
+        try:
+            state = self._order_state(symbol, order_link_id, product)
+        except Exception:
+            self._log_event(order_link_id, _ol.RECONCILE_REQUIRED)
+            raise
         if state is None:
+            self._log_event(order_link_id, _ol.RECONCILE_REQUIRED)
             # No row at all for an id the venue accepted earlier. Nothing can
             # be said about what it filled; a cancelled-with-zero-fill order
             # is NOT this case - it comes back as a row and is a definite 0.
             raise PairIncident(
                 f"{order_link_id} could not be read back after a cancel; what "
                 "it filled is unknown")
+        cum = float(state.get("filled_qty") or 0.0)
+        avg = float(state.get("avg_price") or 0.0)
+        if state.get("resting"):
+            # The cancel did not take (or has not yet): still a live order.
+            self._log_fill(order_link_id, cum, avg)
+        else:
+            self._log_event(order_link_id, _ol.CANCEL_CONFIRM, filled_qty=cum,
+                            avg_price=avg or None)
         return state
+
+    # -- the durable order record -----------------------------------------------
+
+    def begin_cycle(self, cycle_id: str) -> None:
+        """The cycle new order intents belong to (named by the engine)."""
+        self._cycle_id = str(cycle_id)
+
+    def _log_event(self, link_id: str, kind: str, **kw: Any) -> None:
+        """Best effort AFTER an order has left: the order exists whatever the
+        log says, so a failed write is shouted about, not allowed to unwind a
+        leg the engine must still book. The restart resolver reads the venue."""
+        if self.order_log is None:
+            return
+        try:
+            self.order_log.apply_order_event(link_id, kind, **kw)
+        except Exception as exc:  # noqa: BLE001
+            logger.critical("order log: could not record %s for %s (%s: %s); "
+                            "the restart resolver will read the venue",
+                            kind, link_id, type(exc).__name__, exc)
+
+    def _log_fill(self, link_id: str, cum: float, avg: float) -> None:
+        if cum > 0:
+            self._log_event(link_id, _ol.FILL_REPORT, filled_qty=cum,
+                            avg_price=avg or None,
+                            event_key=f"{link_id}:fill:{cum:.12g}")
 
     @staticmethod
     def _terminal_statuses():
@@ -1402,6 +1635,30 @@ class CarryBroker:
                 f"totalAvailableBalance is {value}; a negative balance is not "
                 "a readable one")
         return value
+
+    def get_quote_free_usd(self, coin: str = "USDT") -> float:
+        """Free balance of the quote coin a spot purchase pays in:
+        `walletBalance - locked`, both STATED. `totalAvailableBalance` is the
+        whole account's collateral value and says nothing about whether the
+        coin the purchase is settled in is there. Raises on a missing row, an
+        unstated, non-finite or negative lock or balance."""
+        result = self.client._request(
+            "GET", "/v5/account/wallet-balance", signed=True,
+            params={"accountType": "UNIFIED", "coin": coin})
+        rows = self._v5_list(result) or []
+        coins = (rows[0].get("coin") if rows and isinstance(rows[0], dict)
+                 else None) or []
+        for entry in coins:
+            if str(entry.get("coin", "")).upper() != coin.upper():
+                continue
+            balance = self._stated(entry, "walletBalance", f"wallet row for {coin}")
+            locked = self._stated(entry, "locked", f"wallet row for {coin}")
+            if balance < 0 or locked < 0:
+                raise PairIncident(
+                    f"wallet row for {coin} states balance {balance} / locked "
+                    f"{locked}; a negative figure is not a readable one")
+            return max(0.0, balance - locked)
+        raise PairIncident(f"no wallet row for {coin}; the free balance is unknown")
 
     @staticmethod
     def _optional_margin(row: Dict[str, Any]) -> Optional[float]:

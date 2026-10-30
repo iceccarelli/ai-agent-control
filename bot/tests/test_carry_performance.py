@@ -180,7 +180,7 @@ def test_committed_capital_needs_an_observed_margin(journal):
     assert all(c["margin_committed_usd"] is None for c in cycles)
     assert all(c["capital_committed_usd"] is None for c in cycles)
     s = perf.summarise(cycles)
-    assert s["return_on_committed_capital_pct"] is None
+    assert s["period_return_on_peak_capital_pct"] is None
     assert s["margin_committed_usd"] is None
 
 
@@ -198,8 +198,14 @@ def test_return_on_committed_capital_uses_the_peak_venue_margin_plus_the_spot_le
     s = perf.summarise(cycles)
     assert s["margin_committed_usd"] == pytest.approx(12_000.0)
     assert s["peak_capital_committed_usd"] == pytest.approx(112_000.0)
-    assert s["return_on_committed_capital_pct"] == pytest.approx(
+    assert s["period_return_on_peak_capital_pct"] == pytest.approx(
         -450.0 / 112_000.0 * 100, rel=1e-6)
+    # cycle level and period level are different measurements
+    assert cycles[0]["return_on_committed_capital_pct"] == pytest.approx(
+        190.0 / 112_000.0 * 100, rel=1e-6)
+    assert s["capital_basis"].startswith("peak single-cycle")
+    assert s["period_days"] == pytest.approx(40.0)          # day 0 -> day 40
+    assert "not an account-level return" in s["capital_basis"]
     assert "margin_note" in s and "observed" in s["margin_note"]
 
 
@@ -245,6 +251,7 @@ def test_the_cli_reads_the_margin_observations_from_the_same_database(tmp_path, 
     assert perf.main(["--db", db]) == 0
     out = capsys.readouterr().out
     assert "committed capital (venue margin + spot leg)" in out
+    assert "not an account-level return" in out
     assert "15,002.00" in out                     # peak margin of the third cycle
 
 

@@ -46,22 +46,34 @@ def main(argv=None) -> int:
         print(f"refusing: {args.key} is not marked complete in the gate file; "
               "approve only what you have read and found true", file=sys.stderr)
         return 2
-    problem = pg._approvals_untrusted(args.out) if os.path.exists(args.out) \
-        else (f"--out {args.out!r} is inside the repository"
-              if os.path.realpath(args.out).startswith(
-                  os.path.realpath(pg.REPO_ROOT) + os.sep) else None)
+    out_real, problem = pg._approvals_location_problem(args.out)
+    if problem is None and not os.path.isdir(os.path.dirname(out_real)):
+        problem = f"the directory of --out {args.out!r} does not exist"
+    if problem is None and os.path.exists(out_real):
+        _existing, problem = pg._read_approvals(args.out)
     if problem is not None:
         print(f"refusing: {problem}", file=sys.stderr)
         return 2
-    existing = pg._read_approvals(args.out)[0] if os.path.exists(args.out) else {}
+    existing = pg._read_approvals(args.out)[0] if os.path.exists(out_real) else {}
     existing[args.key] = pg.approval_digest(args.key, entry)
-    tmp = args.out + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump({"schema": "promotion_approvals/1", "approved": existing},
-                  handle, indent=2, sort_keys=True)
-        handle.write("\n")
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, args.out)
+    tmp = out_real + ".tmp"
+    # Created private from the first instant (no window with looser mode),
+    # written, flushed to disk, then renamed over the target atomically.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"schema": "promotion_approvals/1", "approved": existing},
+                      handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, out_real)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     print(f"approved {args.key}: {existing[args.key]}")
     return 0
 

@@ -149,9 +149,12 @@ jobs:
           tests/test_liquidation_evidence_at_open.py
           tests/test_kill_switch_entry_gate.py
           tests/test_client_entry_gate.py
+          tests/test_spot_order_backing.py
           tests/test_cycle_identity.py
           tests/test_carry_broker_liquidation_view_im.py
           tests/test_pretrade_capital_check.py
+          tests/test_order_lifecycle.py
+          tests/test_paired_leg_recovery.py
           tests/test_simulator_parameter_parity.py
           tests/test_integration_acceptance.py
           tests/test_promotion_approvals.py
