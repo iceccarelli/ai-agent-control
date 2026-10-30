@@ -429,7 +429,11 @@ class BybitClient:
         #: A stand-down run (`ENTRIES_ENABLED=0`) must end with this at 0, and
         #: `session_log.PaperSessionLog` reports it verbatim.
         self.orders_submitted = 0
-        self._entry_gate: Optional[Callable[[], Tuple[bool, str]]] = None
+        #: Asked before any order that can ADD exposure; never for an exit.
+        #: `build_bot` wires it to the store's kill switch. None = no extra
+        #: gate (tools that build their own client). A value that is not
+        #: callable refuses every entry.
+        self.entry_gate: Optional[Callable[[], Tuple[bool, str]]] = None
 
         # The venue is resolved ONCE, centrally, and refused when the config
         # contradicts itself or states nothing (resolve_client_venue). USE_TESTNET
@@ -1040,30 +1044,17 @@ class BybitClient:
             prefix=str(getattr(self.cfg, "ORDERLINK_PREFIX", "BB")),
         )
 
-    @property
-    def entry_gate(self) -> Optional[Callable[[], Tuple[bool, str]]]:
-        """Asked before any order that can ADD exposure; never for an exit.
-        `build_bot` wires it to the store's kill switch. None = no extra gate
-        (tools that build their own client)."""
-        return self._entry_gate
-
-    @entry_gate.setter
-    def entry_gate(self, gate: Optional[Callable[[], Tuple[bool, str]]]) -> None:
-        if gate is not None and not callable(gate):
-            raise TypeError("entry_gate must be callable -> (may_send, reason)")
-        self._entry_gate = gate
-
     def _entry_refusal(self, direction: str, reduce_only: bool) -> Optional[str]:
         """A reason string when this order may not go, else None.
 
         Exits are never asked: a reduce-only order, and on spot a SELL (spot
         has no short, so a sell can only reduce a held long)."""
-        if self._entry_gate is None or reduce_only:
+        if self.entry_gate is None or reduce_only:
             return None
         if self.is_spot and direction == "Sell":
             return None
         try:
-            allowed, reason = self._entry_gate()
+            allowed, reason = self.entry_gate()
         except Exception as exc:  # noqa: BLE001 - an unreadable gate is closed
             return f"ENTRY_GATE_REFUSED: gate unreadable ({exc!r})"
         if allowed is not True:

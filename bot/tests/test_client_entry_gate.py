@@ -100,9 +100,11 @@ def test_a_client_without_a_gate_behaves_as_before(client, exchange):
     assert client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001).ok is True
 
 
-def test_a_gate_that_is_not_callable_is_refused_at_assignment(client):
-    with pytest.raises(TypeError):
-        client.entry_gate = "yes"
+def test_a_gate_that_is_not_callable_refuses_every_entry(client, exchange):
+    client.entry_gate = "yes"
+    r = client.place_order(symbol="BTCUSDT", side="Buy", qty=0.001)
+    assert r.ok is False and r.reason.startswith("ENTRY_GATE_REFUSED")
+    assert exchange.orders == {}
 
 
 def test_the_refusal_happens_before_any_network_or_ledger_effect(client, exchange, store):
