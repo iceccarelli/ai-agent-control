@@ -124,3 +124,98 @@ def test_a_restored_engine_names_the_same_cycle():
                          persist=lambda s: None)
     reborn.restore(engine.to_state())
     assert reborn.position.cycle_id == engine.position.cycle_id
+
+
+# -- collisions, repeats, partial fills, aborted attempts ----------------------------
+
+def test_two_cycles_given_the_same_name_stay_two_cycles():
+    j = L.Journal()
+    j.begin_cycle("cyc-5")
+    one_cycle(j, 0, "a")
+    j.begin_cycle("cyc-5")                        # same millisecond, later cycle
+    one_cycle(j, 5, "b")
+    ids = [e.cycle for e in j.entries]
+    assert len(set(ids[:4])) == 1 and len(set(ids[4:])) == 1
+    assert ids[0] != ids[4]
+    assert ids[0] == "cyc-5" and ids[4] == "cyc-5-2"
+
+
+def test_collisions_are_resolved_the_same_way_on_a_replay():
+    j = L.Journal()
+    j.begin_cycle("cyc-5"); one_cycle(j, 0, "a")
+    j.begin_cycle("cyc-5"); one_cycle(j, 5, "b")
+    legacy = [{k: v for k, v in r.items() if k != "cycle"} for r in j.to_rows()]
+    again = L.Journal.from_rows(legacy)
+    assert len({e.cycle for e in again.entries}) == 2
+    assert [e.cycle for e in L.Journal.from_rows(j.to_rows()).entries] == \
+        [e.cycle for e in j.entries]
+
+
+def test_naming_the_open_cycle_again_does_not_split_it():
+    j = L.Journal()
+    j.begin_cycle("cyc-7")
+    L.perp_open(j, ms=T0, ref="o1", qty=0.5, price=100_000.0, fee_usd=10.0,
+                fee_status="confirmed")
+    j.begin_cycle("cyc-7")                        # the engine names it again
+    L.perp_open(j, ms=T0 + 1, ref="o2", qty=0.5, price=100_000.0, fee_usd=10.0,
+                fee_status="confirmed")
+    L.funding(j, ms=T0 + DAY, ref="f", usd=3.0, basis="venue")
+    L.perp_close(j, ms=T0 + 2 * DAY, ref="c", qty=1.0, price=100_000.0,
+                 entry_price=100_000.0, fee_usd=20.0, fee_status="confirmed")
+    assert {e.cycle for e in j.entries} == {"cyc-7"}
+
+
+def test_additional_and_partial_fills_stay_in_one_cycle():
+    j = L.Journal()
+    L.spot_buy(j, ms=T0, ref="s1", qty=0.4, price=100_000.0, fee_btc=0.0004,
+               fee_status="confirmed")
+    L.perp_open(j, ms=T0 + 1, ref="o1", qty=0.3996, price=100_000.0, fee_usd=5.0,
+                fee_status="confirmed")
+    L.spot_buy(j, ms=T0 + 2, ref="s2", qty=0.6, price=100_000.0, fee_btc=0.0006,
+               fee_status="confirmed")
+    L.perp_open(j, ms=T0 + 3, ref="o2", qty=0.5994, price=100_000.0, fee_usd=5.0,
+                fee_status="confirmed")
+    L.perp_close(j, ms=T0 + DAY, ref="c1", qty=0.5, price=100_000.0,
+                 entry_price=100_000.0, fee_usd=5.0, fee_status="confirmed")
+    L.perp_close(j, ms=T0 + DAY + 1, ref="c2", qty=0.4990, price=100_000.0,
+                 entry_price=100_000.0, fee_usd=5.0, fee_status="confirmed")
+    assert len({e.cycle for e in j.entries}) == 1
+
+
+def test_a_failed_attempt_is_its_own_closed_cycle_and_its_fees_are_counted():
+    """Spot bought, perp never opened, spot sold back: a round trip of fees for
+    nothing. It must not stay 'open' forever or vanish from the net."""
+    j = L.Journal()
+    j.begin_cycle("cyc-10")
+    L.spot_buy(j, ms=T0, ref="s", qty=1.0, price=100_000.0, fee_btc=0.001,
+               fee_status="confirmed")
+    L.spot_sell(j, ms=T0 + 60_000, ref="ss", qty=0.999, price=100_000.0,
+                cost_basis=100_000.0, fee_usd=55.0, fee_status="confirmed")
+    j.begin_cycle("cyc-11")
+    one_cycle(j, 1, "real")
+    cycles = perf.cycles_from_journal(j)
+    assert [c["cycle_id"] for c in cycles] == ["cyc-10", "cyc-11"]
+    aborted, real = cycles
+    assert aborted["outcome"] == "ABORTED_BEFORE_HEDGE" and aborted["closed"]
+    assert real["outcome"] == "CLOSED"
+    assert aborted["fees_usd"] == pytest.approx(100.0 + 55.0)   # 0.001 BTC fee + sale fee
+    s = perf.summarise(cycles)
+    assert s["aborted_cycles"] == 1 and s["closed_cycles"] == 2
+    assert s["net_usd_confirmed"] == pytest.approx(
+        aborted["net_usd"] + real["net_usd"])
+    assert s["fees_usd"] == pytest.approx(aborted["fees_usd"] + real["fees_usd"])
+    assert s["peak_notional_usd"] == pytest.approx(100_000.0)   # only the hedged one
+
+
+def test_an_attempt_still_holding_spot_is_open_not_aborted():
+    j = L.Journal()
+    L.spot_buy(j, ms=T0, ref="s", qty=1.0, price=100_000.0, fee_btc=0.001,
+               fee_status="confirmed")
+    c = perf.cycles_from_journal(j)[0]
+    assert c["outcome"] == "OPEN" and not c["closed"]
+
+
+def test_a_suffixed_cycle_id_still_maps_to_its_observations():
+    assert perf._cycle_ms("cyc-1700000000000") == 1700000000000
+    assert perf._cycle_ms("cyc-1700000000000-2") == 1700000000000
+    assert perf._cycle_ms("junk") is None

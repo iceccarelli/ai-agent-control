@@ -45,6 +45,12 @@ MARGIN_NOTE = ("margin committed comes from the venue's initial margin as "
                "computed from a guess; returns are on notional")
 
 
+CAPITAL_BASIS = ("peak single-cycle committed capital (observed venue margin + "
+                 "the spot leg); capital is reused between sequential cycles, so "
+                 "the period figure is net over the period divided by the "
+                 "largest amount tied up at once, not an account-level return")
+
+
 def _notional_of(entry: Any) -> Optional[float]:
     m = _SHORT_MEMO.match(entry.memo or "")
     if not m:
@@ -65,16 +71,32 @@ def _basis(fee_statuses: List[str], bases: List[str]) -> str:
 
 def _finish(cur: Dict[str, Any]) -> Dict[str, Any]:
     first, last = cur["first_open_ms"], cur["last_close_ms"]
-    cur["closed"] = bool(cur["perp_closed"])
-    cur["hold_days"] = (None if first is None or last is None or not cur["closed"]
-                        else (last - first) / DAY_MS)
+    hedged = first is not None
+    if hedged and cur["perp_closed"]:
+        cur["outcome"] = "CLOSED"
+    elif (not hedged and cur["spot_cost_usd"] > 0 and cur["spot_sold"]
+          and abs(cur["spot_qty"]) <= L.DUST[L.BTC]):
+        # Spot bought, the perp leg never landed, spot sold back flat: a round
+        # trip of fees for nothing. It is a result, not an open position.
+        cur["outcome"] = "ABORTED_BEFORE_HEDGE"
+    else:
+        cur["outcome"] = "OPEN"
+    cur["closed"] = cur["outcome"] != "OPEN"
+    if cur["outcome"] == "CLOSED":
+        cur["end_ms"] = last
+        cur["hold_days"] = (last - first) / DAY_MS
+    elif cur["outcome"] == "ABORTED_BEFORE_HEDGE":
+        cur["end_ms"] = cur["last_ms"]
+        cur["hold_days"] = (cur["last_ms"] - cur["start_ms"]) / DAY_MS
+    else:
+        cur["end_ms"], cur["hold_days"] = None, None
     cur["net_usd"] = (cur["funding_usd"] - cur["fees_usd"] - cur["borrow_usd"]
                       + cur["realised_usd"])
-    cur["notional_usd"] = (None if cur["notional_unknown"]
+    cur["notional_usd"] = (None if not hedged or cur["notional_unknown"]
                            or cur["notional_usd"] <= 0 else cur["notional_usd"])
     cur["basis"] = _basis(cur.pop("_fee_statuses"), cur.pop("_bases"))
     for key in ("perp_closed", "notional_unknown", "first_open_ms",
-                "last_close_ms", "perp_qty"):
+                "last_close_ms", "perp_qty", "spot_qty", "spot_sold", "last_ms"):
         cur.pop(key, None)
     return cur
 
@@ -91,13 +113,15 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
         cur = by_id.get(e.cycle)
         if cur is None:
             cur = by_id[e.cycle] = {
-                "cycle_id": e.cycle, "start_ms": e.ms, "funding_usd": 0.0,
-                "fees_usd": 0.0, "borrow_usd": 0.0, "realised_usd": 0.0,
-                "notional_usd": 0.0, "notional_unknown": False,
-                "perp_closed": False, "perp_qty": 0.0, "spot_cost_usd": 0.0,
-                "first_open_ms": None,
+                "cycle_id": e.cycle, "start_ms": e.ms, "last_ms": e.ms,
+                "funding_usd": 0.0, "fees_usd": 0.0, "borrow_usd": 0.0,
+                "realised_usd": 0.0, "notional_usd": 0.0,
+                "notional_unknown": False, "perp_closed": False,
+                "perp_qty": 0.0, "spot_cost_usd": 0.0, "spot_qty": 0.0,
+                "spot_sold": False, "first_open_ms": None,
                 "last_close_ms": None, "_fee_statuses": [], "_bases": []}
             order.append(e.cycle)
+        cur["last_ms"] = e.ms
         for line in e.lines:
             if line.account == L.FUNDING:
                 cur["funding_usd"] += -line.usd
@@ -109,6 +133,10 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 cur["realised_usd"] += -line.usd
             elif line.account == L.PERP:
                 cur["perp_qty"] += line.qty
+            elif line.account == L.BTC and e.kind in ("spot_buy", "spot_sell"):
+                cur["spot_qty"] += line.qty
+        if e.kind == "spot_sell":
+            cur["spot_sold"] = True
         if e.fee_status:
             cur["_fee_statuses"].append(e.fee_status)
         if e.basis:
@@ -131,8 +159,10 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
 
 
 def _cycle_ms(cycle_id: str) -> Optional[int]:
-    prefix, _, tail = str(cycle_id).partition("-")
-    return int(tail) if prefix == "cyc" and tail.isdigit() else None
+    """The open timestamp inside a `cyc-<ms>` or `cyc-<ms>-<n>` id."""
+    parts = str(cycle_id).split("-")
+    return int(parts[1]) if len(parts) >= 2 and parts[0] == "cyc" \
+        and parts[1].isdigit() else None
 
 
 def attach_capital(cycles: Sequence[Dict[str, Any]],
@@ -165,16 +195,23 @@ def attach_capital(cycles: Sequence[Dict[str, Any]],
         c["capital_committed_usd"] = (
             None if c["margin_committed_usd"] is None or c["spot_leg_usd"] is None
             else c["margin_committed_usd"] + c["spot_leg_usd"])
+        c["return_on_committed_capital_pct"] = (
+            100.0 * c["net_usd"] / c["capital_committed_usd"]
+            if c["closed"] and c["outcome"] == "CLOSED"
+            and c["capital_committed_usd"] else None)
 
 
 def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     closed = [c for c in cycles if c["closed"]]
     s: Dict[str, Any] = {
         "closed_cycles": len(closed),
+        "aborted_cycles": sum(1 for c in closed
+                              if c["outcome"] == "ABORTED_BEFORE_HEDGE"),
         "open_cycles": len(cycles) - len(closed),
         "margin_committed_usd": None, "margin_note": MARGIN_NOTE,
         "peak_capital_committed_usd": None,
-        "return_on_committed_capital_pct": None,
+        "period_return_on_peak_capital_pct": None, "period_days": None,
+        "capital_basis": CAPITAL_BASIS,
         "slippage_note": ("decision-time marks are not journalled, so fill "
                           "slippage is not computed here; fees are the venue's"),
     }
@@ -199,7 +236,8 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     s["gross_before_costs_usd"] = s["funding_usd"] + s["price_leg_usd"]
     s["fees_pct_of_funding"] = (100.0 * s["fees_usd"] / s["funding_usd"]
                                 if s["funding_usd"] > 0 else None)
-    notionals = [c["notional_usd"] for c in closed]
+    hedged = [c for c in closed if c["outcome"] == "CLOSED"]
+    notionals = [c["notional_usd"] for c in hedged]
     peak = (max(notionals) if notionals and all(n is not None for n in notionals)
             else None)
     s["peak_notional_usd"] = peak
@@ -223,13 +261,17 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     s["best_cycle_share_of_winning_net_pct"] = (
         100.0 * wins[0] / sum(wins) if wins else None)
     s["mean_hold_days"] = days / len(closed)
-    margins = [c["margin_committed_usd"] for c in closed
+    margins = [c["margin_committed_usd"] for c in hedged
                if c.get("margin_committed_usd") is not None]
     s["margin_committed_usd"] = max(margins) if margins else None
-    caps = [c.get("capital_committed_usd") for c in closed]
+    ends = [c["end_ms"] for c in closed if c.get("end_ms") is not None]
+    starts = [c["start_ms"] for c in closed]
+    s["period_days"] = ((max(ends) - min(starts)) / DAY_MS
+                        if ends and starts else None)
+    caps = [c.get("capital_committed_usd") for c in hedged]
     if caps and all(c is not None for c in caps):
         s["peak_capital_committed_usd"] = max(caps)
-        s["return_on_committed_capital_pct"] = 100.0 * total_net / max(caps)
+        s["period_return_on_peak_capital_pct"] = 100.0 * total_net / max(caps)
     return s
 
 
@@ -265,7 +307,8 @@ def load_observations(db_path: str) -> List[Dict[str, Any]]:
 
 def report_lines(cycles: Sequence[Dict[str, Any]], s: Dict[str, Any]) -> List[str]:
     f = lambda v, p="{:,.2f}": "n/a" if v is None else p.format(v)  # noqa: E731
-    lines = [f"cycles: {s['closed_cycles']} closed, {s['open_cycles']} open "
+    lines = [f"cycles: {s['closed_cycles']} closed ({s['aborted_cycles']} "
+             f"aborted before the hedge), {s['open_cycles']} open "
              f"({s['provisional_cycles']} closed but provisional)"]
     if s["status"] == "NO_CLOSED_CYCLES":
         lines.append("no closed cycle: no performance figure exists yet")
@@ -285,12 +328,13 @@ def report_lines(cycles: Sequence[Dict[str, Any]], s: Dict[str, Any]) -> List[st
             f"rate {f(100 * s['win_rate'], '{:.0f}')}%  best winner = "
             f"{f(s['best_cycle_share_of_winning_net_pct'], '{:.1f}')}% of "
             f"winning net  mean hold {f(s['mean_hold_days'], '{:.1f}')} days"]
-    if s.get("return_on_committed_capital_pct") is not None:
+    if s.get("period_return_on_peak_capital_pct") is not None:
         lines.append(
             f"committed capital (venue margin + spot leg), peak "
-            f"${f(s['peak_capital_committed_usd'])}; return on it "
-            f"{f(s['return_on_committed_capital_pct'])}% (peak margin "
-            f"${f(s['margin_committed_usd'])})")
+            f"${f(s['peak_capital_committed_usd'])}; period net / that peak "
+            f"{f(s['period_return_on_peak_capital_pct'])}% over "
+            f"{f(s['period_days'], '{:.1f}')} calendar days (peak margin "
+            f"${f(s['margin_committed_usd'])}); {s['capital_basis']}")
     else:
         lines.append("committed capital: not available (no observed venue margin "
                      "for every closed cycle); no return on capital is shown")
