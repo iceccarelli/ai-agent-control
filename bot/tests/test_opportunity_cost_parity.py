@@ -367,3 +367,33 @@ def test_the_replay_engine_decides_with_the_same_gate():
     assert mid["net_after_opportunity_cost_usd"] == pytest.approx(
         mid["net_usd"] + mid["opportunity_cost_usd"])
     assert mid["ledger_agrees"] is True
+
+
+def test_the_thirty_day_assumption_cannot_approve_in_any_implementation(native):
+    """The headline requirement, on every path that decides an entry: 0.3 bps
+    per 8h clears the round trip amortised over ASSUMED_HOLD_DAYS (30) but
+    needs 37 settlements against the 17 a DEMONSTRATED_HOLD_DAYS hold has.
+    The Python gate, the runtime engine, the replay (the engine driven by
+    main.tick's sequence), the Python simulator and the C++ core all refuse,
+    for the same reason."""
+    import carry_replay as cr
+    reason = "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD"
+    assert cc.evaluate_entry(funding_prints_bps=[0.3] * 5, perp=SPOT,
+                             spot=SPOT, borrow_apr=0.0,
+                             round_trip_bps=11.0).allowed
+    assert python_gate([0.3] * 5, SPOT, 0.0, 11.0, 0.0) == (False, reason)
+    assert runtime_gate([0.3] * 5, SPOT, 0.0, 11.0, 0.0) == (False, reason)
+    assert cpp_gate([0.3] * 5, SPOT, 0.0, 11.0, 0.0) == (False, reason)
+    rows = _constant_rows(0.3, n=14)
+    replayed = cr.replay(rows, notional=1_000.0, borrow_apr=0.0)
+    assert replayed["trades"] == 0
+    assert replayed["reasons"].get(reason, 0) > 0
+    sim = cb.simulate_settlements_series(rows, borrow_apr=0.0, gated=True,
+                                         mode=cb.OVERLAY)
+    assert sim["trades"] == 0 and sim["refusals"].get(reason, 0) > 0
+    p = core.params(borrow_apr=0.0, gated=True, overlay=True,
+                    round_trip_bps=11.0)
+    cpp = core.simulate(rows, p)
+    assert cpp["trades"] == 0
+    assert cpp["refusals_by_reason"][cc.GATE_REASONS.index(reason)] == \
+        sim["refusals"][reason]

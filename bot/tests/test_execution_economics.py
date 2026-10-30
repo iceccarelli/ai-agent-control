@@ -121,6 +121,9 @@ def test_the_report_is_labelled_a_sensitivity_and_changes_nothing():
     assert r["measured_fill_data_used"] is False
     assert r["production_execution_style_changed"] is False
     assert "NOT A MEASUREMENT" in r["label"]
+    # the engine never rests an exit; the report must not imply it does
+    assert r["production_exit_style"] == "taker_always"
+    assert r["exit_leg_is_hypothetical"] is True
     rt = r["round_trip"]
     assert rt["taker_bps"] == pytest.approx(11.0)
     assert rt["maker_first_saving_bps"] == pytest.approx(

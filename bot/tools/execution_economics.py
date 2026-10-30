@@ -219,6 +219,11 @@ def compare(entry: LegAssumptions, exit_: LegAssumptions, *,
         "measured_fill_data_used": False,
         "production_execution_style_changed": False,
         "execution_mode": "overlay",
+        # carry_engine: only the two ENTRY paths may rest (patient=True);
+        # every exit crosses at once whatever execution_style says. The exit
+        # leg here is therefore a hypothetical the engine does not run.
+        "production_exit_style": "taker_always",
+        "exit_leg_is_hypothetical": True,
         "legs": legs,
         "round_trip": {
             "taker_bps": taker_rt, "maker_first_bps": maker_rt,
