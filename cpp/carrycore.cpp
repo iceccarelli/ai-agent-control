@@ -28,6 +28,7 @@ struct Trade {
     double entry_spot = 0.0, entry_perp = 0.0;
     double exit_spot = 0.0, exit_perp = 0.0;
     double funding = 0.0, fees = 0.0, borrow = 0.0, impact = 0.0;
+    double opportunity = 0.0;   /* not in net(): reported beside it */
     int64_t opened_ms = 0, closed_ms = 0;
     double max_adverse_pct = 0.0;
     bool open_at_end = false;
@@ -69,10 +70,11 @@ double round_dp(double x, int digits) {
 
 /* carry_costs._invalid_cost_inputs. */
 bool cost_inputs_valid(double round_trip_bps, double hold_days,
-                       double borrow_apr) {
+                       double borrow_apr, double opportunity_cost_apr) {
     return std::isfinite(round_trip_bps) && round_trip_bps > 0.0 &&
            std::isfinite(hold_days) && hold_days > 0.0 &&
-           std::isfinite(borrow_apr) && borrow_apr >= 0.0;
+           std::isfinite(borrow_apr) && borrow_apr >= 0.0 &&
+           std::isfinite(opportunity_cost_apr) && opportunity_cost_apr >= 0.0;
 }
 
 /* carry_costs.hold_clears_round_trip, after evaluate_entry has allowed: does
@@ -80,10 +82,13 @@ bool cost_inputs_valid(double round_trip_bps, double hold_days,
    `smoothed` is finite and positive here. */
 bool hold_clears(double smoothed, const CarryParams &p) {
     const double borrow_per_day = (p.borrow_apr / 365.0) * 1e4;
+    const double opportunity_per_day = (p.opportunity_cost_apr / 365.0) * 1e4;
+    /* borrow first, then opportunity: carry_costs.hold_clears_round_trip */
+    const double capital_per_day = borrow_per_day + opportunity_per_day;
     const double budget = std::floor(round_dp(
         p.demonstrated_hold_days * kFundingPeriodsPerDay, 9));
     const double net =
-        round_dp(smoothed - borrow_per_day / kFundingPeriodsPerDay, 12);
+        round_dp(smoothed - capital_per_day / kFundingPeriodsPerDay, 12);
     if (net <= 0.0) return false;           /* never clears                  */
     const double needed =
         std::max(1.0, std::ceil(round_dp(p.round_trip_bps / net, 9)));
@@ -96,7 +101,8 @@ int gate_reason(const double *history, int count, double perp, double spot,
                 const CarryParams &p) {
     /* carry_costs._invalid_cost_inputs: a NaN, a missing or non-positive
        round trip / hold, or a negative borrow is refused, not priced. */
-    if (!cost_inputs_valid(p.round_trip_bps, p.hold_days, p.borrow_apr)) {
+    if (!cost_inputs_valid(p.round_trip_bps, p.hold_days, p.borrow_apr,
+                           p.opportunity_cost_apr)) {
         return CARRY_GATE_COST_INPUT_INVALID;
     }
     double smoothed = 0.0;
@@ -107,9 +113,12 @@ int gate_reason(const double *history, int count, double perp, double spot,
 
     const double carry_per_day = smoothed * kFundingPeriodsPerDay;
     const double borrow_per_day = (p.borrow_apr / 365.0) * 1e4;
+    const double opportunity_per_day = (p.opportunity_cost_apr / 365.0) * 1e4;
     const double round_trip_per_day =
         p.round_trip_bps / std::max(p.hold_days, 1e-9);
-    const double net_edge = carry_per_day - borrow_per_day - round_trip_per_day;
+    /* carry_costs.evaluate_entry, term for term and in its order */
+    const double net_edge = carry_per_day - borrow_per_day -
+                            opportunity_per_day - round_trip_per_day;
 
     /* carry_costs.basis_bps raises for a non-finite or non-positive price. */
     if (!(std::isfinite(perp) && std::isfinite(spot)) || spot <= 0.0 ||
@@ -129,8 +138,15 @@ int gate_reason(const double *history, int count, double perp, double spot,
     /* The hold check. A demonstrated hold that is not a positive number
        refuses (hold_clears_round_trip answers COST_INPUT_INVALID). */
     if (!cost_inputs_valid(p.round_trip_bps, p.demonstrated_hold_days,
-                           p.borrow_apr) ||
+                           p.borrow_apr, p.opportunity_cost_apr) ||
         !std::isfinite(p.demonstrated_hold_days * kFundingPeriodsPerDay)) {
+        return CARRY_GATE_COST_INPUT_INVALID;
+    }
+    /* carry_costs.hold_clears_round_trip: a per-day borrow, or borrow plus
+       opportunity, that overflows is refused rather than compared. */
+    if (!std::isfinite((p.borrow_apr / 365.0) * 1e4) ||
+        !std::isfinite((p.borrow_apr / 365.0) * 1e4 +
+                       (p.opportunity_cost_apr / 365.0) * 1e4)) {
         return CARRY_GATE_COST_INPUT_INVALID;
     }
     if (!hold_clears(smoothed, p)) {
@@ -156,6 +172,8 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
     int history_len = 0;
 
     const double per_print_borrow = p.borrow_apr / (365.0 * kFundingPeriodsPerDay);
+    const double per_print_opportunity =
+        p.opportunity_cost_apr / (365.0 * kFundingPeriodsPerDay);
     const double spot_legs = p.overlay ? 0.0 : 1.0;
     const int window = std::min(p.funding_history > 0 ? p.funding_history : 8,
                                 kMaxHistory);
@@ -226,6 +244,7 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
             if (exit_fill_at == i) funding = std::min(funding, 0.0);
             live.funding += funding;
             live.borrow += per_print_borrow * live.qty * st.spot;
+            live.opportunity += per_print_opportunity * live.qty * st.spot;
             live.max_adverse_pct = std::max(
                 live.max_adverse_pct, 100.0 * (st.perp_high / live.entry_perp - 1.0));
             if (exit_fill_at == i) {
@@ -290,6 +309,7 @@ extern "C" int carry_simulate(const CarrySettlement *rows, int32_t n,
         r.fees += t.fees;
         r.borrow += t.borrow;
         r.impact += t.impact;
+        r.opportunity += t.opportunity;
         r.net += t.net();
         r.days_in_market +=
             static_cast<double>(t.closed_ms - t.opened_ms) / 86400000.0;
@@ -379,4 +399,4 @@ extern "C" int32_t carry_sweep(const CarrySettlement *rows, int32_t n,
     return total;
 }
 
-extern "C" const char *carrycore_version(void) { return "carrycore/4 (latency, cost-input gate, hold gate)"; }
+extern "C" const char *carrycore_version(void) { return "carrycore/5 (latency, cost-input gate, hold gate, opportunity cost)"; }

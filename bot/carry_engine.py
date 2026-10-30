@@ -608,7 +608,8 @@ class CarryEngine:
                  require_liquidation_check: bool = False,
                  risk_observer: Any = None,
                  leverage: Any = 1.0,
-                 require_capital_check: bool = False) -> None:
+                 require_capital_check: bool = False,
+                 opportunity_cost_apr: Any = 0.0) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -672,6 +673,19 @@ class CarryEngine:
         self.position: Optional[CarryPosition] = None
         self.state = BookState.FLAT
         self.borrow_apr = float(borrow_apr)
+        #: The forgone return on the hedged capital, per year, charged by the
+        #: entry gate beside borrow (carry_costs.DEFAULT_OPPORTUNITY_COST_APR).
+        #: 0.0 by default, which is the earlier gate to the bit. Zero borrow is
+        #: not zero capital cost, but this repository has no rate to charge,
+        #: so the number is the OPERATOR's: build_bot passes it when config
+        #: carries one. A value the gate cannot price (negative, NaN, inf) is
+        #: refused at construction - a silently refused book is a mystery.
+        if isinstance(opportunity_cost_apr, bool) or not self._finite(
+                opportunity_cost_apr) or float(opportunity_cost_apr) < 0:
+            raise ValueError(
+                f"opportunity_cost_apr={opportunity_cost_apr!r}: the forgone "
+                "return on the hedged capital must be a finite number >= 0")
+        self.opportunity_cost_apr = float(opportunity_cost_apr)
         #: Set by build_bot. Consulted in _open BEFORE the first leg goes out,
         #: because a gate that runs after one leg has landed is not a gate, it
         #: is a post-mortem.
@@ -1141,19 +1155,30 @@ class CarryEngine:
         verdict = _costs().entry_gate(
             funding_prints_bps=self._funding_history,
             perp=mark, spot=spot, borrow_apr=self.borrow_apr,
-            round_trip_bps=round_trip)
+            round_trip_bps=round_trip,
+            opportunity_cost_apr=self.opportunity_cost_apr)
         if not verdict:
             return EntryEconomics(round_trip, verdict, CarryDecision(
                 "stand_aside", reason=verdict.reason, state=BookState.FLAT,
                 detail={"funding_bps": funding_bps,
                         "smoothed_bps": verdict.smoothed_funding_bps,
                         "entry_basis_bps": verdict.entry_basis_bps,
-                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day}))
+                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day,
+                        # Observability only (carry_costs.decision_audit):
+                        # nothing decides on it.
+                        "entry_audit": (verdict.detail or {}).get("audit")}))
         return EntryEconomics(round_trip, verdict, None)
 
     # -- the loop ---------------------------------------------------------
 
-    def _drop_history_the_clock_disproves(self, now_ms: int) -> bool:
+    #: The stamp of a print discarded as STALE by the tick clock. Nothing at or
+    #: before it can be a new settlement: it was seen, and booked, already.
+    #: Without this the cleared watermark let the same stale print read as
+    #: new on every tick (booked again, streak moved again). Process memory
+    #: only: a restart re-derives everything through cold start.
+    _stale_print_floor_ms: Optional[int] = None
+
+    def _drop_history_the_clock_disproves(self, now_ms: int) -> Optional[str]:
         """Discard a funding history whose newest stamp the tick clock refutes.
 
         Two shapes, both judged on the thresholds the code already owns:
@@ -1161,22 +1186,33 @@ class CarryEngine:
         and no tick carried a print to say so), and one stamped in the future
         (a corrupt ledger stamp would make every real print read as a replay
         and freeze the history). `now_ms` is 0 when the caller has no clock;
-        then nothing can be judged. True when it discarded.
+        then nothing can be judged. Returns "stale" or "future" when it
+        discarded (truthy), None when it did not.
+
+        Only a FUTURE watermark may make an older print new again: a real
+        print is older than a corrupt future stamp. A STALE watermark was a
+        real settlement, so it becomes `_stale_print_floor_ms` and a print
+        stamped at or before it is never new.
         """
         last = self._last_print_ms
         if now_ms <= 0 or last is None or not self._funding_history:
-            return False
+            return None
         from market_snapshot import MAX_CLOCK_SKEW_S
-        if (now_ms - last > self.MAX_PRINT_GAP_MS
-                or last - now_ms > MAX_CLOCK_SKEW_S * 1000.0):
+        stale = now_ms - last > self.MAX_PRINT_GAP_MS
+        if stale or last - now_ms > MAX_CLOCK_SKEW_S * 1000.0:
             logger.warning(
                 "carry: newest funding print is stamped %d, the tick is %d; "
                 "discarding %d prints that cannot be placed in time",
                 last, now_ms, len(self._funding_history))
             self._funding_history = []
             self._last_print_ms = None
-            return True
-        return False
+            if stale:
+                self._stale_print_floor_ms = max(
+                    last, self._stale_print_floor_ms or last)
+                return "stale"
+            self._stale_print_floor_ms = None
+            return "future"
+        return None
 
     def on_candle(self, *, mark: float, funding_bps: float,
                   spot: Optional[float] = None,
@@ -1226,12 +1262,16 @@ class CarryEngine:
                     and self._finite(funding_bps)
                     and self._finite(funding_print_ms)
                     and (self._last_print_ms is None
-                         or int(funding_print_ms) > self._last_print_ms))
+                         or int(funding_print_ms) > self._last_print_ms)
+                    and (self._stale_print_floor_ms is None
+                         or int(funding_print_ms) > self._stale_print_floor_ms))
 
         new_print = is_new()
-        # No new print to date the history by: the tick clock has to.
+        # No new print to date the history by: the tick clock has to. Only a
+        # FUTURE watermark can make the print in hand new; after a STALE one
+        # the print in hand is the stale settlement itself, already booked.
         if not new_print and self._drop_history_the_clock_disproves(
-                int(timestamp_ms or 0)):
+                int(timestamp_ms or 0)) == "future":
             new_print = is_new()
         if new_print:
             # The history is rates without stamps. If a settlement was missed
@@ -1356,7 +1396,14 @@ class CarryEngine:
         if econ.refusal is not None:
             return econ.refusal
 
-        return self._open(mark, spot, funding_bps, timestamp_ms)
+        decision = self._open(mark, spot, funding_bps, timestamp_ms)
+        # The arithmetic the APPROVAL rested on, beside whatever _open did with
+        # it (opened, refused by a later gate, halted). Attached after the
+        # fact; it cannot change what was decided.
+        if isinstance(decision.detail, dict) and econ.verdict is not None:
+            decision.detail.setdefault(
+                "entry_audit", (econ.verdict.detail or {}).get("audit"))
+        return decision
 
     # -- actions ----------------------------------------------------------
 
