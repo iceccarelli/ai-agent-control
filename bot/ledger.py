@@ -1356,6 +1356,9 @@ class LedgerBroker:
     def get_liquidation_view(self, symbol):
         return self.inner.get_liquidation_view(symbol)
 
+    def get_available_margin_usd(self):
+        return self.inner.get_available_margin_usd()
+
     def get_closed_short_qty_since(self, symbol, since_ms):
         return self.inner.get_closed_short_qty_since(symbol, since_ms)
 

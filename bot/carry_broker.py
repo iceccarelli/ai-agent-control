@@ -1382,6 +1382,27 @@ class CarryBroker:
                 "margin_mode": margin_mode, "position_im_usd": im_usd,
                 "reason": ""}
 
+    def get_available_margin_usd(self) -> float:
+        """What the unified account has free to fund NEW positions, in USD
+        (`totalAvailableBalance`). Raises unless the venue states a finite,
+        non-negative number: an unreadable balance is not an empty one, and
+        not an infinite one either."""
+        result = self.client._request(
+            "GET", "/v5/account/wallet-balance", signed=True,
+            params={"accountType": "UNIFIED"})
+        rows = self._v5_list(result)
+        if not rows or not isinstance(rows[0], dict):
+            raise PairIncident("wallet balance unreadable; available margin unknown")
+        row = rows[0]
+        if isinstance(row.get("totalAvailableBalance"), bool):
+            raise PairIncident("totalAvailableBalance is a boolean, not a number")
+        value = self._stated(row, "totalAvailableBalance", "wallet account row")
+        if value < 0:
+            raise PairIncident(
+                f"totalAvailableBalance is {value}; a negative balance is not "
+                "a readable one")
+        return value
+
     @staticmethod
     def _optional_margin(row: Dict[str, Any]) -> Optional[float]:
         """The venue's initial margin for the position, for the RECORD only.
