@@ -23,6 +23,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -71,7 +72,11 @@ def kill_switch_state(db_path: str) -> Tuple[bool, str]:
         row = con.execute("SELECT engaged, reason FROM kill_switch LIMIT 1").fetchone()
         con.close()
     except Exception as exc:  # noqa: BLE001
-        return False, f"unreadable ({exc})"
+        # A state db that exists but cannot be read says nothing about the
+        # kill switch, and "nothing" must not read as "clear": it used to
+        # return False here and the preflight passed SANDBOX_OK.
+        return True, f"state db unreadable ({type(exc).__name__}); the kill " \
+                     "switch state is unknown"
     if not row:
         return False, "no row"
     return bool(row[0]), str(row[1] or "")
@@ -141,7 +146,24 @@ def gate_dict(repo: str) -> Dict[str, Any]:
         return {"allows_live": False, "error": f"gate unreadable ({exc}); REFUSE"}
 
 
-def run(repo: str, env: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
+def forward_status_dict(path: Optional[str], now: float) -> Dict[str, Any]:
+    """`forward_status` facts about the ladder's artefact: its age, freshness
+    and a machine-derived state. Facts only - never a gate decision."""
+    if path is None:
+        return {"state": "NO_DATA", "evidence_state": "NO_DATA", "path": None,
+                "reasons": ["no forward-shadow artefact in artifacts/"],
+                "is_gate_decision": False}
+    try:
+        import forward_status as fs
+        return fs.evaluate_forward_evidence(path, now=now).as_dict()
+    except Exception as exc:  # noqa: BLE001
+        return {"state": "UNREADABLE", "path": path,
+                "reasons": [f"forward_status failed ({type(exc).__name__})"],
+                "is_gate_decision": False}
+
+
+def run(repo: str, env: Dict[str, str],
+        now: Optional[float] = None) -> Tuple[int, Dict[str, Any]]:
     verdict, reasons = preflight(env, repo)
     report: Dict[str, Any] = {
         "tool": "operator_paper_daily", "one_shot": True, "daemon": False,
@@ -155,6 +177,10 @@ def run(repo: str, env: Dict[str, str]) -> Tuple[int, Dict[str, Any]]:
     report["promotion_gate"] = gate_dict(repo)
     newest = newest_shadow_artifact(repo)
     report["ladder"] = read_ladder(newest) if newest else {"artifact": None}
+    # The ladder above is whatever the artefact says, however old. This says
+    # how old, and whether its trades support any reading at all.
+    report["forward_status"] = forward_status_dict(
+        newest, time.time() if now is None else float(now))
     try:
         import config as _config
         allowed, why = _config.is_live_authorized(_config.load(env))
@@ -176,7 +202,18 @@ def three_lines(report: Dict[str, Any]) -> str:
         f"ladder(setups/flags/eligible/candidates/entries/CLOSED)={ladder} "
         f"n_trades={lad.get('forward_n_trades')} mean_net_r={lad.get('forward_mean_net_r')} "
         f"closer_to_autonomous_profit_agent=False",
+        _forward_line(report.get("forward_status") or {}),
     ])
+
+
+def _forward_line(fs: Dict[str, Any]) -> str:
+    age = fs.get("age_s")
+    age_txt = "?" if not isinstance(age, (int, float)) else f"{age / 3600.0:.1f}h"
+    return (f"forward_state={fs.get('state', 'n/a')} "
+            f"evidence={fs.get('evidence_state', 'n/a')} "
+            f"observed_at={fs.get('observed_at_utc')} age={age_txt} "
+            f"trades={fs.get('trades_vs_gate', '?')} days={fs.get('days_vs_gate', '?')} "
+            "(facts, not a gate decision)")
 
 
 def main(argv=None) -> int:

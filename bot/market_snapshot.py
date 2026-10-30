@@ -61,6 +61,15 @@ MAX_CLOCK_SKEW_S = 30.0
 #: engine's funding history describes a market the venue has moved past.
 FUNDING_INTERVAL_MS = 8 * 3600 * 1000
 
+#: The legs of one snapshot are read one after another. If the first and the
+#: last of them are further apart than this, they do not describe one instant
+#: and the basis between them carries that much price drift (the module
+#: docstring's forty-second example). 10s is twice Bybit's own recv_window
+#: default (5s): a single slow but healthy call does not trip it, a feed that
+#: stalls mid-read does. Measured with a monotonic clock, so a wall-clock step
+#: during the read cannot hide or invent a gap.
+MAX_LEG_SPAN_S = 10.0
+
 
 def _finite_number(value: Any, *, minimum: float, strict: bool = False) -> bool:
     """A real, finite number (not a bool) at or above `minimum` (above it when
@@ -107,6 +116,9 @@ class MarketSnapshot:
     #: The venue's perp position size in this same observation (the read that
     #: decides whether margin exists). `None` on a hand-built snapshot.
     perp_held: Optional[float] = None
+    #: Seconds between the start of the first leg read and the end of the last
+    #: (monotonic clock). `None` on a hand-built snapshot: not measured.
+    leg_span_s: Optional[float] = None
 
     @property
     def basis_bps(self) -> float:
@@ -123,7 +135,8 @@ class MarketSnapshot:
         return abs(self.venue_time_s - self.observed_at_s)
 
     def assert_fresh(self, *, max_age_s: float = MAX_SNAPSHOT_AGE_S,
-                     max_skew_s: float = MAX_CLOCK_SKEW_S) -> None:
+                     max_skew_s: float = MAX_CLOCK_SKEW_S,
+                     max_leg_span_s: float = MAX_LEG_SPAN_S) -> None:
         """Raise unless this view is safe to act on.
 
         Raises rather than returning a flag. A flag is a thing a caller can
@@ -143,8 +156,15 @@ class MarketSnapshot:
                     and math.isfinite(self.margin_multiple)
                     and self.margin_multiple > 0):
                 raise StaleMarket(f"margin_multiple is {self.margin_multiple!r}")
-        if not math.isfinite(self.funding_bps):
+        # A bool or a string is not a rate (and a string made isfinite raise
+        # TypeError, which is not the refusal callers catch).
+        if not _finite_number(self.funding_bps, minimum=-math.inf):
             raise StaleMarket(f"funding_bps is {self.funding_bps!r}")
+        # The observation time is what every age below is measured from. NaN
+        # made `age_s` read 0.0 (max(0, nan) is 0) and +inf made it negative,
+        # clamped to 0: both passed as perfectly fresh.
+        if not _finite_number(self.observed_at_s, minimum=0.0):
+            raise StaleMarket(f"observed_at_s is {self.observed_at_s!r}")
         # "Is anything open" decided margin: a NaN size compares False with
         # every threshold and used to read as flat. Size is a finite, unsigned
         # quantity or the view is unreadable.
@@ -157,6 +177,25 @@ class MarketSnapshot:
         if self.venue_time_s is not None and not _finite_number(
                 self.venue_time_s, minimum=0.0, strict=True):
             raise StaleMarket(f"venue_time_s is {self.venue_time_s!r}")
+
+        # Signed, not the clamped `age_s`: an observation stamped in the future
+        # used to read as age 0, i.e. as fresh as possible, for as long as the
+        # stamp stayed ahead. It is a clock disagreement and is refused on the
+        # same tolerance as the venue clock.
+        raw_age = time.time() - self.observed_at_s
+        if raw_age < -max_skew_s:
+            raise StaleMarket(
+                f"snapshot is stamped {-raw_age:.1f}s in the future (limit "
+                f"{max_skew_s:.0f}s); this host's clock and the observation's "
+                "disagree, so its age cannot be known")
+        if self.leg_span_s is not None:
+            if not _finite_number(self.leg_span_s, minimum=0.0):
+                raise StaleMarket(f"leg_span_s is {self.leg_span_s!r}")
+            if self.leg_span_s > max_leg_span_s:
+                raise StaleMarket(
+                    f"the snapshot's legs were read {self.leg_span_s:.1f}s "
+                    f"apart (limit {max_leg_span_s:.0f}s); they do not "
+                    "describe one instant and the basis between them is drift")
 
         age = self.age_s
         if age > max_age_s:
@@ -195,7 +234,8 @@ class MarketSnapshot:
                 "funding_print_ms": self.funding_print_ms,
                 "basis_bps": self.basis_bps,
                 "margin_multiple": self.margin_multiple, "age_s": self.age_s,
-                "clock_skew_s": self.clock_skew_s}
+                "clock_skew_s": self.clock_skew_s,
+                "leg_span_s": self.leg_span_s}
 
 
 def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
@@ -208,6 +248,7 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     information.
     """
     observed = time.time() if now_s is None else float(now_s)
+    started = time.monotonic()
     perp = float(broker.get_mark(perp_symbol))
     spot = float(broker.get_spot_mark(spot_symbol))
     funding = float(broker.get_funding_bps(perp_symbol))
@@ -227,6 +268,7 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
         # otherwise read NaN as flat and skip the margin read on a live book.
         raise StaleMarket(f"perp position for {perp_symbol} is {held!r}")
     margin = float(broker.get_margin_multiple(perp_symbol)) if held > 0 else None
+    leg_span = max(0.0, time.monotonic() - started)
 
     venue_time = None
     getter = getattr(broker, "get_venue_time_s", None)
@@ -244,7 +286,7 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
                           venue_time_s=venue_time,
                           funding_print_bps=float(print_bps),
                           funding_print_ms=int(print_ms),
-                          perp_held=held,
+                          perp_held=held, leg_span_s=leg_span,
                           detail={"perp_symbol": perp_symbol,
                                   "spot_symbol": spot_symbol,
                                   "clock_checked": venue_time is not None})
