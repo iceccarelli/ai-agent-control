@@ -2542,6 +2542,8 @@ class CarryEngine:
                 "distance_pct": view.get("distance_pct"),
                 "account_mm_rate": view.get("account_mm_rate"),
                 "margin_multiple": self._last_margin,
+                "cycle_opened_ms": (None if self.position is None
+                                    else self.position.opened_ms),
                 "reason": f"{prefix}{view.get('reason', '')}"})
         except Exception as exc:  # noqa: BLE001
             logger.warning("carry: risk observation not recorded (%s: %s)",
