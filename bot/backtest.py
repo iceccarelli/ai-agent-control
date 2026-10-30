@@ -418,6 +418,13 @@ class SimulatedExchange(Transport):
                             if stop.status == "Untriggered":
                                 stop.status = "Cancelled"
 
+    @staticmethod
+    def _refuse(order: "_SimOrder") -> None:
+        """An order the venue will not (further) fill. One that already filled
+        something is cancelled for the rest, never 'Rejected': a rejection with
+        fills is the contradiction the order lifecycle refuses to believe."""
+        order.status = "Cancelled" if float(order.cum_qty) > 1e-12 else "Rejected"
+
     def _execute(self, order: _SimOrder, price: float, *, taker: bool) -> None:
         base = self._base(order.symbol)
         fee_rate = self.taker_fee if taker else self.maker_fee
@@ -433,7 +440,7 @@ class SimulatedExchange(Transport):
             # testnet record shows it), so the quote pays the notional only and
             # the account receives the quantity less the fee.
             if self.balances.get(self.quote_asset, 0.0) < notional:
-                order.status = "Rejected"
+                self._refuse(order)
                 return
             fee_base = order.qty * fee_rate
             self.balances[self.quote_asset] -= notional
@@ -442,7 +449,7 @@ class SimulatedExchange(Transport):
             order.fee_coin, order.fee_amount = base, fee_base
         else:
             if self.balances.get(base, 0.0) < order.qty - 1e-12:
-                order.status = "Rejected"
+                self._refuse(order)
                 return
             self.balances[base] -= order.qty
             self.balances[self.quote_asset] = (
@@ -1120,7 +1127,7 @@ class LinearSimulatedExchange(SimulatedExchange):
         is_market = order.order_type == "Market" and not self._resolving
         remaining = float(order.qty) - float(order.cum_qty)
         if float(order.qty) <= 0 or remaining <= 1e-12:
-            order.status = "Rejected"
+            self._refuse(order)
             return
         position = self.positions.get(symbol)
         incoming = 1.0 if normalize_side(order.side) == "Buy" else -1.0
@@ -1130,7 +1137,7 @@ class LinearSimulatedExchange(SimulatedExchange):
             # beyond the position is cut to it. It never opens or flips.
             if (position is None or position.size <= 1e-12
                     or position.direction == incoming):
-                order.status = "Rejected"
+                self._refuse(order)
                 return
             if remaining > position.size:
                 remaining = position.size
@@ -1157,7 +1164,7 @@ class LinearSimulatedExchange(SimulatedExchange):
             # already committed to another position.
             margin = qty * fill_price / max(1e-9, self.leverage)
             if self.available_balance() < margin + fee:
-                order.status = "Rejected"
+                self._refuse(order)
                 return
             self.positions[symbol] = _SimPosition(
                 symbol=symbol, side=order.side, size=qty,
@@ -1166,7 +1173,7 @@ class LinearSimulatedExchange(SimulatedExchange):
         elif position.direction == incoming:
             margin = qty * fill_price / max(1e-9, self.leverage)
             if self.available_balance() < margin + fee:
-                order.status = "Rejected"
+                self._refuse(order)
                 return
             notional = position.size * position.entry_price + qty * fill_price
             position.size += qty

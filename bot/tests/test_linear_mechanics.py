@@ -406,3 +406,14 @@ class TestRestartAndRecovery:
         self._drive(a, 99)
         self._drive(b, 99)
         assert a.to_state() == b.to_state()
+
+
+def test_an_order_refused_after_a_partial_fill_is_cancelled_not_rejected():
+    from backtest import LinearSimulatedExchange, _SimOrder
+    order = _SimOrder.__new__(_SimOrder)
+    order.cum_qty, order.status = 0.4, "PartiallyFilled"
+    LinearSimulatedExchange._refuse(order)
+    assert order.status == "Cancelled"
+    order.cum_qty, order.status = 0.0, "New"
+    LinearSimulatedExchange._refuse(order)
+    assert order.status == "Rejected"
