@@ -194,6 +194,12 @@ TRANSIENT_RET_CODES = frozenset({
 #: 170007 a timeout waiting for the backend.
 UNKNOWN_OUTCOME_RET_CODES = frozenset({0, 10000, 170007})
 
+#: retCodes by which the VENUE ANSWERS a lookup with "there is no such order"
+#: (the codes `cancel_order` already treats as "already gone"). Every other
+#: refusal of a lookup - authentication, permission, IP whitelist, rate limit, a
+#: proxy body - is NOT an answer about the order, and must never be read as one.
+ORDER_NOT_FOUND_RET_CODES = frozenset({110001, 170213})
+
 #: HTTP statuses worth retrying.
 TRANSIENT_HTTP = frozenset({408, 429, 500, 502, 503, 504,
                             520, 521, 522, 523, 524})
@@ -1018,7 +1024,12 @@ class BybitClient:
             try:
                 payload = self._request("GET", endpoint, params=params, signed=True)
             except PermanentAPIError as exc:
-                if exc.ret_code in UNKNOWN_OUTCOME_RET_CODES:
+                # Only the venue's own "no such order" is an answer of absence.
+                # A refusal of the READ (10003/10004/10005/10010 auth, whitelist,
+                # permission; rate limits; anything unrecognised) says nothing
+                # about the order: treating it as absence erased orders whose
+                # fate was unknown (reconcile wrote `never_sent`).
+                if exc.ret_code not in ORDER_NOT_FOUND_RET_CODES:
                     unanswered = exc
                 continue
             rows = payload.get("result", {}).get("list") or []
@@ -1449,7 +1460,7 @@ class BybitClient:
         try:
             self._request("POST", "/v5/order/cancel", body=body, signed=True)
         except PermanentAPIError as exc:
-            if exc.ret_code in (110001, 170213):  # already gone
+            if exc.ret_code in ORDER_NOT_FOUND_RET_CODES:  # already gone
                 self._mark_cancelled(order_link_id or order_id)
                 return True
             logger.error("cancel failed for %s: %s", order_link_id or order_id, exc)
