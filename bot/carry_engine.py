@@ -609,6 +609,7 @@ class CarryEngine:
                  risk_observer: Any = None,
                  leverage: Any = 1.0,
                  require_capital_check: bool = False,
+                 capital_authority: Any = None,
                  opportunity_cost_apr: Any = 0.0) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
@@ -660,6 +661,10 @@ class CarryEngine:
         #: Off by default so a bare engine (tests, the shadow book) is not
         #: changed; build_bot turns it on for the production book.
         self.require_capital_check = bool(require_capital_check)
+        #: The portfolio authority (carry_capital.CarryCapitalAuthority): asked
+        #: before every ENTRY, never for an exit. None = not wired (a bare
+        #: engine, the shadow book).
+        self.capital_authority = capital_authority
         self._last_margin: Optional[float] = None
         self.persist = persist
         self.execution_mode = execution_mode
@@ -1234,6 +1239,7 @@ class CarryEngine:
         delta is checked before opening more because adding size to a drifted
         book compounds the exposure you already failed to hedge.
         """
+        self._capital_sync()
         self._last_tick_ms = int(timestamp_ms or 0)
         if self.state is BookState.HALTED:
             if self._halt_unwritten:
@@ -1511,6 +1517,9 @@ class CarryEngine:
         refused = self._capital_refusal(qty * mark)
         if refused is not None:
             return refused
+        refused = self._portfolio_refusal()
+        if refused is not None:
+            return refused
 
         # THE PAIR GATE, before the first leg. Ordered by damage inside
         # CarryRisk: a tripped kill switch outranks a stale price, both outrank
@@ -1523,6 +1532,9 @@ class CarryEngine:
             return CarryDecision("stand_aside", reason=gate.reason,
                                  state=BookState.FLAT, detail=gate.detail)
 
+        refused = self._reserve_capital(timestamp_ms, qty * mark)
+        if refused is not None:
+            return refused
         self._name_cycle(timestamp_ms)
         self.state = BookState.OPENING
         self._last_leg_error = ""
@@ -1897,6 +1909,58 @@ class CarryEngine:
                 "note": "after the spot BUY's fee the short snaps down a whole "
                         "lot and the pair would land unpaired, then unwind: a "
                         "round trip of fees for nothing"}
+
+    def _portfolio_refusal(self) -> Optional[CarryDecision]:
+        """The portfolio authority's verdict on NEW exposure. Unwired -> None.
+        An authority that cannot answer refuses. Exits never reach here."""
+        authority = self.capital_authority
+        if authority is None:
+            return None
+        try:
+            blockers = list(authority.entry_blockers())
+        except Exception as exc:  # noqa: BLE001 - an unreadable state refuses
+            return CarryDecision(
+                "stand_aside", reason="PORTFOLIO_STATE_UNREADABLE",
+                state=BookState.FLAT,
+                detail={"error": f"{type(exc).__name__}: {exc}"})
+        if blockers:
+            return CarryDecision(
+                "stand_aside", reason="PORTFOLIO_BLOCKED", state=BookState.FLAT,
+                detail={"blockers": blockers})
+        return None
+
+    def _reserve_capital(self, timestamp_ms: int,
+                         notional_usd: float) -> Optional[CarryDecision]:
+        """Hold this entry's dollars (margin, spot leg, fee reserve) against
+        every other strategy BEFORE the first leg. Unwired -> None."""
+        authority = self.capital_authority
+        if authority is None:
+            return None
+        try:
+            amount = (self.required_capital_usd(notional_usd)
+                      + self.fee_reserve_usd(notional_usd))
+            ok, code = authority.reserve_entry(f"cyc-{timestamp_ms}", amount)
+        except Exception as exc:  # noqa: BLE001
+            return CarryDecision(
+                "stand_aside", reason="PORTFOLIO_STATE_UNREADABLE",
+                state=BookState.FLAT,
+                detail={"error": f"{type(exc).__name__}: {exc}"})
+        if not ok:
+            return CarryDecision(
+                "stand_aside", reason="CAPITAL_RESERVATION_REFUSED",
+                state=BookState.FLAT,
+                detail={"code": code, "amount_usd": amount})
+        return None
+
+    def _capital_sync(self) -> None:
+        authority = self.capital_authority
+        if authority is None:
+            return
+        try:
+            authority.sync(position_open=self.position is not None)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping never decides
+            logger.warning("carry: capital sync failed (%s: %s)",
+                           type(exc).__name__, exc)
 
     def required_capital_usd(self, notional_usd: float) -> float:
         """Free balance needed before the pair: the perp's initial margin at the
