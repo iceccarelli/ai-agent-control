@@ -61,6 +61,13 @@ cd /workspaces/ai-agent-control && scripts/runner_status.sh
 ```
 Read-only. Never re-initialise the forward book and never change a frozen constant. The forward book and the public-market data live on the Fly runner, not in Codespaces.
 
+## Net performance of what the book actually booked (read-only)
+
+```bash
+cd /workspaces/ai-agent-control/bot && python3 tools/carry_performance.py --db <path to a COPY of the state database>
+```
+Per cycle and in total: confirmed versus provisional net, funding, fees, financing, price leg, return on notional, drawdown, concentration, holding time. It prints "no closed cycle" and no ratios until the book has closed one. Margin committed and fill slippage are not journalled and are reported as such. Point it at a copy, never at `bot/state/trading_state.db`.
+
 ## 6. Recording a human promotion approval (only when you have read the evidence)
 
 The gate no longer trusts a flag in the repository. Approve one item at a time, writing outside the repo:

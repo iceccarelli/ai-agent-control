@@ -151,6 +151,7 @@ jobs:
           tests/test_simulator_parameter_parity.py
           tests/test_integration_acceptance.py
           tests/test_promotion_approvals.py
+          tests/test_carry_performance.py
           tests/test_state_store_fail_closed_reopen.py
           tests/test_liquidation_view_absent_fields.py
           tests/test_broker_unstated_fields_fail_closed.py

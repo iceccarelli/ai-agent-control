@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""Net performance of a carry book, read only from what the ledger booked.
+
+Reads a state database READ-ONLY, cuts the double-entry journal into cycles
+(flat -> opened -> flat) and reports, per cycle and in total: confirmed versus
+provisional net, funding, fees, financing, the price leg, return on the notional
+committed, drawdown, concentration and holding time.
+
+Nothing is estimated and nothing is assumed zero:
+
+  * a cycle is CONFIRMED only if every fill's fee was venue-stated and every
+    funding entry came from a venue settlement row; otherwise it is provisional
+    and kept out of the confirmed total;
+  * a quantity the ledger never recorded (the margin actually committed, the
+    decision-time mark needed for slippage) is None with the reason, never a
+    default;
+  * a book with no closed cycle gets no ratios.
+
+"Confirmed" here is per-entry evidence. Whether every settlement the venue
+should have paid was booked is `carry_report.py` / `evidence_reconcile.py`'s
+question. Places nothing; writes nothing.
+
+    python3 tools/carry_performance.py --db state/trading_state.db [--json]
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+from typing import Any, Dict, List, Optional, Sequence
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(HERE))
+
+import ledger as L  # noqa: E402
+
+DAY_MS = 86_400_000
+_SHORT_MEMO = re.compile(r"^short (\S+) @ (\S+)$")
+MARGIN_NOTE = ("margin committed is not recorded by the ledger (the venue's "
+               "initial margin is not journalled), so no return on margin is "
+               "computed; returns are on notional")
+
+
+def _notional_of(entry: Any) -> Optional[float]:
+    m = _SHORT_MEMO.match(entry.memo or "")
+    if not m:
+        return None
+    try:
+        return float(m.group(1)) * float(m.group(2))
+    except ValueError:
+        return None
+
+
+def _basis(fee_statuses: List[str], bases: List[str]) -> str:
+    if any(s in ("unknown", "unresolved", "unlabelled") for s in fee_statuses):
+        return "provisional_fees_incomplete"
+    if any(b in ("engine_estimate", "unattributed", "unread") for b in bases):
+        return "provisional_funding_unverified"
+    return "confirmed"
+
+
+def _finish(cur: Dict[str, Any]) -> Dict[str, Any]:
+    first, last = cur["first_open_ms"], cur["last_close_ms"]
+    cur["closed"] = bool(cur["perp_closed"])
+    cur["hold_days"] = (None if first is None or last is None or not cur["closed"]
+                        else (last - first) / DAY_MS)
+    cur["net_usd"] = (cur["funding_usd"] - cur["fees_usd"] - cur["borrow_usd"]
+                      + cur["realised_usd"])
+    cur["notional_usd"] = (None if cur["notional_unknown"]
+                           or cur["notional_usd"] <= 0 else cur["notional_usd"])
+    cur["basis"] = _basis(cur.pop("_fee_statuses"), cur.pop("_bases"))
+    for key in ("perp_closed", "notional_unknown", "first_open_ms",
+                "last_close_ms"):
+        cur.pop(key, None)
+    return cur
+
+
+def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    cur: Optional[Dict[str, Any]] = None
+    perp_qty = 0.0
+    for e in journal.entries:
+        is_start = e.kind in ("spot_buy", "perp_open")
+        if is_start and (cur is None or (cur["perp_closed"]
+                                         and abs(perp_qty) <= L.DUST[L.PERP])):
+            if cur is not None:
+                out.append(_finish(cur))
+            cur = {"start_ms": e.ms, "funding_usd": 0.0, "fees_usd": 0.0,
+                   "borrow_usd": 0.0, "realised_usd": 0.0, "notional_usd": 0.0,
+                   "notional_unknown": False, "perp_closed": False,
+                   "first_open_ms": None, "last_close_ms": None,
+                   "_fee_statuses": [], "_bases": []}
+        for line in e.lines:
+            if line.account == L.PERP:
+                perp_qty += line.qty
+        if cur is None:
+            continue
+        for line in e.lines:
+            if line.account == L.FUNDING:
+                cur["funding_usd"] += -line.usd
+            elif line.account == L.FEES:
+                cur["fees_usd"] += line.usd
+            elif line.account == L.BORROW:
+                cur["borrow_usd"] += line.usd
+            elif line.account == L.REALISED:
+                cur["realised_usd"] += -line.usd
+        if e.fee_status:
+            cur["_fee_statuses"].append(e.fee_status)
+        if e.basis:
+            cur["_bases"].append(e.basis)
+        if e.kind == "perp_open":
+            if cur["first_open_ms"] is None:
+                cur["first_open_ms"] = e.ms
+            n = _notional_of(e)
+            if n is None:
+                cur["notional_unknown"] = True
+            else:
+                cur["notional_usd"] += n
+        if e.kind == "perp_close" and abs(perp_qty) <= L.DUST[L.PERP]:
+            cur["perp_closed"] = True
+            cur["last_close_ms"] = e.ms
+    if cur is not None:
+        out.append(_finish(cur))
+    return out
+
+
+def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    closed = [c for c in cycles if c["closed"]]
+    s: Dict[str, Any] = {
+        "closed_cycles": len(closed),
+        "open_cycles": len(cycles) - len(closed),
+        "margin_committed_usd": None, "margin_note": MARGIN_NOTE,
+        "slippage_note": ("decision-time marks are not journalled, so fill "
+                          "slippage is not computed here; fees are the venue's"),
+    }
+    if not closed:
+        s.update(status="NO_CLOSED_CYCLES", net_usd_confirmed=0.0,
+                 net_usd_provisional=0.0, provisional_cycles=0)
+        for key in ("return_on_peak_notional_pct", "win_rate",
+                    "max_drawdown_usd", "annualised_on_notional_in_market_pct",
+                    "mean_hold_days", "best_cycle_share_of_winning_net_pct"):
+            s[key] = None
+        return s
+    confirmed = [c for c in closed if c["basis"] == "confirmed"]
+    provisional = [c for c in closed if c["basis"] != "confirmed"]
+    s["status"] = "OK"
+    s["net_usd_confirmed"] = sum(c["net_usd"] for c in confirmed)
+    s["net_usd_provisional"] = sum(c["net_usd"] for c in provisional)
+    s["provisional_cycles"] = len(provisional)
+    s["funding_usd"] = sum(c["funding_usd"] for c in closed)
+    s["fees_usd"] = sum(c["fees_usd"] for c in closed)
+    s["borrow_usd"] = sum(c["borrow_usd"] for c in closed)
+    s["price_leg_usd"] = sum(c["realised_usd"] for c in closed)
+    s["gross_before_costs_usd"] = s["funding_usd"] + s["price_leg_usd"]
+    s["fees_pct_of_funding"] = (100.0 * s["fees_usd"] / s["funding_usd"]
+                                if s["funding_usd"] > 0 else None)
+    notionals = [c["notional_usd"] for c in closed]
+    peak = (max(notionals) if notionals and all(n is not None for n in notionals)
+            else None)
+    s["peak_notional_usd"] = peak
+    total_net = sum(c["net_usd"] for c in closed)
+    s["return_on_peak_notional_pct"] = (100.0 * total_net / peak
+                                        if peak else None)
+    days = sum(c["hold_days"] or 0.0 for c in closed)
+    s["days_in_market"] = days
+    s["annualised_on_notional_in_market_pct"] = (
+        100.0 * total_net / peak * 365.0 / days
+        if peak and days >= 1.0 else None)
+    cum = peak_cum = drawdown = 0.0
+    for c in sorted(closed, key=lambda c: c["start_ms"]):
+        cum += c["net_usd"]
+        peak_cum = max(peak_cum, cum)
+        drawdown = max(drawdown, peak_cum - cum)
+    s["max_drawdown_usd"] = drawdown
+    s["win_rate"] = sum(1 for c in closed if c["net_usd"] > 0) / len(closed)
+    wins = sorted((c["net_usd"] for c in closed if c["net_usd"] > 0),
+                  reverse=True)
+    s["best_cycle_share_of_winning_net_pct"] = (
+        100.0 * wins[0] / sum(wins) if wins else None)
+    s["mean_hold_days"] = days / len(closed)
+    return s
+
+
+def load_journal(db_path: str) -> Any:
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(db_path)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        row = conn.execute(
+            "SELECT payload FROM carry_ledger WHERE id = 1").fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        raise LookupError("no carry ledger in this database")
+    return L.Journal.from_rows(json.loads(row[0] or "[]"))
+
+
+def report_lines(cycles: Sequence[Dict[str, Any]], s: Dict[str, Any]) -> List[str]:
+    f = lambda v, p="{:,.2f}": "n/a" if v is None else p.format(v)  # noqa: E731
+    lines = [f"cycles: {s['closed_cycles']} closed, {s['open_cycles']} open "
+             f"({s['provisional_cycles']} closed but provisional)"]
+    if s["status"] == "NO_CLOSED_CYCLES":
+        lines.append("no closed cycle: no performance figure exists yet")
+    else:
+        lines += [
+            f"confirmed net: ${f(s['net_usd_confirmed'])}   provisional net "
+            f"(not confirmed): ${f(s['net_usd_provisional'])}",
+            f"funding ${f(s['funding_usd'])}  price leg ${f(s['price_leg_usd'])}  "
+            f"= gross before costs ${f(s['gross_before_costs_usd'])}",
+            f"fees ${f(s['fees_usd'])}  financing ${f(s['borrow_usd'])}  "
+            f"(fees are {f(s['fees_pct_of_funding'], '{:.1f}')}% of funding)",
+            f"peak notional ${f(s['peak_notional_usd'])}  return on it "
+            f"{f(s['return_on_peak_notional_pct'])}%  annualised over "
+            f"{f(s['days_in_market'], '{:.1f}')} days in market: "
+            f"{f(s['annualised_on_notional_in_market_pct'])}%",
+            f"max drawdown (closed cycles) ${f(s['max_drawdown_usd'])}  win "
+            f"rate {f(100 * s['win_rate'], '{:.0f}')}%  best winner = "
+            f"{f(s['best_cycle_share_of_winning_net_pct'], '{:.1f}')}% of "
+            f"winning net  mean hold {f(s['mean_hold_days'], '{:.1f}')} days"]
+    lines.append(s["margin_note"])
+    lines.append(s["slippage_note"])
+    lines.append("confirmed = every fee venue-stated and every funding entry "
+                 "from a venue row; completeness against the public funding "
+                 "prints is carry_report.py / evidence_reconcile.py")
+    return lines
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--db", required=True)
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    try:
+        journal = load_journal(args.db)
+    except (FileNotFoundError, LookupError, sqlite3.Error, ValueError) as exc:
+        print(f"refusing: {exc}", file=sys.stderr)
+        return 2
+    cycles = cycles_from_journal(journal)
+    summary = summarise(cycles)
+    if args.json:
+        print(json.dumps({"cycles": cycles, "summary": summary}, indent=2,
+                         default=str))
+    else:
+        print("\n".join(report_lines(cycles, summary)))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
