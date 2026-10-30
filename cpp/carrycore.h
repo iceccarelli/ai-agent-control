@@ -63,6 +63,14 @@ typedef struct {
                                     hold an entry must clear its round trip
                                     inside. Not a switch: a non-positive or
                                     non-finite value REFUSES every entry. */
+    double opportunity_cost_apr; /* carry_costs opportunity_cost_apr: the
+                                    forgone return on the hedged capital, a
+                                    per-year cost charged like borrow_apr (in
+                                    the gate beside borrow, and per print on
+                                    qty * spot by the simulator). 0.0 is the
+                                    earlier behaviour bit for bit; a negative
+                                    or non-finite value REFUSES every entry.
+                                    Added in carrycore/5. */
 } CarryParams;
 
 /* Entry-gate reason codes, in carry_costs.GATE_REASONS order. */
@@ -95,6 +103,10 @@ typedef struct {
     int32_t unresolved_entries;  /* decided, but the fill row is past the data */
     int32_t unresolved_exits;    /* decided, but the fill row is past the data */
     int32_t refusals_by_reason[CARRY_GATE_REASONS]; /* gated refusals, by code */
+    double opportunity;          /* opportunity cost charged, positive = a cost.
+                                    NOT in `net`, which stays cash: the Python
+                                    simulator reports it beside net the same
+                                    way. Added in carrycore/5. */
 } CarryResult;
 
 /* carry_costs.entry_gate: may the book open on these prints at these prices?

@@ -608,7 +608,8 @@ class CarryEngine:
                  require_liquidation_check: bool = False,
                  risk_observer: Any = None,
                  leverage: Any = 1.0,
-                 require_capital_check: bool = False) -> None:
+                 require_capital_check: bool = False,
+                 opportunity_cost_apr: Any = 0.0) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -672,6 +673,19 @@ class CarryEngine:
         self.position: Optional[CarryPosition] = None
         self.state = BookState.FLAT
         self.borrow_apr = float(borrow_apr)
+        #: The forgone return on the hedged capital, per year, charged by the
+        #: entry gate beside borrow (carry_costs.DEFAULT_OPPORTUNITY_COST_APR).
+        #: 0.0 by default, which is the earlier gate to the bit. Zero borrow is
+        #: not zero capital cost, but this repository has no rate to charge,
+        #: so the number is the OPERATOR's: build_bot passes it when config
+        #: carries one. A value the gate cannot price (negative, NaN, inf) is
+        #: refused at construction - a silently refused book is a mystery.
+        if isinstance(opportunity_cost_apr, bool) or not self._finite(
+                opportunity_cost_apr) or float(opportunity_cost_apr) < 0:
+            raise ValueError(
+                f"opportunity_cost_apr={opportunity_cost_apr!r}: the forgone "
+                "return on the hedged capital must be a finite number >= 0")
+        self.opportunity_cost_apr = float(opportunity_cost_apr)
         #: Set by build_bot. Consulted in _open BEFORE the first leg goes out,
         #: because a gate that runs after one leg has landed is not a gate, it
         #: is a post-mortem.
@@ -1141,14 +1155,18 @@ class CarryEngine:
         verdict = _costs().entry_gate(
             funding_prints_bps=self._funding_history,
             perp=mark, spot=spot, borrow_apr=self.borrow_apr,
-            round_trip_bps=round_trip)
+            round_trip_bps=round_trip,
+            opportunity_cost_apr=self.opportunity_cost_apr)
         if not verdict:
             return EntryEconomics(round_trip, verdict, CarryDecision(
                 "stand_aside", reason=verdict.reason, state=BookState.FLAT,
                 detail={"funding_bps": funding_bps,
                         "smoothed_bps": verdict.smoothed_funding_bps,
                         "entry_basis_bps": verdict.entry_basis_bps,
-                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day}))
+                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day,
+                        # Observability only (carry_costs.decision_audit):
+                        # nothing decides on it.
+                        "entry_audit": (verdict.detail or {}).get("audit")}))
         return EntryEconomics(round_trip, verdict, None)
 
     # -- the loop ---------------------------------------------------------
@@ -1356,7 +1374,14 @@ class CarryEngine:
         if econ.refusal is not None:
             return econ.refusal
 
-        return self._open(mark, spot, funding_bps, timestamp_ms)
+        decision = self._open(mark, spot, funding_bps, timestamp_ms)
+        # The arithmetic the APPROVAL rested on, beside whatever _open did with
+        # it (opened, refused by a later gate, halted). Attached after the
+        # fact; it cannot change what was decided.
+        if isinstance(decision.detail, dict) and econ.verdict is not None:
+            decision.detail.setdefault(
+                "entry_audit", (econ.verdict.detail or {}).get("audit"))
+        return decision
 
     # -- actions ----------------------------------------------------------
 

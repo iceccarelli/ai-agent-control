@@ -65,7 +65,8 @@ class Params(ctypes.Structure):
                 ("negative_exit_prints", ctypes.c_int),
                 ("funding_history", ctypes.c_int),
                 ("latency_rows", ctypes.c_int),
-                ("demonstrated_hold_days", ctypes.c_double)]
+                ("demonstrated_hold_days", ctypes.c_double),
+                ("opportunity_cost_apr", ctypes.c_double)]
 
 
 #: Entry-gate reason codes, carrycore.h CARRY_GATE_*; the order of
@@ -75,7 +76,8 @@ GATE_REASONS = 9
 #: The struct layouts above only match a library of this ABI. A stale
 #: libcarrycore.so (older struct sizes) would be written past its end, so it is
 #: treated as not built.
-ABI_NAME = b"carrycore/4"
+ABI_NAME = b"carrycore/5"      # /5 added Params.opportunity_cost_apr and
+                               # Result.opportunity
 
 
 class Result(ctypes.Structure):
@@ -89,7 +91,8 @@ class Result(ctypes.Structure):
                 ("refusals", ctypes.c_int32),
                 ("unresolved_entries", ctypes.c_int32),
                 ("unresolved_exits", ctypes.c_int32),
-                ("refusals_by_reason", ctypes.c_int32 * GATE_REASONS)]
+                ("refusals_by_reason", ctypes.c_int32 * GATE_REASONS),
+                ("opportunity", ctypes.c_double)]
 
     def as_dict(self) -> Dict[str, Any]:
         out = {name: getattr(self, name) for name, _t in self._fields_}
@@ -194,7 +197,8 @@ def params(*, notional: float = 100_000.0, entry_bps: float = 0.2,
            negative_exit_prints: int = 3,
            funding_history: int = 8,
            latency_rows: int = LATENCY_ROWS,
-           demonstrated_hold_days: Optional[float] = None) -> Params:
+           demonstrated_hold_days: Optional[float] = None,
+           opportunity_cost_apr: float = 0.0) -> Params:
     for name, value in (("latency_rows", latency_rows),
                         ("negative_exit_prints", negative_exit_prints),
                         ("funding_history", funding_history),
@@ -216,7 +220,7 @@ def params(*, notional: float = 100_000.0, entry_bps: float = 0.2,
                   hold_days, taker_spot_bps, taker_perp_bps, ewma_alpha,
                   int(bool(gated)), int(bool(overlay)), ewma_min_prints,
                   negative_exit_prints, funding_history, int(latency_rows),
-                  float(demonstrated_hold_days))
+                  float(demonstrated_hold_days), float(opportunity_cost_apr))
 
 
 def entry_gate(prints_bps: Sequence[float], perp: float, spot: float,

@@ -174,6 +174,11 @@ class Trade:
     open_at_end: bool = False
     #: Settlement clock only: worst perp HIGH against the short entry, in %.
     max_adverse_short_pct: float = 0.0
+    #: Opportunity cost of the hedged capital (`opportunity_cost_apr`), a COST
+    #: >= 0. Deliberately NOT in `net`, which stays the cash the book made and
+    #: the attribution identity sums; it is reported beside it so a reader can
+    #: subtract it, and the native core reports it the same way.
+    opportunity: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -1044,7 +1049,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
                                 ewma_min_prints: Optional[int] = None,
                                 negative_exit_prints: int = NEGATIVE_EXIT_PRINTS,
                                 hold_days: Optional[float] = None,
-                                demonstrated_hold_days: Optional[float] = None
+                                demonstrated_hold_days: Optional[float] = None,
+                                opportunity_cost_apr: float = 0.0
                                 ) -> Dict[str, Any]:
     """One step per funding print. The rules are the engine's, in its units:
     a print is a print (not a day, not a tick), three consecutive negative
@@ -1068,7 +1074,13 @@ def simulate_settlements_series(rows: List[Settlement], *,
     row's own prices); it is an upper bound, not an estimate. One row is one
     8-hour funding interval, so `latency_rows=1` is a deliberately coarse
     stress bound, not a measured latency: the data here is settlement-stamped
-    OHLC, not ticks, and the two legs cannot be separated finer than a row."""
+    OHLC, not ticks, and the two legs cannot be separated finer than a row.
+
+    `opportunity_cost_apr` (default 0.0) is the forgone return on the hedged
+    capital: the gate charges it beside borrow, and each held print accrues
+    it on qty * spot exactly as scalar borrow does. It is reported as
+    `opportunity_cost_usd` and `net_after_opportunity_cost_usd`; `net_usd`
+    stays cash. carrycore.cpp takes the same parameter."""
     if int(latency_rows) < 0:
         raise ValueError("latency_rows cannot be negative")
     latency_rows = int(latency_rows)
@@ -1094,6 +1106,11 @@ def simulate_settlements_series(rows: List[Settlement], *,
                         ("demonstrated_hold_days", demonstrated_hold_days)):
         if not (math.isfinite(float(value)) and float(value) > 0):
             raise ValueError(f"{name} must be a positive number")
+    if not (math.isfinite(float(opportunity_cost_apr))
+            and float(opportunity_cost_apr) >= 0):
+        # The gate would refuse every entry on it; a negative or unknowable
+        # cost is not a run anyone should read numbers from.
+        raise ValueError("opportunity_cost_apr must be a finite number >= 0")
     window = min(int(funding_history), _CORE_MAX_HISTORY)
     trades: List[Trade] = []
     live: Optional[Trade] = None
@@ -1101,6 +1118,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
     history: List[float] = []
     refusals: Dict[str, int] = {}
     per_print_borrow = borrow_apr / (365.0 * FUNDING_PERIODS_PER_DAY)
+    per_print_opportunity = (float(opportunity_cost_apr)
+                             / (365.0 * FUNDING_PERIODS_PER_DAY))
     #: Prints the curve could not price, which fell back to the declared
     #: scalar. A list so the charge closure can increment it. Counted and
     #: reported, never silently substituted — the `unknown_fees` rule.
@@ -1183,6 +1202,7 @@ def simulate_settlements_series(rows: List[Settlement], *,
                     rate = per_print_borrow
                     borrow_unpriced[0] += 1
                 live.borrow += rate * live.qty * st.spot
+            live.opportunity += per_print_opportunity * live.qty * st.spot
             live.max_adverse_short_pct = max(
                 live.max_adverse_short_pct,
                 100.0 * (st.perp_high / live.entry_perp - 1.0))
@@ -1208,7 +1228,8 @@ def simulate_settlements_series(rows: List[Settlement], *,
                 spot=st.spot, borrow_apr=borrow_apr,
                 round_trip_bps=round_trip_bps_for(mode), hold_days=hold_days,
                 demonstrated_hold_days=demonstrated_hold_days,
-                ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints)
+                ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints,
+                opportunity_cost_apr=opportunity_cost_apr)
             may_open = bool(verdict)
             if not may_open:
                 refusals[verdict.reason] = refusals.get(verdict.reason, 0) + 1
@@ -1277,6 +1298,10 @@ def simulate_settlements_series(rows: List[Settlement], *,
         "net_annualised_pct": (100.0 * a["net_usd"] / notional) / years,
         "naive_funding_sum_pct_per_yr": 100.0 * sum(s.rate for s in rows) / years,
         "borrow_apr": borrow_apr, "impact_bps_per_leg": impact_bps,
+        "opportunity_cost_apr": opportunity_cost_apr,
+        "opportunity_cost_usd": -sum(t.opportunity for t in trades),
+        "net_after_opportunity_cost_usd": (
+            a["net_usd"] - sum(t.opportunity for t in trades)),
         # D43. `borrow_source` says WHICH financing was charged, and
         # `borrow_periods_unpriced` how many prints the curve could not cover
         # and therefore fell back to the scalar. A run reporting a curve with
