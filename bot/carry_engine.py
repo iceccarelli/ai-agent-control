@@ -1542,6 +1542,10 @@ class CarryEngine:
             return CarryDecision("stand_aside", reason=gate.reason,
                                  state=BookState.FLAT, detail=gate.detail)
 
+        # The daily entry limit keeps the caller's clock (0 = wall clock); only
+        # the cycle's identity is made unique.
+        self._entry_clock_ms = timestamp_ms
+        timestamp_ms = self._unique_cycle_ms(timestamp_ms)
         refused = self._reserve_capital(timestamp_ms, qty * mark)
         if refused is not None:
             return refused
@@ -1582,7 +1586,8 @@ class CarryEngine:
                 perp=Leg(symbol=self.perp_symbol, side="Sell",
                          product="linear"),
                 opened_ms=timestamp_ms)
-            self.pair_risk.record_broken_pair(now=self._gate_now(timestamp_ms))
+            self.pair_risk.record_broken_pair(
+                now=self._gate_now(self._entry_clock_ms))
             return self._halt(
                 "SPOT_FEE_UNVERIFIABLE",
                 "spot BUY fee currency/amount is not reliably reported; no perp "
@@ -1611,7 +1616,7 @@ class CarryEngine:
             # It paid a round trip, so it spends the day (INVENTORY D4).
             self.position = position
             self.pair_risk.record_broken_pair(
-                now=self._gate_now(timestamp_ms))
+                now=self._gate_now(self._entry_clock_ms))
             return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
 
         self.position = position
@@ -1620,7 +1625,7 @@ class CarryEngine:
         self.state = BookState.HEDGED
         # Only now: both legs landed. A refused pair consumed nothing; a
         # broken one spent the day through record_broken_pair instead.
-        self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
+        self.pair_risk.record_entry(now=self._gate_now(self._entry_clock_ms))
         failed = self._record()
         if failed is not None:
             return failed
@@ -1709,7 +1714,7 @@ class CarryEngine:
         if self.state is BookState.HALTED:
             return self._halted_with_exposure("PERP_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
-        self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
+        self.pair_risk.record_entry(now=self._gate_now(self._entry_clock_ms))
         failed = self._record()
         if failed is not None:
             return failed
@@ -2061,6 +2066,20 @@ class CarryEngine:
                         "leverage": self.leverage,
                         "execution_mode": self.execution_mode})
         return None
+
+    #: The newest cycle stamp this engine has issued. A cycle's identity is
+    #: `cyc-<opened_ms>`; two cycles stamped alike (an engine driven on the
+    #: default clock, or two entries inside one millisecond) must still be two
+    #: cycles, or the second would be refused as a spent reservation id and its
+    #: orders could not be told from the first's.
+    _last_cycle_ms: int = -1
+    _entry_clock_ms: int = 0
+
+    def _unique_cycle_ms(self, timestamp_ms: int) -> int:
+        """`timestamp_ms`, or the next integer above the last stamp issued."""
+        stamp = max(int(timestamp_ms or 0), self._last_cycle_ms + 1)
+        self._last_cycle_ms = stamp
+        return stamp
 
     def _name_cycle(self, timestamp_ms: int) -> None:
         """Tell the ledger which cycle the coming fills belong to, so its

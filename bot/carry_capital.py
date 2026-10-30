@@ -84,17 +84,22 @@ class CarryCapitalAuthority:
         return bool(result.ok), str(result.code)
 
     def sync(self, *, position_open: bool) -> None:
-        """Called once per tick. Never raises into the engine's decision."""
+        """Called once per tick. Never raises into the engine's decision.
+
+        Order matters. FIRST every hold that has an order behind it is bound to
+        that order (committed), whether or not a pair is open: a first leg that
+        timed out leaves an unresolved order and a flat book, and its hold must
+        not expire on a timer and free dollars that order may be using. ONLY THEN
+        are holds that never got an order expired, and a flat book with nothing
+        in flight gives its dollars back. (Expiring first lost the hold of a
+        pair whose tick came later than the TTL.)"""
         now = self.clock()
+        for row in self._carry_live():
+            if row.get("state") == "RESERVED":
+                self._commit(row)
         self.reservations.expire_stale(now=now, account_scope=self.account_scope)
-        live = [r for r in self.reservations.live(self.account_scope)
-                if r.get("strategy_id") == STRATEGY_ID]
-        if not live:
-            return
-        if position_open:
-            for row in live:
-                if row.get("state") == "RESERVED":
-                    self._commit(row)
+        live = self._carry_live()
+        if not live or position_open:
             return
         # Flat. Give the dollars back only if nothing of ours is still in
         # flight: an unresolved order may be using them.
@@ -106,6 +111,10 @@ class CarryCapitalAuthority:
             if not res.ok:
                 logger.warning("capital: reservation %s kept (%s)",
                                row["intent_id"], res.code)
+
+    def _carry_live(self) -> list:
+        return [r for r in self.reservations.live(self.account_scope)
+                if r.get("strategy_id") == STRATEGY_ID]
 
     def _commit(self, row: dict) -> None:
         """A held pair's hold must not expire on a timer: bind it to the cycle's

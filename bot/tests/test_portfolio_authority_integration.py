@@ -238,3 +238,78 @@ def test_the_authority_always_allows_reduction(path):
     store.trip_kill_switch("test")
     assert auth.reduction_allowed() is True
     store.close()
+
+
+# -- holds are bound to their orders before they can expire; ids never repeat ------------------
+
+def test_a_hold_for_an_unresolved_first_leg_survives_its_ttl(path):
+    """Code-review finding: with the entry halted and flat, nothing committed the
+    hold, so it expired after the TTL and another strategy could spend dollars an
+    unanswered order may be using."""
+    from test_paired_leg_recovery import inject
+    now = [time.time()]
+    store, venue, broker, engine, auth, res = wired(path, clock=lambda: now[0])
+    inject(venue, lambda m, e, b, real, kw: (
+        (lambda: (_ for _ in ()).throw(RuntimeError("connection reset")))
+        if e == "/v5/order/create" and b.get("category") == "linear" else None))
+    warm_and_open(engine)
+    assert store.unresolved_carry_orders()                    # the perp leg is unanswered
+    assert len(res.live(SCOPE)) == 1
+    now[0] += 3600.0                                          # far beyond the 600s TTL
+    auth.sync(position_open=False)
+    live = res.live(SCOPE)
+    assert len(live) == 1 and live[0]["state"] == "COMMITTED"
+    other = res.reserve("other", "other-9", 400_000.0, SCOPE, "entry",
+                        available=auth._state().available_capital, ttl_s=600.0,
+                        now=now[0])
+    assert not other.ok and other.code == "INSUFFICIENT_FREE_CAPITAL"
+    store.close()
+
+
+def test_a_tick_interval_longer_than_the_ttl_does_not_lose_a_held_pairs_hold(path):
+    now = [time.time()]
+    store, venue, broker, engine, auth, res = wired(path, clock=lambda: now[0])
+    assert opened(warm_and_open(engine))
+    now[0] += 7200.0                                          # one very slow tick
+    auth.sync(position_open=True)
+    live = res.live(SCOPE)
+    assert len(live) == 1 and live[0]["state"] == "COMMITTED"
+    store.close()
+
+
+def test_two_cycles_stamped_alike_get_distinct_ids_and_both_can_reserve(path):
+    store, venue, broker, engine, auth, res = wired(path)
+    assert opened(warm_and_open(engine))
+    first = engine.position.cycle_id
+    stamp = 4 * H8
+    for _ in range(12):                                       # invert, unwind
+        fresh_view(engine)
+        engine.on_candle(mark=MARK, funding_bps=-4.0, spot=MARK, funding_print_ms=stamp)
+        stamp += H8
+        if engine.position is None:
+            break
+    assert engine.position is None
+    store.save_ledger(engine.broker.journal.to_rows())
+    for _ in range(6):                                        # funding recovers, reopen
+        fresh_view(engine)
+        d = engine.on_candle(mark=MARK, funding_bps=3.0, spot=MARK, funding_print_ms=stamp)
+        stamp += H8
+        if opened(d):
+            break
+    else:
+        pytest.fail(f"the second cycle never opened: {d.reason} {d.detail}")
+    second = engine.position.cycle_id
+    assert second != first                                    # same default clock, new id
+    assert {e.cycle for e in engine.broker.journal.entries if e.cycle} == {first, second}
+    store.close()
+
+
+def test_a_bumped_cycle_stamp_never_becomes_the_daily_limit_clock(path):
+    """Cycle identity is made unique; the per-day entry limit keeps the caller's
+    clock, so a second default-clock entry is not dated 1970."""
+    store, venue, broker, engine, auth, res = wired(path)
+    assert opened(warm_and_open(engine))
+    assert engine._entry_clock_ms == 0
+    assert engine._gate_now(engine._entry_clock_ms) is None   # wall clock
+    assert engine.position.opened_ms >= 0
+    store.close()
