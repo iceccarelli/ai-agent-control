@@ -285,8 +285,12 @@ class _Alerts:
     a BaseException and still passes through."""
 
     def __init__(self, root: str, notifier: Optional[RA.Notifier],
-                 clock: Callable[[], float]) -> None:
+                 clock: Callable[[], float],
+                 forward_artifact: Optional[str] = None) -> None:
         self.root, self.notifier, self.clock = root, notifier, clock
+        #: A forward-shadow artefact whose freshness is checked each cycle
+        #: (runner_alerts.forward_status); None: no forward check.
+        self.forward_artifact = forward_artifact
         self.throttle = RA.Throttle()
         self._digest_last = clock()
         self.watchdog_throttle = RA.Throttle()   # its own: one shared set of
@@ -319,8 +323,11 @@ class _Alerts:
                 "startup", RA.INFO,
                 f"alerts are ON: the monitor started. Pages: no cycle within "
                 f"{RA.STALE_MINUTES:g} min, a MONITOR_FAILED streak, a shadow "
-                "fault, any order_sent other than false. One digest a day; "
-                "silence otherwise means healthy."))
+                "fault, any order_sent other than false"
+                + (", stale/unreadable/missing forward-shadow evidence"
+                   if self.forward_artifact else "")
+                + ". One digest a day (a WARNING when the history is not "
+                "healthy); silence otherwise means healthy."))
             UD._say(self.root, f"alert startup {RA.INFO}: {result}")
         except Exception as exc:                               # noqa: BLE001
             UD._say(self.root, f"alert startup failed ({type(exc).__name__}); "
@@ -344,11 +351,14 @@ class _Alerts:
             except OSError:
                 raw = ""
             now = self.clock()
-            for alert in self.throttle.plan(RA.evaluate(raw, now), now):
+            forward = RA.forward_status(self.forward_artifact, now)
+            for alert in self.throttle.plan(RA.evaluate(raw, now, forward=forward),
+                                            now):
                 self._deliver(self.throttle, alert)
             if now - self._digest_last >= RA.DIGEST_INTERVAL_S:
                 # the clock only advances when the digest was DELIVERED
-                if self._deliver(self.throttle, RA.build_digest(raw, now)) == "sent":
+                digest = RA.build_digest(raw, now, forward=forward)
+                if self._deliver(self.throttle, digest) == "sent":
                     self._digest_last = now
         except Exception as exc:                               # noqa: BLE001
             UD._say(self.root, f"alert step failed ({type(exc).__name__}); "
@@ -382,11 +392,12 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
          once: Callable[..., int] = monitor_once,
          shadow_db: Optional[str] = None,
          notifier: Optional[RA.Notifier] = None,
-         mainnet_db: Optional[str] = None) -> int:
+         mainnet_db: Optional[str] = None,
+         forward_artifact: Optional[str] = None) -> int:
     """A stop signal ends the loop with 143 wherever it lands, including the
     sleep between cycles where it spends nearly all its time: under the Fly
     on-failure restart policy a deploy or stop must not look like a failure."""
-    alerts = _Alerts(root, notifier, clock)
+    alerts = _Alerts(root, notifier, clock, forward_artifact=forward_artifact)
     alerts.announce()
     stop_watchdog = alerts.start_watchdog()
     try:
@@ -484,6 +495,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="also append one observation per cycle of Bybit's PUBLIC "
                          "MAINNET market (unauthenticated GETs, read-only) to this "
                          "JSONL evidence file; never the testnet shadow book")
+    ap.add_argument("--forward-artifact", default=None,
+                    help="alert when this forward-shadow artefact (e.g. "
+                         "artifacts/forward_shadow_current.json) is stale, "
+                         "unreadable or missing (forward_status.py; read-only)")
     args = ap.parse_args(argv)
     missing = [k for k in UD.CREDENTIALS if not os.environ.get(k)]
     if missing:
@@ -524,7 +539,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return loop(args.run_dir, env=os.environ, notifier=notifier,
                     interval_s=args.interval_minutes * 60.0,
                     max_runs=args.max_runs, shadow_db=args.shadow_db,
-                    mainnet_db=args.mainnet_db)
+                    mainnet_db=args.mainnet_db,
+                    forward_artifact=args.forward_artifact)
     finally:
         lock.close()
 
