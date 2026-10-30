@@ -52,6 +52,12 @@ class _Store:
     def session_boot_token(self):
         return "test-session-token"
 
+    # The order log. A store that cannot say which carry orders are unresolved
+    # makes the book refuse to start; an empty list is a real store's answer
+    # for a clean database.
+    def unresolved_carry_orders(self):
+        return []
+
     def trip_kill_switch(self, reason):
         self.tripped.append(reason)
 

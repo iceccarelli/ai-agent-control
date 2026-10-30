@@ -1012,8 +1012,12 @@ class LedgerBroker:
 
     def begin_cycle(self, cycle_id: str) -> None:
         """Name the cycle the engine is about to open (explicit delegation to
-        the journal; it moves no money)."""
+        the journal and, when it keeps an order log, the venue adapter; it
+        moves no money)."""
         self.journal.begin_cycle(cycle_id)
+        inner_naming = getattr(self.inner, "begin_cycle", None)
+        if callable(inner_naming):
+            inner_naming(cycle_id)
 
     def __init__(self, inner: Any, journal: Journal,
                  ms: Optional[Callable[[], int]] = None,
@@ -1383,6 +1387,9 @@ class LedgerBroker:
 
     def get_available_margin_usd(self):
         return self.inner.get_available_margin_usd()
+
+    def read_order(self, symbol, order_link_id, product="linear"):
+        return self.inner.read_order(symbol, order_link_id, product)
 
     def get_closed_short_qty_since(self, symbol, since_ms):
         return self.inner.get_closed_short_qty_since(symbol, since_ms)

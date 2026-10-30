@@ -156,7 +156,8 @@ def cold_bot(rows):
     bot = _main.TradingBot.__new__(_main.TradingBot)
     bot.carry = CarryEngine(broker=b, max_notional_usd=100.0, borrow_apr=0.0,
                             execution_mode="acquire", persist=lambda s: None)
-    bot.store = mock.Mock(load_carry_position=lambda: None)
+    bot.store = mock.Mock(load_carry_position=lambda: None,
+                          unresolved_carry_orders=lambda: [])
     return bot, inner._client
 
 

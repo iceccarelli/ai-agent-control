@@ -853,6 +853,32 @@ class TradingBot:
         restart that cannot see the venue must not assume it is flat.
         """
         broker = self.carry.broker
+        # FIRST: settle whatever the last run left half-done. An order that is
+        # still unresolved means its fill (or its absence) is unknown, and a
+        # book must not start, size or hedge on top of that.
+        try:
+            import order_recovery as _recovery
+            recovery = _recovery.resolve_unresolved_orders(broker, self.store)
+            if not isinstance(recovery, _recovery.RecoveryReport):
+                raise TypeError(f"recovery returned {type(recovery).__name__}")
+        except Exception as exc:  # noqa: BLE001
+            logger.critical(
+                "carry cold start: the order log could not be reconciled "
+                "(%s: %s); refusing to start", type(exc).__name__, exc)
+            return False
+        if recovery.unresolved:
+            logger.critical(
+                "carry cold start: %d carry order(s) are still unresolved "
+                "(%s); a human must reconcile before this process trades",
+                len(recovery.unresolved),
+                ", ".join(f"{u.order_link_id}={u.outcome}"
+                          for u in recovery.unresolved[:5]))
+            try:
+                self.store.trip_kill_switch(
+                    "CARRY_COLD_START: unresolved carry orders")
+            except Exception:  # noqa: BLE001
+                logger.critical("kill switch itself failed on cold start")
+            return False
         try:
             ledger = self.store.load_carry_position()
         except Exception as exc:  # noqa: BLE001
@@ -1939,7 +1965,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                         bot.store.next_order_seq(),
                     session_token=bot.store.session_boot_token(),
                     order_gate=_carry_orders_permitted,
-                    entry_gate=carry_entries_permitted_from(bot.store)),
+                    entry_gate=carry_entries_permitted_from(bot.store),
+                    # Every carry order is written down before it can leave
+                    # and followed through its lifecycle (order_lifecycle.py).
+                    order_log=bot.store),
                 bot.carry_journal,
                 ms=lambda: int(time.time() * 1000),
                 spot_symbol=cfg.CARRY_SPOT_SYMBOL),

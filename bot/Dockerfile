@@ -24,7 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
      carry_risk.py carry_shadow.py config.py directional_funding.py features.py funding_reconcile.py ledger.py main.py \
      market_data.py \
-     market_snapshot.py memory.py ml_strategy.py persistence.py \
+     market_snapshot.py memory.py ml_strategy.py order_lifecycle.py \
+     order_recovery.py persistence.py \
      policy.py position_sizing.py private_ws_consumer.py project_status.py \
      promotion_gate.py pure_indicators.py risk_management.py session_log.py \
      shadow.py shadow_strategy.py technical_analysis.py trading_engine.py \
