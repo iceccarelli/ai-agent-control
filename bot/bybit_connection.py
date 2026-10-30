@@ -1047,9 +1047,14 @@ class BybitClient:
     def _entry_refusal(self, direction: str, reduce_only: bool) -> Optional[str]:
         """A reason string when this order may not go, else None.
 
-        Exits are never asked: a reduce-only order, and on spot a SELL (spot
-        has no short, so a sell can only reduce a held long)."""
-        if self.entry_gate is None or reduce_only:
+        Asked only about orders that can ADD exposure: any spot BUY (spot has
+        no reduce-only; the flag is a caller's claim, never evidence), and any
+        linear order that is not reduce-only (the venue enforces that flag
+        there). A spot SELL is never asked: `_spot_exit_qty` has already proved
+        inventory behind it, which is what makes it an exit."""
+        if self.entry_gate is None:
+            return None
+        if self.is_linear and reduce_only:
             return None
         if self.is_spot and direction == "Sell":
             return None
@@ -1060,6 +1065,28 @@ class BybitClient:
         if allowed is not True:
             return f"ENTRY_GATE_REFUSED: {reason}"
         return None
+
+    def _spot_exit_qty(self, symbol: str, qty: float, *, clamp: bool
+                       ) -> Tuple[Optional[float], Optional[str]]:
+        """(qty, None) when the wallet STATES a base balance that backs a spot
+        sale, else (None, reason). A sale with no coin behind it is a borrow
+        when spot margin is on, which is a short, so it is never sent on a
+        guess. `clamp` sells at most what is held (a protective exit sized a
+        fee-dust above the balance still exits); otherwise the whole quantity
+        must be covered. The balance is the wallet's TOTAL (resting orders
+        reserve coin that is still ours)."""
+        try:
+            held = self.get_coin_balance(self._base_asset(symbol), total=True)
+        except (BybitAPIError, PermanentAPIError) as exc:
+            return None, f"BALANCE_UNREADABLE: {exc}"
+        if not (held == held and held > 0):
+            return None, "NOTHING_HELD_TO_SELL"
+        if clamp:
+            return min(float(qty), held), None
+        if held + 1e-12 < float(qty):
+            return None, (f"SPOT_SALE_NOT_BACKED: selling {float(qty):.8f} "
+                          f"with {held:.8f} held")
+        return float(qty), None
 
     def place_order(
         self,
@@ -1083,6 +1110,15 @@ class BybitClient:
         direction = normalize_side(side)
         if direction is None:
             return OrderResult(reason=f"UNKNOWN_SIDE:{side!r}")
+        if self.is_spot and direction == "Buy" and reduce_only:
+            return OrderResult(
+                reason="REDUCE_ONLY_BUY_NOT_AVAILABLE_ON_SPOT: spot has no "
+                       "reduce-only, so a flagged BUY is an entry")
+        if self.is_spot and direction == "Sell" and reduce_only:
+            backed, problem = self._spot_exit_qty(symbol, float(qty), clamp=True)
+            if problem is not None:
+                return OrderResult(reason=problem)
+            qty = backed
         refused = self._entry_refusal(direction, reduce_only)
         if refused is not None:
             return OrderResult(reason=refused)
@@ -1520,6 +1556,15 @@ class BybitClient:
             filters = filters or self.get_instrument_filters(symbol)
         except BybitAPIError as exc:
             return OrderResult(reason=f"NO_FILTERS: {exc}")
+
+        refused = self._entry_refusal(direction, False)
+        if refused is not None:
+            return OrderResult(reason=refused)
+        if direction == "Sell":
+            backed, problem = self._spot_exit_qty(symbol, float(qty), clamp=True)
+            if problem is not None:
+                return OrderResult(reason=f"STOP_{problem}")
+            qty = backed
 
         snapped_qty = snap_qty_down(float(qty), filters.qty_step)
         if snapped_qty <= 0 or snapped_qty < filters.min_qty:
