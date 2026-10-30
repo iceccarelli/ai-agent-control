@@ -23,7 +23,11 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 import promotion_gate as pg  # noqa: E402
 
-NON_MACHINE = [k for k, _d, owner in pg.CHECKLIST_ITEMS if owner != "machine"]
+# The forward-shadow item ALSO needs live machine evidence from the artefact
+# (tests/test_promotion_forward_evidence.py); these tests are about the digest
+# logic of the items a human alone completes.
+NON_MACHINE = [k for k, _d, owner in pg.CHECKLIST_ITEMS
+               if owner != "machine" and k != pg.FORWARD_ITEM]
 
 
 def write_gate(tmp_path, **overrides):

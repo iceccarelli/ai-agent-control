@@ -48,6 +48,7 @@ import json
 import logging
 import os
 import stat
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -280,9 +281,43 @@ def _live_chain_satisfied(config: Any = None) -> Tuple[bool, str]:
     return allowed, str(reason)
 
 
+#: The one item whose evidence is DERIVED from an artefact on every evaluation
+#: instead of read from a sentence in the gate file.
+FORWARD_ITEM = "forward_shadow_clean"
+#: States of `forward_status` that mean "no usable current evidence".
+_FORWARD_UNUSABLE = frozenset({"NO_DATA", "UNREADABLE", "STALE"})
+
+
+def _forward_item(artifact: str, now: float) -> Tuple[bool, str]:
+    """(machine_ok, evidence) for the forward-shadow item, from the artefact.
+
+    machine_ok needs: readable, FRESH, not DETERIORATING, and at least the
+    gate's own minimum trades AND days. It is necessary, never sufficient: the
+    human flag and approval digest are still required by the caller."""
+    import forward_status as _fs
+    try:
+        fs = _fs.evaluate_forward_evidence(artifact, now=float(now))
+    except Exception as exc:  # noqa: BLE001 - unreadable evidence is a refusal
+        return False, (f"forward evidence could not be evaluated "
+                       f"({type(exc).__name__}: {exc})")
+    age = "n/a" if fs.age_s is None else f"{fs.age_s / 3600.0:.1f}h"
+    mean = "n/a" if fs.mean_net_r is None else f"{fs.mean_net_r:+.4f} R"
+    evidence = (
+        f"machine-derived from {os.path.basename(artifact)}: state {fs.state} "
+        f"(evidence {fs.evidence_state}); {fs.trades_vs_gate} forward closed "
+        f"trades, {fs.days_vs_gate} forward days; mean {mean}; observed "
+        f"{fs.observed_at_utc}, age {age} (limit {fs.max_age_s / 3600.0:.0f}h). "
+        "These are paper observations, not cash.")
+    ok = (fs.state not in _FORWARD_UNUSABLE and fs.state != "DETERIORATING"
+          and bool(fs.trades_at_or_above_min) and bool(fs.days_at_or_above_min))
+    return ok, evidence
+
+
 def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None,
                             config: Any = None,
-                            approvals_path: Optional[str] = None) -> GateVerdict:
+                            approvals_path: Optional[str] = None,
+                            forward_artifact: Optional[str] = None,
+                            now: Optional[float] = None) -> GateVerdict:
     """Every item, its state, and whether live may be promoted. Fails closed.
 
     A non-machine item is complete only if its flag is a JSON true AND the
@@ -335,6 +370,14 @@ def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None
                 complete = False
                 evidence = (f"flag set in the gate file but no matching human "
                             f"approval digest: {evidence}")
+            if key == FORWARD_ITEM:
+                # The typed sentence in the gate file is NOT evidence. The item
+                # is read from the artefact now, and must also pass it.
+                machine_ok, evidence = _forward_item(
+                    forward_artifact or os.path.join(
+                        repo, "artifacts", "forward_shadow_current.json"),
+                    time.time() if now is None else now)
+                complete = bool(complete and machine_ok)
 
         items.append(GateItem(key=key, description=description, owner=owner,
                               complete=complete, evidence=evidence))
@@ -388,7 +431,9 @@ def strategy_is_the_cleared_signal(strategy: Any, *, config: Any = None,
 def promotion_gate_allows_live(*, path: str = GATE_PATH,
                                repo: Optional[str] = None,
                                config: Any = None,
-                               approvals_path: Optional[str] = None) -> bool:
+                               approvals_path: Optional[str] = None,
+                               forward_artifact: Optional[str] = None,
+                               now: Optional[float] = None) -> bool:
     """`True` only if every item is complete AND live is independently armed.
 
     Returns `False` on this tree. Note what this function does NOT do even when
@@ -396,4 +441,6 @@ def promotion_gate_allows_live(*, path: str = GATE_PATH,
     remains `config.is_live_authorized`'s alone.
     """
     return evaluate_promotion_gate(path=path, repo=repo, config=config,
-                                   approvals_path=approvals_path).allows_live
+                                   approvals_path=approvals_path,
+                                   forward_artifact=forward_artifact,
+                                   now=now).allows_live
