@@ -43,6 +43,7 @@ FAIL-CLOSED, INCLUDING AGAINST ITS OWN FILE
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -62,6 +63,7 @@ __all__ = [
     "GateVerdict",
     "evaluate_promotion_gate",
     "promotion_gate_allows_live",
+    "approval_digest",
 ]
 
 GATE_PATH = os.path.join(
@@ -133,6 +135,32 @@ class GateVerdict:
         return [item.key for item in self.items if not item.complete]
 
 
+def approval_digest(key: str, entry: Any) -> str:
+    """SHA-256 of one gate entry exactly as written (key order ignored). A human
+    approval is this digest recorded in a file OUTSIDE the repository
+    (`tools/promotion_approve.py`), so a commit that flips the flag or edits
+    the evidence cannot supply it, and an edit after approval voids it."""
+    canonical = json.dumps({"key": key, "entry": entry}, sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _read_approvals(path: str) -> Dict[str, str]:
+    """{key: digest}. Anything unreadable or malformed approves nothing."""
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    approved = payload.get("approved") if isinstance(payload, dict) else None
+    if not isinstance(approved, dict):
+        return {}
+    return {k: v for k, v in approved.items()
+            if isinstance(k, str) and isinstance(v, str)}
+
+
 def _read_gate(path: str) -> Optional[Dict[str, Any]]:
     if not path or not os.path.isfile(path):
         logger.warning("promotion gate file %s is missing; REFUSING", path)
@@ -186,10 +214,18 @@ def _live_chain_satisfied(config: Any = None) -> Tuple[bool, str]:
 
 
 def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None,
-                            config: Any = None) -> GateVerdict:
-    """Every item, its state, and whether live may be promoted. Fails closed."""
+                            config: Any = None,
+                            approvals_path: Optional[str] = None) -> GateVerdict:
+    """Every item, its state, and whether live may be promoted. Fails closed.
+
+    A non-machine item is complete only if its flag is a JSON true AND the
+    digest of its entry is in the approvals file (`approvals_path`, else the
+    config's PROMOTION_APPROVALS_FILE, else none: nothing is approved)."""
     repo = repo or os.path.dirname(os.path.abspath(__file__))
     payload = _read_gate(path)
+    if approvals_path is None:
+        approvals_path = str(getattr(config, "PROMOTION_APPROVALS_FILE", "") or "")
+    approvals = _read_approvals(approvals_path)
     declared = (payload or {}).get("checklist", {})
     reasons: List[str] = []
     items: List[GateItem] = []
@@ -226,6 +262,10 @@ def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None
                 if isinstance(entry, dict) else "not declared in the gate file"
             if not isinstance(entry, dict):
                 reasons.append(f"{key}: not declared in the gate file")
+            elif complete and approvals.get(key) != approval_digest(key, entry):
+                complete = False
+                evidence = (f"flag set in the gate file but no matching human "
+                            f"approval digest: {evidence}")
 
         items.append(GateItem(key=key, description=description, owner=owner,
                               complete=complete, evidence=evidence))
@@ -278,12 +318,13 @@ def strategy_is_the_cleared_signal(strategy: Any, *, config: Any = None,
 
 def promotion_gate_allows_live(*, path: str = GATE_PATH,
                                repo: Optional[str] = None,
-                               config: Any = None) -> bool:
+                               config: Any = None,
+                               approvals_path: Optional[str] = None) -> bool:
     """`True` only if every item is complete AND live is independently armed.
 
     Returns `False` on this tree. Note what this function does NOT do even when
     it returns `True`: it does not arm anything. It answers a question. Arming
     remains `config.is_live_authorized`'s alone.
     """
-    return evaluate_promotion_gate(path=path, repo=repo,
-                                   config=config).allows_live
+    return evaluate_promotion_gate(path=path, repo=repo, config=config,
+                                   approvals_path=approvals_path).allows_live

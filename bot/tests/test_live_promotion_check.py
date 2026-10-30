@@ -183,14 +183,22 @@ def test_only_a_real_json_true_marks_a_human_item_complete(value, tmp_path):
     assert verdict.allows_live is False
 
 
-def test_a_real_json_true_still_marks_a_human_item_complete(tmp_path):
+def test_a_real_json_true_marks_a_human_item_complete_only_with_an_approval(tmp_path):
+    """E6: the flag is necessary, not sufficient. The digest of the entry must
+    also be in the approvals file (details in test_promotion_approvals.py)."""
     import json
 
     import promotion_gate as pg
     keys = [i.key for i in pg.evaluate_promotion_gate(
         path=str(tmp_path / "missing.json")).items]
+    entries = {k: {"complete": True, "evidence": "x"} for k in keys}
     gate = tmp_path / "gate.json"
-    gate.write_text(json.dumps(
-        {"checklist": {k: {"complete": True, "evidence": "x"} for k in keys}}))
-    verdict = pg.evaluate_promotion_gate(path=str(gate))
+    gate.write_text(json.dumps({"checklist": entries}))
+    flag_only = pg.evaluate_promotion_gate(path=str(gate))
+    assert not any(i.complete and i.evidence == "x" for i in flag_only.items)
+    approvals = tmp_path / "approvals.json"
+    approvals.write_text(json.dumps({"approved": {
+        k: pg.approval_digest(k, e) for k, e in entries.items()}}))
+    verdict = pg.evaluate_promotion_gate(path=str(gate),
+                                         approvals_path=str(approvals))
     assert any(i.complete and i.evidence == "x" for i in verdict.items)

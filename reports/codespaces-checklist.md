@@ -61,6 +61,14 @@ cd /workspaces/ai-agent-control && scripts/runner_status.sh
 ```
 Read-only. Never re-initialise the forward book and never change a frozen constant. The forward book and the public-market data live on the Fly runner, not in Codespaces.
 
+## 6. Recording a human promotion approval (only when you have read the evidence)
+
+The gate no longer trusts a flag in the repository. Approve one item at a time, writing outside the repo:
+```bash
+cd /workspaces/ai-agent-control/bot && python3 tools/promotion_approve.py --key kill_switch_drill_recorded --out ~/promotion_approvals.json
+```
+Then set `PROMOTION_APPROVALS_FILE=$HOME/promotion_approvals.json` in the process environment. Changing the item's entry afterwards voids the approval. This does not open live trading: the live-arming chain and the forward evidence are still required.
+
 ## What "ready" means
 
 Ready is steps 1-4 passing. It does not mean profitable. Live trading, any profit claim and any real capital stay blocked until the frozen protocol has venue-reconciled closed forward trades (see `forward-holdout-plan.md`).
