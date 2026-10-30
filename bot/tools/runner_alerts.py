@@ -24,6 +24,19 @@ WHAT IT ALERTS ON
                 (WARNING: the protocol's 30-day clock is not accumulating)
   shadow        the last forward-shadow step was FAULT or REFUSED (WARNING)
   no_data       the history has no readable cycle (WARNING)
+  forward_stale / forward_unreadable / forward_no_data
+                with a forward-shadow artefact configured (--forward-artifact):
+                `forward_status.evaluate_forward_evidence` says it is older than
+                its max age, cannot be used as evidence, or is absent (WARNING).
+                Facts about paper shadow evidence; never a gate decision.
+
+A history line repeated verbatim (a re-delivered or concatenated file) is one
+cycle, not two: it can neither make a single failure a "streak" nor count twice
+toward a stall.
+
+The daily digest is a heartbeat. When the history it summarises is not healthy
+(stale, failed, future-stamped...) it is sent as a WARNING headed NOT HEALTHY,
+never as an INFO that reads like proof of life.
 
 WHAT IT CANNOT DO. A process or machine that has died cannot report its own
 death. The in-process notifier covers a failing, faulting or HUNG monitor. For a
@@ -53,6 +66,10 @@ from typing import Callable, Dict, List, Mapping, Optional, Sequence
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+#: forward_status lives one level up (a pure file reader: no client, no network)
+BOT = os.path.dirname(HERE)
+if BOT not in sys.path:
+    sys.path.insert(1, BOT)
 
 import monitor_summary as MS  # noqa: E402
 
@@ -236,6 +253,61 @@ def _mainnet_stall(rows: Sequence[Mapping[str, object]], n: int):
     return None
 
 
+def distinct_rows(rows: Sequence[Mapping[str, object]]) -> List[Mapping[str, object]]:
+    """`rows` with verbatim repeats removed, first occurrence kept, order kept.
+
+    Two cycles cannot produce byte-identical lines (each carries its own `at`
+    and readings), so an exact repeat is the same cycle delivered twice, and
+    counting it twice would turn one MONITOR_FAILED into a paging "streak"."""
+    seen = set()
+    out: List[Mapping[str, object]] = []
+    for r in rows:
+        key = json.dumps(r, sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
+#: forward_status states that are a concrete failure of the forward evidence
+#: feed. INSUFFICIENT_SAMPLE / DETERIORATING / RECOVERING / STABLE are readings,
+#: not failures, and never page.
+FORWARD_ALERT_KEYS = {"STALE": "forward_stale",
+                      "UNREADABLE": "forward_unreadable",
+                      "NO_DATA": "forward_no_data"}
+
+
+def forward_status(path: Optional[str], now: float):
+    """`forward_status.evaluate_forward_evidence(path, now=now)`, or None when
+    no artefact is configured. A reader that raises is reported as UNREADABLE
+    rather than silencing the check."""
+    if not path:
+        return None
+    try:
+        import forward_status as FS
+        return FS.evaluate_forward_evidence(path, now=now).as_dict()
+    except Exception as exc:                                   # noqa: BLE001
+        return {"state": "UNREADABLE", "path": path,
+                "reasons": [f"forward_status failed ({type(exc).__name__})"]}
+
+
+def forward_alerts(status: Optional[Mapping[str, object]]) -> List[Alert]:
+    """One WARNING per concrete forward-evidence failure; nothing otherwise.
+    The key is per failure kind so the throttle deduplicates it and announces
+    its recovery once."""
+    if not status:
+        return []
+    key = FORWARD_ALERT_KEYS.get(str(status.get("state")))
+    if key is None:
+        return []
+    reasons = "; ".join(map(str, status.get("reasons") or [])) or "no reason recorded"
+    return [Alert(key, WARNING,
+                  f"forward-shadow evidence is {status.get('state')} "
+                  f"({status.get('path')}): {reasons}. Paper shadow facts, "
+                  "not a gate decision.")]
+
+
 def _failed_streak(rows: Sequence[Mapping[str, object]]) -> int:
     n = 0
     for r in reversed(rows):
@@ -247,13 +319,16 @@ def _failed_streak(rows: Sequence[Mapping[str, object]]) -> int:
 
 def evaluate(history_text: str, now: float, *,
              stale_minutes: float = STALE_MINUTES,
-             failed_streak: int = FAILED_STREAK) -> List[Alert]:
-    """The alerts a history deserves right now. Pure: no clock, no network."""
-    return _evaluate(history_text, now, stale_minutes, failed_streak)[0]
+             failed_streak: int = FAILED_STREAK,
+             forward: Optional[Mapping[str, object]] = None) -> List[Alert]:
+    """The alerts a history deserves right now. Pure: no clock, no network.
+    `forward` is a `forward_status` result (dict), or None for no check."""
+    return _evaluate(history_text, now, stale_minutes, failed_streak,
+                     forward)[0]
 
 
-def _evaluate(history_text, now, stale_minutes, failed_streak):
-    rows, _ = MS.scan(history_text)
+def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None):
+    rows = distinct_rows(MS.scan(history_text)[0])
     s = MS.summarise(rows, now=now, stale_minutes=stale_minutes,
                      raw_text=history_text)
     alerts: List[Alert] = []
@@ -288,15 +363,31 @@ def _evaluate(history_text, now, stale_minutes, failed_streak):
             f"the last {MAINNET_STALL_CYCLES} cycles recorded no real-market "
             f"observation (last state {last['mainnet_state']}: {why}). The "
             "30-day protocol clock is not accumulating evidence."))
+    alerts.extend(forward_alerts(forward))
     return alerts, s
 
 
-def build_digest(history_text: str, now: float) -> Alert:
-    """The once-a-day heartbeat: proof the runner AND the connection are alive."""
-    rows, _ = MS.scan(history_text)
-    summary = MS.summarise(rows, now=now, raw_text=history_text)
+def build_digest(history_text: str, now: float,
+                 forward: Optional[Mapping[str, object]] = None) -> Alert:
+    """The once-a-day heartbeat: proof the runner AND the connection are alive.
+
+    Only a healthy history is sent as that proof (INFO). A stale, failed,
+    future-stamped or empty one is a WARNING headed NOT HEALTHY: a digest must
+    never claim the runner is operating when its own history says it is not."""
+    rows = distinct_rows(MS.scan(history_text)[0])
+    summary = MS.summarise(list(rows), now=now, raw_text=history_text)
     body = MS.render(summary)
-    return Alert("digest", INFO, "daily digest\n" + body)
+    healthy = summary.get("exit") == 0
+    lines = ["daily digest" + ("" if healthy else
+                               f": NOT HEALTHY ({summary.get('health')})"), body]
+    if forward:
+        lines.append(f"forward    {forward.get('state')} "
+                     f"(evidence {forward.get('evidence_state')}, trades "
+                     f"{forward.get('trades_vs_gate')}, days "
+                     f"{forward.get('days_vs_gate')}, observed "
+                     f"{forward.get('observed_at_utc')}); paper shadow facts, "
+                     "not a gate decision")
+    return Alert("digest", INFO if healthy else WARNING, "\n".join(lines))
 
 
 class Throttle:
@@ -382,6 +473,9 @@ def main(argv: Optional[Sequence[str]] = None,
     ap.add_argument("--stale-minutes", type=float, default=STALE_MINUTES)
     ap.add_argument("--failed-streak", type=int, default=FAILED_STREAK)
     ap.add_argument("--now", type=float, default=None)
+    ap.add_argument("--forward-artifact", default=None,
+                    help="also check this forward-shadow artefact's freshness "
+                         "(forward_status.py); omitted, no forward check")
     ap.add_argument("--dry-run", action="store_true",
                     help="print the alerts; send nothing")
     args = ap.parse_args(argv)
@@ -404,7 +498,8 @@ def main(argv: Optional[Sequence[str]] = None,
         print(f"cannot read {args.history}: {type(exc).__name__}", file=sys.stderr)
         return 2
     now = time.time() if args.now is None else args.now
-    alerts, summary = _evaluate(raw, now, args.stale_minutes, args.failed_streak)
+    alerts, summary = _evaluate(raw, now, args.stale_minutes, args.failed_streak,
+                                forward_status(args.forward_artifact, now))
     code = max(int(summary["exit"]), 1 if alerts else 0)
     for a in alerts:
         print(f"[{a.severity}] {a.key}: {a.text}")

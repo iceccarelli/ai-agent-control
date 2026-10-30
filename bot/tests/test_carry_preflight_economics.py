@@ -272,7 +272,7 @@ class TestTheThreeStatesCannotOverrideEachOther:
         # stronger gate that delegates to it rather than copying its logic)
         assert "carry_orders_permitted_for(cfg, bot.client)" in \
             inspect.getsource(_main.build_bot)
-        assert "carry_orders_permitted(cfg)" in \
+        assert "carry_orders_permitted(cfg, exit=exit)" in \
             inspect.getsource(_main.carry_orders_permitted_for)
 
 

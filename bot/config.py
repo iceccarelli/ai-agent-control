@@ -548,6 +548,17 @@ class Config:
     #: it again). REQUIRED for BOOK_MODE=carry, with no default, because the
     #: two modes send different orders. None means "not set".
     CARRY_EXECUTION_MODE: Optional[str] = None
+    #: What the capital behind the hedge could earn elsewhere, as a fraction
+    #: per year on the hedged notional, charged like financing in the entry
+    #: economics. 0.0 (the default) changes nothing: the repo holds no rate
+    #: source and none is invented. An operator who knows what owned BTC could
+    #: earn as cash sets it, and the entry gate then demands the funding clear
+    #: it as well as the fees and financing.
+    CARRY_OPPORTUNITY_COST_APR: float = 0.0
+    #: How long an entry's capital reservation may sit unconfirmed before it
+    #: expires (seconds). An expired hold never frees dollars an unresolved
+    #: order may be using. Operational, not economic.
+    CAPITAL_RESERVATION_TTL_S: float = 600.0
     #: HOW each leg is executed: "taker" crosses the spread on every order,
     #: "maker_first" rests an ENTRY at the touch for CARRY_MAKER_WAIT_S and
     #: then crosses whatever did not fill. Exits are taker under both. The
@@ -963,6 +974,10 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_SPOT_SYMBOL=parse_str(env, "CARRY_SPOT_SYMBOL", "BTCUSDT"),
         CARRY_PERP_SYMBOL=parse_str(env, "CARRY_PERP_SYMBOL", "BTCUSDT"),
         CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
+        CARRY_OPPORTUNITY_COST_APR=parse_float(
+            env, "CARRY_OPPORTUNITY_COST_APR", 0.0, low=0.0, high=1.0),
+        CAPITAL_RESERVATION_TTL_S=parse_float(
+            env, "CAPITAL_RESERVATION_TTL_S", 600.0, low=1.0, high=86_400.0),
         CARRY_EXECUTION_MODE=parse_execution_mode(env),
         CARRY_EXECUTION_STYLE=parse_execution_style(env),
         CARRY_MAKER_WAIT_S=parse_maker_wait(env),

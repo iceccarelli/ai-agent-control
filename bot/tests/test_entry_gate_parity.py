@@ -140,7 +140,7 @@ def test_reason_table_matches_the_native_library(native):
         "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET",
         "BREAKEVEN_HOLD_EXCEEDS_DEMONSTRATED_HOLD")
     assert core.GATE_REASONS == len(cc.GATE_REASONS) == 9
-    assert core.version().startswith("carrycore/4")
+    assert core.version().startswith("carrycore/5")
     # and each name is what the C++ returns for an input that produces it
     probes = {
         "COST_INPUT_INVALID": dict(prints=[5.0] * 5, rt=0.0),
@@ -178,13 +178,14 @@ def test_the_abi_check_tells_a_stale_library_from_the_current_one(native, tmp_pa
                                                                   monkeypatch):
     """make compares mtimes only, so an old-ABI .so touched after checkout is
     left alone; build() therefore asks the library itself and clean-rebuilds.
-    This pins the question it asks: exact name, so carrycore/40 or /3 fail."""
+    This pins the question it asks: exact name, so carrycore/50, /4 or /3 fail."""
     import shutil
     import subprocess
     if shutil.which("g++") is None:
         pytest.skip("no compiler")
     assert core._abi_current() is True
-    for name in ("carrycore/3 (stale)", "carrycore/40 (future)"):
+    for name in ("carrycore/4 (stale)", "carrycore/3 (stale)",
+                 "carrycore/50 (future)"):
         src = tmp_path / "v.cpp"
         src.write_text('extern "C" const char *carrycore_version(void)'
                        '{return "%s";}\n' % name)

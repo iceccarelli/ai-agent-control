@@ -128,6 +128,12 @@ class Entry:
     #: `Journal.post`, persisted, and re-derived identically for older rows.
     #: "" for an entry before any cycle (the opening balance).
     cycle: str = ""
+    #: The mark the engine DECIDED on, for a fill entry, when the order path
+    #: supplied one. None = not journalled (every row written before this field
+    #: existed, and every fill whose caller did not pass it). It is serialised
+    #: only when set, so an older row round-trips byte-for-byte; slippage is
+    #: computed only from fills that carry it and is UNAVAILABLE otherwise.
+    decision_mark: Optional[float] = None
 
 
 @dataclass
@@ -230,6 +236,14 @@ class Journal:
             raise LedgerError(
                 f"entry {entry.ref!r} has basis {entry.basis!r}; expected one "
                 f"of {FUNDING_BASES}")
+        if entry.decision_mark is not None and not (
+                isinstance(entry.decision_mark, (int, float))
+                and math.isfinite(entry.decision_mark)
+                and entry.decision_mark > 0):
+            raise LedgerError(
+                f"entry {entry.ref!r} has decision_mark "
+                f"{entry.decision_mark!r}; a mark is a finite positive price "
+                "or None (not journalled)")
         if entry.fee_status not in FEE_STATUSES:
             raise LedgerError(
                 f"entry {entry.ref!r} has fee_status {entry.fee_status!r}; "
@@ -384,11 +398,19 @@ class Journal:
     # -- persistence ------------------------------------------------------
 
     def to_rows(self) -> List[Dict[str, Any]]:
-        return [{"ms": e.ms, "kind": e.kind, "ref": e.ref, "memo": e.memo,
-                 "fee_status": e.fee_status, "fee_raw": e.fee_raw,
-                 "basis": e.basis, "cycle": e.cycle,
-                 "lines": [{"account": l.account, "usd": l.usd, "qty": l.qty}
-                           for l in e.lines]} for e in self.entries]
+        rows = []
+        for e in self.entries:
+            row = {"ms": e.ms, "kind": e.kind, "ref": e.ref, "memo": e.memo,
+                   "fee_status": e.fee_status, "fee_raw": e.fee_raw,
+                   "basis": e.basis, "cycle": e.cycle,
+                   "lines": [{"account": l.account, "usd": l.usd, "qty": l.qty}
+                             for l in e.lines]}
+            if e.decision_mark is not None:
+                # additive: absent (not null) when never journalled, so a row
+                # written before the field existed serialises identically
+                row["decision_mark"] = float(e.decision_mark)
+            rows.append(row)
+        return rows
 
     @classmethod
     def from_rows(cls, rows: List[Dict[str, Any]]) -> "Journal":
@@ -411,6 +433,8 @@ class Journal:
                 basis=str(row["basis"] if "basis" in row else
                           ("engine_estimate" if kind == "funding" else "")),
                 cycle=str(row.get("cycle") or ""),
+                decision_mark=(None if row.get("decision_mark") is None
+                               else float(row["decision_mark"])),
                 lines=[Line(str(l["account"]), float(l["usd"]),
                             float(l.get("qty", 0.0)))
                        for l in row["lines"]]))
@@ -627,7 +651,8 @@ def opening_balance(journal: Journal, *, ms: int, btc: float,
 
 def spot_buy(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
              fee_btc: float, fee_usdt: float = 0.0, fee_status: str = "",
-             fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
+             fee_raw: Optional[Dict[str, Any]] = None,
+             decision_mark: Optional[float] = None) -> Entry:
     """A spot BUY, whose fee the venue takes in BTC (INVENTORY F3).
 
     The wallet ends up holding `qty - fee_btc` while the perp leg hedges
@@ -642,12 +667,14 @@ def spot_buy(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
         Line(FEES, fee_usd + fee_usdt),
         Line(BTC, -fee_usd, qty=-fee_btc),
         Line(USDT, -fee_usdt, qty=-fee_usdt)],
-        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
+        fee_status=fee_status, fee_raw=dict(fee_raw or {}),
+        decision_mark=decision_mark))
 
 
 def spot_sell(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
               cost_basis: float, fee_usd: float, fee_status: str = "",
-              fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
+              fee_raw: Optional[Dict[str, Any]] = None,
+              decision_mark: Optional[float] = None) -> Entry:
     proceeds = qty * price
     cost = qty * cost_basis
     return journal.post(Entry(ms=ms, kind="spot_sell", ref=ref, lines=[
@@ -656,12 +683,14 @@ def spot_sell(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
         Line(REALISED, -(proceeds - cost)),
         Line(FEES, fee_usd),
         Line(USDT, -fee_usd, qty=-fee_usd)],
-        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
+        fee_status=fee_status, fee_raw=dict(fee_raw or {}),
+        decision_mark=decision_mark))
 
 
 def perp_open(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
               fee_usd: float, fee_status: str = "",
-              fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
+              fee_raw: Optional[Dict[str, Any]] = None,
+              decision_mark: Optional[float] = None) -> Entry:
     """Open (or add to) the short. A derivative costs no principal, so the
     only money that moves is the fee; the position is carried as a quantity."""
     return journal.post(Entry(ms=ms, kind="perp_open", ref=ref, lines=[
@@ -669,13 +698,15 @@ def perp_open(journal: Journal, *, ms: int, ref: str, qty: float, price: float,
         Line(FEES, fee_usd),
         Line(USDT, -fee_usd, qty=-fee_usd)],
         memo=f"short {qty} @ {price}",
-        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
+        fee_status=fee_status, fee_raw=dict(fee_raw or {}),
+        decision_mark=decision_mark))
 
 
 def perp_close(journal: Journal, *, ms: int, ref: str, qty: float,
                price: float, entry_price: float, fee_usd: float,
                fee_status: str = "",
-               fee_raw: Optional[Dict[str, Any]] = None) -> Entry:
+               fee_raw: Optional[Dict[str, Any]] = None,
+              decision_mark: Optional[float] = None) -> Entry:
     """Buy the short back. A short gains when the price falls."""
     realised = qty * (entry_price - price)
     return journal.post(Entry(ms=ms, kind="perp_close", ref=ref, lines=[
@@ -685,7 +716,8 @@ def perp_close(journal: Journal, *, ms: int, ref: str, qty: float,
         Line(FEES, fee_usd),
         Line(USDT, -fee_usd, qty=-fee_usd)],
         memo=f"cover {qty} @ {price} from {entry_price}",
-        fee_status=fee_status, fee_raw=dict(fee_raw or {})))
+        fee_status=fee_status, fee_raw=dict(fee_raw or {}),
+        decision_mark=decision_mark))
 
 
 def funding(journal: Journal, *, ms: int, ref: str, usd: float,
@@ -1244,6 +1276,16 @@ class LedgerBroker:
             return
         fee_btc, fee_usdt, status, fee_raw = self._resolve_fee(
             result, side=side, product=product)
+        # The mark the engine decided on, when the order path passed one back
+        # with the result. Anything that is not a finite positive price is
+        # "not journalled", never a guess.
+        mark = result.get("decision_mark")
+        try:
+            mark = float(mark) if mark is not None else None
+        except (TypeError, ValueError):
+            mark = None
+        if mark is not None and not (math.isfinite(mark) and mark > 0):
+            mark = None
         ref = str(result.get("order_link_id") or f"fill:{self._ms()}")
         # Never behind the journal's last entry: a wall clock that stepped back
         # must not turn a venue fill into a booking failure.
@@ -1265,7 +1307,8 @@ class LedgerBroker:
                 held_qty = max(0.0, held_qty)
                 spot_buy(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                          fee_btc=fee_btc, fee_usdt=fee_usdt,
-                         fee_status=status, fee_raw=fee_raw)
+                         fee_status=status, fee_raw=fee_raw,
+                         decision_mark=mark)
                 self._note_fill(ref=ref, ms=ms, product=product, side=side,
                                 qty=qty, price=price, fee_usdt=fee_usdt,
                                 fee_btc=fee_btc, status=status, fee_raw=fee_raw)
@@ -1301,7 +1344,8 @@ class LedgerBroker:
                          else price)
                 spot_sell(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                           cost_basis=entry, fee_usd=fee_usdt,
-                          fee_status=status, fee_raw=fee_raw)
+                          fee_status=status, fee_raw=fee_raw,
+                          decision_mark=mark)
                 self._note_fill(ref=ref, ms=ms, product=product, side=side,
                                 qty=qty, price=price, fee_usdt=fee_usdt,
                                 fee_btc=fee_btc, status=status, fee_raw=fee_raw)
@@ -1312,7 +1356,8 @@ class LedgerBroker:
 
         if side == "Sell":
             perp_open(self.journal, ms=ms, ref=ref, qty=qty, price=price,
-                      fee_usd=fee_usdt, fee_status=status, fee_raw=fee_raw)
+                      fee_usd=fee_usdt, fee_status=status, fee_raw=fee_raw,
+                      decision_mark=mark)
             self._note_fill(ref=ref, ms=ms, product=product, side=side,
                             qty=qty, price=price, fee_usdt=fee_usdt,
                             fee_btc=fee_btc, status=status, fee_raw=fee_raw)
@@ -1325,7 +1370,8 @@ class LedgerBroker:
             entry = self._perp_entry if self._perp_entry is not None else price
             perp_close(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                        entry_price=entry, fee_usd=fee_usdt,
-                       fee_status=status, fee_raw=fee_raw)
+                       fee_status=status, fee_raw=fee_raw,
+                       decision_mark=mark)
             self._note_fill(ref=ref, ms=ms, product=product, side=side,
                             qty=qty, price=price, fee_usdt=fee_usdt,
                             fee_btc=fee_btc, status=status, fee_raw=fee_raw)

@@ -608,7 +608,10 @@ class CarryEngine:
                  require_liquidation_check: bool = False,
                  risk_observer: Any = None,
                  leverage: Any = 1.0,
-                 require_capital_check: bool = False) -> None:
+                 require_capital_check: bool = False,
+                 capital_authority: Any = None,
+                 entries_enabled: bool = True,
+                 opportunity_cost_apr: Any = 0.0) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -659,6 +662,14 @@ class CarryEngine:
         #: Off by default so a bare engine (tests, the shadow book) is not
         #: changed; build_bot turns it on for the production book.
         self.require_capital_check = bool(require_capital_check)
+        #: The portfolio authority (carry_capital.CarryCapitalAuthority): asked
+        #: before every ENTRY, never for an exit. None = not wired (a bare
+        #: engine, the shadow book).
+        self.capital_authority = capital_authority
+        #: ENTRIES_ENABLED=0 stops NEW pairs and nothing else: a held pair is
+        #: still watched, margin-checked and exited. (It used to detach the
+        #: whole engine, leaving a held short with nobody looking at it.)
+        self.entries_enabled = bool(entries_enabled)
         self._last_margin: Optional[float] = None
         self.persist = persist
         self.execution_mode = execution_mode
@@ -672,6 +683,19 @@ class CarryEngine:
         self.position: Optional[CarryPosition] = None
         self.state = BookState.FLAT
         self.borrow_apr = float(borrow_apr)
+        #: The forgone return on the hedged capital, per year, charged by the
+        #: entry gate beside borrow (carry_costs.DEFAULT_OPPORTUNITY_COST_APR).
+        #: 0.0 by default, which is the earlier gate to the bit. Zero borrow is
+        #: not zero capital cost, but this repository has no rate to charge,
+        #: so the number is the OPERATOR's: build_bot passes it when config
+        #: carries one. A value the gate cannot price (negative, NaN, inf) is
+        #: refused at construction - a silently refused book is a mystery.
+        if isinstance(opportunity_cost_apr, bool) or not self._finite(
+                opportunity_cost_apr) or float(opportunity_cost_apr) < 0:
+            raise ValueError(
+                f"opportunity_cost_apr={opportunity_cost_apr!r}: the forgone "
+                "return on the hedged capital must be a finite number >= 0")
+        self.opportunity_cost_apr = float(opportunity_cost_apr)
         #: Set by build_bot. Consulted in _open BEFORE the first leg goes out,
         #: because a gate that runs after one leg has landed is not a gate, it
         #: is a post-mortem.
@@ -1141,19 +1165,30 @@ class CarryEngine:
         verdict = _costs().entry_gate(
             funding_prints_bps=self._funding_history,
             perp=mark, spot=spot, borrow_apr=self.borrow_apr,
-            round_trip_bps=round_trip)
+            round_trip_bps=round_trip,
+            opportunity_cost_apr=self.opportunity_cost_apr)
         if not verdict:
             return EntryEconomics(round_trip, verdict, CarryDecision(
                 "stand_aside", reason=verdict.reason, state=BookState.FLAT,
                 detail={"funding_bps": funding_bps,
                         "smoothed_bps": verdict.smoothed_funding_bps,
                         "entry_basis_bps": verdict.entry_basis_bps,
-                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day}))
+                        "net_edge_bps_per_day": verdict.net_edge_bps_per_day,
+                        # Observability only (carry_costs.decision_audit):
+                        # nothing decides on it.
+                        "entry_audit": (verdict.detail or {}).get("audit")}))
         return EntryEconomics(round_trip, verdict, None)
 
     # -- the loop ---------------------------------------------------------
 
-    def _drop_history_the_clock_disproves(self, now_ms: int) -> bool:
+    #: The stamp of a print discarded as STALE by the tick clock. Nothing at or
+    #: before it can be a new settlement: it was seen, and booked, already.
+    #: Without this the cleared watermark let the same stale print read as
+    #: new on every tick (booked again, streak moved again). Process memory
+    #: only: a restart re-derives everything through cold start.
+    _stale_print_floor_ms: Optional[int] = None
+
+    def _drop_history_the_clock_disproves(self, now_ms: int) -> Optional[str]:
         """Discard a funding history whose newest stamp the tick clock refutes.
 
         Two shapes, both judged on the thresholds the code already owns:
@@ -1161,22 +1196,33 @@ class CarryEngine:
         and no tick carried a print to say so), and one stamped in the future
         (a corrupt ledger stamp would make every real print read as a replay
         and freeze the history). `now_ms` is 0 when the caller has no clock;
-        then nothing can be judged. True when it discarded.
+        then nothing can be judged. Returns "stale" or "future" when it
+        discarded (truthy), None when it did not.
+
+        Only a FUTURE watermark may make an older print new again: a real
+        print is older than a corrupt future stamp. A STALE watermark was a
+        real settlement, so it becomes `_stale_print_floor_ms` and a print
+        stamped at or before it is never new.
         """
         last = self._last_print_ms
         if now_ms <= 0 or last is None or not self._funding_history:
-            return False
+            return None
         from market_snapshot import MAX_CLOCK_SKEW_S
-        if (now_ms - last > self.MAX_PRINT_GAP_MS
-                or last - now_ms > MAX_CLOCK_SKEW_S * 1000.0):
+        stale = now_ms - last > self.MAX_PRINT_GAP_MS
+        if stale or last - now_ms > MAX_CLOCK_SKEW_S * 1000.0:
             logger.warning(
                 "carry: newest funding print is stamped %d, the tick is %d; "
                 "discarding %d prints that cannot be placed in time",
                 last, now_ms, len(self._funding_history))
             self._funding_history = []
             self._last_print_ms = None
-            return True
-        return False
+            if stale:
+                self._stale_print_floor_ms = max(
+                    last, self._stale_print_floor_ms or last)
+                return "stale"
+            self._stale_print_floor_ms = None
+            return "future"
+        return None
 
     def on_candle(self, *, mark: float, funding_bps: float,
                   spot: Optional[float] = None,
@@ -1198,6 +1244,7 @@ class CarryEngine:
         delta is checked before opening more because adding size to a drifted
         book compounds the exposure you already failed to hedge.
         """
+        self._capital_sync()
         self._last_tick_ms = int(timestamp_ms or 0)
         if self.state is BookState.HALTED:
             if self._halt_unwritten:
@@ -1226,12 +1273,16 @@ class CarryEngine:
                     and self._finite(funding_bps)
                     and self._finite(funding_print_ms)
                     and (self._last_print_ms is None
-                         or int(funding_print_ms) > self._last_print_ms))
+                         or int(funding_print_ms) > self._last_print_ms)
+                    and (self._stale_print_floor_ms is None
+                         or int(funding_print_ms) > self._stale_print_floor_ms))
 
         new_print = is_new()
-        # No new print to date the history by: the tick clock has to.
+        # No new print to date the history by: the tick clock has to. Only a
+        # FUTURE watermark can make the print in hand new; after a STALE one
+        # the print in hand is the stale settlement itself, already booked.
         if not new_print and self._drop_history_the_clock_disproves(
-                int(timestamp_ms or 0)):
+                int(timestamp_ms or 0)) == "future":
             new_print = is_new()
         if new_print:
             # The history is rates without stamps. If a settlement was missed
@@ -1356,13 +1407,25 @@ class CarryEngine:
         if econ.refusal is not None:
             return econ.refusal
 
-        return self._open(mark, spot, funding_bps, timestamp_ms)
+        decision = self._open(mark, spot, funding_bps, timestamp_ms)
+        # The arithmetic the APPROVAL rested on, beside whatever _open did with
+        # it (opened, refused by a later gate, halted). Attached after the
+        # fact; it cannot change what was decided.
+        if isinstance(decision.detail, dict) and econ.verdict is not None:
+            decision.detail.setdefault(
+                "entry_audit", (econ.verdict.detail or {}).get("audit"))
+        return decision
 
     # -- actions ----------------------------------------------------------
 
     def _open(self, mark: float, spot_mark: float, funding_bps: float,
               timestamp_ms: int) -> CarryDecision:
         """Both legs, or neither. There is no partially-open carry position."""
+        if not self.entries_enabled:
+            return CarryDecision(
+                "stand_aside", reason="ENTRIES_DISABLED", state=BookState.FLAT,
+                detail={"note": "ENTRIES_ENABLED is off: no new pair is opened; "
+                                "a held pair is still managed"})
         # THE PRECONDITIONS (0033, INVENTORY D8). Until 0033 the pair gate ran
         # only "if self.pair_risk is not None and self.snapshot is not None",
         # so an engine built without either opened on the cost gates alone. No
@@ -1464,6 +1527,9 @@ class CarryEngine:
         refused = self._capital_refusal(qty * mark)
         if refused is not None:
             return refused
+        refused = self._portfolio_refusal()
+        if refused is not None:
+            return refused
 
         # THE PAIR GATE, before the first leg. Ordered by damage inside
         # CarryRisk: a tripped kill switch outranks a stale price, both outrank
@@ -1476,6 +1542,13 @@ class CarryEngine:
             return CarryDecision("stand_aside", reason=gate.reason,
                                  state=BookState.FLAT, detail=gate.detail)
 
+        # The daily entry limit keeps the caller's clock (0 = wall clock); only
+        # the cycle's identity is made unique.
+        self._entry_clock_ms = timestamp_ms
+        timestamp_ms = self._unique_cycle_ms(timestamp_ms)
+        refused = self._reserve_capital(timestamp_ms, qty * mark)
+        if refused is not None:
+            return refused
         self._name_cycle(timestamp_ms)
         self.state = BookState.OPENING
         self._last_leg_error = ""
@@ -1513,7 +1586,8 @@ class CarryEngine:
                 perp=Leg(symbol=self.perp_symbol, side="Sell",
                          product="linear"),
                 opened_ms=timestamp_ms)
-            self.pair_risk.record_broken_pair(now=self._gate_now(timestamp_ms))
+            self.pair_risk.record_broken_pair(
+                now=self._gate_now(self._entry_clock_ms))
             return self._halt(
                 "SPOT_FEE_UNVERIFIABLE",
                 "spot BUY fee currency/amount is not reliably reported; no perp "
@@ -1542,7 +1616,7 @@ class CarryEngine:
             # It paid a round trip, so it spends the day (INVENTORY D4).
             self.position = position
             self.pair_risk.record_broken_pair(
-                now=self._gate_now(timestamp_ms))
+                now=self._gate_now(self._entry_clock_ms))
             return self._unwind(mark, "LEGS_LANDED_UNPAIRED")
 
         self.position = position
@@ -1551,7 +1625,7 @@ class CarryEngine:
         self.state = BookState.HEDGED
         # Only now: both legs landed. A refused pair consumed nothing; a
         # broken one spent the day through record_broken_pair instead.
-        self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
+        self.pair_risk.record_entry(now=self._gate_now(self._entry_clock_ms))
         failed = self._record()
         if failed is not None:
             return failed
@@ -1640,7 +1714,7 @@ class CarryEngine:
         if self.state is BookState.HALTED:
             return self._halted_with_exposure("PERP_LEG_OUTCOME_UNKNOWN")
         self.state = BookState.HEDGED
-        self.pair_risk.record_entry(now=self._gate_now(timestamp_ms))
+        self.pair_risk.record_entry(now=self._gate_now(self._entry_clock_ms))
         failed = self._record()
         if failed is not None:
             return failed
@@ -1851,6 +1925,58 @@ class CarryEngine:
                         "lot and the pair would land unpaired, then unwind: a "
                         "round trip of fees for nothing"}
 
+    def _portfolio_refusal(self) -> Optional[CarryDecision]:
+        """The portfolio authority's verdict on NEW exposure. Unwired -> None.
+        An authority that cannot answer refuses. Exits never reach here."""
+        authority = self.capital_authority
+        if authority is None:
+            return None
+        try:
+            blockers = list(authority.entry_blockers())
+        except Exception as exc:  # noqa: BLE001 - an unreadable state refuses
+            return CarryDecision(
+                "stand_aside", reason="PORTFOLIO_STATE_UNREADABLE",
+                state=BookState.FLAT,
+                detail={"error": f"{type(exc).__name__}: {exc}"})
+        if blockers:
+            return CarryDecision(
+                "stand_aside", reason="PORTFOLIO_BLOCKED", state=BookState.FLAT,
+                detail={"blockers": blockers})
+        return None
+
+    def _reserve_capital(self, timestamp_ms: int,
+                         notional_usd: float) -> Optional[CarryDecision]:
+        """Hold this entry's dollars (margin, spot leg, fee reserve) against
+        every other strategy BEFORE the first leg. Unwired -> None."""
+        authority = self.capital_authority
+        if authority is None:
+            return None
+        try:
+            amount = (self.required_capital_usd(notional_usd)
+                      + self.fee_reserve_usd(notional_usd))
+            ok, code = authority.reserve_entry(f"cyc-{timestamp_ms}", amount)
+        except Exception as exc:  # noqa: BLE001
+            return CarryDecision(
+                "stand_aside", reason="PORTFOLIO_STATE_UNREADABLE",
+                state=BookState.FLAT,
+                detail={"error": f"{type(exc).__name__}: {exc}"})
+        if not ok:
+            return CarryDecision(
+                "stand_aside", reason="CAPITAL_RESERVATION_REFUSED",
+                state=BookState.FLAT,
+                detail={"code": code, "amount_usd": amount})
+        return None
+
+    def _capital_sync(self) -> None:
+        authority = self.capital_authority
+        if authority is None:
+            return
+        try:
+            authority.sync(position_open=self.position is not None)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping never decides
+            logger.warning("carry: capital sync failed (%s: %s)",
+                           type(exc).__name__, exc)
+
     def required_capital_usd(self, notional_usd: float) -> float:
         """Free balance needed before the pair: the perp's initial margin at the
         account's leverage, plus the spot leg's cost when the book buys it
@@ -1940,6 +2066,20 @@ class CarryEngine:
                         "leverage": self.leverage,
                         "execution_mode": self.execution_mode})
         return None
+
+    #: The newest cycle stamp this engine has issued. A cycle's identity is
+    #: `cyc-<opened_ms>`; two cycles stamped alike (an engine driven on the
+    #: default clock, or two entries inside one millisecond) must still be two
+    #: cycles, or the second would be refused as a spent reservation id and its
+    #: orders could not be told from the first's.
+    _last_cycle_ms: int = -1
+    _entry_clock_ms: int = 0
+
+    def _unique_cycle_ms(self, timestamp_ms: int) -> int:
+        """`timestamp_ms`, or the next integer above the last stamp issued."""
+        stamp = max(int(timestamp_ms or 0), self._last_cycle_ms + 1)
+        self._last_cycle_ms = stamp
+        return stamp
 
     def _name_cycle(self, timestamp_ms: int) -> None:
         """Tell the ledger which cycle the coming fills belong to, so its

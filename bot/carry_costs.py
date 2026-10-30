@@ -81,6 +81,23 @@ ROUND_TRIP_BPS = 2 * TAKER_BPS_SPOT + 2 * TAKER_BPS_PERP   # 31.0
 #: site. Until 0033 this comment said so and the signature defaulted it to
 #: 0.05 anyway (INVENTORY D7); the constant is gone so nothing can reach for it.
 
+#: OPPORTUNITY COST OF CAPITAL (an explicit input, default 0.0).
+#:
+#: `borrow_apr` = 0.0 models a book that already owns the BTC: nothing is
+#: financed. That is NOT a free position. Hedged BTC earns the carry and
+#: nothing else, so the capital forgoes whatever the owner's next-best use of
+#: it would return. `opportunity_cost_apr` states that return as a per-year
+#: cost on the hedged notional, in the same units and with the same treatment
+#: as `borrow_apr` (bps/day = apr / 365 * 1e4, charged per print by the
+#: simulators). It is SEPARATE from borrow so a report can say which is which.
+#:
+#: There is no risk-free-rate source in this repository and none is invented:
+#: the default is 0.0, which reproduces every earlier decision bit for bit, and
+#: a value is the OPERATOR's statement, never a constant reached for here. A
+#: missing, non-finite or negative value is refused (COST_INPUT_INVALID), as a
+#: borrow rate is: a negative cost would be income nobody measured.
+DEFAULT_OPPORTUNITY_COST_APR = 0.0
+
 #: Funding prints per day on Binance USDT-M and Bybit linear.
 FUNDING_PERIODS_PER_DAY = 3
 
@@ -161,6 +178,9 @@ class CarryVerdict:
     basis_budget_bps: float = 0.0
     smoothed_funding_bps: float = 0.0
     detail: Dict[str, Any] = field(default_factory=dict)
+    #: The opportunity cost of the hedged capital, bps/day (0.0 unless the
+    #: caller stated one). Charged in `net_edge_bps_per_day` beside borrow.
+    opportunity_cost_bps_per_day: float = 0.0
 
     def __bool__(self) -> bool:
         return self.allowed
@@ -205,12 +225,15 @@ def _usable(value: Any) -> Optional[float]:
 
 
 def _invalid_cost_inputs(*, borrow_apr: Any, round_trip_bps: Any,
-                         hold_days: Any) -> List[str]:
+                         hold_days: Any,
+                         opportunity_cost_apr: Any = DEFAULT_OPPORTUNITY_COST_APR
+                         ) -> List[str]:
     """Names of the inputs the gate may not price. Empty means all usable."""
     bad: List[str] = []
     for name, value, minimum_exclusive in (
             ("round_trip_bps", round_trip_bps, True),
-            ("hold_days", hold_days, True), ("borrow_apr", borrow_apr, False)):
+            ("hold_days", hold_days, True), ("borrow_apr", borrow_apr, False),
+            ("opportunity_cost_apr", opportunity_cost_apr, False)):
         number = _usable(value)
         if number is None or (number <= 0 if minimum_exclusive else number < 0):
             bad.append(name)
@@ -221,11 +244,15 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
                    spot: float, borrow_apr: float, round_trip_bps: float,
                    hold_days: float = ASSUMED_HOLD_DAYS,
                    ewma_alpha: float = EWMA_ALPHA,
-                   ewma_min_prints: int = EWMA_MIN_PRINTS) -> CarryVerdict:
+                   ewma_min_prints: int = EWMA_MIN_PRINTS,
+                   opportunity_cost_apr: float = DEFAULT_OPPORTUNITY_COST_APR
+                   ) -> CarryVerdict:
     """May the book open this pair?
 
     `ewma_alpha` and `ewma_min_prints` default to the production constants;
     they exist so the simulators can state the values they ran with.
+    `opportunity_cost_apr` (default 0.0) is charged beside borrow; see
+    DEFAULT_OPPORTUNITY_COST_APR.
 
     Order matters. Cheapest and most decisive checks first, so a refusal names
     the binding constraint rather than the first thing that happened to fail.
@@ -238,7 +265,8 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
     # is refused and named rather than priced.
     invalid = _invalid_cost_inputs(borrow_apr=borrow_apr,
                                    round_trip_bps=round_trip_bps,
-                                   hold_days=hold_days)
+                                   hold_days=hold_days,
+                                   opportunity_cost_apr=opportunity_cost_apr)
     if invalid:
         return CarryVerdict(
             False, "COST_INPUT_INVALID",
@@ -263,8 +291,13 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
 
     carry_per_day = smoothed * FUNDING_PERIODS_PER_DAY
     borrow_per_day = (borrow_apr / 365.0) * 1e4
+    opportunity_per_day = (float(opportunity_cost_apr) / 365.0) * 1e4
     round_trip_per_day = float(round_trip_bps) / max(hold_days, 1e-9)
-    net_edge = carry_per_day - borrow_per_day - round_trip_per_day
+    # Subtracted as its own term (carrycore.cpp in the same order): at the
+    # default 0.0 this is `carry - borrow - 0.0 - round_trip`, which is the
+    # pre-existing expression to the bit.
+    net_edge = (carry_per_day - borrow_per_day - opportunity_per_day
+                - round_trip_per_day)
 
     try:
         entry_basis = basis_bps(perp, spot)
@@ -279,6 +312,7 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
             False, "CARRY_BELOW_COST_OF_CAPITAL",
             expected_carry_bps_per_day=carry_per_day,
             borrow_bps_per_day=borrow_per_day,
+            opportunity_cost_bps_per_day=opportunity_per_day,
             amortised_round_trip_bps_per_day=round_trip_per_day,
             net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
             smoothed_funding_bps=smoothed,
@@ -310,6 +344,7 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
             False, "ENTRY_BASIS_EXCEEDS_CARRY_BUDGET",
             expected_carry_bps_per_day=carry_per_day,
             borrow_bps_per_day=borrow_per_day,
+            opportunity_cost_bps_per_day=opportunity_per_day,
             amortised_round_trip_bps_per_day=round_trip_per_day,
             net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
             basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed,
@@ -325,6 +360,7 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
             False, "ENTRY_BASIS_DISCOUNT_EXCEEDS_CARRY_BUDGET",
             expected_carry_bps_per_day=carry_per_day,
             borrow_bps_per_day=borrow_per_day,
+            opportunity_cost_bps_per_day=opportunity_per_day,
             amortised_round_trip_bps_per_day=round_trip_per_day,
             net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
             basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed,
@@ -336,6 +372,7 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
         True, "CARRY_CLEARS_COSTS_AND_BASIS",
         expected_carry_bps_per_day=carry_per_day,
         borrow_bps_per_day=borrow_per_day,
+        opportunity_cost_bps_per_day=opportunity_per_day,
         amortised_round_trip_bps_per_day=round_trip_per_day,
         net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
         basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed)
@@ -429,19 +466,23 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
                            round_trip_bps: float, borrow_apr: float,
                            hold_days: float = DEMONSTRATED_HOLD_DAYS,
                            ewma_alpha: float = EWMA_ALPHA,
-                           ewma_min_prints: int = EWMA_MIN_PRINTS
+                           ewma_min_prints: int = EWMA_MIN_PRINTS,
+                           opportunity_cost_apr: float =
+                           DEFAULT_OPPORTUNITY_COST_APR
                            ) -> CarryVerdict:
     """May this entry open, judged on the hold that has been DEMONSTRATED?
 
     `evaluate_entry` amortises over ASSUMED_HOLD_DAYS. This asks the harder,
     unflattering question: does the smoothed funding earn back the round trip
-    (plus borrow) within `hold_days`, by default the measured median hold?
+    (plus borrow, plus the stated opportunity cost of the capital) within
+    `hold_days`, by default the measured median hold?
     Fail-closed on every unusable input, on too little history, and on funding
     that never clears. Allowed means only "not refused here".
     """
     invalid = _invalid_cost_inputs(borrow_apr=borrow_apr,
                                    round_trip_bps=round_trip_bps,
-                                   hold_days=hold_days)
+                                   hold_days=hold_days,
+                                   opportunity_cost_apr=opportunity_cost_apr)
     # A hold so long that its settlement count is not a finite number is not a
     # horizon anyone can enforce; refused, not compared (and not an OverflowError).
     if not invalid and not math.isfinite(float(hold_days) * FUNDING_PERIODS_PER_DAY):
@@ -450,6 +491,12 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
     # ValueError out of min_settlements_to_clear instead of refusing.
     if not invalid and not math.isfinite((float(borrow_apr) / 365.0) * 1e4):
         invalid = ["borrow_apr"]
+    # The opportunity cost the same way, and the two together: each finite
+    # alone can still sum past the largest double.
+    if not invalid and not math.isfinite(
+            (float(borrow_apr) / 365.0) * 1e4
+            + (float(opportunity_cost_apr) / 365.0) * 1e4):
+        invalid = ["opportunity_cost_apr"]
     if invalid:
         return CarryVerdict(False, "COST_INPUT_INVALID",
                             detail={"fields": invalid})
@@ -459,16 +506,20 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
         return CarryVerdict(False, "INSUFFICIENT_FUNDING_HISTORY",
                             detail={"required": ewma_min_prints})
     borrow_per_day = (float(borrow_apr) / 365.0) * 1e4
+    opportunity_per_day = (float(opportunity_cost_apr) / 365.0) * 1e4
+    # Capital cost per day, borrow first then opportunity (carrycore.cpp adds
+    # them in this order). At the default 0.0 it is `borrow + 0.0`: unchanged.
+    capital_per_day = borrow_per_day + opportunity_per_day
     budget = int(math.floor(round(float(hold_days) * FUNDING_PERIODS_PER_DAY, 9)))
     needed = min_settlements_to_clear(
         smoothed, round_trip_bps=float(round_trip_bps),
-        borrow_bps_per_day=borrow_per_day)
+        borrow_bps_per_day=capital_per_day)
     detail = {"settlements_needed": needed, "settlements_budget": budget,
               "hold_days": float(hold_days),
               "break_even_funding_bps_at_budget": (
                   breakeven_funding_bps_per_settlement(
                       max(budget, 1), round_trip_bps=float(round_trip_bps),
-                      borrow_bps_per_day=borrow_per_day)),
+                      borrow_bps_per_day=capital_per_day)),
               "note": "the funding does not earn back the round trip inside "
                       "the hold that has actually been measured; ASSUMED_HOLD_"
                       "DAYS is not enforced by anything"}
@@ -477,6 +528,102 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
                             smoothed_funding_bps=smoothed, detail=detail)
     return CarryVerdict(True, "HOLD_CLEARS_ROUND_TRIP",
                         smoothed_funding_bps=smoothed, detail=detail)
+
+
+# -- decision observability: what was known when the gate answered --------------
+
+def decision_audit(*, funding_prints_bps: Sequence[float], perp: Any, spot: Any,
+                   borrow_apr: Any, round_trip_bps: Any, hold_days: Any,
+                   demonstrated_hold_days: Any, ewma_alpha: Any = EWMA_ALPHA,
+                   ewma_min_prints: Any = EWMA_MIN_PRINTS,
+                   opportunity_cost_apr: Any = DEFAULT_OPPORTUNITY_COST_APR
+                   ) -> Dict[str, Any]:
+    """The arithmetic behind an entry decision, for an auditor. NOT a gate.
+
+    Nothing reads this to decide. It is computed from the same inputs the gate
+    saw and attached to its verdict so a refusal or an approval can be checked
+    by hand: how volatile the recent funding was, how often it inverted, which
+    hold each half of the gate used, and what the smoothed rate is expected to
+    net over each hold. Any value that cannot be computed is None, and the
+    function never raises (a failure here must not be able to change, or
+    block, a decision that was already taken).
+
+        funding_volatility_bps     population std of the finite prints, bps/8h
+        funding_inversion_share    share of the finite prints that are <= 0
+        expected_net_over_*_bps    (carry - borrow - opportunity) * hold - round trip
+    """
+    def num(value: Any) -> Optional[float]:
+        try:
+            return _usable(value)
+        except Exception:  # noqa: BLE001 - observability never raises
+            return None
+
+    try:
+        prints = [float(p) for p in (funding_prints_bps or ())
+                  if num(p) is not None]
+    except Exception:  # noqa: BLE001
+        prints = []
+    out: Dict[str, Any] = {
+        "observability_only": True,
+        "funding_prints_seen": len(prints),
+        "funding_mean_bps": (sum(prints) / len(prints)) if prints else None,
+        "funding_volatility_bps": None,
+        "funding_inversion_share": (
+            sum(1 for p in prints if p <= 0) / len(prints)) if prints else None,
+        "assumed_hold_days": num(hold_days),
+        "demonstrated_hold_days": num(demonstrated_hold_days),
+        "hold_used": {"amortisation_and_basis_budget": "assumed_hold_days",
+                      "break_even_round_trip": "demonstrated_hold_days"},
+        "borrow_apr": num(borrow_apr),
+        "opportunity_cost_apr": num(opportunity_cost_apr),
+        "round_trip_bps": num(round_trip_bps),
+        "smoothed_funding_bps": None,
+        "carry_bps_per_day": None,
+        "borrow_bps_per_day": None,
+        "opportunity_cost_bps_per_day": None,
+        "net_carry_bps_per_day": None,
+        "expected_net_over_assumed_hold_bps": None,
+        "expected_net_over_demonstrated_hold_bps": None,
+        "entry_basis_bps": None,
+    }
+    try:
+        if len(prints) >= 2:
+            mean = out["funding_mean_bps"]
+            var = sum((p - mean) ** 2 for p in prints) / len(prints)
+            out["funding_volatility_bps"] = math.sqrt(var) if math.isfinite(var) else None
+        elif len(prints) == 1:
+            out["funding_volatility_bps"] = 0.0
+        alpha, minimum = num(ewma_alpha), num(ewma_min_prints)
+        if alpha is not None and minimum is not None:
+            out["smoothed_funding_bps"] = ewma_funding_bps(
+                prints, alpha=alpha, min_prints=int(minimum))
+        smoothed = out["smoothed_funding_bps"]
+        b, o = out["borrow_apr"], out["opportunity_cost_apr"]
+        if b is not None:
+            out["borrow_bps_per_day"] = (b / 365.0) * 1e4
+        if o is not None:
+            out["opportunity_cost_bps_per_day"] = (o / 365.0) * 1e4
+        if smoothed is not None:
+            out["carry_bps_per_day"] = smoothed * FUNDING_PERIODS_PER_DAY
+        if None not in (out["carry_bps_per_day"], out["borrow_bps_per_day"],
+                        out["opportunity_cost_bps_per_day"]):
+            net = (out["carry_bps_per_day"] - out["borrow_bps_per_day"]
+                   - out["opportunity_cost_bps_per_day"])
+            out["net_carry_bps_per_day"] = net
+            rt = out["round_trip_bps"]
+            if rt is not None:
+                for key, hold in (("expected_net_over_assumed_hold_bps",
+                                   out["assumed_hold_days"]),
+                                  ("expected_net_over_demonstrated_hold_bps",
+                                   out["demonstrated_hold_days"])):
+                    if hold is not None:
+                        out[key] = net * hold - rt
+        p_, s_ = num(perp), num(spot)
+        if p_ is not None and s_ is not None and p_ > 0 and s_ > 0:
+            out["entry_basis_bps"] = basis_bps(p_, s_)
+    except Exception as exc:  # noqa: BLE001 - observability never raises
+        out["audit_error"] = f"{type(exc).__name__}: {exc}"
+    return out
 
 
 # -- the entry gate: what the engine, the simulators and the C++ core all ask ---
@@ -501,7 +648,8 @@ def entry_gate(*, funding_prints_bps: Sequence[float], perp: float,
                hold_days: float = ASSUMED_HOLD_DAYS,
                demonstrated_hold_days: float = DEMONSTRATED_HOLD_DAYS,
                ewma_alpha: float = EWMA_ALPHA,
-               ewma_min_prints: int = EWMA_MIN_PRINTS
+               ewma_min_prints: int = EWMA_MIN_PRINTS,
+               opportunity_cost_apr: float = DEFAULT_OPPORTUNITY_COST_APR
                ) -> CarryVerdict:
     """May the book open this pair? `evaluate_entry`, then the hold check.
 
@@ -513,18 +661,47 @@ def entry_gate(*, funding_prints_bps: Sequence[float], perp: float,
 
     A refused entry carries `evaluate_entry`'s arithmetic (smoothed funding,
     basis, net edge) so callers log the same fields whichever gate refused.
+
+    Every verdict also carries `detail["audit"]` (`decision_audit`): funding
+    volatility and inversion share, the assumed and demonstrated holds and the
+    expected net over each. It is attached AFTER the decision and nothing
+    reads it to decide.
     """
+    verdict = _entry_gate_decision(
+        funding_prints_bps=funding_prints_bps, perp=perp, spot=spot,
+        borrow_apr=borrow_apr, round_trip_bps=round_trip_bps,
+        hold_days=hold_days, demonstrated_hold_days=demonstrated_hold_days,
+        ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints,
+        opportunity_cost_apr=opportunity_cost_apr)
+    from dataclasses import replace
+    audit = decision_audit(
+        funding_prints_bps=funding_prints_bps, perp=perp, spot=spot,
+        borrow_apr=borrow_apr, round_trip_bps=round_trip_bps,
+        hold_days=hold_days, demonstrated_hold_days=demonstrated_hold_days,
+        ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints,
+        opportunity_cost_apr=opportunity_cost_apr)
+    return replace(verdict, detail={**verdict.detail, "audit": audit})
+
+
+def _entry_gate_decision(*, funding_prints_bps: Sequence[float], perp: float,
+                         spot: float, borrow_apr: float, round_trip_bps: float,
+                         hold_days: float, demonstrated_hold_days: float,
+                         ewma_alpha: float, ewma_min_prints: int,
+                         opportunity_cost_apr: float) -> CarryVerdict:
+    """`entry_gate`'s decision, before the audit is attached."""
     verdict = evaluate_entry(
         funding_prints_bps=funding_prints_bps, perp=perp, spot=spot,
         borrow_apr=borrow_apr, round_trip_bps=round_trip_bps,
         hold_days=hold_days, ewma_alpha=ewma_alpha,
-        ewma_min_prints=ewma_min_prints)
+        ewma_min_prints=ewma_min_prints,
+        opportunity_cost_apr=opportunity_cost_apr)
     if not verdict.allowed:
         return verdict
     horizon = hold_clears_round_trip(
         funding_prints_bps=funding_prints_bps, round_trip_bps=round_trip_bps,
         borrow_apr=borrow_apr, hold_days=demonstrated_hold_days,
-        ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints)
+        ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints,
+        opportunity_cost_apr=opportunity_cost_apr)
     if horizon.allowed:
         return verdict
     from dataclasses import replace

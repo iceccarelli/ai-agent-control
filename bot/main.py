@@ -512,6 +512,21 @@ class TradingBot:
                                "equity will not seed today's anchor", scope)
         except Exception:  # noqa: BLE001
             logger.exception("could not record the equity scope")
+        environment = execution_environment_of(self.cfg)
+        try:
+            conflict = environment_conflict(self.store, environment)
+        except Exception as exc:  # noqa: BLE001 - an unreadable scope refuses
+            conflict = f"the database's environment could not be read ({exc})"
+        if conflict is not None:
+            logger.critical("startup blocked: %s", conflict)
+            return False
+        try:
+            # What kind of money this database's execution records are. The
+            # performance report refuses to call anything realised cash unless
+            # this says mainnet (carry_performance --environment).
+            self.store.record_execution_environment(environment)
+        except Exception:  # noqa: BLE001
+            logger.exception("could not record the execution environment")
         live_armed, live_why = _config.is_live_authorized(self.cfg)
         logger.warning(
             "mode: %s | testnet=%s paper=%s | %s",
@@ -860,8 +875,17 @@ class TradingBot:
             import order_recovery as _recovery
             # The ledger wrapper hides the adapter's order reads on purpose
             # (tests/test_real_stack_adapter.py); recovery reads through `.inner`.
+            from bybit_connection import BybitClient as _BC
+            window = _recovery.absence_window_s(
+                request_timeout_s=float(getattr(
+                    getattr(self, "cfg", None), "REQUEST_TIMEOUT_SECONDS", 10.0)),
+                recv_window_ms=float(getattr(
+                    getattr(self, "cfg", None), "BYBIT_RECV_WINDOW_MS", 5000)),
+                attempts=4,                         # _request(retries=3) + the first
+                max_wait_s=max(2.0, float(_BC.RATE_LIMIT_MAX_WAIT_S)))
             recovery = _recovery.resolve_unresolved_orders(
-                getattr(broker, "inner", broker), self.store)
+                getattr(broker, "inner", broker), self.store,
+                absence_proof_s=window)
             if not isinstance(recovery, _recovery.RecoveryReport):
                 raise TypeError(f"recovery returned {type(recovery).__name__}")
         except Exception as exc:  # noqa: BLE001
@@ -1742,7 +1766,7 @@ class TradingBot:
 # ---------------------------------------------------------------------------
 
 
-def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
+def carry_orders_permitted(cfg: Any, *, exit: bool = False) -> Tuple[bool, str]:
     """May the carry book send an order right now? The ONE answer.
 
     `build_bot` hands this (bound to its config) to `CarryBroker` as the order
@@ -1754,6 +1778,13 @@ def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
     are both sandboxes that cannot touch real money, so both are permitted, with
     the reason naming which one. Mainnet needs the live authorisation AND a
     signed promotion gate.
+
+    `exit=True` is the question for an order that only REDUCES exposure (a spot
+    Sell, a reduce-only perp Buy). The promotion gate decides whether to START
+    exposure; it is not asked about keeping it, so editing a gate artefact or an
+    approvals file mid-hold can never refuse the buy-back of a live short. Exits
+    still need the paper flag clear, the sandbox/URL agreement (the `_for`
+    wrapper) and, on mainnet, the live-arming chain.
     """
     if bool(cfg.PAPER_TRADING):
         return (False, "PAPER_TRADING=1: the carry book has no paper venue")
@@ -1765,6 +1796,9 @@ def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
     armed, why = _config.is_live_authorized(cfg)
     if armed is not True:
         return (False, f"mainnet URL without live authorisation: {why}")
+    if exit:
+        return (True, "LIVE exit (arming chain satisfied; the promotion gate "
+                      "governs entries only)")
     # Defence in depth: start() already refuses a live-armed process whose
     # promotion gate is unsigned. The broker asks again, per order, so no path
     # around start() reaches a mainnet carry order.
@@ -1774,7 +1808,8 @@ def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
     return (True, "LIVE (authorised, promotion gate signed)")
 
 
-def carry_orders_permitted_for(cfg: Any, client: Any) -> Tuple[bool, str]:
+def carry_orders_permitted_for(cfg: Any, client: Any, *,
+                               exit: bool = False) -> Tuple[bool, str]:
     """`carry_orders_permitted`, plus: the client must talk to the venue the
     config says it talks to.
 
@@ -1784,7 +1819,7 @@ def carry_orders_permitted_for(cfg: Any, client: Any) -> Tuple[bool, str]:
     that matters is refused here, per order: a sandbox config with a client
     whose base URL is the mainnet host.
     """
-    allowed, why = carry_orders_permitted(cfg)
+    allowed, why = carry_orders_permitted(cfg, exit=exit)
     if allowed is not True:
         return (allowed, why)
     if bool(cfg.USE_TESTNET):
@@ -1811,6 +1846,79 @@ def carry_entries_permitted_from(store: Any) -> Callable[[], Tuple[bool, str]]:
             return (False, f"KILL_SWITCH_ENGAGED: {why}")
         return (True, "kill switch clear")
     return gate
+
+
+def execution_environment_of(cfg: Any) -> str:
+    """What kind of money this process's execution records are. Sandbox
+    flags default to the safe answer when absent; only an explicit
+    USE_TESTNET=0 and PAPER_TRADING=0 is mainnet."""
+    if bool(getattr(cfg, "USE_TESTNET", True)):
+        return "testnet"
+    if bool(getattr(cfg, "PAPER_TRADING", True)):
+        return "paper"
+    return "mainnet"
+
+
+def environment_conflict(store: Any, environment: str) -> Optional[str]:
+    """Why this database may not be used as `environment`, or None.
+
+    A database holds ONE kind of money. The carry journal, position and order
+    rows carry no venue scope of their own, so the recorded environments are the
+    scope: a database that has recorded anything other than `environment` is
+    refused (a testnet journal with venue funding in it must never be resumed as
+    mainnet cash). A mainnet process also refuses a ledger of UNKNOWN origin - it
+    holds rows but no recorded environment - because it cannot show they are not
+    testnet's. A sandbox may adopt such a ledger."""
+    seen = list(store.execution_environments_seen())
+    others = [e for e in seen if e != environment]
+    if others:
+        return (f"this database has recorded {sorted(set(seen))} and this "
+                f"process is {environment!r}; its ledger, position and orders "
+                "are not scoped by venue, so they must not be resumed as "
+                f"{environment}. Use a separate database")
+    if environment == "mainnet" and not seen:
+        try:
+            has_rows = bool(store.load_ledger())
+        except Exception as exc:  # noqa: BLE001
+            return (f"the ledger could not be read ({type(exc).__name__}); its "
+                    "origin is unknown")
+        if has_rows:
+            return ("the ledger holds rows but no recorded environment: its "
+                    "origin is unknown and cannot be shown not to be testnet's")
+    return None
+
+
+def _attach_portfolio_authority(bot: Any, cfg: Any) -> None:
+    """Give the carry engine its seat at the portfolio table (carry_capital).
+
+    Wired only onto the real StateStore: the authority and its reservations
+    persist through it, and a test double that is not one cannot hold them. The
+    reading freshness limit is the one the market snapshot already enforces; no
+    new tunable is invented for it. Exits never consult the authority."""
+    from persistence import StateStore
+    if not isinstance(bot.store, StateStore):
+        return
+    import capital_reservations as _capres
+    import portfolio_state as _ps
+    from carry_capital import CarryCapitalAuthority
+    from market_snapshot import MAX_SNAPSHOT_AGE_S
+
+    adapter = getattr(bot.carry.broker, "inner", bot.carry.broker)
+    # The fee reserve is part of every reservation's amount (CarryEngine adds it),
+    # so no separate buffer is held back.
+    reservations = _capres.CapitalReservations(
+        bot.store, buffer_usd=0.0, max_available_age_s=float(MAX_SNAPSHOT_AGE_S))
+    limits = _ps.PortfolioLimits(
+        max_daily_loss_fraction=float(cfg.MAX_DAILY_LOSS_PCT),
+        max_drawdown_fraction=float(cfg.MAX_DRAWDOWN_PCT),
+        max_state_age_s=float(MAX_SNAPSHOT_AGE_S), max_total_capital_usd=None)
+    scope = (f"venue={str(getattr(cfg, 'BYBIT_VENUE', '')).lower()};"
+             f"testnet={bool(getattr(cfg, 'USE_TESTNET', True))};UNIFIED")
+    bot.carry.capital_authority = CarryCapitalAuthority(
+        store=bot.store, broker=adapter, spot_symbol=cfg.CARRY_SPOT_SYMBOL,
+        perp_symbol=cfg.CARRY_PERP_SYMBOL, reservations=reservations,
+        limits=limits, account_scope=scope,
+        ttl_s=float(cfg.CAPITAL_RESERVATION_TTL_S))
 
 
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
@@ -1884,7 +1992,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         raise ValueError(
             f"BOOK_MODE={cfg.BOOK_MODE!r} is not a book. Refusing rather than "
             "falling back: a typo must not silently select a strategy.")
-    if book_mode == "carry" and attach_strategy and bot.carry is None:
+    # The carry ENGINE is attached whenever the book is carry, whatever
+    # ENTRIES_ENABLED says: it is what watches a held pair. ENTRIES_ENABLED only
+    # stops new pairs (CarryEngine.entries_enabled).
+    if book_mode == "carry" and bot.carry is None:
         from carry_broker import CarryBroker
         from carry_engine import CarryEngine
 
@@ -1929,6 +2040,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         def _carry_orders_permitted():
             return carry_orders_permitted_for(cfg, bot.client)
 
+        def _carry_exits_permitted():
+            return carry_orders_permitted_for(cfg, bot.client, exit=True)
+
         # HOW THE LONG SIDE IS HELD (0036). No default: "overlay" shorts the
         # perp against BTC the client already owns and never touches their
         # spot; "acquire" buys the spot leg and sells it again. PHASE1_DECISION
@@ -1968,6 +2082,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                         bot.store.next_order_seq(),
                     session_token=bot.store.session_boot_token(),
                     order_gate=_carry_orders_permitted,
+                    exit_gate=_carry_exits_permitted,
                     entry_gate=carry_entries_permitted_from(bot.store),
                     # Every carry order is written down before it can leave
                     # and followed through its lifecycle (order_lifecycle.py).
@@ -1995,6 +2110,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             # The account must be able to fund the pair before any leg leaves.
             require_capital_check=True,
             leverage=float(cfg.DEFAULT_LEVERAGE),
+            # What the capital behind the hedge could earn elsewhere; 0.0
+            # unless an operator supplies a rate (none is invented).
+            opportunity_cost_apr=float(cfg.CARRY_OPPORTUNITY_COST_APR),
+            entries_enabled=bool(attach_strategy),
             # What that gate reads each held tick is kept (additive table, no
             # new venue request) so a later replay can run on the venue's own
             # numbers. A store without the method records nothing and says so.
@@ -2014,6 +2133,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         bot.carry.pair_risk = CarryRisk(
             store=bot.store,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
+        _attach_portfolio_authority(bot, cfg)
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
             "%.4f/yr, execution %s/%s, orders: %s. The directional strategy is "

@@ -746,8 +746,15 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
            warm_prints: Sequence[Any] = (),
            trace: Optional[List[Dict[str, Any]]] = None,
            liquidation: Optional[LiquidationInputs] = None,
-           require_liquidation_evidence: bool = False) -> Dict[str, Any]:
+           require_liquidation_evidence: bool = False,
+           opportunity_cost_apr: float = 0.0) -> Dict[str, Any]:
     """Drive the real engine through `rows`. One bar, one `main.tick`.
+
+    ``opportunity_cost_apr`` (default 0.0) is handed to the engine's
+    constructor, so its entry gate charges it exactly as production would, and
+    is accrued per held print on the hedged quantity at the bar's spot, as
+    borrow is. It is not cash: it never enters the journal or ``net_usd``, and
+    is reported as ``opportunity_cost_usd`` / ``net_after_opportunity_cost_usd``.
 
     ``warm_prints`` are SETTLED prints (``Settlement`` rows) that happened
     before ``rows[0]``; they seed the engine through ``warm_funding_history``,
@@ -792,6 +799,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         max_notional_usd=notional, borrow_apr=borrow_apr,
         execution_mode=execution_mode, execution_style=execution_style,
         persist=lambda state: None,
+        opportunity_cost_apr=opportunity_cost_apr,
         # main.build_bot sets this True. The replay sets it whenever it can
         # answer the gate (evidence supplied) or has been told to behave as
         # production does without evidence (it then halts). Left off only for
@@ -812,6 +820,9 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
     actions: Dict[str, int] = {}
     reasons: Dict[str, int] = {}
     per_print_borrow = borrow_apr / (365.0 * cb.FUNDING_PERIODS_PER_DAY)
+    per_print_opportunity = (float(opportunity_cost_apr)
+                             / (365.0 * cb.FUNDING_PERIODS_PER_DAY))
+    opportunity_usd = 0.0
     funding_usd = basis_usd = fees_usd = borrow_usd = 0.0
     fee_events: List[Any] = []        # (ms, usd) per tick, for per-trade fees
     borrow_events: List[Any] = []     # (ms, usd) per tick, for per-trade borrow
@@ -897,6 +908,8 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             # and made the replay $891 richer than the truth over 79 trades.
             borrow_usd += per_print_borrow * position.perp.filled_qty * row.spot
             borrow_events.append((int(row.ms), per_print_borrow * position.perp.filled_qty * row.spot))
+            opportunity_usd += (per_print_opportunity
+                                * position.perp.filled_qty * row.spot)
         if position is None and open_trade is not None:
             # THE ENGINE'S OWN NUMBER, taken from the decision that closed the
             # position. Reading `funding_collected` off the position after the
@@ -1010,6 +1023,9 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "settlements": len(rows), "settlements_walked": walked,
         "years": years,
         "notional_usd": notional, "borrow_apr": borrow_apr,
+        "opportunity_cost_apr": float(opportunity_cost_apr),
+        "opportunity_cost_usd": -opportunity_usd,
+        "net_after_opportunity_cost_usd": net - opportunity_usd,
         "execution_mode": execution_mode, "execution_style": execution_style,
         "impact_bps_per_leg": impact_bps,
         "margin_multiple": margin_multiple,
@@ -1140,6 +1156,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--repo", default=ROOT)
     ap.add_argument("--notional", type=float, default=100_000.0)
     ap.add_argument("--borrow-apr", type=float, default=0.0)
+    ap.add_argument("--opportunity-cost-apr", type=float, default=0.0,
+                    help="the forgone return on the hedged capital, per year, "
+                         "charged by the entry gate beside borrow (an "
+                         "operator statement; the repo holds no rate)")
     ap.add_argument("--mode", choices=("acquire", "overlay"),
                     default="overlay")
     ap.add_argument("--style", choices=("taker", "maker_first"),
@@ -1195,7 +1215,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                execution_mode=args.mode, execution_style=args.style,
                impact_bps=impact, max_entries_per_day=args.entries_per_day,
                liquidation=evidence,
-               require_liquidation_evidence=args.require_liquidation_evidence)
+               require_liquidation_evidence=args.require_liquidation_evidence,
+               opportunity_cost_apr=args.opportunity_cost_apr)
 
     print("=" * 74)
     print("CARRY REPLAY — the ENGINE driven through history, not a model of it")
@@ -1282,7 +1303,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.diff:
         sim = cb.simulate_settlements_series(
             rows, notional=args.notional, borrow_apr=args.borrow_apr,
-            gated=True, impact_bps=impact, mode=args.mode)
+            gated=True, impact_bps=impact, mode=args.mode,
+            opportunity_cost_apr=args.opportunity_cost_apr)
         print("\n" + "=" * 74)
         print("DIFF — the engine against tools/carry_backtest.py")
         print("=" * 74)

@@ -422,3 +422,70 @@ def test_the_next_cycle_stays_blocked_after_the_crash_until_it_is_resolved(path)
     assert d.action != "opened" and d.reason == "UNRESOLVED_ORDERS"
     assert len(venue.created) == created
     store2.close()
+
+
+# 12 -- the absence window is derived and measured from the request, not the intent ----------------
+
+def test_the_absence_window_covers_the_transports_worst_case():
+    import order_recovery as rec
+    w = rec.absence_window_s(request_timeout_s=10.0, recv_window_ms=5000,
+                             attempts=4, max_wait_s=2.0)
+    assert w >= 4 * 10.0 + 3 * 2.0 + 5.0                  # every attempt, every wait, the window
+    assert w >= rec.ABSENCE_PROOF_S                       # never below the floor
+
+
+def test_a_slower_transport_widens_the_window():
+    import order_recovery as rec
+    base = rec.absence_window_s(request_timeout_s=20.0, recv_window_ms=5000,
+                                attempts=4, max_wait_s=2.0)
+    assert base > rec.ABSENCE_PROOF_S                      # above the floor
+    assert rec.absence_window_s(request_timeout_s=40.0, recv_window_ms=5000,
+                                attempts=4, max_wait_s=2.0) > base
+    assert rec.absence_window_s(request_timeout_s=20.0, recv_window_ms=10000,
+                                attempts=4, max_wait_s=2.0) > base
+
+
+def test_the_default_transport_never_gets_less_than_the_floor():
+    import order_recovery as rec
+    assert rec.absence_window_s(request_timeout_s=10.0, recv_window_ms=5000,
+                                attempts=4, max_wait_s=2.0) == rec.ABSENCE_PROOF_S
+
+
+@pytest.mark.parametrize("bad", [dict(request_timeout_s=0), dict(request_timeout_s=float("nan")),
+                                 dict(recv_window_ms=-1), dict(attempts=0)])
+def test_nonsense_transport_numbers_are_refused(bad):
+    import order_recovery as rec
+    kw = dict(request_timeout_s=10.0, recv_window_ms=5000, attempts=4, max_wait_s=2.0)
+    kw.update(bad)
+    with pytest.raises(ValueError):
+        rec.absence_window_s(**kw)
+
+
+def test_absence_is_measured_from_the_request_not_from_the_intent(path):
+    import order_recovery as rec
+    store, venue, broker, engine = stack(path)
+    store.record_order_intent("BB-carr-2-late", "BTCUSDT", "Sell", 1.0,
+                              leg="linear", cycle_id="cyc-2")
+    # the intent is old, but the request left only now
+    store._exec("UPDATE orders SET created_epoch = ? WHERE order_link_id = ?",
+                (time.time() - 3600.0, "BB-carr-2-late"))
+    store.apply_order_event("BB-carr-2-late", ol.SUBMIT_ATTEMPT)
+    report = rec.resolve_unresolved_orders(broker, store)
+    assert store.get_order("BB-carr-2-late")["status"] == "reconciliation_required"
+    assert [u.order_link_id for u in report.unresolved] == ["BB-carr-2-late"]
+    store.close()
+
+
+def test_a_caller_supplied_window_is_honoured(path):
+    import order_recovery as rec
+    store, venue, broker, engine = stack(path)
+    store.record_order_intent("BB-carr-2-w", "BTCUSDT", "Sell", 1.0,
+                              leg="linear", cycle_id="cyc-2")
+    store.apply_order_event("BB-carr-2-w", ol.SUBMIT_ATTEMPT)
+    rec.resolve_unresolved_orders(broker, store, now_epoch=time.time() + 100.0,
+                                  absence_proof_s=500.0)
+    assert store.get_order("BB-carr-2-w")["status"] == "reconciliation_required"
+    rec.resolve_unresolved_orders(broker, store, now_epoch=time.time() + 600.0,
+                                  absence_proof_s=500.0)
+    assert store.get_order("BB-carr-2-w")["status"] == "never_sent"
+    store.close()

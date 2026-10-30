@@ -21,7 +21,8 @@ RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 # omitted market_data.py, memory.py, project_status.py and session_log.py, all
 # imported unconditionally, so `python3 main.py` died on ModuleNotFoundError
 # before the health server bound and the container restart-looped.
-COPY bybit_connection.py carry_broker.py carry_costs.py carry_engine.py \
+COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.py \
+     carry_costs.py carry_engine.py forward_status.py portfolio_state.py \
      carry_risk.py carry_shadow.py config.py directional_funding.py features.py funding_reconcile.py ledger.py main.py \
      market_data.py \
      market_snapshot.py memory.py ml_strategy.py order_lifecycle.py \
