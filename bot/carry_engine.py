@@ -514,6 +514,12 @@ class CarryPosition:
     negative_funding_streak: int = 0
 
     @property
+    def cycle_id(self) -> str:
+        """The identity this cycle carries in the ledger and in the liquidation
+        observations: named from the open timestamp before the first leg."""
+        return f"cyc-{self.opened_ms}"
+
+    @property
     def spot_held_qty(self) -> float:
         """BTC actually held after any explicitly reported base-coin BUY fee."""
         return max(0.0, self.spot.filled_qty - self.spot.fee_base_qty)
@@ -1455,6 +1461,7 @@ class CarryEngine:
             return CarryDecision("stand_aside", reason=gate.reason,
                                  state=BookState.FLAT, detail=gate.detail)
 
+        self._name_cycle(timestamp_ms)
         self.state = BookState.OPENING
         self._last_leg_error = ""
         if self.execution_mode == OVERLAY:
@@ -1828,6 +1835,19 @@ class CarryEngine:
                 "note": "after the spot BUY's fee the short snaps down a whole "
                         "lot and the pair would land unpaired, then unwind: a "
                         "round trip of fees for nothing"}
+
+    def _name_cycle(self, timestamp_ms: int) -> None:
+        """Tell the ledger which cycle the coming fills belong to, so its
+        entries carry the same identity as the position. Bookkeeping only: a
+        ledger that cannot take the name infers its own and trading goes on."""
+        name = getattr(self.broker, "begin_cycle", None)
+        if not callable(name):
+            return
+        try:
+            name(f"cyc-{timestamp_ms}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("carry: cycle not named in the ledger (%s: %s)",
+                           type(exc).__name__, exc)
 
     def _confirm_venue_after_open(self, booked: float) -> None:
         """Establish the "book == venue" baseline at the moment of the open.

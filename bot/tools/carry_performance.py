@@ -73,31 +73,29 @@ def _finish(cur: Dict[str, Any]) -> Dict[str, Any]:
                            or cur["notional_usd"] <= 0 else cur["notional_usd"])
     cur["basis"] = _basis(cur.pop("_fee_statuses"), cur.pop("_bases"))
     for key in ("perp_closed", "notional_unknown", "first_open_ms",
-                "last_close_ms"):
+                "last_close_ms", "perp_qty"):
         cur.pop(key, None)
     return cur
 
 
 def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    cur: Optional[Dict[str, Any]] = None
-    perp_qty = 0.0
+    """One row per ledger cycle id, in time order. The journal assigns the id
+    (and re-derives it for rows written before it existed), so this reader no
+    longer has a boundary rule of its own."""
+    by_id: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
     for e in journal.entries:
-        is_start = e.kind in ("spot_buy", "perp_open")
-        if is_start and (cur is None or (cur["perp_closed"]
-                                         and abs(perp_qty) <= L.DUST[L.PERP])):
-            if cur is not None:
-                out.append(_finish(cur))
-            cur = {"start_ms": e.ms, "funding_usd": 0.0, "fees_usd": 0.0,
-                   "borrow_usd": 0.0, "realised_usd": 0.0, "notional_usd": 0.0,
-                   "notional_unknown": False, "perp_closed": False,
-                   "first_open_ms": None, "last_close_ms": None,
-                   "_fee_statuses": [], "_bases": []}
-        for line in e.lines:
-            if line.account == L.PERP:
-                perp_qty += line.qty
+        if not e.cycle:
+            continue                      # before any cycle (opening balance)
+        cur = by_id.get(e.cycle)
         if cur is None:
-            continue
+            cur = by_id[e.cycle] = {
+                "cycle_id": e.cycle, "start_ms": e.ms, "funding_usd": 0.0,
+                "fees_usd": 0.0, "borrow_usd": 0.0, "realised_usd": 0.0,
+                "notional_usd": 0.0, "notional_unknown": False,
+                "perp_closed": False, "perp_qty": 0.0, "first_open_ms": None,
+                "last_close_ms": None, "_fee_statuses": [], "_bases": []}
+            order.append(e.cycle)
         for line in e.lines:
             if line.account == L.FUNDING:
                 cur["funding_usd"] += -line.usd
@@ -107,6 +105,8 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 cur["borrow_usd"] += line.usd
             elif line.account == L.REALISED:
                 cur["realised_usd"] += -line.usd
+            elif line.account == L.PERP:
+                cur["perp_qty"] += line.qty
         if e.fee_status:
             cur["_fee_statuses"].append(e.fee_status)
         if e.basis:
@@ -119,12 +119,10 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 cur["notional_unknown"] = True
             else:
                 cur["notional_usd"] += n
-        if e.kind == "perp_close" and abs(perp_qty) <= L.DUST[L.PERP]:
+        if e.kind == "perp_close" and abs(cur["perp_qty"]) <= L.DUST[L.PERP]:
             cur["perp_closed"] = True
             cur["last_close_ms"] = e.ms
-    if cur is not None:
-        out.append(_finish(cur))
-    return out
+    return [_finish(by_id[c]) for c in order]
 
 
 def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
