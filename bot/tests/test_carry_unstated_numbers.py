@@ -307,6 +307,10 @@ def test_a_high_account_rate_still_unwinds(mode):
 
 def test_isolated_margin_keeps_the_per_position_distance_gate():
     engine, _ = _engine(dict(POS, liqPrice="101000"), "ISOLATED_MARGIN", None)
+    # a squeeze DURING a hold: the position has already had a healthy read, as
+    # after any normal tick (a breach on the first read of a position opened
+    # inside the floor halts instead: test_liquidation_breach_on_first_read)
+    engine._liq_read_ok_for = engine.position.opened_ms
     d = engine._check_liquidation_distance()
     assert d.action == "unwound" and "LIQUIDATION_1.0PCT" in d.reason
     engine, tripped = _engine(SAFE, "ISOLATED_MARGIN", None)

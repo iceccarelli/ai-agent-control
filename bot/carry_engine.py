@@ -1731,6 +1731,10 @@ class CarryEngine:
 
     #: True while the last HALT could not be persisted (retried each halted tick).
     _halt_unwritten = False
+    #: opened_ms of the position whose liquidation distance has been read and
+    #: found at or above the floor. A breach on a position with no such earlier
+    #: read was opened inside the floor (see _check_liquidation_distance).
+    _liq_read_ok_for: Optional[int] = None
 
     #: Wall-clock ms of the last moment the book's perp size was CONFIRMED equal
     #: to the venue's (a passing `_check_venue_position`, or a cold-start resume),
@@ -2378,6 +2382,21 @@ class CarryEngine:
             detail={"inventory": inventory, "hedged_now": remaining,
                     "closed_qty": closed.filled_qty})
 
+    def _entry_distance_pct(self, view: Dict[str, Any]) -> Optional[float]:
+        """How far above the ENTRY price the venue's liquidation price sits, in
+        percent, or None when either number is not usable. For a short the
+        liquidation price is above entry. Independent of when the position is
+        read, which is what separates "opened inside the floor" from "squeezed
+        since"."""
+        position = self.position
+        if position is None:
+            return None
+        entry = getattr(position.perp, "avg_price", None)
+        liq = view.get("liq_price")
+        if not (self._finite(entry) and self._finite(liq)) or float(entry) <= 0:
+            return None
+        return 100.0 * (float(liq) - float(entry)) / float(entry)
+
     def _check_liquidation_distance(self) -> Optional[CarryDecision]:
         """How far the price can move before the short is gone (F4, 0048).
 
@@ -2456,6 +2475,8 @@ class CarryEngine:
             # broker stating nothing is held (the venue-vs-book check judges
             # that). Any other reason, or none, is an unread distance.
             if view.get("reason") in ("BEYOND_VENUE_PRICE_BOUNDS", "NO_POSITION"):
+                if self.position is not None:
+                    self._liq_read_ok_for = self.position.opened_ms
                 return None
             return self._halt(
                 "LIQUIDATION_DISTANCE_UNUSABLE",
@@ -2466,10 +2487,40 @@ class CarryEngine:
             return self._halt(
                 "LIQUIDATION_DISTANCE_UNUSABLE",
                 f"the venue reported a liquidation distance of {distance!r}")
+        position = self.position
+        opened_ms = None if position is None else position.opened_ms
         if float(distance) < MIN_LIQUIDATION_DISTANCE_PCT:
-            return self._unwind(
+            # A position opened INSIDE the floor would unwind on its next read
+            # and be opened again (830 round trips, -190%/yr on the real replay
+            # at 10x). The entry gate cannot see a liquidation price before a
+            # position exists, so this is where it is caught. Both must hold:
+            # it is the first read of this position AND the venue's liquidation
+            # price sat inside the floor relative to the ENTRY price (so a real
+            # adverse move since entry, which is a correct mid-hold exit, is
+            # never mistaken for it). Flatten as before, then halt for a human.
+            first_read = opened_ms is None or self._liq_read_ok_for != opened_ms
+            entry_distance = self._entry_distance_pct(view)
+            opened_inside = first_read and (
+                entry_distance is None
+                or entry_distance < MIN_LIQUIDATION_DISTANCE_PCT)
+            decision = self._unwind(
                 self._exit_mark(),
                 f"LIQUIDATION_{float(distance):.1f}PCT_AWAY_BELOW_FLOOR")
+            if opened_inside and self.position is None \
+                    and decision.state is not BookState.HALTED:
+                where = ("unknown" if entry_distance is None
+                         else f"{entry_distance:.1f}%")
+                return self._halt(
+                    "LIQUIDATION_FLOOR_BREACHED_AT_ENTRY",
+                    f"the first liquidation-distance read of a position was "
+                    f"{float(distance):.1f}% (floor {MIN_LIQUIDATION_DISTANCE_PCT}%) "
+                    f"and the liquidation price sat {where} from the entry "
+                    "price: it was opened inside the floor, which the leverage "
+                    "in use makes certain to repeat. The position was "
+                    "flattened; a human must lower the leverage (or confirm "
+                    "the venue's liquidation price) and clear the kill switch")
+            return decision
+        self._liq_read_ok_for = opened_ms
         return None
 
     def _observe_risk(self, view: Dict[str, Any]) -> None:

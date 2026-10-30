@@ -145,6 +145,7 @@ jobs:
           tests/test_monitor_fail_closed.py
           tests/test_liquidation_gate_fail_closed.py
           tests/test_liquidation_unknown_reason_fail_closed.py
+          tests/test_liquidation_breach_on_first_read.py
           tests/test_state_store_fail_closed_reopen.py
           tests/test_liquidation_view_absent_fields.py
           tests/test_broker_unstated_fields_fail_closed.py

@@ -103,9 +103,28 @@ def attribute_by_third(table: Sequence[Dict[str, Any]],
             unplaced += net
     total = sum(nets)
     share = (by_third["high"] / total) if (nets and total > 0) else None
+    # How much of each third the book was in the market, and what it earned per
+    # day there: separates "was in more often" from "earned more when in".
+    held_days = [max((int(t["closed_ms"]) - int(t["opened_ms"])) / DAY_MS, 0.0)
+                 for t in trades]
+    days_by_quarter = allocate_to_quarters(trades, held_days)
+    days_by_third = {"low": 0.0, "mid": 0.0, "high": 0.0}
+    for quarter, d in days_by_quarter.items():
+        if quarter in third_of:
+            days_by_third[third_of[quarter]] += d
+    observed = {"low": 0.0, "mid": 0.0, "high": 0.0}
+    for row in table:
+        observed[row["third"]] += row["prints"] / float(PRINTS_PER_DAY)
     return {"net_by_quarter": by_quarter, "net_by_third": by_third,
             "net_outside_corpus": unplaced, "total_net": total,
-            "share_in_high_third": share}
+            "share_in_high_third": share,
+            "days_by_third": days_by_third,
+            "pct_of_days_in_market_by_third": {
+                k: (100.0 * days_by_third[k] / observed[k] if observed[k] else None)
+                for k in days_by_third},
+            "net_per_day_by_third": {
+                k: (by_third[k] / days_by_third[k] if days_by_third[k] > 1e-9 else None)
+                for k in days_by_third}}
 
 
 def latest_window(rows: Sequence[Any], prints_back: int = 270) -> Dict[str, Any]:
@@ -141,6 +160,12 @@ def report_lines(table: Sequence[Dict[str, Any]], latest: Dict[str, Any],
         if attribution["share_in_high_third"] is not None:
             lines.append(f"  {100.0 * attribution['share_in_high_third']:.1f}% of "
                          "the net was earned in the highest third of quarters")
+        pct, per = attribution["pct_of_days_in_market_by_third"], attribution["net_per_day_by_third"]
+        for k in ("low", "mid", "high"):
+            rate = "n/a" if per[k] is None else f"${per[k]:,.2f} per day"
+            share = "n/a" if pct[k] is None else f"{pct[k]:.0f}%"
+            lines.append(f"  {k:4s} third: in the market {share} of the days; "
+                         f"{rate} in the market")
         lines.append("  (each trade's net is spread evenly over the days it was held)")
     lines.append("DESCRIPTIVE, IN-SAMPLE: this describes a corpus already seen. It "
                  "is not a forecast and not a rule.")

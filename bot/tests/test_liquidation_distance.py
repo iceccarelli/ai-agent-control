@@ -143,11 +143,15 @@ class TestTheFloorCameFromMeasurement:
 
 class TestAShortBeingSqueezedGetsOut:
     def test_a_close_liquidation_price_unwinds_the_book(self):
-        venue = Venue(liq=MARK * 1.05)          # 5% away, under the floor
+        venue = Venue(liq=MARK * 1.60)
         e = opened(venue, require_liquidation_check=True)
+        assert e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=4 * H8,
+                           timestamp_ms=4 * H8).action == "hold"   # healthy read
+        venue.liq = MARK * 1.05                 # squeezed to 5% away, under the floor
         venue.orders.clear()
         d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
-                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
+                        funding_print_ms=5 * H8, timestamp_ms=5 * H8)
         assert d.action == "unwound"
         assert "LIQUIDATION" in d.reason
         assert venue.orders, "it must actually close the leg"
@@ -172,10 +176,14 @@ class TestAShortBeingSqueezedGetsOut:
     def test_the_exact_floor_is_the_boundary(self):
         for pct, expect in ((MIN_LIQUIDATION_DISTANCE_PCT - 0.1, "unwound"),
                             (MIN_LIQUIDATION_DISTANCE_PCT + 0.1, "hold")):
-            venue = Venue(liq=MARK * (1.0 + pct / 100.0))
+            venue = Venue(liq=MARK * 1.60)
             e = opened(venue, require_liquidation_check=True)
+            assert e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                               funding_print_ms=4 * H8,
+                               timestamp_ms=4 * H8).action == "hold"
+            venue.liq = MARK * (1.0 + pct / 100.0)
             d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
-                            funding_print_ms=4 * H8, timestamp_ms=4 * H8)
+                            funding_print_ms=5 * H8, timestamp_ms=5 * H8)
             assert d.action == expect, (pct, d.reason)
 
 
@@ -203,15 +211,19 @@ class TestAnExitDoesNotWaitForTheTicker:
         """The exit orders are market orders; an unreadable ticker used to
         raise out of the tick before `_unwind` ran, leaving the book held and
         the exception swallowed every tick."""
-        venue = Venue(liq=MARK * 1.05)
+        venue = Venue(liq=MARK * 1.60)
         e = opened(venue, require_liquidation_check=True)
+        assert e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                           funding_print_ms=4 * H8,
+                           timestamp_ms=4 * H8).action == "hold"   # healthy read
+        venue.liq = MARK * 1.05
 
         def boom(symbol):
             raise RuntimeError("ticker down")
         venue.get_mark = boom
         before = len(venue.orders)
         d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
-                        funding_print_ms=4 * H8, timestamp_ms=4 * H8)
+                        funding_print_ms=5 * H8, timestamp_ms=5 * H8)
         assert d.action == "unwound"
         assert any(o[0] == "Buy" and o[1] == "linear"
                    for o in venue.orders[before:])
