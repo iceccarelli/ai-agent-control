@@ -858,7 +858,10 @@ class TradingBot:
         # book must not start, size or hedge on top of that.
         try:
             import order_recovery as _recovery
-            recovery = _recovery.resolve_unresolved_orders(broker, self.store)
+            # The ledger wrapper hides the adapter's order reads on purpose
+            # (tests/test_real_stack_adapter.py); recovery reads through `.inner`.
+            recovery = _recovery.resolve_unresolved_orders(
+                getattr(broker, "inner", broker), self.store)
             if not isinstance(recovery, _recovery.RecoveryReport):
                 raise TypeError(f"recovery returned {type(recovery).__name__}")
         except Exception as exc:  # noqa: BLE001

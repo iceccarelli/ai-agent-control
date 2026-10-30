@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import carry_costs as cc  # noqa: E402
 import main as _main  # noqa: E402
+from order_log_stub import InMemoryOrderLog  # noqa: E402
 from carry_broker import CarryBroker, CarryOrderRefused, LegFill  # noqa: E402
 from carry_engine import BookState, CarryEngine  # noqa: E402
 from carry_risk import CarryRisk  # noqa: E402
@@ -165,7 +166,7 @@ class TestBorrowIsRequiredEverywhere:
             _config.load({"BOOK_MODE": "carry", "CARRY_BORROW_APR": bad})
 
 
-class _Store:
+class _Store(InMemoryOrderLog):
     def __init__(self):
         self.seq = 0
 

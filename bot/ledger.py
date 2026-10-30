@@ -1388,9 +1388,6 @@ class LedgerBroker:
     def get_available_margin_usd(self):
         return self.inner.get_available_margin_usd()
 
-    def read_order(self, symbol, order_link_id, product="linear"):
-        return self.inner.read_order(symbol, order_link_id, product)
-
     def get_closed_short_qty_since(self, symbol, since_ms):
         return self.inner.get_closed_short_qty_since(symbol, since_ms)
 
