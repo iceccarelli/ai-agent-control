@@ -100,3 +100,46 @@ class TestThePrintedReportShowsIt:
     def test_nothing_is_printed_for_a_replay_with_no_trades(self):
         c = rp.trade_concentration([], notional=1000.0)
         assert rp.concentration_lines(c, years=1.0, notional=1000.0) == []
+
+
+class TestTheCaptionSaysWhatWasCharged:
+    """The 'without the best trade' figure comes from per-trade nets that already
+    include whatever borrow the run charged. The caption used to say 'before
+    financing' on every run, which is false the moment a borrow rate is set."""
+
+    def _lines(self, borrow_apr):
+        trades = [trade(0, 5, 100.0), trade(10, 15, 10.0)]
+        c = rp.trade_concentration(trades, notional=1000.0)
+        return "\n".join(rp.concentration_lines(
+            c, years=1.0, notional=1000.0, borrow_apr=borrow_apr))
+
+    def test_with_no_borrow_it_says_none_was_charged(self):
+        assert "0% borrow" in self._lines(0.0)
+        assert "before financing" not in self._lines(0.0)
+
+    def test_with_borrow_it_says_the_rate_that_was_charged(self):
+        assert "after 5% borrow" in self._lines(0.05)
+        assert "before financing" not in self._lines(0.05)
+
+
+class TestReturnOnTotalCapital:
+    """The headline is a return on NOTIONAL. A hedged book also posts margin for
+    the short perp, so the money tied up is the spot leg plus that margin. The
+    margin fraction is a stated assumption, never a venue figure."""
+
+    def test_total_capital_is_spot_notional_plus_assumed_margin(self):
+        out = rp.return_on_total_capital(net_annualised_pct=8.0, margin_fractions=(0.10, 0.25))
+        assert out[0.10] == pytest.approx(8.0 / 1.10)
+        assert out[0.25] == pytest.approx(8.0 / 1.25)
+
+    def test_a_negative_return_stays_negative(self):
+        assert rp.return_on_total_capital(-2.0, (0.2,))[0.2] == pytest.approx(-2.0 / 1.2)
+
+    def test_the_lines_name_the_assumption_and_say_it_is_not_the_venues(self):
+        text = "\n".join(rp.capital_lines(8.05))
+        assert "10%" in text and "20%" in text and "33%" in text
+        assert "assumed" in text and "not the venue" in text.lower()
+
+    def test_an_unusable_fraction_is_refused(self):
+        with pytest.raises(ValueError):
+            rp.return_on_total_capital(8.0, (-0.1,))

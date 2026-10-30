@@ -683,8 +683,31 @@ def trade_concentration(trade_rows: Sequence[Dict[str, Any]], *, notional: float
     }
 
 
+def return_on_total_capital(net_annualised_pct: float,
+                            margin_fractions: Sequence[float]) -> Dict[float, float]:
+    """Annualised net as a return on the money tied up: the spot leg (notional)
+    plus an ASSUMED margin fraction of notional posted for the short perp. The
+    fraction is the reader's declared assumption; the replay has no venue margin
+    figure (it says so under not_modelled)."""
+    out: Dict[float, float] = {}
+    for m in margin_fractions:
+        if not (isinstance(m, (int, float)) and math.isfinite(m) and m >= 0):
+            raise ValueError(f"margin fraction must be a finite number >= 0, got {m!r}")
+        out[m] = net_annualised_pct / (1.0 + m)
+    return out
+
+
+def capital_lines(net_annualised_pct: float,
+                  margin_fractions: Sequence[float] = (0.10, 0.20, 1.0 / 3.0)
+                  ) -> List[str]:
+    shown = return_on_total_capital(net_annualised_pct, margin_fractions)
+    parts = [f"{100.0 * m:.0f}% margin -> {v:+.2f}%/yr" for m, v in shown.items()]
+    return ["  on total capital (spot + assumed perp margin, not the venue's "
+            "figure): " + "; ".join(parts)]
+
+
 def concentration_lines(c: Dict[str, Any], *, years: float,
-                        notional: float) -> List[str]:
+                        notional: float, borrow_apr: float = 0.0) -> List[str]:
     """The printed form of :func:`trade_concentration`. Empty when there is
     nothing to say. The 'without the best trade' figure is the point: a headline
     one trade supplied is a different claim from one spread across many."""
@@ -699,10 +722,12 @@ def concentration_lines(c: Dict[str, Any], *, years: float,
             f"{100.0 * c['best_trade_share_of_net']:.1f}% of net; best five = "
             f"{100.0 * c['top5_share_of_net']:.1f}%")
         if years > 0 and notional:
+            charged = (f"after {100.0 * borrow_apr:g}% borrow" if borrow_apr
+                       else "at 0% borrow charged")
             out.append(
                 f"  without the best trade ${without:,.0f} = "
                 f"{100.0 * without / notional / years:+.2f}%/yr on notional "
-                "(before financing)")
+                f"({charged}; fees included)")
     out.append(
         f"  {c['losing_trade_pct']:.0f}% of trades lose money; max drawdown of "
         f"closed trades ${c['max_drawdown_usd']:,.0f} "
@@ -1210,8 +1235,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"  trades {r['trades']}, orders {r['orders']} "
           f"({r['maker_fills']} maker), in market "
           f"{r['market_exposure_pct']:.1f}%")
+    for line in capital_lines(r["net_annualised_pct"]):
+        print(line)
     for line in concentration_lines(r["concentration"], years=r["years"],
-                                    notional=r["notional_usd"]):
+                                    notional=r["notional_usd"],
+                                    borrow_apr=r["borrow_apr"]):
         print(line)
     if r["halted_at_ms"]:
         print(f"  HALTED at {cb._iso_ms(r['halted_at_ms'])} — the replay "
