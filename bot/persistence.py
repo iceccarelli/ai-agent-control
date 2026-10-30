@@ -79,6 +79,7 @@ __all__ = [
     "DEFAULT_DB_PATH",
     "MEMORY_KEY_CONVENTION",
     "slippage_bps",
+    "EXECUTION_ENVIRONMENTS",
 ]
 
 logger = logging.getLogger(__name__)
@@ -533,6 +534,10 @@ CREATE INDEX IF NOT EXISTS idx_decisions_reason ON decisions(decision, reason);
 #: Outcomes ``record_execution`` accepts.  An unknown outcome is refused rather
 #: than stored, because a typo silently becomes a category nobody aggregates.
 EXECUTION_OUTCOMES = ("filled", "partial", "rejected", "cancelled", "unfilled")
+
+#: Environments whose orders a ledger can have booked. Recorded in ``meta`` by
+#: ``record_execution_environment``; only "mainnet" can ever be read as cash.
+EXECUTION_ENVIRONMENTS = ("mainnet", "testnet", "paper")
 
 #: Local, lowercase ``orders.status`` values that are TERMINAL: an order in
 #: one of these will never legitimately change status again on this venue.
@@ -2158,6 +2163,42 @@ class StateStore:
             # Today's anchor was set from the OTHER account's equity.
             self._exec("DELETE FROM daily_anchor WHERE day = ?", (utc_day(),))
         return bool(rows)
+
+    def record_execution_environment(self, environment: str) -> List[str]:
+        """Record which environment's orders this database's ledger books.
+
+        Additive (two `meta` keys, no schema change): `execution_environment`
+        is the latest declaration and `execution_environments_seen` every one
+        ever made, comma-separated, never shrunk. A ledger that was ever written
+        under testnet or paper cannot later be read as mainnet cash, and the
+        history is what lets a reader see that. Returns the environments seen.
+        """
+        env = str(environment).strip().lower()
+        if env not in EXECUTION_ENVIRONMENTS:
+            raise PersistenceError(
+                f"execution environment {environment!r} is not one of "
+                f"{EXECUTION_ENVIRONMENTS}; refusing to record it")
+        seen = self.execution_environments_seen()
+        if env not in seen:
+            seen.append(env)
+        with self.transaction():
+            self._put_meta("execution_environment", env)
+            self._put_meta("execution_environments_seen", ",".join(seen))
+        return seen
+
+    def execution_environment(self) -> Optional[str]:
+        """The latest recorded execution environment, or None (never recorded)."""
+        rows = self._query(
+            "SELECT value FROM meta WHERE key = 'execution_environment'")
+        return str(rows[0]["value"]) if rows else None
+
+    def execution_environments_seen(self) -> List[str]:
+        """Every execution environment ever recorded here, first-seen order."""
+        rows = self._query(
+            "SELECT value FROM meta WHERE key = 'execution_environments_seen'")
+        if not rows:
+            return []
+        return [v for v in str(rows[0]["value"]).split(",") if v]
 
     def traded_signal(self, symbol: str) -> str:
         """The signature of the last signal traded on `symbol` ('' if none)."""
