@@ -43,6 +43,7 @@ def write_approvals(tmp_path, entries, keys=None):
     path = tmp_path / "approvals.json"
     path.write_text(json.dumps({"schema": "promotion_approvals/1",
                                 "approved": approved}))
+    os.chmod(path, 0o600)
     return str(path)
 
 
@@ -141,3 +142,85 @@ def test_the_approve_tool_refuses_an_incomplete_or_unknown_item(tmp_path):
                             "--out", str(out)], capture_output=True, text=True)
         assert r.returncode != 0, key
         assert not out.exists(), key
+
+
+# -- where the approvals file may live, and who may write it ------------------
+
+def test_an_approvals_file_inside_the_repository_is_ignored(tmp_path):
+    gate, entries = write_gate(tmp_path)
+    inside = os.path.join(pg.REPO_ROOT, "bot", "artifacts",
+                          "_approvals_inside_repo_test.json")
+    approved = {k: pg.approval_digest(k, entries[k]) for k in entries}
+    try:
+        with open(inside, "w") as handle:
+            json.dump({"approved": approved}, handle)
+        os.chmod(inside, 0o600)
+        v = pg.evaluate_promotion_gate(path=gate, approvals_path=inside)
+        assert completed(v).isdisjoint(NON_MACHINE)
+        assert any("inside the repository" in r for r in v.reasons)
+    finally:
+        os.remove(inside)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+@pytest.mark.parametrize("mode", [0o620, 0o602, 0o666, 0o660])
+def test_a_group_or_world_writable_approvals_file_is_ignored(tmp_path, mode):
+    gate, entries = write_gate(tmp_path)
+    ap = write_approvals(tmp_path, entries)
+    os.chmod(ap, mode)
+    v = pg.evaluate_promotion_gate(path=gate, approvals_path=ap)
+    assert completed(v).isdisjoint(NON_MACHINE)
+    assert any("writable" in r for r in v.reasons)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_a_symlink_into_the_repository_does_not_launder_the_location(tmp_path):
+    gate, entries = write_gate(tmp_path)
+    inside = os.path.join(pg.REPO_ROOT, "bot", "artifacts",
+                          "_approvals_link_target_test.json")
+    link = tmp_path / "link.json"
+    approved = {k: pg.approval_digest(k, entries[k]) for k in entries}
+    try:
+        with open(inside, "w") as handle:
+            json.dump({"approved": approved}, handle)
+        os.chmod(inside, 0o600)
+        os.symlink(inside, link)
+        v = pg.evaluate_promotion_gate(path=gate, approvals_path=str(link))
+        assert completed(v).isdisjoint(NON_MACHINE)
+    finally:
+        os.remove(inside)
+
+
+def test_the_config_path_is_honoured_and_checked_the_same_way(tmp_path):
+    gate, entries = write_gate(tmp_path)
+    ap = write_approvals(tmp_path, entries)
+
+    class Cfg:
+        PROMOTION_APPROVALS_FILE = ap
+    v = pg.evaluate_promotion_gate(path=gate, config=Cfg())
+    assert set(NON_MACHINE) <= completed(v)
+    os.chmod(ap, 0o666)
+    v = pg.evaluate_promotion_gate(path=gate, config=Cfg())
+    assert completed(v).isdisjoint(NON_MACHINE)
+
+
+def test_the_approve_tool_refuses_an_output_inside_the_repository(tmp_path):
+    gate, _ = write_gate(tmp_path)
+    tool = os.path.join(os.path.dirname(HERE), "tools", "promotion_approve.py")
+    inside = os.path.join(pg.REPO_ROOT, "bot", "artifacts", "_must_not_exist.json")
+    r = subprocess.run([sys.executable, tool, "--gate", gate, "--key",
+                        "kill_switch_drill_recorded", "--out", inside],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "inside the repository" in r.stderr
+    assert not os.path.exists(inside)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+def test_the_approve_tool_writes_a_private_file(tmp_path):
+    gate, _ = write_gate(tmp_path)
+    out = tmp_path / "a.json"
+    tool = os.path.join(os.path.dirname(HERE), "tools", "promotion_approve.py")
+    subprocess.run([sys.executable, tool, "--gate", gate, "--key",
+                    "kill_switch_drill_recorded", "--out", str(out)],
+                   capture_output=True, text=True, check=True)
+    assert (os.stat(out).st_mode & 0o777) == 0o600

@@ -145,20 +145,48 @@ def approval_digest(key: str, entry: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _read_approvals(path: str) -> Dict[str, str]:
-    """{key: digest}. Anything unreadable or malformed approves nothing."""
+#: The checkout. An approvals file inside it could be committed, which is the
+#: bypass the file exists to close.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _approvals_untrusted(path: str) -> Optional[str]:
+    """Why this approvals file may not be trusted, or None. Checked on the
+    RESOLVED path, so a link from outside into the repository does not launder
+    the location."""
+    real = os.path.realpath(path)
+    root = os.path.realpath(REPO_ROOT)
+    if real == root or real.startswith(root + os.sep):
+        return f"approvals file {path!r} is inside the repository"
+    if os.name == "posix":
+        try:
+            mode = os.stat(real).st_mode
+        except OSError:
+            return None                      # unreadable: nothing to trust anyway
+        if mode & 0o022:
+            return (f"approvals file {path!r} is group- or world-writable "
+                    f"(mode {mode & 0o777:o})")
+    return None
+
+
+def _read_approvals(path: str) -> Tuple[Dict[str, str], Optional[str]]:
+    """({key: digest}, problem). Anything unreadable, malformed or untrusted
+    approves nothing; `problem` says why when a file was named but refused."""
     if not path:
-        return {}
+        return {}, None
+    problem = _approvals_untrusted(path)
+    if problem is not None:
+        return {}, problem
     try:
         with open(path, encoding="utf-8") as handle:
             payload = json.load(handle)
     except (OSError, ValueError):
-        return {}
+        return {}, None
     approved = payload.get("approved") if isinstance(payload, dict) else None
     if not isinstance(approved, dict):
-        return {}
-    return {k: v for k, v in approved.items()
-            if isinstance(k, str) and isinstance(v, str)}
+        return {}, None
+    return ({k: v for k, v in approved.items()
+             if isinstance(k, str) and isinstance(v, str)}, None)
 
 
 def _read_gate(path: str) -> Optional[Dict[str, Any]]:
@@ -225,11 +253,13 @@ def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None
     payload = _read_gate(path)
     if approvals_path is None:
         approvals_path = str(getattr(config, "PROMOTION_APPROVALS_FILE", "") or "")
-    approvals = _read_approvals(approvals_path)
+    approvals, approvals_problem = _read_approvals(approvals_path)
     declared = (payload or {}).get("checklist", {})
     reasons: List[str] = []
     items: List[GateItem] = []
 
+    if approvals_problem is not None:
+        reasons.append(f"{approvals_problem}; no approval from it is counted")
     if payload is None:
         reasons.append(
             "the promotion gate file is missing or unreadable; a gate that "

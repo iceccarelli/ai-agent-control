@@ -46,13 +46,21 @@ def main(argv=None) -> int:
         print(f"refusing: {args.key} is not marked complete in the gate file; "
               "approve only what you have read and found true", file=sys.stderr)
         return 2
-    existing = pg._read_approvals(args.out) if os.path.exists(args.out) else {}
+    problem = pg._approvals_untrusted(args.out) if os.path.exists(args.out) \
+        else (f"--out {args.out!r} is inside the repository"
+              if os.path.realpath(args.out).startswith(
+                  os.path.realpath(pg.REPO_ROOT) + os.sep) else None)
+    if problem is not None:
+        print(f"refusing: {problem}", file=sys.stderr)
+        return 2
+    existing = pg._read_approvals(args.out)[0] if os.path.exists(args.out) else {}
     existing[args.key] = pg.approval_digest(args.key, entry)
     tmp = args.out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump({"schema": "promotion_approvals/1", "approved": existing},
                   handle, indent=2, sort_keys=True)
         handle.write("\n")
+    os.chmod(tmp, 0o600)
     os.replace(tmp, args.out)
     print(f"approved {args.key}: {existing[args.key]}")
     return 0
