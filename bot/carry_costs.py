@@ -167,7 +167,8 @@ class CarryVerdict:
 
 
 def ewma_funding_bps(prints_bps: Sequence[float], *,
-                     alpha: float = EWMA_ALPHA) -> Optional[float]:
+                     alpha: float = EWMA_ALPHA,
+                     min_prints: int = EWMA_MIN_PRINTS) -> Optional[float]:
     """Smoothed funding in bps per 8h print, newest last.
 
     Returns None below EWMA_MIN_PRINTS. None means REFUSE at the call site, not
@@ -175,7 +176,7 @@ def ewma_funding_bps(prints_bps: Sequence[float], *,
     history to know the rate should not open on it.
     """
     values = [float(p) for p in prints_bps if p is not None and math.isfinite(p)]
-    if len(values) < EWMA_MIN_PRINTS:
+    if len(values) < min_prints or not values:
         return None
     smoothed = values[0]
     for value in values[1:]:
@@ -218,8 +219,13 @@ def _invalid_cost_inputs(*, borrow_apr: Any, round_trip_bps: Any,
 
 def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
                    spot: float, borrow_apr: float, round_trip_bps: float,
-                   hold_days: float = ASSUMED_HOLD_DAYS) -> CarryVerdict:
+                   hold_days: float = ASSUMED_HOLD_DAYS,
+                   ewma_alpha: float = EWMA_ALPHA,
+                   ewma_min_prints: int = EWMA_MIN_PRINTS) -> CarryVerdict:
     """May the book open this pair?
+
+    `ewma_alpha` and `ewma_min_prints` default to the production constants;
+    they exist so the simulators can state the values they ran with.
 
     Order matters. Cheapest and most decisive checks first, so a refusal names
     the binding constraint rather than the first thing that happened to fail.
@@ -241,12 +247,13 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
                             "must be positive, or negative is not priced; the "
                             "gate refuses instead of assuming it is free"})
 
-    smoothed = ewma_funding_bps(funding_prints_bps)
+    smoothed = ewma_funding_bps(funding_prints_bps, alpha=ewma_alpha,
+                                min_prints=ewma_min_prints)
     if smoothed is None:
         return CarryVerdict(
             False, "INSUFFICIENT_FUNDING_HISTORY",
             detail={"prints": len(list(funding_prints_bps)),
-                    "required": EWMA_MIN_PRINTS,
+                    "required": ewma_min_prints,
                     "note": "too little history to know the rate; not an "
                             "invitation to assume zero or use the last print"})
 
@@ -420,7 +427,9 @@ def hedge_basis_pnl_bps(entry_basis_bps: float, exit_basis_bps: float) -> float:
 
 def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
                            round_trip_bps: float, borrow_apr: float,
-                           hold_days: float = DEMONSTRATED_HOLD_DAYS
+                           hold_days: float = DEMONSTRATED_HOLD_DAYS,
+                           ewma_alpha: float = EWMA_ALPHA,
+                           ewma_min_prints: int = EWMA_MIN_PRINTS
                            ) -> CarryVerdict:
     """May this entry open, judged on the hold that has been DEMONSTRATED?
 
@@ -444,10 +453,11 @@ def hold_clears_round_trip(*, funding_prints_bps: Sequence[float],
     if invalid:
         return CarryVerdict(False, "COST_INPUT_INVALID",
                             detail={"fields": invalid})
-    smoothed = ewma_funding_bps(funding_prints_bps)
+    smoothed = ewma_funding_bps(funding_prints_bps, alpha=ewma_alpha,
+                                min_prints=ewma_min_prints)
     if smoothed is None:
         return CarryVerdict(False, "INSUFFICIENT_FUNDING_HISTORY",
-                            detail={"required": EWMA_MIN_PRINTS})
+                            detail={"required": ewma_min_prints})
     borrow_per_day = (float(borrow_apr) / 365.0) * 1e4
     budget = int(math.floor(round(float(hold_days) * FUNDING_PERIODS_PER_DAY, 9)))
     needed = min_settlements_to_clear(
@@ -489,7 +499,9 @@ GATE_REASONS = (
 def entry_gate(*, funding_prints_bps: Sequence[float], perp: float,
                spot: float, borrow_apr: float, round_trip_bps: float,
                hold_days: float = ASSUMED_HOLD_DAYS,
-               demonstrated_hold_days: float = DEMONSTRATED_HOLD_DAYS
+               demonstrated_hold_days: float = DEMONSTRATED_HOLD_DAYS,
+               ewma_alpha: float = EWMA_ALPHA,
+               ewma_min_prints: int = EWMA_MIN_PRINTS
                ) -> CarryVerdict:
     """May the book open this pair? `evaluate_entry`, then the hold check.
 
@@ -505,12 +517,14 @@ def entry_gate(*, funding_prints_bps: Sequence[float], perp: float,
     verdict = evaluate_entry(
         funding_prints_bps=funding_prints_bps, perp=perp, spot=spot,
         borrow_apr=borrow_apr, round_trip_bps=round_trip_bps,
-        hold_days=hold_days)
+        hold_days=hold_days, ewma_alpha=ewma_alpha,
+        ewma_min_prints=ewma_min_prints)
     if not verdict.allowed:
         return verdict
     horizon = hold_clears_round_trip(
         funding_prints_bps=funding_prints_bps, round_trip_bps=round_trip_bps,
-        borrow_apr=borrow_apr, hold_days=demonstrated_hold_days)
+        borrow_apr=borrow_apr, hold_days=demonstrated_hold_days,
+        ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints)
     if horizon.allowed:
         return verdict
     from dataclasses import replace
