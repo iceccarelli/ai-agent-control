@@ -155,6 +155,7 @@ jobs:
           tests/test_pretrade_capital_check.py
           tests/test_order_lifecycle.py
           tests/test_order_lookup_unanswered.py
+          tests/test_exit_gate.py
           tests/test_carry_orders_belong_to_the_carry_resolver.py
           tests/test_portfolio_authority_integration.py
           tests/test_capital_engine_wiring.py

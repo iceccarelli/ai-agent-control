@@ -569,7 +569,8 @@ class CarryBroker:
                  duplicate_ret_codes: Optional[Tuple[int, ...]] = None,
                  session_token: str = "",
                  entry_gate: Any = None,
-                 order_log: Any = None) -> None:
+                 order_log: Any = None,
+                 exit_gate: Any = None) -> None:
         if not callable(order_gate):
             raise TypeError("order_gate must be callable -> (may_send, reason)")
         if entry_gate is not None and not callable(entry_gate):
@@ -578,6 +579,11 @@ class CarryBroker:
         #: never for an exit, so a switched-off book can always flatten.
         #: Anything but an explicit (True, reason) refuses the entry.
         self.entry_gate = entry_gate
+        #: The gate for orders that only REDUCE exposure (see `_is_exit`). When
+        #: given, an exit asks it INSTEAD of `order_gate`, so controls that
+        #: decide whether to start exposure (a promotion gate) cannot refuse the
+        #: buy-back of a held short. None = exits ask `order_gate` as before.
+        self.exit_gate = exit_gate
         #: The durable order record (a StateStore). With it, every carry order
         #: is written BEFORE it can leave and moved through its lifecycle
         #: (order_lifecycle.py) as the venue answers; None = no record (tests,
@@ -649,7 +655,7 @@ class CarryBroker:
     def _place_market_core(self, *, symbol: str, side: str, qty: float,
                            product: str, trail: "_OrderTrail"
                            ) -> Optional[Dict[str, Any]]:
-        self._assert_orders_permitted()
+        self._assert_orders_permitted(exit=self._is_exit(product, side))
         self._assert_entry_permitted(product, side)
         if product not in VALID_PRODUCTS:
             raise ValueError(
@@ -944,7 +950,7 @@ class CarryBroker:
         order the book does not know about, plus the market order the caller
         would send next, is two legs where one was intended.
         """
-        self._assert_orders_permitted()
+        self._assert_orders_permitted(exit=self._is_exit(product, side))
         self._assert_entry_permitted(product, side)
         if product not in VALID_PRODUCTS:
             raise ValueError(
@@ -2312,10 +2318,19 @@ class CarryBroker:
             fee=CarryBroker._fee(row), fee_detail=CarryBroker._fee_detail(row),
             detail=dict(row))
 
-    def _assert_orders_permitted(self) -> None:
+    @staticmethod
+    def _is_exit(product: str, side: str) -> bool:
+        """An order that can only reduce the book: a spot SELL (the book holds
+        what it sells) or a perp BUY (always reduce-only, `_short_only_guard`)."""
+        return (product == SPOT and side == "Sell") or (
+            product == LINEAR and side == "Buy")
+
+    def _assert_orders_permitted(self, *, exit: bool = False) -> None:
         """Ask the gate. Anything but an explicit (True, reason) refuses."""
+        gate = self.exit_gate if (exit and self.exit_gate is not None) \
+            else self.order_gate
         try:
-            allowed, reason = self.order_gate()
+            allowed, reason = gate()
         except Exception as exc:  # noqa: BLE001 - an unreadable gate is closed
             raise CarryOrderRefused(
                 f"order gate unreadable ({exc!r}); no carry order sent") from exc

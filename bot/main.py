@@ -1750,7 +1750,7 @@ class TradingBot:
 # ---------------------------------------------------------------------------
 
 
-def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
+def carry_orders_permitted(cfg: Any, *, exit: bool = False) -> Tuple[bool, str]:
     """May the carry book send an order right now? The ONE answer.
 
     `build_bot` hands this (bound to its config) to `CarryBroker` as the order
@@ -1762,6 +1762,13 @@ def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
     are both sandboxes that cannot touch real money, so both are permitted, with
     the reason naming which one. Mainnet needs the live authorisation AND a
     signed promotion gate.
+
+    `exit=True` is the question for an order that only REDUCES exposure (a spot
+    Sell, a reduce-only perp Buy). The promotion gate decides whether to START
+    exposure; it is not asked about keeping it, so editing a gate artefact or an
+    approvals file mid-hold can never refuse the buy-back of a live short. Exits
+    still need the paper flag clear, the sandbox/URL agreement (the `_for`
+    wrapper) and, on mainnet, the live-arming chain.
     """
     if bool(cfg.PAPER_TRADING):
         return (False, "PAPER_TRADING=1: the carry book has no paper venue")
@@ -1773,6 +1780,9 @@ def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
     armed, why = _config.is_live_authorized(cfg)
     if armed is not True:
         return (False, f"mainnet URL without live authorisation: {why}")
+    if exit:
+        return (True, "LIVE exit (arming chain satisfied; the promotion gate "
+                      "governs entries only)")
     # Defence in depth: start() already refuses a live-armed process whose
     # promotion gate is unsigned. The broker asks again, per order, so no path
     # around start() reaches a mainnet carry order.
@@ -1782,7 +1792,8 @@ def carry_orders_permitted(cfg: Any) -> Tuple[bool, str]:
     return (True, "LIVE (authorised, promotion gate signed)")
 
 
-def carry_orders_permitted_for(cfg: Any, client: Any) -> Tuple[bool, str]:
+def carry_orders_permitted_for(cfg: Any, client: Any, *,
+                               exit: bool = False) -> Tuple[bool, str]:
     """`carry_orders_permitted`, plus: the client must talk to the venue the
     config says it talks to.
 
@@ -1792,7 +1803,7 @@ def carry_orders_permitted_for(cfg: Any, client: Any) -> Tuple[bool, str]:
     that matters is refused here, per order: a sandbox config with a client
     whose base URL is the mainnet host.
     """
-    allowed, why = carry_orders_permitted(cfg)
+    allowed, why = carry_orders_permitted(cfg, exit=exit)
     if allowed is not True:
         return (allowed, why)
     if bool(cfg.USE_TESTNET):
@@ -1984,6 +1995,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         def _carry_orders_permitted():
             return carry_orders_permitted_for(cfg, bot.client)
 
+        def _carry_exits_permitted():
+            return carry_orders_permitted_for(cfg, bot.client, exit=True)
+
         # HOW THE LONG SIDE IS HELD (0036). No default: "overlay" shorts the
         # perp against BTC the client already owns and never touches their
         # spot; "acquire" buys the spot leg and sells it again. PHASE1_DECISION
@@ -2023,6 +2037,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                         bot.store.next_order_seq(),
                     session_token=bot.store.session_boot_token(),
                     order_gate=_carry_orders_permitted,
+                    exit_gate=_carry_exits_permitted,
                     entry_gate=carry_entries_permitted_from(bot.store),
                     # Every carry order is written down before it can leave
                     # and followed through its lifecycle (order_lifecycle.py).
