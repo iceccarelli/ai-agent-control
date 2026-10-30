@@ -225,6 +225,8 @@ def _carry_bot(**env):
                     "result": {"list": [
                         {"totalAvailableBalance": "1000000",
                          "coin": [{"coin": "BTC", "walletBalance": "5",
+                                   "locked": "0"},
+                                  {"coin": "USDT", "walletBalance": "1000000",
                                    "locked": "0"}]}]}}
         if endpoint == "/v5/order/realtime":
             # the venue is asked what an accepted order did; it filled
