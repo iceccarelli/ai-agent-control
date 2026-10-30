@@ -92,3 +92,46 @@ def test_the_latest_ninety_days_are_summarised_separately_from_the_quarters():
     latest = fr.latest_window(rows, prints_back=270)
     assert latest["mean_annualised_pct"] == pytest.approx(0.00001 * 3 * 365 * 100)
     assert latest["prints"] == 270
+
+
+class TestDoesTheBookStayOutOfTheLeanQuarters:
+    """Net per third says WHERE profit was earned. It does not say whether the
+    book was simply in the market more in the generous quarters, or earned more
+    per day it was there. Days in market per third, and net per day in market,
+    separate the two."""
+
+    def _setup(self):
+        rows = []
+        for i, rate in enumerate([0.00001, 0.00005, 0.0003]):
+            rows += prints(2023, 1 + 3 * i, 90, rate)          # 30 days of prints each
+        table = fr.with_terciles(fr.quarterly_table(rows))
+        # 10 days in the low quarter earning 1; 20 days in the high one earning 90
+        trades = [{"opened_ms": ms(2023, 1, 5), "closed_ms": ms(2023, 1, 15)},
+                  {"opened_ms": ms(2023, 7, 1), "closed_ms": ms(2023, 7, 21)}]
+        return table, trades, [1.0, 90.0]
+
+    def test_days_in_market_are_attributed_to_each_third(self):
+        out = fr.attribute_by_third(*self._setup())
+        assert out["days_by_third"]["low"] == pytest.approx(10.0)
+        assert out["days_by_third"]["high"] == pytest.approx(20.0)
+        assert out["days_by_third"]["mid"] == pytest.approx(0.0)
+
+    def test_net_per_day_in_market_is_net_over_days(self):
+        out = fr.attribute_by_third(*self._setup())
+        assert out["net_per_day_by_third"]["low"] == pytest.approx(0.1)
+        assert out["net_per_day_by_third"]["high"] == pytest.approx(4.5)
+        assert out["net_per_day_by_third"]["mid"] is None        # no days: no rate
+
+    def test_the_share_of_each_thirds_days_spent_in_the_market(self):
+        out = fr.attribute_by_third(*self._setup())
+        # each third observed 90 prints = 30 days
+        assert out["pct_of_days_in_market_by_third"]["low"] == pytest.approx(100 * 10 / 30)
+        assert out["pct_of_days_in_market_by_third"]["high"] == pytest.approx(100 * 20 / 30)
+        assert out["pct_of_days_in_market_by_third"]["mid"] == pytest.approx(0.0)
+
+    def test_the_printed_report_shows_it(self):
+        table, trades, nets = self._setup()
+        lines = fr.report_lines(table, fr.latest_window(prints(2023, 1, 10, 0.0001), 10),
+                                fr.attribute_by_third(table, trades, nets))
+        text = "\n".join(lines)
+        assert "in the market" in text and "per day" in text
