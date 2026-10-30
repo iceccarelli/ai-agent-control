@@ -47,6 +47,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -150,38 +151,76 @@ def approval_digest(key: str, entry: Any) -> str:
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _approvals_untrusted(path: str) -> Optional[str]:
-    """Why this approvals file may not be trusted, or None. Checked on the
-    RESOLVED path, so a link from outside into the repository does not launder
-    the location."""
-    real = os.path.realpath(path)
+def _approvals_location_problem(path: str) -> Tuple[str, Optional[str]]:
+    """(real path, why it may not be used). The directory is resolved, the final
+    component is not followed: a link is refused, never laundered."""
+    abspath = os.path.abspath(path)
+    parent = os.path.realpath(os.path.dirname(abspath))
+    real = os.path.join(parent, os.path.basename(abspath))
     root = os.path.realpath(REPO_ROOT)
     if real == root or real.startswith(root + os.sep):
-        return f"approvals file {path!r} is inside the repository"
-    if os.name == "posix":
-        try:
-            mode = os.stat(real).st_mode
-        except OSError:
-            return None                      # unreadable: nothing to trust anyway
-        if mode & 0o022:
-            return (f"approvals file {path!r} is group- or world-writable "
-                    f"(mode {mode & 0o777:o})")
-    return None
+        return real, f"approvals file {path!r} is inside the repository"
+    return real, None
 
 
 def _read_approvals(path: str) -> Tuple[Dict[str, str], Optional[str]]:
-    """({key: digest}, problem). Anything unreadable, malformed or untrusted
-    approves nothing; `problem` says why when a file was named but refused."""
+    """({key: digest}, problem). The file is VALIDATED AND READ THROUGH ONE
+    DESCRIPTOR, so it cannot be swapped between the check and the read; a
+    symlink, a non-regular file, a foreign owner, group/world write on the file
+    or on its parent directory (unless sticky), or a file replaced while being
+    opened, approves nothing. Unreadable or malformed content approves nothing.
+    `problem` says why when a file was named and refused.
+
+    This establishes that the file is private to the account running the
+    process. It does not establish WHO wrote it: an attacker with that
+    account's rights can write approvals too. It is a barrier against a commit
+    or another account, not proof of human identity."""
     if not path:
         return {}, None
-    problem = _approvals_untrusted(path)
+    real, problem = _approvals_location_problem(path)
     if problem is not None:
         return {}, problem
     try:
-        with open(path, encoding="utf-8") as handle:
+        lst = os.lstat(real)
+    except OSError:
+        return {}, None                         # absent: nothing is approved
+    if stat.S_ISLNK(lst.st_mode):
+        return {}, f"approvals file {path!r} is a symbolic link"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(real, flags)
+    except OSError as exc:
+        return {}, f"approvals file {path!r} cannot be opened safely ({exc.strerror})"
+    try:
+        st = os.fstat(fd)
+        why: Optional[str] = None
+        if not stat.S_ISREG(st.st_mode):
+            why = f"approvals file {path!r} is not a regular file"
+        elif os.name == "posix":
+            parent = os.path.dirname(real)
+            pst = os.stat(parent)
+            now = os.stat(real)
+            if st.st_uid != os.geteuid():
+                why = (f"approvals file {path!r} is owned by uid {st.st_uid}, "
+                       f"not the running account")
+            elif st.st_mode & 0o022:
+                why = (f"approvals file {path!r} is group- or world-writable "
+                       f"(mode {st.st_mode & 0o777:o})")
+            elif pst.st_mode & 0o022 and not pst.st_mode & stat.S_ISVTX:
+                why = (f"the parent directory of {path!r} is writable by "
+                       f"others (mode {pst.st_mode & 0o777:o})")
+            elif (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+                why = f"approvals file {path!r} was replaced while being opened"
+        if why is not None:
+            return {}, why
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
             payload = json.load(handle)
     except (OSError, ValueError):
         return {}, None
+    finally:
+        if fd >= 0:
+            os.close(fd)
     approved = payload.get("approved") if isinstance(payload, dict) else None
     if not isinstance(approved, dict):
         return {}, None
