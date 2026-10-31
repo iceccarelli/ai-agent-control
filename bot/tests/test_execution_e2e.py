@@ -221,3 +221,56 @@ def test_old_rows_without_execution_still_load():
     j2 = L.Journal.from_rows(j.to_rows())
     assert j2.entries[0].decision_mark is None
     assert "execution" not in j2.entries[0].fee_raw
+
+
+def test_the_engine_declares_the_tick_mark_as_the_decision_price():
+    from carry_engine import CarryEngine
+
+    seen = []
+
+    class B:
+        def begin_decision(self, **kw):
+            seen.append(kw)
+
+    e = CarryEngine.__new__(CarryEngine)
+    e.broker = B()
+    e._decision_marks = {"linear": 60000.0, "spot": 59990.0}
+    e._declare_decision("BTCUSDT", "linear", "Sell", 0.01)
+    e._declare_decision("BTCUSDT", "spot", "Buy", 0.01)
+    assert [(k["product"], k["mark"]) for k in seen] == [("linear", 60000.0),
+                                                         ("spot", 59990.0)]
+
+
+def test_no_decision_price_means_nothing_is_declared():
+    from carry_engine import CarryEngine
+
+    class B:
+        def begin_decision(self, **kw):
+            raise AssertionError("must not be called")
+
+    e = CarryEngine.__new__(CarryEngine)
+    e.broker = B()
+    e._decision_marks = {"linear": 60000.0, "spot": None}
+    e._declare_decision("BTCUSDT", "spot", "Buy", 0.01)      # no spot mark
+
+
+def test_an_engine_opened_pair_journals_the_decision_price(tmp_path):
+    """Production path end to end: on_candle -> _fire -> LedgerBroker ->
+    CarryBroker -> Journal. Every fill carries the tick's decision mark."""
+    from test_paired_leg_recovery import (FeeVenue, MARK, modern, stack,
+                                          warm_and_open)
+    store, venue, broker, engine = stack(str(tmp_path / "s.db"),
+                                         FeeVenue(modern, spot_qty=0.0))
+    d = warm_and_open(engine)
+    assert engine.position is not None, d
+    fills = [e for e in engine.broker.journal.entries
+             if e.kind in ("spot_buy", "perp_open")]
+    assert len(fills) == 2
+    for e in fills:
+        rec = e.fee_raw["execution"]
+        assert e.decision_mark is not None and e.decision_mark > 0
+        assert rec["status"] == "MEASURED", rec
+        # the reference is the decision-time executable side price, not a mark
+        # reconstructed from the fill
+        assert abs(e.decision_mark - MARK) / MARK < 0.01
+    store.close()

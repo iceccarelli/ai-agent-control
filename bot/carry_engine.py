@@ -1246,6 +1246,12 @@ class CarryEngine:
         """
         self._capital_sync()
         self._last_tick_ms = int(timestamp_ms or 0)
+        # The prices THIS tick decided on, kept for the execution record: the
+        # slippage of every order sent during this tick is measured against
+        # these, never against anything observed later.
+        self._decision_marks = {
+            "linear": float(mark),
+            "spot": float(spot) if spot is not None else None}
         if self.state is BookState.HALTED:
             if self._halt_unwritten:
                 # The write that records the halt (and any exposure noted with
@@ -2898,9 +2904,25 @@ class CarryEngine:
             return None
         if symbol == self.perp_symbol and product == "linear":
             self._venue_verified_ms = None      # we are about to change it
+        self._declare_decision(symbol, product, side, qty)
         if patient and self.execution_style == MAKER_FIRST:
             return self._rest_then_take(symbol, side, qty, product, qty_step)
         return self._take(symbol, side, qty, product)
+
+    def _declare_decision(self, symbol: str, product: str, side: str,
+                          qty: float) -> None:
+        """Tell the broker which price this order was decided at. Bookkeeping
+        only: a broker that cannot take it, or a tick with no decision price,
+        leaves the fill's slippage UNAVAILABLE and trading goes on."""
+        begin = getattr(self.broker, "begin_decision", None)
+        mark = (getattr(self, "_decision_marks", None) or {}).get(product)
+        if not callable(begin) or not mark or not self._finite(mark):
+            return
+        try:
+            begin(symbol=symbol, product=product, side=side, qty=qty,
+                  mark=float(mark))
+        except Exception:  # noqa: BLE001
+            logger.warning("decision context not recorded", exc_info=True)
 
     @staticmethod
     def _accountable(result: Any, qty: float, *,
