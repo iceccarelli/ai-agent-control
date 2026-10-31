@@ -198,3 +198,30 @@ def test_estimation_changes_nothing_it_is_given():
     snapshot = [dict(r.fee_raw["execution"]) for r in rows]
     ece.estimate_leg(rows, **LEG)
     assert [r.fee_raw["execution"] for r in rows] == snapshot
+
+
+def test_observations_survive_a_journal_save_and_reload():
+    """A restarted process rebuilds its journal from stored rows; the estimator
+    must read the same records from it."""
+    import ledger as L
+    j = L.Journal()
+    base_ms = NOW - DAY
+    for i in range(25):
+        L.perp_open(j, ms=base_ms - 100_000 + 2000 * i, ref=f"BB-open-{i}", qty=0.01,
+                    price=60000.0, fee_usd=0.2, fee_status="confirmed",
+                    fee_raw={"execution": rec(side="Sell")})
+        L.perp_close(j, ms=base_ms - 100_000 + 2000 * i + 1000, ref=f"BB-close-{i}", qty=0.01,
+                     price=60000.0, entry_price=60000.0, fee_usd=0.2,
+                     fee_status="confirmed",
+                     fee_raw={"execution": rec(side="Buy")})
+    live = ece.estimate_round_trip(j.entries, as_of_ms=NOW, execution_mode="overlay",
+                                   perp_symbol="BTCUSDT", spot_symbol="BTCUSDT",
+                                   planned_notional_usd=600.0)
+    reloaded = L.Journal.from_rows(j.to_rows())
+    again = ece.estimate_round_trip(reloaded.entries, as_of_ms=NOW,
+                                    execution_mode="overlay",
+                                    perp_symbol="BTCUSDT", spot_symbol="BTCUSDT",
+                                    planned_notional_usd=600.0)
+    assert live["status"] == ece.MEASURED
+    assert (again["spread_bps"], again["slippage_bps"]) == \
+        (live["spread_bps"], live["slippage_bps"])
