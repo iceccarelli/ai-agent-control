@@ -24,6 +24,9 @@ ALLOWED = {
     "tools/runner_alerts.py": 1,         # alert transport settings
     "tools/runner_monitor.py": 4,        # credential presence, alert settings
     "tools/unattended_drill.py": 3,      # credential presence, testnet env
+    "tools/owner_policy_check.py": 1,    # reports the deployment's own owner-policy
+                                         # settings; reads nothing else, prints no value
+    "tools/execution_samples_report.py": 1,  # defaults mode/symbols from the deployment env
 }
 
 #: Nothing here may read the environment: these are the order, risk and
