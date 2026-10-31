@@ -562,6 +562,54 @@ def load_unresolved_carry_orders(db_path: str) -> Optional[int]:
     return int(row[0])
 
 
+def load_carry_order_fills(db_path: str) -> Optional[List[Dict[str, Any]]]:
+    """(link, status, filled_qty) of every carry-leg order, or None when the
+    database has no orders table."""
+    conn = _ro(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT order_link_id, status, filled_qty FROM orders "
+            "WHERE purpose LIKE 'carry-%'").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return [{"link": str(r[0]), "status": str(r[1]),
+             "filled_qty": float(r[2] or 0.0)} for r in rows]
+
+
+def order_fills_match_ledger(journal: Any,
+                             orders: Optional[Sequence[Mapping[str, Any]]]
+                             ) -> Dict[str, Any]:
+    """Invariant: for every finished carry order, the quantity the order record
+    holds equals the quantity the ledger booked under its link id. A fill the
+    order record has and the ledger lacks (or the reverse) means the cash in the
+    report rests on a quantity nobody reconciled, however the record got there
+    (a resolved contradiction included)."""
+    name = "carry_order_fills_equal_ledger_fills"
+    if orders is None:
+        return {"name": name, "ok": True,
+                "detail": {"skipped": "no orders table to compare with"}}
+    booked: Dict[str, float] = {}
+    for e in journal.entries:
+        if e.kind not in L.FILL_KINDS:
+            continue
+        spq = _fill_price_qty(e)
+        if spq is not None:
+            booked[e.ref] = booked.get(e.ref, 0.0) + float(spq[1])
+    mismatched = []
+    for o in orders:
+        if o["status"] not in _order_lifecycle.TERMINAL:
+            continue            # in flight: the unresolved-orders blocker speaks
+        want, have = float(o["filled_qty"]), booked.get(o["link"], 0.0)
+        if abs(want - have) > max(1e-9, 1e-6 * max(want, have)):
+            mismatched.append({"order_link_id": o["link"],
+                               "order_filled_qty": want,
+                               "ledger_filled_qty": have})
+    return {"name": name, "ok": not mismatched,
+            "detail": {"mismatched": mismatched}}
+
+
 # -- environment, reconciliation, invariants -----------------------------------
 
 def classify_environment(declared: Optional[str],
@@ -825,6 +873,8 @@ def build_report(db_path: str, *, environment: Optional[str] = None,
     attach_capital(cycles, load_observations(db_path))
     summary = summarise(cycles)
     invariants = check_invariants(journal, cycles, statement)
+    invariants.append(order_fills_match_ledger(
+        journal, load_carry_order_fills(db_path)))
     unresolved = load_unresolved_carry_orders(db_path)
 
     blockers: List[str] = list(env["reasons"])

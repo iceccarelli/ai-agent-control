@@ -275,6 +275,21 @@ class CapitalReservations:
                 return link
             if order is not None and str(order.get("status")) not in ol.TERMINAL:
                 return link
+        # Orders are also tied to a reservation by CYCLE: a carry order's link id
+        # is `carry-...`, not the intent id, and a hold not yet committed to its
+        # first order link must still be protected while any order of its cycle
+        # is in flight.
+        terminal = tuple(sorted(ol.TERMINAL))
+        marks = ",".join("?" for _ in terminal)
+        try:
+            rows = self.store._query(
+                "SELECT order_link_id FROM orders WHERE cycle_id = ? "
+                f"AND status NOT IN ({marks}) LIMIT 1",
+                (str(row["intent_id"]),) + terminal)
+        except Exception:  # noqa: BLE001 - unreadable is unresolved
+            return str(row["intent_id"])
+        if rows:
+            return str(dict(rows[0])["order_link_id"])
         return None
 
     def _expire_locked(self, now: float, account_scope: Optional[str]) -> List[str]:

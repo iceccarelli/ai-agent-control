@@ -248,6 +248,31 @@ class TestExpiry:
         assert not res.ok and res.code == cr.INSUFFICIENT_FREE_CAPITAL
         assert any(e["kind"] == "EXPIRY_DEFERRED" for e in r.events("i-old"))
 
+    def test_expiry_defers_for_an_unresolved_order_of_the_same_cycle(self, store):
+        """A carry order's link id is `carry-...`, never the intent id; the
+        reservation is tied to it by the cycle id alone."""
+        r = make(store, buffer_usd=0.0)
+        now = time.time()
+        r.reserve("a", "cyc-7", 80.0, SCOPE, "entry",
+                  available=avail(100.0, now), ttl_s=5, now=now)
+        store.record_order_intent("carry-cyc-7-perp", "BTCUSDT", "Sell", 0.01,
+                                  leg="linear", cycle_id="cyc-7")
+        store.apply_order_event("carry-cyc-7-perp", "submit_attempt")
+        assert r.expire_stale(now=now + 10) == []
+        assert r.get("cyc-7")["state"] == cr.RESERVED
+        ev = [e for e in r.events("cyc-7") if e["kind"] == "EXPIRY_DEFERRED"]
+        assert ev and "carry-cyc-7-perp" in str(ev[0])
+
+    def test_expiry_proceeds_once_the_cycles_orders_are_terminal(self, store):
+        r = make(store, buffer_usd=0.0)
+        now = time.time()
+        r.reserve("a", "cyc-8", 80.0, SCOPE, "entry",
+                  available=avail(100.0, now), ttl_s=5, now=now)
+        store.record_order_intent("carry-cyc-8-perp", "BTCUSDT", "Sell", 0.01,
+                                  leg="linear", cycle_id="cyc-8")
+        store.apply_order_event("carry-cyc-8-perp", "never_sent")
+        assert r.expire_stale(now=now + 10) == ["cyc-8"]
+
     def test_committed_reservations_never_expire_on_a_timer(self, store):
         r = make(store, buffer_usd=0.0)
         now = time.time()
