@@ -271,8 +271,9 @@ def assess_restart(
     elif must_alert or reduce_now or (degraded and has_position):
         alert = OperatorAlert(
             True, "CRITICAL" if reduce_now else "WARNING",
-            "PROTECT-ONLY RESTART: entries are disabled; the open position is "
-            "managed by reduce-only exits only. Reconcile: "
+            "PROTECT-ONLY RESTART: entries are disabled and this process sends NO "
+            "orders on its own; the open position needs a human (reduce-only "
+            "exits remain permitted). Reconcile: "
             + "; ".join(r.split(":")[0] for r in reasons if not
                         r.startswith("ENTRIES_DISABLED")) + ".")
     else:

@@ -2915,12 +2915,28 @@ class CarryEngine:
         only: a broker that cannot take it, or a tick with no decision price,
         leaves the fill's slippage UNAVAILABLE and trading goes on."""
         begin = getattr(self.broker, "begin_decision", None)
-        mark = (getattr(self, "_decision_marks", None) or {}).get(product)
-        if not callable(begin) or not mark or not self._finite(mark):
+        if not callable(begin):
             return
+        mark = (getattr(self, "_decision_marks", None) or {}).get(product)
+        if not mark or not self._finite(mark):
+            # No price for this decision: a context left from an earlier tick
+            # must not be measured against.
+            end = getattr(self.broker, "end_decision", None)
+            if callable(end):
+                try:
+                    end(symbol=symbol, product=product, side=side)
+                except Exception:  # noqa: BLE001
+                    logger.warning("stale decision context not cleared",
+                                   exc_info=True)
+            return
+        # Getting out is never slowed: an exit takes no extra public read to
+        # capture the touch; its reference is the tick's mark.
+        is_exit = (product == "linear" and side == "Buy") or (
+            product == "spot" and side == "Sell")
+        extra = {"capture_book": False} if is_exit else {}
         try:
             begin(symbol=symbol, product=product, side=side, qty=qty,
-                  mark=float(mark))
+                  mark=float(mark), **extra)
         except Exception:  # noqa: BLE001
             logger.warning("decision context not recorded", exc_info=True)
 

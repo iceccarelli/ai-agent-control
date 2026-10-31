@@ -274,3 +274,25 @@ def test_an_engine_opened_pair_journals_the_decision_price(tmp_path):
         # reconstructed from the fill
         assert abs(e.decision_mark - MARK) / MARK < 0.01
     store.close()
+
+
+def test_an_exit_takes_no_extra_book_read_and_a_missing_price_clears_the_context():
+    from carry_engine import CarryEngine
+    calls = []
+
+    class B:
+        def begin_decision(self, **kw):
+            calls.append(("begin", kw))
+
+        def end_decision(self, **kw):
+            calls.append(("end", kw))
+
+    e = CarryEngine.__new__(CarryEngine)
+    e.broker = B()
+    e._decision_marks = {"linear": 60000.0, "spot": None}
+    e._declare_decision("BTCUSDT", "linear", "Buy", 0.01)     # an exit
+    e._declare_decision("BTCUSDT", "linear", "Sell", 0.01)    # an entry
+    e._declare_decision("BTCUSDT", "spot", "Buy", 0.01)       # no spot price
+    assert calls[0][0] == "begin" and calls[0][1]["capture_book"] is False
+    assert calls[1][0] == "begin" and "capture_book" not in calls[1][1]
+    assert calls[2][0] == "end"

@@ -577,7 +577,7 @@ class TradingBot:
             logger.warning("paper mode on the mainnet endpoint: leverage "
                            "is not changed")
         if (bool(getattr(self.cfg, "ALLOW_SHORTS", False))
-                and not mainnet_paper
+                and not mainnet_paper and not self.protect_only_reason
                 and not self.store.is_kill_switch_engaged()[0]):
             for symbol in self.symbols:
                 if not self.client.set_leverage(symbol):
@@ -598,34 +598,42 @@ class TradingBot:
             return False
 
         # Reconcile BEFORE any trading decision.
-        try:
-            summary = self.engine.reconcile()
-            logger.warning("reconciliation: %s", summary)
-            if summary.get("unknown"):
-                logger.critical(
-                    "%d order(s) could not be resolved against the exchange; "
-                    "refusing to start", summary["unknown"]
-                )
+        if self.protect_only_reason:
+            # The store is not trusted (or holds unresolved orders) and
+            # reconcile writes to it: nothing is adopted or marked.
+            logger.critical("reconciliation skipped: PROTECT-ONLY")
+        else:
+            try:
+                summary = self.engine.reconcile()
+                logger.warning("reconciliation: %s", summary)
+                if summary.get("unknown"):
+                    logger.critical(
+                        "%d order(s) could not be resolved against the exchange; "
+                        "refusing to start", summary["unknown"]
+                    )
+                    return False
+                if summary.get("orphan_positions"):
+                    logger.critical(
+                        "venue holds position(s) the ledger does not know: %s; "
+                        "refusing to start until a human reconciles them",
+                        summary["orphan_positions"],
+                    )
+                    return False
+            except Exception as exc:  # noqa: BLE001
+                logger.critical("reconciliation failed: %s", exc, exc_info=True)
                 return False
-            if summary.get("orphan_positions"):
-                logger.critical(
-                    "venue holds position(s) the ledger does not know: %s; "
-                    "refusing to start until a human reconciles them",
-                    summary["orphan_positions"],
-                )
-                return False
-        except Exception as exc:  # noqa: BLE001
-            logger.critical("reconciliation failed: %s", exc, exc_info=True)
-            return False
         self._reconciled = True
 
         engaged, reason = self.store.is_kill_switch_engaged()
-        if engaged:
+        if engaged and not self.protect_only_reason:
             logger.critical(
                 "kill switch is engaged (%s). A human must clear it before "
                 "trading resumes.", reason
             )
             return False
+        if engaged:
+            logger.critical("kill switch is engaged (%s); continuing "
+                            "PROTECT-ONLY (entries stay off)", reason)
 
         try:
             days = int(getattr(self.cfg, "DECISIONS_RETENTION_DAYS", 90))
@@ -946,6 +954,18 @@ class TradingBot:
         self.protect_only_reason = "; ".join(verdict.reasons) or "protect-only"
         return True
 
+    def _protect_only_tick(self) -> None:
+        """What a protect-only process does each cycle: read the venue (reads
+        only), keep the operator alert alive, and touch nothing else. The book
+        holds no adopted position, so it is not run: running it would halt on
+        the venue short it never recorded and write that halt into a database
+        that was refused. NO exit is sent here; the alert says so."""
+        snap = self._venue_snapshot()
+        logger.critical(
+            "PROTECT-ONLY (%s): venue perp=%s spot=%s. No order is sent by "
+            "this process; a human must reconcile and restart.",
+            self.protect_only_reason, snap.perp_qty, snap.spot_qty)
+
     def carry_cold_start(self) -> bool:
         """Reconcile the carry ledger against the venue. False = do not start.
 
@@ -1245,6 +1265,9 @@ class TradingBot:
         # raise when unreadable and the raise reaches CarryEngine as a halt,
         # because a book that trades on absent data is the failure this whole
         # system exists to prevent.
+        if self.carry is not None and self.protect_only_reason:
+            self._protect_only_tick()
+            return
         if self.carry is not None:
             # The symbol the book TRADES, never TRADING_SYMBOLS[0]: config
             # accepts the two independently, and reading one symbol's mark,

@@ -6,6 +6,7 @@ import ast
 import os
 import sys
 
+import dataclasses
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -291,3 +292,12 @@ def test_entry_refuses_negative_and_too_uncertain_and_unsupported():
     for evid in (None, verdict(ev([-1.0] * 30)), verdict(None)):
         d = entry(evidence=evid)
         assert not d.allowed and d.reasons[0].startswith(se.REFUSE_NO_EVIDENCE)
+
+
+def test_one_trade_copied_many_times_is_not_a_sample():
+    one = se.EvidenceTrade(entry_s=NOW - 50 * DAY, exit_s=NOW - 49 * DAY, net=0.8)
+    base = ev()
+    copies = dataclasses.replace(base, trades=tuple([one] * 25))
+    v = verdict(copies)
+    assert v.verdict != se.ALLOCATE
+    assert any("duplicate_trades" in r for r in v.reasons)

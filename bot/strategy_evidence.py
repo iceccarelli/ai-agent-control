@@ -182,6 +182,16 @@ def evaluate_strategy_evidence(ev: Optional[StrategyEvidence], *, now_s: float,
     if bad:
         insuf.append(f"{INVALID_EVIDENCE}:malformed_trades={len(bad)}")
         trades = [t for t in trades if t not in bad]
+    # One trade copied N times has zero variance and a flattering confidence
+    # bound; a repeated (entry, exit) window is the same trade, not a sample.
+    seen_windows: set = set()
+    duplicates = 0
+    for t in trades:
+        key = (t.entry_s, t.exit_s)
+        duplicates += key in seen_windows
+        seen_windows.add(key)
+    if duplicates:
+        insuf.append(f"{INVALID_EVIDENCE}:duplicate_trades={duplicates}")
 
     # staleness / clock
     if not _finite(ev.observed_at_s):
