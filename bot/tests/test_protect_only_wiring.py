@@ -96,3 +96,11 @@ def test_a_held_short_whose_exit_path_is_refused_is_an_unmistakable_alert(path, 
     assert bot.carry_cold_start() is False
     assert "POSITION MAY BE UNMANAGED" in caplog.text
     store.close()
+
+
+def test_startup_refuses_a_host_whose_clock_is_far_from_the_venues():
+    """The clock gate sits in startup's sync_time block, ahead of any order."""
+    import inspect
+    body = inspect.getsource(_main.TradingBot.startup)
+    assert body.index("sync_time()") < body.index("assert_clock_within") \
+        < body.index("carry_cold_start")
