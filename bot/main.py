@@ -518,13 +518,20 @@ class TradingBot:
         except Exception as exc:  # noqa: BLE001 - an unreadable scope refuses
             conflict = f"the database's environment could not be read ({exc})"
         if conflict is not None:
-            logger.critical("startup blocked: %s", conflict)
-            return False
+            # A database that disagrees about its environment cannot be adopted,
+            # but a position may be held at the venue. Refusing outright would
+            # leave it unmanaged: continue PROTECT-ONLY (entries off, no
+            # ledger adoption) when the venue position is visible.
+            if not self._enter_protect_only(conflict=conflict, orders=[]):
+                logger.critical("startup blocked: %s", conflict)
+                return False
+            logger.critical("startup continues PROTECT-ONLY: %s", conflict)
         try:
             # What kind of money this database's execution records are. The
             # performance report refuses to call anything realised cash unless
             # this says mainnet (carry_performance --environment).
-            self.store.record_execution_environment(environment)
+            if not self.protect_only_reason:    # never write into a conflicted DB
+                self.store.record_execution_environment(environment)
         except Exception:  # noqa: BLE001
             logger.exception("could not record the execution environment")
         live_armed, live_why = _config.is_live_authorized(self.cfg)
@@ -580,7 +587,8 @@ class TradingBot:
         # the venue: what did the last run believe, and what is actually
         # there? A container that died holding a hedge used to come back FLAT
         # and open a second one against the same liquidation price.
-        if self.carry is not None and not self.carry_cold_start():
+        if (self.carry is not None and not self.protect_only_reason
+                and not self.carry_cold_start()):
             return False
 
         # Reconcile BEFORE any trading decision.
@@ -860,6 +868,78 @@ class TradingBot:
             "UNSTATED" if leverage is None else f"{leverage:g}x",
             self.carry.perp_symbol)
 
+    # -- protect-only restart ---------------------------------------------------
+    #: Set when startup could not safely resume NORMAL carry operation but the
+    #: venue position can still be seen. Entries stay off for this process; the
+    #: ledger is not adopted; the operator is alerted. It is never cleared at
+    #: runtime: leaving it takes a restart after a human has reconciled.
+    protect_only_reason: str = ""
+
+    def _venue_snapshot(self) -> Any:
+        """The venue's own view of the carry legs; a failed read is UNKNOWN
+        (None), never zero."""
+        import protective_restart as _pr
+        broker = self.carry.broker
+
+        def read(fn: Any, symbol: str) -> Optional[float]:
+            try:
+                value = float(fn(symbol))
+            except Exception as exc:  # noqa: BLE001
+                logger.critical("protective restart: venue read failed (%s: %s)",
+                                type(exc).__name__, exc)
+                return None
+            return value if value == value else None
+
+        short = read(broker.get_perp_position, self.carry.perp_symbol)
+        # The broker reports the carry short as an UNSIGNED size (it refuses a
+        # long outright); protective_restart's convention is signed, short < 0.
+        # Passing it through unchanged would read the hedge as a long and aim
+        # the protective exit at the wrong side.
+        return _pr.VenueSnapshot(
+            perp_qty=None if short is None else -abs(short),
+            spot_qty=read(broker.get_spot_inventory, self.carry.spot_symbol))
+
+    def _enter_protect_only(self, *, conflict: Optional[str],
+                            orders: Any) -> bool:
+        """Decide whether startup may continue PROTECT-ONLY instead of
+        refusing. True = continue with entries disabled and no ledger adoption;
+        False = the position cannot be protected, refuse (alert already sent).
+        Nothing here sends an order."""
+        import protective_restart as _pr
+        if self.carry is None:
+            return False
+        try:
+            killed = self.store.is_kill_switch_engaged()[0]
+        except Exception:  # noqa: BLE001
+            killed = None
+        try:
+            exits_ok = bool(carry_orders_permitted_for(
+                getattr(self, "cfg", None), getattr(self, "client", None),
+                exit=True)[0])
+        except Exception:  # noqa: BLE001
+            exits_ok = False
+        verdict = _pr.assess_restart(
+            environment_conflict=conflict, store_readable=orders is not None,
+            orders=orders, venue=self._venue_snapshot(),
+            kill_switch_engaged=killed,
+            entries_enabled=bool(getattr(self.carry, "entries_enabled", False)),
+            exits_permitted=exits_ok)
+        payload = _pr.build_alert_payload(verdict)
+        logger.critical("PROTECTIVE RESTART %s", json.dumps(payload, default=str))
+        if verdict.required_operator_alert:
+            logger.critical("%s", verdict.alert.message)
+        if verdict.mode != "PROTECT_ONLY":
+            return False
+        if verdict.exposure != "OPEN":
+            # Nothing is held, so there is nothing to protect by staying up; an
+            # unresolved order might still fill into the flat book, and a
+            # process that is running but not managing it is worse than the
+            # refusal (and, for unresolved orders, the kill switch) it replaces.
+            return False
+        self.carry.entries_enabled = False
+        self.protect_only_reason = "; ".join(verdict.reasons) or "protect-only"
+        return True
+
     def carry_cold_start(self) -> bool:
         """Reconcile the carry ledger against the venue. False = do not start.
 
@@ -900,6 +980,10 @@ class TradingBot:
                 len(recovery.unresolved),
                 ", ".join(f"{u.order_link_id}={u.outcome}"
                           for u in recovery.unresolved[:5]))
+            facts = [_protective_fact(u, self.store.get_order(u.order_link_id))
+                     for u in recovery.unresolved]
+            if self._enter_protect_only(conflict=None, orders=facts):
+                return True
             try:
                 self.store.trip_kill_switch(
                     "CARRY_COLD_START: unresolved carry orders")
@@ -1857,6 +1941,17 @@ def execution_environment_of(cfg: Any) -> str:
     if bool(getattr(cfg, "PAPER_TRADING", True)):
         return "paper"
     return "mainnet"
+
+
+def _protective_fact(unresolved: Any, row: Any) -> Any:
+    """An unresolved recovery entry as the plain fact protective_restart takes."""
+    import protective_restart as _pr
+    row = dict(row or {})
+    return _pr.OrderFact(
+        order_link_id=str(unresolved.order_link_id),
+        status=str(row.get("status") or unresolved.outcome or "unknown"),
+        leg=str(row.get("leg") or ""), qty=float(row.get("qty") or 0.0),
+        filled_qty=float(row.get("filled_qty") or 0.0))
 
 
 def environment_conflict(store: Any, environment: str) -> Optional[str]:
