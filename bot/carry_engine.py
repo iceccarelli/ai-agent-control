@@ -684,6 +684,7 @@ class CarryEngine:
         #: whole engine, leaving a held short with nobody looking at it.)
         self.entries_enabled = bool(entries_enabled)
         self._last_margin: Optional[float] = None
+        self._last_margin_ms: Optional[int] = None
         self.persist = persist
         self.execution_mode = execution_mode
         self.broker = broker
@@ -1172,7 +1173,7 @@ class CarryEngine:
             "smoothed_funding_bps": None,
             "funding_needed_bps_per_print": None,
             "gap_bps_per_print": None,
-            "entry_gate_reason": None,
+            "entry_gate_reason": None, "blocked_by": [],
             "status": "UNKNOWN", "why": "",
             "mechanical_entry_eligible": False,
             "not_evaluated": {
@@ -1185,6 +1186,11 @@ class CarryEngine:
         }
         if self.position is not None:
             out["status"] = "HOLDING"
+            return out
+        if self.perp_symbol not in self.FUNDING_8H_PROVEN:
+            # The same refusal entry_economics gives: the stale bound, the gap
+            # rule and every per-day figure assume an 8h settlement.
+            out["why"] = "FUNDING_CADENCE_UNPROVEN"
             return out
         if spot is None or not self._finite(mark) or not self._finite(spot):
             out["why"] = "SPOT_OR_MARK_UNAVAILABLE"
@@ -1232,6 +1238,8 @@ class CarryEngine:
         out["entry_gate_reason"] = verdict.reason
         if needed is not None:
             out["gap_bps_per_print"] = needed - smoothed
+        if not self.entries_enabled:
+            out["blocked_by"] = ["ENTRIES_DISABLED"]
         if verdict:
             out["status"] = "ENTRY_CONDITIONS_MET"
             out["mechanical_entry_eligible"] = True
@@ -1279,7 +1287,7 @@ class CarryEngine:
                               lambda v: v >= NEGATIVE_FUNDING_EXIT_PRINTS)},
             {"id": "MARGIN_HEADROOM", "action": "UNWIND",
              "threshold": self.min_margin_multiple, "unit": "x (margin multiple)",
-             "current": margin,
+             "current": margin, "read_ms": self._last_margin_ms,
              "active": active(margin, lambda v: v < self.min_margin_multiple),
              "unreadable": "HALT (not an exit): an unreadable margin halts the book"},
             {"id": "LIQUIDATION_DISTANCE", "action": "UNWIND",
@@ -2647,6 +2655,7 @@ class CarryEngine:
     def _check_margin(self) -> Optional[CarryDecision]:
         margin = self._margin_multiple()
         self._last_margin = margin
+        self._last_margin_ms = int(time.time() * 1000)
         if margin is None:
             if (self.execution_mode == ACQUIRE and self.position is not None
                     and self._perp_confirmed_closed(

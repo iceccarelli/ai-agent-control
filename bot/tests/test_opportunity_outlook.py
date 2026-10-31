@@ -257,3 +257,31 @@ def test_an_old_round_trip_price_is_not_used(eng):
     eng._last_round_trip = (30.0, NOW - 1000)
     assert eng.opportunity_outlook(mark=MARK, spot=MARK,
                                    now_ms=NOW)["mechanical_entry_eligible"] is True
+
+
+def test_an_unproven_settlement_cadence_is_unknown_like_the_entry_path(eng):
+    seed(eng, [3.0, 3.0, 3.0])
+    eng.perp_symbol = "ETHUSDT"
+    assert eng.perp_symbol not in eng.FUNDING_8H_PROVEN
+    o = eng.opportunity_outlook(mark=MARK, spot=MARK, now_ms=NOW)
+    assert o["why"] == "FUNDING_CADENCE_UNPROVEN" and not o["mechanical_entry_eligible"]
+    # the production entry path refuses the same symbol for the same reason
+    eng.spot_symbol = "ETHUSDT"
+    assert eng.entry_economics(mark=MARK, spot=MARK).refusal.reason == \
+        "FUNDING_CADENCE_UNPROVEN"
+
+
+def test_disabled_entries_are_named_beside_a_mechanical_pass(eng):
+    seed(eng, [3.0, 3.0, 3.0])
+    eng.entries_enabled = False
+    o = eng.opportunity_outlook(mark=MARK, spot=MARK, now_ms=NOW)
+    assert o["status"] == "ENTRY_CONDITIONS_MET"
+    assert o["blocked_by"] == ["ENTRIES_DISABLED"]
+
+
+def test_the_margin_read_carries_its_time(eng):
+    warm_and_open(eng)
+    eng._check_margin()
+    o = eng.opportunity_outlook(mark=MARK, spot=MARK, now_ms=NOW)
+    rule = {r["id"]: r for r in o["exit"]["rules"]}["MARGIN_HEADROOM"]
+    assert rule["read_ms"] is not None
