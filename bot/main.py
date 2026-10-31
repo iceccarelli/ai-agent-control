@@ -2007,15 +2007,15 @@ def _carry_evidence_provider(bot: Any, cfg: Any) -> Any:
     path = getattr(bot.store, "_path", None)
     if not isinstance(path, str) or not path or path == ":memory:":
         return None
-    start = getattr(cfg, "CARRY_EVIDENCE_DISCOVERY_START_EPOCH", None)
-    end = getattr(cfg, "CARRY_EVIDENCE_DISCOVERY_END_EPOCH", None)
+    start = cfg.CARRY_EVIDENCE_DISCOVERY_START_EPOCH
+    end = cfg.CARRY_EVIDENCE_DISCOVERY_END_EPOCH
     window = (float(start), float(end)) if start is not None \
         and end is not None and float(start) < float(end) else None
     import carry_evidence
     return carry_evidence.make_provider(
         db_path=path, environment=execution_environment_of(cfg),
         strategy_id="btc_funding_carry", discovery_window_s=window,
-        drawdown_limit_usd=getattr(cfg, "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD", None))
+        drawdown_limit_usd=cfg.CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD)
 
 
 def _protective_fact(unresolved: Any, row: Any) -> Any:
