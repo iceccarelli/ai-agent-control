@@ -30,6 +30,11 @@ BOOK_MODE = "carry"
 CARRY_BORROW_APR = "0.0"
 CARRY_EXECUTION_MODE = "overlay"
 CARRY_EXECUTION_STYLE = "taker"
+# The entry net-benefit gate refuses an entry until real execution samples and
+# a strategy-evidence verdict exist. Stated here so the deployment does not rely
+# on the code default; whether this app should instead run "observe" (record
+# what would be refused, let the entry continue) is the owner's decision.
+CARRY_ENTRY_BENEFIT_MODE = "enforce"
 USE_TESTNET = "1"
 PAPER_TRADING = "1"
 ENABLE_HEALTH_SERVER = "1"

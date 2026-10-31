@@ -142,6 +142,10 @@ cat <<NEXT
   see it                flyctl logs --app $APP
   the four invariants   flyctl ssh console --app $APP -C "python3 tools/session_tail.py"
   the preflight drill   flyctl ssh console --app $APP -C "python3 tools/drill.py"
+  owner policy inputs   flyctl ssh console --app $APP -C "python3 tools/owner_policy_check.py"
+                        (read-only; exit 0 only when the evidence inputs are set; it suggests no value)
+  execution samples     flyctl ssh console --app $APP -C "python3 tools/execution_samples_report.py --db /app/state/trading_state.db --mode overlay --notional-usd N"
+                        (read-only; how many real fills per leg, and how many more the entry gate needs)
 NEXT
 
 if [ "$VENUE" = "demo" ]; then cat <<NEXT

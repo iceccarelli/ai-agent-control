@@ -71,14 +71,20 @@ def _default_report() -> Optional[Callable[..., Dict[str, Any]]]:
 
 
 def make_provider(*, db_path: str, environment: str, strategy_id: str,
-                  discovery_window_s: Optional[Tuple[float, float]],
-                  drawdown_limit_usd: Optional[float],
+                  discovery_window_s: Any,
+                  drawdown_limit_usd: Any,
                   report_fn: Optional[Callable[..., Dict[str, Any]]] = None,
                   now_fn: Callable[[], float] = time.time
                   ) -> Callable[[], Optional[_se.EvidenceVerdict]]:
     """A zero-argument provider for the entry gate. It re-evaluates on every
     call (no cached verdict), reads the ledger read-only, and returns None when
-    the report cannot be built: no verdict is not a pass."""
+    the report cannot be built: no verdict is not a pass.
+
+    `discovery_window_s` and `drawdown_limit_usd` may each be a value or a
+    zero-argument callable, which is called at every verdict."""
+    def resolve(x: Any) -> Any:
+        return x() if callable(x) else x
+
     def provider() -> Optional[_se.EvidenceVerdict]:
         build = report_fn
         if build is None:
@@ -93,7 +99,7 @@ def make_provider(*, db_path: str, environment: str, strategy_id: str,
             return None
         evidence = evidence_from_report(
             report, strategy_id=strategy_id, observed_at_s=now,
-            discovery_window_s=discovery_window_s,
-            drawdown_limit_usd=drawdown_limit_usd)
+            discovery_window_s=resolve(discovery_window_s),
+            drawdown_limit_usd=resolve(drawdown_limit_usd))
         return _se.evaluate_strategy_evidence(evidence, now_s=now)
     return provider

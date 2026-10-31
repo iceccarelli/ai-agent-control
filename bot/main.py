@@ -49,6 +49,7 @@ import config as _config
 from bybit_connection import BybitAPIError, BybitClient
 from memory import TradingMemory
 from persistence import StateStore
+import owner_policy as _owner_policy
 import project_status as _project_status
 from session_log import PaperSessionLog
 from position_sizing import BillionairePositionSizing
@@ -382,6 +383,8 @@ class TradingBot:
                 "last_decision": dict(self._last_carry_decision),
                 "last_entry_trace": dict(getattr(engine, "last_entry_trace",
                                                  {}) or {}),
+                "owner_policy": _owner_policy_status(
+                    getattr(self, "cfg", None)),
 
                 "outlook": self._carry_outlook(engine),
                 # The carry book installs no protective stop BY DESIGN: it is
@@ -546,6 +549,13 @@ class TradingBot:
             getattr(self.cfg, "PAPER_TRADING", True),
             live_why,
         )
+        if self.carry is not None:
+            policy = _owner_policy_status(getattr(self, "cfg", None))
+            if policy.get("missing_or_unusable"):
+                logger.warning(
+                    "owner policy inputs missing or unusable: %s. %s",
+                    ", ".join(policy["missing_or_unusable"]),
+                    policy.get("consequence", ""))
         if live_armed:
             # The four-part env chain arms the PROCESS. It says nothing about
             # whether the STRATEGY has earned live. That second question has
@@ -1997,6 +2007,12 @@ def execution_environment_of(cfg: Any) -> str:
     return "mainnet"
 
 
+def _owner_policy_status(cfg: Any) -> Dict[str, Any]:
+    if cfg is None:
+        return _owner_policy.unknown_status()
+    return _owner_policy.owner_policy_status(cfg)
+
+
 def _carry_evidence_provider(bot: Any, cfg: Any) -> Any:
     """The carry book's strategy-evidence provider (carry_evidence), or None.
 
@@ -2007,15 +2023,18 @@ def _carry_evidence_provider(bot: Any, cfg: Any) -> Any:
     path = getattr(bot.store, "_path", None)
     if not isinstance(path, str) or not path or path == ":memory:":
         return None
-    start = cfg.CARRY_EVIDENCE_DISCOVERY_START_EPOCH
-    end = cfg.CARRY_EVIDENCE_DISCOVERY_END_EPOCH
-    window = (float(start), float(end)) if start is not None \
-        and end is not None and float(start) < float(end) else None
+    # Resolved at each verdict, never fixed at startup, so the status and the
+    # gate read the same configuration at the same moment.
+    def window():
+        return _owner_policy.discovery_window(cfg)[0]
+
+    def limit():
+        return _owner_policy.drawdown_limit(cfg)[0]
     import carry_evidence
     return carry_evidence.make_provider(
         db_path=path, environment=execution_environment_of(cfg),
         strategy_id="btc_funding_carry", discovery_window_s=window,
-        drawdown_limit_usd=cfg.CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD)
+        drawdown_limit_usd=limit)
 
 
 def _protective_fact(unresolved: Any, row: Any) -> Any:
