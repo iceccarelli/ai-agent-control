@@ -337,6 +337,23 @@ def parse_str(env: Mapping[str, str], name: str, default: str = "") -> str:
     return default if raw is None else str(raw).strip()
 
 
+def parse_optional_float(env: Mapping[str, str], name: str, *,
+                         positive: bool = False) -> Optional[float]:
+    """A finite number, or None when the key is absent or blank. Never a
+    default: used for inputs only the OWNER may supply."""
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        raise ConfigError(f"{name}={raw!r} is not a number")
+    if not math.isfinite(value) or (positive and value <= 0):
+        raise ConfigError(f"{name}={value} is not a usable "
+                          f"{'positive ' if positive else ''}number")
+    return value
+
+
 def parse_choice(env: Mapping[str, str], name: str, default: str,
                  choices: Tuple[str, ...]) -> str:
     value = parse_str(env, name, default).lower()
@@ -571,6 +588,13 @@ class Config:
     #: already requires the net benefit to exceed one sigma of that income's
     #: uncertainty; this is an extra operator-owned haircut, 0 unless set.
     CARRY_INCOME_HAIRCUT_FRACTION: float = 0.0
+    #: OWNER-supplied evidence policy, never defaulted: when the carry design
+    #: was tuned (epoch seconds, start and end) and the largest drawdown the
+    #: evidence may show (USD). Unset, the strategy-evidence verdict is
+    #: INSUFFICIENT and the entry gate refuses.
+    CARRY_EVIDENCE_DISCOVERY_START_EPOCH: Optional[float] = None
+    CARRY_EVIDENCE_DISCOVERY_END_EPOCH: Optional[float] = None
+    CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD: Optional[float] = None
     #: Largest venue-clock skew (ms) startup tolerates; beyond it the process
     #: refuses to start rather than reason about funding windows and price age
     #: on a wrong clock.
@@ -1000,6 +1024,12 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
             env, "CARRY_ENTRY_BENEFIT_MODE", "enforce", ("enforce", "observe")),
         CARRY_INCOME_HAIRCUT_FRACTION=parse_float(
             env, "CARRY_INCOME_HAIRCUT_FRACTION", 0.0, low=0.0, high=1.0),
+        CARRY_EVIDENCE_DISCOVERY_START_EPOCH=parse_optional_float(
+            env, "CARRY_EVIDENCE_DISCOVERY_START_EPOCH"),
+        CARRY_EVIDENCE_DISCOVERY_END_EPOCH=parse_optional_float(
+            env, "CARRY_EVIDENCE_DISCOVERY_END_EPOCH"),
+        CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD=parse_optional_float(
+            env, "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD", positive=True),
         MAX_CLOCK_SKEW_MS=int(parse_float(
             env, "MAX_CLOCK_SKEW_MS", 2000.0, low=100.0, high=60_000.0)),
         CAPITAL_RESERVATION_TTL_S=parse_float(

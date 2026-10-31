@@ -21,13 +21,15 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      promotion_gate.py pure_indicators.py risk_management.py session_log.py \
      shadow.py shadow_strategy.py technical_analysis.py trading_engine.py \
      venue_fees.py ws_transport.py protective_restart.py execution_record.py \
-     entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py ./
+     entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py \
+     carry_evidence.py performance_analytics.py ./
 COPY signals/ ./signals/
 COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/unattended_drill.py tools/next_settlement.py tools/recon_summary.py \
      tools/drill.py tools/close_testnet_short.py tools/drill_final_state.py \
      tools/evidence_reconcile.py tools/venue_evidence.py tools/provenance.py \
      tools/runner_alerts.py tools/monitor_summary.py tools/mainnet_public.py \
+     tools/carry_performance.py \
      ./tools/
 COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
 RUN useradd --create-home --shell /usr/sbin/nologin bot \

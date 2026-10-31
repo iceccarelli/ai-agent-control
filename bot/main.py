@@ -1997,6 +1997,27 @@ def execution_environment_of(cfg: Any) -> str:
     return "mainnet"
 
 
+def _carry_evidence_provider(bot: Any, cfg: Any) -> Any:
+    """The carry book's strategy-evidence provider (carry_evidence), or None.
+
+    The discovery window and drawdown limit are the owner's; either unset stays
+    None, so the verdict is INSUFFICIENT and no entry is qualified. A store
+    that is not a real on-disk database has no ledger to judge and no provider.
+    """
+    path = getattr(bot.store, "_path", None)
+    if not isinstance(path, str) or not path or path == ":memory:":
+        return None
+    start = cfg.CARRY_EVIDENCE_DISCOVERY_START_EPOCH
+    end = cfg.CARRY_EVIDENCE_DISCOVERY_END_EPOCH
+    window = (float(start), float(end)) if start is not None \
+        and end is not None and float(start) < float(end) else None
+    import carry_evidence
+    return carry_evidence.make_provider(
+        db_path=path, environment=execution_environment_of(cfg),
+        strategy_id="btc_funding_carry", discovery_window_s=window,
+        drawdown_limit_usd=cfg.CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD)
+
+
 def _protective_fact(unresolved: Any, row: Any) -> Any:
     """An unresolved recovery entry as the plain fact protective_restart takes."""
     import protective_restart as _pr
@@ -2292,7 +2313,8 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
 
         bot.carry.entry_benefit = EntryBenefitGate(
             mode=str(cfg.CARRY_ENTRY_BENEFIT_MODE),
-            income_haircut_fraction=float(cfg.CARRY_INCOME_HAIRCUT_FRACTION))
+            income_haircut_fraction=float(cfg.CARRY_INCOME_HAIRCUT_FRACTION),
+            evidence_provider=_carry_evidence_provider(bot, cfg))
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
             "%.4f/yr, execution %s/%s, orders: %s. The directional strategy is "
