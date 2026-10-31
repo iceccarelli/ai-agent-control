@@ -1129,6 +1129,11 @@ class TradingBot:
 
     def tick(self) -> None:
         """One cycle: refresh equity, check the brakes, then consider each symbol."""
+        if self.carry is not None and self.protect_only_reason:
+            # Before anything that writes: equity, risk and order resolution
+            # all write the store this process refused to adopt.
+            self._protect_only_tick()
+            return
         self.session.tick()
         # A HELD carry pair must be watched whatever the account-level brakes
         # say. The equity read and the risk layer's halt are directional-book
@@ -1265,9 +1270,6 @@ class TradingBot:
         # raise when unreadable and the raise reaches CarryEngine as a halt,
         # because a book that trades on absent data is the failure this whole
         # system exists to prevent.
-        if self.carry is not None and self.protect_only_reason:
-            self._protect_only_tick()
-            return
         if self.carry is not None:
             # The symbol the book TRADES, never TRADING_SYMBOLS[0]: config
             # accepts the two independently, and reading one symbol's mark,

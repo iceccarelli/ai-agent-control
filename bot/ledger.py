@@ -1416,10 +1416,18 @@ class LedgerBroker:
         # else its mark), from the context it declared before sending. Anything
         # that does not validate is "not journalled", never a guess; the full
         # record travels on the entry (`fee_raw["execution"]`).
-        exec_rec, mark = self._execution_record(
-            result, side=side, product=product, symbol=symbol,
-            requested_qty=requested_qty, order_type=order_type, qty=qty,
-            price=price, fee_btc=fee_btc, fee_usdt=fee_usdt, status=status)
+        try:
+            exec_rec, mark = self._execution_record(
+                result, side=side, product=product, symbol=symbol,
+                requested_qty=requested_qty, order_type=order_type, qty=qty,
+                price=price, fee_btc=fee_btc, fee_usdt=fee_usdt, status=status)
+        except Exception as exc:  # noqa: BLE001
+            # Measuring the fill must never stop the fill being booked: the
+            # venue already filled it. The record says it could not be made.
+            exec_rec = {"status": "UNAVAILABLE",
+                        "reasons": [f"EXECUTION_RECORD_ERROR: "
+                                    f"{type(exc).__name__}"]}
+            mark = None
         fee_raw = dict(fee_raw)
         fee_raw["execution"] = exec_rec
         self.executions.append(exec_rec)

@@ -104,3 +104,20 @@ def test_startup_refuses_a_host_whose_clock_is_far_from_the_venues():
     body = inspect.getsource(_main.TradingBot.startup)
     assert body.index("sync_time()") < body.index("assert_clock_within") \
         < body.index("carry_cold_start")
+
+
+def test_a_protect_only_tick_writes_nothing_to_the_refused_store(path, exits_open):
+    store, venue, broker, engine = stack(path, FeeVenue(modern, perp_qty=0.5,
+                                                         spot_qty=0.5))
+    unresolved_link(store)
+    bot = _bot_on(store, engine)
+    assert bot.carry_cold_start() is True
+
+    class Boom:
+        def __getattr__(self, name):
+            raise AssertionError(f"protect-only touched {name}")
+
+    bot.session = Boom()
+    bot.risk = Boom()
+    bot.client = Boom()
+    bot.tick()                         # must return before session/risk/client
