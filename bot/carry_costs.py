@@ -683,6 +683,45 @@ def entry_gate(*, funding_prints_bps: Sequence[float], perp: float,
     return replace(verdict, detail={**verdict.detail, "audit": audit})
 
 
+def breakeven_funding_bps(*, perp: float, spot: float, borrow_apr: float,
+                          round_trip_bps: float,
+                          hold_days: float = ASSUMED_HOLD_DAYS,
+                          demonstrated_hold_days: float = DEMONSTRATED_HOLD_DAYS,
+                          ewma_alpha: float = EWMA_ALPHA,
+                          ewma_min_prints: int = EWMA_MIN_PRINTS,
+                          opportunity_cost_apr: float = DEFAULT_OPPORTUNITY_COST_APR,
+                          ceiling_bps: float = 100.0) -> Optional[float]:
+    """The smallest steady per-print funding (bps) at which `entry_gate` would
+    allow opening NOW, or None when even `ceiling_bps` does not clear it.
+
+    ADVISORY ONLY. It asks the production gate the question "what funding
+    would you need?" by bisection, so it cannot drift from the gate; nothing
+    decides on it and it places nothing. A steady rate is a model of what the
+    funding would have to be, not a forecast that it will be.
+    """
+    def passes(f: float) -> bool:
+        history = [f] * max(int(ewma_min_prints), 3)
+        return bool(entry_gate(
+            funding_prints_bps=history, perp=perp, spot=spot,
+            borrow_apr=borrow_apr, round_trip_bps=round_trip_bps,
+            hold_days=hold_days, demonstrated_hold_days=demonstrated_hold_days,
+            ewma_alpha=ewma_alpha, ewma_min_prints=ewma_min_prints,
+            opportunity_cost_apr=opportunity_cost_apr))
+
+    lo, hi = 0.0, float(ceiling_bps)
+    if not passes(hi):
+        return None
+    if passes(lo):
+        return 0.0
+    for _ in range(40):
+        mid = (lo + hi) / 2.0
+        if passes(mid):
+            hi = mid
+        else:
+            lo = mid
+    return hi
+
+
 def _entry_gate_decision(*, funding_prints_bps: Sequence[float], perp: float,
                          spot: float, borrow_apr: float, round_trip_bps: float,
                          hold_days: float, demonstrated_hold_days: float,
