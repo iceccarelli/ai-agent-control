@@ -157,6 +157,7 @@ jobs:
           tests/test_order_lookup_unanswered.py
           tests/test_exit_gate.py
           tests/test_resolve_order_contradiction_tool.py
+          tests/test_owner_tools.py
           tests/test_owner_policy.py
           tests/test_execution_sample_bootstrap.py
           tests/test_durable_entry_trace.py
