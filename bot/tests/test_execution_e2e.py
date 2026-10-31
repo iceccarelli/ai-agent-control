@@ -296,3 +296,23 @@ def test_an_exit_takes_no_extra_book_read_and_a_missing_price_clears_the_context
     assert calls[0][0] == "begin" and calls[0][1]["capture_book"] is False
     assert calls[1][0] == "begin" and "capture_book" not in calls[1][1]
     assert calls[2][0] == "end"
+
+
+def test_the_decision_prices_do_not_outlive_their_tick():
+    from test_paired_leg_recovery import FeeVenue, MARK, modern, stack, warm_and_open
+    import tempfile, os
+    store, venue, broker, engine = stack(os.path.join(tempfile.mkdtemp(), "s.db"),
+                                         FeeVenue(modern, spot_qty=0.0))
+    warm_and_open(engine)
+    assert engine._decision_marks == {}
+    store.close()
+
+
+def test_the_in_memory_execution_index_is_bounded():
+    import ledger as L
+    lb = L.LedgerBroker.__new__(L.LedgerBroker)
+    lb.executions = []
+    lb.MAX_EXECUTIONS_KEPT = 10
+    for i in range(25):
+        lb._keep_execution({"i": i})
+    assert len(lb.executions) == 10 and lb.executions[-1]["i"] == 24

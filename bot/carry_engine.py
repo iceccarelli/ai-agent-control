@@ -1228,6 +1228,20 @@ class CarryEngine:
                   spot: Optional[float] = None,
                   timestamp_ms: int = 0,
                   funding_print_ms: Optional[int] = None) -> CarryDecision:
+        """One tick (see `_on_candle`). The prices it decided on are kept only
+        for the orders sent DURING it: an order sent by any later path must not
+        be measured against this tick's price."""
+        try:
+            return self._on_candle(
+                mark=mark, funding_bps=funding_bps, spot=spot,
+                timestamp_ms=timestamp_ms, funding_print_ms=funding_print_ms)
+        finally:
+            self._decision_marks = {}
+
+    def _on_candle(self, *, mark: float, funding_bps: float,
+                   spot: Optional[float] = None,
+                   timestamp_ms: int = 0,
+                   funding_print_ms: Optional[int] = None) -> CarryDecision:
         """One tick. Act or state why not. This is the entire loop.
 
         `funding_bps` is the rate of the SETTLED print stamped

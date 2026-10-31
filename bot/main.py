@@ -558,7 +558,7 @@ class TradingBot:
             # whose clock is far off cannot reason about funding windows or
             # the age of a price. Refuse rather than trade on it.
             self.client.assert_clock_within(
-                int(getattr(self.cfg, "MAX_CLOCK_SKEW_MS", 2_000)))
+                int(getattr(self.cfg, "MAX_CLOCK_SKEW_MS", 2000)))
         except BybitAPIError as exc:
             logger.critical("cannot reach the exchange or its clock is off: %s",
                             exc)

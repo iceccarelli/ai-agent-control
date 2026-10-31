@@ -136,3 +136,17 @@ class _Broker:
 def test_take_snapshot_refuses_mismapped_legs(perp, spot):
     with pytest.raises(ms.StaleMarket):
         ms.take_snapshot(_Broker(), perp_symbol=perp, spot_symbol=spot)
+
+
+def test_a_flat_hedge_mode_account_is_flat_not_an_error(tmp_path):
+    rows = [{"symbol": "BTCUSDT", "positionIdx": 1, "size": "0", "side": ""},
+            {"symbol": "BTCUSDT", "positionIdx": 2, "size": "0", "side": ""}]
+    c = _client(tmp_path, Scripted(_ok({"list": rows})), "linear")
+    assert c.get_position("BTCUSDT") is None
+
+
+def test_perp_and_spot_must_share_the_quote_currency():
+    import market_snapshot as ms
+    ms.assert_symbols_map("BTCUSDT", "BTCUSDT")
+    with pytest.raises(ms.StaleMarket):
+        ms.assert_symbols_map("BTCUSDT", "BTCUSDC")

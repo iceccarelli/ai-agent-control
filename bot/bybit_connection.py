@@ -1886,14 +1886,15 @@ class BybitClient:
                                     "treating it as flat")
         held = [row for row in rows if float(row.get("size", 0) or 0) > 0]
         # positionIdx 1/2 are the hedge-mode slots. This client is one-way
-        # (positionIdx 0 on every order); returning "the first" of two slots
-        # would report half of a hedge book as the whole position.
-        for row in rows:
+        # (positionIdx 0 on every order); returning "the first" of two held
+        # slots would report half of a hedge book as the whole position. A
+        # flat hedge-mode account holds nothing, so it is flat here (placing
+        # an order on it is refused elsewhere: the carry broker reads the mode).
+        for row in held:
             if str(row.get("positionIdx", "0")) not in ("0", ""):
-                if row in held or len(rows) > 1:
-                    raise PermanentAPIError(
-                        f"{symbol} reports hedge-mode slot positionIdx="
-                        f"{row.get('positionIdx')!r}; this client is one-way only")
+                raise PermanentAPIError(
+                    f"{symbol} holds size in hedge-mode slot positionIdx="
+                    f"{row.get('positionIdx')!r}; this client is one-way only")
         return held[0] if held else None
 
     def get_funding_history_fractions(

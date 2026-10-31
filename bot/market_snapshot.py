@@ -89,7 +89,7 @@ _QUOTE_SUFFIXES = ("USDT", "USDC", "PERP", "USD")
 
 
 def split_symbol(symbol: str) -> tuple:
-    """``(multiplier, base)`` of a Bybit symbol such as ``1000PEPEUSDT``.
+    """``(multiplier, base, quote)`` of a Bybit symbol such as ``1000PEPEUSDT``.
 
     ``multiplier`` is the leading contract multiplier (``1000``) or ``""``.
     Raises ValueError for a symbol with no recognisable quote suffix.
@@ -102,7 +102,7 @@ def split_symbol(symbol: str) -> tuple:
     else:
         raise ValueError(f"symbol {symbol!r} has no recognised quote suffix")
     digits = len(text) - len(text.lstrip("0123456789"))
-    return text[:digits], text[digits:]
+    return text[:digits], text[digits:], suffix
 
 
 def assert_symbols_map(perp_symbol: str, spot_symbol: str) -> None:
@@ -113,14 +113,15 @@ def assert_symbols_map(perp_symbol: str, spot_symbol: str) -> None:
     produce a plausible-looking, enormous "basis". Refused, never mapped.
     """
     try:
-        p_mult, p_base = split_symbol(perp_symbol)
-        s_mult, s_base = split_symbol(spot_symbol)
+        p_mult, p_base, p_quote = split_symbol(perp_symbol)
+        s_mult, s_base, s_quote = split_symbol(spot_symbol)
     except ValueError as exc:
         raise StaleMarket(str(exc)) from exc
-    if p_base != s_base or p_mult != s_mult or not p_base:
+    if p_base != s_base or p_mult != s_mult or p_quote != s_quote or not p_base:
         raise StaleMarket(
             f"perp {perp_symbol!r} and spot {spot_symbol!r} are not the same "
-            "asset at the same contract unit; the basis between them is meaningless")
+            "asset at the same contract unit and quote currency; the basis between "
+            "them is meaningless")
 
 
 @dataclass(frozen=True)

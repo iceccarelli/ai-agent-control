@@ -179,7 +179,10 @@ def test_hedge_mode_is_refused(client, venue):
     venue.position_rows = [{"symbol": "BTCUSDT", "positionIdx": 1, "size": "0"},
                            {"symbol": "BTCUSDT", "positionIdx": 2, "size": "0"}]
     assert _verdict(client, venue).has(tr.INVALID_POSITION_MODE)
-    with pytest.raises(bc.PermanentAPIError):
+    assert client.get_position("BTCUSDT") is None     # flat is flat; the readiness
+    #                                                  verdict is what refuses the mode
+    venue.position_rows[1]["size"] = "0.5"
+    with pytest.raises(bc.PermanentAPIError):          # a held hedge slot is never "the" position
         client.get_position("BTCUSDT")
 
 

@@ -1129,6 +1129,16 @@ class LedgerBroker:
             expected_fee_usd=expected_fee_usd,
             expected_cost_usd=expected_cost_usd)
 
+    #: Execution records kept in memory. The journal entry holds each fill's
+    #: record durably; this list is only its in-process index, so it is bounded.
+    MAX_EXECUTIONS_KEPT = 5000
+
+    def _keep_execution(self, record: Dict[str, Any]) -> None:
+        self.executions.append(record)
+        extra = len(self.executions) - self.MAX_EXECUTIONS_KEPT
+        if extra > 0:
+            del self.executions[:extra]
+
     def end_decision(self, *, symbol: str, product: str, side: str) -> None:
         self._decisions.pop((symbol, product, side), None)
 
@@ -1136,7 +1146,7 @@ class LedgerBroker:
                            qty: float, order_type: str, why: str) -> None:
         import execution_record as xr
         ctx = self._decisions.get((symbol, product, side))
-        self.executions.append(xr.failed_submission(
+        self._keep_execution(xr.failed_submission(
             ctx, side=side, symbol=symbol, product=product,
             venue=str(getattr(self.inner, "VENUE", "unknown")),
             order_type=order_type, requested_qty=qty, why=why))
@@ -1430,7 +1440,7 @@ class LedgerBroker:
             mark = None
         fee_raw = dict(fee_raw)
         fee_raw["execution"] = exec_rec
-        self.executions.append(exec_rec)
+        self._keep_execution(exec_rec)
         ref = str(result.get("order_link_id") or f"fill:{self._ms()}")
         # Never behind the journal's last entry: a wall clock that stepped back
         # must not turn a venue fill into a booking failure.
