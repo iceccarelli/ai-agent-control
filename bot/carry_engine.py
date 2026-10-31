@@ -63,6 +63,7 @@ direction. This module has no direction to give it.
 from __future__ import annotations
 
 import json
+import functools
 import logging
 import datetime as dt
 import math
@@ -569,6 +570,18 @@ class EntryEconomics:
     round_trip_bps: Optional[float]
     verdict: Optional[Any]
     refusal: Optional["CarryDecision"]
+
+
+def _clears_decision_marks(fn):
+    """The prices a tick decided on are kept only for the orders sent DURING
+    it: an order sent by any later path must not be measured against them."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._decision_marks = {}
+    return wrapper
 
 
 class CarryEngine:
@@ -1224,24 +1237,11 @@ class CarryEngine:
             return "future"
         return None
 
+    @_clears_decision_marks
     def on_candle(self, *, mark: float, funding_bps: float,
                   spot: Optional[float] = None,
                   timestamp_ms: int = 0,
                   funding_print_ms: Optional[int] = None) -> CarryDecision:
-        """One tick (see `_on_candle`). The prices it decided on are kept only
-        for the orders sent DURING it: an order sent by any later path must not
-        be measured against this tick's price."""
-        try:
-            return self._on_candle(
-                mark=mark, funding_bps=funding_bps, spot=spot,
-                timestamp_ms=timestamp_ms, funding_print_ms=funding_print_ms)
-        finally:
-            self._decision_marks = {}
-
-    def _on_candle(self, *, mark: float, funding_bps: float,
-                   spot: Optional[float] = None,
-                   timestamp_ms: int = 0,
-                   funding_print_ms: Optional[int] = None) -> CarryDecision:
         """One tick. Act or state why not. This is the entire loop.
 
         `funding_bps` is the rate of the SETTLED print stamped
