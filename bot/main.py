@@ -2009,8 +2009,7 @@ def execution_environment_of(cfg: Any) -> str:
 
 def _owner_policy_status(cfg: Any) -> Dict[str, Any]:
     if cfg is None:
-        return {"evidence_can_qualify": False,
-                "missing_or_unusable": ["config unavailable"]}
+        return _owner_policy.unknown_status()
     return _owner_policy.owner_policy_status(cfg)
 
 
@@ -2024,8 +2023,13 @@ def _carry_evidence_provider(bot: Any, cfg: Any) -> Any:
     path = getattr(bot.store, "_path", None)
     if not isinstance(path, str) or not path or path == ":memory:":
         return None
-    window = _owner_policy.discovery_window(cfg)[0]
-    limit = _owner_policy.drawdown_limit(cfg)[0]
+    # Resolved at each verdict, never fixed at startup, so the status and the
+    # gate read the same configuration at the same moment.
+    def window():
+        return _owner_policy.discovery_window(cfg)[0]
+
+    def limit():
+        return _owner_policy.drawdown_limit(cfg)[0]
     import carry_evidence
     return carry_evidence.make_provider(
         db_path=path, environment=execution_environment_of(cfg),

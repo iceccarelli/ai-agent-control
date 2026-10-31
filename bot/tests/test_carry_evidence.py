@@ -177,8 +177,8 @@ def test_an_inverted_or_partial_window_is_treated_as_unset(monkeypatch):
                 {"CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1000"},
                 {}):
         _main._carry_evidence_provider(Bot(), _config.load(env))
-    assert [kw["discovery_window_s"] for kw in seen] == [None, None, None]
+    assert [kw["discovery_window_s"]() for kw in seen] == [None, None, None]
     _main._carry_evidence_provider(Bot(), _config.load(
         {"CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1000",
          "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "2000"}))
-    assert seen[-1]["discovery_window_s"] == (1000.0, 2000.0)
+    assert seen[-1]["discovery_window_s"]() == (1000.0, 2000.0)

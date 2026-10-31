@@ -33,7 +33,7 @@ def run(main, *args, **kw):
 def test_nothing_set_exits_3_and_lists_what_is_missing():
     code, out = run(opc.main, env={})
     body = json.loads(out)
-    assert code == 3 and body["evidence_can_qualify"] is False
+    assert code == 3 and body["policy_inputs_complete"] is False
     assert len(body["missing_or_unusable"]) == 2
 
 
@@ -42,13 +42,26 @@ def test_a_complete_policy_exits_0():
         "CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1000",
         "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "2000",
         "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD": "50"})
-    assert code == 0 and json.loads(out)["evidence_can_qualify"] is True
+    assert code == 0 and json.loads(out)["policy_inputs_complete"] is True
 
 
-def test_a_bad_setting_exits_2_without_echoing_other_settings():
-    code, out = run(opc.main, env={"CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD": "x",
+def test_a_malformed_owner_setting_is_named_not_echoed():
+    code, out = run(opc.main, env={"CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD": "sekrit-x",
                                    "BYBIT_API_SECRET": "s3cr3t-value-123"})
-    assert code == 2 and "s3cr3t" not in out
+    body = json.loads(out)
+    assert code == 3 and "sekrit-x" not in out and "s3cr3t" not in out
+    assert body["unparseable_settings"] == ["CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD"]
+    assert body["policy_inputs_complete"] is False
+
+
+def test_a_bad_unrelated_setting_cannot_hide_the_owner_policy():
+    code, out = run(opc.main, env={
+        "ENABLE_HEALTH_SERVER": "banana-secret", "LOOP_INTERVAL_SECONDS": "zzz",
+        "CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1000",
+        "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "2000",
+        "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD": "50"})
+    assert code == 0 and "banana-secret" not in out
+    assert json.loads(out)["policy_inputs_complete"] is True
 
 
 def test_the_output_never_contains_credentials():
@@ -129,5 +142,35 @@ def test_a_database_with_no_ledger_is_an_error_not_a_pass(tmp_path):
     path = str(tmp_path / "e.db")
     StateStore(path).close()
     code, out = run(esr.main, ["--db", path, "--mode", "overlay",
+                               "--notional-usd", "600"])
+    assert code == 2 and "error" in json.loads(out)
+
+
+def test_the_report_defaults_mode_and_symbols_from_the_environment(tmp_path):
+    path = _db(tmp_path, 22)
+    code, out = run(esr.main, ["--db", path, "--notional-usd", "600"],
+                    env={"CARRY_EXECUTION_MODE": "overlay"})
+    body = json.loads(out)
+    assert code == 0 and [l["symbol"] for l in body["legs"]] == ["BTCUSDT", "BTCUSDT"]
+    other = run(esr.main, ["--db", path, "--notional-usd", "600"],
+                env={"CARRY_EXECUTION_MODE": "overlay", "CARRY_PERP_SYMBOL": "ETHUSDT"})
+    assert other[0] == 3                           # that symbol has no samples here
+
+
+def test_the_report_demands_a_mode_and_a_sane_notional(tmp_path):
+    path = _db(tmp_path, 3)
+    for argv, env in ((["--db", path, "--notional-usd", "600"], {}),
+                      (["--db", path, "--mode", "overlay", "--notional-usd", "0"], {}),
+                      (["--db", path, "--mode", "overlay", "--notional-usd", "-5"], {}),
+                      (["--db", path, "--mode", "overlay", "--notional-usd", "nan"], {})):
+        with pytest.raises(SystemExit) as e:
+            esr.main(argv, env=env)
+        assert e.value.code == 2
+
+
+def test_any_database_failure_is_exit_2_not_a_traceback(tmp_path):
+    bad = tmp_path / "junk.db"
+    bad.write_bytes(b"this is not sqlite" * 50)
+    code, out = run(esr.main, ["--db", str(bad), "--mode", "overlay",
                                "--notional-usd", "600"])
     assert code == 2 and "error" in json.loads(out)

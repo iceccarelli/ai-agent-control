@@ -14,7 +14,6 @@ reports and what the gate uses cannot drift apart.
 from __future__ import annotations
 
 import math
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 SET, UNSET, INVALID = "SET", "UNSET", "INVALID"
@@ -30,11 +29,11 @@ def _num(x: Any) -> Optional[float]:
     return v if math.isfinite(v) else None
 
 
-def discovery_window(cfg: Any, *, now_s: Optional[float] = None
+def discovery_window(cfg: Any, *, now_s: Optional[float] = None  # now_s kept for callers
                      ) -> Tuple[Optional[Tuple[float, float]], str, str]:
     """(window, state, reason). The window is None unless both ends are set,
-    start < end, and the window has ended (a window still open is not
-    'before' anything)."""
+    and start < end. Whether evidence is independent of the window (including a
+    window still open) is `strategy_evidence`'s judgement, not repeated here."""
     start = _num(getattr(cfg, "CARRY_EVIDENCE_DISCOVERY_START_EPOCH", None))
     end = _num(getattr(cfg, "CARRY_EVIDENCE_DISCOVERY_END_EPOCH", None))
     if start is None and end is None:
@@ -43,10 +42,6 @@ def discovery_window(cfg: Any, *, now_s: Optional[float] = None
         return None, INVALID, "only one end of the discovery window is set"
     if not start < end:
         return None, INVALID, "the window's start is not before its end"
-    now = time.time() if now_s is None else float(now_s)
-    if end > now:
-        return None, INVALID, ("the window has not ended yet; evidence cannot "
-                               "be independent of a period still open")
     return (start, end), SET, ""
 
 
@@ -58,6 +53,21 @@ def drawdown_limit(cfg: Any) -> Tuple[Optional[float], str, str]:
     if v is None or v <= 0:
         return None, INVALID, "the drawdown limit is not a positive number"
     return v, SET, ""
+
+
+def unknown_status() -> Dict[str, Any]:
+    """The same shape as `owner_policy_status`, for when no configuration is
+    available: nothing is known, so nothing is claimed."""
+    return {
+        "discovery_window": {"state": "UNKNOWN", "reason": "no configuration",
+                             "start_epoch": None, "end_epoch": None},
+        "drawdown_limit_usd": {"state": "UNKNOWN", "reason": "no configuration",
+                               "value": None},
+        "entry_benefit_mode": None, "income_haircut_fraction": None,
+        "missing_or_unusable": ["configuration unavailable"],
+        "policy_inputs_complete": False,
+        "consequence": "unknown", "note": "these are owner decisions; this "
+                                          "software suggests no values"}
 
 
 def owner_policy_status(cfg: Any, *, now_s: Optional[float] = None
@@ -80,9 +90,11 @@ def owner_policy_status(cfg: Any, *, now_s: Optional[float] = None
         "entry_benefit_mode": mode,
         "income_haircut_fraction": getattr(cfg, "CARRY_INCOME_HAIRCUT_FRACTION", None),
         "missing_or_unusable": missing,
-        "evidence_can_qualify": ok,
+        "policy_inputs_complete": ok,
         "consequence": (
-            "strategy evidence can be judged once real reconciled cycles exist"
+            "the evidence inputs are set; under 'enforce' entries stay refused "
+            "until real execution samples AND reconciled cycles that pass the "
+            "evidence policy also exist"
             if ok else
             "strategy evidence stays INSUFFICIENT, so under 'enforce' the entry "
             "gate refuses every entry; under 'observe' entries are not refused "

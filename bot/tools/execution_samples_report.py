@@ -40,21 +40,34 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
     return out
 
 
-def main(argv=None) -> int:
+def main(argv=None, env=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--db", required=True)
-    ap.add_argument("--mode", choices=("overlay", "acquire"), required=True)
-    ap.add_argument("--notional-usd", type=float, required=True)
-    ap.add_argument("--perp", default="BTCUSDT")
-    ap.add_argument("--spot", default="BTCUSDT")
+    ap.add_argument("--mode", choices=("overlay", "acquire"), default=None,
+                    help="default: CARRY_EXECUTION_MODE from the environment")
+    ap.add_argument("--notional-usd", type=float, required=True,
+                    help="the planned position size in USD")
+    ap.add_argument("--perp", default=None,
+                    help="default: CARRY_PERP_SYMBOL from the environment")
+    ap.add_argument("--spot", default=None,
+                    help="default: CARRY_SPOT_SYMBOL from the environment")
     args = ap.parse_args(argv)
+    if not (args.notional_usd == args.notional_usd and args.notional_usd > 0
+            and args.notional_usd != float("inf")):
+        ap.error("--notional-usd must be a positive, finite number")
+    env = os.environ if env is None else env
+    args.mode = args.mode or str(env.get("CARRY_EXECUTION_MODE", "")).strip().lower()
+    if args.mode not in ("overlay", "acquire"):
+        ap.error("--mode is required (or set CARRY_EXECUTION_MODE to overlay/acquire)")
+    args.perp = args.perp or str(env.get("CARRY_PERP_SYMBOL", "BTCUSDT")).strip().upper()
+    args.spot = args.spot or str(env.get("CARRY_SPOT_SYMBOL", "BTCUSDT")).strip().upper()
     if not os.path.exists(args.db):
         print(json.dumps({"error": f"no database at {args.db}"}))
         return 2
     try:
         report = build(args.db, mode=args.mode, notional_usd=args.notional_usd,
                        perp=args.perp, spot=args.spot)
-    except (LookupError, OSError) as exc:
+    except Exception as exc:  # noqa: BLE001 - any failure is exit 2, never a traceback
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
         return 2
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
