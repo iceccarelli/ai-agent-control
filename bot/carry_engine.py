@@ -1123,54 +1123,171 @@ class CarryEngine:
                                                "spot")["taker_bps"])
         return 2.0 * (spot + perp)
 
-    def opportunity_outlook(self, *, mark: float, spot: Optional[float]
-                            ) -> Dict[str, Any]:
-        """What the book is waiting for, in numbers. Read-only, advisory.
+    #: (round-trip bps, wall-clock ms) from the last time the PRODUCTION entry
+    #: path priced it. The outlook uses this and never asks the venue itself:
+    #: it is served from the health thread.
+    _last_round_trip: Optional[Tuple[float, int]] = None
 
-        Says whether a pair is held, what funding (bps per settlement) the
-        production entry gate would need to open now, how far the smoothed
-        funding is from it, and what would make the book leave. Every field is
-        derived from the same gate `on_candle` asks; nothing here decides.
-        An input it cannot read is reported as None, never guessed.
+    #: A funding estimate older than one settlement interval plus this grace is
+    #: stale: the next print was due and has not been seen.
+    OUTLOOK_FUNDING_GRACE_MS = 3_600_000
+
+    def opportunity_outlook(self, *, mark: float, spot: Optional[float],
+                            now_ms: Optional[int] = None) -> Dict[str, Any]:
+        """What the book is waiting for, in numbers. Read-only and ADVISORY.
+
+        It decides nothing and sends nothing. Every figure comes from the same
+        production functions `on_candle` uses (`carry_costs.entry_gate`,
+        `ewma_funding_bps`, the engine's own fee and borrow inputs); the status
+        below is "would the real gate open on the real history right now", read
+        straight off that gate. `ENTRY_CONDITIONS_MET` is MECHANICAL only: it
+        says nothing about strategy evidence, capital allocation or order
+        permission (see `not_evaluated`). An input that cannot be read is
+        reported as None with a reason, never defaulted.
+
+        Units: funding is bps PER SETTLEMENT (8h), never annualised.
         """
+        costs = _costs()
+        now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+        history = [float(x) for x in self._funding_history]
+        last_ms = self._last_print_ms
+        from market_snapshot import FUNDING_INTERVAL_MS
+        max_age_ms = FUNDING_INTERVAL_MS + self.OUTLOOK_FUNDING_GRACE_MS
+        age_s = None if last_ms is None else max(0, now - int(last_ms)) / 1000.0
         out: Dict[str, Any] = {
+            "units": {"funding": "bps per 8h settlement (not annualised)",
+                      "age": "seconds"},
+            "symbol": self.perp_symbol, "spot_symbol": self.spot_symbol,
             "holding": self.position is not None,
             "entries_enabled": bool(self.entries_enabled),
-            "exit_rule": (f"unwind after {NEGATIVE_FUNDING_EXIT_PRINTS} "
-                          "consecutive negative funding prints, or on a "
-                          "margin / liquidation / delta-band breach"),
-            "funding_needed_bps_per_print": None,
+            "funding_evidence": {
+                "source": "settled funding prints held by the engine "
+                          "(venue-stated, newest last)",
+                "sample_count": len(history),
+                "min_samples": int(costs.EWMA_MIN_PRINTS),
+                "last_print_ms": last_ms, "age_s": age_s,
+                "stale_after_s": max_age_ms / 1000.0},
             "smoothed_funding_bps": None,
-            "gap_bps_per_print": None, "status": "UNKNOWN", "why": ""}
+            "funding_needed_bps_per_print": None,
+            "gap_bps_per_print": None,
+            "entry_gate_reason": None,
+            "status": "UNKNOWN", "why": "",
+            "mechanical_entry_eligible": False,
+            "not_evaluated": {
+                "strategy_evidence": "not evaluated here",
+                "capital_allocation": "not evaluated here",
+                "order_permission": "not evaluated here",
+                "note": "ENTRY_CONDITIONS_MET means the cost gate would open "
+                        "on the current history; it is not a trade signal"},
+            "exit": self._exit_outlook(mark),
+        }
         if self.position is not None:
             out["status"] = "HOLDING"
             return out
         if spot is None or not self._finite(mark) or not self._finite(spot):
             out["why"] = "SPOT_OR_MARK_UNAVAILABLE"
             return out
+        smoothed = costs.ewma_funding_bps(history)
+        out["smoothed_funding_bps"] = smoothed
+        if smoothed is None:
+            out["status"] = "WAITING_FOR_FUNDING_HISTORY"
+            out["why"] = (f"{len(history)} of {costs.EWMA_MIN_PRINTS} settled "
+                          "prints needed")
+            return out
+        if age_s is None or age_s * 1000.0 > max_age_ms:
+            out["status"] = "WAITING_FOR_FUNDING_HISTORY"
+            out["why"] = ("FUNDING_AGE_UNKNOWN" if age_s is None
+                          else "FUNDING_STALE: the latest print is older than "
+                               "one settlement interval plus grace")
+            return out
+        cached = self._last_round_trip
+        if cached is None:
+            out["why"] = ("ROUND_TRIP_COST_NOT_YET_READ: the production entry "
+                          "path has not priced this account's fees yet; the "
+                          "outlook never asks the venue")
+            return out
+        round_trip = float(cached[0])
+        out["round_trip_bps"] = round_trip
+        out["round_trip_read_ms"] = int(cached[1])
         try:
-            round_trip = self.round_trip_bps()
-            needed = _costs().breakeven_funding_bps(
+            needed = costs.breakeven_funding_bps(
                 perp=mark, spot=spot, borrow_apr=self.borrow_apr,
                 round_trip_bps=round_trip,
+                opportunity_cost_apr=self.opportunity_cost_apr)
+            verdict = costs.entry_gate(
+                funding_prints_bps=history, perp=mark, spot=spot,
+                borrow_apr=self.borrow_apr, round_trip_bps=round_trip,
                 opportunity_cost_apr=self.opportunity_cost_apr)
         except Exception as exc:  # noqa: BLE001 - unreadable is reported
             out["why"] = f"UNREADABLE: {type(exc).__name__}"
             return out
         out["funding_needed_bps_per_print"] = needed
-        out["smoothed_funding_bps"] = _costs().ewma_funding_bps(
-            self._funding_history)
-        if needed is None:
+        out["entry_gate_reason"] = verdict.reason
+        if needed is not None:
+            out["gap_bps_per_print"] = needed - smoothed
+        if verdict:
+            out["status"] = "ENTRY_CONDITIONS_MET"
+            out["mechanical_entry_eligible"] = True
+        elif verdict.reason == "COST_INPUT_INVALID":
+            # An input the gate cannot price (a zero round trip, say) is the
+            # gate refusing, not proof that no funding could ever clear costs.
+            out["status"] = "ENTRY_GATE_REFUSED"
+            out["why"] = verdict.reason
+        elif needed is None:
             out["status"] = "NO_FUNDING_LEVEL_CLEARS_THE_COSTS"
-            out["why"] = "even the model ceiling does not clear fees, borrow and opportunity cost"
-        elif out["smoothed_funding_bps"] is None:
-            out["status"] = "WAITING_FOR_FUNDING_HISTORY"
+            out["why"] = ("even the model ceiling does not clear fees, borrow, "
+                          "opportunity cost and the hold test")
+        elif needed - smoothed > 0:
+            out["status"] = "WAITING_FOR_FUNDING"
         else:
-            gap = needed - out["smoothed_funding_bps"]
-            out["gap_bps_per_print"] = gap
-            out["status"] = ("ENTRY_CONDITIONS_MET" if gap <= 0
-                             else "WAITING_FOR_FUNDING")
+            # Funding is at or above the steady-state need, yet the gate says
+            # no: a basis or hold constraint, not funding. Say so.
+            out["status"] = "ENTRY_GATE_REFUSED"
+            out["why"] = verdict.reason
         return out
+
+    def _exit_outlook(self, mark: float) -> Dict[str, Any]:
+        """The exit rules that exist in this engine and which, if any, is
+        active right now. Thresholds are the engine's own constants; nothing
+        here is a separate policy. `active` is None when the input is not
+        known to the outlook (it reads no venue)."""
+        pos = self.position
+        streak = None if pos is None else int(pos.negative_funding_streak)
+        margin = self._last_margin if pos is not None else None
+        try:
+            drift = (None if pos is None or not self._finite(mark)
+                     else float(pos.delta_fraction(mark)))
+        except Exception:  # noqa: BLE001
+            drift = None
+
+        def active(value, test):
+            return None if value is None else bool(test(value))
+
+        rules = [
+            {"id": "FUNDING_INVERTED", "action": "UNWIND",
+             "threshold": NEGATIVE_FUNDING_EXIT_PRINTS,
+             "unit": "consecutive negative settled prints",
+             "current": streak,
+             "active": active(streak,
+                              lambda v: v >= NEGATIVE_FUNDING_EXIT_PRINTS)},
+            {"id": "MARGIN_HEADROOM", "action": "UNWIND",
+             "threshold": self.min_margin_multiple, "unit": "x (margin multiple)",
+             "current": margin,
+             "active": active(margin, lambda v: v < self.min_margin_multiple),
+             "unreadable": "HALT (not an exit): an unreadable margin halts the book"},
+            {"id": "LIQUIDATION_DISTANCE", "action": "UNWIND",
+             "threshold": MIN_LIQUIDATION_DISTANCE_PCT, "unit": "% to liquidation",
+             "current": None, "active": None,
+             "note": "read from the venue each tick; not read by the outlook"},
+            {"id": "DELTA_DRIFT", "action": "REBALANCE (not an exit)",
+             "threshold": self.delta_band, "unit": "fraction of hedged size",
+             "current": drift,
+             "active": active(drift, lambda v: v > self.delta_band)},
+        ]
+        return {"rules": rules, "holding": pos is not None,
+                "active_exit_triggers": [r["id"] for r in rules
+                                         if r["action"] == "UNWIND"
+                                         and r["active"]]}
 
     def entry_economics(self, *, mark: float, spot: Optional[float],
                         funding_bps: float = 0.0) -> "EntryEconomics":
@@ -1216,6 +1333,8 @@ class CarryEngine:
                                 "an unknown basis is not a small one"}))
         try:
             round_trip = self.round_trip_bps()
+            # Kept for the read-only outlook, which must not touch the venue.
+            self._last_round_trip = (round_trip, int(time.time() * 1000))
         except Exception as exc:  # noqa: BLE001 - an unpriced exit is a refusal
             return EntryEconomics(None, None, CarryDecision(
                 "stand_aside", reason="FEE_RATES_UNREADABLE",
