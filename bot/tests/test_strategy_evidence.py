@@ -125,7 +125,7 @@ def test_positive_mean_not_distinguishable_from_zero_is_insufficient():
 
 
 def test_malformed_trades_and_blank_basis_are_not_allocated():
-    bad = ev(GOOD) 
+    bad = ev(GOOD)
     bad = se.StrategyEvidence(**{**bad.__dict__, "net_basis": "  "})
     assert verdict(bad).verdict == se.INSUFFICIENT
     nan = ev(GOOD, trades=trades(GOOD) + (se.EvidenceTrade(1.0, 2.0, float("nan")),))
