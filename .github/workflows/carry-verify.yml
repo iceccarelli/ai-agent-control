@@ -158,6 +158,7 @@ jobs:
           tests/test_exit_gate.py
           tests/test_resolve_order_contradiction_tool.py
           tests/test_carry_evidence.py
+          tests/test_tick_book_for_exits.py
           tests/test_execution_cost_estimate.py
           tests/test_entry_benefit_gate.py
           tests/test_opportunity_outlook.py

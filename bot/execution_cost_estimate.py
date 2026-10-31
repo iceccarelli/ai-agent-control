@@ -13,7 +13,7 @@ PREDICT the cost of a future entry, and the prediction is a bound, not a quote.
 
 Definitions (per leg = one product and side; bps of that leg's notional)
   half-spread  decision-time (ask - bid) / 2, from a book observed before the
-               order (reference_basis == "book"); a mark-referenced record has
+               order (reference_basis == "executable_side"); a mark-referenced record has
                no spread and is not used.
   slippage     fill vs the decision-time executable price (spread excluded).
   cost bound   max(0, mean + z * sd * sqrt(1 + 1/n)): a one-sided prediction
@@ -43,6 +43,11 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 UNAVAILABLE = "UNAVAILABLE"
 MEASURED = "MEASURED"
+#: `execution_record` marks a record measured against the decision-time book's
+#: executable side with this basis ("mark" when no book was seen). The value is
+#: the producer's; a test builds records with the real producer so the two
+#: cannot drift apart.
+BOOK_BASIS = "executable_side"
 DAY_MS = 86_400_000
 
 #: Entry kinds that are fills (ledger.FILL_KINDS; repeated so this stays pure).
@@ -128,7 +133,7 @@ def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
                 or rec.get("side") != side
                 or rec.get("order_type") not in order_types):
             continue                        # another leg: not a rejection
-        if rec.get("status") != MEASURED or rec.get("reference_basis") != "book":
+        if rec.get("status") != MEASURED or rec.get("reference_basis") != BOOK_BASIS:
             drop("NOT_BOOK_MEASURED")
             continue
         ms = _num(getattr(e, "ms", None))
