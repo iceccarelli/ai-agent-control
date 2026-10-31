@@ -1079,6 +1079,67 @@ class LedgerBroker:
         #: name the orders a venue capture must be able to reproduce. In
         #: memory only: the journal stays the book, this is its index.
         self.fills: List[Dict[str, Any]] = []
+        #: The decision each (symbol, product, side) is currently trading on,
+        #: stated by the engine BEFORE it sends (`begin_decision`). Never
+        #: filled in from an observation taken after the order.
+        self._decisions: Dict[Tuple[str, str, str], Any] = {}
+        #: Execution records (execution_record.py) of every order this broker
+        #: sent, including the ones that filled nothing. In memory; the same
+        #: record of every FILL is persisted on its journal entry
+        #: (`fee_raw["execution"]`), so there is no second ledger.
+        self.executions: List[Dict[str, Any]] = []
+        #: What a resting order was decided on and asked for, by link id, so
+        #: a cancel-time fill is measured against the same decision.
+        self._resting_exec: Dict[str, tuple] = {}
+
+    # -- decision-time context (execution_record) -------------------------
+
+    def begin_decision(self, *, symbol: str, product: str, side: str,
+                       qty: float, mark: Optional[float] = None,
+                       bid: Optional[float] = None, ask: Optional[float] = None,
+                       decision_ms: Optional[int] = None,
+                       observed_ms: Optional[int] = None,
+                       expected_fee_usd: Optional[float] = None,
+                       expected_cost_usd: Optional[float] = None,
+                       capture_book: bool = True) -> None:
+        """State what the strategy sees at the moment it decides to trade.
+
+        Call it immediately before the order(s) for this leg. With no bid/ask
+        and ``capture_book`` it reads the touch NOW (public, read-only), which
+        is a decision-time observation; if that read fails the reference is
+        the mark alone. Nothing here moves money. A context is replaced by the
+        next call for the same (symbol, product, side) and ignored once stale.
+        """
+        import execution_record as xr
+        now = int(self._ms())
+        if bid is None and ask is None and capture_book:
+            getter = getattr(self.inner, "get_book_top", None)
+            if callable(getter):
+                try:
+                    top = getter(symbol, product)
+                    bid, ask = top["bid"], top["ask"]
+                    observed_ms = now
+                except Exception:  # noqa: BLE001 - mark-only is the fallback
+                    bid = ask = None
+        self._decisions[(symbol, product, side)] = xr.DecisionContext(
+            venue=str(getattr(self.inner, "VENUE", "unknown")),
+            symbol=symbol, product=product, side=side,
+            decision_ms=now if decision_ms is None else decision_ms,
+            qty=qty, mark=mark, bid=bid, ask=ask, observed_ms=observed_ms,
+            expected_fee_usd=expected_fee_usd,
+            expected_cost_usd=expected_cost_usd)
+
+    def end_decision(self, *, symbol: str, product: str, side: str) -> None:
+        self._decisions.pop((symbol, product, side), None)
+
+    def _note_failed_order(self, *, symbol: str, side: str, product: str,
+                           qty: float, order_type: str, why: str) -> None:
+        import execution_record as xr
+        ctx = self._decisions.get((symbol, product, side))
+        self.executions.append(xr.failed_submission(
+            ctx, side=side, symbol=symbol, product=product,
+            venue=str(getattr(self.inner, "VENUE", "unknown")),
+            order_type=order_type, requested_qty=qty, why=why))
 
     def _note_fill(self, *, ref: str, ms: int, product: str, side: str,
                    qty: float, price: float, fee_usdt: float, fee_btc: float,
@@ -1113,10 +1174,22 @@ class LedgerBroker:
 
     def place_market(self, *, symbol: str, side: str, qty: float,
                      product: str):
-        result = self.inner.place_market(symbol=symbol, side=side, qty=qty,
-                                         product=product)
         try:
-            self._book(result, side=side, product=product)
+            result = self.inner.place_market(symbol=symbol, side=side, qty=qty,
+                                             product=product)
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged
+            self._note_failed_order(
+                symbol=symbol, side=side, product=product, qty=qty,
+                order_type="market",
+                why=f"SUBMISSION_FAILED: {type(exc).__name__}")
+            raise
+        if not result:
+            self._note_failed_order(symbol=symbol, side=side, product=product,
+                                    qty=qty, order_type="market",
+                                    why="NO_ORDER: venue returned no fill")
+        try:
+            self._book(result, side=side, product=product, symbol=symbol,
+                       requested_qty=qty, order_type="market")
         except Exception as exc:  # noqa: BLE001
             # The venue already ACCEPTED this order. A booking error is not
             # "the order failed": reporting it as one made the engine buy the
@@ -1131,9 +1204,22 @@ class LedgerBroker:
 
     def place_post_only(self, *, symbol: str, side: str, qty: float,
                         price: float, product: str):
-        result = self.inner.place_post_only(symbol=symbol, side=side, qty=qty,
-                                            price=price, product=product)
-        self._book(result, side=side, product=product)
+        try:
+            result = self.inner.place_post_only(
+                symbol=symbol, side=side, qty=qty, price=price,
+                product=product)
+        except Exception as exc:  # noqa: BLE001 - re-raised unchanged
+            self._note_failed_order(
+                symbol=symbol, side=side, product=product, qty=qty,
+                order_type="post_only",
+                why=f"SUBMISSION_FAILED: {type(exc).__name__}")
+            raise
+        if not result:
+            self._note_failed_order(symbol=symbol, side=side, product=product,
+                                    qty=qty, order_type="post_only",
+                                    why="NO_ORDER: rejected, nothing rests")
+        self._book(result, side=side, product=product, symbol=symbol,
+                   requested_qty=qty, order_type="post_only")
         if result:
             link = str(result.get("order_link_id") or "")
             if link:
@@ -1146,6 +1232,8 @@ class LedgerBroker:
                                               "nothing filled, no fee")
                             if booked <= 0 else self._fee_set_of(result))
                 self._resting[link] = (side, max(0.0, booked), baseline)
+                self._resting_exec[link] = (
+                    symbol, float(qty), result.get("submit_ms"))
         return result
 
     def cancel_order(self, *, symbol: str, order_link_id: str, product: str):
@@ -1172,6 +1260,7 @@ class LedgerBroker:
                                          order_link_id=order_link_id,
                                          product=product)
         known = self._resting.pop(str(order_link_id), None)
+        exec_known = self._resting_exec.pop(str(order_link_id), None)
         if not result or known is None:
             # Nothing was remembered for this id, so there is no baseline to
             # take an increment against. Refusing to guess is the same rule
@@ -1203,11 +1292,20 @@ class LedgerBroker:
         elif fee_extra.known and any(c.amount < -1e-12
                                      for c in fee_extra.components):
             fee_extra = venue_fees.UNKNOWN_FEES
-        self._book({"filled_qty": extra,
-                    "avg_price": result.get("avg_price", 0.0),
-                    "order_link_id": f"{order_link_id}+cancel",
-                    "fee_detail": fee_extra.to_dict()},
-                   side=side, product=product)
+        inc = {"filled_qty": extra,
+               "avg_price": result.get("avg_price", 0.0),
+               "order_link_id": f"{order_link_id}+cancel",
+               "fee_detail": fee_extra.to_dict(),
+               "fill_ms": result.get("updated_ms"),
+               "fill_ms_basis": "venue_updated_time",
+               "response_ms": int(self._ms())}
+        requested_left = None
+        if exec_known is not None:
+            inc["submit_ms"] = exec_known[2]
+            requested_left = max(0.0, exec_known[1] - booked_qty)
+        self._book(inc, side=side, product=product,
+                   symbol=(exec_known[0] if exec_known else ""),
+                   requested_qty=requested_left, order_type="post_only")
         return result
 
     @staticmethod
@@ -1262,8 +1360,46 @@ class LedgerBroker:
         return fee_btc, fee_usdt, ("unresolved" if unresolved
                                    else "confirmed"), raw
 
+    def _execution_record(self, result, *, side: str, product: str,
+                          symbol: str, requested_qty: Any, order_type: str,
+                          qty: float, price: float, fee_btc: float,
+                          fee_usdt: float, status: str
+                          ) -> Tuple[Dict[str, Any], Optional[float]]:
+        """``(record, decision_reference)`` for one booked fill.
+
+        The reference is what the journal stores as ``decision_mark``: the
+        decision-time executable-side price (or the mark when no book was
+        seen), only when the record validates; None otherwise.
+        """
+        import execution_record as xr
+        symbol = symbol or str(result.get("symbol") or "")
+        ctx = self._decisions.get((symbol, product, side))
+        fee_usd = fee_usdt + fee_btc * price
+        fill_ms = result.get("fill_ms")
+        rec = xr.assess_fill(
+            ctx, side=side, symbol=symbol, product=product,
+            venue=str(result.get("venue")
+                      or getattr(self.inner, "VENUE", "unknown")),
+            order_type=str(result.get("order_type") or order_type),
+            requested_qty=(requested_qty if requested_qty is not None
+                           else result.get("requested_qty")),
+            filled_qty=qty, avg_price=price, now_ms=int(self._ms()),
+            fee_usd=fee_usd, fee_confirmed=(status == "confirmed"),
+            order_link_id=str(result.get("order_link_id") or ""),
+            submit_ms=result.get("submit_ms"), fill_ms=fill_ms,
+            fill_ms_basis=str(result.get("fill_ms_basis") or ""))
+        ref = rec.get("reference_price")
+        if ref is None:
+            # A caller that supplied a mark with the result itself (no engine
+            # context): still honoured, still validated as a price.
+            legacy = xr._price(result.get("decision_mark"))
+            if legacy is not None:
+                ref = legacy
+        return rec, ref
+
     def _book(self, result, *, side: str, product: str,
-              allow_missing_side: bool = False) -> None:
+              allow_missing_side: bool = False, symbol: str = "",
+              requested_qty: Any = None, order_type: str = "market") -> None:
         if not result:
             return
         qty = float(result.get("filled_qty", 0.0) or 0.0)
@@ -1276,16 +1412,17 @@ class LedgerBroker:
             return
         fee_btc, fee_usdt, status, fee_raw = self._resolve_fee(
             result, side=side, product=product)
-        # The mark the engine decided on, when the order path passed one back
-        # with the result. Anything that is not a finite positive price is
-        # "not journalled", never a guess.
-        mark = result.get("decision_mark")
-        try:
-            mark = float(mark) if mark is not None else None
-        except (TypeError, ValueError):
-            mark = None
-        if mark is not None and not (math.isfinite(mark) and mark > 0):
-            mark = None
+        # The price the engine DECIDED on (executable side of the book it saw,
+        # else its mark), from the context it declared before sending. Anything
+        # that does not validate is "not journalled", never a guess; the full
+        # record travels on the entry (`fee_raw["execution"]`).
+        exec_rec, mark = self._execution_record(
+            result, side=side, product=product, symbol=symbol,
+            requested_qty=requested_qty, order_type=order_type, qty=qty,
+            price=price, fee_btc=fee_btc, fee_usdt=fee_usdt, status=status)
+        fee_raw = dict(fee_raw)
+        fee_raw["execution"] = exec_rec
+        self.executions.append(exec_rec)
         ref = str(result.get("order_link_id") or f"fill:{self._ms()}")
         # Never behind the journal's last entry: a wall clock that stepped back
         # must not turn a venue fill into a booking failure.
