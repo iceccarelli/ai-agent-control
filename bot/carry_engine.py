@@ -3177,16 +3177,48 @@ class CarryEngine:
                     logger.warning("stale decision context not cleared",
                                    exc_info=True)
             return
-        # Getting out is never slowed: an exit takes no extra public read to
-        # capture the touch; its reference is the tick's mark.
         is_exit = (product == "linear" and side == "Buy") or (
             product == "spot" and side == "Sell")
-        extra = {"capture_book": False} if is_exit else {}
+        kwargs: Dict[str, Any] = {}
+        book = self._tick_book(product)
+        if book is not None:
+            # The touch this tick DECIDED on: a decision-time observation that
+            # costs no read at the moment of the order, so an exit has a real
+            # book too and its spread and slippage can be measured.
+            kwargs.update(bid=book[0], ask=book[1], observed_ms=book[2])
+        elif is_exit:
+            # Getting out is never slowed: with no usable tick book an exit
+            # takes no extra public read; its reference falls back to the mark.
+            kwargs["capture_book"] = False
         try:
             begin(symbol=symbol, product=product, side=side, qty=qty,
-                  mark=float(mark), **extra)
+                  mark=float(mark), **kwargs)
         except Exception:  # noqa: BLE001
             logger.warning("decision context not recorded", exc_info=True)
+
+    #: A tick's touch older than this is not "what the decision saw" any more.
+    #: It sits inside execution_record.MAX_OBSERVATION_AGE_MS (5 s) so a book
+    #: used here is never rejected there as stale.
+    TICK_BOOK_MAX_AGE_S = 3.0
+
+    def _tick_book(self, product: str):
+        """(bid, ask, observed_ms) of this tick's snapshot for `product`, when
+        it exists and is fresh; None otherwise."""
+        view = getattr(self, "snapshot", None)
+        book = getattr(view, "perp_book" if product == "linear" else "spot_book",
+                       None)
+        seen = getattr(view, "book_observed_s", None)
+        if not book or seen is None:
+            return None
+        try:
+            bid, ask, seen = float(book[0]), float(book[1]), float(seen)
+        except (TypeError, ValueError, IndexError):
+            return None
+        age = time.time() - seen
+        if not (0.0 <= age <= self.TICK_BOOK_MAX_AGE_S) or not (
+                self._finite(bid) and self._finite(ask)) or bid <= 0 or ask < bid:
+            return None
+        return bid, ask, int(seen * 1000)
 
     @staticmethod
     def _accountable(result: Any, qty: float, *,
