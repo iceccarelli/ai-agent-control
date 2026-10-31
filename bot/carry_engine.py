@@ -678,6 +678,12 @@ class CarryEngine:
         #: The portfolio authority (carry_capital.CarryCapitalAuthority): asked
         #: before every ENTRY, never for an exit. None = not wired (a bare
         #: engine, the shadow book).
+        #: The additional entry net-benefit gate (entry_benefit_gate); None =
+        #: absent. It sits in front of ENTRIES only, after the production gates.
+        self.entry_benefit: Any = None
+        #: The last entry decision's full layered trace (for status/audit).
+        self.last_entry_trace: Dict[str, Any] = {}
+        self._observe_logged = ""
         self.capital_authority = capital_authority
         #: ENTRIES_ENABLED=0 stops NEW pairs and nothing else: a held pair is
         #: still watched, margin-checked and exited. (It used to detach the
@@ -1128,6 +1134,46 @@ class CarryEngine:
     #: path priced it. The outlook uses this and never asks the venue itself:
     #: it is served from the health thread.
     _last_round_trip: Optional[Tuple[float, int]] = None
+
+    def _entry_benefit_refusal(self, mark: float, spot_mark: float,
+                               notional_usd: float) -> Optional[CarryDecision]:
+        """The additional entry net-benefit gate (None = pass or absent).
+
+        Runs only for an ENTRY, after the cost gate and the pair gate have
+        passed; it never replaces them and never sees an exit. Its trace is
+        kept whatever the verdict, so every entry decision can be explained."""
+        gate = self.entry_benefit
+        if gate is None:
+            return None
+        journal = getattr(self.broker, "journal", None)
+        # The round trip the production cost gate just priced for this very
+        # decision, not a second venue lookup that could disagree with it.
+        priced = self._last_round_trip
+        round_trip = None if priced is None else priced[0]
+        # The caller's clock when it supplied one (replay, tests), as the pair
+        # gate uses; the wall clock otherwise.
+        now_ms = (int(self._entry_clock_ms) if self._entry_clock_ms > 0
+                  else int(time.time() * 1000))
+        result = gate.check(
+            now_ms=now_ms, execution_style=self.execution_style,
+            entries=list(getattr(journal, "entries", ()) or ()),
+            execution_mode=self.execution_mode, perp_symbol=self.perp_symbol,
+            spot_symbol=self.spot_symbol, mark=mark, spot=spot_mark,
+            funding_history=list(self._funding_history),
+            last_print_ms=self._last_print_ms, round_trip_bps=round_trip,
+            borrow_apr=self.borrow_apr,
+            opportunity_cost_apr=self.opportunity_cost_apr,
+            notional_usd=notional_usd, mechanical_reason="CLEARED")
+        self.last_entry_trace = dict(result.trace)
+        if result.allowed:
+            if result.reason and result.reason != self._observe_logged:
+                logger.warning("entry net-benefit gate (observe): WOULD refuse "
+                               "%s", result.reason)
+            self._observe_logged = result.reason
+            return None
+        return CarryDecision("stand_aside", reason=result.reason,
+                             state=BookState.FLAT, detail=dict(result.trace))
+
     #: A remembered round-trip price older than this is not used by the outlook.
     OUTLOOK_COST_MAX_AGE_MS = 600_000
 
@@ -1744,6 +1790,10 @@ class CarryEngine:
         if not gate:
             return CarryDecision("stand_aside", reason=gate.reason,
                                  state=BookState.FLAT, detail=gate.detail)
+
+        refused = self._entry_benefit_refusal(mark, spot_mark, qty * mark)
+        if refused is not None:
+            return refused
 
         # The daily entry limit keeps the caller's clock (0 = wall clock); only
         # the cycle's identity is made unique.

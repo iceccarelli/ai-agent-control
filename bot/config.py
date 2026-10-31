@@ -337,6 +337,14 @@ def parse_str(env: Mapping[str, str], name: str, default: str = "") -> str:
     return default if raw is None else str(raw).strip()
 
 
+def parse_choice(env: Mapping[str, str], name: str, default: str,
+                 choices: Tuple[str, ...]) -> str:
+    value = parse_str(env, name, default).lower()
+    if value not in choices:
+        raise ConfigError(f"{name}={value!r} is not one of {choices}")
+    return value
+
+
 def parse_symbols(env: Mapping[str, str], name: str, default: str) -> Tuple[str, ...]:
     raw = parse_str(env, name, default)
     symbols = tuple(s.strip().upper() for s in raw.split(",") if s.strip())
@@ -555,6 +563,14 @@ class Config:
     #: earn as cash sets it, and the entry gate then demands the funding clear
     #: it as well as the fees and financing.
     CARRY_OPPORTUNITY_COST_APR: float = 0.0
+    #: "enforce" refuses an entry the net-benefit gate refuses; "observe" records
+    #: what it WOULD refuse and lets the entry continue (an explicit operator
+    #: choice for gathering evidence). Anything else is rejected at load.
+    CARRY_ENTRY_BENEFIT_MODE: str = "enforce"
+    #: Share of the expected funding income not believed, in [0, 1]. The gate
+    #: already requires the net benefit to exceed one sigma of that income's
+    #: uncertainty; this is an extra operator-owned haircut, 0 unless set.
+    CARRY_INCOME_HAIRCUT_FRACTION: float = 0.0
     #: Largest venue-clock skew (ms) startup tolerates; beyond it the process
     #: refuses to start rather than reason about funding windows and price age
     #: on a wrong clock.
@@ -980,6 +996,10 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
         CARRY_OPPORTUNITY_COST_APR=parse_float(
             env, "CARRY_OPPORTUNITY_COST_APR", 0.0, low=0.0, high=1.0),
+        CARRY_ENTRY_BENEFIT_MODE=parse_choice(
+            env, "CARRY_ENTRY_BENEFIT_MODE", "enforce", ("enforce", "observe")),
+        CARRY_INCOME_HAIRCUT_FRACTION=parse_float(
+            env, "CARRY_INCOME_HAIRCUT_FRACTION", 0.0, low=0.0, high=1.0),
         MAX_CLOCK_SKEW_MS=int(parse_float(
             env, "MAX_CLOCK_SKEW_MS", 2000.0, low=100.0, high=60_000.0)),
         CAPITAL_RESERVATION_TTL_S=parse_float(

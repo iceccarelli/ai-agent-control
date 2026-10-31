@@ -310,7 +310,13 @@ class TestPaperMeansNoCarryOrder:
                            product="spot")
 
     def test_the_engine_names_the_refusal(self):
-        bot, _client = _carry_bot(USE_TESTNET="1", PAPER_TRADING="1")
+        # This test is about the ORDER gate naming PAPER. The entry net-benefit
+        # gate (default "enforce") would refuse first on a book with no
+        # execution history, so it is put in observe mode to let the entry
+        # reach the order path; its own refusals are tested in
+        # test_entry_benefit_gate.py.
+        bot, _client = _carry_bot(USE_TESTNET="1", PAPER_TRADING="1",
+                                  CARRY_ENTRY_BENEFIT_MODE="observe")
         e = bot.carry
         e.snapshot = snap()
         warmed(e)
@@ -318,6 +324,27 @@ class TestPaperMeansNoCarryOrder:
                            funding_print_ms=_print_ms())
         assert d.acted is False
         assert "PAPER" in str(d.detail.get("error", ""))
+
+
+class TestTheEntryBenefitGateIsWiredAndFailsClosed:
+    def test_the_default_book_refuses_an_entry_before_any_order(self):
+        bot, client = _carry_bot(USE_TESTNET="1", PAPER_TRADING="1")
+        assert bot.carry.entry_benefit is not None
+        assert bot.carry.entry_benefit.mode == "enforce"
+        e = bot.carry
+        e.snapshot = snap()
+        warmed(e)
+        d = e.on_candle(mark=MARK, funding_bps=3.0, spot=MARK,
+                        funding_print_ms=_print_ms())
+        assert d.acted is False
+        assert d.reason == "ENTRY_BENEFIT_UNAVAILABLE"
+        assert e.last_entry_trace["layers"]["mechanical"]["passed"] is True
+        assert _created(client) == []
+
+    def test_observe_is_an_explicit_operator_choice(self):
+        bot, _ = _carry_bot(USE_TESTNET="1", PAPER_TRADING="1",
+                            CARRY_ENTRY_BENEFIT_MODE="observe")
+        assert bot.carry.entry_benefit.mode == "observe"
 
 
 class TestTheSpotLegIsSizedInBtc:

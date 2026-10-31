@@ -380,6 +380,9 @@ class TradingBot:
                 },
                 "book_state": engine.state.value,
                 "last_decision": dict(self._last_carry_decision),
+                "last_entry_trace": dict(getattr(engine, "last_entry_trace",
+                                                 {}) or {}),
+
                 "outlook": self._carry_outlook(engine),
                 # The carry book installs no protective stop BY DESIGN: it is
                 # delta-neutral and its protection is the margin-headroom and
@@ -2280,6 +2283,16 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             store=bot.store,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
         _attach_portfolio_authority(bot, cfg)
+        # The additional entry net-benefit gate: real execution costs, a
+        # conservative hold, and an evidence verdict, in front of every entry.
+        # No evidence provider exists in this repository, so under "enforce" an
+        # entry is refused (STRATEGY_EVIDENCE_INSUFFICIENT) until a verdict is
+        # genuinely supplied; that is the intended fail-closed state.
+        from entry_benefit_gate import EntryBenefitGate
+
+        bot.carry.entry_benefit = EntryBenefitGate(
+            mode=str(cfg.CARRY_ENTRY_BENEFIT_MODE),
+            income_haircut_fraction=float(cfg.CARRY_INCOME_HAIRCUT_FRACTION))
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
             "%.4f/yr, execution %s/%s, orders: %s. The directional strategy is "
