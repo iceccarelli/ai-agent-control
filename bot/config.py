@@ -555,6 +555,10 @@ class Config:
     #: earn as cash sets it, and the entry gate then demands the funding clear
     #: it as well as the fees and financing.
     CARRY_OPPORTUNITY_COST_APR: float = 0.0
+    #: Largest venue-clock skew (ms) startup tolerates; beyond it the process
+    #: refuses to start rather than reason about funding windows and price age
+    #: on a wrong clock.
+    MAX_CLOCK_SKEW_MS: int = 2000
     #: How long an entry's capital reservation may sit unconfirmed before it
     #: expires (seconds). An expired hold never frees dollars an unresolved
     #: order may be using. Operational, not economic.
@@ -976,6 +980,8 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
         CARRY_OPPORTUNITY_COST_APR=parse_float(
             env, "CARRY_OPPORTUNITY_COST_APR", 0.0, low=0.0, high=1.0),
+        MAX_CLOCK_SKEW_MS=int(parse_float(
+            env, "MAX_CLOCK_SKEW_MS", 2000.0, low=100.0, high=60_000.0)),
         CAPITAL_RESERVATION_TTL_S=parse_float(
             env, "CAPITAL_RESERVATION_TTL_S", 600.0, low=1.0, high=86_400.0),
         CARRY_EXECUTION_MODE=parse_execution_mode(env),

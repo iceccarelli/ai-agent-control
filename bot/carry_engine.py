@@ -63,6 +63,7 @@ direction. This module has no direction to give it.
 from __future__ import annotations
 
 import json
+import functools
 import logging
 import datetime as dt
 import math
@@ -569,6 +570,18 @@ class EntryEconomics:
     round_trip_bps: Optional[float]
     verdict: Optional[Any]
     refusal: Optional["CarryDecision"]
+
+
+def _clears_decision_marks(fn):
+    """The prices a tick decided on are kept only for the orders sent DURING
+    it: an order sent by any later path must not be measured against them."""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        finally:
+            self._decision_marks = {}
+    return wrapper
 
 
 class CarryEngine:
@@ -1224,6 +1237,7 @@ class CarryEngine:
             return "future"
         return None
 
+    @_clears_decision_marks
     def on_candle(self, *, mark: float, funding_bps: float,
                   spot: Optional[float] = None,
                   timestamp_ms: int = 0,
@@ -1246,6 +1260,12 @@ class CarryEngine:
         """
         self._capital_sync()
         self._last_tick_ms = int(timestamp_ms or 0)
+        # The prices THIS tick decided on, kept for the execution record: the
+        # slippage of every order sent during this tick is measured against
+        # these, never against anything observed later.
+        self._decision_marks = {
+            "linear": float(mark),
+            "spot": float(spot) if spot is not None else None}
         if self.state is BookState.HALTED:
             if self._halt_unwritten:
                 # The write that records the halt (and any exposure noted with
@@ -2898,9 +2918,41 @@ class CarryEngine:
             return None
         if symbol == self.perp_symbol and product == "linear":
             self._venue_verified_ms = None      # we are about to change it
+        self._declare_decision(symbol, product, side, qty)
         if patient and self.execution_style == MAKER_FIRST:
             return self._rest_then_take(symbol, side, qty, product, qty_step)
         return self._take(symbol, side, qty, product)
+
+    def _declare_decision(self, symbol: str, product: str, side: str,
+                          qty: float) -> None:
+        """Tell the broker which price this order was decided at. Bookkeeping
+        only: a broker that cannot take it, or a tick with no decision price,
+        leaves the fill's slippage UNAVAILABLE and trading goes on."""
+        begin = getattr(self.broker, "begin_decision", None)
+        if not callable(begin):
+            return
+        mark = (getattr(self, "_decision_marks", None) or {}).get(product)
+        if not mark or not self._finite(mark):
+            # No price for this decision: a context left from an earlier tick
+            # must not be measured against.
+            end = getattr(self.broker, "end_decision", None)
+            if callable(end):
+                try:
+                    end(symbol=symbol, product=product, side=side)
+                except Exception:  # noqa: BLE001
+                    logger.warning("stale decision context not cleared",
+                                   exc_info=True)
+            return
+        # Getting out is never slowed: an exit takes no extra public read to
+        # capture the touch; its reference is the tick's mark.
+        is_exit = (product == "linear" and side == "Buy") or (
+            product == "spot" and side == "Sell")
+        extra = {"capture_book": False} if is_exit else {}
+        try:
+            begin(symbol=symbol, product=product, side=side, qty=qty,
+                  mark=float(mark), **extra)
+        except Exception:  # noqa: BLE001
+            logger.warning("decision context not recorded", exc_info=True)
 
     @staticmethod
     def _accountable(result: Any, qty: float, *,

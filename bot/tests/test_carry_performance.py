@@ -78,8 +78,9 @@ def test_the_summary_figures(journal):
     assert s["peak_notional_usd"] == pytest.approx(100_000.0)
     assert s["return_on_peak_notional_pct"] == pytest.approx(-0.45)
     assert s["days_in_market"] == pytest.approx(32.0)
-    assert s["annualised_on_notional_in_market_pct"] == pytest.approx(
-        -450.0 / 100_000.0 * 100 * 365 / 32, rel=1e-6)
+    # three cycles is below the minimum sample: annualising it is refused
+    assert s["annualised_on_notional_in_market_pct"] is None
+    assert "SAMPLE_TOO_SMALL" in s["annualised_refusal_reason"]
     assert s["max_drawdown_usd"] == pytest.approx(1130.0)
     assert s["win_rate"] == pytest.approx(2 / 3)
     assert s["best_cycle_share_of_winning_net_pct"] == pytest.approx(

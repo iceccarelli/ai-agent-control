@@ -183,7 +183,10 @@ class PrivateWebSocket:
             return
         try:
             self._send_frame(OP_CLOSE, b"", sock=sock)
-        except OSError:
+        except (OSError, WSClosed):
+            # `_send_frame` wraps OSError as WSClosed; on a peer that already
+            # vanished that used to escape `close()` and skip `sock.close()`,
+            # leaking the descriptor on every reconnect.
             pass
         try:
             sock.close()
@@ -212,6 +215,10 @@ class PrivateWebSocket:
 
     #: How long the rest of a frame may take once its first byte has arrived.
     MID_FRAME_TIMEOUT_S = 10.0
+    #: Largest payload accepted. The length comes from the peer; trusting it
+    #: lets one corrupt header (or a hostile 2**63) make `recv` try to read or
+    #: allocate without bound. Bybit stream payloads are a few KB.
+    MAX_PAYLOAD_BYTES = 1 << 20
 
     def recv(self, *, timeout: Optional[float] = None) -> Tuple[int, bytes]:
         """One frame: (opcode, payload). Raises WSClosed on a close frame
@@ -256,6 +263,10 @@ class PrivateWebSocket:
                 length = struct.unpack("!H", self._recv_exact(sock, 2))[0]
             elif length == 127:
                 length = struct.unpack("!Q", self._recv_exact(sock, 8))[0]
+            if length > self.MAX_PAYLOAD_BYTES:
+                raise WSProtocolError(
+                    f"frame announces {length} bytes (limit "
+                    f"{self.MAX_PAYLOAD_BYTES}); refusing to read it")
             payload = self._recv_exact(sock, length) if length else b""
         except socket.timeout as exc:
             raise WSClosed("timed out in the middle of a frame") from exc

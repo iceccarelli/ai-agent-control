@@ -435,6 +435,11 @@ class _OrderTrail:
         self.link: Optional[str] = None
         self.submitted = False
         self.acked = False
+        #: Local wall-clock stamps (ms) taken at the time, never rebuilt: the
+        #: instant before the create request left, and when its answer (and
+        #: any read-back) was in hand. Feed the execution record's delays.
+        self.submit_ms: Optional[int] = None
+        self.response_ms: Optional[int] = None
 
     def intent(self, link: str, product: str, symbol: str, side: str,
                qty_text: str, price: float, qty: float, *,
@@ -482,6 +487,7 @@ class _OrderTrail:
 
     def submitting(self) -> None:
         log = self.b.order_log
+        self.submit_ms = self.b._clock_ms()
         if log is None or self.link is None:
             return
         try:
@@ -570,7 +576,8 @@ class CarryBroker:
                  session_token: str = "",
                  entry_gate: Any = None,
                  order_log: Any = None,
-                 exit_gate: Any = None) -> None:
+                 exit_gate: Any = None,
+                 clock_ms: Any = None) -> None:
         if not callable(order_gate):
             raise TypeError("order_gate must be callable -> (may_send, reason)")
         if entry_gate is not None and not callable(entry_gate):
@@ -591,6 +598,8 @@ class CarryBroker:
         self.order_log = order_log
         #: The cycle the engine named (via the ledger broker) for new intents.
         self._cycle_id = ""
+        #: Wall clock for execution timing stamps (injectable for tests).
+        self._clock_ms = clock_ms or (lambda: int(time.time() * 1000))
         self.client = client
         self.sequence_source = sequence_source
         self.order_gate = order_gate
@@ -650,7 +659,36 @@ class CarryBroker:
             trail.unresolved(exc)
             raise
         trail.finish(result)
-        return result
+        return self._annotate(result, trail, symbol=symbol, side=side,
+                              product=product, qty=qty, order_type="market")
+
+    #: Execution-record identity of every venue this adapter talks to.
+    VENUE = "bybit"
+
+    def _annotate(self, result: Optional[Dict[str, Any]], trail: "_OrderTrail",
+                  *, symbol: str, side: str, product: str, qty: Any,
+                  order_type: str) -> Optional[Dict[str, Any]]:
+        """Add the execution facts the ledger needs to a returned result.
+
+        Additive keys only (venue, symbol, order_type, requested_qty,
+        submit_ms, response_ms, fill_ms, fill_ms_basis). The fill itself
+        (filled_qty, avg_price, fee, order_link_id) is not touched."""
+        if not isinstance(result, dict):
+            return result
+        out = dict(result)
+        venue_ms = out.get("fill_ms") or out.get("updated_ms")
+        out.update(
+            venue=self.VENUE, symbol=symbol, product=product, side=side,
+            order_type=order_type,
+            requested_qty=(float(qty) if self._positive_finite(qty) else None),
+            submit_ms=trail.submit_ms, response_ms=self._clock_ms())
+        if venue_ms:
+            out["fill_ms"] = venue_ms
+            out["fill_ms_basis"] = "venue_updated_time"
+        else:
+            out["fill_ms"] = out["response_ms"]
+            out["fill_ms_basis"] = "local_receipt"
+        return out
 
     def _place_market_core(self, *, symbol: str, side: str, qty: float,
                            product: str, trail: "_OrderTrail"
@@ -859,7 +897,8 @@ class CarryBroker:
         return {"filled_qty": state["filled_qty"],
                 "avg_price": state["avg_price"],
                 "order_link_id": state["order_link_id"],
-                "fee": state["fee"], "fee_detail": state["fee_detail"]}
+                "fee": state["fee"], "fee_detail": state["fee_detail"],
+                "fill_ms": state.get("updated_ms")}
 
     # -- resting orders (0040) --------------------------------------------
 
@@ -932,7 +971,9 @@ class CarryBroker:
             trail.unresolved(exc)
             raise
         trail.finish_resting(result)
-        return result
+        return self._annotate(result, trail, symbol=symbol, side=side,
+                              product=product, qty=qty,
+                              order_type="post_only")
 
     def _place_post_only_core(self, *, symbol: str, side: str, qty: float,
                               price: float, product: str,
@@ -1148,7 +1189,16 @@ class CarryBroker:
                               if filled > 0 else 0.0),
                 "order_link_id": link_id, "fee": self._fee(row),
                 "fee_detail": self._fee_detail(row),
-                "maker": True, "resting": resting, "status": status}
+                "maker": True, "resting": resting, "status": status,
+                "updated_ms": self._venue_ms(row.get("updatedTime"))}
+
+    @staticmethod
+    def _venue_ms(raw: Any) -> Optional[int]:
+        try:
+            v = int(float(raw))
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
 
     def read_order(self, symbol: str, order_link_id: str,
                    product: str = LINEAR) -> Optional[Dict[str, Any]]:
