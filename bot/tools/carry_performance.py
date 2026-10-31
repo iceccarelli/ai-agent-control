@@ -288,6 +288,10 @@ def _finish(cur: Dict[str, Any]) -> Dict[str, Any]:
     cur["perp_exit_price"] = (
         sum(q * p for q, p in closes) / sum(q for q, _ in closes)
         if qty and closes and cur["outcome"] == "CLOSED" else None)
+    cur["perp_entry_notional_usd"] = (
+        sum(q * p for q, p in opens) if opens and not unread else None)
+    cur["perp_exit_notional_usd"] = (
+        sum(q * p for q, p in closes) if closes and not unread else None)
     cur["overlay"] = hedged and cur["spot_cost_usd"] <= 0
     cur["has_perp"] = hedged
     for key in ("perp_closed", "notional_unknown", "first_open_ms",
@@ -316,16 +320,27 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 "spot_sold": False, "first_open_ms": None,
                 "last_close_ms": None, "_fee_statuses": [], "_bases": [],
                 "revalue_usd": 0.0, "fills": 0, "_opens": [], "_closes": [],
-                "_fill_memo_unread": False}
+                "_fill_memo_unread": False,
+                "funding_received_usd": 0.0, "funding_paid_usd": 0.0,
+                "funding_entries": 0, "borrow_entries": 0,
+                "spot_buy_gross_usd": 0.0, "spot_buy_net_qty": 0.0,
+                "spot_sell_gross_usd": 0.0, "spot_sold_qty": 0.0,
+                "fill_refs": []}
             order.append(e.cycle)
         cur["last_ms"] = e.ms
         for line in e.lines:
             if line.account == L.FUNDING:
                 cur["funding_usd"] += -line.usd
+                cur["funding_entries"] += 1
+                if -line.usd >= 0:
+                    cur["funding_received_usd"] += -line.usd
+                else:
+                    cur["funding_paid_usd"] += line.usd
             elif line.account == L.FEES:
                 cur["fees_usd"] += line.usd
             elif line.account == L.BORROW:
                 cur["borrow_usd"] += line.usd
+                cur["borrow_entries"] += 1
             elif line.account == L.REALISED:
                 cur["realised_usd"] += -line.usd
             elif line.account == L.PERP:
@@ -334,6 +349,14 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 cur["spot_qty"] += line.qty
         if e.kind in L.FILL_KINDS:
             cur["fills"] += 1
+            cur["fill_refs"].append(e.ref)
+        if e.kind == "spot_buy" and e.lines:
+            cur["spot_buy_gross_usd"] += e.lines[0].usd
+            cur["spot_buy_net_qty"] += sum(l.qty for l in e.lines
+                                           if l.account == L.BTC)
+        if e.kind == "spot_sell" and len(e.lines) > 1:
+            cur["spot_sell_gross_usd"] += e.lines[0].usd
+            cur["spot_sold_qty"] += -e.lines[1].qty
         if e.kind in ("perp_open", "perp_close"):
             fill = _memo_fill(e)
             if fill is None:
@@ -460,15 +483,30 @@ def summarise(cycles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                                         if peak else None)
     days = sum(c["hold_days"] or 0.0 for c in closed)
     s["days_in_market"] = days
-    s["annualised_on_notional_in_market_pct"] = (
-        100.0 * total_net / peak * 365.0 / days
-        if peak and days >= 1.0 else None)
+    import performance_analytics as PA
+    ann, ann_why = PA.annualise_simple(
+        100.0 * total_net / peak if peak else None, days, len(closed))
+    s["annualised_on_notional_in_market_pct"] = ann
+    s["annualised_refusal_reason"] = ann_why or None
+    s["annualisation_rule"] = (
+        f">= {PA.MIN_ANNUALISE_CYCLES} closed cycles and >= "
+        f"{PA.MIN_ANNUALISE_DAYS:g} days in market, else None")
+    # A cost the venue did not state is booked as 0 and flagged; the totals
+    # above are then a LOWER BOUND on cost / UPPER BOUND on net, never final.
+    s["cycles_with_unstated_fees"] = sum(
+        1 for c in closed if c.get("fees_unconfirmed_fills"))
+    s["cycles_with_unverified_funding"] = sum(
+        1 for c in closed if c.get("funding_unverified_entries"))
+    s["totals_are_bounds"] = bool(s["cycles_with_unstated_fees"]
+                                  or s["cycles_with_unverified_funding"])
     cum = peak_cum = drawdown = 0.0
     for c in sorted(closed, key=lambda c: c["start_ms"]):
         cum += c["net_usd"]
         peak_cum = max(peak_cum, cum)
         drawdown = max(drawdown, peak_cum - cum)
     s["max_drawdown_usd"] = drawdown
+    s["open_cycle_booked_costs_usd"] = sum(
+        c["fees_usd"] + c["borrow_usd"] for c in cycles if not c["closed"])
     s["win_rate"] = sum(1 for c in closed if c["net_usd"] > 0) / len(closed)
     wins = sorted((c["net_usd"] for c in closed if c["net_usd"] > 0),
                   reverse=True)
@@ -858,11 +896,661 @@ def slippage_section(journal: Any, env: Mapping[str, Any]) -> Dict[str, Any]:
         slippage_cost_usd=total, **fields)
 
 
+# -- net economics: every component a number with its evidence, or UNAVAILABLE --
+
+NET_ECONOMICS_SCHEMA = "net_economics/1"
+
+#: Components that ADD UP to a cycle's net. Everything else in a cycle's
+#: ``components`` is a memo line (``additive: False``): shown for diagnosis,
+#: never summed into net, because its cost is already inside an additive line
+#: (slippage is inside the price leg; failed-leg cost is inside the aborted
+#: cycle's net; a counterfactual is not a cost at all).
+ADDITIVE_COMPONENTS = ("funding_net", "fees", "financing", "price_leg")
+
+
+def _comp(value: Optional[float], evidence_class: str, *, unit: str = "usd",
+          status: str = "BOOKED", why: Optional[str] = None,
+          additive: bool = False, sign: str = "", **extra: Any) -> Dict[str, Any]:
+    """One economics line. A missing number is None AND says why: it is never
+    0 and never omitted."""
+    if value is None:
+        evidence_class = UNAVAILABLE
+        status = status if status != "BOOKED" else "UNAVAILABLE"
+        if not why:
+            raise ReportIntegrityError("an UNAVAILABLE component must say why")
+    out = {"value": value, "unit": unit, "evidence_class": evidence_class,
+           "status": status, "additive": additive, "sign": sign}
+    if why:
+        out["why"] = why
+    out.update(extra)
+    return out
+
+
+def slippage_by_cycle(journal: Any) -> Dict[str, Dict[str, Any]]:
+    """Per cycle: fills, fills with a decision mark, and the measured slippage
+    (positive = adverse). Same arithmetic as `slippage_section`."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for e in journal.entries:
+        if e.kind not in L.FILL_KINDS or not e.cycle:
+            continue
+        cur = out.setdefault(e.cycle, {"fills": 0, "measured": 0, "usd": 0.0})
+        cur["fills"] += 1
+        spq = _fill_price_qty(e)
+        if e.decision_mark is None or spq is None:
+            continue
+        side, qty, price = spq
+        cur["measured"] += 1
+        cur["usd"] += ((price - e.decision_mark) if side == "Buy"
+                       else (e.decision_mark - price)) * qty
+    return out
+
+
+def cycle_net_economics(c: Mapping[str, Any],
+                        slip: Optional[Mapping[str, Any]] = None,
+                        opp: Optional[Mapping[str, Any]] = None
+                        ) -> Dict[str, Any]:
+    """The complete per-cycle economics of a classified cycle."""
+    cls = c.get("evidence_class", UNAVAILABLE)
+    closed = bool(c["closed"])
+    fees_ok = c.get("fees_complete", c.get("fees_unconfirmed_fills", 0) == 0)
+    fund_ok = c.get("funding_complete", c.get("funding_unverified_entries", 0) == 0)
+    bad_cls = cls if cls != UNAVAILABLE else UNAVAILABLE
+    comp: Dict[str, Any] = {}
+    overlay = bool(c.get("overlay"))
+
+    def principal(name, value, why_none):
+        comp[name] = _comp(value, cls, status="BOOKED", additive=False,
+                           why=why_none, note="gross principal flow; "
+                           "its gain/loss is the price leg, not added again")
+
+    principal("spot_buy", c["spot_buy_gross_usd"] if c["spot_buy_gross_usd"]
+              else None, "no spot purchase in this cycle (overlay hedges the "
+              "client's own BTC, or the cycle never bought)")
+    principal("spot_sell", c["spot_sell_gross_usd"] if c["spot_sold_qty"]
+              else None, "no spot sale in this cycle")
+    principal("perp_entry", c.get("perp_entry_notional_usd"),
+              "no perp entry, or a perp fill memo could not be read")
+    principal("perp_exit", c.get("perp_exit_notional_usd"),
+              "the perp leg has not been closed, or a fill memo was unreadable")
+
+    comp["funding_received"] = _comp(
+        c["funding_received_usd"], cls, additive=False, sign="income",
+        status="BOOKED" if fund_ok else "UNVERIFIED",
+        note="sum of positive funding prints (venue paid the book)")
+    comp["funding_paid"] = _comp(
+        c["funding_paid_usd"], cls, additive=False, sign="cost",
+        status="BOOKED" if fund_ok else "UNVERIFIED",
+        note="sum of negative funding prints (book paid the venue)")
+    comp["funding_net"] = _comp(
+        c["funding_usd"], cls, additive=True, sign="income",
+        status="BOOKED" if fund_ok else "UNVERIFIED",
+        note=None if fund_ok else "includes entries that are estimated, "
+        "unattributed (booked $0) or unread")
+    comp["maker_fee"] = _comp(None, UNAVAILABLE, why=(
+        "MAKER_TAKER_NOT_JOURNALLED: a ledger entry records the fee, not the "
+        "execution type, so the fee cannot be split into maker and taker"))
+    comp["taker_fee"] = comp["maker_fee"]
+    comp["fees"] = _comp(
+        c["fees_usd"], cls, additive=True, sign="cost",
+        status="BOOKED" if fees_ok else "INCOMPLETE_LOWER_BOUND",
+        note=None if fees_ok else (
+            f"{c.get('fees_unconfirmed_fills')} fill(s) with a fee the venue "
+            "did not state were booked at $0: the true fee is at least this"))
+    comp["financing"] = _comp(
+        c["borrow_usd"], cls, additive=True, sign="cost",
+        status="BOOKED" if c["borrow_entries"] else "NONE_BOOKED",
+        note=None if c["borrow_entries"] else (
+            "no borrow/financing entry was booked; that is not proof that "
+            "none accrued"))
+    comp["price_leg"] = _comp(c["realised_usd"], cls, additive=True,
+                              sign="income_or_cost")
+
+    s = slip or {}
+    if not s.get("fills"):
+        comp["slippage"] = _comp(None, UNAVAILABLE, why="no fills in this cycle")
+    elif s["measured"] < s["fills"]:
+        comp["slippage"] = _comp(
+            None, UNAVAILABLE, why=(
+                f"DECISION_MARK_NOT_JOURNALLED: {s['fills'] - s['measured']} of "
+                f"{s['fills']} fills carry no decision mark; unknown, not zero"),
+            measured_subset_usd=s["usd"])
+    else:
+        comp["slippage"] = _comp(
+            s["usd"], cls, sign="cost", additive=False,
+            embedded_in="price_leg",
+            note="fill price vs decision-time mark; ALREADY inside price_leg "
+                 "(fills are booked at the actual price) and is not part of "
+                 "fees; never subtract it from net again")
+    comp["spread"] = _comp(None, UNAVAILABLE, why=(
+        "BOOK_TOP_NOT_JOURNALLED: bid/ask at decision time is not recorded; "
+        "spread paid is unknown, not zero"))
+
+    if c["outcome"] == "ABORTED_BEFORE_HEDGE":
+        comp["failed_leg_cost"] = _comp(
+            -c["net_usd"], cls, sign="cost", additive=False,
+            embedded_in="cycle net", note="spot bought, perp never landed, "
+            "spot sold flat: the whole round trip is this cycle's loss")
+    elif closed:
+        comp["failed_leg_cost"] = _comp(
+            0.0, cls, status="NOT_APPLICABLE", additive=False,
+            note="the cycle completed its hedge; an order that never filled "
+                 "is counted at book level (execution_quality)")
+    else:
+        comp["failed_leg_cost"] = _comp(None, UNAVAILABLE,
+                                        why="cycle still open")
+    comp["partial_execution"] = _comp(None, UNAVAILABLE, why=(
+        "the ledger books fills only; requested-vs-filled quantity lives in "
+        "the order record and is reported at book level (execution_quality)"))
+
+    # hedge imbalance: spot actually held vs the perp it was hedged with
+    hq = c.get("hedged_qty")
+    if overlay:
+        comp["hedge_imbalance"] = _comp(None, UNAVAILABLE, status="NOT_APPLICABLE",
+                                        why="overlay: the client's BTC is the "
+                                        "spot leg, no purchase to compare")
+    elif hq is None or not c["spot_buy_net_qty"]:
+        comp["hedge_imbalance"] = _comp(None, UNAVAILABLE, why=(
+            "no spot purchase or no readable perp quantity in this cycle"))
+    else:
+        diff = c["spot_buy_net_qty"] - hq
+        px = c.get("perp_entry_price") or 0.0
+        comp["hedge_imbalance"] = _comp(
+            diff, cls, unit="btc", sign="exposure", additive=False,
+            usd_at_entry=diff * px,
+            note="spot BTC held (net of BTC-denominated fee) minus perp qty; "
+                 "positive = long residual, negative = short residual")
+
+    cap, days = c.get("capital_committed_usd"), c.get("hold_days")
+    comp["capital_reservation"] = _comp(None, UNAVAILABLE, why=(
+        "reservations are not keyed to a cycle; see execution_quality / "
+        "capital_reservations at book level"))
+    if cap and days:
+        comp["capital_occupation"] = _comp(cap * days, cls, unit="usd_days",
+                                           capital_usd=cap, hold_days=days)
+    else:
+        comp["capital_occupation"] = _comp(None, UNAVAILABLE, unit="usd_days",
+                                           why="no committed capital or no "
+                                           "holding period for this cycle")
+    o = (opp or {}).get("vs_unhedged_btc") or {}
+    if o.get("available"):
+        comp["btc_opportunity_cost"] = _comp(
+            o["unhedged_btc_pnl_usd"], HISTORICAL_SIMULATION,
+            status="COUNTERFACTUAL", additive=False,
+            note="what the same BTC would have made unhedged over the "
+                 "holding period; a counterfactual, not a booked cost")
+    else:
+        comp["btc_opportunity_cost"] = _comp(None, UNAVAILABLE, why=(
+            o.get("why") or "no opportunity-cost computation for this cycle"))
+    r = (opp or {}).get("vs_benchmark_rate") or {}
+    if r.get("available"):
+        comp["benchmark_rate_alternative"] = _comp(
+            r["benchmark_alternative_usd"], HISTORICAL_SIMULATION,
+            status="COUNTERFACTUAL", additive=False,
+            benchmark_apr_pct=r.get("benchmark_apr_pct"))
+    else:
+        comp["benchmark_rate_alternative"] = _comp(None, UNAVAILABLE, why=(
+            r.get("why") or "no benchmark computation for this cycle"))
+    comp["conversion_cost"] = _comp(None, UNAVAILABLE, why=(
+        "USDT<->BTC conversions are not journalled as their own entries; a "
+        "BTC-denominated spot fee is booked at the fill price"))
+
+    additive_sum = (comp["funding_net"]["value"] - comp["fees"]["value"]
+                    - comp["financing"]["value"] + comp["price_leg"]["value"])
+    complete = bool(fees_ok and fund_ok)
+    return {"cycle_id": c["cycle_id"], "outcome": c["outcome"],
+            "evidence_class": cls, "closed": closed,
+            "complete": complete,
+            "net_after_booked_costs_usd": c["net_usd"],
+            "additive_components_sum_usd": additive_sum,
+            "components": comp}
+
+
+def check_net_components(cycles: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Invariant: per cycle, funding - fees - financing + price leg equals the
+    net the cycle reports, and funding received - paid equals funding net.
+    A cost counted twice (or dropped) shows up as a difference here."""
+    bad = []
+    for c in cycles:
+        e = (c["funding_usd"] - c["fees_usd"] - c["borrow_usd"]
+             + c["realised_usd"])
+        f = c["funding_received_usd"] - c["funding_paid_usd"]
+        if (abs(e - c["net_usd"]) > L.BALANCE_TOLERANCE
+                or abs(f - c["funding_usd"]) > L.BALANCE_TOLERANCE):
+            bad.append({"cycle_id": c["cycle_id"], "components_sum_usd": e,
+                        "net_usd": c["net_usd"], "funding_split_usd": f,
+                        "funding_usd": c["funding_usd"]})
+    return {"name": "net_components_sum_to_cycle_net", "ok": not bad,
+            "detail": {"mismatched": bad}}
+
+
+def load_carry_order_execution(db_path: str) -> Optional[List[Dict[str, Any]]]:
+    conn = _ro(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT order_link_id, status, qty, filled_qty FROM orders "
+            "WHERE purpose LIKE 'carry-%'").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return [{"link": str(r[0]), "status": str(r[1]), "qty": float(r[2] or 0.0),
+             "filled_qty": float(r[3] or 0.0)} for r in rows]
+
+
+def load_capital_reservations(db_path: str) -> Optional[List[Dict[str, Any]]]:
+    conn = _ro(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT intent_id, state, amount_usd, created_epoch, updated_epoch "
+            "FROM capital_reservation").fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+    return [{"intent_id": str(r[0]), "state": str(r[1]),
+             "amount_usd": float(r[2] or 0.0), "created": float(r[3] or 0.0),
+             "updated": float(r[4] or 0.0)} for r in rows]
+
+
+def execution_quality(orders: Optional[Sequence[Mapping[str, Any]]],
+                      slip_total: Mapping[str, Any]) -> Dict[str, Any]:
+    """Book-level partial / abandoned order counts and expected-vs-actual."""
+    if orders is None:
+        return {"orders": _comp(None, UNAVAILABLE,
+                                why="no orders table in this database")}
+    term = [o for o in orders if o["status"] in _order_lifecycle.TERMINAL]
+    partial = [o for o in term if 0 < o["filled_qty"] < o["qty"]
+               and abs(o["qty"] - o["filled_qty"]) > max(1e-9, 1e-6 * o["qty"])]
+    unfilled = [o for o in term if o["filled_qty"] <= 0]
+    return {
+        "carry_orders": len(orders), "terminal_orders": len(term),
+        "partially_filled_orders": len(partial),
+        "unfilled_terminal_orders": len(unfilled),
+        "unfilled_qty_total": sum(o["qty"] - o["filled_qty"] for o in term
+                                  if o["qty"] > o["filled_qty"]),
+        "cost_of_partial_or_abandoned_orders": _comp(None, UNAVAILABLE, why=(
+            "a leg that filled partially or not at all leaves unhedged "
+            "exposure whose price move is not journalled; count only")),
+        "slippage_expected_vs_actual": slip_total}
+
+
+def reservation_stats(rows: Optional[Sequence[Mapping[str, Any]]],
+                      now_ms: int, cls: str) -> Dict[str, Any]:
+    if rows is None:
+        return _comp(None, UNAVAILABLE, why="no capital_reservation table")
+    if not rows:
+        return _comp(None, UNAVAILABLE, why="no capital reservations recorded")
+    now_s = now_ms / 1000.0
+    durs: List[float] = []
+    usd_days, still = 0.0, 0
+    for r in rows:
+        end = r["updated"]
+        if r["state"] == "RESERVED":
+            end, still = now_s, still + 1
+        d = max(0.0, end - r["created"])
+        durs.append(d)
+        usd_days += r["amount_usd"] * d / 86400.0
+    return _comp(sum(durs) / len(durs) / 3600.0, cls, unit="hours_mean",
+                 reservations=len(rows), still_reserved=still,
+                 max_hours=max(durs) / 3600.0,
+                 reserved_capital_usd_days=usd_days,
+                 note="duration from created to last update (still-RESERVED "
+                      "rows to now); a reservation is an intent, not a fill")
+
+
+def _metric(value: Optional[float], evidence_class: str, definition: str, *,
+            unit: str = "usd", why: Optional[str] = None,
+            status: str = "COMPUTED", **extra: Any) -> Dict[str, Any]:
+    if value is None:
+        evidence_class, status = UNAVAILABLE, "UNAVAILABLE"
+        if not why:
+            raise ReportIntegrityError("an UNAVAILABLE metric must say why")
+    out = {"value": value, "unit": unit, "evidence_class": evidence_class,
+           "status": status, "definition": definition}
+    if why:
+        out["why"] = why
+    out.update(extra)
+    return out
+
+
+def _agg_class(cycles: Sequence[Mapping[str, Any]], default: str) -> str:
+    if cycles and all(c["evidence_class"] == ACTUAL_RECONCILED for c in cycles):
+        return ACTUAL_RECONCILED
+    return default
+
+
+def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
+                  journal: Any, opp_by_cycle: Mapping[str, Mapping[str, Any]],
+                  period_days: Optional[float],
+                  total_capital_usd: Optional[float] = None,
+                  cash_apr_pct: Optional[float] = None,
+                  orders: Optional[Sequence[Mapping[str, Any]]] = None,
+                  reservations: Optional[Sequence[Mapping[str, Any]]] = None,
+                  now_ms: int = 0) -> Dict[str, Any]:
+    """The complete net-economics section body and the verdict.
+
+    DEFINITIONS (one each):
+      net            = funding received - funding paid - fees - financing
+                       + price legs (perp entry->exit, spot cost->proceeds),
+                       booked in the ledger; execution slippage is INSIDE the
+                       price legs and is not subtracted again.
+      committed capital = observed venue initial margin + spot leg (per cycle);
+                       the period base is the PEAK single-cycle figure.
+      capital-day    = committed capital x holding days.
+      headline return = net / peak committed capital. Never gross funding.
+    """
+    import performance_analytics as PA
+
+    booked_cls = env["booked_figures_class"]
+    closed = [c for c in cycles if c["closed"]]
+    open_ = [c for c in cycles if not c["closed"]]
+    slip_all = slippage_by_cycle(journal)
+    per_cycle = [cycle_net_economics(c, slip_all.get(c["cycle_id"]),
+                                     opp_by_cycle.get(c["cycle_id"]))
+                 for c in cycles]
+    cls_closed = _agg_class(closed, booked_cls)
+    ordered = sorted(closed, key=lambda c: c["start_ms"])
+    nets = [c["net_usd"] for c in ordered]
+    complete = all(c.get("fees_complete") and c.get("funding_complete")
+                   for c in closed)
+    inc_status = "COMPLETE" if complete else "INCOMPLETE_BOUND"
+    M: Dict[str, Any] = {}
+
+    funding_net = sum(c["funding_usd"] for c in closed)
+    funding_in = sum(c["funding_received_usd"] for c in closed)
+    funding_out = sum(c["funding_paid_usd"] for c in closed)
+    fees = sum(c["fees_usd"] for c in closed)
+    fin = sum(c["borrow_usd"] for c in closed)
+    price = sum(c["realised_usd"] for c in closed)
+    net = sum(nets)
+    if not closed:
+        no = "NO_CLOSED_CYCLES: no cycle has gone flat"
+        for k in ("net_closed_cycles_usd", "funding_received_usd",
+                  "funding_paid_usd"):
+            M[k] = _metric(None, UNAVAILABLE, k, why=no)
+    else:
+        M["net_closed_cycles_usd"] = _metric(
+            net, cls_closed, "sum over closed cycles of funding received - "
+            "funding paid - fees - financing + price legs", status=inc_status)
+        M["funding_received_usd"] = _metric(
+            funding_in, cls_closed, "sum of positive funding prints",
+            status=inc_status)
+        M["funding_paid_usd"] = _metric(
+            funding_out, cls_closed, "sum of negative funding prints "
+            "(a cost)", status=inc_status)
+    # open positions: costs and income booked so far; NOT valued at a mark
+    open_booked = sum(c["funding_usd"] - c["fees_usd"] - c["borrow_usd"]
+                      + c["realised_usd"] for c in open_)
+    if open_:
+        M["net_open_positions_booked_usd"] = _metric(
+            open_booked, OPEN_MARK_TO_MARKET, "funding - fees - financing + "
+            "price legs booked so far on cycles that have not gone flat; NO "
+            "mark is journalled, so the unrealised price move is excluded",
+            status="PARTIAL_NO_MARK",
+            mark_to_market_usd=_metric(None, UNAVAILABLE, "mark to market",
+                                       why="NO_MARK_JOURNALLED"))
+    else:
+        M["net_open_positions_booked_usd"] = _metric(
+            None, UNAVAILABLE, "open positions", why="no open cycle")
+    M["net_total_including_open_booked_usd"] = _metric(
+        net + open_booked, booked_cls, "closed net + open positions' booked "
+        "costs and income (no mark)", status="PARTIAL_NO_MARK") \
+        if closed or open_ else _metric(None, UNAVAILABLE, "total",
+                                        why="no cycles")
+
+    # capital
+    hedged = [c for c in closed if c["outcome"] == "CLOSED"]
+    caps = [c.get("capital_committed_usd") for c in hedged]
+    cap_ok = bool(hedged) and all(x for x in caps)
+    peak_cap = max(caps) if cap_ok else None
+    cap_days = (sum(c["capital_committed_usd"] * c["hold_days"] for c in hedged)
+                if cap_ok else None)
+    no_cap = ("no observed venue margin (or no spot leg value) for every "
+              "closed hedged cycle; committed capital is never guessed")
+    M["return_on_committed_capital_pct"] = (
+        _metric(100.0 * net / peak_cap, cls_closed, "net / PEAK single-cycle "
+                "committed capital; whole period, not annualised",
+                unit="pct", status=inc_status, denominator_usd=peak_cap)
+        if peak_cap and closed else
+        _metric(None, UNAVAILABLE, "net / peak committed capital", why=no_cap))
+    if total_capital_usd is not None and total_capital_usd > 0 \
+            and math.isfinite(total_capital_usd) and closed:
+        M["return_on_total_capital_pct"] = _metric(
+            100.0 * net / total_capital_usd, cls_closed,
+            "net / operator-supplied total account capital; not annualised",
+            unit="pct", status=inc_status, denominator_usd=total_capital_usd,
+            denominator_source="operator-supplied (--total-capital-usd)")
+    else:
+        M["return_on_total_capital_pct"] = _metric(
+            None, UNAVAILABLE, "net / total capital", unit="pct",
+            why="TOTAL_CAPITAL_NOT_SUPPLIED: pass --total-capital-usd; the "
+                "ledger does not know the account's capital")
+    days_in_market = sum(c.get("hold_days") or 0.0 for c in closed)
+    M["capital_occupation_usd_days"] = (
+        _metric(cap_days, cls_closed, "sum over closed hedged cycles of "
+                "committed capital x holding days", unit="usd_days")
+        if cap_days else _metric(None, UNAVAILABLE, "capital-days", why=no_cap,
+                                 unit="usd_days"))
+    per_cd = (100.0 * net / cap_days) if cap_days else None
+    M["net_return_per_capital_day_pct"] = (
+        _metric(per_cd, cls_closed, "net / capital-days x 100 (per $ of "
+                "committed capital per day)", unit="pct_per_usd_day",
+                status=inc_status)
+        if per_cd is not None else
+        _metric(None, UNAVAILABLE, "net per capital-day", why=no_cap,
+                unit="pct_per_usd_day"))
+    ann = ann_why = None
+    if per_cd is not None:
+        ann, ann_why = PA.annualise_simple(per_cd * days_in_market,
+                                           days_in_market, len(closed))
+    M["annualised_return_on_committed_capital_pct"] = (
+        _metric(ann, cls_closed, "net per capital-day x 365 (simple, not "
+                "compounded); refused for small samples", unit="pct",
+                status=inc_status)
+        if ann is not None else _metric(
+            None, UNAVAILABLE, "annualised return", unit="pct",
+            why=ann_why or no_cap))
+    M["annualisation_rule"] = {
+        "min_closed_cycles": PA.MIN_ANNUALISE_CYCLES,
+        "min_days_in_market": PA.MIN_ANNUALISE_DAYS,
+        "closed_cycles": len(closed), "days_in_market": days_in_market}
+    M["time_utilization_pct"] = (
+        _metric(100.0 * min(1.0, days_in_market / period_days), cls_closed,
+                "days with a position open / calendar days first start to last "
+                "close", unit="pct")
+        if closed and period_days and period_days > 0 else
+        _metric(None, UNAVAILABLE, "time utilization", unit="pct",
+                why="no closed cycle or zero-length period"))
+    M["capital_utilization_pct"] = (
+        _metric(100.0 * cap_days / (total_capital_usd * period_days),
+                cls_closed, "capital-days / (total capital x period days)",
+                unit="pct")
+        if cap_days and total_capital_usd and total_capital_usd > 0
+        and period_days and period_days > 0 else
+        _metric(None, UNAVAILABLE, "capital utilization", unit="pct",
+                why="needs committed capital for every closed hedged cycle AND "
+                    "an operator-supplied total capital"))
+    M["reservation_duration"] = reservation_stats(reservations, now_ms,
+                                                  booked_cls)
+
+    # risk and distribution
+    dd = PA.max_drawdown_usd(nets) if closed else None
+    M["max_drawdown_usd"] = (
+        _metric(dd, cls_closed, "largest peak-to-trough fall of cumulative net "
+                "across closed cycles in start order; counts closed cycles "
+                "only (no intra-cycle mark)", status=inc_status)
+        if closed else _metric(None, UNAVAILABLE, "drawdown",
+                               why="NO_CLOSED_CYCLES"))
+    dsd = PA.downside_deviation(nets) if closed else None
+    M["downside_deviation_usd"] = (
+        _metric(dsd, cls_closed, "sqrt(mean(min(cycle net, 0)^2)) over all "
+                "closed cycles", status=inc_status)
+        if dsd is not None else _metric(
+            None, UNAVAILABLE, "downside deviation",
+            why=f"SAMPLE_TOO_SMALL: needs >= {PA.MIN_CYCLES_FOR_DISPERSION} "
+                "closed cycles"))
+    conc = PA.profit_concentration(nets) if closed else {}
+    M["net_excluding_largest_winner_usd"] = (
+        _metric(conc["net_excluding_largest_winner_usd"], cls_closed,
+                "net of closed cycles with the single best cycle removed",
+                status=inc_status)
+        if closed else _metric(None, UNAVAILABLE, "ex-winner",
+                               why="NO_CLOSED_CYCLES"))
+    M["profit_concentration"] = (
+        _metric(conc["largest_winner_share_of_winning_net_pct"], cls_closed,
+                "best cycle / sum of winning cycles x 100", unit="pct",
+                status=inc_status,
+                top_quartile_share_of_winning_net_pct=conc[
+                    "top_quartile_share_of_winning_net_pct"])
+        if closed and conc["largest_winner_usd"] is not None else
+        _metric(None, UNAVAILABLE, "concentration", unit="pct",
+                why="no winning closed cycle"))
+    ex = PA.expectancy(nets)
+    M["expectancy_after_costs_usd"] = (
+        _metric(ex["expectancy_per_cycle_usd"], cls_closed, "mean net per "
+                "closed cycle, after every booked cost", status=inc_status,
+                win_rate=ex["win_rate"], avg_win_usd=ex["avg_win_usd"],
+                avg_loss_usd=ex["avg_loss_usd"], cycles=len(closed))
+        if closed else _metric(None, UNAVAILABLE, "expectancy",
+                               why="NO_CLOSED_CYCLES"))
+    for dim in ("regime", "symbol", "venue"):
+        M[f"performance_by_{dim}"] = _metric(
+            None, UNAVAILABLE, f"net by {dim}", why=(
+                f"{dim.upper()}_NOT_JOURNALLED: the carry ledger's cycles carry "
+                "no " + dim + " attribute, so no split is computed"))
+
+    # execution
+    slip_tot = {"fills": sum(v["fills"] for v in slip_all.values()),
+                "measured_fills": sum(v["measured"] for v in slip_all.values()),
+                "slippage_cost_usd_measured_subset": sum(
+                    v["usd"] for v in slip_all.values()),
+                "complete": all(v["measured"] == v["fills"]
+                                for v in slip_all.values()) and bool(slip_all),
+                "expected_funding": _comp(None, UNAVAILABLE, why=(
+                    "the funding expected at entry is not journalled, so "
+                    "expected-vs-actual funding is unknown"))}
+    M["execution_quality"] = execution_quality(orders, slip_tot)
+
+    # benchmarks: only when every closed hedged cycle has the figure
+    def _all(key: str, field: str) -> Optional[List[float]]:
+        vals = []
+        for c in hedged:
+            blk = (opp_by_cycle.get(c["cycle_id"]) or {}).get(key) or {}
+            if not blk.get("available"):
+                return None
+            vals.append(blk[field])
+        return vals or None
+    u = _all("vs_unhedged_btc", "unhedged_btc_pnl_usd")
+    M["vs_unhedged_btc_hold"] = (
+        _metric(sum(u), HISTORICAL_SIMULATION, "sum of what the hedged BTC "
+                "would have made unhedged over the same holding periods",
+                status="COUNTERFACTUAL", hedged_pair_minus_unhedged_usd=net - sum(u))
+        if u else _metric(None, UNAVAILABLE, "unhedged BTC", why=(
+            "an unhedged-hold comparison needs a closed overlay cycle with "
+            "readable perp prices for EVERY closed hedged cycle")))
+    b = _all("vs_benchmark_rate", "benchmark_alternative_usd")
+    M["vs_benchmark_rate"] = (
+        _metric(sum(b), HISTORICAL_SIMULATION, "committed capital held at the "
+                "operator-supplied APR over the same holding periods",
+                status="COUNTERFACTUAL", benchmark_apr_pct=cash_apr_pct,
+                net_minus_benchmark_usd=net - sum(b))
+        if b else _metric(None, UNAVAILABLE, "benchmark rate", why=(
+            "no operator-supplied --cash-apr, or committed capital missing "
+            "for a closed hedged cycle")))
+
+    verdict = net_verdict(
+        closed=closed, net=net, funding_net=funding_net, fees=fees,
+        financing=fin, price=price, complete=complete,
+        net_ex_winner=(conc.get("net_excluding_largest_winner_usd")
+                       if closed else None),
+        open_booked=open_booked, n_open=len(open_),
+        vs_benchmark=(net - sum(b)) if b else None,
+        sample_ok=len(closed) >= PA.MIN_ANNUALISE_CYCLES)
+    headline = {
+        "basis": "NET_AFTER_BOOKED_COSTS",
+        "net_usd": net if closed else None,
+        "return_on_committed_capital_pct": M["return_on_committed_capital_pct"][
+            "value"],
+        "annualised_return_on_committed_capital_pct": M[
+            "annualised_return_on_committed_capital_pct"]["value"],
+        "complete": complete,
+        "evidence_class": cls_closed if closed else UNAVAILABLE,
+        "gross_funding_is_not_the_headline": funding_net if closed else None}
+    return {"schema": NET_ECONOMICS_SCHEMA,
+            "headline": headline, "metrics": M, "cycles": per_cycle,
+            "verdict": verdict}
+
+
+def net_verdict(*, closed: Sequence[Any], net: float, funding_net: float,
+                fees: float, financing: float, price: float, complete: bool,
+                net_ex_winner: Optional[float], open_booked: float,
+                n_open: int, vs_benchmark: Optional[float],
+                sample_ok: bool) -> Dict[str, Any]:
+    """One plain statement of what the book's economics are. A carry whose
+    funding beats its costs but whose NET is negative says so here."""
+    costs = fees + financing
+    base = {"funding_net_usd": funding_net, "explicit_costs_usd": costs,
+            "price_leg_usd": price, "net_usd": net,
+            "funding_exceeds_explicit_costs": funding_net > costs,
+            "net_complete": complete}
+    if not closed:
+        return {"code": "NO_CLOSED_CYCLES", **base, "statement": (
+            "No cycle has gone flat: there is no net result to report."
+            + (f" {n_open} open position(s) have booked costs of "
+               f"${-open_booked:,.2f} net so far and are not valued."
+               if n_open and open_booked < 0 else ""))}
+    money = lambda v: f"{'-' if v < 0 else ''}${abs(v):,.2f}"  # noqa: E731
+    tail = "" if complete else (
+        " Some fees or funding are unconfirmed, so this net is a bound, not "
+        "a final figure.")
+    if net <= 0:
+        if funding_net > costs:
+            code = "FUNDING_POSITIVE_BUT_NET_NEGATIVE"
+            msg = (f"Funding ({money(funding_net)}) exceeds fees and financing "
+                   f"({money(costs)}), but NET after the price legs "
+                   f"({money(price)}) is {money(net)}: this carry LOSES money "
+                   "net. Gross funding is not profit.")
+        elif funding_net > 0:
+            code = "FUNDING_DOES_NOT_COVER_COSTS"
+            msg = (f"Funding ({money(funding_net)}) is below fees and "
+                   f"financing ({money(costs)}); NET is {money(net)}.")
+        else:
+            code = "NET_NEGATIVE"
+            msg = f"Net is {money(net)}; funding was {money(funding_net)}."
+        return {"code": code, **base, "statement": msg + tail}
+    if not complete:
+        return {"code": "NET_POSITIVE_UNVERIFIED", **base, "statement": (
+            f"Booked net is {money(net)} but fees or funding are unconfirmed; "
+            "do not quote it as profit.")}
+    if net_ex_winner is not None and net_ex_winner <= 0 and len(closed) > 1:
+        return {"code": "NET_POSITIVE_DEPENDS_ON_LARGEST_WINNER", **base,
+                "statement": (f"Net is {money(net)}, but without the single "
+                              f"best cycle it is {money(net_ex_winner)}.")}
+    if vs_benchmark is not None and vs_benchmark < 0:
+        return {"code": "NET_POSITIVE_BELOW_BENCHMARK_RATE", **base,
+                "statement": (f"Net is {money(net)} but committed capital at "
+                              f"the supplied benchmark rate would have earned "
+                              f"{money(-vs_benchmark)} more.")}
+    if not sample_ok:
+        return {"code": "NET_POSITIVE_SMALL_SAMPLE", **base, "statement": (
+            f"Net is {money(net)} over {len(closed)} closed cycle(s): too few "
+            "to annualise or to call an edge.")}
+    drag = (" Open positions carry booked costs of "
+            f"{money(-open_booked)} not in this net." if n_open
+            and open_booked < 0 else "")
+    return {"code": "NET_POSITIVE", **base,
+            "statement": f"Net after booked costs is {money(net)}." + drag}
+
+
 def build_report(db_path: str, *, environment: Optional[str] = None,
                  cash_apr_pct: Optional[float] = None,
                  cash_apr_source: str = "",
-                 now_ms: Optional[int] = None) -> Dict[str, Any]:
-    """The one machine-readable performance report. Reads only."""
+                 now_ms: Optional[int] = None,
+                 total_capital_usd: Optional[float] = None) -> Dict[str, Any]:
+    """The one machine-readable performance report. Reads only.
+
+    ``total_capital_usd`` is operator-supplied account capital; without it
+    return on total capital and capital utilization are UNAVAILABLE."""
     import performance_analytics as PA
 
     journal = load_journal(db_path)
@@ -875,6 +1563,7 @@ def build_report(db_path: str, *, environment: Optional[str] = None,
     invariants = check_invariants(journal, cycles, statement)
     invariants.append(order_fills_match_ledger(
         journal, load_carry_order_fills(db_path)))
+    invariants.append(check_net_components(cycles))
     unresolved = load_unresolved_carry_orders(db_path)
 
     blockers: List[str] = list(env["reasons"])
@@ -984,7 +1673,28 @@ def build_report(db_path: str, *, environment: Optional[str] = None,
               "upgraded by this comparison"),
         cycles=opp)
 
+    opp_by_cycle = {o["cycle_id"]: o for o in opp}
+    ne = net_economics(
+        cycles, env, journal=journal, opp_by_cycle=opp_by_cycle,
+        period_days=summary.get("period_days"),
+        total_capital_usd=total_capital_usd, cash_apr_pct=cash_apr_pct,
+        orders=load_carry_order_execution(db_path),
+        reservations=load_capital_reservations(db_path), now_ms=now_ms)
+    ne_complete = ne["headline"]["complete"] and not blockers
+    sections["net_economics"] = section(
+        ne["headline"]["evidence_class"] if closed else cls,
+        why=([] if ne_complete and cls == ACTUAL_RECONCILED else
+             (blockers or ["a closed cycle has unconfirmed fees or funding"]
+              if closed else ["NO_CLOSED_CYCLES"])),
+        status=None if ne["headline"]["evidence_class"] == ACTUAL_RECONCILED
+        else ("PROVISIONAL" if cls in (UNAVAILABLE, UNDECLARED_ENVIRONMENT)
+              else "NOT_CASH"),
+        headline=ne["headline"], metrics=ne["metrics"], cycles=ne["cycles"],
+        verdict=ne["verdict"], schema=ne["schema"])
+
     report = {"report_schema": REPORT_SCHEMA, "db": db_path,
+              "net_economics_verdict": ne["verdict"],
+              "headline": ne["headline"],
               "as_of_ms": now_ms,
               "evidence_classes": list(SECTION_CLASSES),
               "environment": env,
@@ -1041,7 +1751,9 @@ def evidence_lines(report: Mapping[str, Any]) -> List[str]:
     """The evidence header the text report leads with."""
     env = report["environment"]
     rc = report["sections"]["realized_cash"]
-    lines = [f"environment: declared={env['declared'] or 'NONE'}  "
+    v = report.get("net_economics_verdict")
+    lines = ([f"NET ECONOMICS [{v['code']}]: {v['statement']}"] if v else [])
+    lines += [f"environment: declared={env['declared'] or 'NONE'}  "
              f"recorded={env['recorded_seen'] or 'none'}  booked figures are "
              f"{env['booked_figures_class']}"]
     if rc["evidence_class"] == ACTUAL_RECONCILED:
@@ -1071,13 +1783,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                          "comparison is UNAVAILABLE")
     ap.add_argument("--cash-apr-source", default="",
                     help="where the benchmark rate came from (recorded)")
+    ap.add_argument("--total-capital-usd", type=float, default=None,
+                    help="operator-supplied total account capital in USD; "
+                         "omitted, return on total capital and capital "
+                         "utilization are UNAVAILABLE")
     ap.add_argument("--now-ms", type=int, default=None)
     args = ap.parse_args(argv)
     try:
         report = build_report(args.db, environment=args.environment,
                               cash_apr_pct=args.cash_apr,
                               cash_apr_source=args.cash_apr_source,
-                              now_ms=args.now_ms)
+                              now_ms=args.now_ms,
+                              total_capital_usd=args.total_capital_usd)
     except (FileNotFoundError, LookupError, sqlite3.Error, ValueError,
             L.LedgerError) as exc:
         print(f"refusing: {exc}", file=sys.stderr)

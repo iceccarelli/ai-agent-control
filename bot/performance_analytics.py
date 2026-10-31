@@ -49,6 +49,11 @@ __all__ = [
     "MIN_TRADES_FOR_RATIOS",
     "TRADING_DAYS_PER_YEAR",
     "overlay_opportunity_cost",
+    "annualise_simple",
+    "max_drawdown_usd",
+    "downside_deviation",
+    "profit_concentration",
+    "expectancy",
 ]
 
 #: Crypto trades every day, so the annualisation factor is 365, not 252.
@@ -524,6 +529,88 @@ def overlay_opportunity_cost(cycle: Mapping[str, Any], *,
     if not avail:
         out["why"] = "neither alternative is computable for this cycle"
     return out
+
+
+# ---------------------------------------------------------------------------
+# per-cycle net-economics statistics (pure; used by tools/carry_performance.py)
+# ---------------------------------------------------------------------------
+
+#: A return is annualised ONLY from at least this many closed cycles AND this
+#: many days in market. Below either, an annualised figure is a decimal point
+#: on noise (one funding print annualises to hundreds of percent), so it is
+#: None with the reason. One rule for every annualised figure in the report.
+MIN_ANNUALISE_CYCLES = 5
+MIN_ANNUALISE_DAYS = 30.0
+#: Dispersion / expectancy statistics need at least this many cycles.
+MIN_CYCLES_FOR_DISPERSION = 3
+
+
+def annualise_simple(return_pct: Optional[float], days: Optional[float],
+                     n_cycles: int) -> Tuple[Optional[float], str]:
+    """Simple (non-compounded) annualisation, or (None, reason)."""
+    r, d = _finite(return_pct), _finite(days)
+    if r is None or d is None:
+        return None, "return or duration not available"
+    if n_cycles < MIN_ANNUALISE_CYCLES:
+        return None, (f"SAMPLE_TOO_SMALL: {n_cycles} closed cycle(s) < "
+                      f"{MIN_ANNUALISE_CYCLES}; not annualised")
+    if d < MIN_ANNUALISE_DAYS:
+        return None, (f"DURATION_TOO_SHORT: {d:.1f} days in market < "
+                      f"{MIN_ANNUALISE_DAYS:g}; not annualised")
+    return r * 365.0 / d, ""
+
+
+def max_drawdown_usd(nets_in_time_order: Sequence[float]) -> float:
+    """Largest peak-to-trough fall of the cumulative net, starting from 0."""
+    cum = peak = dd = 0.0
+    for n in nets_in_time_order:
+        cum += n
+        peak = max(peak, cum)
+        dd = max(dd, peak - cum)
+    return dd
+
+
+def downside_deviation(values: Sequence[float], target: float = 0.0
+                       ) -> Optional[float]:
+    """sqrt(mean(min(x - target, 0)^2)) over ALL observations (population
+    form, the usual semideviation). None below the dispersion minimum."""
+    if len(values) < MIN_CYCLES_FOR_DISPERSION:
+        return None
+    return math.sqrt(sum(min(v - target, 0.0) ** 2 for v in values)
+                     / len(values))
+
+
+def profit_concentration(nets: Sequence[float]) -> Dict[str, Any]:
+    """Share of gross winning net held by the largest winner, and by the top
+    quartile; plus the total with the largest winner removed."""
+    wins = sorted((n for n in nets if n > 0), reverse=True)
+    total = sum(nets)
+    out: Dict[str, Any] = {
+        "largest_winner_usd": wins[0] if wins else None,
+        "largest_winner_share_of_winning_net_pct": (
+            100.0 * wins[0] / sum(wins) if wins else None),
+        "net_excluding_largest_winner_usd": (total - wins[0]) if wins else total,
+        "winning_cycles": len(wins)}
+    if len(wins) >= 4:
+        k = max(1, len(wins) // 4)
+        out["top_quartile_share_of_winning_net_pct"] = (
+            100.0 * sum(wins[:k]) / sum(wins))
+    else:
+        out["top_quartile_share_of_winning_net_pct"] = None
+    return out
+
+
+def expectancy(nets: Sequence[float]) -> Dict[str, Any]:
+    """Mean net per closed cycle (already after every booked cost)."""
+    if not nets:
+        return {"expectancy_per_cycle_usd": None, "win_rate": None,
+                "avg_win_usd": None, "avg_loss_usd": None}
+    wins = [n for n in nets if n > 0]
+    losses = [n for n in nets if n <= 0]
+    return {"expectancy_per_cycle_usd": sum(nets) / len(nets),
+            "win_rate": len(wins) / len(nets),
+            "avg_win_usd": sum(wins) / len(wins) if wins else None,
+            "avg_loss_usd": sum(losses) / len(losses) if losses else None}
 
 
 # ---------------------------------------------------------------------------
