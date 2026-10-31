@@ -335,15 +335,38 @@ def test_the_engine_reuses_the_round_trip_the_cost_gate_just_priced(tmp_path):
     store.close()
 
 
-def test_observe_mode_logs_a_repeated_would_refuse_once(tmp_path, caplog):
-    from test_paired_leg_recovery import fresh_view, MARK
+def test_observe_mode_logs_a_repeated_would_refuse_once(tmp_path):
+    """Counted with a handler of our own: other tests change how the logging
+    tree propagates, which must not decide this one."""
+    from test_paired_leg_recovery import MARK
     import logging
+    import carry_engine as ce
+
+    class Count(logging.Handler):
+        def __init__(self):
+            super().__init__(logging.WARNING)
+            self.n = 0
+
+        def emit(self, record):
+            if "WOULD refuse" in record.getMessage():
+                self.n += 1
+
     store, venue, engine = _engine(tmp_path, ebg.EntryBenefitGate(mode=ebg.OBSERVE))
     engine.entry_benefit.check = lambda **kw: ebg.EntryBenefitResult(
         True, False, ebg.BENEFIT_UNAVAILABLE, False, {"outcome": "x"})
-    caplog.set_level(logging.WARNING)
-    engine._observe_logged = ""
-    for _ in range(3):
-        engine._entry_benefit_refusal(MARK, MARK, 600.0)
-    assert caplog.text.count("WOULD refuse") == 1
+    handler = Count()
+    log = ce.logger
+    old_level, old_disabled = log.level, log.disabled
+    log.addHandler(handler)
+    log.setLevel(logging.WARNING)
+    log.disabled = False
+    try:
+        engine._observe_logged = ""
+        for _ in range(3):
+            engine._entry_benefit_refusal(MARK, MARK, 600.0)
+    finally:
+        log.removeHandler(handler)
+        log.setLevel(old_level)
+        log.disabled = old_disabled
+    assert handler.n == 1
     store.close()
