@@ -575,9 +575,25 @@ class BybitClient:
             server_ms = int(second) * 1000
         else:
             server_ms = int(int(nano) // 1_000_000) if int(nano) > 10**14 else int(nano)
+        if server_ms <= 0:
+            raise PermanentAPIError(f"time response is not a time: {server_ms}")
         self._time_skew_ms = server_ms - int(time.time() * 1000)
         logger.info("clock skew vs exchange: %d ms", self._time_skew_ms)
         return self._time_skew_ms
+
+    def assert_clock_within(self, max_skew_ms: int = 5_000) -> int:
+        """Raise unless the last measured venue skew is within `max_skew_ms`.
+
+        `sync_time` only RECORDS the skew (and corrects signing with it); a
+        host whose clock is an hour off still signs correctly after the sync
+        yet cannot reason about funding windows. This is the explicit gate.
+        """
+        skew = int(self._time_skew_ms)
+        if abs(skew) > int(max_skew_ms):
+            raise PermanentAPIError(
+                f"clock skew vs {self.venue} is {skew} ms (limit "
+                f"{int(max_skew_ms)} ms)")
+        return skew
 
     # -- signing -----------------------------------------------------------
 
@@ -830,6 +846,11 @@ class BybitClient:
             raise PermanentAPIError(f"no instrument info for {symbol}")
 
         row = rows[0]
+        status = row.get("status")
+        if status is not None and str(status) != "Trading":
+            raise PermanentAPIError(
+                f"{symbol} status is {status!r}, not 'Trading'; no order "
+                "rules are served for an instrument that cannot be traded")
         lot = row.get("lotSizeFilter") or {}
         price_filter = row.get("priceFilter") or {}
         merged = {
@@ -841,7 +862,16 @@ class BybitClient:
             "minOrderQty": lot.get("minOrderQty"),
             "minOrderAmt": lot.get("minOrderAmt") or lot.get("minNotionalValue"),
         }
-        filters = InstrumentFilters.parse(symbol, merged, from_exchange=True)
+        try:
+            filters = InstrumentFilters.parse(symbol, merged, from_exchange=True)
+        except (ValueError, ArithmeticError) as exc:
+            raise PermanentAPIError(f"unusable instrument filters: {exc}") from exc
+        for name in ("tick_size", "qty_step", "min_qty", "min_notional"):
+            value = getattr(filters, name)
+            if not (value.is_finite() and value > 0):
+                raise PermanentAPIError(
+                    f"{symbol} {name}={value} is not a positive rule; "
+                    "refusing to size orders against it")
         with self._lock:
             self._filters[symbol] = (now, filters)
         logger.info(
@@ -1854,10 +1884,17 @@ class BybitClient:
         if not isinstance(rows, list):
             raise PermanentAPIError("position list carries no list; not "
                                     "treating it as flat")
+        held = [row for row in rows if float(row.get("size", 0) or 0) > 0]
+        # positionIdx 1/2 are the hedge-mode slots. This client is one-way
+        # (positionIdx 0 on every order); returning "the first" of two slots
+        # would report half of a hedge book as the whole position.
         for row in rows:
-            if float(row.get("size", 0) or 0) > 0:
-                return row
-        return None
+            if str(row.get("positionIdx", "0")) not in ("0", ""):
+                if row in held or len(rows) > 1:
+                    raise PermanentAPIError(
+                        f"{symbol} reports hedge-mode slot positionIdx="
+                        f"{row.get('positionIdx')!r}; this client is one-way only")
+        return held[0] if held else None
 
     def get_funding_history_fractions(
         self, symbol: str, limit: int = 200

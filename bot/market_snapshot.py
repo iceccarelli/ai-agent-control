@@ -85,6 +85,44 @@ class StaleMarket(RuntimeError):
     """The view is too old, internally inconsistent, or unreadable."""
 
 
+_QUOTE_SUFFIXES = ("USDT", "USDC", "PERP", "USD")
+
+
+def split_symbol(symbol: str) -> tuple:
+    """``(multiplier, base)`` of a Bybit symbol such as ``1000PEPEUSDT``.
+
+    ``multiplier`` is the leading contract multiplier (``1000``) or ``""``.
+    Raises ValueError for a symbol with no recognisable quote suffix.
+    """
+    text = str(symbol).strip().upper().replace("-", "").replace("_", "")
+    for suffix in _QUOTE_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+            break
+    else:
+        raise ValueError(f"symbol {symbol!r} has no recognised quote suffix")
+    digits = len(text) - len(text.lstrip("0123456789"))
+    return text[:digits], text[digits:]
+
+
+def assert_symbols_map(perp_symbol: str, spot_symbol: str) -> None:
+    """The perp and spot legs must be the SAME asset at the SAME unit.
+
+    ``1000PEPEUSDT`` against ``PEPEUSDT`` differs by a factor of 1000 in price
+    and ``BTCUSDT`` against ``ETHUSDT`` is not a basis at all: either would
+    produce a plausible-looking, enormous "basis". Refused, never mapped.
+    """
+    try:
+        p_mult, p_base = split_symbol(perp_symbol)
+        s_mult, s_base = split_symbol(spot_symbol)
+    except ValueError as exc:
+        raise StaleMarket(str(exc)) from exc
+    if p_base != s_base or p_mult != s_mult or not p_base:
+        raise StaleMarket(
+            f"perp {perp_symbol!r} and spot {spot_symbol!r} are not the same "
+            "asset at the same contract unit; the basis between them is meaningless")
+
+
 @dataclass(frozen=True)
 class MarketSnapshot:
     """Perp, spot, funding and margin as of ONE observation.
@@ -264,6 +302,7 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     clothes, and the caller cannot tell the difference. The exception is the
     information.
     """
+    assert_symbols_map(perp_symbol, spot_symbol)
     observed = time.time() if now_s is None else float(now_s)
     started = time.monotonic()
     perp = float(broker.get_mark(perp_symbol))
