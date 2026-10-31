@@ -683,6 +683,12 @@ class CarryEngine:
         self.entry_benefit: Any = None
         #: The last entry decision's full layered trace (for status/audit).
         self.last_entry_trace: Dict[str, Any] = {}
+        #: Where each entry decision's trace is made durable (callable(trace)),
+        #: so a restart does not lose why the book did or did not enter. None =
+        #: memory only. Failures are logged, never raised: explaining a decision
+        #: must not change it.
+        self.trace_sink: Any = None
+        self._trace_persisted: Tuple[str, float] = ("", 0.0)
         self._observe_logged = ""
         self.capital_authority = capital_authority
         #: ENTRIES_ENABLED=0 stops NEW pairs and nothing else: a held pair is
@@ -1135,6 +1141,27 @@ class CarryEngine:
     #: it is served from the health thread.
     _last_round_trip: Optional[Tuple[float, int]] = None
 
+    #: A trace is written when its outcome changes, and at least this often
+    #: while it stays the same, so a refusal repeated every tick is one row an
+    #: hour and not one a minute.
+    TRACE_HEARTBEAT_S = 3600.0
+
+    def _persist_trace(self, trace: Dict[str, Any]) -> None:
+        sink = self.trace_sink
+        if sink is None:
+            return
+        outcome = str(trace.get("outcome", ""))
+        now = time.time()
+        last_outcome, last_at = self._trace_persisted
+        if outcome == last_outcome and now - last_at < self.TRACE_HEARTBEAT_S:
+            return
+        try:
+            sink(trace)
+        except Exception:  # noqa: BLE001
+            logger.warning("entry decision trace not persisted", exc_info=True)
+            return
+        self._trace_persisted = (outcome, now)
+
     def _entry_benefit_refusal(self, mark: float, spot_mark: float,
                                notional_usd: float) -> Optional[CarryDecision]:
         """The additional entry net-benefit gate (None = pass or absent).
@@ -1165,6 +1192,7 @@ class CarryEngine:
             opportunity_cost_apr=self.opportunity_cost_apr,
             notional_usd=notional_usd, mechanical_reason="CLEARED")
         self.last_entry_trace = dict(result.trace)
+        self._persist_trace(self.last_entry_trace)
         if result.allowed:
             if result.reason and result.reason != self._observe_logged:
                 logger.warning("entry net-benefit gate (observe): WOULD refuse "

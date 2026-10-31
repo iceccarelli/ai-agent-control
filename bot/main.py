@@ -2315,6 +2315,13 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             mode=str(cfg.CARRY_ENTRY_BENEFIT_MODE),
             income_haircut_fraction=float(cfg.CARRY_INCOME_HAIRCUT_FRACTION),
             evidence_provider=_carry_evidence_provider(bot, cfg))
+        # Every entry decision's layered trace is kept in the decision journal
+        # (on change, and hourly while unchanged), so the explanation survives
+        # a restart. The journal is a store write; the engine runs on the
+        # store's writer thread.
+        perp_symbol = bot.carry.perp_symbol
+        bot.carry.trace_sink = lambda trace: bot.store.journal(
+            perp_symbol, "CARRY_ENTRY_TRACE", str(trace.get("outcome", "")), trace)
         logger.warning(
             "BOOK_MODE=carry: delta-neutral book attached, cap $%.2f, borrow "
             "%.4f/yr, execution %s/%s, orders: %s. The directional strategy is "
