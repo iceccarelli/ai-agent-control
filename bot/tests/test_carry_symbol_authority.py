@@ -74,9 +74,18 @@ def test_tick_reads_the_symbol_the_book_trades_not_trading_symbols_0():
 
 
 def test_the_reverse_mismatch_is_also_read_for_the_traded_symbol():
-    b, rec = bot(["BTCUSDT"], perp="ETHUSDT")
+    # The traded symbol is read, not TRADING_SYMBOLS[0]. The spot leg is the
+    # same asset: a perp/spot pair on different assets is refused before any
+    # venue read (market_snapshot.assert_symbols_map), tested below.
+    b, rec = bot(["BTCUSDT"], perp="ETHUSDT", spot="ETHUSDT")
     b.tick()
     assert perp_reads(rec) == {"ETHUSDT"}, rec.reads
+
+
+def test_a_perp_and_spot_on_different_assets_read_nothing():
+    b, rec = bot(["BTCUSDT"], perp="ETHUSDT")
+    b.tick()
+    assert perp_reads(rec) == set(), rec.reads
 
 
 def test_default_configuration_is_unchanged():
