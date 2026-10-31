@@ -158,6 +158,15 @@ class MarketSnapshot:
     #: Seconds between the start of the first leg read and the end of the last
     #: (monotonic clock). `None` on a hand-built snapshot: not measured.
     leg_span_s: Optional[float] = None
+    #: The touch (bid, ask) of each leg, read AFTER the marks and outside the
+    #: freshness span: it exists so an order sent this tick, an EXIT included,
+    #: has a decision-time book without a second read at the moment of the
+    #: order. Best effort: `None` when the broker has no touch or the read
+    #: failed, and then nothing depends on it. `book_observed_s` is when the
+    #: reads finished.
+    perp_book: Optional[tuple] = None
+    spot_book: Optional[tuple] = None
+    book_observed_s: Optional[float] = None
 
     @property
     def basis_bps(self) -> float:
@@ -294,6 +303,24 @@ class MarketSnapshot:
                 "leg_span_s": self.leg_span_s}
 
 
+def _touch(broker: Any, symbol: str, product: str) -> Optional[tuple]:
+    """(bid, ask) of one leg, or None. Never raises and never refuses a
+    snapshot: the touch is an execution-record input, not part of the view the
+    gates judge."""
+    getter = getattr(broker, "get_book_top", None)
+    if not callable(getter):
+        return None
+    try:
+        top = getter(symbol, product)
+        bid, ask = float(top["bid"]), float(top["ask"])
+    except Exception:  # noqa: BLE001
+        return None
+    if not (math.isfinite(bid) and math.isfinite(ask)) or bid <= 0 or ask <= 0 \
+            or bid > ask:
+        return None
+    return (bid, ask)
+
+
 def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
                   now_s: Optional[float] = None) -> MarketSnapshot:
     """Read the venue once. Any failure propagates.
@@ -338,7 +365,13 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
             # simply does not apply, and that is recorded rather than assumed.
             venue_time = None
 
+    perp_book, spot_book = (_touch(broker, perp_symbol, "linear"),
+                            _touch(broker, spot_symbol, "spot"))
+    book_at = time.time() if now_s is None else observed
     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=funding,
+                          perp_book=perp_book, spot_book=spot_book,
+                          book_observed_s=(book_at if (perp_book or spot_book)
+                                           else None),
                           margin_multiple=margin, observed_at_s=observed,
                           venue_time_s=venue_time,
                           funding_print_bps=float(print_bps),

@@ -29,7 +29,7 @@ class E:
 
 
 def rec(side, product="linear", q=0.01, ref=60000.0, slip=0.12, spr=0.3):
-    return {"schema": 1, "status": "MEASURED", "reference_basis": "book",
+    return {"schema": 1, "status": "MEASURED", "reference_basis": "executable_side",
             "symbol": "BTCUSDT", "product": product, "side": side,
             "order_type": "market", "filled_qty": q, "requested_qty": q,
             "avg_price": ref, "reference_price": ref, "slippage_usd": slip,

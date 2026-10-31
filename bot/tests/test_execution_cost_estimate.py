@@ -26,7 +26,7 @@ class E:
 
 
 def rec(side="Sell", product="linear", q=0.01, ref=60000.0, slip_usd=0.12,
-        spr_usd=0.3, status="MEASURED", basis="book", order_type="market",
+        spr_usd=0.3, status="MEASURED", basis="executable_side", order_type="market",
         symbol="BTCUSDT", req=None, **over):
     r = {"schema": 1, "status": status, "reference_basis": basis,
          "symbol": symbol, "product": product, "side": side,
@@ -225,3 +225,32 @@ def test_observations_survive_a_journal_save_and_reload():
     assert live["status"] == ece.MEASURED
     assert (again["spread_bps"], again["slippage_bps"]) == \
         (live["spread_bps"], live["slippage_bps"])
+
+
+def test_records_made_by_the_real_producer_are_accepted_by_the_estimator():
+    """The estimator filters on the producer's own vocabulary. Records here come
+    from execution_record.assess_fill, not from a hand-made dict, so a rename on
+    either side fails this test."""
+    import execution_record as xr
+
+    def real(i, side, product, kind):
+        ctx = xr.DecisionContext(
+            venue="bybit", symbol="BTCUSDT", product=product, side=side,
+            decision_ms=NOW - DAY - i - 50, qty=0.01, mark=60000.0,
+            bid=59995.0, ask=60005.0, observed_ms=NOW - DAY - i - 60)
+        px = 60005.0 if side == "Buy" else 59995.0
+        r = xr.assess_fill(
+            ctx, side=side, symbol="BTCUSDT", product=product, venue="bybit",
+            order_type="market", requested_qty=0.01, filled_qty=0.01,
+            avg_price=px + (0.2 if side == "Buy" else -0.2), now_ms=NOW - DAY - i,
+            fee_usd=0.3, fee_confirmed=True, order_link_id=f"BB-{kind}-{i}",
+            submit_ms=NOW - DAY - i - 40, fill_ms=NOW - DAY - i - 5)
+        return E(kind, int(NOW - DAY - i), f"BB-{kind}-{i}", {"execution": r})
+
+    rows = ([real(i, "Sell", "linear", "perp_open") for i in range(25)]
+            + [real(i, "Buy", "linear", "perp_close") for i in range(25)])
+    out = ece.estimate_round_trip(rows, as_of_ms=NOW, execution_mode="overlay",
+                                  perp_symbol="BTCUSDT", spot_symbol="BTCUSDT",
+                                  planned_notional_usd=600.0)
+    assert out["status"] == ece.MEASURED, out["reasons"]
+    assert out["spread_bps"] > 0 and out["slippage_bps"] > 0
