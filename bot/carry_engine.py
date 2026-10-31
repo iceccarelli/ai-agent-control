@@ -1127,6 +1127,8 @@ class CarryEngine:
     #: path priced it. The outlook uses this and never asks the venue itself:
     #: it is served from the health thread.
     _last_round_trip: Optional[Tuple[float, int]] = None
+    #: A remembered round-trip price older than this is not used by the outlook.
+    OUTLOOK_COST_MAX_AGE_MS = 600_000
 
     #: A funding estimate older than one settlement interval plus this grace is
     #: stale: the next print was due and has not been seen.
@@ -1209,6 +1211,11 @@ class CarryEngine:
         round_trip = float(cached[0])
         out["round_trip_bps"] = round_trip
         out["round_trip_read_ms"] = int(cached[1])
+        if now - int(cached[1]) > self.OUTLOOK_COST_MAX_AGE_MS:
+            # The entry path prices fees every tick; an old figure means the
+            # tick loop stopped, and an account's fee tier can change.
+            out["why"] = "ROUND_TRIP_COST_STALE: not re-priced recently"
+            return out
         try:
             needed = costs.breakeven_funding_bps(
                 perp=mark, spot=spot, borrow_apr=self.borrow_apr,

@@ -961,9 +961,16 @@ class TradingBot:
         guessed."""
         view = getattr(engine, "snapshot", None)
         try:
-            return engine.opportunity_outlook(
+            out = engine.opportunity_outlook(
                 mark=float(getattr(view, "perp_mark", float("nan"))),
                 spot=getattr(view, "spot_mark", None))
+            seen = getattr(view, "observed_at_s", None)
+            out["market_view"] = {
+                "observed_at_s": seen,
+                "age_s": (None if seen is None
+                          else max(0.0, time.time() - float(seen))),
+                "source": "the last snapshot the tick loop took"}
+            return out
         except Exception as exc:  # noqa: BLE001
             return {"status": "UNKNOWN", "why": f"{type(exc).__name__}"}
 

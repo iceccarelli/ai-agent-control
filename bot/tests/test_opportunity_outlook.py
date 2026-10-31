@@ -238,6 +238,7 @@ def test_carry_status_carries_the_outlook_and_keeps_its_existing_fields(eng, tmp
     bot._journal_unsaved = False
     seed(eng, [3.0, 3.0, 3.0])
     status = bot.carry_status()
+    assert "market_view" in status["outlook"]
     for key in ("attached", "environment", "book_state", "last_decision",
                 "protective_stop", "journal_unsaved"):
         assert key in status, key
@@ -246,3 +247,13 @@ def test_carry_status_carries_the_outlook_and_keeps_its_existing_fields(eng, tmp
         "ENTRY_CONDITIONS_MET", "ENTRY_GATE_REFUSED", "HOLDING",
         "NO_FUNDING_LEVEL_CLEARS_THE_COSTS"}
     store.close()
+
+
+def test_an_old_round_trip_price_is_not_used(eng):
+    seed(eng, [3.0, 3.0, 3.0])
+    eng._last_round_trip = (30.0, NOW - eng.OUTLOOK_COST_MAX_AGE_MS - 1)
+    o = eng.opportunity_outlook(mark=MARK, spot=MARK, now_ms=NOW)
+    assert "STALE" in o["why"] and o["mechanical_entry_eligible"] is False
+    eng._last_round_trip = (30.0, NOW - 1000)
+    assert eng.opportunity_outlook(mark=MARK, spot=MARK,
+                                   now_ms=NOW)["mechanical_entry_eligible"] is True
