@@ -91,6 +91,8 @@ TOTAL_LOSS_CAP = "TOTAL_LOSS_CAP"
 DRAWDOWN_CAP = "DRAWDOWN_CAP"
 CONCENTRATION_CAP = "CONCENTRATION_CAP"
 LIMITS_INVALID = "LIMITS_INVALID"
+EVIDENCE_NOT_ALLOCATE = "EVIDENCE_NOT_ALLOCATE"
+NO_STRATEGY_EVIDENCE = "NO_STRATEGY_EVIDENCE"
 ALLOCATED = "ALLOCATED"
 
 
@@ -207,6 +209,19 @@ def _validate(op: Opportunity) -> Tuple[Dict[str, Any], List[str]]:
     return vals, reasons
 
 
+def _evidence_reasons(strategy_id: str, evidence: Mapping[str, Any]) -> List[str]:
+    from strategy_evidence import ALLOCATE, EvidenceVerdict
+    v = evidence.get(strategy_id) if isinstance(evidence, Mapping) else None
+    if v is None:
+        return [f"{NO_STRATEGY_EVIDENCE}:{strategy_id}"]
+    if not isinstance(v, EvidenceVerdict) or v.verdict != ALLOCATE \
+            or v.strategy_id != strategy_id:
+        label = getattr(v, "verdict", type(v).__name__)
+        return [f"{EVIDENCE_NOT_ALLOCATE}:{label}"] + [
+            f"evidence:{r}" for r in getattr(v, "reasons", ())]
+    return []
+
+
 def incremental_tail_risk(book: float, tail: float, rho: float) -> float:
     """sqrt(B^2 + t^2 + 2 rho B t) - B, floored at -B (never below removing B)."""
     inside = book * book + tail * tail + 2.0 * rho * book * tail
@@ -214,8 +229,18 @@ def incremental_tail_risk(book: float, tail: float, rho: float) -> float:
 
 
 def allocate(opportunities: Sequence[Opportunity], limits: AllocationLimits, *,
-             risk_aversion: float) -> Allocation:
-    """Return a plan (possibly all zero). Reserves NOTHING; see module doc."""
+             risk_aversion: float,
+             evidence: Optional[Mapping[str, Any]] = None) -> Allocation:
+    """Return a plan (possibly all zero). Reserves NOTHING; see module doc.
+
+    ``evidence`` maps strategy_id -> ``strategy_evidence.EvidenceVerdict``. When
+    it is given (production callers MUST give it), a strategy gets capital only
+    if its verdict is a genuine EvidenceVerdict with verdict ALLOCATE for that
+    same strategy_id. BLOCK, INSUFFICIENT, a missing entry or anything that is
+    not an EvidenceVerdict forces zero for that strategy, whatever its stated
+    expected return. ``None`` is the legacy no-evidence call, kept only so the
+    pure allocator tests still run; it is not a way to assert evidence.
+    """
     plan_reasons: List[str] = []
     free = _num(getattr(limits.free_capital_usd, "value", None))
     if free is None or not str(getattr(limits.free_capital_usd, "source", "")).strip():
@@ -248,6 +273,8 @@ def allocate(opportunities: Sequence[Opportunity], limits: AllocationLimits, *,
             if isinstance(limits.per_strategy_max_usd, Mapping) else None
         if cap is None or cap < 0:
             reasons.append(NO_STRATEGY_CAP)
+        if evidence is not None:
+            reasons.extend(_evidence_reasons(op.strategy_id, evidence))
         if reasons:
             results[oid] = OpportunityResult(oid, op.strategy_id, 0.0, False,
                                              tuple(reasons))
