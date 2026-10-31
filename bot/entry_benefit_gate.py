@@ -39,7 +39,7 @@ MODES = (ENFORCE, OBSERVE)
 BENEFIT_UNAVAILABLE = "ENTRY_BENEFIT_UNAVAILABLE"
 BENEFIT_NOT_SUPPORTED = "ENTRY_BENEFIT_NOT_SUPPORTED"
 EVIDENCE_INSUFFICIENT = "STRATEGY_EVIDENCE_INSUFFICIENT"
-SETTLEMENTS_PER_DAY = 3
+SETTLEMENTS_PER_DAY = _costs.FUNDING_PERIODS_PER_DAY
 
 
 def _finite(x: Any) -> bool:
@@ -60,6 +60,7 @@ class EntryBenefitGate:
     def __init__(self, *, mode: str = ENFORCE,
                  income_haircut_fraction: float = 0.0,
                  evidence_provider: Optional[Callable[[], Any]] = None,
+                 strategy_id: str = "btc_funding_carry",
                  cost_policy: _est.CostSamplePolicy = _est.DEFAULT_POLICY) -> None:
         if mode not in MODES:
             raise ValueError(f"entry-benefit mode must be one of {MODES}, "
@@ -71,12 +72,14 @@ class EntryBenefitGate:
         self.mode = mode
         self.income_haircut_fraction = float(income_haircut_fraction)
         self.evidence_provider = evidence_provider
+        self.strategy_id = str(strategy_id)
         self.cost_policy = cost_policy
 
     # -- identity of the rule, so a trace can be tied to what produced it -------
     def fingerprint(self) -> str:
         body = {
             "mode": self.mode, "haircut": self.income_haircut_fraction,
+            "strategy_id": self.strategy_id,
             "hold_days": _costs.DEMONSTRATED_HOLD_DAYS,
             "min_sigma": _se.MIN_SIGMA_MULTIPLE,
             "settlements_per_day": SETTLEMENTS_PER_DAY,
@@ -89,7 +92,8 @@ class EntryBenefitGate:
               perp_symbol: str, spot_symbol: str, mark: float, spot: float,
               funding_history: List[float], last_print_ms: Optional[int],
               round_trip_bps: Any, borrow_apr: Any, opportunity_cost_apr: Any,
-              notional_usd: Any, mechanical_reason: str = "") -> EntryBenefitResult:
+              notional_usd: Any, execution_style: str = "taker",
+              mechanical_reason: str = "") -> EntryBenefitResult:
         """The verdict for opening NOW. Pure given its arguments."""
         enforcing = self.mode == ENFORCE
         history = [float(x) for x in funding_history if _finite(x)]
@@ -110,6 +114,9 @@ class EntryBenefitGate:
             entries, as_of_ms=now_ms, execution_mode=execution_mode,
             perp_symbol=perp_symbol, spot_symbol=spot_symbol,
             planned_notional_usd=notional_usd if _finite(notional_usd) else 0.0,
+            order_types=(("market", "post_only")
+                         if str(execution_style) == "maker_first"
+                         else ("market",)),
             policy=self.cost_policy)
 
         verdict_obj = None
@@ -142,8 +149,11 @@ class EntryBenefitGate:
         if est["status"] != _est.MEASURED and not unavailable:
             unavailable.append(f"{_se.REFUSE_UNAVAILABLE}:execution_cost")
         benefit_ok = not benefit_reasons and est["status"] == _est.MEASURED
+        # A verdict counts only when it is for THIS strategy: a verdict about
+        # another one (or a cached object of unknown origin) unlocks nothing.
         evidence_ok = (isinstance(verdict_obj, _se.EvidenceVerdict)
-                       and verdict_obj.verdict == _se.ALLOCATE)
+                       and verdict_obj.verdict == _se.ALLOCATE
+                       and verdict_obj.strategy_id == self.strategy_id)
 
         if unavailable:
             reason = BENEFIT_UNAVAILABLE
@@ -165,7 +175,10 @@ class EntryBenefitGate:
             "fingerprint": self.fingerprint(),
             "layers": {
                 "mechanical": {"passed": True, "reason": mechanical_reason,
-                               "note": "decided before this gate; not replaced"},
+                               "note": "this gate is reached only after the production "
+                                       "cost gate and the pair gate passed (by "
+                                       "position in the call path); it does "
+                                       "not re-decide or replace them"},
                 "entry_benefit": {
                     "passed": benefit_ok, "reasons": benefit_reasons,
                     "net_benefit_bps": decision.net_benefit_bps,
@@ -174,6 +187,8 @@ class EntryBenefitGate:
                     "min_sigma_multiple": _se.MIN_SIGMA_MULTIPLE},
                 "strategy_evidence": {
                     "passed": evidence_ok, "classification": evidence_state,
+                    "expected_strategy_id": self.strategy_id,
+                    "verdict_strategy_id": getattr(verdict_obj, "strategy_id", None),
                     "reasons": list(getattr(verdict_obj, "reasons", ()) or ())},
                 "capital_allocation": {"passed": None,
                                        "note": "not decided here; the "

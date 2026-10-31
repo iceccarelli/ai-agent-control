@@ -46,7 +46,7 @@ FULL = fills(25, "Sell", "perp_open") + fills(25, "Buy", "perp_close")
 
 
 def allow_verdict():
-    return se.EvidenceVerdict("carry", se.ALLOCATE, ("OK",), {})
+    return se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {})
 
 
 def args(**over):
@@ -84,7 +84,7 @@ def test_no_evidence_provider_means_strategy_evidence_insufficient():
 
 def test_an_insufficient_or_blocked_verdict_refuses():
     for v in (se.INSUFFICIENT, se.BLOCK):
-        r = gate(evidence_provider=lambda v=v: se.EvidenceVerdict("carry", v, ("x",), {})
+        r = gate(evidence_provider=lambda v=v: se.EvidenceVerdict("btc_funding_carry", v, ("x",), {})
                  ).check(**args())
         assert r.reason == ebg.EVIDENCE_INSUFFICIENT and not r.allowed
 
@@ -261,4 +261,89 @@ def test_the_mechanical_gate_still_decides_first(tmp_path):
     assert d.action == "stand_aside" and d.reason not in (
         ebg.BENEFIT_UNAVAILABLE, ebg.BENEFIT_NOT_SUPPORTED, ebg.EVIDENCE_INSUFFICIENT)
     assert engine.last_entry_trace == {}                       # never reached
+    store.close()
+
+
+# -- review follow-ups -------------------------------------------------------------
+
+def test_maker_first_pools_resting_and_market_fills_for_each_leg():
+    resting = fills(25, "Sell", "perp_open")
+    for e in resting:
+        e.fee_raw["execution"]["order_type"] = "post_only"
+    closes = fills(25, "Buy", "perp_close")
+    taker = gate().check(**args(entries=resting + closes, execution_style="taker"))
+    maker = gate().check(**args(entries=resting + closes, execution_style="maker_first"))
+    assert taker.reason == ebg.BENEFIT_UNAVAILABLE          # no market samples on the entry leg
+    assert maker.trace["inputs"]["execution_cost"]["status"] == "MEASURED"
+
+
+def test_a_verdict_for_another_strategy_unlocks_nothing():
+    other = lambda: se.EvidenceVerdict("some_other_strategy", se.ALLOCATE, ("OK",), {})
+    r = gate(evidence_provider=other).check(**args())
+    assert r.reason == ebg.EVIDENCE_INSUFFICIENT
+    assert r.trace["layers"]["strategy_evidence"]["verdict_strategy_id"] == "some_other_strategy"
+    mine = lambda: se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {})
+    assert gate(evidence_provider=mine).check(**args()).would_allow
+
+
+def test_settlements_per_day_is_the_cost_models():
+    import carry_costs
+    assert ebg.SETTLEMENTS_PER_DAY == carry_costs.FUNDING_PERIODS_PER_DAY
+
+
+def test_two_identical_partials_in_one_millisecond_do_not_change_the_bps():
+    """Dropping a byte-identical partial halves numerator and denominator
+    together, so the order's bps is unchanged."""
+    rows = fills(25, "Sell", "perp_open", q=0.005, slip=0.06, spr=0.15)
+    dup = [E(r.kind, r.ms, r.ref, r.fee_raw) for r in rows]
+    a = ece.estimate_leg(rows, as_of_ms=NOW, symbol="BTCUSDT", product="linear",
+                         side="Sell", planned_notional_usd=300.0)
+    b = ece.estimate_leg(rows + dup, as_of_ms=NOW, symbol="BTCUSDT", product="linear",
+                         side="Sell", planned_notional_usd=300.0)
+    assert a["slippage_bps"] == b["slippage_bps"]
+
+
+def test_the_engine_judges_samples_on_the_callers_clock(tmp_path):
+    """A replay clock earlier than the recorded fills sees them as later than
+    the decision (look-ahead), whatever the wall clock says."""
+    from test_paired_leg_recovery import warm_and_open
+    store, venue, engine = _engine(tmp_path, ebg.EntryBenefitGate(mode=ebg.OBSERVE))
+    seen = {}
+    real = engine.entry_benefit.check
+
+    def spy(**kw):
+        seen.update(kw)
+        return real(**kw)
+    engine.entry_benefit.check = spy
+    engine._entry_clock_ms = 0
+    warm_and_open(engine)
+    assert seen["now_ms"] > 1_000_000_000_000                # wall clock when none given
+    store.close()
+
+
+def test_the_engine_reuses_the_round_trip_the_cost_gate_just_priced(tmp_path):
+    from test_paired_leg_recovery import warm_and_open
+    store, venue, engine = _engine(tmp_path, ebg.EntryBenefitGate(mode=ebg.OBSERVE))
+    calls = []
+    real = engine.round_trip_bps
+    engine.round_trip_bps = lambda: calls.append(1) or real()
+    warm_and_open(engine)
+    # entry_economics priced it once per tick; the gate adds no second lookup
+    entry_ticks = len(calls)
+    assert engine.last_entry_trace["inputs"]["round_trip_fee_bps"] == real()
+    assert entry_ticks == 3                                   # the three warm_and_open ticks
+    store.close()
+
+
+def test_observe_mode_logs_a_repeated_would_refuse_once(tmp_path, caplog):
+    from test_paired_leg_recovery import fresh_view, MARK
+    import logging
+    store, venue, engine = _engine(tmp_path, ebg.EntryBenefitGate(mode=ebg.OBSERVE))
+    engine.entry_benefit.check = lambda **kw: ebg.EntryBenefitResult(
+        True, False, ebg.BENEFIT_UNAVAILABLE, False, {"outcome": "x"})
+    caplog.set_level(logging.WARNING)
+    engine._observe_logged = ""
+    for _ in range(3):
+        engine._entry_benefit_refusal(MARK, MARK, 600.0)
+    assert caplog.text.count("WOULD refuse") == 1
     store.close()

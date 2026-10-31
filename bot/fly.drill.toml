@@ -33,6 +33,9 @@ retries = 10
 USE_TESTNET = "1"
 PAPER_TRADING = "0"
 BYBIT_VENUE = "testnet"
+# Gathering execution evidence is this app's purpose: record what the entry
+# net-benefit gate would refuse without refusing the drill's entries.
+CARRY_ENTRY_BENEFIT_MODE = "observe"
 
 [[mounts]]
 source = "drill_runs"

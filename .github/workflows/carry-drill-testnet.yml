@@ -77,6 +77,9 @@ jobs:
       BOOK_MODE: carry
       CARRY_BORROW_APR: "0.0"
       CARRY_EXECUTION_MODE: overlay
+      # The drill exists to produce the execution evidence the net-benefit gate
+      # needs; "enforce" would refuse its entries until that evidence exists.
+      CARRY_ENTRY_BENEFIT_MODE: observe
       BYBIT_VENUE: testnet
       USE_TESTNET: "1"
       PAPER_TRADING: "0"

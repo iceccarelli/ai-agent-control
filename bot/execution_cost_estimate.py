@@ -105,7 +105,7 @@ def _base_link(link: str) -> str:
 
 
 def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
-            side: str, order_type: str = "market"
+            side: str, order_types: Sequence[str] = ("market",)
             ) -> Tuple[List[Observation], Dict[str, int]]:
     """Valid observations for one leg, and why the others were dropped.
 
@@ -125,7 +125,8 @@ def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
             drop("NO_EXECUTION_RECORD")
             continue
         if (rec.get("symbol") != symbol or rec.get("product") != product
-                or rec.get("side") != side or rec.get("order_type") != order_type):
+                or rec.get("side") != side
+                or rec.get("order_type") not in order_types):
             continue                        # another leg: not a rejection
         if rec.get("status") != MEASURED or rec.get("reference_basis") != "book":
             drop("NOT_BOOK_MEASURED")
@@ -183,11 +184,17 @@ def _bound(values: Sequence[float], z: float) -> Tuple[float, float, float]:
 
 def estimate_leg(entries: Iterable[Any], *, as_of_ms: int, symbol: str,
                  product: str, side: str, planned_notional_usd: float,
-                 order_type: str = "market",
+                 order_types: Sequence[str] = ("market",),
                  policy: CostSamplePolicy = DEFAULT_POLICY) -> Dict[str, Any]:
-    """One leg's expected execution cost, or UNAVAILABLE with the reason."""
+    """One leg's expected execution cost, or UNAVAILABLE with the reason.
+
+    `order_types` names the kinds of order whose fills describe this leg. A
+    taker-only book prices from "market"; a maker-first book also sends resting
+    "post_only" orders and a market remainder, so both are pooled. A resting
+    fill's recorded half-spread is a cost it did not really pay, so pooling can
+    only make the bound more conservative, never less."""
     policy.validate()
-    leg = f"{product}/{side}/{order_type}"
+    leg = f"{product}/{side}/{'+'.join(order_types)}"
     out: Dict[str, Any] = {
         "leg": leg, "symbol": symbol, "status": UNAVAILABLE, "reasons": [],
         "units": "bps of the leg's notional (positive = cost)",
@@ -201,7 +208,7 @@ def estimate_leg(entries: Iterable[Any], *, as_of_ms: int, symbol: str,
         out["reasons"].append("PLANNED_NOTIONAL_INVALID")
         return out
     obs, rejected = extract(entries, as_of_ms=as_of_ms, symbol=symbol,
-                            product=product, side=side, order_type=order_type)
+                            product=product, side=side, order_types=order_types)
     out["rejected"] = rejected
     out["n"] = len(obs)
     cutoff = as_of_ms - policy.max_sample_age_days * DAY_MS
@@ -248,6 +255,7 @@ def required_legs(execution_mode: str, perp_symbol: str, spot_symbol: str
 def estimate_round_trip(entries: Iterable[Any], *, as_of_ms: int,
                         execution_mode: str, perp_symbol: str, spot_symbol: str,
                         planned_notional_usd: float,
+                        order_types: Sequence[str] = ("market",),
                         policy: CostSamplePolicy = DEFAULT_POLICY
                         ) -> Dict[str, Any]:
     """The round trip's spread and slippage (bps of the pair notional), summed
@@ -258,7 +266,7 @@ def estimate_round_trip(entries: Iterable[Any], *, as_of_ms: int,
     entries = list(entries)
     legs = [estimate_leg(entries, as_of_ms=as_of_ms, symbol=sym, product=prod,
                          side=side, planned_notional_usd=planned_notional_usd,
-                         policy=policy)
+                         order_types=order_types, policy=policy)
             for sym, prod, side in required_legs(execution_mode, perp_symbol,
                                                  spot_symbol)]
     missing = [l for l in legs if l["status"] != MEASURED]

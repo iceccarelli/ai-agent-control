@@ -683,6 +683,7 @@ class CarryEngine:
         self.entry_benefit: Any = None
         #: The last entry decision's full layered trace (for status/audit).
         self.last_entry_trace: Dict[str, Any] = {}
+        self._observe_logged = ""
         self.capital_authority = capital_authority
         #: ENTRIES_ENABLED=0 stops NEW pairs and nothing else: a held pair is
         #: still watched, margin-checked and exited. (It used to detach the
@@ -1128,6 +1129,11 @@ class CarryEngine:
                                                "spot")["taker_bps"])
         return 2.0 * (spot + perp)
 
+    #: (round-trip bps, wall-clock ms) from the last time the PRODUCTION entry
+    #: path priced it. The outlook uses this and never asks the venue itself:
+    #: it is served from the health thread.
+    _last_round_trip: Optional[Tuple[float, int]] = None
+
     def _entry_benefit_refusal(self, mark: float, spot_mark: float,
                                notional_usd: float) -> Optional[CarryDecision]:
         """The additional entry net-benefit gate (None = pass or absent).
@@ -1139,12 +1145,16 @@ class CarryEngine:
         if gate is None:
             return None
         journal = getattr(self.broker, "journal", None)
-        try:
-            round_trip = self.round_trip_bps()
-        except Exception:  # noqa: BLE001 - an unpriced round trip is unavailable
-            round_trip = None
+        # The round trip the production cost gate just priced for this very
+        # decision, not a second venue lookup that could disagree with it.
+        priced = self._last_round_trip
+        round_trip = None if priced is None else priced[0]
+        # The caller's clock when it supplied one (replay, tests), as the pair
+        # gate uses; the wall clock otherwise.
+        now_ms = (int(self._entry_clock_ms) if self._entry_clock_ms > 0
+                  else int(time.time() * 1000))
         result = gate.check(
-            now_ms=int(time.time() * 1000),
+            now_ms=now_ms, execution_style=self.execution_style,
             entries=list(getattr(journal, "entries", ()) or ()),
             execution_mode=self.execution_mode, perp_symbol=self.perp_symbol,
             spot_symbol=self.spot_symbol, mark=mark, spot=spot_mark,
@@ -1155,9 +1165,10 @@ class CarryEngine:
             notional_usd=notional_usd, mechanical_reason="CLEARED")
         self.last_entry_trace = dict(result.trace)
         if result.allowed:
-            if result.reason:
+            if result.reason and result.reason != self._observe_logged:
                 logger.warning("entry net-benefit gate (observe): WOULD refuse "
                                "%s", result.reason)
+            self._observe_logged = result.reason
             return None
         return CarryDecision("stand_aside", reason=result.reason,
                              state=BookState.FLAT, detail=dict(result.trace))
@@ -1206,6 +1217,8 @@ class CarryEngine:
                                 "an unknown basis is not a small one"}))
         try:
             round_trip = self.round_trip_bps()
+            # Kept for the read-only outlook, which must not touch the venue.
+            self._last_round_trip = (round_trip, int(time.time() * 1000))
         except Exception as exc:  # noqa: BLE001 - an unpriced exit is a refusal
             return EntryEconomics(None, None, CarryDecision(
                 "stand_aside", reason="FEE_RATES_UNREADABLE",
