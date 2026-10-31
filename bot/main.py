@@ -380,6 +380,7 @@ class TradingBot:
                 },
                 "book_state": engine.state.value,
                 "last_decision": dict(self._last_carry_decision),
+                "outlook": self._carry_outlook(engine),
                 # The carry book installs no protective stop BY DESIGN: it is
                 # delta-neutral and its protection is the margin-headroom and
                 # liquidation-distance exits run on every tick.
@@ -953,6 +954,18 @@ class TradingBot:
         self.carry.entries_enabled = False
         self.protect_only_reason = "; ".join(verdict.reasons) or "protect-only"
         return True
+
+    def _carry_outlook(self, engine: Any) -> Dict[str, Any]:
+        """The engine's advisory outlook from the last view this process took
+        (marks only; nothing is fetched here). Absent data is reported, not
+        guessed."""
+        view = getattr(engine, "snapshot", None)
+        try:
+            return engine.opportunity_outlook(
+                mark=float(getattr(view, "perp_mark", float("nan"))),
+                spot=getattr(view, "spot_mark", None))
+        except Exception as exc:  # noqa: BLE001
+            return {"status": "UNKNOWN", "why": f"{type(exc).__name__}"}
 
     def _protect_only_tick(self) -> None:
         """What a protect-only process does each cycle: read the venue (reads

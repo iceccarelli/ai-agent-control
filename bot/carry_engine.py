@@ -1123,6 +1123,55 @@ class CarryEngine:
                                                "spot")["taker_bps"])
         return 2.0 * (spot + perp)
 
+    def opportunity_outlook(self, *, mark: float, spot: Optional[float]
+                            ) -> Dict[str, Any]:
+        """What the book is waiting for, in numbers. Read-only, advisory.
+
+        Says whether a pair is held, what funding (bps per settlement) the
+        production entry gate would need to open now, how far the smoothed
+        funding is from it, and what would make the book leave. Every field is
+        derived from the same gate `on_candle` asks; nothing here decides.
+        An input it cannot read is reported as None, never guessed.
+        """
+        out: Dict[str, Any] = {
+            "holding": self.position is not None,
+            "entries_enabled": bool(self.entries_enabled),
+            "exit_rule": (f"unwind after {NEGATIVE_FUNDING_EXIT_PRINTS} "
+                          "consecutive negative funding prints, or on a "
+                          "margin / liquidation / delta-band breach"),
+            "funding_needed_bps_per_print": None,
+            "smoothed_funding_bps": None,
+            "gap_bps_per_print": None, "status": "UNKNOWN", "why": ""}
+        if self.position is not None:
+            out["status"] = "HOLDING"
+            return out
+        if spot is None or not self._finite(mark) or not self._finite(spot):
+            out["why"] = "SPOT_OR_MARK_UNAVAILABLE"
+            return out
+        try:
+            round_trip = self.round_trip_bps()
+            needed = _costs().breakeven_funding_bps(
+                perp=mark, spot=spot, borrow_apr=self.borrow_apr,
+                round_trip_bps=round_trip,
+                opportunity_cost_apr=self.opportunity_cost_apr)
+        except Exception as exc:  # noqa: BLE001 - unreadable is reported
+            out["why"] = f"UNREADABLE: {type(exc).__name__}"
+            return out
+        out["funding_needed_bps_per_print"] = needed
+        out["smoothed_funding_bps"] = _costs().ewma_funding_bps(
+            self._funding_history)
+        if needed is None:
+            out["status"] = "NO_FUNDING_LEVEL_CLEARS_THE_COSTS"
+            out["why"] = "even the model ceiling does not clear fees, borrow and opportunity cost"
+        elif out["smoothed_funding_bps"] is None:
+            out["status"] = "WAITING_FOR_FUNDING_HISTORY"
+        else:
+            gap = needed - out["smoothed_funding_bps"]
+            out["gap_bps_per_print"] = gap
+            out["status"] = ("ENTRY_CONDITIONS_MET" if gap <= 0
+                             else "WAITING_FOR_FUNDING")
+        return out
+
     def entry_economics(self, *, mark: float, spot: Optional[float],
                         funding_bps: float = 0.0) -> "EntryEconomics":
         """The cost gate's answer for opening NOW, exactly as `on_candle` asks it.

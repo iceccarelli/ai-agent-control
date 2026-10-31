@@ -157,6 +157,7 @@ jobs:
           tests/test_order_lookup_unanswered.py
           tests/test_exit_gate.py
           tests/test_resolve_order_contradiction_tool.py
+          tests/test_opportunity_outlook.py
           tests/test_market_data_venue_defects.py
           tests/test_testnet_readiness_harness.py
           tests/test_testnet_readiness.py
