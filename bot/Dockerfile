@@ -32,7 +32,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      shadow.py shadow_strategy.py technical_analysis.py trading_engine.py \
      venue_fees.py ws_transport.py protective_restart.py execution_record.py \
      entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py \
-     carry_evidence.py performance_analytics.py ./
+     carry_evidence.py performance_analytics.py owner_policy.py ./
 COPY signals/ ./signals/
 
 # carry_shadow.py is the forward-shadow runtime: the real CarryEngine against a
