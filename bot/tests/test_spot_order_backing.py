@@ -221,7 +221,10 @@ def test_the_modules_that_construct_a_bybit_client_are_pinned():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     found = set()
     for base, dirs, files in os.walk(root):
-        dirs[:] = [d for d in dirs if d not in ("tests", "__pycache__", "venv")]
+        dirs[:] = [d for d in dirs if d not in ("tests", "__pycache__", "venv",
+                                                "env", "site-packages",
+                                                "node_modules")
+                   and not d.startswith(".")]
         for name in files:
             if not name.endswith(".py"):
                 continue
