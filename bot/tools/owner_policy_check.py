@@ -15,6 +15,7 @@ owner's to choose.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import types
@@ -22,13 +23,28 @@ import types
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
-import config as _config  # noqa: E402
 import owner_policy  # noqa: E402
 
 
-_FIELDS = (("CARRY_EVIDENCE_DISCOVERY_START_EPOCH", {}),
-           ("CARRY_EVIDENCE_DISCOVERY_END_EPOCH", {}),
-           ("CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD", {"positive": True}))
+_FIELDS = (("CARRY_EVIDENCE_DISCOVERY_START_EPOCH", False),
+           ("CARRY_EVIDENCE_DISCOVERY_END_EPOCH", False),
+           ("CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD", True))
+
+
+def _parse_optional(env, name, positive):
+    """A finite number, None when absent/blank, ValueError when malformed.
+
+    Deliberately NOT `config.parse_optional_float`: importing `config` loads and
+    validates the WHOLE environment at import time, so one bad setting (or a
+    malformed owner value) would crash this tool with a traceback that echoes
+    the value. The rule is the same one (a parity test pins it)."""
+    raw = env.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    value = float(str(raw).strip())              # ValueError if not a number
+    if not math.isfinite(value) or (positive and value <= 0):
+        raise ValueError(name)
+    return value
 
 
 def read_policy(env):
@@ -36,10 +52,10 @@ def read_policy(env):
     hide them and nothing but these names is read. A malformed owner setting is
     reported by NAME only (its value is never echoed)."""
     values, bad = {}, []
-    for name, kw in _FIELDS:
+    for name, positive in _FIELDS:
         try:
-            values[name] = _config.parse_optional_float(env, name, **kw)
-        except _config.ConfigError:
+            values[name] = _parse_optional(env, name, positive)
+        except ValueError:
             values[name] = None
             bad.append(name)
     values["CARRY_ENTRY_BENEFIT_MODE"] = str(

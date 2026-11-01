@@ -41,6 +41,10 @@ ORDER_PATH = (
 def _reads():
     found = {}
     for root, _dirs, files in os.walk(BOT):
+        # A virtual environment or tool cache inside bot/ (a common place for
+        # `.venv`) is not repository source and must not be scanned as such.
+        _dirs[:] = [d for d in _dirs if not d.startswith(".")
+                    and d not in ("venv", "env", "site-packages", "node_modules")]
         rel_root = os.path.relpath(root, BOT)
         if rel_root.split(os.sep)[0] in ("tests", "data", "lib", "__pycache__"):
             continue

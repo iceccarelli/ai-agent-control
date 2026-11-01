@@ -174,3 +174,49 @@ def test_any_database_failure_is_exit_2_not_a_traceback(tmp_path):
     code, out = run(esr.main, ["--db", str(bad), "--mode", "overlay",
                                "--notional-usd", "600"])
     assert code == 2 and "error" in json.loads(out)
+
+
+def test_a_literal_word_in_a_policy_setting_is_named_not_a_traceback():
+    code, out = run(opc.main, env={"CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "START",
+                                   "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "END",
+                                   "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD": "LIMIT"})
+    body = json.loads(out)
+    assert code == 3 and "START'" not in out and "LIMIT'" not in out
+    assert sorted(body["unparseable_settings"]) == [
+        "CARRY_EVIDENCE_DISCOVERY_END_EPOCH",
+        "CARRY_EVIDENCE_DISCOVERY_START_EPOCH",
+        "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD"]
+
+
+def test_the_tool_survives_a_process_whose_environment_config_would_reject():
+    """Run as a real process: importing config validates every setting at import,
+    which this tool must not do. A bad owner value exits 3 without a traceback."""
+    import subprocess
+    env = dict(os.environ, CARRY_EVIDENCE_DISCOVERY_START_EPOCH="START",
+               LOOP_INTERVAL_SECONDS="zzz")
+    r = subprocess.run([sys.executable, os.path.join(BOT, "tools",
+                                                     "owner_policy_check.py")],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert r.returncode == 3, (r.returncode, r.stderr[-300:])
+    assert "Traceback" not in r.stderr and "START'" not in r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "5", " 5.5 ", "-3", "0", "nan", "inf",
+                                 "x", "1e3", "True"])
+@pytest.mark.parametrize("positive", [False, True])
+def test_the_local_parser_agrees_with_the_configs(raw, positive):
+    import config as _config
+
+    def local():
+        try:
+            return ("ok", opc._parse_optional({"K": raw}, "K", positive))
+        except ValueError:
+            return ("bad", None)
+
+    def official():
+        try:
+            return ("ok", _config.parse_optional_float({"K": raw}, "K",
+                                                       positive=positive))
+        except _config.ConfigError:
+            return ("bad", None)
+    assert local() == official()
