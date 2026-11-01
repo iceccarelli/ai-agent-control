@@ -536,6 +536,44 @@ def session_refusal(cfg: Any, client: Any = None) -> Optional[str]:
     return None
 
 
+EXECUTION_RECORDS_SCHEMA = "execution_records/1"
+
+
+def append_execution_records(path: str, journal: Any, venue: str,
+                             written: set) -> int:
+    """Append the journal's FILL entries (each carrying its decision-time
+    execution record in `fee_raw["execution"]`) to a JSONL file, once each.
+
+    The drill's journal is in memory and its state database is a throwaway, so
+    without this its measured fills are gone when it exits. The file is append
+    only and shared by every drill run, so the samples accumulate; each line is
+    labelled with the venue environment, because a testnet fill says nothing
+    about mainnet and the reader must be able to keep them apart. `written` is
+    the set of (ref, ms) already appended by this process, so the report being
+    written twice does not duplicate a line."""
+    fills = ("spot_buy", "spot_sell", "perp_open", "perp_close")
+    lines = []
+    for e in journal.entries:
+        if e.kind not in fills:
+            continue
+        key = (str(e.ref), int(e.ms))
+        if key in written:
+            continue
+        written.add(key)
+        lines.append(json.dumps(
+            {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
+             "kind": e.kind, "ms": int(e.ms), "ref": str(e.ref),
+             "fee_raw": e.fee_raw}, sort_keys=True, default=str))
+    if not lines:
+        return 0
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return len(lines)
+
+
 def write_carry_cash_ledger(path: str, *, journal: Any, state: Dict[str, Any],
                             status: str, flat: bool, venue: str) -> str:
     """``cash_ledger/2``: one carry cycle, from the journal, nothing invented."""
@@ -589,7 +627,8 @@ HOLD_AGING_MARGIN_MS = 15_000
 def run_drill(*, broker: Any, notional: Optional[float] = None,
               arm: bool = False, out: str = "", venue: str = "unknown",
               engine_factory: Any = None, hold: Optional[HoldPlan] = None,
-              cash_ledger: str = "", capture_final: bool = False
+              cash_ledger: str = "", capture_final: bool = False,
+              execution_records: str = ""
               ) -> Dict[str, Any]:
     """The whole sequence. Returns the transcript whatever happens.
 
@@ -602,7 +641,8 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     asked = cap if notional is None else float(notional)
     d = Drill(broker=broker, notional=asked, arm=arm)
     d.venue = str(venue or "unknown")
-    state: Dict[str, Any] = {}
+    state: Dict[str, Any] = {"execution_records": execution_records,
+                             "records_written": set()}
 
     def reachability(s: Stage) -> None:
         perp = float(broker.get_mark(PERP_SYMBOL))
@@ -1153,6 +1193,16 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
     if booked is not None and booked.fills:
         report["round_trip"] = round_trip_summary(booked.fills)
         report["claims"] = drill_claims(booked.fills, journal, venue=d.venue)
+    records_path = state.get("execution_records")
+    if records_path and journal is not None:
+        try:
+            report["execution_records"] = {
+                "path": records_path, "venue": d.venue,
+                "appended": append_execution_records(
+                    records_path, journal, d.venue,
+                    state.setdefault("records_written", set()))}
+        except Exception as exc:  # noqa: BLE001 - never lose the report
+            report["execution_records_error"] = f"{type(exc).__name__}: {exc}"
     if state.get("capture_requested") and booked is not None and booked.fills:
         report["evidence_capture"] = {
             "requested": True,
@@ -1288,6 +1338,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "tools/evidence_reconcile.py")
     ap.add_argument("--cash-ledger", default="",
                     help="write cash_ledger/2 here when the book ends flat")
+    ap.add_argument("--execution-records", default="",
+                    help="append this run's measured fills (decision-time "
+                         "execution records) to this JSONL file, labelled "
+                         "with the venue, for tools/execution_samples_report.py")
     args = ap.parse_args(argv)
     if args.hold_for_settlement and not args.arm:
         print("REFUSED: --hold-for-settlement sends orders and needs --arm.",
@@ -1372,6 +1426,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         report = run_drill(broker=bot.carry.broker, notional=args.notional,
                            arm=args.arm, out=args.out, hold=plan,
                            cash_ledger=args.cash_ledger,
+                           execution_records=args.execution_records,
                            capture_final=bool(args.evidence_path),
                            venue=str(getattr(bot.cfg, "BYBIT_VENUE", "unknown")
                                      if hasattr(bot, "cfg") else "unknown"))
