@@ -203,6 +203,7 @@ def test_a_real_json_true_marks_a_human_item_complete_only_with_an_approval(tmp_
     # set explicitly rather than inherited from the account's umask (a 002
     # umask, the Codespaces default, would make this file 664).
     os.chmod(approvals, 0o600)
+    os.chmod(tmp_path, 0o700)       # and its directory (an ACL mask can widen both)
     verdict = pg.evaluate_promotion_gate(path=str(gate),
                                          approvals_path=str(approvals))
     assert any(i.complete and i.evidence == "x" for i in verdict.items)
