@@ -220,3 +220,77 @@ def test_the_local_parser_agrees_with_the_configs(raw, positive):
         except _config.ConfigError:
             return ("bad", None)
     assert local() == official()
+
+
+# -- drill execution records -> samples report ---------------------------------------
+
+def _journal_with_fills(n, tag="x"):
+    import ledger as L
+    import time
+    j = L.Journal()
+    base = int(time.time() * 1000) - 86_400_000
+
+    def rec(side):
+        return {"schema": 1, "status": "MEASURED",
+                "reference_basis": "executable_side", "symbol": "BTCUSDT",
+                "product": "linear", "side": side, "order_type": "market",
+                "filled_qty": 0.01, "requested_qty": 0.01, "avg_price": 60000.0,
+                "reference_price": 60000.0, "slippage_usd": 0.1,
+                "spread_cost_usd": 0.3, "decision_to_submit_ms": 5,
+                "submit_to_fill_ms": 40}
+    for i in range(n):
+        L.perp_open(j, ms=base + 2000 * i, ref=f"BB-{tag}o-{i}", qty=0.01,
+                    price=60000.0, fee_usd=0.2, fee_status="confirmed",
+                    fee_raw={"execution": rec("Sell")})
+        L.perp_close(j, ms=base + 2000 * i + 1000, ref=f"BB-{tag}c-{i}",
+                     qty=0.01, price=60000.0, entry_price=60000.0, fee_usd=0.2,
+                     fee_status="confirmed", fee_raw={"execution": rec("Buy")})
+    return j
+
+
+def test_drill_records_accumulate_and_are_counted_per_environment(tmp_path):
+    import drill
+    path = str(tmp_path / "execution_records.jsonl")
+    written = set()
+    j = _journal_with_fills(12)
+    assert drill.append_execution_records(path, j, "testnet", written) == 24
+    # the same journal written again appends nothing
+    assert drill.append_execution_records(path, j, "testnet", written) == 0
+    # a second drill run (new process, fresh `written`) adds its own fills
+    j2 = _journal_with_fills(12, tag="y")
+    assert drill.append_execution_records(path, j2, "testnet", set()) == 24
+    code, out = run(esr.main, ["--records", path, "--environment", "testnet",
+                               "--mode", "overlay", "--notional-usd", "600"])
+    body = json.loads(out)
+    assert code == 0 and body["status"] == "MEASURED", body
+    # none of those testnet fills count as mainnet samples
+    code, out = run(esr.main, ["--records", path, "--environment", "mainnet",
+                               "--mode", "overlay", "--notional-usd", "600"])
+    body = json.loads(out)
+    assert code == 3 and body["records_skipped"] == 48
+
+
+def test_records_need_an_environment_and_bad_lines_are_not_samples(tmp_path):
+    import pytest
+    path = tmp_path / "r.jsonl"
+    path.write_text("not json\n{\"schema\": \"other\"}\n\n")
+    with pytest.raises(SystemExit):
+        run(esr.main, ["--records", str(path), "--mode", "overlay",
+                       "--notional-usd", "600"])
+    code, out = run(esr.main, ["--records", str(path), "--environment",
+                               "testnet", "--mode", "overlay",
+                               "--notional-usd", "600"])
+    body = json.loads(out)
+    assert code == 3 and body["records_skipped"] == 2
+
+
+def test_db_and_records_merge(tmp_path):
+    import drill
+    db = _db(tmp_path, 12)
+    path = str(tmp_path / "r.jsonl")
+    drill.append_execution_records(path, _journal_with_fills(12, "z"),
+                                   "testnet", set())
+    code, out = run(esr.main, ["--db", db, "--records", path, "--environment",
+                               "testnet", "--mode", "overlay",
+                               "--notional-usd", "600"])
+    assert code == 0 and json.loads(out)["status"] == "MEASURED"

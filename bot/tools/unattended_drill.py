@@ -283,6 +283,10 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
     out = os.path.join(run_dir, "drill_out.json")
     led = os.path.join(run_dir, "drill_ledger.json")
     rep = os.path.join(run_dir, "reconciliation.json")
+    # Beside the run folders, not in one: old run folders are pruned, and the
+    # samples are meant to accumulate across runs.
+    records = os.path.join(os.path.dirname(os.path.abspath(run_dir)),
+                           "execution_records.jsonl")
     _say(run_dir, f"settlement in {lead} s: running")
 
     preflight: Optional[int] = None
@@ -338,7 +342,8 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                      "--hold-for-settlement", "--max-hold-hours", "0.5",
                      "--poll-seconds", "30", "--settle-wait-hours", "0",
                      "--min-settlements", "1", "--evidence-path", ev,
-                     "--out", out, "--cash-ledger", led],
+                     "--out", out, "--cash-ledger", led,
+                     "--execution-records", records],
                     cenv, log_path=log, timeout_s=DRILL_TIMEOUT_S))
     finally:
         # ALWAYS, even if this process was told to stop (the child has already
