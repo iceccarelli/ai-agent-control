@@ -45,6 +45,7 @@ things that are not estimates.
 from __future__ import annotations
 
 import inspect
+import logging
 import math
 import time
 from dataclasses import dataclass, field
@@ -1080,11 +1081,26 @@ class LedgerBroker:
 
     def __init__(self, inner: Any, journal: Journal,
                  ms: Optional[Callable[[], int]] = None,
-                 spot_symbol: str = "BTCUSDT") -> None:
+                 spot_symbol: str = "BTCUSDT",
+                 book_overlay_inventory: bool = False) -> None:
         self.inner = inner
         self.journal = journal
         self.spot_symbol = spot_symbol
         self._ms = ms or (lambda: 0)
+        #: OVERLAY ONLY. The book never trades the client's BTC, so without a
+        #: revaluation the journal holds the short's price move and not the
+        #: coin it hedges. When on, each close marks the hedged quantity from
+        #: the spot seen at entry to the spot seen at exit (`revalue_inventory`,
+        #: the entry the replay uses). Off in acquire, where `spot_sell`
+        #: already realises the move: both would count the same dollars twice.
+        self.book_overlay_inventory = bool(book_overlay_inventory)
+        #: The spot the engine decided on this tick (None outside a tick).
+        self._hedge_ref: Optional[float] = None
+        #: Quantity of the open short whose entry spot is known, and the sum of
+        #: qty x spot over it. A short with an unknown part is never averaged
+        #: over the gap: the close then books no revaluation at all.
+        self._hedge_ref_qty: float = 0.0
+        self._hedge_ref_cost: float = 0.0
         #: Entry price per open short, so a close can realise against it.
         self._perp_entry: Optional[float] = None
         self._perp_qty: float = 0.0
@@ -1290,6 +1306,58 @@ class LedgerBroker:
             "fee_btc": fee_btc, "fee_status": status,
             "fee_currencies": currencies})
 
+    def note_hedge_reference(self, spot: Optional[float]) -> None:
+        """The spot price the engine decided on, for the overlay's inventory
+        leg. None (outside a tick, or no spot) means "not observed"; nothing is
+        carried over from an earlier tick."""
+        ok = (isinstance(spot, (int, float)) and not isinstance(spot, bool)
+              and math.isfinite(spot) and spot > 0)
+        self._hedge_ref = float(spot) if ok else None
+
+    def _hedge_reference_now(self, symbol: str) -> Optional[float]:
+        """The tick's spot, else one public read of the spot mark (after the
+        fill is booked, so it can never delay an order). None when neither
+        exists; a failed read is "not observed", never a guess."""
+        if self._hedge_ref is not None:
+            return self._hedge_ref
+        getter = getattr(self.inner, "get_spot_mark", None)
+        if not callable(getter):
+            return None
+        try:
+            px = float(getter(self.spot_symbol or symbol))
+        except Exception:  # noqa: BLE001
+            return None
+        return px if math.isfinite(px) and px > 0 else None
+
+    def _rebuild_hedge_references(self) -> None:
+        """Re-derive the entry spot of the open short from the journal (each
+        open fill carries `fee_raw["hedge_spot_ref"]`), so a restart does not
+        forget what the client's coin was worth when the short was opened."""
+        pos = ref_qty = cost = 0.0
+        for e in self.journal.entries:
+            if e.kind not in ("perp_open", "perp_close"):
+                continue
+            leg = next((ln for ln in e.lines if ln.account == PERP), None)
+            if leg is None:
+                continue
+            q = abs(float(leg.qty))
+            if e.kind == "perp_open":
+                ref = (e.fee_raw or {}).get("hedge_spot_ref")
+                pos += q
+                if isinstance(ref, (int, float)) and not isinstance(ref, bool) \
+                        and math.isfinite(ref) and ref > 0:
+                    ref_qty += q
+                    cost += q * float(ref)
+            else:
+                if pos > 0 and ref_qty > 0:
+                    share = min(1.0, q / pos)
+                    ref_qty -= ref_qty * share
+                    cost -= cost * share
+                pos = max(0.0, pos - q)
+                if pos <= 1e-12:
+                    pos = ref_qty = cost = 0.0
+        self._hedge_ref_qty, self._hedge_ref_cost = ref_qty, cost
+
     def resume_basis(self, *, perp_qty: float = 0.0,
                      perp_price: Optional[float] = None,
                      spot_qty: float = 0.0,
@@ -1306,6 +1374,8 @@ class LedgerBroker:
             self._perp_qty, self._perp_entry = float(perp_qty), float(perp_price)
         if spot_qty > 0 and spot_price is not None and spot_price > 0:
             self._spot_qty, self._spot_entry = float(spot_qty), float(spot_price)
+        if self.book_overlay_inventory and perp_qty > 0:
+            self._rebuild_hedge_references()
 
     # -- orders: booked ---------------------------------------------------
 
@@ -1546,6 +1616,34 @@ class LedgerBroker:
                 ref = legacy
         return rec, ref
 
+    def _mark_hedged_inventory(self, *, ms: int, ref: str, qty: float,
+                               qty_before: float, symbol: str) -> None:
+        """Mark the hedged BTC for the quantity just covered. Never raises: the
+        close is already booked, and a failure here leaves the cycle's
+        inventory leg unbooked (which keeps it out of evidence), not the fill
+        unbooked."""
+        try:
+            entry_qty, entry_cost = self._hedge_ref_qty, self._hedge_ref_cost
+            known = (entry_qty > 0 and qty_before > 0
+                     and abs(entry_qty - qty_before) <= 1e-9 + 1e-6 * qty_before)
+            if entry_qty > 0:
+                share = min(1.0, qty / entry_qty)
+                self._hedge_ref_qty = entry_qty - entry_qty * share
+                self._hedge_ref_cost = entry_cost - entry_cost * share
+            if self._perp_qty <= 0:
+                self._hedge_ref_qty = self._hedge_ref_cost = 0.0
+            if not known:
+                return
+            exit_spot = self._hedge_reference_now(symbol)
+            if exit_spot is None:
+                return
+            revalue_inventory(self.journal, ms=ms, ref=f"reval:{ref}", qty=qty,
+                              from_price=entry_cost / entry_qty,
+                              to_price=exit_spot)
+        except Exception:  # noqa: BLE001
+            logging.getLogger(__name__).warning(
+                "overlay inventory leg not booked for %s", ref, exc_info=True)
+
     def _book(self, result, *, side: str, product: str,
               allow_missing_side: bool = False, symbol: str = "",
               requested_qty: Any = None, order_type: str = "market") -> None:
@@ -1667,9 +1765,17 @@ class LedgerBroker:
             return
 
         if side == "Sell":
+            hedge_ref = None
+            if self.book_overlay_inventory:
+                hedge_ref = self._hedge_reference_now(symbol)
+                fee_raw = dict(fee_raw or {})
+                fee_raw["hedge_spot_ref"] = hedge_ref
             perp_open(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                       fee_usd=fee_usdt, fee_status=status, fee_raw=fee_raw,
                       decision_mark=mark)
+            if hedge_ref is not None:
+                self._hedge_ref_qty += qty
+                self._hedge_ref_cost += qty * hedge_ref
             self._note_fill(ref=ref, ms=ms, product=product, side=side,
                             qty=qty, price=price, fee_usdt=fee_usdt,
                             fee_btc=fee_btc, status=status, fee_raw=fee_raw)
@@ -1687,9 +1793,13 @@ class LedgerBroker:
             self._note_fill(ref=ref, ms=ms, product=product, side=side,
                             qty=qty, price=price, fee_usdt=fee_usdt,
                             fee_btc=fee_btc, status=status, fee_raw=fee_raw)
+            before = self._perp_qty
             self._perp_qty = max(0.0, self._perp_qty - qty)
             if self._perp_qty <= 0:
                 self._perp_entry = None
+            if self.book_overlay_inventory:
+                self._mark_hedged_inventory(ms=ms, ref=ref, qty=qty,
+                                            qty_before=before, symbol=symbol)
 
     # -- reads: forwarded, one by one -------------------------------------
 
