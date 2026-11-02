@@ -44,7 +44,9 @@ things that are not estimates.
 """
 from __future__ import annotations
 
+import inspect
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -1126,33 +1128,98 @@ class LedgerBroker:
                        observed_ms: Optional[int] = None,
                        expected_fee_usd: Optional[float] = None,
                        expected_cost_usd: Optional[float] = None,
-                       capture_book: bool = True) -> None:
+                       capture_book: bool = True,
+                       book_source: str = "",
+                       book_timeout_s: Optional[float] = None) -> None:
         """State what the strategy sees at the moment it decides to trade.
 
         Call it immediately before the order(s) for this leg. With no bid/ask
         and ``capture_book`` it reads the touch NOW (public, read-only), which
         is a decision-time observation; if that read fails the reference is
-        the mark alone. Nothing here moves money. A context is replaced by the
-        next call for the same (symbol, product, side) and ignored once stale.
+        the mark alone, or nothing when there is no mark either. Nothing here
+        moves money. A context is replaced by the next call for the same
+        (symbol, product, side) and ignored once stale.
+
+        The read prefers the public order book (``get_book_depth``: touch plus
+        the ladders, so the record can state a depth-walked VWAP) and falls
+        back to the public ticker touch (``get_book_top``). ``book_timeout_s``
+        bounds it in wall-clock time: an exit passes a small one so that a slow
+        or hung venue read can never hold the order back; None = unbounded
+        (an entry is optional and may wait). A book is never built from the
+        mark or a last price, and a read that returns nothing usable is the
+        same as no read.
         """
         import execution_record as xr
         now = int(self._ms())
+        source, venue_ts, bids, asks = str(book_source or ""), None, None, None
         if bid is None and ask is None and capture_book:
-            getter = getattr(self.inner, "get_book_top", None)
-            if callable(getter):
-                try:
-                    top = getter(symbol, product)
-                    bid, ask = top["bid"], top["ask"]
-                    observed_ms = now
-                except Exception:  # noqa: BLE001 - mark-only is the fallback
-                    bid = ask = None
+            touch = self._read_touch(symbol, product, timeout_s=book_timeout_s)
+            if touch is not None:
+                bid, ask = touch["bid"], touch["ask"]
+                observed_ms = now
+                source = touch["source"]
+                venue_ts = touch.get("venue_ts_ms")
+                bids, asks = touch.get("bids"), touch.get("asks")
+        elif (bid is not None or ask is not None) and not source:
+            source = "supplied"
         self._decisions[(symbol, product, side)] = xr.DecisionContext(
             venue=str(getattr(self.inner, "VENUE", "unknown")),
             symbol=symbol, product=product, side=side,
             decision_ms=now if decision_ms is None else decision_ms,
             qty=qty, mark=mark, bid=bid, ask=ask, observed_ms=observed_ms,
             expected_fee_usd=expected_fee_usd,
-            expected_cost_usd=expected_cost_usd)
+            expected_cost_usd=expected_cost_usd, book_source=source,
+            book_venue_ts_ms=venue_ts, bids=bids, asks=asks)
+
+    def _read_touch(self, symbol: str, product: str, *,
+                    timeout_s: Optional[float]) -> Optional[Dict[str, Any]]:
+        """``{bid, ask, source, venue_ts_ms, bids, asks}`` from a public read,
+        or None. Never raises.
+
+        With ``timeout_s`` the whole read (depth, then the ticker fallback)
+        shares ONE deadline, and each source is handed what is left of it as
+        its own request timeout (a single attempt, no retry, no backoff) - the
+        wait is bounded by the transport, not by a thread (live modules start
+        none). A source that cannot take a timeout is called as it is."""
+        deadline = None if timeout_s is None else time.monotonic() + float(timeout_s)
+        for name, source in (("get_book_depth", "orderbook"),
+                             ("get_book_top", "ticker_touch")):
+            getter = getattr(self.inner, name, None)
+            if not callable(getter):
+                continue
+            kwargs: Dict[str, Any] = {}
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0.01:
+                    return None                  # the budget is spent
+                try:
+                    if "timeout_s" in inspect.signature(getter).parameters:
+                        kwargs["timeout_s"] = left
+                except (TypeError, ValueError):
+                    pass
+            try:
+                top = getter(symbol, product, **kwargs)
+                bid, ask = float(top["bid"]), float(top["ask"])
+            except Exception:  # noqa: BLE001 - the next source, or none
+                continue
+            if not (math.isfinite(bid) and math.isfinite(ask)) \
+                    or bid <= 0 or ask <= 0 or bid > ask:
+                continue
+            out: Dict[str, Any] = {"bid": bid, "ask": ask, "source": source}
+            if source == "orderbook":
+                out.update(venue_ts_ms=top.get("venue_ts_ms"),
+                           bids=top.get("bids"), asks=top.get("asks"))
+            return out
+        return None
+
+    def _environment(self) -> str:
+        """The venue environment the inner broker's client talks to ("testnet",
+        "mainnet", ...), or "" when it does not say. Provenance only."""
+        try:
+            value = getattr(getattr(self.inner, "client", None), "venue", None)
+        except Exception:  # noqa: BLE001 - a broker with no client
+            return ""
+        return value if isinstance(value, str) else ""
 
     #: Execution records kept in memory. The journal entry holds each fill's
     #: record durably; this list is only its in-process index, so it is bounded.
@@ -1174,7 +1241,42 @@ class LedgerBroker:
         self._keep_execution(xr.failed_submission(
             ctx, side=side, symbol=symbol, product=product,
             venue=str(getattr(self.inner, "VENUE", "unknown")),
-            order_type=order_type, requested_qty=qty, why=why))
+            order_type=order_type, requested_qty=qty, why=why,
+            environment=self._environment(), recorded_ms=int(self._ms())))
+
+    def _note_unfilled(self, result: Dict[str, Any], *, side: str,
+                       product: str, symbol: str, requested_qty: Any,
+                       order_type: str, qty: float, price: float,
+                       why: str = "") -> None:
+        """Keep the record of an order the venue ANSWERED that booked nothing:
+        a market order that filled zero, or a fill that cannot be booked. It is
+        execution-outcome evidence (status NO_FILL / UNAVAILABLE), never a
+        sample, and it must not stop the caller."""
+        if not side:
+            return
+        try:
+            import execution_record as xr
+            symbol = symbol or str(result.get("symbol") or "")
+            ctx = self._decisions.get((symbol, product, side))
+            rec = xr.assess_fill(
+                ctx, side=side, symbol=symbol, product=product,
+                venue=str(result.get("venue")
+                          or getattr(self.inner, "VENUE", "unknown")),
+                order_type=str(result.get("order_type") or order_type),
+                requested_qty=(requested_qty if requested_qty is not None
+                               else result.get("requested_qty")),
+                filled_qty=qty, avg_price=price, now_ms=int(self._ms()),
+                order_link_id=str(result.get("order_link_id") or ""),
+                submit_ms=result.get("submit_ms"),
+                fill_ms=result.get("fill_ms"),
+                fill_ms_basis=str(result.get("fill_ms_basis") or ""),
+                environment=self._environment())
+            rec["recorded_ms"] = int(self._ms())
+            if why:
+                rec["reasons"] = list(rec.get("reasons") or []) + [why]
+            self._keep_execution(rec)
+        except Exception:  # noqa: BLE001 - bookkeeping never stops an order
+            pass
 
     def _note_fill(self, *, ref: str, ms: int, product: str, side: str,
                    qty: float, price: float, fee_usdt: float, fee_btc: float,
@@ -1305,6 +1407,17 @@ class LedgerBroker:
         total = float(result.get("filled_qty", 0.0) or 0.0)
         extra = total - booked_qty
         if extra <= 0:
+            if total <= 0 and exec_known is not None:
+                # Cancelled with nothing filled at all: that is the outcome of
+                # the resting order, and the only place it is known.
+                self._note_unfilled(
+                    dict(result, order_link_id=str(order_link_id),
+                         submit_ms=exec_known[2], fill_ms=None),
+                    side=side, product=product,
+                    symbol=exec_known[0], requested_qty=exec_known[1],
+                    order_type="post_only", qty=0.0, price=0.0,
+                    why="CANCELLED_UNFILLED: resting order cancelled with "
+                        "nothing filled")
             return result
 
         # The fee on the increment is the difference of two CUMULATIVE venue
@@ -1422,7 +1535,8 @@ class LedgerBroker:
             fee_usd=fee_usd, fee_confirmed=(status == "confirmed"),
             order_link_id=str(result.get("order_link_id") or ""),
             submit_ms=result.get("submit_ms"), fill_ms=fill_ms,
-            fill_ms_basis=str(result.get("fill_ms_basis") or ""))
+            fill_ms_basis=str(result.get("fill_ms_basis") or ""),
+            environment=self._environment())
         ref = rec.get("reference_price")
         if ref is None:
             # A caller that supplied a mark with the result itself (no engine
@@ -1440,6 +1554,15 @@ class LedgerBroker:
         qty = float(result.get("filled_qty", 0.0) or 0.0)
         price = float(result.get("avg_price", 0.0) or 0.0)
         if qty <= 0 or price <= 0:
+            # Nothing is booked. A market order that filled nothing (or a fill
+            # that cannot be priced) is still an OUTCOME worth keeping; a
+            # resting post-only that has not filled yet is not one: its fate
+            # is recorded when it fills or is cancelled.
+            if qty > 0 or order_type == "market":
+                self._note_unfilled(
+                    result, side=side, product=product, symbol=symbol,
+                    requested_qty=requested_qty, order_type=order_type,
+                    qty=qty, price=price)
             return
         if not side and not allow_missing_side:
             raise LedgerError("a fill with no side cannot be booked")
@@ -1471,7 +1594,11 @@ class LedgerBroker:
         fee_raw = dict(fee_raw)
         fee_raw["execution"] = exec_rec
         self._keep_execution(exec_rec)
-        ref = str(result.get("order_link_id") or f"fill:{self._ms()}")
+        # An order with no link id is still ONE order: its ref carries a
+        # running count so two fills in the same millisecond are two refs, not
+        # one row the readers would merge as a duplicate.
+        ref = str(result.get("order_link_id")
+                  or f"fill:{self._ms()}:{len(self.fills)}")
         # Never behind the journal's last entry: a wall clock that stepped back
         # must not turn a venue fill into a booking failure.
         ms = max(int(self._ms()),
