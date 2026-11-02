@@ -1447,6 +1447,11 @@ class LedgerBroker:
             return
         fee_btc, fee_usdt, status, fee_raw = self._resolve_fee(
             result, side=side, product=product)
+        if product == "spot" and side == "Buy":
+            # A base-coin rebate never makes the wallet hold more than the fill
+            # and is not booked; the execution record must state the fee that
+            # IS booked, not the pre-clamp rebate (one fill, one fee).
+            fee_btc = max(0.0, fee_btc)
         # The price the engine DECIDED on (executable side of the book it saw,
         # else its mark), from the context it declared before sending. Anything
         # that does not validate is "not journalled", never a guess; the full

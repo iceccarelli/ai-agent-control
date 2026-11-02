@@ -520,3 +520,26 @@ def test_a_negative_base_fee_on_a_spot_buy_does_not_inflate_the_held_quantity():
     broker = L.LedgerBroker(V(), journal, ms=lambda: 1)
     broker.place_market(symbol="BTCUSDT", side="Buy", qty=0.01, product="spot")
     assert journal.balances()[L.BTC].qty == pytest.approx(0.01)
+
+
+def test_the_execution_record_states_the_fee_the_ledger_booked_for_a_base_rebate():
+    """A spot BUY base-coin rebate is not booked (the wallet never holds more
+    than the fill). The execution record must state that same fee, not the
+    pre-clamp rebate: one fill, one fee, in both places."""
+    import ledger as L
+
+    class V:
+        def place_market(self, **k):
+            return {"filled_qty": 0.01, "avg_price": 30000.0, "order_link_id": "n2",
+                    "fee_detail": {"known": True, "source": "cumFeeDetail", "note": "",
+                                   "components": [{"amount": -0.001,
+                                                   "currency": "BTC"}]}}
+
+    journal = L.Journal()
+    broker = L.LedgerBroker(V(), journal, ms=lambda: 1)
+    broker.place_market(symbol="BTCUSDT", side="Buy", qty=0.01, product="spot")
+    (entry,) = [e for e in journal.entries if e.kind == "spot_buy"]
+    booked = sum(l.usd for l in entry.lines if l.account == L.FEES)
+    assert booked == pytest.approx(0.0)
+    rec = entry.fee_raw["execution"]
+    assert rec.get("fee_usd") == pytest.approx(booked)
