@@ -173,6 +173,18 @@ jobs:
           tests/test_net_economics.py
           tests/test_execution_e2e.py
           tests/test_execution_record.py
+          tests/test_book_depth_record.py
+          tests/test_carry_create_response_is_a_claim.py
+          tests/test_evidence_integrity.py
+          tests/test_execution_integrity.py
+          tests/test_execution_roundtrip.py
+          tests/test_exit_book_measured.py
+          tests/test_ledger_funding_cycle.py
+          tests/test_net_economics_pair.py
+          tests/test_opportunity_map.py
+          tests/test_protect_only_overlay_and_watch.py
+          tests/test_protective_restart_unverified_exposure.py
+          tests/test_seed_pilot.py
           tests/test_protective_restart.py
           tests/test_protect_only_wiring.py
           tests/test_database_environment_scope.py

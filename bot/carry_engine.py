@@ -3188,41 +3188,61 @@ class CarryEngine:
     def _declare_decision(self, symbol: str, product: str, side: str,
                           qty: float) -> None:
         """Tell the broker which price this order was decided at. Bookkeeping
-        only: a broker that cannot take it, or a tick with no decision price,
-        leaves the fill's slippage UNAVAILABLE and trading goes on."""
+        only: a broker that cannot take it, or a decision with no price at all,
+        leaves the fill's slippage UNAVAILABLE and trading goes on.
+
+        An EXIT is declared even when this is not a tick (the drill's unwind,
+        the held-position watch without a market view): `_decision_marks` is
+        cleared when `on_candle` returns, and an exit left without a decision
+        was recorded as NO_DECISION_CONTEXT, so the exits were never
+        book-measured while the entries were. Such an exit carries no mark
+        (none was decided on); the book read at the moment of the decision is
+        its only reference, and when that read fails the record says so."""
         begin = getattr(self.broker, "begin_decision", None)
         if not callable(begin):
             return
-        mark = (getattr(self, "_decision_marks", None) or {}).get(product)
-        if not mark or not self._finite(mark):
-            # No price for this decision: a context left from an earlier tick
-            # must not be measured against.
-            end = getattr(self.broker, "end_decision", None)
-            if callable(end):
-                try:
-                    end(symbol=symbol, product=product, side=side)
-                except Exception:  # noqa: BLE001
-                    logger.warning("stale decision context not cleared",
-                                   exc_info=True)
-            return
         is_exit = (product == "linear" and side == "Buy") or (
             product == "spot" and side == "Sell")
+        mark = (getattr(self, "_decision_marks", None) or {}).get(product)
+        if not mark or not self._finite(mark):
+            if not is_exit:
+                # No price for this decision: a context left from an earlier
+                # tick must not be measured against.
+                end = getattr(self.broker, "end_decision", None)
+                if callable(end):
+                    try:
+                        end(symbol=symbol, product=product, side=side)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("stale decision context not cleared",
+                                       exc_info=True)
+                return
+            mark = None
         kwargs: Dict[str, Any] = {}
         book = self._tick_book(product)
         if book is not None:
             # The touch this tick DECIDED on: a decision-time observation that
             # costs no read at the moment of the order, so an exit has a real
             # book too and its spread and slippage can be measured.
-            kwargs.update(bid=book[0], ask=book[1], observed_ms=book[2])
+            kwargs.update(bid=book[0], ask=book[1], observed_ms=book[2],
+                          book_source="tick_snapshot")
         elif is_exit:
-            # Getting out is never slowed: with no usable tick book an exit
-            # takes no extra public read; its reference falls back to the mark.
-            kwargs["capture_book"] = False
+            # No usable tick book (older than TICK_BOOK_MAX_AGE_S: a drill
+            # holds across a settlement; or none at all). Getting out is never
+            # SLOWED: the exit takes ONE public read of the touch, hard-bounded
+            # in wall-clock time, and goes on without a book if it fails. A
+            # book is never rebuilt from the mark or from an older reading.
+            kwargs.update(capture_book=True,
+                          book_timeout_s=self.EXIT_BOOK_READ_TIMEOUT_S)
         try:
             begin(symbol=symbol, product=product, side=side, qty=qty,
-                  mark=float(mark), **kwargs)
+                  mark=(float(mark) if mark is not None else None), **kwargs)
         except Exception:  # noqa: BLE001
             logger.warning("decision context not recorded", exc_info=True)
+
+    #: The most an exit waits for the public book read that measures it, in
+    #: seconds. A healthy read takes tens of milliseconds; this is the bound on
+    #: a slow or hung one, after which the exit proceeds unmeasured.
+    EXIT_BOOK_READ_TIMEOUT_S = 1.0
 
     #: A tick's touch older than this is not "what the decision saw" any more.
     #: It sits inside execution_record.MAX_OBSERVATION_AGE_MS (5 s) so a book

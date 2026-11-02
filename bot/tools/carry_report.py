@@ -42,6 +42,22 @@ def _evidence(db_path: str, environment: Optional[str]) -> Dict[str, Any]:
     return env
 
 
+def _performance_agrees(db_path: str, environment: Optional[str]) -> bool:
+    """Does the performance report - the ONE classifier of cash - also call the
+    WHOLE ledger reconciled? This tool's own conditions are a subset of its
+    (they miss, for one, an order record whose fill the ledger lacks), so it may
+    narrow the class but never widen it. Any failure to build that report is a
+    no: an unclassifiable ledger is not cash."""
+    try:
+        import carry_performance as _perf
+        rep = _perf.build_report(db_path, environment=environment)
+        sections = rep["sections"]
+        return (sections["realized_cash"]["evidence_class"] == "ACTUAL_RECONCILED"
+                and sections["ledger_detail"]["evidence_class"] == "ACTUAL_RECONCILED")
+    except Exception:  # noqa: BLE001 - fail closed
+        return False
+
+
 def build_report(db_path: str,
                  environment: Optional[str] = None) -> Dict[str, Any]:
     import ledger as _ledger
@@ -115,6 +131,7 @@ def build_report(db_path: str,
                 and out["carry"]["status"] == "REALISED"
                 and out["carry"]["invariants_hold"] and unresolved == 0
                 and abs(st["open_perp_qty"]) <= _ledger.DUST[_ledger.PERP]
+                and _performance_agrees(db_path, environment)
                 else env["booked_figures_class"])
         all_trades: List[sqlite3.Row] = conn.execute(
             "SELECT * FROM trades").fetchall() if _has(conn, "trades") else []

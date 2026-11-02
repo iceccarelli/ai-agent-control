@@ -951,7 +951,11 @@ class TradingBot:
             orders=orders, venue=self._venue_snapshot(),
             kill_switch_engaged=killed,
             entries_enabled=bool(getattr(self.carry, "entries_enabled", False)),
-            exits_permitted=exits_ok)
+            exits_permitted=exits_ok,
+            # OVERLAY's spot balance is the client's own BTC: not the book's
+            # exposure, and never an exit candidate.
+            spot_is_client_inventory=(
+                getattr(self.carry, "execution_mode", "") == "overlay"))
         payload = _pr.build_alert_payload(verdict)
         logger.critical("PROTECTIVE RESTART %s", json.dumps(payload, default=str))
         if verdict.required_operator_alert:
@@ -995,9 +999,35 @@ class TradingBot:
         that was refused. NO exit is sent here; the alert says so."""
         snap = self._venue_snapshot()
         logger.critical(
-            "PROTECT-ONLY (%s): venue perp=%s spot=%s. No order is sent by "
-            "this process; a human must reconcile and restart.",
+            "PROTECT-ONLY (%s): venue perp=%s spot=%s. THE POSITION IS "
+            "UNMANAGED: no order, margin action or exit is taken by this "
+            "process and the carry short has no exchange-side stop; a human "
+            "must reconcile and restart.",
             self.protect_only_reason, snap.perp_qty, snap.spot_qty)
+        # READ-ONLY watch (a GET, never an order, never a store write): a short
+        # nobody manages can still approach its liquidation price, and the
+        # operator is told when it does or when it cannot be seen.
+        if snap.perp_qty is not None and abs(snap.perp_qty) > 1e-12:
+            try:
+                margin = float(self.carry.broker.get_margin_multiple(
+                    self.carry.perp_symbol))
+                if margin != margin:
+                    raise ValueError("margin is not a number")
+            except Exception as exc:  # noqa: BLE001
+                logger.critical(
+                    "PROTECT-ONLY UNMANAGED short: its margin is UNREADABLE "
+                    "(%s: %s); nobody is watching it", type(exc).__name__, exc)
+            else:
+                floor = float(getattr(self.carry, "min_margin_multiple", 0.0))
+                if margin < floor:
+                    logger.critical(
+                        "PROTECT-ONLY UNMANAGED short: margin %.2fx is BELOW "
+                        "the %.2fx floor and NOTHING will act on it - close or "
+                        "hedge it manually NOW", margin, floor)
+                else:
+                    logger.critical(
+                        "PROTECT-ONLY UNMANAGED short: margin %.2fx (floor "
+                        "%.2fx); still nobody is managing it", margin, floor)
 
     def carry_cold_start(self) -> bool:
         """Reconcile the carry ledger against the venue. False = do not start.

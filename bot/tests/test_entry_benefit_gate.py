@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config as _config                                     # noqa: E402
 import entry_benefit_gate as ebg                             # noqa: E402
 import execution_cost_estimate as ece                        # noqa: E402
+from execution_fixtures import valid_record                  # noqa: E402
 import strategy_evidence as se                               # noqa: E402
 
 NOW = 1_800_000_000_000
@@ -28,17 +29,15 @@ class E:
     fee_raw: Dict[str, Any] = field(default_factory=dict)
 
 
-def rec(side, product="linear", q=0.01, ref=60000.0, slip=0.12, spr=0.3):
-    return {"schema": 1, "status": "MEASURED", "reference_basis": "executable_side",
-            "symbol": "BTCUSDT", "product": product, "side": side,
-            "order_type": "market", "filled_qty": q, "requested_qty": q,
-            "avg_price": ref, "reference_price": ref, "slippage_usd": slip,
-            "spread_cost_usd": spr, "decision_to_submit_ms": 5,
-            "submit_to_fill_ms": 40}
+def rec(side, product="linear", q=0.01, ref=60000.0, slip=0.12, spr=0.3,
+        ms=NOW - DAY, link="L"):
+    return valid_record(side=side, product=product, q=q, ref=ref, slip_usd=slip,
+                        spr_usd=spr, ms=int(ms), link=link)
 
 
 def fills(n, side, kind, **kw):
-    return [E(kind, int(NOW - DAY - i), f"BB-{kind}-{i}", {"execution": rec(side, **kw)})
+    return [E(kind, int(NOW - DAY - i), f"BB-{kind}-{i}",
+              {"execution": rec(side, ms=NOW - DAY - i, link=f"BB-{kind}-{i}", **kw)})
             for i in range(n)]
 
 
@@ -46,7 +45,7 @@ FULL = fills(25, "Sell", "perp_open") + fills(25, "Buy", "perp_close")
 
 
 def allow_verdict():
-    return se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {})
+    return se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {}, se.CASH_EVIDENCE_CLASS)
 
 
 def args(**over):
@@ -84,7 +83,7 @@ def test_no_evidence_provider_means_strategy_evidence_insufficient():
 
 def test_an_insufficient_or_blocked_verdict_refuses():
     for v in (se.INSUFFICIENT, se.BLOCK):
-        r = gate(evidence_provider=lambda v=v: se.EvidenceVerdict("btc_funding_carry", v, ("x",), {})
+        r = gate(evidence_provider=lambda v=v: se.EvidenceVerdict("btc_funding_carry", v, ("x",), {}, se.CASH_EVIDENCE_CLASS)
                  ).check(**args())
         assert r.reason == ebg.EVIDENCE_INSUFFICIENT and not r.allowed
 
@@ -278,11 +277,11 @@ def test_maker_first_pools_resting_and_market_fills_for_each_leg():
 
 
 def test_a_verdict_for_another_strategy_unlocks_nothing():
-    other = lambda: se.EvidenceVerdict("some_other_strategy", se.ALLOCATE, ("OK",), {})
+    other = lambda: se.EvidenceVerdict("some_other_strategy", se.ALLOCATE, ("OK",), {}, se.CASH_EVIDENCE_CLASS)
     r = gate(evidence_provider=other).check(**args())
     assert r.reason == ebg.EVIDENCE_INSUFFICIENT
     assert r.trace["layers"]["strategy_evidence"]["verdict_strategy_id"] == "some_other_strategy"
-    mine = lambda: se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {})
+    mine = lambda: se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {}, se.CASH_EVIDENCE_CLASS)
     assert gate(evidence_provider=mine).check(**args()).would_allow
 
 
@@ -370,3 +369,79 @@ def test_observe_mode_logs_a_repeated_would_refuse_once(tmp_path):
         log.disabled = old_disabled
     assert handler.n == 1
     store.close()
+
+
+# -- the basis the hedge gives back on convergence ----------------------------
+#
+# Short perp / long spot earns `entry_basis - exit_basis` (basis = perp/spot-1).
+# Entering with the perp BELOW spot and exiting at parity gives that discount
+# back, in full, whatever the funding paid in between. The net-benefit rule
+# listed fees, spread, slippage, financing and opportunity cost but no basis, and
+# `check` accepted mark and spot without reading them. A premium is never
+# credited (it may not converge in our favour in the hold).
+
+THIN = [2.0, 2.1, 1.9, 2.0]     # ~2 bps/8h: the net is positive but thin
+
+
+def discount(bps, spot=60000.0):
+    return dict(mark=spot * (1.0 - bps / 1e4), spot=spot)
+
+
+def test_the_baseline_thin_carry_is_supported_at_parity():
+    r = gate().check(**args(funding_history=THIN))
+    net = r.trace["layers"]["entry_benefit"]["net_benefit_bps"]
+    assert r.would_allow and 0.0 < net < 27.0, net
+
+
+def test_a_27_bps_discount_gives_back_more_than_the_thin_carry_earns():
+    r = gate().check(**args(funding_history=THIN, **discount(27.0)))
+    assert r.reason == ebg.BENEFIT_NOT_SUPPORTED and not r.allowed
+    layer = r.trace["layers"]["entry_benefit"]
+    assert layer["components_bps"]["basis_convergence"] == pytest.approx(27.0)
+    assert layer["net_benefit_bps"] < 0.0
+    base = gate().check(**args(funding_history=THIN)).trace["layers"][
+        "entry_benefit"]["net_benefit_bps"]
+    assert layer["net_benefit_bps"] == pytest.approx(base - 27.0)
+
+
+def test_a_premium_is_not_credited():
+    r = gate().check(**args(funding_history=THIN, **discount(-27.0)))
+    layer = r.trace["layers"]["entry_benefit"]
+    assert layer["components_bps"]["basis_convergence"] == 0.0
+    base = gate().check(**args(funding_history=THIN)).trace["layers"][
+        "entry_benefit"]["net_benefit_bps"]
+    assert layer["net_benefit_bps"] == pytest.approx(base)
+    assert r.would_allow
+
+
+@pytest.mark.parametrize("mark,spot", [(None, 60000.0), (60000.0, None),
+                                       (60000.0, 0.0), (float("nan"), 60000.0),
+                                       (60000.0, -1.0)])
+def test_an_unreadable_basis_is_unavailable_not_zero(mark, spot):
+    r = gate().check(**args(mark=mark, spot=spot))
+    assert r.reason == ebg.BENEFIT_UNAVAILABLE and not r.allowed
+    assert r.trace["layers"]["entry_benefit"]["components_bps"][
+        "basis_convergence"] == se.UNAVAILABLE
+
+
+def test_the_basis_term_is_part_of_the_rule_fingerprint():
+    import inspect
+    assert "basis" in inspect.getsource(ebg.EntryBenefitGate.fingerprint)
+
+
+def test_the_pure_rule_prices_a_supplied_basis_and_never_assumes_one():
+    base = dict(expected_funding_bps_per_settlement=2.0, hold_days=10.0,
+                notional_usd=1000.0, round_trip_fee_bps=11.0, spread_bps=1.0,
+                expected_slippage_bps=2.0, borrow_apr=0.0,
+                opportunity_cost_apr=0.0, income_haircut_fraction=0.0,
+                income_uncertainty_bps=0.0, evidence=se.EvidenceVerdict(
+                    "s", se.ALLOCATE, ("OK",), {},
+                    evidence_class=se.CASH_EVIDENCE_CLASS))
+    plain = se.evaluate_entry_benefit(**base)
+    assert "basis_convergence" not in plain.components_bps      # nothing assumed
+    with_basis = se.evaluate_entry_benefit(basis_convergence_bps=27.0, **base)
+    assert with_basis.net_benefit_bps == pytest.approx(plain.net_benefit_bps - 27.0)
+    for bad in (None, float("nan"), float("inf"), -1.0):
+        d = se.evaluate_entry_benefit(basis_convergence_bps=bad, **base)
+        assert not d.allowed and d.reasons[0].startswith(se.REFUSE_UNAVAILABLE)
+        assert d.net_benefit_bps is None

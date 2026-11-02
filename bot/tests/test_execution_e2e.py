@@ -276,7 +276,7 @@ def test_an_engine_opened_pair_journals_the_decision_price(tmp_path):
     store.close()
 
 
-def test_an_exit_takes_no_extra_book_read_and_a_missing_price_clears_the_context():
+def test_an_exit_reads_the_book_bounded_and_a_missing_entry_price_clears_the_context():
     from carry_engine import CarryEngine
     calls = []
 
@@ -293,7 +293,10 @@ def test_an_exit_takes_no_extra_book_read_and_a_missing_price_clears_the_context
     e._declare_decision("BTCUSDT", "linear", "Buy", 0.01)     # an exit
     e._declare_decision("BTCUSDT", "linear", "Sell", 0.01)    # an entry
     e._declare_decision("BTCUSDT", "spot", "Buy", 0.01)       # no spot price
-    assert calls[0][0] == "begin" and calls[0][1]["capture_book"] is False
+    # an exit with no fresh tick book takes one BOUNDED read (it used to take
+    # none and was then never book-measured)
+    assert calls[0][0] == "begin" and calls[0][1]["capture_book"] is True
+    assert calls[0][1]["book_timeout_s"] > 0
     assert calls[1][0] == "begin" and "capture_book" not in calls[1][1]
     assert calls[2][0] == "end"
 

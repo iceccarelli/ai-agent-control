@@ -109,7 +109,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -537,26 +537,48 @@ def session_refusal(cfg: Any, client: Any = None) -> Optional[str]:
 
 
 EXECUTION_RECORDS_SCHEMA = "execution_records/1"
+#: A line holding an order that did NOT fill (a rejected, unsent, cancelled or
+#: zero-fill attempt). It is evidence of the execution OUTCOME, kept so the
+#: samples that survive are not mistaken for the whole story; its `kind` is not
+#: a fill kind, so nothing that prices a filled order can count it.
+OUTCOME_KIND = "execution_outcome"
+_FILL_KINDS = ("spot_buy", "spot_sell", "perp_open", "perp_close")
+
+
+def _outcome_key(rec: Dict[str, Any]) -> Tuple[str, str]:
+    return ("outcome", json.dumps(rec, sort_keys=True, default=str))
 
 
 def append_execution_records(path: str, journal: Any, venue: str,
-                             written: set) -> int:
+                             written: set, outcomes: Any = ()) -> int:
     """Append the journal's FILL entries (each carrying its decision-time
-    execution record in `fee_raw["execution"]`) to a JSONL file, once each.
+    execution record in `fee_raw["execution"]`) to a JSONL file, once each, and
+    the execution OUTCOMES of orders that did not fill.
 
     The drill's journal is in memory and its state database is a throwaway, so
     without this its measured fills are gone when it exits. The file is append
     only and shared by every drill run, so the samples accumulate; each line is
     labelled with the venue environment, because a testnet fill says nothing
     about mainnet and the reader must be able to keep them apart. `written` is
-    the set of (ref, ms) already appended by this process, so the report being
-    written twice does not duplicate a line."""
-    fills = ("spot_buy", "spot_sell", "perp_open", "perp_close")
+    the set of keys already appended by this process, so the report being
+    written twice does not duplicate a line.
+
+    `outcomes` is the broker's execution records (`LedgerBroker.executions`).
+    The ones that filled nothing, or whose fill the journal does not hold, are
+    written with the distinct kind ``execution_outcome`` and the record under
+    ``execution`` (no ``fee_raw``). They are never fills: the reader keeps them
+    out of every cost sample and only counts them."""
     lines = []
+    booked_refs = set()
     for e in journal.entries:
-        if e.kind not in fills:
+        if e.kind not in _FILL_KINDS:
             continue
-        key = (str(e.ref), int(e.ms))
+        booked_refs.add(str(e.ref))
+        # (ref, ms) alone would collapse two distinct fills that share both; the
+        # execution record's own timestamps and quantities tell them apart.
+        exe = (e.fee_raw or {}).get("execution") or {}
+        key = (str(e.ref), int(e.ms), exe.get("filled_qty"),
+               exe.get("avg_price"), exe.get("submit_ms"), exe.get("fill_ms"))
         if key in written:
             continue
         written.add(key)
@@ -564,6 +586,21 @@ def append_execution_records(path: str, journal: Any, venue: str,
             {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
              "kind": e.kind, "ms": int(e.ms), "ref": str(e.ref),
              "fee_raw": e.fee_raw}, sort_keys=True, default=str))
+    for rec in list(outcomes or ()):
+        if not isinstance(rec, dict):
+            continue
+        link = str(rec.get("order_link_id") or "")
+        if rec.get("filled_qty") and link in booked_refs:
+            continue                         # a fill: it is persisted above
+        key = _outcome_key(rec)
+        if key in written:
+            continue
+        written.add(key)
+        ms = rec.get("recorded_ms") or rec.get("decision_ms") or 0
+        lines.append(json.dumps(
+            {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
+             "kind": OUTCOME_KIND, "ms": int(ms), "ref": link,
+             "execution": rec}, sort_keys=True, default=str))
     if not lines:
         return 0
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -1200,7 +1237,8 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
                 "path": records_path, "venue": d.venue,
                 "appended": append_execution_records(
                     records_path, journal, d.venue,
-                    state.setdefault("records_written", set()))}
+                    state.setdefault("records_written", set()),
+                    outcomes=getattr(booked, "executions", ()))}
         except Exception as exc:  # noqa: BLE001 - never lose the report
             report["execution_records_error"] = f"{type(exc).__name__}: {exc}"
     if state.get("capture_requested") and booked is not None and booked.fills:

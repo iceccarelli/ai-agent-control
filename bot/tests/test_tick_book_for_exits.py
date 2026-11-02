@@ -111,12 +111,17 @@ def test_the_spot_exit_uses_the_spot_touch():
     assert (kw["bid"], kw["ask"]) == (99.8, 100.2)
 
 
-def test_an_exit_without_a_fresh_touch_takes_no_extra_read():
+def test_an_exit_without_a_fresh_touch_takes_one_bounded_public_read():
+    """Replaces "takes no extra read" (the exit used to fall back to the mark
+    and was dropped from the cost samples as NOT_BOOK_MEASURED): the exit now
+    reads the touch itself, under a hard wall-clock bound, never from the mark."""
     for v in (view(age=10.0), view(perp=None), None):
         e = engine_with(v)
         e._declare_decision("BTCUSDT", "linear", "Buy", 0.01)
         kw = e.broker.calls[0]
-        assert kw.get("capture_book") is False and "bid" not in kw
+        assert kw.get("capture_book") is True and "bid" not in kw
+        assert kw["book_timeout_s"] == ce.CarryEngine.EXIT_BOOK_READ_TIMEOUT_S
+        assert 0 < kw["book_timeout_s"] <= 2.0
 
 
 def test_an_entry_without_a_fresh_touch_still_reads_the_book_itself():

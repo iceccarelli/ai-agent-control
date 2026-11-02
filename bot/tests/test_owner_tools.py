@@ -14,9 +14,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 sys.path.insert(0, BOT)
 sys.path.insert(0, os.path.join(BOT, "tools"))
+sys.path.insert(0, HERE)
 
 import execution_samples_report as esr                       # noqa: E402
 import owner_policy_check as opc                              # noqa: E402
+from execution_fixtures import valid_record                  # noqa: E402
 
 NOW = 2_000_000_000.0
 
@@ -88,30 +90,26 @@ def _db(tmp_path, n):
     import time
     base = int(time.time() * 1000) - 86_400_000
 
-    def rec(side, i):
-        return {"schema": 1, "status": "MEASURED",
-                "reference_basis": "executable_side", "symbol": "BTCUSDT",
-                "product": "linear", "side": side, "order_type": "market",
-                "filled_qty": 0.01, "requested_qty": 0.01, "avg_price": 60000.0,
-                "reference_price": 60000.0, "slippage_usd": 0.1,
-                "spread_cost_usd": 0.3, "decision_to_submit_ms": 5,
-                "submit_to_fill_ms": 40}
     for i in range(n):
         L.perp_open(j, ms=base + 2000 * i, ref=f"BB-o-{i}", qty=0.01, price=60000.0,
                     fee_usd=0.2, fee_status="confirmed",
-                    fee_raw={"execution": rec("Sell", i)})
+                    fee_raw={"execution": valid_record(
+                        side="Sell", ms=base + 2000 * i, link=f"BB-o-{i}")})
         L.perp_close(j, ms=base + 2000 * i + 1000, ref=f"BB-c-{i}", qty=0.01,
                      price=60000.0, entry_price=60000.0, fee_usd=0.2,
-                     fee_status="confirmed", fee_raw={"execution": rec("Buy", i)})
+                     fee_status="confirmed", fee_raw={"execution": valid_record(
+                         side="Buy", ms=base + 2000 * i + 1000,
+                         link=f"BB-c-{i}")})
     store.save_ledger(j.to_rows())
+    store.record_execution_environment("testnet")
     store.close()
     return path
 
 
 def test_the_report_names_the_shortfall_per_leg(tmp_path):
     path = _db(tmp_path, 5)
-    code, out = run(esr.main, ["--db", path, "--mode", "overlay",
-                               "--notional-usd", "600"])
+    code, out = run(esr.main, ["--db", path, "--environment", "testnet",
+                               "--mode", "overlay", "--notional-usd", "600"])
     body = json.loads(out)
     assert code == 3 and body["status"] == "UNAVAILABLE"
     assert body["shortfall"]["linear/Sell/market"] == 15
@@ -119,8 +117,8 @@ def test_the_report_names_the_shortfall_per_leg(tmp_path):
 
 def test_enough_samples_exit_0(tmp_path):
     path = _db(tmp_path, 22)
-    code, out = run(esr.main, ["--db", path, "--mode", "overlay",
-                               "--notional-usd", "600"])
+    code, out = run(esr.main, ["--db", path, "--environment", "testnet",
+                               "--mode", "overlay", "--notional-usd", "600"])
     body = json.loads(out)
     assert code == 0 and body["status"] == "MEASURED"
     assert set(body["shortfall"].values()) == {0}
@@ -128,12 +126,13 @@ def test_enough_samples_exit_0(tmp_path):
 
 def test_it_is_read_only_and_never_creates_a_database(tmp_path):
     missing = str(tmp_path / "nope.db")
-    code, out = run(esr.main, ["--db", missing, "--mode", "overlay",
-                               "--notional-usd", "600"])
+    code, out = run(esr.main, ["--db", missing, "--environment", "testnet",
+                               "--mode", "overlay", "--notional-usd", "600"])
     assert code == 2 and not os.path.exists(missing)
     path = _db(tmp_path, 3)
     before = open(path, "rb").read()
-    run(esr.main, ["--db", path, "--mode", "overlay", "--notional-usd", "600"])
+    run(esr.main, ["--db", path, "--environment", "testnet", "--mode",
+                   "overlay", "--notional-usd", "600"])
     assert open(path, "rb").read() == before
 
 
@@ -141,28 +140,31 @@ def test_a_database_with_no_ledger_is_an_error_not_a_pass(tmp_path):
     from persistence import StateStore
     path = str(tmp_path / "e.db")
     StateStore(path).close()
-    code, out = run(esr.main, ["--db", path, "--mode", "overlay",
-                               "--notional-usd", "600"])
+    code, out = run(esr.main, ["--db", path, "--environment", "testnet",
+                               "--mode", "overlay", "--notional-usd", "600"])
     assert code == 2 and "error" in json.loads(out)
 
 
 def test_the_report_defaults_mode_and_symbols_from_the_environment(tmp_path):
     path = _db(tmp_path, 22)
-    code, out = run(esr.main, ["--db", path, "--notional-usd", "600"],
+    code, out = run(esr.main, ["--db", path, "--environment", "testnet", "--notional-usd", "600"],
                     env={"CARRY_EXECUTION_MODE": "overlay"})
     body = json.loads(out)
     assert code == 0 and [l["symbol"] for l in body["legs"]] == ["BTCUSDT", "BTCUSDT"]
-    other = run(esr.main, ["--db", path, "--notional-usd", "600"],
+    other = run(esr.main, ["--db", path, "--environment", "testnet", "--notional-usd", "600"],
                 env={"CARRY_EXECUTION_MODE": "overlay", "CARRY_PERP_SYMBOL": "ETHUSDT"})
     assert other[0] == 3                           # that symbol has no samples here
 
 
 def test_the_report_demands_a_mode_and_a_sane_notional(tmp_path):
     path = _db(tmp_path, 3)
-    for argv, env in ((["--db", path, "--notional-usd", "600"], {}),
-                      (["--db", path, "--mode", "overlay", "--notional-usd", "0"], {}),
-                      (["--db", path, "--mode", "overlay", "--notional-usd", "-5"], {}),
-                      (["--db", path, "--mode", "overlay", "--notional-usd", "nan"], {})):
+    for argv, env in ((["--db", path, "--environment", "testnet", "--notional-usd", "600"], {}),
+                      (["--db", path, "--environment", "testnet", "--mode", "overlay",
+                       "--notional-usd", "0"], {}),
+                      (["--db", path, "--environment", "testnet", "--mode", "overlay",
+                       "--notional-usd", "-5"], {}),
+                      (["--db", path, "--environment", "testnet", "--mode", "overlay",
+                       "--notional-usd", "nan"], {})):
         with pytest.raises(SystemExit) as e:
             esr.main(argv, env=env)
         assert e.value.code == 2
@@ -171,8 +173,8 @@ def test_the_report_demands_a_mode_and_a_sane_notional(tmp_path):
 def test_any_database_failure_is_exit_2_not_a_traceback(tmp_path):
     bad = tmp_path / "junk.db"
     bad.write_bytes(b"this is not sqlite" * 50)
-    code, out = run(esr.main, ["--db", str(bad), "--mode", "overlay",
-                               "--notional-usd", "600"])
+    code, out = run(esr.main, ["--db", str(bad), "--environment", "testnet",
+                               "--mode", "overlay", "--notional-usd", "600"])
     assert code == 2 and "error" in json.loads(out)
 
 
@@ -230,21 +232,17 @@ def _journal_with_fills(n, tag="x"):
     j = L.Journal()
     base = int(time.time() * 1000) - 86_400_000
 
-    def rec(side):
-        return {"schema": 1, "status": "MEASURED",
-                "reference_basis": "executable_side", "symbol": "BTCUSDT",
-                "product": "linear", "side": side, "order_type": "market",
-                "filled_qty": 0.01, "requested_qty": 0.01, "avg_price": 60000.0,
-                "reference_price": 60000.0, "slippage_usd": 0.1,
-                "spread_cost_usd": 0.3, "decision_to_submit_ms": 5,
-                "submit_to_fill_ms": 40}
     for i in range(n):
         L.perp_open(j, ms=base + 2000 * i, ref=f"BB-{tag}o-{i}", qty=0.01,
                     price=60000.0, fee_usd=0.2, fee_status="confirmed",
-                    fee_raw={"execution": rec("Sell")})
+                    fee_raw={"execution": valid_record(
+                        side="Sell", ms=base + 2000 * i,
+                        link=f"BB-{tag}o-{i}")})
         L.perp_close(j, ms=base + 2000 * i + 1000, ref=f"BB-{tag}c-{i}",
                      qty=0.01, price=60000.0, entry_price=60000.0, fee_usd=0.2,
-                     fee_status="confirmed", fee_raw={"execution": rec("Buy")})
+                     fee_status="confirmed", fee_raw={"execution": valid_record(
+                         side="Buy", ms=base + 2000 * i + 1000,
+                         link=f"BB-{tag}c-{i}")})
     return j
 
 

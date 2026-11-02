@@ -628,6 +628,7 @@ class BybitClient:
         body: Optional[Mapping[str, Any]] = None,
         signed: bool = False,
         retries: int = 3,
+        timeout_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         """One transport for every call. Returns the WHOLE parsed v5 envelope
         on ``retCode == 0`` - ``{"retCode", "retMsg", "result": {...}, ...}`` -
@@ -649,6 +650,11 @@ class BybitClient:
         Note the keyword-only ``params``/``body``: the legacy signature allowed
         a body to be passed positionally into the ``params`` slot, which is how
         fifteen POST call sites ended up sending an empty body.
+
+        ``timeout_s`` replaces the configured request timeout for THIS call
+        only, and ``retries=0`` means exactly one attempt with no backoff sleep
+        after it: together they are how a best-effort public read (the
+        decision-time book) is held to a wall-clock bound.
         """
         method = method.upper()
         url = f"{self.base_url}{endpoint}"
@@ -704,16 +710,20 @@ class BybitClient:
                     url + (f"?{query}" if (method == "GET" and query) else ""),
                     headers=headers,
                     body=body_str if method != "GET" else None,
-                    timeout=self.timeout_s,
+                    timeout=(self.timeout_s if timeout_s is None
+                             else float(timeout_s)),
                 )
             except Exception as exc:  # noqa: BLE001 - network layer
                 last_error = TransientAPIError(f"transport error: {exc}")
-                self._backoff(attempt)
+                if retries > 0:
+                    self._backoff(attempt)
                 continue
 
             if status in TRANSIENT_HTTP:
                 last_error = TransientAPIError(f"HTTP {status}", payload=text)
-                if status == 429:
+                if retries <= 0:
+                    pass            # one attempt only: nothing to wait for
+                elif status == 429:
                     self._rate_limit_backoff(attempt)
                 else:
                     self._backoff(attempt)
@@ -758,7 +768,9 @@ class BybitClient:
                     pass
             if ret_code in TRANSIENT_RET_CODES:
                 last_error = TransientAPIError(ret_msg, ret_code, payload_json)
-                if ret_code in (10006, 10018):
+                if retries <= 0:
+                    pass            # one attempt only: nothing to wait for
+                elif ret_code in (10006, 10018):
                     self._rate_limit_backoff(attempt)
                 else:
                     self._backoff(attempt)

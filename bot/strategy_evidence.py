@@ -28,7 +28,13 @@ WHAT THE INPUT MUST BE
 ======================
 Closed trades NET of fees, funding, borrow and slippage as the caller measured
 them (this module cannot verify that; ``net_basis`` is a required, non-blank
-label so the claim is at least attributable). Each trade has an entry and exit
+label so the claim is at least attributable). The evidence must also NAME ITS
+CLASS, and only ``ACTUAL_RECONCILED`` (reconciled mainnet cash) can ever
+ALLOCATE: paper, testnet, simulated, mark-to-market and unspecified evidence is
+INSUFFICIENT however good its numbers look, so a verdict can no longer be
+produced from a simulation and mistaken for cash. Closed results the caller left
+out because they were not qualified (``unqualified_results``) also make the
+evidence INSUFFICIENT: a set that omits some of its own outcomes is not a sample. Each trade has an entry and exit
 time (epoch seconds). The discovery window is the interval of data used to find
 or tune the strategy; a strategy cannot certify on data it was discovered on, so
 a trade that overlaps it BLOCKs the whole evidence set. An unknown discovery
@@ -69,6 +75,7 @@ NO_EVIDENCE = "NO_EVIDENCE"
 UNKNOWN_EXPECTANCY = "UNKNOWN_EXPECTANCY"
 STALE_EVIDENCE = "STALE_EVIDENCE"
 INVALID_EVIDENCE = "INVALID_EVIDENCE"
+EVIDENCE_NOT_CASH = "EVIDENCE_NOT_CASH"
 INSUFFICIENT_TRADES = "INSUFFICIENT_TRADES"
 DISCOVERY_WINDOW_UNKNOWN = "DISCOVERY_WINDOW_UNKNOWN"
 DRAWDOWN_LIMIT_UNKNOWN = "DRAWDOWN_LIMIT_UNKNOWN"
@@ -78,6 +85,13 @@ ALL_CHECKS_PASSED = "ALL_CHECKS_PASSED"
 
 UNAVAILABLE = "UNAVAILABLE"
 FUTURE_TOLERANCE_S = 300.0
+
+#: The one evidence class that is cash (carry_performance.ACTUAL_RECONCILED):
+#: reconciled MAINNET execution. Repeated as a literal because the report tool
+#: is a script, not a package; a test pins the two together.
+CASH_EVIDENCE_CLASS = "ACTUAL_RECONCILED"
+#: What the forward-shadow adapter is (carry_performance.FORWARD_SIMULATION).
+FORWARD_SIMULATION_CLASS = "FORWARD_SIMULATION"
 
 
 @dataclass(frozen=True)
@@ -119,6 +133,12 @@ class StrategyEvidence:
     net_basis: str                                   # what "net" nets, and who says so
     discovery_window_s: Optional[Tuple[float, float]]   # (start, end) or None = unknown
     drawdown_limit: Optional[float]                  # same unit as net, > 0, None = unknown
+    #: What the trades ARE. Only CASH_EVIDENCE_CLASS can ALLOCATE; the default
+    #: is "unspecified", which cannot.
+    evidence_class: Any = ""
+    #: Closed results that exist but are NOT in ``trades`` (unreconciled,
+    #: untimed, incomplete). Any > 0 means the sample omits outcomes.
+    unqualified_results: Any = 0
 
 
 @dataclass(frozen=True)
@@ -127,8 +147,19 @@ class EvidenceVerdict:
     verdict: str
     reasons: Tuple[str, ...]
     metrics: Mapping[str, Any]
+    #: The class of the evidence this verdict was judged on ("" = none given).
+    evidence_class: str = ""
     #: Always False. A verdict is not an approval and nothing reads it as one.
     grants_owner_approval: bool = field(default=False, init=False)
+
+    def __post_init__(self) -> None:
+        # No ALLOCATE verdict can exist for anything but reconciled mainnet
+        # cash: constructing one for another class (or none) raises, so a
+        # verdict cannot be forged or built by accident from a simulation.
+        if self.verdict == ALLOCATE and self.evidence_class != CASH_EVIDENCE_CLASS:
+            raise ValueError(
+                f"an ALLOCATE verdict needs evidence_class={CASH_EVIDENCE_CLASS!r}, "
+                f"not {self.evidence_class!r}")
 
     @property
     def allows_capital(self) -> bool:
@@ -137,6 +168,7 @@ class EvidenceVerdict:
     def as_dict(self) -> Dict[str, Any]:
         return {"strategy_id": self.strategy_id, "verdict": self.verdict,
                 "reasons": list(self.reasons), "metrics": dict(self.metrics),
+                "evidence_class": self.evidence_class,
                 "grants_owner_approval": False}
 
 
@@ -171,6 +203,24 @@ def evaluate_strategy_evidence(ev: Optional[StrategyEvidence], *, now_s: float,
 
     if not isinstance(ev.net_basis, str) or not ev.net_basis.strip():
         insuf.append(UNSOURCED_NET_BASIS)
+
+    # Only reconciled mainnet cash is cash. Exact match: no case folding, no
+    # stripping, no truthiness.
+    declared_class = ev.evidence_class if isinstance(ev.evidence_class, str) else ""
+    m["evidence_class"] = declared_class
+    if not (isinstance(ev.evidence_class, str)
+            and ev.evidence_class == CASH_EVIDENCE_CLASS):
+        label = (ev.evidence_class.strip() if isinstance(ev.evidence_class, str)
+                 and ev.evidence_class.strip() else
+                 ("UNSPECIFIED" if not ev.evidence_class else
+                  type(ev.evidence_class).__name__))
+        insuf.append(f"{EVIDENCE_NOT_CASH}:{label}")
+    left_out = ev.unqualified_results
+    if isinstance(left_out, bool) or not isinstance(left_out, int) or left_out < 0:
+        insuf.append(f"{INVALID_EVIDENCE}:unqualified_results")
+    elif left_out:
+        m["unqualified_results"] = left_out
+        insuf.append(f"{INVALID_EVIDENCE}:unqualified_closed_results={left_out}")
 
     trades = list(ev.trades or ())
     bad = [t for t in trades if not (
@@ -268,7 +318,8 @@ def evaluate_strategy_evidence(ev: Optional[StrategyEvidence], *, now_s: float,
         v, reasons = INSUFFICIENT, tuple(insuf)
     else:
         v, reasons = ALLOCATE, (ALL_CHECKS_PASSED,)
-    return EvidenceVerdict(ev.strategy_id or strategy_id, v, reasons, m)
+    return EvidenceVerdict(ev.strategy_id or strategy_id, v, reasons, m,
+                           declared_class)
 
 
 def evidence_from_forward_status(fs: Any, *, strategy_id: str,
@@ -299,7 +350,8 @@ def evidence_from_forward_status(fs: Any, *, strategy_id: str,
     return StrategyEvidence(
         strategy_id=strategy_id, trades=tuple(trades), observed_at_s=obs,
         net_basis="forward_shadow net_r (paper, modelled costs)",
-        discovery_window_s=discovery_window_s, drawdown_limit=drawdown_limit)
+        discovery_window_s=discovery_window_s, drawdown_limit=drawdown_limit,
+        evidence_class=FORWARD_SIMULATION_CLASS)
 
 
 def status_report(verdicts: Mapping[str, EvidenceVerdict],
@@ -335,6 +387,11 @@ REFUSE_NEGATIVE = "NET_BENEFIT_NOT_POSITIVE"
 REFUSE_TOO_UNCERTAIN = "NET_BENEFIT_WITHIN_UNCERTAINTY"
 REFUSE_NO_EVIDENCE = "STRATEGY_EVIDENCE_NOT_ALLOCATE"
 
+#: `basis_convergence_bps` not passed: the component is left out entirely (the
+#: pure rule's older callers). A caller that passes anything else, None
+#: included, is pricing it, and a value it cannot price is UNAVAILABLE.
+NOT_SUPPLIED = object()
+
 
 @dataclass(frozen=True)
 class EntryDecision:
@@ -355,7 +412,9 @@ def evaluate_entry_benefit(*, expected_funding_bps_per_settlement: Any,
                            income_haircut_fraction: Any,
                            income_uncertainty_bps: Any,
                            evidence: Optional[EvidenceVerdict],
-                           settlements_per_day: Any = 3) -> EntryDecision:
+                           settlements_per_day: Any = 3,
+                           basis_convergence_bps: Any = NOT_SUPPLIED
+                           ) -> EntryDecision:
     """Expected net benefit of one entry over its expected hold. Pure.
 
     Every cost argument is REQUIRED (no default); None/NaN/inf/negative is
@@ -392,6 +451,11 @@ def evaluate_entry_benefit(*, expected_funding_bps_per_settlement: Any,
             bad.append(name)
     if not (_finite(income_haircut_fraction) and 0 <= income_haircut_fraction <= 1):
         bad.append("income_haircut_fraction")
+    priced_basis = basis_convergence_bps is not NOT_SUPPLIED
+    if priced_basis:
+        comps["basis_convergence"] = UNAVAILABLE
+        if not nonneg(basis_convergence_bps):
+            bad.append("basis_convergence_bps")
     if bad:
         return EntryDecision(False, (f"{REFUSE_UNAVAILABLE}:" + ",".join(bad),),
                              comps, None, None,
@@ -404,9 +468,15 @@ def evaluate_entry_benefit(*, expected_funding_bps_per_settlement: Any,
         financing=float(borrow_apr) / 365.0 * 1e4 * h,
         opportunity_cost=float(opportunity_cost_apr) / 365.0 * 1e4 * h,
         model_haircut=max(income, 0.0) * float(income_haircut_fraction))
-    net = comps["income"] - sum(comps[k] for k in (
-        "fees", "spread", "slippage", "financing", "opportunity_cost",
-        "model_haircut"))
+    cost_keys = ["fees", "spread", "slippage", "financing", "opportunity_cost",
+                 "model_haircut"]
+    if priced_basis:
+        # What a perp trading BELOW spot gives back when the pair converges: a
+        # cost, charged in full. A premium is never credited (the caller passes
+        # 0 for it); it is a bps figure of the position notional like the rest.
+        comps["basis_convergence"] = float(basis_convergence_bps)
+        cost_keys.append("basis_convergence")
+    net = comps["income"] - sum(comps[k] for k in cost_keys)
     if not math.isfinite(net):
         return EntryDecision(False, (f"{REFUSE_UNAVAILABLE}:arithmetic_overflow",),
                              comps, None, None, h)

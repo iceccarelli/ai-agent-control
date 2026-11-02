@@ -22,6 +22,12 @@ Definitions (per leg = one product and side; bps of that leg's notional)
 Selection and look-ahead
   * only observations with fill time <= as_of_ms are used (a decision never
     sees its own or later fills);
+  * a record's own "MEASURED" is not believed: its stored book, timestamps and
+    fill are re-validated by `execution_record.verify_record` and its slippage,
+    spread and reference must reproduce (RECORD_UNVERIFIABLE /
+    RECORD_INCONSISTENT otherwise);
+  * the bound is taken over per-order slippage floored at zero and is never
+    below the raw bound: price improvement is not credited;
   * the journal holds FILLED orders only, so unfilled attempts are invisible:
     the output says so (`survivorship`) and the bound is not a guarantee;
   * one order is one observation (partial fills and the cancel-time increment
@@ -38,6 +44,7 @@ frozen policy that may be made stricter, never looser.
 from __future__ import annotations
 
 import math
+import execution_record as _xr
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -150,6 +157,12 @@ def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
         if req is not None and q > req * (1 + 1e-6) + 1e-9:
             drop("FILL_EXCEEDS_ORDER")
             continue
+        unverified = _xr.verify_record(rec, entry_ms=int(ms))
+        if unverified:
+            # The record's own claim of "MEASURED" is not evidence: its stored
+            # book, times and fill must reproduce its status and figures.
+            drop(unverified.split(":", 1)[0])
+            continue
         d2s, s2f = rec.get("decision_to_submit_ms"), rec.get("submit_to_fill_ms")
         if (d2s is not None and _num(d2s) is not None and _num(d2s) < 0) or \
                 (s2f is not None and _num(s2f) is not None and _num(s2f) < 0):
@@ -159,7 +172,8 @@ def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
         if not link:
             drop("NO_ORDER_LINK")
             continue
-        key = (getattr(e, "ref", ""), int(ms), q)
+        key = (getattr(e, "ref", ""), int(ms), q, px, rec.get("order_link_id"),
+               rec.get("submit_ms"), rec.get("fill_ms"), rec.get("decision_ms"))
         if key in seen:
             drop("DUPLICATE_ROW")
             continue
@@ -238,7 +252,14 @@ def estimate_leg(entries: Iterable[Any], *, as_of_ms: int, symbol: str,
             f"STALE_SAMPLES: newest {out['newest_age_days']:.1f}d old "
             f"(limit {policy.max_newest_age_days}d)")
         return out
-    s_mean, s_sd, s_bound = _bound([o.slippage_bps for o in band], policy.z)
+    s_mean, s_sd, _raw_bound = _bound([o.slippage_bps for o in band], policy.z)
+    # Price improvement is never credited: the bound is taken over each order's
+    # slippage floored at zero, so a maker-first fill that came in better than
+    # the touch cannot pull the bound down. The mean/sd shown stay the raw ones.
+    improved = sum(1 for o in band if o.slippage_bps < 0)
+    s_bound = max(_raw_bound, _bound([max(0.0, o.slippage_bps)
+                                       for o in band], policy.z)[2])
+    out["price_improved_orders"] = improved
     h_mean, h_sd, h_bound = _bound([o.half_spread_bps for o in band], policy.z)
     out.update(status=MEASURED,
                slippage_bps={"mean": s_mean, "sd": s_sd, "bound": s_bound},

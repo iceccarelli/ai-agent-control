@@ -19,18 +19,28 @@ WINDOW = (NOW - 400 * DAY, NOW - 200 * DAY)        # designed and tuned before t
 
 
 def cycles(n, nets=(2.0, 3.0, 1.0, 4.0, 2.5)):
+    """Cycles in the shape of the REAL report's ledger_detail (`end_ms`, not
+    `last_ms`; the completeness flags and the cycle's own class)."""
     return [{"cycle_id": f"cyc-{i}", "start_ms": int((NOW - (150 - 3 * i) * DAY) * 1000),
-             "last_ms": int((NOW - (149 - 3 * i) * DAY) * 1000),
-             "net_usd": nets[i % len(nets)]} for i in range(n)]
+             "end_ms": int((NOW - (149 - 3 * i) * DAY) * 1000),
+             "net_usd": nets[i % len(nets)], "outcome": "CLOSED", "closed": True,
+             "evidence_class": "ACTUAL_RECONCILED", "fees_complete": True,
+             "funding_complete": True} for i in range(n)]
 
 
 def report(n=25, *, cls="ACTUAL_RECONCILED", nets=(2.0, 3.0, 1.0, 4.0, 2.5)):
     cs = cycles(n, nets)
-    return {"sections": {
-        "realized_cash": {"evidence_class": cls,
-                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]
-                          if cls == "ACTUAL_RECONCILED" else []},
-        "ledger_detail": {"cycles": cs}}}
+    ids = [c["cycle_id"] for c in cs] if cls == "ACTUAL_RECONCILED" else []
+    return {
+        "environment": {"declared": "mainnet", "actual_reconciled_eligible": True,
+                        "recorded_seen": ["mainnet"],
+                        "booked_figures_class": "UNAVAILABLE"},
+        "invariants_hold": True, "unresolved_carry_orders": 0,
+        "sections": {
+            "realized_cash": {"evidence_class": cls, "realized_cash_cycle_ids": ids,
+                              "realized_cash_cycles": len(ids)},
+            "closed_cycles_booked": {"cycle_count": 0},
+            "ledger_detail": {"cycles": cs}}}
 
 
 def provider(rep, *, window=WINDOW, dd=50.0, raises=False):
@@ -90,6 +100,7 @@ def test_too_few_reconciled_cycles_are_insufficient():
 def test_only_the_ids_the_report_calls_realized_cash_are_used():
     rep = report(25)
     rep["sections"]["realized_cash"]["realized_cash_cycle_ids"] = ["cyc-0"]
+    rep["sections"]["realized_cash"]["realized_cash_cycles"] = 1
     ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
                                   discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
     assert len(ev.trades) == 1
@@ -112,6 +123,7 @@ def test_the_verdict_is_recomputed_every_call():
     p = provider(rep)
     assert p().verdict == se.ALLOCATE
     rep["sections"]["realized_cash"]["realized_cash_cycle_ids"] = []
+    rep["sections"]["realized_cash"]["realized_cash_cycles"] = 0
     assert p().verdict == se.INSUFFICIENT
 
 
@@ -182,3 +194,50 @@ def test_an_inverted_or_partial_window_is_treated_as_unset(monkeypatch):
         {"CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1000",
          "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "2000"}))
     assert seen[-1]["discovery_window_s"]() == (1000.0, 2000.0)
+
+
+# -- an overlay's price leg is a hedge, not an edge ----------------------------
+
+def overlay_report(nets, leg, n=25):
+    rep = report(n, nets=nets)                 # corroborated mainnet cash
+    for c in rep["sections"]["ledger_detail"]["cycles"]:
+        c["overlay"] = True
+        c["hedged_pair_inventory_leg"] = leg
+    return rep
+
+
+def test_a_short_perp_windfall_in_a_falling_market_is_not_carry_evidence():
+    # Overlay short at 60000, funding +100, fees 33 each way: exit 54000 books
+    # +6034, exit 60000 +34, exit 66000 -5966. The first reads as a run of wins
+    # and used to reach ALLOCATE on BTC's direction alone.
+    rep = overlay_report((6034.0, 6100.0, 5990.0, 6050.0, 6010.0),
+                         "DERIVED_FROM_PERP_FILL_PRICES")
+    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
+                                  discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
+    assert ev.trades == ()
+    v = provider(rep)()
+    assert v.verdict == se.INSUFFICIENT
+
+
+def test_a_rally_does_not_breach_the_evidence_either():
+    rep = overlay_report((-5966.0, -6000.0, -5900.0, -6100.0, -5950.0),
+                         "DERIVED_FROM_PERP_FILL_PRICES")
+    assert provider(rep)().verdict == se.INSUFFICIENT      # not BLOCK
+
+
+def test_an_overlay_with_its_inventory_leg_booked_counts():
+    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), "BOOKED")
+    assert provider(rep)().verdict == se.ALLOCATE
+
+
+def test_an_overlay_with_no_stated_inventory_leg_is_left_out():
+    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), None)
+    assert provider(rep)().verdict == se.INSUFFICIENT
+
+
+def test_an_acquire_cycle_holds_both_legs_and_counts():
+    rep = report(25)
+    for c in rep["sections"]["ledger_detail"]["cycles"]:
+        c["overlay"] = False
+        c["hedged_pair_inventory_leg"] = "SPOT_LEG_BOOKED"
+    assert provider(rep)().verdict == se.ALLOCATE
