@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config as _config                                     # noqa: E402
 import entry_benefit_gate as ebg                             # noqa: E402
 import execution_cost_estimate as ece                        # noqa: E402
+from execution_fixtures import valid_record                  # noqa: E402
 import strategy_evidence as se                               # noqa: E402
 
 NOW = 1_800_000_000_000
@@ -28,17 +29,15 @@ class E:
     fee_raw: Dict[str, Any] = field(default_factory=dict)
 
 
-def rec(side, product="linear", q=0.01, ref=60000.0, slip=0.12, spr=0.3):
-    return {"schema": 1, "status": "MEASURED", "reference_basis": "executable_side",
-            "symbol": "BTCUSDT", "product": product, "side": side,
-            "order_type": "market", "filled_qty": q, "requested_qty": q,
-            "avg_price": ref, "reference_price": ref, "slippage_usd": slip,
-            "spread_cost_usd": spr, "decision_to_submit_ms": 5,
-            "submit_to_fill_ms": 40}
+def rec(side, product="linear", q=0.01, ref=60000.0, slip=0.12, spr=0.3,
+        ms=NOW - DAY, link="L"):
+    return valid_record(side=side, product=product, q=q, ref=ref, slip_usd=slip,
+                        spr_usd=spr, ms=int(ms), link=link)
 
 
 def fills(n, side, kind, **kw):
-    return [E(kind, int(NOW - DAY - i), f"BB-{kind}-{i}", {"execution": rec(side, **kw)})
+    return [E(kind, int(NOW - DAY - i), f"BB-{kind}-{i}",
+              {"execution": rec(side, ms=NOW - DAY - i, link=f"BB-{kind}-{i}", **kw)})
             for i in range(n)]
 
 

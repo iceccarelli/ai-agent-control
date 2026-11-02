@@ -924,18 +924,25 @@ class CarryBroker:
             raise PairIncident(f"venue time is not a time: {result!r}")
         return seconds
 
-    def get_book_top(self, symbol: str, product: str) -> Dict[str, float]:
+    def get_book_top(self, symbol: str, product: str,
+                     timeout_s: Optional[float] = None) -> Dict[str, float]:
         """`{bid, ask}` — the touch, as the venue publishes it.
 
         Raises when the ticker carries no touch. The caller then crosses the
         spread: quoting into a price nobody quoted is worse than paying 0.013
         bps of spread.
+
+        ``timeout_s`` (default None = the client's own timeout and retries)
+        makes this a single, time-bounded attempt: the best-effort read an
+        exit takes for its execution record.
         """
         if product not in VALID_PRODUCTS:
             raise ValueError(f"unknown product {product!r}")
+        extra = ({} if timeout_s is None
+                 else {"retries": 0, "timeout_s": float(timeout_s)})
         result = self.client._request(
             "GET", "/v5/market/tickers",
-            params={"category": product, "symbol": symbol})
+            params={"category": product, "symbol": symbol}, **extra)
         rows = self._v5_list(result) or []
         if not rows:
             raise PairIncident(f"no ticker for {symbol} on {product}")
@@ -954,6 +961,63 @@ class CarryBroker:
                 f"touch for {symbol}/{product} is unusable: "
                 f"bid {bid!r} ask {ask!r}")
         return {"bid": bid, "ask": ask}
+
+    #: Levels asked of the public order book. 50 is accepted for both spot and
+    #: linear (`/v5/market/orderbook` limits: spot 1/25/50/100/200, linear
+    #: 1/25/50/100/200/500) and is deep enough to walk a drill-sized order.
+    BOOK_DEPTH_LEVELS = 50
+
+    def get_book_depth(self, symbol: str, product: str,
+                       limit: Optional[int] = None,
+                       timeout_s: Optional[float] = None) -> Dict[str, Any]:
+        """The public order book: ``{bid, ask, bids, asks, venue_ts_ms}``.
+
+        PUBLIC `GET /v5/market/orderbook` (no key, no signature), asked ONCE:
+        ``retries=0``, because the caller is deciding an order and a read that
+        needs a retry has already taken longer than the decision is worth.
+        ``timeout_s`` additionally bounds the request itself (the client's
+        per-call timeout) so the wait is bounded without a thread. It
+        is best-effort evidence for an execution record, never an input to a
+        gate, and a failed read raises so the caller can carry on without it.
+
+        ``bids``/``asks`` are tuples of ``(price, size)``, best first. The
+        ladders are validated whole (finite positive prices and sizes,
+        strictly monotone, uncrossed); a book with one bad level is refused
+        rather than trimmed. ``venue_ts_ms`` is the venue's own timestamp for
+        the snapshot (`ts`) or None when it did not state one. Nothing here is
+        built from a mark, a last price or a ticker.
+        """
+        import execution_record as _xr
+        if product not in VALID_PRODUCTS:
+            raise ValueError(f"unknown product {product!r}")
+        levels = int(limit if limit is not None else self.BOOK_DEPTH_LEVELS)
+        extra = {} if timeout_s is None else {"timeout_s": float(timeout_s)}
+        payload = self.client._request(
+            "GET", "/v5/market/orderbook", signed=False, retries=0,
+            params={"category": product, "symbol": symbol, "limit": levels},
+            **extra)
+        result = self._v5_result(payload)
+        named = result.get("s")
+        if named is not None and str(named) != symbol:
+            raise PairIncident(
+                f"order book is for {named!r}, not {symbol!r}; refusing to "
+                "price one instrument from another's book")
+        bids = _xr.parse_ladder(result.get("b"), descending=True)
+        asks = _xr.parse_ladder(result.get("a"), descending=False)
+        if bids is None or asks is None:
+            raise PairIncident(
+                f"order book for {symbol}/{product} is missing a side or "
+                "carries an unusable level")
+        if bids[0][0] > asks[0][0]:
+            raise PairIncident(
+                f"order book for {symbol}/{product} is crossed: bid "
+                f"{bids[0][0]!r} ask {asks[0][0]!r}")
+        try:
+            ts = int(float(result.get("ts")))
+        except (TypeError, ValueError, OverflowError):
+            ts = None
+        return {"bid": bids[0][0], "ask": asks[0][0], "bids": bids,
+                "asks": asks, "venue_ts_ms": ts if ts and ts > 0 else None}
 
     def place_post_only(self, *, symbol: str, side: str, qty: float,
                         price: float, product: str) -> Optional[Dict[str, Any]]:

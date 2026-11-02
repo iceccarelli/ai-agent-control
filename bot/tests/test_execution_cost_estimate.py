@@ -10,8 +10,10 @@ from typing import Any, Dict
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import execution_cost_estimate as ece                        # noqa: E402
+from execution_fixtures import valid_record                  # noqa: E402
 
 NOW = 1_800_000_000_000
 DAY = ece.DAY_MS
@@ -27,20 +29,20 @@ class E:
 
 def rec(side="Sell", product="linear", q=0.01, ref=60000.0, slip_usd=0.12,
         spr_usd=0.3, status="MEASURED", basis="executable_side", order_type="market",
-        symbol="BTCUSDT", req=None, **over):
-    r = {"schema": 1, "status": status, "reference_basis": basis,
-         "symbol": symbol, "product": product, "side": side,
-         "order_type": order_type, "filled_qty": q, "requested_qty": req or q,
-         "avg_price": ref, "reference_price": ref, "slippage_usd": slip_usd,
-         "spread_cost_usd": spr_usd, "decision_to_submit_ms": 10,
-         "submit_to_fill_ms": 50}
+        symbol="BTCUSDT", req=None, ms=NOW - DAY, **over):
+    """A record the real producer could have written (see execution_fixtures);
+    `status`/`basis`/`over` then overwrite fields to make it invalid."""
+    r = valid_record(side=side, product=product, q=q, ref=ref, slip_usd=slip_usd,
+                     spr_usd=spr_usd, order_type=order_type, symbol=symbol,
+                     req=req, ms=int(ms))
+    r["status"], r["reference_basis"] = status, basis
     r.update(over)
     return r
 
 
 def fill(i, *, kind="perp_open", ago_days=1.0, **kw):
-    return E(kind, int(NOW - ago_days * DAY - i), f"BB-{kind}-{i}",
-             {"execution": rec(**kw)})
+    ms = int(NOW - ago_days * DAY - i)
+    return E(kind, ms, f"BB-{kind}-{i}", {"execution": rec(ms=ms, **kw)})
 
 
 def many(n, **kw):
@@ -69,8 +71,11 @@ def test_too_few_samples_is_unavailable_not_zero():
 
 
 def test_price_improvement_is_never_credited():
-    out = ece.estimate_leg(many(25, slip_usd=-0.5, spr_usd=0.0), **LEG)
+    # (a zero-spread book is a locked book and no longer a valid sample, so the
+    # fixture carries a real, if tiny, spread)
+    out = ece.estimate_leg(many(25, slip_usd=-0.1, spr_usd=0.01), **LEG)
     assert out["slippage_bps"]["mean"] < 0 and out["slippage_bps"]["bound"] == 0.0
+    assert out["price_improved_orders"] == 25
 
 
 def test_variance_widens_the_bound():

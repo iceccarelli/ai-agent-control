@@ -2,14 +2,17 @@
 """Read-only: how many real execution samples this book holds, and how many more
 the entry net-benefit gate needs before it can price a round trip.
 
-    python3 tools/execution_samples_report.py [--db PATH] \\
-        [--records PATH --environment testnet|mainnet] \\
-        --mode overlay|acquire --notional-usd N
+    python3 tools/execution_samples_report.py --environment testnet|mainnet \\
+        [--db PATH] [--records PATH] --mode overlay|acquire --notional-usd N
 
 `--records` reads the JSONL a drill appends (`tools/drill.py
 --execution-records`); only lines labelled with `--environment` count, so
-testnet fills are never mixed into a mainnet tally. `--db` and `--records` may
-be combined; the same fill is counted once.
+testnet fills are never mixed into a mainnet tally. `--db` needs the same
+`--environment` and is REFUSED (exit 2) unless the database itself recorded
+exactly that environment (`carry_performance.load_environment_record`); the
+report states both under `environment`. `--db` and `--records` may be
+combined; the same fill is counted once. Orders that did not fill are counted
+under `outcomes` (with a per-leg miss rate) and never as samples.
 
 Opens the database read-only, sends nothing, contacts no venue. For each leg of
 a round trip it prints the orders on record, those usable for the planned size,
@@ -40,11 +43,33 @@ class _Fill:
         self.kind, self.ms, self.ref, self.fee_raw = kind, ms, ref, fee_raw
 
 
-def load_records(paths, environment):
-    """(fills, skipped) from drill JSONL files. A line that is unreadable, of
-    another schema or labelled with another environment is not a sample; it is
-    counted as skipped, never guessed at."""
-    fills, skipped = [], 0
+#: The kind of a JSONL line that records an order which did NOT fill
+#: (`tools/drill.py` OUTCOME_KIND). Repeated, not imported: this reader stays
+#: standalone, and a test pins the two together.
+OUTCOME_KIND = "execution_outcome"
+SCHEMA = "execution_records/1"
+
+
+def _env_agrees(record, environment) -> bool:
+    """A record that states its own environment must state THIS one. The line's
+    label is what the drill wrote; a record that contradicts it is not trusted
+    for either."""
+    stated = record.get("environment") if isinstance(record, dict) else None
+    return stated in (None, "", environment)
+
+
+def load_records_ex(paths, environment):
+    """(fills, outcomes, skipped) from drill JSONL files.
+
+    `fills` are the lines of a filled order (a ledger fill kind with its
+    execution record under `fee_raw`); they are the only lines the estimator
+    ever sees. `outcomes` are the records of orders that did not fill
+    (kind `execution_outcome`); they are returned apart and are only ever
+    counted. A line that is unreadable, of another schema or labelled with
+    another environment is not a sample; it is counted as skipped, never
+    guessed at. The same outcome repeated is kept once."""
+    fills, outcomes, skipped = [], [], 0
+    seen_outcomes = set()
     for path in paths:
         with open(path, encoding="utf-8") as handle:
             for line in handle:
@@ -52,33 +77,112 @@ def load_records(paths, environment):
                     continue
                 try:
                     d = json.loads(line)
-                    ok = (d.get("schema") == "execution_records/1"
-                          and d.get("environment") == environment
-                          and isinstance(d.get("fee_raw"), dict))
-                    if not ok:
+                    if not (d.get("schema") == SCHEMA
+                            and d.get("environment") == environment):
+                        skipped += 1
+                        continue
+                    if d.get("kind") == OUTCOME_KIND:
+                        rec = d.get("execution")
+                        if not isinstance(rec, dict) \
+                                or not _env_agrees(rec, environment):
+                            skipped += 1
+                            continue
+                        key = json.dumps(rec, sort_keys=True, default=str)
+                        if key not in seen_outcomes:
+                            seen_outcomes.add(key)
+                            outcomes.append(rec)
+                        continue
+                    fee_raw = d.get("fee_raw")
+                    if not isinstance(fee_raw, dict) or not _env_agrees(
+                            fee_raw.get("execution"), environment):
                         skipped += 1
                         continue
                     fills.append(_Fill(d["kind"], int(d["ms"]), str(d["ref"]),
-                                       d["fee_raw"]))
-                except (ValueError, KeyError, TypeError, AttributeError):
+                                       fee_raw))
+                except (ValueError, KeyError, TypeError, AttributeError, OverflowError):
                     skipped += 1
+    return fills, outcomes, skipped
+
+
+def load_records(paths, environment):
+    """(fills, skipped): `load_records_ex` without the outcomes."""
+    fills, _outcomes, skipped = load_records_ex(paths, environment)
     return fills, skipped
+
+
+def summarize_outcomes(outcomes, filled_by_leg=None) -> dict:
+    """What the attempts that did not fill look like, per leg. Nothing here is a
+    cost sample: `counted_as_samples` is 0 by construction and the estimator is
+    never given these records."""
+    by_leg, reasons = {}, {}
+    for rec in outcomes:
+        leg = "/".join(str(rec.get(k) or "?")
+                       for k in ("product", "side", "order_type"))
+        status = str(rec.get("status") or "?")
+        by_leg.setdefault(leg, {})
+        by_leg[leg][status] = by_leg[leg].get(status, 0) + 1
+        first = (rec.get("reasons") or ["?"])[0]
+        why = str(first).split(":", 1)[0]
+        reasons[why] = reasons.get(why, 0) + 1
+    # Miss rate per leg: orders that filled nothing / all orders attempted
+    # (those plus the filled orders on record). None when nothing was attempted.
+    miss = {}
+    for leg, counts in by_leg.items():
+        missed = counts.get("NO_FILL", 0)
+        filled = int((filled_by_leg or {}).get(leg, 0))
+        miss[leg] = {"unfilled_orders": missed, "filled_orders": filled,
+                     "miss_rate": (missed / (missed + filled)
+                                   if missed + filled else None)}
+    return {"total": len(outcomes), "by_leg": by_leg, "reasons": reasons,
+            "miss_rate": miss, "counted_as_samples": 0,
+            "note": "orders that did not fill; execution-outcome evidence "
+                    "only, never a filled-order cost sample"}
+
+
+def check_db_environment(db_path: str, environment: str) -> dict:
+    """The environment the database itself recorded, checked against the one
+    the report is asked for. Raises ValueError (a refusal) unless the database
+    recorded exactly that environment and no other: a testnet book's round
+    trips are not evidence for mainnet, and a database that never said whose
+    orders it booked cannot be assumed to be anyone's."""
+    import carry_performance
+    record = carry_performance.load_environment_record(db_path)
+    seen = list(record.get("seen") or [])
+    recorded = record.get("recorded")
+    info = {"declared": environment, "recorded": recorded,
+            "recorded_seen": seen, "equity_scope": record.get("equity_scope")}
+    if not recorded and not seen:
+        raise ValueError(
+            "the database never recorded which environment's orders it books "
+            f"(ENVIRONMENT_NOT_RECORDED), so it cannot be counted as {environment}")
+    if recorded != environment or any(e != environment for e in seen):
+        raise ValueError(
+            f"ENVIRONMENT_MISMATCH: the report asks for {environment!r} but the "
+            f"database recorded {recorded!r} (ever seen: {seen})")
+    return info
 
 
 def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
           now_ms: int = 0, records=(), environment: str = "") -> dict:
-    entries, skipped = [], 0
+    entries, skipped, outcomes = [], 0, []
+    env_info = {"declared": environment or None, "database": None,
+                "records_label": environment if records else None}
     if db_path:
         import carry_performance
+        if environment:
+            env_info["database"] = check_db_environment(db_path, environment)
         entries.extend(carry_performance.load_journal(db_path).entries)
     if records:
-        extra, skipped = load_records(records, environment)
+        extra, outcomes, skipped = load_records_ex(records, environment)
         entries.extend(extra)
     now = now_ms or int(time.time() * 1000)
     out = est.estimate_round_trip(
         entries, as_of_ms=now, execution_mode=mode, perp_symbol=perp,
         spot_symbol=spot, planned_notional_usd=notional_usd)
+    out["environment"] = env_info
     out["records_skipped"] = skipped
+    filled = {l["leg"]: l["n"] for l in out["legs"]}
+    out["outcomes"] = summarize_outcomes(outcomes, filled)
     need = est.DEFAULT_POLICY.min_samples
     out["shortfall"] = {l["leg"]: max(0, need - int(l["n_in_size_band"]))
                         for l in out["legs"]}
@@ -112,9 +216,10 @@ def main(argv=None, env=None) -> int:
     args.spot = args.spot or str(env.get("CARRY_SPOT_SYMBOL", "BTCUSDT")).strip().upper()
     if not args.db and not args.records:
         ap.error("give --db and/or --records")
-    if args.records and not args.environment:
-        ap.error("--records needs --environment (testnet fills must never be "
-                 "counted as mainnet)")
+    if (args.records or args.db) and not args.environment:
+        ap.error("--environment is required with --db or --records: testnet "
+                 "fills must never be counted as mainnet, and a report that "
+                 "does not say whose fills it counts is not evidence")
     for missing in ([args.db] if args.db else []) + args.records:
         if not os.path.exists(missing):
             print(json.dumps({"error": f"no such file: {missing}"}))
@@ -123,6 +228,9 @@ def main(argv=None, env=None) -> int:
         report = build(args.db, mode=args.mode, notional_usd=args.notional_usd,
                        perp=args.perp, spot=args.spot,
                        records=args.records, environment=args.environment)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc), "refused": True}))
+        return 2
     except Exception as exc:  # noqa: BLE001 - any failure is exit 2, never a traceback
         print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
         return 2
