@@ -58,6 +58,16 @@ def read_policy(env):
         except ValueError:
             values[name] = None
             bad.append(name)
+    # Informational only (an assumption the gate makes, not a required input):
+    # None = not supplied. A malformed value is named like any other.
+    try:
+        opp = _parse_optional(env, "CARRY_OPPORTUNITY_COST_APR", False)
+        if opp is not None and opp > 1.0:
+            raise ValueError("CARRY_OPPORTUNITY_COST_APR")
+    except ValueError:
+        opp = None
+        bad.append("CARRY_OPPORTUNITY_COST_APR")
+    values["CARRY_OPPORTUNITY_COST_APR"] = opp
     values["CARRY_ENTRY_BENEFIT_MODE"] = str(
         env.get("CARRY_ENTRY_BENEFIT_MODE", "enforce")).strip().lower() or "enforce"
     values["CARRY_INCOME_HAIRCUT_FRACTION"] = None
