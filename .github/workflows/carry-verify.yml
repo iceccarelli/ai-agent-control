@@ -188,6 +188,7 @@ jobs:
           tests/test_overlay_inventory_leg.py
           tests/test_cash_vs_marked_pair.py
           tests/test_promotion_identity.py
+          tests/test_drill_records_robustness.py
           tests/test_protective_restart.py
           tests/test_protect_only_wiring.py
           tests/test_database_environment_scope.py

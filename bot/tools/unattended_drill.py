@@ -13,7 +13,7 @@ is the same procedure as `.github/workflows/carry-drill-testnet.yml`, as one
 tested program, to run where the venue is reachable (a Fly.io machine in
 Frankfurt, a small server, or - while it stays awake - the Codespace).
 
-ONE RUN, in order (`--once`):
+ONE RUN, in order (a run without `--loop`, or each pass of the loop):
   1. is the testnet reachable from here? (public endpoint, no credentials;
      anything but HTTP 200 stops with exit 4 and NOTHING is sent);
   2. is a settlement 4-20 minutes away? (else exit 10, nothing sent);
@@ -242,6 +242,21 @@ def _guard(fn: Callable[[], int]) -> int:
         return 125
 
 
+def records_path_for(run_dir: str) -> str:
+    """Where this run's measured fills are appended: ONE file, beside the run
+    folder (never inside it, so pruning old run folders keeps the samples).
+
+    It is derived from the folder of THIS run, so it depends on the mode:
+      * `--loop --run-dir ROOT` makes `ROOT/run-<time>` per run, so the file is
+        `ROOT/execution_records.jsonl`;
+      * a single run `--run-dir DIR` is `DIR` itself, so the file is
+        `<parent of DIR>/execution_records.jsonl`.
+    Each run also writes the exact path to its run.log, and
+    tools/execution_samples_report.py takes it explicitly via `--records`."""
+    return os.path.join(os.path.dirname(os.path.abspath(run_dir)),
+                        "execution_records.jsonl")
+
+
 def run_once(run_dir: str, *, env: Mapping[str, str],
              now_ms: Optional[int] = None,
              prober: Callable[[], int] = probe,
@@ -285,9 +300,9 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
     rep = os.path.join(run_dir, "reconciliation.json")
     # Beside the run folders, not in one: old run folders are pruned, and the
     # samples are meant to accumulate across runs.
-    records = os.path.join(os.path.dirname(os.path.abspath(run_dir)),
-                           "execution_records.jsonl")
-    _say(run_dir, f"settlement in {lead} s: running")
+    records = records_path_for(run_dir)
+    _say(run_dir, f"settlement in {lead} s: running; execution records: "
+                  f"{records}")
 
     preflight: Optional[int] = None
     drill: Optional[int] = None

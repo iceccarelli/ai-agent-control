@@ -569,6 +569,11 @@ def append_execution_records(path: str, journal: Any, venue: str,
     ``execution`` (no ``fee_raw``). They are never fills: the reader keeps them
     out of every cost sample and only counts them."""
     lines = []
+    #: Keys of the lines built here. They join `written` only AFTER the file
+    #: write succeeds: marking them first meant a failed write (unwritable
+    #: path, full disk) lost those records for good, because the second pass
+    #: found nothing "new".
+    pending: set = set()
     booked_refs = set()
     for e in journal.entries:
         if e.kind not in _FILL_KINDS:
@@ -579,9 +584,9 @@ def append_execution_records(path: str, journal: Any, venue: str,
         exe = (e.fee_raw or {}).get("execution") or {}
         key = (str(e.ref), int(e.ms), exe.get("filled_qty"),
                exe.get("avg_price"), exe.get("submit_ms"), exe.get("fill_ms"))
-        if key in written:
+        if key in written or key in pending:
             continue
-        written.add(key)
+        pending.add(key)
         lines.append(json.dumps(
             {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
              "kind": e.kind, "ms": int(e.ms), "ref": str(e.ref),
@@ -593,9 +598,9 @@ def append_execution_records(path: str, journal: Any, venue: str,
         if rec.get("filled_qty") and link in booked_refs:
             continue                         # a fill: it is persisted above
         key = _outcome_key(rec)
-        if key in written:
+        if key in written or key in pending:
             continue
-        written.add(key)
+        pending.add(key)
         ms = rec.get("recorded_ms") or rec.get("decision_ms") or 0
         lines.append(json.dumps(
             {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
@@ -608,6 +613,7 @@ def append_execution_records(path: str, journal: Any, venue: str,
         handle.write("\n".join(lines) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+    written.update(pending)
     return len(lines)
 
 

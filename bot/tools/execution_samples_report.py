@@ -181,7 +181,16 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
         spot_symbol=spot, planned_notional_usd=notional_usd)
     out["environment"] = env_info
     out["records_skipped"] = skipped
-    filled = {l["leg"]: l["n"] for l in out["legs"]}
+    # Orders that FILLED on each leg, priced or not: the valid observations
+    # plus the fills the estimator had to reject (mark-referenced, unverifiable,
+    # malformed...). Using only the valid ones hid the true denominator and
+    # overstated the miss rate. A fill with no execution record at all cannot
+    # be assigned to a leg and is not counted here; the later age and size-band
+    # rejections are subsets of the valid ones and are not added again.
+    not_per_leg = {"NO_EXECUTION_RECORD", "TOO_OLD", "OUTSIDE_SIZE_BAND"}
+    filled = {l["leg"]: l["n"] + sum(
+        int(v) for k, v in (l.get("rejected") or {}).items()
+        if k not in not_per_leg) for l in out["legs"]}
     out["outcomes"] = summarize_outcomes(outcomes, filled)
     need = est.DEFAULT_POLICY.min_samples
     out["shortfall"] = {l["leg"]: max(0, need - int(l["n_in_size_band"]))
