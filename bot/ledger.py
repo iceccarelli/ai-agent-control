@@ -186,7 +186,32 @@ class Journal:
             cid = f"{candidate}-{n}"
         return cid
 
+    @staticmethod
+    def _settlement_ms(entry: Entry) -> Optional[int]:
+        """When the VENUE settled this funding row, or None if it is not one."""
+        if entry.basis in ("venue", "unattributed") and "venue_ms" in entry.fee_raw:
+            try:
+                return int(entry.fee_raw["venue_ms"])
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def _assign_cycle(self, entry: Entry) -> None:
+        # A venue funding row belongs to the cycle that held the position AT
+        # THE SETTLEMENT, not to whichever cycle is current when the row is
+        # delivered (a row for a settlement inside cycle A can arrive after
+        # cycle B opened). It carries no position line, so it never moves the
+        # running cycle state either: restoring it from a stored row must not
+        # make an older cycle current.
+        settled = self._settlement_ms(entry)
+        if settled is not None:
+            if not entry.cycle:
+                for prior in reversed(self.entries):
+                    if prior.cycle and prior.ms <= settled:
+                        entry.cycle = prior.cycle
+                        return
+                entry.cycle = self._cycle         # nothing earlier: as before
+            return
         flat = abs(self._cycle_perp) <= DUST[PERP]
         if entry.cycle:                       # restored from a stored row
             if entry.cycle != self._cycle:
