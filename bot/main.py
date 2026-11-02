@@ -813,8 +813,11 @@ class TradingBot:
         """
         try:
             import promotion_gate as _gate
-            if not _gate.promotion_gate_allows_live(config=self.cfg):
-                verdict = _gate.evaluate_promotion_gate(config=self.cfg)
+            book = _book_mode_of(self.cfg)
+            if not _gate.promotion_gate_allows_live(config=self.cfg,
+                                                    book_mode=book):
+                verdict = _gate.evaluate_promotion_gate(config=self.cfg,
+                                                        book_mode=book)
                 return False, "promotion gate refuses: " + "; ".join(
                     verdict.reasons[:3] or ["no reason recorded"])
         except Exception as exc:  # noqa: BLE001
@@ -828,6 +831,10 @@ class TradingBot:
             return False, f"strategy identity could not be checked ({exc}); refusing"
         if not ok:
             return False, why
+        if getattr(self, "strategy", None) is None:
+            return True, ("promotion gate allows live for the "
+                          f"{_book_mode_of(self.cfg)!r} book (no directional "
+                          "signal is attached to it)")
         return True, "promotion gate allows live and the cleared signal is attached"
 
     def run(self) -> int:
@@ -1944,6 +1951,13 @@ class TradingBot:
 # ---------------------------------------------------------------------------
 
 
+def _book_mode_of(cfg: Any) -> str:
+    """The book being promoted, from the config. An empty or missing value is
+    the directional default; anything else is passed on as it is, and the
+    promotion gate refuses a mode it has no evidence for."""
+    return str(getattr(cfg, "BOOK_MODE", "") or "directional").strip().lower()
+
+
 def carry_orders_permitted(cfg: Any, *, exit: bool = False) -> Tuple[bool, str]:
     """May the carry book send an order right now? The ONE answer.
 
@@ -1981,7 +1995,8 @@ def carry_orders_permitted(cfg: Any, *, exit: bool = False) -> Tuple[bool, str]:
     # promotion gate is unsigned. The broker asks again, per order, so no path
     # around start() reaches a mainnet carry order.
     import promotion_gate as _gate
-    if _gate.promotion_gate_allows_live(config=cfg) is not True:
+    if _gate.promotion_gate_allows_live(
+            config=cfg, book_mode=_book_mode_of(cfg)) is not True:
         return (False, "mainnet URL: the promotion gate is not signed")
     return (True, "LIVE (authorised, promotion gate signed)")
 

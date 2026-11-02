@@ -70,7 +70,15 @@ def test_the_same_artefact_is_not_stale_on_its_own_day():
 
 
 def passing_artefact(tmp_path, n=95):
-    art, observed_epoch = write(tmp_path, [0.30 + 0.01 * (i % 3) for i in range(n)])
+    # An artefact the gate may count is one produced by THIS strategy (its own
+    # signal, symbol, constants and paper mode); tests/test_promotion_identity.py
+    # pins what happens when it is not.
+    import shadow
+    art, observed_epoch = write(
+        tmp_path, [0.30 + 0.01 * (i % 3) for i in range(n)],
+        extra={"signal": shadow.SHADOW_SIGNAL, "symbol": shadow.SHADOW_SYMBOL,
+               "constants_fingerprint": shadow.CONSTANTS_FINGERPRINT,
+               "execution_mode": "paper"})
     return art, observed_epoch
 
 
