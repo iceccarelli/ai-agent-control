@@ -182,3 +182,57 @@ def test_an_inverted_or_partial_window_is_treated_as_unset(monkeypatch):
         {"CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1000",
          "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "2000"}))
     assert seen[-1]["discovery_window_s"]() == (1000.0, 2000.0)
+
+
+# -- an overlay's price leg is a hedge, not an edge ----------------------------
+
+def overlay_report(nets, leg, n=25):
+    cs = cycles(n, nets)
+    for c in cs:
+        c["overlay"] = True
+        c["hedged_pair_inventory_leg"] = leg
+    return {"sections": {
+        "realized_cash": {"evidence_class": "ACTUAL_RECONCILED",
+                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]},
+        "ledger_detail": {"cycles": cs}}}
+
+
+def test_a_short_perp_windfall_in_a_falling_market_is_not_carry_evidence():
+    # Overlay short at 60000, funding +100, fees 33 each way: exit 54000 books
+    # +6034, exit 60000 +34, exit 66000 -5966. The first reads as a run of wins
+    # and used to reach ALLOCATE on BTC's direction alone.
+    rep = overlay_report((6034.0, 6100.0, 5990.0, 6050.0, 6010.0),
+                         "DERIVED_FROM_PERP_FILL_PRICES")
+    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
+                                  discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
+    assert ev.trades == ()
+    v = provider(rep)()
+    assert v.verdict == se.INSUFFICIENT
+
+
+def test_a_rally_does_not_breach_the_evidence_either():
+    rep = overlay_report((-5966.0, -6000.0, -5900.0, -6100.0, -5950.0),
+                         "DERIVED_FROM_PERP_FILL_PRICES")
+    assert provider(rep)().verdict == se.INSUFFICIENT      # not BLOCK
+
+
+def test_an_overlay_with_its_inventory_leg_booked_counts():
+    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), "BOOKED")
+    assert provider(rep)().verdict == se.ALLOCATE
+
+
+def test_an_overlay_with_no_stated_inventory_leg_is_left_out():
+    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), None)
+    assert provider(rep)().verdict == se.INSUFFICIENT
+
+
+def test_an_acquire_cycle_holds_both_legs_and_counts():
+    cs = cycles(25)
+    for c in cs:
+        c["overlay"] = False
+        c["hedged_pair_inventory_leg"] = "SPOT_LEG_BOOKED"
+    rep = {"sections": {
+        "realized_cash": {"evidence_class": "ACTUAL_RECONCILED",
+                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]},
+        "ledger_detail": {"cycles": cs}}}
+    assert provider(rep)().verdict == se.ALLOCATE

@@ -42,6 +42,19 @@ EVIDENCE_INSUFFICIENT = "STRATEGY_EVIDENCE_INSUFFICIENT"
 SETTLEMENTS_PER_DAY = _costs.FUNDING_PERIODS_PER_DAY
 
 
+def adverse_basis_bps(mark: Any, spot: Any) -> Optional[float]:
+    """What the entry basis gives back when it converges to zero, in bps.
+
+    Short perp / long spot earns `entry_basis - exit_basis` (see
+    `carry_costs.hedge_basis_pnl_bps`), basis = perp/spot - 1. A perp BELOW spot
+    (negative basis) loses its whole discount on convergence; a premium may gain
+    but is never credited, so it costs 0. None when either price is unreadable:
+    an unknown basis is not a small one."""
+    if not (_finite(mark) and _finite(spot)) or mark <= 0 or spot <= 0:
+        return None
+    return max(0.0, -_costs.basis_bps(float(mark), float(spot)))
+
+
 def _finite(x: Any) -> bool:
     return (not isinstance(x, bool) and x is not None
             and isinstance(x, (int, float)) and math.isfinite(x))
@@ -81,6 +94,7 @@ class EntryBenefitGate:
             "mode": self.mode, "haircut": self.income_haircut_fraction,
             "strategy_id": self.strategy_id,
             "hold_days": _costs.DEMONSTRATED_HOLD_DAYS,
+            "basis_term": "discount_converges_to_zero_premium_not_credited",
             "min_sigma": _se.MIN_SIGMA_MULTIPLE,
             "settlements_per_day": SETTLEMENTS_PER_DAY,
             "cost_policy": vars(self.cost_policy),
@@ -135,7 +149,8 @@ class EntryBenefitGate:
             borrow_apr=borrow_apr, opportunity_cost_apr=opportunity_cost_apr,
             income_haircut_fraction=self.income_haircut_fraction,
             income_uncertainty_bps=uncertainty, evidence=verdict_obj,
-            settlements_per_day=SETTLEMENTS_PER_DAY)
+            settlements_per_day=SETTLEMENTS_PER_DAY,
+            basis_convergence_bps=adverse_basis_bps(mark, spot))
 
         # `evaluate_entry_benefit` labels a pass "NET_BENEFIT_POSITIVE"; that is
         # not a refusal reason, and the evidence refusal is judged separately.
@@ -205,6 +220,8 @@ class EntryBenefitGate:
                 "funding_age_s": (None if last_print_ms is None else
                                   max(0, now_ms - int(last_print_ms)) / 1000.0),
                 "income_uncertainty_bps": uncertainty,
+                "entry_basis_bps": (None if adverse_basis_bps(mark, spot) is None
+                                    else _costs.basis_bps(mark, spot)),
                 "hold_days": hold, "round_trip_fee_bps": round_trip_bps,
                 "borrow_apr": borrow_apr,
                 "opportunity_cost_apr": opportunity_cost_apr,

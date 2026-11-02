@@ -23,7 +23,10 @@ from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 import strategy_evidence as _se
 
 NET_BASIS = ("ledger net USD per closed cycle after booked fees, funding and "
-             "financing; ACTUAL_RECONCILED cycles only (tools/carry_performance)")
+             "financing; ACTUAL_RECONCILED cycles only (tools/carry_performance); "
+             "an overlay cycle counts only when its hedged BTC inventory leg is "
+             "booked in the journal, because otherwise its net is that of an "
+             "unhedged short")
 
 
 def evidence_from_report(report: Mapping[str, Any], *, strategy_id: str,
@@ -45,6 +48,16 @@ def evidence_from_report(report: Mapping[str, Any], *, strategy_id: str,
             start, end, net = c.get("start_ms"), c.get("last_ms"), c.get("net_usd")
             if None in (start, end, net):
                 continue                    # a cycle the report cannot time is not used
+            # An overlay's booked net holds the short's price leg but not the
+            # client's BTC it hedges (the live journal never revalues it), so
+            # it is the net of an unhedged short: a falling market reads as a
+            # run of wins and a rising one as losses. Such a cycle is NOT
+            # carry evidence and is left out, so the verdict goes INSUFFICIENT
+            # instead of passing or breaching on BTC's direction. Only an
+            # overlay cycle whose inventory leg is BOOKED counts; a cycle that
+            # carries no overlay flag at all (older fixtures) is read as before.
+            if c.get("overlay") and c.get("hedged_pair_inventory_leg") != "BOOKED":
+                continue
             trades.append(_se.EvidenceTrade(
                 entry_s=float(start) / 1000.0, exit_s=float(end) / 1000.0,
                 net=float(net)))
