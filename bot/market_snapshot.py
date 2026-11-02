@@ -365,9 +365,12 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
             # simply does not apply, and that is recorded rather than assumed.
             venue_time = None
 
+    # Stamped BEFORE the reads: a book read at or after this instant can only
+    # be as old as the stamp says or younger, so a slow second read can never
+    # make the pair look fresher than it was (a later stamp would).
+    book_at = time.time() if now_s is None else observed
     perp_book, spot_book = (_touch(broker, perp_symbol, "linear"),
                             _touch(broker, spot_symbol, "spot"))
-    book_at = time.time() if now_s is None else observed
     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=funding,
                           perp_book=perp_book, spot_book=spot_book,
                           book_observed_s=(book_at if (perp_book or spot_book)
