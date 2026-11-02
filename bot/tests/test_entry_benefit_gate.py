@@ -435,7 +435,8 @@ def test_the_pure_rule_prices_a_supplied_basis_and_never_assumes_one():
                 expected_slippage_bps=2.0, borrow_apr=0.0,
                 opportunity_cost_apr=0.0, income_haircut_fraction=0.0,
                 income_uncertainty_bps=0.0, evidence=se.EvidenceVerdict(
-                    "s", se.ALLOCATE, ("OK",), {}))
+                    "s", se.ALLOCATE, ("OK",), {},
+                    evidence_class=se.CASH_EVIDENCE_CLASS))
     plain = se.evaluate_entry_benefit(**base)
     assert "basis_convergence" not in plain.components_bps      # nothing assumed
     with_basis = se.evaluate_entry_benefit(basis_convergence_bps=27.0, **base)

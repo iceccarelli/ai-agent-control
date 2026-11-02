@@ -199,14 +199,11 @@ def test_an_inverted_or_partial_window_is_treated_as_unset(monkeypatch):
 # -- an overlay's price leg is a hedge, not an edge ----------------------------
 
 def overlay_report(nets, leg, n=25):
-    cs = cycles(n, nets)
-    for c in cs:
+    rep = report(n, nets=nets)                 # corroborated mainnet cash
+    for c in rep["sections"]["ledger_detail"]["cycles"]:
         c["overlay"] = True
         c["hedged_pair_inventory_leg"] = leg
-    return {"sections": {
-        "realized_cash": {"evidence_class": "ACTUAL_RECONCILED",
-                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]},
-        "ledger_detail": {"cycles": cs}}}
+    return rep
 
 
 def test_a_short_perp_windfall_in_a_falling_market_is_not_carry_evidence():
@@ -239,12 +236,8 @@ def test_an_overlay_with_no_stated_inventory_leg_is_left_out():
 
 
 def test_an_acquire_cycle_holds_both_legs_and_counts():
-    cs = cycles(25)
-    for c in cs:
+    rep = report(25)
+    for c in rep["sections"]["ledger_detail"]["cycles"]:
         c["overlay"] = False
         c["hedged_pair_inventory_leg"] = "SPOT_LEG_BOOKED"
-    rep = {"sections": {
-        "realized_cash": {"evidence_class": "ACTUAL_RECONCILED",
-                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]},
-        "ledger_detail": {"cycles": cs}}}
     assert provider(rep)().verdict == se.ALLOCATE
