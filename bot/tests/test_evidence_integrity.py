@@ -43,6 +43,12 @@ def journal(n=N, *, extra=None):
     j = L.Journal()
     for i in range(n):
         T.overlay_cycle(j, 2 * i, 2 * i + 1, tag=f"c{i}", funding=300.0 + i)
+        # The client's BTC the short hedges, marked to the close: an overlay
+        # cycle without this leg is the net of a naked short and is (rightly)
+        # not carry evidence, so the fixture must be a hedged pair.
+        L.revalue_inventory(j, ms=T.T0 + (2 * i + 1) * T.DAY + 1,
+                            ref=f"c{i}-inv", qty=1.0, from_price=100_000.0,
+                            to_price=98_000.0)
     if extra:
         extra(j)
     return j
