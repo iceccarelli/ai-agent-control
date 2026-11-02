@@ -47,6 +47,22 @@ def test_the_snapshot_carries_each_legs_touch_and_when_it_was_read():
     assert b.calls == [("BTCUSDT", "linear"), ("BTCUSDT", "spot")]
 
 
+def test_the_books_observation_time_never_postdates_the_reads():
+    # The stamp used to be taken AFTER both reads, so a slow second read made a
+    # book look fresher than it was. It must be no later than the first read.
+    reads = []
+
+    class Slow(Broker):
+        def get_book_top(self, symbol, product):
+            reads.append(time.time())
+            time.sleep(0.05)
+            return super().get_book_top(symbol, product)
+
+    s = snap(Slow({"bid": 99.9, "ask": 100.1}))
+    assert len(reads) == 2
+    assert s.book_observed_s <= min(reads)
+
+
 def test_a_failed_or_missing_or_bad_touch_never_fails_the_snapshot():
     assert snap(Broker(raises=True)).perp_book is None
     assert snap(Broker({"bid": 101.0, "ask": 100.0})).perp_book is None   # crossed
