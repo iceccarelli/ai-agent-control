@@ -440,6 +440,10 @@ class _OrderTrail:
         #: any read-back) was in hand. Feed the execution record's delays.
         self.submit_ms: Optional[int] = None
         self.response_ms: Optional[int] = None
+        #: True when the result handed back carries a fill the venue's own
+        #: order record never confirmed as final (a partial fill CLAIMED by the
+        #: create response). `finish` then does not write a cancellation.
+        self.final_unconfirmed = False
 
     def intent(self, link: str, product: str, symbol: str, side: str,
                qty_text: str, price: float, qty: float, *,
@@ -472,7 +476,16 @@ class _OrderTrail:
         self.submitted = True
         self.acked = status in (_ol.ACKNOWLEDGED, _ol.PARTIAL,
                                 _ol.CANCEL_REQUESTED)
-        state = self.b._order_state(symbol, link, product)
+        try:
+            state = self.b._order_state(symbol, link, product)
+        except Exception as exc:  # noqa: BLE001
+            # The id was sent. Whatever is wrong with the read (a timeout, an
+            # unstated field), "the venue could not say" is an unknown outcome,
+            # never a bare error the engine would read as "did not fill".
+            raise OrderOutcomeUnknown(
+                f"{link} was already recorded as {status!r} and the venue "
+                f"could not be read for it ({type(exc).__name__}: {exc}); it "
+                "is not sent again") from exc
         if state is None:
             raise OrderOutcomeUnknown(
                 f"{link} was already recorded as {status!r} and the venue "
@@ -536,7 +549,7 @@ class _OrderTrail:
             return
         cum = float(result.get("filled_qty") or 0.0)
         self.b._log_fill(self.link, cum, float(result.get("avg_price") or 0.0))
-        if cum < self.requested * (1.0 - 1e-9):
+        if cum < self.requested * (1.0 - 1e-9) and not self.final_unconfirmed:
             # Final at the venue with less than asked: the rest will not fill.
             self.b._log_event(self.link, _ol.CANCEL_CONFIRM, filled_qty=cum)
 
@@ -843,6 +856,13 @@ class CarryBroker:
                     f"{state['filled_qty']!r} filled so far; a market order "
                     "that is still live has no final fill to book")
             return self._engine_result_from_state(state, qty)
+        if fill.filled_qty < float(qty_text) * (1.0 - PAIR_DUST_FRACTION):
+            # The engine takes this partial as the leg (a response's partial
+            # fill is sane), but the response is a claim: nothing established
+            # that the rest of the order is not still to come. The lifecycle
+            # log must not call it cancelled; it stays partial, unresolved, so
+            # the next cycle is blocked and a restart reads the venue.
+            trail.final_unconfirmed = True
         return fill.as_engine_result()
 
     ORDER_READBACK_POLLS = 4

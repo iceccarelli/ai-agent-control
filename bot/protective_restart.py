@@ -151,6 +151,7 @@ def assess_restart(
     exits_permitted: bool = True,
     exits_refused_reason: str = "",
     immediate_reduction_required: bool = False,
+    spot_is_client_inventory: bool = False,
 ) -> RestartVerdict:
     """Decide how a restarting process may treat the book.
 
@@ -164,7 +165,16 @@ def assess_restart(
     exits_permitted       `carry_orders_permitted_for(cfg, client, exit=True)[0]`.
     immediate_reduction_required
                           caller-detected urgency (margin/liquidation risk).
+    spot_is_client_inventory
+                          OVERLAY: the spot balance is the CLIENT's BTC, not
+                          the book's. It is reported but is neither exposure
+                          nor an exit candidate (a sale of client coin is never
+                          listed as an exit leg), and an unreadable wallet does
+                          not make the perp reading unverified.
     """
+    reported = venue
+    if spot_is_client_inventory and venue is not None:
+        venue = VenueSnapshot(perp_qty=venue.perp_qty, spot_qty=0.0)
     reasons = []
     degraded = False       # something forbids a normal restart
     must_alert = False
@@ -223,6 +233,11 @@ def assess_restart(
         reasons.append("EXPOSURE_UNKNOWN: the venue position could not be "
                        "read; it is NOT assumed flat")
     elif exposure is Exposure.OPEN and not verified:
+        # A position that is only half read is not a NORMAL restart: the leg
+        # that could not be read may be the one that is not hedged. Without
+        # this the verdict stayed NORMAL (entries allowed, no alert) whenever
+        # nothing else was degraded.
+        degraded = must_alert = True
         reasons.append("EXPOSURE_PARTIAL: one leg is open, the other could "
                        "not be read")
 
@@ -271,9 +286,14 @@ def assess_restart(
     elif must_alert or reduce_now or (degraded and has_position):
         alert = OperatorAlert(
             True, "CRITICAL" if reduce_now else "WARNING",
-            "PROTECT-ONLY RESTART: entries are disabled and this process sends NO "
-            "orders on its own; the open position needs a human (reduce-only "
-            "exits remain permitted). Reconcile: "
+            "PROTECT-ONLY RESTART: "
+            + ("THE POSITION IS UNMANAGED (the carry short has no "
+               "exchange-side stop either). " if has_position else "")
+            + "Entries are disabled and this process sends NO orders on its "
+            "own and takes no margin, liquidation or exit action; "
+            + ("the open position needs a human now. " if has_position
+               else "a human must reconcile. ")
+            + "Reconcile: "
             + "; ".join(r.split(":")[0] for r in reasons if not
                         r.startswith("ENTRIES_DISABLED")) + ".")
     else:
@@ -288,7 +308,7 @@ def assess_restart(
         reconciliation_required=bool(links or not orders_known),
         reduce_now=reduce_now, exit_legs=legs if exits_allowed else (),
         perp_qty=_finite(venue.perp_qty) if venue else None,
-        spot_qty=_finite(venue.spot_qty) if venue else None)
+        spot_qty=_finite(reported.spot_qty) if reported else None)
 
 
 def may_send_order(verdict: RestartVerdict, *, order_link_id: str,
