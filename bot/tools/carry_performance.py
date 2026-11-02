@@ -319,7 +319,8 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 "perp_qty": 0.0, "spot_cost_usd": 0.0, "spot_qty": 0.0,
                 "spot_sold": False, "first_open_ms": None,
                 "last_close_ms": None, "_fee_statuses": [], "_bases": [],
-                "revalue_usd": 0.0, "fills": 0, "_opens": [], "_closes": [],
+                "revalue_usd": 0.0, "revalue_entries": 0, "fills": 0,
+                "_opens": [], "_closes": [],
                 "_fill_memo_unread": False,
                 "funding_received_usd": 0.0, "funding_paid_usd": 0.0,
                 "funding_entries": 0, "borrow_entries": 0,
@@ -366,6 +367,7 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
         if e.kind == "revalue":
             cur["revalue_usd"] += -sum(l.usd for l in e.lines
                                        if l.account == L.REALISED)
+            cur["revalue_entries"] += 1
         if e.kind == "spot_sell":
             cur["spot_sold"] = True
         if e.fee_status:
@@ -945,6 +947,67 @@ def slippage_by_cycle(journal: Any) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def hedged_pair(c: Mapping[str, Any]) -> Dict[str, Any]:
+    """The net of the hedged PAIR for one closed cycle, and how it was reached.
+
+    The booked cycle net is funding - fees - financing + the price legs the
+    journal holds. For an ACQUIRE cycle both price legs are booked (spot cost to
+    proceeds, perp entry to exit), so the booked net is the pair's. For an
+    OVERLAY the live journal books the short's price leg and never revalues the
+    client's BTC that it hedges, so the booked net is the net of an UNHEDGED
+    SHORT: a rally reads as a large loss and a fall as a large win, neither of
+    which is carry.
+
+    * ``SPOT_LEG_BOOKED``  acquire: the booked net already holds both legs.
+    * ``BOOKED``           overlay with revaluation entries (the replay writes
+                           them): the booked net already holds the inventory
+                           leg at the spot price, and the basis residual is the
+                           booked price leg.
+    * ``DERIVED_FROM_PERP_FILL_PRICES``  overlay, inventory not booked: the
+                           leg is hedged_qty x (perp exit - perp entry), the
+                           perp fill prices standing in for the BTC price. That
+                           makes the price legs cancel BY CONSTRUCTION, so the
+                           basis P&L (entry basis - exit basis) is NOT measured
+                           and is reported UNAVAILABLE, never as zero.
+
+    Nothing is invented: an overlay cycle without a readable hedged quantity
+    and both perp prices has no pair net (available False).
+    """
+    if not c.get("closed"):
+        return {"available": False, "why": "cycle still open"}
+    net = c.get("net_usd")
+    if c.get("outcome") == "ABORTED_BEFORE_HEDGE":
+        return {"available": True, "net_usd": net,
+                "inventory_leg": "NOT_APPLICABLE", "inventory_leg_usd": None,
+                "derived": False, "basis_pnl_usd": None,
+                "basis_why": "the hedge never landed; the whole round trip "
+                             "is the cycle's loss"}
+    if not c.get("overlay"):
+        return {"available": True, "net_usd": net,
+                "inventory_leg": "SPOT_LEG_BOOKED", "inventory_leg_usd": None,
+                "derived": False, "basis_pnl_usd": c["realised_usd"],
+                "basis_why": None}
+    if c.get("revalue_entries"):
+        return {"available": True, "net_usd": net, "inventory_leg": "BOOKED",
+                "inventory_leg_usd": c["revalue_usd"], "derived": False,
+                "basis_pnl_usd": c["realised_usd"], "basis_why": None}
+    qty, p0, p1 = (c.get("hedged_qty"), c.get("perp_entry_price"),
+                   c.get("perp_exit_price"))
+    if not (qty and p0 and p1 and qty > 0 and p0 > 0 and p1 > 0
+            and all(math.isfinite(x) for x in (qty, p0, p1))):
+        return {"available": False, "why": (
+            "overlay inventory leg not booked and the hedged quantity or a "
+            "perp fill price is not in the journal for this cycle")}
+    leg = qty * (p1 - p0)
+    return {"available": True, "net_usd": net + leg,
+            "inventory_leg": "DERIVED_FROM_PERP_FILL_PRICES",
+            "inventory_leg_usd": leg, "derived": True, "basis_pnl_usd": None,
+            "basis_why": (
+                "BASIS_NOT_MEASURABLE: the inventory leg is derived from the "
+                "perp fill prices, so basis (perp vs spot) at entry and exit "
+                "never enters; the journal holds no spot price for this cycle")}
+
+
 def cycle_net_economics(c: Mapping[str, Any],
                         slip: Optional[Mapping[str, Any]] = None,
                         opp: Optional[Mapping[str, Any]] = None
@@ -1004,6 +1067,29 @@ def cycle_net_economics(c: Mapping[str, Any],
             "none accrued"))
     comp["price_leg"] = _comp(c["realised_usd"], cls, additive=True,
                               sign="income_or_cost")
+
+    pr = hedged_pair(c)
+    if pr["available"]:
+        comp["hedged_pair_net"] = _comp(
+            pr["net_usd"], HISTORICAL_SIMULATION if pr["derived"] else cls,
+            status="DERIVED_NOT_BOOKED" if pr["derived"] else "BOOKED",
+            additive=False, sign="income_or_cost",
+            inventory_leg=pr["inventory_leg"],
+            inventory_leg_usd=pr["inventory_leg_usd"],
+            note="booked net plus the inventory leg when the overlay's hedged "
+                 "BTC was not revalued in the journal; NOT added to the "
+                 "additive lines (net_after_booked_costs_usd is unchanged)")
+        if pr["basis_pnl_usd"] is not None:
+            comp["basis_pnl"] = _comp(
+                pr["basis_pnl_usd"], cls, additive=False,
+                sign="income_or_cost", note="both price legs booked: what is "
+                "left after the hedge cancels, slippage included")
+        else:
+            comp["basis_pnl"] = _comp(None, UNAVAILABLE, why=(
+                pr["basis_why"] or "no basis figure for this cycle"))
+    else:
+        comp["hedged_pair_net"] = _comp(None, UNAVAILABLE, why=pr["why"])
+        comp["basis_pnl"] = _comp(None, UNAVAILABLE, why=pr["why"])
 
     s = slip or {}
     if not s.get("fills"):
@@ -1219,6 +1305,188 @@ def _agg_class(cycles: Sequence[Mapping[str, Any]], default: str) -> str:
     return default
 
 
+#: Shocks the sensitivity applies. Stated here so a reader can see exactly what
+#: was assumed; they are not forecasts and not a measurement.
+SENSITIVITY_EXTRA_BPS = (0.0, 2.0, 5.0, 10.0, 20.0)
+SENSITIVITY_FEE_MULTIPLES = (1.0, 1.5, 2.0, 3.0)
+SETTLEMENTS_PER_DAY = 3
+
+PAIR_METRIC_KEYS = (
+    "hedged_pair_net_usd", "observed_funding_bps_per_settlement",
+    "break_even_funding_bps_per_settlement",
+    "funding_margin_over_break_even_bps", "min_holding_days_to_cover_costs",
+    "min_required_funding_edge_bps_per_settlement", "net_bps_per_notional_day",
+    "pair_return_on_posted_margin_pct", "execution_cost_sensitivity")
+
+
+def pair_economics(closed: Sequence[Mapping[str, Any]], cls_closed: str,
+                   inc_status: str) -> Dict[str, Any]:
+    """The hedged-pair net, break-evens, required edge, efficiency and the
+    sensitivity of the result to execution cost. Additive: nothing here changes
+    a booked figure, and every metric is None with a reason where an input is
+    missing (never 0).
+
+    DEFINITIONS (notional = perp entry notional; a settlement is one 8h print,
+    three a day; ND = sum over hedged cycles of notional x holding days):
+      observed funding      funding net / (3 x ND) x 1e4, bps per settlement
+      break-even funding    (funding - pair net) / (3 x ND) x 1e4: the flat
+                            funding per settlement at which the hedged pair
+                            would have netted exactly zero over the holds
+                            actually observed (fees, financing, and the price
+                            leg when it is booked)
+      min holding days      fixed cost (fees less any booked price leg, bps of
+                            notional) / observed funding net of financing
+                            (bps of notional per day); NEVER (None) when that
+                            rate is not positive
+      required edge         the break-even at the MEDIAN observed hold:
+                            fixed bps / (3 x median days) + financing/3
+      sensitivity           pair net minus a stated extra round-trip cost, or
+                            minus extra multiples of the journalled fees; the
+                            slippage already inside the price leg is not
+                            scaled, and spread is not journalled
+    """
+    out: Dict[str, Any] = {}
+
+    def unavailable(why: str, defn: str, unit: str = "usd") -> Dict[str, Any]:
+        return _metric(None, UNAVAILABLE, defn, unit=unit, why=why)
+
+    def all_unavailable(why: str) -> Dict[str, Any]:
+        return {k: unavailable(why, k) for k in PAIR_METRIC_KEYS}
+
+    if not closed:
+        return all_unavailable("NO_CLOSED_CYCLES: no cycle has gone flat")
+    hedged = [c for c in closed if c["outcome"] == "CLOSED"]
+    aborted = [c for c in closed if c["outcome"] != "CLOSED"]
+    aborted_net = sum(c["net_usd"] for c in aborted)
+    if not hedged:
+        return all_unavailable(
+            "NO_HEDGED_CYCLE: only aborted cycles are closed; their whole "
+            f"round trip (${aborted_net:,.2f}) is booked in the net")
+    pairs = [(c, hedged_pair(c)) for c in hedged]
+    missing = [c["cycle_id"] for c, p in pairs if not p["available"]]
+    if missing:
+        return all_unavailable(
+            f"PAIR_NOT_COMPUTABLE: no hedged-pair net for cycle(s) {missing}: "
+            + "; ".join(sorted({p["why"] for _, p in pairs
+                                if not p["available"]})))
+    derived = [c for c, p in pairs if p["derived"]]
+    cls = HISTORICAL_SIMULATION if derived else cls_closed
+    status = ("INCOMPLETE_BOUND" if inc_status != "COMPLETE" else
+              "DERIVED_NOT_BOOKED" if derived else "COMPUTED")
+    pair_h = sum(p["net_usd"] for _, p in pairs)
+    out["hedged_pair_net_usd"] = _metric(
+        pair_h + aborted_net, cls,
+        "booked net plus, for an overlay cycle whose hedged BTC was not "
+        "revalued in the journal, hedged_qty x (perp exit - perp entry); "
+        "aborted cycles at their booked loss", status=status,
+        derived_cycles=len(derived), booked_net_usd=sum(
+            c["net_usd"] for c in closed),
+        aborted_cycles_net_usd=aborted_net,
+        basis_pnl_included=not derived,
+        basis_note=("basis (perp vs spot) P&L is NOT in this figure for the "
+                    f"{len(derived)} derived cycle(s): it is not measurable "
+                    "from perp prices" if derived else
+                    "every price leg is booked; basis is inside the price leg"))
+
+    notional = [c.get("notional_usd") for c in hedged]
+    days = [c.get("hold_days") for c in hedged]
+    if not all(n and n > 0 for n in notional) or not all(
+            d and d > 0 for d in days):
+        why = ("NOTIONAL_OR_HOLD_UNKNOWN: a closed hedged cycle has no "
+               "readable perp notional or a zero holding period; a rate is "
+               "never computed from a guess")
+        for k in PAIR_METRIC_KEYS[1:]:
+            out[k] = unavailable(why, k)
+        return out
+    N = sum(notional)
+    ND = sum(n * d for n, d in zip(notional, days))
+    funding = sum(c["funding_usd"] for c in hedged)
+    fees = sum(c["fees_usd"] for c in hedged)
+    fin = sum(c["borrow_usd"] for c in hedged)
+    S = SETTLEMENTS_PER_DAY
+
+    realised_rate = funding / (S * ND) * 1e4
+    out["observed_funding_bps_per_settlement"] = _metric(
+        realised_rate, cls_closed, "funding net / (3 x sum notional x days) "
+        "x 1e4 over closed hedged cycles", unit="bps_per_settlement",
+        status=inc_status)
+    be = (funding - pair_h) / (S * ND) * 1e4
+    out["break_even_funding_bps_per_settlement"] = _metric(
+        be, cls, "flat funding per 8h settlement at which the hedged pair "
+        "nets zero over the holds observed: (funding - pair net)/(3 x ND)",
+        unit="bps_per_settlement", status=status,
+        basis_pnl_included=not derived,
+        covers="fees + financing" + (
+            " - booked price leg" if not derived else
+            " (basis P&L not measurable for derived cycles)"))
+    out["funding_margin_over_break_even_bps"] = _metric(
+        realised_rate - be, cls, "observed funding - break-even funding, bps "
+        "per settlement; negative = funding did not pay for the cycles",
+        unit="bps_per_settlement", status=status)
+
+    fixed_bps = (funding - fin - pair_h) / N * 1e4     # fees less price leg
+    rate_day = (funding - fin) / ND * 1e4              # funding net of financing
+    if rate_day <= 0:
+        out["min_holding_days_to_cover_costs"] = unavailable(
+            "NEVER: observed funding net of financing is "
+            f"{rate_day:.4f} bps/day, which cannot pay back a fixed cost of "
+            f"{fixed_bps:.2f} bps at any holding period", "min holding days",
+            unit="days")
+    else:
+        out["min_holding_days_to_cover_costs"] = _metric(
+            max(0.0, fixed_bps / rate_day), cls, "fixed cost (fees less any "
+            "booked price leg, bps of notional) / observed funding net of "
+            "financing (bps of notional per day)", unit="days", status=status,
+            fixed_cost_bps_of_notional=fixed_bps,
+            funding_net_of_financing_bps_per_day=rate_day,
+            observed_mean_hold_days=sum(days) / len(days))
+    ordered = sorted(days)
+    mid = len(ordered) // 2
+    median_hold = (ordered[mid] if len(ordered) % 2 else
+                   (ordered[mid - 1] + ordered[mid]) / 2.0)
+    out["min_required_funding_edge_bps_per_settlement"] = _metric(
+        max(0.0, fixed_bps) / (S * median_hold) + fin / ND * 1e4 / S, cls,
+        "break-even funding at the median observed hold: fixed bps / (3 x "
+        "median days) + financing bps per day / 3", unit="bps_per_settlement",
+        status=status, median_hold_days=median_hold)
+    out["net_bps_per_notional_day"] = _metric(
+        pair_h / ND * 1e4, cls, "hedged-pair net / sum(notional x days) x 1e4 "
+        "over closed hedged cycles (aborted cycles excluded: no holding "
+        "period)", unit="bps_per_notional_day", status=status)
+    margins = [c.get("margin_committed_usd") for c in hedged]
+    if all(m and m > 0 for m in margins):
+        peak_margin = max(margins)
+        out["pair_return_on_posted_margin_pct"] = _metric(
+            100.0 * (pair_h + aborted_net) / peak_margin, cls,
+            "hedged-pair net / PEAK observed venue initial margin; for an "
+            "overlay the client's BTC is already owned, so margin is the only "
+            "capital the hedge adds. Whole period, not annualised",
+            unit="pct", status=status, denominator_usd=peak_margin)
+    else:
+        out["pair_return_on_posted_margin_pct"] = unavailable(
+            "no observed venue margin for every closed hedged cycle",
+            "pair return on posted margin", unit="pct")
+
+    rows_bps = [{"extra_round_trip_bps": b, "net_usd": pair_h - b / 1e4 * N}
+                for b in SENSITIVITY_EXTRA_BPS]
+    rows_mult = [{"fee_multiple": m, "net_usd": pair_h - (m - 1.0) * fees}
+                 for m in SENSITIVITY_FEE_MULTIPLES]
+    out["execution_cost_sensitivity"] = _metric(
+        pair_h, HISTORICAL_SIMULATION, "hedged-pair net under stated extra "
+        "round-trip cost (bps of notional, per cycle) and stated multiples of "
+        "the journalled fees",
+        status="SENSITIVITY_NOT_MEASUREMENT", base_net_usd=pair_h,
+        extra_bps=rows_bps, fee_multiple=rows_mult,
+        extra_round_trip_bps_to_zero_net=(pair_h / N * 1e4
+                                          if pair_h > 0 else None),
+        fee_multiple_to_zero_net=(1.0 + pair_h / fees
+                                  if pair_h > 0 and fees > 0 else None),
+        notional_usd=N, fees_usd=fees,
+        not_scaled="slippage already inside the price leg; spread (not "
+                   "journalled); financing")
+    return out
+
+
 def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
                   journal: Any, opp_by_cycle: Mapping[str, Mapping[str, Any]],
                   period_days: Optional[float],
@@ -1373,6 +1641,9 @@ def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
     M["reservation_duration"] = reservation_stats(reservations, now_ms,
                                                   booked_cls)
 
+    # the hedged pair, break-evens and sensitivity (additive; see pair_economics)
+    M.update(pair_economics(closed, cls_closed, inc_status))
+
     # risk and distribution
     dd = PA.max_drawdown_usd(nets) if closed else None
     M["max_drawdown_usd"] = (
@@ -1458,7 +1729,11 @@ def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
             "no operator-supplied --cash-apr, or committed capital missing "
             "for a closed hedged cycle")))
 
+    pair_metric = M["hedged_pair_net_usd"]
+    n_unbooked = (pair_metric.get("derived_cycles", 0)
+                  if pair_metric["value"] is not None else 0)
     verdict = net_verdict(
+        hedged_pair_net=pair_metric["value"], inventory_unbooked_cycles=n_unbooked,
         closed=closed, net=net, funding_net=funding_net, fees=fees,
         financing=fin, price=price, complete=complete,
         net_ex_winner=(conc.get("net_excluding_largest_winner_usd")
@@ -1475,17 +1750,40 @@ def net_economics(cycles: Sequence[Dict[str, Any]], env: Mapping[str, Any], *,
             "annualised_return_on_committed_capital_pct"]["value"],
         "complete": complete,
         "evidence_class": cls_closed if closed else UNAVAILABLE,
+        "hedged_pair_net_usd": pair_metric["value"],
         "gross_funding_is_not_the_headline": funding_net if closed else None}
     return {"schema": NET_ECONOMICS_SCHEMA,
             "headline": headline, "metrics": M, "cycles": per_cycle,
             "verdict": verdict}
 
 
-def net_verdict(*, closed: Sequence[Any], net: float, funding_net: float,
-                fees: float, financing: float, price: float, complete: bool,
-                net_ex_winner: Optional[float], open_booked: float,
-                n_open: int, vs_benchmark: Optional[float],
-                sample_ok: bool) -> Dict[str, Any]:
+def net_verdict(*, hedged_pair_net: Optional[float] = None,
+                inventory_unbooked_cycles: int = 0, **kw: Any) -> Dict[str, Any]:
+    """`_net_verdict` plus, additively, the hedged-pair net and (when an
+    overlay cycle's hedged BTC was never revalued in the journal) a note that
+    the booked net is the net of an unhedged short. The code and the booked
+    figures are unchanged."""
+    v = _net_verdict(**kw)
+    v["hedged_pair_net_usd"] = hedged_pair_net
+    v["inventory_unbooked_cycles"] = inventory_unbooked_cycles
+    if kw["closed"] and inventory_unbooked_cycles and hedged_pair_net is not None:
+        money = lambda x: f"{'-' if x < 0 else ''}${abs(x):,.2f}"  # noqa: E731
+        v["booked_net_minus_pair_net_usd"] = kw["net"] - hedged_pair_net
+        v["statement"] += (
+            f" NOTE: {inventory_unbooked_cycles} overlay cycle(s) hedge client "
+            "BTC inventory that the journal never revalued, so the booked net "
+            "is the net of an unhedged short, not of the pair. With the "
+            "inventory leg derived from the perp fill prices the hedged-pair "
+            f"net is {money(hedged_pair_net)} (basis P&L is not measurable "
+            "from perp prices).")
+    return v
+
+
+def _net_verdict(*, closed: Sequence[Any], net: float, funding_net: float,
+                 fees: float, financing: float, price: float, complete: bool,
+                 net_ex_winner: Optional[float], open_booked: float,
+                 n_open: int, vs_benchmark: Optional[float],
+                 sample_ok: bool) -> Dict[str, Any]:
     """One plain statement of what the book's economics are. A carry whose
     funding beats its costs but whose NET is negative says so here."""
     costs = fees + financing
@@ -1753,6 +2051,14 @@ def evidence_lines(report: Mapping[str, Any]) -> List[str]:
     rc = report["sections"]["realized_cash"]
     v = report.get("net_economics_verdict")
     lines = ([f"NET ECONOMICS [{v['code']}]: {v['statement']}"] if v else [])
+    h = report.get("headline") or {}
+    pair, booked = h.get("hedged_pair_net_usd"), h.get("net_usd")
+    if pair is not None and booked is not None and abs(pair - booked) > 0.005:
+        lines.append(
+            f"hedged-pair net ${pair:,.2f} vs booked net ${booked:,.2f}: an "
+            "overlay's hedged BTC is not revalued in the journal, so the "
+            "booked net includes the short's price leg without its offset "
+            "(basis P&L not measurable from perp prices)")
     lines += [f"environment: declared={env['declared'] or 'NONE'}  "
              f"recorded={env['recorded_seen'] or 'none'}  booked figures are "
              f"{env['booked_figures_class']}"]
