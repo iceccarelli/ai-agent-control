@@ -2308,7 +2308,12 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
                     order_log=bot.store),
                 bot.carry_journal,
                 ms=lambda: int(time.time() * 1000),
-                spot_symbol=cfg.CARRY_SPOT_SYMBOL),
+                spot_symbol=cfg.CARRY_SPOT_SYMBOL,
+                # An overlay hedges BTC the client already owns and never
+                # trades it, so its journal books that leg's move by marking
+                # it between the entry and exit spot (acquire realises it
+                # through spot_sell and must not be marked as well).
+                book_overlay_inventory=(execution_mode == "overlay")),
             kill_switch=bot.store.trip_kill_switch,
             spot_symbol=cfg.CARRY_SPOT_SYMBOL,
             perp_symbol=cfg.CARRY_PERP_SYMBOL,

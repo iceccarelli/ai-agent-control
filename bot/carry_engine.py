@@ -581,6 +581,7 @@ def _clears_decision_marks(fn):
             return fn(self, *args, **kwargs)
         finally:
             self._decision_marks = {}
+            self._tell_hedge_reference(None)
     return wrapper
 
 
@@ -1523,6 +1524,9 @@ class CarryEngine:
         self._decision_marks = {
             "linear": float(mark),
             "spot": float(spot) if spot is not None else None}
+        # And the spot this tick saw, for an overlay's inventory leg: the
+        # client's BTC is marked from the spot at entry to the spot at exit.
+        self._tell_hedge_reference(spot)
         if self.state is BookState.HALTED:
             if self._halt_unwritten:
                 # The write that records the halt (and any exposure noted with
@@ -3243,6 +3247,17 @@ class CarryEngine:
     #: seconds. A healthy read takes tens of milliseconds; this is the bound on
     #: a slow or hung one, after which the exit proceeds unmeasured.
     EXIT_BOOK_READ_TIMEOUT_S = 1.0
+
+    def _tell_hedge_reference(self, spot: Optional[float]) -> None:
+        """Hand the broker the spot this tick decided on (None clears it).
+        Explicit, like every other broker call: a broker that does not book an
+        inventory leg simply has no such method."""
+        note = getattr(self.broker, "note_hedge_reference", None)
+        if callable(note):
+            try:
+                note(spot)
+            except Exception:  # noqa: BLE001 - a reference is never worth a halt
+                logger.warning("hedge reference not recorded", exc_info=True)
 
     #: A tick's touch older than this is not "what the decision saw" any more.
     #: It sits inside execution_record.MAX_OBSERVATION_AGE_MS (5 s) so a book

@@ -185,6 +185,7 @@ jobs:
           tests/test_protect_only_overlay_and_watch.py
           tests/test_protective_restart_unverified_exposure.py
           tests/test_seed_pilot.py
+          tests/test_overlay_inventory_leg.py
           tests/test_protective_restart.py
           tests/test_protect_only_wiring.py
           tests/test_database_environment_scope.py
