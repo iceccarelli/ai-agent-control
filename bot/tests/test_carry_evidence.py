@@ -186,11 +186,11 @@ def test_an_inverted_or_partial_window_is_treated_as_unset(monkeypatch):
 
 # -- an overlay's price leg is a hedge, not an edge ----------------------------
 
-def overlay_report(n, booked, pair):
-    cs = cycles(n, booked)
-    for i, c in enumerate(cs):
+def overlay_report(nets, leg, n=25):
+    cs = cycles(n, nets)
+    for c in cs:
         c["overlay"] = True
-        c["hedged_pair_net_usd"] = pair[i % len(pair)]
+        c["hedged_pair_inventory_leg"] = leg
     return {"sections": {
         "realized_cash": {"evidence_class": "ACTUAL_RECONCILED",
                           "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]},
@@ -198,28 +198,41 @@ def overlay_report(n, booked, pair):
 
 
 def test_a_short_perp_windfall_in_a_falling_market_is_not_carry_evidence():
-    # booked nets are large wins (BTC fell: the short gained); the hedged pair,
-    # which also holds the inventory that lost, netted funding less fees only,
-    # and that is NEGATIVE. The verdict must not ALLOCATE on the windfall.
-    rep = overlay_report(25, booked=(500.0, 700.0, 600.0, 650.0, 550.0),
-                         pair=(-3.0, -2.0, -4.0, -1.0, -2.5))
+    # Overlay short at 60000, funding +100, fees 33 each way: exit 54000 books
+    # +6034, exit 60000 +34, exit 66000 -5966. The first reads as a run of wins
+    # and used to reach ALLOCATE on BTC's direction alone.
+    rep = overlay_report((6034.0, 6100.0, 5990.0, 6050.0, 6010.0),
+                         "DERIVED_FROM_PERP_FILL_PRICES")
+    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
+                                  discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
+    assert ev.trades == ()
     v = provider(rep)()
-    assert v.verdict == se.BLOCK
-    assert any(r.startswith(se.NEGATIVE_NET_EXPECTANCY) for r in v.reasons)
+    assert v.verdict == se.INSUFFICIENT
 
 
-def test_a_rally_loss_is_never_judged_better_than_the_booked_net():
-    # booked nets are losses because BTC rose; the pair is positive. The
-    # evidence keeps the WORSE figure: it is never looser than the booked net.
-    rep = overlay_report(25, booked=(-5.0, -4.0, -6.0, -5.5, -4.5),
-                         pair=(2.0, 3.0, 1.0, 4.0, 2.5))
-    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
-                                  discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
-    assert [t.net for t in ev.trades[:3]] == [-5.0, -4.0, -6.0]
+def test_a_rally_does_not_breach_the_evidence_either():
+    rep = overlay_report((-5966.0, -6000.0, -5900.0, -6100.0, -5950.0),
+                         "DERIVED_FROM_PERP_FILL_PRICES")
+    assert provider(rep)().verdict == se.INSUFFICIENT      # not BLOCK
 
 
-def test_a_cycle_with_no_pair_figure_keeps_its_booked_net():
-    rep = report(25)
-    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
-                                  discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
-    assert [t.net for t in ev.trades[:5]] == [2.0, 3.0, 1.0, 4.0, 2.5]
+def test_an_overlay_with_its_inventory_leg_booked_counts():
+    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), "BOOKED")
+    assert provider(rep)().verdict == se.ALLOCATE
+
+
+def test_an_overlay_with_no_stated_inventory_leg_is_left_out():
+    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), None)
+    assert provider(rep)().verdict == se.INSUFFICIENT
+
+
+def test_an_acquire_cycle_holds_both_legs_and_counts():
+    cs = cycles(25)
+    for c in cs:
+        c["overlay"] = False
+        c["hedged_pair_inventory_leg"] = "SPOT_LEG_BOOKED"
+    rep = {"sections": {
+        "realized_cash": {"evidence_class": "ACTUAL_RECONCILED",
+                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]},
+        "ledger_detail": {"cycles": cs}}}
+    assert provider(rep)().verdict == se.ALLOCATE
