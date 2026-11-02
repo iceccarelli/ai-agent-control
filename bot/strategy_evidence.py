@@ -335,6 +335,11 @@ REFUSE_NEGATIVE = "NET_BENEFIT_NOT_POSITIVE"
 REFUSE_TOO_UNCERTAIN = "NET_BENEFIT_WITHIN_UNCERTAINTY"
 REFUSE_NO_EVIDENCE = "STRATEGY_EVIDENCE_NOT_ALLOCATE"
 
+#: `basis_convergence_bps` not passed: the component is left out entirely (the
+#: pure rule's older callers). A caller that passes anything else, None
+#: included, is pricing it, and a value it cannot price is UNAVAILABLE.
+NOT_SUPPLIED = object()
+
 
 @dataclass(frozen=True)
 class EntryDecision:
@@ -355,7 +360,9 @@ def evaluate_entry_benefit(*, expected_funding_bps_per_settlement: Any,
                            income_haircut_fraction: Any,
                            income_uncertainty_bps: Any,
                            evidence: Optional[EvidenceVerdict],
-                           settlements_per_day: Any = 3) -> EntryDecision:
+                           settlements_per_day: Any = 3,
+                           basis_convergence_bps: Any = NOT_SUPPLIED
+                           ) -> EntryDecision:
     """Expected net benefit of one entry over its expected hold. Pure.
 
     Every cost argument is REQUIRED (no default); None/NaN/inf/negative is
@@ -392,6 +399,11 @@ def evaluate_entry_benefit(*, expected_funding_bps_per_settlement: Any,
             bad.append(name)
     if not (_finite(income_haircut_fraction) and 0 <= income_haircut_fraction <= 1):
         bad.append("income_haircut_fraction")
+    priced_basis = basis_convergence_bps is not NOT_SUPPLIED
+    if priced_basis:
+        comps["basis_convergence"] = UNAVAILABLE
+        if not nonneg(basis_convergence_bps):
+            bad.append("basis_convergence_bps")
     if bad:
         return EntryDecision(False, (f"{REFUSE_UNAVAILABLE}:" + ",".join(bad),),
                              comps, None, None,
@@ -404,9 +416,15 @@ def evaluate_entry_benefit(*, expected_funding_bps_per_settlement: Any,
         financing=float(borrow_apr) / 365.0 * 1e4 * h,
         opportunity_cost=float(opportunity_cost_apr) / 365.0 * 1e4 * h,
         model_haircut=max(income, 0.0) * float(income_haircut_fraction))
-    net = comps["income"] - sum(comps[k] for k in (
-        "fees", "spread", "slippage", "financing", "opportunity_cost",
-        "model_haircut"))
+    cost_keys = ["fees", "spread", "slippage", "financing", "opportunity_cost",
+                 "model_haircut"]
+    if priced_basis:
+        # What a perp trading BELOW spot gives back when the pair converges: a
+        # cost, charged in full. A premium is never credited (the caller passes
+        # 0 for it); it is a bps figure of the position notional like the rest.
+        comps["basis_convergence"] = float(basis_convergence_bps)
+        cost_keys.append("basis_convergence")
+    net = comps["income"] - sum(comps[k] for k in cost_keys)
     if not math.isfinite(net):
         return EntryDecision(False, (f"{REFUSE_UNAVAILABLE}:arithmetic_overflow",),
                              comps, None, None, h)
