@@ -107,6 +107,11 @@ def build_report(db_path: str,
                 "entries": st["entries"], "funding_usd": st["funding_usd"],
                 "fees_usd": st["fees_usd"], "borrow_usd": st["borrow_usd"],
                 "realised_usd": st["realised_usd"], "net_usd": st["net_usd"],
+                # NOT cash: the client's BTC marked between two spots and never
+                # sold, and the pair (cash net + the mark) it makes up.
+                "inventory_mark_usd": st["inventory_mark_usd"],
+                "pair_net_usd": st["pair_net_usd"],
+                "pair_net_class": "MARKED_PAIR_ECONOMICS",
                 "fees_unknown": st["fees_unknown"],
                 "fees_unresolved": st["fees_unresolved"],
                 "fees_unlabelled": st["fees_unlabelled"],

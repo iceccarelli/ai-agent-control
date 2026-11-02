@@ -411,10 +411,15 @@ class TestTheJournalReproducesFourYearsOfPandL:
         rows, _meta = cb.load_bybit_settlements(repo)
         r = rp.replay(rows, notional=100_000.0, borrow_apr=borrow,
                       impact_bps=impact)
-        assert r["ledger_agrees"], (r["ledger"]["net_usd"],
+        # The replay's net values BOTH legs, so it is the journal's PAIR net
+        # (cash net + the marked inventory move) that must equal it; the
+        # statement's `net_usd` is cash and no longer holds the marks.
+        assert r["ledger_agrees"], (r["ledger"]["pair_net_usd"],
                                     r["unrealised_usd"], r["net_usd"])
-        assert r["ledger"]["net_usd"] + r["unrealised_usd"] == pytest.approx(
-            r["net_usd"], abs=0.01)
+        assert r["ledger"]["pair_net_usd"] + r["unrealised_usd"] == (
+            pytest.approx(r["net_usd"], abs=0.01))
+        assert r["ledger"]["net_usd"] + r["ledger"]["inventory_mark_usd"] == (
+            pytest.approx(r["ledger"]["pair_net_usd"], abs=1e-6))
 
     @corpus
     def test_the_fees_agree_exactly(self):

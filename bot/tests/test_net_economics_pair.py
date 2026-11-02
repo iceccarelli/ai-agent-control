@@ -39,8 +39,14 @@ def overlay(j, d0, d1, *, tag, funding=300.0, close=P0, revalue=False,
         L.borrow(j, ms=T0 + ((d0 + d1) // 2) * DAY + 1, ref=f"{tag}-b",
                  usd=borrow)
     if revalue:
-        L.revalue_inventory(j, ms=T0 + d1 * DAY - 1, ref=f"{tag}-rv", qty=1.0,
-                            from_price=P0, to_price=close)
+        L.revalue_inventory(
+            j, ms=T0 + d1 * DAY - 1, ref=f"{tag}-rv", qty=1.0,
+            from_price=P0, to_price=close,
+            raw={"valuation": L.MARK_VALUATION, "qty": 1.0,
+                 "entry_spot": P0, "exit_spot": close,
+                 "exit_mark_source": "tick_spot_mark",
+                 "exit_mark_observed_ms": T0 + d1 * DAY - 1,
+                 "fill_ms": T0 + d1 * DAY})
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=1.0, price=close,
                  entry_price=P0, fee_usd=55.0, fee_status="confirmed")
 
@@ -113,19 +119,23 @@ def test_a_btc_fall_is_not_a_carry_win_for_an_overlay():
     assert ne["metrics"]["hedged_pair_net_usd"]["value"] == pytest.approx(190.0)
 
 
-def test_a_booked_inventory_revaluation_is_not_added_a_second_time():
+def test_a_booked_inventory_mark_is_added_to_the_pair_once_and_never_to_cash():
     j = L.Journal()
     overlay(j, 0, 10, tag="a", close=105_000.0, revalue=True)
     ne, cycles = economics(j)
     assert cycles[0]["revalue_usd"] == pytest.approx(5000.0)
-    # booked net already holds the inventory gain: 300 - 110 - 5000 + 5000
-    assert ne["headline"]["net_usd"] == pytest.approx(190.0)
+    # CASH: 300 - 110 - 5000 (the short really lost 5000 on the venue). The
+    # +5000 on the client's coin is a mark, not money.
+    assert ne["headline"]["net_usd"] == pytest.approx(-4810.0)
+    # PAIR: cash + the mark, once: 300 - 110 - 5000 + 5000
     m = ne["metrics"]["hedged_pair_net_usd"]
     assert m["value"] == pytest.approx(190.0)
     assert m["status"] == "COMPUTED"
+    assert m["evidence_class"] == perf.MARKED_PAIR_ECONOMICS
     pair = ne["cycles"][0]["components"]["hedged_pair_net"]
-    assert pair["inventory_leg"] == "BOOKED"
-    # with the inventory booked at its own price the residual IS measured
+    assert pair["inventory_leg"] == "BOOKED_MARK"
+    assert pair["evidence_class"] == perf.MARKED_PAIR_ECONOMICS
+    # with the inventory marked at its own price the residual IS measured
     assert ne["cycles"][0]["components"]["basis_pnl"]["value"] == pytest.approx(0.0)
     assert "never revalued" not in ne["verdict"]["statement"]
 

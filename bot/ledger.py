@@ -364,7 +364,16 @@ class Journal:
         funding_usd = -acc[FUNDING].usd          # income is credit-normal
         fees_usd = acc[FEES].usd
         borrow_usd = acc[BORROW].usd
-        realised_usd = -acc[REALISED].usd
+        # A revaluation posts to REALISED too, but it MARKS coin that was never
+        # sold: it is kept out of the realised/net (cash) figures and reported
+        # on its own, with the pair (cash net + mark) beside it.
+        inventory_mark_usd = -sum(
+            line.usd for entry in self.entries
+            if entry.kind == "revalue"
+            and (from_ms is None or entry.ms >= from_ms)
+            and (to_ms is None or entry.ms <= to_ms)
+            for line in entry.lines if line.account == REALISED)
+        realised_usd = -acc[REALISED].usd - inventory_mark_usd
         net = funding_usd - fees_usd - borrow_usd + realised_usd
 
         # The identity, enforced. Every term is a balance read off the same
@@ -380,6 +389,11 @@ class Journal:
             "borrow_usd": borrow_usd,
             "realised_usd": realised_usd,
             "net_usd": net,
+            # Marked-to-market, NOT cash: the client's BTC valued between two
+            # spot prices and never sold. `pair_net_usd` is the hedged pair's
+            # economic result (cash net + the mark), labelled as such.
+            "inventory_mark_usd": inventory_mark_usd,
+            "pair_net_usd": net + inventory_mark_usd,
             "fees_unknown": fee_counts["unknown"],
             "fees_unresolved": fee_counts["unresolved"],
             "fees_unlabelled": fee_counts["unlabelled"],
@@ -970,8 +984,15 @@ def borrow(journal: Journal, *, ms: int, ref: str, usd: float) -> Entry:
         Line(USDT, -usd, qty=-usd)]))
 
 
+#: The only valuation basis a revaluation may claim. A revaluation is a MARK of
+#: coin the book still holds (or never traded): it is not cash, and the report
+#: keeps it out of every realised-cash figure on the strength of this label.
+MARK_VALUATION = "MARK_TO_MARKET"
+
+
 def revalue_inventory(journal: Journal, *, ms: int, ref: str, qty: float,
-                      from_price: float, to_price: float) -> Entry:
+                      from_price: float, to_price: float,
+                      raw: Optional[Dict[str, Any]] = None) -> Entry:
     """Mark the hedged BTC to a new price.
 
     In the OVERLAY the book never trades the client's coin, so without this
@@ -986,7 +1007,8 @@ def revalue_inventory(journal: Journal, *, ms: int, ref: str, qty: float,
     return journal.post(Entry(ms=ms, kind="revalue", ref=ref, lines=[
         Line(BTC, change),
         Line(REALISED, -change)],
-        memo=f"{qty} BTC from {from_price} to {to_price}"))
+        memo=f"{qty} BTC from {from_price} to {to_price}",
+        fee_raw=dict(raw or {})))
 
 
 def hedge_effectiveness(*, perp_realised_usd: float,
@@ -1096,6 +1118,7 @@ class LedgerBroker:
         self.book_overlay_inventory = bool(book_overlay_inventory)
         #: The spot the engine decided on this tick (None outside a tick).
         self._hedge_ref: Optional[float] = None
+        self._hedge_ref_ms: Optional[int] = None
         #: Quantity of the open short whose entry spot is known, and the sum of
         #: qty x spot over it. A short with an unknown part is never averaged
         #: over the gap: the close then books no revaluation at all.
@@ -1313,13 +1336,17 @@ class LedgerBroker:
         ok = (isinstance(spot, (int, float)) and not isinstance(spot, bool)
               and math.isfinite(spot) and spot > 0)
         self._hedge_ref = float(spot) if ok else None
+        #: When the engine saw it: a mark's age is part of its provenance.
+        self._hedge_ref_ms = int(self._ms()) if ok else None
 
-    def _hedge_reference_now(self, symbol: str) -> Optional[float]:
-        """The tick's spot, else one public read of the spot mark (after the
-        fill is booked, so it can never delay an order). None when neither
-        exists; a failed read is "not observed", never a guess."""
-        if self._hedge_ref is not None:
-            return self._hedge_ref
+    def _hedge_reference_now(self, symbol: str
+                             ) -> Optional[Tuple[float, str, int]]:
+        """(spot, source, observed_ms): the tick's spot, else one public read
+        of the spot mark (after the fill is booked, so it can never delay an
+        order). None when neither exists; a failed read is "not observed",
+        never a guess."""
+        if self._hedge_ref is not None and self._hedge_ref_ms is not None:
+            return self._hedge_ref, "tick_spot_mark", self._hedge_ref_ms
         getter = getattr(self.inner, "get_spot_mark", None)
         if not callable(getter):
             return None
@@ -1327,7 +1354,9 @@ class LedgerBroker:
             px = float(getter(self.spot_symbol or symbol))
         except Exception:  # noqa: BLE001
             return None
-        return px if math.isfinite(px) and px > 0 else None
+        if not (math.isfinite(px) and px > 0):
+            return None
+        return px, "public_spot_read", int(self._ms())
 
     def _rebuild_hedge_references(self) -> None:
         """Re-derive the entry spot of the open short from the journal (each
@@ -1634,12 +1663,22 @@ class LedgerBroker:
                 self._hedge_ref_qty = self._hedge_ref_cost = 0.0
             if not known:
                 return
-            exit_spot = self._hedge_reference_now(symbol)
-            if exit_spot is None:
+            seen = self._hedge_reference_now(symbol)
+            if seen is None:
                 return
-            revalue_inventory(self.journal, ms=ms, ref=f"reval:{ref}", qty=qty,
-                              from_price=entry_cost / entry_qty,
-                              to_price=exit_spot)
+            exit_spot, source, observed_ms = seen
+            entry_spot = entry_cost / entry_qty
+            revalue_inventory(
+                self.journal, ms=ms, ref=f"reval:{ref}", qty=qty,
+                from_price=entry_spot, to_price=exit_spot,
+                raw={"valuation": MARK_VALUATION, "qty": qty,
+                     "entry_spot": entry_spot, "exit_spot": exit_spot,
+                     "exit_mark_source": source,
+                     "exit_mark_observed_ms": observed_ms, "fill_ms": ms,
+                     "close_ref": ref,
+                     "entry_basis": "quantity-weighted spot mark seen at "
+                                    "each open fill",
+                     "note": "client BTC marked, not sold: not cash"})
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning(
                 "overlay inventory leg not booked for %s", ref, exc_info=True)
@@ -1767,9 +1806,13 @@ class LedgerBroker:
         if side == "Sell":
             hedge_ref = None
             if self.book_overlay_inventory:
-                hedge_ref = self._hedge_reference_now(symbol)
+                seen = self._hedge_reference_now(symbol)
+                hedge_ref = seen[0] if seen else None
                 fee_raw = dict(fee_raw or {})
                 fee_raw["hedge_spot_ref"] = hedge_ref
+                fee_raw["hedge_spot_ref_source"] = seen[1] if seen else None
+                fee_raw["hedge_spot_ref_observed_ms"] = (
+                    seen[2] if seen else None)
             perp_open(self.journal, ms=ms, ref=ref, qty=qty, price=price,
                       fee_usd=fee_usdt, fee_status=status, fee_raw=fee_raw,
                       decision_mark=mark)
