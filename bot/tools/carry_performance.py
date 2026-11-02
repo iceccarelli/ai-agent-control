@@ -1930,6 +1930,10 @@ def build_report(db_path: str, *, environment: Optional[str] = None,
     for c in cycles:
         d = {k: v for k, v in c.items() if k != "realised_usd"}
         d["price_leg_usd"] = c["realised_usd"]
+        pr = hedged_pair(c)
+        d["hedged_pair_net_usd"] = pr["net_usd"] if pr["available"] else None
+        d["hedged_pair_inventory_leg"] = (pr["inventory_leg"]
+                                          if pr["available"] else None)
         detail_cycles.append(d)
     sections["ledger_detail"] = section(
         ACTUAL_RECONCILED if all_actual else cls,

@@ -280,3 +280,8 @@ def test_the_report_carries_the_pair_metrics_under_the_paper_class(tmp_path):
     assert m["pair_return_on_posted_margin_pct"]["value"] == pytest.approx(1.9)
     # nothing in it claims cash
     assert r["sections"]["realized_cash"]["evidence_class"] == perf.UNAVAILABLE
+    # the evidence feed reads the pair figure off the detail cycle
+    detail = r["sections"]["ledger_detail"]["cycles"][0]
+    assert detail["hedged_pair_net_usd"] == pytest.approx(190.0)
+    assert detail["net_usd"] == pytest.approx(-4810.0)
+    assert detail["hedged_pair_inventory_leg"] == "DERIVED_FROM_PERP_FILL_PRICES"

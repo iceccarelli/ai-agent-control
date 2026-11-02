@@ -182,3 +182,44 @@ def test_an_inverted_or_partial_window_is_treated_as_unset(monkeypatch):
         {"CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1000",
          "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "2000"}))
     assert seen[-1]["discovery_window_s"]() == (1000.0, 2000.0)
+
+
+# -- an overlay's price leg is a hedge, not an edge ----------------------------
+
+def overlay_report(n, booked, pair):
+    cs = cycles(n, booked)
+    for i, c in enumerate(cs):
+        c["overlay"] = True
+        c["hedged_pair_net_usd"] = pair[i % len(pair)]
+    return {"sections": {
+        "realized_cash": {"evidence_class": "ACTUAL_RECONCILED",
+                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]},
+        "ledger_detail": {"cycles": cs}}}
+
+
+def test_a_short_perp_windfall_in_a_falling_market_is_not_carry_evidence():
+    # booked nets are large wins (BTC fell: the short gained); the hedged pair,
+    # which also holds the inventory that lost, netted funding less fees only,
+    # and that is NEGATIVE. The verdict must not ALLOCATE on the windfall.
+    rep = overlay_report(25, booked=(500.0, 700.0, 600.0, 650.0, 550.0),
+                         pair=(-3.0, -2.0, -4.0, -1.0, -2.5))
+    v = provider(rep)()
+    assert v.verdict == se.BLOCK
+    assert any(r.startswith(se.NEGATIVE_NET_EXPECTANCY) for r in v.reasons)
+
+
+def test_a_rally_loss_is_never_judged_better_than_the_booked_net():
+    # booked nets are losses because BTC rose; the pair is positive. The
+    # evidence keeps the WORSE figure: it is never looser than the booked net.
+    rep = overlay_report(25, booked=(-5.0, -4.0, -6.0, -5.5, -4.5),
+                         pair=(2.0, 3.0, 1.0, 4.0, 2.5))
+    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
+                                  discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
+    assert [t.net for t in ev.trades[:3]] == [-5.0, -4.0, -6.0]
+
+
+def test_a_cycle_with_no_pair_figure_keeps_its_booked_net():
+    rep = report(25)
+    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
+                                  discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
+    assert [t.net for t in ev.trades[:5]] == [2.0, 3.0, 1.0, 4.0, 2.5]
