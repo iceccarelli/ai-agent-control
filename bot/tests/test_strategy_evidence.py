@@ -31,7 +31,8 @@ def trades(nets, start=NOW - 100 * DAY):
 def ev(nets=None, **over):
     nets = nets if nets is not None else [1.0, -0.5] * 15
     base = dict(strategy_id="carry", trades=trades(nets), observed_at_s=NOW - 3600,
-                net_basis="fixture", discovery_window_s=DISC, drawdown_limit=50.0)
+                net_basis="fixture", discovery_window_s=DISC, drawdown_limit=50.0,
+                evidence_class=se.CASH_EVIDENCE_CLASS)
     base.update(over)
     return se.StrategyEvidence(**base)
 
@@ -185,7 +186,7 @@ def test_allocator_refuses_forged_or_mismatched_evidence():
         a = ca.allocate([opp("a")], limits(), risk_aversion=1.0,
                         evidence={"carry": forged})
         assert a.total_allocated_usd == 0.0
-    other = se.EvidenceVerdict("other", se.ALLOCATE, (), {})
+    other = se.EvidenceVerdict("other", se.ALLOCATE, (), {}, se.CASH_EVIDENCE_CLASS)
     a = ca.allocate([opp("a")], limits(), risk_aversion=1.0,
                     evidence={"carry": other})
     assert a.total_allocated_usd == 0.0

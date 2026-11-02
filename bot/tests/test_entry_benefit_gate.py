@@ -46,7 +46,7 @@ FULL = fills(25, "Sell", "perp_open") + fills(25, "Buy", "perp_close")
 
 
 def allow_verdict():
-    return se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {})
+    return se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {}, se.CASH_EVIDENCE_CLASS)
 
 
 def args(**over):
@@ -84,7 +84,7 @@ def test_no_evidence_provider_means_strategy_evidence_insufficient():
 
 def test_an_insufficient_or_blocked_verdict_refuses():
     for v in (se.INSUFFICIENT, se.BLOCK):
-        r = gate(evidence_provider=lambda v=v: se.EvidenceVerdict("btc_funding_carry", v, ("x",), {})
+        r = gate(evidence_provider=lambda v=v: se.EvidenceVerdict("btc_funding_carry", v, ("x",), {}, se.CASH_EVIDENCE_CLASS)
                  ).check(**args())
         assert r.reason == ebg.EVIDENCE_INSUFFICIENT and not r.allowed
 
@@ -278,11 +278,11 @@ def test_maker_first_pools_resting_and_market_fills_for_each_leg():
 
 
 def test_a_verdict_for_another_strategy_unlocks_nothing():
-    other = lambda: se.EvidenceVerdict("some_other_strategy", se.ALLOCATE, ("OK",), {})
+    other = lambda: se.EvidenceVerdict("some_other_strategy", se.ALLOCATE, ("OK",), {}, se.CASH_EVIDENCE_CLASS)
     r = gate(evidence_provider=other).check(**args())
     assert r.reason == ebg.EVIDENCE_INSUFFICIENT
     assert r.trace["layers"]["strategy_evidence"]["verdict_strategy_id"] == "some_other_strategy"
-    mine = lambda: se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {})
+    mine = lambda: se.EvidenceVerdict("btc_funding_carry", se.ALLOCATE, ("OK",), {}, se.CASH_EVIDENCE_CLASS)
     assert gate(evidence_provider=mine).check(**args()).would_allow
 
 
