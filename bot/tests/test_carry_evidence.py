@@ -19,18 +19,28 @@ WINDOW = (NOW - 400 * DAY, NOW - 200 * DAY)        # designed and tuned before t
 
 
 def cycles(n, nets=(2.0, 3.0, 1.0, 4.0, 2.5)):
+    """Cycles in the shape of the REAL report's ledger_detail (`end_ms`, not
+    `last_ms`; the completeness flags and the cycle's own class)."""
     return [{"cycle_id": f"cyc-{i}", "start_ms": int((NOW - (150 - 3 * i) * DAY) * 1000),
-             "last_ms": int((NOW - (149 - 3 * i) * DAY) * 1000),
-             "net_usd": nets[i % len(nets)]} for i in range(n)]
+             "end_ms": int((NOW - (149 - 3 * i) * DAY) * 1000),
+             "net_usd": nets[i % len(nets)], "outcome": "CLOSED", "closed": True,
+             "evidence_class": "ACTUAL_RECONCILED", "fees_complete": True,
+             "funding_complete": True} for i in range(n)]
 
 
 def report(n=25, *, cls="ACTUAL_RECONCILED", nets=(2.0, 3.0, 1.0, 4.0, 2.5)):
     cs = cycles(n, nets)
-    return {"sections": {
-        "realized_cash": {"evidence_class": cls,
-                          "realized_cash_cycle_ids": [c["cycle_id"] for c in cs]
-                          if cls == "ACTUAL_RECONCILED" else []},
-        "ledger_detail": {"cycles": cs}}}
+    ids = [c["cycle_id"] for c in cs] if cls == "ACTUAL_RECONCILED" else []
+    return {
+        "environment": {"declared": "mainnet", "actual_reconciled_eligible": True,
+                        "recorded_seen": ["mainnet"],
+                        "booked_figures_class": "UNAVAILABLE"},
+        "invariants_hold": True, "unresolved_carry_orders": 0,
+        "sections": {
+            "realized_cash": {"evidence_class": cls, "realized_cash_cycle_ids": ids,
+                              "realized_cash_cycles": len(ids)},
+            "closed_cycles_booked": {"cycle_count": 0},
+            "ledger_detail": {"cycles": cs}}}
 
 
 def provider(rep, *, window=WINDOW, dd=50.0, raises=False):
@@ -90,6 +100,7 @@ def test_too_few_reconciled_cycles_are_insufficient():
 def test_only_the_ids_the_report_calls_realized_cash_are_used():
     rep = report(25)
     rep["sections"]["realized_cash"]["realized_cash_cycle_ids"] = ["cyc-0"]
+    rep["sections"]["realized_cash"]["realized_cash_cycles"] = 1
     ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
                                   discovery_window_s=WINDOW, drawdown_limit_usd=50.0)
     assert len(ev.trades) == 1
@@ -112,6 +123,7 @@ def test_the_verdict_is_recomputed_every_call():
     p = provider(rep)
     assert p().verdict == se.ALLOCATE
     rep["sections"]["realized_cash"]["realized_cash_cycle_ids"] = []
+    rep["sections"]["realized_cash"]["realized_cash_cycles"] = 0
     assert p().verdict == se.INSUFFICIENT
 
 

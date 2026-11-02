@@ -17,10 +17,14 @@ nothing by itself (`grants_owner_approval` is always False).
 """
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 import strategy_evidence as _se
+
+#: Cycle outcomes of `carry_performance` that are results (the other is OPEN).
+_RESULT_OUTCOMES = ("CLOSED", "ABORTED_BEFORE_HEDGE")
 
 NET_BASIS = ("ledger net USD per closed cycle after booked fees, funding and "
              "financing; ACTUAL_RECONCILED cycles only (tools/carry_performance); "
@@ -29,42 +33,113 @@ NET_BASIS = ("ledger net USD per closed cycle after booked fees, funding and "
              "unhedged short")
 
 
+def _num(x: Any) -> Optional[float]:
+    """A finite float from a real number only (bool and text are not numbers)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    v = float(x)
+    return v if math.isfinite(v) else None
+
+
+def _is_corroborated_mainnet(report: Mapping[str, Any]) -> bool:
+    """Does the report's OWN environment block say corroborated mainnet? A
+    section's label is not trusted by itself: it must agree with the block the
+    report derived from the database, and the report must not admit a broken
+    ledger. Anything missing or different is no."""
+    env = report.get("environment")
+    if not isinstance(env, Mapping):
+        return False
+    return (env.get("declared") == "mainnet"
+            and env.get("actual_reconciled_eligible") is True
+            and env.get("recorded_seen") == ["mainnet"]
+            # what classify_environment assigns a corroborated mainnet ledger's
+            # non-cash figures; any other class contradicts the eligibility flag
+            and env.get("booked_figures_class") == "UNAVAILABLE"
+            and report.get("invariants_hold") is True
+            and report.get("unresolved_carry_orders") == 0)
+
+
+def _cycle_is_cash(c: Mapping[str, Any]) -> bool:
+    """A cycle as the report's detail shows it: closed, reconciled cash by its
+    own account, fees and funding complete."""
+    return (isinstance(c, Mapping)
+            and c.get("evidence_class") == "ACTUAL_RECONCILED"
+            and c.get("closed") is True
+            and c.get("outcome") in _RESULT_OUTCOMES
+            and c.get("fees_complete") is True
+            and c.get("funding_complete") is True)
+
+
 def evidence_from_report(report: Mapping[str, Any], *, strategy_id: str,
                          observed_at_s: float,
                          discovery_window_s: Optional[Tuple[float, float]],
                          drawdown_limit_usd: Optional[float]
                          ) -> _se.StrategyEvidence:
     """A `StrategyEvidence` from a performance report. Only the cycles the
-    report itself lists as realized cash become trades."""
-    sections = report.get("sections") or {}
-    cash = sections.get("realized_cash") or {}
-    ids = set(cash.get("realized_cash_cycle_ids") or ())
+    report itself lists as realized cash, AND whose own record says reconciled
+    closed cash, AND only from a report whose environment block is corroborated
+    mainnet, become trades. Closed results the report excluded (and any it
+    cannot account for) are counted in ``unqualified_results`` so the sample
+    cannot silently omit its own losers."""
+    sections = report.get("sections") if isinstance(report, Mapping) else None
+    sections = sections if isinstance(sections, Mapping) else {}
+    cash = sections.get("realized_cash")
+    cash = cash if isinstance(cash, Mapping) else {}
+    raw_ids = cash.get("realized_cash_cycle_ids")
+    ids = [i for i in raw_ids if isinstance(i, str)] \
+        if isinstance(raw_ids, (list, tuple)) else []
     trades = []
-    if ids and cash.get("evidence_class") == "ACTUAL_RECONCILED":
-        detail = (sections.get("ledger_detail") or {}).get("cycles") or []
-        for c in detail:
-            if c.get("cycle_id") not in ids:
+    taken: set = set()
+    mainnet_cash = (_is_corroborated_mainnet(report)
+                    and cash.get("evidence_class") == "ACTUAL_RECONCILED")
+    unqualified = 0
+    if mainnet_cash and ids:
+        ledger = sections.get("ledger_detail")
+        detail = ledger.get("cycles") if isinstance(ledger, Mapping) else None
+        want = set(ids)
+        for c in (detail if isinstance(detail, (list, tuple)) else ()):
+            cid = c.get("cycle_id") if isinstance(c, Mapping) else None
+            if cid not in want:
+                continue                    # not listed as cash
+            if cid in taken:
+                unqualified += 1            # the same cycle twice: inconsistent
                 continue
-            start, end, net = c.get("start_ms"), c.get("last_ms"), c.get("net_usd")
-            if None in (start, end, net):
-                continue                    # a cycle the report cannot time is not used
+            start, end, net = _num(c.get("start_ms")), _num(c.get("end_ms")), \
+                _num(c.get("net_usd"))
+            if (None in (start, end, net) or end < start or not _cycle_is_cash(c)):
+                continue                    # a cycle the report cannot vouch for
             # An overlay's booked net holds the short's price leg but not the
             # client's BTC it hedges (the live journal never revalues it), so
             # it is the net of an unhedged short: a falling market reads as a
             # run of wins and a rising one as losses. Such a cycle is NOT
-            # carry evidence and is left out, so the verdict goes INSUFFICIENT
-            # instead of passing or breaching on BTC's direction. Only an
-            # overlay cycle whose inventory leg is BOOKED counts; a cycle that
-            # carries no overlay flag at all (older fixtures) is read as before.
+            # carry evidence and is left out (it is then counted in
+            # `unqualified_results`, never silently dropped), so the verdict
+            # goes INSUFFICIENT instead of passing or breaching on BTC's
+            # direction. Only an overlay cycle whose inventory leg is BOOKED
+            # counts; a cycle with no overlay flag at all is read as before.
             if c.get("overlay") and c.get("hedged_pair_inventory_leg") != "BOOKED":
                 continue
+            taken.add(cid)
             trades.append(_se.EvidenceTrade(
-                entry_s=float(start) / 1000.0, exit_s=float(end) / 1000.0,
-                net=float(net)))
+                entry_s=start / 1000.0, exit_s=end / 1000.0, net=net))
+        # a listed cash id with no usable cycle behind it is a missing result,
+        # a repeated id or a count that disagrees with the list is inconsistent
+        unqualified += len(want - taken) + (len(ids) - len(want))
+        if cash.get("realized_cash_cycles") != len(ids):
+            unqualified += 1
+    # closed cycles the report booked but did NOT call cash
+    booked = sections.get("closed_cycles_booked")
+    count = booked.get("cycle_count") if isinstance(booked, Mapping) else None
+    if mainnet_cash:
+        unqualified += (count if isinstance(count, int)
+                        and not isinstance(count, bool) and count >= 0 else 1)
     return _se.StrategyEvidence(
         strategy_id=strategy_id, trades=tuple(trades),
         observed_at_s=float(observed_at_s), net_basis=NET_BASIS,
-        discovery_window_s=discovery_window_s, drawdown_limit=drawdown_limit_usd)
+        discovery_window_s=discovery_window_s, drawdown_limit=drawdown_limit_usd,
+        evidence_class=(_se.CASH_EVIDENCE_CLASS if mainnet_cash else
+                        "UNAVAILABLE"),
+        unqualified_results=unqualified)
 
 
 def _default_report() -> Optional[Callable[..., Dict[str, Any]]]:
