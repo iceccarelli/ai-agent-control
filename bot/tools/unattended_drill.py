@@ -403,9 +403,7 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                      "--poll-seconds", "30", "--settle-wait-hours", "0",
                      "--min-settlements", "1", "--evidence-path", ev,
                      "--out", out, "--cash-ledger", led,
-                     "--execution-records", records,
-                 "--recording-status-out",
-                 os.path.join(run_dir, "close_recording.json")],
+                     "--execution-records", records],
                     cenv, log_path=log, timeout_s=DRILL_TIMEOUT_S))
     finally:
         # ALWAYS, even if this process was told to stop (the child has already
@@ -419,7 +417,9 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                  os.path.join(evdir, "ensure_flat_evidence.jsonl"),
                  # the safety-net close is an exit too (the worst kind: the
                  # drill failed to complete its own): it joins the samples
-                 "--execution-records", records],
+                 "--execution-records", records,
+                 "--recording-status-out",
+                 os.path.join(run_dir, "close_recording.json")],
                 cenv, log_path=log, timeout_s=300))
         finally:
             _SIGNAL["protect"] = False

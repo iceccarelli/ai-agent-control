@@ -215,3 +215,19 @@ def test_the_report_states_the_limits_of_what_it_can_prove(tmp_path):
     assert any("deleted" in x for x in integ["cannot_detect"])
     assert any("forg" in x for x in integ["cannot_detect"])
     assert integ["detects"]
+
+
+def test_a_legitimate_record_without_fill_ms_is_still_a_sample():
+    """A resting order booked at its cancel may state no fill time. It is dated
+    by the times it DOES state (submit, decision, observed); it must not be
+    dropped as unverifiable just because one field is absent."""
+    now = int(time.time() * 1000)
+    es = []
+    for i in range(25):
+        line = now - 60_000 - 2000 * i
+        rec = valid_record("Sell", "linear", ms=line, link=f"o{i}")
+        rec.pop("fill_ms", None)
+        es.append(E(line, rec, i))
+    obs, rej = est.extract(es, as_of_ms=now, symbol="BTCUSDT", product="linear",
+                           side="Sell")
+    assert len(obs) == 25 and not rej

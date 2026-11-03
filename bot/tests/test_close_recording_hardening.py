@@ -367,3 +367,53 @@ def test_two_hanging_sources_cannot_chain_their_waits(tmp_path):
     assert out["ok"] and len(v.sent) == 1
     assert time.monotonic() - t0 < 6.0
     assert v.calls == ["depth"]                      # the second never started
+
+
+def _tool_help(tool):
+    import subprocess
+    r = subprocess.run([sys.executable, os.path.join(BOT, "tools", tool),
+                        "--help"], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    return r.stdout
+
+
+def test_every_flag_the_runner_passes_is_a_flag_its_tool_accepts(tmp_path):
+    """The real `run_once`, with a capturing runner: each command's flags are
+    checked against the --help of the tool it is sent to. (A flag handed to the
+    wrong tool is an argparse error, i.e. a crashed drill.)"""
+    from test_unattended_drill import Recorder, run
+    rec = Recorder()
+    run(tmp_path, rec)
+    seen = {}
+    for tool, argv, _env, _t in rec.calls:
+        seen[tool] = argv
+    assert "drill.py" in seen and "close_testnet_short.py" in seen
+    for tool in ("drill.py", "close_testnet_short.py"):
+        help_text = _tool_help(tool)
+        for token in seen[tool]:
+            if isinstance(token, str) and token.startswith("--"):
+                assert token in help_text, f"{tool} does not accept {token}"
+    # and they went to the right tool
+    assert "--recording-status-out" in seen["close_testnet_short.py"]
+    assert "--recording-status-out" not in seen["drill.py"]
+    assert "--execution-records" in seen["drill.py"]
+    assert "--execution-records" in seen["close_testnet_short.py"]
+
+
+def test_a_getter_that_swallows_exceptions_in_a_retry_loop_is_still_cut_off(tmp_path):
+    """Adapters wrap their waits in retry loops that `except Exception`. The
+    deadline must not be an Exception, or the one-shot alarm is swallowed and
+    the loop carries on waiting."""
+    class Retrying(Venue):
+        def get_book_top(self, symbol, product, *, timeout_s=None):
+            for _ in range(6):
+                try:
+                    time.sleep(1.5)
+                except Exception:
+                    pass                      # a naive retry-on-any-error loop
+            return {"bid": 1.0, "ask": 2.0}
+    v = Retrying()
+    t0 = time.monotonic()
+    out = close(v, str(tmp_path / "r.jsonl"))
+    assert out["ok"] and len(v.sent) == 1
+    assert time.monotonic() - t0 < 4.5        # cut at ~2 s, not after 9 s
