@@ -152,3 +152,178 @@ def test_the_cycle_report_stops_calling_a_doubled_cycle_actual_reconciled():
     assert cls(j, now) == "ACTUAL_RECONCILED"
     L.book_funding_payments(j, [pay(2, S, 1.0)], ms=now + 3 * H)
     assert cls(j, now + 3 * H) != "ACTUAL_RECONCILED"
+
+
+# -- the ten invariants, one adversarial case each ---------------------------------
+
+def cash(j):
+    return j.statement()["funding_usd"]
+
+
+def restart(j):
+    """What a process restart does: the journal comes back from its persisted rows."""
+    return L.Journal.from_rows(j.to_rows())
+
+
+def test_the_same_settlement_delivered_twice_before_reconciliation_counts_once():
+    j = L.Journal()
+    L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
+                fee_status="confirmed")
+    r1 = L.book_funding_payments(j, [pay(1, S, 1.0)], ms=S + H)
+    r2 = L.book_funding_payments(j, [pay(1, S, 1.0), pay(1, S, 1.0)], ms=S + 2 * H)
+    assert (r1["booked"], r2["booked"], r2["duplicate"]) == (1, 0, 2)
+    assert cash(j) == pytest.approx(1.0)
+
+
+def test_the_same_settlement_replayed_after_reconciliation_adds_nothing_and_keeps_it_reconciled():
+    j, now = reconciled_journal()
+    before = [(e.ms, e.kind, e.ref, e.basis, [(l.account, l.usd) for l in e.lines])
+              for e in j.entries]
+    res = L.book_funding_payments(j, [pay(1, S, 1.0)], ms=now + 5 * H)
+    assert res["booked"] == 0 and res["duplicate"] == 1
+    assert cash(j) == pytest.approx(1.0) and state(j)["reconciled"] is True
+    after = [(e.ms, e.kind, e.ref, e.basis, [(l.account, l.usd) for l in e.lines])
+             for e in j.entries]
+    assert after == before                       # nothing was written, let alone rewritten
+
+
+def test_replay_after_a_process_restart_does_not_double_credit_or_lose_reconciliation():
+    j, now = reconciled_journal()
+    j2 = restart(j)
+    assert cash(j2) == pytest.approx(1.0) and state(j2)["reconciled"] is True
+    res = L.book_funding_payments(j2, [pay(1, S, 1.0)], ms=now + 5 * H)
+    assert res["duplicate"] == 1 and cash(j2) == pytest.approx(1.0)
+    assert state(j2)["reconciled"] is True
+
+
+def test_a_late_duplicate_after_a_restart_still_downgrades():
+    j, now = reconciled_journal()
+    j2 = restart(j)
+    L.book_funding_payments(j2, [pay(2, S, 1.0)], ms=now + 3 * H)
+    assert cash(j2) == pytest.approx(2.0)                    # booked under its own id...
+    assert state(j2)["reconciled"] is False                  # ...but never vouched for
+
+
+def test_a_conflicting_amount_under_the_same_id_is_refused_as_income_and_flagged():
+    j, now = reconciled_journal()
+    res = L.book_funding_payments(j, [pay(1, S, 7.0)], ms=now + 3 * H)
+    assert res["id_collisions"] == 1 and res["booked"] == 0
+    assert cash(j) == pytest.approx(1.0)                      # not a dollar of it is income
+    row = state(j)
+    assert row["reconciled"] is False
+    assert "IDENTITY_CONFLICT" in row["reasons"]
+
+
+def test_distinct_settlements_at_the_same_timestamp_are_not_collapsed_by_time():
+    j = L.Journal()
+    L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
+                fee_status="confirmed")
+    res = L.book_funding_payments(j, [pay(1, S, 1.0), pay(2, S, 1.0)], ms=S + H)
+    assert res["booked"] == 2 and res["duplicate"] == 0
+    assert cash(j) == pytest.approx(2.0)
+
+
+def test_delivery_order_does_not_change_the_cash():
+    rows = [pay(1, S, 1.0), pay(2, S + H8, -0.4), pay(3, S + 2 * H8, 0.7)]
+
+    def run(batches):
+        j = L.Journal()
+        L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
+                    fee_status="confirmed")
+        t = S + 3 * H8
+        for b in batches:
+            L.book_funding_payments(j, b, ms=t)
+            t += H
+        return cash(j)
+    in_order = run([rows])
+    assert run([list(reversed(rows))]) == pytest.approx(in_order)
+    assert run([[rows[2]], [rows[0]], [rows[1], rows[0]]]) == pytest.approx(in_order)
+    assert in_order == pytest.approx(1.3)
+
+
+def test_a_duplicate_after_a_delayed_reconciliation_is_counted_by_it_not_hidden():
+    """The first reconciliation record is PROVISIONAL (log not yet judgeable);
+    a duplicate arrives; the later full reconciliation must refuse to call the
+    doubled cash reconciled."""
+    j = closed_journal = L.Journal()
+    L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
+                fee_status="confirmed")
+    L.perp_close(j, ms=S + 2 * H, ref="c1", qty=0.5, price=MARK,
+                 entry_price=MARK, fee_usd=1, fee_status="confirmed")
+    early = S + 3 * H
+    L.book_funding_payments(j, [pay(1, S, 1.0)], ms=early)
+    R.reconcile_funding(j, history=hist([S - H8, S, S + H8], S - 2 * H - 60_000, early),
+                        evidence=evid([pay(1, S, 1.0)], S - 2 * H - 60_000, early),
+                        now_ms=early)
+    assert state(j)["reconciled"] is False                    # too early to judge
+    L.book_funding_payments(j, [pay(2, S, 1.0)], ms=early + H)
+    late = S + 20 * H
+    R.reconcile_funding(
+        j, history=hist([S - H8, S, S + H8], S - 2 * H - 60_000, late),
+        evidence=evid([pay(1, S, 1.0), pay(2, S, 1.0)], S - 2 * H - 60_000, late),
+        now_ms=late)
+    assert state(j)["reconciled"] is False
+    assert cash(j) == pytest.approx(2.0)                      # visible, not reconciled
+
+
+def test_a_genuine_late_settlement_inside_a_reconciled_lifecycle_cannot_re_credit_silently():
+    j, now = reconciled_journal()
+    # the lifecycle spans S-2h..S+2h; a row for another settlement inside it
+    L.book_funding_payments(j, [pay(9, S + H, 0.5)], ms=now + 3 * H)
+    assert state(j)["reconciled"] is False
+
+
+def test_partial_or_contradictory_evidence_stays_visible_after_a_downgrade():
+    j, now = reconciled_journal()
+    L.book_funding_payments(j, [pay(2, S, 1.0)], ms=now + 3 * H)
+    row = state(j)
+    assert row["state"] == "CONTRADICTED_AFTER_RECONCILIATION"
+    assert row["reasons"] == ["SETTLEMENT_ROWS_CHANGED_SINCE_RECONCILIATION"]
+    # the audit trail of the earlier FULLY_RECONCILED record is still in the journal
+    recs = [e for e in j.entries if e.kind == L.RECONCILIATION_KIND]
+    assert recs and recs[0].fee_raw["state"] == "FULLY_RECONCILED"
+
+
+# -- legacy records: no stored identity ------------------------------------------------
+
+def legacy_journal(usd=1.0, ref="fund:S1"):
+    """A venue-basis funding entry written before identity (venue_id) was stored."""
+    j = L.Journal()
+    L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
+                fee_status="confirmed")
+    L.funding(j, ms=S + H, ref=ref, usd=usd, basis="venue")
+    return j
+
+
+def test_a_legacy_venue_entry_is_not_booked_again_when_its_payment_is_replayed():
+    j = legacy_journal()
+    assert "venue_id" not in j.entries[-1].fee_raw
+    res = L.book_funding_payments(j, [pay(1, S, 1.0)], ms=S + 2 * H)
+    assert res["duplicate"] == 1 and res["booked"] == 0
+    assert cash(j) == pytest.approx(1.0)
+
+
+def test_a_legacy_entry_with_a_different_amount_under_the_same_id_is_a_conflict():
+    j = legacy_journal(usd=1.0)
+    res = L.book_funding_payments(j, [pay(1, S, 4.0)], ms=S + 2 * H)
+    assert res["id_collisions"] == 1 and res["booked"] == 0
+    assert cash(j) == pytest.approx(1.0)
+
+
+def test_an_unrelated_new_payment_still_books_alongside_a_legacy_entry():
+    j = legacy_journal()
+    res = L.book_funding_payments(j, [pay(2, S + H8, 0.5)], ms=S + 9 * H)
+    assert res["booked"] == 1 and cash(j) == pytest.approx(1.5)
+
+
+def test_a_legacy_row_with_no_basis_never_counts_as_venue_cash():
+    """Rows written before provenance existed come back as engine estimates."""
+    j = L.Journal()
+    L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
+                fee_status="confirmed")
+    L.funding(j, ms=S + H, ref="fund:S1", usd=1.0, basis="venue")
+    rows = j.to_rows()
+    for r in rows:
+        r.pop("basis", None)
+    j2 = L.Journal.from_rows(rows)
+    assert j2.statement()["funding_venue_usd"] == pytest.approx(0.0)

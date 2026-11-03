@@ -872,6 +872,20 @@ def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _legacy_funding_by_id(journal: "Journal") -> Dict[str, List[float]]:
+    """{venue id: amounts already booked} for venue-basis funding entries that
+    carry no `venue_id` (written before identity was stored), read from the ref
+    the booking always used. Empty for every entry written today."""
+    out: Dict[str, List[float]] = {}
+    for e in journal.entries:
+        if (e.kind == "funding" and e.basis == "venue"
+                and "venue_id" not in e.fee_raw and e.ref.startswith("fund:")):
+            vid = e.ref[len("fund:"):].split("#", 1)[0]
+            usd = sum(l.usd for l in e.lines if l.account == USDT)
+            out.setdefault(vid, []).append(usd)
+    return out
+
+
 def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
                           ms: int) -> Dict[str, int]:
     """Book what the VENUE paid, once each, and only what is this book's.
@@ -893,12 +907,22 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
     """
     known = {i for i in (_entry_identity(e) for e in journal.entries) if i}
     ids_seen = {i[0] for i in known}
+    # A venue-basis funding entry written before identity was stored has no
+    # `venue_id`; its ref still names the payment ("fund:<id>"). Without this a
+    # replay of that payment would be booked a second time. Matched by id and
+    # amount it is a duplicate; the same id with another amount is a conflict.
+    legacy = _legacy_funding_by_id(journal)
+    ids_seen |= set(legacy)
     used_refs = {e.ref for e in journal.entries}
     out = {"booked": 0, "duplicate": 0, "unattributed": 0, "id_collisions": 0}
     stamp = max(int(ms), journal.entries[-1].ms if journal.entries else 0)
     for p in sorted(payments, key=lambda r: (int(r["ms"]), str(r["id"]))):
         ident = _payment_identity(p)
         if ident in known:
+            out["duplicate"] += 1
+            continue
+        if ident[0] in legacy and ident not in known and any(
+                abs(u - ident[2]) <= 1e-9 for u in legacy[ident[0]]):
             out["duplicate"] += 1
             continue
         collision = ident[0] in ids_seen
