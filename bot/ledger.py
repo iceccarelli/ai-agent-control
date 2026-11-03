@@ -2105,6 +2105,9 @@ class LedgerBroker:
     def get_available_margin_usd(self):
         return self.inner.get_available_margin_usd()
 
+    def get_collateral_facts(self, symbol):
+        return self.inner.get_collateral_facts(symbol)
+
     def get_quote_free_usd(self, coin="USDT"):
         return self.inner.get_quote_free_usd(coin)
 

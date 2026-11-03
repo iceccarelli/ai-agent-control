@@ -185,10 +185,14 @@ def snap_to_lot(qty: float, step: float) -> float:
 #:     intra-settlement high 11.52%   (what a liquidation engine actually sees)
 #:     24h                   17.93%
 #:
-#: 15.0 clears the first two. It is not tuned to make anything pass: a
-#: correctly collateralised overlay — one BTC short against one BTC held —
-#: has no reachable liquidation price at all, so this gate should never bind,
-#: and when it binds something has gone wrong that a human needs to see.
+#: 15.0 clears the first two. It is not tuned to make anything pass. IF the
+#: venue counts the held BTC as margin collateral, a one-BTC short against one
+#: BTC held has no reachable liquidation price and this gate should rarely
+#: bind; when it binds something has gone wrong that a human needs to see.
+#: That "if" is a venue-side fact, so it is no longer assumed: the overlay
+#: entry asks the venue whether the held coin is collateral
+#: (`_collateral_refusal`, INSUFFICIENT_RISK_DATA when it will not say), and the
+#: collateral RATIO, which the wallet row does not carry, is never guessed.
 MIN_LIQUIDATION_DISTANCE_PCT = 15.0
 
 #: Account maintenance-margin ratio at which the book leaves. Under UTA cross
@@ -625,6 +629,7 @@ class CarryEngine:
                  risk_observer: Any = None,
                  leverage: Any = 1.0,
                  require_capital_check: bool = False,
+                 require_collateral_facts: bool = False,
                  capital_authority: Any = None,
                  entries_enabled: bool = True,
                  opportunity_cost_apr: Any = 0.0) -> None:
@@ -678,6 +683,7 @@ class CarryEngine:
         #: Off by default so a bare engine (tests, the shadow book) is not
         #: changed; build_bot turns it on for the production book.
         self.require_capital_check = bool(require_capital_check)
+        self.require_collateral_facts = bool(require_collateral_facts)
         #: The portfolio authority (carry_capital.CarryCapitalAuthority): asked
         #: before every ENTRY, never for an exit. None = not wired (a bare
         #: engine, the shadow book).
@@ -1810,6 +1816,9 @@ class CarryEngine:
         refused = self._capital_refusal(qty * mark)
         if refused is not None:
             return refused
+        refused = self._collateral_refusal()
+        if refused is not None:
+            return refused
         refused = self._portfolio_refusal()
         if refused is not None:
             return refused
@@ -2289,6 +2298,47 @@ class CarryEngine:
         taker = float(self.broker.get_fee_rates(self.spot_symbol,
                                                 "spot")["taker_bps"])
         return float(notional_usd) * (1.0 + taker / 1e4)
+
+    def _collateral_refusal(self) -> Optional[CarryDecision]:
+        """OVERLAY only: refuse to open a short against BTC the venue does not
+        say is collateral. None when the check is off, the mode is not overlay,
+        or the venue states that the held coin backs the position.
+
+        The hedge only protects the margin account if the BTC counts as
+        collateral. `liqPrice` and `accountMMRate` already reflect whatever the
+        venue does with it, but they exist only AFTER a position is open; this
+        is the one chance to ask before any order leaves. A refusal here costs
+        nothing. A field the venue did not state is INSUFFICIENT_RISK_DATA, not
+        a pass, and the collateral ratio (tiered, not on this endpoint) is never
+        assumed."""
+        if not self.require_collateral_facts or self.execution_mode != OVERLAY:
+            return None
+        try:
+            reader = getattr(self.broker, "get_collateral_facts", None)
+            if not callable(reader):
+                raise RuntimeError("the broker cannot state collateral facts")
+            facts = reader(self.spot_symbol)
+            if not isinstance(facts, dict) or "status" not in facts:
+                raise ValueError(f"collateral facts are {type(facts).__name__}")
+        except Exception as exc:  # noqa: BLE001 - unreadable is a refusal
+            return CarryDecision(
+                "stand_aside", reason="INSUFFICIENT_RISK_DATA",
+                state=BookState.FLAT,
+                detail={"why": "COLLATERAL_FACTS_UNREADABLE",
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "note": "whether the held coin backs the short is "
+                                "unknown; no order was sent"})
+        status = facts.get("status")
+        if status == "OK":
+            return None
+        return CarryDecision(
+            "stand_aside",
+            reason=("INSUFFICIENT_RISK_DATA" if status == "INSUFFICIENT_RISK_DATA"
+                    else "HELD_COIN_NOT_COLLATERAL"),
+            state=BookState.FLAT,
+            detail={"why": facts.get("reason"), "facts": facts,
+                    "note": "the venue does not say this coin backs a "
+                            "derivatives position; no order was sent"})
 
     def _capital_refusal(self, notional_usd: float) -> Optional[CarryDecision]:
         """None when the account can fund the pair (or the check is off), else

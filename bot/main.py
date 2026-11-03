@@ -2348,6 +2348,9 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             require_liquidation_check=True,
             # The account must be able to fund the pair before any leg leaves.
             require_capital_check=True,
+            # And, for an overlay, the venue must say the held coin backs the
+            # short (collateral state is a venue fact, not an assumption).
+            require_collateral_facts=True,
             leverage=float(cfg.DEFAULT_LEVERAGE),
             # What the capital behind the hedge could earn elsewhere; 0.0
             # unless an operator supplies a rate (none is invented).
