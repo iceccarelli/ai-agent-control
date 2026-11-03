@@ -104,6 +104,15 @@ class Venue:
                 "account_mm_rate": 0.05, "margin_mode": "REGULAR_MARGIN",
                 "reason": ""}
 
+    collateral_status = "OK"
+
+    def get_collateral_facts(self, symbol):
+        """What the venue states about the held coin (production asks first)."""
+        self._live()
+        return {"status": self.collateral_status, "coin": "BTC",
+                "reason": "" if self.collateral_status == "OK"
+                else "COLLATERAL_SWITCH_OFF"}
+
     def get_lot_rules(self, symbol, product):
         self._live()
         return {"qty_step": 0.001, "min_qty": 0.001, "min_notional": 0.0}

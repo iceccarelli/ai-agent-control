@@ -1759,7 +1759,7 @@ class CarryBroker:
     def get_collateral_facts(self, symbol: str) -> Dict[str, Any]:
         """Does the venue say the held base coin backs a derivatives position?
 
-        Reads the same wallet-balance coin row the inventory read uses and
+        Reads the unified wallet-balance response (unfiltered) and picks the coin row, and
         returns `margin_facts.collateral_status` for it: OK only when the
         platform allows the coin as margin collateral AND the user switched it
         on. A row or field the venue did not state is INSUFFICIENT_RISK_DATA,
@@ -1768,9 +1768,12 @@ class CarryBroker:
         UNAVAILABLE rather than guessed. Raises only when the wallet cannot be
         read at all; an unreadable wallet is not a collateralised one."""
         coin = symbol[:-4] if symbol.upper().endswith("USDT") else symbol
+        # UNFILTERED on purpose: the booleans are proven on the tracked testnet
+        # capture of the unfiltered call (artifacts/testnet_conformance_
+        # evidence.jsonl); nothing in the repo shows them on a coin-filtered one.
         result = self.client._request(
             "GET", "/v5/account/wallet-balance", signed=True,
-            params={"accountType": "UNIFIED", "coin": coin})
+            params={"accountType": "UNIFIED"})
         rows = self._v5_list(result)
         if rows is None:
             raise PairIncident(

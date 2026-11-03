@@ -976,6 +976,10 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         # (F4): ON here exactly as in the production book, and what it reads
         # each held tick is kept so the hold's evidence can show it.
         require_liquidation_check=True,
+        # And the pre-entry question production asks: does the venue say the
+        # held coin backs the short? The real-venue run must meet the same
+        # refusal the production book would, not skip it.
+        require_collateral_facts=True,
         risk_observer=lambda obs: state.setdefault("risk_obs", []).append(obs))
     engine.pair_risk = CarryRisk(store=_Store(), max_notional_usd=d.notional)
     engine.warm_funding_history(state["prints"])

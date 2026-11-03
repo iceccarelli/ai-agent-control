@@ -5,6 +5,7 @@ no account, no credential."""
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import os
 import sys
@@ -244,13 +245,40 @@ def test_the_check_is_for_the_overlay_only_acquire_margin_is_usdt_not_the_held_c
     assert e._collateral_refusal() is None
 
 
-def test_the_refusal_does_not_loosen_any_other_gate():
-    """A passing collateral check still goes through the capital, pair and
-    benefit gates: it only adds a refusal."""
+def test_a_passing_collateral_check_still_meets_the_other_gates():
+    """It only ADDS a refusal: with the facts OK a stale market view is still
+    refused by the pair gate, and with the facts NOT OK the collateral refusal
+    is the one named (it comes first, before any gate that could reserve)."""
+    ok = V()
+    e = engine(ok)
+    e.snapshot = dataclasses.replace(e.snapshot, observed_at_s=e.snapshot.observed_at_s - 3600)
+    refused = tick(e)
+    assert refused.action == "stand_aside"
+    assert refused.reason != "HELD_COIN_NOT_COLLATERAL" and ok.orders == []
+    bad = V()
+    bad.facts = {"status": "NOT_COLLATERAL", "reason": "COLLATERAL_SWITCH_OFF"}
+    e2 = engine(bad)
+    e2.snapshot = dataclasses.replace(e2.snapshot, observed_at_s=e2.snapshot.observed_at_s - 3600)
+    assert tick(e2).reason == "HELD_COIN_NOT_COLLATERAL"
+
+
+def test_a_refusal_leaves_no_residue():
+    from carry_engine import BookState
     v = V()
-    v.inventory = 0.0                                # no inventory to hedge
-    d = tick(engine(v))
-    assert d.action == "stand_aside" and d.reason != "HELD_COIN_NOT_COLLATERAL"
+    v.facts = {"status": "INSUFFICIENT_RISK_DATA", "reason": "COLLATERAL_FIELD_ABSENT"}
+    e = engine(v)
+    before = (e._last_cycle_ms, e.state, e.position)
+    d = tick(e)
+    assert d.reason == "INSUFFICIENT_RISK_DATA"
+    assert (e._last_cycle_ms, e.state, e.position) == before
+    assert e.state == BookState.FLAT and v.orders == []
+
+
+def test_an_acquire_entry_is_driven_end_to_end_unaffected():
+    v = V()
+    v.facts = {"status": "NOT_COLLATERAL", "reason": "COLLATERAL_SWITCH_OFF"}
+    d = tick(engine(v, mode="acquire"))
+    assert d.reason not in ("HELD_COIN_NOT_COLLATERAL", "INSUFFICIENT_RISK_DATA")
 
 
 # -- the production wiring --------------------------------------------------------------
@@ -282,3 +310,31 @@ def test_the_comment_no_longer_asserts_the_collateral_assumption_as_fact():
     src = open(os.path.join(BOT, "carry_engine.py"), encoding="utf-8").read()
     assert "has no reachable liquidation price at all, so this gate should never bind" not in src
     assert "_collateral_refusal" in src
+
+
+def test_the_drill_exercises_the_same_gate_as_production():
+    """The real-venue drill must meet the refusal production would, not skip it."""
+    tree = ast.parse(open(os.path.join(BOT, "tools", "drill.py"), encoding="utf-8").read())
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and any(k.arg == "require_liquidation_check" for k in n.keywords)]
+    assert calls, "the drill builds its engine with the liquidation check"
+    for c in calls:
+        kw = {k.arg: k.value for k in c.keywords}
+        assert isinstance(kw.get("require_collateral_facts"), ast.Constant) \
+            and kw["require_collateral_facts"].value is True
+
+
+def test_the_broker_asks_the_unfiltered_wallet_like_the_tracked_capture():
+    seen = []
+    client = FakeClient(mark=MARK)
+    real = client._request
+
+    def request(method, endpoint, **kw):
+        if endpoint == "/v5/account/wallet-balance":
+            seen.append(kw.get("params"))
+            return envelope({"list": wallet(REAL_ROW)})
+        return real(method, endpoint, **kw)
+    client._request = request
+    CarryBroker(client=client, order_gate=lambda: (True, "T"),
+                sequence_source=lambda *a: 1).get_collateral_facts("BTCUSDT")
+    assert seen == [{"accountType": "UNIFIED"}]
