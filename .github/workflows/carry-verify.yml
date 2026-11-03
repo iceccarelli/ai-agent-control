@@ -179,6 +179,7 @@ jobs:
           tests/test_execution_integrity.py
           tests/test_execution_roundtrip.py
           tests/test_decision_context_lifecycle.py
+          tests/test_reconciled_funding_late_row.py
           tests/test_exit_book_measured.py
           tests/test_ledger_funding_cycle.py
           tests/test_net_economics_pair.py
