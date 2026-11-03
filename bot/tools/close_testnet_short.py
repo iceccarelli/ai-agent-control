@@ -48,9 +48,13 @@ flat is NOT verified (a human must look); 2 cannot start; 3 refused.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import json
 import math
 import os
+import signal
 import sys
+import threading
 import time
 from typing import Any, List, Optional
 
@@ -92,26 +96,164 @@ def plan_problem(state: dict) -> Optional[str]:
     return None
 
 
+#: Wall-clock ceiling on the OPTIONAL decision-time book read in front of the
+#: emergency close, enforced by a one-shot OS timer (no thread, no leftover
+#: work). The transport's own `timeout_s` is a per-socket-operation figure that
+#: does not cover name resolution, so it is not treated as the bound.
+BOOK_DEADLINE_S = 2.0
+#: What the read is told to use for its own request timeout (inside the ceiling).
+BOOK_TIMEOUT_S = 1.0
+
+
+class BookReadDeadline(BaseException):
+    """Raised by the timer. A BaseException so that no `except Exception` on the
+    way (the transport's, `_read_touch`'s) can swallow it and carry on to the
+    next, unbounded, step."""
+
+
+@contextlib.contextmanager
+def hard_deadline(seconds: float):
+    """Arm a one-shot SIGALRM for `seconds`; yield True if armed, False if it
+    cannot be (no `setitimer`, not the main thread, or a timer already running
+    that must not be clobbered). Always disarms and restores the previous
+    handler on exit."""
+    armed = False
+    previous = None
+    try:
+        if (hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM")
+                and threading.current_thread() is threading.main_thread()
+                and signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)):
+            def _expired(signum, frame):
+                raise BookReadDeadline(
+                    f"the optional market-data read exceeded {seconds}s")
+            previous = signal.signal(signal.SIGALRM, _expired)
+            signal.setitimer(signal.ITIMER_REAL, float(seconds))
+            armed = True
+        yield armed
+    finally:
+        if armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous if previous is not None
+                          else signal.SIG_DFL)
+
+
 def _recording_broker(broker: Any, symbol: str, qty: float, path: str,
                       venue_label: str):
-    """(order_broker, error). The order goes through a `LedgerBroker` whose sink
-    appends the close's execution record the moment it fills, so the exits the
-    drill itself failed to complete (the worst ones) are in the sample set, not
-    missing from it. Every read still uses the raw adapter. ANY failure here
-    returns (broker, reason): the close then goes out exactly as it did before
-    this existed - recording never gets in the way of getting flat."""
+    """(order_broker, writer, recorder, error, note).
+
+    The order goes through a `LedgerBroker` whose sink appends the close's
+    execution record the moment it fills, so the exits the drill itself failed
+    to complete (the worst ones) are in the sample set, not missing from it.
+    Every read still uses the raw adapter.
+
+    NOTHING here may delay or prevent the close:
+      * no mark is read (the book's own touch is the reference, or there is
+        none); the only optional read is the decision-time book, and it runs
+        under `hard_deadline` and only through a getter that can take a
+        timeout - otherwise it is skipped and the record is UNMEASURED;
+      * ANY failure returns (broker, writer, None, reason, note): the close
+        then goes out exactly as it did before this existed.
+    `writer` is returned so the caller can read its final status."""
+    writer = None
     try:
         import drill as _drill
         import ledger as _ledger
-        order_broker = _ledger.LedgerBroker(
+        writer = _drill.RecordWriter(path, venue_label, set())
+        recorder = _ledger.LedgerBroker(
             broker, _ledger.Journal(), ms=lambda: int(time.time() * 1000),
-            record_sink=_drill.RecordWriter(path, venue_label, set()))
-        order_broker.begin_decision(
-            symbol=symbol, product="linear", side="Buy", qty=qty,
-            mark=float(broker.get_mark(symbol)), book_timeout_s=1.0)
-        return order_broker, None
+            record_sink=writer)
     except Exception as exc:                                   # noqa: BLE001
-        return broker, f"{type(exc).__name__}: {exc}"
+        return broker, writer, None, f"{type(exc).__name__}: {exc}", ""
+    note = ""
+    declared = False
+    try:
+        with hard_deadline(BOOK_DEADLINE_S) as armed:
+            if armed:
+                recorder.begin_decision(
+                    symbol=symbol, product="linear", side="Buy", qty=qty,
+                    book_timeout_s=BOOK_TIMEOUT_S)
+                declared = True
+            else:
+                note = ("no hard deadline can be armed here, so the decision-"
+                        "time book was NOT read; the close is unmeasured")
+    except BookReadDeadline as exc:
+        note = f"{exc}; the close is unmeasured"
+    except Exception as exc:                                   # noqa: BLE001
+        note = f"decision-time book not read ({type(exc).__name__}: {exc})"
+    if not declared:
+        try:
+            # a decision context with NO book and NO mark: the record then says
+            # it could not be measured, rather than not existing
+            recorder.begin_decision(symbol=symbol, product="linear",
+                                    side="Buy", qty=qty, capture_book=False)
+        except Exception as exc:                               # noqa: BLE001
+            note = (note + "; " if note else "") + \
+                f"no decision context ({type(exc).__name__}: {exc})"
+    return recorder, writer, recorder, None, note
+
+
+def _recording_status(path: str, *, attempted: bool, writer: Any,
+                      recorder: Any, setup_error: Optional[str],
+                      booking_error: Optional[str], note: str) -> dict:
+    """The final, observable state of the close's evidence. One of:
+    NOT_CONFIGURED (no path), NOT_ATTEMPTED (no order was sent, nothing to
+    record), SETUP_FAILED, OK (a record is in the file and synced), RECOVERED
+    (a write failed, the post-close flush wrote it), UNSYNCED (in the file,
+    durability unconfirmed), FAILED (a record could not be written), or
+    NOT_WRITTEN (an order went out and no record reached the file, with no
+    write error: e.g. a booking failure). Recording failure is NEVER a failure
+    of the close: this only describes the evidence."""
+    if not path:
+        return {"state": "NOT_CONFIGURED"}
+    if not attempted:
+        return {"state": "NOT_ATTEMPTED", "path": path,
+                "why": "no order was sent, so there is nothing to record"}
+    status: dict = {"path": path, "market_data_note": note,
+                    "booking_error": booking_error}
+    if setup_error is not None or writer is None:
+        status.update(state="SETUP_FAILED", setup_error=setup_error or
+                      "no writer", records_written=0, writer_errors=0)
+        return status
+    recovered = 0
+    recovery_error = ""
+    if writer.errors and recorder is not None:
+        # a record the writer could not write: try ONCE more from the journal.
+        # This never sends an order; it only re-attempts the file append.
+        try:
+            import drill as _drill
+            recovered = _drill.append_execution_records(
+                path, recorder.journal, writer.venue, writer.written,
+                outcomes=recorder.executions)
+        except Exception as exc:                               # noqa: BLE001
+            recovery_error = f"{type(exc).__name__}: {exc}"
+    written = writer.count + recovered
+    status.update(records_written=written, writer_errors=writer.errors,
+                  writer_sync_errors=writer.sync_errors,
+                  writer_last_error=writer.last_error or recovery_error)
+    if writer.errors:
+        status["state"] = "RECOVERED" if recovered and not recovery_error \
+            else "FAILED"
+    elif written == 0:
+        status["state"] = "NOT_WRITTEN"
+    else:
+        status["state"] = "OK"
+    if writer.sync_errors or (recovery_error and recovered):
+        if status["state"] in ("OK", "RECOVERED"):
+            status["state"] = "UNSYNCED"
+    return status
+
+
+def write_recording_status(path: str, outcome: dict) -> None:
+    """Best effort: the operator-visible record of what happened to the close's
+    evidence, for the unattended runner's verdict. Never raises."""
+    try:
+        data = {"recording": outcome.get("recording"),
+                "flat_verified": outcome.get("flat_verified"),
+                "ok": outcome.get("ok"), "sent": outcome.get("sent")}
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True, default=str)
+    except Exception:                                          # noqa: BLE001
+        pass
 
 
 def close_short(broker: Any, symbol: str, *, expected_qty: Optional[float] = None,
@@ -122,41 +264,67 @@ def close_short(broker: Any, symbol: str, *, expected_qty: Optional[float] = Non
     ``expected_qty`` is what the operator confirmed: if the venue's short is not
     exactly that when the order is about to go, nothing is sent.
 
-    ``records_path`` appends this close's execution record (book-measured
-    where the public book could be read in a second) to the drill's records
-    file, labelled ``venue_label``. Optional and fail-open."""
+    ``records_path`` appends this close's execution record (book-measured only
+    where the public book could be read inside a hard deadline) to the drill's
+    records file, labelled ``venue_label``. It is purely observational: every
+    return carries a ``recording`` status saying what became of the evidence,
+    and a recording failure is never a failure of the close, never delays it
+    and never causes a second order."""
+    def status(**kw) -> dict:
+        return _recording_status(records_path, **kw)
+
     before = read_state(broker, symbol)
     problem = plan_problem(before)
     if problem:
-        return {"ok": False, "refused": problem, "before": before}
+        return {"ok": False, "refused": problem, "before": before,
+                "recording": status(attempted=False, writer=None,
+                                    recorder=None, setup_error=None,
+                                    booking_error=None, note="")}
     qty = before["short_qty"]
     if expected_qty is not None and abs(qty - float(expected_qty)) > FLAT_DUST:
         return {"ok": False, "before": before, "refused": (
             f"the venue's short is {qty}, not the {expected_qty} that was "
-            "confirmed; it changed while waiting. Nothing was sent")}
+            "confirmed; it changed while waiting. Nothing was sent"),
+            "recording": status(attempted=False, writer=None, recorder=None,
+                                setup_error=None, booking_error=None, note="")}
     if qty <= FLAT_DUST:
         return {"ok": True, "sent": False, "before": before, "after": before,
-                "note": "the venue is already flat; nothing was sent"}
-    order_broker, recording_error = broker, None
+                "note": "the venue is already flat; nothing was sent",
+                "recording": status(attempted=False, writer=None,
+                                    recorder=None, setup_error=None,
+                                    booking_error=None, note="")}
+    order_broker, writer, recorder, setup_error, note = broker, None, None, \
+        None, ""
     if records_path:
-        order_broker, recording_error = _recording_broker(
+        order_broker, writer, recorder, setup_error, note = _recording_broker(
             broker, symbol, qty, records_path, venue_label)
+    booking_error: Optional[str] = None
+
+    def current_status() -> dict:
+        return status(attempted=True, writer=writer, recorder=recorder,
+                      setup_error=setup_error, booking_error=booking_error,
+                      note=note)
     try:
         result = order_broker.place_market(symbol=symbol, side="Buy", qty=qty,
                                            product="linear")
     except Exception as exc:                                   # noqa: BLE001
         import ledger as _ledger
         if not isinstance(exc, _ledger.BookingFailedAfterFill):
+            # the order itself failed or its outcome is unknown: this is the
+            # caller's to handle exactly as before; the evidence status rides
+            # on the exception so it is not lost
+            exc.recording = current_status()
             raise
         # The venue ACCEPTED the order; only the bookkeeping failed. That is
         # not "the close failed": go on to verify flat, and say what was lost.
         result = {"booking_failed": str(exc)}
-        recording_error = f"booking failed after the order was sent: {exc}"
+        booking_error = f"booking failed after the order was sent: {exc}"
     if result is None:
         # a definite rejection: nothing was filled and no second order follows
         return {"ok": False, "sent": False, "before": before,
                 "note": "the venue rejected the order; nothing filled. Look at "
-                        "the venue and the reject reason"}
+                        "the venue and the reject reason",
+                "recording": current_status()}
     after: dict = {}
     flat = False
     for attempt in range(VERIFY_TRIES):
@@ -171,9 +339,14 @@ def close_short(broker: Any, symbol: str, *, expected_qty: Optional[float] = Non
         if attempt + 1 < VERIFY_TRIES:
             sleep(VERIFY_SLEEP_S)
     out = {"ok": flat, "sent": True, "before": before, "after": after,
-           "fill": result, "flat_verified": flat}
-    if recording_error:
-        out["recording_error"] = recording_error
+           "fill": result, "flat_verified": flat,
+           "recording": current_status()}
+    if booking_error:
+        out["recording_error"] = booking_error
+    elif out["recording"]["state"] not in ("OK", "NOT_CONFIGURED"):
+        out["recording_error"] = (out["recording"].get("writer_last_error")
+                                  or out["recording"].get("setup_error")
+                                  or out["recording"]["state"])
     return out
 
 
@@ -196,6 +369,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="append this close's execution record to the drill's "
                          "records file (testnet only; optional, and a failure "
                          "to record never blocks the close)")
+    ap.add_argument("--recording-status-out", default="",
+                    help="write what became of this close's execution record "
+                         "(OK/RECOVERED/UNSYNCED/FAILED/...) here, for the "
+                         "unattended runner's verdict")
     ap.add_argument("--evidence-path", default="",
                     help="capture this run's REST traffic (redacted, "
                          "hash-chained) here; must not already exist")
@@ -298,7 +475,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt as exc:
         outcome = {"ok": False, "interrupted": str(exc)}
     except Exception as exc:                                   # noqa: BLE001
-        outcome = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+        outcome = {"ok": False, "error": f"{type(exc).__name__}: {exc}",
+                   "recording": getattr(exc, "recording", None)}
     # Everything below runs after an order may be on the wire: a signal or an
     # error here must end in the "look at the venue" message, never a traceback.
     try:
@@ -315,6 +493,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.evidence_path and getattr(broker, "sent_order_links", None):
             outcome["evidence_capture"] = D.capture_final_venue_state(
                 broker, args.symbol)
+        if args.recording_status_out:
+            write_recording_status(args.recording_status_out, outcome)
         for key, value in outcome.items():
             print(f"  {key}: {value}")
     except BaseException as exc:                               # noqa: BLE001

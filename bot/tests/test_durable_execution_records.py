@@ -45,8 +45,8 @@ class Venue:
 
     def get_mark(self, s): return self.px
     def get_spot_mark(self, s): return self.px
-    def get_book_top(self, symbol, product): return {"bid": self.px - 5,
-                                                      "ask": self.px + 5}
+    def get_book_top(self, symbol, product, *, timeout_s=None):
+        return {"bid": self.px - 5, "ask": self.px + 5}
     def get_perp_position(self, s): return float(self.short)
     def get_open_carry_orders(self, a, b): return []
     def get_position_slots(self, s): return []

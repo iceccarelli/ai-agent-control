@@ -574,6 +574,70 @@ def _outcome_line(venue: str, rec: Dict[str, Any]) -> str:
         sort_keys=True, default=str)
 
 
+def _fsync_dir(path: str) -> None:
+    """Make a directory entry durable (a new file's name only survives a power
+    loss once its parent directory has been synced)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durable_append(path: str, data: bytes) -> Dict[str, Any]:
+    """Append `data` to `path` with the strongest guarantees a plain file gives.
+
+    * ONE O_APPEND `write` of the whole buffer (looping only on a short write),
+      not buffered text I/O that can split a long line across several writes
+      and interleave with another process;
+    * a torn tail is quarantined: if the file does not end in a newline (a
+      previous write was cut off), the new record starts on a fresh line, so a
+      truncated fragment can never swallow it;
+    * `fsync` of the file, and - when this call created the file or its parent
+      directories - `fsync` of the directory entries, because a synced file in
+      an unsynced directory can vanish after a power loss.
+
+    Raises only if the DATA could not be written. A failed sync after a
+    successful write is returned (`sync_error`) rather than raised: the line is
+    in the file, but its durability is not confirmed, and the caller reports
+    that without writing the line a second time."""
+    path = os.path.abspath(path)
+    folder = os.path.dirname(path)
+    created_dirs = []
+    probe = folder
+    while probe and not os.path.isdir(probe):
+        created_dirs.append(probe)
+        probe = os.path.dirname(probe)
+    os.makedirs(folder, exist_ok=True)
+    existed = os.path.exists(path)
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
+    sync_error = ""
+    try:
+        size = os.fstat(fd).st_size
+        if size > 0:
+            with open(path, "rb") as reader:
+                reader.seek(size - 1)
+                if reader.read(1) != b"\n":
+                    data = b"\n" + data
+        view = memoryview(data)
+        while len(view):
+            written = os.write(fd, view)
+            view = view[written:]
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            sync_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        os.close(fd)
+    if not existed or created_dirs:
+        try:
+            for made in [path] + created_dirs:
+                _fsync_dir(os.path.dirname(made))
+        except OSError as exc:
+            sync_error = sync_error or f"{type(exc).__name__}: {exc}"
+    return {"synced": not sync_error, "sync_error": sync_error}
+
+
 class RecordWriter:
     """Writes each fill / outcome to the records file THE MOMENT it is booked
     (`LedgerBroker.record_sink`), one fsynced line at a time, so a hard kill
@@ -590,7 +654,11 @@ class RecordWriter:
     def __init__(self, path: str, venue: str, written: set) -> None:
         self.path, self.venue, self.written = path, str(venue), written
         self.count = 0
+        #: lines that could NOT be written (they are not in the file)
         self.errors = 0
+        #: lines that were written but whose fsync failed (in the file, but
+        #: their durability is not confirmed; never written a second time)
+        self.sync_errors = 0
         self.last_error = ""
 
     def __call__(self, event: Dict[str, Any]) -> None:
@@ -607,14 +675,12 @@ class RecordWriter:
                 return
             if key in self.written:
                 return
-            os.makedirs(os.path.dirname(os.path.abspath(self.path)),
-                        exist_ok=True)
-            with open(self.path, "a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            result = durable_append(self.path, (line + "\n").encode("utf-8"))
             self.written.add(key)
             self.count += 1
+            if result["sync_error"]:
+                self.sync_errors += 1
+                self.last_error = result["sync_error"]
         except Exception as exc:  # noqa: BLE001 - counted, reported, never raised
             self.errors += 1
             self.last_error = f"{type(exc).__name__}: {exc}"
@@ -670,12 +736,12 @@ def append_execution_records(path: str, journal: Any, venue: str,
         lines.append(_outcome_line(venue, rec))
     if not lines:
         return 0
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write("\n".join(lines) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    written.update(pending)
+    result = durable_append(path, ("\n".join(lines) + "\n").encode("utf-8"))
+    written.update(pending)               # the data is in the file
+    if result["sync_error"]:
+        # in the file, but not confirmed durable: say so, do not rewrite it
+        raise OSError(f"{len(lines)} record(s) written but not confirmed "
+                      f"durable ({result['sync_error']})")
     return len(lines)
 
 
@@ -1319,6 +1385,7 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
                 # write, or a record the sink never saw)
                 "appended": flushed,
                 "durable_write_errors": writer.errors if writer else 0,
+                "durable_sync_errors": writer.sync_errors if writer else 0,
                 "durable_write_last_error": writer.last_error if writer else ""}
         except Exception as exc:  # noqa: BLE001 - never lose the report
             report["execution_records_error"] = f"{type(exc).__name__}: {exc}"

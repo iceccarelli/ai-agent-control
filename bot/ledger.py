@@ -1229,7 +1229,8 @@ class LedgerBroker:
         shares ONE deadline, and each source is handed what is left of it as
         its own request timeout (a single attempt, no retry, no backoff) - the
         wait is bounded by the transport, not by a thread (live modules start
-        none). A source that cannot take a timeout is called as it is."""
+        none). A source that cannot take a timeout is NOT called when a bound
+        was requested."""
         deadline = None if timeout_s is None else time.monotonic() + float(timeout_s)
         for name, source in (("get_book_depth", "orderbook"),
                              ("get_book_top", "ticker_touch")):
@@ -1242,10 +1243,17 @@ class LedgerBroker:
                 if left <= 0.01:
                     return None                  # the budget is spent
                 try:
-                    if "timeout_s" in inspect.signature(getter).parameters:
-                        kwargs["timeout_s"] = left
+                    takes_timeout = "timeout_s" in inspect.signature(
+                        getter).parameters
                 except (TypeError, ValueError):
-                    pass
+                    takes_timeout = False
+                if not takes_timeout:
+                    # A bound was asked for and this getter cannot honour one:
+                    # calling it would be an unbounded wait in front of an
+                    # order. The book is simply not read (an unmeasured record,
+                    # never an invented one).
+                    continue
+                kwargs["timeout_s"] = left
             try:
                 top = getter(symbol, product, **kwargs)
                 bid, ask = float(top["bid"]), float(top["ask"])
