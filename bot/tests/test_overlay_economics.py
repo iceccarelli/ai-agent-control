@@ -34,6 +34,15 @@ def book(i10=0.3, i100=2.0, spread=0.1, buy10=None, sell10=None):
                            "100000": {"buy": i100, "sell": i100}}}
 
 
+def _hashed(rows):
+    """Give synthetic rows a chain-style hash (the real reader supplies one)."""
+    import hashlib
+    for r in rows:
+        r["hash"] = hashlib.sha256(
+            json.dumps(r["obs"], sort_keys=True, default=str).encode()).hexdigest()
+    return rows
+
+
 def series(print_bps, *, t0=START + 1, hours=None, spot=100_000.0,
            perp_off=0.0, spot_fn=None, perp_fn=None, bk=None):
     """Hourly observations; one funding print every 8 hours."""
@@ -55,7 +64,7 @@ def series(print_bps, *, t0=START + 1, hours=None, spot=100_000.0,
             "funding_print_ms": settled[-1][1] if settled else 0,
             "settled_prints": settled,
             "book": {"linear": bk or book(), "spot": bk or book()}}})
-    return rows
+    return _hashed(rows)
 
 
 # -- execution cost: measured sizes, bounded between, nothing beyond ------------
@@ -449,7 +458,7 @@ def test_this_module_imports_nothing_that_can_place_an_order():
         elif isinstance(n, ast.ImportFrom):
             mods.add((n.module or "").split(".")[0])
     assert mods <= {"__future__", "argparse", "hashlib", "json", "math", "os",
-                    "sys", "typing", "carry_costs", "mainnet_public"}
+                    "sys", "typing", "random", "carry_costs", "mainnet_public"}
 
 
 # -- review findings: each one a failing case before it was fixed -------------------
@@ -538,7 +547,9 @@ def test_observations_out_of_time_order_are_unreadable_evidence():
     rows[10], rows[11] = rows[11], rows[10]
     rep = oe.evaluate(rows, **GO_KW)
     assert (rep["verdict"], rep["verdict_reasons"]) == ("INSUFFICIENT", ["EVIDENCE_UNREADABLE"])
-    assert "OBSERVATIONS_NOT_STRICTLY_INCREASING_IN_TIME" in rep["chain_issues"]
+    assert any(c.startswith("OBSERVATIONS_NOT_STRICTLY_INCREASING_IN_TIME")
+               and "index" in c for c in rep["chain_issues"])
+    assert rep["observations_total"] == len(rows)            # the count is not masked
 
 
 def test_an_open_episode_is_marked_and_a_loss_on_it_blocks_go():
@@ -563,7 +574,8 @@ def test_an_open_episode_is_marked_and_a_loss_on_it_blocks_go():
         "LOWER_95_BOUND_NOT_ABOVE_ZERO_WITH_OPEN_EPISODE")
     assert bad["worst_episode_usd"] < -20.0          # the open episode's path counts
     # and when the open episode only drags the lower bound to zero, that alone blocks GO
-    rep["carry_bps_with_open_episode"] = dict(rep["carry_bps_with_open_episode"], lower95=-1.0)
+    cwo = rep["capital_with_open_episode"]
+    cwo["result"] = dict(cwo["result"], lower95=-1.0)
     assert oe.verdict(rep, 20.0)[1] == ["LOWER_95_BOUND_NOT_ABOVE_ZERO_WITH_OPEN_EPISODE"]
 
 
@@ -649,21 +661,32 @@ def test_financing_is_stated_as_zero_for_an_overlay_not_silently_omitted():
     assert e["financing_bps"] == 0.0 and "borrows nothing" in e["financing_note"]
 
 
-def test_a_hedge_that_underperforms_passive_btc_in_the_sample_is_not_go():
-    """A rally in the forward window: the carry is positive but the overlay as a
-    whole trails simply holding the BTC. That cannot be called an investment."""
-    rally = lambda h: 100_000.0 * (1 + 0.0004 * h)               # ~ +1 %/day
-    rep = oe.evaluate(rich(spot_fn=rally), **GO_KW)
+def test_an_overlay_that_trails_passive_btc_per_unit_of_risk_is_not_go():
+    """Steady, low-volatility appreciation of the held BTC: unhedged it beats the
+    overlay per unit of risk, so the overlay is not a better use of the BTC."""
+    steady = lambda h: 100_000.0 * (1 + 0.0001 * h)
+    rep = oe.evaluate(rich(spot_fn=steady), **GO_KW)
     assert rep["carry_bps_per_episode"]["lower95"] > 0           # the carry is fine
-    assert rep["incremental_vs_passive_bps"]["mean"] < 0
+    ra = rep["risk_adjusted_vs_passive"]
+    assert ra["overlay_mean_over_sd"] < ra["passive_mean_over_sd"]
     assert (rep["verdict"], rep["verdict_reasons"]) == (
-        "INSUFFICIENT", ["OVERLAY_UNDERPERFORMS_PASSIVE_BTC_IN_SAMPLE"])
+        "INSUFFICIENT", ["OVERLAY_TRAILS_PASSIVE_BTC_PER_UNIT_OF_RISK"])
 
 
-def test_a_flat_or_falling_window_does_not_trip_the_underperformance_rule():
+def test_a_rally_alone_does_not_decide_the_verdict_it_is_risk_not_raw_return():
+    """A mean-return test would make GO depend on the price path (a rally always
+    beats a hedge in raw return). The test is per unit of risk."""
+    rally = lambda h: 100_000.0 * (1 + 0.0004 * h)
+    rep = oe.evaluate(rich(spot_fn=rally), **GO_KW)
+    assert rep["incremental_vs_passive_bps"]["mean"] < 0         # trails in raw return
+    assert rep["verdict"] == "GO"                                # but not per unit of risk
+
+
+def test_a_flat_or_falling_window_does_not_trip_the_benchmark_rule():
     assert oe.evaluate(rich(), **GO_KW)["verdict"] == "GO"
     drop = lambda h: 100_000.0 * (1 - 0.0001 * h)
-    assert oe.evaluate(rich(spot_fn=drop), **GO_KW)["incremental_vs_passive_bps"]["mean"] > 0
+    rep = oe.evaluate(rich(spot_fn=drop), **GO_KW)
+    assert rep["verdict"] == "GO" and rep["incremental_vs_passive_bps"]["mean"] > 0
 
 
 def test_the_distinct_latest_prints_are_reported_as_v1_does_not_the_hourly_count():
@@ -739,4 +762,215 @@ def test_an_explicit_zero_capital_cost_is_go_eligible_but_reports_its_margin_of_
     assert "break_even_capital_apr" in rep["capital"] and "sensitivity" in rep["capital"]
 
 
-PINNED = "e9710b1265909d49b74b7cbbdf05acc8487a4646ff9b59ef12f14285b3cf1e11"
+# -- review round 2: each finding as a failing case before it was fixed ---------------------
+
+def _exit_indices(rows):
+    out = oe.simulate_episodes(rows, 100.0)["closed"]
+    idx = {r["obs"]["observed_at_s"]: i for i, r in enumerate(rows)}
+    return [idx[e["exit_s"]] for e in out]
+
+
+def test_f1_episodes_across_an_outage_are_priced_from_their_end_books_not_dropped():
+    """Outages cluster in stress. Deleting the hours before three losing exits
+    used to remove those episodes and flip the answer to GO."""
+    rows = rich()
+    ex = _exit_indices(rows)
+    for k in ex[5:15]:
+        rows[k]["obs"]["perp_mark"] *= 1.10                    # a squeeze at the exit
+    intact = oe.evaluate(_hashed(rows), **GO_KW)
+    kill = {m for k in ex[5:15] for m in range(k - 5, k - 1)}
+    gappy = oe.evaluate(_hashed([r for i, r in enumerate(rows) if i not in kill]), **GO_KW)
+    assert gappy["episodes"]["gap_spanning"] >= 10
+    assert gappy["episodes"]["closed"] == intact["episodes"]["closed"]   # none vanished
+    assert gappy["episodes"]["unpriced_unavailable"] == 0
+    assert gappy["verdict"] != "GO" and intact["verdict"] != "GO"
+    assert gappy["carry_bps_per_episode"]["mean"] == pytest.approx(
+        intact["carry_bps_per_episode"]["mean"], rel=1e-9)
+
+
+def test_f1_an_episode_whose_path_is_unobserved_claims_no_worst_point():
+    rows = rich()
+    k = _exit_indices(rows)[3]
+    kill = set(range(k - 5, k - 1))
+    e = [x for x in oe.simulate_episodes(
+        [r for i, r in enumerate(rows) if i not in kill], 100.0)["closed"]
+         if x["gap_spanning"]]
+    assert e and all(x["worst_path_usd"] is None for x in e)
+
+
+def test_f1_an_episode_with_unseen_funding_prints_is_unpriced_and_valued_adversely():
+    rows = rich()
+    k = _exit_indices(rows)[10]
+    # wipe the printed history for the hours of one episode (a long outage)
+    kill = set(range(k - 60, k - 1))
+    kept = [r for i, r in enumerate(rows) if i not in kill]
+    for r in kept:
+        r["obs"]["settled_prints"] = [p for p in r["obs"]["settled_prints"]
+                                      if not (rows[k - 60]["obs"]["observed_at_s"] * 1000
+                                              < p[1] <= rows[k - 2]["obs"]["observed_at_s"] * 1000)]
+    rep = oe.evaluate(_hashed(kept), **GO_KW)
+    assert rep["episodes"]["unpriced_unavailable"] >= 1
+    assert rep["episodes"]["closed"] == rep["episodes"]["priced"] + rep["episodes"]["unpriced_unavailable"]
+    assert rep["carry_bps_per_episode"]["n"] == rep["episodes"]["closed"]   # all counted
+
+
+def test_f2_the_open_episode_check_includes_the_cost_of_capital():
+    prints = cyc(12.0, 5) * 40 + [12.0] * 5
+    n = len(prints) * 8
+    mk = lambda h: 100_000.0 * (1 + (0.004 if h > n - 2 else 0.0))
+    rows = series(prints, bk=book(i10=0.3, i100=2.0), perp_fn=mk)
+    base = oe.evaluate(rows, **dict(GO_KW, owner_capital_apr=0.0, committed_capital_fraction=1.0))
+    be = base["capital"]["break_even_capital_apr"]
+    assert be and base["open_episode_marked"]["carry_bps"] is not None
+    tight = oe.evaluate(rows, **dict(GO_KW, owner_capital_apr=be * 0.97,
+                                     committed_capital_fraction=1.0))
+    cwo = tight["capital_with_open_episode"]["result"]["lower95"]
+    assert cwo < tight["capital"]["result"]["lower95"] + 1e-9
+    if cwo <= 0:
+        assert tight["verdict"] != "GO"
+
+
+def test_f3_the_digest_covers_the_planned_size_and_the_row_contents():
+    rows = rich()
+    a = oe.evaluate(rows, **GO_KW)["provenance"]["inputs_digest"]
+    b = oe.evaluate(rows, **dict(GO_KW, planned_notional_usd=10_000.0))["provenance"]["inputs_digest"]
+    assert a != b
+    changed = json.loads(json.dumps(rows))
+    changed[100]["obs"]["spot_mark"] += 1.0
+    for r in changed:
+        r.pop("hash", None)
+    unhashed = oe.evaluate(changed, **GO_KW)
+    assert unhashed["verdict"] == "INSUFFICIENT"                 # no chain hash: unreadable
+    assert unhashed["verdict_reasons"] == ["EVIDENCE_UNREADABLE"]
+    other = oe.evaluate(_hashed(changed), **GO_KW)["provenance"]["inputs_digest"]
+    assert other != a                                            # content is in the digest
+
+
+def test_f4_the_protocol_hash_covers_the_parameters_that_move_the_answer():
+    import carry_costs
+    rp = oe.PROTOCOL["resolved_parameters"]
+    assert rp["entry_gate"]["ewma_alpha"] == carry_costs.EWMA_ALPHA
+    assert rp["entry_gate"]["ewma_min_prints"] == carry_costs.EWMA_MIN_PRINTS
+    assert rp["entry_gate"]["round_trip_bps"] == mp.GATE_ROUND_TRIP_BPS
+    assert rp["negative_exit_prints"] == oe.NEGATIVE_EXIT_PRINTS == 3
+    assert rp["t95"] and rp["capital_apr_grid"] and rp["bootstrap"]
+    import copy
+    tweaked = copy.deepcopy(oe.PROTOCOL)
+    tweaked["resolved_parameters"]["entry_gate"]["ewma_alpha"] += 0.01
+    import hashlib
+    h = hashlib.sha256(json.dumps(tweaked, sort_keys=True,
+                                  separators=(",", ":")).encode()).hexdigest()
+    assert h != oe.protocol_hash()
+    assert "unhedged" in oe.PROTOCOL["meaning"]["GO"] and \
+        "liquidation" in oe.PROTOCOL["meaning"]["GO"]
+
+
+def test_f4_the_exit_rule_uses_the_declared_constant_not_a_literal():
+    src = open(os.path.join(BOT, "tools", "overlay_economics.py")).read()
+    assert "NEGATIVE_EXIT_PRINTS" in src and "streak >= 3" not in src
+
+
+def _false_pass(gen, trials=400):
+    import random
+    rng = random.Random(11)
+    return sum(oe.mean_bounds(gen(rng))["lower95"] > 0 for _ in range(trials)) / trials
+
+
+def test_f5_a_true_zero_mean_rarely_passes_even_with_dependence_and_skew():
+    def iid(r): return [r.gauss(0, 1) for _ in range(30)]
+
+    def ar(rho):
+        def g(r):
+            x, o = 0.0, []
+            for _ in range(30):
+                x = rho * x + r.gauss(0, 1)
+                o.append(x)
+            return o
+        return g
+
+    def skew(r): return [1.0 if r.random() < 0.9 else -9.0 for _ in range(30)]
+    # the plain t-interval measured 4.9%, 16.6%, 24.9% and 18.5% on these
+    assert _false_pass(iid) < 0.07
+    assert _false_pass(ar(0.5)) < 0.11
+    assert _false_pass(ar(0.7)) < 0.13
+    assert _false_pass(skew) < 0.10
+
+
+def test_f5_positive_dependence_widens_the_bound_and_negative_never_narrows_it():
+    iid = [1.0, -1.0, 0.5, -0.5, 1.2, -1.1, 0.4, -0.3, 0.9, -0.8] * 3
+    persist = sorted(iid)                    # same values, strongly persistent order
+    a, b = oe.mean_bounds(iid), oe.mean_bounds(persist)
+    assert b["rho1"] > 0.5 > a["rho1"]
+    assert (b["upper95"] - b["mean"]) > (a["upper95"] - a["mean"])
+
+
+def test_f5_the_analysis_horizon_is_declared_and_later_rows_are_a_new_test():
+    rows = rich()
+    horizon = oe.ANALYSIS_HORIZON_DAYS * 86400
+    far = json.loads(json.dumps(rows[-1]))
+    far["obs"]["observed_at_s"] = oe.EVALUATION_START_S + horizon + 10 * 86400
+    rep = oe.evaluate(_hashed(rows + [far]), **GO_KW)
+    assert rep["observations_after_horizon_excluded"] == 1
+    assert rep["observations_forward"] == len(rows)
+
+
+@pytest.mark.parametrize("cr,mm", [(1.5, 0.0033), (-0.1, 0.0033), (0.85, 0.0),
+                                   (0.85, 1.0), (0.85, -0.1), (float("nan"), 0.0033),
+                                   (0.85, float("inf"))])
+def test_f7_out_of_range_margin_facts_never_reach_go(cr, mm):
+    rep = oe.evaluate(rich(), **dict(GO_KW, collateral_ratio=cr, maintenance_margin_rate=mm))
+    assert rep["verdict"] == "INSUFFICIENT"
+    assert rep["verdict_reasons"] == [oe.INSUFFICIENT_OWNER_INPUT + ":MARGIN_FACTS"]
+    assert rep["stress"]["status"] == "INVALID_INPUT"
+
+
+def test_f8_a_print_stamped_after_its_observation_is_look_ahead_and_unreadable():
+    rows = rich()
+    o = rows[300]["obs"]
+    o["settled_prints"] = o["settled_prints"] + [[5.0, int((o["observed_at_s"] + 3600) * 1000)]]
+    rep = oe.evaluate(_hashed(rows), **GO_KW)
+    assert rep["verdict_reasons"] == ["EVIDENCE_UNREADABLE"]
+    assert any("after the observation" in c for c in rep["chain_issues"])
+
+
+def test_f8_two_values_for_one_print_are_two_stories_and_unreadable():
+    rows = rich()
+    target = rows[400]["obs"]["settled_prints"][-1][1]
+    for r in rows[401:]:                      # row 400 keeps the original value
+        for pr in r["obs"]["settled_prints"]:
+            if pr[1] == target:
+                pr[0] += 0.5
+    rep = oe.evaluate(_hashed(rows), **GO_KW)
+    assert rep["verdict_reasons"] == ["EVIDENCE_UNREADABLE"]
+    assert any("two different values" in c for c in rep["chain_issues"])
+
+
+def test_f8_prints_that_are_not_eight_hours_apart_are_unreadable():
+    rows = rich()
+    o = rows[200]["obs"]
+    o["settled_prints"] = [[o["settled_prints"][0][0], o["settled_prints"][0][1] - 3 * 3600 * 1000]] \
+        + o["settled_prints"][1:]
+    rep = oe.evaluate(_hashed(rows), **GO_KW)
+    assert rep["verdict_reasons"] == ["EVIDENCE_UNREADABLE"]
+
+
+def test_f9_one_failed_book_read_does_not_block_capacity_but_many_do():
+    rows = rich(bk=book(i10=0.3, i100=0.6))
+    rows[10]["obs"]["book"] = {"linear": None, "spot": None}
+    few = oe.capacity_bounds(rows, impact_budget_bps=1.0, planned_notional_usd=5_000)
+    assert few["planned_inside_measured_capacity"] is True
+    for r in rows[::4]:
+        r["obs"]["book"] = {"linear": None, "spot": None}
+    many = oe.capacity_bounds(rows, impact_budget_bps=1.0, planned_notional_usd=5_000)
+    assert many["planned_inside_measured_capacity"] is not True
+
+
+def test_f11_the_annualised_figure_values_unpriced_episodes_adversely_and_says_pre_capital():
+    rep = oe.evaluate(rich(), **GO_KW)
+    n = rep["episodes"]["closed"]
+    assert rep["carry_bps_per_episode"]["n"] == n
+    assert "BEFORE capital cost" in rep["annualisation_note"]
+    assert "adversely" in rep["annualisation_note"]
+
+
+PINNED = "cfa96f68a33c740f4a29e550ad6f5eaeaf5f30442464b1633fa2b094a289760b"

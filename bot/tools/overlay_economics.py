@@ -41,6 +41,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -72,6 +73,25 @@ TAKER_FEE_BPS = carry_costs.TAKER_BPS_PERP
 #: beside the result so the owner can see where the sign flips.
 CAPITAL_APR_GRID = (0.0, 0.02, 0.05, 0.10)
 
+#: The exit rule is the frozen engine's: leave after this many consecutive
+#: negative settled prints (carry_engine.NEGATIVE_FUNDING_EXIT_PRINTS).
+NEGATIVE_EXIT_PRINTS = 3
+#: Funding settles every 8 hours on the proven symbol; a print series that is
+#: not spaced like that is evidence we do not understand, not evidence.
+PRINT_SPACING_S = 8 * 3600
+PRINT_SPACING_TOLERANCE_S = 120
+#: A print stamped later than the observation that carries it (beyond clock
+#: skew) would be look-ahead.
+PRINT_CLOCK_SKEW_S = 120
+#: Declared analysis horizon: rows after this are a different test.
+ANALYSIS_HORIZON_DAYS = 120
+#: Largest tolerated share of unpriced book sides when judging capacity.
+MAX_UNPRICED_BOOK_FRACTION = 0.05
+#: Block bootstrap of the mean: fixed seed and size, so a report is reproducible.
+BOOTSTRAP_SEED = 20261103
+BOOTSTRAP_RESAMPLES = 2000
+BOOTSTRAP_MIN_N = 8
+
 #: One-sided 95% Student-t critical values by degrees of freedom; between rows
 #: the value for the SMALLER df is used (wider, never narrower).
 _T95 = ((1, 6.314), (2, 2.920), (3, 2.353), (4, 2.132), (5, 2.015), (6, 1.943),
@@ -98,6 +118,41 @@ PROTOCOL = {
     "adequacy": {"min_closed_episodes": 30, "min_span_days": 60,
                  "min_distinct_settled_prints": 100},
     "evaluation_start_s": EVALUATION_START_S,
+    "analysis_horizon_days": ANALYSIS_HORIZON_DAYS,
+    "analysis_rule": ("one analysis: only rows observed in [evaluation_start_s, "
+                      "evaluation_start_s + analysis_horizon_days] are judged; "
+                      "later rows belong to a new protocol, so the same data "
+                      "cannot be re-tested as it grows"),
+    "inference": ("one-sided 95% bound on the mean carry per closed episode: the "
+                  "wider of a Student-t interval whose standard error is inflated "
+                  "by sqrt((1+rho1)/(1-rho1)) for positive lag-1 autocorrelation, "
+                  "and a fixed-seed moving-block bootstrap percentile"),
+    "unpriceable_episodes": ("never dropped: for the GO path each is valued at "
+                             "the worst priced episode, for the NO_GO path at "
+                             "the best; more than max_unpriced_fraction of them "
+                             "is INSUFFICIENT"),
+    "benchmark_rule": ("the hedged overlay must not trail passive BTC per unit "
+                       "of risk: mean/sd of the overlay's episode returns must "
+                       "be at least that of the same BTC held unhedged"),
+    "resolved_parameters": {
+        "t95": [list(r) for r in _T95], "z95": _Z95,
+        "capital_apr_grid": list(CAPITAL_APR_GRID),
+        "negative_exit_prints": NEGATIVE_EXIT_PRINTS,
+        "print_spacing_s": PRINT_SPACING_S,
+        "print_spacing_tolerance_s": PRINT_SPACING_TOLERANCE_S,
+        "print_clock_skew_s": PRINT_CLOCK_SKEW_S,
+        "max_unpriced_book_fraction": MAX_UNPRICED_BOOK_FRACTION,
+        "bootstrap": [BOOTSTRAP_SEED, BOOTSTRAP_RESAMPLES, BOOTSTRAP_MIN_N],
+        "capacity_budget_rule": ("half the mean pre-impact edge per leg; "
+                                 "95th-percentile one-way impact per measured size"),
+        "entry_gate": {"round_trip_bps": mp.GATE_ROUND_TRIP_BPS,
+                       "borrow_apr": mp.GATE_BORROW_APR,
+                       "ewma_alpha": carry_costs.EWMA_ALPHA,
+                       "ewma_min_prints": carry_costs.EWMA_MIN_PRINTS,
+                       "assumed_hold_days": carry_costs.ASSUMED_HOLD_DAYS,
+                       "demonstrated_hold_days": carry_costs.DEMONSTRATED_HOLD_DAYS,
+                       "opportunity_cost_apr": carry_costs.DEFAULT_OPPORTUNITY_COST_APR},
+        "measured_notionals_usd": list(MEASURED_NOTIONALS)},
     "taker_fee_bps_per_leg": TAKER_FEE_BPS,
     "max_gap_between_observations_s": 3 * 3600,
     "max_unpriced_fraction": 0.10,
@@ -115,11 +170,15 @@ PROTOCOL = {
                        "walked at; between them bounded, above them UNAVAILABLE"),
     "verdicts": ["GO", "NO_GO", "INSUFFICIENT"],
     "meaning": {
-        "GO": ("The lower 95% bound of the mean CARRY result per closed "
-               "episode is above zero after the UPPER execution-cost bound and "
-               "the owner's cost of capital; the sample is adequate; the "
-               "planned size is inside measured capacity; the worst episode is "
-               "inside the owner's drawdown limit. Evidence to run a small "
+        "GO": ("The dependence-adjusted lower 95% bound of the mean CARRY result "
+               "per closed episode is above zero after the UPPER execution-cost "
+               "bound and the owner's cost of capital (with any open episode "
+               "marked and unpriceable episodes valued adversely); the sample is "
+               "adequate; the hedged overlay does not trail the same BTC held "
+               "unhedged per unit of risk; the planned size is inside measured "
+               "capacity; the worst episode path is inside the owner's drawdown "
+               "limit; and the owner's venue margin facts put liquidation "
+               "beyond the engine's own floor. Evidence to run a small "
                "real-money pilot under the owner's signed charter, not a "
                "forecast of profit."),
         "NO_GO": ("The sample is adequate and even the MOST favourable reading "
@@ -163,22 +222,69 @@ def t_crit(n: int) -> float:
     return out
 
 
+def _lag1(vals: Sequence[float], mean: float) -> float:
+    den = sum((v - mean) ** 2 for v in vals)
+    if den <= 0 or len(vals) < 3:
+        return 0.0
+    num = sum((vals[i] - mean) * (vals[i + 1] - mean) for i in range(len(vals) - 1))
+    return max(-0.95, min(0.95, num / den))
+
+
+def _boot_bounds(vals: Sequence[float]) -> Tuple[float, float]:
+    """5th / 95th percentile of the mean under a fixed-seed moving-block
+    bootstrap (block length n**(1/3)), which keeps serial dependence and skew."""
+    n = len(vals)
+    rng = random.Random(BOOTSTRAP_SEED)
+    block = max(1, int(round(n ** (1.0 / 3.0))))
+    means = []
+    for _ in range(BOOTSTRAP_RESAMPLES):
+        total, count = 0.0, 0
+        while count < n:
+            st = rng.randrange(0, n - block + 1)
+            take = min(block, n - count)
+            total += sum(vals[st:st + take])
+            count += take
+        means.append(total / n)
+    means.sort()
+    return (means[int(0.05 * BOOTSTRAP_RESAMPLES)],
+            means[int(0.95 * BOOTSTRAP_RESAMPLES) - 1])
+
+
 def mean_bounds(values: Sequence[float]) -> Dict[str, Any]:
-    """Mean and one-sided 95% bounds. n < 2 has no spread, so no bound."""
+    """Mean and one-sided 95% bounds of `values`, TAKEN IN TIME ORDER.
+
+    Episodes are not independent: funding persists and the gate's EWMA windows
+    overlap. A plain t-interval then passes a true-zero mean 11-25% of the time
+    instead of 5%. So the standard error is inflated by sqrt((1+rho1)/(1-rho1))
+    when the lag-1 autocorrelation is positive, and the bound is the wider of
+    that and a block-bootstrap percentile (which also respects skew). n < 2 has
+    no spread, so no bound."""
     vals = [float(v) for v in values if isinstance(v, (int, float))
-            and math.isfinite(v)]
+            and not isinstance(v, bool) and math.isfinite(v)]
     n = len(vals)
     if n == 0:
-        return {"n": 0, "mean": None, "sd": None, "lower95": None,
-                "upper95": None}
+        return {"n": 0, "mean": None, "sd": None, "rho1": None,
+                "lower95": None, "upper95": None}
     mean = sum(vals) / n
     if n < 2:
-        return {"n": n, "mean": mean, "sd": None, "lower95": None,
-                "upper95": None}
+        return {"n": n, "mean": mean, "sd": None, "rho1": None,
+                "lower95": None, "upper95": None}
     sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / (n - 1))
-    half = t_crit(n) * sd / math.sqrt(n)
-    return {"n": n, "mean": mean, "sd": sd, "lower95": mean - half,
-            "upper95": mean + half}
+    # the sample lag-1 autocorrelation is biased towards zero in short series
+    # (Kendall); correct it upward, never downward
+    raw = _lag1(vals, mean)
+    rho = min(0.95, raw + (1.0 + 3.0 * raw) / n) if raw > 0 else raw
+    infl = math.sqrt((1.0 + rho) / (1.0 - rho)) if rho > 0 else 1.0
+    half = t_crit(n) * sd / math.sqrt(n) * infl
+    lower, upper = mean - half, mean + half
+    method = "t_inflated"
+    if n >= BOOTSTRAP_MIN_N and sd > 0:
+        bl, bu = _boot_bounds(vals)
+        if bl < lower:
+            lower, method = bl, "block_bootstrap"
+        upper = max(upper, bu)
+    return {"n": n, "mean": mean, "sd": sd, "rho1": rho, "lower95": lower,
+            "upper95": upper, "method": method}
 
 
 # -- execution cost: measured sizes only, bounded between, nothing beyond ------
@@ -329,8 +435,13 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
     cost = overlay_cost_bounds(a, b, notional_usd, taker_fee_bps)
     gaps = [rows[m + 1]["obs"]["observed_at_s"] - rows[m]["obs"]["observed_at_s"]
             for m in range(i, j)]
-    if gaps and max(gaps) > PROTOCOL["max_gap_between_observations_s"]:
-        cost = {"status": UNAVAILABLE, "reason": "EPISODE_SPANS_OBSERVATION_GAP",
+    # Both end books are present, so the cost is known; only the path between
+    # them is not. Funding is another matter: fewer prints than the elapsed time
+    # allows means some were never seen, and the income cannot be stated.
+    gap_spanning = bool(gaps) and max(gaps) > PROTOCOL["max_gap_between_observations_s"]
+    expected_prints = int((b["observed_at_s"] - a["observed_at_s"]) // PRINT_SPACING_S)
+    if len(prints) < expected_prints:
+        cost = {"status": UNAVAILABLE, "reason": "FUNDING_PRINTS_MISSING",
                 "legs": 2, "spot_legs": 0}
     hold_days = (b["observed_at_s"] - a["observed_at_s"]) / 86400.0
     out: Dict[str, Any] = {
@@ -341,7 +452,7 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
         "passive_btc_pnl_usd": passive_btc,
         "overlay_btc_pnl_usd": passive_btc,          # the same BTC, never added twice
         "perp_pnl_marks_usd": perp_pnl, "funding_usd": funding_usd,
-        "cost": cost}
+        "gap_spanning": gap_spanning, "cost": cost}
     out["directional_component_usd"] = -qty * (spot_out - spot_in)
     out["inventory_value_in_usd"] = qty * spot_in
     out["passive_return_bps"] = (spot_out / spot_in - 1.0) * 1e4
@@ -358,7 +469,9 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
         return out
     scale = float(notional_usd) / 1e4
     cost_hi, cost_lo = cost["total_upper_bps"] * scale, cost["total_lower_bps"] * scale
-    out["worst_path_usd"] = _worst_path(rows, i, j, qty, cost_hi)
+    # a path across a gap is unobserved: no worst point is claimed for it
+    out["worst_path_usd"] = (None if gap_spanning
+                             else _worst_path(rows, i, j, qty, cost_hi))
     out["overlay_total_usd"] = passive_btc + perp_pnl + funding_usd - cost_hi
     out["overlay_total_return_bps"] = out["overlay_total_usd"] / scale
     out["incremental_vs_passive_bps"] = (out["overlay_total_usd"] - passive_btc) / scale
@@ -401,7 +514,7 @@ def simulate_episodes(rows: Sequence[Dict[str, Any]], notional_usd: float,
             if ms > last_print_ms:
                 streak = streak + 1 if bps < 0 else 0
                 last_print_ms = ms
-                if streak >= 3:          # the rule fires at the third print itself
+                if streak >= NEGATIVE_EXIT_PRINTS:   # fires at the Nth print itself
                     exited = True
                     break
         if exited:
@@ -507,6 +620,14 @@ def stress_table(notional_usd: float, *, leverage: float = 1.0,
     input, and without it the answer is UNAVAILABLE, never a comfortable
     default."""
     n = float(notional_usd)
+    for name, val, lo, hi in (("maintenance_margin_rate", maintenance_margin_rate, 0.0, 1.0),
+                              ("collateral_ratio", collateral_ratio, 0.0, 1.0)):
+        if val is not None and not _stage(val, lo, hi, open_lo=(name == "maintenance_margin_rate"),
+                                          open_hi=(name == "maintenance_margin_rate")):
+            return {"status": "INVALID_INPUT", "invalid": name,
+                    "liquidation_rally_pct_usdt_margin_only": {"status": "INVALID_INPUT"},
+                    "liquidation_rally_pct_btc_collateral": {"status": "INVALID_INPUT"},
+                    "perp_loss_usd_by_rally": {}, "held_btc_gain_usd_by_rally": {}}
     moves = (0.10, 0.25, 0.50, 1.00)
     out: Dict[str, Any] = {
         "perp_loss_usd_by_rally": {f"{int(m * 100)}%": n * m for m in moves},
@@ -575,9 +696,12 @@ def capacity_bounds(rows: Sequence[Dict[str, Any]], impact_budget_bps: float,
                 else:
                     missing += 1
         p95 = _p95(vals)
+        frac = missing / (missing + len(vals)) if (missing + len(vals)) else 1.0
         per[key] = {"p95_bps": p95, "unpriced_sides": missing, "n": len(vals),
-                    "within_budget": (None if p95 is None
-                                      else (p95 <= impact_budget_bps and missing == 0))}
+                    "unpriced_fraction": frac,
+                    "within_budget": (None if p95 is None else
+                                      (p95 <= impact_budget_bps
+                                       and frac <= MAX_UNPRICED_BOOK_FRACTION))}
     if not rows or all(v["p95_bps"] is None for v in per.values()):
         return {"status": UNAVAILABLE, "reason": "NO_BOOK_MEASUREMENTS", "by_size": per}
     # A walked book's cost never falls as the order grows, so a size is only
@@ -603,26 +727,78 @@ def capacity_bounds(rows: Sequence[Dict[str, Any]], impact_budget_bps: float,
 
 # -- the report and the one verdict -----------------------------------------------
 
+def _canon(x: Any) -> str:
+    return json.dumps(x, sort_keys=True, default=str, separators=(",", ":"))
+
+
 def _provenance(fwd: Sequence[Dict[str, Any]], run_inputs: Dict[str, Any]
                 ) -> Dict[str, Any]:
     """What this answer was computed from, so it can be reproduced from the
-    immutable inputs and nothing else: the chain hashes of the rows used, the
-    protocol, and every owner input. Two runs with the same digest are the same
-    experiment; a different digest is a different one, not a re-run."""
-    hashes = [r.get("hash") for r in fwd]
-    body = {"protocol_hash": protocol_hash(), "row_hashes": hashes,
-            "run_inputs": run_inputs}
-    digest = hashlib.sha256(json.dumps(body, sort_keys=True, default=str,
-                                       separators=(",", ":")).encode()).hexdigest()
+    immutable inputs and nothing else: the chain hash AND a content hash of every
+    row used, the protocol, and every input. Two runs with the same digest are
+    the same experiment; a different digest is a different one, not a re-run."""
+    chain = [r.get("hash") for r in fwd]
+    content = [hashlib.sha256(_canon(r.get("obs")).encode()).hexdigest() for r in fwd]
+    digest = hashlib.sha256(_canon({
+        "protocol_hash": protocol_hash(), "chain_hashes": chain,
+        "content_hashes": content, "run_inputs": run_inputs}).encode()).hexdigest()
     return {"protocol_hash": protocol_hash(),
             "evaluation_start_s": EVALUATION_START_S,
+            "analysis_horizon_days": ANALYSIS_HORIZON_DAYS,
             "forward_rows": len(fwd),
-            "first_row_hash": hashes[0] if hashes else None,
-            "last_row_hash": hashes[-1] if hashes else None,
+            "first_row_hash": chain[0] if chain else None,
+            "last_row_hash": chain[-1] if chain else None,
             "first_observed_at_s": fwd[0]["obs"]["observed_at_s"] if fwd else None,
             "last_observed_at_s": fwd[-1]["obs"]["observed_at_s"] if fwd else None,
             "inputs_digest": digest,
-            "rows_missing_a_chain_hash": sum(1 for h in hashes if not h)}
+            "rows_missing_a_chain_hash": sum(1 for h in chain if not h)}
+
+
+def validate_rows(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    """Reasons the observations cannot be trusted as a time series. Anything here
+    makes the evidence unreadable: a print stamped after the observation that
+    carries it is look-ahead, conflicting values for one print are two stories,
+    and prints not 8 hours apart are a series this module does not understand."""
+    issues: List[str] = []
+    seen: Dict[int, float] = {}
+    for idx, r in enumerate(rows):
+        o = r["obs"]
+        t_ms = o["observed_at_s"] * 1000.0
+        ps = o.get("settled_prints", [])
+        for bps, ms in ps:
+            ms = int(ms)
+            if not _finite(bps):
+                issues.append(f"row {idx}: a funding print is not a finite number")
+            if ms > t_ms + PRINT_CLOCK_SKEW_S * 1000:
+                issues.append(f"row {idx}: a print is stamped after the observation")
+            if ms in seen and _finite(bps) and _finite(seen[ms]) and seen[ms] != bps:
+                issues.append(f"row {idx}: print {ms} has two different values")
+            seen.setdefault(ms, bps)
+        mss = sorted(int(m) for _b, m in ps)
+        for x, y in zip(mss, mss[1:]):
+            if abs((y - x) / 1000.0 - PRINT_SPACING_S) > PRINT_SPACING_TOLERANCE_S:
+                issues.append(f"row {idx}: prints are not 8 hours apart")
+                break
+        if not r.get("hash"):
+            issues.append(f"row {idx}: no chain hash")
+        if len(issues) >= 5:
+            break
+    return issues
+
+
+def _stage(x: Optional[float], lo: float, hi: float, *, open_lo: bool = False,
+           open_hi: bool = False) -> bool:
+    if not _finite(x):
+        return False
+    return ((x > lo) if open_lo else (x >= lo)) and ((x < hi) if open_hi else (x <= hi))
+
+
+def _ratio(mean: Optional[float], sd: Optional[float]) -> Optional[float]:
+    if mean is None:
+        return None
+    if not sd:
+        return math.inf if mean > 0 else (-math.inf if mean < 0 else 0.0)
+    return mean / sd
 
 
 def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
@@ -634,36 +810,46 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
              chain_issues: Sequence[str] = (),
              taker_fee_bps: float = TAKER_FEE_BPS) -> Dict[str, Any]:
     chain_issues = list(chain_issues)
+    total_rows = len(rows)
     ts = [r["obs"].get("observed_at_s") for r in rows]
-    if any(not isinstance(t, (int, float)) or not math.isfinite(t) for t in ts) \
-            or any(b <= a for a, b in zip(ts, ts[1:]) if isinstance(a, (int, float))
-                   and isinstance(b, (int, float))):
-        chain_issues.append("OBSERVATIONS_NOT_STRICTLY_INCREASING_IN_TIME")
+    bad_i = next((i for i, t in enumerate(ts)
+                  if not isinstance(t, (int, float)) or not math.isfinite(t)), None)
+    if bad_i is None:
+        bad_i = next((i + 1 for i in range(len(ts) - 1) if ts[i + 1] <= ts[i]), None)
+    if bad_i is not None:
+        chain_issues.append(
+            f"OBSERVATIONS_NOT_STRICTLY_INCREASING_IN_TIME (first offending row "
+            f"index {bad_i})")
         rows = []
-    fwd = [r for r in rows if r["obs"].get("observed_at_s", 0) >= EVALUATION_START_S]
-    excluded = len(rows) - len(fwd)
+    horizon_end = EVALUATION_START_S + ANALYSIS_HORIZON_DAYS * 86400
+    fwd = [r for r in rows
+           if EVALUATION_START_S <= r["obs"].get("observed_at_s", 0) <= horizon_end]
+    before = sum(1 for r in rows if r["obs"].get("observed_at_s", 0) < EVALUATION_START_S)
+    after = sum(1 for r in rows if r["obs"].get("observed_at_s", 0) > horizon_end)
+    if fwd:
+        chain_issues += ["ROWS: " + m for m in validate_rows(fwd)]
+    run_inputs = {"planned_notional_usd": planned_notional_usd,
+                  "owner_capital_apr": owner_capital_apr,
+                  "owner_drawdown_limit_usd": owner_drawdown_limit_usd,
+                  "maintenance_margin_rate": maintenance_margin_rate,
+                  "collateral_ratio": collateral_ratio,
+                  "committed_capital_fraction": committed_capital_fraction,
+                  "taker_fee_bps": taker_fee_bps,
+                  "note": ("a verdict is a function of the evidence AND these "
+                           "inputs; changing them to re-run is not a new test")}
     out: Dict[str, Any] = {
         "schema": SCHEMA, "protocol_hash": protocol_hash(), "class": SIMULATED,
         "cash": False, "mode": "overlay",
         "planned_notional_usd": planned_notional_usd,
-        "observations_total": len(rows), "observations_forward": len(fwd),
-        "observations_before_declaration_excluded": excluded,
-        "chain_issues": chain_issues,
-        "run_inputs": {"owner_capital_apr": owner_capital_apr,
-                       "owner_drawdown_limit_usd": owner_drawdown_limit_usd,
-                       "maintenance_margin_rate": maintenance_margin_rate,
-                       "collateral_ratio": collateral_ratio,
-                       "committed_capital_fraction": committed_capital_fraction,
-                       "taker_fee_bps": taker_fee_bps,
-                       "note": ("a verdict is a function of the evidence AND "
-                                "these inputs; changing them to re-run is not "
-                                "a new test")}}
+        "observations_total": total_rows, "observations_forward": len(fwd),
+        "observations_before_declaration_excluded": before,
+        "observations_after_horizon_excluded": after,
+        "chain_issues": chain_issues, "run_inputs": run_inputs}
     prints = {int(p[1]) for r in fwd for p in r["obs"].get("settled_prints", [])
               if int(p[1]) >= EVALUATION_START_S * 1000}
     span_days = ((fwd[-1]["obs"]["observed_at_s"] - fwd[0]["obs"]["observed_at_s"])
                  / 86400.0) if len(fwd) > 1 else 0.0
-    out.update({"distinct_settled_prints": len(prints),
-                "span_days": span_days,
+    out.update({"distinct_settled_prints": len(prints), "span_days": span_days,
                 "independence_note": ("observations are hourly but a funding "
                                       "print settles every 8 hours: counts of "
                                       "observations are not counts of "
@@ -671,65 +857,96 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
     latest = {r["obs"].get("funding_print_ms") for r in fwd
               if isinstance(r["obs"].get("funding_print_ms"), (int, float))}
     out["distinct_latest_funding_prints"] = len(latest)     # what v1 also reports
-    out["provenance"] = _provenance(fwd, out["run_inputs"])
-    sim = simulate_episodes(fwd, planned_notional_usd, taker_fee_bps) if fwd else {
-        "closed": [], "open_at_end": False, "open_since_s": None}
+    out["provenance"] = _provenance(fwd, run_inputs)
+    sim = (simulate_episodes(fwd, planned_notional_usd, taker_fee_bps)
+           if fwd and not chain_issues else
+           {"closed": [], "open_at_end": False, "open_since_s": None,
+            "open_marked": None})
     closed = sim["closed"]
-    priced = [e for e in closed if _finite(e.get("carry_bps"))
-              and _finite(e.get("carry_usd")) and _finite(e.get("worst_path_usd"))]
-    out["episodes"] = {"closed": len(closed), "priced": len(priced),
-                       "unpriced_unavailable": len(closed) - len(priced),
-                       "unpriced_fraction": ((len(closed) - len(priced)) / len(closed))
-                       if closed else 0.0,
-                       "open_at_end": sim["open_at_end"],
-                       "open_since_s": sim["open_since_s"]}
-    carry = [e["carry_bps"] for e in priced]
-    favourable = [e["carry_bps_most_favourable"] for e in priced]
+
+    def ok(e: Dict[str, Any]) -> bool:
+        return (_finite(e.get("carry_bps"))
+                and _finite(e.get("carry_bps_most_favourable")))
+    priced = [e for e in closed if ok(e)]
+    unpriced = [e for e in closed if not ok(e)]
+    out["episodes"] = {
+        "closed": len(closed), "priced": len(priced),
+        "unpriced_unavailable": len(unpriced),
+        "unpriced_fraction": (len(unpriced) / len(closed)) if closed else 0.0,
+        "gap_spanning": sum(1 for e in closed if e.get("gap_spanning")),
+        "open_at_end": sim["open_at_end"], "open_since_s": sim["open_since_s"],
+        "unpriced_valuation": ("GO path: the worst priced episode; NO_GO path: "
+                               "the best; never dropped")}
+    worst_c = min((e["carry_bps"] for e in priced), default=None)
+    best_f = max((e["carry_bps_most_favourable"] for e in priced), default=None)
+    worst_p = min((e["worst_path_usd"] for e in priced if _finite(e.get("worst_path_usd"))),
+                  default=None)
+    scale = planned_notional_usd / 1e4
+
+    def adverse(e: Dict[str, Any]) -> float:
+        return e["carry_bps"] if _finite(e.get("carry_bps")) else worst_c
+
+    def favourable(e: Dict[str, Any]) -> float:
+        return (e["carry_bps_most_favourable"]
+                if _finite(e.get("carry_bps_most_favourable")) else best_f)
+    have = bool(priced)
+    carry = [adverse(e) for e in closed] if have else []
+    fav = [favourable(e) for e in closed] if have else []
+    holds = [e["hold_days"] for e in closed] if have else []
+    passive = [e["passive_return_bps"] for e in closed] if have else []
     out["carry_bps_per_episode"] = mean_bounds(carry)
-    out["carry_bps_most_favourable"] = mean_bounds(favourable)
-    out["incremental_vs_passive_usd"] = mean_bounds(
-        [e["incremental_vs_passive_usd"] for e in priced])
-    out["passive_return_bps"] = mean_bounds([e["passive_return_bps"] for e in priced])
-    out["overlay_total_return_bps"] = mean_bounds(
-        [e["overlay_total_return_bps"] for e in priced])
+    out["carry_bps_most_favourable"] = mean_bounds(fav)
+    # overlay total return == carry (the BTC leg cancels); incremental = carry - passive
+    out["overlay_total_return_bps"] = out["carry_bps_per_episode"]
+    out["passive_return_bps"] = mean_bounds(passive)
     out["incremental_vs_passive_bps"] = mean_bounds(
-        [e["incremental_vs_passive_bps"] for e in priced])
-    held_days = sum(e["hold_days"] for e in priced)
-    out["capital_utilisation"] = (held_days / span_days) if span_days > 0 else None
-    # net carry earned across the whole forward span (idle time included), per
-    # year, in bps of the notional: the number that says what the idea pays
-    out["annualised_carry_bps_of_notional"] = (
-        sum(e["carry_bps"] for e in priced) / span_days * 365.0
-        if priced and span_days > 0 else None)
-    out["annualisation_note"] = ("sum of closed-episode carry over the forward "
-                                 "span, scaled to 365 days; idle time is in the "
-                                 "denominator; not a forecast")
+        [c - p for c, p in zip(carry, passive)])
     out["directional_component_usd"] = mean_bounds(
-        [e["directional_component_usd"] for e in priced])
-    worst = min((e["worst_path_usd"] for e in priced), default=None)
-    out["worst_episode_usd"] = worst           # lowest point of any priced episode's path
+        [e["directional_component_usd"] for e in closed] if have else [])
+    out["incremental_vs_passive_usd"] = mean_bounds(
+        [(c - p) * scale for c, p in zip(carry, passive)])
+    o_m, p_m = out["carry_bps_per_episode"], out["passive_return_bps"]
+    out["risk_adjusted_vs_passive"] = {
+        "overlay_mean_over_sd": _ratio(o_m["mean"], o_m["sd"]),
+        "passive_mean_over_sd": _ratio(p_m["mean"], p_m["sd"]),
+        "overlay_sd_bps": o_m["sd"], "passive_sd_bps": p_m["sd"],
+        "note": ("per closed episode, unannualised; the overlay sheds the price "
+                 "exposure on purpose, so raw return alone is not the test")}
+    held_days = sum(holds)
+    out["capital_utilisation"] = (held_days / span_days) if span_days > 0 else None
+    out["annualised_carry_bps_of_notional"] = (
+        sum(carry) / span_days * 365.0 if carry and span_days > 0 else None)
+    out["annualisation_note"] = ("sum of closed-episode carry after execution "
+                                 "costs and BEFORE capital cost, over the forward "
+                                 "span scaled to 365 days; idle time is in the "
+                                 "denominator; unpriced episodes valued "
+                                 "adversely; not a forecast")
+    worst = worst_p
     om = sim.get("open_marked")
     om_ok = om is not None and _finite(om.get("carry_bps"))
     if om_ok and _finite(om.get("worst_path_usd")):
         worst = om["worst_path_usd"] if worst is None else min(worst, om["worst_path_usd"])
-        out["worst_episode_usd"] = worst
+    out["worst_episode_usd"] = worst
     out["open_episode_marked"] = (
         {"carry_bps": om["carry_bps"], "carry_usd": om["carry_usd"],
+         "hold_days": om["hold_days"],
          "note": "marked to market at the last observation; not an exit"}
         if om_ok else ({"status": UNAVAILABLE} if sim["open_at_end"] else None))
     out["carry_bps_with_open_episode"] = mean_bounds(
         carry + ([om["carry_bps"]] if om_ok else []))
     out["return_distribution_bps"] = (
-        {"status": UNAVAILABLE, "reason": "FEWER_THAN_20_EPISODES"} if len(priced) < 20
+        {"status": UNAVAILABLE, "reason": "FEWER_THAN_20_EPISODES"} if len(closed) < 20 or not carry
         else {"status": "MEASURED", "min": min(carry), "p5": _quantile(carry, 0.05),
               "median": _quantile(carry, 0.5), "p95": _quantile(carry, 0.95),
               "max": max(carry)})
-    cap = capital_model(owner_capital_apr, carry, [e["hold_days"] for e in priced],
-                        committed_capital_fraction)
-    out["capital"] = cap
-    # The break-even one-way impact: what the mean episode earns before any
-    # impact (carry + the impact charged) after fees, split over its two legs.
-    gross = [e["carry_bps"] + e["impact_upper_bps"] for e in priced]
+    out["capital"] = capital_model(owner_capital_apr, carry, holds,
+                                   committed_capital_fraction)
+    out["capital_with_open_episode"] = (
+        capital_model(owner_capital_apr, carry + [om["carry_bps"]],
+                      holds + [om["hold_days"]], committed_capital_fraction)
+        if om_ok else None)
+    gross = [adverse(e) + (e["impact_upper_bps"] if _finite(e.get("impact_upper_bps"))
+                           else 0.0) for e in closed] if have else []
     budget = (sum(gross) / len(gross) / 2.0) if gross else None
     if budget is None or budget <= 0 or not fwd:
         out["capacity"] = {"status": UNAVAILABLE,
@@ -774,7 +991,7 @@ def verdict(rep: Dict[str, Any], drawdown_limit_usd: Optional[float] = None
     if (rep.get("distinct_settled_prints") or 0) < ad["min_distinct_settled_prints"]:
         why.append(f"FEWER_THAN_{ad['min_distinct_settled_prints']}_DISTINCT_PRINTS")
     if ep.get("unpriced_fraction", 0.0) > PROTOCOL["max_unpriced_fraction"]:
-        why.append("TOO_MANY_EPISODES_UNPRICEABLE_OR_ACROSS_GAPS")
+        why.append("TOO_MANY_EPISODES_UNPRICEABLE")
     if why:
         return "INSUFFICIENT", why
     fav = rep["carry_bps_most_favourable"]
@@ -786,15 +1003,17 @@ def verdict(rep: Dict[str, Any], drawdown_limit_usd: Optional[float] = None
     res = cap["result"]
     if res["lower95"] is None or res["lower95"] <= 0:
         return "INSUFFICIENT", ["LOWER_95_BOUND_NOT_ABOVE_ZERO_AFTER_CAPITAL_COST"]
-    inc = rep.get("incremental_vs_passive_bps") or {}
-    if inc.get("mean") is None or inc["mean"] < 0:
-        return "INSUFFICIENT", ["OVERLAY_UNDERPERFORMS_PASSIVE_BTC_IN_SAMPLE"]
     if rep.get("open_episode_marked") == {"status": UNAVAILABLE}:
         return "INSUFFICIENT", ["OPEN_EPISODE_CANNOT_BE_MARKED"]
-    wo = rep.get("carry_bps_with_open_episode") or {}
-    if rep.get("open_episode_marked") and (wo.get("lower95") is None
-                                           or wo.get("lower95") <= 0):
+    cwo = rep.get("capital_with_open_episode")
+    if rep.get("open_episode_marked") and (
+            not cwo or cwo.get("result") is None
+            or cwo["result"].get("lower95") is None or cwo["result"]["lower95"] <= 0):
         return "INSUFFICIENT", ["LOWER_95_BOUND_NOT_ABOVE_ZERO_WITH_OPEN_EPISODE"]
+    ra = rep.get("risk_adjusted_vs_passive") or {}
+    o_r, p_r = ra.get("overlay_mean_over_sd"), ra.get("passive_mean_over_sd")
+    if o_r is None or p_r is None or o_r < p_r:
+        return "INSUFFICIENT", ["OVERLAY_TRAILS_PASSIVE_BTC_PER_UNIT_OF_RISK"]
     if rep["capacity"].get("planned_inside_measured_capacity") is not True:
         return "INSUFFICIENT", ["PLANNED_SIZE_NOT_INSIDE_MEASURED_CAPACITY"]
     if not _finite(drawdown_limit_usd) or drawdown_limit_usd <= 0:
@@ -804,7 +1023,9 @@ def verdict(rep: Dict[str, Any], drawdown_limit_usd: Optional[float] = None
         return "INSUFFICIENT", [INSUFFICIENT_OWNER_INPUT + ":MARGIN_FACTS"]
     if liq["pct"] < PROTOCOL["min_liquidation_distance_pct"]:
         return "INSUFFICIENT", ["LIQUIDATION_DISTANCE_BELOW_ENGINE_FLOOR"]
-    if rep["worst_episode_usd"] is None or rep["worst_episode_usd"] < -float(drawdown_limit_usd):
+    if rep["worst_episode_usd"] is None:
+        return "INSUFFICIENT", ["NO_OBSERVED_EPISODE_PATH"]
+    if rep["worst_episode_usd"] < -float(drawdown_limit_usd):
         return "INSUFFICIENT", ["WORST_EPISODE_EXCEEDS_DRAWDOWN_LIMIT"]
     return "GO", ["LOWER_95_BOUND_POSITIVE_AFTER_MEASURED_COSTS_AND_CAPITAL"]
 
