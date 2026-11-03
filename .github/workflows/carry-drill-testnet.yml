@@ -77,8 +77,10 @@ jobs:
       BOOK_MODE: carry
       CARRY_BORROW_APR: "0.0"
       CARRY_EXECUTION_MODE: overlay
-      # The drill exists to produce the execution evidence the net-benefit gate
-      # needs; "enforce" would refuse its entries until that evidence exists.
+      # "observe" lets entries proceed while recording what the net-benefit
+      # gate would have refused; it is not read-only. It is inert for the drill
+      # today (tools/drill.py builds its own engine and never attaches that
+      # gate); it is declared so the drill cannot silently pick up "enforce".
       CARRY_ENTRY_BENEFIT_MODE: observe
       BYBIT_VENUE: testnet
       USE_TESTNET: "1"

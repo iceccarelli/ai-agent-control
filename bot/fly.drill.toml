@@ -33,8 +33,13 @@ retries = 10
 USE_TESTNET = "1"
 PAPER_TRADING = "0"
 BYBIT_VENUE = "testnet"
-# Gathering execution evidence is this app's purpose: record what the entry
-# net-benefit gate would refuse without refusing the drill's entries.
+# "observe" LETS ENTRIES PROCEED while recording what the entry net-benefit
+# gate would have refused; it is not read-only and not a safety setting. Today
+# it is also INERT here: the drill builds its own engine (tools/drill.py) and
+# never attaches that gate, and the read-only monitor does not read it. It is
+# declared so that this app can never silently pick up "enforce" if the gate
+# is ever attached to it. The drill's only protections are the testnet-only
+# checks (session_refusal) and its $100 cap.
 CARRY_ENTRY_BENEFIT_MODE = "observe"
 
 [[mounts]]

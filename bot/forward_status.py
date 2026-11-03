@@ -117,6 +117,10 @@ class ForwardStatus:
     signal: Optional[str] = None
     symbol: Optional[str] = None
     schema: Optional[str] = None
+    #: What the artefact says it was produced under; the promotion gate binds
+    #: the evidence to the strategy and mode it is used for.
+    constants_fingerprint: Optional[str] = None
+    execution_mode: Optional[str] = None
     observed_at_utc: Optional[str] = None
     age_s: Optional[float] = None
     fresh: Optional[bool] = None
@@ -252,7 +256,11 @@ def evaluate_forward_evidence(
 
     ident = dict(signal=art.get("signal") if isinstance(art.get("signal"), str) else None,
                  symbol=art.get("symbol") if isinstance(art.get("symbol"), str) else None,
-                 schema=art.get("schema") if isinstance(art.get("schema"), str) else None)
+                 schema=art.get("schema") if isinstance(art.get("schema"), str) else None,
+                 constants_fingerprint=art.get("constants_fingerprint")
+                 if isinstance(art.get("constants_fingerprint"), str) else None,
+                 execution_mode=art.get("execution_mode")
+                 if isinstance(art.get("execution_mode"), str) else None)
     observed = _epoch(art.get("observed_at_utc"))
     if observed is None:
         return refused(UNREADABLE, "observed_at_utc is missing or not "

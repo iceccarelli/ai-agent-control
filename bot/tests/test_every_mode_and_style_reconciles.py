@@ -69,13 +69,17 @@ class TestEveryCombinationReconciles:
     def test_the_journal_agrees_with_the_running_totals(self, runs, combo):
         r = runs[combo]
         assert r["ledger_agrees"], (
-            f"{combo}: journal {r['ledger_net_usd']:,.2f} + unrealised "
+            f"{combo}: journal pair {r['ledger_pair_net_usd']:,.2f} + unrealised "
             f"{r['unrealised_usd']:,.2f} != replay {r['net_usd']:,.2f}")
 
     @pytest.mark.parametrize("combo", COMBINATIONS)
     def test_the_gap_is_zero_to_the_cent(self, runs, combo):
         r = runs[combo]
-        gap = r["ledger_net_usd"] + r["unrealised_usd"] - r["net_usd"]
+        # The replay values BOTH legs: its net is the journal's PAIR net (cash
+        # + the marked inventory move), not its cash net.
+        gap = r["ledger_pair_net_usd"] + r["unrealised_usd"] - r["net_usd"]
+        assert (r["ledger_net_usd"] + r["ledger_inventory_mark_usd"]
+                - r["ledger_pair_net_usd"]) == pytest.approx(0.0, abs=1e-6)
         assert abs(gap) < 0.01, f"{combo}: ${gap:,.2f} unaccounted"
 
     @pytest.mark.parametrize("combo", COMBINATIONS)

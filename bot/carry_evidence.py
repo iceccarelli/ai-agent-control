@@ -28,9 +28,9 @@ _RESULT_OUTCOMES = ("CLOSED", "ABORTED_BEFORE_HEDGE")
 
 NET_BASIS = ("ledger net USD per closed cycle after booked fees, funding and "
              "financing; ACTUAL_RECONCILED cycles only (tools/carry_performance); "
-             "an overlay cycle counts only when its hedged BTC inventory leg is "
-             "booked in the journal, because otherwise its net is that of an "
-             "unhedged short")
+             "overlay cycles are never counted: their cash is the short's "
+             "result alone and their pair economics rest on a marked, unsold "
+             "inventory leg, which is not cash")
 
 
 def _num(x: Any) -> Optional[float]:
@@ -108,16 +108,17 @@ def evidence_from_report(report: Mapping[str, Any], *, strategy_id: str,
                 _num(c.get("net_usd"))
             if (None in (start, end, net) or end < start or not _cycle_is_cash(c)):
                 continue                    # a cycle the report cannot vouch for
-            # An overlay's booked net holds the short's price leg but not the
-            # client's BTC it hedges (the live journal never revalues it), so
-            # it is the net of an unhedged short: a falling market reads as a
-            # run of wins and a rising one as losses. Such a cycle is NOT
-            # carry evidence and is left out (it is then counted in
-            # `unqualified_results`, never silently dropped), so the verdict
-            # goes INSUFFICIENT instead of passing or breaching on BTC's
-            # direction. Only an overlay cycle whose inventory leg is BOOKED
-            # counts; a cycle with no overlay flag at all is read as before.
-            if c.get("overlay") and c.get("hedged_pair_inventory_leg") != "BOOKED":
+            # An overlay hedges BTC the client already owns and the book never
+            # sells. Its cash is the short's result alone (the hedge is not in
+            # it) and its pair economics rest on a MARKED, unsold inventory
+            # leg: neither is cash evidence of a hedged carry, and a cash-only
+            # policy must not be satisfied by marks. Such a cycle is therefore
+            # never a trade here; it is counted in `unqualified_results`, which
+            # keeps the verdict INSUFFICIENT rather than silently dropping it.
+            # Only a cycle that is explicitly NOT an overlay (spot really
+            # bought and sold: both legs are cash) can count, and a cycle that
+            # does not say is refused.
+            if c.get("overlay") is not False:
                 continue
             taken.add(cid)
             trades.append(_se.EvidenceTrade(

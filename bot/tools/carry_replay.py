@@ -943,10 +943,19 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             # cancellation into a visible double-count: exactly $151,904.02 of
             # it, which is the acquire revaluation total to the cent.
             if execution_mode == cb.OVERLAY:
+                _to = exit_spot if exit_spot is not None else row.spot
                 L.revalue_inventory(
                     journal, ms=int(row.ms), ref=f"reval:{row.ms}",
                     qty=open_trade["qty"], from_price=open_trade["entry_spot"],
-                    to_price=(exit_spot if exit_spot is not None else row.spot))
+                    to_price=_to,
+                    raw={"valuation": L.MARK_VALUATION, "qty": open_trade["qty"],
+                         "entry_spot": open_trade["entry_spot"],
+                         "exit_spot": _to,
+                         "exit_mark_source": "replay_corpus_spot_row",
+                         "exit_mark_observed_ms": int(row.ms),
+                         "fill_ms": int(row.ms),
+                         "note": "HISTORICAL_SIMULATION: a corpus row, not an "
+                                 "observation of this book"})
             open_trade.update({"closed_ms": int(row.ms),
                                "exit_perp": (exit_perp if exit_perp is not None
                                              else row.perp),
@@ -1056,12 +1065,17 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         },
         "ledger_entries": len(journal.entries),
         "ledger_net_usd": statement["net_usd"],
+        "ledger_pair_net_usd": statement["pair_net_usd"],
+        "ledger_inventory_mark_usd": statement["inventory_mark_usd"],
         # THE CROSS-CHECK. The journal holds realised money only, so the
         # replay's net — which marks the position still open at the window
         # end — must equal the journal's net plus that mark and nothing else.
         "unrealised_usd": unrealised_usd,
+        # The replay's net is the PAIR's (both legs valued); the journal's
+        # cash net excludes the inventory mark, so the pair figure is the one
+        # that must agree with it.
         "ledger_agrees": abs(
-            statement["net_usd"] + unrealised_usd - net) < max(
+            statement["pair_net_usd"] + unrealised_usd - net) < max(
                 0.01, 1e-6 * abs(net)),
         "halted_at_ms": halted_at,
         "trade_rows": trades,

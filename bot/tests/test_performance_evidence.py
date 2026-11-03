@@ -45,6 +45,27 @@ def overlay_cycle(j, d0, d1, *, tag, funding=300.0, close_price=98_000.0,
         reconcile_last(j, ms=T0 + d1 * DAY + 1)
 
 
+def acquire_cycle(j, d0, d1, *, tag, funding=300.0, close_price=98_000.0,
+                  fee_status="confirmed", reconcile=True, qty=1.0):
+    """An ACQUIRE cycle: the spot is bought and sold, so BOTH legs are cash
+    (the perp's result and the spot's realised result), unlike an overlay whose
+    coin is never sold. Net with the defaults: 300 - 4 x 55 + 2000 - 2000 = 80."""
+    L.spot_buy(j, ms=T0 + d0 * DAY, ref=f"{tag}-sb", qty=qty, price=100_000.0,
+               fee_btc=0.0, fee_usdt=55.0, fee_status=fee_status)
+    L.perp_open(j, ms=T0 + d0 * DAY + 1, ref=f"{tag}-o", qty=qty,
+                price=100_000.0, fee_usd=55.0, fee_status=fee_status)
+    L.funding(j, ms=T0 + (d0 + 1) * DAY, ref=f"{tag}-f", usd=funding,
+              basis="venue")
+    L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=qty,
+                 price=close_price, entry_price=100_000.0, fee_usd=55.0,
+                 fee_status=fee_status)
+    L.spot_sell(j, ms=T0 + d1 * DAY + 1, ref=f"{tag}-ss", qty=qty,
+                price=close_price, cost_basis=100_000.0, fee_usd=55.0,
+                fee_status=fee_status)
+    if reconcile:
+        reconcile_last(j, ms=T0 + d1 * DAY + 2)
+
+
 def reconcile_last(j, *, ms):
     """A FULLY_RECONCILED record for the newest lifecycle, as
     funding_reconcile writes one (fingerprint of the exposure it judged)."""

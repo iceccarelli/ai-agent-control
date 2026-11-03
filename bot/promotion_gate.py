@@ -288,13 +288,33 @@ FORWARD_ITEM = "forward_shadow_clean"
 _FORWARD_UNUSABLE = frozenset({"NO_DATA", "UNREADABLE", "STALE"})
 
 
-def _forward_item(artifact: str, now: float) -> Tuple[bool, str]:
+#: The book mode the forward-shadow artefact is evidence for. The artefact is
+#: the DIRECTIONAL funding-fade shadow's paper record; it says nothing about
+#: any other book, so any other mode is refused rather than defaulted.
+FORWARD_EVIDENCE_BOOK_MODE = "directional"
+
+
+def _forward_item(artifact: str, now: float, *,
+                  book_mode: str = FORWARD_EVIDENCE_BOOK_MODE
+                  ) -> Tuple[bool, str]:
     """(machine_ok, evidence) for the forward-shadow item, from the artefact.
+
+    BOUND TO THE STRATEGY: the artefact must name the shadow's own signal,
+    symbol, constants fingerprint and paper mode, and the book being promoted
+    must be the directional one. Directional paper evidence cannot promote a
+    carry book (or any other), and an artefact that does not state who it is
+    for is refused.
 
     machine_ok needs: readable, FRESH, not DETERIORATING, and at least the
     gate's own minimum trades AND days. It is necessary, never sufficient: the
     human flag and approval digest are still required by the caller."""
     import forward_status as _fs
+    if book_mode != FORWARD_EVIDENCE_BOOK_MODE:
+        return False, (
+            f"the forward-shadow artefact is DIRECTIONAL paper evidence "
+            f"({shadow.SHADOW_SIGNAL}); it cannot promote the {book_mode!r} "
+            "book, and no evidence source for that book is wired into this "
+            "gate")
     try:
         fs = _fs.evaluate_forward_evidence(artifact, now=float(now))
     except Exception as exc:  # noqa: BLE001 - unreadable evidence is a refusal
@@ -308,6 +328,14 @@ def _forward_item(artifact: str, now: float) -> Tuple[bool, str]:
         f"trades, {fs.days_vs_gate} forward days; mean {mean}; observed "
         f"{fs.observed_at_utc}, age {age} (limit {fs.max_age_s / 3600.0:.0f}h). "
         "These are paper observations, not cash.")
+    wanted = {"signal": shadow.SHADOW_SIGNAL, "symbol": shadow.SHADOW_SYMBOL,
+              "constants_fingerprint": shadow.CONSTANTS_FINGERPRINT,
+              "execution_mode": "paper"}
+    wrong = [f"{k}={getattr(fs, k)!r} (expected {v!r})"
+             for k, v in wanted.items() if getattr(fs, k) != v]
+    if wrong:
+        return False, ("artefact identity does not match the strategy being "
+                       "promoted: " + "; ".join(wrong) + ". " + evidence)
     ok = (fs.state not in _FORWARD_UNUSABLE and fs.state != "DETERIORATING"
           and bool(fs.trades_at_or_above_min) and bool(fs.days_at_or_above_min))
     return ok, evidence
@@ -317,8 +345,13 @@ def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None
                             config: Any = None,
                             approvals_path: Optional[str] = None,
                             forward_artifact: Optional[str] = None,
-                            now: Optional[float] = None) -> GateVerdict:
+                            now: Optional[float] = None,
+                            book_mode: str = FORWARD_EVIDENCE_BOOK_MODE
+                            ) -> GateVerdict:
     """Every item, its state, and whether live may be promoted. Fails closed.
+
+    `book_mode` is the book being promoted ("directional" or "carry"); the
+    forward-shadow evidence is bound to the directional one only.
 
     A non-machine item is complete only if its flag is a JSON true AND the
     digest of its entry is in the approvals file (`approvals_path`, else the
@@ -376,7 +409,8 @@ def evaluate_promotion_gate(*, path: str = GATE_PATH, repo: Optional[str] = None
                 machine_ok, evidence = _forward_item(
                     forward_artifact or os.path.join(
                         repo, "artifacts", "forward_shadow_current.json"),
-                    time.time() if now is None else now)
+                    time.time() if now is None else now,
+                    book_mode=book_mode)
                 complete = bool(complete and machine_ok)
 
         items.append(GateItem(key=key, description=description, owner=owner,
@@ -433,7 +467,9 @@ def promotion_gate_allows_live(*, path: str = GATE_PATH,
                                config: Any = None,
                                approvals_path: Optional[str] = None,
                                forward_artifact: Optional[str] = None,
-                               now: Optional[float] = None) -> bool:
+                               now: Optional[float] = None,
+                               book_mode: str = FORWARD_EVIDENCE_BOOK_MODE
+                               ) -> bool:
     """`True` only if every item is complete AND live is independently armed.
 
     Returns `False` on this tree. Note what this function does NOT do even when
@@ -443,4 +479,4 @@ def promotion_gate_allows_live(*, path: str = GATE_PATH,
     return evaluate_promotion_gate(path=path, repo=repo, config=config,
                                    approvals_path=approvals_path,
                                    forward_artifact=forward_artifact,
-                                   now=now).allows_live
+                                   now=now, book_mode=book_mode).allows_live

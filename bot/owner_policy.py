@@ -55,6 +55,34 @@ def drawdown_limit(cfg: Any) -> Tuple[Optional[float], str, str]:
     return v, SET, ""
 
 
+def opportunity_cost_assumption(cfg: Any) -> Dict[str, Any]:
+    """What the entry gate assumes about the OWNER's capital. Not a required
+    input and never given a value here: no verified hurdle rate exists in this
+    repository, and an unset setting is not a rate. The gate's default is 0.0,
+    which prices the owner's capital (BTC already held, margin posted) as free.
+    `cfg` may carry None (the setting was not supplied) or the parsed number."""
+    raw = getattr(cfg, "CARRY_OPPORTUNITY_COST_APR", None)
+    v = _num(raw)
+    if raw is None:
+        state, meaning = "UNSET_TREATED_AS_ZERO", (
+            "the entry gate treats the owner's capital as FREE (0.0 "
+            "opportunity cost); no hurdle rate has been supplied and none is "
+            "suggested")
+    elif v is None or v < 0:
+        state, meaning = INVALID, "not a usable non-negative number"
+    elif v == 0.0:
+        state, meaning = "ZERO_UNSET_OR_EXPLICIT", (
+            "0.0: either unset or explicitly zero (indistinguishable once "
+            "parsed); the entry gate treats the owner's capital as FREE")
+    else:
+        state, meaning = "USER_SUPPLIED", (
+            f"{v:.4f}/yr as supplied by the operator; this software has not "
+            "verified it against any actual alternative use of the capital")
+    return {"name": "CARRY_OPPORTUNITY_COST_APR", "state": state,
+            "value": v, "meaning": meaning,
+            "affects_policy_inputs_complete": False}
+
+
 def unknown_status() -> Dict[str, Any]:
     """The same shape as `owner_policy_status`, for when no configuration is
     available: nothing is known, so nothing is claimed."""
@@ -66,6 +94,7 @@ def unknown_status() -> Dict[str, Any]:
         "entry_benefit_mode": None, "income_haircut_fraction": None,
         "missing_or_unusable": ["configuration unavailable"],
         "policy_inputs_complete": False,
+        "assumptions": [opportunity_cost_assumption(None)],
         "consequence": "unknown", "note": "these are owner decisions; this "
                                           "software suggests no values"}
 
@@ -91,6 +120,9 @@ def owner_policy_status(cfg: Any, *, now_s: Optional[float] = None
         "income_haircut_fraction": getattr(cfg, "CARRY_INCOME_HAIRCUT_FRACTION", None),
         "missing_or_unusable": missing,
         "policy_inputs_complete": ok,
+        # Assumptions the gate makes on the owner's behalf. They are reported,
+        # not required: they do not change `policy_inputs_complete`.
+        "assumptions": [opportunity_cost_assumption(cfg)],
         "consequence": (
             "the evidence inputs are set; under 'enforce' entries stay refused "
             "until real execution samples AND reconciled cycles that pass the "

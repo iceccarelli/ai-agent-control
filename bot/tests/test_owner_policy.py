@@ -166,3 +166,68 @@ def test_no_deployment_config_sets_the_owner_evidence_inputs():
     text = open(os.path.join(REPO, ".github", "workflows",
                              "carry-drill-testnet.yml"), encoding="utf-8").read()
     assert "CARRY_EVIDENCE_" not in text
+
+
+# -- the opportunity-cost assumption is stated, never invented -------------------
+
+def test_an_unset_opportunity_cost_is_reported_as_free_capital_and_is_not_required():
+    import types
+    import owner_policy as op
+    cfg = types.SimpleNamespace(
+        CARRY_EVIDENCE_DISCOVERY_START_EPOCH=1.0,
+        CARRY_EVIDENCE_DISCOVERY_END_EPOCH=2.0,
+        CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD=20.0,
+        CARRY_ENTRY_BENEFIT_MODE="enforce", CARRY_OPPORTUNITY_COST_APR=None)
+    st = op.owner_policy_status(cfg)
+    (a,) = st["assumptions"]
+    assert a["state"] == "UNSET_TREATED_AS_ZERO" and a["value"] is None
+    assert "FREE" in a["meaning"] and a["affects_policy_inputs_complete"] is False
+    assert st["policy_inputs_complete"] is True        # not a required input
+
+
+def test_a_supplied_opportunity_cost_is_labelled_user_supplied_and_unverified():
+    import types
+    import owner_policy as op
+    a = op.opportunity_cost_assumption(
+        types.SimpleNamespace(CARRY_OPPORTUNITY_COST_APR=0.05))
+    assert a["state"] == "USER_SUPPLIED" and a["value"] == 0.05
+    assert "not verified" in a["meaning"]
+
+
+def test_zero_cannot_be_told_from_unset_once_parsed_and_says_so():
+    import types
+    import owner_policy as op
+    a = op.opportunity_cost_assumption(
+        types.SimpleNamespace(CARRY_OPPORTUNITY_COST_APR=0.0))
+    assert a["state"] == "ZERO_UNSET_OR_EXPLICIT" and "FREE" in a["meaning"]
+
+
+def test_a_negative_or_bad_opportunity_cost_is_invalid():
+    import types
+    import owner_policy as op
+    for bad in (-0.01, "x", float("nan")):
+        a = op.opportunity_cost_assumption(
+            types.SimpleNamespace(CARRY_OPPORTUNITY_COST_APR=bad))
+        assert a["state"] == "INVALID"
+
+
+def test_the_check_tool_reports_the_assumption_without_changing_its_exit_code():
+    import io
+    import json
+    from contextlib import redirect_stdout
+    import owner_policy_check as chk
+    base = {"CARRY_EVIDENCE_DISCOVERY_START_EPOCH": "1",
+            "CARRY_EVIDENCE_DISCOVERY_END_EPOCH": "2",
+            "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD": "20"}
+    def run(extra):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = chk.main(env={**base, **extra})
+        return code, json.loads(buf.getvalue())
+    code, out = run({})
+    assert code == 0 and out["assumptions"][0]["state"] == "UNSET_TREATED_AS_ZERO"
+    code, out = run({"CARRY_OPPORTUNITY_COST_APR": "0.04"})
+    assert code == 0 and out["assumptions"][0]["state"] == "USER_SUPPLIED"
+    code, out = run({"CARRY_OPPORTUNITY_COST_APR": "banana"})
+    assert code == 3 and "CARRY_OPPORTUNITY_COST_APR" in out["unparseable_settings"]
+    assert "banana" not in json.dumps(out)

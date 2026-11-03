@@ -60,7 +60,7 @@ import re
 import sqlite3
 import sys
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -90,8 +90,18 @@ PAPER_EXECUTION = "PAPER_EXECUTION"
 HISTORICAL_SIMULATION = "HISTORICAL_SIMULATION"
 FORWARD_SIMULATION = "FORWARD_SIMULATION"
 UNAVAILABLE = "UNAVAILABLE"
+#: The hedged pair valued with the client's BTC MARKED (never sold) between the
+#: entry spot and the exit spot. It is economic performance, not cash: it can
+#: never be a `realized_cash` figure and never satisfies a cash-only policy.
+MARKED_PAIR_ECONOMICS = "MARKED_PAIR_ECONOMICS"
 EVIDENCE_CLASSES = (ACTUAL_RECONCILED, OPEN_MARK_TO_MARKET, PAPER_EXECUTION,
-                    HISTORICAL_SIMULATION, FORWARD_SIMULATION, UNAVAILABLE)
+                    HISTORICAL_SIMULATION, FORWARD_SIMULATION,
+                    MARKED_PAIR_ECONOMICS, UNAVAILABLE)
+
+#: How old (before the fill it values) an inventory mark may be. A mark is the
+#: spot the engine saw at the decision tick, or one public read taken right
+#: after the fill; anything older than two ticks is not "the price at the time".
+MAX_MARK_AGE_MS = 120_000
 #: The class of an execution ledger whose environment nobody declared.
 UNDECLARED_ENVIRONMENT = "UNDECLARED_ENVIRONMENT"
 SECTION_CLASSES = EVIDENCE_CLASSES + (UNDECLARED_ENVIRONMENT,)
@@ -282,6 +292,10 @@ def _finish(cur: Dict[str, Any]) -> Dict[str, Any]:
     unread = cur.pop("_fill_memo_unread")
     qty = sum(q for q, _ in opens) if opens and not unread else None
     cur["hedged_qty"] = qty
+    cur["perp_closed_qty"] = (sum(q for q, _ in closes)
+                              if closes and not unread else None)
+    cur["mark_status"], cur["mark_reasons"] = verify_marks(
+        cur.pop("_marks"), cur.pop("_open_raw"), cur["perp_closed_qty"])
     cur["perp_fills"] = len(opens) + len(closes)
     cur["perp_entry_price"] = (sum(q * p for q, p in opens) / qty
                                if qty else None)
@@ -298,6 +312,82 @@ def _finish(cur: Dict[str, Any]) -> Dict[str, Any]:
                 "last_close_ms", "perp_qty", "spot_qty", "spot_sold", "last_ms"):
         cur.pop(key, None)
     return cur
+
+
+def _finite_pos(x: Any) -> bool:
+    return (isinstance(x, (int, float)) and not isinstance(x, bool)
+            and math.isfinite(x) and x > 0)
+
+
+def verify_marks(marks: Sequence[Mapping[str, Any]],
+                 opens: Sequence[Any],
+                 closed_qty: Optional[float]) -> Tuple[str, List[str]]:
+    """Is every inventory mark in this cycle a usable one? Returns
+    ("NONE" | "VERIFIED" | "UNVERIFIED", reasons). Fails closed: a mark with no
+    stated provenance, a label other than MARK_TO_MARKET, a non-finite or
+    non-positive price, an amount that disagrees with its own prices, an age
+    beyond `MAX_MARK_AGE_MS` (or observed after its fill), a repeated or
+    conflicting entry, or marks that do not cover the quantity the perp closed
+    is UNVERIFIED, and the cycle then has no pair economics at all."""
+    if not marks:
+        return "NONE", []
+    why: List[str] = []
+    seen: Dict[str, Mapping[str, Any]] = {}
+    for m in marks:
+        ref, raw = m["ref"], m["raw"]
+        if ref in seen:
+            same = all(raw.get(k) == seen[ref]["raw"].get(k)
+                       for k in ("qty", "entry_spot", "exit_spot")) \
+                and abs(m["usd"] - seen[ref]["usd"]) <= L.BALANCE_TOLERANCE
+            why.append(f"{'DUPLICATE_MARK' if same else 'CONFLICTING_MARK'}: "
+                       f"{ref} appears more than once")
+            continue
+        seen[ref] = m
+    for ref, m in seen.items():
+        raw = m["raw"]
+        if raw.get("valuation") != L.MARK_VALUATION:
+            why.append(f"UNVERIFIED_MARK: {ref} states no MARK_TO_MARKET "
+                       "provenance (source, prices, observation time)")
+            continue
+        qty, p0, p1 = raw.get("qty"), raw.get("entry_spot"), raw.get("exit_spot")
+        if not (_finite_pos(qty) and _finite_pos(p0) and _finite_pos(p1)):
+            why.append(f"UNVERIFIED_MARK: {ref} has a non-finite or "
+                       "non-positive quantity or price")
+            continue
+        if abs(qty * (p1 - p0) - m["usd"]) > max(L.BALANCE_TOLERANCE,
+                                                 1e-9 * abs(m["usd"])):
+            why.append(f"MARK_AMOUNT_INCONSISTENT: {ref} books {m['usd']} but "
+                       f"its own prices give {qty * (p1 - p0)}")
+        obs, fill = raw.get("exit_mark_observed_ms"), raw.get("fill_ms")
+        if not (isinstance(obs, (int, float)) and isinstance(fill, (int, float))
+                and not isinstance(obs, bool) and not isinstance(fill, bool)
+                and math.isfinite(obs) and math.isfinite(fill)):
+            why.append(f"UNVERIFIED_MARK: {ref} has no observation time")
+        elif obs > fill:
+            why.append(f"MARK_OBSERVED_AFTER_FILL: {ref} was observed "
+                       f"{obs - fill:.0f} ms after the fill it values")
+        elif fill - obs > MAX_MARK_AGE_MS:
+            why.append(f"STALE_MARK: {ref} was observed {fill - obs:.0f} ms "
+                       f"before the fill it values (limit {MAX_MARK_AGE_MS})")
+    for ms, raw in opens:
+        if "hedge_spot_ref" in raw and not _finite_pos(raw["hedge_spot_ref"]):
+            why.append("UNVERIFIED_MARK: an open fill recorded no entry spot")
+            break
+        obs = raw.get("hedge_spot_ref_observed_ms")
+        if obs is not None and (not isinstance(obs, (int, float))
+                                or obs > ms or ms - obs > MAX_MARK_AGE_MS):
+            why.append("STALE_MARK: an open fill's entry spot was not "
+                       "observed within the allowed window before it")
+            break
+    covered = sum(float(m["raw"].get("qty") or 0.0) for m in seen.values()
+                  if _finite_pos(m["raw"].get("qty")))
+    if closed_qty is None or not _finite_pos(closed_qty):
+        why.append("MARK_QTY_MISMATCH: the closed perp quantity is not "
+                   "readable, so what the marks cover cannot be checked")
+    elif abs(covered - closed_qty) > 1e-9 + 1e-6 * closed_qty:
+        why.append(f"MARK_QTY_MISMATCH: marks cover {covered} BTC but the "
+                   f"perp closed {closed_qty}")
+    return ("UNVERIFIED", why) if why else ("VERIFIED", [])
 
 
 def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
@@ -320,6 +410,7 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 "spot_sold": False, "first_open_ms": None,
                 "last_close_ms": None, "_fee_statuses": [], "_bases": [],
                 "revalue_usd": 0.0, "revalue_entries": 0, "fills": 0,
+                "_marks": [], "_open_raw": [],
                 "_opens": [], "_closes": [],
                 "_fill_memo_unread": False,
                 "funding_received_usd": 0.0, "funding_paid_usd": 0.0,
@@ -343,7 +434,11 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
                 cur["borrow_usd"] += line.usd
                 cur["borrow_entries"] += 1
             elif line.account == L.REALISED:
-                cur["realised_usd"] += -line.usd
+                # A revaluation posts here too, but it is a MARK of coin that
+                # was never sold: it is accumulated apart (`revalue_usd`) and
+                # is not part of any cash figure.
+                if e.kind != "revalue":
+                    cur["realised_usd"] += -line.usd
             elif line.account == L.PERP:
                 cur["perp_qty"] += line.qty
             elif line.account == L.BTC and e.kind in ("spot_buy", "spot_sell"):
@@ -358,6 +453,8 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
         if e.kind == "spot_sell" and len(e.lines) > 1:
             cur["spot_sell_gross_usd"] += e.lines[0].usd
             cur["spot_sold_qty"] += -e.lines[1].qty
+        if e.kind == "perp_open":
+            cur["_open_raw"].append((e.ms, e.fee_raw or {}))
         if e.kind in ("perp_open", "perp_close"):
             fill = _memo_fill(e)
             if fill is None:
@@ -365,9 +462,11 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
             else:
                 cur["_opens" if e.kind == "perp_open" else "_closes"].append(fill)
         if e.kind == "revalue":
-            cur["revalue_usd"] += -sum(l.usd for l in e.lines
-                                       if l.account == L.REALISED)
+            usd = -sum(l.usd for l in e.lines if l.account == L.REALISED)
+            cur["revalue_usd"] += usd
             cur["revalue_entries"] += 1
+            cur["_marks"].append({"ref": e.ref, "ms": e.ms, "usd": usd,
+                                  "raw": e.fee_raw or {}})
         if e.kind == "spot_sell":
             cur["spot_sold"] = True
         if e.fee_status:
@@ -742,7 +841,7 @@ def check_invariants(journal: Any, cycles: Sequence[Mapping[str, Any]],
                 pre_net += -line.usd
             elif line.account in (L.FEES, L.BORROW):
                 pre_net -= line.usd
-            elif line.account == L.REALISED:
+            elif line.account == L.REALISED and e.kind != "revalue":
                 pre_net += -line.usd
     cyc_sum = sum(float(c["net_usd"]) for c in cycles)
     diff = cyc_sum + pre_net - float(statement["net_usd"])
@@ -819,6 +918,26 @@ def _classify_cycle(c: Dict[str, Any], env: Mapping[str, Any],
                            else env["booked_figures_class"])
 
 
+def _pair_fields(c: Mapping[str, Any], complete: bool) -> Dict[str, Any]:
+    """The marked-pair view of a cycle, kept apart from its cash fields. The
+    pair is only offered for a complete (fees and funding confirmed) closed
+    cycle with verified marks."""
+    pr = hedged_pair(c) if c.get("closed") else {"available": False,
+                                                 "why": "cycle still open"}
+    ok = bool(pr["available"] and complete and pr.get("marked"))
+    return {
+        "inventory_mark_usd": c.get("revalue_usd") if c.get(
+            "revalue_entries") else None,
+        "pair_net_usd": pr["net_usd"] if ok else None,
+        "pair_economics_class": MARKED_PAIR_ECONOMICS if ok else None,
+        "pair_unavailable_reasons": (
+            [] if ok else
+            ([pr["why"]] if not pr["available"] else
+             ([] if not c.get("revalue_entries") else
+              ["cash figures incomplete: fees or funding not confirmed"]))),
+    }
+
+
 def _public_cycle(c: Mapping[str, Any]) -> Dict[str, Any]:
     """A cycle as a section shows it. An incomplete fee or funding figure is
     None with the booked amount beside it, never a number read as final."""
@@ -836,6 +955,7 @@ def _public_cycle(c: Mapping[str, Any]) -> Dict[str, Any]:
         "price_leg_usd": c["realised_usd"],
         "net_usd": c["net_usd"] if fees_ok and fund_ok and c["closed"] else None,
         "booked_net_usd": c["net_usd"],
+        **_pair_fields(c, fees_ok and fund_ok),
         "notional_usd": c.get("notional_usd"),
         "capital_committed_usd": c.get("capital_committed_usd"),
         "return_on_committed_capital_pct": c.get(
@@ -959,10 +1079,10 @@ def hedged_pair(c: Mapping[str, Any]) -> Dict[str, Any]:
     which is carry.
 
     * ``SPOT_LEG_BOOKED``  acquire: the booked net already holds both legs.
-    * ``BOOKED``           overlay with revaluation entries (the replay writes
-                           them): the booked net already holds the inventory
-                           leg at the spot price, and the basis residual is the
-                           booked price leg.
+    * ``BOOKED_MARK``      overlay with VERIFIED revaluation entries: the
+                           pair is the cash net PLUS the marked (never sold)
+                           inventory move. It is MARKED_PAIR_ECONOMICS, not
+                           cash; unverified marks give no pair at all.
     * ``DERIVED_FROM_PERP_FILL_PRICES``  overlay, inventory not booked: the
                            leg is hedged_qty x (perp exit - perp entry), the
                            perp fill prices standing in for the BTC price. That
@@ -988,9 +1108,17 @@ def hedged_pair(c: Mapping[str, Any]) -> Dict[str, Any]:
                 "derived": False, "basis_pnl_usd": c["realised_usd"],
                 "basis_why": None}
     if c.get("revalue_entries"):
-        return {"available": True, "net_usd": net, "inventory_leg": "BOOKED",
+        if c.get("mark_status") != "VERIFIED":
+            return {"available": False, "why": (
+                "UNVERIFIED_INVENTORY_MARK: " + "; ".join(
+                    c.get("mark_reasons") or ["no usable mark"]))}
+        # `net` is CASH (funding - fees - financing + the perp's realised
+        # result); the pair adds the MARKED, never-sold inventory move.
+        return {"available": True, "net_usd": net + c["revalue_usd"],
+                "inventory_leg": "BOOKED_MARK",
                 "inventory_leg_usd": c["revalue_usd"], "derived": False,
-                "basis_pnl_usd": c["realised_usd"], "basis_why": None}
+                "marked": True, "basis_pnl_usd": c["realised_usd"]
+                + c["revalue_usd"], "basis_why": None}
     qty, p0, p1 = (c.get("hedged_qty"), c.get("perp_entry_price"),
                    c.get("perp_exit_price"))
     if not (qty and p0 and p1 and qty > 0 and p0 > 0 and p1 > 0
@@ -1071,17 +1199,22 @@ def cycle_net_economics(c: Mapping[str, Any],
     pr = hedged_pair(c)
     if pr["available"]:
         comp["hedged_pair_net"] = _comp(
-            pr["net_usd"], HISTORICAL_SIMULATION if pr["derived"] else cls,
-            status="DERIVED_NOT_BOOKED" if pr["derived"] else "BOOKED",
+            pr["net_usd"], HISTORICAL_SIMULATION if pr["derived"] else
+            (MARKED_PAIR_ECONOMICS if pr.get("marked") else cls),
+            status="DERIVED_NOT_BOOKED" if pr["derived"] else
+            ("MARKED" if pr.get("marked") else "BOOKED"),
             additive=False, sign="income_or_cost",
             inventory_leg=pr["inventory_leg"],
             inventory_leg_usd=pr["inventory_leg_usd"],
-            note="booked net plus the inventory leg when the overlay's hedged "
-                 "BTC was not revalued in the journal; NOT added to the "
-                 "additive lines (net_after_booked_costs_usd is unchanged)")
+            note="cash net plus the inventory leg: MARKED (client BTC not "
+                 "sold) when verified marks exist, else derived from perp "
+                 "fill prices; never cash and NOT added to the additive "
+                 "lines (net_after_booked_costs_usd is cash and unchanged)")
         if pr["basis_pnl_usd"] is not None:
             comp["basis_pnl"] = _comp(
-                pr["basis_pnl_usd"], cls, additive=False,
+                pr["basis_pnl_usd"],
+                MARKED_PAIR_ECONOMICS if pr.get("marked") else cls,
+                additive=False,
                 sign="income_or_cost", note="both price legs booked: what is "
                 "left after the hedge cancels, slippage included")
         else:
@@ -1370,7 +1503,9 @@ def pair_economics(closed: Sequence[Mapping[str, Any]], cls_closed: str,
             + "; ".join(sorted({p["why"] for _, p in pairs
                                 if not p["available"]})))
     derived = [c for c, p in pairs if p["derived"]]
-    cls = HISTORICAL_SIMULATION if derived else cls_closed
+    marked = [c for c, p in pairs if p.get("marked")]
+    cls = (HISTORICAL_SIMULATION if derived else
+           MARKED_PAIR_ECONOMICS if marked else cls_closed)
     status = ("INCOMPLETE_BOUND" if inc_status != "COMPLETE" else
               "DERIVED_NOT_BOOKED" if derived else "COMPUTED")
     pair_h = sum(p["net_usd"] for _, p in pairs)
@@ -1934,6 +2069,8 @@ def build_report(db_path: str, *, environment: Optional[str] = None,
         d["hedged_pair_net_usd"] = pr["net_usd"] if pr["available"] else None
         d["hedged_pair_inventory_leg"] = (pr["inventory_leg"]
                                           if pr["available"] else None)
+        d.update(_pair_fields(c, bool(c["fees_complete"]
+                                      and c["funding_complete"])))
         detail_cycles.append(d)
     sections["ledger_detail"] = section(
         ACTUAL_RECONCILED if all_actual else cls,
@@ -1948,6 +2085,35 @@ def build_report(db_path: str, *, environment: Optional[str] = None,
         statement={k: v for k, v in statement.items()
                    if k not in ("funding_lifecycles", "_cash_check",
                                 "realised_usd")})
+
+    marked = [d for d in detail_cycles if d.get("pair_net_usd") is not None]
+    if marked:
+        sections["marked_pair_economics"] = section(
+            MARKED_PAIR_ECONOMICS,
+            why=["the client's BTC is valued at a mark and was not sold: this "
+                 "is economic performance of the hedged pair, not settled "
+                 "money, and it can never satisfy a cash-only policy"],
+            status="NOT_CASH", settled_on_venue=False,
+            valuation=("inventory MARKED from the quantity-weighted spot seen "
+                       "at each open fill to the spot seen at the decision "
+                       "tick (or one public read right after the fill) of "
+                       "each close; marks older than "
+                       f"{MAX_MARK_AGE_MS} ms before their fill, observed "
+                       "after it, duplicated, conflicting or not covering the "
+                       "closed quantity make a cycle UNAVAILABLE"),
+            marked_pair_net_usd=sum(d["pair_net_usd"] for d in marked),
+            inventory_mark_usd=sum(d["inventory_mark_usd"] for d in marked),
+            net_after_booked_costs_usd=sum(d["net_usd"] for d in marked),
+            marked_pair_cycles=len(marked),
+            marked_pair_cycle_ids=[d["cycle_id"] for d in marked],
+            max_mark_age_ms=MAX_MARK_AGE_MS)
+    else:
+        sections["marked_pair_economics"] = section(
+            UNAVAILABLE, why=sorted({r for d in detail_cycles
+                                     for r in d.get("pair_unavailable_reasons",
+                                                    []) if r}) or [
+                "NO_VERIFIED_MARKED_PAIR_CYCLE: no closed, complete overlay "
+                "cycle has verified inventory marks"])
 
     sections["slippage"] = slippage_section(journal, env)
     sections["spread_cost"] = section(

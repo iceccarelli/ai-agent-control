@@ -68,8 +68,13 @@ def test_a_hedged_overlay_cycle_books_both_legs():
     buy(b, QTY, 90_000.0, 90_000.0, v)
     (r,) = revals(b.journal)
     assert r.memo.startswith(f"{QTY} BTC from 100000.0 to 90000.0")
-    # short +$10, client's BTC -$10: the pair is flat to price
-    assert b.journal.statement()["realised_usd"] == pytest.approx(0.0)
+    # short +$10 is CASH; the client's BTC -$10 is a MARK (never sold). The
+    # pair is flat to price, and the two are reported apart.
+    st = b.journal.statement()
+    assert st["realised_usd"] == pytest.approx(10.0)
+    assert st["inventory_mark_usd"] == pytest.approx(-10.0)
+    assert st["realised_usd"] + st["inventory_mark_usd"] == pytest.approx(0.0)
+    assert st["pair_net_usd"] == pytest.approx(st["net_usd"] - 10.0)
 
 
 def test_the_cycle_is_reported_with_its_inventory_leg_booked():

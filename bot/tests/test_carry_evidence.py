@@ -25,7 +25,9 @@ def cycles(n, nets=(2.0, 3.0, 1.0, 4.0, 2.5)):
              "end_ms": int((NOW - (149 - 3 * i) * DAY) * 1000),
              "net_usd": nets[i % len(nets)], "outcome": "CLOSED", "closed": True,
              "evidence_class": "ACTUAL_RECONCILED", "fees_complete": True,
-             "funding_complete": True} for i in range(n)]
+             "funding_complete": True,
+             # the real report always says; a cycle that does not is refused
+             "overlay": False} for i in range(n)]
 
 
 def report(n=25, *, cls="ACTUAL_RECONCILED", nets=(2.0, 3.0, 1.0, 4.0, 2.5)):
@@ -225,9 +227,23 @@ def test_a_rally_does_not_breach_the_evidence_either():
     assert provider(rep)().verdict == se.INSUFFICIENT      # not BLOCK
 
 
-def test_an_overlay_with_its_inventory_leg_booked_counts():
-    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), "BOOKED")
-    assert provider(rep)().verdict == se.ALLOCATE
+def test_an_overlay_with_its_inventory_leg_booked_is_still_not_cash_evidence():
+    # A booked inventory leg is a MARK of coin that was never sold. It makes
+    # the pair measurable (see tests/test_cash_vs_marked_pair.py); it does not
+    # make the cycle cash, and a cash-only policy must not be satisfied by it.
+    rep = overlay_report((2.0, 3.0, 1.0, 4.0, 2.5), "BOOKED_MARK")
+    ev = cev.evidence_from_report(rep, strategy_id="s", observed_at_s=NOW,
+                                  discovery_window_s=WINDOW,
+                                  drawdown_limit_usd=50.0)
+    assert ev.trades == () and ev.unqualified_results == 25
+    assert provider(rep)().verdict == se.INSUFFICIENT
+
+
+def test_a_cycle_that_does_not_say_whether_it_is_an_overlay_is_refused():
+    rep = report()
+    for c in rep["sections"]["ledger_detail"]["cycles"]:
+        del c["overlay"]
+    assert provider(rep)().verdict == se.INSUFFICIENT
 
 
 def test_an_overlay_with_no_stated_inventory_leg_is_left_out():

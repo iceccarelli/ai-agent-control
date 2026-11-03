@@ -41,14 +41,11 @@ N = 25
 
 def journal(n=N, *, extra=None):
     j = L.Journal()
+    # ACQUIRE cycles: both legs were traded, so the cycle is cash. An overlay
+    # cycle (the coin is never sold) is not cash evidence and is refused by the
+    # adapter; tests/test_cash_vs_marked_pair.py covers that rule.
     for i in range(n):
-        T.overlay_cycle(j, 2 * i, 2 * i + 1, tag=f"c{i}", funding=300.0 + i)
-        # The client's BTC the short hedges, marked to the close: an overlay
-        # cycle without this leg is the net of a naked short and is (rightly)
-        # not carry evidence, so the fixture must be a hedged pair.
-        L.revalue_inventory(j, ms=T.T0 + (2 * i + 1) * T.DAY + 1,
-                            ref=f"c{i}-inv", qty=1.0, from_price=100_000.0,
-                            to_price=98_000.0)
+        T.acquire_cycle(j, 2 * i, 2 * i + 1, tag=f"c{i}", funding=300.0 + i)
     if extra:
         extra(j)
     return j
@@ -207,7 +204,7 @@ def test_a_closed_unreconciled_loss_cannot_be_hidden_behind_reconciled_wins(tmp_
     reconciled and which lost heavily. The report lists only the 25 as cash and
     says the other is excluded; the verdict must not pretend it does not exist."""
     def loser(j):
-        T.overlay_cycle(j, 2 * N, 2 * N + 1, tag="loser", close_price=130_000.0,
+        T.acquire_cycle(j, 2 * N, 2 * N + 1, tag="loser", funding=-3_000.0,
                         reconcile=False)
     _db, rep = real_report(tmp_path, journal(extra=loser))
     rc = rep["sections"]["realized_cash"]
