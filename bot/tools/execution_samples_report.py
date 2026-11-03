@@ -61,7 +61,7 @@ def _env_agrees(record, environment) -> bool:
     return stated in (None, "", environment)
 
 
-def load_records_ex(paths, environment):
+def load_records_ex(paths, environment, _stats=None):
     """(fills, outcomes, skipped) from drill JSONL files.
 
     `fills` are the lines of a filled order (a ledger fill kind with its
@@ -73,11 +73,24 @@ def load_records_ex(paths, environment):
     guessed at. The same outcome repeated is kept once."""
     fills, outcomes, skipped = [], [], 0
     seen_outcomes = set()
+    seen_lines = set()
     for path in paths:
-        with open(path, encoding="utf-8") as handle:
+        # errors="replace": a line of invalid UTF-8 (a torn write, a stray
+        # edit) becomes text that fails to parse and is skipped; it must not
+        # abort the whole report.
+        with open(path, encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 if not line.strip():
                     continue
+                # The same line appended twice (a restart or a second process
+                # has a fresh in-memory key set) is one record.
+                digest = line.strip()
+                if digest in seen_lines:
+                    if _stats is not None:
+                        _stats["duplicate_lines"] = _stats.get(
+                            "duplicate_lines", 0) + 1
+                    continue
+                seen_lines.add(digest)
                 try:
                     d = json.loads(line)
                     if not (d.get("schema") == SCHEMA
@@ -141,6 +154,32 @@ def summarize_outcomes(outcomes, filled_by_leg=None) -> dict:
             "miss_rate": miss, "counted_as_samples": 0,
             "note": "orders that did not fill; execution-outcome evidence "
                     "only, never a filled-order cost sample"}
+
+
+#: What the records file can and cannot prove. Stated in every report so the
+#: counts are not read as more than they are. No hash chain: written by the same
+#: process with no key or anchor held elsewhere, one is recomputable by anyone
+#: who can edit the file and shows nothing about a deleted tail, so it would add
+#: appearance, not a property.
+INTEGRITY_STATEMENT = {
+    "tamper_evident": False,
+    "form": "plain append-only JSONL; lines are labelled with the venue "
+            "environment they were written under",
+    "detects": [
+        "unparseable, torn or non-UTF-8 lines (skipped and counted)",
+        "a repeated line (counted once; the repeats are reported)",
+        "a record that does not reproduce its own MEASURED verdict and "
+        "figures from its stored book, times and fill",
+        "a line time that disagrees with ANY time the record states",
+        "a line labelled for another environment than the one asked for",
+    ],
+    "cannot_detect": [
+        "a deliberate, internally consistent forgery by someone who can edit "
+        "the file (every field, including all times, rewritten together)",
+        "records deleted from the file or from its tail",
+        "a record produced by a run that was itself misconfigured",
+    ],
+}
 
 
 def partial_fills(entries) -> dict:
@@ -212,7 +251,7 @@ def check_db_environment(db_path: str, environment: str) -> dict:
 
 def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
           now_ms: int = 0, records=(), environment: str = "") -> dict:
-    entries, skipped, outcomes = [], 0, []
+    entries, skipped, outcomes, duplicate_lines = [], 0, [], 0
     env_info = {"declared": environment or None, "database": None,
                 "records_label": environment if records else None}
     if db_path:
@@ -221,14 +260,18 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
             env_info["database"] = check_db_environment(db_path, environment)
         entries.extend(carry_performance.load_journal(db_path).entries)
     if records:
-        extra, outcomes, skipped = load_records_ex(records, environment)
+        stats = {}
+        extra, outcomes, skipped = load_records_ex(records, environment, stats)
         entries.extend(extra)
+        duplicate_lines = stats.get("duplicate_lines", 0)
     now = now_ms or int(time.time() * 1000)
     out = est.estimate_round_trip(
         entries, as_of_ms=now, execution_mode=mode, perp_symbol=perp,
         spot_symbol=spot, planned_notional_usd=notional_usd)
     out["environment"] = env_info
     out["records_skipped"] = skipped
+    out["records_duplicate_lines"] = duplicate_lines
+    out["integrity"] = INTEGRITY_STATEMENT
     out["partial_fills"] = partial_fills(entries)
     # Orders that FILLED on each leg, priced or not: the valid observations
     # plus the fills the estimator had to reject (mark-referenced, unverifiable,

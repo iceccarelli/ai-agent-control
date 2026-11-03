@@ -594,6 +594,9 @@ def durable_append(path: str, data: bytes) -> Dict[str, Any]:
     * ONE O_APPEND `write` of the whole buffer (looping only on a short write),
       not buffered text I/O that can split a long line across several writes
       and interleave with another process;
+    * cooperating appenders (every writer in this repo uses this function) are
+      serialized by an advisory lock, so the tail check and the write cannot
+      interleave with another process's;
     * a torn tail is quarantined: if the file does not end in a newline (a
       previous write was cut off), the new record starts on a fresh line, so a
       truncated fragment can never swallow it;
@@ -617,6 +620,11 @@ def durable_append(path: str, data: bytes) -> Dict[str, Any]:
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644)
     sync_error = ""
     try:
+        try:
+            import fcntl                     # POSIX; elsewhere: no lock
+            fcntl.flock(fd, fcntl.LOCK_EX)   # released when the fd closes
+        except (ImportError, OSError):
+            pass
         size = os.fstat(fd).st_size
         if size > 0:
             with open(path, "rb") as reader:
