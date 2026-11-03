@@ -1067,6 +1067,11 @@ def reconcile(journal: Journal, *, venue_btc: float, venue_usdt: float,
 
 # -- the broker wrapper ---------------------------------------------------
 
+#: Status of the execution record of an order the venue accepted whose local
+#: booking failed. Never a fill, never a miss, never a cost sample.
+UNBOOKED_STATUS = "UNBOOKED"
+
+
 class BookingFailedAfterFill(RuntimeError):
     """An order was sent and answered, and the journal could not book it.
 
@@ -1229,7 +1234,8 @@ class LedgerBroker:
         shares ONE deadline, and each source is handed what is left of it as
         its own request timeout (a single attempt, no retry, no backoff) - the
         wait is bounded by the transport, not by a thread (live modules start
-        none). A source that cannot take a timeout is called as it is."""
+        none). A source that cannot take a timeout is NOT called when a bound
+        was requested."""
         deadline = None if timeout_s is None else time.monotonic() + float(timeout_s)
         for name, source in (("get_book_depth", "orderbook"),
                              ("get_book_top", "ticker_touch")):
@@ -1242,10 +1248,17 @@ class LedgerBroker:
                 if left <= 0.01:
                     return None                  # the budget is spent
                 try:
-                    if "timeout_s" in inspect.signature(getter).parameters:
-                        kwargs["timeout_s"] = left
+                    takes_timeout = "timeout_s" in inspect.signature(
+                        getter).parameters
                 except (TypeError, ValueError):
-                    pass
+                    takes_timeout = False
+                if not takes_timeout:
+                    # A bound was asked for and this getter cannot honour one:
+                    # calling it would be an unbounded wait in front of an
+                    # order. The book is simply not read (an unmeasured record,
+                    # never an invented one).
+                    continue
+                kwargs["timeout_s"] = left
             try:
                 top = getter(symbol, product, **kwargs)
                 bid, ask = float(top["bid"]), float(top["ask"])
@@ -1346,6 +1359,8 @@ class LedgerBroker:
     def _note_fill(self, *, ref: str, ms: int, product: str, side: str,
                    qty: float, price: float, fee_usdt: float, fee_btc: float,
                    status: str, fee_raw: Dict[str, Any]) -> None:
+        if isinstance(fee_raw.get("execution"), dict):
+            self._keep_execution(fee_raw["execution"])
         currencies = sorted({str(c.get("currency") or "")
                              for c in (fee_raw.get("components") or [])
                              if c.get("amount")})
@@ -1455,19 +1470,14 @@ class LedgerBroker:
             self._note_failed_order(symbol=symbol, side=side, product=product,
                                     qty=qty, order_type="market",
                                     why="NO_ORDER: venue returned no fill")
-        try:
-            self._book(result, side=side, product=product, symbol=symbol,
-                       requested_qty=qty, order_type="market")
-        except Exception as exc:  # noqa: BLE001
-            # The venue already ACCEPTED this order. A booking error is not
-            # "the order failed": reporting it as one made the engine buy the
-            # spot again on every tick, or sell the spot under a perp short
-            # that had filled. The fill is real and the book cannot account
-            # for it, which is exactly an outcome the engine must halt on.
-            raise BookingFailedAfterFill(
-                f"{side} {qty} {symbol} ({product}) was sent and the venue "
-                f"returned {result!r}, but booking it failed "
-                f"({type(exc).__name__}: {exc})") from exc
+        # The venue already ACCEPTED this order. A booking error is not "the
+        # order failed": reporting it as one made the engine buy the spot again
+        # on every tick, or sell the spot under a perp short that had filled.
+        # The fill is real and the book cannot account for it, which is exactly
+        # an outcome the engine must halt on (see `_book_checked`).
+        self._book_checked(result, side=side, product=product, symbol=symbol,
+                           requested_qty=qty, order_type="market",
+                           what=f"{side} {qty} {symbol} ({product})")
         return result
 
     def place_post_only(self, *, symbol: str, side: str, qty: float,
@@ -1486,8 +1496,9 @@ class LedgerBroker:
             self._note_failed_order(symbol=symbol, side=side, product=product,
                                     qty=qty, order_type="post_only",
                                     why="NO_ORDER: rejected, nothing rests")
-        self._book(result, side=side, product=product, symbol=symbol,
-                   requested_qty=qty, order_type="post_only")
+        self._book_checked(result, side=side, product=product, symbol=symbol,
+                           requested_qty=qty, order_type="post_only",
+                           what=f"post-only {side} {qty} {symbol} ({product})")
         if result:
             link = str(result.get("order_link_id") or "")
             if link:
@@ -1582,9 +1593,10 @@ class LedgerBroker:
         if exec_known is not None:
             inc["submit_ms"] = exec_known[2]
             requested_left = max(0.0, exec_known[1] - booked_qty)
-        self._book(inc, side=side, product=product,
-                   symbol=(exec_known[0] if exec_known else ""),
-                   requested_qty=requested_left, order_type="post_only")
+        self._book_checked(inc, side=side, product=product,
+                           symbol=(exec_known[0] if exec_known else ""),
+                           requested_qty=requested_left, order_type="post_only",
+                           what=f"the cancel-time fill of {order_link_id}")
         return result
 
     @staticmethod
@@ -1715,6 +1727,73 @@ class LedgerBroker:
             logging.getLogger(__name__).warning(
                 "overlay inventory leg not booked for %s", ref, exc_info=True)
 
+    def _note_unbooked(self, result: Any, *, side: str, product: str,
+                       symbol: str, requested_qty: Any, order_type: str,
+                       error: BaseException) -> None:
+        """Keep, and hand to the sink, the evidence of an order the venue
+        ACCEPTED whose local booking failed. It is its own thing: not a fill
+        (the journal does not hold one), not a miss (the venue reported a
+        fill), never a cost sample. Each stage is stated separately and
+        `position_verified` is None - whether the position really changed is an
+        independent read that nothing here infers. Never raises."""
+        try:
+            res = result if isinstance(result, dict) else {}
+
+            def num(x: Any) -> Any:
+                return (x if isinstance(x, (int, float))
+                        and not isinstance(x, bool) and math.isfinite(x)
+                        else (None if x is None else repr(x)[:80]))
+            reported = num(res.get("filled_qty"))
+            ctx = self._decisions.get((symbol, product, side))
+            rec = {
+                "schema": 1, "status": UNBOOKED_STATUS, "booking": "FAILED",
+                "venue": str(res.get("venue")
+                             or getattr(self.inner, "VENUE", "unknown")),
+                "environment": self._environment(),
+                "symbol": symbol or str(res.get("symbol") or ""),
+                "product": product, "side": side,
+                "order_type": str(res.get("order_type") or order_type),
+                "requested_qty": num(requested_qty),
+                "reported_filled_qty": reported,
+                "reported_avg_price": num(res.get("avg_price")),
+                "order_link_id": str(res.get("order_link_id") or ""),
+                "decision_ms": getattr(ctx, "decision_ms", None),
+                "recorded_ms": int(self._ms()),
+                "lifecycle": {
+                    "order_submitted": True,
+                    "venue_response_received": True,
+                    "reported_fill": isinstance(reported, (int, float))
+                    and reported > 0,
+                    "locally_booked": False,
+                    "booking_error": f"{type(error).__name__}: {error}"[:300],
+                    "position_verified": None},
+                "reasons": ["BOOKING_FAILED_AFTER_ACCEPTANCE: the venue "
+                            "answered and the local booking failed; the "
+                            "position must be verified independently"]}
+            self._keep_execution(rec)
+            self._emit({"type": "unbooked", "execution": rec})
+        except Exception:  # noqa: BLE001 - evidence is best effort, the raise is not
+            pass
+
+    def _book_checked(self, result: Any, *, side: str, product: str,
+                      symbol: str, requested_qty: Any, order_type: str,
+                      what: str) -> None:
+        """`_book`, with one rule for every order path: the venue already
+        ACCEPTED this order, so a booking error is not "the order failed". It is
+        recorded as an UNBOOKED event and raised as `BookingFailedAfterFill`,
+        which the engine treats as an unknown outcome and halts on - it never
+        retries or re-sends because accounting failed."""
+        try:
+            self._book(result, side=side, product=product, symbol=symbol,
+                       requested_qty=requested_qty, order_type=order_type)
+        except Exception as exc:  # noqa: BLE001
+            self._note_unbooked(result, side=side, product=product,
+                                symbol=symbol, requested_qty=requested_qty,
+                                order_type=order_type, error=exc)
+            raise BookingFailedAfterFill(
+                f"{what} was sent and the venue returned {result!r}, but "
+                f"booking it failed ({type(exc).__name__}: {exc})") from exc
+
     def _book(self, result, *, side: str, product: str,
               allow_missing_side: bool = False, symbol: str = "",
               requested_qty: Any = None, order_type: str = "market") -> None:
@@ -1762,7 +1841,9 @@ class LedgerBroker:
             mark = None
         fee_raw = dict(fee_raw)
         fee_raw["execution"] = exec_rec
-        self._keep_execution(exec_rec)
+        # NOT kept in `executions` yet: a fill the journal does not hold must
+        # not sit there looking like a measured one. `_note_fill` keeps it once
+        # the booking has gone through.
         # An order with no link id is still ONE order: its ref carries a
         # running count so two fills in the same millisecond are two refs, not
         # one row the readers would merge as a duplicate.

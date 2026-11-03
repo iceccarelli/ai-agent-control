@@ -47,6 +47,9 @@ class _Fill:
 #: (`tools/drill.py` OUTCOME_KIND). Repeated, not imported: this reader stays
 #: standalone, and a test pins the two together.
 OUTCOME_KIND = "execution_outcome"
+#: An order the venue accepted whose local booking failed (`tools/drill.py`
+#: UNBOOKED_KIND). Not a fill, not a miss: reported as uncertainty.
+UNBOOKED_KIND = "execution_unbooked"
 SCHEMA = "execution_records/1"
 
 
@@ -58,7 +61,7 @@ def _env_agrees(record, environment) -> bool:
     return stated in (None, "", environment)
 
 
-def load_records_ex(paths, environment):
+def load_records_ex(paths, environment, _stats=None):
     """(fills, outcomes, skipped) from drill JSONL files.
 
     `fills` are the lines of a filled order (a ledger fill kind with its
@@ -70,18 +73,31 @@ def load_records_ex(paths, environment):
     guessed at. The same outcome repeated is kept once."""
     fills, outcomes, skipped = [], [], 0
     seen_outcomes = set()
+    seen_lines = set()
     for path in paths:
-        with open(path, encoding="utf-8") as handle:
+        # errors="replace": a line of invalid UTF-8 (a torn write, a stray
+        # edit) becomes text that fails to parse and is skipped; it must not
+        # abort the whole report.
+        with open(path, encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 if not line.strip():
                     continue
+                # The same line appended twice (a restart or a second process
+                # has a fresh in-memory key set) is one record.
+                digest = line.strip()
+                if digest in seen_lines:
+                    if _stats is not None:
+                        _stats["duplicate_lines"] = _stats.get(
+                            "duplicate_lines", 0) + 1
+                    continue
+                seen_lines.add(digest)
                 try:
                     d = json.loads(line)
                     if not (d.get("schema") == SCHEMA
                             and d.get("environment") == environment):
                         skipped += 1
                         continue
-                    if d.get("kind") == OUTCOME_KIND:
+                    if d.get("kind") in (OUTCOME_KIND, UNBOOKED_KIND):
                         rec = d.get("execution")
                         if not isinstance(rec, dict) \
                                 or not _env_agrees(rec, environment):
@@ -115,6 +131,7 @@ def summarize_outcomes(outcomes, filled_by_leg=None) -> dict:
     cost sample: `counted_as_samples` is 0 by construction and the estimator is
     never given these records."""
     by_leg, reasons = {}, {}
+    outcomes = [r for r in outcomes if r.get("status") != "UNBOOKED"]
     for rec in outcomes:
         leg = "/".join(str(rec.get(k) or "?")
                        for k in ("product", "side", "order_type"))
@@ -139,6 +156,32 @@ def summarize_outcomes(outcomes, filled_by_leg=None) -> dict:
                     "only, never a filled-order cost sample"}
 
 
+#: What the records file can and cannot prove. Stated in every report so the
+#: counts are not read as more than they are. No hash chain: written by the same
+#: process with no key or anchor held elsewhere, one is recomputable by anyone
+#: who can edit the file and shows nothing about a deleted tail, so it would add
+#: appearance, not a property.
+INTEGRITY_STATEMENT = {
+    "tamper_evident": False,
+    "form": "plain append-only JSONL; lines are labelled with the venue "
+            "environment they were written under",
+    "detects": [
+        "unparseable, torn or non-UTF-8 lines (skipped and counted)",
+        "a repeated line (counted once; the repeats are reported)",
+        "a record that does not reproduce its own MEASURED verdict and "
+        "figures from its stored book, times and fill",
+        "a line time that disagrees with ANY time the record states",
+        "a line labelled for another environment than the one asked for",
+    ],
+    "cannot_detect": [
+        "a deliberate, internally consistent forgery by someone who can edit "
+        "the file (every field, including all times, rewritten together)",
+        "records deleted from the file or from its tail",
+        "a record produced by a run that was itself misconfigured",
+    ],
+}
+
+
 def partial_fills(entries) -> dict:
     """Per leg: filled orders that filled LESS than they asked for, and the
     quantity left unfilled. A partial fill is a cost sample for what filled,
@@ -161,6 +204,26 @@ def partial_fills(entries) -> dict:
         row["orders"] += 1
         row["unfilled_qty"] += asked - filled
     return out
+
+
+def summarize_unbooked(outcomes) -> dict:
+    """Orders the venue ACCEPTED whose local booking failed. They are neither
+    fills nor misses and never samples: the venue reported a fill the book does
+    not hold, so the true execution is UNCERTAIN until the position is verified
+    independently. Reported so they are not silently absent."""
+    by_leg = {}
+    for rec in outcomes:
+        if rec.get("status") != "UNBOOKED":
+            continue
+        leg = "/".join(str(rec.get(k) or "?")
+                       for k in ("product", "side", "order_type"))
+        by_leg[leg] = by_leg.get(leg, 0) + 1
+    return {"total": sum(by_leg.values()), "by_leg": by_leg,
+            "counted_as_samples": 0,
+            "note": "UNCERTAIN: the venue accepted these orders and reported a "
+                    "fill the local book failed to record. They are not cost "
+                    "samples and not misses; verify the position independently "
+                    "before trusting the counts above."}
 
 
 def check_db_environment(db_path: str, environment: str) -> dict:
@@ -188,7 +251,7 @@ def check_db_environment(db_path: str, environment: str) -> dict:
 
 def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
           now_ms: int = 0, records=(), environment: str = "") -> dict:
-    entries, skipped, outcomes = [], 0, []
+    entries, skipped, outcomes, duplicate_lines = [], 0, [], 0
     env_info = {"declared": environment or None, "database": None,
                 "records_label": environment if records else None}
     if db_path:
@@ -197,14 +260,18 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
             env_info["database"] = check_db_environment(db_path, environment)
         entries.extend(carry_performance.load_journal(db_path).entries)
     if records:
-        extra, outcomes, skipped = load_records_ex(records, environment)
+        stats = {}
+        extra, outcomes, skipped = load_records_ex(records, environment, stats)
         entries.extend(extra)
+        duplicate_lines = stats.get("duplicate_lines", 0)
     now = now_ms or int(time.time() * 1000)
     out = est.estimate_round_trip(
         entries, as_of_ms=now, execution_mode=mode, perp_symbol=perp,
         spot_symbol=spot, planned_notional_usd=notional_usd)
     out["environment"] = env_info
     out["records_skipped"] = skipped
+    out["records_duplicate_lines"] = duplicate_lines
+    out["integrity"] = INTEGRITY_STATEMENT
     out["partial_fills"] = partial_fills(entries)
     # Orders that FILLED on each leg, priced or not: the valid observations
     # plus the fills the estimator had to reject (mark-referenced, unverifiable,
@@ -217,6 +284,7 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
         int(v) for k, v in (l.get("rejected") or {}).items()
         if k not in not_per_leg) for l in out["legs"]}
     out["outcomes"] = summarize_outcomes(outcomes, filled)
+    out["unbooked_orders"] = summarize_unbooked(outcomes)
     need = est.DEFAULT_POLICY.min_samples
     out["shortfall"] = {l["leg"]: max(0, need - int(l["n_in_size_band"]))
                         for l in out["legs"]}

@@ -187,12 +187,37 @@ def records_problem(report: Any) -> Optional[str]:
                 f"{report['execution_records_error']}")
     if not isinstance(rec, dict):
         return None
+    if int(rec.get("durable_sync_errors") or 0):
+        return (f"{rec['durable_sync_errors']} record(s) written but their "
+                "fsync failed, so durability is not confirmed: "
+                f"{rec.get('durable_write_last_error') or 'unknown error'}")
     errors = int(rec.get("durable_write_errors") or 0)
     if errors and int(rec.get("appended") or 0) < errors:
         return (f"{errors} durable record write(s) failed and the end-of-run "
                 "flush did not recover them: "
                 f"{rec.get('durable_write_last_error') or 'unknown error'}")
     return None
+
+
+def close_recording_problem(path: str) -> Optional[str]:
+    """Why the safety-net close's evidence is missing or unconfirmed, or None.
+    The close writes a small status file; an absent or unreadable one is NOT a
+    problem here (the close may not have run, or may have refused before any
+    order). The close itself is judged by its own exit code, never by this."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    rec = (data or {}).get("recording") if isinstance(data, dict) else None
+    if not isinstance(rec, dict):
+        return None
+    state = rec.get("state")
+    if state in (None, "OK", "NOT_CONFIGURED", "NOT_ATTEMPTED", "RECOVERED"):
+        return None
+    detail = (rec.get("writer_last_error") or rec.get("setup_error")
+              or rec.get("booking_error") or rec.get("market_data_note") or "")
+    return f"safety-net close record {state}: {detail}".rstrip(": ")
 
 
 def verdict(*, preflight: Optional[int], drill: Optional[int],
@@ -392,7 +417,9 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                  os.path.join(evdir, "ensure_flat_evidence.jsonl"),
                  # the safety-net close is an exit too (the worst kind: the
                  # drill failed to complete its own): it joins the samples
-                 "--execution-records", records],
+                 "--execution-records", records,
+                 "--recording-status-out",
+                 os.path.join(run_dir, "close_recording.json")],
                 cenv, log_path=log, timeout_s=300))
         finally:
             _SIGNAL["protect"] = False
@@ -440,7 +467,11 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                      not_eligible=not_eligible,
                      assessment_failed=assessment_failed, reconciled=reconciled,
                      orders_placed=orders_placed)
-    result["execution_records_problem"] = records_problem(drill_report)
+    problems_seen = [m for m in (
+        records_problem(drill_report),
+        close_recording_problem(os.path.join(run_dir, "close_recording.json")))
+        if m]
+    result["execution_records_problem"] = "; ".join(problems_seen) or None
     if result["execution_records_problem"]:
         _say(run_dir, "EXECUTION RECORDS: " + result["execution_records_problem"])
     if window_closed:

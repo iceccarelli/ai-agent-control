@@ -173,8 +173,17 @@ def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
         # A line's time decides the sample's AGE, so it must agree with the
         # record it carries: a record whose own fill time is far from the
         # line's would otherwise be passed off as fresh by editing one field.
-        fill_t = _num(rec.get("fill_ms"))
-        if fill_t is not None and abs(ms - fill_t) > LINE_TIME_TOLERANCE_MS:
+        #
+        # EVERY time the record states is compared, not just one: deleting the
+        # field a single check relies on must not switch the check off. A record
+        # that states no time at all cannot be dated and is not a sample.
+        anchors = [_num(rec.get(k)) for k in
+                   ("fill_ms", "submit_ms", "decision_ms", "observed_ms")]
+        anchors = [a for a in anchors if a is not None]
+        if not anchors:
+            drop("LINE_TIME_UNVERIFIABLE")
+            continue
+        if any(abs(ms - a) > LINE_TIME_TOLERANCE_MS for a in anchors):
             drop("LINE_TIME_MISMATCH")
             continue
         d2s, s2f = rec.get("decision_to_submit_ms"), rec.get("submit_to_fill_ms")

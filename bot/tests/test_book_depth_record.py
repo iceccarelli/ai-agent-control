@@ -404,9 +404,24 @@ def test_an_unbounded_read_passes_no_timeout():
     assert seen == [None]
 
 
+class Bounded(Inner):
+    """Getters shaped like the real adapter's: they CAN take a timeout."""
+    def get_book_depth(self, symbol, product, timeout_s=None):
+        return super().get_book_depth(symbol, product)
+
+    def get_book_top(self, symbol, product, timeout_s=None):
+        return super().get_book_top(symbol, product)
+
+
 def test_a_bounded_read_that_answers_in_time_is_used():
-    c = decide(Inner(DEPTH, TOP), book_timeout_s=1.0)
+    c = decide(Bounded(DEPTH, TOP), book_timeout_s=1.0)
     assert c.book_source == "orderbook" and c.bid == 99990.0
+
+
+def test_a_bounded_read_never_calls_a_getter_that_cannot_take_a_bound():
+    inner = Inner(DEPTH, TOP)                      # timeout-less getters
+    c = decide(inner, book_timeout_s=1.0)
+    assert inner.calls == [] and c.bid is None     # unmeasured, not unbounded
 
 
 def test_a_bounded_read_that_raises_is_no_book():
