@@ -542,6 +542,9 @@ EXECUTION_RECORDS_SCHEMA = "execution_records/1"
 #: samples that survive are not mistaken for the whole story; its `kind` is not
 #: a fill kind, so nothing that prices a filled order can count it.
 OUTCOME_KIND = "execution_outcome"
+#: A line for an order the venue ACCEPTED whose local booking failed. Neither a
+#: fill nor a miss: the reader only reports it, as uncertainty.
+UNBOOKED_KIND = "execution_unbooked"
 _FILL_KINDS = ("spot_buy", "spot_sell", "perp_open", "perp_close")
 
 
@@ -567,9 +570,10 @@ def _fill_line(venue: str, kind: str, ms: Any, ref: Any, fee_raw: Any) -> str:
 
 def _outcome_line(venue: str, rec: Dict[str, Any]) -> str:
     ms = rec.get("recorded_ms") or rec.get("decision_ms") or 0
+    kind = UNBOOKED_KIND if rec.get("status") == "UNBOOKED" else OUTCOME_KIND
     return json.dumps(
         {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
-         "kind": OUTCOME_KIND, "ms": int(ms),
+         "kind": kind, "ms": int(ms),
          "ref": str(rec.get("order_link_id") or ""), "execution": rec},
         sort_keys=True, default=str)
 
@@ -667,7 +671,7 @@ class RecordWriter:
                 key = _fill_key(event["ref"], event["ms"], event.get("fee_raw"))
                 line = _fill_line(self.venue, event["kind"], event["ms"],
                                   event["ref"], event.get("fee_raw"))
-            elif event.get("type") == "outcome":
+            elif event.get("type") in ("outcome", "unbooked"):
                 rec = event["execution"]
                 key = _outcome_key(rec)
                 line = _outcome_line(self.venue, rec)

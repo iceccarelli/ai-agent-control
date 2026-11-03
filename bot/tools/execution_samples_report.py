@@ -47,6 +47,9 @@ class _Fill:
 #: (`tools/drill.py` OUTCOME_KIND). Repeated, not imported: this reader stays
 #: standalone, and a test pins the two together.
 OUTCOME_KIND = "execution_outcome"
+#: An order the venue accepted whose local booking failed (`tools/drill.py`
+#: UNBOOKED_KIND). Not a fill, not a miss: reported as uncertainty.
+UNBOOKED_KIND = "execution_unbooked"
 SCHEMA = "execution_records/1"
 
 
@@ -81,7 +84,7 @@ def load_records_ex(paths, environment):
                             and d.get("environment") == environment):
                         skipped += 1
                         continue
-                    if d.get("kind") == OUTCOME_KIND:
+                    if d.get("kind") in (OUTCOME_KIND, UNBOOKED_KIND):
                         rec = d.get("execution")
                         if not isinstance(rec, dict) \
                                 or not _env_agrees(rec, environment):
@@ -115,6 +118,7 @@ def summarize_outcomes(outcomes, filled_by_leg=None) -> dict:
     cost sample: `counted_as_samples` is 0 by construction and the estimator is
     never given these records."""
     by_leg, reasons = {}, {}
+    outcomes = [r for r in outcomes if r.get("status") != "UNBOOKED"]
     for rec in outcomes:
         leg = "/".join(str(rec.get(k) or "?")
                        for k in ("product", "side", "order_type"))
@@ -161,6 +165,26 @@ def partial_fills(entries) -> dict:
         row["orders"] += 1
         row["unfilled_qty"] += asked - filled
     return out
+
+
+def summarize_unbooked(outcomes) -> dict:
+    """Orders the venue ACCEPTED whose local booking failed. They are neither
+    fills nor misses and never samples: the venue reported a fill the book does
+    not hold, so the true execution is UNCERTAIN until the position is verified
+    independently. Reported so they are not silently absent."""
+    by_leg = {}
+    for rec in outcomes:
+        if rec.get("status") != "UNBOOKED":
+            continue
+        leg = "/".join(str(rec.get(k) or "?")
+                       for k in ("product", "side", "order_type"))
+        by_leg[leg] = by_leg.get(leg, 0) + 1
+    return {"total": sum(by_leg.values()), "by_leg": by_leg,
+            "counted_as_samples": 0,
+            "note": "UNCERTAIN: the venue accepted these orders and reported a "
+                    "fill the local book failed to record. They are not cost "
+                    "samples and not misses; verify the position independently "
+                    "before trusting the counts above."}
 
 
 def check_db_environment(db_path: str, environment: str) -> dict:
@@ -217,6 +241,7 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
         int(v) for k, v in (l.get("rejected") or {}).items()
         if k not in not_per_leg) for l in out["legs"]}
     out["outcomes"] = summarize_outcomes(outcomes, filled)
+    out["unbooked_orders"] = summarize_unbooked(outcomes)
     need = est.DEFAULT_POLICY.min_samples
     out["shortfall"] = {l["leg"]: max(0, need - int(l["n_in_size_band"]))
                         for l in out["legs"]}
