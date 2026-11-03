@@ -70,6 +70,15 @@ def opportunity_cost_assumption(cfg: Any) -> Dict[str, Any]:
             "suggested")
     elif v is None or v < 0:
         state, meaning = INVALID, "not a usable non-negative number"
+    elif v == 0.0 and getattr(cfg, "CARRY_OPPORTUNITY_COST_APR_SUPPLIED", None) is False:
+        state, meaning = "UNSET_TREATED_AS_ZERO", (
+            "no value was supplied; the entry gate treats the owner's capital "
+            "as FREE (0.0). An economic verdict that needs a capital cost "
+            "reports INSUFFICIENT_OWNER_INPUT, not zero")
+    elif v == 0.0 and getattr(cfg, "CARRY_OPPORTUNITY_COST_APR_SUPPLIED", None) is True:
+        state, meaning = "EXPLICIT_ZERO", (
+            "the operator explicitly supplied 0.0: the owner's capital is "
+            "priced as free by decision, not by omission")
     elif v == 0.0:
         state, meaning = "ZERO_UNSET_OR_EXPLICIT", (
             "0.0: either unset or explicitly zero (indistinguishable once "
