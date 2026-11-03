@@ -1,0 +1,412 @@
+"""Overlay economics: what it measures, what it refuses, and the one verdict.
+
+Every observation here is synthetic. Nothing reads the network, an account, a
+runtime directory or a credential."""
+from __future__ import annotations
+
+import ast
+import json
+import math
+import os
+import sys
+
+import pytest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BOT = os.path.dirname(HERE)
+for p in (BOT, os.path.join(BOT, "tools"), HERE):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import mainnet_public as mp                                     # noqa: E402
+import overlay_economics as oe                                  # noqa: E402
+
+H = 3600
+START = oe.EVALUATION_START_S
+PRINT_S = 8 * H
+
+
+def book(i10=0.3, i100=2.0, spread=0.1, buy10=None, sell10=None):
+    return {"best_bid": 99_999.0, "best_ask": 100_001.0, "mid": 100_000.0,
+            "spread_bps": spread, "levels": {"bids": 50, "asks": 50},
+            "impact_bps": {"10000": {"buy": i10 if buy10 is None else buy10,
+                                     "sell": i10 if sell10 is None else sell10},
+                           "100000": {"buy": i100, "sell": i100}}}
+
+
+def series(print_bps, *, t0=START + 1, hours=None, spot=100_000.0,
+           perp_off=0.0, spot_fn=None, perp_fn=None, bk=None):
+    """Hourly observations; one funding print every 8 hours."""
+    n_prints = len(print_bps)
+    hours = hours if hours is not None else n_prints * 8
+    rows = []
+    for h in range(hours + 1):
+        t = t0 + h * H
+        k = (h // 8)                       # prints settled so far
+        settled = [[print_bps[m], int((t0 + (m + 1) * PRINT_S - 1) * 1000)]
+                   for m in range(min(k, n_prints))][-8:]
+        sp = spot_fn(h) if spot_fn else spot
+        pp = perp_fn(h) if perp_fn else sp + perp_off
+        rows.append({"obs": {
+            "origin": mp.ORIGIN, "venue": mp.VENUE, "observed_at_s": float(t),
+            "perp_mark": pp, "spot_mark": sp,
+            "funding_bps": print_bps[min(k, n_prints) - 1] if k else 0.0,
+            "funding_print_bps": settled[-1][0] if settled else 0.0,
+            "funding_print_ms": settled[-1][1] if settled else 0,
+            "settled_prints": settled,
+            "book": {"linear": bk or book(), "spot": bk or book()}}})
+    return rows
+
+
+# -- execution cost: measured sizes, bounded between, nothing beyond ------------
+
+def test_cost_is_exact_at_the_measured_sizes():
+    b = book(i10=0.3, i100=2.0)
+    r = oe.leg_impact_bounds(b, "buy", 10_000)
+    assert r == {"status": "MEASURED", "lower_bps": 0.3, "upper_bps": 0.3}
+    assert oe.leg_impact_bounds(b, "sell", 100_000)["upper_bps"] == 2.0
+
+
+def test_cost_below_the_smallest_size_is_bounded_by_half_the_spread():
+    r = oe.leg_impact_bounds(book(i10=0.3, spread=0.2), "buy", 100)
+    assert r["status"] == "BOUNDED"
+    assert r["lower_bps"] == pytest.approx(0.1) and r["upper_bps"] == 0.3
+
+
+def test_cost_between_measured_sizes_is_bracketed_by_them():
+    r = oe.leg_impact_bounds(book(i10=0.3, i100=2.0), "buy", 50_000)
+    assert (r["status"], r["lower_bps"], r["upper_bps"]) == ("BOUNDED", 0.3, 2.0)
+
+
+def test_cost_above_the_largest_measured_size_is_unavailable_not_extrapolated():
+    r = oe.leg_impact_bounds(book(), "buy", 100_001)
+    assert r["status"] == oe.UNAVAILABLE
+    assert r["reason"] == "ABOVE_LARGEST_MEASURED_SIZE"
+    assert "upper_bps" not in r
+
+
+@pytest.mark.parametrize("bad", [0, -5, float("nan"), float("inf"), None, "x"])
+def test_a_nonsense_notional_is_unavailable(bad):
+    assert oe.leg_impact_bounds(book(), "buy", bad)["status"] == oe.UNAVAILABLE
+
+
+def test_a_book_too_thin_to_price_a_size_is_unavailable():
+    b = book(buy10=None)
+    b["impact_bps"]["10000"]["buy"] = None
+    assert oe.leg_impact_bounds(b, "buy", 10_000)["status"] == oe.UNAVAILABLE
+    assert oe.leg_impact_bounds(b, "buy", 100)["status"] == oe.UNAVAILABLE
+
+
+def test_a_missing_book_is_unavailable():
+    assert oe.leg_impact_bounds(None, "buy", 100)["status"] == oe.UNAVAILABLE
+    assert oe.leg_impact_bounds({}, "buy", 100)["status"] == oe.UNAVAILABLE
+
+
+def test_the_overlay_round_trip_is_two_perp_legs_and_no_spot():
+    rows = series([2.0] * 3)
+    c = oe.overlay_cost_bounds(rows[0]["obs"], rows[-1]["obs"], 100)
+    assert (c["legs"], c["spot_legs"]) == (2, 0)
+    assert c["fees_bps"] == pytest.approx(2 * oe.TAKER_FEE_BPS) == 11.0
+    assert c["total_upper_bps"] == pytest.approx(11.0 + 0.6)
+    assert c["total_lower_bps"] == pytest.approx(11.0 + 0.1)   # 2 * half-spread
+
+
+def test_one_unavailable_leg_makes_the_round_trip_unavailable():
+    rows = series([2.0] * 3)
+    rows[0]["obs"]["book"]["linear"] = None
+    assert oe.overlay_cost_bounds(rows[0]["obs"], rows[-1]["obs"],
+                                  100)["status"] == oe.UNAVAILABLE
+
+
+def test_the_overlay_cost_is_below_the_four_leg_acquire_structure():
+    """The frozen report prices four legs; an overlay trades two."""
+    rows = series([2.0] * 3, bk=book(i10=0.5, i100=3.0))
+    c = oe.overlay_cost_bounds(rows[0]["obs"], rows[-1]["obs"], 10_000)
+    four_leg = 4 * 0.5 + 2 * 2 * oe.TAKER_FEE_BPS       # same impact, two more legs
+    assert c["total_upper_bps"] < four_leg
+
+
+# -- one episode: the owner's BTC is the benchmark -------------------------------
+
+def episode(spot_move=0.0, basis_move=0.0, prints=(4.0, 4.0, 4.0)):
+    n = len(prints)
+    rows = series(list(prints), hours=n * 8,
+                  spot_fn=lambda h: 100_000.0 * (1 + spot_move * h / (n * 8)),
+                  perp_fn=lambda h: 100_000.0 * (1 + spot_move * h / (n * 8))
+                  + basis_move * 100_000.0 * h / (n * 8))
+    return oe.episode_result(rows, 0, len(rows) - 1, 1_000.0)
+
+
+def test_the_btc_leg_is_identical_for_overlay_and_passive_and_not_added_twice():
+    e = episode(spot_move=0.10)
+    assert e["overlay_btc_pnl_usd"] == e["passive_btc_pnl_usd"]
+    assert e["passive_btc_pnl_usd"] == pytest.approx(100.0)
+    # increment = perp + funding - cost; the BTC leg cancels
+    assert e["incremental_vs_passive_usd"] == pytest.approx(
+        e["perp_pnl_marks_usd"] + e["funding_usd"]
+        - e["cost"]["total_upper_bps"] * 1_000.0 / 1e4)
+    assert e["overlay_total_usd"] - e["passive_btc_pnl_usd"] == pytest.approx(
+        e["incremental_vs_passive_usd"])
+
+
+def test_a_rally_with_constant_basis_changes_the_directional_part_not_the_carry():
+    # no funding, so the only thing that differs is the price path
+    flat = episode(spot_move=0.0, prints=(0.0, 0.0, 0.0))
+    rally = episode(spot_move=0.25, prints=(0.0, 0.0, 0.0))
+    assert rally["directional_component_usd"] == pytest.approx(-250.0)
+    assert rally["carry_usd"] == pytest.approx(flat["carry_usd"], abs=1e-6)
+    assert rally["incremental_vs_passive_usd"] < flat["incremental_vs_passive_usd"]
+
+
+def test_a_basis_blow_out_is_carry_loss():
+    flat = episode(prints=(0.0, 0.0, 0.0))
+    wide = episode(basis_move=0.01, prints=(0.0, 0.0, 0.0))
+    assert wide["carry_usd"] == pytest.approx(flat["carry_usd"] - 10.0, abs=1e-6)
+
+
+def test_funding_is_counted_once_per_print_not_once_per_observation():
+    e = episode(prints=(4.0, 4.0, 4.0))
+    qty = 1_000.0 / 100_000.0
+    assert e["settlements_held"] == 3
+    assert e["funding_usd"] == pytest.approx(3 * 4.0 / 1e4 * qty * 100_000.0)
+
+
+def test_a_negative_print_is_paid_not_received():
+    e = episode(prints=(4.0, -2.0, -2.0))
+    assert e["funding_usd"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_an_unpriceable_episode_has_no_carry_number():
+    rows = series([4.0] * 3)
+    rows[-1]["obs"]["book"]["linear"] = None
+    e = oe.episode_result(rows, 0, len(rows) - 1, 100.0)
+    assert e["carry_usd"] is None and e["incremental_vs_passive_usd"] is None
+
+
+def test_nothing_in_an_episode_is_cash():
+    e = episode()
+    assert e["cash"] is False and e["class"] == oe.SIMULATED
+
+
+# -- capital: unset is not zero --------------------------------------------------
+
+def test_an_unset_capital_cost_is_insufficient_owner_input_with_a_sensitivity():
+    m = oe.capital_model(None, [10.0, 12.0, 8.0], [3.0, 3.0, 3.0])
+    assert m["status"] == oe.INSUFFICIENT_OWNER_INPUT
+    assert m["applied_apr"] is None and m["result"] is None
+    assert set(m["sensitivity"]) == {"0.00", "0.02", "0.05", "0.10"}
+
+
+def test_an_explicit_zero_is_a_supplied_value_and_applies_nothing():
+    z = oe.capital_model(0.0, [10.0, 12.0], [3.0, 3.0])
+    assert z["status"] == "OWNER_SUPPLIED" and z["applied_apr"] == 0.0
+    assert z["result"]["mean"] == pytest.approx(11.0)
+
+
+def test_a_positive_capital_cost_is_charged_by_days_held():
+    m = oe.capital_model(0.10, [10.0], [36.5])
+    assert m["result"]["mean"] == pytest.approx(10.0 - 0.10 * 36.5 / 365 * 1e4)
+
+
+@pytest.mark.parametrize("bad", [-0.01, float("nan"), "x"])
+def test_a_bad_capital_cost_is_invalid_not_zero(bad):
+    assert oe.capital_model(bad, [1.0], [1.0])["status"] == "INVALID_OWNER_INPUT"
+
+
+# -- statistics -------------------------------------------------------------------
+
+def test_bounds_need_two_values_and_widen_for_small_samples():
+    assert oe.mean_bounds([1.0])["lower95"] is None
+    small = oe.mean_bounds([1.0, 2.0, 3.0])
+    big = oe.mean_bounds([1.0, 2.0, 3.0] * 20)
+    assert (small["upper95"] - small["mean"]) > (big["upper95"] - big["mean"])
+    assert oe.mean_bounds([float("nan"), 1.0, 3.0])["n"] == 2
+
+
+# -- stress and capacity: unknowns stay unknown ------------------------------------
+
+def test_stress_names_every_input_it_does_not_have():
+    s = oe.stress_table(100.0)
+    assert s["perp_loss_usd_by_rally"]["100%"] == 100.0
+    for k in ("funding_inversion_cost_3_prints_usd", "gap_exit_slippage_bound_usd",
+              "liquidation_rally_pct_usdt_margin_only",
+              "liquidation_rally_pct_btc_collateral"):
+        assert s[k]["status"] == oe.UNAVAILABLE and s[k]["needs"]
+
+
+def test_stress_with_inputs_gives_labelled_numbers():
+    s = oe.stress_table(100.0, leverage=1.0, maintenance_margin_rate=0.0033,
+                        collateral_ratio=0.85, funding_cap_bps=33.3,
+                        price_limit_ratio=0.02)
+    assert s["funding_inversion_cost_3_prints_usd"]["usd"] == pytest.approx(0.999)
+    assert s["gap_exit_slippage_bound_usd"]["usd"] == pytest.approx(2.0)
+    assert s["liquidation_rally_pct_usdt_margin_only"]["pct"] == pytest.approx(99.34, abs=0.05)
+    assert s["liquidation_rally_pct_usdt_margin_only"]["status"] == "ILLUSTRATIVE"
+    assert s["liquidation_rally_pct_btc_collateral"]["pct"] == pytest.approx(552, abs=2)
+
+
+def test_capacity_is_bracketed_and_never_extrapolated():
+    rows = series([4.0] * 3, bk=book(i10=0.5, i100=4.0))
+    cap = oe.capacity_bounds(rows, impact_budget_bps=1.0, planned_notional_usd=5_000)
+    assert cap["status"] == "BRACKETED"
+    assert cap["supported_notional_lower_usd"] == 10_000.0 and \
+        cap["supported_notional_upper_usd"] == 100_000.0
+    assert cap["above_largest_measured_usd"] == oe.UNAVAILABLE
+    assert cap["planned_inside_measured_capacity"] is True
+
+
+def test_capacity_with_every_size_inside_budget_has_no_upper_bound():
+    rows = series([4.0] * 3, bk=book(i10=0.5, i100=0.9))
+    cap = oe.capacity_bounds(rows, impact_budget_bps=1.0, planned_notional_usd=50_000)
+    assert cap["status"] == "LOWER_BOUND_ONLY"
+    assert cap["supported_notional_upper_usd"] is None
+    assert cap["supported_notional_lower_usd"] == 100_000.0
+    assert cap["planned_inside_measured_capacity"] is True
+    # a size above everything measured is neither approved nor refused
+    assert oe.capacity_bounds(rows, 1.0, 150_000)["planned_inside_measured_capacity"] is None
+
+
+def test_an_unpriced_side_counts_against_a_size():
+    rows = series([4.0] * 3, bk=book(i10=0.5, i100=0.9))
+    rows[0]["obs"]["book"]["linear"]["impact_bps"]["100000"]["buy"] = None
+    cap = oe.capacity_bounds(rows, impact_budget_bps=1.0, planned_notional_usd=50_000)
+    assert cap["by_size"]["100000"]["within_budget"] is False
+
+
+def test_capacity_without_any_measurement_is_unavailable():
+    assert oe.capacity_bounds([], 1.0, 100.0)["status"] == oe.UNAVAILABLE
+
+
+# -- the frozen strategy, replayed ---------------------------------------------------
+
+def cyc(pos, k_pos=3):
+    """k_pos positive prints then three negative ones, repeated."""
+    return ([pos] * k_pos + [-1.0] * 3)
+
+
+def test_the_replay_enters_on_the_gate_and_exits_on_three_negative_prints():
+    rows = series(cyc(6.0, 5) * 2, bk=book(i10=0.3, i100=2.0))
+    sim = oe.simulate_episodes(rows, 100.0)
+    assert len(sim["closed"]) >= 1
+    for e in sim["closed"]:
+        assert e["settlements_held"] >= 3
+        assert (e["cost"]["legs"], e["cost"]["spot_legs"]) == (2, 0)
+
+
+def test_an_episode_still_open_at_the_end_is_reported_and_not_counted():
+    rows = series([6.0] * 12)
+    sim = oe.simulate_episodes(rows, 100.0)
+    assert sim["closed"] == [] and sim["open_at_end"] is True
+
+
+# -- forward-only, independence, and the verdict -------------------------------------
+
+def test_184_hourly_observations_are_about_23_independent_windows():
+    rows = series([2.0] * 23, hours=183)
+    assert len(rows) == 184
+    rep = oe.evaluate(rows, planned_notional_usd=100.0)
+    assert rep["observations_forward"] == 184
+    assert rep["distinct_settled_prints"] <= 23
+    assert rep["verdict"] == "INSUFFICIENT"
+    assert any("DISTINCT_PRINTS" in r for r in rep["verdict_reasons"])
+    assert "not counts of independent" in rep["independence_note"]
+
+
+def test_rows_before_the_declaration_cannot_decide_anything():
+    rows = series(cyc(6.0, 5) * 40, t0=START - 400 * 86400)
+    rep = oe.evaluate(rows, planned_notional_usd=100.0, owner_capital_apr=0.0,
+                      owner_drawdown_limit_usd=20.0)
+    assert rep["observations_forward"] == 0
+    assert rep["observations_before_declaration_excluded"] == len(rows)
+    assert rep["verdict"] == "INSUFFICIENT"
+
+
+def test_a_rich_adequate_forward_sample_is_go_only_with_every_owner_input():
+    rows = series(cyc(30.0, 5) * 40, bk=book(i10=0.3, i100=2.0))
+    kw = dict(planned_notional_usd=100.0)
+    base = oe.evaluate(rows, **kw)
+    assert base["episodes"]["priced"] >= 30 and base["span_days"] >= 60
+    assert base["verdict"] == "INSUFFICIENT"            # no owner capital cost
+    assert base["verdict_reasons"] == [oe.INSUFFICIENT_OWNER_INPUT]
+    no_dd = oe.evaluate(rows, owner_capital_apr=0.0, **kw)
+    assert no_dd["verdict"] == "INSUFFICIENT"
+    assert "DRAWDOWN" in no_dd["verdict_reasons"][0]
+    go = oe.evaluate(rows, owner_capital_apr=0.0, owner_drawdown_limit_usd=20.0, **kw)
+    assert go["verdict"] == "GO", go["verdict_reasons"]
+    assert go["cash"] is False and go["class"] == oe.SIMULATED
+
+
+def test_a_high_capital_cost_turns_a_marginal_go_into_insufficient():
+    rows = series(cyc(30.0, 5) * 40, bk=book(i10=0.3, i100=2.0))
+    rep = oe.evaluate(rows, planned_notional_usd=100.0, owner_capital_apr=5.0,
+                      owner_drawdown_limit_usd=20.0)
+    assert rep["verdict"] == "INSUFFICIENT"
+
+
+def test_an_adequate_sample_that_cannot_cover_costs_is_no_go():
+    rows = series(cyc(1.0, 5) * 40, bk=book(i10=0.3, i100=2.0))
+    rep = oe.evaluate(rows, planned_notional_usd=100.0, owner_capital_apr=0.0,
+                      owner_drawdown_limit_usd=20.0)
+    assert rep["episodes"]["priced"] >= 30
+    assert rep["verdict"] == "NO_GO", rep["verdict_reasons"]
+
+
+def test_a_size_above_the_measured_books_cannot_be_priced_or_approved():
+    rows = series(cyc(30.0, 5) * 40, bk=book())
+    rep = oe.evaluate(rows, planned_notional_usd=500_000.0, owner_capital_apr=0.0,
+                      owner_drawdown_limit_usd=20.0)
+    assert rep["episodes"]["priced"] == 0
+    assert rep["verdict"] == "INSUFFICIENT"
+
+
+def test_unreadable_evidence_is_insufficient_whatever_the_rows_say():
+    rows = series(cyc(30.0, 5) * 40)
+    rep = oe.evaluate(rows, planned_notional_usd=100.0, owner_capital_apr=0.0,
+                      owner_drawdown_limit_usd=20.0, chain_issues=["line 3: broken"])
+    assert (rep["verdict"], rep["verdict_reasons"]) == (
+        "INSUFFICIENT", ["EVIDENCE_UNREADABLE"])
+
+
+def test_there_are_exactly_three_verdicts_and_each_has_a_meaning():
+    assert oe.PROTOCOL["verdicts"] == ["GO", "NO_GO", "INSUFFICIENT"]
+    assert set(oe.PROTOCOL["meaning"]) == {"GO", "NO_GO", "INSUFFICIENT"}
+    assert oe.PROTOCOL["cash"] is False
+
+
+def test_the_report_reads_a_real_evidence_file_and_flags_a_broken_chain(tmp_path):
+    db = str(tmp_path / "m.jsonl")
+    for r in series([2.0] * 3, hours=4):
+        mp.append(db, r["obs"])
+    rep = oe.report(db, planned_notional_usd=100.0)
+    assert rep["chain_issues"] == [] and rep["observations_total"] == 5
+    lines = open(db).read().splitlines()
+    lines[2] = lines[2].replace('"perp_mark":100000.0', '"perp_mark":100001.0')
+    open(db, "w").write("\n".join(lines) + "\n")
+    bad = oe.report(db, planned_notional_usd=100.0)
+    assert bad["chain_issues"] and bad["verdict"] == "INSUFFICIENT"
+
+
+# -- the frozen v1 protocol is untouched, and this module cannot trade -----------------
+
+def test_the_frozen_v1_protocol_hash_is_unchanged():
+    import test_mainnet_protocol as tmp
+    assert mp.protocol_hash() == tmp.DECLARED_HASH
+
+
+def test_the_v2_protocol_hash_is_pinned():
+    assert oe.protocol_hash() == PINNED
+
+
+def test_this_module_imports_nothing_that_can_place_an_order():
+    tree = ast.parse(open(os.path.join(BOT, "tools", "overlay_economics.py")).read())
+    mods = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            mods |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            mods.add((n.module or "").split(".")[0])
+    assert mods <= {"__future__", "argparse", "hashlib", "json", "math", "os",
+                    "sys", "typing", "carry_costs", "mainnet_public"}
+
+
+PINNED = "37193957cea395fa9157059c2dc53cdd272ad2c63f445b2fb4756b64d3992051"
