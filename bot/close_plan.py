@@ -31,7 +31,9 @@ INVARIANTS (each is a test)
 """
 from __future__ import annotations
 
+import hashlib
 import math
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
@@ -125,10 +127,27 @@ class Plan:
     resolve: Tuple[Tuple[int, str, float, Tuple[str, ...]], ...] = ()
 
 
+LINK_ID_MAX = 36
+_LINK_OK = re.compile(r"^[A-Za-z0-9_-]{1,36}$")
+
+
+def valid_link_id(link_id: str) -> bool:
+    """Bybit's orderLinkId rule: 1-36 characters of letters, digits, dashes and
+    underscores. (Colons and dots are not allowed.)"""
+    return bool(_LINK_OK.match(str(link_id)))
+
+
 def link_id_for(cycle_id: str, n: int) -> str:
-    """Deterministic: the same cycle and attempt number always name the same
-    order, so a re-send after a restart cannot create a second order."""
-    return f"{cycle_id}:close:{int(n)}"
+    """Deterministic and venue-legal: the same cycle and attempt number always
+    name the same order, so a re-send after a restart cannot create a second
+    one. A cycle id that would not fit is replaced by a fixed-length digest of
+    itself (still a pure function of the cycle id)."""
+    safe = re.sub(r"[^A-Za-z0-9_-]", "-", str(cycle_id))
+    link = f"CL-{safe}-{int(n)}"
+    if len(link) > LINK_ID_MAX:
+        digest = hashlib.sha256(str(cycle_id).encode()).hexdigest()[:16]
+        link = f"CL-{digest}-{int(n)}"
+    return link
 
 
 def floor_to_step(qty: float, step: float) -> float:

@@ -74,6 +74,8 @@ class Venue:
 
     def place(self, link_id: str, qty: float) -> None:
         short = -self.net
+        if not CP.valid_link_id(link_id):                # the venue refuses an illegal id
+            raise ValueError(f"INVALID_ORDER_LINK_ID {link_id!r}")
         self.placed.append((link_id, qty, short))
         if link_id in self.orders:                       # one order per link id, ever
             self.duplicate_sends_seen += 1
