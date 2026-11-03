@@ -1104,8 +1104,18 @@ class LedgerBroker:
     def __init__(self, inner: Any, journal: Journal,
                  ms: Optional[Callable[[], int]] = None,
                  spot_symbol: str = "BTCUSDT",
-                 book_overlay_inventory: bool = False) -> None:
+                 book_overlay_inventory: bool = False,
+                 record_sink: Optional[Callable[[Dict[str, Any]], None]] = None
+                 ) -> None:
         self.inner = inner
+        #: Called synchronously right after a fill or an order outcome is
+        #: booked, so evidence reaches disk at the moment it exists (a hard
+        #: kill loses nothing that already happened). It is only an observer:
+        #: an exception from it is counted and logged, and never touches the
+        #: order, the booking or the engine.
+        self.record_sink = record_sink
+        self.sink_errors = 0
+        self.sink_last_error = ""
         self.journal = journal
         self.spot_symbol = spot_symbol
         self._ms = ms or (lambda: 0)
@@ -1264,6 +1274,20 @@ class LedgerBroker:
     #: record durably; this list is only its in-process index, so it is bounded.
     MAX_EXECUTIONS_KEPT = 5000
 
+    def _emit(self, event: Dict[str, Any]) -> None:
+        """Hand one booked fill / outcome to the sink. Never raises."""
+        sink = self.record_sink
+        if sink is None:
+            return
+        try:
+            sink(event)
+        except Exception as exc:  # noqa: BLE001 - an observer must not stop an order
+            self.sink_errors += 1
+            self.sink_last_error = f"{type(exc).__name__}: {exc}"
+            logging.getLogger(__name__).warning(
+                "execution record not written durably: %s",
+                self.sink_last_error)
+
     def _keep_execution(self, record: Dict[str, Any]) -> None:
         self.executions.append(record)
         extra = len(self.executions) - self.MAX_EXECUTIONS_KEPT
@@ -1282,6 +1306,7 @@ class LedgerBroker:
             venue=str(getattr(self.inner, "VENUE", "unknown")),
             order_type=order_type, requested_qty=qty, why=why,
             environment=self._environment(), recorded_ms=int(self._ms())))
+        self._emit({"type": "outcome", "execution": self.executions[-1]})
 
     def _note_unfilled(self, result: Dict[str, Any], *, side: str,
                        product: str, symbol: str, requested_qty: Any,
@@ -1314,6 +1339,7 @@ class LedgerBroker:
             if why:
                 rec["reasons"] = list(rec.get("reasons") or []) + [why]
             self._keep_execution(rec)
+            self._emit({"type": "outcome", "execution": rec})
         except Exception:  # noqa: BLE001 - bookkeeping never stops an order
             pass
 
@@ -1328,6 +1354,12 @@ class LedgerBroker:
             "qty": qty, "price": price, "fee_usdt": fee_usdt,
             "fee_btc": fee_btc, "fee_status": status,
             "fee_currencies": currencies})
+        kind = {("spot", "Buy"): "spot_buy", ("spot", "Sell"): "spot_sell",
+                ("linear", "Sell"): "perp_open",
+                ("linear", "Buy"): "perp_close"}.get((product, side))
+        if kind:
+            self._emit({"type": "fill", "kind": kind, "ms": int(ms),
+                        "ref": str(ref), "fee_raw": fee_raw})
 
     def note_hedge_reference(self, spot: Optional[float]) -> None:
         """The spot price the engine decided on, for the overlay's inventory

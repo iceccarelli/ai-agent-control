@@ -92,12 +92,39 @@ def plan_problem(state: dict) -> Optional[str]:
     return None
 
 
+def _recording_broker(broker: Any, symbol: str, qty: float, path: str,
+                      venue_label: str):
+    """(order_broker, error). The order goes through a `LedgerBroker` whose sink
+    appends the close's execution record the moment it fills, so the exits the
+    drill itself failed to complete (the worst ones) are in the sample set, not
+    missing from it. Every read still uses the raw adapter. ANY failure here
+    returns (broker, reason): the close then goes out exactly as it did before
+    this existed - recording never gets in the way of getting flat."""
+    try:
+        import drill as _drill
+        import ledger as _ledger
+        order_broker = _ledger.LedgerBroker(
+            broker, _ledger.Journal(), ms=lambda: int(time.time() * 1000),
+            record_sink=_drill.RecordWriter(path, venue_label, set()))
+        order_broker.begin_decision(
+            symbol=symbol, product="linear", side="Buy", qty=qty,
+            mark=float(broker.get_mark(symbol)), book_timeout_s=1.0)
+        return order_broker, None
+    except Exception as exc:                                   # noqa: BLE001
+        return broker, f"{type(exc).__name__}: {exc}"
+
+
 def close_short(broker: Any, symbol: str, *, expected_qty: Optional[float] = None,
-                sleep=time.sleep) -> dict:
+                sleep=time.sleep, records_path: str = "",
+                venue_label: str = "testnet") -> dict:
     """Send the one reduce-only Buy for the venue's short, then verify flat.
 
     ``expected_qty`` is what the operator confirmed: if the venue's short is not
-    exactly that when the order is about to go, nothing is sent."""
+    exactly that when the order is about to go, nothing is sent.
+
+    ``records_path`` appends this close's execution record (book-measured
+    where the public book could be read in a second) to the drill's records
+    file, labelled ``venue_label``. Optional and fail-open."""
     before = read_state(broker, symbol)
     problem = plan_problem(before)
     if problem:
@@ -110,8 +137,21 @@ def close_short(broker: Any, symbol: str, *, expected_qty: Optional[float] = Non
     if qty <= FLAT_DUST:
         return {"ok": True, "sent": False, "before": before, "after": before,
                 "note": "the venue is already flat; nothing was sent"}
-    result = broker.place_market(symbol=symbol, side="Buy", qty=qty,
-                                 product="linear")
+    order_broker, recording_error = broker, None
+    if records_path:
+        order_broker, recording_error = _recording_broker(
+            broker, symbol, qty, records_path, venue_label)
+    try:
+        result = order_broker.place_market(symbol=symbol, side="Buy", qty=qty,
+                                           product="linear")
+    except Exception as exc:                                   # noqa: BLE001
+        import ledger as _ledger
+        if not isinstance(exc, _ledger.BookingFailedAfterFill):
+            raise
+        # The venue ACCEPTED the order; only the bookkeeping failed. That is
+        # not "the close failed": go on to verify flat, and say what was lost.
+        result = {"booking_failed": str(exc)}
+        recording_error = f"booking failed after the order was sent: {exc}"
     if result is None:
         # a definite rejection: nothing was filled and no second order follows
         return {"ok": False, "sent": False, "before": before,
@@ -130,8 +170,11 @@ def close_short(broker: Any, symbol: str, *, expected_qty: Optional[float] = Non
             break
         if attempt + 1 < VERIFY_TRIES:
             sleep(VERIFY_SLEEP_S)
-    return {"ok": flat, "sent": True, "before": before, "after": after,
-            "fill": result, "flat_verified": flat}
+    out = {"ok": flat, "sent": True, "before": before, "after": after,
+           "fill": result, "flat_verified": flat}
+    if recording_error:
+        out["recording_error"] = recording_error
+    return out
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -149,6 +192,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--max-qty", type=float, default=0.0,
                     help="with --no-prompt: refuse to close a short larger than "
                          "this (a position this tool was not expecting)")
+    ap.add_argument("--execution-records", default="",
+                    help="append this close's execution record to the drill's "
+                         "records file (testnet only; optional, and a failure "
+                         "to record never blocks the close)")
     ap.add_argument("--evidence-path", default="",
                     help="capture this run's REST traffic (redacted, "
                          "hash-chained) here; must not already exist")
@@ -245,7 +292,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     D.InterruptGuard().install()
     try:
         outcome = close_short(broker, args.symbol,
-                              expected_qty=state["short_qty"])
+                              expected_qty=state["short_qty"],
+                              records_path=args.execution_records,
+                              venue_label="testnet")
     except KeyboardInterrupt as exc:
         outcome = {"ok": False, "interrupted": str(exc)}
     except Exception as exc:                                   # noqa: BLE001

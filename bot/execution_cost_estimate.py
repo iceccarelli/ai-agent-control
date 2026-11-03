@@ -110,6 +110,13 @@ class Observation:
     half_spread_bps: float
 
 
+#: How far a journal line's time may be from the fill time inside its record.
+#: A line is stamped when the fill is booked (seconds after the fill; a resting
+#: order that fills before its cancel is booked can be minutes), so an hour is
+#: generous for honest data and far below the days an edit would need.
+LINE_TIME_TOLERANCE_MS = 3_600_000
+
+
 def _base_link(link: str) -> str:
     """The order a fill belongs to: the cancel-time increment is booked under
     `<link>+cancel`, which is the same order."""
@@ -162,6 +169,13 @@ def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
             # The record's own claim of "MEASURED" is not evidence: its stored
             # book, times and fill must reproduce its status and figures.
             drop(unverified.split(":", 1)[0])
+            continue
+        # A line's time decides the sample's AGE, so it must agree with the
+        # record it carries: a record whose own fill time is far from the
+        # line's would otherwise be passed off as fresh by editing one field.
+        fill_t = _num(rec.get("fill_ms"))
+        if fill_t is not None and abs(ms - fill_t) > LINE_TIME_TOLERANCE_MS:
+            drop("LINE_TIME_MISMATCH")
             continue
         d2s, s2f = rec.get("decision_to_submit_ms"), rec.get("submit_to_fill_ms")
         if (d2s is not None and _num(d2s) is not None and _num(d2s) < 0) or \

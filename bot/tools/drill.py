@@ -549,6 +549,77 @@ def _outcome_key(rec: Dict[str, Any]) -> Tuple[str, str]:
     return ("outcome", json.dumps(rec, sort_keys=True, default=str))
 
 
+def _fill_key(ref: Any, ms: Any, fee_raw: Any) -> Tuple[Any, ...]:
+    """What makes two fill lines the same fill. (ref, ms) alone would collapse
+    two distinct fills that share both; the execution record's own timestamps
+    and quantities tell them apart."""
+    exe = (fee_raw or {}).get("execution") or {}
+    return (str(ref), int(ms), exe.get("filled_qty"), exe.get("avg_price"),
+            exe.get("submit_ms"), exe.get("fill_ms"))
+
+
+def _fill_line(venue: str, kind: str, ms: Any, ref: Any, fee_raw: Any) -> str:
+    return json.dumps(
+        {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
+         "kind": kind, "ms": int(ms), "ref": str(ref), "fee_raw": fee_raw},
+        sort_keys=True, default=str)
+
+
+def _outcome_line(venue: str, rec: Dict[str, Any]) -> str:
+    ms = rec.get("recorded_ms") or rec.get("decision_ms") or 0
+    return json.dumps(
+        {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
+         "kind": OUTCOME_KIND, "ms": int(ms),
+         "ref": str(rec.get("order_link_id") or ""), "execution": rec},
+        sort_keys=True, default=str)
+
+
+class RecordWriter:
+    """Writes each fill / outcome to the records file THE MOMENT it is booked
+    (`LedgerBroker.record_sink`), one fsynced line at a time, so a hard kill
+    loses nothing that already happened.
+
+    `written` is the same key set `append_execution_records` uses, so the
+    end-of-run flush skips what is already on disk and picks up anything this
+    writer could not write (a key joins `written` only after its line is on
+    disk). It is an observer: it never raises into the caller, it counts its
+    failures (`errors`, `last_error`) so they can be reported, and the label on
+    every line is the venue it was given - a testnet fill is never unlabelled.
+    """
+
+    def __init__(self, path: str, venue: str, written: set) -> None:
+        self.path, self.venue, self.written = path, str(venue), written
+        self.count = 0
+        self.errors = 0
+        self.last_error = ""
+
+    def __call__(self, event: Dict[str, Any]) -> None:
+        try:
+            if event.get("type") == "fill":
+                key = _fill_key(event["ref"], event["ms"], event.get("fee_raw"))
+                line = _fill_line(self.venue, event["kind"], event["ms"],
+                                  event["ref"], event.get("fee_raw"))
+            elif event.get("type") == "outcome":
+                rec = event["execution"]
+                key = _outcome_key(rec)
+                line = _outcome_line(self.venue, rec)
+            else:
+                return
+            if key in self.written:
+                return
+            os.makedirs(os.path.dirname(os.path.abspath(self.path)),
+                        exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.written.add(key)
+            self.count += 1
+        except Exception as exc:  # noqa: BLE001 - counted, reported, never raised
+            self.errors += 1
+            self.last_error = f"{type(exc).__name__}: {exc}"
+
+
 def append_execution_records(path: str, journal: Any, venue: str,
                              written: set, outcomes: Any = ()) -> int:
     """Append the journal's FILL entries (each carrying its decision-time
@@ -581,16 +652,11 @@ def append_execution_records(path: str, journal: Any, venue: str,
         booked_refs.add(str(e.ref))
         # (ref, ms) alone would collapse two distinct fills that share both; the
         # execution record's own timestamps and quantities tell them apart.
-        exe = (e.fee_raw or {}).get("execution") or {}
-        key = (str(e.ref), int(e.ms), exe.get("filled_qty"),
-               exe.get("avg_price"), exe.get("submit_ms"), exe.get("fill_ms"))
+        key = _fill_key(e.ref, e.ms, e.fee_raw)
         if key in written or key in pending:
             continue
         pending.add(key)
-        lines.append(json.dumps(
-            {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
-             "kind": e.kind, "ms": int(e.ms), "ref": str(e.ref),
-             "fee_raw": e.fee_raw}, sort_keys=True, default=str))
+        lines.append(_fill_line(venue, e.kind, e.ms, e.ref, e.fee_raw))
     for rec in list(outcomes or ()):
         if not isinstance(rec, dict):
             continue
@@ -601,11 +667,7 @@ def append_execution_records(path: str, journal: Any, venue: str,
         if key in written or key in pending:
             continue
         pending.add(key)
-        ms = rec.get("recorded_ms") or rec.get("decision_ms") or 0
-        lines.append(json.dumps(
-            {"schema": EXECUTION_RECORDS_SCHEMA, "environment": str(venue),
-             "kind": OUTCOME_KIND, "ms": int(ms), "ref": link,
-             "execution": rec}, sort_keys=True, default=str))
+        lines.append(_outcome_line(venue, rec))
     if not lines:
         return 0
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
@@ -813,7 +875,12 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     from carry_risk import CarryRisk
 
     journal = L.Journal()
-    booked = L.LedgerBroker(broker, journal, ms=lambda: int(time.time() * 1000))
+    records_writer = (RecordWriter(execution_records, d.venue,
+                                   state["records_written"])
+                      if execution_records else None)
+    booked = L.LedgerBroker(broker, journal, ms=lambda: int(time.time() * 1000),
+                            record_sink=records_writer)
+    state["record_writer"] = records_writer
 
     class _Store:
         def is_kill_switch_engaged(self):
@@ -1239,12 +1306,20 @@ def _report(d: Drill, state: Dict[str, Any], out: str, cap: float,
     records_path = state.get("execution_records")
     if records_path and journal is not None:
         try:
+            flushed = append_execution_records(
+                records_path, journal, d.venue,
+                state.setdefault("records_written", set()),
+                outcomes=getattr(booked, "executions", ()))
+            writer = state.get("record_writer")
             report["execution_records"] = {
                 "path": records_path, "venue": d.venue,
-                "appended": append_execution_records(
-                    records_path, journal, d.venue,
-                    state.setdefault("records_written", set()),
-                    outcomes=getattr(booked, "executions", ()))}
+                # written at the moment of the fill / outcome
+                "durable_at_fill": writer.count if writer else 0,
+                # found missing at the end and written then (a failed durable
+                # write, or a record the sink never saw)
+                "appended": flushed,
+                "durable_write_errors": writer.errors if writer else 0,
+                "durable_write_last_error": writer.last_error if writer else ""}
         except Exception as exc:  # noqa: BLE001 - never lose the report
             report["execution_records_error"] = f"{type(exc).__name__}: {exc}"
     if state.get("capture_requested") and booked is not None and booked.fills:
