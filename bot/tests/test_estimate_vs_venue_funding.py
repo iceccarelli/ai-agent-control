@@ -310,3 +310,106 @@ def test_reversing_a_venue_row_does_not_turn_the_estimate_counters_into_cash():
     j.reverse("est:x", ms=NOW, why="test")
     st = j.statement(now_ms=NOW)
     assert st["funding_venue_usd"] == pytest.approx(0.0)
+
+
+# -- review round: the supersession cannot be gamed, split or half-applied ------------------------------
+
+def superseded_journal(venue_usd=7.0):
+    j = estimate_journal(usd=1.0)
+    L.book_funding_payments(j, [pay(1, S, venue_usd)], ms=NOW)
+    return j
+
+
+def test_a_later_estimate_that_reuses_the_ref_is_not_covered_by_the_old_reversal():
+    j = superseded_journal(1.0)
+    reconcile(j, [pay(1, S, 1.0)])
+    L.funding(j, ms=NOW + H, ref="fund:S1", usd=5.0)          # a NEW estimate, same ref
+    st = j.statement(now_ms=NOW + H)
+    assert st["funding_usd"] == pytest.approx(6.0)
+    assert st["funding_estimated_entries"] == 1               # counted as what it is
+    assert st["funding_estimated_usd"] == pytest.approx(5.0)
+    assert st["funding_confirmed"] is False
+    assert cls(j, now=NOW + H) != ["ACTUAL_RECONCILED"]
+
+
+def test_a_second_delivery_does_not_cancel_a_later_estimate_either():
+    j = superseded_journal(1.0)
+    L.funding(j, ms=NOW + H, ref="fund:S1", usd=5.0)
+    res = L.book_funding_payments(j, [pay(1, S, 1.0)], ms=NOW + 2 * H)
+    assert res["duplicate"] == 1 and res.get("superseded", 0) == 0
+    assert j.statement(now_ms=NOW + 2 * H)["funding_estimated_entries"] == 1
+
+
+def test_a_forged_reversal_with_the_right_keys_cancels_nothing():
+    j = estimate_journal(ref="fund:S9", usd=5.0)
+    L.book_funding_payments(j, [pay(1, S, 1.0)], ms=NOW)
+    j.post(L.Entry(ms=NOW + 1, kind="reversal", ref="forged",
+                   lines=[L.Line(L.USDT, 0.0), L.Line(L.FUNDING, 0.0)],
+                   fee_raw={"supersedes": "fund:S9", "superseded_by_venue_id": "nonexistent"}))
+    st = j.statement(now_ms=NOW + 1)
+    assert st["funding_estimated_entries"] == 1 and st["funding_confirmed"] is False
+
+
+def test_a_reversal_whose_lines_do_not_negate_the_estimate_cancels_nothing():
+    j = estimate_journal(ref="fund:S1", usd=5.0)
+    L.book_funding_payments(j, [pay(1, S, 1.0)], ms=NOW)       # supersedes the real one
+    j2 = estimate_journal(ref="fund:S1", usd=5.0)
+    L.funding(j2, ms=S + 3 * H, ref="v", usd=1.0, basis="venue", raw=vraw("S1", S, 1.0))
+    j2.post(L.Entry(ms=S + 4 * H, kind="reversal", ref="partial~rev",
+                    lines=[L.Line(L.USDT, -1.0), L.Line(L.FUNDING, 1.0)],       # only $1 of $5
+                    fee_raw={"supersedes": "fund:S1", "superseded_by_venue_id": "S1"}))
+    assert j2.statement(now_ms=NOW)["funding_estimated_entries"] == 1
+
+
+def test_two_estimates_with_one_ref_are_each_replaced_by_their_own_reversal():
+    j = closed_journal(lambda j: (L.funding(j, ms=S + H, ref="fund:S1", usd=1.0),
+                                  L.funding(j, ms=S + H + 1, ref="fund:S1", usd=2.0)))
+    L.book_funding_payments(j, [pay(1, S, 3.0)], ms=NOW)
+    st = j.statement(now_ms=NOW)
+    assert st["funding_usd"] == pytest.approx(3.0)
+    assert st["funding_estimated_entries"] == 0
+    assert len([e for e in j.entries if e.kind == "reversal"]) == 2
+
+
+def test_a_period_ending_before_the_replacement_still_shows_the_estimate_as_an_estimate():
+    j = superseded_journal(7.0)
+    early = j.statement(to_ms=S + H, now_ms=NOW)
+    assert early["funding_usd"] == pytest.approx(1.0)
+    assert early["funding_estimated_entries"] == 1
+    assert early["funding_estimated_usd"] == pytest.approx(1.0)
+    assert early["funding_confirmed"] is False
+
+
+def test_a_period_holding_only_the_replacement_explains_its_own_arithmetic():
+    j = superseded_journal(7.0)
+    late = j.statement(from_ms=NOW, now_ms=NOW)
+    assert late["funding_venue_usd"] == pytest.approx(7.0)
+    assert late["funding_usd"] == pytest.approx(6.0)               # 7 - the earlier period's 1
+    assert late["funding_prior_period_estimate_reversals_usd"] == pytest.approx(-1.0)
+    assert (late["funding_venue_usd"] + late["funding_estimated_usd"]
+            + late["funding_prior_period_estimate_reversals_usd"]
+            == pytest.approx(late["funding_usd"]))
+
+
+def test_the_whole_window_still_adds_up():
+    j = superseded_journal(7.0)
+    st = j.statement(now_ms=NOW)
+    assert st["funding_usd"] == pytest.approx(7.0)
+    assert st["funding_prior_period_estimate_reversals_usd"] == 0.0
+
+
+def test_the_gross_funding_figures_do_not_count_a_cancelled_estimate_as_a_cost():
+    j = superseded_journal(7.0)
+    (c,) = perf.cycles_from_journal(j)
+    assert c["funding_usd"] == pytest.approx(7.0)
+    assert c["funding_received_usd"] == pytest.approx(7.0)
+    assert c["funding_paid_usd"] == pytest.approx(0.0)             # no phantom $1 cost
+    assert c["funding_entries"] == 1
+
+
+def test_an_unusable_venue_amount_cancels_nothing():
+    j = estimate_journal(usd=1.0)
+    with pytest.raises(Exception):
+        L.book_funding_payments(j, [pay(1, S, float("nan"))], ms=NOW)
+    assert [e for e in j.entries if e.kind == "reversal"] == []
+    assert j.statement(now_ms=NOW)["funding_estimated_entries"] == 1

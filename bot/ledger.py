@@ -152,12 +152,46 @@ def funding_basis(e: "Entry") -> str:
     return "engine_estimate" if (e.kind == "funding" and e.basis == "") else e.basis
 
 
-def superseded_refs(entries) -> set:
-    """Refs of estimate entries a venue settlement has replaced: a reversal that
-    names the estimate and the venue id. The estimate stays in the journal."""
-    return {e.fee_raw["supersedes"] for e in entries
-            if e.kind == "reversal" and "supersedes" in e.fee_raw
-            and "superseded_by_venue_id" in e.fee_raw}
+def _negates(original: "Entry", reversal: "Entry") -> bool:
+    """Do the reversal's lines exactly cancel the original's?"""
+    if len(original.lines) != len(reversal.lines):
+        return False
+    return all(a.account == b.account and abs(a.usd + b.usd) <= 1e-9
+               and abs(a.qty + b.qty) <= 1e-12
+               for a, b in zip(original.lines, reversal.lines))
+
+
+def supersession_pairs(entries) -> Dict[int, int]:
+    """{index of an engine-estimate funding entry: index of the reversal that
+    replaced it}, in JOURNAL ORDER and validated.
+
+    A pairing exists only if (a) a venue-basis funding entry for the named venue
+    id came EARLIER in the journal (a settlement that arrived), (b) the reversal's
+    lines exactly negate the estimate's, and (c) the estimate is the latest
+    still-unpaired estimate of that ref before the reversal. Each reversal pairs
+    with ONE estimate; a second estimate that reuses a ref is not covered by the
+    first one's reversal; a reversal that merely carries the right keys, with no
+    such settlement or other lines, pairs with nothing and is just cash. The
+    estimate stays in the journal either way."""
+    venue_ids: set = set()
+    open_est: Dict[str, List[int]] = {}
+    pairs: Dict[int, int] = {}
+    for i, e in enumerate(entries):
+        if e.kind == "funding":
+            if funding_basis(e) == "engine_estimate":
+                open_est.setdefault(e.ref, []).append(i)
+            elif e.basis == "venue" and "venue_id" in e.fee_raw:
+                venue_ids.add(str(e.fee_raw["venue_id"]))
+        elif (e.kind == "reversal" and "supersedes" in e.fee_raw
+              and "superseded_by_venue_id" in e.fee_raw):
+            if str(e.fee_raw["superseded_by_venue_id"]) not in venue_ids:
+                continue
+            for j in reversed(open_est.get(str(e.fee_raw["supersedes"]), [])):
+                if _negates(entries[j], e):
+                    pairs[j] = i
+                    open_est[str(e.fee_raw["supersedes"])].remove(j)
+                    break
+    return pairs
 
 
 def _net_basis(fee_counts: Dict[str, int], fund_counts: Dict[str, int],
@@ -339,13 +373,17 @@ class Journal:
         return entry
 
     def reverse(self, ref: str, *, ms: int, why: str,
-                raw: Optional[Dict[str, Any]] = None) -> Entry:
-        """Undo an entry the only way a ledger may: by writing another one."""
-        original = next((e for e in self.entries if e.ref == ref), None)
+                raw: Optional[Dict[str, Any]] = None,
+                original: Optional["Entry"] = None) -> Entry:
+        """Undo an entry the only way a ledger may: by writing another one.
+        `original` names the exact entry when a ref has been reused."""
+        if original is None:
+            original = next((e for e in self.entries if e.ref == ref), None)
         if original is None:
             raise LedgerError(f"no entry {ref!r} to reverse")
+        used = sum(1 for e in self.entries if e.ref.startswith(f"{ref}~rev"))
         return self.post(Entry(
-            ms=ms, kind="reversal", ref=f"{ref}~rev",
+            ms=ms, kind="reversal", ref=f"{ref}~rev" + (f"{used}" if used else ""),
             lines=[Line(l.account, -l.usd, -l.qty) for l in original.lines],
             memo=f"reverses {ref}: {why}", fee_raw=dict(raw or {})))
 
@@ -374,8 +412,10 @@ class Journal:
         fee_counts = {k: 0 for k in FEE_STATUSES if k}
         fund_counts = {k: 0 for k in FUNDING_BASES if k}
         fund_usd = {k: 0.0 for k in FUNDING_BASES if k}
-        superseded = superseded_refs(self.entries)
-        for entry in self.entries:
+        pairs = supersession_pairs(self.entries)
+        rev_of = {j: i for j, i in pairs.items()}
+        prior_reversals = 0.0
+        for idx, entry in enumerate(self.entries):
             if from_ms is not None and entry.ms < from_ms:
                 continue
             if to_ms is not None and entry.ms > to_ms:
@@ -383,7 +423,21 @@ class Journal:
             if entry.fee_status:
                 fee_counts[entry.fee_status] += 1
             fb = funding_basis(entry)
-            if fb and entry.ref not in superseded:
+            cancelled = False
+            if idx in rev_of:
+                r = self.entries[rev_of[idx]]
+                # cancelled for the counters only if its replacement is in this
+                # period too; otherwise it is an estimate in THIS period
+                cancelled = ((from_ms is None or r.ms >= from_ms)
+                             and (to_ms is None or r.ms <= to_ms))
+            if idx in rev_of.values():
+                # a reversal in THIS period of an estimate that lies in an earlier
+                # one: its cash is real here, so say what it is
+                est_idx = next(j for j, i in rev_of.items() if i == idx)
+                e_ms = self.entries[est_idx].ms
+                if (from_ms is not None and e_ms < from_ms) or (to_ms is not None and e_ms > to_ms):
+                    prior_reversals += -sum(l.usd for l in entry.lines if l.account == FUNDING)
+            if fb and not cancelled:
                 fund_counts[fb] += 1
                 fund_usd[fb] += -sum(
                     l.usd for l in entry.lines if l.account == FUNDING)
@@ -451,6 +505,9 @@ class Journal:
             # as observed; the engine's own rate x qty x mark does not.
             "funding_venue_usd": fund_usd["venue"],
             "funding_estimated_usd": fund_usd["engine_estimate"],
+            # reversals in this period of estimates that sit in an earlier one:
+            # they explain why funding_usd can be below funding_venue_usd here
+            "funding_prior_period_estimate_reversals_usd": prior_reversals,
             "funding_estimated_entries": fund_counts["engine_estimate"],
             "funding_unattributed": fund_counts["unattributed"],
             "funding_unread": fund_counts["unread"],
@@ -655,9 +712,9 @@ def lifecycle_flags(journal: "Journal", lc: Lifecycle) -> Dict[str, List[Entry]]
         # The engine's own funding number inside the lifecycle (not cancelled by
         # a venue settlement): cash that is not the venue's, so the lifecycle's
         # funding cannot be called reconciled.
-        "estimated": [e for e in journal.entries
+        "estimated": [e for i, e in enumerate(journal.entries)
                       if e.kind == "funding" and funding_basis(e) == "engine_estimate"
-                      and e.ref not in superseded_refs(journal.entries)
+                      and i not in supersession_pairs(journal.entries)
                       and lc.start_ms <= e.ms <= tail],
     }
 
@@ -1062,19 +1119,22 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
                 basis="unattributed", fee_raw=raw))
             out["unattributed"] += 1
         else:
-            # An engine estimate booked for this same settlement (ref fund:<id>)
-            # is cancelled by a reversal that names the venue id; both stay.
-            done = superseded_refs(journal.entries)
-            for old in [e for e in journal.entries
+            # The venue's row first (it validates the amount and the evidence; if it
+            # raises, nothing has been cancelled). Then every still-unpaired
+            # engine estimate booked for this same settlement (ref fund:<id>) is
+            # replaced by a reversal naming the venue id; each stays in the journal.
+            funding(journal, ms=stamp, ref=ref, usd=float(p["usd"]),
+                    basis="venue", raw=raw)
+            paired = supersession_pairs(journal.entries)
+            for idx in [i for i, e in enumerate(journal.entries)
                         if e.kind == "funding" and funding_basis(e) == "engine_estimate"
-                        and e.ref == f"fund:{p['id']}" and e.ref not in done]:
-                journal.reverse(old.ref, ms=stamp, why=(
+                        and e.ref == f"fund:{p['id']}" and i not in paired]:
+                old = journal.entries[idx]
+                journal.reverse(old.ref, ms=stamp, original=old, why=(
                     f"estimate superseded by venue settlement {p['id']!r}"),
                     raw={"supersedes": old.ref,
                          "superseded_by_venue_id": str(p["id"])})
                 out["superseded"] = out.get("superseded", 0) + 1
-            funding(journal, ms=stamp, ref=ref, usd=float(p["usd"]),
-                    basis="venue", raw=raw)
             out["booked"] += 1
     return out
 
