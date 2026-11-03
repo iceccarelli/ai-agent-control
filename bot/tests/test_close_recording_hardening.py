@@ -310,10 +310,11 @@ def test_no_hard_deadline_available_means_no_optional_read(tmp_path):
 
 def test_get_mark_is_not_read_before_the_close(tmp_path):
     v = Venue()
-    v.get_mark = lambda s: (_ for _ in ()).throw(
-        AssertionError("get_mark before the close"))
+    calls = []                       # recorded, not raised: a raise could be
+    v.get_mark = lambda s: calls.append("get_mark") or 1.0   # swallowed upstream
     out = close(v, str(tmp_path / "r.jsonl"))
     assert out["ok"] and len(v.sent) == 1
+    assert calls == []
 
 
 def test_read_touch_never_calls_a_getter_that_cannot_take_a_timeout():
@@ -329,3 +330,40 @@ def test_read_touch_never_calls_a_getter_that_cannot_take_a_timeout():
     assert Inner.called is False
     # with no bound requested (an entry may wait) the old behaviour stands
     assert b._read_touch("BTCUSDT", "linear", timeout_s=None) is not None
+
+
+# -- the raised-order path and a second hanging source ------------------------------
+
+def test_an_order_that_raises_still_carries_the_recording_status(tmp_path):
+    class Raises(Venue):
+        def place_market(self, **kw):
+            self.sent.append("attempt")
+            raise RuntimeError("ambiguous: the order may or may not be live")
+    v = Raises()
+    with pytest.raises(RuntimeError) as err:
+        close(v, str(tmp_path))                      # unwritable AND raising
+    assert err.value.recording["state"] in ("FAILED", "NOT_WRITTEN")
+    assert v.sent == ["attempt"]                    # one attempt, no resend
+
+
+def test_two_hanging_sources_cannot_chain_their_waits(tmp_path):
+    """If the deadline were an ordinary Exception, `_read_touch` would swallow
+    it on the first source and wait on the second: 2 x the hang."""
+    class TwoHangs(Venue):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.calls = []
+
+        def get_book_depth(self, symbol, product, *, timeout_s=None):
+            self.calls.append("depth")
+            time.sleep(30)
+
+        def get_book_top(self, symbol, product, *, timeout_s=None):
+            self.calls.append("top")
+            time.sleep(30)
+    v = TwoHangs()
+    t0 = time.monotonic()
+    out = close(v, str(tmp_path / "r.jsonl"))
+    assert out["ok"] and len(v.sent) == 1
+    assert time.monotonic() - t0 < 6.0
+    assert v.calls == ["depth"]                      # the second never started
