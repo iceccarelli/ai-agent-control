@@ -97,6 +97,51 @@ def _ms(x: Any) -> Optional[int]:
     return int(v) if v is not None and v > 0 else None
 
 
+#: Why an order was sent. Costs are measured per ROUTE because they are not
+#: comparable: an emergency close in a fast market is not a planned exit, and a
+#: large number of easy entries must not hide expensive emergency exits.
+ROUTE_NORMAL_ENTRY = "normal_entry"          # the strategy opening the pair
+ROUTE_NORMAL_EXIT = "normal_exit"            # a planned / signalled exit
+ROUTE_PROTECTIVE_CLOSE = "protective_close"  # margin, liquidation, unpaired
+#                                              legs, or the safety-net close
+ROUTE_RECOVERY_CLOSE = "recovery_close"      # correcting an over-fill
+ROUTE_REBALANCE = "rebalance"                # delta-drift correction
+ROUTE_PARTIAL_INCREMENT = "partial_increment"  # a resting order's cancel-time fill
+ROUTE_UNBOOKED = "unbooked"                  # accepted, local booking failed
+ROUTE_UNCLASSIFIED_EXIT = "unclassified_exit"  # an exit whose reason is unknown
+ROUTES = (ROUTE_NORMAL_ENTRY, ROUTE_NORMAL_EXIT, ROUTE_PROTECTIVE_CLOSE,
+          ROUTE_RECOVERY_CLOSE, ROUTE_REBALANCE, ROUTE_PARTIAL_INCREMENT,
+          ROUTE_UNBOOKED, ROUTE_UNCLASSIFIED_EXIT)
+
+#: Exit reasons that are the strategy (or a scheduled drill) choosing to leave.
+_NORMAL_EXIT_REASONS = frozenset({"FUNDING_INVERTED", "DRILL_COMPLETE"})
+#: Exit reasons that are the book protecting itself. Matched as prefixes.
+_PROTECTIVE_EXIT_PREFIXES = ("MARGIN_", "ACCOUNT_MM_RATE_", "LIQUIDATION_",
+                             "LEGS_LANDED_UNPAIRED", "DRILL_ABORT", "VENUE_")
+
+
+def route_for_exit(reason: Any) -> str:
+    """The route of an exit from the reason the engine gave for it. An unknown
+    reason is UNCLASSIFIED, never assumed to be a normal exit: it is kept out of
+    the normal-exit cost bound until someone classifies it."""
+    r = str(reason or "").upper()
+    if r in _NORMAL_EXIT_REASONS:
+        return ROUTE_NORMAL_EXIT
+    if r.startswith(_PROTECTIVE_EXIT_PREFIXES):
+        return ROUTE_PROTECTIVE_CLOSE
+    return ROUTE_UNCLASSIFIED_EXIT
+
+
+def default_route(product: str, side: str) -> str:
+    """The route of a record that states none (data written before routes
+    existed). Only an ENTRY side can be inferred: in overlay the perp is sold
+    only to open and the spot is bought only to open. A buy of the perp could be
+    a planned or an emergency exit, so it is UNCLASSIFIED."""
+    if (product, side) in (("linear", "Sell"), ("spot", "Buy")):
+        return ROUTE_NORMAL_ENTRY
+    return ROUTE_UNCLASSIFIED_EXIT
+
+
 @dataclass(frozen=True)
 class DecisionContext:
     """What the engine knew when it decided to send an order."""
@@ -124,6 +169,11 @@ class DecisionContext:
     #: Depth ladders, best first, from a depth read: ((price, size), ...).
     bids: Optional[Tuple[Tuple[float, float], ...]] = None
     asks: Optional[Tuple[Tuple[float, float], ...]] = None
+    #: Why this order exists (one of ROUTES), what for (free text, e.g. the exit
+    #: reason) and under which execution mode. Provenance only.
+    route: str = ""
+    purpose: str = ""
+    execution_mode: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {k: getattr(self, k) for k in (
@@ -415,6 +465,10 @@ def assess_fill(ctx: Optional[DecisionContext], *, side: str, symbol: str,
         "schema": SCHEMA, "venue": venue, "symbol": symbol, "product": product,
         "side": side, "order_type": order_type,
         "order_link_id": order_link_id,
+        "route": str(ctx.route or "") if ctx else "",
+        "purpose": str(ctx.purpose or "") if ctx else "",
+        "execution_mode": str(ctx.execution_mode or "") if ctx else "",
+        "fee_confirmed": bool(fee_confirmed),
         "decision_ms": d_ms, "submit_ms": sub, "fill_ms": fil,
         "fill_ms_basis": fill_ms_basis if fil is not None else "",
         "decision_to_submit_ms": d2s, "submit_to_fill_ms": s2f,
@@ -524,6 +578,9 @@ def failed_submission(ctx: Optional[DecisionContext], *, side: str,
             "product": product, "side": side, "order_type": order_type,
             "order_link_id": order_link_id, "status": NO_FILL,
             "reasons": [why], "requested_qty": _price(requested_qty),
+            "route": str(ctx.route or "") if ctx else "",
+            "purpose": str(ctx.purpose or "") if ctx else "",
+            "execution_mode": str(ctx.execution_mode or "") if ctx else "",
             "filled_qty": 0.0, "unfilled_qty": _price(requested_qty),
             "decision_ms": d_ms, "observed_ms": obs,
             "recorded_ms": _ms(recorded_ms),

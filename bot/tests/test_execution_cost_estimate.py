@@ -242,7 +242,10 @@ def test_records_made_by_the_real_producer_are_accepted_by_the_estimator():
         ctx = xr.DecisionContext(
             venue="bybit", symbol="BTCUSDT", product=product, side=side,
             decision_ms=NOW - DAY - i - 50, qty=0.01, mark=60000.0,
-            bid=59995.0, ask=60005.0, observed_ms=NOW - DAY - i - 60)
+            bid=59995.0, ask=60005.0, observed_ms=NOW - DAY - i - 60,
+            # declared as the engine declares it: a perp Sell opens, a planned
+            # Buy closes
+            route="normal_entry" if side == "Sell" else "normal_exit")
         px = 60005.0 if side == "Buy" else 59995.0
         r = xr.assess_fill(
             ctx, side=side, symbol="BTCUSDT", product=product, venue="bybit",

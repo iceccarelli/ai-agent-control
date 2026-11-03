@@ -1184,7 +1184,9 @@ class LedgerBroker:
                        expected_cost_usd: Optional[float] = None,
                        capture_book: bool = True,
                        book_source: str = "",
-                       book_timeout_s: Optional[float] = None) -> None:
+                       book_timeout_s: Optional[float] = None,
+                       route: str = "", purpose: str = "",
+                       execution_mode: str = "") -> None:
         """State what the strategy sees at the moment it decides to trade.
 
         Call it immediately before the order(s) for this leg. With no bid/ask
@@ -1223,7 +1225,9 @@ class LedgerBroker:
             qty=qty, mark=mark, bid=bid, ask=ask, observed_ms=observed_ms,
             expected_fee_usd=expected_fee_usd,
             expected_cost_usd=expected_cost_usd, book_source=source,
-            book_venue_ts_ms=venue_ts, bids=bids, asks=asks)
+            book_venue_ts_ms=venue_ts, bids=bids, asks=asks,
+            route=str(route or ""), purpose=str(purpose or ""),
+            execution_mode=str(execution_mode or ""))
 
     def _read_touch(self, symbol: str, product: str, *,
                     timeout_s: Optional[float]) -> Optional[Dict[str, Any]]:
@@ -1680,6 +1684,10 @@ class LedgerBroker:
             submit_ms=result.get("submit_ms"), fill_ms=fill_ms,
             fill_ms_basis=str(result.get("fill_ms_basis") or ""),
             environment=self._environment())
+        if str(result.get("order_link_id") or "").endswith("+cancel"):
+            # what a resting order filled before its cancel: its own population,
+            # not a fresh order (it was never decided at this moment)
+            rec["route"] = xr.ROUTE_PARTIAL_INCREMENT
         ref = rec.get("reference_price")
         if ref is None:
             # A caller that supplied a mark with the result itself (no engine
@@ -1737,6 +1745,7 @@ class LedgerBroker:
         `position_verified` is None - whether the position really changed is an
         independent read that nothing here infers. Never raises."""
         try:
+            import execution_record as xr
             res = result if isinstance(result, dict) else {}
 
             def num(x: Any) -> Any:
@@ -1747,6 +1756,9 @@ class LedgerBroker:
             ctx = self._decisions.get((symbol, product, side))
             rec = {
                 "schema": 1, "status": UNBOOKED_STATUS, "booking": "FAILED",
+                "route": xr.ROUTE_UNBOOKED,
+                "purpose": str(getattr(ctx, "purpose", "") or ""),
+                "execution_mode": str(getattr(ctx, "execution_mode", "") or ""),
                 "venue": str(res.get("venue")
                              or getattr(self.inner, "VENUE", "unknown")),
                 "environment": self._environment(),
