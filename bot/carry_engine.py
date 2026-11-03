@@ -74,6 +74,8 @@ from dataclasses import fields as dataclass_fields
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import execution_record as xr
+
 logger = logging.getLogger(__name__)
 
 #: Rebalance when |delta| exceeds this fraction of book notional. Below it,
@@ -1951,7 +1953,9 @@ class CarryEngine:
         if perp.filled_qty > inventory + QTY_DUST:
             excess = snap_to_lot(perp.filled_qty - inventory,
                                  float(rules.get("qty_step", 0.0)))
-            closed = (self._fire(self.perp_symbol, "Buy", excess, "linear")
+            closed = (self._fire(self.perp_symbol, "Buy", excess, "linear",
+                                 route=xr.ROUTE_RECOVERY_CLOSE,
+                                 purpose="OVERFILL_CORRECTION")
                       if excess > 0 else None)
             if closed is None or closed.filled_qty <= 0:
                 # The whole short is still at the venue: record it before
@@ -2044,7 +2048,8 @@ class CarryEngine:
                 "below one lot (%.10g); nothing can be sent",
                 drift * 100.0, abs(delta), step)
             return None
-        fill = self._fire(self.perp_symbol, side, qty, "linear")
+        fill = self._fire(self.perp_symbol, side, qty, "linear",
+                          route=xr.ROUTE_REBALANCE, purpose="DELTA_DRIFT")
         if fill is None or fill.filled_qty <= 0:
             return self._halt(
                 "REBALANCE_FAILED",
@@ -2472,7 +2477,8 @@ class CarryEngine:
         except Exception:  # noqa: BLE001
             pass
         sell = self._spot_sellable(sellable)
-        sold = (self._fire(self.spot_symbol, "Sell", sell, "spot")
+        sold = (self._fire(self.spot_symbol, "Sell", sell, "spot",
+                           route=xr.route_for_exit(reason), purpose=str(reason))
                 if sell > 0 else None)
         left = max(0.0, wanted_spot - (sold.filled_qty if sold else 0.0))
         position.perp.filled_qty = 0.0
@@ -2518,6 +2524,15 @@ class CarryEngine:
             return 0.0
 
     def _unwind(self, mark: float, reason: str) -> CarryDecision:
+        """Close both legs (see `_unwind_impl`), with the REASON kept for the
+        orders it sends so each is routed as a planned or a protective exit."""
+        self._exit_reason = reason
+        try:
+            return self._unwind_impl(mark, reason)
+        finally:
+            self._exit_reason = None
+
+    def _unwind_impl(self, mark: float, reason: str) -> CarryDecision:
         """Close both legs. Perp first: it is the leg that can be liquidated."""
         position = self.position
         assert position is not None
@@ -2685,7 +2700,9 @@ class CarryEngine:
         self.state = BookState.UNWINDING
         wanted = self._spot_sellable(
             max(0.0, spot.filled_qty - spot.fee_base_qty))   # held, net, on-lot
-        closed = self._fire(self.spot_symbol, "Sell", wanted, "spot")
+        closed = self._fire(self.spot_symbol, "Sell", wanted, "spot",
+                            route=xr.ROUTE_PROTECTIVE_CLOSE,
+                            purpose="PERP_LEG_NEVER_LANDED")
         if closed is None or closed.filled_qty <= 0:
             # The spot is still held and still naked: write it down so the
             # ledger, the journal and the next cold start all see it.
@@ -2891,7 +2908,9 @@ class CarryEngine:
                 excess, inventory, hedged, step)
             return None
 
-        closed = self._fire(self.perp_symbol, "Buy", buy, "linear")
+        closed = self._fire(self.perp_symbol, "Buy", buy, "linear",
+                            route=xr.ROUTE_PROTECTIVE_CLOSE,
+                            purpose="INVENTORY_COVER_LOST")
         if closed is None or closed.filled_qty <= 0:
             return self._halt(
                 "INVENTORY_LEFT_AND_HEDGE_WOULD_NOT_CLOSE",
@@ -3179,18 +3198,21 @@ class CarryEngine:
 
     def _fire(self, symbol: str, side: str, qty: float, product: str,
               *, patient: bool = False,
-              qty_step: float = 0.0) -> Optional[Leg]:
+              qty_step: float = 0.0, route: str = "",
+              purpose: str = "") -> Optional[Leg]:
         if qty <= 0 or not self._finite(qty):
             return None
         if symbol == self.perp_symbol and product == "linear":
             self._venue_verified_ms = None      # we are about to change it
-        self._declare_decision(symbol, product, side, qty)
+        self._declare_decision(symbol, product, side, qty, route=route,
+                               purpose=purpose)
         if patient and self.execution_style == MAKER_FIRST:
             return self._rest_then_take(symbol, side, qty, product, qty_step)
         return self._take(symbol, side, qty, product)
 
     def _declare_decision(self, symbol: str, product: str, side: str,
-                          qty: float) -> None:
+                          qty: float, *, route: str = "",
+                          purpose: str = "") -> None:
         """Tell the broker which price this order was decided at. Bookkeeping
         only: a broker that cannot take it, or a decision with no price at all,
         leaves the fill's slippage UNAVAILABLE and trading goes on.
@@ -3237,9 +3259,30 @@ class CarryEngine:
             # book is never rebuilt from the mark or from an older reading.
             kwargs.update(capture_book=True,
                           book_timeout_s=self.EXIT_BOOK_READ_TIMEOUT_S)
+        # WHY this order exists is part of the decision: an emergency close and
+        # a planned exit are different populations. An exit with no stated
+        # route takes the one its exit REASON implies; an unknown reason is
+        # UNCLASSIFIED, never assumed normal.
+        if not route:
+            route = (xr.route_for_exit(getattr(self, "_exit_reason", None))
+                     if is_exit else xr.ROUTE_NORMAL_ENTRY)
+        if not purpose:
+            purpose = str(getattr(self, "_exit_reason", None) or "") \
+                if is_exit else "OPEN"
         try:
             begin(symbol=symbol, product=product, side=side, qty=qty,
-                  mark=(float(mark) if mark is not None else None), **kwargs)
+                  mark=(float(mark) if mark is not None else None),
+                  route=route, purpose=purpose,
+                  execution_mode=str(getattr(self, "execution_mode", "") or ""),
+                  **kwargs)
+        except TypeError:
+            # a broker whose begin_decision predates routes: declare as before
+            try:
+                begin(symbol=symbol, product=product, side=side, qty=qty,
+                      mark=(float(mark) if mark is not None else None),
+                      **kwargs)
+            except Exception:  # noqa: BLE001
+                logger.warning("decision context not recorded", exc_info=True)
         except Exception:  # noqa: BLE001
             logger.warning("decision context not recorded", exc_info=True)
 

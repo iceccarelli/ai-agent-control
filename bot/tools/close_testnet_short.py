@@ -137,6 +137,12 @@ def hard_deadline(seconds: float):
                           else signal.SIG_DFL)
 
 
+#: What this order IS: the safety net closing a short the drill left behind.
+#: An emergency close is its own population, never pooled with planned exits.
+_ROUTE = {"route": "protective_close", "purpose": "safety_net_close",
+          "execution_mode": "overlay"}
+
+
 def _recording_broker(broker: Any, symbol: str, qty: float, path: str,
                       venue_label: str):
     """(order_broker, writer, recorder, error, note).
@@ -171,7 +177,7 @@ def _recording_broker(broker: Any, symbol: str, qty: float, path: str,
             if armed:
                 recorder.begin_decision(
                     symbol=symbol, product="linear", side="Buy", qty=qty,
-                    book_timeout_s=BOOK_TIMEOUT_S)
+                    book_timeout_s=BOOK_TIMEOUT_S, **_ROUTE)
                 declared = True
             else:
                 note = ("no hard deadline can be armed here, so the decision-"
@@ -185,7 +191,8 @@ def _recording_broker(broker: Any, symbol: str, qty: float, path: str,
             # a decision context with NO book and NO mark: the record then says
             # it could not be measured, rather than not existing
             recorder.begin_decision(symbol=symbol, product="linear",
-                                    side="Buy", qty=qty, capture_book=False)
+                                    side="Buy", qty=qty, capture_book=False,
+                                    **_ROUTE)
         except Exception as exc:                               # noqa: BLE001
             note = (note + "; " if note else "") + \
                 f"no decision context ({type(exc).__name__}: {exc})"
