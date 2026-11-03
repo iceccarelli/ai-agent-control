@@ -182,8 +182,29 @@ def test_the_same_fill_twice_in_a_file_counts_once(tmp_path):
     path.write_text(text + text)                      # a file concatenated twice
     rep = report(path, now_ms=clock[0])
     for name in ("linear/Sell/market", "linear/Buy/market"):
+        assert leg(rep, name)["n"] == 21              # counted once
+    # identical lines are dropped by the reader and REPORTED (42 = the copies)
+    assert rep["records_duplicate_lines"] == 42
+
+
+def test_a_duplicate_that_is_not_byte_identical_is_still_caught_by_the_estimator(
+        tmp_path):
+    """Defence in depth: the reader drops identical lines; a copy re-serialised
+    differently (other key order / spacing) is not identical text, and the
+    estimator's own duplicate key must still count the fill once."""
+    lb, j, clock = run_round_trips(21)
+    path = tmp_path / "r.jsonl"
+    drill.append_execution_records(str(path), j, "testnet", set(),
+                                   outcomes=lb.executions)
+    lines = path.read_text().splitlines()
+    again = [json.dumps(json.loads(x), indent=None, separators=(",", ":"),
+                        sort_keys=False) for x in lines]
+    path.write_text("\n".join(lines + again) + "\n")
+    rep = report(path, now_ms=clock[0])
+    for name in ("linear/Sell/market", "linear/Buy/market"):
         assert leg(rep, name)["n"] == 21
         assert leg(rep, name)["rejected"] == {"DUPLICATE_ROW": 21}
+    assert rep["records_duplicate_lines"] == 0
 
 
 def test_a_second_process_appending_the_same_fills_is_not_double_counted(tmp_path):
@@ -311,9 +332,14 @@ def test_outcomes_are_environment_strict_and_deduplicated(tmp_path):
                                    outcomes=lb.executions)
     text = path.read_text()
     path.write_text(text + text)
-    assert report(path, now_ms=clock[0])["outcomes"]["total"] == 4   # not 8
+    first = report(path, now_ms=clock[0])
+    assert first["outcomes"]["total"] == 4                           # not 8
+    assert first["records_duplicate_lines"] == 4
     other = report(path, environment="mainnet", now_ms=clock[0])
-    assert other["outcomes"]["total"] == 0 and other["records_skipped"] == 8
+    # the four distinct lines are skipped for the wrong environment; the four
+    # copies are duplicates of them, dropped before the environment is looked at
+    assert other["outcomes"]["total"] == 0 and other["records_skipped"] == 4
+    assert other["records_duplicate_lines"] == 4
 
 
 def test_outcome_writing_is_idempotent_within_a_process(tmp_path):
