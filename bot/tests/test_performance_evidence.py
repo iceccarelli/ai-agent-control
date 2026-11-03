@@ -23,6 +23,7 @@ import ledger as L                      # noqa: E402
 import carry_performance as perf        # noqa: E402
 import performance_analytics as PA      # noqa: E402
 from persistence import StateStore, PersistenceError  # noqa: E402
+from ledger_fixtures import vraw as _vraw  # noqa: E402
 
 DAY = 86_400_000
 T0 = 1_700_000_000_000
@@ -37,7 +38,7 @@ def overlay_cycle(j, d0, d1, *, tag, funding=300.0, close_price=98_000.0,
     L.perp_open(j, ms=T0 + d0 * DAY, ref=f"{tag}-o", qty=qty, price=100_000.0,
                 fee_usd=55.0, fee_status=fee_status)
     L.funding(j, ms=T0 + (d0 + 1) * DAY, ref=f"{tag}-f", usd=funding,
-              basis=basis)
+              basis=basis, raw=(_vraw(f"{tag}-f", T0 + (d0 + 1) * DAY, funding) if basis == "venue" else None))
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=qty,
                  price=close_price, entry_price=100_000.0, fee_usd=55.0,
                  fee_status=close_fee_status or fee_status)
@@ -55,7 +56,7 @@ def acquire_cycle(j, d0, d1, *, tag, funding=300.0, close_price=98_000.0,
     L.perp_open(j, ms=T0 + d0 * DAY + 1, ref=f"{tag}-o", qty=qty,
                 price=100_000.0, fee_usd=55.0, fee_status=fee_status)
     L.funding(j, ms=T0 + (d0 + 1) * DAY, ref=f"{tag}-f", usd=funding,
-              basis="venue")
+              basis="venue", raw=_vraw(f"{tag}-f", T0 + (d0 + 1) * DAY, funding))
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=qty,
                  price=close_price, entry_price=100_000.0, fee_usd=55.0,
                  fee_status=fee_status)
@@ -377,7 +378,7 @@ def test_slippage_is_measured_from_journalled_decision_marks(tmp_path):
     j = L.Journal()
     L.perp_open(j, ms=T0, ref="a-o", qty=1.0, price=100_000.0, fee_usd=55.0,
                 fee_status="confirmed", decision_mark=100_010.0)  # sold 10 low
-    L.funding(j, ms=T0 + DAY, ref="a-f", usd=300.0, basis="venue")
+    L.funding(j, ms=T0 + DAY, ref="a-f", usd=300.0, basis="venue", raw=_vraw("a-f", T0 + DAY, 300.0))
     L.perp_close(j, ms=T0 + 10 * DAY, ref="a-c", qty=1.0, price=98_000.0,
                  entry_price=100_000.0, fee_usd=55.0, fee_status="confirmed",
                  decision_mark=97_995.0)                           # bought 5 high

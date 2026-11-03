@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
 
 import ledger as L                      # noqa: E402
 import carry_performance as perf        # noqa: E402
+from ledger_fixtures import vraw as _vraw  # noqa: E402
 
 DAY = 86_400_000
 T0 = 1_700_000_000_000
@@ -34,7 +35,7 @@ def overlay(j, d0, d1, *, tag, funding=300.0, close=P0, revalue=False,
     L.perp_open(j, ms=T0 + d0 * DAY, ref=f"{tag}-o", qty=1.0, price=P0,
                 fee_usd=55.0, fee_status="confirmed")
     L.funding(j, ms=T0 + ((d0 + d1) // 2) * DAY, ref=f"{tag}-f", usd=funding,
-              basis="venue")
+              basis="venue", raw=_vraw(f"{tag}-f", T0 + ((d0 + d1) // 2) * DAY, funding))
     if borrow:
         L.borrow(j, ms=T0 + ((d0 + d1) // 2) * DAY + 1, ref=f"{tag}-b",
                  usd=borrow)
@@ -57,7 +58,7 @@ def acquire(j, d0, d1, *, tag, funding=300.0, close=P0):
     L.perp_open(j, ms=T0 + d0 * DAY + 1, ref=f"{tag}-o", qty=1.0, price=P0,
                 fee_usd=55.0, fee_status="confirmed")
     L.funding(j, ms=T0 + ((d0 + d1) // 2) * DAY, ref=f"{tag}-f", usd=funding,
-              basis="venue")
+              basis="venue", raw=_vraw(f"{tag}-f", T0 + ((d0 + d1) // 2) * DAY, funding))
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=1.0, price=close,
                  entry_price=P0, fee_usd=55.0, fee_status="confirmed")
     L.spot_sell(j, ms=T0 + d1 * DAY + 1, ref=f"{tag}-ss", qty=1.0, price=close,

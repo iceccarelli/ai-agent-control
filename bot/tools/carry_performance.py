@@ -396,6 +396,7 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
     longer has a boundary rule of its own."""
     by_id: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
+    _superseded = L.superseded_refs(journal.entries)
     for e in journal.entries:
         if not e.cycle:
             continue                      # before any cycle (opening balance)
@@ -471,8 +472,8 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
             cur["spot_sold"] = True
         if e.fee_status:
             cur["_fee_statuses"].append(e.fee_status)
-        if e.basis:
-            cur["_bases"].append(e.basis)
+        if L.funding_basis(e) and e.ref not in _superseded:
+            cur["_bases"].append(L.funding_basis(e))
         if e.kind == "spot_buy":
             cur["spot_cost_usd"] += sum(
                 l.usd for l in e.lines if l.account == L.BTC and l.usd > 0)

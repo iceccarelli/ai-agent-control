@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
 
 import ledger as L                      # noqa: E402
 import carry_performance as perf        # noqa: E402
+from ledger_fixtures import vraw as _vraw  # noqa: E402
 
 DAY = 86_400_000
 T0 = 1_700_000_000_000
@@ -33,7 +34,7 @@ def cycle(j, day_open, day_close, *, funding, close_price=100_000.0, tag,
     L.perp_open(j, ms=T0 + day_open * DAY, ref=f"{tag}-o", qty=qty,
                 price=100_000.0, fee_usd=55.0, fee_status=fee_status)
     mid = (day_open + day_close) // 2
-    L.funding(j, ms=T0 + mid * DAY, ref=f"{tag}-f", usd=funding, basis=basis)
+    L.funding(j, ms=T0 + mid * DAY, ref=f"{tag}-f", usd=funding, basis=basis, raw=(_vraw(f"{tag}-f", T0 + mid * DAY, funding) if basis == "venue" else None))
     L.perp_close(j, ms=T0 + day_close * DAY, ref=f"{tag}-c", qty=qty,
                  price=close_price, entry_price=100_000.0, fee_usd=55.0,
                  fee_status=fee_status)
