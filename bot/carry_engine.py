@@ -3275,8 +3275,17 @@ class CarryEngine:
                   route=route, purpose=purpose,
                   execution_mode=str(getattr(self, "execution_mode", "") or ""),
                   **kwargs)
-        except TypeError:
-            # a broker whose begin_decision predates routes: declare as before
+        except TypeError as exc:
+            if "keyword" not in str(exc):
+                # a real TypeError inside begin_decision, not a signature
+                # mismatch: do not retry (a retry would repeat the bounded book
+                # read) and say so
+                logger.warning("decision context not recorded", exc_info=True)
+                return
+            # a broker whose begin_decision predates routes: declare as before,
+            # and say the route was lost rather than hiding it
+            logger.warning("begin_decision does not accept route fields; "
+                           "declaring without them")
             try:
                 begin(symbol=symbol, product=product, side=side, qty=qty,
                       mark=(float(mark) if mark is not None else None),

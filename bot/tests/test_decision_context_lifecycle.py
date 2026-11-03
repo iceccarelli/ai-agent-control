@@ -168,6 +168,10 @@ def test_the_close_flows_to_the_report_as_a_protective_close(tmp_path):
     assert buy["n"] == 0
     assert buy["by_route"]["protective_close"]["n"] == 1
     assert buy["by_route"]["protective_close"]["counted_in_bound"] is False
+    # ...and it is a filled order on this leg, so the miss-rate denominator
+    # counts it although the bound does not.
+    assert esr.leg_filled_orders(buy, {"NO_EXECUTION_RECORD", "TOO_OLD",
+                                        "OUTSIDE_SIZE_BAND"}) == 1
 
 
 # -- the invariant that makes a recurrence visible --------------------------------
@@ -177,23 +181,29 @@ def _call_sites():
     sends an order to a broker."""
     sites = []
     for base, _dirs, files in os.walk(BOT):
-        if "tests" in base.split(os.sep) or ".venv" in base or "venv" in base:
+        parts = os.path.relpath(base, BOT).split(os.sep)
+        if "tests" in parts or any(x in (".venv", "venv", "__pycache__")
+                                   for x in parts):
             continue
         for name in files:
             if not name.endswith(".py"):
                 continue
             path = os.path.join(base, name)
             tree = ast.parse(open(path, encoding="utf-8").read())
+            names = ("place_market", "place_post_only")
             for fn in ast.walk(tree):
                 if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 for node in ast.walk(fn):
-                    if (isinstance(node, ast.Call)
-                            and isinstance(node.func, ast.Attribute)
-                            and node.func.attr in ("place_market",
-                                                   "place_post_only")):
+                    # a call, or ANY other reference that could alias the sender
+                    # (`f = broker.place_market`, `getattr(b, "place_market")`)
+                    if isinstance(node, ast.Attribute) and node.attr in names:
                         sites.append((os.path.relpath(path, BOT), fn.name,
-                                      node.func.attr))
+                                      node.attr))
+                    elif (isinstance(node, ast.Constant)
+                          and node.value in names):
+                        sites.append((os.path.relpath(path, BOT), fn.name,
+                                      "ref:" + node.value))
     return sorted(set(sites))
 
 
@@ -209,7 +219,7 @@ def test_every_order_send_site_is_a_known_one():
 
 def test_the_engines_senders_are_reached_only_through_the_declaring_choke_point():
     tree = ast.parse(open(os.path.join(BOT, "carry_engine.py")).read())
-    callers = {"_take": set(), "_rest": set()}
+    callers = {"_take": set(), "_rest": set(), "_rest_then_take": set()}
     for fn in ast.walk(tree):
         if isinstance(fn, ast.FunctionDef):
             for node in ast.walk(fn):
@@ -222,7 +232,19 @@ def test_the_engines_senders_are_reached_only_through_the_declaring_choke_point(
     # _take: _fire (declares), and the maker path that follows a declaration
     assert callers["_take"] <= {"_fire", "_rest_then_take"}
     assert callers["_rest"] <= {"_rest_then_take"}
-    assert "_declare_decision" in open(os.path.join(BOT, "carry_engine.py")).read()
+    assert callers["_rest_then_take"] <= {"_fire"}
+    # _fire itself must declare the decision BEFORE it sends anything
+    fire = next(f for f in ast.walk(tree)
+                if isinstance(f, ast.FunctionDef) and f.name == "_fire")
+    calls = sorted((n.lineno, n.func.attr) for n in ast.walk(fire)
+                   if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                   and isinstance(n.func.value, ast.Name)
+                   and n.func.value.id == "self")
+    order = [a for _l, a in calls]
+    assert "_declare_decision" in order
+    first_send = min(order.index(a) for a in ("_take", "_rest_then_take")
+                     if a in order)
+    assert order.index("_declare_decision") < first_send
 
 
 # -- rejection reasons are preserved, not collapsed -------------------------------
@@ -276,6 +298,18 @@ def test_legacy_owner_records_with_no_route_are_unclassified_but_not_hidden():
     un = leg["by_route"]["unclassified_exit"]
     assert un["n"] == 0 and un["counted_in_bound"] is False
     assert un["rejected"] == {"NOT_BOOK_MEASURED": 2}
+
+
+def test_a_context_less_exit_keeps_its_reason_in_its_own_route():
+    """A record that states no route and no context lands in unclassified_exit,
+    so its reason must be readable there, not only as a bare count."""
+    now = 1_700_000_100_000
+    es = [E(now - 1000 * i, dict(OWNER_PATTERN), i) for i in range(2)]
+    leg = est.estimate_leg(es, as_of_ms=now, symbol="BTCUSDT", product="linear",
+                           side="Buy", planned_notional_usd=100.0)
+    un = leg["by_route"]["unclassified_exit"]
+    assert un["rejected_detail"] == {
+        "NOT_BOOK_MEASURED": {"NO_DECISION_CONTEXT": 2}}
 
 
 def test_legacy_sell_records_still_count_as_entries():

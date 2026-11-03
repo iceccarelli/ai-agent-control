@@ -271,13 +271,14 @@ def _by_route(entries: List[Any], *, as_of_ms: int, symbol: str, product: str,
             seen.add(str(rec.get("route") or _xr.default_route(product, side)))
     out: Dict[str, Any] = {}
     for route in sorted(seen):
+        det: Dict[str, Dict[str, int]] = {}
         obs, rej = extract(entries, as_of_ms=as_of_ms, symbol=symbol,
                            product=product, side=side, order_types=order_types,
-                           routes=(route,))
+                           routes=(route,), detail=det)
         slips = [o.slippage_bps for o in obs]
         halves = [o.half_spread_bps for o in obs]
         out[route] = {
-            "n": len(obs), "rejected": rej,
+            "n": len(obs), "rejected": rej, "rejected_detail": det,
             "counted_in_bound": route in counted,
             "slippage_bps_mean": (sum(slips) / len(slips)) if slips else None,
             "slippage_bps_max": max(slips) if slips else None,
