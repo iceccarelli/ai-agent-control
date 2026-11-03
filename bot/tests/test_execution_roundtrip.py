@@ -60,7 +60,11 @@ def rig(venue, clock):
 
 def trade(lb, clock, side, *, qty=QTY, product="linear", tolerate=False):
     lb.begin_decision(symbol="BTCUSDT", product=product, side=side, qty=qty,
-                      mark=100_000.0, book_timeout_s=1.0)
+                      mark=100_000.0, book_timeout_s=1.0,
+                      # as the engine declares it
+                      route=("normal_entry" if (product, side) in
+                             (("linear", "Sell"), ("spot", "Buy"))
+                             else "normal_exit"))
     clock[0] += 40
     try:
         res = lb.place_market(symbol="BTCUSDT", side=side, qty=qty,

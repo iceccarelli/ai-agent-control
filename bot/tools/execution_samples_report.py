@@ -249,6 +249,21 @@ def check_db_environment(db_path: str, environment: str) -> dict:
     return info
 
 
+def leg_filled_orders(l: dict, not_per_leg) -> int:
+    # The bound's own population, plus every other route's fills (protective
+    # closes, recoveries, rebalances, unclassified exits): they are orders
+    # that filled on this leg and belong in the denominator even though
+    # they are not priced into the bound.
+    n = l["n"] + sum(int(v) for k, v in (l.get("rejected") or {}).items()
+                     if k not in not_per_leg)
+    for route, r in (l.get("by_route") or {}).items():
+        if r.get("counted_in_bound"):
+            continue
+        n += r["n"] + sum(int(v) for k, v in (r.get("rejected") or {}).items()
+                          if k not in not_per_leg)
+    return n
+
+
 def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
           now_ms: int = 0, records=(), environment: str = "") -> dict:
     entries, skipped, outcomes, duplicate_lines = [], 0, [], 0
@@ -280,9 +295,7 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
     # be assigned to a leg and is not counted here; the later age and size-band
     # rejections are subsets of the valid ones and are not added again.
     not_per_leg = {"NO_EXECUTION_RECORD", "TOO_OLD", "OUTSIDE_SIZE_BAND"}
-    filled = {l["leg"]: l["n"] + sum(
-        int(v) for k, v in (l.get("rejected") or {}).items()
-        if k not in not_per_leg) for l in out["legs"]}
+    filled = {l["leg"]: leg_filled_orders(l, not_per_leg) for l in out["legs"]}
     out["outcomes"] = summarize_outcomes(outcomes, filled)
     out["unbooked_orders"] = summarize_unbooked(outcomes)
     need = est.DEFAULT_POLICY.min_samples
