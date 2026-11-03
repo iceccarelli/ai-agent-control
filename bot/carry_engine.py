@@ -211,6 +211,16 @@ _MARGIN_PORTFOLIO = "PORTFOLIO_MARGIN"
 _MARGIN_ISOLATED = "ISOLATED_MARGIN"
 _ACCOUNT_LEVEL_MARGIN_MODES = (_MARGIN_REGULAR, _MARGIN_PORTFOLIO)
 
+#: While HELD, the collateral state is read on every tick from the wallet
+#: response the liquidation view already fetches. A venue that STATES the held
+#: coin no longer backs the short (switch off, platform disallows) is a known
+#: loss of cover and exits through the ordinary unwind. A venue that will not
+#: say (field absent or malformed in a readable wallet) is not a known loss: it
+#: is recorded every tick and, if it persists this many consecutive ticks,
+#: halts the book (no order), because an unreadable margin fact is a margin
+#: call you cannot see. A single bad read does not.
+COLLATERAL_UNKNOWN_HALT_TICKS = 3
+
 #: Unwind when funding has been negative this many consecutive prints. Negative
 #: funding means the trade has inverted: you are now PAYING to hold the hedge.
 #: Three prints is one day — long enough not to react to a single squeeze,
@@ -3019,6 +3029,41 @@ class CarryEngine:
             return None
         return 100.0 * (float(liq) - float(entry)) / float(entry)
 
+    _collateral_unknown_ticks: int = 0
+
+    def _collateral_while_held(self, view: Dict[str, Any]) -> Optional[CarryDecision]:
+        """HOLD-time twin of `_collateral_refusal`. None when the check is off,
+        the mode is not overlay, or the venue says the held coin still backs the
+        short. NOT_COLLATERAL unwinds through the ordinary single reduce-only
+        exit; an unstated state is observed and, after
+        COLLATERAL_UNKNOWN_HALT_TICKS consecutive ticks, halts with no order.
+        Nothing here retries or resizes a close."""
+        if not self.require_collateral_facts or self.execution_mode != OVERLAY:
+            return None
+        facts = view.get("collateral")
+        status = facts.get("status") if isinstance(facts, dict) else None
+        if status == "OK":
+            self._collateral_unknown_ticks = 0
+            return None
+        if status == "NOT_COLLATERAL":
+            self._collateral_unknown_ticks = 0
+            self._observe_risk(view, prefix="COLLATERAL_LOST:")
+            why = str(facts.get("reason") or "NOT_COLLATERAL").upper()
+            return self._unwind(self._exit_mark(), f"COLLATERAL_LOST_{why}")
+        # unknown: absent, malformed, or no collateral block at all
+        self._collateral_unknown_ticks += 1
+        why = (str(facts.get("reason")) if isinstance(facts, dict)
+               else "NO_COLLATERAL_BLOCK_IN_VIEW")
+        self._observe_risk(view, prefix=f"COLLATERAL_UNKNOWN:{why}:")
+        if self._collateral_unknown_ticks >= COLLATERAL_UNKNOWN_HALT_TICKS:
+            return self._halt(
+                "COLLATERAL_STATE_UNREADABLE",
+                f"the venue has not stated whether the held coin backs the "
+                f"short for {self._collateral_unknown_ticks} consecutive ticks "
+                f"({why}); an unreadable margin fact is a margin call you "
+                "cannot see")
+        return None
+
     def _check_liquidation_distance(self) -> Optional[CarryDecision]:
         """How far the price can move before the short is gone (F4, 0048).
 
@@ -3064,6 +3109,9 @@ class CarryEngine:
                 return self._unwind(
                     self._exit_mark(),
                     f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
+            held = self._collateral_while_held(view)
+            if held is not None:
+                return held
         elif mode == _MARGIN_ISOLATED:
             # Per-position liquidation: the account rate does not describe it.
             # The distance below is the gate, and it is mandatory.
