@@ -127,6 +127,7 @@ jobs:
           tests/test_recon_summary.py
           tests/test_carry_broker_position_rows.py
           tests/test_mainnet_public.py
+          tests/test_overlay_economics.py
           tests/test_mainnet_collect.py
           tests/test_mainnet_protocol.py
           tests/test_monitor_self_heal.py

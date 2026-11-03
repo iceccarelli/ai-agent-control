@@ -580,6 +580,11 @@ class Config:
     #: earn as cash sets it, and the entry gate then demands the funding clear
     #: it as well as the fees and financing.
     CARRY_OPPORTUNITY_COST_APR: float = 0.0
+    #: Was CARRY_OPPORTUNITY_COST_APR actually supplied? The number above is 0.0
+    #: either way (the gate's behaviour is unchanged), so on its own an owner
+    #: who chose zero cannot be told from one who never decided. Reporting only;
+    #: nothing in the entry gate reads it.
+    CARRY_OPPORTUNITY_COST_APR_SUPPLIED: bool = False
     #: "enforce" refuses an entry the net-benefit gate refuses; "observe" records
     #: what it WOULD refuse and lets the entry continue (an explicit operator
     #: choice for gathering evidence). Anything else is rejected at load.
@@ -1020,6 +1025,8 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_BORROW_APR=parse_optional_fraction(env, "CARRY_BORROW_APR"),
         CARRY_OPPORTUNITY_COST_APR=parse_float(
             env, "CARRY_OPPORTUNITY_COST_APR", 0.0, low=0.0, high=1.0),
+        CARRY_OPPORTUNITY_COST_APR_SUPPLIED=bool(
+            str(env.get("CARRY_OPPORTUNITY_COST_APR") or "").strip()),
         CARRY_ENTRY_BENEFIT_MODE=parse_choice(
             env, "CARRY_ENTRY_BENEFIT_MODE", "enforce", ("enforce", "observe")),
         CARRY_INCOME_HAIRCUT_FRACTION=parse_float(

@@ -231,3 +231,28 @@ def test_the_check_tool_reports_the_assumption_without_changing_its_exit_code():
     code, out = run({"CARRY_OPPORTUNITY_COST_APR": "banana"})
     assert code == 3 and "CARRY_OPPORTUNITY_COST_APR" in out["unparseable_settings"]
     assert "banana" not in json.dumps(out)
+
+
+def test_unset_and_explicit_zero_are_told_apart_when_the_config_says_so():
+    import types
+    import owner_policy as op
+    unset = op.opportunity_cost_assumption(types.SimpleNamespace(
+        CARRY_OPPORTUNITY_COST_APR=0.0, CARRY_OPPORTUNITY_COST_APR_SUPPLIED=False))
+    zero = op.opportunity_cost_assumption(types.SimpleNamespace(
+        CARRY_OPPORTUNITY_COST_APR=0.0, CARRY_OPPORTUNITY_COST_APR_SUPPLIED=True))
+    assert unset["state"] == "UNSET_TREATED_AS_ZERO" and unset["value"] == 0.0
+    assert zero["state"] == "EXPLICIT_ZERO" and zero["value"] == 0.0
+    assert unset["state"] != zero["state"]
+
+
+def test_config_records_whether_the_opportunity_cost_was_supplied():
+    import config
+    base = config.load({})
+    assert base is not None
+    assert base.CARRY_OPPORTUNITY_COST_APR_SUPPLIED is False
+    assert base.CARRY_OPPORTUNITY_COST_APR == 0.0
+    z = config.load({"CARRY_OPPORTUNITY_COST_APR": "0"})
+    assert z.CARRY_OPPORTUNITY_COST_APR_SUPPLIED is True
+    assert z.CARRY_OPPORTUNITY_COST_APR == 0.0
+    blank = config.load({"CARRY_OPPORTUNITY_COST_APR": "  "})
+    assert blank.CARRY_OPPORTUNITY_COST_APR_SUPPLIED is False
