@@ -662,11 +662,22 @@ def lifecycle_reconciliation(journal: "Journal", *, from_ms: Optional[int] = Non
                 # journal holds NOW and the record never counted (a late
                 # duplicate under a new id, a late delivery) changes the cash
                 # the record vouches for, so it cannot stay vouched for.
+                #
+                # CLOSED lifecycles only: an open one is re-assessed on every
+                # poll and a legitimate new settlement is expected to arrive, so
+                # a changed count there is not a contradiction (the print
+                # cross-check judges it at the next assessment).
                 counted = (rec.get("evidence") or {}).get(
                     "account_rows_attributed")
-                if counted is not None and int(counted) != sum(
-                        1 for e in f["booked"] if e.basis == "venue"):
-                    contra.append("SETTLEMENT_ROWS_CHANGED_SINCE_RECONCILIATION")
+                if counted is not None and lc.end_ms is not None:
+                    held = sum(1 for e in f["booked"] if e.basis == "venue")
+                    try:
+                        same = int(counted) == held
+                    except (TypeError, ValueError):
+                        same = False          # an unreadable count vouches for nothing
+                    if not same:
+                        contra.append(
+                            "SETTLEMENT_ROWS_CHANGED_SINCE_RECONCILIATION")
                 if contra:
                     state = "CONTRADICTED_AFTER_RECONCILIATION"
                     reasons = contra
@@ -872,18 +883,30 @@ def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def _legacy_funding_by_id(journal: "Journal") -> Dict[str, List[float]]:
-    """{venue id: amounts already booked} for venue-basis funding entries that
-    carry no `venue_id` (written before identity was stored), read from the ref
-    the booking always used. Empty for every entry written today."""
-    out: Dict[str, List[float]] = {}
+def _legacy_funding_by_id(journal: "Journal") -> Dict[str, List[List[float]]]:
+    """{venue id: [[amount, booked-at ms], ...]} for venue-basis funding entries
+    that carry no `venue_id` (written before identity was stored), read from the
+    ref the booking always used (`fund:<id>`, the whole remainder is the id: ids
+    may contain '#'). Empty for every entry written today."""
+    out: Dict[str, List[List[float]]] = {}
     for e in journal.entries:
         if (e.kind == "funding" and e.basis == "venue"
                 and "venue_id" not in e.fee_raw and e.ref.startswith("fund:")):
-            vid = e.ref[len("fund:"):].split("#", 1)[0]
             usd = sum(l.usd for l in e.lines if l.account == USDT)
-            out.setdefault(vid, []).append(usd)
+            out.setdefault(e.ref[len("fund:"):], []).append([usd, float(e.ms)])
     return out
+
+
+def _consume_legacy(legacy: Dict[str, List[List[float]]], ident: tuple) -> bool:
+    """Is this payment the one a legacy entry already booked? Same id, same
+    amount, and booked no earlier than the settlement it pays (a payment cannot
+    have been booked before it existed). Each legacy entry answers ONE replay:
+    a second row with the same id is a different payment and is not swallowed."""
+    for slot in legacy.get(ident[0], []):
+        if abs(slot[0] - ident[2]) <= 1e-9 and slot[1] >= ident[1]:
+            legacy[ident[0]].remove(slot)
+            return True
+    return False
 
 
 def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
@@ -913,6 +936,12 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
     # amount it is a duplicate; the same id with another amount is a conflict.
     legacy = _legacy_funding_by_id(journal)
     ids_seen |= set(legacy)
+    # A closed lifecycle that is already reconciled has had every settlement it
+    # will ever have judged. A row that is not an exact replay and arrives for
+    # one now cannot be credited: it is kept as $0 evidence, the lifecycle is
+    # contradicted, and a human decides. (Never silently re-credited.)
+    sealed = [r for r in lifecycle_reconciliation(journal)
+              if r["reconciled"] and not r["open"]]
     used_refs = {e.ref for e in journal.entries}
     out = {"booked": 0, "duplicate": 0, "unattributed": 0, "id_collisions": 0}
     stamp = max(int(ms), journal.entries[-1].ms if journal.entries else 0)
@@ -921,8 +950,7 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
         if ident in known:
             out["duplicate"] += 1
             continue
-        if ident[0] in legacy and ident not in known and any(
-                abs(u - ident[2]) <= 1e-9 for u in legacy[ident[0]]):
+        if ident[0] in legacy and _consume_legacy(legacy, ident):
             out["duplicate"] += 1
             continue
         collision = ident[0] in ids_seen
@@ -954,6 +982,11 @@ def book_funding_payments(journal: Journal, payments: List[Dict[str, Any]], *,
             out["unattributed"] += 1
             continue
         reason = _attribution_problem(journal, p)
+        if reason is None and any(
+                r["start_ms"] - ATTRIBUTION_SLACK_MS <= ident[1]
+                <= r["end_ms"] + ATTRIBUTION_SLACK_MS for r in sealed):
+            reason = ("arrived after the lifecycle it belongs to was already "
+                      "reconciled; it is kept as evidence, not credited")
         if reason is not None:
             journal.post(Entry(
                 ms=stamp, kind="funding_unattributed", ref=ref,
@@ -988,8 +1021,11 @@ def check_funding_completeness(journal: Journal, print_ms: List[int], *,
             continue
         before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
         after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
-        if abs(before) <= DUST[PERP] or abs(after) <= DUST[PERP]:
-            # Flat on EITHER side of the print: the book opened or closed within
+        if (abs(before) <= DUST[PERP] or abs(after) <= DUST[PERP]
+                or _perp_moved_within(journal, t - ATTRIBUTION_SLACK_MS,
+                                      t + ATTRIBUTION_SLACK_MS)):
+            # Flat on EITHER side of the print, or the quantity moved inside the
+            # window (a close and a same-size reopen is flat for a moment): the book opened or closed within
             # the attribution slack of it, so whether it held through the
             # settlement is not established by the bot's clock. That is the
             # OWNERSHIP_AMBIGUOUS case (funding_reconcile), not a missing venue
