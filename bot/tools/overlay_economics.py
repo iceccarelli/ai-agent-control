@@ -103,7 +103,8 @@ PROTOCOL = {
     "max_unpriced_fraction": 0.10,
     "min_liquidation_distance_pct": 15.0,
     "inputs_the_owner_must_supply": [
-        "CARRY_OPPORTUNITY_COST_APR", "drawdown limit (USD)",
+        "CARRY_OPPORTUNITY_COST_APR", "committed_capital_fraction",
+        "drawdown limit (USD)",
         "maintenance_margin_rate", "collateral_ratio (venue values for the "
         "owner's account)"],
     "open_episodes": ("an episode still open at the last observation is marked "
@@ -342,6 +343,11 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
         "perp_pnl_marks_usd": perp_pnl, "funding_usd": funding_usd,
         "cost": cost}
     out["directional_component_usd"] = -qty * (spot_out - spot_in)
+    out["inventory_value_in_usd"] = qty * spot_in
+    out["passive_return_bps"] = (spot_out / spot_in - 1.0) * 1e4
+    out["financing_bps"] = 0.0
+    out["financing_note"] = ("overlay borrows nothing and trades no spot: "
+                             "mainnet_public.GATE_BORROW_APR is 0.0")
     out["impact_upper_bps"] = cost.get("impact_upper_bps")
     if cost["status"] == UNAVAILABLE:
         out["worst_path_usd"] = None
@@ -354,6 +360,8 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
     cost_hi, cost_lo = cost["total_upper_bps"] * scale, cost["total_lower_bps"] * scale
     out["worst_path_usd"] = _worst_path(rows, i, j, qty, cost_hi)
     out["overlay_total_usd"] = passive_btc + perp_pnl + funding_usd - cost_hi
+    out["overlay_total_return_bps"] = out["overlay_total_usd"] / scale
+    out["incremental_vs_passive_bps"] = (out["overlay_total_usd"] - passive_btc) / scale
     out["incremental_vs_passive_usd"] = out["overlay_total_usd"] - passive_btc
     carry = perp_pnl + funding_usd - cost_hi - out["directional_component_usd"]
     out["carry_usd"] = carry
@@ -412,30 +420,75 @@ def simulate_episodes(rows: Sequence[Dict[str, Any]], notional_usd: float,
 # -- capital: unset is not zero --------------------------------------------------
 
 def capital_model(owner_apr: Optional[float], carry_bps: Sequence[float],
-                  hold_days: Sequence[float]) -> Dict[str, Any]:
-    """The cost of capital over each episode's hold, in bps of notional.
+                  hold_days: Sequence[float],
+                  committed_fraction: Optional[float] = None) -> Dict[str, Any]:
+    """The cost of the capital the overlay commits, in bps of notional.
 
-    `owner_apr` is the OWNER's number or None. None is not zero: the effect is
-    INSUFFICIENT_OWNER_INPUT, and a sensitivity grid is printed so the owner can
-    see the sign flip. The full notional is treated as committed, which is the
-    conservative reading (the BTC is already owned; only margin is incremental,
-    and the margin ratio is the venue's, not this software's)."""
+    The owner's BTC is held with or without the overlay, so its opportunity cost
+    is in the passive benchmark already and is NOT charged again. Only capital
+    the overlay adds (margin posted, collateral encumbered) is a cost, as
+    `committed_fraction` of the notional. Both it and `owner_apr` are the
+    OWNER's numbers; None is not zero. Either missing is
+    INSUFFICIENT_OWNER_INPUT, and the grid beside it prices the worst reading
+    (the whole notional as incremental capital) at several rates so the owner
+    can see where the sign flips. An explicit zero is a supplied value."""
     pairs = [(c, d) for c, d in zip(carry_bps, hold_days)
              if c is not None and math.isfinite(c)]
 
-    def after(apr: float) -> Dict[str, Any]:
-        return mean_bounds([c - apr * d / 365.0 * 1e4 for c, d in pairs])
-    grid = {f"{a:.2f}": after(a) for a in CAPITAL_APR_GRID}
+    def after(apr: float, frac: float) -> Dict[str, Any]:
+        k = apr * frac / 365.0 * 1e4
+        return mean_bounds([c - k * d for c, d in pairs])
+    grid = {f"{a:.2f}": after(a, 1.0) for a in CAPITAL_APR_GRID}
+    base = {"sensitivity": grid,
+            "sensitivity_note": ("whole notional treated as incremental capital: "
+                                 "the worst reading, shown only to locate the "
+                                 "sign flip")}
+
+    def bad(x: Any, hi: float) -> bool:
+        return not (isinstance(x, (int, float)) and not isinstance(x, bool)
+                    and math.isfinite(x) and 0 <= x <= hi)
     if owner_apr is None:
-        return {"status": INSUFFICIENT_OWNER_INPUT,
-                "needs": "CARRY_OPPORTUNITY_COST_APR, supplied by the owner",
-                "applied_apr": None, "result": None, "sensitivity": grid}
-    if not (isinstance(owner_apr, (int, float)) and math.isfinite(owner_apr)
-            and owner_apr >= 0):
-        return {"status": "INVALID_OWNER_INPUT", "applied_apr": None,
-                "result": None, "sensitivity": grid}
-    return {"status": "OWNER_SUPPLIED", "applied_apr": float(owner_apr),
-            "result": after(float(owner_apr)), "sensitivity": grid}
+        return dict(base, status=INSUFFICIENT_OWNER_INPUT, applied_apr=None,
+                    needs="CARRY_OPPORTUNITY_COST_APR, supplied by the owner",
+                    result=None)
+    if bad(owner_apr, 10.0):
+        return dict(base, status="INVALID_OWNER_INPUT", applied_apr=None, result=None)
+    if committed_fraction is None:
+        return dict(base, status=INSUFFICIENT_OWNER_INPUT, applied_apr=float(owner_apr),
+                    needs=("committed_capital_fraction: the share of the notional "
+                           "the overlay commits beyond the BTC already held"),
+                    result=None)
+    if bad(committed_fraction, 1.0):
+        return dict(base, status="INVALID_OWNER_INPUT", applied_apr=float(owner_apr),
+                    result=None)
+    apr, frac = float(owner_apr), float(committed_fraction)
+    result = after(apr, frac)
+    # the cost of capital at which the lower 95% bound reaches zero: the owner's
+    # margin of safety on the one assumption this software cannot know
+    be: Optional[float] = None
+    lo = after(0.0, frac)["lower95"]
+    if lo is not None and lo > 0 and frac > 0:
+        hi_apr = 10.0
+        top = after(hi_apr, frac)["lower95"]
+        if top is not None and top > 0:
+            be = None                       # above 1000%/yr: effectively unbounded
+        else:
+            lo_a, hi_a = 0.0, hi_apr
+            for _ in range(60):
+                mid = (lo_a + hi_a) / 2.0
+                v = after(mid, frac)["lower95"]
+                if v is not None and v > 0:
+                    lo_a = mid
+                else:
+                    hi_a = mid
+            be = lo_a
+    elif lo is not None and lo <= 0:
+        be = 0.0
+    return dict(base, status="OWNER_SUPPLIED", applied_apr=apr,
+                committed_fraction=frac, result=result,
+                break_even_capital_apr=be,
+                break_even_note=("None: still positive at 1000%/yr or no capital "
+                                 "committed; 0.0: not positive even at zero cost"))
 
 
 # -- stress: arithmetic on the position, with the unknowns named ------------------
@@ -550,11 +603,34 @@ def capacity_bounds(rows: Sequence[Dict[str, Any]], impact_budget_bps: float,
 
 # -- the report and the one verdict -----------------------------------------------
 
+def _provenance(fwd: Sequence[Dict[str, Any]], run_inputs: Dict[str, Any]
+                ) -> Dict[str, Any]:
+    """What this answer was computed from, so it can be reproduced from the
+    immutable inputs and nothing else: the chain hashes of the rows used, the
+    protocol, and every owner input. Two runs with the same digest are the same
+    experiment; a different digest is a different one, not a re-run."""
+    hashes = [r.get("hash") for r in fwd]
+    body = {"protocol_hash": protocol_hash(), "row_hashes": hashes,
+            "run_inputs": run_inputs}
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, default=str,
+                                       separators=(",", ":")).encode()).hexdigest()
+    return {"protocol_hash": protocol_hash(),
+            "evaluation_start_s": EVALUATION_START_S,
+            "forward_rows": len(fwd),
+            "first_row_hash": hashes[0] if hashes else None,
+            "last_row_hash": hashes[-1] if hashes else None,
+            "first_observed_at_s": fwd[0]["obs"]["observed_at_s"] if fwd else None,
+            "last_observed_at_s": fwd[-1]["obs"]["observed_at_s"] if fwd else None,
+            "inputs_digest": digest,
+            "rows_missing_a_chain_hash": sum(1 for h in hashes if not h)}
+
+
 def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
              owner_capital_apr: Optional[float] = None,
              owner_drawdown_limit_usd: Optional[float] = None,
              maintenance_margin_rate: Optional[float] = None,
              collateral_ratio: Optional[float] = None,
+             committed_capital_fraction: Optional[float] = None,
              chain_issues: Sequence[str] = (),
              taker_fee_bps: float = TAKER_FEE_BPS) -> Dict[str, Any]:
     chain_issues = list(chain_issues)
@@ -577,6 +653,7 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
                        "owner_drawdown_limit_usd": owner_drawdown_limit_usd,
                        "maintenance_margin_rate": maintenance_margin_rate,
                        "collateral_ratio": collateral_ratio,
+                       "committed_capital_fraction": committed_capital_fraction,
                        "taker_fee_bps": taker_fee_bps,
                        "note": ("a verdict is a function of the evidence AND "
                                 "these inputs; changing them to re-run is not "
@@ -591,6 +668,10 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
                                       "print settles every 8 hours: counts of "
                                       "observations are not counts of "
                                       "independent samples")})
+    latest = {r["obs"].get("funding_print_ms") for r in fwd
+              if isinstance(r["obs"].get("funding_print_ms"), (int, float))}
+    out["distinct_latest_funding_prints"] = len(latest)     # what v1 also reports
+    out["provenance"] = _provenance(fwd, out["run_inputs"])
     sim = simulate_episodes(fwd, planned_notional_usd, taker_fee_bps) if fwd else {
         "closed": [], "open_at_end": False, "open_since_s": None}
     closed = sim["closed"]
@@ -608,6 +689,21 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
     out["carry_bps_most_favourable"] = mean_bounds(favourable)
     out["incremental_vs_passive_usd"] = mean_bounds(
         [e["incremental_vs_passive_usd"] for e in priced])
+    out["passive_return_bps"] = mean_bounds([e["passive_return_bps"] for e in priced])
+    out["overlay_total_return_bps"] = mean_bounds(
+        [e["overlay_total_return_bps"] for e in priced])
+    out["incremental_vs_passive_bps"] = mean_bounds(
+        [e["incremental_vs_passive_bps"] for e in priced])
+    held_days = sum(e["hold_days"] for e in priced)
+    out["capital_utilisation"] = (held_days / span_days) if span_days > 0 else None
+    # net carry earned across the whole forward span (idle time included), per
+    # year, in bps of the notional: the number that says what the idea pays
+    out["annualised_carry_bps_of_notional"] = (
+        sum(e["carry_bps"] for e in priced) / span_days * 365.0
+        if priced and span_days > 0 else None)
+    out["annualisation_note"] = ("sum of closed-episode carry over the forward "
+                                 "span, scaled to 365 days; idle time is in the "
+                                 "denominator; not a forecast")
     out["directional_component_usd"] = mean_bounds(
         [e["directional_component_usd"] for e in priced])
     worst = min((e["worst_path_usd"] for e in priced), default=None)
@@ -628,7 +724,8 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
         else {"status": "MEASURED", "min": min(carry), "p5": _quantile(carry, 0.05),
               "median": _quantile(carry, 0.5), "p95": _quantile(carry, 0.95),
               "max": max(carry)})
-    cap = capital_model(owner_capital_apr, carry, [e["hold_days"] for e in priced])
+    cap = capital_model(owner_capital_apr, carry, [e["hold_days"] for e in priced],
+                        committed_capital_fraction)
     out["capital"] = cap
     # The break-even one-way impact: what the mean episode earns before any
     # impact (carry + the impact charged) after fees, split over its two legs.
@@ -689,6 +786,9 @@ def verdict(rep: Dict[str, Any], drawdown_limit_usd: Optional[float] = None
     res = cap["result"]
     if res["lower95"] is None or res["lower95"] <= 0:
         return "INSUFFICIENT", ["LOWER_95_BOUND_NOT_ABOVE_ZERO_AFTER_CAPITAL_COST"]
+    inc = rep.get("incremental_vs_passive_bps") or {}
+    if inc.get("mean") is None or inc["mean"] < 0:
+        return "INSUFFICIENT", ["OVERLAY_UNDERPERFORMS_PASSIVE_BTC_IN_SAMPLE"]
     if rep.get("open_episode_marked") == {"status": UNAVAILABLE}:
         return "INSUFFICIENT", ["OPEN_EPISODE_CANNOT_BE_MARKED"]
     wo = rep.get("carry_bps_with_open_episode") or {}
@@ -713,13 +813,16 @@ def report(db: str, *, planned_notional_usd: float,
            owner_capital_apr: Optional[float] = None,
            owner_drawdown_limit_usd: Optional[float] = None,
            maintenance_margin_rate: Optional[float] = None,
-           collateral_ratio: Optional[float] = None) -> Dict[str, Any]:
+           collateral_ratio: Optional[float] = None,
+           committed_capital_fraction: Optional[float] = None) -> Dict[str, Any]:
     rows, issues = mp.read(db)
     return evaluate(rows, planned_notional_usd=planned_notional_usd,
                     owner_capital_apr=owner_capital_apr,
                     owner_drawdown_limit_usd=owner_drawdown_limit_usd,
                     maintenance_margin_rate=maintenance_margin_rate,
-                    collateral_ratio=collateral_ratio, chain_issues=issues)
+                    collateral_ratio=collateral_ratio,
+                    committed_capital_fraction=committed_capital_fraction,
+                    chain_issues=issues)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -732,12 +835,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--drawdown-limit-usd", type=float, default=None)
     p.add_argument("--maintenance-margin-rate", type=float, default=None)
     p.add_argument("--collateral-ratio", type=float, default=None)
+    p.add_argument("--committed-capital-fraction", type=float, default=None)
     args = ap.parse_args(argv)
     out = report(args.db, planned_notional_usd=args.notional,
                  owner_capital_apr=args.capital_apr,
                  owner_drawdown_limit_usd=args.drawdown_limit_usd,
                  maintenance_margin_rate=args.maintenance_margin_rate,
-                 collateral_ratio=args.collateral_ratio)
+                 collateral_ratio=args.collateral_ratio,
+                 committed_capital_fraction=args.committed_capital_fraction)
     print(json.dumps(out, indent=2, sort_keys=True, default=str))
     return 0
 

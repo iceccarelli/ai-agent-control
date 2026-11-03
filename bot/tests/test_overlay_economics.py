@@ -198,19 +198,52 @@ def test_an_unset_capital_cost_is_insufficient_owner_input_with_a_sensitivity():
 
 
 def test_an_explicit_zero_is_a_supplied_value_and_applies_nothing():
-    z = oe.capital_model(0.0, [10.0, 12.0], [3.0, 3.0])
+    z = oe.capital_model(0.0, [10.0, 12.0], [3.0, 3.0], 0.5)
     assert z["status"] == "OWNER_SUPPLIED" and z["applied_apr"] == 0.0
     assert z["result"]["mean"] == pytest.approx(11.0)
 
 
 def test_a_positive_capital_cost_is_charged_by_days_held():
-    m = oe.capital_model(0.10, [10.0], [36.5])
+    m = oe.capital_model(0.10, [10.0], [36.5], 1.0)
     assert m["result"]["mean"] == pytest.approx(10.0 - 0.10 * 36.5 / 365 * 1e4)
 
 
-@pytest.mark.parametrize("bad", [-0.01, float("nan"), "x"])
+@pytest.mark.parametrize("bad", [-0.01, float("nan"), "x", True, 11.0])
 def test_a_bad_capital_cost_is_invalid_not_zero(bad):
-    assert oe.capital_model(bad, [1.0], [1.0])["status"] == "INVALID_OWNER_INPUT"
+    assert oe.capital_model(bad, [1.0], [1.0], 1.0)["status"] == "INVALID_OWNER_INPUT"
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.5, float("nan"), "x"])
+def test_a_bad_committed_fraction_is_invalid(bad):
+    assert oe.capital_model(0.05, [1.0], [1.0], bad)["status"] == "INVALID_OWNER_INPUT"
+
+
+def test_a_missing_committed_fraction_is_insufficient_owner_input_not_the_full_notional():
+    """The owner's BTC is held with or without the overlay: charging its
+    opportunity cost again would count the passive benchmark twice."""
+    m = oe.capital_model(0.05, [10.0, 12.0], [3.0, 3.0], None)
+    assert m["status"] == oe.INSUFFICIENT_OWNER_INPUT and m["result"] is None
+    assert "committed_capital_fraction" in m["needs"]
+
+
+def test_capital_cost_is_charged_on_the_committed_part_only():
+    full = oe.capital_model(0.10, [100.0] * 3, [30.0] * 3, 1.0)["result"]["mean"]
+    tenth = oe.capital_model(0.10, [100.0] * 3, [30.0] * 3, 0.1)["result"]["mean"]
+    none = oe.capital_model(0.10, [100.0] * 3, [30.0] * 3, 0.0)["result"]["mean"]
+    assert none == pytest.approx(100.0)
+    assert (100.0 - tenth) == pytest.approx(0.1 * (100.0 - full))
+
+
+def test_break_even_capital_cost_is_where_the_lower_bound_reaches_zero():
+    c = [100.0, 110.0, 90.0, 105.0, 95.0] * 8
+    m = oe.capital_model(0.0, c, [30.0] * 40, 1.0)
+    be = oe.capital_model(0.0, c, [30.0] * 40, 1.0)["break_even_capital_apr"]
+    assert be is not None and be > 0
+    just_below = oe.capital_model(be * 0.99, c, [30.0] * 40, 1.0)["result"]["lower95"]
+    just_above = oe.capital_model(be * 1.01, c, [30.0] * 40, 1.0)["result"]["lower95"]
+    assert just_below > 0 >= just_above
+    neg = oe.capital_model(0.0, [-5.0, -4.0, -6.0] * 5, [3.0] * 15, 1.0)
+    assert neg["break_even_capital_apr"] == 0.0
 
 
 # -- statistics -------------------------------------------------------------------
@@ -328,13 +361,16 @@ def test_a_rich_adequate_forward_sample_is_go_only_with_every_owner_input():
     assert base["episodes"]["priced"] >= 30 and base["span_days"] >= 60
     assert base["verdict"] == "INSUFFICIENT"            # no owner capital cost
     assert base["verdict_reasons"] == [oe.INSUFFICIENT_OWNER_INPUT]
-    no_dd = oe.evaluate(rows, owner_capital_apr=0.0, **kw)
+    no_dd = oe.evaluate(rows, owner_capital_apr=0.0,
+                        committed_capital_fraction=0.1, **kw)
     assert no_dd["verdict"] == "INSUFFICIENT"
     assert "DRAWDOWN" in no_dd["verdict_reasons"][0]
     no_margin = oe.evaluate(rows, owner_capital_apr=0.0,
+                            committed_capital_fraction=0.1,
                             owner_drawdown_limit_usd=20.0, **kw)
     assert no_margin["verdict_reasons"] == [oe.INSUFFICIENT_OWNER_INPUT + ":MARGIN_FACTS"]
-    go = oe.evaluate(rows, owner_capital_apr=0.0, owner_drawdown_limit_usd=20.0,
+    go = oe.evaluate(rows, owner_capital_apr=0.0, committed_capital_fraction=0.1,
+                     owner_drawdown_limit_usd=20.0,
                      maintenance_margin_rate=0.0033, collateral_ratio=0.85, **kw)
     assert go["verdict"] == "GO", go["verdict_reasons"]
     assert go["cash"] is False and go["class"] == oe.SIMULATED
@@ -343,6 +379,7 @@ def test_a_rich_adequate_forward_sample_is_go_only_with_every_owner_input():
 def test_a_high_capital_cost_turns_a_marginal_go_into_insufficient():
     rows = series(cyc(30.0, 5) * 40, bk=book(i10=0.3, i100=2.0))
     rep = oe.evaluate(rows, planned_notional_usd=100.0, owner_capital_apr=5.0,
+                      committed_capital_fraction=1.0,
                       owner_drawdown_limit_usd=20.0, maintenance_margin_rate=0.0033,
                       collateral_ratio=0.85)
     assert rep["verdict"] == "INSUFFICIENT"
@@ -418,6 +455,7 @@ def test_this_module_imports_nothing_that_can_place_an_order():
 # -- review findings: each one a failing case before it was fixed -------------------
 
 GO_KW = dict(planned_notional_usd=100.0, owner_capital_apr=0.0,
+             committed_capital_fraction=0.1,
              owner_drawdown_limit_usd=20.0, maintenance_margin_rate=0.0033,
              collateral_ratio=0.85)
 
@@ -593,4 +631,112 @@ def test_the_v2_protocol_pins_every_input_that_could_move_the_answer():
     assert oe.PROTOCOL["evaluation_start_s"] == oe.EVALUATION_START_S
 
 
-PINNED = "b84745c38b4ee57f455f9445b4b53b22139c0a1160e8c3af95980a30e71390d5"
+# -- stage 4: benchmark consistency, provenance, no look-ahead ----------------------------
+
+def test_every_return_is_expressed_on_the_same_inventory_value():
+    e = episode(spot_move=0.10, prints=(0.0, 0.0, 0.0))
+    assert e["inventory_value_in_usd"] == pytest.approx(1_000.0)
+    assert e["passive_return_bps"] == pytest.approx(1_000.0)           # +10%
+    assert e["overlay_total_return_bps"] == pytest.approx(
+        e["passive_return_bps"] + e["incremental_vs_passive_bps"])
+    # a flat-basis hedge gives up the rally: it underperforms passive by ~10%
+    assert e["incremental_vs_passive_bps"] == pytest.approx(
+        -1_000.0 + e["carry_bps"], abs=1e-6)
+
+
+def test_financing_is_stated_as_zero_for_an_overlay_not_silently_omitted():
+    e = episode()
+    assert e["financing_bps"] == 0.0 and "borrows nothing" in e["financing_note"]
+
+
+def test_a_hedge_that_underperforms_passive_btc_in_the_sample_is_not_go():
+    """A rally in the forward window: the carry is positive but the overlay as a
+    whole trails simply holding the BTC. That cannot be called an investment."""
+    rally = lambda h: 100_000.0 * (1 + 0.0004 * h)               # ~ +1 %/day
+    rep = oe.evaluate(rich(spot_fn=rally), **GO_KW)
+    assert rep["carry_bps_per_episode"]["lower95"] > 0           # the carry is fine
+    assert rep["incremental_vs_passive_bps"]["mean"] < 0
+    assert (rep["verdict"], rep["verdict_reasons"]) == (
+        "INSUFFICIENT", ["OVERLAY_UNDERPERFORMS_PASSIVE_BTC_IN_SAMPLE"])
+
+
+def test_a_flat_or_falling_window_does_not_trip_the_underperformance_rule():
+    assert oe.evaluate(rich(), **GO_KW)["verdict"] == "GO"
+    drop = lambda h: 100_000.0 * (1 - 0.0001 * h)
+    assert oe.evaluate(rich(spot_fn=drop), **GO_KW)["incremental_vs_passive_bps"]["mean"] > 0
+
+
+def test_the_distinct_latest_prints_are_reported_as_v1_does_not_the_hourly_count():
+    rows = series([2.0] * 23, hours=183)
+    rep = oe.evaluate(rows, planned_notional_usd=100.0)
+    assert len(rows) == 184 and rep["observations_forward"] == 184
+    assert rep["distinct_latest_funding_prints"] == 23
+
+
+def test_the_report_names_its_inputs_and_they_reproduce_the_same_digest(tmp_path):
+    db = str(tmp_path / "m.jsonl")
+    for r in series([2.0] * 3, hours=6):
+        mp.append(db, r["obs"])
+    a = oe.report(db, planned_notional_usd=100.0, owner_capital_apr=0.05)
+    b = oe.report(db, planned_notional_usd=100.0, owner_capital_apr=0.05)
+    c = oe.report(db, planned_notional_usd=100.0, owner_capital_apr=0.06)
+    pa = a["provenance"]
+    assert pa["inputs_digest"] == b["provenance"]["inputs_digest"]
+    assert pa["inputs_digest"] != c["provenance"]["inputs_digest"]       # an input is part of it
+    assert pa["forward_rows"] == 7 and pa["rows_missing_a_chain_hash"] == 0
+    assert len(pa["first_row_hash"]) == 64 and pa["protocol_hash"] == oe.protocol_hash()
+    assert pa["first_observed_at_s"] < pa["last_observed_at_s"]
+    rows, _ = mp.read(db)
+    assert pa["last_row_hash"] == rows[-1]["hash"]
+
+
+def test_a_changed_historical_row_changes_the_digest_and_breaks_the_chain(tmp_path):
+    db = str(tmp_path / "m.jsonl")
+    for r in series([2.0] * 3, hours=6):
+        mp.append(db, r["obs"])
+    good = oe.report(db, planned_notional_usd=100.0)
+    lines = open(db).read().splitlines()
+    lines[1] = lines[1].replace('"spot_mark":100000.0', '"spot_mark":100050.0')
+    open(db, "w").write("\n".join(lines) + "\n")
+    bad = oe.report(db, planned_notional_usd=100.0)
+    assert bad["chain_issues"] and bad["verdict_reasons"] == ["EVIDENCE_UNREADABLE"]
+    assert bad["provenance"]["inputs_digest"] != good["provenance"]["inputs_digest"]
+
+
+def test_no_decision_uses_information_from_the_future():
+    """Truncation invariance: replaying only the first k observations must
+    reproduce exactly the episodes that had closed by observation k in the full
+    replay. A decision that peeked ahead would differ."""
+    rows = rich()
+    full = oe.simulate_episodes(rows, 100.0)["closed"]
+    assert len(full) >= 30
+    for k in (97, 211, 480, 1003, len(rows) - 1):
+        part = oe.simulate_episodes(rows[:k + 1], 100.0)["closed"]
+        expect = [e for e in full if e["exit_s"] <= rows[k]["obs"]["observed_at_s"]]
+        assert [(e["entry_s"], e["exit_s"], e["carry_bps"]) for e in part] == \
+               [(e["entry_s"], e["exit_s"], e["carry_bps"]) for e in expect]
+
+
+def test_utilisation_and_annualised_carry_are_stated_with_idle_time_in_the_denominator():
+    rep = oe.evaluate(rich(), **GO_KW)
+    assert 0.0 < rep["capital_utilisation"] < 1.0
+    ann = rep["annualised_carry_bps_of_notional"]
+    total = sum(rep["carry_bps_per_episode"]["mean"] for _ in range(rep["episodes"]["priced"]))
+    assert ann == pytest.approx(total / rep["span_days"] * 365.0, rel=1e-9)
+    assert "not a forecast" in rep["annualisation_note"]
+
+
+def test_go_states_how_much_capital_cost_it_would_survive():
+    rep = oe.evaluate(rich(), **GO_KW)
+    assert rep["verdict"] == "GO"
+    assert rep["capital"]["break_even_capital_apr"] is None or \
+        rep["capital"]["break_even_capital_apr"] > 0
+
+
+def test_an_explicit_zero_capital_cost_is_go_eligible_but_reports_its_margin_of_safety():
+    rep = oe.evaluate(rich(), **dict(GO_KW, owner_capital_apr=0.0))
+    assert rep["capital"]["status"] == "OWNER_SUPPLIED"
+    assert "break_even_capital_apr" in rep["capital"] and "sensitivity" in rep["capital"]
+
+
+PINNED = "e9710b1265909d49b74b7cbbdf05acc8487a4646ff9b59ef12f14285b3cf1e11"
