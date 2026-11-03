@@ -60,6 +60,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+import margin_facts
 import venue_fees
 
 import order_lifecycle as _ol
@@ -1754,6 +1755,29 @@ class CarryBroker:
                 "distance_pct": distance, "account_mm_rate": account_mm,
                 "margin_mode": margin_mode, "position_im_usd": im_usd,
                 "reason": ""}
+
+    def get_collateral_facts(self, symbol: str) -> Dict[str, Any]:
+        """Does the venue say the held base coin backs a derivatives position?
+
+        Reads the same wallet-balance coin row the inventory read uses and
+        returns `margin_facts.collateral_status` for it: OK only when the
+        platform allows the coin as margin collateral AND the user switched it
+        on. A row or field the venue did not state is INSUFFICIENT_RISK_DATA,
+        never OK. The collateral RATIO is not on this row (it is a tiered,
+        size-dependent value behind another endpoint) and is reported
+        UNAVAILABLE rather than guessed. Raises only when the wallet cannot be
+        read at all; an unreadable wallet is not a collateralised one."""
+        coin = symbol[:-4] if symbol.upper().endswith("USDT") else symbol
+        result = self.client._request(
+            "GET", "/v5/account/wallet-balance", signed=True,
+            params={"accountType": "UNIFIED", "coin": coin})
+        rows = self._v5_list(result)
+        if rows is None:
+            raise PairIncident(
+                f"wallet balance unreadable; whether {coin} is collateral is "
+                "unknown, and an unknown collateral state is not a safe one")
+        return margin_facts.collateral_status(
+            margin_facts.find_coin_row(rows, coin), coin)
 
     def get_available_margin_usd(self) -> float:
         """What the unified account has free to fund NEW positions, in USD
