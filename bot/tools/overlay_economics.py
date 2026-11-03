@@ -76,7 +76,7 @@ CAPITAL_APR_GRID = (0.0, 0.02, 0.05, 0.10)
 #: the value for the SMALLER df is used (wider, never narrower).
 _T95 = ((1, 6.314), (2, 2.920), (3, 2.353), (4, 2.132), (5, 2.015), (6, 1.943),
         (7, 1.895), (8, 1.860), (9, 1.833), (10, 1.812), (15, 1.753),
-        (20, 1.725), (30, 1.697), (60, 1.671))
+        (20, 1.725), (30, 1.697), (60, 1.671), (120, 1.658))
 _Z95 = 1.645
 
 #: The question, the sample the answer needs, and what each answer means. Written
@@ -97,6 +97,18 @@ PROTOCOL = {
                  "after three consecutive negative settled prints"),
     "adequacy": {"min_closed_episodes": 30, "min_span_days": 60,
                  "min_distinct_settled_prints": 100},
+    "evaluation_start_s": EVALUATION_START_S,
+    "taker_fee_bps_per_leg": TAKER_FEE_BPS,
+    "max_gap_between_observations_s": 3 * 3600,
+    "max_unpriced_fraction": 0.10,
+    "min_liquidation_distance_pct": 15.0,
+    "inputs_the_owner_must_supply": [
+        "CARRY_OPPORTUNITY_COST_APR", "drawdown limit (USD)",
+        "maintenance_margin_rate", "collateral_ratio (venue values for the "
+        "owner's account)"],
+    "open_episodes": ("an episode still open at the last observation is marked "
+                      "to market as if closed there and GO must hold with it "
+                      "included"),
     "confidence": "one-sided 95% (Student t, smaller-df row between table rows)",
     "execution_cost": ("measured from the public book at the two sizes it was "
                        "walked at; between them bounded, above them UNAVAILABLE"),
@@ -139,12 +151,10 @@ def protocol_hash() -> str:
 def t_crit(n: int) -> float:
     """One-sided 95% critical value for a mean of n values. The row for the
     largest tabulated df not above n-1 (wider than the exact value, never
-    narrower); the normal value only from df 120 up."""
+    narrower)."""
     df = n - 1
     if df < 1:
         return float("inf")
-    if df >= 120:
-        return _Z95
     out = _T95[0][1]
     for d, v in _T95:
         if df >= d:
@@ -253,6 +263,28 @@ def overlay_cost_bounds(entry_obs: Dict[str, Any], exit_obs: Dict[str, Any],
 
 # -- one episode: overlay result minus passive BTC, no double counting ----------
 
+def _worst_path(rows: Sequence[Dict[str, Any]], i: int, j: int, qty: float,
+                cost_usd: float) -> float:
+    """The lowest the hedged position's carry result stood at any observation:
+    basis change so far + funding settled so far - the full round-trip cost.
+    Price direction is excluded (the BTC offsets it), so this is the drawdown a
+    hedged book feels in its own P&L, not its margin pressure."""
+    a = rows[i]["obs"]
+    base = float(a["perp_mark"]) - float(a["spot_mark"])
+    worst, funding = 0.0 - cost_usd, 0.0
+    t_prev = a["observed_at_s"] * 1000.0
+    for m in range(i + 1, j + 1):
+        o = rows[m]["obs"]
+        t = o["observed_at_s"] * 1000.0
+        for bps, ms in _prints_between(rows, i, m):
+            if t_prev < ms <= t:
+                funding += bps / 1e4 * qty * float(o["perp_mark"])
+        t_prev = t
+        basis_pnl = -qty * ((float(o["perp_mark"]) - float(o["spot_mark"])) - base)
+        worst = min(worst, basis_pnl + funding - cost_usd)
+    return worst
+
+
 def _prints_between(rows: Sequence[Dict[str, Any]], i: int, j: int
                     ) -> List[Tuple[float, int]]:
     """Distinct settled prints with entry_time < print_time <= exit_time."""
@@ -294,6 +326,11 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
     passive_btc = qty * (spot_out - spot_in)
     perp_pnl = qty * (perp_in - perp_out)
     cost = overlay_cost_bounds(a, b, notional_usd, taker_fee_bps)
+    gaps = [rows[m + 1]["obs"]["observed_at_s"] - rows[m]["obs"]["observed_at_s"]
+            for m in range(i, j)]
+    if gaps and max(gaps) > PROTOCOL["max_gap_between_observations_s"]:
+        cost = {"status": UNAVAILABLE, "reason": "EPISODE_SPANS_OBSERVATION_GAP",
+                "legs": 2, "spot_legs": 0}
     hold_days = (b["observed_at_s"] - a["observed_at_s"]) / 86400.0
     out: Dict[str, Any] = {
         "class": SIMULATED, "cash": False,
@@ -307,6 +344,7 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
     out["directional_component_usd"] = -qty * (spot_out - spot_in)
     out["impact_upper_bps"] = cost.get("impact_upper_bps")
     if cost["status"] == UNAVAILABLE:
+        out["worst_path_usd"] = None
         out["incremental_vs_passive_usd"] = None
         out["carry_usd"] = None
         out["carry_bps"] = None
@@ -314,6 +352,7 @@ def episode_result(rows: Sequence[Dict[str, Any]], i: int, j: int,
         return out
     scale = float(notional_usd) / 1e4
     cost_hi, cost_lo = cost["total_upper_bps"] * scale, cost["total_lower_bps"] * scale
+    out["worst_path_usd"] = _worst_path(rows, i, j, qty, cost_hi)
     out["overlay_total_usd"] = passive_btc + perp_pnl + funding_usd - cost_hi
     out["incremental_vs_passive_usd"] = out["overlay_total_usd"] - passive_btc
     carry = perp_pnl + funding_usd - cost_hi - out["directional_component_usd"]
@@ -348,18 +387,26 @@ def simulate_episodes(rows: Sequence[Dict[str, Any]], notional_usd: float,
                 last_print_ms = max((int(p[1]) for p in o.get("settled_prints", [])),
                                     default=0)
             continue
+        exited = False
         for bps, ms in sorted(((p[0], int(p[1])) for p in o.get("settled_prints", [])),
                               key=lambda p: p[1]):
             if ms > last_print_ms:
                 streak = streak + 1 if bps < 0 else 0
                 last_print_ms = ms
-        if streak >= 3:
+                if streak >= 3:          # the rule fires at the third print itself
+                    exited = True
+                    break
+        if exited:
             closed.append(episode_result(rows, open_i, k, notional_usd, taker_fee_bps))
             open_i = None
+            streak = 0
+    open_ep = (episode_result(rows, open_i, len(rows) - 1, notional_usd, taker_fee_bps)
+               if open_i is not None and open_i < len(rows) - 1 else None)
     return {"closed": closed,
             "open_at_end": open_i is not None,
             "open_since_s": rows[open_i]["obs"]["observed_at_s"]
-            if open_i is not None else None}
+            if open_i is not None else None,
+            "open_marked": open_ep}
 
 
 # -- capital: unset is not zero --------------------------------------------------
@@ -480,10 +527,16 @@ def capacity_bounds(rows: Sequence[Dict[str, Any]], impact_budget_bps: float,
                                       else (p95 <= impact_budget_bps and missing == 0))}
     if not rows or all(v["p95_bps"] is None for v in per.values()):
         return {"status": UNAVAILABLE, "reason": "NO_BOOK_MEASUREMENTS", "by_size": per}
-    ok = [s for s in MEASURED_NOTIONALS if per[str(int(s))]["within_budget"]]
-    bad = [s for s in MEASURED_NOTIONALS if per[str(int(s))]["within_budget"] is False]
-    lower = max(ok) if ok else 0.0
-    upper = min(bad) if bad else None            # None: nothing above was measured
+    # A walked book's cost never falls as the order grows, so a size is only
+    # supported if every smaller measured size is too; one that is not within
+    # budget (or not priced) caps everything above it.
+    lower, upper = 0.0, None
+    for size in MEASURED_NOTIONALS:
+        w = per[str(int(size))]["within_budget"]
+        if w is True and upper is None:
+            lower = size
+        elif upper is None:
+            upper = size
     out = {"status": "BRACKETED" if upper is not None else "LOWER_BOUND_ONLY",
            "supported_notional_lower_usd": lower,
            "supported_notional_upper_usd": upper,
@@ -500,8 +553,17 @@ def capacity_bounds(rows: Sequence[Dict[str, Any]], impact_budget_bps: float,
 def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
              owner_capital_apr: Optional[float] = None,
              owner_drawdown_limit_usd: Optional[float] = None,
+             maintenance_margin_rate: Optional[float] = None,
+             collateral_ratio: Optional[float] = None,
              chain_issues: Sequence[str] = (),
              taker_fee_bps: float = TAKER_FEE_BPS) -> Dict[str, Any]:
+    chain_issues = list(chain_issues)
+    ts = [r["obs"].get("observed_at_s") for r in rows]
+    if any(not isinstance(t, (int, float)) or not math.isfinite(t) for t in ts) \
+            or any(b <= a for a, b in zip(ts, ts[1:]) if isinstance(a, (int, float))
+                   and isinstance(b, (int, float))):
+        chain_issues.append("OBSERVATIONS_NOT_STRICTLY_INCREASING_IN_TIME")
+        rows = []
     fwd = [r for r in rows if r["obs"].get("observed_at_s", 0) >= EVALUATION_START_S]
     excluded = len(rows) - len(fwd)
     out: Dict[str, Any] = {
@@ -510,7 +572,15 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
         "planned_notional_usd": planned_notional_usd,
         "observations_total": len(rows), "observations_forward": len(fwd),
         "observations_before_declaration_excluded": excluded,
-        "chain_issues": list(chain_issues)}
+        "chain_issues": chain_issues,
+        "run_inputs": {"owner_capital_apr": owner_capital_apr,
+                       "owner_drawdown_limit_usd": owner_drawdown_limit_usd,
+                       "maintenance_margin_rate": maintenance_margin_rate,
+                       "collateral_ratio": collateral_ratio,
+                       "taker_fee_bps": taker_fee_bps,
+                       "note": ("a verdict is a function of the evidence AND "
+                                "these inputs; changing them to re-run is not "
+                                "a new test")}}
     prints = {int(p[1]) for r in fwd for p in r["obs"].get("settled_prints", [])
               if int(p[1]) >= EVALUATION_START_S * 1000}
     span_days = ((fwd[-1]["obs"]["observed_at_s"] - fwd[0]["obs"]["observed_at_s"])
@@ -524,9 +594,12 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
     sim = simulate_episodes(fwd, planned_notional_usd, taker_fee_bps) if fwd else {
         "closed": [], "open_at_end": False, "open_since_s": None}
     closed = sim["closed"]
-    priced = [e for e in closed if e["carry_bps"] is not None]
+    priced = [e for e in closed if _finite(e.get("carry_bps"))
+              and _finite(e.get("carry_usd")) and _finite(e.get("worst_path_usd"))]
     out["episodes"] = {"closed": len(closed), "priced": len(priced),
                        "unpriced_unavailable": len(closed) - len(priced),
+                       "unpriced_fraction": ((len(closed) - len(priced)) / len(closed))
+                       if closed else 0.0,
                        "open_at_end": sim["open_at_end"],
                        "open_since_s": sim["open_since_s"]}
     carry = [e["carry_bps"] for e in priced]
@@ -537,8 +610,19 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
         [e["incremental_vs_passive_usd"] for e in priced])
     out["directional_component_usd"] = mean_bounds(
         [e["directional_component_usd"] for e in priced])
-    worst = min((e["carry_usd"] for e in priced), default=None)
-    out["worst_episode_usd"] = worst
+    worst = min((e["worst_path_usd"] for e in priced), default=None)
+    out["worst_episode_usd"] = worst           # lowest point of any priced episode's path
+    om = sim.get("open_marked")
+    om_ok = om is not None and _finite(om.get("carry_bps"))
+    if om_ok and _finite(om.get("worst_path_usd")):
+        worst = om["worst_path_usd"] if worst is None else min(worst, om["worst_path_usd"])
+        out["worst_episode_usd"] = worst
+    out["open_episode_marked"] = (
+        {"carry_bps": om["carry_bps"], "carry_usd": om["carry_usd"],
+         "note": "marked to market at the last observation; not an exit"}
+        if om_ok else ({"status": UNAVAILABLE} if sim["open_at_end"] else None))
+    out["carry_bps_with_open_episode"] = mean_bounds(
+        carry + ([om["carry_bps"]] if om_ok else []))
     out["return_distribution_bps"] = (
         {"status": UNAVAILABLE, "reason": "FEWER_THAN_20_EPISODES"} if len(priced) < 20
         else {"status": "MEASURED", "min": min(carry), "p5": _quantile(carry, 0.05),
@@ -556,7 +640,13 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
                            "impact_budget_bps": budget}
     else:
         out["capacity"] = capacity_bounds(fwd, budget, planned_notional_usd)
-    out["stress"] = stress_table(planned_notional_usd)
+    out["stress"] = stress_table(
+        planned_notional_usd, leverage=1.0,
+        maintenance_margin_rate=maintenance_margin_rate,
+        collateral_ratio=collateral_ratio)
+    out["stress"]["read_by_verdict"] = (
+        "GO needs the BTC-collateral liquidation distance, from the owner's "
+        "venue values, above the engine's own floor")
     out["verdict"], out["verdict_reasons"] = verdict(out, owner_drawdown_limit_usd)
     out["protocol"] = {"adequacy": PROTOCOL["adequacy"],
                        "meaning": PROTOCOL["meaning"][out["verdict"]]}
@@ -566,6 +656,10 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
 def _quantile(values: Sequence[float], q: float) -> float:
     vs = sorted(values)
     return vs[min(len(vs) - 1, max(0, math.ceil(q * len(vs)) - 1))]
+
+
+def _finite(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
 def verdict(rep: Dict[str, Any], drawdown_limit_usd: Optional[float] = None
@@ -582,8 +676,8 @@ def verdict(rep: Dict[str, Any], drawdown_limit_usd: Optional[float] = None
         why.append(f"SPAN_UNDER_{ad['min_span_days']}_DAYS")
     if (rep.get("distinct_settled_prints") or 0) < ad["min_distinct_settled_prints"]:
         why.append(f"FEWER_THAN_{ad['min_distinct_settled_prints']}_DISTINCT_PRINTS")
-    if ep.get("unpriced_unavailable", 0):
-        why.append("EXECUTION_COST_UNAVAILABLE_FOR_SOME_EPISODES")
+    if ep.get("unpriced_fraction", 0.0) > PROTOCOL["max_unpriced_fraction"]:
+        why.append("TOO_MANY_EPISODES_UNPRICEABLE_OR_ACROSS_GAPS")
     if why:
         return "INSUFFICIENT", why
     fav = rep["carry_bps_most_favourable"]
@@ -595,23 +689,37 @@ def verdict(rep: Dict[str, Any], drawdown_limit_usd: Optional[float] = None
     res = cap["result"]
     if res["lower95"] is None or res["lower95"] <= 0:
         return "INSUFFICIENT", ["LOWER_95_BOUND_NOT_ABOVE_ZERO_AFTER_CAPITAL_COST"]
+    if rep.get("open_episode_marked") == {"status": UNAVAILABLE}:
+        return "INSUFFICIENT", ["OPEN_EPISODE_CANNOT_BE_MARKED"]
+    wo = rep.get("carry_bps_with_open_episode") or {}
+    if rep.get("open_episode_marked") and (wo.get("lower95") is None
+                                           or wo.get("lower95") <= 0):
+        return "INSUFFICIENT", ["LOWER_95_BOUND_NOT_ABOVE_ZERO_WITH_OPEN_EPISODE"]
     if rep["capacity"].get("planned_inside_measured_capacity") is not True:
         return "INSUFFICIENT", ["PLANNED_SIZE_NOT_INSIDE_MEASURED_CAPACITY"]
-    if drawdown_limit_usd is None:
+    if not _finite(drawdown_limit_usd) or drawdown_limit_usd <= 0:
         return "INSUFFICIENT", [INSUFFICIENT_OWNER_INPUT + ":DRAWDOWN_LIMIT"]
-    if rep["worst_episode_usd"] is None or rep["worst_episode_usd"] < -abs(drawdown_limit_usd):
+    liq = (rep.get("stress") or {}).get("liquidation_rally_pct_btc_collateral") or {}
+    if liq.get("status") != "ILLUSTRATIVE" or not _finite(liq.get("pct")):
+        return "INSUFFICIENT", [INSUFFICIENT_OWNER_INPUT + ":MARGIN_FACTS"]
+    if liq["pct"] < PROTOCOL["min_liquidation_distance_pct"]:
+        return "INSUFFICIENT", ["LIQUIDATION_DISTANCE_BELOW_ENGINE_FLOOR"]
+    if rep["worst_episode_usd"] is None or rep["worst_episode_usd"] < -float(drawdown_limit_usd):
         return "INSUFFICIENT", ["WORST_EPISODE_EXCEEDS_DRAWDOWN_LIMIT"]
     return "GO", ["LOWER_95_BOUND_POSITIVE_AFTER_MEASURED_COSTS_AND_CAPITAL"]
 
 
 def report(db: str, *, planned_notional_usd: float,
            owner_capital_apr: Optional[float] = None,
-           owner_drawdown_limit_usd: Optional[float] = None) -> Dict[str, Any]:
+           owner_drawdown_limit_usd: Optional[float] = None,
+           maintenance_margin_rate: Optional[float] = None,
+           collateral_ratio: Optional[float] = None) -> Dict[str, Any]:
     rows, issues = mp.read(db)
     return evaluate(rows, planned_notional_usd=planned_notional_usd,
                     owner_capital_apr=owner_capital_apr,
                     owner_drawdown_limit_usd=owner_drawdown_limit_usd,
-                    chain_issues=issues)
+                    maintenance_margin_rate=maintenance_margin_rate,
+                    collateral_ratio=collateral_ratio, chain_issues=issues)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -622,10 +730,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--notional", type=float, required=True)
     p.add_argument("--capital-apr", type=float, default=None)
     p.add_argument("--drawdown-limit-usd", type=float, default=None)
+    p.add_argument("--maintenance-margin-rate", type=float, default=None)
+    p.add_argument("--collateral-ratio", type=float, default=None)
     args = ap.parse_args(argv)
     out = report(args.db, planned_notional_usd=args.notional,
                  owner_capital_apr=args.capital_apr,
-                 owner_drawdown_limit_usd=args.drawdown_limit_usd)
+                 owner_drawdown_limit_usd=args.drawdown_limit_usd,
+                 maintenance_margin_rate=args.maintenance_margin_rate,
+                 collateral_ratio=args.collateral_ratio)
     print(json.dumps(out, indent=2, sort_keys=True, default=str))
     return 0
 

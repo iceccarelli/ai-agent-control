@@ -331,7 +331,11 @@ def test_a_rich_adequate_forward_sample_is_go_only_with_every_owner_input():
     no_dd = oe.evaluate(rows, owner_capital_apr=0.0, **kw)
     assert no_dd["verdict"] == "INSUFFICIENT"
     assert "DRAWDOWN" in no_dd["verdict_reasons"][0]
-    go = oe.evaluate(rows, owner_capital_apr=0.0, owner_drawdown_limit_usd=20.0, **kw)
+    no_margin = oe.evaluate(rows, owner_capital_apr=0.0,
+                            owner_drawdown_limit_usd=20.0, **kw)
+    assert no_margin["verdict_reasons"] == [oe.INSUFFICIENT_OWNER_INPUT + ":MARGIN_FACTS"]
+    go = oe.evaluate(rows, owner_capital_apr=0.0, owner_drawdown_limit_usd=20.0,
+                     maintenance_margin_rate=0.0033, collateral_ratio=0.85, **kw)
     assert go["verdict"] == "GO", go["verdict_reasons"]
     assert go["cash"] is False and go["class"] == oe.SIMULATED
 
@@ -339,8 +343,10 @@ def test_a_rich_adequate_forward_sample_is_go_only_with_every_owner_input():
 def test_a_high_capital_cost_turns_a_marginal_go_into_insufficient():
     rows = series(cyc(30.0, 5) * 40, bk=book(i10=0.3, i100=2.0))
     rep = oe.evaluate(rows, planned_notional_usd=100.0, owner_capital_apr=5.0,
-                      owner_drawdown_limit_usd=20.0)
+                      owner_drawdown_limit_usd=20.0, maintenance_margin_rate=0.0033,
+                      collateral_ratio=0.85)
     assert rep["verdict"] == "INSUFFICIENT"
+    assert "AFTER_CAPITAL_COST" in rep["verdict_reasons"][0]
 
 
 def test_an_adequate_sample_that_cannot_cover_costs_is_no_go():
@@ -409,4 +415,182 @@ def test_this_module_imports_nothing_that_can_place_an_order():
                     "sys", "typing", "carry_costs", "mainnet_public"}
 
 
-PINNED = "37193957cea395fa9157059c2dc53cdd272ad2c63f445b2fb4756b64d3992051"
+# -- review findings: each one a failing case before it was fixed -------------------
+
+GO_KW = dict(planned_notional_usd=100.0, owner_capital_apr=0.0,
+             owner_drawdown_limit_usd=20.0, maintenance_margin_rate=0.0033,
+             collateral_ratio=0.85)
+
+
+def rich(**kw):
+    return series(cyc(30.0, 5) * 40, bk=kw.pop("bk", book(i10=0.3, i100=2.0)), **kw)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -5.0, 0.0, "20"])
+def test_a_malformed_drawdown_limit_never_reaches_go(bad):
+    kw = dict(GO_KW, owner_drawdown_limit_usd=bad)
+    rep = oe.evaluate(rich(), **kw)
+    assert rep["verdict"] == "INSUFFICIENT"
+    assert "DRAWDOWN_LIMIT" in rep["verdict_reasons"][0]
+
+
+def test_a_drawdown_limit_below_the_worst_path_blocks_go():
+    rep = oe.evaluate(rich(), **dict(GO_KW, owner_drawdown_limit_usd=0.01))
+    assert rep["verdict_reasons"] == ["WORST_EPISODE_EXCEEDS_DRAWDOWN_LIMIT"]
+    assert rep["worst_episode_usd"] < -0.01
+
+
+def test_the_worst_episode_is_the_lowest_point_of_the_path_not_its_end():
+    """Basis spikes against the short mid-episode and recovers before exit."""
+    spike = lambda h: 100_000.0 + (500.0 if 8 <= h <= 12 else 0.0)
+    rows = series([4.0] * 3, hours=24, perp_fn=spike)
+    e = oe.episode_result(rows, 0, len(rows) - 1, 1_000.0)
+    assert e["carry_usd"] > e["worst_path_usd"]
+    assert e["worst_path_usd"] < -4.0            # 500 * 0.01 BTC = 5 USD, plus cost
+
+
+def test_a_missing_margin_fact_or_a_near_liquidation_cannot_be_go():
+    miss = oe.evaluate(rich(), **dict(GO_KW, collateral_ratio=None))
+    assert miss["verdict_reasons"] == [oe.INSUFFICIENT_OWNER_INPUT + ":MARGIN_FACTS"]
+    near = oe.evaluate(rich(), **dict(GO_KW, collateral_ratio=0.10))
+    assert near["verdict_reasons"] == ["LIQUIDATION_DISTANCE_BELOW_ENGINE_FLOOR"]
+
+
+def test_the_liquidation_floor_is_the_engines_own():
+    import carry_engine
+    assert oe.PROTOCOL["min_liquidation_distance_pct"] == \
+        carry_engine.MIN_LIQUIDATION_DISTANCE_PCT
+
+
+def test_a_nan_funding_print_makes_an_episode_unpriced_not_silently_dropped():
+    rows = rich()
+    # poison one settled print everywhere it appears
+    target = rows[300]["obs"]["settled_prints"][-1][1]
+    for r in rows:
+        for pr in r["obs"]["settled_prints"]:
+            if pr[1] == target:
+                pr[0] = float("nan")
+    rep = oe.evaluate(rows, **GO_KW)
+    ep = rep["episodes"]
+    assert ep["priced"] + ep["unpriced_unavailable"] == ep["closed"]
+    assert rep["carry_bps_per_episode"]["n"] == ep["priced"]       # same sample
+
+
+def test_an_episode_across_an_observation_gap_is_not_priced():
+    rows = rich()
+    ep_before = oe.evaluate(rows, **GO_KW)["episodes"]
+    gap = 200 * 3600
+    for r in rows[100:]:
+        r["obs"]["observed_at_s"] += gap
+    after = oe.evaluate(rows, **GO_KW)["episodes"]
+    assert after["unpriced_unavailable"] >= 1
+    assert after["unpriced_unavailable"] > ep_before["unpriced_unavailable"]
+
+
+def test_too_many_unpriceable_episodes_make_the_sample_insufficient():
+    rows = rich()
+    for r in rows[::7]:
+        r["obs"]["book"]["linear"] = None
+    rep = oe.evaluate(rows, **GO_KW)
+    assert rep["verdict"] == "INSUFFICIENT"
+
+
+def test_observations_out_of_time_order_are_unreadable_evidence():
+    rows = rich()
+    rows[10], rows[11] = rows[11], rows[10]
+    rep = oe.evaluate(rows, **GO_KW)
+    assert (rep["verdict"], rep["verdict_reasons"]) == ("INSUFFICIENT", ["EVIDENCE_UNREADABLE"])
+    assert "OBSERVATIONS_NOT_STRICTLY_INCREASING_IN_TIME" in rep["chain_issues"]
+
+
+def test_an_open_episode_is_marked_and_a_loss_on_it_blocks_go():
+    prints = cyc(30.0, 5) * 40 + [30.0] * 6          # ends inside an open episode
+    n = len(prints) * 8
+    calm = series(prints, bk=book(i10=0.3, i100=2.0))
+    rep = oe.evaluate(calm, **GO_KW)
+    assert rep["episodes"]["open_at_end"] is True
+    assert rep["open_episode_marked"]["carry_bps"] > 0
+    assert rep["carry_bps_with_open_episode"]["n"] == rep["carry_bps_per_episode"]["n"] + 1
+    assert rep["verdict"] == "GO"
+    # the same history, but the short bleeds hard in the open episode (the basis
+    # widens 20% before the last observation)
+    bleed = series(prints, bk=book(i10=0.3, i100=2.0),
+                   perp_fn=lambda h: 100_000.0 * (1 + (0.30 if h > n - 24 else 0.0)))
+    bad = oe.evaluate(bleed, **GO_KW)
+    assert bad["open_episode_marked"]["carry_bps"] < 0
+    assert bad["verdict"] == "INSUFFICIENT"
+    assert bad["verdict"] == "INSUFFICIENT"
+    assert bad["verdict_reasons"][0] in (
+        "WORST_EPISODE_EXCEEDS_DRAWDOWN_LIMIT",
+        "LOWER_95_BOUND_NOT_ABOVE_ZERO_WITH_OPEN_EPISODE")
+    assert bad["worst_episode_usd"] < -20.0          # the open episode's path counts
+    # and when the open episode only drags the lower bound to zero, that alone blocks GO
+    rep["carry_bps_with_open_episode"] = dict(rep["carry_bps_with_open_episode"], lower95=-1.0)
+    assert oe.verdict(rep, 20.0)[1] == ["LOWER_95_BOUND_NOT_ABOVE_ZERO_WITH_OPEN_EPISODE"]
+
+
+def test_an_unmarkable_open_episode_blocks_go():
+    rep = oe.evaluate(rich(), **GO_KW)
+    rep["open_episode_marked"] = {"status": oe.UNAVAILABLE}
+    assert oe.verdict(rep, 20.0)[1] == ["OPEN_EPISODE_CANNOT_BE_MARKED"]
+
+
+def test_the_exit_fires_on_the_third_negative_print_even_inside_one_observation():
+    """Several prints arrive in one observation after a gap: -,-,-,+ must exit."""
+    n = [6.0] * 6
+    rows = series(n, hours=48)
+    open_ms = rows[-1]["obs"]["settled_prints"][-1][1]
+    big = json.loads(json.dumps(rows[-1]))
+    big["obs"]["observed_at_s"] += 3600
+    big["obs"]["settled_prints"] = [[6.0, open_ms],
+                                    [-1.0, open_ms + 1], [-1.0, open_ms + 2],
+                                    [-1.0, open_ms + 3], [6.0, open_ms + 4]]
+    sim = oe.simulate_episodes(rows + [big], 100.0)
+    assert len(sim["closed"]) == 1 and sim["open_at_end"] is False
+
+
+def test_the_critical_value_is_never_narrower_than_the_exact_one():
+    exact = {2: 6.314, 3: 2.920, 11: 1.812, 31: 1.697, 121: 1.658}
+    for n, v in exact.items():
+        assert oe.t_crit(n) >= v - 1e-3
+    assert oe.t_crit(1) == float("inf")
+    assert oe.t_crit(500) >= 1.658 - 1e-9
+
+
+def test_capacity_is_monotone_a_failing_small_size_caps_larger_ones():
+    rows = series([4.0] * 3, bk=book(i10=2.0, i100=0.5))     # impossible book, odd p95s
+    cap = oe.capacity_bounds(rows, impact_budget_bps=1.0, planned_notional_usd=50_000)
+    assert cap["supported_notional_lower_usd"] == 0.0
+    assert cap["planned_inside_measured_capacity"] is False or \
+        cap["planned_inside_measured_capacity"] is None
+    assert cap["planned_inside_measured_capacity"] is not True
+
+
+def test_a_planned_size_outside_capacity_blocks_go():
+    rep = oe.evaluate(rich(bk=book(i10=0.3, i100=2.0)), **GO_KW)
+    rep["capacity"]["planned_inside_measured_capacity"] = None
+    assert oe.verdict(rep, 20.0)[1] == ["PLANNED_SIZE_NOT_INSIDE_MEASURED_CAPACITY"]
+
+
+def test_no_go_is_withheld_on_thin_evidence_even_when_clearly_negative():
+    rows = series(cyc(0.9, 5) * 6)
+    rep = oe.evaluate(rows, **GO_KW)
+    assert rep["episodes"]["priced"] < 30
+    assert rep["verdict"] == "INSUFFICIENT"
+
+
+def test_a_positive_mean_whose_lower_bound_is_not_positive_is_not_go():
+    rep = oe.evaluate(rich(), **GO_KW)
+    rep["capital"]["result"] = dict(rep["capital"]["result"], mean=1.0, lower95=-0.5)
+    assert oe.verdict(rep, 20.0)[1] == ["LOWER_95_BOUND_NOT_ABOVE_ZERO_AFTER_CAPITAL_COST"]
+
+
+def test_the_v2_protocol_pins_every_input_that_could_move_the_answer():
+    for k in ("evaluation_start_s", "taker_fee_bps_per_leg", "adequacy",
+              "max_gap_between_observations_s", "max_unpriced_fraction",
+              "min_liquidation_distance_pct", "inputs_the_owner_must_supply"):
+        assert k in oe.PROTOCOL
+    assert oe.PROTOCOL["evaluation_start_s"] == oe.EVALUATION_START_S
+
+
+PINNED = "b84745c38b4ee57f455f9445b4b53b22139c0a1160e8c3af95980a30e71390d5"
