@@ -181,6 +181,7 @@ jobs:
           tests/test_execution_roundtrip.py
           tests/test_decision_context_lifecycle.py
           tests/test_collateral_facts_refusal.py
+          tests/test_close_plan.py
           tests/test_reconciled_funding_late_row.py
           tests/test_exit_book_measured.py
           tests/test_ledger_funding_cycle.py
