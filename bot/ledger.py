@@ -658,6 +658,15 @@ def lifecycle_reconciliation(journal: "Journal", *, from_ms: Optional[int] = Non
             elif state == "FULLY_RECONCILED":
                 f = lifecycle_flags(journal, lc)
                 contra = [code for name, code in _CONTRADICTIONS if f[name]]
+                # The record says how many venue rows it attributed. A row the
+                # journal holds NOW and the record never counted (a late
+                # duplicate under a new id, a late delivery) changes the cash
+                # the record vouches for, so it cannot stay vouched for.
+                counted = (rec.get("evidence") or {}).get(
+                    "account_rows_attributed")
+                if counted is not None and int(counted) != sum(
+                        1 for e in f["booked"] if e.basis == "venue"):
+                    contra.append("SETTLEMENT_ROWS_CHANGED_SINCE_RECONCILIATION")
                 if contra:
                     state = "CONTRADICTED_AFTER_RECONCILIATION"
                     reasons = contra
@@ -799,6 +808,16 @@ def _perp_qty_at(journal: Journal, ms: int) -> float:
     return journal.balances(to_ms=int(ms))[PERP].qty
 
 
+def _perp_moved_within(journal: Journal, lo_ms: int, hi_ms: int) -> bool:
+    """Did any entry change the perp quantity in (lo_ms, hi_ms]? Equal
+    quantity at both ends does not prove the position was held in between: a
+    close then a same-size reopen is flat for a moment."""
+    return any(e.ms > lo_ms and e.ms <= hi_ms
+               and any(l.account == PERP and abs(l.qty or 0.0) > DUST[PERP]
+                       for l in e.lines)
+               for e in journal.entries)
+
+
 def _payment_identity(p: Dict[str, Any]) -> tuple:
     """What makes two settlement rows the SAME payment.
 
@@ -835,7 +854,9 @@ def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
     t = int(p["ms"])
     before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
     after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
-    if abs(after - before) > DUST[PERP]:
+    if (abs(after - before) > DUST[PERP]
+            or _perp_moved_within(journal, t - ATTRIBUTION_SLACK_MS,
+                                  t + ATTRIBUTION_SLACK_MS)):
         return ("the book's position changed within a minute of this "
                 "settlement; ownership cannot be established")
     if abs(after) <= DUST[PERP]:

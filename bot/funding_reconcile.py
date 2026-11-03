@@ -58,7 +58,9 @@ def _classify_print(journal: L.Journal, t: int) -> str:
     dust = L.DUST[L.PERP]
     if abs(before) <= dust and abs(after) <= dust:
         return "flat"
-    if abs(after - before) <= dust and abs(after) > dust:
+    if (abs(after - before) <= dust and abs(after) > dust
+            and not L._perp_moved_within(journal, t - L.ATTRIBUTION_SLACK_MS,
+                                         t + L.ATTRIBUTION_SLACK_MS)):
         return "held"
     return "ambiguous"
 
