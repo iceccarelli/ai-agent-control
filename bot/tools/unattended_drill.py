@@ -175,6 +175,26 @@ def run_child(argv: Sequence[str], env: Mapping[str, str], *, log_path: str,
             raise
 
 
+def records_problem(report: Any) -> Optional[str]:
+    """Why this run's execution records may be incomplete, or None. Evidence
+    persistence is a different question from whether the order path worked, so
+    it is reported beside the verdict and never inside `problems`: a lost
+    sample must be VISIBLE, but must not fake or hide an order-path result."""
+    rec = (report or {}).get("execution_records") if isinstance(
+        report, dict) else None
+    if isinstance(report, dict) and report.get("execution_records_error"):
+        return ("the end-of-run records write failed: "
+                f"{report['execution_records_error']}")
+    if not isinstance(rec, dict):
+        return None
+    errors = int(rec.get("durable_write_errors") or 0)
+    if errors and int(rec.get("appended") or 0) < errors:
+        return (f"{errors} durable record write(s) failed and the end-of-run "
+                "flush did not recover them: "
+                f"{rec.get('durable_write_last_error') or 'unknown error'}")
+    return None
+
+
 def verdict(*, preflight: Optional[int], drill: Optional[int],
             flat: Optional[int], recon: Optional[int],
             not_eligible: Optional[str] = None,
@@ -369,7 +389,10 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
             flat = _guard(lambda: runner(
                 [py, os.path.join(TOOLS, "close_testnet_short.py"), "--arm",
                  "--no-prompt", "--max-qty", MAX_CLOSE_QTY, "--evidence-path",
-                 os.path.join(evdir, "ensure_flat_evidence.jsonl")],
+                 os.path.join(evdir, "ensure_flat_evidence.jsonl"),
+                 # the safety-net close is an exit too (the worst kind: the
+                 # drill failed to complete its own): it joins the samples
+                 "--execution-records", records],
                 cenv, log_path=log, timeout_s=300))
         finally:
             _SIGNAL["protect"] = False
@@ -417,6 +440,9 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                      not_eligible=not_eligible,
                      assessment_failed=assessment_failed, reconciled=reconciled,
                      orders_placed=orders_placed)
+    result["execution_records_problem"] = records_problem(drill_report)
+    if result["execution_records_problem"]:
+        _say(run_dir, "EXECUTION RECORDS: " + result["execution_records_problem"])
     if window_closed:
         result["problems"].append("the window closed during the preflight: no drill")
         result.update(ok=False, outcome=RO.CONFORMANCE_FAILED,

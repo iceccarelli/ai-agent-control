@@ -139,6 +139,30 @@ def summarize_outcomes(outcomes, filled_by_leg=None) -> dict:
                     "only, never a filled-order cost sample"}
 
 
+def partial_fills(entries) -> dict:
+    """Per leg: filled orders that filled LESS than they asked for, and the
+    quantity left unfilled. A partial fill is a cost sample for what filled,
+    but its remainder is an execution outcome the cost bound cannot see; it is
+    reported here so it is not mistaken for a clean fill."""
+    out = {}
+    for e in entries:
+        rec = (getattr(e, "fee_raw", None) or {}).get("execution")
+        if not isinstance(rec, dict):
+            continue
+        try:
+            filled, asked = float(rec["filled_qty"]), float(rec["requested_qty"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (filled > 0 and asked > 0) or filled >= asked * (1 - 1e-6):
+            continue
+        leg = "/".join(str(rec.get(k) or "?")
+                       for k in ("product", "side", "order_type"))
+        row = out.setdefault(leg, {"orders": 0, "unfilled_qty": 0.0})
+        row["orders"] += 1
+        row["unfilled_qty"] += asked - filled
+    return out
+
+
 def check_db_environment(db_path: str, environment: str) -> dict:
     """The environment the database itself recorded, checked against the one
     the report is asked for. Raises ValueError (a refusal) unless the database
@@ -181,6 +205,7 @@ def build(db_path: str, *, mode: str, notional_usd: float, perp: str, spot: str,
         spot_symbol=spot, planned_notional_usd=notional_usd)
     out["environment"] = env_info
     out["records_skipped"] = skipped
+    out["partial_fills"] = partial_fills(entries)
     # Orders that FILLED on each leg, priced or not: the valid observations
     # plus the fills the estimator had to reject (mark-referenced, unverifiable,
     # malformed...). Using only the valid ones hid the true denominator and
