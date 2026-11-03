@@ -49,7 +49,12 @@ def valid_record(side: str = "Sell", product: str = "linear", q: float = 0.01,
     ctx = xr.DecisionContext(
         venue="bybit", symbol=symbol, product=product, side=side,
         decision_ms=ms - 50, qty=qb, mark=(bid + ask) / 2.0, bid=bid, ask=ask,
-        observed_ms=ms - 60, book_source="tick_snapshot")
+        observed_ms=ms - 60, book_source="tick_snapshot",
+        route=(over.pop("route", None)
+               or (xr.ROUTE_NORMAL_ENTRY if (product, side) in
+                   (("linear", "Sell"), ("spot", "Buy"))
+                   else xr.ROUTE_NORMAL_EXIT)),
+        purpose="fixture", execution_mode="overlay")
     r = xr.assess_fill(
         ctx, side=side, symbol=symbol, product=product, venue="bybit",
         order_type=order_type, requested_qty=reqb, filled_qty=qb, avg_price=fill,

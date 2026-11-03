@@ -124,11 +124,22 @@ def _base_link(link: str) -> str:
 
 
 def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
-            side: str, order_types: Sequence[str] = ("market",)
+            side: str, order_types: Sequence[str] = ("market",),
+            routes: Optional[Sequence[str]] = None,
+            detail: Optional[Dict[str, Dict[str, int]]] = None
             ) -> Tuple[List[Observation], Dict[str, int]]:
     """Valid observations for one leg, and why the others were dropped.
 
-    `entries` need `.kind`, `.ms`, `.ref` and `.fee_raw` (ledger `Entry`)."""
+    `entries` need `.kind`, `.ms`, `.ref` and `.fee_raw` (ledger `Entry`).
+
+    `routes`, when given, keeps only the orders sent for those reasons (see
+    `execution_record.ROUTES`); an order of another route is a different
+    population, not a rejection. A record that states no route takes the one
+    its side implies (`execution_record.default_route`): only an entry side can
+    be inferred, so an unstated buy of the perp is UNCLASSIFIED.
+
+    `detail`, when given, receives WHY a record was not book-measured, keyed
+    under the same rejection name, so the aggregate never hides the cause."""
     rejected: Dict[str, int] = {}
 
     def drop(why: str) -> None:
@@ -147,8 +158,19 @@ def extract(entries: Iterable[Any], *, as_of_ms: int, symbol: str, product: str,
                 or rec.get("side") != side
                 or rec.get("order_type") not in order_types):
             continue                        # another leg: not a rejection
+        if routes is not None:
+            route = str(rec.get("route") or _xr.default_route(product, side))
+            if route not in routes:
+                continue                    # another population: not a rejection
         if rec.get("status") != MEASURED or rec.get("reference_basis") != BOOK_BASIS:
             drop("NOT_BOOK_MEASURED")
+            if detail is not None:
+                reasons = rec.get("reasons")
+                why = (str(reasons[0]).split(":", 1)[0]
+                       if isinstance(reasons, list) and reasons
+                       else f"REFERENCE_BASIS_{rec.get('reference_basis') or 'NONE'}")
+                bucket = detail.setdefault("NOT_BOOK_MEASURED", {})
+                bucket[why] = bucket.get(why, 0) + 1
             continue
         ms = _num(getattr(e, "ms", None))
         if ms is None or ms > as_of_ms:
@@ -224,10 +246,51 @@ def _bound(values: Sequence[float], z: float) -> Tuple[float, float, float]:
     return mean, sd, max(0.0, mean + z * sd * math.sqrt(1.0 + 1.0 / n))
 
 
+def required_routes(product: str, side: str) -> Tuple[str, ...]:
+    """The routes whose fills price a leg. An entry side is priced by planned
+    entries and an exit side by PLANNED exits only: protective closes, recovery
+    closes, rebalances, cancel-time increments and unclassified exits are other
+    populations, reported beside the bound and never pooled into it."""
+    if (product, side) in (("linear", "Sell"), ("spot", "Buy")):
+        return (_xr.ROUTE_NORMAL_ENTRY,)
+    return (_xr.ROUTE_NORMAL_EXIT,)
+
+
+def _by_route(entries: List[Any], *, as_of_ms: int, symbol: str, product: str,
+              side: str, order_types: Sequence[str],
+              counted: Sequence[str]) -> Dict[str, Any]:
+    """Every route seen on this leg, with what its valid fills cost. Nothing is
+    discarded: an expensive emergency close is as visible as an easy entry."""
+    seen = set()
+    for e in entries:
+        rec = (getattr(e, "fee_raw", None) or {}).get("execution")
+        if (getattr(e, "kind", None) in FILL_KINDS and isinstance(rec, Mapping)
+                and rec.get("symbol") == symbol
+                and rec.get("product") == product and rec.get("side") == side
+                and rec.get("order_type") in order_types):
+            seen.add(str(rec.get("route") or _xr.default_route(product, side)))
+    out: Dict[str, Any] = {}
+    for route in sorted(seen):
+        det: Dict[str, Dict[str, int]] = {}
+        obs, rej = extract(entries, as_of_ms=as_of_ms, symbol=symbol,
+                           product=product, side=side, order_types=order_types,
+                           routes=(route,), detail=det)
+        slips = [o.slippage_bps for o in obs]
+        halves = [o.half_spread_bps for o in obs]
+        out[route] = {
+            "n": len(obs), "rejected": rej, "rejected_detail": det,
+            "counted_in_bound": route in counted,
+            "slippage_bps_mean": (sum(slips) / len(slips)) if slips else None,
+            "slippage_bps_max": max(slips) if slips else None,
+            "half_spread_bps_mean": (sum(halves) / len(halves)) if halves else None}
+    return out
+
+
 def estimate_leg(entries: Iterable[Any], *, as_of_ms: int, symbol: str,
                  product: str, side: str, planned_notional_usd: float,
                  order_types: Sequence[str] = ("market",),
-                 policy: CostSamplePolicy = DEFAULT_POLICY) -> Dict[str, Any]:
+                 policy: CostSamplePolicy = DEFAULT_POLICY,
+                 routes: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """One leg's expected execution cost, or UNAVAILABLE with the reason.
 
     `order_types` names the kinds of order whose fills describe this leg. A
@@ -236,6 +299,8 @@ def estimate_leg(entries: Iterable[Any], *, as_of_ms: int, symbol: str,
     fill's recorded half-spread is a cost it did not really pay, so pooling can
     only make the bound more conservative, never less."""
     policy.validate()
+    entries = list(entries)
+    routes = tuple(routes) if routes else required_routes(product, side)
     leg = f"{product}/{side}/{'+'.join(order_types)}"
     out: Dict[str, Any] = {
         "leg": leg, "symbol": symbol, "status": UNAVAILABLE, "reasons": [],
@@ -244,14 +309,21 @@ def estimate_leg(entries: Iterable[Any], *, as_of_ms: int, symbol: str,
         "half_spread_bps": None, "slippage_bps": None, "cost_bound_bps": None,
         "survivorship": "only filled orders are observed; orders that did not "
                         "fill are invisible, so this is not a guarantee",
-        "as_of_ms": int(as_of_ms), "rejected": {}}
+        "as_of_ms": int(as_of_ms), "rejected": {}, "rejected_detail": {},
+        "route_policy": list(routes), "by_route": {}}
     planned = _num(planned_notional_usd)
     if planned is None or planned <= 0:
         out["reasons"].append("PLANNED_NOTIONAL_INVALID")
         return out
+    detail: Dict[str, Dict[str, int]] = {}
     obs, rejected = extract(entries, as_of_ms=as_of_ms, symbol=symbol,
-                            product=product, side=side, order_types=order_types)
+                            product=product, side=side, order_types=order_types,
+                            routes=routes, detail=detail)
     out["rejected"] = rejected
+    out["rejected_detail"] = detail
+    out["by_route"] = _by_route(entries, as_of_ms=as_of_ms, symbol=symbol,
+                                product=product, side=side,
+                                order_types=order_types, counted=routes)
     out["n"] = len(obs)
     cutoff = as_of_ms - policy.max_sample_age_days * DAY_MS
     fresh = [o for o in obs if o.ms >= cutoff]
@@ -327,6 +399,20 @@ def estimate_round_trip(entries: Iterable[Any], *, as_of_ms: int,
                    "max_sample_age_days": policy.max_sample_age_days,
                    "max_newest_age_days": policy.max_newest_age_days,
                    "size_band": policy.size_band, "z": policy.z}}
+    # Emergency closes are NOT in the bound above (it prices planned exits) and
+    # cannot be forced to happen, so their cost is reported on its own.
+    emergency = [l["by_route"][_xr.ROUTE_PROTECTIVE_CLOSE] for l in legs
+                 if _xr.ROUTE_PROTECTIVE_CLOSE in l["by_route"]]
+    n_emergency = sum(r["n"] for r in emergency)
+    out["emergency_exit"] = {
+        "status": "OBSERVED" if n_emergency else "UNMEASURED",
+        "n": n_emergency,
+        "slippage_bps_max": (max((r["slippage_bps_max"] for r in emergency
+                                  if r["slippage_bps_max"] is not None),
+                                 default=None)),
+        "note": "protective closes are excluded from cost_bound_bps, which "
+                "prices planned exits; the cost of leaving in a fast market is "
+                "not covered by it"}
     if not missing:
         out["spread_bps"] = sum(l["half_spread_bps"]["bound"] for l in legs)
         out["slippage_bps"] = sum(l["slippage_bps"]["bound"] for l in legs)
