@@ -1881,8 +1881,13 @@ class CarryEngine:
         # THE PAIR GATE, before the first leg. Ordered by damage inside
         # CarryRisk: a tripped kill switch outranks a stale price, both outrank
         # a cap. Never skipped: its absence refused above.
+        #
+        # The gate is shown the notional of the order ABOUT TO BE SENT (the sized
+        # quantity at the mark), not this engine's own cap constant: handing it the
+        # constant made its cap check a comparison of a number with itself, so a
+        # sizing bug could never trip it.
         gate = self.pair_risk.gate_open(
-            notional_usd=self.max_notional_usd, snapshot=self.snapshot,
+            notional_usd=qty * mark, snapshot=self.snapshot,
             has_open_pair=self.position is not None,
             now=self._gate_now(timestamp_ms))
         if not gate:

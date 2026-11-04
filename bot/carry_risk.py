@@ -192,7 +192,8 @@ class CarryRisk:
                 and math.isfinite(notional_usd) and notional_usd > 0):
             return _block("NOTIONAL_INVALID", notional_usd=notional_usd)
 
-        if notional_usd > self.max_notional_usd:
+        # A relative 1e-9 absorbs float noise in qty*mark; a real excess is far larger.
+        if notional_usd > self.max_notional_usd * (1.0 + 1e-9):
             return _block("NOTIONAL_ABOVE_CAP", requested=float(notional_usd),
                           cap=self.max_notional_usd)
 

@@ -335,7 +335,7 @@ class TradingBot:
                 "memory": self._memory_health(),
                 "policy": self._policy_health(),
                 "observation_status": self.observation_status,
-                "market_feed": self._market_feed_status(),
+                "market_feed": TradingBot._market_feed_status(self),
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -741,8 +741,8 @@ class TradingBot:
 
     def _market_feed_status(self) -> str:
         """RUNNING only while every feed thread is alive and the log is writable."""
-        state = self._market_feed_state
-        feed = self.market_feed
+        state = getattr(self, "_market_feed_state", "DISABLED")
+        feed = getattr(self, "market_feed", None)
         if state != "RUNNING" or feed is None:
             return state
         try:
