@@ -51,6 +51,8 @@ WHAT THIS TOOL WILL NOT DO
   that can ever return True for live.
 * It never trips or clears the kill switch, never places an order, never
   touches the cleared-edge revoke path.
+* It refuses unless EVERY artifact the checklist cites exists on disk as
+  readable JSON (`--artifacts-dir`, default bot/artifacts).
 * It is dry-run by default. `--write` is required to persist anything.
 """
 from __future__ import annotations
@@ -72,6 +74,9 @@ DEFAULT_CHECKLIST = os.path.join(
 DEFAULT_MEMO = os.path.join(
     REPO, "docs", "promotion", "LINEAR_STOP_MARGIN_MEMO.md")
 DEFAULT_GATE = pg.GATE_PATH
+#: Where the cited transcripts must exist. A checklist that cites a transcript
+#: nobody committed is a claim with nothing under it, so the tool refuses.
+DEFAULT_ARTIFACTS = os.path.join(REPO, "artifacts")
 
 #: One artifact name per venue item, in order. At least the Item 1 name must
 #: appear in the checklist text - the read-back that started this whole
@@ -140,7 +145,8 @@ def _artifacts_cited(text: str) -> List[str]:
 
 
 def evaluate(*, checklist_path: str = DEFAULT_CHECKLIST,
-             memo_path: str = DEFAULT_MEMO) -> Dict[str, Any]:
+             memo_path: str = DEFAULT_MEMO,
+             artifacts_dir: Optional[str] = None) -> Dict[str, Any]:
     """Read-only: is there enough signed evidence to transcribe? Fails closed."""
     checklist_text = _load_text(checklist_path)
     if checklist_text is None:
@@ -168,6 +174,17 @@ def evaluate(*, checklist_path: str = DEFAULT_CHECKLIST,
                 "reason": (f"checklist does not cite {ITEM_1_ARTIFACT!r} - "
                            "the Item 1 read-back that started this item")}
 
+    adir = DEFAULT_ARTIFACTS if artifacts_dir is None else artifacts_dir
+    absent = [name for name in artifacts
+              if _load_json(os.path.join(adir, name)) is None]
+    if absent:
+        return {"ok": False,
+                "reason": ("cited artifact(s) missing or not readable JSON in "
+                           f"{adir}: {', '.join(absent)} - run "
+                           "tools/linear_stop_venue_drill.py against Bybit "
+                           "testnet (operator action), commit the "
+                           "transcripts, then re-run this tool")}
+
     evidence = (
         f"Checklist evidence complete: all four venue items [x] in "
         f"docs/promotion/LINEAR_STOP_VERIFICATION_CHECKLIST.md; Sign-off "
@@ -186,8 +203,10 @@ def _recount_items_complete(gate: Dict[str, Any]) -> int:
 
 
 def sync(*, checklist_path: str = DEFAULT_CHECKLIST, memo_path: str = DEFAULT_MEMO,
-          gate_path: str = DEFAULT_GATE, write: bool = False) -> Dict[str, Any]:
-    check = evaluate(checklist_path=checklist_path, memo_path=memo_path)
+          gate_path: str = DEFAULT_GATE, write: bool = False,
+          artifacts_dir: Optional[str] = None) -> Dict[str, Any]:
+    check = evaluate(checklist_path=checklist_path, memo_path=memo_path,
+                     artifacts_dir=artifacts_dir)
     if not check["ok"]:
         return check
 
@@ -248,12 +267,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="margin memo to require exists (default: %(default)s)")
     parser.add_argument("--gate", default=DEFAULT_GATE,
                         help="promotion gate JSON to sync (default: %(default)s)")
+    parser.add_argument("--artifacts-dir", default=None,
+                        help="directory the cited transcripts must exist in "
+                             "(default: bot/artifacts)")
     parser.add_argument("--write", action="store_true",
                         help="persist the change; default is dry-run (print only)")
     args = parser.parse_args(argv)
 
     result = sync(checklist_path=args.checklist, memo_path=args.memo,
-                  gate_path=args.gate, write=args.write)
+                  gate_path=args.gate, write=args.write,
+                  artifacts_dir=args.artifacts_dir)
     if not result["ok"]:
         print(f"REFUSE: {result['reason']}")
         return 1

@@ -524,6 +524,38 @@ CREATE TABLE IF NOT EXISTS carry_risk_observation (
     position_im_usd REAL
 );
 
+-- THE CLOSE LOG. One row per close attempt, written BEFORE its order can leave
+-- and never deleted. It is what makes a multi-step close survive a restart: the
+-- planner (close_plan.py) is a pure function of this log plus fresh venue reads,
+-- so a restart resumes where it stopped and cannot start over with a fresh retry
+-- budget. `carry_close_state` holds the consecutive-wait counters beside it, for
+-- the same reason: losing them would let a stuck close wait longer than the
+-- owner's limit allows. Additive; nothing else reads or writes these tables.
+CREATE TABLE IF NOT EXISTS carry_close_attempts (
+    cycle_id      TEXT NOT NULL,
+    n             INTEGER NOT NULL,
+    link_id       TEXT NOT NULL UNIQUE,
+    qty           REAL NOT NULL,
+    state         TEXT NOT NULL,
+    filled_qty    REAL NOT NULL DEFAULT 0.0,
+    exec_ids      TEXT NOT NULL DEFAULT '[]',
+    sends         INTEGER NOT NULL DEFAULT 1,
+    short_before  REAL NOT NULL DEFAULT 0.0,
+    intent_epoch  REAL NOT NULL DEFAULT 0.0,
+    sent_epoch    REAL,
+    updated_epoch REAL NOT NULL DEFAULT 0.0,
+    PRIMARY KEY (cycle_id, n)
+);
+
+CREATE TABLE IF NOT EXISTS carry_close_state (
+    cycle_id      TEXT PRIMARY KEY,
+    waits         INTEGER NOT NULL DEFAULT 0,
+    lag_waits     INTEGER NOT NULL DEFAULT 0,
+    halted_reason TEXT NOT NULL DEFAULT '',
+    closed        INTEGER NOT NULL DEFAULT 0,
+    updated_epoch REAL NOT NULL DEFAULT 0.0
+);
+
 -- Additive indexes for the memory reads.  Both are over existing tables and
 -- change no existing behaviour; they only stop the health thread's aggregate
 -- reads from turning into full scans as the ledger grows.
@@ -2644,6 +2676,137 @@ class StateStore:
         """Carry-leg orders that have not reached a terminal state."""
         return [o for o in self.unresolved_orders()
                 if str(o.get("purpose", "")).startswith("carry-")]
+
+    # -- the close log (close_plan.py / close_executor.py) -----------------
+
+    _CLOSE_RESOLVED = ("FILLED", "PARTIAL", "CANCELLED", "REJECTED", "MOOT",
+                       "NEVER_SENT")
+
+    def close_attempts(self, cycle_id: str) -> List[Dict[str, Any]]:
+        """Every close attempt of one cycle, oldest first, exec ids decoded."""
+        out = []
+        for r in self._query(
+                "SELECT * FROM carry_close_attempts WHERE cycle_id = ? ORDER BY n",
+                (str(cycle_id),)):
+            row = dict(r)
+            try:
+                ids = json.loads(row.get("exec_ids") or "[]")
+            except ValueError as exc:
+                raise PersistenceError(
+                    f"close attempt {row.get('link_id')} has unreadable "
+                    f"exec_ids: {exc}") from exc
+            if not isinstance(ids, list):
+                raise PersistenceError(
+                    f"close attempt {row.get('link_id')} exec_ids is not a list")
+            row["exec_ids"] = tuple(str(i) for i in ids)
+            out.append(row)
+        return out
+
+    def close_state(self, cycle_id: str) -> Dict[str, Any]:
+        rows = self._query(
+            "SELECT * FROM carry_close_state WHERE cycle_id = ?", (str(cycle_id),))
+        if not rows:
+            return {"cycle_id": str(cycle_id), "waits": 0, "lag_waits": 0,
+                    "halted_reason": "", "closed": 0}
+        return dict(rows[0])
+
+    def open_close_cycles(self) -> List[str]:
+        """Cycles with a close in progress: attempts on file and not closed."""
+        return [str(r["cycle_id"]) for r in self._query(
+            "SELECT DISTINCT a.cycle_id FROM carry_close_attempts a "
+            "LEFT JOIN carry_close_state s ON s.cycle_id = a.cycle_id "
+            "WHERE COALESCE(s.closed, 0) = 0 ORDER BY a.cycle_id")]
+
+    def apply_close_step(
+        self, cycle_id: str, *,
+        resolutions: Sequence[Tuple[int, str, float, Sequence[str]]] = (),
+        new_attempt: Optional[Mapping[str, Any]] = None,
+        resend_n: Optional[int] = None,
+        waits: int, lag_waits: int, halted_reason: str = "",
+        closed: bool = False, now: Optional[float] = None,
+    ) -> None:
+        """Commit ONE close step atomically: the resolutions the venue decided,
+        the new INTENT (or the bump of a re-sent attempt), the wait counters, a
+        halt reason, the closed flag. All or nothing, and BEFORE the order is
+        sent: when this raises, nothing may be sent. A resolution never moves a
+        resolved attempt, never lowers a recorded fill and never forgets an
+        execution id; an INTENT whose id or number already exists is refused
+        (that would be a second order under a recorded one)."""
+        cid = str(cycle_id)
+        t = utc_now_epoch() if now is None else float(now)
+        for name, v in (("waits", waits), ("lag_waits", lag_waits)):
+            if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                raise PersistenceError(f"close step: {name} must be a whole number >= 0")
+        with self.transaction():
+            for n, state, filled, ids in resolutions:
+                if state not in self._CLOSE_RESOLVED:
+                    raise PersistenceError(f"close step: {state!r} is not a resolution")
+                rows = self._query(
+                    "SELECT state, filled_qty, exec_ids FROM carry_close_attempts "
+                    "WHERE cycle_id = ? AND n = ?", (cid, int(n)))
+                if not rows:
+                    raise PersistenceError(f"close step: no attempt {n} in {cid}")
+                cur = dict(rows[0])
+                if str(cur["state"]) in self._CLOSE_RESOLVED:
+                    if (str(cur["state"]) == state
+                            and float(cur["filled_qty"]) >= float(filled) - 1e-12):
+                        continue            # idempotent re-application
+                    raise PersistenceError(
+                        f"close step: attempt {n} is already {cur['state']}; a "
+                        "resolved attempt does not change")
+                try:
+                    known = set(json.loads(cur["exec_ids"] or "[]"))
+                except ValueError as exc:
+                    raise PersistenceError(f"close step: unreadable exec_ids: {exc}") from exc
+                merged = sorted(known | {str(i) for i in ids})
+                self._exec(
+                    "UPDATE carry_close_attempts SET state = ?, filled_qty = ?, "
+                    "exec_ids = ?, updated_epoch = ? WHERE cycle_id = ? AND n = ?",
+                    (state, max(float(cur["filled_qty"]), float(filled)),
+                     json.dumps(merged), t, cid, int(n)))
+            if new_attempt is not None:
+                a = dict(new_attempt)
+                cur = self._exec(
+                    "INSERT INTO carry_close_attempts(cycle_id, n, link_id, qty, "
+                    "state, sends, short_before, intent_epoch, updated_epoch) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    (cid, int(a["n"]), str(a["link_id"]), float(a["qty"]),
+                     "INTENT", 1, float(a.get("short_before", 0.0)), t, t))
+                if cur.rowcount != 1:
+                    raise PersistenceError("close step: the intent was not recorded")
+            if resend_n is not None:
+                cur = self._exec(
+                    "UPDATE carry_close_attempts SET sends = sends + 1, "
+                    "state = 'INTENT', intent_epoch = ?, sent_epoch = NULL, "
+                    "updated_epoch = ? WHERE cycle_id = ? AND n = ? "
+                    "AND state IN ('INTENT','SENT')", (t, t, cid, int(resend_n)))
+                if cur.rowcount != 1:
+                    raise PersistenceError(
+                        f"close step: attempt {resend_n} cannot be re-sent")
+            self._exec(
+                "INSERT INTO carry_close_state(cycle_id, waits, lag_waits, "
+                "halted_reason, closed, updated_epoch) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(cycle_id) DO UPDATE SET waits = excluded.waits, "
+                "lag_waits = excluded.lag_waits, "
+                "halted_reason = CASE WHEN excluded.halted_reason != '' "
+                "THEN excluded.halted_reason ELSE carry_close_state.halted_reason END, "
+                "closed = MAX(carry_close_state.closed, excluded.closed), "
+                "updated_epoch = excluded.updated_epoch",
+                (cid, int(waits), int(lag_waits), str(halted_reason),
+                 1 if closed else 0, t))
+
+    def mark_close_sent(self, cycle_id: str, n: int, *,
+                        now: Optional[float] = None) -> bool:
+        """INTENT -> SENT, stamped with the time the request had left by. True
+        when it moved. Written AFTER the call returns or raises; if this write is
+        lost the attempt stays INTENT, which the planner reads as unresolved just
+        the same."""
+        t = utc_now_epoch() if now is None else float(now)
+        cur = self._exec(
+            "UPDATE carry_close_attempts SET state = 'SENT', sent_epoch = ?, "
+            "updated_epoch = ? WHERE cycle_id = ? AND n = ? AND state = 'INTENT'",
+            (t, t, str(cycle_id), int(n)))
+        return cur.rowcount == 1
 
     # -- decision journal --------------------------------------------------
 

@@ -600,6 +600,21 @@ class Config:
     CARRY_EVIDENCE_DISCOVERY_START_EPOCH: Optional[float] = None
     CARRY_EVIDENCE_DISCOVERY_END_EPOCH: Optional[float] = None
     CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD: Optional[float] = None
+    #: OWNER-supplied close policy (see close_policy.py): raw strings, never
+    #: defaulted, validated in ONE place. Unset/invalid keeps the original
+    #: single-order close. The path turns on only when every value is valid AND
+    #: CARRY_CLOSE_PATH_APPROVED is exactly APPROVED_BY_OWNER.
+    CARRY_CLOSE_MAX_ATTEMPTS: str = ""
+    CARRY_CLOSE_MAX_WAITS: str = ""
+    CARRY_CLOSE_MAX_LAG_WAITS: str = ""
+    CARRY_CLOSE_RESEND: str = ""
+    CARRY_CLOSE_MAX_SENDS: str = ""
+    CARRY_CLOSE_ORDER_TYPE: str = ""
+    CARRY_CLOSE_ON_TIMEOUT: str = ""
+    CARRY_CLOSE_RESIDUAL: str = ""
+    CARRY_CLOSE_ESCALATION: str = ""
+    CARRY_CLOSE_SLIPPAGE_CEILING_BPS: str = ""
+    CARRY_CLOSE_PATH_APPROVED: str = ""
     #: Largest venue-clock skew (ms) startup tolerates; beyond it the process
     #: refuses to start rather than reason about funding windows and price age
     #: on a wrong clock.
@@ -1037,6 +1052,17 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
             env, "CARRY_EVIDENCE_DISCOVERY_END_EPOCH"),
         CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD=parse_optional_float(
             env, "CARRY_EVIDENCE_DRAWDOWN_LIMIT_USD", positive=True),
+        CARRY_CLOSE_MAX_ATTEMPTS=parse_str(env, "CARRY_CLOSE_MAX_ATTEMPTS", ""),
+        CARRY_CLOSE_MAX_WAITS=parse_str(env, "CARRY_CLOSE_MAX_WAITS", ""),
+        CARRY_CLOSE_MAX_LAG_WAITS=parse_str(env, "CARRY_CLOSE_MAX_LAG_WAITS", ""),
+        CARRY_CLOSE_RESEND=parse_str(env, "CARRY_CLOSE_RESEND", ""),
+        CARRY_CLOSE_MAX_SENDS=parse_str(env, "CARRY_CLOSE_MAX_SENDS", ""),
+        CARRY_CLOSE_ORDER_TYPE=parse_str(env, "CARRY_CLOSE_ORDER_TYPE", ""),
+        CARRY_CLOSE_ON_TIMEOUT=parse_str(env, "CARRY_CLOSE_ON_TIMEOUT", ""),
+        CARRY_CLOSE_RESIDUAL=parse_str(env, "CARRY_CLOSE_RESIDUAL", ""),
+        CARRY_CLOSE_ESCALATION=parse_str(env, "CARRY_CLOSE_ESCALATION", ""),
+        CARRY_CLOSE_SLIPPAGE_CEILING_BPS=parse_str(env, "CARRY_CLOSE_SLIPPAGE_CEILING_BPS", ""),
+        CARRY_CLOSE_PATH_APPROVED=parse_str(env, "CARRY_CLOSE_PATH_APPROVED", ""),
         MAX_CLOCK_SKEW_MS=int(parse_float(
             env, "MAX_CLOCK_SKEW_MS", 2000.0, low=100.0, high=60_000.0)),
         CAPITAL_RESERVATION_TTL_S=parse_float(

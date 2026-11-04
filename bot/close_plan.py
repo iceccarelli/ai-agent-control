@@ -1,12 +1,20 @@
 """A close that survives partial fills, restarts, duplicates and ambiguity.
 
 STATUS: a pure planner. It reads observations and a durable attempt log and says
-what the NEXT safe step is. It sends nothing, imports no client and is not wired
-into the live engine. The live book still closes with one reduce-only Buy and,
-on a partial fill, records the remainder and halts without retrying
-(`CarryEngine._partial_close`): changing that to multi-step resume is new order
-behaviour and is an owner decision. This module is what that decision would be
-made against, and the deterministic fault-injection tests are its evidence.
+what the NEXT safe step is. It sends nothing and imports no client. It is driven
+by `close_executor.CloseExecutor`, which `CarryEngine` uses for an OVERLAY close
+ONLY when the owner has approved every close-policy value (`close_policy`); until
+then the engine still closes with one reduce-only Buy and, on a partial fill,
+records the remainder and halts without retrying (`CarryEngine._partial_close`).
+
+NOTHING HERE IS A VENUE FACT. Whether a repeated orderLinkId is rejected, and
+under which conditions, has not been measured by this repository. The default is
+therefore to NEVER re-send an id: an attempt the venue does not show is waited on
+until the caller proves it absent (`Observation.absence_proven`), then it is
+resolved NEVER_SENT and a NEW attempt under a NEW link id may follow.
+Re-sending the same id is available only when the policy says so explicitly
+(`Policy.resend_same_link_id`), i.e. after an operator has run the testnet
+experiment and decided it is safe.
 
 THE FIVE FAILURES IT IS BUILT AGAINST
   partial fill      the remainder is sized from the VENUE'S CURRENT short, never
@@ -15,27 +23,30 @@ THE FIVE FAILURES IT IS BUILT AGAINST
                     venue reads); there is no in-memory state to lose
   duplicate events  fills are merged by execution id; the plan never sums fills
   ambiguity         a response that did not arrive leaves the attempt SENT; the
-                    only things allowed next are WAIT, or re-sending THAT attempt
-                    under the SAME order link id (the venue accepts one order per
-                    link id, so a second send cannot become a second order)
+                    only things allowed next are WAIT until the venue shows the
+                    order or the caller PROVES it never landed (then a new
+                    attempt, new link id). Re-sending THAT attempt under the SAME
+                    link id happens only if the policy opts in
   reversal          the order is always reduce-only, never larger than the short
                     the venue reports, and a net-LONG read halts: a Buy is never
                     proposed against a position that is not short
 
 WHAT THE DESIGN ASSUMES ABOUT THE VENUE (read before wiring it in)
-  1. A second order under an orderLinkId that already exists is REJECTED. Bybit's
-     docs say the id must be "always unique" but do not say how long, nor what the
-     rejection looks like; the repo's own broker treats retCode 170141 as "the
-     first attempt landed". If a venue re-accepted an id once its first order was
-     final, a re-send could add a second order: the exposure is then bounded by
-     `max_sends` per attempt AND every proposal is clamped to the short observed,
-     so with reduce-only the position still cannot reverse.
+  1. (ONLY when `Policy.resend_same_link_id` is True) A second order under an
+     orderLinkId that already exists is REJECTED. Bybit's docs say the id must be
+     "always unique" but do not say how long, nor what the rejection looks like;
+     the repo's own broker treats retCode 170141 as "the first attempt landed".
+     If a venue re-accepted an id once its first order was final, a re-send could
+     add a second order: the exposure is then bounded by `max_sends` per attempt
+     AND every proposal is clamped to the short observed, so with reduce-only the
+     position still cannot reverse. With the default (False) this assumption is
+     not used at all.
   2. A reduce-only order larger than the position is refused or trimmed, never
      reversing. The docs do not say which. Every proposal is sized from the short
      just observed, so an oversize order can arise only from a stale read, which
      the lag guard waits out (bounded).
   3. An order can be looked up by link id. A lookup that lags looks like "not
-     known": that is the ambiguous case, handled by the bounded same-id re-send.
+     known": that is the ambiguous case (see `Observation.absence_proven`).
   4. Order statuses: only Bybit's documented ones are understood (live: New,
      PartiallyFilled, Created, Untriggered, Triggered, Active; terminal: Filled,
      Cancelled, PartiallyFilledCanceled, Rejected, Deactivated). Anything else
@@ -56,7 +67,7 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass, field, replace
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 # -- attempt states (durable) ---------------------------------------------------
 INTENT = "INTENT"              # recorded before sending; the send may or may not have happened
@@ -65,7 +76,8 @@ FILLED = "FILLED"              # resolved: the venue says fully filled
 PARTIAL = "PARTIAL"            # resolved: ended with less than requested filled
 CANCELLED = "CANCELLED"        # resolved: ended with nothing filled
 REJECTED = "REJECTED"          # resolved: the venue refused it (e.g. reduce-only)
-RESOLVED = (FILLED, PARTIAL, CANCELLED, REJECTED, "MOOT")
+NEVER_SENT = "NEVER_SENT"      # resolved: PROVEN absent at the venue past the acceptance window
+RESOLVED = (FILLED, PARTIAL, CANCELLED, REJECTED, "MOOT", NEVER_SENT)
 UNRESOLVED = (INTENT, SENT)
 
 #: Bybit's documented order statuses. Only a DOCUMENTED terminal status resolves an
@@ -92,6 +104,7 @@ R_EXHAUSTED = "ATTEMPTS_EXHAUSTED"
 R_DUST = "REMAINDER_BELOW_MIN_ORDER"
 R_LAG = "POSITION_READ_LAGS_FILLS"
 R_UNKNOWN_ORDER = "ATTEMPT_NOT_VISIBLE_AT_VENUE"
+R_UNPROVEN = "ATTEMPT_ABSENCE_NOT_YET_PROVEN"
 R_ORDER_UNREADABLE = "ORDER_STATUS_UNREADABLE"
 R_UNKNOWN_STATUS = "ORDER_STATUS_NOT_UNDERSTOOD"
 R_WAIT_EXHAUSTED = "WAITED_TOO_LONG"
@@ -133,6 +146,12 @@ class Observation:
     net_qty: Optional[float]
     orders: Mapping[str, OrderObs] = field(default_factory=dict)
     order_read_failed: Tuple[str, ...] = ()
+    #: Link ids of attempts the caller has PROVEN never landed: the venue shows no
+    #: such order in the realtime AND history lists, and longer has passed since
+    #: the request could have left than a signed request can still be accepted
+    #: (`order_recovery.absence_window_s`). Absence seen sooner than that is not
+    #: proof, so the caller must not list the id.
+    absence_proven: Tuple[str, ...] = ()
     #: Consecutive WAIT plans of any reason, and of the lagging-read reason, held
     #: by the caller. Losing them (a restart) only means waiting a little longer,
     #: never sending sooner.
@@ -156,6 +175,11 @@ class Policy:
     max_waits: int = 12
     #: Sends of ONE attempt (the first plus re-sends) before a human is called.
     max_sends: int = 3
+    #: May an attempt the venue does not show be re-sent under the SAME link id?
+    #: False (the default) never does it: the attempt is waited on until its
+    #: absence is proven, then replaced by a NEW attempt. True relies on the
+    #: venue rejecting a repeated id, which this repository has not verified.
+    resend_same_link_id: bool = False
 
 
 @dataclass(frozen=True)
@@ -262,7 +286,7 @@ def _plan(cycle_id: str, attempts: Sequence[Attempt], obs: Observation,
     # 2. Resolve what the venue has already decided about earlier attempts.
     resolve = []
     live_attempt: Optional[Attempt] = None
-    ambiguous: Optional[Attempt] = None
+    ambiguous: List[Attempt] = []
     not_understood: Optional[Attempt] = None
     resolved: Dict[int, Tuple[float, float]] = {}      # n -> (short_before, filled)
     for a in log:
@@ -273,7 +297,7 @@ def _plan(cycle_id: str, attempts: Sequence[Attempt], obs: Observation,
             return Plan(WAIT, R_ORDER_UNREADABLE, attempt=a.n, link_id=a.link_id)
         o = obs.orders.get(a.link_id)
         if o is None:
-            ambiguous = a
+            ambiguous.append(a)
             continue
         if o.status in LIVE_STATUSES:
             live_attempt = a
@@ -296,22 +320,41 @@ def _plan(cycle_id: str, attempts: Sequence[Attempt], obs: Observation,
         return Plan(WAIT, R_UNKNOWN_STATUS, attempt=not_understood.n,
                     link_id=not_understood.link_id, resolve=resolve_t)
 
-    # 4. An attempt the venue does not know. It may never have landed, or the
-    #    lookup may lag. The only thing proposed is the SAME order under the SAME
-    #    link id, a bounded number of times, clamped to the short actually held.
-    if ambiguous is not None:
+    # 4. An attempt the venue does not show. It may never have landed, or the
+    #    lookup may lag. By default NOTHING is sent for it: it is waited on until
+    #    the caller PROVES it absent, and only then is it resolved NEVER_SENT and
+    #    replaced by a new attempt (new link id). Re-sending the same id happens
+    #    only under `policy.resend_same_link_id`.
+    if ambiguous:
         if short <= policy.dust:
-            # Nothing left to close; the attempt is moot (its fills are not known).
-            return Plan(NOOP_FLAT, R_FLAT, resolve=resolve_t
-                        + ((ambiguous.n, MOOT, ambiguous.filled_qty, ambiguous.exec_ids),))
-        if ambiguous.sends >= policy.max_sends:
-            return Plan(HALT, R_RESEND_EXHAUSTED, attempt=ambiguous.n,
-                        link_id=ambiguous.link_id, resolve=resolve_t)
-        qty = floor_to_step(min(ambiguous.qty, short), policy.qty_step)
-        if qty < policy.min_qty:
-            return Plan(HALT, R_DUST, resolve=resolve_t)
-        return Plan(RESEND, R_UNKNOWN_ORDER, qty=qty, link_id=ambiguous.link_id,
-                    attempt=ambiguous.n, short_seen=short, resolve=resolve_t)
+            # Nothing left to close; the attempts are moot (their fills are not known).
+            return Plan(NOOP_FLAT, R_FLAT, resolve=resolve_t + tuple(
+                (a.n, MOOT, a.filled_qty, a.exec_ids) for a in ambiguous))
+        if policy.resend_same_link_id:
+            a = ambiguous[-1]
+            if a.sends >= policy.max_sends:
+                return Plan(HALT, R_RESEND_EXHAUSTED, attempt=a.n,
+                            link_id=a.link_id, resolve=resolve_t)
+            qty = floor_to_step(min(a.qty, short), policy.qty_step)
+            if qty < policy.min_qty:
+                return Plan(HALT, R_DUST, resolve=resolve_t)
+            return Plan(RESEND, R_UNKNOWN_ORDER, qty=qty, link_id=a.link_id,
+                        attempt=a.n, short_seen=short, resolve=resolve_t)
+        unproven = [a for a in ambiguous
+                    if a.link_id not in obs.absence_proven
+                    or a.filled_qty > policy.dust or a.exec_ids]
+        if unproven:
+            # Includes an attempt that already recorded a fill or an execution
+            # id: an order that left a trace cannot be "absent", whatever the
+            # lookup says now. It waits, and the wait bound ends in a HALT.
+            a = unproven[0]
+            return Plan(WAIT, R_UNPROVEN, attempt=a.n, link_id=a.link_id,
+                        resolve=resolve_t)
+        for a in ambiguous:
+            resolve.append((a.n, NEVER_SENT, 0.0, ()))
+            resolved[a.n] = (a.short_before, 0.0)
+        resolve_t = tuple(resolve)
+        # fall through: every earlier attempt is now resolved
 
     # 5. Everything earlier is resolved. What is left to close is what the VENUE
     #    holds now.

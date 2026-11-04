@@ -20,7 +20,11 @@ for p in (BOT, HERE):
 import close_plan as CP                                         # noqa: E402
 from close_fault_venue import Timeout, Venue, drive              # noqa: E402
 
-POL = CP.Policy(max_attempts=3, qty_step=0.001, min_qty=0.001)
+# Semantics DELIBERATELY changed (see close_plan.py STATUS): the planner no longer
+# re-sends an unseen attempt under the same link id unless the policy opts in. The
+# tests below that exercise the re-send do so with this explicit opt-in; the
+# default behaviour is covered by test_close_plan_absence_proof.py.
+POL = CP.Policy(max_attempts=3, qty_step=0.001, min_qty=0.001, resend_same_link_id=True)
 
 
 def lid(n):
@@ -340,9 +344,10 @@ def test_no_fault_schedule_reverses_the_position_or_doubles_an_order(seed):
 
 # -- this module is not wired into the order path ----------------------------------------------------
 
-def test_the_live_code_does_not_import_the_planner():
-    """It is a design under test, not a behaviour change: wiring it into the
-    engine is an owner decision (it is multi-step close behaviour)."""
+def test_only_the_close_executor_and_policy_import_the_planner():
+    """The planner is wired into the order path ONLY through close_executor
+    (and close_policy, which builds its Policy), which main constructs only
+    from an owner-approved close policy. Nothing else may import it."""
     offenders = []
     for base, _d, files in os.walk(BOT):
         if os.sep + "tests" in base or any(x in base for x in ("venv", ".venv", "__pycache__")):
@@ -355,7 +360,7 @@ def test_the_live_code_does_not_import_the_planner():
                             else [n.module or ""] if isinstance(n, ast.ImportFrom) else [])
                     if any(m.split(".")[0] == "close_plan" for m in mods):
                         offenders.append(f)
-    assert offenders == []
+    assert sorted(set(offenders)) == ["close_executor.py", "close_policy.py"]
 
 
 def test_the_planner_imports_nothing_that_can_send_an_order():

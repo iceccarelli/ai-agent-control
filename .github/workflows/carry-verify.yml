@@ -145,6 +145,7 @@ jobs:
           tests/test_runner_alerts_reliability.py
           tests/test_monitor_summary.py
           tests/test_monitor_fail_closed.py
+          tests/test_monitor_mid_history_unreadable.py
           tests/test_liquidation_gate_fail_closed.py
           tests/test_liquidation_unknown_reason_fail_closed.py
           tests/test_liquidation_breach_on_first_read.py
@@ -183,6 +184,14 @@ jobs:
           tests/test_decision_context_lifecycle.py
           tests/test_collateral_facts_refusal.py
           tests/test_close_plan.py
+          tests/test_close_plan_absence_proof.py
+          tests/test_close_policy.py
+          tests/test_close_store.py
+          tests/test_close_execution_faults.py
+          tests/test_close_engine_integration.py
+          tests/test_close_broker_hooks.py
+          tests/test_close_real_stack.py
+          tests/test_btc_hold_benchmark.py
           tests/test_collateral_while_held.py
           tests/test_reconciled_funding_late_row.py
           tests/test_estimate_vs_venue_funding.py
@@ -265,6 +274,8 @@ jobs:
           tests/test_live_promotion_check.py
           tests/test_maker_entry_no_double_order.py
           tests/test_micro_live_preflight.py
+          tests/test_promotion_gate_cited_evidence_exists.py
+          tests/test_sync_linear_stop_gate_evidence.py
           tests/test_naked_position_handling.py
           tests/test_negative_quantity_gate.py
           tests/test_orchestrator.py
@@ -334,6 +345,7 @@ jobs:
           tests/test_control_plane_boundary.py
           tests/test_operator_tools.py
           tests/test_concurrency_and_dataflow.py
+          tests/test_close_testnet_experiment.py
 
       - name: Fly build context
         run: python tools/fly_stack.py --check

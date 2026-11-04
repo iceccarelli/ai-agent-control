@@ -211,6 +211,9 @@ def test_every_order_send_site_is_a_known_one():
     assert _call_sites() == [
         ("carry_engine.py", "_rest", "place_post_only"),
         ("carry_engine.py", "_take", "place_market"),
+        # the staged close: the one other sender, always reduce-only, reached
+        # only through CloseExecutor._send after its intent is on disk
+        ("close_executor.py", "_send", "place_market"),
         ("ledger.py", "place_market", "place_market"),
         ("ledger.py", "place_post_only", "place_post_only"),
         ("tools/close_testnet_short.py", "close_short", "place_market"),

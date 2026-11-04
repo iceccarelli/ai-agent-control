@@ -27,6 +27,7 @@ ALLOWED = {
     "tools/owner_policy_check.py": 1,    # reports the deployment's own owner-policy
                                          # settings; reads nothing else, prints no value
     "tools/execution_samples_report.py": 1,  # defaults mode/symbols from the deployment env
+    "tools/close_testnet_experiment.py": 1,  # default env mapping for the LIVE_TRADING_ACK-present refusal
 }
 
 #: Nothing here may read the environment: these are the order, risk and

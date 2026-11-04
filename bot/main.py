@@ -2155,6 +2155,62 @@ def _attach_portfolio_authority(bot: Any, cfg: Any) -> None:
         ttl_s=float(cfg.CAPITAL_RESERVATION_TTL_S))
 
 
+def close_absence_window_s(cfg: Any) -> float:
+    """How long the venue's silence takes to prove a request never landed: the
+    transport's worst case for one POST (shared with the restart resolver)."""
+    import order_recovery as _recovery
+    from bybit_connection import BybitClient as _BC
+    return _recovery.absence_window_s(
+        request_timeout_s=float(getattr(cfg, "REQUEST_TIMEOUT_SECONDS", 10.0)),
+        recv_window_ms=float(getattr(cfg, "BYBIT_RECV_WINDOW_MS", 5000)),
+        attempts=4,                                 # _request(retries=3) + the first
+        max_wait_s=max(2.0, float(_BC.RATE_LIMIT_MAX_WAIT_S)))
+
+
+def build_close_executor(cfg: Any, store: Any, broker: Any) -> Optional[Any]:
+    """The staged close, or None.
+
+    None unless EVERY close-policy value is set and valid AND the owner approved
+    the path (close_policy.CloseVerdict.enabled), AND the owner's patience is
+    long enough to outlast the absence window at the loop's cadence: with a
+    wait limit shorter than that, an attempt could never be proven absent and
+    every lost request would end in a halt. Each refusal is logged with the
+    exact reason."""
+    import close_policy as _cp
+    verdict = _cp.load_close_policy(cfg)
+    for line in _cp.status_lines(verdict):
+        (logger.warning if verdict.enabled else logger.info)("carry close: %s", line)
+    if not verdict.enabled:
+        for why in verdict.blockers():
+            logger.info("carry close blocked: %s", why)
+        return None
+    import close_executor as _ce
+    policy = verdict.policy
+    assert policy is not None
+    try:
+        window = close_absence_window_s(cfg)
+    except Exception as exc:  # noqa: BLE001
+        logger.critical("carry close NOT enabled: absence window unavailable (%s)", exc)
+        return None
+    cadence = float(getattr(cfg, "LOOP_INTERVAL_SECONDS", 60.0))
+    need = _ce.INTENT_TO_SEND_MAX_S + window
+    if not policy.resend_same_link_id and policy.max_waits * cadence < need:
+        logger.critical(
+            "carry close NOT enabled: %s=%d polls of %.1fs is %.0fs, shorter than "
+            "the %.0fs a lost request needs to be proven absent; raise it",
+            _cp.K_WAITS, policy.max_waits, cadence, policy.max_waits * cadence, need)
+        return None
+    reader = getattr(broker, "inner", broker)
+
+    def planner_policy() -> Any:
+        rules = reader.get_lot_rules(cfg.CARRY_PERP_SYMBOL, "linear")
+        return _cp.planner_policy(policy, qty_step=float(rules["qty_step"]),
+                                  min_qty=float(rules["min_qty"]))
+    return _ce.CloseExecutor(
+        broker=broker, reader=reader, store=store, symbol=cfg.CARRY_PERP_SYMBOL,
+        policy_factory=planner_policy, absence_window_s=window)
+
+
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
     """Construct the stack in dependency order.
 
@@ -2375,6 +2431,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         bot.carry.pair_risk = CarryRisk(
             store=bot.store,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
+        # The staged close is built only from an OWNER-APPROVED close policy
+        # (close_policy.py). Anything less leaves the original single-order
+        # close exactly as it was; the reason is logged, never defaulted.
+        bot.carry.close_executor = build_close_executor(cfg, bot.store, bot.carry.broker)
         _attach_portfolio_authority(bot, cfg)
         # The additional entry net-benefit gate: real execution costs, a
         # conservative hold, and an evidence verdict, in front of every entry.
