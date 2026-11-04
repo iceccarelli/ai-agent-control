@@ -145,6 +145,7 @@ jobs:
           tests/test_runner_alerts_reliability.py
           tests/test_monitor_summary.py
           tests/test_monitor_fail_closed.py
+          tests/test_monitor_mid_history_unreadable.py
           tests/test_liquidation_gate_fail_closed.py
           tests/test_liquidation_unknown_reason_fail_closed.py
           tests/test_liquidation_breach_on_first_read.py
@@ -272,6 +273,8 @@ jobs:
           tests/test_live_promotion_check.py
           tests/test_maker_entry_no_double_order.py
           tests/test_micro_live_preflight.py
+          tests/test_promotion_gate_cited_evidence_exists.py
+          tests/test_sync_linear_stop_gate_evidence.py
           tests/test_naked_position_handling.py
           tests/test_negative_quantity_gate.py
           tests/test_orchestrator.py

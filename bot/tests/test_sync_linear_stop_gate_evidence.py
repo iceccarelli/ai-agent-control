@@ -94,6 +94,83 @@ def _gate(*, complete: bool = False) -> dict:
     }
 
 
+CITED = ("linear_protective_stop_venue.json", "linear_stop_hold.json",
+         "linear_stop_naked_induce.json", "linear_stop_margin_doc.json")
+
+
+def _populate(directory, names=CITED):
+    os.makedirs(directory, exist_ok=True)
+    for name in names:
+        _write_json(os.path.join(directory, name), {"transcript": name})
+    return str(directory)
+
+
+@pytest.fixture(autouse=True)
+def _fixture_artifacts(tmp_path_factory, monkeypatch):
+    # Deliberately changed: the tool now refuses unless every cited transcript
+    # exists, so the pre-existing tests (which model a fully evidenced checklist)
+    # point the default artifacts dir at a populated scratch directory. The
+    # real repo's directory is never consulted here.
+    monkeypatch.setattr(sync_tool, "DEFAULT_ARTIFACTS",
+                        _populate(tmp_path_factory.mktemp("artifacts")),
+                        raising=False)
+
+
+class TestRefusesWhenACitedArtifactDoesNotExist:
+    def _setup(self, tmp_path):
+        checklist_path = str(tmp_path / "checklist.md")
+        memo_path = str(tmp_path / "memo.md")
+        gate_path = str(tmp_path / "gate.json")
+        _write_text(checklist_path, SIGNED_CHECKLIST)
+        _write_text(memo_path, MEMO_TEXT)
+        _write_json(gate_path, _gate())
+        return checklist_path, memo_path, gate_path
+
+    def test_empty_artifacts_dir_refuses_and_writes_nothing(self, tmp_path):
+        c, m, g = self._setup(tmp_path)
+        empty = str(tmp_path / "empty")
+        os.makedirs(empty)
+        before = open(g, encoding="utf-8").read()
+        result = sync_tool.sync(checklist_path=c, memo_path=m, gate_path=g,
+                                write=True, artifacts_dir=empty)
+        assert result["ok"] is False
+        assert "linear_protective_stop_venue.json" in result["reason"]
+        assert open(g, encoding="utf-8").read() == before
+
+    def test_one_missing_artifact_among_those_cited_refuses(self, tmp_path):
+        c, m, g = self._setup(tmp_path)
+        d = _populate(tmp_path / "a", CITED[:-1])
+        result = sync_tool.sync(checklist_path=c, memo_path=m, gate_path=g,
+                                write=True, artifacts_dir=d)
+        assert result["ok"] is False
+        assert "linear_stop_margin_doc.json" in result["reason"]
+
+    def test_unreadable_json_artifact_refuses(self, tmp_path):
+        c, m, g = self._setup(tmp_path)
+        d = _populate(tmp_path / "a")
+        _write_text(os.path.join(d, "linear_stop_hold.json"), "{not json")
+        result = sync_tool.sync(checklist_path=c, memo_path=m, gate_path=g,
+                                write=True, artifacts_dir=d)
+        assert result["ok"] is False
+        assert "linear_stop_hold.json" in result["reason"]
+
+    def test_all_cited_artifacts_present_succeeds(self, tmp_path):
+        c, m, g = self._setup(tmp_path)
+        d = _populate(tmp_path / "a")
+        result = sync_tool.sync(checklist_path=c, memo_path=m, gate_path=g,
+                                write=False, artifacts_dir=d)
+        assert result["ok"] is True
+
+    def test_cli_flag_and_exit_code(self, tmp_path):
+        c, m, g = self._setup(tmp_path)
+        empty = str(tmp_path / "empty")
+        os.makedirs(empty)
+        assert sync_tool.main(["--checklist", c, "--memo", m, "--gate", g,
+                               "--artifacts-dir", empty, "--write"]) == 1
+        assert sync_tool.main(["--checklist", c, "--memo", m, "--gate", g,
+                               "--artifacts-dir", _populate(tmp_path / "a")]) == 0
+
+
 class TestASignedChecklistFlipsExactlyOneItem:
     def test_dry_run_prints_the_change_and_writes_nothing(self, tmp_path):
         checklist_path = str(tmp_path / "checklist.md")
