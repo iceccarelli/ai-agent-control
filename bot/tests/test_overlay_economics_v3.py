@@ -64,8 +64,16 @@ def gen(seed=1, *, pos=(8, 14), neg=3, amp=(15, 35), drift=0.0, vol=0.004,
 
 
 def due(rows):
+    """The rows a first look after the horizon sees: everything up to and including
+    the first observation at or after it."""
     horizon = v3.EVALUATION_START_S + v3.ANALYSIS_HORIZON_DAYS * 86400
-    return [r for r in rows if r["obs"]["observed_at_s"] <= horizon]
+    out, seen = [], False
+    for r in rows:
+        if seen:
+            break
+        out.append(r)
+        seen = r["obs"]["observed_at_s"] >= horizon
+    return out
 
 
 def until(rows, days):
@@ -265,14 +273,17 @@ def test_a_constant_basis_is_a_copied_feed_not_a_perfect_hedge():
     assert rep["verdict"] == "INSUFFICIENT" and "BASIS_CONSTANT" in rep["verdict_reasons"]
 
 
-def test_a_time_shifted_replay_of_the_best_funding_block_is_refused():
+@pytest.mark.parametrize("jitter", [0.0, 1e-9, 1e-6, 1e-4, 4e-3])
+def test_a_time_shifted_replay_of_the_best_funding_block_is_refused(jitter):
+    """P8: a 28-day sample tiled with jitter of 1e-4 bps used to pass as 36 weeks."""
     block = gen(7, pos=(8, 10), days=12)
     uniq = {}
     for r in block:
         for bps, ms in r["obs"]["settled_prints"]:
             uniq.setdefault(ms, bps)
     values = [uniq[k] for k in sorted(uniq)][:30]
-    tiled = values * 90
+    rj = random.Random(5)
+    tiled = [v + rj.uniform(-jitter, jitter) for v in values * 90]
     rows = _rehash(series(tiled, t0=T0, hours=len(tiled) * 8,
                           spot_fn=lambda h: 100000.0 * (1 + 0.02 * math.sin(h / 53.0)) + 3.0 * (h % 17),
                           perp_fn=lambda h: 100000.0 * (1 + 0.02 * math.sin(h / 53.0)) + 3.0 * (h % 17) + 5.0 * math.sin(h),
@@ -314,7 +325,8 @@ def _daily_rows(daily):
     prints = []
     for d in daily:
         prints += [d / 3.0] * 3
-    return series(prints, t0=T0, hours=len(prints) * 8, bk=book())
+    # the first print lands on 00:00 UTC, so a UTC day holds exactly its own three prints
+    return series(prints, t0=T0 - 8 * 3600, hours=len(prints) * 8, bk=book())
 
 
 def test_a_persistent_funding_series_has_fewer_effective_blocks():
@@ -331,7 +343,7 @@ def test_a_persistent_funding_series_has_fewer_effective_blocks():
         return sum(ks) / len(ks)
     iid, mid, sticky = mean_k(0.0), mean_k(0.9), mean_k(0.99)
     assert iid > mid > sticky
-    assert iid > 15 and sticky < v3.MIN_EFFECTIVE_BLOCKS
+    assert iid > 12 and sticky < v3.MIN_EFFECTIVE_BLOCKS
 
 
 def test_the_effective_blocks_are_never_more_than_the_blocks():
@@ -578,4 +590,142 @@ def test_an_empty_dataset_is_insufficient():
     assert rep["verdict"] == "INSUFFICIENT" and rep["cash"] is False
 
 
-PINNED_V3 = "4cb79c11a80ecd621e9d59e5841f84fb4e92391117eba36a8ab976513d673e66"
+# -- second independent review of the rewritten rule --------------------------------------------------------------------
+
+@pytest.mark.parametrize("phi,noise", [(0.99, 10.0), (0.99, 3.0), (0.95, 10.0), (0.90, 3.0)])
+def test_a_slow_regime_hidden_under_daily_noise_does_not_pass_a_zero_edge(phi, noise):
+    """R1: lag-1 autocorrelation of the daily series was ~0 for these, K_eff stayed
+    near 18, and a true-zero edge passed 11-35% of the time."""
+    rng = random.Random(int(phi * 100 + noise))
+    trials, hits = 400, 0
+    for _ in range(trials):
+        x, daily = 0.0, []
+        for _d in range(252):
+            x = phi * x + rng.gauss(0, 3.0)
+            daily.append(x + rng.gauss(0, noise))
+        k_eff = v3.effective_blocks_from_daily(daily, 18)["k_eff"]
+        blocks = [sum(daily[i * 14:(i + 1) * 14]) / 14.0 for i in range(18)]
+        b = v3.block_bounds(blocks, k_eff)
+        hits += (b["lower95"] is not None and b["lower95"] > 0)
+    assert hits / trials <= 0.09, (phi, noise, hits / trials)
+
+
+def test_the_long_run_form_does_not_cost_power_on_an_uncorrelated_series():
+    rng = random.Random(3)
+    ks = [v3.effective_blocks_from_daily([rng.gauss(0, 5) for _ in range(252)], 18)["k_eff"]
+          for _ in range(30)]
+    assert sum(ks) / len(ks) > 12
+
+
+def test_a_missing_stress_input_never_leaves_the_door_open_to_no_go():
+    """R2: without funding_cap_bps/price_limit_ratio the upside credit shrank ~20x and
+    a process that is INSUFFICIENT with the inputs became NO_GO."""
+    rows = gen(1, amp=(2, 5), pos=(4, 8))
+    with_inputs = v3.evaluate(rows, **KW)
+    without = v3.evaluate(rows, **dict(KW, funding_cap_bps=None, price_limit_ratio=None))
+    assert with_inputs["verdict"] != "NO_GO"
+    assert without["verdict"] == "INSUFFICIENT"
+    assert without["verdict_reasons"][0].startswith("INSUFFICIENT_OWNER_INPUT")
+
+
+def test_the_window_opens_after_the_rule_was_fixed():
+    import datetime as dt
+    assert v3.EVALUATION_START_S == int(dt.datetime(2026, 11, 11, tzinfo=dt.timezone.utc).timestamp())
+    assert "2026-11-04" in v3.PROTOCOL["declared"] and "2026-11-11" in v3.PROTOCOL["declared"]
+    assert v3.PROTOCOL["evaluation_start_s"] == v3.EVALUATION_START_S
+
+
+def _numbers(x, out):
+    if isinstance(x, bool):
+        return
+    if isinstance(x, (int, float)):
+        out.add(float(x))
+    elif isinstance(x, dict):
+        for v in x.values():
+            _numbers(v, out)
+    elif isinstance(x, (list, tuple)):
+        for v in x:
+            _numbers(v, out)
+
+
+def test_every_numeric_constant_that_can_move_a_verdict_is_inside_the_hashed_protocol():
+    """R4: MIN_DAILY_POINTS_FOR_PERSISTENCE, v2's max gap and liquidation floor, the
+    stress multiples and others were outside the hash."""
+    inside = set()
+    _numbers(v3.PROTOCOL, inside)
+    skip = {"HERE", "BOOT_SEED", "BOOT_N", "MAX_START_DELAY_S", "MIN_CLOSED_EPISODES",
+            "MAX_UNPRICED_FRACTION", "MIN_DISTINCT_WINDOW_SHARE", "UNAVAILABLE"}
+    missing = []
+    for name, val in vars(v3).items():
+        if name.isupper() and isinstance(val, (int, float)) and not isinstance(val, bool) \
+                and name not in skip:
+            if float(val) not in inside:
+                missing.append(name)
+    assert missing == [], missing
+    for key in ("max_gap_between_observations_s", "min_liquidation_distance_pct"):
+        assert float(v2.PROTOCOL[key]) in inside
+    assert v3.IMPLEMENTATION_VERSION == v3.PROTOCOL["resolved_parameters"]["implementation_version"]
+
+
+@pytest.mark.parametrize("bad", [dict(funding_cap_bps=1e308), dict(funding_cap_bps=1e300),
+                                 dict(funding_cap_bps=1e5), dict(price_limit_ratio=1e305),
+                                 dict(price_limit_ratio=5.0), dict(taker_fee_bps=0.0),
+                                 dict(taker_fee_bps=0.5), dict(committed_capital_fraction=0.0)])
+def test_overflowing_or_nonsensical_inputs_are_refused_not_silently_zeroed(bad):
+    rep = v3.evaluate(gen(1), **dict(KW, **bad))
+    assert rep["verdict"] == "INSUFFICIENT"
+    assert rep["verdict_reasons"][0].startswith(("INVALID_OWNER_INPUT", "INSUFFICIENT_OWNER_INPUT")) \
+        or rep["verdict_reasons"] == ["INVALID_OWNER_INPUT"], rep["verdict_reasons"]
+
+
+@pytest.mark.parametrize("field", ["spot_mark", "perp_mark"])
+@pytest.mark.parametrize("bad", [float("nan"), 0.0, -5.0, float("inf"), "x", None, True])
+def test_a_bad_mark_makes_the_evidence_unreadable(field, bad):
+    rows = gen(1)
+    rows[3000]["obs"][field] = bad
+    rep = v3.evaluate(_rehash(rows), **KW)
+    assert rep["verdict"] == "INSUFFICIENT"
+    assert rep["verdict_reasons"] == ["EVIDENCE_UNREADABLE"], rep["verdict_reasons"]
+
+
+def test_episodes_that_span_an_observation_gap_are_unpriced_and_cannot_hide_from_the_drawdown_gate():
+    """R9: a third of the episodes had no worst path and the gate never saw them."""
+    rows = due(gen(1))
+    sim = v2.simulate_episodes(rows, 100.0)["closed"]
+    idx = {r["obs"]["observed_at_s"]: i for i, r in enumerate(rows)}
+    drop = set()
+    for e in sim[::3]:
+        a, b = idx[e["entry_s"]], idx[e["exit_s"]]
+        mid = (a + b) // 2
+        drop |= set(range(mid, mid + 10))
+    holed = [r for i, r in enumerate(rows) if i not in drop]
+    rep = v3.evaluate(_rehash(holed), **KW)
+    assert rep["verdict"] == "INSUFFICIENT"
+    assert rep["episodes"]["unpriced"] > 0
+    assert any(x in rep["verdict_reasons"] for x in ("TOO_MANY_EPISODES_UNPRICEABLE",)) or \
+        rep["verdict_reasons"][0].startswith("BLOCK_"), rep["verdict_reasons"]
+
+
+def test_the_analysis_is_due_at_the_first_row_at_or_after_the_horizon_and_reads_the_same_inputs_forever():
+    """R10/R11: cutting at H-1h and at H were both 'due' with different inputs."""
+    start = v3.EVALUATION_START_S
+    end = start + v3.ANALYSIS_HORIZON_DAYS * 86400
+    rows = gen(1, t0=start, days=v3.ANALYSIS_HORIZON_DAYS + 12)
+    before = [r for r in rows if r["obs"]["observed_at_s"] <= end - 3600]
+    at = [r for r in rows if r["obs"]["observed_at_s"] <= end]
+    later = [r for r in rows if r["obs"]["observed_at_s"] <= end + 9 * 86400]
+    assert v3.evaluate(before, **KW)["verdict_reasons"] == ["ANALYSIS_NOT_YET_DUE"]
+    a, b = v3.evaluate(at, **KW), v3.evaluate(later, **KW)
+    assert a["verdict"] == b["verdict"] == "GO"
+    assert a["provenance"]["inputs_digest"] == b["provenance"]["inputs_digest"]
+    assert a["net_after_tail_charge_bps_per_day"]["mean"] == b["net_after_tail_charge_bps_per_day"]["mean"]
+
+
+def test_a_three_hour_cadence_with_an_offset_still_becomes_due():
+    rows = gen(1)[::3]
+    end = v3.EVALUATION_START_S + v3.ANALYSIS_HORIZON_DAYS * 86400
+    assert any(r["obs"]["observed_at_s"] >= end for r in rows)
+    assert v3.evaluate(rows, **KW)["analysis_due"] is True
+
+
+PINNED_V3 = "d64e9eec15b32a3562ba25ce3d49fa433504fcf1c14bf28df92986c004627d4d"

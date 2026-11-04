@@ -75,13 +75,16 @@ UNAVAILABLE = v2.UNAVAILABLE
 INSUFFICIENT_OWNER_INPUT = v2.INSUFFICIENT_OWNER_INPUT
 SIMULATED = v2.SIMULATED
 
-#: Declared 2026-11-04 00:00 UTC (a day after v2's, so no row v2 judged is judged here).
-EVALUATION_START_S = 1_793_750_400
+#: The window opens 2026-11-11 00:00 UTC. The rule was fixed in the commit that
+#: introduces this file (2026-11-04) and the window opens a week later, so no
+#: observation it judges existed when the rule was last changed. If this file is
+#: merged AFTER that instant, EVALUATION_START_S must be re-declared (the hash
+#: changes) so that the window still opens after the rule.
+EVALUATION_START_S = 1_794_355_200
 BLOCK_DAYS = 14
 #: The single analysis is due at this horizon; rows after it are excluded.
 ANALYSIS_HORIZON_DAYS = 252                      # eighteen complete blocks
 N_BLOCKS = ANALYSIS_HORIZON_DAYS // BLOCK_DAYS
-DUE_TOLERANCE_S = 3600                           # one observation interval
 MAX_START_DELAY_S = 24 * 3600                    # the collection must begin on time
 MIN_BLOCK_COVERAGE = 0.90                        # share of a block's expected rows present
 MIN_EFFECTIVE_BLOCKS = 4.0
@@ -101,12 +104,23 @@ MIN_DISTINCT_PRINT_VALUES = 8
 MIN_DAILY_POINTS_FOR_PERSISTENCE = 30
 MAX_DAILY_PERSISTENCE = 0.99
 PERSISTENCE_UPPER_Z = 1.645
+LONG_RUN_BANDWIDTH_DAYS = 42        # Bartlett window of the long-run-variance K_eff
+STRESS_FUNDING_PRINTS = 3.0         # stress loss = this many cap-sized funding prints ...
+WORST_LOSS_MULTIPLE = 2.0           # ... and never below this multiple of the worst loss seen
+CAPACITY_BUDGET_DIVISOR = 2.0
+MIN_ROWS_FOR_FROZEN_CHECK = 10
+MIN_PRINTS_FOR_DISTINCT_CHECK = 24
+REPEAT_TOLERANCE_BPS = 0.01         # two 24-print windows within this of each other are one
+MIN_TAKER_FEE_BPS = 1.0
+MAX_STRESS_FUNDING_CAP_BPS = 10_000.0
+IMPLEMENTATION_VERSION = "3.1.0"    # bumped with any change to the logic, not only the numbers
 BOOT_SEED = 20261104
 BOOT_N = 4000
 
 PROTOCOL = {
     "schema": SCHEMA,
-    "declared": "2026-11-03, before any observation it judges was read",
+    "declared": ("rule fixed 2026-11-04 in the commit that introduces it; the window opens "
+                 "2026-11-11 00:00 UTC, after the rule; re-declare the start if merged later"),
     "supersedes": "nothing: overlay_economics/1 is preserved and keeps its meaning",
     "mode": "overlay: two perp legs only; the owner's BTC is never traded",
     "question": ("Does the frozen entry gate and exit rule earn a positive NET carry "
@@ -117,9 +131,10 @@ PROTOCOL = {
     "unit_of_independence": (f"a non-overlapping {BLOCK_DAYS}-day calendar block, "
                              "discounted for the persistence of the funding series itself"),
     "evaluation_start_s": EVALUATION_START_S,
-    "analysis": ("ONE analysis, due at analysis_horizon_days (one observation interval "
-                 "of tolerance); earlier looks are INSUFFICIENT (ANALYSIS_NOT_YET_DUE); "
-                 "later rows are excluded"),
+    "analysis": ("ONE analysis, due when the first observation at or after "
+                 "analysis_horizon_days exists; it uses only rows up to the horizon, so "
+                 "every look after that one reads identical inputs; earlier looks are "
+                 "INSUFFICIENT (ANALYSIS_NOT_YET_DUE)"),
     "analysis_horizon_days": ANALYSIS_HORIZON_DAYS,
     "block_days": BLOCK_DAYS,
     "blocks": N_BLOCKS,
@@ -152,7 +167,9 @@ PROTOCOL = {
     "capital": ("a basis is always stated; charged on committed_capital_fraction x "
                 "notional x the mean price growth since entry; a materiality floor in "
                 "USD per year is required"),
-    "inputs_validated": {"taker_fee_bps": [0.0, MAX_TAKER_FEE_BPS],
+    "inputs_validated": {"taker_fee_bps": [MIN_TAKER_FEE_BPS, MAX_TAKER_FEE_BPS],
+                         "funding_cap_bps": [0.0, MAX_STRESS_FUNDING_CAP_BPS],
+                         "price_limit_ratio": [0.0, 1.0], "committed_capital_fraction": [0.0, 1.0],
                          "min_stress_loss_bps": MIN_STRESS_LOSS_BPS},
     "verdicts": ["GO", "NO_GO", "INSUFFICIENT"],
     "meaning": {
@@ -178,10 +195,20 @@ PROTOCOL = {
     "cash": False,
     "resolved_parameters": {
         "block_days": BLOCK_DAYS, "n_blocks": N_BLOCKS, "boot": [BOOT_SEED, BOOT_N],
-        "due_tolerance_s": DUE_TOLERANCE_S,
+        "due": "the first observation at or after the horizon makes the one analysis due",
         "thresholds": [MIN_EFFECTIVE_BLOCKS, MIN_BLOCK_COVERAGE, HEDGE_RESIDUAL_RATIO_MAX,
                        MIN_STRESS_LOSS_BPS, MIN_PASSIVE_SD_BPS_PER_DAY, MIN_NET_SD_BPS_PER_DAY,
-                       MIN_HOURLY_PRICE_RETURN_SD, MAX_DAILY_PERSISTENCE, PERSISTENCE_UPPER_Z],
+                       MIN_HOURLY_PRICE_RETURN_SD, MAX_DAILY_PERSISTENCE, PERSISTENCE_UPPER_Z,
+                       LONG_RUN_BANDWIDTH_DAYS, MIN_DAILY_POINTS_FOR_PERSISTENCE,
+                       STRESS_FUNDING_PRINTS, WORST_LOSS_MULTIPLE, CAPACITY_BUDGET_DIVISOR,
+                       MIN_TAKER_FEE_BPS, MAX_TAKER_FEE_BPS, MAX_STRESS_FUNDING_CAP_BPS,
+                       MIN_ROWS_FOR_FROZEN_CHECK, MIN_PRINTS_FOR_DISTINCT_CHECK,
+                       REPEAT_TOLERANCE_BPS],
+        "implementation_version": IMPLEMENTATION_VERSION,
+        "v2_constants_used": {
+            "max_gap_between_observations_s": v2.PROTOCOL["max_gap_between_observations_s"],
+            "min_liquidation_distance_pct": v2.PROTOCOL["min_liquidation_distance_pct"],
+            "default_taker_fee_bps": v2.TAKER_FEE_BPS},
         "degenerate": [PRICE_FROZEN_SHARE, REPEAT_WINDOW_PRINTS, MIN_DISTINCT_WINDOW_SHARE,
                        MIN_DISTINCT_PRINT_VALUES],
         "v2_inference": v2.PROTOCOL["resolved_parameters"],
@@ -213,21 +240,49 @@ def _lag1(vals: Sequence[float]) -> float:
 
 
 def daily_funding_series(rows: Sequence[Dict[str, Any]]) -> List[float]:
-    """Funding per UTC day (sum of the distinct settled prints that day), in order."""
+    """Funding per UTC day (sum of the distinct settled prints that day), in order,
+    complete days only (those with the usual number of prints)."""
     seen: Dict[int, float] = {}
     for r in rows:
         for bps, ms in r["obs"].get("settled_prints", []):
             if _finite(bps):
                 seen.setdefault(int(ms), float(bps))
     days: Dict[int, float] = {}
+    counts: Dict[int, int] = {}
     for ms, bps in seen.items():
-        days[ms // 86_400_000] = days.get(ms // 86_400_000, 0.0) + bps
-    return [days[d] for d in sorted(days)]
+        d = ms // 86_400_000
+        days[d] = days.get(d, 0.0) + bps
+        counts[d] = counts.get(d, 0) + 1
+    if not counts:
+        return []
+    # Only complete days: a window edge holds a part day whose smaller sum is an
+    # outlier that would be read as persistence or as a regime.
+    modal = max(set(counts.values()), key=list(counts.values()).count)
+    return [days[d] for d in sorted(days) if counts[d] == modal]
 
 
 def effective_blocks(rows: Sequence[Dict[str, Any]], n_blocks: int) -> Dict[str, Any]:
     """K_eff for these rows: see `effective_blocks_from_daily`."""
     return effective_blocks_from_daily(daily_funding_series(rows), n_blocks)
+
+
+def _long_run_k_eff(daily: Sequence[float], n_blocks: int) -> float:
+    """K / (long-run variance of the daily series / its own variance), with a
+    Bartlett window. A slow regime under large daily noise has a small lag-1
+    autocorrelation but a large long-run variance, so the lag-1 estimate alone
+    overstates the independent blocks (measured: a zero edge passed 20-35% of the
+    time on such series; the long-run form is at or below nominal)."""
+    n = len(daily)
+    m = sum(daily) / n
+    x = [v - m for v in daily]
+    g0 = sum(v * v for v in x) / n
+    if g0 <= 0:
+        return float(n_blocks)
+    lags = min(LONG_RUN_BANDWIDTH_DAYS, n - 2)
+    s = g0
+    for k in range(1, lags + 1):
+        s += 2.0 * (1.0 - k / (lags + 1.0)) * sum(x[i] * x[i + k] for i in range(n - k)) / n
+    return max(1.0, min(float(n_blocks), n_blocks / max(s / g0, 1.0)))
 
 
 def effective_blocks_from_daily(daily: Sequence[float], n_blocks: int) -> Dict[str, Any]:
@@ -237,7 +292,9 @@ def effective_blocks_from_daily(daily: Sequence[float], n_blocks: int) -> Dict[s
     overstates K_eff: measured, the unmargined estimate passed a zero edge about
     7% of the time at a true daily persistence of 0.9-0.99; with the margin it is
     at or below the nominal 5%. Capped; carried over a block it is
-    rho = phi**BLOCK_DAYS; K_eff = K(1-rho)/(1+rho) (never above K)."""
+    rho = phi**BLOCK_DAYS; K_eff = K(1-rho)/(1+rho) (never above K). The result is
+    the smaller of that and the long-run-variance form (`_long_run_k_eff`), which
+    also catches a slow regime hidden under daily noise."""
     if len(daily) < MIN_DAILY_POINTS_FOR_PERSISTENCE:
         return {"status": UNAVAILABLE, "reason": "TOO_FEW_DAYS_TO_MEASURE_PERSISTENCE",
                 "daily_points": len(daily), "k_eff": None}
@@ -247,10 +304,13 @@ def effective_blocks_from_daily(daily: Sequence[float], n_blocks: int) -> Dict[s
                        raw + (1.0 + 3.0 * raw) / n
                        + PERSISTENCE_UPPER_Z * (1.0 - max(raw, 0.0) ** 2) / math.sqrt(n)))
     rho = phi ** BLOCK_DAYS
-    k_eff = max(1.0, min(float(n_blocks), n_blocks * (1.0 - rho) / (1.0 + rho)))
+    k_ar1 = max(1.0, min(float(n_blocks), n_blocks * (1.0 - rho) / (1.0 + rho)))
+    k_lr = _long_run_k_eff(daily, n_blocks)
+    k_eff = min(k_ar1, k_lr)
     half_life = (math.log(0.5) / math.log(phi)) if 0 < phi < 1 else 0.0
     return {"status": "MEASURED", "daily_points": len(daily), "phi_daily": phi,
-            "rho_block": rho, "k": n_blocks, "k_eff": k_eff, "half_life_days": half_life}
+            "rho_block": rho, "k": n_blocks, "k_eff": k_eff, "k_eff_ar1": k_ar1,
+            "k_eff_long_run": k_lr, "half_life_days": half_life}
 
 
 def block_bounds(values: Sequence[float], k_eff: Optional[float] = None) -> Dict[str, Any]:
@@ -293,7 +353,7 @@ def unseen_tail_charge_bps_per_episode(net_bps: Sequence[float], stress_loss_bps
     if n == 0 or not _finite(stress_loss_bps) or stress_loss_bps <= 0:
         return {"status": UNAVAILABLE, "charge_bps_per_episode": None}
     worst = min(net_bps)
-    stress = max(float(stress_loss_bps), 2.0 * max(0.0, -worst))
+    stress = max(float(stress_loss_bps), WORST_LOSS_MULTIPLE * max(0.0, -worst))
     k = sum(1 for x in net_bps if x <= -stress)
     ub = poisson_upper95(k) / n
     extra = max(0.0, ub - k / n)
@@ -304,6 +364,23 @@ def unseen_tail_charge_bps_per_episode(net_bps: Sequence[float], stress_loss_bps
 
 
 # -- degenerate samples ---------------------------------------------------------------------
+
+def _distinct_window_share(windows: Sequence[Sequence[float]]) -> float:
+    """Share of windows that are not a near-copy (every print within
+    REPEAT_TOLERANCE_BPS) of an earlier one. Tolerance, not rounding: a replay
+    with a little jitter must not look like new data."""
+    reps: Dict[int, List[Sequence[float]]] = {}
+    distinct = 0
+    step = 4.0 * REPEAT_TOLERANCE_BPS
+    for wd in windows:
+        key = int(math.floor(wd[0] / step))
+        copy = any(max(abs(a - b) for a, b in zip(wd, r)) <= REPEAT_TOLERANCE_BPS
+                   for k in (key - 1, key, key + 1) for r in reps.get(k, ()))
+        if not copy:
+            distinct += 1
+            reps.setdefault(key, []).append(wd)
+    return distinct / len(windows) if windows else 1.0
+
 
 def degenerate_reasons(rows: Sequence[Dict[str, Any]]) -> List[str]:
     """Named reasons the observations cannot carry an economic conclusion."""
@@ -316,22 +393,22 @@ def degenerate_reasons(rows: Sequence[Dict[str, Any]]) -> List[str]:
     rets = [math.log(b / a) for a, b in zip(spots, spots[1:]) if a > 0 and b > 0]
     sd = (math.sqrt(sum((x - sum(rets) / len(rets)) ** 2 for x in rets) / (len(rets) - 1))
           if len(rets) > 2 else 0.0)
-    if len(spots) > 10 and (top / len(spots) >= PRICE_FROZEN_SHARE or sd < MIN_HOURLY_PRICE_RETURN_SD):
+    if len(spots) > MIN_ROWS_FOR_FROZEN_CHECK and (top / len(spots) >= PRICE_FROZEN_SHARE or sd < MIN_HOURLY_PRICE_RETURN_SD):
         out.append("PRICE_FEED_FROZEN")
     basis = [round(float(r["obs"]["perp_mark"]) - float(r["obs"]["spot_mark"]), 6) for r in rows]
-    if len(basis) > 10 and len(set(basis)) <= 2:
+    if len(basis) > MIN_ROWS_FOR_FROZEN_CHECK and len(set(basis)) <= 2:
         out.append("BASIS_CONSTANT")
     seq: Dict[int, float] = {}
     for r in rows:
         for bps, ms in r["obs"].get("settled_prints", []):
             seq.setdefault(int(ms), round(float(bps), 9))
     vals = [seq[k] for k in sorted(seq)]
-    if len(set(vals)) < MIN_DISTINCT_PRINT_VALUES and len(vals) >= 24:
+    if len(set(vals)) < MIN_DISTINCT_PRINT_VALUES and len(vals) >= MIN_PRINTS_FOR_DISTINCT_CHECK:
         out.append("TOO_FEW_DISTINCT_FUNDING_VALUES")
     w = REPEAT_WINDOW_PRINTS
     if len(vals) >= 2 * w:
-        windows = [tuple(vals[i:i + w]) for i in range(0, len(vals) - w + 1, w // 2)]
-        if len(set(windows)) / len(windows) < MIN_DISTINCT_WINDOW_SHARE:
+        windows = [vals[i:i + w] for i in range(0, len(vals) - w + 1, w // 2)]
+        if _distinct_window_share(windows) < MIN_DISTINCT_WINDOW_SHARE:
             out.append("FUNDING_SEQUENCE_REPEATED")
     return out
 
@@ -517,6 +594,12 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
     after = sum(1 for r in rows if r["obs"].get("observed_at_s", 0) > horizon_end)
     if fwd:
         chain_issues += ["ROWS: " + m for m in v2.validate_rows(fwd)]
+        for i, r in enumerate(fwd):
+            for k in ("spot_mark", "perp_mark"):
+                v = r["obs"].get(k)
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not (_finite(v) and v > 0):
+                    chain_issues.append(f"ROWS: {k.upper()}_NOT_A_POSITIVE_NUMBER (row {i})")
+                    break
     inputs = {"planned_notional_usd": planned_notional_usd, "owner_capital_apr": owner_capital_apr,
               "committed_capital_fraction": committed_capital_fraction,
               "capital_cost_basis": capital_cost_basis, "min_annual_net_usd": min_annual_net_usd,
@@ -539,13 +622,14 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
     bad_inputs = []
     if not (_finite(planned_notional_usd) and planned_notional_usd > 0):
         bad_inputs.append("planned_notional_usd")
-    if not (_finite(taker_fee_bps) and 0.0 <= taker_fee_bps <= MAX_TAKER_FEE_BPS):
+    if not (_finite(taker_fee_bps) and MIN_TAKER_FEE_BPS <= taker_fee_bps <= MAX_TAKER_FEE_BPS):
         bad_inputs.append("taker_fee_bps")
     stress = None
     if funding_cap_bps is not None or price_limit_ratio is not None:
         if (_finite(funding_cap_bps) and _finite(price_limit_ratio)
-                and funding_cap_bps > 0 and price_limit_ratio > 0):
-            stress = 3.0 * float(funding_cap_bps) + float(price_limit_ratio) * 1e4
+                and 0 < funding_cap_bps <= MAX_STRESS_FUNDING_CAP_BPS
+                and 0 < price_limit_ratio <= 1.0):
+            stress = STRESS_FUNDING_PRINTS * float(funding_cap_bps) + float(price_limit_ratio) * 1e4
             if stress < MIN_STRESS_LOSS_BPS:
                 bad_inputs.append("stress_loss_below_floor")
                 stress = None
@@ -556,14 +640,16 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
                  if len(fwd) > 1 else 0.0)
     out["span_days"] = span_days
     out["distinct_settled_prints"] = len({int(p[1]) for r in fwd for p in r["obs"].get("settled_prints", [])})
-    out["analysis_due"] = bool(fwd) and fwd[-1]["obs"]["observed_at_s"] >= horizon_end - DUE_TOLERANCE_S
+    out["analysis_due"] = bool(fwd) and any(
+        t >= horizon_end for t in (r["obs"].get("observed_at_s", 0) for r in rows))
     out["coverage"] = coverage_problems(fwd) if fwd and not chain_issues else []
     out["degenerate"] = degenerate_reasons(fwd) if fwd and not chain_issues else []
     sim = (v2.simulate_episodes(fwd, planned_notional_usd, taker_fee_bps)
            if fwd and not chain_issues and not bad_inputs else
            {"closed": [], "open_at_end": False, "open_marked": None})
     closed = sim["closed"]
-    priced = [e for e in closed if _finite(e.get("carry_bps")) and _finite(e.get("carry_bps_most_favourable"))]
+    priced = [e for e in closed if _finite(e.get("carry_bps"))
+              and _finite(e.get("carry_bps_most_favourable")) and not e.get("gap_spanning")]
     unpriced = [e for e in closed if e not in priced]
     out["episodes"] = {"closed": len(closed), "priced": len(priced), "unpriced": len(unpriced),
                        "unpriced_fraction": len(unpriced) / len(closed) if closed else 0.0,
@@ -574,7 +660,7 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
     if owner_capital_apr is None or committed_capital_fraction is None:
         cap_status = INSUFFICIENT_OWNER_INPUT
     elif not (_finite(owner_capital_apr) and 0 <= owner_capital_apr <= 10
-              and _finite(committed_capital_fraction) and 0 <= committed_capital_fraction <= 1):
+              and _finite(committed_capital_fraction) and 0 < committed_capital_fraction <= 1):
         cap_status = "INVALID_OWNER_INPUT"
     elif not (isinstance(capital_cost_basis, str) and capital_cost_basis.strip()):
         cap_status = "CAPITAL_COST_NEEDS_A_STATED_BASIS"
@@ -683,7 +769,7 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
                                    default=None)
     nclosed = max(1, len([e for e in enriched if not e.get("open")]))
     budget = (sum(e["carry_adv"] + (e.get("impact_upper_bps") or 0.0)
-                  for e in enriched if not e.get("open")) / nclosed) / 2.0
+                  for e in enriched if not e.get("open")) / nclosed) / CAPACITY_BUDGET_DIVISOR
     out["capacity"] = (v2.capacity_bounds(fwd, budget, planned_notional_usd) if budget > 0
                        else {"status": UNAVAILABLE, "reason": "NO_POSITIVE_EDGE_BEFORE_IMPACT"})
     out["stress"] = v2.stress_table(planned_notional_usd, leverage=1.0,
@@ -730,6 +816,8 @@ def _verdict(rep: Dict[str, Any], stress: Optional[float], drawdown: Optional[fl
     sd_net = rep["net_after_tail_charge_bps_per_day"]["sd"]
     if sd_net is None or sd_net < MIN_NET_SD_BPS_PER_DAY:
         return "INSUFFICIENT", ["BLOCK_VALUES_CONSTANT"]
+    if stress is None:
+        return "INSUFFICIENT", [INSUFFICIENT_OWNER_INPUT + ":STRESS_LOSS(funding_cap_bps,price_limit_ratio)"]
     fav = rep["most_favourable_bps_per_day"]
     if (fav["upper95"] is not None
             and fav["upper95"] + rep.get("unseen_upside_credit_bps_per_day", 0.0) <= 0):
