@@ -1,45 +1,53 @@
 #!/usr/bin/env python3
 """Overlay economics, prospective protocol v3 (schema `overlay_economics/v3`).
 
-WHY A NEW PROTOCOL. `overlay_economics` (protocol `overlay_economics/1`, "v2" in
-the project's own numbering) is merged, pinned and frozen; its historical
-meaning does not change and this module does not edit it. A red-team of that
-rule (seeded Monte Carlo on the repo's own helpers) showed the decision rule
-itself can be driven to an unjustified GO or NO_GO:
+WHY A NEW PROTOCOL. `overlay_economics` (schema `overlay_economics/1`, "v2" in the
+project's own numbering) is merged, pinned and frozen; this module does not edit
+it. A red team of that rule, and then of the first draft of THIS one, produced
+unjustified GOs with seeded Monte Carlo on the repo's own helpers:
 
-  * episode counts overstate information: persistent funding regimes gave a
-    22% false-GO rate on a ZERO-edge process (nominal 5%), and the lag-1
-    correction barely engaged (measured rho 0.14-0.20)
-  * weekly looks (optional stopping) gave 29% any-look vs 21% final-look
-  * an unseen tail is invisible to a bootstrap: a rare large loss sized for a
-    zero mean gave 55% false GO at n=30
-  * the risk-adjusted benchmark compared two POINT estimates, wrong in both
-    directions (23% pass when the overlay truly trails; 45% block when equal)
-  * a zero-variance sample, or a time-shifted replay of the best funding block,
-    produced GO
-  * mean-of-episodes ignores duration; carry and "absolute overlay portfolio
-    return" were the same object under two names
+  * persistent funding regimes: 22% false GO on a zero-edge process (nominal 5%)
+    for v2; for the first draft of v3, 8% at a 35-day regime dwell, 17% at 70
+    days, 27% at a 150-day OU half-life. A calendar block is NOT independent
+    when the thing that drives it persists for longer than the block, and the
+    lag-1 correlation of ~9 noisy block values cannot see that.
+  * weekly looks (optional stopping); a rare large loss sized for zero mean (55%
+    at n=30); a point-estimate benchmark; zero-variance and replayed samples;
+    unpriced episodes credited with a positive value; a frozen price defeated
+    by jitter; a hedge gate that passed a hedge removing 40% of the variance; a
+    3h "due" tolerance that allowed two analyses; blocks anchored to the first
+    row, so a late collector was judged on fewer blocks.
 
-THE RULE HERE (declared 2026-11-03, before any observation it judges):
-  1. independence is CALENDAR TIME: fixed non-overlapping BLOCKS of 14 days, each
-     episode allocated to blocks pro rata by the days it spans; a block value is
-     net bps per calendar day on the notional, idle days included (so a
-     duration is never an unweighted mean)
-  2. a SINGLE analysis, due when the declared horizon is reached; earlier looks
-     answer INSUFFICIENT (analysis not due), later rows are excluded
-  3. an unseen tail is charged: the stress loss (3 negative prints at the venue
-     cap plus a gap exit at the price band) times the exact upper bound on how
-     often such a loss could occur given none (rule of three) or k were seen
-  4. the comparison with passive BTC is by UNCERTAINTY, not point estimates, and
-     its five facets are separate keys: positive carry after costs; the absolute
-     portfolio return of the combined position (idle time unhedged); the
-     incremental return versus passive; risk-adjusted versus passive; and what
-     is cash (nothing) versus a simulated mark
-  5. degenerate samples are refused by name (zero variance, frozen price, a
-     repeated funding sequence, too few distinct values)
-  6. an explicit zero capital cost needs a stated basis; capital is charged on the
-     committed fraction scaled by how far price has grown; a materiality floor in
-     USD per year is an owner input
+THE RULE (declared 2026-11-03, before any observation it judges):
+  1. the unit is a fixed 14-day calendar BLOCK anchored to the DECLARED start
+     (a late or gappy collection is INSUFFICIENT, never re-anchored); each
+     episode is allocated to blocks pro rata by days, idle days in the denominator
+  2. PERSISTENCE IS MEASURED ON THE DRIVER, not on the noisy block values: the
+     lag-1 autocorrelation of the DAILY funding series, carried over a block,
+     gives an effective number of independent blocks K_eff = K(1-rho)/(1+rho);
+     the interval uses K_eff, and fewer than MIN_EFFECTIVE_BLOCKS is INSUFFICIENT
+     ("the sample is too persistent for its length"). The single analysis is due
+     at 252 days (18 blocks) for exactly this reason.
+  3. ONE analysis, at the declared horizon (one observation interval of tolerance);
+     rows after it are excluded; earlier looks are INSUFFICIENT (not yet due)
+  4. an unseen tail is charged: the stress loss, taken as at least twice the worst
+     observed episode, times the exact Poisson 95% bound on how often such a loss
+     could occur given k seen (rule of three if none). A mirrored credit of
+     unseen UPSIDE must be exceeded before any NO_GO.
+  5. an episode that cannot be priced is valued at the full stress loss for the
+     GO path (and at the best priced rate for NO_GO), never at "the worst priced"
+  6. the benchmark is by uncertainty, with five separate facets: positive carry
+     after costs; the combined position's absolute return (idle time unhedged);
+     the increment versus passive; risk-adjusted versus passive; cash (none)
+     versus simulated marks. GO needs the hedge shown to work (per closed
+     episode, basis residual SD / price-move SD, bootstrap upper95 < 0.5) and the
+     increment not significantly negative
+  7. degenerate samples are refused by name (constant block values or passive
+     return, a frozen or near-frozen price, a constant basis, a repeated funding
+     sequence, too few distinct funding values)
+  8. a capital basis is always stated; capital is charged on the committed
+     fraction scaled by the mean price growth; a materiality floor in USD per
+     year is an owner input; the stress inputs have floors
 Everything is SIMULATED_FROM_PUBLIC_DATA. Nothing here is cash, a fill or a P&L.
 """
 from __future__ import annotations
@@ -71,17 +79,28 @@ SIMULATED = v2.SIMULATED
 EVALUATION_START_S = 1_793_750_400
 BLOCK_DAYS = 14
 #: The single analysis is due at this horizon; rows after it are excluded.
-ANALYSIS_HORIZON_DAYS = 126                      # nine complete blocks
-MIN_COMPLETE_BLOCKS = 6
+ANALYSIS_HORIZON_DAYS = 252                      # eighteen complete blocks
+N_BLOCKS = ANALYSIS_HORIZON_DAYS // BLOCK_DAYS
+DUE_TOLERANCE_S = 3600                           # one observation interval
+MAX_START_DELAY_S = 24 * 3600                    # the collection must begin on time
+MIN_BLOCK_COVERAGE = 0.90                        # share of a block's expected rows present
+MIN_EFFECTIVE_BLOCKS = 4.0
 MIN_CLOSED_EPISODES = 20
 MAX_UNPRICED_FRACTION = 0.10
+HEDGE_RESIDUAL_RATIO_MAX = 0.5
+MIN_STRESS_LOSS_BPS = 100.0
+MAX_TAKER_FEE_BPS = 100.0
 #: Degenerate-sample thresholds.
-MIN_BLOCK_SD_BPS_PER_DAY = 1e-6
+MIN_PASSIVE_SD_BPS_PER_DAY = 0.5
+MIN_NET_SD_BPS_PER_DAY = 1e-6
+MIN_HOURLY_PRICE_RETURN_SD = 1e-5
 PRICE_FROZEN_SHARE = 0.95
 REPEAT_WINDOW_PRINTS = 24
 MIN_DISTINCT_WINDOW_SHARE = 0.90
 MIN_DISTINCT_PRINT_VALUES = 8
-#: Bootstrap of block-level statistics: fixed seed and size.
+MIN_DAILY_POINTS_FOR_PERSISTENCE = 30
+MAX_DAILY_PERSISTENCE = 0.99
+PERSISTENCE_UPPER_Z = 1.645
 BOOT_SEED = 20261104
 BOOT_N = 4000
 
@@ -93,63 +112,78 @@ PROTOCOL = {
     "question": ("Does the frozen entry gate and exit rule earn a positive NET carry "
                  "per calendar day, after measured costs, an unseen-tail charge and "
                  "the owner's cost of capital, without the hedge adding risk to the "
-                 "BTC the owner already holds, and is it material?"),
-    "unit_of_independence": f"a non-overlapping {BLOCK_DAYS}-day calendar block",
+                 "BTC the owner already holds, over a sample long enough, relative "
+                 "to how persistent funding is, to mean anything, and is it material?"),
+    "unit_of_independence": (f"a non-overlapping {BLOCK_DAYS}-day calendar block, "
+                             "discounted for the persistence of the funding series itself"),
     "evaluation_start_s": EVALUATION_START_S,
-    "analysis": ("ONE analysis, due at analysis_horizon_days; earlier looks are "
-                 "INSUFFICIENT (ANALYSIS_NOT_YET_DUE); later rows are excluded"),
+    "analysis": ("ONE analysis, due at analysis_horizon_days (one observation interval "
+                 "of tolerance); earlier looks are INSUFFICIENT (ANALYSIS_NOT_YET_DUE); "
+                 "later rows are excluded"),
     "analysis_horizon_days": ANALYSIS_HORIZON_DAYS,
     "block_days": BLOCK_DAYS,
-    "adequacy": {"min_complete_blocks": MIN_COMPLETE_BLOCKS,
+    "blocks": N_BLOCKS,
+    "collection": {"max_start_delay_s": MAX_START_DELAY_S,
+                   "min_block_coverage": MIN_BLOCK_COVERAGE,
+                   "note": "blocks are anchored to evaluation_start_s, never to the first row"},
+    "adequacy": {"min_effective_blocks": MIN_EFFECTIVE_BLOCKS,
                  "min_closed_episodes": MIN_CLOSED_EPISODES},
     "max_unpriced_fraction": MAX_UNPRICED_FRACTION,
-    "inference": ("one-sided 95% bound on the mean block value: the wider of the "
-                  "dependence-inflated Student-t interval and a fixed-seed "
-                  "whole-block bootstrap"),
-    "tail": ("an unseen-tail charge = stress_loss_bps x max(0, upper95 frequency of "
-             "episodes at least that bad - observed frequency), the upper bound "
-             "being the exact Poisson 95% bound (rule of three when none was seen), "
-             "expressed per calendar day; stress_loss_bps = 3 x funding cap + price "
-             "band, from owner/venue inputs; missing = INSUFFICIENT_OWNER_INPUT"),
-    "benchmark": ("GO needs: lower95 of the net carry per day > 0 after the tail "
-                  "charge; the HEDGE shown to work as a hedge (per closed episode, the "
-                  "SD of the basis residual over the SD of the price move it hedged, "
-                  "upper95 of the bootstrap < 1); and the incremental return versus "
-                  "passive NOT significantly negative (upper95 >= 0). The block-level "
-                  "SD ratio and the risk-adjusted difference are reported with their "
-                  "uncertainty and do not gate: occupancy is a property of the entry "
-                  "gate, not of the hedge. Noise alone never blocks or passes a GO."),
-    "degenerate": ["BLOCK_VALUES_CONSTANT", "PASSIVE_RETURN_CONSTANT",
-                   "PRICE_FEED_FROZEN", "FUNDING_SEQUENCE_REPEATED",
+    "inference": ("one-sided 95% bound on the mean block value with the effective "
+                  "number of independent blocks K_eff = K(1-rho)/(1+rho), rho = the "
+                  "bias-corrected lag-1 autocorrelation of the daily funding series "
+                  "raised to the block length; Student-t with floor(K_eff) values"),
+    "tail": ("stress_loss_bps = max(3 x funding cap + price band, 2 x the worst observed "
+             "episode loss) times max(0, upper95 Poisson frequency of such losses - "
+             "observed frequency), per calendar day; an episode that cannot be priced "
+             "is valued at the full stress loss on the GO path"),
+    "upside": ("NO_GO requires the best-case upper bound to stay at or below zero AFTER "
+               "crediting an unseen upside of (rule of three / n) x max(best observed "
+               "episode, stress loss)"),
+    "benchmark": ("GO needs: lower95 of the net carry per day > 0 after the tail charge; "
+                  f"the HEDGE shown to work (per closed episode, SD of the basis residual / "
+                  f"SD of the price move hedged, bootstrap upper95 < {HEDGE_RESIDUAL_RATIO_MAX}); "
+                  "and the incremental return versus passive NOT significantly negative "
+                  "(upper95 >= 0). The block-level SD ratio and the risk-adjusted "
+                  "difference are reported with their uncertainty and do not gate."),
+    "degenerate": ["BLOCK_VALUES_CONSTANT", "PASSIVE_RETURN_CONSTANT", "PRICE_FEED_FROZEN",
+                   "BASIS_CONSTANT", "FUNDING_SEQUENCE_REPEATED",
                    "TOO_FEW_DISTINCT_FUNDING_VALUES"],
-    "capital": ("charged on committed_capital_fraction x notional x the mean price "
-                "growth since entry; an explicit zero of either input needs a "
-                "stated basis; a materiality floor in USD per year is required"),
+    "capital": ("a basis is always stated; charged on committed_capital_fraction x "
+                "notional x the mean price growth since entry; a materiality floor in "
+                "USD per year is required"),
+    "inputs_validated": {"taker_fee_bps": [0.0, MAX_TAKER_FEE_BPS],
+                         "min_stress_loss_bps": MIN_STRESS_LOSS_BPS},
     "verdicts": ["GO", "NO_GO", "INSUFFICIENT"],
     "meaning": {
-        "GO": ("Over one pre-declared window, the dependence-adjusted lower 95% bound "
-               "of the net carry per calendar day, after execution costs, the "
-               "unseen-tail charge and the owner's cost of capital, is above zero "
-               "and above the owner's materiality floor; the hedge did not add risk "
-               "to the BTC held and did not significantly lose wealth versus holding "
-               "it; capacity, drawdown and margin facts hold. Evidence for a small "
+        "GO": ("Over one pre-declared, fully covered window long enough for how "
+               "persistent funding proved to be, the dependence-adjusted lower 95% "
+               "bound of the net carry per calendar day, after execution costs, an "
+               "unseen-tail charge and the owner's cost of capital, is above zero and "
+               "above the owner's materiality floor; the hedge removed most of the "
+               "price risk and did not significantly lose wealth versus holding the "
+               "BTC; capacity, drawdown and margin facts hold. Evidence for a small "
                "pilot under the owner's signed charter, not a forecast, not cash."),
         "NO_GO": ("Adequate sample, one analysis, and even the most favourable reading "
-                  "(lower impact bound, zero capital cost) has an upper 95% bound at "
-                  "or below zero."),
-        "INSUFFICIENT": ("Anything else: unreadable or degenerate evidence, analysis "
-                         "not yet due, too few blocks or episodes, a missing owner "
-                         "input, or a result that is neither clearly positive nor "
-                         "clearly absent."),
+                  "(lower impact bound, zero capital cost, an unseen-upside credit) has "
+                  "an upper 95% bound at or below zero."),
+        "INSUFFICIENT": ("Anything else: unreadable, late, uncovered or degenerate "
+                         "evidence, analysis not yet due, a sample too persistent for "
+                         "its length, a missing or invalid owner input, or a result "
+                         "that is neither clearly positive nor clearly absent."),
     },
     "never": ["a verdict before the analysis date", "re-testing the same window as it grows",
               "treating a missing owner input as zero", "calling a simulation cash",
-              "extrapolating cost beyond the measured sizes"],
+              "extrapolating cost beyond the measured sizes", "re-anchoring blocks to a late start"],
     "cash": False,
     "resolved_parameters": {
-        "block_days": BLOCK_DAYS, "boot": [BOOT_SEED, BOOT_N],
-        "degenerate": [MIN_BLOCK_SD_BPS_PER_DAY, PRICE_FROZEN_SHARE, REPEAT_WINDOW_PRINTS,
-                       MIN_DISTINCT_WINDOW_SHARE, MIN_DISTINCT_PRINT_VALUES],
+        "block_days": BLOCK_DAYS, "n_blocks": N_BLOCKS, "boot": [BOOT_SEED, BOOT_N],
+        "due_tolerance_s": DUE_TOLERANCE_S,
+        "thresholds": [MIN_EFFECTIVE_BLOCKS, MIN_BLOCK_COVERAGE, HEDGE_RESIDUAL_RATIO_MAX,
+                       MIN_STRESS_LOSS_BPS, MIN_PASSIVE_SD_BPS_PER_DAY, MIN_NET_SD_BPS_PER_DAY,
+                       MIN_HOURLY_PRICE_RETURN_SD, MAX_DAILY_PERSISTENCE, PERSISTENCE_UPPER_Z],
+        "degenerate": [PRICE_FROZEN_SHARE, REPEAT_WINDOW_PRINTS, MIN_DISTINCT_WINDOW_SHARE,
+                       MIN_DISTINCT_PRINT_VALUES],
         "v2_inference": v2.PROTOCOL["resolved_parameters"],
         "v2_entry_gate_and_exit": v2.PROTOCOL["resolved_parameters"]["entry_gate"],
     },
@@ -163,33 +197,86 @@ def protocol_hash() -> str:
 
 _finite = v2._finite
 
-# -- statistics over BLOCK values ------------------------------------------------------------
 
-def _boot(values: Sequence[float], stat, rng: random.Random, n: int = BOOT_N) -> List[float]:
-    k = len(values)
-    out = []
-    for _ in range(n):
-        out.append(stat([values[rng.randrange(k)] for _ in range(k)]))
-    out.sort()
-    return out
+# -- persistence and effective sample size -----------------------------------------------------
+
+def _lag1(vals: Sequence[float]) -> float:
+    n = len(vals)
+    if n < 3:
+        return 0.0
+    m = sum(vals) / n
+    den = sum((v - m) ** 2 for v in vals)
+    if den <= 0:
+        return 0.0
+    num = sum((vals[i] - m) * (vals[i + 1] - m) for i in range(n - 1))
+    return num / den
 
 
-def block_bounds(values: Sequence[float]) -> Dict[str, Any]:
-    """Mean of block values with the v2 dependence-adjusted bounds, widened by a
-    fixed-seed whole-block bootstrap (blocks are the independent unit)."""
-    b = v2.mean_bounds(values)
+def daily_funding_series(rows: Sequence[Dict[str, Any]]) -> List[float]:
+    """Funding per UTC day (sum of the distinct settled prints that day), in order."""
+    seen: Dict[int, float] = {}
+    for r in rows:
+        for bps, ms in r["obs"].get("settled_prints", []):
+            if _finite(bps):
+                seen.setdefault(int(ms), float(bps))
+    days: Dict[int, float] = {}
+    for ms, bps in seen.items():
+        days[ms // 86_400_000] = days.get(ms // 86_400_000, 0.0) + bps
+    return [days[d] for d in sorted(days)]
+
+
+def effective_blocks(rows: Sequence[Dict[str, Any]], n_blocks: int) -> Dict[str, Any]:
+    """K_eff for these rows: see `effective_blocks_from_daily`."""
+    return effective_blocks_from_daily(daily_funding_series(rows), n_blocks)
+
+
+def effective_blocks_from_daily(daily: Sequence[float], n_blocks: int) -> Dict[str, Any]:
+    """K_eff from the persistence of the DRIVER. phi is the bias-corrected lag-1
+    autocorrelation of the daily funding series PLUS a one-sided 95% margin
+    (z * (1 - phi^2) / sqrt(n)), because an estimated persistence that is too low
+    overstates K_eff: measured, the unmargined estimate passed a zero edge about
+    7% of the time at a true daily persistence of 0.9-0.99; with the margin it is
+    at or below the nominal 5%. Capped; carried over a block it is
+    rho = phi**BLOCK_DAYS; K_eff = K(1-rho)/(1+rho) (never above K)."""
+    if len(daily) < MIN_DAILY_POINTS_FOR_PERSISTENCE:
+        return {"status": UNAVAILABLE, "reason": "TOO_FEW_DAYS_TO_MEASURE_PERSISTENCE",
+                "daily_points": len(daily), "k_eff": None}
+    raw = _lag1(daily)
+    n = len(daily)
+    phi = max(0.0, min(MAX_DAILY_PERSISTENCE,
+                       raw + (1.0 + 3.0 * raw) / n
+                       + PERSISTENCE_UPPER_Z * (1.0 - max(raw, 0.0) ** 2) / math.sqrt(n)))
+    rho = phi ** BLOCK_DAYS
+    k_eff = max(1.0, min(float(n_blocks), n_blocks * (1.0 - rho) / (1.0 + rho)))
+    half_life = (math.log(0.5) / math.log(phi)) if 0 < phi < 1 else 0.0
+    return {"status": "MEASURED", "daily_points": len(daily), "phi_daily": phi,
+            "rho_block": rho, "k": n_blocks, "k_eff": k_eff, "half_life_days": half_life}
+
+
+def block_bounds(values: Sequence[float], k_eff: Optional[float] = None) -> Dict[str, Any]:
+    """Mean of block values with a one-sided 95% bound that uses K_eff when given:
+    mean +/- t(floor(K_eff)) * sd / sqrt(K_eff). Without it, the v2 bounds."""
     vals = [float(x) for x in values if _finite(x)]
-    if len(vals) >= 3 and b["lower95"] is not None:
-        bs = _boot(vals, lambda xs: sum(xs) / len(xs), random.Random(BOOT_SEED))
-        b = dict(b, lower95=min(b["lower95"], bs[int(0.05 * BOOT_N)]),
-                 upper95=max(b["upper95"], bs[int(0.95 * BOOT_N) - 1]),
-                 method="block_bootstrap_widened")
-    return b
+    n = len(vals)
+    if n == 0:
+        return {"n": 0, "mean": None, "sd": None, "lower95": None, "upper95": None}
+    mean = sum(vals) / n
+    if n < 2:
+        return {"n": n, "mean": mean, "sd": None, "lower95": None, "upper95": None}
+    sd = math.sqrt(sum((v - mean) ** 2 for v in vals) / (n - 1))
+    if k_eff is None:
+        return dict(v2.mean_bounds(vals), k_eff=None)
+    ke = max(1.0, min(float(n), float(k_eff)))
+    if ke < 2.0:
+        return {"n": n, "mean": mean, "sd": sd, "lower95": None, "upper95": None, "k_eff": ke}
+    half = v2.t_crit(max(2, int(math.floor(ke)))) * sd / math.sqrt(ke)
+    return {"n": n, "mean": mean, "sd": sd, "lower95": mean - half, "upper95": mean + half,
+            "k_eff": ke, "method": "t_with_effective_blocks"}
 
 
 def poisson_upper95(k: int) -> float:
     """Exact one-sided 95% upper bound on a Poisson mean given k events seen
-    (3.0 for none: the rule of three)."""
+    (about 3.0 for none: the rule of three)."""
     table = {0: 2.996, 1: 4.744, 2: 6.296, 3: 7.754, 4: 9.154, 5: 10.513,
              6: 11.842, 7: 13.148, 8: 14.435, 9: 15.705, 10: 16.962}
     if k in table:
@@ -199,16 +286,21 @@ def poisson_upper95(k: int) -> float:
 
 def unseen_tail_charge_bps_per_episode(net_bps: Sequence[float], stress_loss_bps: float
                                        ) -> Dict[str, Any]:
-    """What an episode must pay for tail losses the sample did not show."""
+    """What an episode must pay for tail losses the sample did not show. The
+    stress loss used is at least twice the worst loss actually observed, so a
+    loss bigger than the declared stress is not charged at the stress value."""
     n = len(net_bps)
     if n == 0 or not _finite(stress_loss_bps) or stress_loss_bps <= 0:
         return {"status": UNAVAILABLE, "charge_bps_per_episode": None}
-    k = sum(1 for x in net_bps if x <= -stress_loss_bps)
+    worst = min(net_bps)
+    stress = max(float(stress_loss_bps), 2.0 * max(0.0, -worst))
+    k = sum(1 for x in net_bps if x <= -stress)
     ub = poisson_upper95(k) / n
     extra = max(0.0, ub - k / n)
     return {"status": "MEASURED", "observed_tail_episodes": k, "episodes": n,
-            "upper95_frequency": ub, "stress_loss_bps": float(stress_loss_bps),
-            "charge_bps_per_episode": extra * float(stress_loss_bps)}
+            "upper95_frequency": ub, "stress_loss_bps": stress,
+            "declared_stress_loss_bps": float(stress_loss_bps),
+            "charge_bps_per_episode": extra * stress}
 
 
 # -- degenerate samples ---------------------------------------------------------------------
@@ -218,10 +310,17 @@ def degenerate_reasons(rows: Sequence[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
     if not rows:
         return out
-    spots = [round(float(r["obs"]["spot_mark"]), 6) for r in rows]
-    top = max((spots.count(s) for s in set(spots)), default=0)
-    if len(spots) > 10 and top / len(spots) >= PRICE_FROZEN_SHARE:
+    spots = [float(r["obs"]["spot_mark"]) for r in rows]
+    rounded = [round(s, 6) for s in spots]
+    top = max((rounded.count(s) for s in set(rounded)), default=0)
+    rets = [math.log(b / a) for a, b in zip(spots, spots[1:]) if a > 0 and b > 0]
+    sd = (math.sqrt(sum((x - sum(rets) / len(rets)) ** 2 for x in rets) / (len(rets) - 1))
+          if len(rets) > 2 else 0.0)
+    if len(spots) > 10 and (top / len(spots) >= PRICE_FROZEN_SHARE or sd < MIN_HOURLY_PRICE_RETURN_SD):
         out.append("PRICE_FEED_FROZEN")
+    basis = [round(float(r["obs"]["perp_mark"]) - float(r["obs"]["spot_mark"]), 6) for r in rows]
+    if len(basis) > 10 and len(set(basis)) <= 2:
+        out.append("BASIS_CONSTANT")
     seq: Dict[int, float] = {}
     for r in rows:
         for bps, ms in r["obs"].get("settled_prints", []):
@@ -237,12 +336,39 @@ def degenerate_reasons(rows: Sequence[Dict[str, Any]]) -> List[str]:
     return out
 
 
+# -- coverage ---------------------------------------------------------------------------------
+
+def coverage_problems(rows: Sequence[Dict[str, Any]]) -> List[str]:
+    """Collection that began late, or blocks the observations do not cover. A
+    block is covered when its rows span it without a gap beyond the v2 limit and
+    its rows are at least MIN_BLOCK_COVERAGE of what that spacing would give."""
+    probs: List[str] = []
+    if not rows:
+        return ["NO_OBSERVATIONS"]
+    first = rows[0]["obs"]["observed_at_s"]
+    if first > EVALUATION_START_S + MAX_START_DELAY_S:
+        probs.append("COLLECTION_STARTED_LATE")
+    max_gap = float(v2.PROTOCOL["max_gap_between_observations_s"])
+    for b in range(N_BLOCKS):
+        b0 = EVALUATION_START_S + b * BLOCK_DAYS * 86400
+        b1 = b0 + BLOCK_DAYS * 86400
+        ts = [r["obs"]["observed_at_s"] for r in rows if b0 <= r["obs"]["observed_at_s"] < b1]
+        if not ts:
+            probs.append(f"BLOCK_{b}_NOT_COVERED")
+            continue
+        edges = [b0] + ts + [b1]
+        worst = max(y - x for x, y in zip(edges, edges[1:]))
+        covered = sum(min(y - x, max_gap) for x, y in zip(edges, edges[1:])) / (b1 - b0)
+        if worst > max_gap * 4 or covered < MIN_BLOCK_COVERAGE:
+            probs.append(f"BLOCK_{b}_NOT_COVERED")
+    return probs
+
+
 # -- episodes -> block values -----------------------------------------------------------------
 
 def _growth(rows: Sequence[Dict[str, Any]], e: Dict[str, Any]) -> float:
     """Mean spot over the episode relative to entry: margin on a fixed BTC
     quantity grows with price."""
-    ts = [r["obs"]["observed_at_s"] for r in rows]
     inside = [float(r["obs"]["spot_mark"]) for r in rows
               if e["entry_s"] <= r["obs"]["observed_at_s"] <= e["exit_s"]]
     if not inside:
@@ -280,7 +406,7 @@ def _passive_blocks(rows: Sequence[Dict[str, Any]], start_s: float, n_blocks: in
         b1 = b0 + BLOCK_DAYS * 86400.0
         s0 = next((float(r["obs"]["spot_mark"]) for r in rows if r["obs"]["observed_at_s"] >= b0), None)
         s1 = next((float(r["obs"]["spot_mark"]) for r in reversed(rows)
-                   if r["obs"]["observed_at_s"] <= b1), None)
+                   if r["obs"]["observed_at_s"] < b1), None)
         out.append(((s1 / s0 - 1.0) * 1e4 / BLOCK_DAYS) if s0 and s1 else float("nan"))
     return out
 
@@ -294,9 +420,11 @@ def _sd(xs: Sequence[float]) -> float:
 
 
 def paired_ratio_bounds(num: Sequence[float], den: Sequence[float]) -> Dict[str, Any]:
-    """sd(num)/sd(den) with a paired whole-block bootstrap."""
+    """sd(num)/sd(den) with a paired bootstrap. A zero denominator, or a numerator
+    that is identically zero, is reported as not estimable (a perfect hedge is
+    never evidence, it is a copied feed)."""
     k = len(num)
-    if k < 3 or _sd(den) <= 0:
+    if k < 3 or _sd(den) <= 0 or _sd(num) <= 0:
         return {"ratio": None, "upper95": None}
     rng = random.Random(BOOT_SEED + 1)
     rs = []
@@ -331,6 +459,33 @@ def sharpe_diff_bounds(a: Sequence[float], b: Sequence[float]) -> Dict[str, Any]
     pt = sr(a) - sr(b)
     return {"difference": pt if math.isfinite(pt) else None,
             "lower95": ds[int(0.05 * len(ds))] if ds else None}
+
+
+# -- provenance ---------------------------------------------------------------------------------
+
+def _canon(x: Any) -> str:
+    return json.dumps(x, sort_keys=True, default=str, separators=(",", ":"))
+
+
+def provenance(fwd: Sequence[Dict[str, Any]], inputs: Dict[str, Any],
+               chain_issues: Sequence[str]) -> Dict[str, Any]:
+    """What THIS answer was computed from (v3's own protocol, window and rows),
+    so it can be reproduced from immutable inputs and nothing else."""
+    chain = [r.get("hash") for r in fwd]
+    content = [hashlib.sha256(_canon(r.get("obs")).encode()).hexdigest() for r in fwd]
+    digest = hashlib.sha256(_canon({
+        "schema": SCHEMA, "protocol_hash": protocol_hash(), "chain_hashes": chain,
+        "content_hashes": content, "inputs": inputs,
+        "chain_issues": list(chain_issues)}).encode()).hexdigest()
+    return {"schema": SCHEMA, "protocol_hash": protocol_hash(),
+            "evaluation_start_s": EVALUATION_START_S,
+            "analysis_horizon_days": ANALYSIS_HORIZON_DAYS, "forward_rows": len(fwd),
+            "first_row_hash": chain[0] if chain else None,
+            "last_row_hash": chain[-1] if chain else None,
+            "first_observed_at_s": fwd[0]["obs"]["observed_at_s"] if fwd else None,
+            "last_observed_at_s": fwd[-1]["obs"]["observed_at_s"] if fwd else None,
+            "inputs_digest": digest,
+            "rows_missing_a_chain_hash": sum(1 for h in chain if not h)}
 
 
 # -- the evaluation -------------------------------------------------------------------------
@@ -379,17 +534,33 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
         "observations_before_declaration_excluded": before,
         "observations_after_horizon_excluded": after,
         "chain_issues": chain_issues, "run_inputs": inputs,
-        "provenance": v2._provenance(fwd, dict(inputs, protocol=SCHEMA))}
+        "provenance": provenance(fwd, inputs, chain_issues)}
+    # owner inputs are validated before they can touch the arithmetic
+    bad_inputs = []
+    if not (_finite(planned_notional_usd) and planned_notional_usd > 0):
+        bad_inputs.append("planned_notional_usd")
+    if not (_finite(taker_fee_bps) and 0.0 <= taker_fee_bps <= MAX_TAKER_FEE_BPS):
+        bad_inputs.append("taker_fee_bps")
+    stress = None
+    if funding_cap_bps is not None or price_limit_ratio is not None:
+        if (_finite(funding_cap_bps) and _finite(price_limit_ratio)
+                and funding_cap_bps > 0 and price_limit_ratio > 0):
+            stress = 3.0 * float(funding_cap_bps) + float(price_limit_ratio) * 1e4
+            if stress < MIN_STRESS_LOSS_BPS:
+                bad_inputs.append("stress_loss_below_floor")
+                stress = None
+        else:
+            bad_inputs.append("funding_cap_bps/price_limit_ratio")
+    out["invalid_inputs"] = bad_inputs
     span_days = ((fwd[-1]["obs"]["observed_at_s"] - fwd[0]["obs"]["observed_at_s"]) / 86400.0
                  if len(fwd) > 1 else 0.0)
     out["span_days"] = span_days
     out["distinct_settled_prints"] = len({int(p[1]) for r in fwd for p in r["obs"].get("settled_prints", [])})
-    out["analysis_due"] = (bool(fwd) and fwd[-1]["obs"]["observed_at_s"]
-                           >= EVALUATION_START_S + ANALYSIS_HORIZON_DAYS * 86400 - 3600 * 3)
-    deg = degenerate_reasons(fwd) if fwd and not chain_issues else []
-    out["degenerate"] = deg
+    out["analysis_due"] = bool(fwd) and fwd[-1]["obs"]["observed_at_s"] >= horizon_end - DUE_TOLERANCE_S
+    out["coverage"] = coverage_problems(fwd) if fwd and not chain_issues else []
+    out["degenerate"] = degenerate_reasons(fwd) if fwd and not chain_issues else []
     sim = (v2.simulate_episodes(fwd, planned_notional_usd, taker_fee_bps)
-           if fwd and not chain_issues else
+           if fwd and not chain_issues and not bad_inputs else
            {"closed": [], "open_at_end": False, "open_marked": None})
     closed = sim["closed"]
     priced = [e for e in closed if _finite(e.get("carry_bps")) and _finite(e.get("carry_bps_most_favourable"))]
@@ -398,65 +569,99 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
                        "unpriced_fraction": len(unpriced) / len(closed) if closed else 0.0,
                        "open_at_end": sim["open_at_end"]}
 
-    # capital: an explicit zero needs a stated basis; fractions validated
+    # capital: a basis is always stated; fractions validated; invalid input never used
     cap_status = "OWNER_SUPPLIED"
     if owner_capital_apr is None or committed_capital_fraction is None:
         cap_status = INSUFFICIENT_OWNER_INPUT
     elif not (_finite(owner_capital_apr) and 0 <= owner_capital_apr <= 10
               and _finite(committed_capital_fraction) and 0 <= committed_capital_fraction <= 1):
         cap_status = "INVALID_OWNER_INPUT"
-    elif (owner_capital_apr == 0 or committed_capital_fraction == 0) and not (
-            isinstance(capital_cost_basis, str) and capital_cost_basis.strip()):
-        cap_status = "ZERO_CAPITAL_COST_NEEDS_A_STATED_BASIS"
+    elif not (isinstance(capital_cost_basis, str) and capital_cost_basis.strip()):
+        cap_status = "CAPITAL_COST_NEEDS_A_STATED_BASIS"
     out["capital"] = {"status": cap_status, "applied_apr": owner_capital_apr,
-                      "committed_fraction": committed_capital_fraction,
-                      "basis": capital_cost_basis}
+                      "committed_fraction": committed_capital_fraction, "basis": capital_cost_basis}
 
-    n_blocks = int(span_days // BLOCK_DAYS) if fwd else 0
-    out["blocks"] = {"complete": n_blocks, "block_days": BLOCK_DAYS}
-    if not (priced and n_blocks >= 1):
-        out["verdict"], out["verdict_reasons"] = _verdict(out, None, owner_drawdown_limit_usd,
+    n_blocks = N_BLOCKS if (fwd and not out["coverage"] and not chain_issues) else 0
+    out["blocks"] = {"complete": n_blocks, "block_days": BLOCK_DAYS, "anchored_to": EVALUATION_START_S}
+    out["persistence"] = (effective_blocks(fwd, n_blocks) if n_blocks else
+                          {"status": UNAVAILABLE, "k_eff": None})
+    if not (priced and n_blocks and out["persistence"].get("k_eff") and not bad_inputs
+            and not out["degenerate"]):
+        out["verdict"], out["verdict_reasons"] = _verdict(out, stress, owner_drawdown_limit_usd,
                                                           min_annual_net_usd)
         return out
+    k_eff = out["persistence"]["k_eff"]
 
-    # adverse / favourable valuation of unpriced episodes, by rate per day
-    def rate(e: Dict[str, Any], key: str) -> float:
-        return e[key] / max(e["hold_days"], 1e-9)
-    worst_rate = min(rate(e, "carry_bps") for e in priced)
-    best_rate = max(rate(e, "carry_bps_most_favourable") for e in priced)
-    # an input that is missing or invalid is never used in the arithmetic (it
-    # would poison every statistic before the refusal could be reported)
     supplied = cap_status == "OWNER_SUPPLIED"
     apr = float(owner_capital_apr) if supplied else 0.0
     frac = float(committed_capital_fraction) if supplied else 0.0
     scale = planned_notional_usd / 1e4
+    unpriced_adverse = -(stress if stress else MIN_STRESS_LOSS_BPS)
+    best_rate = max(e["carry_bps_most_favourable"] / max(e["hold_days"], 1e-9) for e in priced)
     enriched = []
     for e in closed:
         g = _growth(fwd, e)
-        capital_bps = apr * frac * g * e["hold_days"] / 365.0 * 1e4
-        adv = e["carry_bps"] if e in priced else worst_rate * e["hold_days"]
+        cbps = apr * frac * g * e["hold_days"] / 365.0 * 1e4
+        adv = e["carry_bps"] if e in priced else unpriced_adverse
         fav = e["carry_bps_most_favourable"] if e in priced else best_rate * e["hold_days"]
         passive = e.get("passive_return_bps", 0.0)
-        enriched.append(dict(e, net_adv=adv - capital_bps, net_fav=fav, carry_adv=adv,
-                             incremental_adv=(adv - capital_bps) - passive,
-                             combined_adv=None))
+        enriched.append(dict(e, net_adv=adv - cbps, net_fav=fav, carry_adv=adv,
+                             incremental_adv=(adv - cbps) - passive))
     om = sim.get("open_marked")
+    if om is not None and not _finite(om.get("carry_bps")):
+        out["episodes"]["open_unmarkable"] = True
     if om is not None and _finite(om.get("carry_bps")):
         g = _growth(fwd, om)
         cbps = apr * frac * g * om["hold_days"] / 365.0 * 1e4
-        enriched.append(dict(om, net_adv=om["carry_bps"] - cbps, net_fav=om["carry_bps"],
+        fav_o = om.get("carry_bps_most_favourable")
+        enriched.append(dict(om, net_adv=om["carry_bps"] - cbps,
+                             net_fav=fav_o if _finite(fav_o) else om["carry_bps"],
                              carry_adv=om["carry_bps"],
                              incremental_adv=(om["carry_bps"] - cbps) - om.get("passive_return_bps", 0.0),
                              open=True))
-    start_s = float(EVALUATION_START_S if fwd[0]["obs"]["observed_at_s"] <= EVALUATION_START_S
-                    else fwd[0]["obs"]["observed_at_s"])
-    start_s = float(fwd[0]["obs"]["observed_at_s"])
+    start_s = float(EVALUATION_START_S)
     carry_pd = allocate_to_blocks(enriched, start_s, n_blocks, "carry_adv")
     net_pd = allocate_to_blocks(enriched, start_s, n_blocks, "net_adv")
     fav_pd = allocate_to_blocks(enriched, start_s, n_blocks, "net_fav")
     incr_pd = allocate_to_blocks(enriched, start_s, n_blocks, "incremental_adv")
     passive_pd = _passive_blocks(fwd, start_s, n_blocks)
     combined_pd = [p + i for p, i in zip(passive_pd, incr_pd)]
+
+    closed_net = [e["net_adv"] for e in enriched if not e.get("open")]
+    tail = unseen_tail_charge_bps_per_episode(closed_net, stress or 0.0)
+    eps_per_day = len(closed) / ANALYSIS_HORIZON_DAYS
+    tail_pd = ((tail["charge_bps_per_episode"] or 0.0) * eps_per_day
+               if tail["status"] == "MEASURED" else None)
+    out["tail"] = dict(tail, charge_bps_per_day=tail_pd, episodes_per_day=eps_per_day)
+
+    net_after_tail = [x - (tail_pd or 0.0) for x in net_pd]
+    out["positive_carry_after_costs_bps_per_day"] = dict(block_bounds(carry_pd, k_eff),
+        note="after execution costs, before capital cost and before the unseen-tail charge")
+    out["net_of_capital_bps_per_day"] = block_bounds(net_pd, k_eff)
+    out["net_after_tail_charge_bps_per_day"] = block_bounds(net_after_tail, k_eff)
+    out["most_favourable_bps_per_day"] = block_bounds(fav_pd, k_eff)
+    out["absolute_overlay_portfolio_return_bps_per_day"] = dict(block_bounds(combined_pd, k_eff),
+        note="the owner's BTC with the overlay on only while the gate was open (idle time unhedged)")
+    out["passive_btc_return_bps_per_day"] = block_bounds(passive_pd, k_eff)
+    out["incremental_vs_passive_bps_per_day"] = dict(block_bounds(incr_pd, k_eff),
+        note="includes the BTC drift forgone while hedged; not an edge, a cost of hedging")
+    out["hedge_risk_ratio"] = dict(paired_ratio_bounds(combined_pd, passive_pd),
+        note="sd of the combined position's block returns / sd of passive BTC's (reported, not gating)")
+    out["risk_adjusted_vs_passive"] = dict(sharpe_diff_bounds(combined_pd, passive_pd),
+        note="difference in block mean/sd; reported, with its uncertainty, not a gate on its own")
+
+    # unseen-upside credit before any NO_GO (the mirror of the tail charge)
+    best_obs = max((e["net_fav"] for e in enriched if not e.get("open")), default=0.0)
+    ref_up = max(best_obs, stress or 0.0, 0.0)
+    out["unseen_upside_credit_bps_per_day"] = (
+        (poisson_upper95(0) / max(1, len(closed))) * ref_up * eps_per_day)
+
+    nb = block_bounds(net_after_tail, k_eff)
+    out["annualised"] = {
+        "net_bps_of_notional_lower95": (nb["lower95"] * 365.0 if nb["lower95"] is not None else None),
+        "net_usd_lower95": (nb["lower95"] * 365.0 * scale if nb["lower95"] is not None else None),
+        "capital_utilisation": sum(e["hold_days"] for e in closed) / ANALYSIS_HORIZON_DAYS,
+        "note": "idle time is in the denominator; not a forecast"}
 
     by_t = {r["obs"]["observed_at_s"]: r["obs"] for r in fwd}
     resid, moved = [], []
@@ -468,48 +673,17 @@ def evaluate(rows: Sequence[Dict[str, Any]], *, planned_notional_usd: float,
             continue
         basis_in = float(a["perp_mark"]) - float(a["spot_mark"])
         basis_out = float(b["perp_mark"]) - float(b["spot_mark"])
-        resid.append(-(basis_out - basis_in) / float(a["spot_mark"]) * 1e4)   # the hedge's basis P&L
-        moved.append(float(e["passive_return_bps"]))                          # the price move it hedged
+        resid.append(-(basis_out - basis_in) / float(a["spot_mark"]) * 1e4)
+        moved.append(float(e["passive_return_bps"]))
     out["hedge_effectiveness"] = dict(
         paired_ratio_bounds(resid, moved), episodes=len(resid),
         note="per closed episode: SD of the basis residual / SD of the price move hedged")
 
-    stress = None
-    if _finite(funding_cap_bps) and _finite(price_limit_ratio) and funding_cap_bps > 0 and price_limit_ratio > 0:
-        stress = 3.0 * float(funding_cap_bps) + float(price_limit_ratio) * 1e4
-    tail = unseen_tail_charge_bps_per_episode([e["net_adv"] for e in enriched if not e.get("open")],
-                                              stress or 0.0)
-    eps_per_day = len(closed) / max(span_days, 1e-9)
-    tail_pd = ((tail["charge_bps_per_episode"] or 0.0) * eps_per_day
-               if tail["status"] == "MEASURED" else None)
-    out["tail"] = dict(tail, charge_bps_per_day=tail_pd, episodes_per_day=eps_per_day)
-
-    net_after_tail = [x - (tail_pd or 0.0) for x in net_pd]
-    out["positive_carry_after_costs_bps_per_day"] = dict(block_bounds(carry_pd),
-        note="after execution costs, before capital cost and before the unseen-tail charge")
-    out["net_of_capital_bps_per_day"] = block_bounds(net_pd)
-    out["net_after_tail_charge_bps_per_day"] = block_bounds(net_after_tail)
-    out["most_favourable_bps_per_day"] = block_bounds(fav_pd)
-    out["absolute_overlay_portfolio_return_bps_per_day"] = dict(block_bounds(combined_pd),
-        note="the owner's BTC with the overlay on only while the gate was open (idle time unhedged)")
-    out["passive_btc_return_bps_per_day"] = block_bounds(passive_pd)
-    out["incremental_vs_passive_bps_per_day"] = dict(block_bounds(incr_pd),
-        note="includes the BTC drift forgone while hedged; not an edge, a cost of hedging")
-    out["hedge_risk_ratio"] = dict(paired_ratio_bounds(combined_pd, passive_pd),
-        note="sd of the combined position's block returns / sd of passive BTC's")
-    out["risk_adjusted_vs_passive"] = dict(sharpe_diff_bounds(combined_pd, passive_pd),
-        note="difference in block mean/sd; reported, with its uncertainty, not a gate on its own")
-    ann_bps = [x * 365.0 for x in net_after_tail]
-    nb = block_bounds(net_after_tail)
-    out["annualised"] = {"net_bps_of_notional_lower95": (nb["lower95"] * 365.0 if nb["lower95"] is not None else None),
-                         "net_usd_lower95": (nb["lower95"] * 365.0 * scale if nb["lower95"] is not None else None),
-                         "capital_utilisation": sum(e["hold_days"] for e in closed) / max(span_days, 1e-9),
-                         "note": "idle time is in the denominator; not a forecast"}
-    # path / capacity / margin reuse the v2 definitions
-    worst_p = min((e["worst_path_usd"] for e in priced if _finite(e.get("worst_path_usd"))), default=None)
-    out["worst_episode_usd"] = worst_p
-    budget = ((sum(e["carry_adv"] + (e.get("impact_upper_bps") or 0.0) for e in enriched if not e.get("open"))
-               / max(1, len([e for e in enriched if not e.get("open")]))) / 2.0)
+    out["worst_episode_usd"] = min((e["worst_path_usd"] for e in priced if _finite(e.get("worst_path_usd"))),
+                                   default=None)
+    nclosed = max(1, len([e for e in enriched if not e.get("open")]))
+    budget = (sum(e["carry_adv"] + (e.get("impact_upper_bps") or 0.0)
+                  for e in enriched if not e.get("open")) / nclosed) / 2.0
     out["capacity"] = (v2.capacity_bounds(fwd, budget, planned_notional_usd) if budget > 0
                        else {"status": UNAVAILABLE, "reason": "NO_POSITIVE_EDGE_BEFORE_IMPACT"})
     out["stress"] = v2.stress_table(planned_notional_usd, leverage=1.0,
@@ -526,31 +700,40 @@ def _verdict(rep: Dict[str, Any], stress: Optional[float], drawdown: Optional[fl
     why: List[str] = []
     if rep.get("chain_issues"):
         return "INSUFFICIENT", ["EVIDENCE_UNREADABLE"]
-    if rep.get("degenerate"):
-        return "INSUFFICIENT", list(rep["degenerate"])
+    if rep.get("invalid_inputs"):
+        return "INSUFFICIENT", ["INVALID_OWNER_INPUT:" + ",".join(rep["invalid_inputs"])]
     if not rep.get("analysis_due"):
         return "INSUFFICIENT", ["ANALYSIS_NOT_YET_DUE"]
-    if rep["blocks"]["complete"] < MIN_COMPLETE_BLOCKS:
-        why.append(f"FEWER_THAN_{MIN_COMPLETE_BLOCKS}_COMPLETE_BLOCKS")
+    if rep.get("coverage"):
+        return "INSUFFICIENT", list(rep["coverage"])
+    if rep.get("degenerate"):
+        return "INSUFFICIENT", list(rep["degenerate"])
+    per = rep.get("persistence") or {}
+    if not per.get("k_eff"):
+        return "INSUFFICIENT", ["PERSISTENCE_NOT_MEASURABLE:" + str(per.get("reason", ""))]
+    if per["k_eff"] < MIN_EFFECTIVE_BLOCKS:
+        return "INSUFFICIENT", ["SAMPLE_TOO_PERSISTENT_FOR_ITS_LENGTH"]
     ep = rep["episodes"]
     if ep["priced"] < MIN_CLOSED_EPISODES:
         why.append(f"FEWER_THAN_{MIN_CLOSED_EPISODES}_PRICED_CLOSED_EPISODES")
     if ep["unpriced_fraction"] > MAX_UNPRICED_FRACTION:
         why.append("TOO_MANY_EPISODES_UNPRICEABLE")
+    if ep.get("open_unmarkable"):
+        why.append("OPEN_EPISODE_CANNOT_BE_MARKED")
     if why:
         return "INSUFFICIENT", why
-    for key in ("net_of_capital_bps_per_day", "passive_btc_return_bps_per_day"):
-        if key not in rep:
-            return "INSUFFICIENT", ["NO_BLOCK_STATISTICS"]
-    if rep["passive_btc_return_bps_per_day"]["sd"] in (None, 0.0) or \
-            rep["passive_btc_return_bps_per_day"]["sd"] < MIN_BLOCK_SD_BPS_PER_DAY:
+    if "net_of_capital_bps_per_day" not in rep:
+        return "INSUFFICIENT", ["NO_BLOCK_STATISTICS"]
+    sd_p = rep["passive_btc_return_bps_per_day"]["sd"]
+    if sd_p is None or sd_p < MIN_PASSIVE_SD_BPS_PER_DAY:
         return "INSUFFICIENT", ["PASSIVE_RETURN_CONSTANT"]
     sd_net = rep["net_after_tail_charge_bps_per_day"]["sd"]
-    if sd_net is None or sd_net < MIN_BLOCK_SD_BPS_PER_DAY:
+    if sd_net is None or sd_net < MIN_NET_SD_BPS_PER_DAY:
         return "INSUFFICIENT", ["BLOCK_VALUES_CONSTANT"]
     fav = rep["most_favourable_bps_per_day"]
-    if fav["upper95"] is not None and fav["upper95"] <= 0:
-        return "NO_GO", ["UPPER_95_BOUND_NOT_ABOVE_ZERO_EVEN_AT_BEST_CASE"]
+    if (fav["upper95"] is not None
+            and fav["upper95"] + rep.get("unseen_upside_credit_bps_per_day", 0.0) <= 0):
+        return "NO_GO", ["UPPER_95_BOUND_NOT_ABOVE_ZERO_EVEN_AT_BEST_CASE_WITH_UPSIDE_CREDIT"]
     cap = rep["capital"]
     if cap["status"] != "OWNER_SUPPLIED":
         return "INSUFFICIENT", [cap["status"]]
@@ -566,8 +749,8 @@ def _verdict(rep: Dict[str, Any], stress: Optional[float], drawdown: Optional[fl
     he = rep["hedge_effectiveness"]
     if he["upper95"] is None:
         return "INSUFFICIENT", ["HEDGE_EFFECTIVENESS_NOT_ESTIMABLE"]
-    if he["upper95"] >= 1.0:
-        return "INSUFFICIENT", ["HEDGE_NOT_SHOWN_TO_REMOVE_PRICE_RISK"]
+    if he["upper95"] >= HEDGE_RESIDUAL_RATIO_MAX:
+        return "INSUFFICIENT", ["HEDGE_NOT_SHOWN_TO_REMOVE_MOST_PRICE_RISK"]
     inc = rep["incremental_vs_passive_bps_per_day"]
     if inc["upper95"] is not None and inc["upper95"] < 0:
         return "INSUFFICIENT", ["SIGNIFICANTLY_WORSE_THAN_HOLDING_BTC"]
