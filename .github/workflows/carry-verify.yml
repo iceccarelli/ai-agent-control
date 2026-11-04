@@ -334,6 +334,7 @@ jobs:
           tests/test_control_plane_boundary.py
           tests/test_operator_tools.py
           tests/test_concurrency_and_dataflow.py
+          tests/test_close_testnet_experiment.py
 
       - name: Fly build context
         run: python tools/fly_stack.py --check
