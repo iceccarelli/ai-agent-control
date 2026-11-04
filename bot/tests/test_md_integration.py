@@ -142,12 +142,12 @@ def test_a_stale_book_refuses_the_snapshot_entirely(frozen_time):
 
 def test_a_dropped_connection_refuses_the_snapshot(frozen_time):
     st, now, wall = complete_state()
-    st.on_disconnected(E.SPOT)
+    st.on_disconnected(E.LINEAR)
     frozen_time(wall)
     b, _ = broker_for(st, now, wall)
     with pytest.raises(S.MarketUnusable) as exc:
         snapshot(b, wall)
-    assert "connection:DISCONNECTED:spot" in exc.value.reasons
+    assert "perp_connection:DISCONNECTED" in exc.value.reasons
 
 
 def test_without_a_settled_funding_print_there_is_no_snapshot(frozen_time):
@@ -202,14 +202,14 @@ def test_a_symbol_the_feed_does_not_serve_is_refused(frozen_time):
         b.get_book_top("BTCUSDT", "futures")
 
 
-def test_a_snapshot_detail_failure_refuses_entries(frozen_time):
+def test_a_snapshot_detail_failure_refuses_entries(frozen_time, monkeypatch):
     st, now, wall = complete_state()
     frozen_time(wall)
     b, _ = broker_for(st, now, wall)
 
-    def boom():
+    def boom(self):
         raise RuntimeError("detail broke")
-    b.snapshot_detail = boom
+    monkeypatch.setattr(MB.LiveFeedBroker, "snapshot_detail", boom)
     snap = snapshot(b, wall)
     assert snap.detail["entry_refusals"] == ["SNAPSHOT_DETAIL_UNREADABLE:RuntimeError"]
     assert gate(snap).reason == "MARKET_FEED_REFUSES_ENTRY"
@@ -326,3 +326,38 @@ def test_config_requires_a_directory_when_the_feed_is_enabled():
 
 def _base_env():
     return {"USE_TESTNET": "1", "PAPER_TRADING": "1"}
+
+
+def test_a_truthy_test_double_config_does_not_turn_the_feed_on(tmp_path):
+    """A mock config's auto-created attribute is truthy; only a real True counts."""
+    from unittest import mock
+    bot, broker = bare_bot(tmp_path, enabled=False)
+    bot.cfg = mock.MagicMock()
+    assert bot._market_feed_enabled() is False
+    assert bot._snapshot_source() is broker
+    bot.cfg.MARKET_FEED_ENABLED = "true"
+    assert bot._market_feed_enabled() is False                     # a string is not the flag either
+
+
+def test_a_stub_that_invents_attributes_cannot_inject_entry_refusals(frozen_time):
+    """The hook is declared on the class; an instance attribute (or a mock's
+    auto-attribute) is ignored."""
+    from unittest import mock
+
+    class Stub(mock.MagicMock):
+        pass
+    stub = Stub()
+    stub.get_mark.return_value = 80000.0
+    stub.get_spot_mark.return_value = 80010.0
+    stub.get_funding_bps.return_value = 1.0
+    stub.get_funding_print.return_value = (1.0, 1_793_836_800_000 - 8 * 3600 * 1000)
+    stub.get_perp_position.return_value = 0.0
+    stub.get_venue_time_s.side_effect = RuntimeError("no clock")
+    stub.get_book_top.side_effect = RuntimeError("no touch")
+    frozen_time(1_793_820_000_000)
+    snap = MS.take_snapshot(stub, perp_symbol="BTCUSDT", spot_symbol="BTCUSDT", now_s=1_793_820_000.0)
+    assert "entry_refusals" not in snap.detail
+
+
+def test_only_the_live_feed_broker_declares_the_hook():
+    assert MB.LiveFeedBroker.provides_snapshot_detail is True

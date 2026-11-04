@@ -29,8 +29,8 @@ MD_MODULES = ["md_events", "md_wire", "md_book", "md_state", "md_store", "md_eng
 #: Everything an md_ module may import. No client, no signer, no broker, no store
 #: of the trading state, no persistence, no config (and so no environment).
 ALLOWED_IMPORTS = {
-    "__future__", "base64", "collections", "dataclasses", "datetime", "hashlib", "json", "math",
-    "os", "random", "socket", "sqlite3", "ssl", "struct", "threading", "time", "typing", "urllib",
+    "__future__", "base64", "collections", "dataclasses", "datetime", "fcntl", "hashlib", "json", "math",
+    "os", "random", "re", "socket", "sqlite3", "ssl", "struct", "threading", "time", "typing", "urllib",
     "zlib", "ws_transport", "market_snapshot",
     "md_events", "md_wire", "md_book", "md_state", "md_store", "md_engine", "md_rest",
     "md_transport", "md_feed", "md_broker"}
@@ -164,3 +164,19 @@ def test_cli_status_summarises_the_log(tmp_path):
 def test_cli_collect_refuses_a_directory_inside_the_source_tree():
     with pytest.raises(ST.StoreError):
         md_run.main(["collect", "--dir", os.path.join(BOT, "state", "md"), "--seconds", "0"])
+
+
+# -- the economics layers are pure -------------------------------------------------------------------------------
+
+PURE = {"md_economics": {"__future__", "dataclasses", "math", "typing", "carry_costs", "strategy_evidence"},
+        "candidate_carry_depth_v1": {"__future__", "hashlib", "json", "math", "dataclasses", "typing",
+                                     "carry_costs", "md_economics", "md_state", "strategy_evidence"}}
+
+
+@pytest.mark.parametrize("mod", sorted(PURE))
+def test_the_economics_modules_are_pure(mod):
+    tree = _tree(mod)
+    assert _imports(tree) <= PURE[mod], sorted(_imports(tree) - PURE[mod])
+    toks = _code_text(tree)
+    for ident in ("environ", "getenv", "open", "socket", "time", "sleep", "place_order", "requests"):
+        assert ident not in toks, f"{mod} uses {ident!r}"

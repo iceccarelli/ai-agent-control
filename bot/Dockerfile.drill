@@ -24,7 +24,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py \
      carry_evidence.py performance_analytics.py owner_policy.py \
      margin_facts.py \
-     md_book.py md_broker.py md_engine.py md_events.py md_feed.py md_rest.py \
+     md_book.py md_broker.py md_economics.py md_engine.py md_events.py md_feed.py md_rest.py \
      md_state.py md_store.py md_transport.py md_wire.py ./
 COPY signals/ ./signals/
 COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \

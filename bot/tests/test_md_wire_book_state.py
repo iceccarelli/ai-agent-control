@@ -278,7 +278,7 @@ def test_disconnect_and_reconnect_invalidate_until_fresh_snapshots_arrive():
     (fr, ctx), _ = feed_fixture(st)
     st.on_disconnected(E.LINEAR)
     v = st.view(ctx.recv_mono_s, fr["recv_ms"])
-    assert "connection:DISCONNECTED:linear" in v.refusals(S.MONITOR)
+    assert "perp_connection:DISCONNECTED" in v.refusals(S.MONITOR)
     assert v.perp_bid is None and v.spot_bid is not None       # only the lost leg is lost
     st.on_connected(E.LINEAR)
     v = st.view(ctx.recv_mono_s, fr["recv_ms"])
@@ -371,3 +371,54 @@ def test_trades_are_deduplicated_by_id():
     st.ingest(W.parse_frame(frame, spot), category=E.SPOT)
     st.ingest(W.parse_frame(frame, spot), category=E.SPOT)
     assert len(st.trades[E.SPOT]) == 1
+
+
+# -- review round: totality and strict syntax ----------------------------------------------------------------
+
+def test_parse_frame_is_total_for_hostile_json():
+    huge = "9" * 400
+    frames = [
+        '{"topic":"%s","type":"delta","ts":%d,"data":{"s":"BTCUSDT","b":[["%s","1"]],"a":[],"u":5,"seq":50}}'
+        % (BOOK, TS, huge),
+        '{"topic":"%s","type":"delta","ts":%d,"data":{"s":"BTCUSDT","b":[],"a":[],"u":%s,"seq":50}}' % (BOOK, TS, huge),
+        "[" * 100_000,
+        '{"topic":"%s","type":"snapshot","ts":%d,"data":%s}' % (BOOK, TS, "[" * 50_000),
+        '{"topic":"publicTrade.BTCUSDT","type":"snapshot","ts":%d,"data":[{"T":%s,"s":"BTCUSDT","S":"Buy","v":"1","p":"1","i":"a"}]}' % (TS, huge),
+    ]
+    for raw in frames:
+        p = W.parse_frame(raw, CTX)               # must not raise, whatever the venue (or a proxy) sent
+        assert p.events == () or all(not isinstance(e, E.BookSnapshot) for e in p.events)
+        assert p.rejections or p.events == ()
+
+
+def test_integers_are_exact_and_numbers_are_ascii_decimal_only():
+    ok = W.parse_frame(book_frame(BOOK, "delta", TS, [], [], 9007199254740993, 5), CTX)
+    assert ok.events[0].update_id == 9007199254740993                    # no rounding through float
+    s = json.dumps({"topic": BOOK, "type": "delta", "ts": TS, "data": {"s": "BTCUSDT", "b": [], "a": [], "u": "9007199254740993", "seq": 1}})
+    assert W.parse_frame(s, CTX).events[0].update_id == 9007199254740993
+    for bad_u in ("5.9", 5.9, "٥٠", "1_000", " 5", "5 ", "0x10", "1e3", -4):
+        raw = json.dumps({"topic": BOOK, "type": "delta", "ts": TS,
+                          "data": {"s": "BTCUSDT", "b": [], "a": [], "u": bad_u, "seq": 1}})
+        assert W.parse_frame(raw, CTX).rejections, bad_u
+    for bad_px in ("1_000.5", "１２３", "1,5", "0x1p3", "  5", "5.5.5", "--5", "٣.٥"):
+        raw = book_frame(BOOK, "delta", TS, [(1, 1)], [], 5, 50).replace('"1"', json.dumps(bad_px), 1)
+        assert W.parse_frame(raw, CTX).rejections, bad_px
+    assert W.parse_frame(book_frame(BOOK, "delta", TS, [(100.5, 1e-3)], [], 5, 50), CTX).events
+    under = book_frame(BOOK, "delta", TS, [(100.0, 1.0)], [], 5, 50).replace('"1.0"]', '"1e-400"]')
+    assert W.parse_frame(under, CTX).rejections                          # underflow is not a delete
+    assert W.parse_frame(book_frame(BOOK, "delta", TS, [(100.0, 0)], [], 5, 50), CTX).events   # a real "0" is
+
+
+def test_a_unicode_digit_topic_depth_is_an_unknown_topic():
+    raw = book_frame(BOOK, "delta", TS, [], [], 5, 50).replace("orderbook.50", "orderbook.٥٠")
+    assert W.parse_frame(raw, CTX).rejections[0].reason == E.UNKNOWN_TOPIC
+
+
+def test_rest_parsing_is_total_too():
+    import md_rest as R
+    ctx = W.FrameContext(1, E.LINEAR, "rest", TS, 1.0, E.SOURCE_REST)
+    for body in ("[" * 100_000, '{"retCode":0,"result":{"list":[{"symbol":"BTCUSDT","fundingRate":"%s","fundingRateTimestamp":"1"}]}}' % ("9" * 400),
+                 '{"retCode":0,"result":{"category":"linear","list":[{"symbol":"BTCUSDT","priceFilter":{"tickSize":"1_0"},"lotSizeFilter":{}}]}}'):
+        for ep in ("/v5/market/funding/history", "/v5/market/instruments-info", "/v5/market/orderbook"):
+            p = R.parse_rest(ep, {"category": "linear"}, 200, body, ctx)
+            assert p.rejections and not (p.specs or p.prints or p.touch)

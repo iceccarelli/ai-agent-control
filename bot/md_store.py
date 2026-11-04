@@ -24,6 +24,7 @@ Durability: records are committed in small batches (``commit_every`` records or
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -125,16 +126,30 @@ def _chain(prev: str, kind: str, wall_ms: int, mono_s: float, category: str, con
     return h.hexdigest()
 
 
+def _code_root() -> str:
+    """The tree this code lives in: the nearest ancestor holding a `.git`, else the
+    code directory itself (the production image has no `.git`; its code directory
+    is /app, which also holds the trading state)."""
+    here = os.path.realpath(os.path.dirname(os.path.abspath(__file__)))
+    d = here
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return here
+        d = parent
+
+
 def _forbidden(path: str) -> Optional[str]:
-    p = os.path.abspath(path)
-    if os.path.basename(p) == "trading_state.db" or p.endswith("trading_state.db"):
+    """Why a store may not live at `path`, or None. Symlinks are resolved first,
+    so a link into the source tree is judged by where it lands."""
+    p = os.path.realpath(path)
+    if os.path.basename(p) == "trading_state.db":
         return "the trading runtime database"
-    here = os.path.dirname(os.path.abspath(__file__))
-    tracked_roots = (here, os.path.join(here, "state"), os.path.join(here, "artifacts"),
-                     os.path.join(here, "data"), os.path.join(here, "research"))
-    for root in tracked_roots:
-        if p == root or p.startswith(root + os.sep):
-            return f"a tracked source directory ({root})"
+    root = _code_root()
+    if p == root or p.startswith(root + os.sep):
+        return f"the source tree ({root})"
     return None
 
 
@@ -155,10 +170,18 @@ class MarketStore:
         self._last_commit = time.monotonic()
         self.commit_every = commit_every
         self.commit_interval_s = commit_interval_s
-        self._next_id, self._prev_chain = self._scan_tail()
-        #: "mainnet" | "testnet" | None (a reader that does not care). A store
-        #: holds ONE environment: mainnet and testnet prices must never meet.
+        self._lock_fd: Optional[int] = None
+        self._latest_day: str = ""
+        #: "mainnet" | "testnet" | None (a read-only handle that does not care). A
+        #: store holds ONE environment: mainnet and testnet prices must never meet.
         self.environment = self._check_environment(environment)
+        self._writable = environment is not None
+        if environment is not None:
+            self._take_writer_lock()           # exactly one writer per directory
+        self._next_id, self._prev_chain = self._scan_tail()
+        segs = self.segments()
+        if segs:
+            self._latest_day = segs[-1][3:11]
 
     # -- segments ---------------------------------------------------------------------
 
@@ -181,6 +204,15 @@ class MarketStore:
             if row:
                 return int(row[0]) + 1, bytes(row[1]).hex()
         return 1, GENESIS
+
+    def _take_writer_lock(self) -> None:
+        fd = os.open(os.path.join(self.dir, "LOCK"), os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            os.close(fd)
+            raise StoreError(f"{self.dir} already has a writer: {exc}") from exc
+        self._lock_fd = fd
 
     def _env_file(self) -> str:
         return os.path.join(self.dir, "ENVIRONMENT")
@@ -240,6 +272,8 @@ class MarketStore:
 
     def append(self, kind: str, *, wall_ms: int, mono_s: float, category: str = "",
                conn_id: str = "", topic: str = "", payload: str) -> Record:
+        if not self._writable:
+            raise StoreError("this store was opened read-only (no environment given): it cannot append")
         if kind not in KINDS:
             raise StoreError(f"unknown record kind {kind!r}")
         if not isinstance(payload, str):
@@ -247,7 +281,10 @@ class MarketStore:
         data = payload.encode("utf-8")
         sha = hashlib.sha256(data).hexdigest()
         with self._lock:
-            conn = self._open(_utc_day(wall_ms))
+            # Never back to an earlier segment: a wall clock stepped backwards (or a
+            # thread racing across midnight) must not interleave two files.
+            self._latest_day = max(self._latest_day, _utc_day(wall_ms))
+            conn = self._open(self._latest_day)
             rid = self._next_id
             chain = _chain(self._prev_chain, kind, wall_ms, mono_s, category, conn_id, topic, sha)
             conn.execute(
@@ -279,6 +316,11 @@ class MarketStore:
             if self._conn is not None:
                 self._conn.close()
                 self._conn = None
+            if self._lock_fd is not None:
+                try:
+                    os.close(self._lock_fd)         # releases the flock
+                finally:
+                    self._lock_fd = None
 
     # -- reading --------------------------------------------------------------------------------
 

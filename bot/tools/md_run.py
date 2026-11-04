@@ -71,8 +71,8 @@ def cmd_collect(a: argparse.Namespace) -> int:
             time.sleep(a.status_every)
             v = feed.view()
             line = summarize(v)
-            line["frames"] = state.frames
-            line["rejections"] = dict(state.rejections)
+            line["frames"] = eng.state.frames
+            line["rejections"] = dict(eng.state.rejections)
             line["rest_error"] = feed.rest.last_error if feed.rest else None
             print(json.dumps(line, sort_keys=True), flush=True)
     except KeyboardInterrupt:
@@ -81,7 +81,7 @@ def cmd_collect(a: argparse.Namespace) -> int:
         feed.stop()
         store.flush()
     print(json.dumps({"final": {"records": store.count(), "chain_problems": store.verify(),
-                                "health": state.health()}}, sort_keys=True, default=str))
+                                "health": eng.state.health(), "feed": feed.status()}}, sort_keys=True, default=str))
     return 0
 
 

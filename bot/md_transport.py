@@ -30,6 +30,8 @@ OP_TEXT, OP_BINARY, OP_CLOSE, OP_PING, OP_PONG, OP_CONT = (
 class PublicWebSocket(WT.PrivateWebSocket):
     #: Largest reassembled message accepted.
     MAX_MESSAGE_BYTES = 4 << 20
+    #: A venue message is a handful of frames; this many is an attack or a bug.
+    MAX_FRAGMENTS = 1000
 
     def __init__(self, url: str, *, proxy_url: Optional[str] = None,
                  ca_file: Optional[str] = None, connect_timeout: float = 10.0) -> None:
@@ -140,10 +142,19 @@ class PublicWebSocket(WT.PrivateWebSocket):
         parts = [payload]
         total = len(payload)
         first_op = opcode
+        frames = 1
         while not fin:
-            frame_fin, opcode, more = self._read_frame(sock, self.MID_FRAME_TIMEOUT_S)
+            try:
+                frame_fin, opcode, more = self._read_frame(sock, self.MID_FRAME_TIMEOUT_S)
+            except socket.timeout as exc:             # the rest of the message never came
+                raise WT.WSClosed("timed out between the fragments of a message") from exc
+            frames += 1
+            if frames > self.MAX_FRAGMENTS:
+                raise WT.WSProtocolError("too many fragments in one message")
             if opcode in (OP_PING, OP_PONG):          # control frames may interleave; they
-                if opcode == OP_PING:                  # say nothing about the message's FIN
+                if not frame_fin or len(more) > 125:  # say nothing about the message's FIN
+                    raise WT.WSProtocolError("control frame must be final and <= 125 bytes")
+                if opcode == OP_PING:
                     self.send_pong(more)
                 continue
             if opcode == OP_CLOSE:

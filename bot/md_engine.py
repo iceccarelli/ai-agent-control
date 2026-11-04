@@ -8,10 +8,11 @@ reproduces every logged view exactly (`replay`).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import md_events as E
 import md_rest as R
@@ -33,26 +34,71 @@ class Engine:
         self.lock = threading.RLock()
         self.last_pong_mono: Dict[str, float] = {}
         self.sub_failures: List[str] = []
+        self._unlogged = 0
 
     # -- live helpers: append then apply, atomically ------------------------------------
 
-    def record(self, kind: str, *, wall_ms: int, mono_s: float, category: str = "",
+    def record(self, kind: str, *, wall_ms: Union[int, Callable[[], int]],
+               mono_s: Union[float, Callable[[], float]], category: str = "",
                conn_id: str = "", topic: str = "", payload: str) -> ApplyOutcome:
+        """Append, then apply, atomically. `wall_ms` / `mono_s` may be callables:
+        they are then sampled INSIDE the lock, so the log's order, its timestamps
+        and the order of application all agree (a clock sampled before a contended
+        lock can arrive out of order, and a stepped wall clock can run backwards).
+
+        A store failure never kills the caller. The input is still applied (the
+        market is live) but the state is flagged `store_fault`: entries need a
+        reproducible record and stop until the log is writable again, at which
+        point a `store_gap` marker invalidates every book so live and replay
+        converge on the same unsynced state."""
         if self.store is None:
             raise RuntimeError("no store attached; use apply() on a Record")
         with self.lock:
-            rec = self.store.append(kind, wall_ms=wall_ms, mono_s=mono_s, category=category,
-                                    conn_id=conn_id, topic=topic, payload=payload)
+            w = int(wall_ms() if callable(wall_ms) else wall_ms)
+            m = float(mono_s() if callable(mono_s) else mono_s)
+            if self._unlogged and kind != ST.VIEW:
+                try:
+                    gap = self.store.append(ST.CONN, wall_ms=w, mono_s=m, category="", conn_id="",
+                                            topic="", payload=json.dumps(
+                                                {"event": "store_gap", "unlogged": self._unlogged}))
+                except Exception as exc:  # noqa: BLE001 - still down
+                    self.state.store_fault = f"{type(exc).__name__}: {exc}"[:120]
+                    self._unlogged += 1
+                    return self.apply(ST.Record(0, kind, w, m, category, conn_id, topic, payload))
+                self._unlogged = 0
+                self.apply(gap)
+            try:
+                rec = self.store.append(kind, wall_ms=w, mono_s=m, category=category,
+                                        conn_id=conn_id, topic=topic, payload=payload)
+            except Exception as exc:  # noqa: BLE001 - disk full, locked, corrupt: do not die
+                self.state.store_fault = f"{type(exc).__name__}: {exc}"[:120]
+                self._unlogged += 1
+                return self.apply(ST.Record(0, kind, w, m, category, conn_id, topic, payload))
             return self.apply(rec)
+
+    def start_session(self, wall_ms: Union[int, Callable[[], int]],
+                      mono_s: Union[float, Callable[[], float]]) -> ApplyOutcome:
+        """Write down what this run is (symbol, depth, environment, policy) and
+        start from a fresh state. A replay meets the same record and does the same,
+        so a store that spans restarts replays exactly as it ran."""
+        st = self.state
+        payload = json.dumps({"event": "session_start", "symbol": st.symbol, "depth": st.depth,
+                              "environment": st.environment,
+                              "policy": dataclasses.asdict(st.policy)}, sort_keys=True)
+        return self.record(ST.CONN, wall_ms=wall_ms, mono_s=mono_s, payload=payload)
 
     def log_view(self, now_mono_s: float, now_wall_ms: int) -> S.MarketView:
         """Compute the view and write it to the log at this exact point in the
         stream (so a replay can recompute and compare it)."""
         with self.lock:
             view = self.state.view(now_mono_s, now_wall_ms)
-            if self.store is not None:
-                self.store.append(ST.VIEW, wall_ms=now_wall_ms, mono_s=now_mono_s,
-                                  payload=ST.view_payload(view.to_dict(), self.store._next_id - 1))
+            if self.store is not None and not self._unlogged:
+                try:
+                    self.store.append(ST.VIEW, wall_ms=now_wall_ms, mono_s=now_mono_s,
+                                      payload=ST.view_payload(view.to_dict(), self.store._next_id - 1))
+                except Exception as exc:  # noqa: BLE001
+                    self.state.store_fault = f"{type(exc).__name__}: {exc}"[:120]
+                    self._unlogged += 1
             return view
 
     # -- the one state transition ------------------------------------------------------------
@@ -72,6 +118,18 @@ class Engine:
             self._rest(rec, out)
         return out
 
+    def _session_start(self, info: Dict[str, Any]) -> None:
+        try:
+            known = {f.name for f in dataclasses.fields(S.MarketPolicy)}
+            policy = S.MarketPolicy(**{k: v for k, v in (info.get("policy") or {}).items() if k in known})
+            self.state = S.MarketState(str(info["symbol"]), policy, int(info["depth"]),
+                                       str(info["environment"]))
+        except (KeyError, TypeError, ValueError):
+            return
+        self.last_pong_mono.clear()
+        self.sub_failures.clear()
+        self._unlogged = 0
+
     def _control(self, rec: ST.Record, ctl: Dict[str, Any], out: ApplyOutcome) -> None:
         op = ctl.get("op")
         if op == "ping" or ctl.get("ret_msg") == "pong" or op == "pong":
@@ -89,6 +147,20 @@ class Engine:
             info = json.loads(rec.payload)
             event = info["event"]
         except (ValueError, KeyError, TypeError):
+            return
+        if event == "session_start":
+            self._session_start(info)
+            return
+        if event == "store_gap":
+            # inputs were applied live but never logged: nothing the books hold is
+            # reproducible. Invalidate them; they resync from fresh snapshots.
+            for c in (E.LINEAR, E.SPOT):
+                self.state.invalidate_book(c, "STORE_GAP")
+                self.state.tickers[c].reset()
+            self.state.store_fault = None
+            out.incidents.append(E.Incident(E.RESYNC_REQUESTED,
+                                            f"store gap: {info.get('unlogged')} unlogged inputs",
+                                            rec.wall_ms, rec.mono_s, "", "", {"category": ""}))
             return
         cat = rec.category
         if cat not in self.state.connected:
@@ -159,8 +231,7 @@ def replay(store: ST.MarketStore, *, symbol: str = "BTCUSDT",
            verify_chain: bool = True) -> ReplayReport:
     """Fold every stored record through a fresh state; recompute and compare each
     logged view. Any mismatch is a determinism failure."""
-    state = S.MarketState(symbol, policy, depth, store.environment or "mainnet")
-    eng = Engine(state)
+    eng = Engine(S.MarketState(symbol, policy, depth, store.environment or "mainnet"))
     rep = ReplayReport()
     if verify_chain:
         rep.chain_problems = store.verify()
@@ -168,7 +239,7 @@ def replay(store: ST.MarketStore, *, symbol: str = "BTCUSDT",
         rep.records += 1
         if rec.kind == ST.VIEW:
             logged = json.loads(rec.payload)["view"]
-            fresh = json.loads(json.dumps(state.view(rec.mono_s, rec.wall_ms).to_dict(),
+            fresh = json.loads(json.dumps(eng.state.view(rec.mono_s, rec.wall_ms).to_dict(),
                                           sort_keys=True))
             rep.views_checked += 1
             if fresh != logged:
@@ -177,6 +248,6 @@ def replay(store: ST.MarketStore, *, symbol: str = "BTCUSDT",
         if rec.kind == ST.FRAME:
             rep.frames += 1
         rep.incidents += eng.apply(rec).incidents
-    rep.final_digest = state.digest()
-    rep.rejections = dict(state.rejections)
+    rep.final_digest = eng.state.digest()
+    rep.rejections = dict(eng.state.rejections)
     return rep

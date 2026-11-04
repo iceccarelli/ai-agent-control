@@ -83,6 +83,8 @@ class ScriptedWS:
         item = self.script.pop(0)
         if item[0] == "text":
             return WT.OP_TEXT, item[1].encode()
+        if item[0] == "binary":
+            return WT.OP_BINARY, item[1]
         if item[0] == "timeout":
             raise TimeoutError("scripted timeout")
         if item[0] == "raise":

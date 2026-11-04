@@ -34,6 +34,10 @@ import md_state as S
 
 
 class LiveFeedBroker:
+    #: `market_snapshot.take_snapshot` merges `snapshot_detail()` only from a class
+    #: that declares this, so no stub or mock can inject entry refusals by accident.
+    provides_snapshot_detail = True
+
     def __init__(self, view_provider: Callable[[], S.MarketView], delegate: Any, *,
                  expected_environment: str, perp_symbol: str, spot_symbol: str) -> None:
         if expected_environment not in ("mainnet", "testnet"):
@@ -80,10 +84,17 @@ class LiveFeedBroker:
         return self._need(self._pin().perp_mark, "perp_mark")
 
     def get_spot_mark(self, symbol: str) -> float:
-        """The spot reference: the MID of the live spot touch (an observed bid
-        and ask, not a last trade that may be minutes old)."""
+        """The spot reference: the MID of the live spot touch (an observed bid and
+        ask, not a last trade that may be minutes old). If the spot book is not
+        usable, the perpetual's own INDEX price (an observed spot-market average
+        stated on the perp ticker) stands in so a HELD pair stays managed; the
+        fallback is named in `snapshot_detail()` and entries are refused while the
+        spot book is down (the `spot_book` status is an entry requirement)."""
         self._check_symbol(symbol, self.spot_symbol)
-        return self._need(self._current().spot_mid, "spot_mid")
+        v = self._current()
+        if v.spot_mid is not None:
+            return self._need(v.spot_mid, "spot_mid")
+        return self._need(v.perp_index, "spot_mid_or_index")
 
     def get_funding_bps(self, symbol: str) -> float:
         """The venue's forecast funding rate for the next settlement, in bps."""
@@ -155,6 +166,7 @@ class LiveFeedBroker:
             refusals.append(f"environment:{v.environment}")
         return {
             "market_source": "live_feed",
+            "spot_reference": "SPOT_BOOK_MID" if v.spot_mid is not None else "PERP_INDEX_FALLBACK",
             "environment": v.environment,
             "entry_refusals": refusals,
             "feed_clock_skew_ms": v.clock_skew_ms,
@@ -163,4 +175,7 @@ class LiveFeedBroker:
             "feed_spot_book_age_s": v.spot_book_age_s,
             "feed_observed_wall_ms": v.observed_wall_ms,
             "feed_statuses": [[s.name, s.ok, s.reason] for s in v.statuses],
+            #: the displayed book, best first, for the entry-benefit gate's cost walk
+            "depth": {"perp_bids": [list(x) for x in v.perp_bids], "perp_asks": [list(x) for x in v.perp_asks],
+                      "spot_bids": [list(x) for x in v.spot_bids], "spot_asks": [list(x) for x in v.spot_asks]},
         }

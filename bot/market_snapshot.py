@@ -376,10 +376,11 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     # A broker that serves its public reads from a validated live feed says what
     # that feed refuses ENTRIES on. If it cannot say, entries are refused: a
     # source that cannot describe its own shortfalls is not trusted to have none.
-    extra = getattr(broker, "snapshot_detail", None)
-    if callable(extra):
+    # Declared on the CLASS (`provides_snapshot_detail = True`), never discovered
+    # on an instance: a stub that invents attributes must not change an entry.
+    if getattr(type(broker), "provides_snapshot_detail", False) is True:
         try:
-            detail.update(dict(extra()))
+            detail.update(dict(broker.snapshot_detail()))
         except Exception as exc:  # noqa: BLE001
             detail["entry_refusals"] = [f"SNAPSHOT_DETAIL_UNREADABLE:{type(exc).__name__}"]
     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=funding,

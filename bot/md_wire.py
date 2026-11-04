@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +42,14 @@ _TICKER_NONNEG = ("bid1Size", "ask1Size", "openInterest", "openInterestValue",
                   "turnover24h", "volume24h", "singleOpenInterest",
                   "singleOpenInterestValue", "fundingCap")
 _TICKER_FINITE = ("price24hPcnt",)
+
+
+#: ASCII decimal syntax only. Python's float()/int() also accept underscores,
+#: fullwidth and other Unicode digits, and silently round huge integers through
+#: float; a venue frame is none of those.
+_NUM_RE = re.compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+_INT_RE = re.compile(r"^[0-9]+$")
+_INT64_MAX = (1 << 63) - 1
 
 
 class _Bad(Exception):
@@ -74,12 +83,22 @@ class Parsed:
 def _num(value: Any, name: str, *, positive: bool = False, nonneg: bool = False) -> float:
     if isinstance(value, bool) or value is None:
         raise _Bad(E.BAD_NUMBER, f"{name} is {value!r}")
+    if isinstance(value, str):
+        if not _NUM_RE.match(value):
+            raise _Bad(E.BAD_NUMBER, f"{name} is {value[:40]!r}")
+        text: Optional[str] = value
+    elif isinstance(value, (int, float)):
+        text = None
+    else:
+        raise _Bad(E.BAD_NUMBER, f"{name} is {type(value).__name__}")
     try:
         x = float(value)
-    except (TypeError, ValueError):
-        raise _Bad(E.BAD_NUMBER, f"{name} is {value!r}") from None
+    except (TypeError, ValueError, OverflowError):
+        raise _Bad(E.BAD_NUMBER, f"{name} is not a number") from None
     if not math.isfinite(x):
-        raise _Bad(E.BAD_NUMBER, f"{name} is not finite: {value!r}")
+        raise _Bad(E.BAD_NUMBER, f"{name} is not finite")
+    if x == 0.0 and text is not None and re.search(r"[1-9]", text.split("e")[0].split("E")[0]):
+        raise _Bad(E.BAD_NUMBER, f"{name} {text[:40]!r} underflows to zero")
     if positive and not x > 0:
         raise _Bad(E.BAD_PRICE, f"{name} must be > 0, got {value!r}")
     if nonneg and x < 0:
@@ -88,12 +107,18 @@ def _num(value: Any, name: str, *, positive: bool = False, nonneg: bool = False)
 
 
 def _int(value: Any, name: str, *, positive: bool = True) -> int:
+    """An exact integer: a JSON int, or an ASCII-digit string. Never a float, never
+    rounded through a float, never a Unicode digit."""
     if isinstance(value, bool) or value is None:
         raise _Bad(E.BAD_NUMBER, f"{name} is {value!r}")
-    try:
-        x = int(float(value)) if not isinstance(value, int) else value
-    except (TypeError, ValueError, OverflowError):
-        raise _Bad(E.BAD_NUMBER, f"{name} is {value!r}") from None
+    if isinstance(value, int):
+        x = value
+    elif isinstance(value, str) and _INT_RE.match(value) and len(value) <= 19:
+        x = int(value)
+    else:
+        raise _Bad(E.BAD_NUMBER, f"{name} is not an exact integer: {str(value)[:40]!r}")
+    if x > _INT64_MAX or x < -_INT64_MAX:
+        raise _Bad(E.BAD_NUMBER, f"{name} exceeds 64 bits")
     if positive and x <= 0:
         raise _Bad(E.BAD_NUMBER, f"{name} must be > 0, got {value!r}")
     return x
@@ -136,8 +161,8 @@ def _prov(ctx: FrameContext, topic: str, j: Dict[str, Any], *,
     def opt(key: str) -> Optional[int]:
         v = j.get(key)
         try:
-            return int(v) if v is not None and not isinstance(v, bool) else None
-        except (TypeError, ValueError, OverflowError):
+            return _int(v, key) if v is not None else None
+        except _Bad:
             return None
     return E.Provenance(raw_id=ctx.raw_id, source=ctx.source, conn_id=ctx.conn_id,
                         topic=topic, recv_wall_ms=ctx.recv_wall_ms,
@@ -148,7 +173,7 @@ def _prov(ctx: FrameContext, topic: str, j: Dict[str, Any], *,
 def _split_topic(topic: str) -> Tuple[str, int, str]:
     """('orderbook', depth, symbol) | ('tickers', 0, symbol) | ('publicTrade', 0, symbol)."""
     parts = topic.split(".")
-    if parts[0] == "orderbook" and len(parts) == 3 and parts[1].isdigit():
+    if parts[0] == "orderbook" and len(parts) == 3 and _INT_RE.match(parts[1]):
         return "orderbook", int(parts[1]), parts[2]
     if parts[0] in ("tickers", "publicTrade") and len(parts) == 2:
         return parts[0], 0, parts[1]
@@ -156,7 +181,7 @@ def _split_topic(topic: str) -> Tuple[str, int, str]:
 
 
 def _check_symbol(symbol: str) -> None:
-    if not symbol or not symbol.isalnum() or symbol != symbol.upper():
+    if not symbol or not symbol.isascii() or not symbol.isalnum() or symbol != symbol.upper():
         raise _Bad(E.BAD_SYMBOL, f"symbol {symbol!r}")
 
 
@@ -170,7 +195,7 @@ def parse_frame(raw: str, ctx: FrameContext) -> Parsed:
 
     try:
         j = json.loads(raw)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError, MemoryError):
         return reject(E.NOT_JSON, f"{str(raw)[:80]!r}")
     if not isinstance(j, dict):
         return reject(E.NOT_AN_OBJECT, f"{type(j).__name__}")
@@ -198,6 +223,8 @@ def parse_frame(raw: str, ctx: FrameContext) -> Parsed:
         except _Bad:
             pass
         return reject(bad.reason, bad.detail, topic, j, sym)
+    except Exception as exc:  # noqa: BLE001 - parse_frame is total: no venue input may raise out of it
+        return reject(E.BAD_NUMBER, f"unparseable frame: {type(exc).__name__}", str(topic)[:80], j)
 
 
 def _book(j, ctx, topic, depth, symbol, typ, data) -> Parsed:
@@ -262,8 +289,8 @@ def _ticker(j, ctx, topic, symbol, typ, data) -> Parsed:
 
 def _opt_int(v: Any) -> Optional[int]:
     try:
-        return int(v) if v is not None and not isinstance(v, bool) else None
-    except (TypeError, ValueError, OverflowError):
+        return _int(v, "x") if v is not None else None
+    except _Bad:
         return None
 
 

@@ -24,7 +24,7 @@ TS0 = 1_793_820_000_000
 
 
 def new_engine(tmp_path, **kw):
-    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1)
+    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1, environment="mainnet")
     return EN.Engine(S.MarketState("BTCUSDT"), store), store
 
 
@@ -56,11 +56,11 @@ def test_store_refuses_the_runtime_database_and_tracked_trees(tmp_path):
                 os.path.join(here, "artifacts", "md"), here):
         with pytest.raises(ST.StoreError):
             ST.MarketStore(bad)
-    ST.MarketStore(str(tmp_path / "ok")).close()
+    ST.MarketStore(str(tmp_path / "ok"), environment="mainnet").close()
 
 
 def test_append_read_back_exactly_and_the_chain_verifies(tmp_path):
-    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1)
+    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1, environment="mainnet")
     raw = '{"exact":"text  with   odd spacing","n":1.10}'
     a = store.append(ST.FRAME, wall_ms=TS0, mono_s=1.5, category="linear", conn_id="c", payload=raw)
     store.append(ST.CONN, wall_ms=TS0 + 1, mono_s=1.6, category="linear", payload='{"event":"x"}')
@@ -71,7 +71,7 @@ def test_append_read_back_exactly_and_the_chain_verifies(tmp_path):
 
 
 def test_the_log_is_append_only_and_tampering_is_detected(tmp_path):
-    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1)
+    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1, environment="mainnet")
     for i in range(5):
         store.append(ST.FRAME, wall_ms=TS0 + i, mono_s=float(i), category="spot", payload=f'{{"i":{i}}}')
     seg = os.path.join(store.dir, store.segments()[0])
@@ -91,20 +91,20 @@ def test_the_log_is_append_only_and_tampering_is_detected(tmp_path):
 
 def test_ids_continue_across_reopen_and_utc_day_segments(tmp_path):
     d = str(tmp_path / "md")
-    s1 = ST.MarketStore(d, commit_every=1)
+    s1 = ST.MarketStore(d, commit_every=1, environment="mainnet")
     day1 = 1_793_836_700_000                   # 2026-11-04 23:58:20 UTC
     s1.append(ST.FRAME, wall_ms=day1, mono_s=1.0, category="spot", payload="a")
     s1.append(ST.FRAME, wall_ms=day1 + 300_000, mono_s=2.0, category="spot", payload="b")   # next UTC day
     s1.close()
     assert len(s1.segments()) == 2
-    s2 = ST.MarketStore(d, commit_every=1)
+    s2 = ST.MarketStore(d, commit_every=1, environment="mainnet")
     r = s2.append(ST.FRAME, wall_ms=day1 + 300_001, mono_s=3.0, category="spot", payload="c")
     assert r.id == 3 and [x.payload for x in s2.iter_records()] == ["a", "b", "c"]
     assert s2.verify() == []
 
 
 def test_a_preset_dictionary_makes_small_frames_much_smaller(tmp_path):
-    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1)
+    store = ST.MarketStore(str(tmp_path / "md"), commit_every=1, environment="mainnet")
     frames = [fr["raw"] for fr in load_frames()[:300]]
     raw = sum(len(f.encode()) for f in frames)
     packed = sum(len(ST._compress(f.encode())) for f in frames)
@@ -115,7 +115,7 @@ def test_a_preset_dictionary_makes_small_frames_much_smaller(tmp_path):
 
 def test_pruning_whole_old_segments_keeps_the_rest_verifiable(tmp_path):
     d = str(tmp_path / "md")
-    store = ST.MarketStore(d, commit_every=1)
+    store = ST.MarketStore(d, commit_every=1, environment="mainnet")
     day = 86_400_000
     base = 1_793_750_400_000                       # 2026-11-04 00:00 UTC
     for i in range(3):
@@ -126,18 +126,19 @@ def test_pruning_whole_old_segments_keeps_the_rest_verifiable(tmp_path):
     removed = store.prune_segments_before("20261105")           # only the 4th Nov segment is older
     assert removed == ["md-20261104.db"] and len(store.segments()) == 2
     assert store.verify() == []                                  # checkpointed by pruned.jsonl
-    reopened = ST.MarketStore(d, commit_every=1)
+    store.close()
+    reopened = ST.MarketStore(d, commit_every=1, environment="mainnet")
     r = reopened.append(ST.FRAME, wall_ms=base + 3 * day, mono_s=99.0, category="spot", payload="{}")
     assert r.id == 13 and reopened.verify() == []
-    assert store.prune_segments_before("20250101") == []         # nothing is older
-    # `store` is still writing 20261106 and never removes the segment it has open
-    assert store.prune_segments_before("29991231") == ["md-20261105.db"]
-    assert store.segments() == ["md-20261106.db", "md-20261107.db"] and store.verify() == []
+    assert reopened.prune_segments_before("20250101") == []         # nothing is older
+    # the writer never removes the segment it has open (20261107)
+    assert reopened.prune_segments_before("29991231") == ["md-20261105.db", "md-20261106.db"]
+    assert reopened.segments() == ["md-20261107.db"] and reopened.verify() == []
 
 
 def test_pruning_never_touches_the_newest_segment_and_a_missing_prefix_is_caught(tmp_path):
     d = str(tmp_path / "md")
-    store = ST.MarketStore(d, commit_every=1)
+    store = ST.MarketStore(d, commit_every=1, environment="mainnet")
     day = 86_400_000
     base = 1_793_750_400_000
     for i in range(3):
@@ -147,16 +148,16 @@ def test_pruning_never_touches_the_newest_segment_and_a_missing_prefix_is_caught
     assert store.verify() == []
     # a deleted segment with no prune record is a hole, and is reported
     d2 = str(tmp_path / "md2")
-    s2 = ST.MarketStore(d2, commit_every=1)
+    s2 = ST.MarketStore(d2, commit_every=1, environment="mainnet")
     for i in range(3):
         s2.append(ST.FRAME, wall_ms=base + i * day, mono_s=float(i), category="spot", payload="{}")
     s2.close()
     os.remove(os.path.join(d2, "md-20261105.db"))
-    assert any("does not continue" in p or "id gap" in p for p in ST.MarketStore(d2).verify())
+    assert any("does not continue" in p or "id gap" in p for p in ST.MarketStore(d2, environment="mainnet").verify())
 
 
 def test_unknown_kinds_and_non_text_payloads_are_refused(tmp_path):
-    store = ST.MarketStore(str(tmp_path / "md"))
+    store = ST.MarketStore(str(tmp_path / "md"), environment="mainnet")
     with pytest.raises(ST.StoreError):
         store.append("mystery", wall_ms=TS0, mono_s=0.0, payload="x")
     with pytest.raises(ST.StoreError):
@@ -338,10 +339,11 @@ def test_a_missing_pong_is_a_lost_heartbeat(tmp_path):
     ws = ScriptedWS([snap_frame(clock)], auto_pong=False)
     w, eng, store, factory, _ = make_feed(tmp_path, [ws], clock=clock)
     w.step(); w.step()
-    for _ in range(40):
+    for i in range(40):
         clock.advance(1.0)
-        ws.push(("text", ticker_frame("delta", clock.w, markPrice="80000")))     # data keeps flowing
-        w.step()
+        ws.push(("text", ticker_frame("delta", clock.w, markPrice="80000")),             # data keeps flowing
+                ("text", book_frame(BOOK, "delta", clock.w, [(100.0, 1.0 + i)], [], 101 + i, 1001 + i)))
+        w.step(); w.step()
         if w.ws is None:
             break
     assert w.ws is None

@@ -335,12 +335,16 @@ class TradingBot:
                 "memory": self._memory_health(),
                 "policy": self._policy_health(),
                 "observation_status": self.observation_status,
-                "market_feed": self._market_feed_state,
+                "market_feed": self._market_feed_status(),
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
 
     #: Class-level defaults so a bot built without __init__ (tests, tools) works.
+    market_feed: Any = None
+    market_feed_broker: Any = None
+    _market_feed_state = "DISABLED"
+    _market_feed_factory: Any = None
     _last_tick_ok_epoch = 0.0
     _tick_failures = 0
     #: A loop is called stalled after this many consecutive failed cycles, or when
@@ -679,8 +683,21 @@ class TradingBot:
         self.session.start(reconciled=self._reconciled)
         return True
 
+    def _market_feed_enabled(self) -> bool:
+        """True only for a real ``True`` in the config. A test double's
+        auto-created attribute (or any truthy non-bool) must not move where a
+        trading engine reads its market."""
+        return getattr(getattr(self, "cfg", None), "MARKET_FEED_ENABLED", False) is True
+
     def _market_feed_environment(self) -> str:
-        """Whose prices the feed must carry: the venue the account client talks to."""
+        """Whose prices the feed must carry: the venue the account client talks to.
+        Bybit DEMO trading runs on REAL mainnet market data with simulated matching,
+        so a demo engine is fed mainnet prices, never testnet's."""
+        venue = getattr(getattr(self, "cfg", None), "BYBIT_VENUE", None)
+        if isinstance(venue, str) and venue.strip().lower() in ("mainnet", "demo"):
+            return "mainnet"
+        if isinstance(venue, str) and venue.strip().lower() == "testnet":
+            return "testnet"
         return "testnet" if bool(getattr(self.cfg, "USE_TESTNET", True)) else "mainnet"
 
     def _start_market_feed(self) -> None:
@@ -689,7 +706,7 @@ class TradingBot:
         start is a carry book with no market view: every snapshot is refused
         (never a silent fall-back to another source) and held pairs fall to the
         viewless venue-position watch."""
-        if self.carry is None or not bool(getattr(self.cfg, "MARKET_FEED_ENABLED", False)):
+        if self.carry is None or not self._market_feed_enabled():
             self._market_feed_state = "DISABLED"
             return
         try:
@@ -722,6 +739,20 @@ class TradingBot:
             self.market_feed_broker = None
             self._market_feed_state = "FAILED_TO_START"
 
+    def _market_feed_status(self) -> str:
+        """RUNNING only while every feed thread is alive and the log is writable."""
+        state = self._market_feed_state
+        feed = self.market_feed
+        if state != "RUNNING" or feed is None:
+            return state
+        try:
+            st = feed.status()
+        except Exception:  # noqa: BLE001
+            return "DEGRADED"
+        if not st.get("threads_alive") or st.get("store_fault"):
+            return "DEGRADED"
+        return "RUNNING"
+
     def _stop_market_feed(self) -> None:
         feed, self.market_feed = self.market_feed, None
         if feed is not None:
@@ -736,7 +767,7 @@ class TradingBot:
         """What `take_snapshot` reads: the live feed when it is enabled, else the
         account broker (REST polling, unchanged). An enabled feed that is not
         running raises instead of falling back."""
-        if not bool(getattr(self.cfg, "MARKET_FEED_ENABLED", False)):
+        if not self._market_feed_enabled():
             return self.carry.broker
         if self.market_feed_broker is None or self._market_feed_state != "RUNNING":
             from md_state import MarketUnusable, MONITOR
@@ -1472,9 +1503,14 @@ class TradingBot:
                         "reason": str(watched.reason),
                         "state": watched.state.value,
                         "at_ms": int(time.time() * 1000)}
-                    logger.critical(
-                        "carry book HALTED without a market view: %s",
-                        watched.reason)
+                    if getattr(watched.state, "name", "") == "HALTED":
+                        logger.critical(
+                            "carry book HALTED without a market view: %s",
+                            watched.reason)
+                    else:
+                        logger.warning(
+                            "carry book acted without a market view: %s (%s)",
+                            watched.reason, watched.state.value)
                 return
             mark, spot = view.perp_mark, view.spot_mark
             # An accounting journal that cannot be written down is a book whose

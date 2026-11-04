@@ -63,6 +63,9 @@ class MarketPolicy:
     #: Perp and spot touch must agree with the REST reference within this many
     #: bps (they are not simultaneous, so this is wide on purpose).
     rest_ws_tolerance_bps: float = 20.0
+    #: Instrument rules (tick, step, minimums, status) older than this are not
+    #: current; the feed re-reads them hourly, so a day means the REST path is down.
+    specs_max_age_s: float = 86_400.0
     #: Most recent frames kept per rejection counter and incident log.
     incident_log: int = 500
     trade_tape: int = 2000
@@ -186,9 +189,11 @@ class MarketView:
         return d
 
 
-_ENTRY_NEEDS = ("connection", "perp_book", "spot_book", "perp_ticker", "clock",
-                "instruments", "rest_agreement", "funding_print")
-_MONITOR_NEEDS = ("connection", "perp_book", "perp_ticker")
+#: Management of a HELD pair needs only the perpetual's own feed. The spot leg is
+#: the owner's coin in overlay mode: a spot outage must not blind the exit side.
+_ENTRY_NEEDS = ("perp_connection", "spot_connection", "perp_book", "spot_book", "perp_ticker", "clock",
+                "instruments", "rest_agreement", "funding_print", "store")
+_MONITOR_NEEDS = ("perp_connection", "perp_book", "perp_ticker")
 
 
 class MarketUnusable(_StaleMarket):
@@ -203,6 +208,7 @@ class MarketUnusable(_StaleMarket):
 class _TickerState:
     def __init__(self) -> None:
         self.fields: Dict[str, Any] = {}
+        self.field_mono: Dict[str, float] = {}      # when each field was last STATED
         self.synced = False
         self.last_mono_s: Optional[float] = None
         self.last_wall_ms: Optional[int] = None
@@ -227,6 +233,10 @@ class MarketState:
         self.tickers: Dict[str, _TickerState] = {E.LINEAR: _TickerState(), E.SPOT: _TickerState()}
         self.connected: Dict[str, bool] = {E.LINEAR: False, E.SPOT: False}
         self.specs: Dict[str, E.InstrumentSpec] = {}
+        self.specs_mono: Dict[str, float] = {}
+        #: Set by the engine when the durable log could not be written: the data is
+        #: live but no longer reproducible, so entries (which need provenance) stop.
+        self.store_fault: Optional[str] = None
         self.last_print: Optional[E.FundingPrint] = None
         self.rest_touch: Dict[str, Tuple[float, float, float]] = {}
         self.trades: Dict[str, Deque[E.Trade]] = {E.LINEAR: deque(maxlen=self.policy.trade_tape),
@@ -247,6 +257,13 @@ class MarketState:
         self.frames += 1
         for rej in parsed.rejections:
             self.rejections[rej.reason] = self.rejections.get(rej.reason, 0) + 1
+            # A book frame we could not use is a frame the local book has not
+            # applied: it can no longer be trusted to equal the venue's.
+            book = self.books.get(category)
+            if rej.prov.topic.startswith("orderbook") and book is not None and book.synced:
+                book.invalidate("REJECTED_FRAME")
+                out.append(self._inc(E.RESYNC_REQUESTED, f"book frame rejected: {rej.reason}",
+                                     rej.prov, category=category))
         for ev in parsed.events:
             if isinstance(ev, (E.BookSnapshot, E.BookDelta)):
                 out += self._on_book(ev)
@@ -289,9 +306,12 @@ class MarketState:
         t = self.tickers[ev.category]
         if ev.is_snapshot:
             t.fields = dict(ev.fields)
+            t.field_mono = {k: ev.prov.recv_mono_s for k in ev.fields}
             t.synced = True
         elif t.synced:
             t.fields.update(ev.fields)
+            for k in ev.fields:
+                t.field_mono[k] = ev.prov.recv_mono_s
         else:
             return                      # a delta with no snapshot under it is not a ticker
         t.last_mono_s, t.last_wall_ms = ev.prov.recv_mono_s, ev.prov.recv_wall_ms
@@ -331,6 +351,8 @@ class MarketState:
         for spec in specs:
             if spec.symbol == self.symbol:
                 self.specs[spec.category] = spec
+                if spec.prov is not None:
+                    self.specs_mono[spec.category] = spec.prov.recv_mono_s
                 self.books[spec.category].set_tick_size(spec.tick_size)
 
     def set_last_print(self, fp: E.FundingPrint) -> None:
@@ -342,6 +364,12 @@ class MarketState:
         self.rest_touch[category] = (bid, ask, at_mono_s)
 
     # -- clock -------------------------------------------------------------------------------------
+
+    def _median_lag(self) -> Optional[int]:
+        if len(self._lags) < self.policy.skew_min_samples:
+            return None
+        lags = sorted(self._lags)
+        return lags[len(lags) // 2]
 
     def clock_status(self) -> Tuple[Optional[int], str]:
         p = self.policy
@@ -377,6 +405,16 @@ class MarketState:
             if age > p.book_max_age_s:
                 statuses.append(ComponentStatus(name, False, f"STALE_{age:.1f}s", age))
                 return None, None
+            # Fresh on OUR clock is not fresh on the venue's: a proxy or TCP backlog
+            # delivers old frames at full speed. The frame's lag behind its own venue
+            # stamp, in excess of this feed's usual lag, is how old the book really is.
+            if bk.last_applied_wall_ms is not None and bk.last_exch_ts_ms is not None:
+                lag = bk.last_applied_wall_ms - bk.last_exch_ts_ms
+                base = self._median_lag()
+                excess_s = (lag - (base if base is not None else 0)) / 1000.0
+                if excess_s > p.book_max_age_s:
+                    statuses.append(ComponentStatus(name, False, f"STALE_VENUE_TIME_{excess_s:.1f}s", age))
+                    return None, None
             lad, top = bk.ladders(), bk.top()
             if lad is None or top is None:
                 statuses.append(ComponentStatus(name, False, "ONE_SIDED_OR_EMPTY", age))
@@ -384,10 +422,10 @@ class MarketState:
             statuses.append(ComponentStatus(name, True, "", age))
             return (top, lad), age
 
-        statuses.append(ComponentStatus(
-            "connection", all(self.connected.values()),
-            "" if all(self.connected.values()) else
-            "DISCONNECTED:" + ",".join(c for c, ok in self.connected.items() if not ok)))
+        statuses.append(ComponentStatus("perp_connection", self.connected[E.LINEAR],
+                                        "" if self.connected[E.LINEAR] else "DISCONNECTED"))
+        statuses.append(ComponentStatus("spot_connection", self.connected[E.SPOT],
+                                        "" if self.connected[E.SPOT] else "DISCONNECTED"))
         pb, perp_age = book_part(E.LINEAR, "perp_book")
         sb, spot_age = book_part(E.SPOT, "spot_book")
 
@@ -398,14 +436,20 @@ class MarketState:
         if not tk.synced or tk.last_mono_s is None:
             perp_ticker_ok, why = False, "NO_SNAPSHOT"
         else:
-            tage = now_mono_s - tk.last_mono_s
+            # The prices move constantly, so EACH must have been stated recently; a
+            # stream of unrelated deltas (volume, open interest) does not keep a
+            # frozen mark alive. The funding fields are stable by nature: they must
+            # be present, and the next settlement time must not have passed.
             missing = [k for k in need if k not in f]
+            ages = [now_mono_s - tk.field_mono.get(k, -math.inf) for k in ("markPrice", "indexPrice")]
+            tage = max(ages)
             if missing:
                 perp_ticker_ok, why = False, "MISSING:" + ",".join(missing)
-            elif tage < 0:
+            elif min(ages) < 0:
                 perp_ticker_ok, why = False, "TIME_WENT_BACKWARDS"
             elif tage > p.ticker_max_age_s:
-                perp_ticker_ok, why = False, f"STALE_{tage:.1f}s"
+                stale = [k for k, a in zip(("markPrice", "indexPrice"), ages) if a > p.ticker_max_age_s]
+                perp_ticker_ok, why = False, f"STALE_{tage:.1f}s:{','.join(stale)}"
             elif f["nextFundingTime"] < now_wall_ms - p.funding_rollover_grace_s * 1000:
                 perp_ticker_ok, why = False, "FUNDING_TIME_IN_THE_PAST"
         statuses.append(ComponentStatus("perp_ticker", perp_ticker_ok, why, tage))
@@ -417,16 +461,21 @@ class MarketState:
         missing_specs = [n for n, s in (("perp", pspec), ("spot", sspec)) if s is None]
         bad_status = [n for n, s in (("perp", pspec), ("spot", sspec))
                       if s is not None and s.status != "Trading"]
+        old_specs = [n for n, c in (("perp", E.LINEAR), ("spot", E.SPOT))
+                     if c in self.specs_mono and now_mono_s - self.specs_mono[c] > p.specs_max_age_s]
         statuses.append(ComponentStatus(
-            "instruments", not missing_specs and not bad_status,
+            "instruments", not missing_specs and not bad_status and not old_specs,
             ("NO_SPEC:" + ",".join(missing_specs)) if missing_specs
-            else ("NOT_TRADING:" + ",".join(bad_status)) if bad_status else ""))
+            else ("NOT_TRADING:" + ",".join(bad_status)) if bad_status
+            else ("SPEC_OLD:" + ",".join(old_specs)) if old_specs else ""))
 
         fp = self.last_print
         statuses.append(ComponentStatus("funding_print", fp is not None,
                                         "" if fp is not None else "NO_SETTLED_PRINT"))
 
         statuses.append(self._rest_status(pb, sb, now_mono_s))
+        statuses.append(ComponentStatus("store", self.store_fault is None,
+                                        "" if self.store_fault is None else f"WRITE_FAILED:{self.store_fault}"))
 
         kw: Dict[str, Any] = {}
         if pb:

@@ -72,9 +72,14 @@ class RestParsed:
 
 # -- pure parsing ---------------------------------------------------------------------------
 
+_REST_NUM = __import__("re").compile(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$")
+
+
 def _f(x: Any, name: str, *, positive: bool = False, nonneg: bool = False) -> float:
     if isinstance(x, bool) or x is None or x == "":
         raise ValueError(f"{name} is {x!r}")
+    if isinstance(x, str) and not _REST_NUM.match(x):
+        raise ValueError(f"{name} is {x[:40]!r}")
     v = float(x)
     if not math.isfinite(v):
         raise ValueError(f"{name} is not finite")
@@ -110,7 +115,7 @@ def parse_rest(endpoint: str, params: Mapping[str, Any], http_status: int, body:
         return rej(E.RATE_LIMITED, "HTTP 403 (IP limit)")
     try:
         j = json.loads(body)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError, MemoryError):
         return rej(E.NOT_JSON, f"HTTP {http_status}: {str(body)[:80]!r}")
     if not isinstance(j, dict):
         return rej(E.NOT_AN_OBJECT, type(j).__name__)
@@ -140,8 +145,8 @@ def parse_rest(endpoint: str, params: Mapping[str, Any], http_status: int, body:
                 rows.append((int(r["timestamp"]), _f(r["openInterest"], "openInterest", nonneg=True)))
             return RestParsed(open_interest=tuple(rows))
         return RestParsed()
-    except (ValueError, KeyError, TypeError, OverflowError) as exc:
-        return rej(E.BAD_NUMBER, f"{endpoint}: {exc}", ts)
+    except Exception as exc:  # noqa: BLE001 - total: no venue body may raise out of the parser
+        return rej(E.BAD_NUMBER, f"{endpoint}: {type(exc).__name__}: {exc}", ts)
 
 
 def _specs(result: Dict[str, Any], ctx, ts) -> List[E.InstrumentSpec]:
