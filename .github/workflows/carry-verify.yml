@@ -191,6 +191,7 @@ jobs:
           tests/test_close_engine_integration.py
           tests/test_close_broker_hooks.py
           tests/test_close_real_stack.py
+          tests/test_btc_hold_benchmark.py
           tests/test_collateral_while_held.py
           tests/test_reconciled_funding_late_row.py
           tests/test_estimate_vs_venue_funding.py

@@ -19,6 +19,7 @@ REQUIRED = (
     "test_close_engine_integration",
     "test_close_broker_hooks",
     "test_close_real_stack",
+    "test_btc_hold_benchmark",
     "test_carry_funding_truth", "test_carry_fee_truth", "test_carry_report",
     "test_carry_broker", "test_carry_preflight", "test_fee_payload_probe",
     "test_carry_live_gates", "test_carry_funding_history_gap",
