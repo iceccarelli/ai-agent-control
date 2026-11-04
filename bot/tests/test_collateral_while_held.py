@@ -363,10 +363,29 @@ def test_isolated_margin_has_no_cross_collateral_to_lose_and_is_left_alone():
     assert e.state != BookState.HALTED and len(perp_orders(v)) == 1
 
 
-def test_the_flag_without_the_liquidation_check_warns_instead_of_failing_silently(caplog):
+def test_the_flag_without_the_liquidation_check_warns_instead_of_failing_silently():
+    """Listens on the engine's own logger: an earlier test may have called
+    `config.setup_logging` (basicConfig(force=True)), which removes pytest's caplog
+    handler from the root and made the caplog form of this test order-dependent."""
     import logging
-    with caplog.at_level(logging.WARNING):
+    import carry_engine as ce
+    seen = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    h = _H(level=logging.WARNING)
+    old_level, old_disabled = ce.logger.level, ce.logger.disabled
+    ce.logger.addHandler(h)
+    ce.logger.setLevel(logging.WARNING)
+    ce.logger.disabled = False
+    try:
         CarryEngine(broker=V(), max_notional_usd=100.0, borrow_apr=0.0,
                     execution_mode="overlay", persist=lambda s: None,
                     require_collateral_facts=True, require_liquidation_check=False)
-    assert any("HOLD-time collateral check" in r.message for r in caplog.records)
+    finally:
+        ce.logger.removeHandler(h)
+        ce.logger.setLevel(old_level)
+        ce.logger.disabled = old_disabled
+    assert any("HOLD-time collateral check" in m for m in seen)
