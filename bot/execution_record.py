@@ -117,6 +117,7 @@ ROUTES = (ROUTE_NORMAL_ENTRY, ROUTE_NORMAL_EXIT, ROUTE_PROTECTIVE_CLOSE,
 _NORMAL_EXIT_REASONS = frozenset({"FUNDING_INVERTED", "DRILL_COMPLETE"})
 #: Exit reasons that are the book protecting itself. Matched as prefixes.
 _PROTECTIVE_EXIT_PREFIXES = ("MARGIN_", "ACCOUNT_MM_RATE_", "LIQUIDATION_",
+                             "COLLATERAL_LOST_",
                              "LEGS_LANDED_UNPAIRED", "DRILL_ABORT", "VENUE_")
 
 

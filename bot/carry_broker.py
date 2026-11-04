@@ -1650,6 +1650,7 @@ class CarryBroker:
 
         margin_mode = self.get_margin_mode()
         account_mm = None
+        collateral = None        # only account-level margin reads the wallet
         if margin_mode in ACCOUNT_LEVEL_MARGIN_MODES:
             # Required, not a cross-check: under account-level margin the
             # per-position liqPrice is not the whole answer. A wallet that
@@ -1665,6 +1666,11 @@ class CarryBroker:
                     "wallet balance unreadable; accountMMRate unknown under "
                     f"{margin_mode}, and an unknown account margin rate is a "
                     "margin call you cannot see")
+            # What the venue says about whether the held coin backs the short,
+            # from the very response read for accountMMRate (no extra request).
+            base = symbol[:-4] if symbol.upper().endswith("USDT") else symbol
+            collateral = margin_facts.collateral_status(
+                margin_facts.find_coin_row(wrows, base), base)
             raw = wrows[0].get("accountMMRate")
             try:
                 if raw is None or isinstance(raw, bool) \
@@ -1683,7 +1689,7 @@ class CarryBroker:
         if not rows:
             return {"size": 0.0, "side": "", "mark": 0.0, "liq_price": None,
                     "distance_pct": None, "account_mm_rate": account_mm,
-                    "margin_mode": margin_mode,
+                    "margin_mode": margin_mode, "collateral": collateral,
                     "reason": "NO_POSITION"}
 
         row = self._held_row(rows, symbol)
@@ -1709,7 +1715,7 @@ class CarryBroker:
                 mark = 0.0      # a flat row's mark is informational only
             return {"size": 0.0, "side": "", "mark": mark, "liq_price": None,
                     "distance_pct": None, "account_mm_rate": account_mm,
-                    "margin_mode": margin_mode,
+                    "margin_mode": margin_mode, "collateral": collateral,
                     "reason": "NO_POSITION"}
 
         if not self._positive_finite(mark):
@@ -1729,7 +1735,7 @@ class CarryBroker:
             return {"size": size, "side": side, "mark": mark,
                     "liq_price": None, "distance_pct": None,
                     "account_mm_rate": account_mm,
-                    "margin_mode": margin_mode, "position_im_usd": im_usd,
+                    "margin_mode": margin_mode, "collateral": collateral, "position_im_usd": im_usd,
                     "reason": "BEYOND_VENUE_PRICE_BOUNDS"}
         try:
             liq = float(raw_liq)
@@ -1753,7 +1759,7 @@ class CarryBroker:
                     else 100.0 * (mark - liq) / mark)
         return {"size": size, "side": side, "mark": mark, "liq_price": liq,
                 "distance_pct": distance, "account_mm_rate": account_mm,
-                "margin_mode": margin_mode, "position_im_usd": im_usd,
+                "margin_mode": margin_mode, "collateral": collateral, "position_im_usd": im_usd,
                 "reason": ""}
 
     def get_collateral_facts(self, symbol: str) -> Dict[str, Any]:
