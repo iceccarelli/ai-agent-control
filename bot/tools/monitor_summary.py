@@ -81,6 +81,25 @@ def scan(text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     return rows, unread
 
 
+def _unread_before_last(text: str) -> List[str]:
+    """Unread lines that are NOT the final non-blank line of the file. A torn
+    FINAL line is a write cut by a restart and is tolerated; an unreadable line
+    with anything after it means the history was edited or corrupted."""
+    seen: List[Tuple[str, bool]] = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            obj = json.loads(ln)
+            ok = isinstance(obj, dict) and isinstance(obj.get("at"), str) \
+                and isinstance(obj.get("outcome"), str)
+        except ValueError:
+            ok = False
+        seen.append((ln, ok))
+    return [ln for ln, ok in seen[:-1] if not ok]
+
+
 def parse_lines(text: str) -> List[Dict[str, Any]]:
     """Every line that is a JSON object with an `at` and an `outcome`; anything
     else (a torn last line, a blank) is skipped, never guessed at."""
@@ -121,6 +140,7 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
     alarm; without it only the rows are judged (the old call)."""
     unread = scan(raw_text)[1] if raw_text is not None else []
     forged = [u for u in unread if _claims_an_order(u)]
+    mid_unread = _unread_before_last(raw_text) if raw_text is not None else []
     if not rows:
         if forged:
             return {"health": "ALARM", "exit": 3, "problems": [],
@@ -160,6 +180,11 @@ def summarise(rows: List[Dict[str, Any]], *, now: float,
     if last.get("shadow_state") in ("FAULT", "REFUSED"):
         problems.append(f"the last shadow step was {last['shadow_state']}: "
                         f"{last.get('shadow_detail', 'no detail recorded')}")
+    if mid_unread:
+        problems.append(f"UNREADABLE: {len(mid_unread)} unreadable line(s) before "
+                        f"the last line (first {mid_unread[0][:60]!r}): only a "
+                        "torn final line is tolerated, so the history was "
+                        "edited or corrupted")
     sent = [r["at"] for r in rows if r.get("order_sent") is not False]
     if sent:
         alarms.append(f"{len(sent)} line(s) do not say order_sent=false "

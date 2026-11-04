@@ -145,6 +145,7 @@ jobs:
           tests/test_runner_alerts_reliability.py
           tests/test_monitor_summary.py
           tests/test_monitor_fail_closed.py
+          tests/test_monitor_mid_history_unreadable.py
           tests/test_liquidation_gate_fail_closed.py
           tests/test_liquidation_unknown_reason_fail_closed.py
           tests/test_liquidation_breach_on_first_read.py
