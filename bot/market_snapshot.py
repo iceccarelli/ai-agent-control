@@ -371,6 +371,17 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
     book_at = time.time() if now_s is None else observed
     perp_book, spot_book = (_touch(broker, perp_symbol, "linear"),
                             _touch(broker, spot_symbol, "spot"))
+    detail: Dict[str, Any] = {"perp_symbol": perp_symbol, "spot_symbol": spot_symbol,
+                              "clock_checked": venue_time is not None}
+    # A broker that serves its public reads from a validated live feed says what
+    # that feed refuses ENTRIES on. If it cannot say, entries are refused: a
+    # source that cannot describe its own shortfalls is not trusted to have none.
+    extra = getattr(broker, "snapshot_detail", None)
+    if callable(extra):
+        try:
+            detail.update(dict(extra()))
+        except Exception as exc:  # noqa: BLE001
+            detail["entry_refusals"] = [f"SNAPSHOT_DETAIL_UNREADABLE:{type(exc).__name__}"]
     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=funding,
                           perp_book=perp_book, spot_book=spot_book,
                           book_observed_s=(book_at if (perp_book or spot_book)
@@ -380,6 +391,4 @@ def take_snapshot(broker: Any, *, perp_symbol: str, spot_symbol: str,
                           funding_print_bps=float(print_bps),
                           funding_print_ms=int(print_ms),
                           perp_held=held, leg_span_s=leg_span,
-                          detail={"perp_symbol": perp_symbol,
-                                  "spot_symbol": spot_symbol,
-                                  "clock_checked": venue_time is not None})
+                          detail=detail)

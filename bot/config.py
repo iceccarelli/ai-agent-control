@@ -573,6 +573,14 @@ class Config:
     #: it again). REQUIRED for BOOK_MODE=carry, with no default, because the
     #: two modes send different orders. None means "not set".
     CARRY_EXECUTION_MODE: Optional[str] = None
+    #: The public Bybit market-data feed (md_feed). Off by default: the carry
+    #: book then reads its market by REST polling exactly as before. When on, the
+    #: book's snapshots come from the validated live feed and nothing else, the
+    #: feed is of the SAME environment as USE_TESTNET, and every input is appended
+    #: to a hash-chained log in MARKET_FEED_DIR, a directory chosen by the
+    #: operator OUTSIDE the trading database and outside source trees.
+    MARKET_FEED_ENABLED: bool = False
+    MARKET_FEED_DIR: str = ""
     #: What the capital behind the hedge could earn elsewhere, as a fraction
     #: per year on the hedged notional, charged like financing in the entry
     #: economics. 0.0 (the default) changes nothing: the repo holds no rate
@@ -1068,6 +1076,8 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CAPITAL_RESERVATION_TTL_S=parse_float(
             env, "CAPITAL_RESERVATION_TTL_S", 600.0, low=1.0, high=86_400.0),
         CARRY_EXECUTION_MODE=parse_execution_mode(env),
+        MARKET_FEED_ENABLED=parse_bool(env.get("MARKET_FEED_ENABLED"), False),
+        MARKET_FEED_DIR=parse_str(env, "MARKET_FEED_DIR", ""),
         CARRY_EXECUTION_STYLE=parse_execution_style(env),
         CARRY_MAKER_WAIT_S=parse_maker_wait(env),
         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),
@@ -1105,6 +1115,11 @@ def _validate(cfg: Config) -> None:
             f"MIN_EDGE_BPS ({cfg.MIN_EDGE_BPS}) is below the round-trip cost "
             f"({cfg.ROUND_TRIP_COST_BPS:.1f} bps): trades would be accepted that "
             "cannot cover their own fees"
+        )
+    if cfg.MARKET_FEED_ENABLED and not cfg.MARKET_FEED_DIR:
+        problems.append(
+            "MARKET_FEED_ENABLED needs MARKET_FEED_DIR: the feed's hash-chained log "
+            "must go to an explicit directory (never the trading database)"
         )
     if cfg.CATEGORY == "spot" and cfg.USE_LEVERAGE:
         problems.append(

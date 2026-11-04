@@ -147,6 +147,15 @@ class CarryRisk:
         except Exception as exc:  # noqa: BLE001
             return _block("MARKET_VIEW_STALE", error=str(exc))
 
+        # A live-feed source names what it refuses ENTRIES on (no instrument
+        # rules yet, no REST cross-check, no settled funding print, an unmeasured
+        # clock ...). The management of a held pair does not pass through this
+        # gate, so these shortfalls stop new exposure and nothing else.
+        detail = getattr(snapshot, "detail", None)
+        if isinstance(detail, dict) and detail.get("entry_refusals"):
+            return _block("MARKET_FEED_REFUSES_ENTRY",
+                          reasons=list(detail["entry_refusals"]))
+
         # `None` while flat - a ratio on an OPEN position (INVENTORY F4) is
         # genuinely undefined before the first fill, not a floor this gate
         # can check yet. `CarryEngine`'s own pre-open margin check already
