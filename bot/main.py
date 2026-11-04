@@ -1161,7 +1161,7 @@ class TradingBot:
                     getattr(self, "cfg", None), "REQUEST_TIMEOUT_SECONDS", 10.0)),
                 recv_window_ms=float(getattr(
                     getattr(self, "cfg", None), "BYBIT_RECV_WINDOW_MS", 5000)),
-                attempts=4,                         # _request(retries=3) + the first
+                attempts=_BC.REQUEST_ATTEMPTS,      # the transport's own worst case
                 max_wait_s=max(2.0, float(_BC.RATE_LIMIT_MAX_WAIT_S)))
             recovery = _recovery.resolve_unresolved_orders(
                 getattr(broker, "inner", broker), self.store,
@@ -2273,7 +2273,7 @@ def close_absence_window_s(cfg: Any) -> float:
     return _recovery.absence_window_s(
         request_timeout_s=float(getattr(cfg, "REQUEST_TIMEOUT_SECONDS", 10.0)),
         recv_window_ms=float(getattr(cfg, "BYBIT_RECV_WINDOW_MS", 5000)),
-        attempts=4,                                 # _request(retries=3) + the first
+        attempts=_BC.REQUEST_ATTEMPTS,              # the transport's own worst case
         max_wait_s=max(2.0, float(_BC.RATE_LIMIT_MAX_WAIT_S)))
 
 

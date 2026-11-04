@@ -136,6 +136,7 @@ jobs:
           tests/test_md_boundaries_cli.py
           tests/test_md_review_fixes.py
           tests/test_pair_gate_sees_the_real_order.py
+          tests/test_absence_window_follows_the_transport.py
           tests/test_md_economics.py
           tests/test_candidate_carry_depth_v1.py
           tests/test_entry_benefit_depth.py
