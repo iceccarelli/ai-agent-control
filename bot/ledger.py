@@ -1679,10 +1679,15 @@ class LedgerBroker:
     # -- orders: booked ---------------------------------------------------
 
     def place_market(self, *, symbol: str, side: str, qty: float,
-                     product: str):
+                     product: str, order_link_id=None):
         try:
-            result = self.inner.place_market(symbol=symbol, side=side, qty=qty,
-                                             product=product)
+            if order_link_id is None:
+                result = self.inner.place_market(symbol=symbol, side=side,
+                                                 qty=qty, product=product)
+            else:
+                result = self.inner.place_market(symbol=symbol, side=side,
+                                                 qty=qty, product=product,
+                                                 order_link_id=order_link_id)
         except Exception as exc:  # noqa: BLE001 - re-raised unchanged
             self._note_failed_order(
                 symbol=symbol, side=side, product=product, qty=qty,
@@ -2224,6 +2229,9 @@ class LedgerBroker:
 
     def get_perp_position(self, symbol):
         return self.inner.get_perp_position(symbol)
+
+    def get_perp_net_qty(self, symbol):
+        return self.inner.get_perp_net_qty(symbol)
 
     def get_funding_history(self, symbol, limit=8):
         return self.inner.get_funding_history(symbol, limit)

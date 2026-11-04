@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -659,14 +660,20 @@ class CarryBroker:
             body["reduceOnly"] = True
 
     def place_market(self, *, symbol: str, side: str, qty: float,
-                     product: str) -> Optional[Dict[str, Any]]:
+                     product: str, order_link_id: Optional[str] = None
+                     ) -> Optional[Dict[str, Any]]:
         """One leg. Deterministic id, so a retry cannot double it. Its fate is
-        written down as it unfolds (`_OrderTrail`)."""
+        written down as it unfolds (`_OrderTrail`).
+
+        `order_link_id` is for a caller that must know the id BEFORE the send
+        (the close executor records it durably first). It is used verbatim
+        after validation; absent, the id is minted as before."""
         trail = _OrderTrail(self, requested_qty=float(qty)
                             if self._positive_finite(qty) else 0.0)
         try:
             result = self._place_market_core(symbol=symbol, side=side, qty=qty,
-                                             product=product, trail=trail)
+                                             product=product, trail=trail,
+                                             order_link_id=order_link_id)
         except (CarryOrderRefused, ValueError):
             raise
         except Exception as exc:  # noqa: BLE001 - the outcome is now in doubt
@@ -705,7 +712,8 @@ class CarryBroker:
         return out
 
     def _place_market_core(self, *, symbol: str, side: str, qty: float,
-                           product: str, trail: "_OrderTrail"
+                           product: str, trail: "_OrderTrail",
+                           order_link_id: Optional[str] = None
                            ) -> Optional[Dict[str, Any]]:
         self._assert_orders_permitted(exit=self._is_exit(product, side))
         self._assert_entry_permitted(product, side)
@@ -718,10 +726,17 @@ class CarryBroker:
             return None
 
         qty_text = self._format_qty(qty)
-        link_id = self._build_link_id(
-            seq=int(self.sequence_source(product, symbol, "carry")),
-            symbol=symbol, side=side, qty=qty_text,
-            purpose=f"carry-{product}", session_token=self.session_token)
+        if order_link_id is not None:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,36}", str(order_link_id)):
+                raise ValueError(
+                    f"order_link_id {order_link_id!r} is not a valid Bybit "
+                    "orderLinkId (1-36 of A-Za-z0-9_-)")
+            link_id = str(order_link_id)
+        else:
+            link_id = self._build_link_id(
+                seq=int(self.sequence_source(product, symbol, "carry")),
+                symbol=symbol, side=side, qty=qty_text,
+                purpose=f"carry-{product}", session_token=self.session_token)
 
         body = {"category": product, "symbol": symbol, "side": side,
                 "orderType": "Market", "qty": qty_text,
@@ -2181,6 +2196,39 @@ class CarryBroker:
                     "that as its hedge")
             total += size
         return total
+
+    def get_perp_net_qty(self, symbol: str) -> float:
+        """Signed perp position in base units: short negative, long positive.
+        Unlike `get_perp_position` this does NOT refuse a long, because the
+        close executor must SEE a reversal to halt on it. Raises when the
+        read is unusable (a close that cannot see the venue assumes nothing)."""
+        result = self.client._request(
+            "GET", "/v5/position/list", signed=True,
+            params={"category": LINEAR, "symbol": symbol})
+        rows = self._v5_list(result)
+        if rows is None:
+            raise PairIncident(
+                f"cannot read the {symbol} position; refusing to assume flat")
+        net = 0.0
+        for row in rows:
+            size = self._stated_size(row, symbol)
+            if size == 0.0:
+                continue
+            idx = row.get("positionIdx")
+            if idx is not None and str(idx) not in ("0", "2"):
+                raise PairIncident(
+                    f"{symbol} holds {size:.10g} in positionIdx {idx!r}, not "
+                    "the one-way (0) or hedge-mode short (2) slot")
+            side = str(row.get("side", ""))
+            if side == "Sell":
+                net -= size
+            elif side == "Buy":
+                net += size
+            else:
+                raise PairIncident(
+                    f"{symbol} holds {size:.10g} on side {row.get('side')!r}; "
+                    "the direction is not stated")
+        return net
 
     def get_position_slots(self, symbol: str) -> list:
         """The non-empty position rows of ``symbol`` as ``[{positionIdx, side,

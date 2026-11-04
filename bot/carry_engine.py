@@ -323,7 +323,8 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
                     open_orders: Any = (),
                     dust: float = QTY_DUST,
                     expected_spot_symbol: Optional[str] = None,
-                    expected_perp_symbol: Optional[str] = None) -> ColdStartDecision:
+                    expected_perp_symbol: Optional[str] = None,
+                    close_in_progress: bool = False) -> ColdStartDecision:
     """Compare what the last run believed against what the venue holds.
 
     Pure. It reads both sides and returns a verdict; it never writes to either.
@@ -365,6 +366,23 @@ def plan_cold_start(*, ledger: Optional[Dict[str, Any]],
             "the last run halted and a halt is cleared by a human, never by a "
             "restart",
             detail={"venue_perp_qty": perp})
+
+    if (state == BookState.UNWINDING.value and close_in_progress
+            and isinstance(position, dict) and position
+            and _ledger_position_problem(position) is None
+            and str((ledger or {}).get("execution_mode", ACQUIRE)) == OVERLAY
+            and all(expected is None or position[role]["symbol"] == expected
+                    for role, expected in (("spot", expected_spot_symbol),
+                                           ("perp", expected_perp_symbol)))):
+        # A staged close was under way and its durable log is on file. The
+        # venue position is NOT compared with the ledger here (the close
+        # reduced it, by an amount only the log and the venue can say); the
+        # close executor reconciles against the venue before it sends anything.
+        return ColdStartDecision(
+            ColdStart.RESUME,
+            "a staged close was in progress; resuming it from its durable log",
+            detail={"close_resume": True, "venue_perp_qty": perp,
+                    "venue_spot_qty": spot, "execution_mode": OVERLAY})
 
     if state in (BookState.OPENING.value, BookState.UNWINDING.value):
         # The last write was made BEFORE orders went out and nothing was
@@ -647,7 +665,8 @@ class CarryEngine:
                  require_collateral_facts: bool = False,
                  capital_authority: Any = None,
                  entries_enabled: bool = True,
-                 opportunity_cost_apr: Any = 0.0) -> None:
+                 opportunity_cost_apr: Any = 0.0,
+                 close_executor: Any = None) -> None:
         # borrow_apr has NO default (0033, INVENTORY D7). It decides whether the
         # carry clears its cost of capital, and build_bot never passed it, so
         # the live engine silently financed at 5% whatever the operator meant.
@@ -727,6 +746,12 @@ class CarryEngine:
         self._last_margin: Optional[float] = None
         self._last_margin_ms: Optional[int] = None
         self.persist = persist
+        #: The staged close (`close_executor.CloseExecutor`). None keeps the
+        #: original single reduce-only Buy; it is supplied only when the owner
+        #: has approved the close policy (`close_policy`), and only an OVERLAY
+        #: book uses it.
+        self.close_executor = close_executor
+        self._close_reason = "CLOSE_RESUMED"
         self.execution_mode = execution_mode
         self.broker = broker
         self.kill_switch = kill_switch
@@ -961,12 +986,12 @@ class CarryEngine:
                 detail={"ledger_mode": ledger["execution_mode"],
                         "process_mode": self.execution_mode})
         else:
-            decision = plan_cold_start(ledger=ledger,
-                                       venue_perp_qty=venue_perp_qty,
-                                       venue_spot_qty=venue_spot_qty,
-                                       open_orders=open_orders,
-                                       expected_spot_symbol=self.spot_symbol,
-                                       expected_perp_symbol=self.perp_symbol)
+            decision = plan_cold_start(
+                ledger=ledger, venue_perp_qty=venue_perp_qty,
+                venue_spot_qty=venue_spot_qty, open_orders=open_orders,
+                expected_spot_symbol=self.spot_symbol,
+                expected_perp_symbol=self.perp_symbol,
+                close_in_progress=self._close_log_open(ledger))
         if decision.action is ColdStart.CLEAN and ledger is not None:
             # Flat at both ends: there is no pair to restore, but the day's
             # entry allowance is still spent - a pair opened and closed earlier
@@ -975,6 +1000,8 @@ class CarryEngine:
             self._restore_allowance(ledger.get("entry_days"))
         if decision.action is ColdStart.RESUME:
             self.restore(ledger or {})
+            if decision.detail.get("close_resume") and self.position is not None:
+                self.state = BookState.UNWINDING
             if self._catch_up_missed_prints():
                 self._record()          # the streak/estimate must survive a crash
             if self.position is not None and venue_read_started_ms is not None:
@@ -1569,6 +1596,13 @@ class CarryEngine:
             return CarryDecision("halted", reason="KILL_SWITCH_ENGAGED",
                                  state=self.state,
                                  detail=self._halted_watch(timestamp_ms))
+
+        if (self.state is BookState.UNWINDING and self.close_executor is not None
+                and self.position is not None
+                and self.execution_mode == OVERLAY):
+            # A staged close is under way. It does not wait for a mark (an exit
+            # never does) and nothing else runs until it ends.
+            return self._staged_close(self.position, self._close_reason)
 
         if not self._finite(mark) or mark <= 0:
             return self._halt("MARK_UNREADABLE",
@@ -2593,6 +2627,84 @@ class CarryEngine:
                            "does not wait for it", type(exc).__name__, exc)
             return 0.0
 
+    def _close_log_open(self, ledger: Optional[Dict[str, Any]]) -> bool:
+        """True when the ledger's cycle has a staged close on file that is not
+        finished. Unreadable counts as open: a restart that cannot see the close
+        log must not treat the close as not having happened."""
+        executor = self.close_executor
+        if executor is None or not ledger:
+            return False
+        pos = ledger.get("position")
+        if not isinstance(pos, dict) or not pos:
+            return False
+        try:
+            return bool(executor.in_progress(f"cyc-{int(pos.get('opened_ms', 0))}"))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _staged_close(self, position: "CarryPosition", reason: str) -> CarryDecision:
+        """One step of the staged reduce-only close of the perp hedge (OVERLAY).
+
+        Everything that can send an order lives in `CloseExecutor.step`; this
+        only maps its verdict onto the book. The book is FLAT only when the
+        venue's own position read zero AND our fills explain it AND the ledger
+        booked them. Otherwise it stays UNWINDING (a step per tick) or HALTs
+        with the exposure written down - it never goes FLAT on an inference."""
+        from close_executor import FLAT as _FLAT, HALT as _HALT
+        self._close_reason = reason
+        self.state = BookState.UNWINDING
+        self._venue_verified_ms = None
+        try:
+            res = self.close_executor.step(position.cycle_id)
+        except Exception as exc:  # noqa: BLE001 - the executor never raises; if it does, stop
+            return self._halt("UNWIND_INCOMPLETE",
+                              f"{reason} - the staged close failed unexpectedly "
+                              f"({type(exc).__name__}: {exc}); the book is not flat")
+        detail = {"close": res.reason, "attempts": res.attempts,
+                  "filled": res.filled, "venue_short": res.venue_short}
+        if res.status == _FLAT:
+            if not res.explained:
+                return self._halt(
+                    "UNWIND_FLAT_UNEXPLAINED",
+                    f"{reason} - the venue reads flat but none of this close's "
+                    "fills account for it; the position left some other way "
+                    "and the ledger cannot say how")
+            if res.unbooked:
+                position.perp.filled_qty = 0.0
+                position.perp.requested_qty = 0.0
+                return self._halt(
+                    "UNWIND_FILL_UNBOOKED",
+                    f"{reason} - the venue is flat but the fill of "
+                    f"{', '.join(res.unbooked)} was found by reading the venue "
+                    "and was never booked; the journal still shows the hedge "
+                    "open and needs a human")
+            self.position = None
+            self.state = BookState.FLAT
+            failed = self._record()
+            if failed is not None:
+                return failed
+            return CarryDecision("unwound", acted=True, reason=reason,
+                                 state=BookState.FLAT,
+                                 detail={"collected": position.funding_collected,
+                                         "execution_mode": OVERLAY, **detail})
+        if res.status == _HALT:
+            if res.venue_short is not None and res.venue_short > QTY_DUST:
+                left = res.venue_short
+                position.perp.filled_qty = left
+                position.perp.requested_qty = left
+                position.spot.filled_qty = min(left, position.spot.filled_qty)
+                position.spot.requested_qty = position.spot.filled_qty
+                position.spot.fee_base_qty = 0.0
+            return self._halt(
+                "UNWIND_PARTIAL" if res.filled > QTY_DUST else "UNWIND_INCOMPLETE",
+                f"{reason} - the staged close stopped: {res.reason}. The venue "
+                f"shows a short of {res.venue_short!r}; THE BOOK IS NOT FLAT.")
+        failed = self._record()           # UNWINDING is on disk before the next tick
+        if failed is not None:
+            return failed
+        return CarryDecision("unwinding", acted=True, reason=reason,
+                             state=BookState.UNWINDING, detail=detail)
+
     def _unwind(self, mark: float, reason: str) -> CarryDecision:
         """Close both legs (see `_unwind_impl`), with the REASON kept for the
         orders it sends so each is routed as a planned or a protective exit."""
@@ -2607,6 +2719,8 @@ class CarryEngine:
         position = self.position
         assert position is not None
         self.state = BookState.UNWINDING
+        if self.close_executor is not None and self.execution_mode == OVERLAY:
+            return self._staged_close(position, reason)
         book_perp = position.perp.filled_qty
         verified_ms = self._venue_verified_ms
         # Close what the VENUE holds if that is more than the book recorded: a

@@ -20,7 +20,11 @@ for p in (BOT, HERE):
 import close_plan as CP                                         # noqa: E402
 from close_fault_venue import Timeout, Venue, drive              # noqa: E402
 
-POL = CP.Policy(max_attempts=3, qty_step=0.001, min_qty=0.001)
+# Semantics DELIBERATELY changed (see close_plan.py STATUS): the planner no longer
+# re-sends an unseen attempt under the same link id unless the policy opts in. The
+# tests below that exercise the re-send do so with this explicit opt-in; the
+# default behaviour is covered by test_close_plan_absence_proof.py.
+POL = CP.Policy(max_attempts=3, qty_step=0.001, min_qty=0.001, resend_same_link_id=True)
 
 
 def lid(n):

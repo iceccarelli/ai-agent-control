@@ -11,6 +11,13 @@ from typing import Dict, List, Optional, Sequence
 
 import close_plan as CP
 
+#: The OPT-IN behaviour (re-send an unseen attempt under the SAME link id). The
+#: planner's default policy no longer does this, because whether a venue rejects
+#: a repeated orderLinkId is unverified here; the older fault-injection tests
+#: exercise this behaviour on purpose and so pass it explicitly. The default
+#: (absence-proof) behaviour is exercised by test_close_plan_absence_proof.py.
+LEGACY_RESEND = CP.Policy(resend_same_link_id=True)
+
 
 class Timeout(Exception):
     """The response never arrived. The order MAY have executed."""
@@ -21,7 +28,8 @@ class Venue:
                  position_lag_reads: int = 0, order_lag_reads: int = 0,
                  unreadable_reads: int = 0, trusting: bool = False,
                  dup_accepts_after_final: bool = False, never_shows_orders: bool = False,
-                 status_alias: Optional[dict] = None, order_unreadable_reads: int = 0):
+                 status_alias: Optional[dict] = None, order_unreadable_reads: int = 0,
+                 absence_after_reads: int = 2):
         self.net = -float(short)
         self.initial_short = float(short)
         self.modes = list(modes)            # per NEW order: full | partial:<f> | lost | drop | reject | late
@@ -42,6 +50,14 @@ class Venue:
         self.never_shows_orders = never_shows_orders
         self.status_alias = dict(status_alias or {})    # real status -> reported status
         self.order_unreadable_reads = order_unreadable_reads
+        #: Models a SOUND absence proof: an attempt whose order truly does not
+        #: exist at the venue is reported proven-absent after this many
+        #: consecutive empty lookups. An order that exists but is hidden (lag,
+        #: `never_shows_orders`) is NEVER reported absent: the proof's
+        #: precondition (the lookup lag is shorter than the acceptance window)
+        #: is the caller's to establish, and the executor tests cover it.
+        self.absence_after_reads = absence_after_reads
+        self._absent_reads: Dict[str, int] = {}
         self.sends_by_link: Dict[str, int] = {}
         self.min_net = self.net                          # the most negative..: tracks reversal
         self.max_net_seen = self.net
@@ -68,7 +84,7 @@ class Venue:
 
     def observe(self, attempts: Sequence[CP.Attempt], lag_waits: int = 0, waits: int = 0
                 ) -> CP.Observation:
-        orders, failed = {}, []
+        orders, failed, proven = {}, [], []
         for a in attempts:
             if self.order_unreadable_reads > 0:
                 self.order_unreadable_reads -= 1
@@ -77,8 +93,15 @@ class Venue:
             ob = self.read_order(a.link_id)
             if ob is not None:
                 orders[a.link_id] = ob
+                self._absent_reads[a.link_id] = 0
+            else:
+                n = self._absent_reads.get(a.link_id, 0) + 1
+                self._absent_reads[a.link_id] = n
+                if a.link_id not in self.orders and n >= self.absence_after_reads:
+                    proven.append(a.link_id)
         return CP.Observation(net_qty=self.read_position(), orders=orders,
-                              order_read_failed=tuple(failed), lag_waits=lag_waits, waits=waits)
+                              order_read_failed=tuple(failed), lag_waits=lag_waits, waits=waits,
+                              absence_proven=tuple(proven))
 
     # -- writes ---------------------------------------------------------------------------
     def _fill(self, o: dict, qty: float) -> None:
@@ -141,7 +164,7 @@ class Venue:
         return sum(1 for o in self.orders.values() if o["status"] in ("New", "PartiallyFilled"))
 
 
-def drive(venue: Venue, cycle_id: str = "cyc-1", *, policy: CP.Policy = CP.Policy(),
+def drive(venue: Venue, cycle_id: str = "cyc-1", *, policy: CP.Policy = LEGACY_RESEND,
           restart_rng: Optional[random.Random] = None, restart_p: float = 0.0,
           max_steps: int = 120, book_short: Optional[float] = None,
           durable_counters: bool = False):

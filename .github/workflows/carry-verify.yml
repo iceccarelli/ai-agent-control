@@ -183,6 +183,13 @@ jobs:
           tests/test_decision_context_lifecycle.py
           tests/test_collateral_facts_refusal.py
           tests/test_close_plan.py
+          tests/test_close_plan_absence_proof.py
+          tests/test_close_policy.py
+          tests/test_close_store.py
+          tests/test_close_execution_faults.py
+          tests/test_close_engine_integration.py
+          tests/test_close_broker_hooks.py
+          tests/test_close_real_stack.py
           tests/test_collateral_while_held.py
           tests/test_reconciled_funding_late_row.py
           tests/test_estimate_vs_venue_funding.py

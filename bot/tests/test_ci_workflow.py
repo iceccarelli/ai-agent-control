@@ -12,6 +12,13 @@ WORKFLOW = os.path.join(os.path.dirname(BOT), ".github", "workflows",
                         "carry-verify.yml")
 
 REQUIRED = (
+    "tests/test_close_plan_absence_proof.py",
+    "tests/test_close_policy.py",
+    "tests/test_close_store.py",
+    "tests/test_close_execution_faults.py",
+    "tests/test_close_engine_integration.py",
+    "tests/test_close_broker_hooks.py",
+    "tests/test_close_real_stack.py",
     "test_carry_funding_truth", "test_carry_fee_truth", "test_carry_report",
     "test_carry_broker", "test_carry_preflight", "test_fee_payload_probe",
     "test_carry_live_gates", "test_carry_funding_history_gap",
