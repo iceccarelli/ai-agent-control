@@ -28,6 +28,7 @@ import carry_performance as perf                               # noqa: E402
 import ledger as L                                             # noqa: E402
 import strategy_evidence as se                                 # noqa: E402
 import test_performance_evidence as T                          # noqa: E402
+from ledger_fixtures import vraw as _vraw  # noqa: E402
 
 NOW_S = T.NOW / 1000.0
 WINDOW = (1.0e9, 1.6e9)
@@ -244,7 +245,7 @@ def acquire(j, d0, d1, *, tag, close=P0):
     L.perp_open(j, ms=T.T0 + d0 * T.DAY + 1, ref=f"{tag}-o", qty=1.0,
                 price=P0, fee_usd=55.0, fee_status="confirmed")
     L.funding(j, ms=T.T0 + (d0 + 1) * T.DAY, ref=f"{tag}-f", usd=300.0,
-              basis="venue")
+              basis="venue", raw=_vraw(f"{tag}-f", T.T0 + (d0 + 1) * T.DAY, 300.0))
     L.perp_close(j, ms=T.T0 + d1 * T.DAY, ref=f"{tag}-c", qty=1.0, price=close,
                  entry_price=P0, fee_usd=55.0, fee_status="confirmed")
     L.spot_sell(j, ms=T.T0 + d1 * T.DAY + 1, ref=f"{tag}-ss", qty=1.0,

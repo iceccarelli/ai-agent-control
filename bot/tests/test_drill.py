@@ -102,6 +102,11 @@ class Venue:
                 "liq_price": MARK * (1 + self.liq_distance_pct / 100.0),
                 "distance_pct": self.liq_distance_pct,
                 "account_mm_rate": 0.05, "margin_mode": "REGULAR_MARGIN",
+                # what the venue states about the held coin, read from the same
+                # wallet response as accountMMRate; the hold-time check needs it
+                "collateral": {"status": self.collateral_status, "coin": "BTC",
+                               "reason": "" if self.collateral_status == "OK"
+                               else "COLLATERAL_SWITCH_OFF"},
                 "reason": ""}
 
     collateral_status = "OK"

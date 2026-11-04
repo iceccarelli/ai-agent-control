@@ -23,6 +23,7 @@ import ledger as L                                   # noqa: E402
 import carry_performance as perf                     # noqa: E402
 from persistence import StateStore                   # noqa: E402
 from test_carry_fee_truth import H8, MARK, build, modern, open_the_hedge  # noqa: E402
+from ledger_fixtures import vraw as _vraw  # noqa: E402
 
 DAY = 86_400_000
 T0 = 1_700_000_000_000
@@ -31,7 +32,7 @@ T0 = 1_700_000_000_000
 def one_cycle(j, day, tag, **kw):
     L.perp_open(j, ms=T0 + day * DAY, ref=f"{tag}-o", qty=1.0, price=100_000.0,
                 fee_usd=55.0, fee_status="confirmed")
-    L.funding(j, ms=T0 + (day + 1) * DAY, ref=f"{tag}-f", usd=10.0, basis="venue")
+    L.funding(j, ms=T0 + (day + 1) * DAY, ref=f"{tag}-f", usd=10.0, basis="venue", raw=_vraw(f"{tag}-f", T0 + (day + 1) * DAY, 10.0))
     L.borrow(j, ms=T0 + (day + 1) * DAY, ref=f"{tag}-b", usd=1.0)
     L.perp_close(j, ms=T0 + (day + 2) * DAY, ref=f"{tag}-c", qty=1.0,
                  price=100_000.0, entry_price=100_000.0, fee_usd=55.0,
@@ -72,7 +73,7 @@ def test_the_id_survives_persistence_and_a_restart_mid_hold():
     rows = j.to_rows()
     assert rows[0]["cycle"] == "cyc-9"
     reborn = L.Journal.from_rows(rows)
-    L.funding(reborn, ms=T0 + DAY, ref="f", usd=5.0, basis="venue")
+    L.funding(reborn, ms=T0 + DAY, ref="f", usd=5.0, basis="venue", raw=_vraw("f", T0 + DAY, 5.0))
     L.perp_close(reborn, ms=T0 + 2 * DAY, ref="c", qty=1.0, price=100_000.0,
                  entry_price=100_000.0, fee_usd=55.0, fee_status="confirmed")
     assert {e.cycle for e in reborn.entries} == {"cyc-9"}
@@ -159,7 +160,7 @@ def test_naming_the_open_cycle_again_does_not_split_it():
     j.begin_cycle("cyc-7")                        # the engine names it again
     L.perp_open(j, ms=T0 + 1, ref="o2", qty=0.5, price=100_000.0, fee_usd=10.0,
                 fee_status="confirmed")
-    L.funding(j, ms=T0 + DAY, ref="f", usd=3.0, basis="venue")
+    L.funding(j, ms=T0 + DAY, ref="f", usd=3.0, basis="venue", raw=_vraw("f", T0 + DAY, 3.0))
     L.perp_close(j, ms=T0 + 2 * DAY, ref="c", qty=1.0, price=100_000.0,
                  entry_price=100_000.0, fee_usd=20.0, fee_status="confirmed")
     assert {e.cycle for e in j.entries} == {"cyc-7"}

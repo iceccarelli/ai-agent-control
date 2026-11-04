@@ -396,7 +396,9 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
     longer has a boundary rule of its own."""
     by_id: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
-    for e in journal.entries:
+    _pairs = L.supersession_pairs(journal.entries)
+    _cancelled = set(_pairs) | set(_pairs.values())      # estimate and its reversal
+    for _idx, e in enumerate(journal.entries):
         if not e.cycle:
             continue                      # before any cycle (opening balance)
         cur = by_id.get(e.cycle)
@@ -421,6 +423,8 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
             order.append(e.cycle)
         cur["last_ms"] = e.ms
         for line in e.lines:
+            if line.account == L.FUNDING and _idx in _cancelled:
+                continue      # an estimate and its reversal: neither is funding that happened
             if line.account == L.FUNDING:
                 cur["funding_usd"] += -line.usd
                 cur["funding_entries"] += 1
@@ -471,8 +475,8 @@ def cycles_from_journal(journal: Any) -> List[Dict[str, Any]]:
             cur["spot_sold"] = True
         if e.fee_status:
             cur["_fee_statuses"].append(e.fee_status)
-        if e.basis:
-            cur["_bases"].append(e.basis)
+        if L.funding_basis(e) and _idx not in _pairs:
+            cur["_bases"].append(L.funding_basis(e))
         if e.kind == "spot_buy":
             cur["spot_cost_usd"] += sum(
                 l.usd for l in e.lines if l.account == L.BTC and l.usd > 0)
