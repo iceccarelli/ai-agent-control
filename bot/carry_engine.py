@@ -221,6 +221,11 @@ _ACCOUNT_LEVEL_MARGIN_MODES = (_MARGIN_REGULAR, _MARGIN_PORTFOLIO)
 #: call you cannot see. A single bad read does not.
 COLLATERAL_UNKNOWN_HALT_TICKS = 3
 
+#: A STATED loss of cover acts only when the venue states it on this many
+#: consecutive ticks. An unwind is a real order and a single misread flag is not
+#: worth one; two reads is a minute longer exposed under the book's other gates.
+COLLATERAL_LOST_CONFIRM_TICKS = 2
+
 #: Unwind when funding has been negative this many consecutive prints. Negative
 #: funding means the trade has inverted: you are now PAYING to hold the hedge.
 #: Three prints is one day — long enough not to react to a single squeeze,
@@ -694,6 +699,11 @@ class CarryEngine:
         #: changed; build_bot turns it on for the production book.
         self.require_capital_check = bool(require_capital_check)
         self.require_collateral_facts = bool(require_collateral_facts)
+        if self.require_collateral_facts and not self.require_liquidation_check:
+            logger.warning(
+                "carry: require_collateral_facts is on but require_liquidation_check "
+                "is off; the HOLD-time collateral check rides the liquidation view "
+                "and will not run (the entry check still does)")
         #: The portfolio authority (carry_capital.CarryCapitalAuthority): asked
         #: before every ENTRY, never for an exit. None = not wired (a bare
         #: engine, the shadow book).
@@ -3030,32 +3040,68 @@ class CarryEngine:
         return 100.0 * (float(liq) - float(entry)) / float(entry)
 
     _collateral_unknown_ticks: int = 0
+    _collateral_lost_ticks: int = 0
+    _collateral_for: Optional[int] = None
+    _collateral_view: Optional[Dict[str, Any]] = None
 
-    def _collateral_while_held(self, view: Dict[str, Any]) -> Optional[CarryDecision]:
-        """HOLD-time twin of `_collateral_refusal`. None when the check is off,
-        the mode is not overlay, or the venue says the held coin still backs the
-        short. NOT_COLLATERAL unwinds through the ordinary single reduce-only
-        exit; an unstated state is observed and, after
-        COLLATERAL_UNKNOWN_HALT_TICKS consecutive ticks, halts with no order.
-        Nothing here retries or resizes a close."""
-        if not self.require_collateral_facts or self.execution_mode != OVERLAY:
+    def _collateral_active(self) -> bool:
+        return bool(self.require_collateral_facts and self.execution_mode == OVERLAY
+                    and self.position is not None)
+
+    def _collateral_note(self, view: Dict[str, Any]) -> str:
+        """The prefix for the ONE risk-observation row this tick writes (the table
+        keeps one row per millisecond, so a second observation would be dropped)."""
+        if not self._collateral_active():
+            return ""
+        facts = view.get("collateral")
+        status = facts.get("status") if isinstance(facts, dict) else None
+        if status == "OK" or view.get("margin_mode") not in _ACCOUNT_LEVEL_MARGIN_MODES:
+            return ""
+        why = (str(facts.get("reason")) if isinstance(facts, dict)
+               else "NO_COLLATERAL_BLOCK_IN_VIEW")
+        return ("COLLATERAL_LOST:" if status == "NOT_COLLATERAL"
+                else f"COLLATERAL_UNKNOWN:{why}:")
+
+    def _collateral_action(self, view: Optional[Dict[str, Any]]) -> Optional[CarryDecision]:
+        """HOLD-time twin of `_collateral_refusal`, run AFTER every other margin
+        gate has passed on the tick: the account-MM-rate, liquidation-distance
+        and opened-inside-the-floor exits all take precedence, so an unreadable
+        or lost collateral state can never pre-empt them.
+
+        A STATED loss of cover (switch off, platform disallows) that persists
+        COLLATERAL_LOST_CONFIRM_TICKS ticks exits through the ordinary single
+        reduce-only unwind. An unstated state is counted; at
+        COLLATERAL_UNKNOWN_HALT_TICKS it halts with no order. The counters belong
+        to ONE position: a new position starts them at zero. Nothing here
+        retries, resizes or repeats a close."""
+        if not self._collateral_active() or view is None:
+            self._collateral_unknown_ticks = self._collateral_lost_ticks = 0
+            self._collateral_for = None
             return None
+        opened = self.position.opened_ms
+        if self._collateral_for != opened:
+            self._collateral_for = opened
+            self._collateral_unknown_ticks = self._collateral_lost_ticks = 0
+        if view.get("margin_mode") not in _ACCOUNT_LEVEL_MARGIN_MODES:
+            return None            # isolated margin has no cross-collateral to lose
         facts = view.get("collateral")
         status = facts.get("status") if isinstance(facts, dict) else None
         if status == "OK":
-            self._collateral_unknown_ticks = 0
+            self._collateral_unknown_ticks = self._collateral_lost_ticks = 0
             return None
         if status == "NOT_COLLATERAL":
             self._collateral_unknown_ticks = 0
-            self._observe_risk(view, prefix="COLLATERAL_LOST:")
-            why = str(facts.get("reason") or "NOT_COLLATERAL").upper()
-            return self._unwind(self._exit_mark(), f"COLLATERAL_LOST_{why}")
+            self._collateral_lost_ticks += 1
+            if self._collateral_lost_ticks >= COLLATERAL_LOST_CONFIRM_TICKS:
+                why = str(facts.get("reason") or "NOT_COLLATERAL").upper()
+                return self._unwind(self._exit_mark(), f"COLLATERAL_LOST_{why}")
+            return None
         # unknown: absent, malformed, or no collateral block at all
+        self._collateral_lost_ticks = 0
         self._collateral_unknown_ticks += 1
-        why = (str(facts.get("reason")) if isinstance(facts, dict)
-               else "NO_COLLATERAL_BLOCK_IN_VIEW")
-        self._observe_risk(view, prefix=f"COLLATERAL_UNKNOWN:{why}:")
         if self._collateral_unknown_ticks >= COLLATERAL_UNKNOWN_HALT_TICKS:
+            why = (str(facts.get("reason")) if isinstance(facts, dict)
+                   else "NO_COLLATERAL_BLOCK_IN_VIEW")
             return self._halt(
                 "COLLATERAL_STATE_UNREADABLE",
                 f"the venue has not stated whether the held coin backs the "
@@ -3065,6 +3111,14 @@ class CarryEngine:
         return None
 
     def _check_liquidation_distance(self) -> Optional[CarryDecision]:
+        """The venue's own liquidation view, then (last) the collateral state."""
+        self._collateral_view = None
+        decision = self._check_liquidation_distance_core()
+        if decision is not None:
+            return decision
+        return self._collateral_action(self._collateral_view)
+
+    def _check_liquidation_distance_core(self) -> Optional[CarryDecision]:
         """How far the price can move before the short is gone (F4, 0048).
 
         This is a HOLD-time check and cannot be anything else: before the book
@@ -3091,7 +3145,8 @@ class CarryEngine:
             return self._halt(
                 "LIQUIDATION_PRICE_UNREADABLE",
                 f"the liquidation view is {type(view).__name__}, not a mapping")
-        self._observe_risk(view)
+        self._collateral_view = view
+        self._observe_risk(view, prefix=self._collateral_note(view))
         mode = view.get("margin_mode")
         if mode in _ACCOUNT_LEVEL_MARGIN_MODES:
             # Liquidation is decided at account level: the rate is mandatory.
@@ -3109,9 +3164,6 @@ class CarryEngine:
                 return self._unwind(
                     self._exit_mark(),
                     f"ACCOUNT_MM_RATE_{float(rate):.2f}_ABOVE_FLOOR")
-            held = self._collateral_while_held(view)
-            if held is not None:
-                return held
         elif mode == _MARGIN_ISOLATED:
             # Per-position liquidation: the account rate does not describe it.
             # The distance below is the gate, and it is mandatory.
