@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
 import ledger as L                      # noqa: E402
 import carry_performance as perf        # noqa: E402
 import performance_analytics as PA      # noqa: E402
+from ledger_fixtures import vraw as _vraw  # noqa: E402
 
 DAY = 86_400_000
 T0 = 1_700_000_000_000
@@ -28,7 +29,7 @@ def cyc(j, d0, d1, *, funding, close=100_000.0, tag, fee_status="confirmed",
     L.perp_open(j, ms=T0 + d0 * DAY, ref=f"{tag}-o", qty=1.0, price=100_000.0,
                 fee_usd=55.0, fee_status=fee_status, decision_mark=mark)
     L.funding(j, ms=T0 + ((d0 + d1) // 2) * DAY, ref=f"{tag}-f", usd=funding,
-              basis=basis)
+              basis=basis, raw=(_vraw(f"{tag}-f", T0 + ((d0 + d1) // 2) * DAY, funding) if basis == "venue" else None))
     L.perp_close(j, ms=T0 + d1 * DAY, ref=f"{tag}-c", qty=1.0, price=close,
                  entry_price=100_000.0, fee_usd=55.0, fee_status=fee_status,
                  decision_mark=mark)
@@ -124,8 +125,8 @@ def test_funding_received_and_paid_are_split_and_sum_to_net_funding():
     j = L.Journal()
     L.perp_open(j, ms=T0, ref="o", qty=1.0, price=100_000.0, fee_usd=55.0,
                 fee_status="confirmed")
-    L.funding(j, ms=T0 + DAY, ref="f1", usd=40.0, basis="venue")
-    L.funding(j, ms=T0 + 2 * DAY, ref="f2", usd=-15.0, basis="venue")
+    L.funding(j, ms=T0 + DAY, ref="f1", usd=40.0, basis="venue", raw=_vraw("f1", T0 + DAY, 40.0))
+    L.funding(j, ms=T0 + 2 * DAY, ref="f2", usd=-15.0, basis="venue", raw=_vraw("f2", T0 + 2 * DAY, -15.0))
     L.perp_close(j, ms=T0 + 3 * DAY, ref="c", qty=1.0, price=100_000.0,
                  entry_price=100_000.0, fee_usd=55.0, fee_status="confirmed")
     c = perf.cycles_from_journal(j)[0]

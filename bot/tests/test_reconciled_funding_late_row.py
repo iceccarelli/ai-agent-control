@@ -21,6 +21,7 @@ for p in (os.path.dirname(HERE), os.path.join(os.path.dirname(HERE), "tools")):
 import carry_broker as CB                                       # noqa: E402
 import funding_reconcile as R                                   # noqa: E402
 import ledger as L                                              # noqa: E402
+from ledger_fixtures import legacy_journal as legacy_rows, vraw  # noqa: E402
 
 H = 3_600_000
 H8 = 8 * H
@@ -356,8 +357,13 @@ def legacy_journal(usd=1.0, ref="fund:S1"):
     j = L.Journal()
     L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
                 fee_status="confirmed")
-    L.funding(j, ms=S + H, ref=ref, usd=usd, basis="venue")
-    return j
+    L.funding(j, ms=S + H, ref=ref, usd=usd, basis="venue", raw=vraw(ref, S, usd))
+    # persisted before identity existed: no venue_id/venue_ms/venue_usd on the row
+    rows = j.to_rows()
+    for r in rows:
+        if r["kind"] == "funding":
+            r["fee_raw"] = {}
+    return L.Journal.from_rows(rows)
 
 
 def test_a_legacy_venue_entry_is_not_booked_again_when_its_payment_is_replayed():
@@ -386,11 +392,9 @@ def test_a_legacy_row_with_no_basis_never_counts_as_venue_cash():
     j = L.Journal()
     L.perp_open(j, ms=S - 2 * H, ref="o1", qty=0.5, price=MARK, fee_usd=1,
                 fee_status="confirmed")
-    L.funding(j, ms=S + H, ref="fund:S1", usd=1.0, basis="venue")
-    rows = j.to_rows()
-    for r in rows:
-        r.pop("basis", None)
-    j2 = L.Journal.from_rows(rows)
+    L.funding(j, ms=S + H, ref="fund:S1", usd=1.0, basis="venue",
+              raw=vraw("fund:S1", S, 1.0))
+    j2 = legacy_rows(j, drop=("basis",))
     assert j2.statement()["funding_venue_usd"] == pytest.approx(0.0)
 
 

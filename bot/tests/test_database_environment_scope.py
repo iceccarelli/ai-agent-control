@@ -22,6 +22,7 @@ import config as _config                                     # noqa: E402
 import ledger as L                                           # noqa: E402
 import main as _main                                         # noqa: E402
 from persistence import StateStore                           # noqa: E402
+from ledger_fixtures import vraw as _vraw  # noqa: E402
 
 
 @pytest.fixture()
@@ -33,7 +34,7 @@ def store(tmp_path):
 
 def with_ledger(store):
     j = L.Journal()
-    L.funding(j, ms=1_700_000_000_000, ref="f", usd=123.45, basis="venue")
+    L.funding(j, ms=1_700_000_000_000, ref="f", usd=123.45, basis="venue", raw=_vraw("f", 1_700_000_000_000, 123.45))
     store.save_ledger(j.to_rows())
 
 
