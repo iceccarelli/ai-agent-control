@@ -240,6 +240,8 @@ def test_the_modules_that_construct_a_bybit_client_are_pinned():
         "tools/fee_payload_probe.py", "tools/linear_stop_venue_drill.py",
         "tools/recon_packet.py", "tools/paper_session_demo.py",
         "tools/drill.py", "tools/carry_preflight.py",
+        # testnet-only order-identity experiment: refuses any non-testnet host
+        "tools/close_testnet_experiment.py",
     }, found
 
 
