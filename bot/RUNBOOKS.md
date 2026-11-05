@@ -147,10 +147,11 @@ Run on the recorder's data directory (or a copy; it never writes there):
     python3 tools/profitability_report.py --dir /data/market --history /data/monitor/monitor.jsonl --notional 100000 --hold-days 30
 
 * **Integrity:** every capacity row is validated against `capacity/2`; the sidecar chain is checked
-  against the head copied into `monitor.jsonl` (an anchor the recorder cannot rewrite). A broken chain,
-  a mixed stream, a regression or a duplicate means the numbers are not used; the report says so.
-* **Independence:** unique settlements, not snapshots, are the unit. `INSUFFICIENT` is the honest answer
-  below the floor; it is not an error to fix by waiting less.
+  against the head copied into `monitor.jsonl` (a second copy on the same volume: external to the evidence directory, not to the machine, until you archive it off the machine). A broken chain in ANY file,
+  a mixed stream, a regression, a duplicate or more than 1 % rejected rows withholds the economics block entirely; the report says so.
+* **Dependence:** unique settlements, not snapshots, are the unit, and settlements are themselves serially dependent:
+  a claim needs the effective sample size (>= 30) as well as the count (>= 30 joined, >= 90 for a candidate).
+  `INSUFFICIENT` is the honest answer below the floor; a constant funding history has no variance to test and stays INSUFFICIENT.
 * **Money:** two returns (on hedged notional, on fully allocated economic capital), the 10/15/20 %/yr
   screens labelled `PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED`, and an explicit list of UNKNOWN
   inputs (latency, the account's real fee tier, venue margin rules). Replace them with the owner's.

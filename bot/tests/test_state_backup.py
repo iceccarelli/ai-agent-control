@@ -47,6 +47,7 @@ def test_backup_verify_and_restore_round_trip_and_never_touch_the_source(tmp_pat
     assert SB.verify(bf)["ok"]
     r = SB.restore(bf, str(tmp_path / "rehearsal"))
     assert r["ok"] and r["tables"] == m["tables"]
+    assert os.path.basename(r["restored_to"]) == "restored-state.db"          # never the live file's name
     assert sqlite3.connect(r["restored_to"]).execute("SELECT COUNT(*) FROM orders").fetchone()[0] == 25
     assert digest(live) == before
 
@@ -104,6 +105,9 @@ def test_restore_only_ever_goes_into_a_new_or_empty_disposable_directory(tmp_pat
         SB.restore(bf, str(tmp_path / "state"))
     with pytest.raises(SystemExit, match="live state directory"):
         SB.restore(bf, "/app/state")
+    for bad in ("/app/state/sub", "/app", "/data", str(tmp_path / "state" / "sub"), "/"):
+        with pytest.raises(SystemExit, match="live state directory"):
+            SB.restore(bf, bad)
     empty = tmp_path / "empty"
     empty.mkdir()
     assert SB.restore(bf, str(empty))["ok"]
@@ -117,3 +121,43 @@ def test_the_cli_has_no_default_path_and_reports_failure_in_its_exit_code(tmp_pa
     assert SB.main(["verify", "--backup", str(tmp_path / "o" / bf)]) == 0
     open(tmp_path / "o" / bf, "ab").write(b"x")
     assert SB.main(["verify", "--backup", str(tmp_path / "o" / bf)]) == 1
+
+
+def test_a_path_with_uri_metacharacters_cannot_redirect_the_backup_to_a_decoy(tmp_path):
+    """'st#ate.db' beside an empty decoy file 'st': an unencoded file: URI opened the decoy and 'succeeded'."""
+    d = tmp_path / "live"
+    d.mkdir()
+    (d / "st").write_bytes(b"")
+    p = str(d / "st#ate.db")
+    make_db(p)
+    m = SB.backup(p, str(tmp_path / "out"))
+    assert m["tables"] == {"kill_switch": 1, "orders": 25}
+    q = str(d / "we?ird%20.db")
+    make_db(q)
+    assert SB.backup(q, str(tmp_path / "out2"))["tables"]["orders"] == 25
+
+
+def test_a_backup_of_an_empty_database_is_refused_and_leaves_no_file(tmp_path):
+    d = tmp_path / "live"
+    d.mkdir()
+    p = str(d / "empty.db")
+    sqlite3.connect(p).close()
+    with pytest.raises(SystemExit, match="no tables"):
+        SB.backup(p, str(tmp_path / "out"))
+    assert not [f for f in os.listdir(tmp_path / "out") if f.endswith(".db")]
+
+
+@pytest.mark.parametrize("warm", [True, False])
+def test_a_wal_source_main_file_is_never_modified_whether_or_not_a_writer_holds_it(tmp_path, warm):
+    p = str(tmp_path / "live" / "ledger.db")
+    os.makedirs(os.path.dirname(p))
+    make_db(p, wal=True)
+    writer = sqlite3.connect(p) if warm else None
+    if writer:
+        writer.execute("INSERT INTO orders (link) VALUES ('late')")
+        writer.commit()
+    before = hashlib.sha256(open(p, "rb").read()).hexdigest()
+    SB.backup(p, str(tmp_path / "out"))
+    assert hashlib.sha256(open(p, "rb").read()).hexdigest() == before
+    if writer:
+        writer.close()

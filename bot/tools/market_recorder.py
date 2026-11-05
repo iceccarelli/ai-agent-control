@@ -91,6 +91,7 @@ class Recorder:
         self.capacity_max_fillable: Optional[float] = None
         self.chain_head: Optional[Dict[str, Any]] = None      # {"file", "n", "head"} of the newest row
         self._resealed = 0
+        self._repairs = 0
         os.makedirs(self.dir, exist_ok=True)
 
     # -- capacity ----------------------------------------------------------------------------------------
@@ -137,7 +138,16 @@ class Recorder:
             # entry gate would refuse is still data, but it must say so
             row["entry_refusals"] = list(view.refusals(S.ENTRY))
             path = self._capacity_path(now)
-            n, head = EC.append(path, row)
+            try:
+                n, head = EC.append(path, row)
+            except EC.ChainDesync:
+                # a crash or a full disk between the row and its chain entry: repair it VISIBLY
+                # (a torn row is set aside in <file>.torn, an unchained row is sealed with a
+                # `resealed` mark), then try once more. Never append over a disagreement.
+                self._repairs += 1
+                if not EC.repair(path)["appendable"]:
+                    raise
+                n, head = EC.append(path, row)
             self.chain_head = {"file": os.path.basename(path), "n": n, "head": head}
             self.capacity_rows += 1
             self.last_capacity_ms = now
@@ -192,7 +202,8 @@ class Recorder:
             "capacity": {"rows": self.capacity_rows, "errors": self.capacity_errors,
                          "last_ms": self.last_capacity_ms, "last_error": self.last_capacity_error,
                          "max_displayed_fillable_notional_usd": self.capacity_max_fillable,
-                         "chain_head": self.chain_head, "resealed_rows_at_start": self._resealed},
+                         "chain_head": self.chain_head, "resealed_rows_at_start": self._resealed,
+                         "repairs_while_running": self._repairs},
         }
 
     def write_status(self) -> Dict[str, Any]:
@@ -206,7 +217,8 @@ class Recorder:
         try:
             path = self._capacity_path(self.wall_ms())
             if os.path.exists(path):
-                self._resealed = EC.reseal_tail(path)
+                r = EC.repair(path)
+                self._resealed = r["rows_resealed"]
         except Exception:  # noqa: BLE001 - evidence repair must not stop collection
             pass
         self.feed.start()

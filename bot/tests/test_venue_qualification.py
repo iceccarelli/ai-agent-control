@@ -104,3 +104,29 @@ def test_missing_fee_or_collateral_evidence_alone_leaves_it_unverified(field):
     del e[field]
     r = Q.evaluate_eu(e)
     assert r.verdict == Q.UNVERIFIED and r.missing == (field,) and r.authorises_orders is False
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda e: e["collateral_rules"].update(margin_collateral=False),
+    lambda e: e["fee_rates"].update(taker_fee_rate=0),
+    lambda e: e["fee_rates"].update(taker_fee_rate=0.9),
+    lambda e: e["fee_rates"].update(taker_fee_rate=0.055),            # a percent pasted as a fraction
+    lambda e: e["fee_rates"].update(maker_fee_rate=-0.9),
+    lambda e: e["fee_rates"].update(maker_fee_rate=float("inf")),
+    lambda e: e["collateral_rules"].update(collateral_ratio=1e-9),
+    lambda e: e["fee_rates"].update(source="x"),
+    lambda e: e["collateral_rules"].update(source="trust me"),
+    lambda e: e["fee_rates"].update(taker_fee_rate=True),
+])
+def test_implausible_fee_or_collateral_evidence_is_refused_not_qualified(mutate):
+    """Each input is one the independent review reproduced as QUALIFIED."""
+    e = good()
+    mutate(e)
+    r = Q.evaluate_eu(e)
+    assert r.verdict == Q.NOT_QUALIFIED and r.authorises_orders is False, r
+
+
+def test_a_negative_maker_rebate_within_bounds_is_accepted():
+    e = good()
+    e["fee_rates"]["maker_fee_rate"] = -0.0001
+    assert Q.evaluate_eu(e).verdict == Q.QUALIFIED

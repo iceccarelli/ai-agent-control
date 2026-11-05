@@ -136,3 +136,21 @@ def test_invalid_inputs_are_refused(bad):
         TE.compute(pos(**bad), costs(), [0.1] * 3)
     with pytest.raises(ValueError):
         TE.compute(pos(), costs(), [float("inf")])
+
+
+def test_a_hurdle_that_is_met_on_modelled_costs_says_which_inputs_were_left_unpriced():
+    """The review: `meets` was True even though latency, conversion, custody ... were excluded. It still is - on the
+    costs that were modelled - but the hurdle now says so and names what is missing."""
+    pos = TE.Position(notional_usd=100_000.0, hold_days=30.0, btc_inventory_usd=100_000.0, btc_was_owned=True,
+                      margin_posted_usd=0.0, collateral_haircut=0.1, reserve_usd=10_000.0,
+                      maintenance_margin_rate=0.005, initial_margin_rate=0.05)
+    partial = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.3, slippage_bps=0.1)
+    r = TE.compute(pos, partial, [6.0] * 90, funding_source="SCENARIO")
+    assert all(h["meets"] for h in r["hurdles"])
+    for h in r["hurdles"]:
+        assert h["incomplete"] is True and "MODELLED costs only" in h["meets_means"]
+        assert {"latency", "market_impact", "conversion", "custody"} <= set(h["unpriced_inputs"])
+    full = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.3, slippage_bps=0.1, impact_bps=0.0, latency_bps=0.0,
+                    conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0)
+    r2 = TE.compute(pos, full, [6.0] * 90, funding_source="SCENARIO")
+    assert all(h["incomplete"] is False and h["unpriced_inputs"] == [] for h in r2["hurdles"])

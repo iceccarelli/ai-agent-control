@@ -7,7 +7,7 @@ import pytest
 import funding_eval as FE
 import opportunity_engine as OE
 import trade_economics as TE
-from capacity_helpers import base_row, clone, series, START, H8
+from capacity_helpers import base_row, clone, noisy, series, START, H8
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
@@ -23,14 +23,14 @@ def position(**kw):
 
 
 def bundle(funding=0.65, n=100, fillable=1.0, cost=11.4, reliability="HEALTHY", chain_ok=True, validation_ok=True,
-           pos=None, prospective=None, realised=None):
-    rows = series(BASE, n, lambda T, t: funding, realised or (lambda T: funding), cadence_ms=600_000)
+           pos=None, prospective=None, realised=None, environment="mainnet", source="PUBLIC_REALISED"):
+    rows = series(BASE, n, lambda T, t: funding, realised or noisy(funding, sd=max(0.05, funding * 0.15)), cadence_ms=600_000)
     fe = FE.evaluate(rows)
     f_lo = fe["realised_bps"]["ci"].get("lo", fe["realised_bps"]["mean"])
     costs = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=cost - 11.0, slippage_bps=0.0, impact_bps=0.0,
                      latency_bps=0.0, conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0)
-    econ = TE.compute(pos or position(), costs, [f_lo] * 90, funding_source="PUBLIC_REALISED")
-    return {"carry": {"validation_ok": validation_ok, "chain_ok": chain_ok, "reliability_verdict": reliability,
+    econ = TE.compute(pos or position(), costs, [f_lo] * 90, funding_source=source)
+    return {"carry": {"validation_ok": validation_ok, "chain_ok": chain_ok, "reliability_verdict": reliability, "environment": environment,
                       "funding_eval": fe, "economics": econ, "fillable_share": fillable, "round_trip_cost_bps": cost,
                       "prospective": prospective or {}}, "rows": rows}
 
@@ -85,13 +85,21 @@ def test_a_rich_funding_regime_is_only_a_research_candidate_never_validated_with
     assert "not prospectively validated" in e.reasons[0]
 
 
-def test_prospective_validation_needs_registration_before_the_evidence_and_enough_later_settlements():
-    pro = {"registered_ms": START - 1, "first_evidence_ms": START, "n_after_registration": 270}
-    assert status(bundle(funding=4.0, prospective=pro))[0] == OE.Status.PROSPECTIVELY_VALIDATED
-    late = {"registered_ms": START + 1, "first_evidence_ms": START, "n_after_registration": 270}
+def test_prospective_validation_needs_registration_before_the_evidence_enough_later_settlements_and_the_screens_rerun_on_them():
+    ok = {"registered_ms": START - 1, "first_evidence_ms": START, "n_after_registration": 270,
+          "post_registration_ess": 60.0, "post_registration_annualised_pct_on_economic_capital": 14.0}
+    assert status(bundle(funding=4.0, prospective=ok))[0] == OE.Status.PROSPECTIVELY_VALIDATED
+    late = dict(ok, registered_ms=START + 1)
     assert status(bundle(funding=4.0, prospective=late))[0] == OE.Status.RESEARCH_CANDIDATE
-    few = {"registered_ms": START - 1, "first_evidence_ms": START, "n_after_registration": 100}
+    few = dict(ok, n_after_registration=100)
     assert status(bundle(funding=4.0, prospective=few))[0] == OE.Status.RESEARCH_CANDIDATE
+    # the in-sample pass does not carry over: the screens must pass on the post-registration data ALONE
+    failing_later = dict(ok, post_registration_annualised_pct_on_economic_capital=3.0)
+    assert status(bundle(funding=4.0, prospective=failing_later))[0] == OE.Status.RESEARCH_CANDIDATE
+    no_rerun = {k: v for k, v in ok.items() if not k.startswith("post_registration_annualised")}
+    assert status(bundle(funding=4.0, prospective=no_rerun))[0] == OE.Status.RESEARCH_CANDIDATE
+    thin_ess = dict(ok, post_registration_ess=5.0)
+    assert status(bundle(funding=4.0, prospective=thin_ess))[0] == OE.Status.RESEARCH_CANDIDATE
 
 
 def test_execution_and_risk_failures_are_named_separately():
@@ -148,3 +156,30 @@ def test_a_cross_section_needs_more_than_one_recorded_symbol_and_hypotheses_stay
     assert e.status == OE.Status.INSUFFICIENT_EVIDENCE and "only ['BTCUSDT']" in e.reasons[0]
     for k in ("btc_trend_following/v1", "btc_mean_reversion/v1", "microstructure_imbalance/v1", "regime_classifier/v1"):
         assert OE.evaluate_unrun(OE.REGISTRY[k]).status == OE.Status.INSUFFICIENT_EVIDENCE
+
+
+@pytest.mark.parametrize("kw,needle", [
+    (dict(environment="testnet"), "only mainnet evidence"),
+    (dict(environment=None), "only mainnet evidence"),
+    (dict(reliability="DEGRADED"), "only HEALTHY"),
+    (dict(source="SCENARIO"), "realised public funding print"),
+    (dict(source="PREDICTED"), "realised public funding print"),
+])
+def test_testnet_degraded_or_forecast_based_evidence_cannot_reach_a_candidate(kw, needle):
+    st, e = status(bundle(funding=4.0, **kw))
+    assert st == OE.Status.INSUFFICIENT_EVIDENCE and needle in " ".join(e.reasons)
+
+
+def test_a_constant_funding_history_never_becomes_a_candidate_however_rich_or_long():
+    st, e = status(bundle(funding=4.0, n=150, realised=lambda T: 4.0))
+    assert st == OE.Status.INSUFFICIENT_EVIDENCE and "effective sample size" in " ".join(e.reasons)
+
+
+def test_a_candidate_names_its_unpriced_inputs_instead_of_implying_they_are_zero():
+    costs_unknown = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.4, slippage_bps=0.0)   # nothing else priced
+    b = bundle(funding=4.0)
+    f_lo = b["carry"]["funding_eval"]["realised_bps"]["ci"]["lo"]
+    b["carry"]["economics"] = TE.compute(position(), costs_unknown, [f_lo] * 90, funding_source="PUBLIC_REALISED")
+    st, e = status(b)
+    assert st == OE.Status.RESEARCH_CANDIDATE
+    assert "latency" in e.metrics["unpriced_inputs"] and "unpriced inputs: " in e.reasons[0] and "MODELLED" in e.reasons[0]

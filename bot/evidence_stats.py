@@ -6,13 +6,16 @@ module reports four different numbers and never lets the largest pass for the ev
 
   raw snapshots            how many rows exist
   unique settlements       how many distinct funding clocks they span
-  independent events       settlements with a usable observation (what a test may count)
+  settlement events        settlements with a usable observation. These are SERIALLY DEPENDENT (funding
+                           is persistent), so this count is an upper bound on independent draws, not
+                           the number of them; the ESS below is the figure that gates a claim
   effective sample size    n / (1 + 2 * sum of positive autocorrelations), of the per-settlement
                            series: how many independent draws the dependence leaves
 
-and gives confidence intervals only from a moving-block bootstrap with a fixed seed, which
-preserves the dependence the naive standard error ignores. Under 8 independent points no
-interval is offered: a wide-looking number from 5 points is a false precision.
+and gives confidence intervals from a moving-block bootstrap with a fixed seed whose block length
+follows the measured persistence, widened to an ESS-adjusted t interval for the mean. Under 8
+points, an ESS under 3, or a constant series, no interval is offered: a wide-looking number from 5
+points, or a zero-width one from a constant, is a false precision.
 """
 from __future__ import annotations
 
@@ -45,7 +48,7 @@ def effective_sample_size(xs: Sequence[float]) -> Optional[float]:
     n = len(xs)
     if n < 2:
         return float(n) if n else None
-    if len(set(xs)) == 1:
+    if len(set(xs)) == 1 or (max(xs) - min(xs)) <= 1e-12 * max(1.0, abs(sum(xs) / n)):
         return 1.0
     s = 0.0
     for k in range(1, n // 2 + 1):
@@ -56,14 +59,47 @@ def effective_sample_size(xs: Sequence[float]) -> Optional[float]:
     return max(1.0, min(float(n), n / (1.0 + 2.0 * s)))
 
 
-def block_bootstrap_ci(xs: Sequence[float], stat: Callable[[Sequence[float]], float] = lambda v: sum(v) / len(v),
+def _mean(v: Sequence[float]) -> float:
+    return sum(v) / len(v)
+
+
+def _t_crit(df: float, z: float = 1.959964) -> float:
+    """Two-sided 95 % Student-t critical value by the Cornish-Fisher expansion (stdlib only);
+    adequate for df >= 2, and it never returns less than the normal value."""
+    df = max(df, 2.0)
+    return z + (z ** 3 + z) / (4 * df) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * df * df)
+
+
+def block_bootstrap_ci(xs: Sequence[float], stat: Optional[Callable[[Sequence[float]], float]] = None,
                        *, B: int = 2000, seed: int = DEFAULT_SEED, alpha: float = 0.05,
                        block: Optional[int] = None) -> Dict[str, Any]:
-    """Moving-block bootstrap percentile interval. Deterministic for a given seed."""
+    """Confidence interval for the MEAN (or, with ``stat``, a bootstrap-only interval for another
+    statistic). Deterministic for a given seed.
+
+    Serial dependence is what makes a naive interval overconfident, so this does not trust one
+    method: the moving-block bootstrap uses a block length tied to the measured persistence
+    (``2 * n / ESS``, never shorter than n^(1/3)), and for the mean the result is the WIDER of
+    that and an effective-sample-size t interval. Even so, a short, persistent series stays
+    under-covered: the ESS is reported with every interval so the caller can see how many
+    independent draws it really rests on, and ``funding_eval`` / ``opportunity_engine`` refuse
+    to use an interval whose ESS is below their floor. A constant series has no variance to
+    resample: it gets NO interval (a zero-width interval is not a bound)."""
     n = len(xs)
     if n < MIN_FOR_CI:
-        return {"status": "INSUFFICIENT", "n": n, "reason": f"fewer than {MIN_FOR_CI} independent points"}
-    L = block or max(1, round(n ** (1.0 / 3.0)))
+        return {"status": "INSUFFICIENT", "n": n, "reason": f"fewer than {MIN_FOR_CI} settlement-level points"}
+    m = _mean(xs)
+    var = sum((x - m) ** 2 for x in xs) / (n - 1)
+    if var <= 0 or (max(xs) - min(xs)) <= 1e-12 * max(1.0, abs(m)):      # constant to float precision
+        return {"status": "NO_VARIANCE", "n": n, "estimate": m, "ess": 1.0,
+                "reason": "constant series: nothing to resample, and a zero-width interval would be a false bound"}
+    ess = effective_sample_size(xs) or 1.0
+    if ess < 3.0:
+        return {"status": "INSUFFICIENT", "n": n, "ess": ess, "estimate": m,
+                "reason": "effective sample size below 3: the series carries too few independent draws for any interval"}
+    mean_stat = stat is None
+    f = stat or _mean
+    tau = n / ess
+    L = block or min(max(1, n // 2), max(round(n ** (1.0 / 3.0)), math.ceil(2.0 * tau)))
     rng = random.Random(seed)
     starts = n - L + 1
     nblocks = math.ceil(n / L)
@@ -73,12 +109,21 @@ def block_bootstrap_ci(xs: Sequence[float], stat: Callable[[Sequence[float]], fl
         for _b in range(nblocks):
             i = rng.randrange(starts)
             sample.extend(xs[i:i + L])
-        vals.append(stat(sample[:n]))
+        vals.append(f(sample[:n]))
     vals.sort()
     lo = vals[int((alpha / 2) * (B - 1))]
     hi = vals[int((1 - alpha / 2) * (B - 1))]
-    return {"status": "OK", "n": n, "block": L, "B": B, "seed": seed, "alpha": alpha,
-            "estimate": stat(list(xs)), "lo": lo, "hi": hi}
+    out: Dict[str, Any] = {"status": "OK", "n": n, "ess": ess, "block": L, "B": B, "seed": seed, "alpha": alpha,
+                           "estimate": f(list(xs)), "bootstrap_lo": lo, "bootstrap_hi": hi}
+    if mean_stat and abs(alpha - 0.05) < 1e-12:
+        half = _t_crit(ess - 1.0) * math.sqrt(var / ess)
+        out["ess_t_lo"], out["ess_t_hi"] = m - half, m + half
+        lo, hi = min(lo, m - half), max(hi, m + half)
+        out["method"] = "wider of the moving-block bootstrap and the ESS-adjusted t interval"
+    else:
+        out["method"] = "moving-block bootstrap only"
+    out["lo"], out["hi"] = lo, hi
+    return out
 
 
 def settlement_groups(rows: Sequence[Mapping[str, Any]]) -> Dict[int, List[Mapping[str, Any]]]:
@@ -116,5 +161,5 @@ def independence_report(rows: Sequence[Mapping[str, Any]], *, regime_threshold_b
         "mean_forecast_ci": block_bootstrap_ci(per_settlement),
         "regime_sign_transitions": transitions, "regime_threshold_bps": regime_threshold_bps,
         "time_blocks": time_blocks,
-        "reading": "snapshots are correlated; only independent events count toward any claim",
+        "reading": "snapshots are correlated and settlements are serially dependent; the effective sample size, not the settlement count, says how much evidence there is",
     }

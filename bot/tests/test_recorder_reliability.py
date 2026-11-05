@@ -42,3 +42,13 @@ def test_store_faults_supervisor_and_disk_are_reported_as_measured():
     assert r["verdict"] == "DEGRADED" and r["feed"]["rows_with_store_fault"] == 1
     assert r["feed"]["linear_reconnects_in_window"] == 4 and r["supervisor"]["recorder_restarts"] == 2
     assert r["disk"]["free_bytes_last"] == 4_000_000_000
+
+
+def test_a_future_dated_newest_row_is_not_healthy_and_not_silently_fresh():
+    """A negative age used to mean 'never stale': rows dated ahead of now (wrong clock, copied evidence) looked healthy."""
+    from capacity_helpers import base_row, series
+    rows = series(base_row(), 3, lambda T, t: 0.6, lambda T: 0.6)
+    r = RR.report(rows, now_ms=rows[-1]["at_ms"] - 3_600_000)
+    assert r["verdict"] == "CLOCK_AHEAD" and r["clock_ahead"] and "future" in r["why"]
+    ok = RR.report(rows, now_ms=rows[-1]["at_ms"] + 60_000)
+    assert ok["verdict"] == "HEALTHY" and not ok["clock_ahead"]

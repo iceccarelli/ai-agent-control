@@ -5,9 +5,11 @@
     python3 tools/state_backup.py verify  --backup FILE
     python3 tools/state_backup.py restore --backup FILE --into NEWDIR
 
-* ``backup`` opens the source READ-ONLY and copies a consistent snapshot with SQLite's online
-  backup API (safe while the writer runs). The source is never written, locked for writing,
-  hashed or opened without ``mode=ro``. It refuses an out-dir that is the source's own
+* ``backup`` opens the source READ-ONLY (``mode=ro``, percent-encoded URI) and copies a consistent
+  snapshot with SQLite's online backup API (safe while the writer runs). The source database file
+  is never written. One caveat that is SQLite's, not this tool's: opening a WAL-mode database
+  read-only may create its ``-wal``/``-shm`` side files in the source directory when no writer has
+  them open; the main database file's bytes are unchanged. It refuses an out-dir that is the source's own
   directory (a backup beside the ledger on the same volume is not a backup). It checks the copy
   (``PRAGMA integrity_check``), records its SHA-256 and per-table row COUNTS (never contents) in
   a manifest.
@@ -25,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import pathlib
 import json
 import os
 import shutil
@@ -37,6 +40,12 @@ TOOL_VERSION = 1
 MANIFEST_SUFFIX = ".manifest.json"
 
 
+def _ro_uri(path: str) -> str:
+    """A read-only SQLite URI with the path percent-encoded: a '#', '?' or '%' in a directory or file
+    name must not redirect the open to a different file (an unencoded URI would)."""
+    return pathlib.Path(os.path.abspath(path)).as_uri() + "?mode=ro"
+
+
 def _sha256(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as fh:
@@ -46,7 +55,7 @@ def _sha256(path: str) -> str:
 
 
 def _inspect(path: str) -> Dict[str, Any]:
-    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    con = sqlite3.connect(_ro_uri(path), uri=True)
     try:
         integrity = [r[0] for r in con.execute("PRAGMA integrity_check")]
         tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
@@ -69,7 +78,7 @@ def backup(db: str, out_dir: str, *, now: Optional[float] = None) -> Dict[str, A
     dest = os.path.join(out_dir, f"state-{stamp}.db")
     if os.path.exists(dest):
         raise SystemExit(f"refusing: {dest} already exists")
-    src = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    src = sqlite3.connect(_ro_uri(db), uri=True)
     try:
         dst = sqlite3.connect(dest)
         try:
@@ -79,6 +88,9 @@ def backup(db: str, out_dir: str, *, now: Optional[float] = None) -> Dict[str, A
     finally:
         src.close()
     info = _inspect(dest)
+    if not info["tables"]:
+        os.remove(dest)               # a backup of nothing must never look like a backup
+        raise SystemExit("refusing: the copy holds no tables - the source is empty or the wrong file was opened")
     manifest = {"tool_version": TOOL_VERSION, "created_utc": stamp, "backup_file": os.path.basename(dest),
                 "source_basename": os.path.basename(db), "bytes": os.path.getsize(dest), "sha256": _sha256(dest),
                 "integrity_ok": info["integrity_ok"], "tables": info["tables"],
@@ -117,12 +129,15 @@ def restore(backup_file: str, into: str) -> Dict[str, Any]:
     if not v["ok"]:
         raise SystemExit(f"refusing: the backup does not verify: {v['problems']}")
     target = os.path.realpath(into)
-    if os.path.basename(target) == "state" or target.rstrip(os.sep).endswith(os.sep + "state") or target == "/app/state":
-        raise SystemExit("refusing: --into looks like a live state directory; restore only into a disposable one")
+    parts = [x for x in target.split(os.sep) if x]
+    if ("state" in parts or target == "/app" or target.startswith("/app/") or target == "/data"
+            or os.path.ismount(target)):
+        raise SystemExit("refusing: --into looks like a live state directory or the root of a volume mount "
+                         "(use a new subdirectory); restore only into a disposable one")
     if os.path.exists(target) and (not os.path.isdir(target) or os.listdir(target)):
         raise SystemExit("refusing: --into exists and is not an empty directory")
     os.makedirs(target, exist_ok=True)
-    out = os.path.join(target, "trading_state.db")
+    out = os.path.join(target, "restored-state.db")      # never the live file name
     shutil.copyfile(backup_file, out)
     got = _inspect(out)
     ok = got["integrity_ok"] and got["tables"] == v["tables"] and _sha256(out) == v["sha256"]

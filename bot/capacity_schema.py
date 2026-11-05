@@ -36,6 +36,13 @@ CORRUPT = "CORRUPT_RECORD"
 
 _REQUIRED_TOP = ("schema", "model_version", "venue", "category", "environment", "symbol", "mode",
                  "row_id", "source", "at_ms", "times", "funding", "book", "fees", "curve")
+#: A funding rate beyond this is not a plausible per-settlement print or forecast for a BTC perp
+#: (it is 3 % in ONE interval); it is a unit error or corruption and is rejected, not summarised.
+MAX_ABS_FUNDING_BPS = 300.0
+MAX_FEE_BPS = 100.0
+#: More than this share of the non-legacy rows rejected means the stream as a whole is not trusted.
+MAX_REJECTED_SHARE = 0.01
+TOO_MANY_REJECTED = "TOO_MANY_REJECTED_ROWS"
 _MIN_MS = 1_500_000_000_000          # 2017: anything earlier is not a Bybit-era wall clock
 _MAX_MS = 4_000_000_000_000
 
@@ -102,6 +109,8 @@ def validate_row(row: Any) -> List[Tuple[str, str]]:
         fc, ns, iv = f.get("forecast_bps"), f.get("next_settlement_ms"), f.get("interval_h")
         if not _fin(fc):
             out.append(_issue(NON_FINITE if fc is not None else MISSING_FIELD, "funding.forecast_bps"))
+        elif abs(fc) > MAX_ABS_FUNDING_BPS:
+            out.append(_issue(BAD_TYPE, f"funding.forecast_bps {fc} is outside +/-{MAX_ABS_FUNDING_BPS} bps (a unit error?)"))
         if not _fin(ns):
             out.append(_issue(BAD_SETTLEMENT, f"next_settlement_ms {ns!r}"))
         elif _fin(at) and not (at < ns <= at + 24 * 3_600_000 + 60_000):
@@ -110,19 +119,28 @@ def validate_row(row: Any) -> List[Tuple[str, str]]:
             out.append(_issue(BAD_SETTLEMENT, f"funding interval {iv!r}"))
         elif _fin(ns) and _fin(at) and ns - at > iv * 3_600_000 + 60_000:
             out.append(_issue(BAD_SETTLEMENT, "next settlement farther away than one funding interval"))
+        elif _fin(ns) and int(ns) % (iv * 3_600_000) != 0:
+            # Bybit settles on the UTC grid of its interval. An off-grid clock would let any value
+            # in (now, now+24h] be counted as a distinct "settlement".
+            out.append(_issue(BAD_SETTLEMENT, f"next settlement {ns!r} is not on the {iv} h UTC settlement grid"))
         lp, lps = f.get("last_print_bps"), f.get("last_print_settled_ms")
         if (lp is None) != (lps is None) or (lp is not None and not (_fin(lp) and _fin(lps))):
             out.append(_issue(NON_FINITE, "last print"))
         elif lps is not None and _fin(at) and lps > at:
             out.append(_issue(BAD_SETTLEMENT, "last funding print settled in the future"))
+        elif lp is not None and abs(lp) > MAX_ABS_FUNDING_BPS:
+            out.append(_issue(BAD_TYPE, f"funding.last_print_bps {lp} is outside +/-{MAX_ABS_FUNDING_BPS} bps"))
+        elif lps is not None and isinstance(iv, int) and not isinstance(iv, bool) and 1 <= iv <= 24 \
+                and int(lps) % (iv * 3_600_000) != 0:
+            out.append(_issue(BAD_SETTLEMENT, f"last print settlement {lps!r} is not on the {iv} h UTC grid"))
     b = row["book"]
     if not isinstance(b, dict) or any(not (isinstance(b.get(k), int) and b[k] >= 0) for k in
                                       ("perp_bid_levels", "perp_ask_levels", "spot_bid_levels", "spot_ask_levels")):
         out.append(_issue(BAD_BOOK, "level counts"))
     fe = row["fees"]
     if not isinstance(fe, dict) or not isinstance(fe.get("source"), str) \
-            or not (_fin(fe.get("perp_taker_bps")) and fe["perp_taker_bps"] > 0):
-        out.append(_issue(MISSING_FIELD, "fees provenance"))
+            or not (_fin(fe.get("perp_taker_bps")) and 0 < fe["perp_taker_bps"] <= MAX_FEE_BPS):
+        out.append(_issue(MISSING_FIELD, "fees provenance (a positive taker fee in bps, at most %g)" % MAX_FEE_BPS))
     curve = row["curve"]
     if not isinstance(curve, list) or not curve:
         out.append(_issue(BAD_CURVE, "empty or not a list"))
@@ -165,6 +183,10 @@ def validate_stream(rows: Sequence[Any]) -> Dict[str, Any]:
         if len(vals) > 1:
             mixed = True
             problems.append({"index": None, "code": MIXED, "detail": f"{key} takes {sorted(map(str, vals))}"})
+    ivs = {r["funding"]["interval_h"] for r in v2}
+    if len(ivs) > 1:                       # settlements-per-day and the grid are only defined for one interval
+        mixed = True
+        problems.append({"index": None, "code": MIXED, "detail": f"funding interval takes {sorted(ivs)} h"})
     seen: Dict[str, int] = {}
     prev_at: Optional[float] = None
     for i, r in enumerate(v2):
@@ -175,10 +197,17 @@ def validate_stream(rows: Sequence[Any]) -> Dict[str, Any]:
         if prev_at is not None and r["at_ms"] < prev_at:
             problems.append({"index": i, "code": TIME_REGRESSION, "detail": f"{r['at_ms']} < {prev_at}"})
         prev_at = max(prev_at or 0, r["at_ms"])
+    n_rejected = len(rows) - legacy - len(v2)
+    considered = len(rows) - legacy
+    rejected_share = (n_rejected / considered) if considered else 0.0
+    if rejected_share > MAX_REJECTED_SHARE:
+        problems.append({"index": None, "code": TOO_MANY_REJECTED,
+                         "detail": f"{n_rejected} of {considered} non-legacy rows rejected ({rejected_share:.1%} > {MAX_REJECTED_SHARE:.0%})"})
     bad_codes = {p["code"] for p in problems}
-    stream_bad = bool(bad_codes & {MIXED, DUPLICATE_ID, TIME_REGRESSION})
+    stream_bad = bool(bad_codes & {MIXED, DUPLICATE_ID, TIME_REGRESSION, TOO_MANY_REJECTED})
     accepted = [] if (mixed or stream_bad) else v2
     return {"accepted": accepted, "n_input": len(rows), "n_valid_rows": len(v2),
+            "n_rejected": n_rejected, "rejected_share": rejected_share,
             "n_legacy_quarantined": legacy,
             "problems": problems, "stream_ok": not stream_bad and bool(v2),
             "note": "no repair, default or forward-fill is applied to any record"}

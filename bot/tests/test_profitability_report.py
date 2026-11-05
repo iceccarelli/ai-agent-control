@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), "tools"))
 
 import evidence_chain as EC  # noqa: E402
 import profitability_report as PR  # noqa: E402
-from capacity_helpers import base_row, series, START, H8  # noqa: E402
+from capacity_helpers import base_row, clone, noisy, series, START, H8  # noqa: E402
 
 BASE = base_row()
 
@@ -38,7 +38,7 @@ def test_a_short_clean_recording_is_healthy_but_every_conclusion_is_insufficient
 
 
 def test_a_long_low_funding_recording_reaches_an_economic_verdict_with_the_screens_and_unknowns(tmp_path):
-    rows = series(BASE, 100, lambda T, t: 0.65, lambda T: 0.65, cadence_ms=600_000)
+    rows = series(BASE, 100, lambda T, t: 0.65, noisy(0.65, 0.12))
     rep = report(lay_down(tmp_path, rows), rows)
     assert rep["funding_evaluation"]["status"] == "OK" and rep["economics"] is not None
     res = rep["economics"]["result"]
@@ -47,15 +47,19 @@ def test_a_long_low_funding_recording_reaches_an_economic_verdict_with_the_scree
     assert not any(h["meets"] for h in res["hurdles"])
     stat = {o["strategy"]: o["status"] for o in rep["opportunities"]}
     assert stat["carry_overlay_taker/v1"] == "ECONOMICALLY_UNATTRACTIVE"
-    assert "book-fillable snapshots" in PR.render(rep) and "fills" not in PR.render(rep).replace("book-fillable", "")
+    text = PR.render(rep)
+    assert "book-fillable snapshots" in text and "fills" not in text.replace("book-fillable", "")
+    assert "LOWER BOUND" in text and "best case" in text and "MODELLED net" in text and "UNPRICED" in text
+    assert "environment mainnet, symbol BTCUSDT" in text and "venue bybit" in text
+    assert res["components_usd"]["market_impact_usd"] == 0.0 and "market_impact" in res["unknowns"]     # unknown, not a known zero
 
 
 def test_a_tampered_file_fails_integrity_and_drops_the_conclusion_to_insufficient(tmp_path):
-    rows = series(BASE, 100, lambda T, t: 4.0, lambda T: 4.0, cadence_ms=600_000)
+    rows = series(BASE, 100, lambda T, t: 4.0, noisy(4.0, 0.5))
     d = lay_down(tmp_path, rows)
     p = os.path.join(d, "capacity-20261104.jsonl")
     data = open(p, "rb").read()
-    open(p, "wb").write(data.replace(b'"forecast_bps":4.0', b'"forecast_bps":9.0', 1))
+    open(p, "wb").write(data.replace(b'"mode":"overlay"', b'"mode":"overlaz"', 1))
     rep = report(d, rows)
     assert rep["integrity"]["chain_ok_for_v2_files"] is False
     assert any(i["code"] == "MUTATED" for f in rep["integrity"]["files"] for i in f["chain"]["issues"])
@@ -108,3 +112,66 @@ def test_an_empty_directory_is_no_data_not_healthy(tmp_path):
     rep = PR.build(str(d), now_ms=1_793_800_000_000)
     assert rep["reliability"]["verdict"] == "NO_DATA" and rep["economics"] is None
     assert PR.main(["--dir", str(d)]) == 0
+
+
+# ---- adversarial-review findings -------------------------------------------------------------------------------
+
+def test_a_day_file_emptied_to_zero_bytes_still_fails_the_integrity_gate(tmp_path):
+    rows = series(BASE, 6, lambda T, t: 0.65, noisy(0.65, 0.1))
+    d = lay_down(tmp_path, rows[: len(rows) // 2], name="capacity-20261103.jsonl")
+    d = lay_down(tmp_path, rows[len(rows) // 2:], name="capacity-20261104.jsonl")
+    open(os.path.join(d, "capacity-20261103.jsonl"), "wb").write(b"")       # sidecar and head left intact
+    rep = report(d, rows)
+    assert rep["integrity"]["chain_ok_for_v2_files"] is False
+    assert any(i["code"] == "TRUNCATED" for f in rep["integrity"]["files"] for i in f["chain"]["issues"])
+    assert rep["economics"] is None
+
+
+def test_economics_are_withheld_not_printed_with_a_caveat_when_a_gate_is_not_cleared(tmp_path):
+    """Nine settlements at 6 bps used to print '58.5 %/yr, 10/15/20 -> meets' next to an INSUFFICIENT status."""
+    rows = series(BASE, 9, lambda T, t: 6.0, noisy(6.0, 0.4))
+    rep = report(lay_down(tmp_path, rows), rows)
+    text = PR.render(rep)
+    assert rep["economics"] is None and "WITHHELD" in text
+    assert "meets" not in text and "%/yr on economic capital" not in text
+
+
+def test_a_mutated_file_does_not_print_a_return_next_to_the_integrity_failure(tmp_path):
+    rows = series(BASE, 100, lambda T, t: 4.0, noisy(4.0, 0.5))
+    d = lay_down(tmp_path, rows)
+    p = os.path.join(d, "capacity-20261104.jsonl")
+    open(p, "wb").write(open(p, "rb").read().replace(b'"mode":"overlay"', b'"mode":"overlaz"', 1))
+    text = PR.render(report(d, rows))
+    assert "chain verifies for EVERY file: False" in text and "WITHHELD" in text and "meets" not in text
+
+
+def test_testnet_evidence_cannot_reach_a_candidate_or_a_return_and_the_report_names_the_environment(tmp_path):
+    rows = [clone(BASE, r["source"]["store_record_id"], r["at_ms"], r["funding"]["forecast_bps"], r["funding"]["next_settlement_ms"],
+                  None if r["funding"]["last_print_bps"] is None else (r["funding"]["last_print_settled_ms"], r["funding"]["last_print_bps"]),
+                  env="testnet") for r in series(BASE, 100, lambda T, t: 4.0, noisy(4.0, 0.5))]
+    rep = report(lay_down(tmp_path, rows), rows)
+    text = PR.render(rep)
+    assert rep["economics"] is None and "not mainnet" in " ".join(rep["economics_withheld_because"])
+    assert "environment testnet" in text
+    assert {o["strategy"]: o["status"] for o in rep["opportunities"]}["carry_overlay_taker/v1"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_a_long_constant_funding_recording_is_withheld_for_want_of_effective_sample_size(tmp_path):
+    rows = series(BASE, 150, lambda T, t: 4.0, lambda T: 4.0)
+    rep = report(lay_down(tmp_path, rows), rows)
+    assert rep["economics"] is None and "effective sample size" in " ".join(rep["economics_withheld_because"])
+
+
+def test_the_report_says_when_it_has_no_external_anchor(tmp_path):
+    rows = series(BASE, 4, lambda T, t: 0.65, noisy(0.65, 0.1))
+    d = lay_down(tmp_path, rows)
+    assert "UNANCHORED" in PR.render(report(d, rows)) and report(d, rows)["integrity"]["anchored"] is False
+
+
+def test_a_third_of_the_rows_rejected_voids_the_stream_and_is_printed(tmp_path):
+    rows = series(BASE, 6, lambda T, t: 0.65, noisy(0.65, 0.1))
+    for r in rows[::3]:
+        r["funding"]["forecast_bps"] = 1e6                      # a unit error, not NaN
+    rep = report(lay_down(tmp_path, rows), rows)
+    assert rep["validation"]["stream_ok"] is False and rep["validation"]["n_rejected"] > 0
+    assert "REJECTED" in PR.render(rep)

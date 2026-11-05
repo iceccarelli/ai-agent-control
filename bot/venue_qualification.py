@@ -26,6 +26,10 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Tuple
 
+#: Sanity bounds so that a mistyped or pasted-as-percent number cannot "qualify" an account.
+MAX_PLAUSIBLE_TAKER_RATE = 0.005        # 50 bps: far above any Bybit tier, far below a percent-as-fraction slip
+MIN_BTC_COLLATERAL_RATIO = 0.10
+
 QUALIFIED = "QUALIFIED"
 NOT_QUALIFIED = "NOT_QUALIFIED"
 UNVERIFIED = "UNVERIFIED"
@@ -120,9 +124,14 @@ def evaluate_eu(evidence: Any) -> Qualification:
         missing.append("fee_rates")
     else:
         tk, mk = fee.get("taker_fee_rate"), fee.get("maker_fee_rate")
-        ok_num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) < 1   # noqa: E731
-        if not (_non_empty(fee.get("source")) and ok_num(tk) and ok_num(mk)) or tk < 0:
-            reasons.append("FEE_RATES_INVALID: the account's taker/maker rates must be finite fractions read from the account")
+        fin = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float("inf")   # noqa: E731
+        src = fee.get("source")
+        if not (isinstance(src, str) and "/v5/account/fee-rate" in src):
+            reasons.append("FEE_RATES_INVALID: source must name the account fee-rate endpoint (GET /v5/account/fee-rate)")
+        elif not (fin(tk) and fin(mk)) or not (0 < tk <= MAX_PLAUSIBLE_TAKER_RATE) or not (-MAX_PLAUSIBLE_TAKER_RATE <= mk <= MAX_PLAUSIBLE_TAKER_RATE):
+            reasons.append("FEE_RATES_INVALID: taker must be a positive fraction no greater than "
+                           f"{MAX_PLAUSIBLE_TAKER_RATE} (0.00055 is 5.5 bps; a percent pasted as a fraction is refused) "
+                           "and maker a fraction within the same bound")
         elif fee.get("symbol") != "BTCUSDT" or fee.get("category") != "linear":
             reasons.append("FEE_RATES_FOR_WRONG_INSTRUMENT")
 
@@ -131,9 +140,12 @@ def evaluate_eu(evidence: Any) -> Qualification:
         missing.append("collateral_rules")
     else:
         ratio = col.get("collateral_ratio")
-        if col.get("coin") != "BTC" or not _non_empty(col.get("source")) or not isinstance(col.get("margin_collateral"), bool) \
-                or not (isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and 0 < ratio <= 1):
-            reasons.append("COLLATERAL_RULES_INVALID: BTC collateral ratio in (0, 1] and the margin-collateral flag are required")
+        src = col.get("source")
+        if col.get("coin") != "BTC" or not (isinstance(src, str) and "/v5/account/collateral-info" in src) \
+                or col.get("margin_collateral") is not True \
+                or not (isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and MIN_BTC_COLLATERAL_RATIO <= ratio <= 1):
+            reasons.append("COLLATERAL_RULES_INVALID: BTC must be usable as margin collateral (margin_collateral true) with a "
+                           f"collateral ratio in [{MIN_BTC_COLLATERAL_RATIO}, 1], read from GET /v5/account/collateral-info")
 
     sup = evidence.get("support_confirmation")
     if not (isinstance(sup, Mapping) and _non_empty(sup.get("reference")) and _non_empty(sup.get("statement"))):

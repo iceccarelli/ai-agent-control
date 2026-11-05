@@ -7,8 +7,10 @@ Joins every layer of the evidence into one report and refuses to let a strong la
 weak one:
 
   1. VALIDATION   schema capacity/2, mixed/duplicate/regressed streams, quarantined legacy rows
-  2. INTEGRITY    per-file hash chain, with the chain heads the monitor copied OUT of the evidence
-                  directory used as external anchors
+  2. INTEGRITY    per-file hash chain, with the chain heads the monitor copied out of the evidence
+                  directory used as anchors (a second copy on the same volume; archive monitor.jsonl
+                  off the machine for them to be truly external). Every file counts, not just those
+                  that still hold rows
   3. RELIABILITY  cadence, gaps, staleness against NOW, supervisor restarts, disk
   4. INDEPENDENCE raw snapshots vs unique settlements vs effective sample size
   5. FUNDING      forecast vs the realised PUBLIC print, no forward fill
@@ -18,7 +20,10 @@ weak one:
 
 No status authorises trading. The venue rules used for liquidation headroom (haircut, margin
 rates) are ASSUMED and labelled so: they are not read from the exchange. The economics block uses the
-LOWER confidence bound of realised funding, never the forecast.
+LOWER confidence bound of realised funding, never the forecast, and is WITHHELD (not printed with a
+caveat) unless the evidence is valid, the chain verifies for EVERY file, the recorder is HEALTHY, the
+evidence is mainnet, and the funding evaluation passes both its count and its effective-sample-size
+floors. A number the gates have not cleared is not shown.
 """
 from __future__ import annotations
 
@@ -90,10 +95,12 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         ver = EC.verify(p, anchors=anchors.get(os.path.basename(p)))
         if v2:
             any_v2_file = True
-            if not ver["tamper_evident_ok"]:
-                chain_ok = False
+        if not ver["tamper_evident_ok"]:            # EVERY file counts, including one that lost all its rows
+            chain_ok = False
         files.append({"file": os.path.basename(p), "rows": len(rows), "schema_v2_rows": len(v2),
-                      "quarantined_lines": quarantined, "chain": {k: ver[k] for k in ("ok", "tamper_evident_ok", "n_chained", "unchained_tail", "head", "issues")},
+                      "quarantined_lines": quarantined,
+                      "chain": {k: ver[k] for k in ("ok", "tamper_evident_ok", "n_chained", "unchained_tail", "head", "issues",
+                                                    "resealed_rows", "anchored")},
                       "external_anchors": len(anchors.get(os.path.basename(p), []))})
         all_rows.extend(rows)
     val = CS.validate_stream(all_rows)
@@ -113,8 +120,31 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     book_cost = ES.mean([p["book_round_trip_bps"] for p in measured]) if measured else None
     fee_prov = accepted[-1]["fees"]["source"] if accepted else None
 
+    identity = {"environments": sorted({r["environment"] for r in accepted}), "symbols": sorted({r["symbol"] for r in accepted}),
+                "modes": sorted({r["mode"] for r in accepted}), "venues": sorted({r["venue"] for r in accepted}),
+                "categories": sorted({r["category"] for r in accepted})}
+    env = identity["environments"][0] if len(identity["environments"]) == 1 else None
+    withheld: List[str] = []
+    if not val["stream_ok"]:
+        withheld.append("the evidence stream failed validation")
+    if not (chain_ok and any_v2_file):
+        withheld.append("the chain does not verify for every file")
+    if rel["verdict"] != "HEALTHY":
+        withheld.append(f"the recorder is {rel['verdict']}")
+    if env != "mainnet":
+        withheld.append(f"the evidence environment is {env or identity['environments'] or 'absent'}, not mainnet")
+    if not fe:
+        withheld.append("no funding evaluation")
+    else:
+        if fe["status"] != "OK":
+            withheld.extend(fe.get("status_reasons") or ["the funding evaluation is not OK"])
+        if fe["realised_bps"]["ci"].get("status") != "OK":
+            withheld.append(f"no confidence interval on realised funding ({fe['realised_bps']['ci'].get('status')})")
+    if total_cost is None:
+        withheld.append("no measured round-trip cost at the target size")
+
     economics = None
-    if fe and fe["realised_bps"]["ci"].get("status") == "OK" and total_cost is not None:
+    if not withheld:
         f_lo = fe["realised_bps"]["ci"]["lo"]
         n_settle = max(1, int(round(hold_days * TE.SETTLEMENTS_PER_DAY)))
         pos = TE.Position(notional_usd=notional_usd, hold_days=hold_days, btc_inventory_usd=notional_usd, btc_was_owned=True,
@@ -122,14 +152,17 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                           reserve_usd=0.1 * notional_usd, maintenance_margin_rate=ASSUMED_VENUE_RULES["maintenance_margin_rate"],
                           initial_margin_rate=ASSUMED_VENUE_RULES["initial_margin_rate"])
         perp_fee = accepted[-1]["fees"]["perp_taker_bps"]
-        costs = TE.Costs(perp_entry_fee_bps=perp_fee, perp_exit_fee_bps=perp_fee, spread_bps=book_cost, slippage_bps=0.0,
-                         impact_bps=0.0, latency_bps=None, fee_provenance="UNVERIFIED")
+        spread_mean = ES.mean([p["spread_bps"] for p in measured])
+        slip_mean = ES.mean([p["slippage_bps"] for p in measured])
+        # measured walk of the DISPLAYED book only: market impact beyond it and latency are UNKNOWN, not zero
+        costs = TE.Costs(perp_entry_fee_bps=perp_fee, perp_exit_fee_bps=perp_fee, spread_bps=spread_mean, slippage_bps=slip_mean,
+                         impact_bps=None, latency_bps=None, fee_provenance="UNVERIFIED")
         economics = {"inputs": {"basis": "PER $%s HEDGED NOTIONAL; ILLUSTRATIVE POSITION, NOT YOUR ACCOUNT" % f"{notional_usd:,.0f}",
                                 "hold_days": hold_days, "funding_used_bps_per_settlement": f_lo,
                                 "funding_used_is": "LOWER 95% block-bootstrap bound of the realised public mean",
                                 "venue_rules": ASSUMED_VENUE_RULES},
                      "result": TE.compute(pos, costs, [f_lo] * n_settle, funding_source="PUBLIC_REALISED")}
-    bundle = {"carry": {"validation_ok": val["stream_ok"], "chain_ok": chain_ok and any_v2_file,
+    bundle = {"carry": {"validation_ok": val["stream_ok"], "chain_ok": chain_ok and any_v2_file, "environment": env,
                         "reliability_verdict": rel["verdict"], "funding_eval": fe or {}, "economics": economics["result"] if economics else {},
                         "fillable_share": fillable, "round_trip_cost_bps": total_cost, "prospective": {}},
               "rows": accepted, "rows_by_symbol": {accepted[0]["symbol"]: accepted} if accepted else {},
@@ -137,8 +170,13 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                                             "slice57_stage1_funding_carry_fade_btc_v1.json"))}
     return {
         "generated_at_ms": now_ms, "directory": os.path.basename(os.path.abspath(directory)),
-        "validation": {k: val[k] for k in ("n_input", "n_valid_rows", "n_legacy_quarantined", "stream_ok", "problems", "note")},
-        "integrity": {"files": files, "chain_ok_for_v2_files": chain_ok and any_v2_file},
+        "evidence_identity": identity,
+        "validation": {k: val[k] for k in ("n_input", "n_valid_rows", "n_rejected", "rejected_share", "n_legacy_quarantined",
+                                           "stream_ok", "problems", "note")},
+        "integrity": {"files": files, "chain_ok_for_v2_files": chain_ok and any_v2_file,
+                      "anchored": bool(files) and all(f["external_anchors"] > 0 for f in files),
+                      "anchor_note": "anchors are copies of the chain head in monitor.jsonl on the SAME volume; they are "
+                                     "external to the evidence directory only until the owner archives them off the machine"},
         "reliability": rel, "independence": indep, "funding_evaluation": fe,
         "capacity": {"target_notional_usd": notional_usd, "book_fillable_snapshot_share": fillable,
                      "mean_total_round_trip_bps": total_cost, "mean_book_round_trip_bps": book_cost,
@@ -146,7 +184,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                      "max_book_fillable_notional_usd": max((r.get("max_displayed_fillable_notional_usd") or 0.0 for r in accepted), default=None),
                      "wording": "'book-fillable snapshots' = snapshots in which the DISPLAYED book could fill the size; "
                                 "not executable liquidity"},
-        "economics": economics,
+        "economics": economics, "economics_withheld_because": withheld,
         "opportunities": OE.evaluate_all(bundle),
         "authorizes_trading": False,
     }
@@ -158,16 +196,23 @@ def _f(x: Any, nd: int = 2) -> str:
 
 def render(rep: Dict[str, Any]) -> str:
     v, i, r = rep["validation"], rep["integrity"], rep["reliability"]
-    out = ["PROFITABILITY REPORT - read-only, order-less; no status authorises trading", ""]
-    out.append(f"1 VALIDATION  rows in {v['n_input']}, schema-v2 valid {v['n_valid_rows']}, legacy v1 quarantined "
-               f"{v['n_legacy_quarantined']} (never used), stream ok: {v['stream_ok']}, problems: {len(v['problems'])}")
+    idn = rep["evidence_identity"]
+    out = ["PROFITABILITY REPORT - read-only, order-less; no status authorises trading",
+           "EVIDENCE      venue %s, category %s, environment %s, symbol %s, mode %s" % tuple(
+               ",".join(idn[k]) or "none" for k in ("venues", "categories", "environments", "symbols", "modes")), ""]
+    out.append(f"1 VALIDATION  rows in {v['n_input']}, schema-v2 valid {v['n_valid_rows']}, REJECTED {v['n_rejected']} "
+               f"({v['rejected_share']:.1%}), legacy v1 quarantined {v['n_legacy_quarantined']} (never used), "
+               f"stream ok: {v['stream_ok']}, problems: {len(v['problems'])}")
     for p in v["problems"][:5]:
         out.append(f"    ! {p['code']}: {p['detail']}")
-    out.append("2 INTEGRITY   chain verifies for schema-v2 files: %s" % i["chain_ok_for_v2_files"])
+    out.append("2 INTEGRITY   chain verifies for EVERY file: %s; %s" % (
+        i["chain_ok_for_v2_files"], "ANCHORED to monitor history" if i["anchored"] else
+        "UNANCHORED (a consistent truncation of the newest rows would not be detected)"))
     for f in i["files"]:
         iss = ",".join(x["code"] for x in f["chain"]["issues"]) or "none"
         q = f", QUARANTINED final line(s): {len(f['quarantined_lines'])}" if f["quarantined_lines"] else ""
-        out.append(f"    {f['file']}: rows {f['rows']} (v2 {f['schema_v2_rows']}), issues: {iss}, external anchors {f['external_anchors']}{q}")
+        rs = f", RESEALED rows adopted after a crash: {f['chain']['resealed_rows']}" if f["chain"].get("resealed_rows") else ""
+        out.append(f"    {f['file']}: rows {f['rows']} (v2 {f['schema_v2_rows']}), issues: {iss}, external anchors {f['external_anchors']}{q}{rs}")
     out.append(f"3 RELIABILITY {r['verdict']}: {r.get('why', '')}")
     if r.get("rows"):
         out.append(f"    {r['rows']} rows over {_f(r['window_hours'])} h, completeness {_f(r['completeness'], 3)}, gaps {len(r['gaps'])}, "
@@ -175,29 +220,33 @@ def render(rep: Dict[str, Any]) -> str:
                    f"{(r['supervisor'] or {}).get('recorder_restarts', 'n/a')}")
     ind = rep["independence"]
     if ind:
-        out.append(f"4 INDEPENDENCE raw snapshots {ind['raw_snapshots']}, unique settlements {ind['unique_settlements']}, "
-                   f"independent events {ind['independent_events']}, effective sample size {_f(ind['effective_sample_size'], 1)}")
+        out.append(f"4 DEPENDENCE  raw snapshots {ind['raw_snapshots']}, unique settlements {ind['unique_settlements']} "
+                   f"(serially dependent), effective sample size of the forecast series {_f(ind['effective_sample_size'], 1)}")
     fe = rep["funding_evaluation"]
     if fe:
         o = fe["by_offset"].get(30) or {}
         out.append(f"5 FUNDING     {fe['joined']} settlements joined forecast->realised public print "
                    f"(missing realised {fe['missing_realised']}, anomalies {len(fe['anomalies'])}); status {fe['status']} "
-                   f"(need {fe['min_independent']})")
+                   f"(needs {fe['min_independent']} joined AND effective sample size >= {fe['min_ess']:g}; realised ESS "
+                   f"{_f(fe['realised_bps'].get('ess'), 1)})")
+        for why in fe.get("status_reasons") or []:
+            out.append(f"    ! {why}")
         if o.get("n"):
             out.append(f"    forecast 30 min before: bias {_f(o['bias_bps'], 3)} bps, MAE {_f(o['mae_bps'], 3)}, sign accuracy {_f(o['sign_accuracy'], 2)}")
     cap = rep["capacity"]
     out.append(f"    book-fillable snapshots at ${cap['target_notional_usd']:,.0f}: {_f(cap['book_fillable_snapshot_share'], 2)}, "
-               f"round trip {_f(cap['mean_total_round_trip_bps'])} bps ({cap['fee_provenance']}), max displayed size "
-               f"${_f(cap['max_book_fillable_notional_usd'], 0)}")
+               f"MEAN round trip {_f(cap['mean_total_round_trip_bps'])} bps (a LOWER BOUND: displayed book + {cap['fee_provenance']} fees; "
+               f"no latency, no impact beyond the book), largest displayed size in ANY single snapshot "
+               f"${_f(cap['max_book_fillable_notional_usd'], 0)} (best case, not typical)")
     e = rep["economics"]
     if e:
         res = e["result"]
         out.append(f"6 ECONOMICS   {e['inputs']['basis']}, hold {e['inputs']['hold_days']:g} d, funding = {_f(e['inputs']['funding_used_bps_per_settlement'], 3)} bps/settlement ({e['inputs']['funding_used_is']})")
-        out.append(f"    net {_f(res['net_pnl_usd'])} USD; {_f(res['returns']['annualised_pct_on_economic_capital'])}%/yr on economic capital, "
-                   f"{_f(res['returns']['annualised_pct_on_notional'])}%/yr on notional; unknown inputs: {', '.join(res['unknowns']) or 'none'}")
-        out.append("    screens (" + TE.PROVISIONAL + "): " + ", ".join(f"{h['hurdle_apr_pct']:g}% -> {'meets' if h['meets'] else 'misses'}" for h in res["hurdles"]))
+        out.append(f"    MODELLED net {_f(res['net_pnl_usd'])} USD; {_f(res['returns']['annualised_pct_on_economic_capital'])}%/yr on economic capital, "
+                   f"{_f(res['returns']['annualised_pct_on_notional'])}%/yr on notional; UNPRICED (excluded, not zero): {', '.join(res['unknowns']) or 'none'}")
+        out.append("    screens (" + TE.PROVISIONAL + "), on modelled costs only: " + ", ".join(f"{h['hurdle_apr_pct']:g}% -> {'meets' if h['meets'] else 'misses'}" for h in res["hurdles"]))
     else:
-        out.append("6 ECONOMICS   not computed: no confidence interval on realised funding yet (insufficient joined settlements)")
+        out.append("6 ECONOMICS   WITHHELD: " + "; ".join(rep["economics_withheld_because"]))
     out.append("7 OPPORTUNITIES")
     for o in rep["opportunities"]:
         out.append(f"    {o['strategy']:<34} {o['origin']:<26} {o['status'] or 'FROZEN_ABSENT (never re-evaluated)'}")
@@ -209,7 +258,7 @@ def render(rep: Dict[str, Any]) -> str:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dir", required=True)
-    ap.add_argument("--history", default=None, help="monitor.jsonl: its copied chain heads are external anchors")
+    ap.add_argument("--history", default=None, help="monitor.jsonl: its copied chain heads are anchors (same volume; archive it off the machine to make them external)")
     ap.add_argument("--notional", type=float, default=100_000.0)
     ap.add_argument("--hold-days", type=float, default=30.0)
     ap.add_argument("--now-ms", type=int, default=None)

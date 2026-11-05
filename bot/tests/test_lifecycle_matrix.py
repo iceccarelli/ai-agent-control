@@ -89,6 +89,42 @@ def test_the_money_path_imports_no_recorder_or_analytics_module(module):
     assert not (imported & ANALYTICS), f"{module} imports {sorted(imported & ANALYTICS)}"
 
 
+NEW_ANALYTICS = {"evidence_chain", "evidence_stats", "capacity_schema", "funding_eval", "recorder_reliability",
+                 "trade_economics", "opportunity_engine", "profitability_report", "state_backup", "venue_qualification"}
+
+
+def _imports_of(path):
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    out = set()
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            out |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            out.add((n.module or "").split(".")[0])
+    return out
+
+
+def test_no_production_module_at_all_imports_the_evidence_economics_or_opportunity_modules():
+    """The fixed MONEY_PATH list above misses main.py, config.py, trading_engine.py, the cost gates and the shadow
+    modules; the review showed an `import opportunity_engine` there would have passed. So scan EVERY bot/*.py: the new
+    analytics may be imported only by each other (and by tools/ and tests/, which are not in this glob)."""
+    offenders = {}
+    for name in sorted(os.listdir(BOT)):
+        if not name.endswith(".py") or name[:-3] in NEW_ANALYTICS:
+            continue
+        bad = _imports_of(os.path.join(BOT, name)) & NEW_ANALYTICS
+        if bad:
+            offenders[name] = sorted(bad)
+    assert not offenders, offenders
+
+
+def test_the_guard_itself_can_fail(tmp_path):
+    """Control: the scan really detects an import (a guard that cannot fail is not a guard)."""
+    f = tmp_path / "carry_engine_like.py"
+    f.write_text("def f():\n    import opportunity_engine\n")
+    assert _imports_of(str(f)) & NEW_ANALYTICS == {"opportunity_engine"}
+
+
 def test_the_only_place_the_trading_process_starts_the_feed_is_main_and_it_is_optional():
     src = open(os.path.join(BOT, "main.py"), encoding="utf-8").read()
     assert "MARKET_FEED_ENABLED" in src and "def _start_market_feed" in src

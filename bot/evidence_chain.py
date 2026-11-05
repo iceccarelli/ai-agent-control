@@ -18,10 +18,15 @@ the monitor, every ``monitor.jsonl`` line the external watcher reads). `verify` 
                     visible, and sealed by `reseal_tail` with an explicit ``resealed`` mark
   HEAD_MISSING / HEAD_MISMATCH / ANCHOR_MISMATCH   the head cannot be verified
 
-Honest limit: a writer with access to every file AND to the external anchors can forge a
-consistent history. The anchors in the monitor history are what move that bar from "edit one
-file" to "edit the volume and the watcher's records"; for stronger assurance the owner keeps a
-periodic copy of the head elsewhere (the report prints it). Pure standard library.
+Honest limits:
+  * A writer with access to every file AND to the anchors can forge a consistent history. The
+    anchors copied into ``monitor.jsonl`` are a SECOND COPY ON THE SAME VOLUME: they are external to
+    the evidence directory, not to the machine. They become genuinely external only when the owner
+    archives ``monitor.jsonl`` (or the printed head) off the machine. Without any anchor a consistent
+    truncation of the tail cannot be detected, and the report says "UNANCHORED".
+  * Each day's chain starts from the all-zero genesis; there is no link between days. Removing a
+    whole day (file and sidecars) shows as a gap in the reliability report, not as a chain failure.
+Pure standard library.
 """
 from __future__ import annotations
 
@@ -58,21 +63,65 @@ def _atomic(path: str, text: str) -> None:
     os.replace(tmp, path)
 
 
-def _read_chain(path: str) -> List[Dict[str, Any]]:
+def _read_chain_ex(path: str) -> Tuple[List[Dict[str, Any]], bool, bool]:
+    """``(entries, torn_last_line, corrupt)``. Reading stops at the first line that is not a
+    well-formed entry. A bad FINAL line with no newline is a torn write (benign, healed by the next
+    writer); a bad line anywhere else, or a well-formed JSON line of the wrong shape, is corruption."""
     cpath, _ = _paths(path)
     out: List[Dict[str, Any]] = []
+    torn = corrupt = False
     try:
-        with open(cpath, encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if line:
-                    try:
-                        out.append(json.loads(line))
-                    except ValueError:
-                        break               # a torn last chain line: what precedes it still stands
+        with open(cpath, "rb") as fh:
+            data = fh.read()
     except FileNotFoundError:
-        pass
-    return out
+        return out, False, False
+    parts = data.split(b"\n")
+    last = parts.pop()                       # b"" when the file ends with a newline
+    for raw in parts:
+        if not raw.strip():
+            continue
+        try:
+            e = json.loads(raw)
+        except ValueError:
+            corrupt = True
+            return out, torn, corrupt
+        if not (isinstance(e, dict) and isinstance(e.get("n"), int) and isinstance(e.get("r"), str)
+                and isinstance(e.get("h"), str)):
+            corrupt = True
+            return out, torn, corrupt
+        out.append(e)
+    if last.strip():
+        try:
+            e = json.loads(last)
+            if isinstance(e, dict) and isinstance(e.get("n"), int) and isinstance(e.get("r"), str) \
+                    and isinstance(e.get("h"), str):
+                out.append(e)                # complete entry whose newline was lost
+            else:
+                corrupt = True
+        except ValueError:
+            torn = True
+    return out, torn, corrupt
+
+
+def _read_chain(path: str) -> List[Dict[str, Any]]:
+    return _read_chain_ex(path)[0]
+
+
+class ChainDesync(RuntimeError):
+    """The evidence file and its sidecar disagree about how many rows exist (or the file ends in a
+    torn line). Appending now would weld the disagreement into the record permanently."""
+
+
+def _file_ends_clean(path: str) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return True
+            fh.seek(-1, os.SEEK_END)
+            return fh.read(1) == b"\n"
+    except FileNotFoundError:
+        return True
 
 
 def append(path: str, row: Mapping[str, Any]) -> Tuple[int, str]:
@@ -80,7 +129,14 @@ def append(path: str, row: Mapping[str, Any]) -> Tuple[int, str]:
     Order: row line, chain line, head. A crash between them leaves an UNCHAINED_TAIL (visible)
     or a head one behind the chain (still verifiable), never a silent gap."""
     raw = canonical(row)
-    chain = _read_chain(path)
+    chain, side_torn, side_corrupt = _read_chain_ex(path)
+    if side_corrupt or side_torn:
+        raise ChainDesync("the chain sidecar is torn or corrupt; run repair() before appending")
+    if not _file_ends_clean(path) or not _file_ends_clean(_paths(path)[0]):
+        raise ChainDesync("the evidence file or its sidecar ends in a torn line; run repair() before appending")
+    lines_on_disk, _q = read_lines(path)
+    if len(lines_on_disk) != len(chain):
+        raise ChainDesync(f"{len(lines_on_disk)} rows on disk but {len(chain)} chained; run repair() before appending")
     prev = chain[-1]["h"] if chain else GENESIS
     r = row_hash(raw)
     h = link(prev, r)
@@ -149,7 +205,7 @@ def head_of(path: str) -> Optional[Dict[str, Any]]:
 
 def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> Dict[str, Any]:
     lines, quarantined = read_lines(path)
-    chain = _read_chain(path)
+    chain, side_torn, side_corrupt = _read_chain_ex(path)
     head = head_of(path)
     issues: List[Dict[str, Any]] = []
 
@@ -159,8 +215,15 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
     # 1. the sidecar must be internally consistent (its own chain recomputes)
     prev = GENESIS
     side_ok = True
+    if side_corrupt:
+        add("SIDECAR_CORRUPT", "the chain sidecar holds a line that is not a well-formed entry")
+        side_ok = False
     for i, e in enumerate(chain):
-        if e.get("n") != i + 1 or link(prev, e.get("r", "")) != e.get("h"):
+        try:
+            recomputes = e.get("n") == i + 1 and link(prev, e["r"]) == e["h"]
+        except ValueError:                       # r / h are not hex
+            recomputes = False
+        if not recomputes:
             add("SIDECAR_INCONSISTENT", f"chain entry {i + 1} does not recompute", i)
             side_ok = False
             break
@@ -213,7 +276,9 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
         elif chain[n - 1]["h"] != hd:
             add("ANCHOR_MISMATCH", f"chain head at row {n} differs from the external anchor")
     serious = [i for i in issues if i["code"] != "UNCHAINED_TAIL"]
+    resealed = sum(1 for e in chain if e.get("resealed"))
     return {"path": os.path.basename(path), "ok": not issues, "tamper_evident_ok": not serious,
+            "anchored": bool(anchors), "resealed_rows": resealed, "sidecar_torn_tail": side_torn,
             "n_rows": len(lines), "n_chained": len(chain), "unchained_tail": unchained,
             "head": None if not chain else {"n": chain[-1]["n"], "head": chain[-1]["h"]},
             "quarantined_lines": quarantined, "issues": issues}
@@ -226,9 +291,10 @@ def reseal_tail(path: str) -> int:
     v = verify(path)
     if any(i["code"] not in ("UNCHAINED_TAIL", "HEAD_MISMATCH") for i in v["issues"]):
         return 0
+    cpath, hpath = _paths(path)
+    _truncate_to_last_newline(cpath)          # a torn / newline-less chain tail is regenerated below
     lines, _ = read_lines(path)
     chain = _read_chain(path)
-    cpath, hpath = _paths(path)
     prev = chain[-1]["h"] if chain else GENESIS
     n = len(chain)
     sealed = 0
@@ -244,6 +310,41 @@ def reseal_tail(path: str) -> int:
     if n:
         _atomic(hpath, json.dumps({"n": n, "head": prev}, sort_keys=True))
     return sealed
+
+
+def _truncate_to_last_newline(path: str, keep_aside: Optional[str] = None) -> int:
+    """Drop bytes after the last newline (a torn write). The dropped bytes are appended to
+    ``keep_aside`` when given, so nothing that was on disk is destroyed. Returns bytes dropped."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        return 0
+    cut = data.rfind(b"\n") + 1
+    torn = data[cut:]
+    if not torn:
+        return 0
+    if keep_aside:
+        with open(keep_aside, "ab") as fh:
+            fh.write(torn + b"\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    with open(path, "r+b") as fh:
+        fh.truncate(cut)
+        fh.flush()
+        os.fsync(fh.fileno())
+    return len(torn)
+
+
+def repair(path: str) -> Dict[str, Any]:
+    """Make an evidence file appendable again after a crash, visibly: a torn final row is moved
+    to ``<file>.torn`` (kept, never deleted), rows written but not chained are sealed with a
+    ``resealed`` mark. Refuses (changes nothing further) if anything BEFORE the tail fails to verify."""
+    moved = _truncate_to_last_newline(path, keep_aside=path + ".torn")
+    sealed = reseal_tail(path)
+    v = verify(path)
+    return {"torn_bytes_set_aside": moved, "rows_resealed": sealed, "tamper_evident_ok": v["tamper_evident_ok"],
+            "appendable": v["tamper_evident_ok"] and v["unchained_tail"] == 0 and _file_ends_clean(path)}
 
 
 def bulk_write(path: str, rows: Sequence[Mapping[str, Any]]) -> Tuple[int, str]:

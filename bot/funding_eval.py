@@ -24,6 +24,9 @@ import evidence_stats as ES
 DEFAULT_OFFSETS_MIN = (60, 30, 10)
 TOL_MIN = 3
 MIN_INDEPENDENT = 30
+#: Funding is persistent, so 30 joined settlements can carry far fewer independent draws. A claim
+#: needs the EFFECTIVE sample size of the realised series, not just the count.
+MIN_ESS = 30.0
 
 
 def _pct(xs: Sequence[float], p: float) -> Optional[float]:
@@ -59,7 +62,9 @@ def join(rows: Sequence[Mapping[str, Any]], *, offsets_min: Sequence[int] = DEFA
             missing_realised += 1
             continue
         realised = {round(p["funding"]["last_print_bps"], 9) for p in prints}
-        rec = {"settlement_ms": T, "realised_bps": prints[0]["funding"]["last_print_bps"],
+        # two different public prints for one settlement: keep the one worst for a short carry
+        # (the lowest) and flag the settlement, rather than let the first-read value win silently
+        rec = {"settlement_ms": T, "realised_bps": min(p["funding"]["last_print_bps"] for p in prints),
                "realised_conflict": len(realised) > 1, "forecasts": {}, "naive_last_print": {}}
         for off in offsets_min:
             target = T - off * 60_000
@@ -94,13 +99,25 @@ def evaluate(rows: Sequence[Mapping[str, Any]], *, offsets_min: Sequence[int] = 
     j = join(rows, offsets_min=offsets_min, tol_min=tol_min)
     joined = j["joined"]
     realised = [r["realised_bps"] for r in joined]
+    ess = ES.effective_sample_size(realised)
+    conflicts = sum(1 for r in joined if r["realised_conflict"])
+    why: List[str] = []
+    if len(joined) < MIN_INDEPENDENT:
+        why.append(f"{len(joined)} joined settlements, {MIN_INDEPENDENT} needed")
+    if ess is None or ess < MIN_ESS:
+        why.append(f"effective sample size of the realised series is {'n/a' if ess is None else round(ess, 1)}, "
+                   f"{MIN_ESS:g} needed (funding is persistent: the count overstates the evidence)")
+    if conflicts:
+        why.append(f"{conflicts} settlement(s) with conflicting public prints")
+    if j["anomalies"]:
+        why.append(f"{len(j['anomalies'])} print(s) observed before their own settlement")
     out: Dict[str, Any] = {
         "settlements_seen": j["settlements_seen"], "joined": len(joined),
         "missing_realised": j["missing_realised"], "missing_forecast": j["missing_forecast"],
-        "anomalies": j["anomalies"], "conflicting_prints": sum(1 for r in joined if r["realised_conflict"]),
-        "status": "OK" if len(joined) >= MIN_INDEPENDENT else "INSUFFICIENT",
-        "min_independent": MIN_INDEPENDENT, "offsets_min": list(offsets_min),
-        "realised_bps": {"n": len(realised), "mean": ES.mean(realised),
+        "anomalies": j["anomalies"], "conflicting_prints": conflicts,
+        "status": "OK" if not why else "INSUFFICIENT", "status_reasons": why,
+        "min_independent": MIN_INDEPENDENT, "min_ess": MIN_ESS, "offsets_min": list(offsets_min),
+        "realised_bps": {"n": len(realised), "ess": ess, "mean": ES.mean(realised),
                          "min": min(realised) if realised else None, "p05": _pct(realised, 0.05),
                          "share_negative": (sum(1 for x in realised if x < 0) / len(realised)) if realised else None,
                          "count_below_minus_1bps": sum(1 for x in realised if x < -1.0),

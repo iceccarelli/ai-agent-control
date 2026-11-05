@@ -18,7 +18,7 @@ client, broker, store or configuration, a test pins that, and every spec carries
 state is explicit, it is never re-evaluated, and its rejection is not weakened.
 
 The evaluators are deliberately conservative about what they accept: a stale recorder, a broken
-evidence chain, a mixed stream, or fewer than 90 independent settlements is INSUFFICIENT, and
+evidence chain, a mixed stream, or fewer than 90 settlements (or too small an effective sample size) is INSUFFICIENT, and
 PROSPECTIVELY_VALIDATED needs a registration timestamp that precedes the evidence it is judged on.
 """
 from __future__ import annotations
@@ -46,7 +46,7 @@ ORDER_LESS = "ORDER_LESS_RECOMMENDATION"
 HYPOTHESIS = "RESEARCH_HYPOTHESIS"
 FROZEN_ABSENT = "FROZEN_ABSENT"
 
-MIN_SETTLEMENTS = 90                # 30 days of independent funding events
+MIN_SETTLEMENTS = 90                # 30 days of settlements (serially dependent: the ESS gate in funding_eval also applies)
 PROSPECTIVE_SETTLEMENTS = 270       # 90 days after registration
 
 
@@ -140,7 +140,7 @@ REGISTRY: Dict[str, StrategySpec] = {s.key: s for s in (
         "per-symbol hedge and margin", {**_RISK, "max_correlated_exposure_pct": 50.0},
         {"registered": "2026-11-05 (this programme)", "universe": "liquid linear perpetuals only; no arbitrary illiquid expansion",
          "validation": "prospective", "multiple_testing": "number of symbols is the number of tests"},
-        ("a symbol survives costs, liquidity, concentration and tail screens on independent settlements",), _COMMON_REJECT),
+        ("a symbol survives costs, liquidity, concentration and tail screens on settlement-level data with an adequate effective sample size",), _COMMON_REJECT),
     StrategySpec(
         "btc_trend_following", 1, "BTC trend following (new version; needs untouched data)", HYPOTHESIS,
         {**_BTC_LINEAR, "direction": "directional"}, ("declared before evaluation",), ("declared before evaluation",),
@@ -198,20 +198,28 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
         reasons.append("evidence stream failed validation or holds no schema-v2 rows")
     if not ev.get("chain_ok"):
         reasons.append("evidence chain does not verify")
-    if ev.get("reliability_verdict") not in ("HEALTHY", "DEGRADED"):
-        reasons.append(f"recorder is {ev.get('reliability_verdict')}")
+    if ev.get("reliability_verdict") != "HEALTHY":
+        reasons.append(f"recorder is {ev.get('reliability_verdict')}: only HEALTHY evidence can support a screen")
+    if ev.get("environment") != "mainnet":
+        reasons.append(f"evidence environment is {ev.get('environment')!r}: only mainnet evidence can support a mainnet claim")
     fe = ev.get("funding_eval") or {}
     n = fe.get("joined", 0)
+    ess = (fe.get("realised_bps") or {}).get("ess")
     if n < MIN_SETTLEMENTS:
-        reasons.append(f"{n} independent settlements joined to a realised print; at least {MIN_SETTLEMENTS} needed")
+        reasons.append(f"{n} settlements joined to a realised print; at least {MIN_SETTLEMENTS} needed")
+    if fe.get("status") != "OK":
+        reasons.extend(fe.get("status_reasons") or ["funding evaluation is not OK"])
+    if (ev.get("economics") or {}).get("funding", {}).get("source") != "PUBLIC_REALISED":
+        reasons.append("economics were not computed from the realised public funding print")
     if reasons:
-        return _insufficient(spec, *reasons, independent_settlements=n)
+        return _insufficient(spec, *reasons, settlements_joined=n, effective_sample_size=ess)
     econ = ev.get("economics") or {}
     cap = econ.get("capital") or {}
     risk = spec.risk_limits
     liq = (econ.get("liquidation") or {}).get("conservative_adverse_move_pct")
     worst = (fe.get("realised_bps") or {}).get("min")
-    m = {"independent_settlements": n, "annualised_pct_on_economic_capital":
+    m = {"settlements_joined": n, "effective_sample_size": ess, "unpriced_inputs": list(econ.get("unknowns") or []),
+         "annualised_pct_on_economic_capital":
          (econ.get("returns") or {}).get("annualised_pct_on_economic_capital"),
          "round_trip_cost_bps": ev.get("round_trip_cost_bps"), "fillable_share": ev.get("fillable_share"),
          "worst_realised_settlement_bps": worst, "liquidation_headroom_pct": liq}
@@ -234,12 +242,18 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
                           [f"net {ret if ret is None else round(ret, 2)}%/yr on economic capital (lower-bound funding) is below the lowest "
                            f"{TE.PROVISIONAL} screen of {lowest}%"], m)
     pro = ev.get("prospective") or {}
+    post = pro.get("post_registration_annualised_pct_on_economic_capital")
     if (pro.get("registered_ms") and pro.get("first_evidence_ms") and pro["registered_ms"] < pro["first_evidence_ms"]
-            and pro.get("n_after_registration", 0) >= PROSPECTIVE_SETTLEMENTS):
+            and pro.get("n_after_registration", 0) >= PROSPECTIVE_SETTLEMENTS
+            and pro.get("post_registration_ess", 0) >= PROSPECTIVE_SETTLEMENTS / 9.0
+            and post is not None and post >= lowest):
         return Evaluation(spec.key, spec.origin, Status.PROSPECTIVELY_VALIDATED,
-                          ["registered before the evidence; confirmed on later independent settlements; authorises nothing"], m)
+                          ["registered before the evidence; the screens re-run on post-registration settlements ONLY still pass; "
+                           "authorises nothing"], m)
+    unpriced = ", ".join(m["unpriced_inputs"]) or "none"
     return Evaluation(spec.key, spec.origin, Status.RESEARCH_CANDIDATE,
-                      ["passes the screens on recorded evidence; not prospectively validated; authorises nothing"], m)
+                      [f"passes the {TE.PROVISIONAL} screens on MODELLED costs only (unpriced inputs: {unpriced}); "
+                       "recorded evidence, not prospectively validated; authorises nothing"], m)
 
 
 def basis_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
@@ -298,6 +312,9 @@ def evaluate_btc_fade(spec: StrategySpec, slice57: Optional[Mapping[str, Any]]) 
                        f"({m['q2_mean_net_r']:.3f} R) is a fraction of the first ({m['q1_mean_net_r']:.3f} R)"
                        if all(isinstance(m.get(k), (int, float)) for k in ("m1_margin_replicates", "n_oos", "n_floor", "q1_mean_net_r", "q2_mean_net_r"))
                        else "thin margins reported in its own artefact")
+    else:
+        reasons.append("the slice 57 artefact was not found in this environment (it is not shipped in the drill image): "
+                       "its fragility metrics were NOT loaded")
     return Evaluation(spec.key, spec.origin, Status.INSUFFICIENT_EVIDENCE, reasons, m)
 
 
@@ -320,7 +337,8 @@ def evaluate_all(bundle: Mapping[str, Any]) -> List[Dict[str, Any]]:
         elif key == "carry_overlay_taker/v1" or key == "candidate_carry_depth/v1":
             e = evaluate_carry(spec, bundle.get("carry") or {})
             if key == "candidate_carry_depth/v1":
-                e.reasons.append("order-less recommendation: judged on the same evidence, never executed")
+                e.reasons.append("order-less recommendation: judged on the same carry evidence, never executed; its own depth "
+                                 "entry rule is not evaluated here")
             out.append(e.as_dict())
         elif key == "funding_carry_fade_btc/v1":
             out.append(evaluate_btc_fade(spec, bundle.get("slice57")).as_dict())

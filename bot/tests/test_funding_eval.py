@@ -1,4 +1,6 @@
 import copy
+import math
+import random
 
 import pytest
 
@@ -6,6 +8,13 @@ import funding_eval as FE
 from capacity_helpers import base_row, series, H8, START
 
 BASE = base_row()
+_RNG = random.Random(11)
+_NOISE = {k: 0.6 + _RNG.gauss(0, 0.25) for k in range(2000)}
+
+
+def noisy(T):
+    """A realised print with real variation and no persistence: what a claim-worthy series looks like."""
+    return _NOISE[(T // H8) % 2000]
 
 
 def run(n=60, forecast=lambda T, t: 0.6, realised=lambda T: 0.6, **kw):
@@ -14,17 +23,17 @@ def run(n=60, forecast=lambda T, t: 0.6, realised=lambda T: 0.6, **kw):
 
 
 def test_a_perfect_forecast_has_zero_bias_and_full_sign_accuracy():
-    rows, ev = run()
-    assert ev["status"] == "OK" and ev["joined"] >= 55
+    rows, ev = run(n=150, forecast=lambda T, t: noisy(T), realised=noisy)
+    assert ev["status"] == "OK" and ev["joined"] >= 145 and ev["realised_bps"]["ess"] >= FE.MIN_ESS
     o = ev["by_offset"][30]
     assert o["bias_bps"] == pytest.approx(0.0) and o["mae_bps"] == pytest.approx(0.0) and o["sign_accuracy"] == 1.0
 
 
 def test_a_known_bias_is_measured_exactly_and_the_ci_brackets_it():
-    rows, ev = run(forecast=lambda T, t: 0.9, realised=lambda T: 0.6)
+    rows, ev = run(n=150, forecast=lambda T, t: noisy(T) + 0.3, realised=noisy)
     o = ev["by_offset"][60]
     assert o["bias_bps"] == pytest.approx(0.3) and o["rmse_bps"] == pytest.approx(0.3)
-    assert o["bias_ci"]["status"] == "OK"
+    assert o["bias_ci"]["status"] == "NO_VARIANCE"       # the error is a constant 0.3: nothing to resample, no false bound
 
 
 def test_the_realised_print_is_the_public_print_of_that_settlement_not_a_neighbours():
@@ -85,3 +94,34 @@ def test_too_few_settlements_is_insufficient_not_a_number_to_trust():
 def test_a_naive_last_print_baseline_is_reported_beside_the_forecast():
     rows, ev = run(forecast=lambda T, t: 0.6, realised=lambda T: 0.6)
     assert ev["by_offset"][30]["mae_naive_last_print_bps"] is not None
+
+
+def test_a_constant_realised_series_is_never_called_sufficient_however_long():
+    """Bybit's funding often sits at its baseline for weeks. A month of identical prints says 'no variation was
+    seen', not 'the distribution is known': ESS is 1 and no zero-width interval is offered."""
+    rows, ev = run(n=150)
+    assert ev["joined"] >= 145 and ev["status"] == "INSUFFICIENT"
+    assert ev["realised_bps"]["ess"] == 1.0 and ev["realised_bps"]["ci"]["status"] == "NO_VARIANCE"
+    assert any("effective sample size" in w for w in ev["status_reasons"])
+
+
+def test_a_persistent_series_with_ninety_settlements_does_not_pass_as_ninety_independent_draws():
+    rng = random.Random(5)
+    x, ar = 0.0, {}
+    for k in range(400):
+        x = 0.9 * x + rng.gauss(0, 0.2)
+        ar[k] = 0.6 + x
+    rows, ev = run(n=90, forecast=lambda T, t: ar[(T // H8) % 400], realised=lambda T: ar[(T // H8) % 400])
+    assert ev["joined"] >= 85
+    assert ev["realised_bps"]["ess"] < FE.MIN_ESS and ev["status"] == "INSUFFICIENT"
+
+
+def test_conflicting_public_prints_for_one_settlement_block_the_status_and_keep_the_adverse_value():
+    rows = series(BASE, 150, lambda T, t: noisy(T), noisy)
+    T = START + 40 * H8
+    late = [r for r in rows if r["funding"]["last_print_settled_ms"] == T]
+    late[len(late) // 2]["funding"]["last_print_bps"] = noisy(T) - 5.0
+    ev = FE.evaluate(rows)
+    assert ev["conflicting_prints"] == 1 and ev["status"] == "INSUFFICIENT"
+    rec = [r for r in FE.join(rows)["joined"] if r["settlement_ms"] == T][0]
+    assert rec["realised_bps"] == pytest.approx(noisy(T) - 5.0)

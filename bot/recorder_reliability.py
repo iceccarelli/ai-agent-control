@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 DEFAULT_CADENCE_S = 300.0
 STALE_AFTER_CADENCES = 3.0
 GAP_AFTER_CADENCES = 2.0
+CLOCK_AHEAD_TOLERANCE_S = 120.0       # a row dated further ahead than this is not from "now"
 
 
 def _pct(xs: Sequence[float], p: float) -> Optional[float]:
@@ -74,8 +75,12 @@ def report(rows: Sequence[Mapping[str, Any]], *, now_ms: int, cadence_s: float =
         "recorder_errors": None if status is None else (status.get("capacity") or {}).get("errors"),
     }
     degraded = bool(gaps) or bool(faults) or (out["completeness"] or 1.0) < 0.9
-    out["verdict"] = "STALE" if stale else ("DEGRADED" if degraded else "HEALTHY")
-    out["why"] = (f"last row is {age_s / 60:.0f} min old (limit {STALE_AFTER_CADENCES * cadence_s / 60:.0f} min): "
+    ahead = age_s < -CLOCK_AHEAD_TOLERANCE_S
+    out["clock_ahead"] = ahead
+    out["verdict"] = "CLOCK_AHEAD" if ahead else ("STALE" if stale else ("DEGRADED" if degraded else "HEALTHY"))
+    out["why"] = ("the newest row is dated in the future: a wrong clock, or rows from another time; not collecting evidence"
+                  if ahead else
+                  (f"last row is {age_s / 60:.0f} min old (limit {STALE_AFTER_CADENCES * cadence_s / 60:.0f} min): "
                   "the recorder is not collecting" if stale else
-                  ("gaps, store faults or incomplete cadence in the window" if degraded else "collecting at cadence"))
+                  ("gaps, store faults or incomplete cadence in the window" if degraded else "collecting at cadence")))
     return out

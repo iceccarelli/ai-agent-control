@@ -10,6 +10,8 @@ sys.path.insert(0, HERE)
 import md_capacity as MC  # noqa: E402
 from test_md_integration import complete_state  # noqa: E402
 
+import random as _random
+
 H8 = 8 * 3_600_000
 START = 1_793_750_400_000          # 2026-11-04 00:00:00 UTC
 
@@ -56,3 +58,11 @@ def series(base, n_settlements, forecast_fn, realised_fn, cadence_ms=300_000, sk
             rows.append(clone(base, i, t, forecast_fn(T, t), T, lp))
         t += cadence_ms
     return rows
+
+
+def noisy(mean, sd=0.2, seed=11, size=4000):
+    """Realised funding with real variation and no persistence: what a claim-worthy series looks like.
+    A constant series is NOT used where a claim is tested, because a constant has no variance to test."""
+    rng = _random.Random(seed)
+    vals = [mean + rng.gauss(0, sd) for _ in range(size)]
+    return lambda T: vals[(T // H8) % size]

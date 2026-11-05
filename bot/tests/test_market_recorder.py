@@ -199,3 +199,38 @@ def test_pruning_removes_a_days_chain_and_head_with_its_evidence_file(tmp_path):
     removed = rec.prune_capacity()
     assert removed == ["capacity-20200101.jsonl"]
     assert not [f for f in os.listdir(d) if f.startswith("capacity-20200101")]
+
+
+def test_a_real_recorder_series_validates_as_a_stream_when_the_log_and_clock_advance(tmp_path):
+    """The earlier test shows DUPLICATE_ID on a frozen clock; this is the positive control the review asked for:
+    rows captured as the log grows and time passes pass the strict stream validator with no problem at all."""
+    import capacity_schema as CSM
+    import evidence_chain as EC
+    rec, store, wall = make(tmp_path)
+    t = {"w": wall}
+    rec.wall_ms = lambda: t["w"]
+    for _ in range(6):
+        store._next_id = getattr(store, "_next_id", 1) + 1          # a new market event was logged
+        t["w"] += 300_000                                            # five minutes later
+        assert rec.capture_capacity() is not None
+    path = rec._capacity_path(t["w"])
+    rows = EC.rows_of(EC.read_lines(path)[0])
+    v = CSM.validate_stream(rows)
+    assert v["problems"] == [] and v["stream_ok"] and len(v["accepted"]) == 6 and v["n_rejected"] == 0
+
+
+def test_capture_after_a_torn_write_repairs_visibly_and_keeps_recording(tmp_path):
+    import evidence_chain as EC
+    rec, store, wall = make(tmp_path)
+    t = {"w": wall}
+    rec.wall_ms = lambda: t["w"]
+    assert rec.capture_capacity() is not None
+    path = rec._capacity_path(t["w"])
+    open(path, "ab").write(b'{"torn": tr')                             # power cut mid-row
+    store._next_id = getattr(store, "_next_id", 1) + 1
+    t["w"] += 300_000
+    assert rec.capture_capacity() is not None
+    v = EC.verify(path)
+    assert v["ok"] and v["n_rows"] == 2 and rec._repairs == 1
+    assert open(path + ".torn", "rb").read().startswith(b'{"torn": tr')
+    assert rec.status()["capacity"]["repairs_while_running"] == 1

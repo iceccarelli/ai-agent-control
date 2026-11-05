@@ -139,3 +139,67 @@ def test_bulk_write_produces_exactly_what_row_by_row_append_produces(tmp_path):
     assert EC.verify(b)["ok"]
     with pytest.raises(FileExistsError):
         EC.bulk_write(b, rows(1))
+
+
+# ---- adversarial-review findings: crash safety, visibility, and a sidecar that cannot crash the reader ------------
+
+def test_appending_after_a_torn_tail_is_refused_not_welded_into_the_record(tmp_path):
+    """Before: the new row's bytes merged with the torn fragment and the file was permanently MUTATED/TRUNCATED."""
+    p = write(tmp_path, 4)
+    with open(p, "ab") as fh:
+        fh.write(b'{"id":99,"v')                       # power cut mid-row
+    with pytest.raises(EC.ChainDesync):
+        EC.append(p, {"id": 5})
+    assert open(p, "rb").read().endswith(b'{"id":99,"v')      # nothing was added
+    r = EC.repair(p)
+    assert r["appendable"] and r["torn_bytes_set_aside"] == len(b'{"id":99,"v')
+    assert open(p + ".torn", "rb").read().startswith(b'{"id":99,"v')      # kept, not destroyed
+    EC.append(p, {"id": 5})
+    v = EC.verify(p)
+    assert v["ok"] and v["n_rows"] == v["n_chained"] == 5
+
+
+def test_a_crash_between_the_row_and_its_chain_entry_is_repaired_visibly_and_blocks_blind_appends(tmp_path):
+    p = write(tmp_path, 3)
+    with open(p, "ab") as fh:
+        fh.write(EC.canonical({"id": 3, "v": 4.5}) + b"\n")           # the row landed, the chain entry did not
+    with pytest.raises(EC.ChainDesync):
+        EC.append(p, {"id": 4})                                      # was: a permanent INSERTED
+    r = EC.repair(p)
+    assert r["rows_resealed"] == 1 and r["appendable"]
+    EC.append(p, {"id": 4})
+    v = EC.verify(p)
+    assert v["ok"] and v["n_rows"] == 5
+    assert v["resealed_rows"] == 1                                   # the repair is surfaced, not silent
+
+
+def test_a_torn_sidecar_line_is_healed_and_a_corrupt_one_is_reported_not_raised(tmp_path):
+    p = write(tmp_path, 3)
+    with open(p + ".chain", "ab") as fh:
+        fh.write(b'{"n":4,"r":"ab')                                  # torn chain line, benign
+    assert EC.verify(p)["sidecar_torn_tail"] is True
+    with pytest.raises(EC.ChainDesync):
+        EC.append(p, {"id": 3})
+    for k, junk in enumerate((b"[1,2,3]\n", b'"just a string"\n', b'{"n":"x","r":5,"h":[]}\n', b"not json at all\n")):
+        q = str(tmp_path / f"capacity-2026111{k}.jsonl")
+        for r in rows(3):
+            EC.append(q, r)
+        with open(q + ".chain", "ab") as fh:
+            fh.write(junk)
+        v = EC.verify(q)                                              # must not raise
+        assert "SIDECAR_CORRUPT" in codes(v) and v["tamper_evident_ok"] is False
+
+
+def test_appended_junk_that_is_resealed_stays_visible_in_verify(tmp_path):
+    p = write(tmp_path, 3)
+    with open(p, "ab") as fh:
+        fh.write(b'{"injected":true}\n')
+    assert EC.reseal_tail(p) == 1
+    v = EC.verify(p)
+    assert v["ok"] and v["resealed_rows"] == 1                      # ok on the chain, but flagged as adopted
+
+
+def test_without_an_anchor_a_clean_verify_says_so(tmp_path):
+    p = write(tmp_path, 3)
+    assert EC.verify(p)["anchored"] is False
+    assert EC.verify(p, anchors=[{"n": 3, "head": EC.verify(p)["head"]["head"]}])["anchored"] is True

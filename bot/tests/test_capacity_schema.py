@@ -48,6 +48,11 @@ def test_a_legacy_row_is_quarantined_not_accepted_and_not_called_corrupt():
     (lambda r: r.__setitem__("row_id", "mainnet:BTCUSDT:999"), CS.BAD_TYPE),
     (lambda r: r["fees"].__setitem__("source", None), CS.MISSING_FIELD),
     (lambda r: r.__setitem__("venue", "kraken"), CS.MIXED),
+    # review findings: grid, plausibility, and unit errors
+    (lambda r: r["funding"].__setitem__("next_settlement_ms", r["at_ms"] + 3_600_000), CS.BAD_SETTLEMENT),
+    (lambda r: r["funding"].__setitem__("forecast_bps", 1e6), CS.BAD_TYPE),
+    (lambda r: r["funding"].__setitem__("forecast_bps", -301.0), CS.BAD_TYPE),
+    (lambda r: r["fees"].__setitem__("perp_taker_bps", 5500.0), CS.MISSING_FIELD),
 ])
 def test_each_corruption_is_rejected_with_its_named_reason(good, mutate, code):
     r = copy.deepcopy(good)
@@ -86,3 +91,33 @@ def test_a_clean_series_is_accepted_whole_and_legacy_rows_never_enter_it(good):
     legacy = {"at_ms": 1, "curve": []}
     v2 = CS.validate_stream(rows + [legacy])
     assert v2["n_legacy_quarantined"] == 1 and len(v2["accepted"]) == len(rows)
+
+
+def test_off_grid_settlement_clocks_cannot_manufacture_unique_settlements(good):
+    """200 rows each claiming a different off-grid 'next settlement' used to validate as 200 settlements."""
+    rows = [clone(good, i + 1, good["at_ms"] + i * 1000, 0.5, good["at_ms"] + 3_600_000 + i) for i in range(200)]
+    v = CS.validate_stream(rows)
+    assert v["accepted"] == [] and not v["stream_ok"]
+    assert {p["code"] for p in v["problems"]} >= {CS.BAD_SETTLEMENT, CS.TOO_MANY_REJECTED}
+
+
+def test_a_stream_mixing_funding_intervals_is_rejected_whole(good):
+    ns = good["funding"]["next_settlement_ms"]
+    a = clone(good, 1, good["at_ms"], 0.5, ns)
+    H4 = 4 * 3_600_000
+    ns4 = (good["at_ms"] // H4 + 1) * H4                       # the next 4 h grid point after the rows
+    rows = [a] + [clone(good, i + 2, good["at_ms"] + 1000 * (i + 1), 0.5, ns4, interval_h=4) for i in range(40)]
+    assert all(CS.validate_row(r) == [] for r in rows)         # each row is valid ON ITS OWN
+    v = CS.validate_stream(rows)
+    assert v["accepted"] == [] and any(p["code"] == CS.MIXED and "interval" in p["detail"] for p in v["problems"])
+
+
+def test_silently_dropping_bad_rows_is_no_longer_silent(good):
+    ns = good["funding"]["next_settlement_ms"]
+    rows = [clone(good, i + 1, good["at_ms"] + i * 1000, 0.5, ns) for i in range(10)]
+    for r in rows[:6]:
+        r["funding"]["forecast_bps"] = float("nan")
+    v = CS.validate_stream(rows)
+    assert v["n_rejected"] == 6 and v["rejected_share"] == 0.6
+    assert v["accepted"] == [] and not v["stream_ok"]
+    assert any(p["code"] == CS.TOO_MANY_REJECTED for p in v["problems"])

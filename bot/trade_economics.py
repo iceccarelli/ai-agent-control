@@ -180,6 +180,8 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
                                "risk_premium_pct": risk_premium_pct if risk_premium_pct is not None else UNSPECIFIED},
         "hurdles": [{"hurdle_apr_pct": h, "status": PROVISIONAL,
                      "annualised_pct_on_economic_capital": ret_capital, "meets": ret_capital >= h,
+                     "meets_means": "meets on the MODELLED costs only" if unknowns else "meets on all declared costs",
+                     "incomplete": bool(unknowns), "unpriced_inputs": sorted(set(unknowns)),
                      "margin_pct_points": ret_capital - h} for h in SCREENING_HURDLES_PCT],
         "reading": "arithmetic on declared inputs; a pass is not a profitability claim",
     }
@@ -208,6 +210,7 @@ def sensitivity(position: Position, costs: Costs, base_funding_bps: float, *,
                         funding_source="SCENARIO")
             rows.append({"hold_days": d, "path": name, "net_pnl_usd": r["net_pnl_usd"],
                          "annualised_pct_on_economic_capital": r["returns"]["annualised_pct_on_economic_capital"],
+                         "incomplete": r["hurdles"][0]["incomplete"],
                          "meets_10": r["hurdles"][0]["meets"], "meets_15": r["hurdles"][1]["meets"],
                          "meets_20": r["hurdles"][2]["meets"]})
     return rows
