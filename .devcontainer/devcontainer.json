@@ -1,0 +1,5 @@
+{
+  "customizations": { "codespaces": { "repositories": { "iceccarelli/ai-agent-control": {
+    "permissions": { "contents": "write", "pull_requests": "write", "workflows": "write", "actions": "write" }
+  } } } }
+}
