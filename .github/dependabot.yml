@@ -5,6 +5,16 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+    # Production runs Python 3.11 (bot/Dockerfile). numpy 2.5 has no 3.11 distribution, so
+    # a bump to it cannot even install there. Hold the numerical stack until the image
+    # moves to a newer Python; security advisories are still raised separately.
+    ignore:
+      - dependency-name: "numpy"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "scipy"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "scikit-learn"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
