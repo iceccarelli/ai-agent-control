@@ -86,7 +86,7 @@ jobs:
       USE_TESTNET: "1"
       PAPER_TRADING: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-python@v5
         with:
