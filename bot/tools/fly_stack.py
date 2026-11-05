@@ -47,6 +47,9 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import venues as _venues  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -295,10 +298,12 @@ def check(cfg: Dict[str, Any]) -> List[str]:
                 "the repository. Arming is a deliberate act with four "
                 "independent conditions; `git push` is not one of them.")
 
-    if str(env.get("BYBIT_VENUE", "")).strip().lower() == "mainnet":
+    venue = str(env.get("BYBIT_VENUE", "")).strip().lower()
+    if venue and venue not in _venues.sandbox_names():
         problems.append(
-            "env BYBIT_VENUE='mainnet' would point the process at the live "
-            "exchange from a file in the repository.")
+            f"env BYBIT_VENUE={venue!r} is not a registered sandbox venue "
+            f"{_venues.sandbox_names()}: a live, unqualified or unknown venue "
+            "must never be selected from a file in the repository.")
 
     # -- the book gets what build_bot demands ----------------------------
     if env.get("BOOK_MODE") == "carry":

@@ -30,7 +30,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      policy.py position_sizing.py private_ws_consumer.py project_status.py \
      promotion_gate.py pure_indicators.py risk_management.py session_log.py \
      shadow.py shadow_strategy.py technical_analysis.py trading_engine.py \
-     venue_fees.py ws_transport.py protective_restart.py execution_record.py \
+     venue_fees.py venues.py ws_transport.py protective_restart.py execution_record.py \
      entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py \
      carry_evidence.py performance_analytics.py owner_policy.py \
      margin_facts.py \

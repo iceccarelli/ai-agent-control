@@ -83,13 +83,21 @@ def test_the_settled_print_and_the_instrument_rules_keep_being_refreshed_for_day
 # -- H2: a demo engine is fed MAINNET data --------------------------------------------------------------------
 
 @pytest.mark.parametrize("venue,testnet,expected", [("demo", True, "mainnet"), ("testnet", True, "testnet"),
-                                                     ("mainnet", False, "mainnet"), (None, True, "testnet"),
-                                                     (None, False, "mainnet"), ("weird", True, "testnet")])
+                                                     ("mainnet", False, "mainnet")])
 def test_the_feed_environment_follows_the_venue_not_the_sandbox_flag(tmp_path, venue, testnet, expected):
     bot, _ = bare_bot(tmp_path, testnet=testnet)
-    if venue is not None:
-        bot.cfg.BYBIT_VENUE = venue
+    bot.cfg.BYBIT_VENUE = venue
     assert bot._market_feed_environment() == expected
+
+
+@pytest.mark.parametrize("venue", [None, "", "weird", "eu"])
+def test_a_venue_the_registry_does_not_qualify_picks_no_price_source(tmp_path, venue):
+    """There is no fall-back to USE_TESTNET: a name the registry does not know (or has
+    not qualified, like `eu`) must not silently choose which prices drive an engine."""
+    bot, _ = bare_bot(tmp_path, testnet=True)
+    bot.cfg.BYBIT_VENUE = venue
+    with pytest.raises(Exception, match="no market-data environment"):
+        bot._market_feed_environment()
 
 
 # -- M2: a worker outlives a failing log and a very long outage ----------------------------------------------------

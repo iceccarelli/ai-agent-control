@@ -33,7 +33,9 @@ ALLOWED_IMPORTS = {
     "os", "random", "re", "socket", "sqlite3", "ssl", "struct", "threading", "time", "typing", "urllib",
     "zlib", "ws_transport", "market_snapshot",
     "md_events", "md_wire", "md_book", "md_state", "md_store", "md_engine", "md_rest",
-    "md_transport", "md_feed", "md_broker"}
+    "md_transport", "md_feed", "md_broker",
+    # the pure venue registry: standard library only, no I/O, no environment, no key
+    "venues"}
 
 
 def _tree(mod):

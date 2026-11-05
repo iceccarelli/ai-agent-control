@@ -108,6 +108,9 @@ jobs:
           tests/test_carry_cost_reality.py
           tests/test_gate_arithmetic_overflow.py
           tests/test_venue_isolation.py
+          tests/test_venues_registry.py
+          tests/test_venue_qualification.py
+          tests/test_venue_guards_generalise.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
           tests/test_paper_agent_certification.py

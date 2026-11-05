@@ -43,10 +43,11 @@ import md_engine as EN
 import md_events as E
 import md_rest as R
 import md_store as ST
+import venues as _venues
 import ws_transport as WT
 
-WS_BASE_MAINNET = "wss://stream.bybit.com"
-WS_BASE_TESTNET = "wss://stream-testnet.bybit.com"
+WS_BASE_MAINNET = "wss://" + _venues.get("mainnet").ws_private_host
+WS_BASE_TESTNET = "wss://" + _venues.get("testnet").ws_private_host
 #: environment -> (websocket base, REST base). The feed's environment must equal
 #: the engine's venue: testnet prices never drive a mainnet book or the reverse.
 ENDPOINTS = {"mainnet": (WS_BASE_MAINNET, R.MAINNET), "testnet": (WS_BASE_TESTNET, R.TESTNET)}

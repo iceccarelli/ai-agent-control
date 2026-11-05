@@ -41,6 +41,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+import venues as _venues
+
 __all__ = [
     "Config",
     "ConfigError",
@@ -280,7 +282,7 @@ def parse_maker_wait(env: Mapping[str, str]) -> float:
 #: money is real; the other two are sandboxes and every safety gate treats
 #: them identically, because USE_TESTNET is DERIVED from this rather than
 #: competing with it (0046).
-BYBIT_VENUES = ("mainnet", "testnet", "demo")
+BYBIT_VENUES = _venues.qualified_names()
 
 
 def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
@@ -299,12 +301,18 @@ def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
         sandbox = parse_safety_bool(stated, "USE_TESTNET", True)
         return ("testnet" if sandbox else "mainnet"), sandbox
     venue = str(raw).strip().lower()
-    if venue not in BYBIT_VENUES:
+    if venue in _venues.unqualified():
         raise ConfigError(
-            f"BYBIT_VENUE={raw!r} is not one of {BYBIT_VENUES}. Refusing "
+            f"BYBIT_VENUE={raw!r}: {_venues.unqualified()[venue].reason}. Refusing; "
+            "see venue_qualification for the evidence that would be needed.")
+    if venue not in _venues.qualified_names():
+        raise ConfigError(
+            f"BYBIT_VENUE={raw!r} is not one of {_venues.qualified_names()}. Refusing "
             "rather than defaulting: this decides which exchange the keys "
             "authenticate against.")
-    sandbox = venue != "mainnet"
+    # Whether a venue is a sandbox is a fact in the registry, not "anything that
+    # is not mainnet": a venue added later defaults to needing live authorisation.
+    sandbox = _venues.is_sandbox(venue)
     if stated is not None and str(stated).strip() != "":
         if parse_safety_bool(stated, "USE_TESTNET", True) != sandbox:
             raise ConfigError(
