@@ -27,7 +27,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      md_book.py md_broker.py md_capacity.py md_economics.py md_engine.py md_events.py md_feed.py md_rest.py \
      md_state.py md_store.py md_transport.py md_wire.py \
      capacity_schema.py evidence_chain.py evidence_stats.py funding_eval.py recorder_reliability.py \
-     trade_economics.py opportunity_engine.py strategy_measure.py statistical_power.py capital_survival.py ./
+     trade_economics.py opportunity_engine.py strategy_measure.py statistical_power.py capital_survival.py execution_model.py ./
 COPY signals/ ./signals/
 COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/unattended_drill.py tools/next_settlement.py tools/recon_summary.py \

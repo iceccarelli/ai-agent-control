@@ -39,6 +39,7 @@ from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import evidence_stats as ES
+import execution_model as EM
 import funding_eval as FE
 import strategy_measure as SM
 import trade_economics as TE
@@ -206,6 +207,14 @@ REGISTRY: Dict[str, StrategySpec] = {s.key: s for s in (
         "adverse selection and queue position must be measured; displayed liquidity is not executable",
         "n/a", "n/a", _RISK, {"registered": "not yet", "validation": "replay of the hash-chained log, then prospective"},
         ("net edge after fees, adverse selection and latency on prospective data",), _COMMON_REJECT),
+    StrategySpec(
+        "maker_hybrid_execution", 1, "Maker-first and hybrid (post-only then taker chase) execution of the carry entry/exit", HYPOTHESIS,
+        _BTC_LINEAR, ("measured fill probability, queue behaviour and adverse selection beat the taker round trip",),
+        ("timeout then taker chase",), ("ACCOUNT_EXECUTION records of real maker attempts with fee records",), "n/a", (0.0, 0.1),
+        "fill probability, queue position, partial fills, post-only rejection, adverse selection and legging risk must be MEASURED; "
+        "a quote touch is not a fill and simulated fills are not executions",
+        "n/a", "n/a", _RISK, {"registered": "not yet", "validation": "account execution records from a separately authorised, owner-run measurement"},
+        ("maker or hybrid beats taker at the CONSERVATIVE bounds of measured fills",), _COMMON_REJECT),
     StrategySpec(
         "regime_classifier", 1, "Volatility / funding regime classifier (a modifier, not a strategy)", HYPOTHESIS,
         _BTC_LINEAR, ("uses only past observations",), (), ("timestamp-safe volatility and funding series",),
@@ -588,6 +597,30 @@ def evaluate_regime(spec: StrategySpec, ev: Mapping[str, Any], rows: Sequence[Ma
     return _insufficient(spec, "no out-of-sample improvement from conditioning on a volatility regime was detected", **res)
 
 
+def evaluate_execution(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
+    """Maker and hybrid execution are SUPPORTED only by measured account fills; no assumed parameter changes that. Nothing in this
+    repository produces account fills, so the default answer is: unsupported, taker only. If records are supplied the verdict comes
+    from ``execution_model.recommend_mode`` at the conservative bounds of what they show."""
+    recs = ev.get("account_execution_records")
+    m = EM.measure_account_execution(recs)
+    metrics = {"measured_section": {k: m[k] for k in ("status", "reasons", "minimums") if k in m}, "verdict": EM.MAKER_NOT_SUPPORTED}
+    if m["status"] != "MEASURED":
+        return _insufficient(spec, "maker and hybrid economics are UNSUPPORTED: " + ", ".join(m.get("reasons") or [m["status"]]),
+                             **metrics, taker_remains_the_only_supported_mode=True,
+                             need=f">= {m['minimums']['maker_attempts']} maker attempts, >= {m['minimums']['maker_fills']} fills over >= 24 h, with a fee record each")
+    scen = ev.get("execution_scenario")
+    if scen is None:
+        return _insufficient(spec, "measured fills are present but no depth snapshot scenario was supplied to price them against the taker baseline", **metrics)
+    rec = EM.recommend_mode(scen, recs)
+    metrics["verdict"] = rec["verdict"]
+    if rec["verdict"] == EM.MAKER_SUPPORTED_BY_MEASURED_FILLS:
+        return Evaluation(spec.key, spec.origin, Status.RESEARCH_CANDIDATE,
+                          ["hybrid beats taker at the conservative bounds of the measured fills; account-level reconciliation and prospective "
+                           "confirmation are still required; authorises nothing"], {**metrics, "recommendation": rec})
+    return Evaluation(spec.key, spec.origin, Status.ECONOMICALLY_UNATTRACTIVE if rec["verdict"] == EM.TAKER_ONLY else Status.INSUFFICIENT_EVIDENCE,
+                      [f"verdict {rec['verdict']}: " + "; ".join(rec["reasons"])], {**metrics, "recommendation": rec})
+
+
 def evaluate_cross_sectional(spec: StrategySpec, ev: Mapping[str, Any], rows_by_symbol: Mapping[str, Sequence[Mapping[str, Any]]]) -> Evaluation:
     syms = sorted(s for s, r in rows_by_symbol.items() if r)
     reasons = _evidence_reasons(ev)
@@ -678,6 +711,8 @@ def evaluate_all(bundle: Mapping[str, Any]) -> List[Dict[str, Any]]:
             out.append(evaluate_mean_reversion(spec, carry, bundle.get("rows") or [], one_way).as_dict())
         elif key == "microstructure_imbalance/v1":
             out.append(evaluate_microstructure(spec, carry, bundle.get("rows") or [], one_way).as_dict())
+        elif key == "maker_hybrid_execution/v1":
+            out.append(evaluate_execution(spec, carry).as_dict())
         elif key == "regime_classifier/v1":
             out.append(evaluate_regime(spec, carry, bundle.get("rows") or [], carry.get("funding_eval")).as_dict())
         else:

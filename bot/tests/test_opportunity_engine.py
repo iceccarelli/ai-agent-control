@@ -70,7 +70,7 @@ def test_the_module_imports_nothing_that_can_reach_an_order_a_store_or_the_netwo
             imported |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom):
             imported.add((n.module or "").split(".")[0])
-    allowed = {"__future__", "math", "dataclasses", "enum", "typing", "evidence_stats", "trade_economics", "funding_eval", "strategy_measure"}
+    allowed = {"__future__", "math", "dataclasses", "enum", "typing", "evidence_stats", "trade_economics", "funding_eval", "strategy_measure", "execution_model"}
     assert imported <= allowed, imported - allowed
 
 
@@ -500,3 +500,22 @@ def test_no_default_input_to_the_report_can_reach_economic_reconciliation_or_rea
     """The report builds no account section: whatever the public evidence, the best it can say is a research candidate."""
     st, e = status(bundle(funding=4.0))
     assert st == OE.Status.RESEARCH_CANDIDATE and e.metrics["reconciliation_gaps"] and len(e.metrics["reconciliation_gaps"]) == len(OE.RECONCILIATION_REQUIREMENTS)
+
+
+# ======================= Phase 5: maker and hybrid execution =======================
+
+def test_maker_and_hybrid_are_unsupported_without_measured_fills_whatever_is_assumed():
+    spec = OE.REGISTRY["maker_hybrid_execution/v1"]
+    e = OE.evaluate_execution(spec, good_ev())
+    assert e.status == OE.Status.INSUFFICIENT_EVIDENCE and e.metrics["verdict"] == "MAKER_NOT_SUPPORTED"
+    assert "UNSUPPORTED" in e.reasons[0] and e.metrics["taker_remains_the_only_supported_mode"] is True
+    assert e.authorizes_trading is False and e.order_path_connected is False
+    out = {o["strategy"]: o for o in OE.evaluate_all(bundle(funding=4.0))}
+    assert out["maker_hybrid_execution/v1"]["status"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_simulated_or_derived_results_can_never_be_passed_off_as_account_fills():
+    import execution_model as EM
+    spec = OE.REGISTRY["maker_hybrid_execution/v1"]
+    with pytest.raises(EM.EvidenceClassError):
+        OE.evaluate_execution(spec, dict(good_ev(), account_execution_records=[{"qty_filled": 1.0, "source": "simulated"}]))

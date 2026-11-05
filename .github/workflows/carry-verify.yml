@@ -148,6 +148,7 @@ jobs:
           tests/test_strategy_measure.py
           tests/test_statistical_power.py
           tests/test_capital_survival.py
+          tests/test_execution_model.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
           tests/test_paper_agent_certification.py
