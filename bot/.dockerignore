@@ -48,3 +48,12 @@ data/
 # file one by one, and tests/test_fly_runtime.py refuses any COPY of a bare
 # directory. No operator script reaches the image because none is named, and
 # that fact is asserted rather than hoped for.
+
+# Never in an image: operator-local files and runtime evidence.
+.bybit_testnet_env
+runs/
+*.jsonl.local
+*.patch
+*.sqlite
+*.sqlite3
+.venv/

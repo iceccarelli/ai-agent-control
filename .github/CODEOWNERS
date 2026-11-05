@@ -1,0 +1,15 @@
+# Money-path code and the controls around it need the owner's review. Enforcing
+# this needs branch protection with "Require review from Code Owners" - a setting
+# only the repository owner can change; this file alone enforces nothing.
+*                          @iceccarelli
+/bot/bybit_connection.py   @iceccarelli
+/bot/venues.py             @iceccarelli
+/bot/config.py             @iceccarelli
+/bot/promotion_gate.py     @iceccarelli
+/bot/owner_policy.py       @iceccarelli
+/bot/carry_broker.py       @iceccarelli
+/bot/carry_engine.py       @iceccarelli
+/bot/close_executor.py     @iceccarelli
+/bot/tools/fly_stack.py    @iceccarelli
+/bot/fly.toml              @iceccarelli
+/.github/                  @iceccarelli

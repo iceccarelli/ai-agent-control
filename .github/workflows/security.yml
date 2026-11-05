@@ -1,0 +1,60 @@
+# Repository hygiene scans. Offline except for the vulnerability database lookup.
+#
+# secret-scan   tools/secret_scan.py over `git ls-files`. Prints file:line:rule and
+#               never the matched text (CI logs are public).
+# dependency-audit  pip-audit against the exact pins in constraints.txt and a CycloneDX SBOM, kept as
+#               a build artefact. A known-vulnerable pin turns this job red on
+#               purpose: it is a finding to triage, not a flake.
+#
+# NO CREDENTIALS, NO TRADING: no secret is read, no exchange is contacted, and
+# nothing here can place an order.
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  secret-scan:
+    name: secret scan (tracked files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Scan tracked files for credential shapes
+        run: python bot/tools/secret_scan.py
+
+  dependency-audit:
+    name: dependency audit and SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the auditor
+        run: python -m pip install "pip-audit==2.9.0"
+      - name: Audit the pinned dependencies
+        working-directory: bot
+        run: python -m pip_audit -r constraints.txt --no-deps --progress-spinner off
+      - name: Write the SBOM
+        working-directory: bot
+        run: python -m pip_audit -r constraints.txt --no-deps --progress-spinner off -f cyclonedx-json -o "$RUNNER_TEMP/sbom.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: ${{ runner.temp }}/sbom.cdx.json

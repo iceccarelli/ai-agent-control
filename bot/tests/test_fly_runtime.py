@@ -330,3 +330,21 @@ class TestTheRenderedFileIsTheCheckedOne:
         import tomllib
         rendered = fly_stack.to_toml(fly_stack.template())
         assert tomllib.loads(rendered) == fly_stack.template()
+
+
+class TestTheCommittedTomlIsTheGeneratedToml:
+    def test_fly_toml_is_byte_identical_to_what_the_generator_renders(self):
+        """A hand edit of a generated file (it happened: CARRY_ENTRY_BENEFIT_MODE) is
+        drift the generator would silently delete on its next render."""
+        rendered = fly_stack.HEADER + "\n" + fly_stack.to_toml(fly_stack.template())
+        with open(os.path.join(ROOT, "fly.toml"), encoding="utf-8") as handle:
+            assert handle.read() == rendered
+
+    def test_the_printed_commands_never_arm_and_never_use_launch(self):
+        text = fly_stack.COMMANDS
+        for line in text.splitlines():
+            if line.lstrip().startswith("#") or not line.strip():
+                continue
+            assert "PAPER_TRADING=0" not in line and "LIVE_TRADING_ACK" not in line, line
+            assert "fly launch" not in line, line
+        assert "--ha=false" in text and "fly apps create" in text

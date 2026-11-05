@@ -11,3 +11,14 @@ bot/lib/*.so
 *.patch
 SHA256SUMS
 .bybit_testnet_env
+
+# Credentials and runtime evidence never belong in a public repository.
+.env
+.env.*
+*.pem
+*.key
+runs/
+bot/runs/
+bot/artifacts/testnet_session_evidence*.jsonl
+*.sqlite
+*.sqlite3
