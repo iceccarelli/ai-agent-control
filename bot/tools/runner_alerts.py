@@ -20,6 +20,8 @@ WHAT IT ALERTS ON
   hung          the running loop itself has finished no cycle within the limit
                 (CRITICAL; a watchdog thread inside the monitor)
   failed_streak MONITOR_FAILED on the last N cycles in a row (WARNING)
+  recorder_down the last 3 cycles that report on the market recorder found it ABSENT, STALE,
+                UNREADABLE or in FAULT (WARNING: depth data is not accumulating)
   mainnet_stalled  the last 6 cycles that collect real-market data recorded none
                 (WARNING: the protocol's 30-day clock is not accumulating)
   shadow        the last forward-shadow step was FAULT or REFUSED (WARNING)
@@ -83,6 +85,8 @@ FAILED_STREAK = 2
 #: Cycles in a row, among those that try to collect real-market data, with no
 #: recorded observation before the stream is called stalled.
 MAINNET_STALL_CYCLES = 6
+#: Cycles in a row, among those that report on the recorder, with it not RECORDING.
+RECORDER_DOWN_CYCLES = 3
 RESEND_S = 6 * 3600.0
 WATCHDOG_POLL_S = 60.0
 
@@ -253,6 +257,16 @@ def _mainnet_stall(rows: Sequence[Mapping[str, object]], n: int):
     return None
 
 
+def _recorder_down(rows: Sequence[Mapping[str, object]], n: int):
+    """The last `n` rows that carry a `recorder_state`, when none of them says RECORDING;
+    else None. Rows without the field (no recorder configured) count neither way."""
+    with_state = [r for r in rows if isinstance(r.get("recorder_state"), str)]
+    tail = with_state[-n:]
+    if len(tail) == n and all(r["recorder_state"] != "RECORDING" for r in tail):
+        return tail
+    return None
+
+
 def distinct_rows(rows: Sequence[Mapping[str, object]]) -> List[Mapping[str, object]]:
     """`rows` with verbatim repeats removed, first occurrence kept, order kept.
 
@@ -363,6 +377,14 @@ def _evaluate(history_text, now, stale_minutes, failed_streak, forward=None):
             f"the last {MAINNET_STALL_CYCLES} cycles recorded no real-market "
             f"observation (last state {last['mainnet_state']}: {why}). The "
             "30-day protocol clock is not accumulating evidence."))
+    down = _recorder_down(rows, RECORDER_DOWN_CYCLES)
+    if down:
+        last = down[-1]
+        why = str(last.get("recorder_detail") or "no detail recorded")[:300]
+        alerts.append(Alert(
+            "recorder_down", WARNING,
+            f"the last {RECORDER_DOWN_CYCLES} cycles found the market recorder not recording "
+            f"(state {last['recorder_state']}: {why}). Order-book depth is not accumulating."))
     alerts.extend(forward_alerts(forward))
     return alerts, s
 

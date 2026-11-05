@@ -453,3 +453,33 @@ def test_the_module_has_no_order_capable_import_and_no_credentials():
     for banned in ("carry_broker", "bybit_connection", "place_market", "requests",
                    "BYBIT_API", "LIVE_TRADING_ACK", "place_order"):
         assert banned not in src, banned
+
+
+# -- the market recorder -----------------------------------------------------------------------------------
+
+def _keys(alerts):
+    return [a.key for a in alerts]
+
+
+def _recorder_rows(*states):
+    n = len(states)
+    return [row((n - i) * 60, recorder_state=s, **({"recorder_detail": "OSError: disk is full"} if s == "FAULT" else {}))
+            for i, s in enumerate(states)]
+
+
+def test_three_cycles_in_a_row_without_a_recording_recorder_raise_recorder_down():
+    alerts = RA.evaluate(text(*_recorder_rows("RECORDING", "ABSENT", "STALE", "FAULT")), NOW)
+    assert "recorder_down" in _keys(alerts)
+    msg = next(a for a in alerts if a.key == "recorder_down")
+    assert msg.severity == RA.WARNING and "disk is full" in msg.text and "depth is not accumulating" in msg.text
+
+
+def test_one_or_two_bad_cycles_or_a_recovered_recorder_do_not_alert():
+    for states in (("RECORDING", "FAULT", "FAULT"), ("FAULT", "FAULT", "RECORDING"), ("ABSENT", "STALE")):
+        alerts = RA.evaluate(text(*_recorder_rows(*states)), NOW)
+        assert "recorder_down" not in _keys(alerts), states
+
+
+def test_a_history_with_no_recorder_field_never_raises_recorder_down():
+    alerts = RA.evaluate(text(row(180), row(120), row(60)), NOW)
+    assert "recorder_down" not in _keys(alerts)

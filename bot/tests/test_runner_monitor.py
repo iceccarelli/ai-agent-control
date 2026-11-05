@@ -827,3 +827,55 @@ class TestItImportsWhatItNeedsWhenLaunchedAsAScript:
             assert done.returncode == 0 and "ok" in done.stdout, done.stderr
         finally:
             shutil.rmtree(root, ignore_errors=True)
+
+
+# -- the market recorder block ---------------------------------------------------------------------------
+
+import json as _json
+
+
+def _status(tmp_path, now, **over):
+    st = {"now_ms": int(now * 1000), "feed": {"threads_alive": True},
+          "store": {"records": 1234, "free_bytes": 800 * 1048576, "fault": None},
+          "capacity": {"rows": 7, "max_displayed_fillable_notional_usd": 100000.0},
+          "entry_refusals": []}
+    for k, v in over.items():
+        st[k] = v
+    p = tmp_path / "recorder_status.json"
+    p.write_text(_json.dumps(st))
+    return str(p)
+
+
+def test_no_recorder_configured_adds_nothing():
+    assert RM.recorder_observation(None) is None
+
+
+def test_a_healthy_recorder_is_recording_with_its_numbers_copied(tmp_path):
+    obs = RM.recorder_observation(_status(tmp_path, 1000.0), now=1010.0)
+    assert obs["state"] == "RECORDING" and obs["records"] == 1234 and obs["free_mb"] == 800.0
+    assert obs["capacity_rows"] == 7 and obs["max_fillable_usd"] == 100000.0
+
+
+@pytest.mark.parametrize("over,state", [
+    ({"feed": {"threads_alive": False}}, "FAULT"),
+    ({"store": {"records": 1, "free_bytes": 1, "fault": "OSError: disk is full"}}, "FAULT")])
+def test_a_dead_feed_or_a_store_fault_is_a_fault(tmp_path, over, state):
+    assert RM.recorder_observation(_status(tmp_path, 1000.0, **over), now=1001.0)["state"] == state
+
+
+def test_a_status_that_stopped_updating_is_stale_missing_is_absent_garbage_is_unreadable(tmp_path):
+    assert RM.recorder_observation(_status(tmp_path, 1000.0), now=1000.0 + RM.RECORDER_STALE_S + 1)["state"] == "STALE"
+    assert RM.recorder_observation(str(tmp_path / "nope.json"))["state"] == "ABSENT"
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not json")
+    assert RM.recorder_observation(str(bad))["state"] == "UNREADABLE"
+
+
+def test_a_cycle_reports_the_recorder_in_its_history_line_but_never_fails_because_of_it(tmp_path):
+    root = str(tmp_path)
+    line_ok = RM._history_line(root, {"at": "t", "outcome": "ENTRY_NOT_ELIGIBLE", "reasons": [],
+                                       "recorder": {"state": "FAULT", "fault": "OSError: disk is full", "records": 5}})
+    assert line_ok
+    row = _json.loads(open(os.path.join(root, "monitor.jsonl")).read().splitlines()[-1])
+    assert row["recorder_state"] == "FAULT" and row["recorder_records"] == 5
+    assert "disk is full" in row["recorder_detail"] and row["order_sent"] is False

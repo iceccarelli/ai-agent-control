@@ -115,6 +115,16 @@ the bot's state, as the authority.
   new key with the **least** permission and an IP allowlist, set it, redeploy. Rotate immediately
   if a secret ever appears in a log, a file or a chat.
 
+## 14. Market recorder down (alert `recorder_down`)
+- **Recognise:** Slack/watch alert "the market recorder not recording"; `recorder_state` in the
+  last history lines is ABSENT, STALE, UNREADABLE or FAULT (`fly ssh console -a carry-drill -C
+  "tail -n 3 /data/monitor/monitor.jsonl"`; the recorder's own file is `/data/market/recorder_status.json`).
+- **Already in:** the supervisor restarts the recorder with backoff (`/data/market/supervisor_status.json`
+  shows restarts); the monitor and the shadow book are unaffected; entries are not involved (read-only).
+- **FAULT with "reserve":** the volume is below the 512 MB reserve. Extend it (owner:
+  `fly volumes extend <id> -s <GB>`) or lower `--recorder-retention-days` in the image CMD.
+- **Never:** delete files under `/data/market` by hand; the log is hash-chained and prunes itself by day.
+
 ## Backups (not yet automated)
 A safe backup is an **online SQLite backup** (`sqlite3 trading_state.db ".backup 'copy.db'"`
 taken from inside the machine), encrypted, stored **off** the volume, with a restore
