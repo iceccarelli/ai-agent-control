@@ -2778,6 +2778,11 @@ class CarryEngine:
             # keeps failing is an UNKNOWN position, never a flat one.
             remaining = self._confirmed_short_left(fill_left)
             if remaining is None:
+                if fill_left > QTY_DUST:
+                    # The fills prove at least this much was bought back: write the
+                    # fill-implied upper bound of the short, not the pre-close size.
+                    position.perp.filled_qty = fill_left
+                    position.perp.requested_qty = fill_left
                 return self._halt(
                     "UNWIND_UNCONFIRMED",
                     f"{reason} - the perp buy-back filled {perp.filled_qty:.10g} "
@@ -3151,6 +3156,9 @@ class CarryEngine:
         # FLAT needs the venue's own position, not the arithmetic of one fill.
         confirmed = self._confirmed_short_left(max(0.0, remaining))
         if confirmed is None:
+            if remaining > QTY_DUST:
+                self.position.perp.filled_qty = remaining       # fill-implied upper bound
+                self.position.perp.requested_qty = remaining
             return self._halt(
                 "INVENTORY_CLOSE_UNCONFIRMED",
                 f"the buy-back filled {closed.filled_qty:.10g} against a "

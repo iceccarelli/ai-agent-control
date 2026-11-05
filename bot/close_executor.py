@@ -376,13 +376,15 @@ class CloseExecutor:
                  or r["state"] == CP.MOOT))
         # The short this close STARTED from: the first attempt that actually went
         # out. Flat is explained only if our fills account for that whole short,
-        # within one lot. A venue that reads flat after we filled 0.0001 of a
+        # to within dust. A venue that reads flat after we filled 0.0001 of a
         # 0.01 short has lost the rest some other way (a liquidation, a manual
         # trade, a stale read); calling that "our close" would hide it.
         sent_rows = sorted((r for r in rows if r["state"] != CP.NEVER_SENT),
                            key=lambda r: int(r["n"]))
         baseline = float(sent_rows[0]["short_before"] or 0.0) if sent_rows else 0.0
-        tolerance = max(float(self.policy.dust), float(getattr(self.policy, "qty_step", 0.0) or 0.0))
+        # Fills are whole lots, so a tolerance of a lot would let "half the short filled"
+        # count as explained at the production size of one or two lots. Dust only.
+        tolerance = max(float(self.policy.dust), 1e-9 * baseline)
         covers_start = filled + tolerance >= baseline
         explained = filled > self.policy.dust and not unknown and covers_start
         if status == FLAT and not explained:

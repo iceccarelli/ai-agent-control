@@ -96,7 +96,7 @@ def test_a_venue_the_registry_does_not_qualify_picks_no_price_source(tmp_path, v
     not qualified, like `eu`) must not silently choose which prices drive an engine."""
     bot, _ = bare_bot(tmp_path, testnet=True)
     bot.cfg.BYBIT_VENUE = venue
-    with pytest.raises(Exception, match="no market-data environment"):
+    with pytest.raises(__import__("config").ConfigError, match="no market-data environment"):
         bot._market_feed_environment()
 
 

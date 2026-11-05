@@ -338,6 +338,12 @@ class MarketStore:
         if retention_days <= 0:
             return []
         cutoff = _utc_day(int(now_ms) - int(retention_days) * 86_400_000)
+        # A wall clock that jumps forward must not delete everything: the cutoff is also
+        # bounded by the newest segment already on disk (the log's own idea of "now").
+        segs = self.segments()
+        if segs:
+            newest_ms = int(datetime.strptime(segs[-1][3:11], "%Y%m%d").replace(tzinfo=timezone.utc).timestamp()) * 1000
+            cutoff = min(cutoff, _utc_day(newest_ms - int(retention_days) * 86_400_000))
         return self.prune_segments_before(cutoff)
 
     def _commit_locked(self) -> None:
@@ -478,7 +484,11 @@ class MarketStore:
             _, last = self._segment_meta(name)
             conn = sqlite3.connect(f"file:{os.path.join(self.dir, name)}?mode=ro", uri=True)
             try:
-                count = conn.execute("SELECT COUNT(*) FROM log").fetchone()[0]
+                # ids are one contiguous sequence in an append-only log, so the count is
+                # max-min+1, read from the primary-key index. COUNT(*) would scan a
+                # segment of ~1.5 GB while the caller may hold the engine lock.
+                lo, hi = conn.execute("SELECT MIN(id), MAX(id) FROM log").fetchone()
+                count = 0 if lo is None else int(hi) - int(lo) + 1
             finally:
                 conn.close()
             with open(self._manifest_path(), "a") as fh:

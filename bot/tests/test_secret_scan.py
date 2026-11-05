@@ -54,3 +54,18 @@ def test_a_new_literal_next_to_a_reviewed_fixture_is_still_reported(tmp_path):
         fh.write("\n".join(lines))
     found = SS.apply_reviewed(SS.scan_paths([p]), root)
     assert len(found) == 3          # reviewed count is 2, so the whole file is reported
+
+
+def test_testnet_named_unquoted_and_yaml_credentials_are_found_but_placeholders_are_not():
+    v = "kQ7zWm3x" + "Lp9vRn2bTy"
+    for text in (f'BYBIT_TESTNET_API_KEY = "{v}"', f"BYBIT_API_KEY={v}", f"api_key: {v}",
+                 f'"api_secret": "{v}"'):
+        assert [r for _, r in SS.scan_text(text)] == ["credential-assignment"], text
+    assert SS.scan_text('API_KEY="your_api_key_goes_here_xxxx"') == []
+
+
+def test_a_clean_result_says_how_much_it_did_not_scan(tmp_path, capsys):
+    f = tmp_path / "big.txt"
+    f.write_bytes(b"a" * (SS.MAX_BYTES + 1))
+    SS.main([str(f)])
+    assert "1 not scanned" in capsys.readouterr().out

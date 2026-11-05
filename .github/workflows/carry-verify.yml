@@ -37,10 +37,13 @@ permissions:
   contents: read
 
 # A newer push to a PULL REQUEST supersedes the older run. A push to main, or to a
-# fix/** branch, is never cancelled: a cancelled run on a merged commit is a commit
-# whose gate never finished, and "cancelled" must not be mistaken for "passed".
+# fix/** branch, gets its own group (keyed by the commit): GitHub also cancels a
+# PENDING run when a newer run joins the same group, even with cancel-in-progress off,
+# so a shared group would still let a rapid second push swallow the first commit's
+# gate. A cancelled run on a merged commit is a gate that never finished, and
+# "cancelled" must not be mistaken for "passed".
 concurrency:
-  group: carry-verify-${{ github.event_name }}-${{ github.ref }}
+  group: carry-verify-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

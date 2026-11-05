@@ -214,7 +214,7 @@ def test_a_reused_order_id_with_a_different_payload_sends_nothing_and_is_not_res
     """The id is on file for a Sell of QTY; a request that reuses it for a Buy, a
     different size or another symbol is a different order. It is refused, not resumed
     (which would adopt the old order's venue state) and not sent."""
-    from carry_broker import CarryOrderRefused
+    from carry_broker import OrderOutcomeUnknown
     v = Venue()
     s = Stack(tmp_path, v)
     s.open()
@@ -222,9 +222,16 @@ def test_a_reused_order_id_with_a_different_payload_sends_nothing_and_is_not_res
     import carry_broker as CB
     t = CB._OrderTrail(s.cb, QTY)
     for symbol, side, qty in (("BTCUSDT", "Buy", QTY), ("BTCUSDT", "Sell", QTY * 2), ("ETHUSDT", "Sell", QTY)):
-        with pytest.raises(CarryOrderRefused, match="different order"):
+        # unknown, not refused: a refusal would tell the close executor the order never existed
+        with pytest.raises(OrderOutcomeUnknown, match="different order"):
             t.intent(link, "linear", symbol, side, f"{qty:.8f}", T.MARK, qty)
     assert len(v.creates) == 1
+    # a re-send of the same id for LESS (what is left of a partly filled order) is the same order
+    t3 = CB._OrderTrail(s.cb, QTY / 2)
+    try:
+        t3.intent(link, "linear", "BTCUSDT", "Sell", f"{QTY / 2:.8f}", T.MARK, QTY / 2)
+    except CB.OrderOutcomeUnknown as exc:
+        assert "different order" not in str(exc)
     # the same payload is still an ordinary retry: asked of the venue, never re-sent
     t2 = CB._OrderTrail(s.cb, QTY)
     try:

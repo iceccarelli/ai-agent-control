@@ -86,6 +86,14 @@ def test_flat_after_only_a_sliver_of_our_fills_is_not_called_our_close(tmp_path)
     assert last.filled == pytest.approx(0.001)
 
 
+def test_the_boundary_at_production_size_one_lot_of_two_is_not_a_close(tmp_path):
+    """At one or two lots a tolerance of a lot would call half a close a close."""
+    rig = Rig(tmp_path, 0.0020, policy=POL, modes=["partial:0.5"], external_flatten_after_send=True)
+    last, _ = rig.run(dt=DT)
+    assert last.status == CE.FLAT and last.explained is False
+    assert last.filled == pytest.approx(0.001) and last.detail["started_short"] == pytest.approx(0.0020)
+
+
 def test_flat_after_fills_that_cover_the_whole_short_is_still_explained(tmp_path):
     rig = Rig(tmp_path, 0.0100, policy=POL, modes=["partial:0.6", "full"])
     last, _ = rig.run(dt=DT)

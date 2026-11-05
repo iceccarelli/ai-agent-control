@@ -733,10 +733,12 @@ class TradingBot:
             directory = str(getattr(self.cfg, "MARKET_FEED_DIR", "") or "")
             reserve_mb = getattr(self.cfg, "MARKET_FEED_MIN_FREE_MB", 256)
             retention = getattr(self.cfg, "MARKET_FEED_RETENTION_DAYS", 1)
-            store = _mst.MarketStore(
-                directory, environment=env,
-                min_free_bytes=(int(reserve_mb) * 1024 * 1024
-                                if isinstance(reserve_mb, int) and not isinstance(reserve_mb, bool) else 0))
+            # A value that is not a whole number falls back to the DEFAULT reserve, never
+            # to "no reserve"; retention falls back to keeping everything (nothing deleted).
+            if not isinstance(reserve_mb, int) or isinstance(reserve_mb, bool) or reserve_mb < 0:
+                reserve_mb = 256
+            store = _mst.MarketStore(directory, environment=env,
+                                     min_free_bytes=int(reserve_mb) * 1024 * 1024)
             engine = _me.Engine(_ms.MarketState(self.carry.perp_symbol, environment=env), store)
             fcfg = _mf.FeedConfig(
                 symbol=self.carry.perp_symbol, environment=env,

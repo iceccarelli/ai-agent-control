@@ -435,7 +435,10 @@ def _payload_conflict(row: Optional[Dict[str, Any]], symbol: str, side: str,
         diffs.append(f"side {row.get('side')!r} vs {side!r}")
     try:
         have = float(row.get("qty"))
-        if abs(have - float(qty)) > 1e-9 * max(1.0, abs(have)):
+        # Only a request for MORE than was recorded is a different order. A re-send of
+        # the same id for what is left of a partly filled order is smaller, and is the
+        # same order.
+        if float(qty) > have + 1e-9 * max(1.0, abs(have)):
             diffs.append(f"qty {have!r} vs {qty!r}")
     except (TypeError, ValueError):
         diffs.append("recorded qty unreadable")
@@ -493,9 +496,12 @@ class _OrderTrail:
             # The id is on file for a DIFFERENT order. Sending, or even "resuming",
             # would attribute that order's venue state to this request; the caller
             # asked for something else and nothing is sent.
-            raise CarryOrderRefused(
+            # NOT a refusal: "refused" tells the caller the order provably never
+            # existed. This id is on file and may have reached the venue, so the
+            # outcome is unknown and nothing is sent.
+            raise OrderOutcomeUnknown(
                 f"order id {link} is already recorded for a different order "
-                f"({conflict}); no carry order sent")
+                f"({conflict}); nothing was sent and the recorded order's state is unknown")
         return self._resume(row, link, product, symbol, qty)
 
     def _resume(self, row: Optional[Dict[str, Any]], link: str, product: str,

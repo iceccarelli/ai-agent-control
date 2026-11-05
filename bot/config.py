@@ -333,7 +333,7 @@ def parse_int(
     else:
         try:
             value = int(float(str(raw).strip()))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):     # "inf" overflows int(), it is not an integer
             raise ConfigError(f"{name}={raw!r} is not an integer")
     if not (low <= value <= high):
         raise ConfigError(f"{name}={value} is outside [{low}, {high}]")

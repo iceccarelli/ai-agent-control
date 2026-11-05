@@ -43,3 +43,9 @@ def test_health_reports_the_fingerprint_of_the_running_process():
     assert fp["build_commit"] == "deadbeef" and fp["config"]["USE_TESTNET"] is True
     assert "fingerprint" in open(os.path.join(BOT, "main.py")).read()
     assert app._fingerprint is FPR
+
+
+def test_an_unreadable_code_directory_does_not_break_the_fingerprint(tmp_path):
+    cfg = types.SimpleNamespace(BYBIT_VENUE="testnet", USE_TESTNET=True, PAPER_TRADING=True)
+    fp = FPR.runtime_fingerprint(cfg, root=str(tmp_path / "does-not-exist"))
+    assert fp["code_sha256"] == "unavailable"

@@ -18,8 +18,10 @@ official EU documentation that could be read establishes no derivatives API, and
 nothing here may infer product availability from the global documentation. It is
 registered as *unqualified*: it can be named, it is refused with a reason, and
 `venue_qualification` turns owner-collected read-only evidence into the only
-verdict that could ever change that. Adding a venue means adding one row here
-and nothing else; every guard that matters reads this table.
+verdict that could ever change that. Every GUARD that decides whether an order may leave
+reads this table, so a venue added here is guarded by default. (Some read-only
+reporting tools keep their own host lists for their evidence formats; those never
+send an order and are not authorities on what is real money.)
 
 Pure: no imports beyond the standard library, no I/O, no environment reads
 (``config`` is the only module allowed to read the environment).

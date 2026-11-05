@@ -32,10 +32,12 @@ RULES: Tuple[Tuple[str, "re.Pattern[str]"], ...] = (
     ("anthropic-key", re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b")),
     ("openai-style-key", re.compile(r"\bsk-[A-Za-z0-9]{40,}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
-    # an assignment of a long literal to a name that says it is a credential
+    # an assignment of a long literal to a name that says it is a credential. The
+    # value is group 1; quotes are optional (env / YAML style); a name that contains
+    # "test" or "testnet" is still a credential name.
     ("credential-assignment", re.compile(
-        r"""(?ix)\b(?:api[_-]?key|api[_-]?secret|secret[_-]?key|access[_-]?token|auth[_-]?token|
-            password|passwd|bybit_[a-z_]*(?:key|secret))\b\s*[:=]\s*["'][A-Za-z0-9/+_=-]{16,}["']""")),
+        r"""(?ix)\b(?:[a-z0-9_]*api[_-]?key|[a-z0-9_]*api[_-]?secret|[a-z0-9_]*secret[_-]?key|
+            access[_-]?token|auth[_-]?token|password|passwd)\b["']?\s*[:=]\s*["']?([A-Za-z0-9/+_=-]{16,})["']?""")),
 )
 
 _PLACEHOLDER = re.compile(r"(?i)(x{4,}|\.{3}|<[^>]+>|example|placeholder|changeme|dummy|fake|test|your[_-]|"
@@ -48,7 +50,8 @@ _PLACEHOLDER = re.compile(r"(?i)(x{4,}|\.{3}|<[^>]+>|example|placeholder|changem
 REVIEWED_FIXTURES = {
     ("bot/tests/test_close_testnet_experiment.py", "credential-assignment"): 2,
     ("bot/tests/test_memory.py", "credential-assignment"): 2,
-    ("bot/tests/test_paper_agent_certification.py", "credential-assignment"): 2,
+    ("bot/tests/test_paper_agent_certification.py", "credential-assignment"): 5,
+    ("bot/tests/test_owner_tools.py", "credential-assignment"): 1,
     ("bot/tests/test_project_status.py", "credential-assignment"): 1,
 }
 
@@ -76,23 +79,31 @@ def scan_text(text: str) -> List[Tuple[int, str]]:
             m = pattern.search(line)
             if not m:
                 continue
-            if rule == "credential-assignment" and _PLACEHOLDER.search(m.group(0)):
+            if rule == "credential-assignment" and _PLACEHOLDER.search(m.group(1)):
                 continue
             hits.append((number, rule))
     return hits
 
 
+#: Files the last `scan_paths` could not read (too large / not UTF-8), so a clean
+#: result can say how much it did NOT look at.
+SKIPPED: List[str] = []
+
+
 def scan_paths(paths: Iterable[str]) -> List[Tuple[str, int, str]]:
     found: List[Tuple[str, int, str]] = []
+    SKIPPED.clear()
     for path in paths:
         if path.endswith(SKIP_SUFFIXES) or not os.path.isfile(path):
             continue
         try:
             if os.path.getsize(path) > MAX_BYTES:
+                SKIPPED.append(path)
                 continue
             with open(path, "r", encoding="utf-8", errors="strict") as handle:
                 text = handle.read()
         except (OSError, UnicodeDecodeError):
+            SKIPPED.append(path)
             continue
         found.extend((path, n, rule) for n, rule in scan_text(text))
     return found
@@ -121,7 +132,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     found = apply_reviewed(scan_paths(paths), root)
     for path, line, rule in found:
         print(f"{os.path.relpath(path, root)}:{line}: {rule}")
-    print(f"secret scan: {len(found)} finding(s) in {len(list(paths))} file(s)")
+    print(f"secret scan: {len(found)} finding(s) in {len(list(paths))} file(s); "
+          f"{len(SKIPPED)} not scanned (binary, non-UTF-8 or over {MAX_BYTES} bytes)")
     return 1 if found else 0
 
 

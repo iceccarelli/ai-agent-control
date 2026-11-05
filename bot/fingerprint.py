@@ -49,8 +49,12 @@ def runtime_fingerprint(cfg: Any, root: Optional[str] = None) -> Dict[str, Any]:
     summary = config_summary(cfg)
     commit = getattr(cfg, "BUILD_COMMIT", "") or ""
     image = getattr(cfg, "FLY_IMAGE_REF", "") or ""
+    try:
+        digest = code_digest(root)
+    except OSError:
+        digest = "unavailable"          # provenance must never make /health fail
     return {
-        "code_sha256": code_digest(root),
+        "code_sha256": digest,
         "config": summary,
         "config_sha256": hashlib.sha256(json.dumps(summary, sort_keys=True).encode()).hexdigest(),
         "build_commit": commit if isinstance(commit, str) and commit else "unknown",

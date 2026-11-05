@@ -453,7 +453,8 @@ fly secrets set --app carry-book BYBIT_API_KEY=... BYBIT_API_SECRET=...
 
 # 4. deploy ONE machine. --strategy immediate is also in fly.toml; --ha=false stops
 #    Fly creating a second machine, and two machines is two books.
-fly deploy --app carry-book --strategy immediate --ha=false
+fly deploy --app carry-book --strategy immediate --ha=false \
+    --build-arg BUILD_COMMIT=$(git rev-parse HEAD)   # shown in /health for drift checks
 fly logs --app carry-book
 
 # 5. CAN THIS MACHINE REACH THE VENUE? The question a drill has to answer

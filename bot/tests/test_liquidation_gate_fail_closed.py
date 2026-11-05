@@ -49,11 +49,18 @@ class Venue:
         self.view = None
         self.margin = 5.0
         self.orders = []
+        self.short = 0.0
 
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((side, product, qty))
+        if product == "linear":
+            self.short += qty if side == "Sell" else -qty
         return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x",
                 "fee": qty * MARK * 5.5 / 1e4}
+
+    def get_perp_position(self, symbol):
+        """What the venue itself holds: FLAT is its word, read back after a close."""
+        return self.short
 
     def get_margin_multiple(self, symbol):
         if isinstance(self.margin, Exception):

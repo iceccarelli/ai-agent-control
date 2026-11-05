@@ -2,7 +2,8 @@
 #
 # secret-scan   tools/secret_scan.py over `git ls-files`. Prints file:line:rule and
 #               never the matched text (CI logs are public).
-# dependency-audit  pip-audit against the exact pins in constraints.txt and a CycloneDX SBOM, kept as
+# dependency-audit  pip-audit against the FULL resolved set (pins and transitive
+#               packages, from `pip freeze` after an install) and a CycloneDX SBOM, kept as
 #               a build artefact. A known-vulnerable pin turns this job red on
 #               purpose: it is a finding to triage, not a flake.
 #
@@ -21,7 +22,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: security-${{ github.event_name }}-${{ github.ref }}
+  group: security-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -46,14 +47,18 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Install the dependencies exactly as the application does
+        working-directory: bot
+        run: |
+          python -m pip install -r requirements.txt -c constraints.txt
+          python -m pip freeze --exclude-editable > "$RUNNER_TEMP/frozen.txt"
+          echo "audited set: $(wc -l < "$RUNNER_TEMP/frozen.txt") packages (the pins AND everything they pulled in)"
       - name: Install the auditor
         run: python -m pip install "pip-audit==2.9.0"
-      - name: Audit the pinned dependencies
-        working-directory: bot
-        run: python -m pip_audit -r constraints.txt --no-deps --progress-spinner off
+      - name: Audit the full resolved set
+        run: python -m pip_audit -r "$RUNNER_TEMP/frozen.txt" --no-deps --progress-spinner off
       - name: Write the SBOM
-        working-directory: bot
-        run: python -m pip_audit -r constraints.txt --no-deps --progress-spinner off -f cyclonedx-json -o "$RUNNER_TEMP/sbom.cdx.json"
+        run: python -m pip_audit -r "$RUNNER_TEMP/frozen.txt" --no-deps --progress-spinner off -f cyclonedx-json -o "$RUNNER_TEMP/sbom.cdx.json"
       - uses: actions/upload-artifact@v4
         with:
           name: sbom-cyclonedx

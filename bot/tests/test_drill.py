@@ -427,7 +427,14 @@ class TestFlatnessIsVerifiedAgainstTheVenueNotTheBook:
         assert report["still_open"] is True
         assert report["evidence"]["final_reconcile"]["open_orders"] == 1
 
-    def test_a_venue_that_cannot_be_read_at_the_end_is_unverified_not_flat(self):
+    def test_a_venue_that_cannot_be_read_at_the_end_is_unverified_not_flat(self, monkeypatch):
+        """The venue stops answering position reads once the close has filled. The book no
+        longer takes fill arithmetic for FLAT: it halts at the unwind as UNWIND_UNCONFIRMED
+        (so the drill fails there, earlier than its own final reconcile) and says the
+        position is still open and unverified."""
+        import carry_engine
+        monkeypatch.setattr(carry_engine.CarryEngine, "UNWIND_REREAD_WAIT_S", 0.0)
+
         class Dies(Venue):
             def get_perp_position(self, symbol):
                 if self.orders and abs(self.perp_qty) < 1e-12:
@@ -437,7 +444,9 @@ class TestFlatnessIsVerifiedAgainstTheVenueNotTheBook:
         report = run(Dies())
         assert report["verdict"] == "FAILED"
         assert report["still_open"] is True
-        assert report["evidence"]["final_reconcile"]["verdict"] == "UNVERIFIED"
+        assert report["failed_stage"] == "unwind"
+        why = " ".join(str(s.get("why")) for s in report["stages"])
+        assert "UNWIND_UNCONFIRMED" in why and "flatness is unverified" in why
 
     def test_spot_inventory_that_moved_is_reported(self):
         class Moves(Venue):

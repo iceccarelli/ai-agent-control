@@ -108,9 +108,25 @@ def test_retention_removes_whole_old_days_and_the_rest_still_verifies(tmp_path):
 
 def test_retention_never_removes_the_segment_being_written(tmp_path):
     store = _three_days(str(tmp_path / "md"))
-    removed = store.apply_retention(BASE + 400 * DAY, 1)
-    assert "md-20261106.db" not in removed and store.segments() == ["md-20261106.db"]
+    removed = store.apply_retention(BASE + 2 * DAY + 5_000, 0 + 1)
+    assert "md-20261106.db" not in removed
     assert store.verify() == []
+
+
+def test_a_wall_clock_that_jumps_forward_cannot_delete_the_log(tmp_path):
+    """The cutoff is also bounded by the newest segment already on disk, so a clock
+    stepped 400 days ahead removes what the policy would have removed anyway, no more."""
+    store = _three_days(str(tmp_path / "md"))
+    removed = store.apply_retention(BASE + 400 * DAY, 1)
+    assert removed == ["md-20261104.db"]
+    assert store.segments() == ["md-20261105.db", "md-20261106.db"] and store.verify() == []
+
+
+def test_pruning_reads_record_counts_from_the_index_not_by_scanning(tmp_path):
+    store = _three_days(str(tmp_path / "md"))
+    store.apply_retention(BASE + 2 * DAY + 5_000, 1)
+    manifest = [json.loads(l) for l in open(store._manifest_path()) if l.strip()]
+    assert manifest[0]["segment"] == "md-20261104.db" and manifest[0]["records"] == 3
 
 
 def test_the_feed_applies_retention_under_the_engine_lock_and_counts_a_failure(tmp_path, monkeypatch):
@@ -159,3 +175,9 @@ def test_the_config_defaults_and_bounds():
     for bad in ({"MARKET_FEED_RETENTION_DAYS": "-1"}, {"MARKET_FEED_MIN_FREE_MB": "abc"}):
         with pytest.raises(C.ConfigError):
             C.load(bad)
+
+
+def test_infinity_is_a_config_error_not_an_overflow():
+    import config as C
+    with pytest.raises(C.ConfigError):
+        C.load({"MARKET_FEED_RETENTION_DAYS": "inf"})
