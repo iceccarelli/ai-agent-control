@@ -4,5 +4,5 @@
 # requirements.txt keeps the ranges; this file pins what was actually tested.
 requests==2.33.1
 numpy==2.4.4
-scipy==1.17.1
+scipy==1.18.1
 scikit-learn==1.8.0

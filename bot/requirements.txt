@@ -5,7 +5,7 @@ numpy>=1.24,<3             # indicator math
 
 # Optional. kelly_log_opt uses scipy's bounded minimiser when present and falls
 # back to a golden-section search when it is not, so the bot runs without it.
-scipy>=1.11,<2
+scipy>=1.18.1,<2
 
 # Test-only (not needed at runtime):
 #   pytest>=8
