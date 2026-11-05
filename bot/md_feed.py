@@ -32,10 +32,10 @@ No credentials, no private channel, no order path.
 """
 from __future__ import annotations
 
+import collections.abc
 import json
 import random
 import threading
-import types
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -58,6 +58,29 @@ SUBSCRIBE_CHUNK = 10
 #: 2**16 seconds is far past any cap; bounding the exponent keeps the arithmetic finite
 #: however long the venue stays unreachable.
 MAX_BACKOFF_EXPONENT = 16
+
+
+class ReadOnlyMapping(collections.abc.Mapping):
+    """An immutable copy of a mapping: reads work, any assignment raises TypeError."""
+    __slots__ = ("_d",)
+
+    def __init__(self, d: Any) -> None:
+        object.__setattr__(self, "_d", dict(d))
+
+    def __getitem__(self, k: Any) -> Any:
+        return self._d[k]
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def __setattr__(self, *_a: Any) -> None:
+        raise TypeError("read-only")
+
+    def __repr__(self) -> str:
+        return f"ReadOnlyMapping({self._d!r})"
 
 
 @dataclass(frozen=True)
@@ -474,7 +497,7 @@ class Feed:
             mono, wall = self.mono(), int((wall_ms or self.wall_ms)())
             view = self.engine.state.view(mono, wall)
             ids = dict(identify(self.engine))
-        return MarketSnapshot(view=view, source=types.MappingProxyType(ids), wall_ms=wall, mono_s=mono)
+        return MarketSnapshot(view=view, source=ReadOnlyMapping(ids), wall_ms=wall, mono_s=mono)
 
     def alive(self) -> bool:
         """Every worker thread is running. A dead thread is a feed that will never recover."""
