@@ -36,6 +36,10 @@ import os
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 GENESIS = "00" * 32
+#: `append` writes the row and then its chain entry, so one crash can leave AT MOST ONE row unchained.
+MAX_UNCHAINED = 1
+#: Rows adopted by `reseal_tail` over a file's life. A few crashes are normal; many means rows were injected.
+MAX_RESEALED_PER_FILE = 3
 
 
 def canonical(row: Mapping[str, Any]) -> bytes:
@@ -135,6 +139,8 @@ def append(path: str, row: Mapping[str, Any]) -> Tuple[int, str]:
     if not _file_ends_clean(path) or not _file_ends_clean(_paths(path)[0]):
         raise ChainDesync("the evidence file or its sidecar ends in a torn line; run repair() before appending")
     lines_on_disk, _q = read_lines(path)
+    if _q:
+        raise ChainDesync("the evidence file ends in a line that is not valid JSON; run repair() before appending")
     if len(lines_on_disk) != len(chain):
         raise ChainDesync(f"{len(lines_on_disk)} rows on disk but {len(chain)} chained; run repair() before appending")
     prev = chain[-1]["h"] if chain else GENESIS
@@ -198,7 +204,9 @@ def head_of(path: str) -> Optional[Dict[str, Any]]:
     try:
         with open(hpath, encoding="utf-8") as fh:
             h = json.load(fh)
-        return h if isinstance(h, dict) and "n" in h and "head" in h else None
+        ok = (isinstance(h, dict) and isinstance(h.get("n"), int) and not isinstance(h.get("n"), bool)
+              and isinstance(h.get("head"), str))
+        return h if ok else None
     except (OSError, ValueError):
         return None
 
@@ -257,7 +265,8 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
         add("DUPLICATED", "an identical row appears twice (and was chained twice)", None)
     # 2. the head
     if head is None:
-        add("HEAD_MISSING", "no readable .head: the chain's end is unverifiable")
+        if chain or lines:                    # a brand-new empty file has nothing to anchor yet
+            add("HEAD_MISSING", "no readable .head: the chain's end is unverifiable")
     elif side_ok and chain:
         if head.get("n") != chain[-1]["n"] or head.get("head") != chain[-1]["h"]:
             if head.get("n", 0) > len(chain):
@@ -275,10 +284,15 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
             add("TRUNCATED", f"an external anchor records {n} rows; only {len(chain)} are chained")
         elif chain[n - 1]["h"] != hd:
             add("ANCHOR_MISMATCH", f"chain head at row {n} differs from the external anchor")
-    serious = [i for i in issues if i["code"] != "UNCHAINED_TAIL"]
     resealed = sum(1 for e in chain if e.get("resealed"))
+    if unchained > MAX_UNCHAINED:
+        add("UNCHAINED_TAIL_EXCESS", f"{unchained} unchained rows; a crash can leave at most {MAX_UNCHAINED}", len(chain))
+    if resealed > MAX_RESEALED_PER_FILE:
+        add("RESEALED_EXCESS", f"{resealed} rows were adopted by reseal (more than {MAX_RESEALED_PER_FILE} crashes' worth)")
+    serious = [i for i in issues if i["code"] != "UNCHAINED_TAIL"]
     return {"path": os.path.basename(path), "ok": not issues, "tamper_evident_ok": not serious,
             "anchored": bool(anchors), "resealed_rows": resealed, "sidecar_torn_tail": side_torn,
+            "torn_aside_bytes": (os.path.getsize(path + ".torn") if os.path.exists(path + ".torn") else 0),
             "n_rows": len(lines), "n_chained": len(chain), "unchained_tail": unchained,
             "head": None if not chain else {"n": chain[-1]["n"], "head": chain[-1]["h"]},
             "quarantined_lines": quarantined, "issues": issues}
@@ -289,8 +303,10 @@ def reseal_tail(path: str) -> int:
     marked ``resealed`` so the repair is visible. Refuses unless everything before the tail
     verifies; returns the number sealed."""
     v = verify(path)
-    if any(i["code"] not in ("UNCHAINED_TAIL", "HEAD_MISMATCH") for i in v["issues"]):
+    if any(i["code"] not in ("UNCHAINED_TAIL", "HEAD_MISMATCH", "HEAD_MISSING") for i in v["issues"]):
         return 0
+    if v["unchained_tail"] > MAX_UNCHAINED or v["resealed_rows"] + v["unchained_tail"] > MAX_RESEALED_PER_FILE:
+        return 0                               # more than a crash can explain: do not legitimise it
     cpath, hpath = _paths(path)
     _truncate_to_last_newline(cpath)          # a torn / newline-less chain tail is regenerated below
     lines, _ = read_lines(path)
@@ -336,11 +352,54 @@ def _truncate_to_last_newline(path: str, keep_aside: Optional[str] = None) -> in
     return len(torn)
 
 
+def _set_aside_bad_tail(path: str) -> int:
+    """A newline-terminated final line that is not JSON (read_lines quarantines it) is moved to
+    ``<file>.torn`` and cut from the file, so the file and its chain agree again. Returns bytes moved."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except FileNotFoundError:
+        return 0
+    if not data.endswith(b"\n"):
+        return 0
+    body = data[:-1]
+    cut = body.rfind(b"\n") + 1
+    last = body[cut:]
+    if not last.strip():
+        return 0
+    try:
+        json.loads(last)
+        return 0
+    except ValueError:
+        pass
+    with open(path + ".torn", "ab") as fh:
+        fh.write(last + b"\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    with open(path, "r+b") as fh:
+        fh.truncate(cut)
+        fh.flush()
+        os.fsync(fh.fileno())
+    return len(last)
+
+
+def needs_repair(path: str) -> bool:
+    """True when the file or its sidecar is in a state `append` would refuse, or when its head lags."""
+    chain, side_torn, side_corrupt = _read_chain_ex(path)
+    if side_torn or side_corrupt or not _file_ends_clean(path) or not _file_ends_clean(_paths(path)[0]):
+        return True
+    lines, quarantined = read_lines(path)
+    if quarantined or len(lines) != len(chain):
+        return True
+    return any(i["code"] in ("HEAD_MISMATCH", "HEAD_MISSING", "UNCHAINED_TAIL") for i in verify(path)["issues"])
+
+
 def repair(path: str) -> Dict[str, Any]:
     """Make an evidence file appendable again after a crash, visibly: a torn final row is moved
     to ``<file>.torn`` (kept, never deleted), rows written but not chained are sealed with a
     ``resealed`` mark. Refuses (changes nothing further) if anything BEFORE the tail fails to verify."""
     moved = _truncate_to_last_newline(path, keep_aside=path + ".torn")
+    moved += _set_aside_bad_tail(path)
     sealed = reseal_tail(path)
     v = verify(path)
     return {"torn_bytes_set_aside": moved, "rows_resealed": sealed, "tamper_evident_ok": v["tamper_evident_ok"],

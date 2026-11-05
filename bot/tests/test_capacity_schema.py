@@ -121,3 +121,10 @@ def test_silently_dropping_bad_rows_is_no_longer_silent(good):
     assert v["n_rejected"] == 6 and v["rejected_share"] == 0.6
     assert v["accepted"] == [] and not v["stream_ok"]
     assert any(p["code"] == CS.TOO_MANY_REJECTED for p in v["problems"])
+
+
+def test_the_legacy_duplicate_fields_must_agree_with_the_structured_ones(good):
+    for dup in ("funding_forecast_bps_per_settlement", "next_funding_ms"):
+        r = copy.deepcopy(good)
+        r[dup] = (r[dup] or 0) + 1
+        assert CS.BAD_TYPE in codes(CS.validate_row(r)), dup

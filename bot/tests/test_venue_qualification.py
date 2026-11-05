@@ -130,3 +130,34 @@ def test_a_negative_maker_rebate_within_bounds_is_accepted():
     e = good()
     e["fee_rates"]["maker_fee_rate"] = -0.0001
     assert Q.evaluate_eu(e).verdict == Q.QUALIFIED
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda e: e["fee_rates"].update(source="x /v5/account/fee-rate"),
+    lambda e: e["fee_rates"].update(source="NOT from /v5/account/fee-rate"),
+    lambda e: e["fee_rates"].update(source="https://api.bybit.com/v5/account/fee-rate"),
+    lambda e: e["fee_rates"].update(source="https://evil.example/v5/account/fee-rate"),
+    lambda e: e["collateral_rules"].update(source="trust me /v5/account/collateral-info"),
+    lambda e: e["fee_rates"].update(taker_fee_rate=1e-12),
+    lambda e: e["fee_rates"].update(taker_fee_rate=0.0001, maker_fee_rate=0.0002),          # maker above taker
+    lambda e: e["instruments_linear_btcusdt"].update(retCode=False),                       # False == 0
+    lambda e: e["instruments_linear_btcusdt"].update(symbol="ETHUSDT"),
+    lambda e: e["key_permissions"]["permissions"].update(Wallet=["withdraw"]),             # lower case
+    lambda e: e["key_permissions"]["permissions"].update(Wallet="Withdraw"),               # a string, not a list
+])
+def test_the_spoofs_the_second_review_found_are_refused(mutate):
+    e = good()
+    mutate(e)
+    r = Q.evaluate_eu(e)
+    assert r.verdict == Q.NOT_QUALIFIED and r.authorises_orders is False, r
+
+
+def test_a_credential_pasted_into_a_value_makes_the_evidence_unusable():
+    for bad in ("api_key=abcd1234", "sign=deadbeef", "x-bapi-api-key: zzz", "token: abc"):
+        e = good()
+        e["support_confirmation"]["statement"] = f"see {bad}"
+        r = Q.evaluate_eu(e)
+        assert r.verdict == Q.NOT_QUALIFIED and r.reasons[0].startswith("EVIDENCE_CONTAINS_SECRET_SHAPED_FIELD"), bad
+    ok = good()
+    ok["support_confirmation"]["statement"] = "derivatives and the API are available; no passwords were shared"
+    assert Q.evaluate_eu(ok).verdict == Q.QUALIFIED

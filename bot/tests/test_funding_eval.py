@@ -29,7 +29,7 @@ def test_a_perfect_forecast_has_zero_bias_and_full_sign_accuracy():
     assert o["bias_bps"] == pytest.approx(0.0) and o["mae_bps"] == pytest.approx(0.0) and o["sign_accuracy"] == 1.0
 
 
-def test_a_known_bias_is_measured_exactly_and_the_ci_brackets_it():
+def test_a_known_constant_bias_is_measured_exactly_and_gets_no_false_bound():
     rows, ev = run(n=150, forecast=lambda T, t: noisy(T) + 0.3, realised=noisy)
     o = ev["by_offset"][60]
     assert o["bias_bps"] == pytest.approx(0.3) and o["rmse_bps"] == pytest.approx(0.3)
@@ -125,3 +125,40 @@ def test_conflicting_public_prints_for_one_settlement_block_the_status_and_keep_
     assert ev["conflicting_prints"] == 1 and ev["status"] == "INSUFFICIENT"
     rec = [r for r in FE.join(rows)["joined"] if r["settlement_ms"] == T][0]
     assert rec["realised_bps"] == pytest.approx(noisy(T) - 5.0)
+
+
+def _step_series(trial, n, drop):
+    rng = random.Random(300 + trial)
+    vals = {k: 0.6 + (drop / 2 if k < n // 2 else -drop / 2) + rng.gauss(0, 0.25) for k in range(n)}
+    return lambda T: vals[(T // H8) % n]
+
+
+def test_a_one_sigma_level_drop_rarely_passes_and_when_it_does_the_carried_bound_is_not_above_the_current_level():
+    """The review measured: a 1-sigma midpoint drop passed 35 % of the time and in 95 % of those passes the 'lower bound'
+    sat above the CURRENT level. With the recent-third bound carried forward the same measurement gives a handful of
+    percent (the nominal rate)."""
+    n, drop = 90, 0.25
+    current = 0.6 - drop / 2
+    ok = above = 0
+    for trial in range(60):
+        f = _step_series(trial, n, drop)
+        rows = series(BASE, n, lambda T, t: f(T), f, cadence_ms=1_800_000)
+        ev = FE.evaluate(rows)
+        rb = ev["realised_bps"]
+        if ev["status"] == "OK":
+            ok += 1
+            above += rb["conservative_lo_bps"] > current
+    assert ok <= 0.6 * 60                       # about half are refused outright (the step makes the series look persistent)
+    assert ok == 0 or above / ok <= 0.10, (ok, above)       # measured 0 of 29; before the fix ~95 % of passes were above
+
+
+def test_the_funding_carried_into_the_economics_is_never_above_the_most_recent_third():
+    rng = random.Random(21)
+    vals = {k: 0.9 - 0.6 * k / 150 + rng.gauss(0, 0.25) for k in range(150)}
+    f = lambda T: vals[(T // H8) % 150]                                           # noqa: E731  a steady decline
+    rows, ev = run(n=150, forecast=lambda T, t: f(T), realised=f)
+    rb = ev["realised_bps"]
+    assert rb["conservative_lo_bps"] <= rb["ci"]["lo"]
+    assert rb["conservative_lo_bps"] <= rb["recent"]["mean"]       # a bound, so it sits below the recent level itself
+    steady = run(n=150, forecast=lambda T, t: noisy(T), realised=noisy)[1]["realised_bps"]
+    assert steady["recent"]["adverse_drift"] is False and steady["conservative_lo_bps"] is not None

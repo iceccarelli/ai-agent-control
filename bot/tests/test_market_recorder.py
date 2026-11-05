@@ -234,3 +234,19 @@ def test_capture_after_a_torn_write_repairs_visibly_and_keeps_recording(tmp_path
     assert v["ok"] and v["n_rows"] == 2 and rec._repairs == 1
     assert open(path + ".torn", "rb").read().startswith(b'{"torn": tr')
     assert rec.status()["capacity"]["repairs_while_running"] == 1
+
+
+def test_start_repairs_yesterdays_file_too_not_only_todays(tmp_path):
+    """A crash near midnight leaves YESTERDAY's head one behind; repairing only today's file left it HEAD_MISMATCH (serious) for a year."""
+    import evidence_chain as EC
+    rec, store, wall = make(tmp_path)
+    yesterday = os.path.join(rec.dir, "capacity-20200101.jsonl")
+    for i in range(3):
+        EC.append(yesterday, {"id": i})
+    open(yesterday, "ab").write(EC.canonical({"id": 3}) + b"\n")                     # row landed, chain entry did not
+    assert EC.verify(yesterday)["unchained_tail"] == 1
+    rec.start()
+    try:
+        assert EC.verify(yesterday)["ok"] and rec._resealed >= 1
+    finally:
+        rec.stop()

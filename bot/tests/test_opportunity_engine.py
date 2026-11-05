@@ -26,7 +26,9 @@ def bundle(funding=0.65, n=100, fillable=1.0, cost=11.4, reliability="HEALTHY", 
            pos=None, prospective=None, realised=None, environment="mainnet", source="PUBLIC_REALISED"):
     rows = series(BASE, n, lambda T, t: funding, realised or noisy(funding, sd=max(0.05, funding * 0.15)), cadence_ms=600_000)
     fe = FE.evaluate(rows)
-    f_lo = fe["realised_bps"]["ci"].get("lo", fe["realised_bps"]["mean"])
+    f_lo = fe["realised_bps"].get("conservative_lo_bps")
+    if f_lo is None:
+        f_lo = fe["realised_bps"]["mean"]
     costs = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=cost - 11.0, slippage_bps=0.0, impact_bps=0.0,
                      latency_bps=0.0, conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0)
     econ = TE.compute(pos or position(), costs, [f_lo] * 90, funding_source=source)
@@ -178,8 +180,16 @@ def test_a_constant_funding_history_never_becomes_a_candidate_however_rich_or_lo
 def test_a_candidate_names_its_unpriced_inputs_instead_of_implying_they_are_zero():
     costs_unknown = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.4, slippage_bps=0.0)   # nothing else priced
     b = bundle(funding=4.0)
-    f_lo = b["carry"]["funding_eval"]["realised_bps"]["ci"]["lo"]
+    f_lo = b["carry"]["funding_eval"]["realised_bps"]["conservative_lo_bps"]
     b["carry"]["economics"] = TE.compute(position(), costs_unknown, [f_lo] * 90, funding_source="PUBLIC_REALISED")
     st, e = status(b)
     assert st == OE.Status.RESEARCH_CANDIDATE
     assert "latency" in e.metrics["unpriced_inputs"] and "unpriced inputs: " in e.reasons[0] and "MODELLED" in e.reasons[0]
+
+
+def test_the_depth_candidate_is_never_given_a_screen_on_the_overlays_evidence():
+    out = {o["strategy"]: o for o in OE.evaluate_all(bundle(funding=4.0)["carry"] and {"carry": bundle(funding=4.0)["carry"], "rows": []})}
+    d = out["candidate_carry_depth/v1"]
+    assert d["status"] == "INSUFFICIENT_EVIDENCE" and d["metrics"]["carry_overlay_status"] == "RESEARCH_CANDIDATE"
+    assert "depth-benefit entry rule is not evaluated" in d["reasons"][0]
+    assert out["carry_overlay_taker/v1"]["status"] == "RESEARCH_CANDIDATE"

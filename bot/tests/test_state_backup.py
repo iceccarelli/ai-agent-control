@@ -99,18 +99,21 @@ def test_restore_only_ever_goes_into_a_new_or_empty_disposable_directory(tmp_pat
     full = tmp_path / "full"
     full.mkdir()
     (full / "x").write_text("occupied")
-    with pytest.raises(SystemExit, match="not an empty directory"):
+    with pytest.raises(SystemExit, match="already exists"):
         SB.restore(bf, str(full))
     with pytest.raises(SystemExit, match="live state directory"):
         SB.restore(bf, str(tmp_path / "state"))
     with pytest.raises(SystemExit, match="live state directory"):
         SB.restore(bf, "/app/state")
-    for bad in ("/app/state/sub", "/app", "/data", str(tmp_path / "state" / "sub"), "/"):
+    for bad in ("/app/state/sub", "/app", "/data", "/data/market", "/app/anything", str(tmp_path / "State" / "sub"),
+                str(tmp_path / "state" / "sub"), "/"):
         with pytest.raises(SystemExit, match="live state directory"):
             SB.restore(bf, bad)
     empty = tmp_path / "empty"
     empty.mkdir()
-    assert SB.restore(bf, str(empty))["ok"]
+    with pytest.raises(SystemExit, match="already exists"):          # even an empty existing directory is refused
+        SB.restore(bf, str(empty))
+    assert SB.restore(bf, str(tmp_path / "fresh" / "rehearsal"))["ok"]
 
 
 def test_the_cli_has_no_default_path_and_reports_failure_in_its_exit_code(tmp_path, live, capsys):

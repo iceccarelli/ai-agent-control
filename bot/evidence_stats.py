@@ -9,8 +9,9 @@ module reports four different numbers and never lets the largest pass for the ev
   settlement events        settlements with a usable observation. These are SERIALLY DEPENDENT (funding
                            is persistent), so this count is an upper bound on independent draws, not
                            the number of them; the ESS below is the figure that gates a claim
-  effective sample size    n / (1 + 2 * sum of positive autocorrelations), of the per-settlement
-                           series: how many independent draws the dependence leaves
+  effective sample size    the LOWER of n / (1 + 2 * sum of positive autocorrelations) and the ESS
+                           implied by the variance of batch means: how many independent draws the
+                           dependence leaves
 
 and gives confidence intervals from a moving-block bootstrap with a fixed seed whose block length
 follows the measured persistence, widened to an ESS-adjusted t interval for the mean. Under 8
@@ -21,6 +22,7 @@ from __future__ import annotations
 
 import math
 import random
+from statistics import NormalDist
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 MIN_FOR_CI = 8
@@ -63,11 +65,49 @@ def _mean(v: Sequence[float]) -> float:
     return sum(v) / len(v)
 
 
-def _t_crit(df: float, z: float = 1.959964) -> float:
-    """Two-sided 95 % Student-t critical value by the Cornish-Fisher expansion (stdlib only);
-    adequate for df >= 2, and it never returns less than the normal value."""
+def _t_crit(df: float, alpha: float = 0.05) -> float:
+    """Two-sided Student-t critical value by the Cornish-Fisher expansion (stdlib only); adequate for
+    df >= 2 and never below the normal value."""
+    z = NormalDist().inv_cdf(1.0 - alpha / 2.0)
     df = max(df, 2.0)
     return z + (z ** 3 + z) / (4 * df) + (5 * z ** 5 + 16 * z ** 3 + 3 * z) / (96 * df * df)
+
+
+BATCHES = 6
+
+
+def batch_means_ess(xs: Sequence[float]) -> Optional[float]:
+    """ESS implied by the variance of NON-OVERLAPPING BATCH MEANS (the most recent K*b points,
+    K <= 6). It needs no assumption about the shape of the autocorrelation, so it is not fooled by a
+    seasonal cycle (three settlements a day) that makes the lag-1 autocorrelation negative while a
+    persistent level still dominates the mean's variance. It is noisy at small K, which is why it is only
+    ever combined with the acf estimate by taking the LOWER of the two."""
+    n = len(xs)
+    k = min(BATCHES, n // 4)
+    if k < 2:
+        return None
+    b = n // k
+    tail = list(xs[n - k * b:])
+    bm = [sum(tail[i * b:(i + 1) * b]) / b for i in range(k)]
+    m = sum(tail) / len(tail)
+    s2 = sum((x - m) ** 2 for x in tail) / (len(tail) - 1)
+    mbar = sum(bm) / k
+    var_bm = sum((v - mbar) ** 2 for v in bm) / (k - 1)
+    if s2 <= 0:
+        return 1.0
+    if var_bm <= 0:
+        return float(n)
+    return max(1.0, min(float(n), s2 / (var_bm / k)))
+
+
+def conservative_ess(xs: Sequence[float]) -> Optional[float]:
+    """The LOWER of the autocorrelation-sum ESS and the batch-means ESS. Used wherever an ESS gates a
+    claim or sizes an interval."""
+    a = effective_sample_size(xs)
+    b = batch_means_ess(xs)
+    if a is None:
+        return b
+    return a if b is None else min(a, b)
 
 
 def block_bootstrap_ci(xs: Sequence[float], stat: Optional[Callable[[Sequence[float]], float]] = None,
@@ -92,7 +132,7 @@ def block_bootstrap_ci(xs: Sequence[float], stat: Optional[Callable[[Sequence[fl
     if var <= 0 or (max(xs) - min(xs)) <= 1e-12 * max(1.0, abs(m)):      # constant to float precision
         return {"status": "NO_VARIANCE", "n": n, "estimate": m, "ess": 1.0,
                 "reason": "constant series: nothing to resample, and a zero-width interval would be a false bound"}
-    ess = effective_sample_size(xs) or 1.0
+    ess = conservative_ess(xs) or 1.0
     if ess < 3.0:
         return {"status": "INSUFFICIENT", "n": n, "ess": ess, "estimate": m,
                 "reason": "effective sample size below 3: the series carries too few independent draws for any interval"}
@@ -115,13 +155,24 @@ def block_bootstrap_ci(xs: Sequence[float], stat: Optional[Callable[[Sequence[fl
     hi = vals[int((1 - alpha / 2) * (B - 1))]
     out: Dict[str, Any] = {"status": "OK", "n": n, "ess": ess, "block": L, "B": B, "seed": seed, "alpha": alpha,
                            "estimate": f(list(xs)), "bootstrap_lo": lo, "bootstrap_hi": hi}
-    if mean_stat and abs(alpha - 0.05) < 1e-12:
-        half = _t_crit(ess - 1.0) * math.sqrt(var / ess)
+    if mean_stat:
+        half = _t_crit(ess - 1.0, alpha) * math.sqrt(var / ess)
         out["ess_t_lo"], out["ess_t_hi"] = m - half, m + half
         lo, hi = min(lo, m - half), max(hi, m + half)
-        out["method"] = "wider of the moving-block bootstrap and the ESS-adjusted t interval"
+        for k in sorted({min(BATCHES, n // 4), min(3, n // 4)}):          # 6 and 3 batches: the fewer, the less
+            if k < 2:                                                   # the shape of the dependence is assumed
+                continue
+            b_ = n // k
+            tail = list(xs[n - k * b_:])
+            bm = [sum(tail[i * b_:(i + 1) * b_]) / b_ for i in range(k)]
+            bmm = sum(bm) / k
+            se_bm = math.sqrt(sum((v - bmm) ** 2 for v in bm) / (k - 1) / k)
+            half_bm = _t_crit(k - 1.0, alpha) * se_bm
+            out[f"batch{k}_lo"], out[f"batch{k}_hi"] = m - half_bm, m + half_bm
+            lo, hi = min(lo, m - half_bm), max(hi, m + half_bm)
+        out["method"] = "widest of the moving-block bootstrap, the ESS-adjusted t interval and the 6- and 3-batch-means t intervals"
     else:
-        out["method"] = "moving-block bootstrap only"
+        out["method"] = "moving-block bootstrap only (a custom statistic has no analytic cross-check)"
     out["lo"], out["hi"] = lo, hi
     return out
 
@@ -144,7 +195,7 @@ def independence_report(rows: Sequence[Mapping[str, Any]], *, regime_threshold_b
     for k in keys:
         fc = [r["funding"]["forecast_bps"] for r in groups[k]]
         per_settlement.append(sum(fc) / len(fc))
-    ess = effective_sample_size(per_settlement)
+    ess = conservative_ess(per_settlement)
     # forecast changes across a settlement boundary are the only independent information
     transitions = sum(1 for a, b in zip(per_settlement, per_settlement[1:])
                       if (a > regime_threshold_bps) != (b > regime_threshold_bps))

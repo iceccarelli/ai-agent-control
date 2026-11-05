@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -100,7 +101,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         files.append({"file": os.path.basename(p), "rows": len(rows), "schema_v2_rows": len(v2),
                       "quarantined_lines": quarantined,
                       "chain": {k: ver[k] for k in ("ok", "tamper_evident_ok", "n_chained", "unchained_tail", "head", "issues",
-                                                    "resealed_rows", "anchored")},
+                                                    "resealed_rows", "anchored", "torn_aside_bytes")},
                       "external_anchors": len(anchors.get(os.path.basename(p), []))})
         all_rows.extend(rows)
     val = CS.validate_stream(all_rows)
@@ -136,6 +137,8 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     if not fe:
         withheld.append("no funding evaluation")
     else:
+        if fe["joined"] < OE.MIN_SETTLEMENTS:
+            withheld.append(f"{fe['joined']} joined settlements; the opportunity engine needs {OE.MIN_SETTLEMENTS} before it will screen anything")
         if fe["status"] != "OK":
             withheld.extend(fe.get("status_reasons") or ["the funding evaluation is not OK"])
         if fe["realised_bps"]["ci"].get("status") != "OK":
@@ -145,8 +148,9 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
 
     economics = None
     if not withheld:
-        f_lo = fe["realised_bps"]["ci"]["lo"]
-        n_settle = max(1, int(round(hold_days * TE.SETTLEMENTS_PER_DAY)))
+        f_lo = fe["realised_bps"]["conservative_lo_bps"]
+        interval_h = accepted[-1]["funding"]["interval_h"]
+        n_settle = max(1, int(round(hold_days * 24.0 / interval_h)))
         pos = TE.Position(notional_usd=notional_usd, hold_days=hold_days, btc_inventory_usd=notional_usd, btc_was_owned=True,
                           margin_posted_usd=0.0, collateral_haircut=ASSUMED_VENUE_RULES["collateral_haircut"],
                           reserve_usd=0.1 * notional_usd, maintenance_margin_rate=ASSUMED_VENUE_RULES["maintenance_margin_rate"],
@@ -159,7 +163,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                          impact_bps=None, latency_bps=None, fee_provenance="UNVERIFIED")
         economics = {"inputs": {"basis": "PER $%s HEDGED NOTIONAL; ILLUSTRATIVE POSITION, NOT YOUR ACCOUNT" % f"{notional_usd:,.0f}",
                                 "hold_days": hold_days, "funding_used_bps_per_settlement": f_lo,
-                                "funding_used_is": "LOWER 95% block-bootstrap bound of the realised public mean",
+                                "funding_used_is": fe["realised_bps"]["conservative_lo_is"] + " of the realised public mean",
                                 "venue_rules": ASSUMED_VENUE_RULES},
                      "result": TE.compute(pos, costs, [f_lo] * n_settle, funding_source="PUBLIC_REALISED")}
     bundle = {"carry": {"validation_ok": val["stream_ok"], "chain_ok": chain_ok and any_v2_file, "environment": env,
@@ -212,6 +216,7 @@ def render(rep: Dict[str, Any]) -> str:
         iss = ",".join(x["code"] for x in f["chain"]["issues"]) or "none"
         q = f", QUARANTINED final line(s): {len(f['quarantined_lines'])}" if f["quarantined_lines"] else ""
         rs = f", RESEALED rows adopted after a crash: {f['chain']['resealed_rows']}" if f["chain"].get("resealed_rows") else ""
+        rs += f", torn bytes SET ASIDE in {f['file']}.torn: {f['chain']['torn_aside_bytes']}" if f["chain"].get("torn_aside_bytes") else ""
         out.append(f"    {f['file']}: rows {f['rows']} (v2 {f['schema_v2_rows']}), issues: {iss}, external anchors {f['external_anchors']}{q}{rs}")
     out.append(f"3 RELIABILITY {r['verdict']}: {r.get('why', '')}")
     if r.get("rows"):
@@ -250,8 +255,9 @@ def render(rep: Dict[str, Any]) -> str:
     out.append("7 OPPORTUNITIES")
     for o in rep["opportunities"]:
         out.append(f"    {o['strategy']:<34} {o['origin']:<26} {o['status'] or 'FROZEN_ABSENT (never re-evaluated)'}")
-        if o["status"] and o["reasons"]:
-            out.append(f"        - {o['reasons'][0][:150]}")
+        if o["status"]:
+            for why in o["reasons"][:3]:
+                out.append(f"        - {why[:220]}")
     return "\n".join(out)
 
 
@@ -264,6 +270,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--now-ms", type=int, default=None)
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    if not (math.isfinite(a.hold_days) and 0 < a.hold_days <= 3650):
+        ap.error("--hold-days must be a finite number of days in (0, 3650]")
+    if not (math.isfinite(a.notional) and a.notional > 0):
+        ap.error("--notional must be a finite positive number of USD")
     now = a.now_ms if a.now_ms is not None else int(time.time() * 1000)
     rep = build(a.dir, now_ms=now, history=a.history, notional_usd=a.notional, hold_days=a.hold_days)
     print(json.dumps(rep, indent=2, sort_keys=True, default=str) if a.json else render(rep))

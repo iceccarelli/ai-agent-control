@@ -203,3 +203,87 @@ def test_without_an_anchor_a_clean_verify_says_so(tmp_path):
     p = write(tmp_path, 3)
     assert EC.verify(p)["anchored"] is False
     assert EC.verify(p, anchors=[{"n": 3, "head": EC.verify(p)["head"]["head"]}])["anchored"] is True
+
+
+# ---- second review: the first row of a UTC day, bounded adoption, and a reader that cannot be crashed ------------------
+
+def fresh(tmp_path, name="capacity-20261106.jsonl"):
+    return str(tmp_path / name)
+
+
+def test_every_crash_state_of_the_FIRST_row_of_a_day_is_recoverable(tmp_path):
+    """The review: with no prior rows, a torn first row / first row without a chain entry / chain line without a head were
+    permanently stuck (HEAD_MISSING is not repairable), so append raised every five minutes until midnight."""
+    row = EC.canonical({"id": 0})
+    states = {
+        "torn first row": lambda p: open(p, "wb").write(row[:7]),
+        "first row, no chain entry": lambda p: open(p, "wb").write(row + b"\n"),
+        "first row and chain line, no head": lambda p: (open(p, "wb").write(row + b"\n"),
+                                                        open(p + ".chain", "w").write(json.dumps(
+                                                            {"n": 1, "r": EC.row_hash(row), "h": EC.link(EC.GENESIS, EC.row_hash(row))}, sort_keys=True) + "\n")),
+        "torn first chain line": lambda p: (open(p, "wb").write(row + b"\n"), open(p + ".chain", "wb").write(b'{"n":1,"r":"ab')),
+        "empty file": lambda p: open(p, "wb").write(b""),
+    }
+    for k, (name, make) in enumerate(states.items()):
+        p = fresh(tmp_path, f"capacity-2026110{k}.jsonl")
+        make(p)
+        assert EC.needs_repair(p) or name == "empty file", name
+        r = EC.repair(p)
+        assert r["appendable"], (name, r)
+        EC.append(p, {"id": 1})
+        v = EC.verify(p)
+        assert v["tamper_evident_ok"] and v["n_rows"] == v["n_chained"], (name, v["issues"])
+
+
+def test_more_unchained_rows_than_a_crash_can_explain_is_a_serious_failure_and_is_not_adopted(tmp_path):
+    p = write(tmp_path, 3)
+    with open(p, "ab") as fh:
+        for i in range(60):
+            fh.write(EC.canonical({"injected": i}) + b"\n")
+    v = EC.verify(p)
+    assert "UNCHAINED_TAIL_EXCESS" in codes(v) and v["tamper_evident_ok"] is False
+    assert EC.reseal_tail(p) == 0 and EC.repair(p)["appendable"] is False       # refused: it is not a crash, it is injection
+    assert EC.verify(p)["n_chained"] == 3
+
+
+def test_adoption_over_a_files_life_is_capped(tmp_path):
+    p = write(tmp_path, 2)
+    for k in range(EC.MAX_RESEALED_PER_FILE):
+        open(p, "ab").write(EC.canonical({"crash": k}) + b"\n")
+        assert EC.reseal_tail(p) == 1
+    open(p, "ab").write(EC.canonical({"one too many": True}) + b"\n")
+    assert EC.reseal_tail(p) == 0 and "UNCHAINED_TAIL" in codes(EC.verify(p))
+    # and a file that somehow holds more resealed entries than that is flagged by verify itself
+    q = str(tmp_path / "capacity-20261109.jsonl")
+    EC.bulk_write(q, rows(2))
+    with open(q + ".chain", "w") as fh:
+        prev = EC.GENESIS
+        for i, ln in enumerate(EC.read_lines(q)[0], 1):
+            r = EC.row_hash(ln)
+            prev = EC.link(prev, r)
+            fh.write(json.dumps({"n": i, "r": r, "h": prev, "resealed": True}, sort_keys=True) + "\n")
+    EC.bulk_write(q + "x", [])               # (no-op helper call: keeps the file layout identical to production)
+    assert EC.verify(q)["resealed_rows"] == 2
+
+
+def test_a_newline_terminated_non_json_final_line_is_set_aside_not_welded_in(tmp_path):
+    p = write(tmp_path, 3)
+    with open(p, "ab") as fh:
+        fh.write(b"garbage that ends in a newline\n")
+    with pytest.raises(EC.ChainDesync):
+        EC.append(p, {"id": 9})
+    r = EC.repair(p)
+    assert r["appendable"] and b"garbage" in open(p + ".torn", "rb").read()
+    EC.append(p, {"id": 9})
+    v = EC.verify(p)
+    assert v["ok"] and v["n_rows"] == 4 and v["torn_aside_bytes"] > 0            # surfaced to the report
+
+
+@pytest.mark.parametrize("head", [b'{"n":"3","head":"x"}', b'{"n":null,"head":"x"}', b'{"n":[1],"head":"x"}', b'{"n":3,"head":7}',
+                                  b'{"n":true,"head":"x"}', b"[]", b"7"])
+def test_a_head_file_of_the_wrong_shape_is_reported_not_raised(tmp_path, head):
+    p = write(tmp_path, 3)
+    open(p + ".head", "wb").write(head)
+    v = EC.verify(p)                                                              # must not raise
+    assert "HEAD_MISSING" in codes(v) and v["tamper_evident_ok"] is False
+    assert EC.repair(p)["appendable"] in (True, False)                            # and repair must not raise either

@@ -129,14 +129,15 @@ def restore(backup_file: str, into: str) -> Dict[str, Any]:
     if not v["ok"]:
         raise SystemExit(f"refusing: the backup does not verify: {v['problems']}")
     target = os.path.realpath(into)
-    parts = [x for x in target.split(os.sep) if x]
-    if ("state" in parts or target == "/app" or target.startswith("/app/") or target == "/data"
+    parts = [x.lower() for x in target.split(os.sep) if x]
+    if ("state" in parts or target in ("/", "/app", "/data") or target.startswith(("/app/", "/data/"))
             or os.path.ismount(target)):
-        raise SystemExit("refusing: --into looks like a live state directory or the root of a volume mount "
-                         "(use a new subdirectory); restore only into a disposable one")
-    if os.path.exists(target) and (not os.path.isdir(target) or os.listdir(target)):
-        raise SystemExit("refusing: --into exists and is not an empty directory")
-    os.makedirs(target, exist_ok=True)
+        raise SystemExit("refusing: --into looks like a live state directory, a volume or its contents; "
+                         "restore only into a disposable location")
+    if os.path.exists(target):
+        raise SystemExit("refusing: --into already exists; a restore creates its own new directory so it can never land in "
+                         "a directory something else uses")
+    os.makedirs(target)
     out = os.path.join(target, "restored-state.db")      # never the live file name
     shutil.copyfile(backup_file, out)
     got = _inspect(out)

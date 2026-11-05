@@ -109,12 +109,17 @@ def test_no_production_module_at_all_imports_the_evidence_economics_or_opportuni
     modules; the review showed an `import opportunity_engine` there would have passed. So scan EVERY bot/*.py: the new
     analytics may be imported only by each other (and by tools/ and tests/, which are not in this glob)."""
     offenders = {}
-    for name in sorted(os.listdir(BOT)):
-        if not name.endswith(".py") or name[:-3] in NEW_ANALYTICS:
-            continue
-        bad = _imports_of(os.path.join(BOT, name)) & NEW_ANALYTICS
-        if bad:
-            offenders[name] = sorted(bad)
+    scanned = 0
+    for root, dirs, files in os.walk(BOT):
+        dirs[:] = [d for d in dirs if d not in ("tests", "tools", "__pycache__", "node_modules") and not d.startswith(".")]
+        for name in sorted(files):
+            if not name.endswith(".py") or (root == BOT and name[:-3] in NEW_ANALYTICS):
+                continue
+            scanned += 1
+            bad = _imports_of(os.path.join(root, name)) & NEW_ANALYTICS
+            if bad:
+                offenders[os.path.relpath(os.path.join(root, name), BOT)] = sorted(bad)
+    assert scanned > 60, "the scan found suspiciously few modules"
     assert not offenders, offenders
 
 

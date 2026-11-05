@@ -52,3 +52,18 @@ def test_a_future_dated_newest_row_is_not_healthy_and_not_silently_fresh():
     assert r["verdict"] == "CLOCK_AHEAD" and r["clock_ahead"] and "future" in r["why"]
     ok = RR.report(rows, now_ms=rows[-1]["at_ms"] + 60_000)
     assert ok["verdict"] == "HEALTHY" and not ok["clock_ahead"]
+
+
+def test_an_old_deploy_gap_stays_in_the_list_but_does_not_make_todays_evidence_degraded_forever():
+    """The review: one 15-minute gap anywhere in the retained window made the verdict DEGRADED, and the opportunity engine
+    refuses anything but HEALTHY, so a single deploy blocked all evidence for a year."""
+    from capacity_helpers import base_row, series
+    cad = 300_000
+    day = 24 * 3_600_000
+    rows_ = series(base_row(), 9, lambda T, t: 0.6, lambda T: 0.6, skip=lambda i, t: 100 <= i <= 103)     # a ~20 min hole, early
+    r = RR.report(rows_, now_ms=rows_[-1]["at_ms"] + 60_000)
+    assert r["gaps"] and r["max_gap_s"] > 600
+    assert r["verdict"] == "HEALTHY" and r["recent_gap"] is False and r["completeness"] > 0.99
+    recent = series(base_row(), 3, lambda T, t: 0.6, lambda T: 0.6, skip=lambda i, t: 150 <= i <= 180)    # a 2.5 h hole inside the last day
+    r2 = RR.report(recent, now_ms=recent[-1]["at_ms"] + 60_000)
+    assert r2["verdict"] == "DEGRADED" and r2["recent_gap"] is True

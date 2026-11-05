@@ -175,3 +175,39 @@ def test_a_third_of_the_rows_rejected_voids_the_stream_and_is_printed(tmp_path):
     rep = report(lay_down(tmp_path, rows), rows)
     assert rep["validation"]["stream_ok"] is False and rep["validation"]["n_rejected"] > 0
     assert "REJECTED" in PR.render(rep)
+
+
+def test_thirty_five_settlements_at_eight_bps_do_not_print_meets_while_the_engine_says_insufficient(tmp_path):
+    """The review: 35 joined settlements printed '10/15/20% -> meets' next to INSUFFICIENT_EVIDENCE."""
+    rows = series(BASE, 36, lambda T, t: 8.0, noisy(8.0, 0.6))
+    rep = report(lay_down(tmp_path, rows), rows)
+    text = PR.render(rep)
+    assert rep["economics"] is None and "meets" not in text
+    assert any("opportunity engine needs 90" in w for w in rep["economics_withheld_because"])
+
+
+def test_the_depth_candidates_reasons_are_printed_and_it_claims_no_screen(tmp_path):
+    rows = series(BASE, 100, lambda T, t: 4.0, noisy(4.0, 0.5))
+    rep = report(lay_down(tmp_path, rows), rows)
+    stat = {o["strategy"]: o for o in rep["opportunities"]}
+    assert stat["carry_overlay_taker/v1"]["status"] == "RESEARCH_CANDIDATE"
+    assert stat["candidate_carry_depth/v1"]["status"] == "INSUFFICIENT_EVIDENCE"
+    text = PR.render(rep)
+    assert "depth-benefit entry rule is not evaluated" in text and "unpriced inputs" in text
+
+
+def test_a_set_aside_torn_row_appears_in_the_report(tmp_path):
+    rows = series(BASE, 4, lambda T, t: 0.65, noisy(0.65, 0.1))
+    d = lay_down(tmp_path, rows)
+    p = os.path.join(d, "capacity-20261104.jsonl")
+    open(p, "ab").write(b'{"torn')
+    EC.repair(p)
+    f = report(d, rows)["integrity"]["files"][0]
+    assert f["chain"]["torn_aside_bytes"] > 0 and "SET ASIDE" in PR.render(report(d, rows))
+
+
+@pytest.mark.parametrize("flag,value", [("--hold-days", "0"), ("--hold-days", "-3"), ("--hold-days", "nan"), ("--hold-days", "1e9"),
+                                        ("--notional", "0"), ("--notional", "inf")])
+def test_nonsense_cli_arguments_are_refused_before_any_allocation(tmp_path, flag, value):
+    with pytest.raises(SystemExit):
+        PR.main(["--dir", str(tmp_path), flag, value])

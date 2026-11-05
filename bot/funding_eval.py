@@ -99,7 +99,7 @@ def evaluate(rows: Sequence[Mapping[str, Any]], *, offsets_min: Sequence[int] = 
     j = join(rows, offsets_min=offsets_min, tol_min=tol_min)
     joined = j["joined"]
     realised = [r["realised_bps"] for r in joined]
-    ess = ES.effective_sample_size(realised)
+    ess = ES.conservative_ess(realised)
     conflicts = sum(1 for r in joined if r["realised_conflict"])
     why: List[str] = []
     if len(joined) < MIN_INDEPENDENT:
@@ -107,6 +107,25 @@ def evaluate(rows: Sequence[Mapping[str, Any]], *, offsets_min: Sequence[int] = 
     if ess is None or ess < MIN_ESS:
         why.append(f"effective sample size of the realised series is {'n/a' if ess is None else round(ess, 1)}, "
                    f"{MIN_ESS:g} needed (funding is persistent: the count overstates the evidence)")
+    # a bound on the window MEAN is not a bound on the next 30 days if the level is moving: look at the
+    # most recent third on its own, flag an adverse drift, and carry the LEAST favourable bound forward
+    full_ci = ES.block_bootstrap_ci(realised)
+    recent_n = max(ES.MIN_FOR_CI, len(realised) // 3)
+    recent = realised[-recent_n:] if len(realised) >= ES.MIN_FOR_CI else []
+    recent_ci = ES.block_bootstrap_ci(recent) if len(recent) >= ES.MIN_FOR_CI else {"status": "INSUFFICIENT"}
+    recent_mean = ES.mean(recent)
+    bounds = []
+    if full_ci.get("status") == "OK":
+        bounds.append(full_ci["lo"])
+    if recent_ci.get("status") == "OK":
+        bounds.append(recent_ci["lo"])
+    elif recent_ci.get("status") == "NO_VARIANCE":
+        bounds.append(recent_ci["estimate"])
+    conservative_lo = min(bounds) if (bounds and full_ci.get("status") == "OK") else None
+    drift_adverse = (full_ci.get("status") == "OK" and recent_mean is not None and recent_mean < full_ci["lo"])
+    if drift_adverse:
+        why.append(f"funding is trending below the window: the most recent third averages {recent_mean:.3f} bps, "
+                   f"under the window's lower bound {full_ci['lo']:.3f} bps")
     if conflicts:
         why.append(f"{conflicts} settlement(s) with conflicting public prints")
     if j["anomalies"]:
@@ -121,7 +140,10 @@ def evaluate(rows: Sequence[Mapping[str, Any]], *, offsets_min: Sequence[int] = 
                          "min": min(realised) if realised else None, "p05": _pct(realised, 0.05),
                          "share_negative": (sum(1 for x in realised if x < 0) / len(realised)) if realised else None,
                          "count_below_minus_1bps": sum(1 for x in realised if x < -1.0),
-                         "ci": ES.block_bootstrap_ci(realised)},
+                         "ci": full_ci,
+                         "recent": {"n": len(recent), "mean": recent_mean, "ci": recent_ci, "adverse_drift": drift_adverse},
+                         "conservative_lo_bps": conservative_lo,
+                         "conservative_lo_is": "lower of the window's and the most recent third's 95 % lower bounds"},
         "by_offset": {}, "persistence": None, "reversals": None,
     }
     for off in offsets_min:

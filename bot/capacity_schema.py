@@ -133,6 +133,11 @@ def validate_row(row: Any) -> List[Tuple[str, str]]:
         elif lps is not None and isinstance(iv, int) and not isinstance(iv, bool) and 1 <= iv <= 24 \
                 and int(lps) % (iv * 3_600_000) != 0:
             out.append(_issue(BAD_SETTLEMENT, f"last print settlement {lps!r} is not on the {iv} h UTC grid"))
+    if isinstance(f, dict):
+        # the legacy top-level duplicates must agree with the structured fields they mirror
+        for dup, ref in (("funding_forecast_bps_per_settlement", "forecast_bps"), ("next_funding_ms", "next_settlement_ms")):
+            if dup in row and row[dup] != f.get(ref):
+                out.append(_issue(BAD_TYPE, f"{dup} disagrees with funding.{ref}"))
     b = row["book"]
     if not isinstance(b, dict) or any(not (isinstance(b.get(k), int) and b[k] >= 0) for k in
                                       ("perp_bid_levels", "perp_ask_levels", "spot_bid_levels", "spot_ask_levels")):

@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 DEFAULT_CADENCE_S = 300.0
 STALE_AFTER_CADENCES = 3.0
 GAP_AFTER_CADENCES = 2.0
+RECENT_WINDOW_S = 24 * 3600.0         # a gap only degrades the verdict while it is recent;
+RECENT_GAP_S = 3600.0                 # an old deploy gap stays in the list and in `completeness`, not in the verdict
 CLOCK_AHEAD_TOLERANCE_S = 120.0       # a row dated further ahead than this is not from "now"
 
 
@@ -74,7 +76,9 @@ def report(rows: Sequence[Mapping[str, Any]], *, now_ms: int, cadence_s: float =
                                                        "consecutive_failures": supervisor.get("recorder_consecutive_failures")},
         "recorder_errors": None if status is None else (status.get("capacity") or {}).get("errors"),
     }
-    degraded = bool(gaps) or bool(faults) or (out["completeness"] or 1.0) < 0.9
+    recent_gap = any(g["to_ms"] >= last - RECENT_WINDOW_S * 1000 and g["seconds"] > RECENT_GAP_S for g in gaps)
+    out["recent_gap"] = recent_gap
+    degraded = recent_gap or bool(faults) or (out["completeness"] or 1.0) < 0.9
     ahead = age_s < -CLOCK_AHEAD_TOLERANCE_S
     out["clock_ahead"] = ahead
     out["verdict"] = "CLOCK_AHEAD" if ahead else ("STALE" if stale else ("DEGRADED" if degraded else "HEALTHY"))
@@ -82,5 +86,5 @@ def report(rows: Sequence[Mapping[str, Any]], *, now_ms: int, cadence_s: float =
                   if ahead else
                   (f"last row is {age_s / 60:.0f} min old (limit {STALE_AFTER_CADENCES * cadence_s / 60:.0f} min): "
                   "the recorder is not collecting" if stale else
-                  ("gaps, store faults or incomplete cadence in the window" if degraded else "collecting at cadence")))
+                  ("a recent gap, store faults or incomplete cadence in the window" if degraded else "collecting at cadence")))
     return out

@@ -215,10 +215,13 @@ class Recorder:
     def start(self) -> None:
         # a crash between a row and its chain entry leaves an unchained tail: seal it visibly
         try:
-            path = self._capacity_path(self.wall_ms())
-            if os.path.exists(path):
-                r = EC.repair(path)
-                self._resealed = r["rows_resealed"]
+            # every capacity file, not just today's: a crash near midnight leaves YESTERDAY's head behind
+            for name in sorted(os.listdir(self.dir)):
+                if name.startswith("capacity-") and name.endswith(".jsonl"):
+                    path = os.path.join(self.dir, name)
+                    if EC.needs_repair(path):
+                        r = EC.repair(path)
+                        self._resealed += r["rows_resealed"]
         except Exception:  # noqa: BLE001 - evidence repair must not stop collection
             pass
         self.feed.start()

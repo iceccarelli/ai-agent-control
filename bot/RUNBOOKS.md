@@ -152,6 +152,14 @@ Run on the recorder's data directory (or a copy; it never writes there):
 * **Dependence:** unique settlements, not snapshots, are the unit, and settlements are themselves serially dependent:
   a claim needs the effective sample size (>= 30) as well as the count (>= 30 joined, >= 90 for a candidate).
   `INSUFFICIENT` is the honest answer below the floor; a constant funding history has no variance to test and stays INSUFFICIENT.
+* **How far to trust the interval (measured, not assumed):** the interval is the widest of a block bootstrap and three
+  analytic intervals, and a claim also needs the effective sample size (the LOWER of an autocorrelation estimate and a
+  batch-means estimate) to be >= 30. Among series the gate accepts, simulation gives the true mean inside the interval
+  about 0.88-0.99 of the time for first-order persistence up to 0.8, and the lower bound above the truth about 3 %.
+  Two things it cannot do at ~100 settlements: identify a slow persistent level hidden under noise (measured coverage
+  0.7-0.85 there) and predict a level shift. So the economics carry the LEAST favourable of the window's and the most
+  recent third's lower bounds, a drift below the window is flagged, and a `RESEARCH_CANDIDATE` is a research flag, never
+  a validated edge: only `PROSPECTIVELY_VALIDATED` (screens re-run on post-registration data alone) is evidence of one.
 * **Money:** two returns (on hedged notional, on fully allocated economic capital), the 10/15/20 %/yr
   screens labelled `PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED`, and an explicit list of UNKNOWN
   inputs (latency, the account's real fee tier, venue margin rules). Replace them with the owner's.

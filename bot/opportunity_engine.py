@@ -337,8 +337,14 @@ def evaluate_all(bundle: Mapping[str, Any]) -> List[Dict[str, Any]]:
         elif key == "carry_overlay_taker/v1" or key == "candidate_carry_depth/v1":
             e = evaluate_carry(spec, bundle.get("carry") or {})
             if key == "candidate_carry_depth/v1":
-                e.reasons.append("order-less recommendation: judged on the same carry evidence, never executed; its own depth "
-                                 "entry rule is not evaluated here")
+                # its own depth-benefit entry rule is not evaluated against recorded evidence, so no screen is claimed
+                # for it; the shared carry evidence is shown for reference only
+                ref = None if e.status is None else e.status.value
+                e = Evaluation(spec.key, spec.origin, Status.INSUFFICIENT_EVIDENCE,
+                               ["order-less recommendation: its own depth-benefit entry rule is not evaluated against recorded "
+                                "evidence, so no screen is claimed for it",
+                                f"for reference, the same carry evidence gives the always-on overlay: {ref}"],
+                               {**e.metrics, "carry_overlay_status": ref})
             out.append(e.as_dict())
         elif key == "funding_carry_fade_btc/v1":
             out.append(evaluate_btc_fade(spec, bundle.get("slice57")).as_dict())

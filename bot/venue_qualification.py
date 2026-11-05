@@ -28,7 +28,12 @@ from typing import Any, Dict, List, Mapping, Tuple
 
 #: Sanity bounds so that a mistyped or pasted-as-percent number cannot "qualify" an account.
 MAX_PLAUSIBLE_TAKER_RATE = 0.005        # 50 bps: far above any Bybit tier, far below a percent-as-fraction slip
+MIN_PLAUSIBLE_TAKER_RATE = 0.00001      # 0.1 bps: below this is a typo, not a fee tier
 MIN_BTC_COLLATERAL_RATIO = 0.10
+#: The ONLY accepted provenance strings. A free-text `source` (a URL, a sentence, a copied query string) proves
+#: nothing about where a number came from and is where credentials get pasted by accident.
+FEE_RATE_SOURCE = "GET /v5/account/fee-rate"
+COLLATERAL_SOURCE = "GET /v5/account/collateral-info"
 
 QUALIFIED = "QUALIFIED"
 NOT_QUALIFIED = "NOT_QUALIFIED"
@@ -36,6 +41,7 @@ UNVERIFIED = "UNVERIFIED"
 
 EU_REST_HOST = "api.bybit.eu"
 _SECRET_SHAPED = re.compile(r"(api[_-]?key|secret|token|passw|signature|private[_-]?key|x-bapi)", re.I)
+_SECRET_VALUE = re.compile(r"(api[_-]?key|secret|signature|x-bapi[\w-]*|passw\w*|private[_-]?key|\bsign|\btoken)\s*[=:]", re.I)
 _DERIVATIVES_PERMISSIONS = ("ContractTrade", "Derivatives")
 
 
@@ -59,6 +65,8 @@ def _secret_fields(obj: Any, path: str = "") -> List[str]:
     elif isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
             out += _secret_fields(v, f"{path}[{i}]")
+    elif isinstance(obj, str) and _SECRET_VALUE.search(obj):
+        out.append(path or "<root>")              # a credential pasted into a VALUE (api_key=..., sign=...)
     return out
 
 
@@ -96,8 +104,11 @@ def evaluate_eu(evidence: Any) -> Qualification:
     if not isinstance(inst, Mapping):
         missing.append("instruments_linear_btcusdt")
     else:
-        if inst.get("retCode") != 0:
-            reasons.append(f"LINEAR_INSTRUMENT_RETCODE_NOT_ZERO:{inst.get('retCode')!r}")
+        rc = inst.get("retCode")
+        if not (type(rc) is int and rc == 0):                # False == 0 in Python: a boolean is not a return code
+            reasons.append(f"LINEAR_INSTRUMENT_RETCODE_NOT_ZERO:{rc!r}")
+        elif inst.get("symbol") not in (None, "BTCUSDT"):
+            reasons.append(f"LINEAR_INSTRUMENT_WRONG_SYMBOL:{inst.get('symbol')!r}")
         elif inst.get("status") != "Trading":
             reasons.append(f"LINEAR_INSTRUMENT_NOT_TRADING:{inst.get('status')!r}")
 
@@ -111,7 +122,11 @@ def evaluate_eu(evidence: Any) -> Qualification:
         else:
             if not any(perms.get(p) for p in _DERIVATIVES_PERMISSIONS):
                 reasons.append("NO_DERIVATIVES_PERMISSION: the key offers no ContractTrade/Derivatives permission")
-            if any("Withdraw" in (v or []) for v in perms.values() if isinstance(v, (list, tuple))):
+            def _items(v: Any) -> List[str]:
+                if isinstance(v, str):
+                    return [v]
+                return [str(x) for x in v] if isinstance(v, (list, tuple)) else []
+            if any("withdraw" in x.lower() for k, v in perms.items() for x in [str(k)] + _items(v) if v):
                 reasons.append("WITHDRAW_PERMISSION_PRESENT")
         ips = keyp.get("ips")
         if keyp.get("ip_restricted") is not True or not (isinstance(ips, (list, tuple)) and ips):
@@ -125,13 +140,13 @@ def evaluate_eu(evidence: Any) -> Qualification:
     else:
         tk, mk = fee.get("taker_fee_rate"), fee.get("maker_fee_rate")
         fin = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) != float("inf")   # noqa: E731
-        src = fee.get("source")
-        if not (isinstance(src, str) and "/v5/account/fee-rate" in src):
-            reasons.append("FEE_RATES_INVALID: source must name the account fee-rate endpoint (GET /v5/account/fee-rate)")
-        elif not (fin(tk) and fin(mk)) or not (0 < tk <= MAX_PLAUSIBLE_TAKER_RATE) or not (-MAX_PLAUSIBLE_TAKER_RATE <= mk <= MAX_PLAUSIBLE_TAKER_RATE):
-            reasons.append("FEE_RATES_INVALID: taker must be a positive fraction no greater than "
-                           f"{MAX_PLAUSIBLE_TAKER_RATE} (0.00055 is 5.5 bps; a percent pasted as a fraction is refused) "
-                           "and maker a fraction within the same bound")
+        if fee.get("source") != FEE_RATE_SOURCE:
+            reasons.append(f"FEE_RATES_INVALID: source must be exactly {FEE_RATE_SOURCE!r} (free text proves nothing)")
+        elif not (fin(tk) and fin(mk)) or not (MIN_PLAUSIBLE_TAKER_RATE <= tk <= MAX_PLAUSIBLE_TAKER_RATE) \
+                or not (-MAX_PLAUSIBLE_TAKER_RATE <= mk <= tk):
+            reasons.append("FEE_RATES_INVALID: taker must be a fraction between "
+                           f"{MIN_PLAUSIBLE_TAKER_RATE} and {MAX_PLAUSIBLE_TAKER_RATE} (0.00055 is 5.5 bps; a percent pasted as a "
+                           "fraction is refused) and maker a fraction no greater than taker (a rebate is negative)")
         elif fee.get("symbol") != "BTCUSDT" or fee.get("category") != "linear":
             reasons.append("FEE_RATES_FOR_WRONG_INSTRUMENT")
 
@@ -140,8 +155,7 @@ def evaluate_eu(evidence: Any) -> Qualification:
         missing.append("collateral_rules")
     else:
         ratio = col.get("collateral_ratio")
-        src = col.get("source")
-        if col.get("coin") != "BTC" or not (isinstance(src, str) and "/v5/account/collateral-info" in src) \
+        if col.get("coin") != "BTC" or col.get("source") != COLLATERAL_SOURCE \
                 or col.get("margin_collateral") is not True \
                 or not (isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and MIN_BTC_COLLATERAL_RATIO <= ratio <= 1):
             reasons.append("COLLATERAL_RULES_INVALID: BTC must be usable as margin collateral (margin_collateral true) with a "
