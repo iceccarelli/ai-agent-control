@@ -32,10 +32,15 @@ on:
   pull_request:
   push:
     branches: [main, "fix/**"]
+  # run it by hand: gh workflow run carry-verify.yml --ref <branch>
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# NOTE: the cancelled runs on merge commits were the 15-minute job TIMEOUT (GitHub reports
+# a timed-out job as "cancelled"), not concurrency; the gate takes 11-14 minutes.
+#
 # A newer push to a PULL REQUEST supersedes the older run. A push to main, or to a
 # fix/** branch, gets its own group (keyed by the commit): GitHub also cancels a
 # PENDING run when a newer run joins the same group, even with cancel-in-progress off,
@@ -50,7 +55,7 @@ jobs:
   carry-correctness:
     name: carry correctness (python ${{ matrix.python }})
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
