@@ -179,9 +179,14 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
     recorder = record.get("recorder")
     if isinstance(recorder, dict):
         line["recorder_state"] = recorder.get("state")
-        for key in ("records", "free_mb", "capacity_rows", "max_fillable_usd"):
+        for key in ("records", "free_mb", "capacity_rows", "max_fillable_usd", "chain_n"):
             if isinstance(recorder.get(key), (int, float)):
                 line["recorder_" + key] = recorder[key]
+        # the chain head is copied OUT of the evidence directory into this history (and from there
+        # to the external watcher), so rewriting the evidence cannot also rewrite its anchor
+        if recorder.get("chain_head"):
+            line["recorder_chain_file"] = recorder.get("chain_file")
+            line["recorder_chain_head"] = recorder["chain_head"]
         if recorder.get("fault") or recorder.get("detail"):
             line["recorder_detail"] = str(recorder.get("fault") or recorder.get("detail"))[:300]
     shadow = record.get("shadow")
@@ -229,6 +234,9 @@ def recorder_observation(path: Optional[str], *, now: Optional[float] = None
                 "free_mb": None if store.get("free_bytes") is None else round(store["free_bytes"] / 1048576.0, 1),
                 "fault": fault, "capacity_rows": cap.get("rows"),
                 "max_fillable_usd": cap.get("max_displayed_fillable_notional_usd"),
+                "chain_file": (cap.get("chain_head") or {}).get("file"),
+                "chain_n": (cap.get("chain_head") or {}).get("n"),
+                "chain_head": (cap.get("chain_head") or {}).get("head"),
                 "entry_refusals": st.get("entry_refusals")}
     except FileNotFoundError:
         return {"state": "ABSENT", "detail": "no status file: the recorder has not started"}

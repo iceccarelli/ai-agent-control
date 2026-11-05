@@ -138,3 +138,64 @@ def test_the_service_runs_as_a_process_and_exits_zero_on_sigterm(tmp_path):
             p.kill()
     final = json.load(open(status))
     assert final["schema"] == MR.SCHEMA
+
+
+# -- schema v2, the chain and the externally copied head ----------------------------------------------------
+
+def test_the_recorder_writes_validated_chained_v2_rows_with_source_identity(tmp_path):
+    import capacity_schema as CSM
+    import evidence_chain as EC
+    rec, store, wall = make(tmp_path)
+    for _ in range(3):
+        rec.wall_ms = (lambda w=wall: w)
+        rec.capture_capacity()
+    path = rec._capacity_path(wall)
+    v = EC.verify(path)
+    assert v["ok"] and v["n_rows"] == 3 and rec.chain_head == {"file": os.path.basename(path), "n": 3, "head": v["head"]["head"]}
+    rows = EC.rows_of(EC.read_lines(path)[0])
+    row = rows[0]
+    assert row["schema"] == "capacity/2" and row["venue"] == "bybit" and row["source"]["store_record_id"] >= 0
+    assert isinstance(row["source"]["perp_update_id"], int) and row["funding"]["next_settlement_ms"] > row["at_ms"]
+    assert row["recorder"]["store_fault"] is None and row["recorder"]["free_bytes"] is not None
+    # the same row ids repeat here because the fake clock and store do not move; the validator says so
+    assert any(p["code"] == CSM.DUPLICATE_ID for p in CSM.validate_stream(rows)["problems"])
+
+
+def test_the_status_publishes_the_chain_head_and_the_monitor_copies_it_into_its_history(tmp_path):
+    import runner_monitor as RM
+    rec, store, wall = make(tmp_path)
+    rec.capture_capacity()
+    st = rec.write_status()
+    assert st["capacity"]["chain_head"]["n"] == 1
+    obs = RM.recorder_observation(os.path.join(rec.dir, MR.STATUS_FILE), now=wall / 1000.0 + 1)
+    assert obs["chain_head"] == st["capacity"]["chain_head"]["head"] and obs["chain_n"] == 1
+    root = str(tmp_path / "hist")
+    os.makedirs(root)
+    RM._history_line(root, {"at": "t", "outcome": "ENTRY_NOT_ELIGIBLE", "reasons": [], "recorder": obs})
+    line = json.loads(open(os.path.join(root, "monitor.jsonl")).read().splitlines()[-1])
+    assert line["recorder_chain_head"] == obs["chain_head"] and line["recorder_chain_n"] == 1
+
+
+def test_a_crash_between_a_row_and_its_chain_entry_is_resealed_visibly_at_start(tmp_path):
+    import evidence_chain as EC
+    rec, store, wall = make(tmp_path)
+    rec.capture_capacity()
+    path = rec._capacity_path(wall)
+    open(path, "ab").write(EC.canonical({"schema": "capacity/2", "stub": True}) + b"\n")
+    assert EC.verify(path)["unchained_tail"] == 1
+    rec.start()
+    try:
+        assert rec._resealed == 1 and EC.verify(path)["ok"]
+    finally:
+        rec.stop()
+
+
+def test_pruning_removes_a_days_chain_and_head_with_its_evidence_file(tmp_path):
+    rec, _, wall = make(tmp_path, retention_days=1)
+    rec.capacity_retention_days = 1
+    d = rec.dir
+    for suffix in ("", ".chain", ".head"):
+        open(os.path.join(d, f"capacity-20200101.jsonl{suffix}"), "w").write("{}")
+    removed = rec.prune_capacity()
+    assert removed == ["capacity-20200101.jsonl"]
+    assert not [f for f in os.listdir(d) if f.startswith("capacity-20200101")]
