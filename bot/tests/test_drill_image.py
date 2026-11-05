@@ -14,7 +14,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 ENTRY = ["runner_monitor", "run_outcomes", "carry_preflight", "unattended_drill",
          "next_settlement", "recon_summary", "drill", "close_testnet_short",
-         "drill_final_state", "evidence_reconcile", "runner_alerts", "mainnet_public"]
+         "drill_final_state", "evidence_reconcile", "runner_alerts", "mainnet_public",
+         "market_recorder", "runner_supervisor"]
 
 
 def _read(name):
@@ -91,15 +92,32 @@ def _cmd(text):
     return json.loads(line[0][4:])
 
 
-def test_the_default_command_is_the_read_only_monitor():
+def test_the_default_command_is_the_read_only_monitor_under_the_supervisor():
     text = _read("Dockerfile.drill")
     cmd = _cmd(text)
-    assert cmd[:2] == ["python3", "tools/runner_monitor.py"]
+    assert cmd[:2] == ["python3", "tools/runner_supervisor.py"]
+    cut = cmd.index("--")
+    supervisor_opts, monitor = cmd[2:cut], cmd[cut + 1:]
+    # the supervised primary is exactly the read-only monitor, in its loop
+    assert monitor[:2] == ["python3", "tools/runner_monitor.py"] and "--loop" in monitor
     joined = " ".join(cmd)
     for forbidden in ("unattended_drill", "--conformance", "--arm", "drill.py",
                       "close_testnet_short"):
         assert forbidden not in joined, forbidden
-    assert "--loop" in cmd
+    # the recorder is the PUBLIC feed on mainnet data, bounded by a reserve and a retention
+    assert "--recorder" in supervisor_opts
+    assert supervisor_opts[supervisor_opts.index("--recorder-environment") + 1] == "mainnet"
+    assert int(supervisor_opts[supervisor_opts.index("--recorder-min-free-mb") + 1]) >= 256
+    assert int(supervisor_opts[supervisor_opts.index("--recorder-retention-days") + 1]) >= 1
+    assert "--recorder-status" in monitor
+
+
+def test_the_image_ships_every_module_the_recorder_imports():
+    copied = _copied()
+    for name in ("tools/market_recorder.py", "tools/runner_supervisor.py", "md_capacity.py",
+                 "md_feed.py", "md_store.py", "md_engine.py", "md_state.py", "md_rest.py",
+                 "md_transport.py", "md_economics.py", "ws_transport.py"):
+        assert any(c.rstrip("/") == name or c.endswith("/" + name) or c == name for c in copied), name
 
 
 def test_the_conformance_runner_ships_but_is_never_the_entrypoint_or_default():

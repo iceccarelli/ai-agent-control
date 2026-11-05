@@ -176,6 +176,14 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
             line["mainnet_basis_bps"] = mainnet["basis_bps"]
         if mainnet.get("detail"):
             line["mainnet_detail"] = str(mainnet["detail"])[:300]
+    recorder = record.get("recorder")
+    if isinstance(recorder, dict):
+        line["recorder_state"] = recorder.get("state")
+        for key in ("records", "free_mb", "capacity_rows", "max_fillable_usd"):
+            if isinstance(recorder.get(key), (int, float)):
+                line["recorder_" + key] = recorder[key]
+        if recorder.get("fault") or recorder.get("detail"):
+            line["recorder_detail"] = str(recorder.get("fault") or recorder.get("detail"))[:300]
     shadow = record.get("shadow")
     if isinstance(shadow, dict):
         line["shadow_state"] = shadow.get("state")
@@ -191,6 +199,43 @@ def _history_line(root: str, record: Dict[str, Any]) -> bool:
     return True
 
 
+#: A recorder status file older than this is a recorder that has stopped reporting
+#: (it writes every 30 s); five minutes is ten missed beats.
+RECORDER_STALE_S = 300.0
+
+
+def recorder_observation(path: Optional[str], *, now: Optional[float] = None
+                         ) -> Optional[Dict[str, Any]]:
+    """What the market recorder says about itself, or None when no recorder is configured.
+
+    DATA COLLECTION, reported next to the cycle outcome and never folded into it: a dead
+    recorder cannot fail a good cycle (the monitor's job is the read-only check), but it is
+    visible in every history line and alerted on by the external watcher. Never raises."""
+    if not path:
+        return None
+    now = time.time() if now is None else now
+    try:
+        with open(path, encoding="utf-8") as fh:
+            st = json.load(fh)
+        age = now - float(st["now_ms"]) / 1000.0
+        feed = st.get("feed") or {}
+        store = st.get("store") or {}
+        cap = st.get("capacity") or {}
+        fault = store.get("fault")
+        state = ("STALE" if age > RECORDER_STALE_S
+                 else "FAULT" if fault or not feed.get("threads_alive", False)
+                 else "RECORDING")
+        return {"state": state, "age_s": round(age, 1), "records": store.get("records"),
+                "free_mb": None if store.get("free_bytes") is None else round(store["free_bytes"] / 1048576.0, 1),
+                "fault": fault, "capacity_rows": cap.get("rows"),
+                "max_fillable_usd": cap.get("max_displayed_fillable_notional_usd"),
+                "entry_refusals": st.get("entry_refusals")}
+    except FileNotFoundError:
+        return {"state": "ABSENT", "detail": "no status file: the recorder has not started"}
+    except Exception as exc:                                   # noqa: BLE001
+        return {"state": "UNREADABLE", "detail": f"{type(exc).__name__}: {exc}"[:200]}
+
+
 def monitor_once(run_dir: str, *, env: Mapping[str, str],
                  prober: Callable[[], int] = UD.probe,
                  runner: Callable[..., int] = UD.run_child,
@@ -199,7 +244,8 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
                  shadow_db: Optional[str] = None,
                  shadow_stepper: Optional[Callable[..., Dict[str, Any]]] = None,
                  mainnet_db: Optional[str] = None,
-                 mainnet_observer: Optional[Callable[[], Dict[str, Any]]] = None
+                 mainnet_observer: Optional[Callable[[], Dict[str, Any]]] = None,
+                 recorder_status: Optional[str] = None
                  ) -> int:
     """One read-only cycle. Returns the exit code; writes `monitor.json`.
 
@@ -211,11 +257,14 @@ def monitor_once(run_dir: str, *, env: Mapping[str, str],
     # Taken first and recorded whatever else happens: a day on which testnet is
     # unreachable is still a day on which the real market had a basis.
     mainnet = mainnet_observation(mainnet_db, mainnet_observer)
+    recorder = recorder_observation(recorder_status)
 
     def finish(result: Dict[str, Any], code: int) -> int:
         record = {"at": stamp, "schema": "monitor/1", **result}
         if mainnet is not None:
             record["mainnet"] = mainnet
+        if recorder is not None:
+            record["recorder"] = recorder
         _write_json(os.path.join(run_dir, "monitor.json"), record)
         if not _history_line(history_root or run_dir, record):
             # The history is the operator's only view of the runner; a lost line
@@ -393,7 +442,8 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
          shadow_db: Optional[str] = None,
          notifier: Optional[RA.Notifier] = None,
          mainnet_db: Optional[str] = None,
-         forward_artifact: Optional[str] = None) -> int:
+         forward_artifact: Optional[str] = None,
+         recorder_status: Optional[str] = None) -> int:
     """A stop signal ends the loop with 143 wherever it lands, including the
     sleep between cycles where it spends nearly all its time: under the Fly
     on-failure restart policy a deploy or stop must not look like a failure."""
@@ -403,7 +453,8 @@ def loop(root: str, *, env: Mapping[str, str], interval_s: float,
     try:
         return _loop(root, env=env, interval_s=interval_s, max_runs=max_runs,
                      clock=clock, sleep=sleep, once=once, shadow_db=shadow_db,
-                     alerts=alerts, mainnet_db=mainnet_db)
+                     alerts=alerts, mainnet_db=mainnet_db,
+                     recorder_status=recorder_status)
     except UD.Shutdown as exc:
         UD._say(root, f"told to stop ({exc}): monitor loop ends")
         return EXIT_SIGNALLED
@@ -441,7 +492,8 @@ def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
           sleep: Callable[[float], None], once: Callable[..., int],
           shadow_db: Optional[str] = None,
           alerts: Optional["_Alerts"] = None,
-          mainnet_db: Optional[str] = None) -> int:
+          mainnet_db: Optional[str] = None,
+          recorder_status: Optional[str] = None) -> int:
     alerts = alerts or _Alerts(root, None, clock)
     runs = 0
     while True:
@@ -453,6 +505,8 @@ def _loop(root: str, *, env: Mapping[str, str], interval_s: float,
             extra = {"shadow_db": shadow_db} if shadow_db else {}
             if mainnet_db:
                 extra["mainnet_db"] = mainnet_db
+            if recorder_status:
+                extra["recorder_status"] = recorder_status
             code = once(os.path.join(root, f"run-{stamp}"), env=env,
                         history_root=root, **extra)
         except UD.Shutdown as exc:
@@ -495,6 +549,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="also append one observation per cycle of Bybit's PUBLIC "
                          "MAINNET market (unauthenticated GETs, read-only) to this "
                          "JSONL evidence file; never the testnet shadow book")
+    ap.add_argument("--recorder-status", default=None,
+                    help="copy the market recorder's health (its recorder_status.json) "
+                         "into every history line, so the external watcher can alert "
+                         "when the recorder stops (read-only)")
     ap.add_argument("--forward-artifact", default=None,
                     help="alert when this forward-shadow artefact (e.g. "
                          "artifacts/forward_shadow_current.json) is stale, "
@@ -518,7 +576,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.once:
         try:
             return monitor_once(args.run_dir, env=os.environ,
-                                shadow_db=args.shadow_db)
+                                shadow_db=args.shadow_db,
+                                recorder_status=args.recorder_status)
         except UD.Shutdown as exc:
             print(f"told to stop ({exc})", flush=True)
             return EXIT_SIGNALLED
@@ -540,7 +599,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     interval_s=args.interval_minutes * 60.0,
                     max_runs=args.max_runs, shadow_db=args.shadow_db,
                     mainnet_db=args.mainnet_db,
-                    forward_artifact=args.forward_artifact)
+                    forward_artifact=args.forward_artifact,
+                    recorder_status=args.recorder_status)
     finally:
         lock.close()
 

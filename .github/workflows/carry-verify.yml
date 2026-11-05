@@ -128,6 +128,9 @@ jobs:
           tests/test_md_storage_policy.py
           tests/test_frozen_and_lineage.py
           tests/test_fingerprint.py
+          tests/test_md_capacity.py
+          tests/test_market_recorder.py
+          tests/test_runner_supervisor.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
           tests/test_paper_agent_certification.py

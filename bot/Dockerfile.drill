@@ -24,7 +24,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py \
      carry_evidence.py performance_analytics.py owner_policy.py \
      margin_facts.py \
-     md_book.py md_broker.py md_economics.py md_engine.py md_events.py md_feed.py md_rest.py \
+     md_book.py md_broker.py md_capacity.py md_economics.py md_engine.py md_events.py md_feed.py md_rest.py \
      md_state.py md_store.py md_transport.py md_wire.py ./
 COPY signals/ ./signals/
 COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
@@ -33,7 +33,7 @@ COPY tools/runner_monitor.py tools/run_outcomes.py tools/carry_preflight.py \
      tools/evidence_reconcile.py tools/venue_evidence.py tools/provenance.py \
      tools/runner_alerts.py tools/monitor_summary.py tools/mainnet_public.py \
      tools/carry_performance.py tools/owner_policy_check.py \
-     tools/execution_samples_report.py \
+     tools/execution_samples_report.py tools/market_recorder.py tools/runner_supervisor.py \
      ./tools/
 COPY deploy/drill-entrypoint.sh /usr/local/bin/drill-entrypoint
 RUN useradd --create-home --shell /usr/sbin/nologin bot \
@@ -46,10 +46,13 @@ ENV USE_TESTNET=1 PAPER_TRADING=0 BYBIT_VENUE=testnet BOOK_MODE=carry \
 
 # Starts as root only to chown the volume; the entrypoint drops to `bot`.
 ENTRYPOINT ["/usr/local/bin/drill-entrypoint"]
-# The DEFAULT is READ-ONLY: tools/runner_monitor.py checks reachability, the
+# The DEFAULT is READ-ONLY. tools/runner_supervisor.py keeps two read-only processes alive:
+# the monitor below and tools/market_recorder.py, which records the PUBLIC order-book feed
+# (no key, no order code) with a disk reserve and retention. The monitor is primary: when it
+# exits the supervisor exits with its code. tools/runner_monitor.py checks reachability, the
 # safety preconditions, the venue state and the production entry economics each
 # hour, and cannot place or cancel an order. The order-capable conformance run
 # (tools/unattended_drill.py --conformance) ships in the image but is never the
 # default; it must be invoked explicitly, e.g. `fly machine run ... -- python3
 # tools/unattended_drill.py --conformance --loop --run-dir /data/runs`.
-CMD ["python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor", "--shadow-db", "/data/shadow/post_gate_v1.db", "--mainnet-db", "/data/mainnet/mainnet_public.jsonl"]
+CMD ["python3", "tools/runner_supervisor.py", "--recorder", "--recorder-dir", "/data/market", "--recorder-environment", "mainnet", "--recorder-min-free-mb", "512", "--recorder-retention-days", "2", "--", "python3", "tools/runner_monitor.py", "--loop", "--run-dir", "/data/monitor", "--shadow-db", "/data/shadow/post_gate_v1.db", "--mainnet-db", "/data/mainnet/mainnet_public.jsonl", "--recorder-status", "/data/market/recorder_status.json"]
