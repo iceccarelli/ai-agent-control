@@ -250,3 +250,74 @@ def test_start_repairs_yesterdays_file_too_not_only_todays(tmp_path):
         assert EC.verify(yesterday)["ok"] and rec._resealed >= 1
     finally:
         rec.stop()
+
+
+# ---- Phase 1 C: a view and its event identifiers are ONE read -----------------------------------------------------
+
+def _inject_event(rec):
+    """A market event applied under the engine lock, as a WebSocket worker would apply one: the log's newest record id
+    and the perp book's update id both advance."""
+    with rec.engine.lock:
+        rec.engine.store._next_id += 1
+        bk = rec.engine.state.books[EN.E.LINEAR]
+        bk.update_id += 1
+        return rec.engine.store._next_id - 1, bk.update_id
+
+
+def test_the_old_two_step_read_could_pair_a_view_with_a_later_event_id(tmp_path):
+    """CONTROL: reproduces the defect. view() then _source_of(): an event that lands in between is named by the row."""
+    rec, store, wall = make(tmp_path)
+    view = rec.feed.view()
+    ids_at_view = rec._source_of(rec.engine)
+    new_id, new_update = _inject_event(rec)                         # the interleaving
+    ids_after = rec._source_of(rec.engine)
+    assert ids_after["store_record_id"] == new_id > ids_at_view["store_record_id"]
+    assert ids_after["perp_update_id"] == new_update != ids_at_view["perp_update_id"]
+    assert view is not None
+
+
+def test_a_snapshot_cannot_pair_a_view_with_an_event_that_arrived_after_it(tmp_path):
+    """The fix: an event injected from ANOTHER thread while the view is being computed cannot get in before the identifiers
+    are read, because both reads are one hold of the engine lock."""
+    rec, store, wall = make(tmp_path)
+    before = rec._source_of(rec.engine)
+    state = rec.engine.state
+    real_view = state.view
+    landed = {}
+    started = threading.Event()
+
+    def injector():
+        started.set()
+        landed["ids"] = _inject_event(rec)                          # blocks on the engine lock until the snapshot is done
+
+    t = threading.Thread(target=injector)
+
+    def view_then_race(now_mono, now_wall):
+        v = real_view(now_mono, now_wall)
+        t.start()
+        assert started.wait(2.0)
+        t.join(0.2)                                                 # the event WANTS to land now ...
+        assert t.is_alive(), "the event got in while the snapshot was being taken"       # ... and cannot
+        return v
+
+    state.view = view_then_race
+    try:
+        snap = rec.feed.snapshot(rec._source_of, wall_ms=rec.wall_ms)
+    finally:
+        state.view = real_view
+    t.join(5.0)
+    assert not t.is_alive() and landed["ids"][0] > snap.source["store_record_id"]      # it landed AFTER the snapshot
+    assert snap.source["store_record_id"] == before["store_record_id"]
+    assert snap.source["perp_update_id"] == before["perp_update_id"]
+    assert rec._source_of(rec.engine)["store_record_id"] == landed["ids"][0]
+
+
+def test_the_snapshot_is_immutable_and_carries_the_clock_the_row_uses(tmp_path):
+    rec, store, wall = make(tmp_path)
+    snap = rec.feed.snapshot(rec._source_of, wall_ms=rec.wall_ms)
+    with pytest.raises(Exception):
+        snap.wall_ms = 1                                            # frozen
+    with pytest.raises(TypeError):
+        snap.source["store_record_id"] = 99                         # read-only mapping
+    row = rec.capture_capacity()
+    assert row["at_ms"] == wall and row["source"]["store_record_id"] == snap.source["store_record_id"]

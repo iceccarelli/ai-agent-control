@@ -87,23 +87,36 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     anchors = anchors_from_history(history)
     files: List[Dict[str, Any]] = []
     all_rows: List[Any] = []
-    chain_ok = True
-    any_v2_file = False
+    blockers: List[str] = []
     for p in paths:
+        base = os.path.basename(p)
+        # READ-ONLY: verify, then admit only the chained prefix of a file whose chain is internally consistent.
+        # A row without a chain entry never enters any statistic; the report never repairs what it reads.
+        admitted, ver = EC.admitted_rows(p, anchors=anchors.get(base))
         lines, quarantined = EC.read_lines(p)
-        rows = EC.rows_of(lines)
-        v2 = [r for r in rows if isinstance(r, dict) and r.get("schema") == CS.SCHEMA]
-        ver = EC.verify(p, anchors=anchors.get(os.path.basename(p)))
-        if v2:
-            any_v2_file = True
-        if not ver["tamper_evident_ok"]:            # EVERY file counts, including one that lost all its rows
-            chain_ok = False
-        files.append({"file": os.path.basename(p), "rows": len(rows), "schema_v2_rows": len(v2),
+        every = EC.rows_of(lines)
+        v2_any = any(isinstance(r, dict) and r.get("schema") == CS.SCHEMA for r in every)
+        pre_chain = (not os.path.exists(p + ".chain")) and not v2_any
+        if pre_chain:
+            # a legacy file from before the chain existed: only schema-less rows, which never enter a statistic and
+            # cannot be "tampered into" evidence. It is listed, counted as legacy, and does not block anything.
+            admitted, state = every, "LEGACY_PRE_CHAIN"
+        else:
+            state = ("ELIGIBLE" if ver["economic_evidence_eligible"] else
+                     "UNCHAINED_TAIL" if ver["internally_consistent"] and ver["unchained_tail"] else "CHAIN_BROKEN")
+            if not ver["economic_evidence_eligible"]:
+                codes = ",".join(sorted({i["code"] for i in ver["issues"]})) or "unknown"
+                blockers.append(f"{base}: {ver['unchained_tail']} unchained row(s)" if state == "UNCHAINED_TAIL"
+                                else f"{base}: chain issues {codes}")
+        files.append({"file": base, "rows": len(every), "admitted_rows": len(admitted), "state": state,
+                      "schema_v2_rows": sum(1 for r in every if isinstance(r, dict) and r.get("schema") == CS.SCHEMA),
                       "quarantined_lines": quarantined,
-                      "chain": {k: ver[k] for k in ("ok", "tamper_evident_ok", "n_chained", "unchained_tail", "head", "issues",
-                                                    "resealed_rows", "anchored", "torn_aside_bytes")},
-                      "external_anchors": len(anchors.get(os.path.basename(p), []))})
-        all_rows.extend(rows)
+                      "chain": {k: ver[k] for k in ("ok", "internally_consistent", "fully_chained", "economic_evidence_eligible",
+                                                    "verified_prefix_rows", "n_chained", "unchained_tail", "head", "issues",
+                                                    "resealed_rows", "anchor_status", "chain_rows", "latest_anchor_rows",
+                                                    "anchor_lag_rows", "torn_aside_bytes")},
+                      "external_anchors": len(anchors.get(base, []))})
+        all_rows.extend(admitted)
     val = CS.validate_stream(all_rows)
     accepted = val["accepted"]
     status = _json(os.path.join(directory, "recorder_status.json"))
@@ -121,6 +134,29 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     book_cost = ES.mean([p["book_round_trip_bps"] for p in measured]) if measured else None
     fee_prov = accepted[-1]["fees"]["source"] if accepted else None
 
+    def _count(key: str, value: Any) -> int:
+        return sum(1 for f in files if f["state"] != "LEGACY_PRE_CHAIN" and f["chain"][key] == value)
+
+    chain_files = [f for f in files if f["state"] != "LEGACY_PRE_CHAIN"]
+    summary = {
+        "validated_rows": val["n_valid_rows"], "rejected_rows": val["n_rejected"],
+        "legacy_quarantined_rows": val["n_legacy_quarantined"],
+        "unchained_rows": sum(f["chain"]["unchained_tail"] for f in chain_files),
+        "resealed_rows": sum(f["chain"]["resealed_rows"] for f in chain_files),
+        "torn_lines_quarantined": sum(len(f["quarantined_lines"]) for f in files),
+        "files_total": len(files), "files_legacy_pre_chain": len(files) - len(chain_files),
+        "files_internally_verified": sum(1 for f in chain_files if f["chain"]["internally_consistent"]),
+        "files_fully_chained": sum(1 for f in chain_files if f["chain"]["fully_chained"]),
+        "files_anchored_current": _count("anchor_status", "ANCHORED_CURRENT"),
+        "files_anchored_lagging": _count("anchor_status", "ANCHORED_LAGGING"),
+        "files_stale_anchor": _count("anchor_status", "STALE_ANCHOR"),
+        "files_unanchored": _count("anchor_status", "UNANCHORED"),
+        "files_anchor_conflict": _count("anchor_status", "ANCHOR_CONFLICT"),
+        "max_anchor_lag_rows": max((f["chain"]["anchor_lag_rows"] for f in chain_files if f["chain"]["anchor_lag_rows"] is not None), default=None),
+        "anchor_location": ("SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE" if any(f["external_anchors"] for f in files) else "NONE"),
+        "economic_evidence_blockers": blockers,
+        "economic_evidence_eligible": bool(chain_files) and not blockers and val["stream_ok"],
+    }
     identity = {"environments": sorted({r["environment"] for r in accepted}), "symbols": sorted({r["symbol"] for r in accepted}),
                 "modes": sorted({r["mode"] for r in accepted}), "venues": sorted({r["venue"] for r in accepted}),
                 "categories": sorted({r["category"] for r in accepted})}
@@ -128,8 +164,11 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     withheld: List[str] = []
     if not val["stream_ok"]:
         withheld.append("the evidence stream failed validation")
-    if not (chain_ok and any_v2_file):
-        withheld.append("the chain does not verify for every file")
+    if not summary["economic_evidence_eligible"]:
+        withheld.extend(blockers or ["no chained evidence file"])
+        if summary["unchained_rows"]:
+            withheld.append(f"{summary['unchained_rows']} unchained row(s) exist; they are excluded and an economic calculation "
+                            "cannot rest on a file that is not completely chained (explicit repair is a separate, visible act)")
     if rel["verdict"] != "HEALTHY":
         withheld.append(f"the recorder is {rel['verdict']}")
     if env != "mainnet":
@@ -166,7 +205,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                                 "funding_used_is": fe["realised_bps"]["conservative_lo_is"] + " of the realised public mean",
                                 "venue_rules": ASSUMED_VENUE_RULES},
                      "result": TE.compute(pos, costs, [f_lo] * n_settle, funding_source="PUBLIC_REALISED")}
-    bundle = {"carry": {"validation_ok": val["stream_ok"], "chain_ok": chain_ok and any_v2_file, "environment": env,
+    bundle = {"carry": {"validation_ok": val["stream_ok"], "chain_ok": summary["economic_evidence_eligible"], "integrity": summary, "environment": env,
                         "reliability_verdict": rel["verdict"], "funding_eval": fe or {}, "economics": economics["result"] if economics else {},
                         "fillable_share": fillable, "round_trip_cost_bps": total_cost, "prospective": {}},
               "rows": accepted, "rows_by_symbol": {accepted[0]["symbol"]: accepted} if accepted else {},
@@ -177,10 +216,9 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         "evidence_identity": identity,
         "validation": {k: val[k] for k in ("n_input", "n_valid_rows", "n_rejected", "rejected_share", "n_legacy_quarantined",
                                            "stream_ok", "problems", "note")},
-        "integrity": {"files": files, "chain_ok_for_v2_files": chain_ok and any_v2_file,
-                      "anchored": bool(files) and all(f["external_anchors"] > 0 for f in files),
-                      "anchor_note": "anchors are copies of the chain head in monitor.jsonl on the SAME volume; they are "
-                                     "external to the evidence directory only until the owner archives them off the machine"},
+        "integrity": {"files": files, "summary": summary,
+                      "anchor_note": "anchors read from monitor.jsonl are copies of the chain head on the SAME volume: this tool cannot "
+                                     "verify that any copy exists off the machine"},
         "reliability": rel, "independence": indep, "funding_evaluation": fe,
         "capacity": {"target_notional_usd": notional_usd, "book_fillable_snapshot_share": fillable,
                      "mean_total_round_trip_bps": total_cost, "mean_book_round_trip_bps": book_cost,
@@ -209,15 +247,26 @@ def render(rep: Dict[str, Any]) -> str:
                f"stream ok: {v['stream_ok']}, problems: {len(v['problems'])}")
     for p in v["problems"][:5]:
         out.append(f"    ! {p['code']}: {p['detail']}")
-    out.append("2 INTEGRITY   chain verifies for EVERY file: %s; %s" % (
-        i["chain_ok_for_v2_files"], "ANCHORED to monitor history" if i["anchored"] else
-        "UNANCHORED (a consistent truncation of the newest rows would not be detected)"))
+    sm = i["summary"]
+    out.append("2 INTEGRITY   (separate states, no single flag)")
+    out.append(f"    rows: validated {sm['validated_rows']}, rejected {sm['rejected_rows']}, legacy quarantined {sm['legacy_quarantined_rows']}, "
+               f"UNCHAINED {sm['unchained_rows']} (excluded), resealed {sm['resealed_rows']}, torn lines quarantined {sm['torn_lines_quarantined']}")
+    out.append(f"    files: {sm['files_total']} ({sm['files_legacy_pre_chain']} legacy pre-chain), internally verified {sm['files_internally_verified']}, "
+               f"completely chained {sm['files_fully_chained']}")
+    out.append(f"    anchors (copies in monitor.jsonl, {sm['anchor_location'].replace('_', ' ').lower()}): current {sm['files_anchored_current']}, "
+               f"lagging {sm['files_anchored_lagging']} (max lag {sm['max_anchor_lag_rows']} rows), STALE {sm['files_stale_anchor']}, "
+               f"UNANCHORED {sm['files_unanchored']}, CONFLICT {sm['files_anchor_conflict']}"
+               + ("  - a consistent truncation of the unanchored newest rows would not be detected" if sm["files_unanchored"] or sm["files_stale_anchor"] else ""))
+    out.append(f"    economic-evidence eligible (every chained file complete and consistent, stream valid): {sm['economic_evidence_eligible']}"
+               + ("" if sm["economic_evidence_eligible"] else "  <- " + "; ".join(sm["economic_evidence_blockers"][:3])))
     for f in i["files"]:
         iss = ",".join(x["code"] for x in f["chain"]["issues"]) or "none"
         q = f", QUARANTINED final line(s): {len(f['quarantined_lines'])}" if f["quarantined_lines"] else ""
         rs = f", RESEALED rows adopted after a crash: {f['chain']['resealed_rows']}" if f["chain"].get("resealed_rows") else ""
         rs += f", torn bytes SET ASIDE in {f['file']}.torn: {f['chain']['torn_aside_bytes']}" if f["chain"].get("torn_aside_bytes") else ""
-        out.append(f"    {f['file']}: rows {f['rows']} (v2 {f['schema_v2_rows']}), issues: {iss}, external anchors {f['external_anchors']}{q}{rs}")
+        lag = "" if f["chain"]["anchor_lag_rows"] is None else f" (lag {f['chain']['anchor_lag_rows']} of {f['chain']['chain_rows']} rows)"
+        out.append(f"    {f['file']}: {f['state']}, rows {f['rows']} (admitted {f['admitted_rows']}, v2 {f['schema_v2_rows']}), "
+                   f"issues: {iss}, anchor {f['chain']['anchor_status']}{lag}{q}{rs}")
     out.append(f"3 RELIABILITY {r['verdict']}: {r.get('why', '')}")
     if r.get("rows"):
         out.append(f"    {r['rows']} rows over {_f(r['window_hours'])} h, completeness {_f(r['completeness'], 3)}, gaps {len(r['gaps'])}, "

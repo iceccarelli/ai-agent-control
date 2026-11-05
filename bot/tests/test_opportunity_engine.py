@@ -22,8 +22,15 @@ def position(**kw):
     return TE.Position(**d)
 
 
+ANCHORED = {"files_total": 1, "files_legacy_pre_chain": 0, "files_anchored_current": 1, "files_anchored_lagging": 0,
+            "files_stale_anchor": 0, "files_unanchored": 0, "files_anchor_conflict": 0}
+NOT_ANCHORED = dict(ANCHORED, files_anchored_current=0, files_unanchored=1)
+PRO_OK = {"registered_ms": START - 1, "first_evidence_ms": START, "n_after_registration": 270,
+          "post_registration_ess": 60.0, "post_registration_annualised_pct_on_economic_capital": 14.0}
+
+
 def bundle(funding=0.65, n=100, fillable=1.0, cost=11.4, reliability="HEALTHY", chain_ok=True, validation_ok=True,
-           pos=None, prospective=None, realised=None, environment="mainnet", source="PUBLIC_REALISED"):
+           pos=None, prospective=None, realised=None, environment="mainnet", source="PUBLIC_REALISED", integrity=None):
     rows = series(BASE, n, lambda T, t: funding, realised or noisy(funding, sd=max(0.05, funding * 0.15)), cadence_ms=600_000)
     fe = FE.evaluate(rows)
     f_lo = fe["realised_bps"].get("conservative_lo_bps")
@@ -33,6 +40,7 @@ def bundle(funding=0.65, n=100, fillable=1.0, cost=11.4, reliability="HEALTHY", 
                      latency_bps=0.0, conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0)
     econ = TE.compute(pos or position(), costs, [f_lo] * 90, funding_source=source)
     return {"carry": {"validation_ok": validation_ok, "chain_ok": chain_ok, "reliability_verdict": reliability, "environment": environment,
+                      "integrity": integrity if integrity is not None else NOT_ANCHORED,
                       "funding_eval": fe, "economics": econ, "fillable_share": fillable, "round_trip_cost_bps": cost,
                       "prospective": prospective or {}}, "rows": rows}
 
@@ -84,24 +92,23 @@ def test_a_7_percent_gross_carry_is_economically_unattractive_against_the_lowest
 def test_a_rich_funding_regime_is_only_a_research_candidate_never_validated_without_a_prior_registration():
     st, e = status(bundle(funding=4.0))
     assert st == OE.Status.RESEARCH_CANDIDATE and e.authorizes_trading is False
-    assert "not prospectively validated" in e.reasons[0]
+    assert "not prospectively confirmed" in e.reasons[0]
 
 
 def test_prospective_validation_needs_registration_before_the_evidence_enough_later_settlements_and_the_screens_rerun_on_them():
-    ok = {"registered_ms": START - 1, "first_evidence_ms": START, "n_after_registration": 270,
-          "post_registration_ess": 60.0, "post_registration_annualised_pct_on_economic_capital": 14.0}
-    assert status(bundle(funding=4.0, prospective=ok))[0] == OE.Status.PROSPECTIVELY_VALIDATED
+    ok = PRO_OK
+    assert status(bundle(funding=4.0, prospective=ok, integrity=ANCHORED))[0] == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED
     late = dict(ok, registered_ms=START + 1)
-    assert status(bundle(funding=4.0, prospective=late))[0] == OE.Status.RESEARCH_CANDIDATE
+    assert status(bundle(funding=4.0, prospective=late, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE
     few = dict(ok, n_after_registration=100)
-    assert status(bundle(funding=4.0, prospective=few))[0] == OE.Status.RESEARCH_CANDIDATE
+    assert status(bundle(funding=4.0, prospective=few, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE
     # the in-sample pass does not carry over: the screens must pass on the post-registration data ALONE
     failing_later = dict(ok, post_registration_annualised_pct_on_economic_capital=3.0)
-    assert status(bundle(funding=4.0, prospective=failing_later))[0] == OE.Status.RESEARCH_CANDIDATE
+    assert status(bundle(funding=4.0, prospective=failing_later, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE
     no_rerun = {k: v for k, v in ok.items() if not k.startswith("post_registration_annualised")}
-    assert status(bundle(funding=4.0, prospective=no_rerun))[0] == OE.Status.RESEARCH_CANDIDATE
+    assert status(bundle(funding=4.0, prospective=no_rerun, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE
     thin_ess = dict(ok, post_registration_ess=5.0)
-    assert status(bundle(funding=4.0, prospective=thin_ess))[0] == OE.Status.RESEARCH_CANDIDATE
+    assert status(bundle(funding=4.0, prospective=thin_ess, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE
 
 
 def test_execution_and_risk_failures_are_named_separately():
@@ -193,3 +200,159 @@ def test_the_depth_candidate_is_never_given_a_screen_on_the_overlays_evidence():
     assert d["status"] == "INSUFFICIENT_EVIDENCE" and d["metrics"]["carry_overlay_status"] == "RESEARCH_CANDIDATE"
     assert "depth-benefit entry rule is not evaluated" in d["reasons"][0]
     assert out["carry_overlay_taker/v1"]["status"] == "RESEARCH_CANDIDATE"
+
+
+# ======================= Phase 2: public market edge is not account profit =======================
+
+def full_account():
+    """A structurally COMPLETE account-evidence object. Nothing in the repository produces one; it exists here so that
+    each requirement can be removed in turn and shown to block the claim."""
+    return {
+        "fee_schedule": {"provenance": "ACCOUNT_VERIFIED", "taker_bps": 5.5, "maker_bps": 2.0},
+        "product_qualification": {"verdict": "QUALIFIED", "environment": "mainnet", "product": "BTCUSDT linear", "evidence_ref": "owner-ref-1"},
+        "funding_settlements": {"source": "ACCOUNT_SETTLED", "reconciled": True, "unreconciled": 0, "settlements_reconciled": 120},
+        "fills": {"evidence_class": "ACCOUNT_EXECUTION", "reconciled": True, "fills": 12, "fee_records": 12, "round_trips": 6},
+        "execution_costs": {"provenance": {"latency": "MEASURED", "market_impact": "MEASURED", "slippage": "MEASURED"}},
+        "capital": {"reconciled": True, "source": "ACCOUNT_READ"},
+        "venue_rules": {"verified": True, "source": "owner read of the margin rules"},
+    }
+
+
+def account_economics(**over):
+    costs = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.3, slippage_bps=0.1, impact_bps=0.2, latency_bps=0.1,
+                     conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0,
+                     fee_provenance=over.pop("fee_provenance", "ACCOUNT_VERIFIED"))
+    return TE.compute(position(), costs, [3.8] * 90, funding_source=over.pop("funding_source", "ACCOUNT_SETTLED"))
+
+
+def reconciled(account=None, account_economics_=None, authorisation=None, execution=None, economics=None):
+    b = bundle(funding=4.0, prospective=PRO_OK, integrity=ANCHORED)
+    c = b["carry"]
+    c["account"] = full_account() if account is None else account
+    c["account_economics"] = account_economics() if account_economics_ is None else account_economics_
+    if authorisation is not None:
+        c["execution_authorisation"] = authorisation
+    if execution is not None:
+        c["execution"] = execution
+    if economics is not None:
+        c["economics"] = economics
+    return b
+
+
+def test_complete_account_evidence_reaches_economically_reconciled_but_never_execution_ready_without_a_separate_record():
+    st, e = status(reconciled())
+    assert st == OE.Status.ECONOMICALLY_RECONCILED and e.metrics["reconciliation_gaps"] == []
+    assert e.authorizes_trading is False and "NOT execution-ready" in e.reasons[0]
+
+
+def test_execution_ready_needs_a_named_owner_authorisation_and_still_authorises_nothing():
+    good = {"owner_authorised": True, "reference": "OWNER-AUTH-2026-11-05", "scope": "carry_overlay_taker/v1"}
+    st, e = status(reconciled(authorisation=good))
+    assert st == OE.Status.EXECUTION_READY and e.authorizes_trading is False and e.order_path_connected is False
+    assert e.as_dict()["authorizes_trading"] is False
+    for bad in ({"owner_authorised": True, "reference": "x", "scope": "candidate_carry_depth/v1"},      # another strategy's
+                {"owner_authorised": True, "reference": "", "scope": "carry_overlay_taker/v1"},         # no reference
+                {"owner_authorised": "yes", "reference": "x", "scope": "carry_overlay_taker/v1"},       # not a real True
+                {"owner_authorised": False, "reference": "x", "scope": "carry_overlay_taker/v1"}, {}):
+        assert status(reconciled(authorisation=bad))[0] == OE.Status.ECONOMICALLY_RECONCILED, bad
+
+
+def _drop(path):
+    def mutate(acct):
+        d = acct
+        for k in path[:-1]:
+            d = d[k]
+        d.pop(path[-1]) if path[-1] in d else None
+        return acct
+    return mutate
+
+
+@pytest.mark.parametrize("name,mutate,needle", [
+    ("fees unverified (published defaults)", lambda a: (a["fee_schedule"].update(provenance="PUBLISHED_DEFAULT"), a)[1], "account_fee_schedule"),
+    ("no fee schedule at all", lambda a: (a.pop("fee_schedule"), a)[1], "account_fee_schedule"),
+    ("product not qualified (EU)", lambda a: (a["product_qualification"].update(verdict="UNVERIFIED"), a)[1], "product_account_qualification"),
+    ("qualified but testnet", lambda a: (a["product_qualification"].update(environment="testnet"), a)[1], "product_account_qualification"),
+    ("public funding present, account settlement missing", lambda a: (a.pop("funding_settlements"), a)[1], "account_funding_settlements"),
+    ("account settlements are the public print", lambda a: (a["funding_settlements"].update(source="PUBLIC_REALISED"), a)[1], "account_funding_settlements"),
+    ("an unreconciled settlement", lambda a: (a["funding_settlements"].update(unreconciled=1), a)[1], "account_funding_settlements"),
+    ("too few settlements", lambda a: (a["funding_settlements"].update(settlements_reconciled=30), a)[1], "account_funding_settlements"),
+    ("fills are modelled, not executions", lambda a: (a["fills"].update(evidence_class="SIMULATED_FILL"), a)[1], "fills_and_fee_records"),
+    ("fills without fee records", lambda a: (a["fills"].update(fee_records=3), a)[1], "fills_and_fee_records"),
+    ("latency UNKNOWN", lambda a: (a["execution_costs"]["provenance"].update(latency="UNKNOWN"), a)[1], "execution_and_operational_costs"),
+    ("market impact UNKNOWN", lambda a: (a["execution_costs"]["provenance"].update(market_impact="UNKNOWN"), a)[1], "execution_and_operational_costs"),
+    ("slippage only ESTIMATED", lambda a: (a["execution_costs"]["provenance"].update(slippage="ESTIMATED"), a)[1], "execution_and_operational_costs"),
+    ("capital not reconciled", lambda a: (a["capital"].update(reconciled=False), a)[1], "capital_and_collateral"),
+    ("venue margin rules ASSUMED", lambda a: (a["venue_rules"].update(verified=False), a)[1], "venue_margin_and_liquidation_rules"),
+    ("no venue rules object", lambda a: (a.pop("venue_rules"), a)[1], "venue_margin_and_liquidation_rules"),
+])
+def test_every_missing_account_requirement_blocks_economic_reconciliation(name, mutate, needle):
+    st, e = status(reconciled(account=mutate(full_account())))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED, name
+    assert any(needle in g for g in e.metrics["reconciliation_gaps"]), (name, e.metrics["reconciliation_gaps"])
+    assert "NOT about any account's profit" in " ".join(e.reasons)
+
+
+def test_unknown_latency_or_impact_in_the_ledger_blocks_reconciliation_even_if_the_account_object_claims_measurement():
+    for field in ("latency_bps", "impact_bps"):
+        kw = dict(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.3, slippage_bps=0.1, impact_bps=0.2, latency_bps=0.1,
+                  conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0)
+        kw[field] = None
+        econ = TE.compute(position(), TE.Costs(**kw), [3.9] * 90, funding_source="PUBLIC_REALISED")
+        assert econ["unknowns"]
+        st, e = status(reconciled(economics=econ))
+        assert st != OE.Status.ECONOMICALLY_RECONCILED and any("unpriced inputs remain" in g for g in e.metrics["reconciliation_gaps"]), field
+
+
+def test_an_assumed_maker_fill_probability_blocks_a_maker_or_hybrid_claim_but_not_a_taker_one():
+    for mode in ("maker", "hybrid"):
+        acct = full_account()
+        acct["execution_costs"]["provenance"].update(maker_fill_probability="ASSUMED", adverse_selection="ASSUMED")
+        st, e = status(reconciled(account=acct, execution={"mode": mode}))
+        assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and any("maker_fill_probability" in g for g in e.metrics["reconciliation_gaps"]), mode
+        acct["execution_costs"]["provenance"].update(maker_fill_probability="MEASURED", adverse_selection="MEASURED")
+        assert status(reconciled(account=acct, execution={"mode": mode}))[0] == OE.Status.ECONOMICALLY_RECONCILED
+    acct = full_account()
+    acct["execution_costs"]["provenance"].update(maker_fill_probability="ASSUMED")
+    assert status(reconciled(account=acct, execution={"mode": "taker"}))[0] == OE.Status.ECONOMICALLY_RECONCILED
+
+
+def test_account_economics_computed_from_public_funding_or_unverified_fees_do_not_count():
+    assert status(reconciled(account_economics_=account_economics(funding_source="PUBLIC_REALISED")))[0] == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED
+    assert status(reconciled(account_economics_=account_economics(fee_provenance="UNVERIFIED")))[0] == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED
+    assert status(reconciled(account_economics_={}))[0] == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED
+
+
+def test_account_evidence_cannot_rescue_a_market_edge_that_is_not_supported():
+    """A perfect account object on top of in-sample-only public evidence is still only a candidate."""
+    b = reconciled()
+    b["carry"]["prospective"] = {}
+    assert status(b)[0] == OE.Status.RESEARCH_CANDIDATE
+    b2 = reconciled()
+    b2["carry"]["integrity"] = NOT_ANCHORED
+    assert status(b2)[0] == OE.Status.RESEARCH_CANDIDATE
+    b3 = reconciled()
+    b3["carry"]["reliability_verdict"] = "DEGRADED"
+    assert status(b3)[0] == OE.Status.INSUFFICIENT_EVIDENCE
+
+
+def test_a_prospective_claim_needs_headroom_for_the_unpriced_costs_and_shows_it(monkeypatch):
+    st, e = status(bundle(funding=4.0, prospective=PRO_OK, integrity=ANCHORED))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and e.metrics["unknown_cost_headroom_bps_round_trip"] >= OE.MIN_UNKNOWN_COST_HEADROOM_BPS
+    monkeypatch.setattr(OE, "MIN_UNKNOWN_COST_HEADROOM_BPS", 1e9)
+    assert status(bundle(funding=4.0, prospective=PRO_OK, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE
+
+
+def test_integrity_grade_is_anchored_only_when_every_chained_file_has_a_matching_anchor():
+    assert OE.integrity_grade({"integrity": ANCHORED}) == "ANCHORED"
+    assert OE.integrity_grade({"integrity": dict(ANCHORED, files_anchored_current=0, files_anchored_lagging=1)}) == "ANCHORED"
+    assert OE.integrity_grade({"integrity": dict(ANCHORED, files_total=2, files_legacy_pre_chain=1)}) == "ANCHORED"     # a legacy file is not chained
+    assert OE.integrity_grade({"integrity": NOT_ANCHORED}) == "NOT_FULLY_ANCHORED"
+    assert OE.integrity_grade({"integrity": dict(ANCHORED, files_stale_anchor=1, files_anchored_current=0)}) == "NOT_FULLY_ANCHORED"
+    assert OE.integrity_grade({"integrity": dict(ANCHORED, files_anchor_conflict=1)}) == "CONFLICT"
+    assert OE.integrity_grade({}) == "NOT_FULLY_ANCHORED"
+
+
+def test_no_default_input_to_the_report_can_reach_economic_reconciliation_or_readiness():
+    """The report builds no account section: whatever the public evidence, the best it can say is a research candidate."""
+    st, e = status(bundle(funding=4.0))
+    assert st == OE.Status.RESEARCH_CANDIDATE and e.metrics["reconciliation_gaps"] and len(e.metrics["reconciliation_gaps"]) == len(OE.RECONCILIATION_REQUIREMENTS)

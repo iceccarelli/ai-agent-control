@@ -142,6 +142,7 @@ jobs:
           tests/test_lifecycle_matrix.py
           tests/test_state_backup.py
           tests/test_profitability_report.py
+          tests/test_integrity_semantics.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
           tests/test_paper_agent_certification.py

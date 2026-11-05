@@ -98,11 +98,13 @@ class Recorder:
     def _capacity_path(self, now_ms: int) -> str:
         return os.path.join(self.dir, "capacity-" + ST._utc_day(now_ms) + ".jsonl")
 
-    def _source(self) -> Dict[str, Any]:
-        """The market event this row is computed at: the log's newest record id and the books'
-        update ids / sequence numbers (what the venue stamped)."""
-        st = self.engine.state
-        out: Dict[str, Any] = {"store_record_id": max(0, getattr(self.engine.store, "_next_id", 1) - 1)}
+    @staticmethod
+    def _source_of(engine: Any) -> Dict[str, Any]:
+        """The market event a view is computed at: the log's newest record id and the books' update ids / sequence numbers
+        (what the venue stamped). Called by ``Feed.snapshot`` INSIDE the engine lock, in the same hold as the view, so the
+        identifiers can never belong to a later event than the numbers they accompany."""
+        st = engine.state
+        out: Dict[str, Any] = {"store_record_id": max(0, getattr(engine.store, "_next_id", 1) - 1)}
         for key, cat in (("perp", E.LINEAR), ("spot", E.SPOT)):
             bk = st.books.get(cat)
             out[f"{key}_update_id"] = None if bk is None else getattr(bk, "update_id", None)
@@ -129,11 +131,11 @@ class Recorder:
 
     def capture_capacity(self) -> Optional[Dict[str, Any]]:
         """Append one chained cost curve for the current view. Never raises."""
-        now = self.wall_ms()
         try:
-            view = self.feed.view()
+            snap = self.feed.snapshot(self._source_of, wall_ms=self.wall_ms)          # view + ids + clocks: ONE read under the engine lock
+            view, now = snap.view, snap.wall_ms
             row = MC.capacity_row(view, now_ms=now, notionals=self.notionals,
-                                  source=self._source(), health=self._health())
+                                  source=snap.source, health=self._health())
             # the view's own verdict is recorded with the curve: a curve taken from a view the
             # entry gate would refuse is still data, but it must say so
             row["entry_refusals"] = list(view.refusals(S.ENTRY))

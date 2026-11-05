@@ -28,7 +28,7 @@ def report(d, rows, **kw):
 def test_a_short_clean_recording_is_healthy_but_every_conclusion_is_insufficient(tmp_path):
     rows = series(BASE, 3, lambda T, t: 0.65, lambda T: 0.65)
     rep = report(lay_down(tmp_path, rows), rows)
-    assert rep["validation"]["stream_ok"] and rep["integrity"]["chain_ok_for_v2_files"]
+    assert rep["validation"]["stream_ok"] and rep["integrity"]["summary"]["economic_evidence_eligible"]
     assert rep["reliability"]["verdict"] == "HEALTHY" and rep["authorizes_trading"] is False
     assert rep["economics"] is None
     stat = {o["strategy"]: o["status"] for o in rep["opportunities"]}
@@ -61,7 +61,7 @@ def test_a_tampered_file_fails_integrity_and_drops_the_conclusion_to_insufficien
     data = open(p, "rb").read()
     open(p, "wb").write(data.replace(b'"mode":"overlay"', b'"mode":"overlaz"', 1))
     rep = report(d, rows)
-    assert rep["integrity"]["chain_ok_for_v2_files"] is False
+    assert rep["integrity"]["summary"]["economic_evidence_eligible"] is False
     assert any(i["code"] == "MUTATED" for f in rep["integrity"]["files"] for i in f["chain"]["issues"])
     assert {o["strategy"]: o["status"] for o in rep["opportunities"]}["carry_overlay_taker/v1"] == "INSUFFICIENT_EVIDENCE"
 
@@ -79,7 +79,7 @@ def test_external_anchors_from_the_monitor_history_catch_a_consistently_rewritte
     EC.bulk_write(p, rows[: head["n"] // 2])
     rep = report(d, rows, history=str(hist))
     codes = [i["code"] for f in rep["integrity"]["files"] for i in f["chain"]["issues"]]
-    assert "TRUNCATED" in codes and rep["integrity"]["chain_ok_for_v2_files"] is False
+    assert "TRUNCATED" in codes and rep["integrity"]["summary"]["economic_evidence_eligible"] is False
 
 
 def test_a_stopped_recorder_is_stale_in_the_report_however_good_its_old_rows(tmp_path):
@@ -92,7 +92,7 @@ def test_a_stopped_recorder_is_stale_in_the_report_however_good_its_old_rows(tmp
 
 def test_legacy_rows_are_quarantined_counted_and_never_used(tmp_path):
     rows = series(BASE, 3, lambda T, t: 0.65, lambda T: 0.65)
-    d = lay_down(tmp_path, [{"at_ms": 1, "curve": [], "environment": "mainnet"}] * 4 + rows)
+    d = lay_down(tmp_path, [{"at_ms": k, "curve": [], "environment": "mainnet"} for k in range(1, 5)] + rows)
     rep = report(d, rows)
     assert rep["validation"]["n_legacy_quarantined"] == 4 and rep["validation"]["n_valid_rows"] == len(rows)
 
@@ -122,7 +122,7 @@ def test_a_day_file_emptied_to_zero_bytes_still_fails_the_integrity_gate(tmp_pat
     d = lay_down(tmp_path, rows[len(rows) // 2:], name="capacity-20261104.jsonl")
     open(os.path.join(d, "capacity-20261103.jsonl"), "wb").write(b"")       # sidecar and head left intact
     rep = report(d, rows)
-    assert rep["integrity"]["chain_ok_for_v2_files"] is False
+    assert rep["integrity"]["summary"]["economic_evidence_eligible"] is False
     assert any(i["code"] == "TRUNCATED" for f in rep["integrity"]["files"] for i in f["chain"]["issues"])
     assert rep["economics"] is None
 
@@ -142,7 +142,7 @@ def test_a_mutated_file_does_not_print_a_return_next_to_the_integrity_failure(tm
     p = os.path.join(d, "capacity-20261104.jsonl")
     open(p, "wb").write(open(p, "rb").read().replace(b'"mode":"overlay"', b'"mode":"overlaz"', 1))
     text = PR.render(report(d, rows))
-    assert "chain verifies for EVERY file: False" in text and "WITHHELD" in text and "meets" not in text
+    assert "economic-evidence eligible" in text and ": False" in text and "WITHHELD" in text and "meets" not in text
 
 
 def test_testnet_evidence_cannot_reach_a_candidate_or_a_return_and_the_report_names_the_environment(tmp_path):
@@ -165,7 +165,7 @@ def test_a_long_constant_funding_recording_is_withheld_for_want_of_effective_sam
 def test_the_report_says_when_it_has_no_external_anchor(tmp_path):
     rows = series(BASE, 4, lambda T, t: 0.65, noisy(0.65, 0.1))
     d = lay_down(tmp_path, rows)
-    assert "UNANCHORED" in PR.render(report(d, rows)) and report(d, rows)["integrity"]["anchored"] is False
+    assert "UNANCHORED" in PR.render(report(d, rows)) and report(d, rows)["integrity"]["summary"]["files_unanchored"] == 1
 
 
 def test_a_third_of_the_rows_rejected_voids_the_stream_and_is_printed(tmp_path):

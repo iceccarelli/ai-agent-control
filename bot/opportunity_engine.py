@@ -3,14 +3,24 @@
 Every candidate is a ``StrategySpec``: identity and version, instrument/product, entry and
 exit conditions, the market inputs it needs, funding and execution assumptions, holding period,
 sizing, capital, risk limits, its research protocol and its acceptance/rejection criteria. An
-evaluator turns the recorded evidence into one of six statuses:
+evaluator turns the recorded evidence into one of eight statuses. They answer DIFFERENT questions, and a later one
+never follows from an earlier one by accumulation of public data alone:
 
-  RESEARCH_CANDIDATE         passes the screens on what was recorded; not validated
-  INSUFFICIENT_EVIDENCE      not enough, or untrustworthy, evidence to say anything
-  ECONOMICALLY_UNATTRACTIVE  the net edge on economic capital misses even the lowest screen
-  EXECUTION_UNATTRACTIVE     cost or fillability destroys the edge
-  RISK_UNACCEPTABLE          the risk limits are breached
-  PROSPECTIVELY_VALIDATED    pre-registered, then confirmed on data that arrived afterwards
+  INSUFFICIENT_EVIDENCE               not enough, or untrustworthy, evidence to say anything
+  RESEARCH_CANDIDATE                  passes the screens on what was recorded (in sample); modelled costs only
+  PROSPECTIVE_MARKET_EDGE_SUPPORTED   pre-registered, then the screens still pass on PUBLIC market data that arrived afterwards,
+                                      with the integrity anchored and a stated headroom for the unpriced costs. It is a
+                                      statement about the public market, NOT about any account's profit
+  ECONOMICALLY_RECONCILED             the same edge reproduced from ACCOUNT records: the real fee schedule, product and account
+                                      qualification, reconciled account funding settlements, real fills and fee records, every
+                                      cost input priced from measurements, reconciled capital, verified venue margin rules
+  EXECUTION_READY                     ECONOMICALLY_RECONCILED plus a separate, explicit owner execution authorisation record.
+                                      Still not an order and not a permission
+  ECONOMICALLY_UNATTRACTIVE           the net edge on economic capital misses even the lowest screen
+  EXECUTION_UNATTRACTIVE              cost or fillability destroys the edge
+  RISK_UNACCEPTABLE                   the risk limits are breached
+
+A public funding print is not account cash. A modelled fill is not an execution. A predicted rebate is not a rebate received.
 
 NO STATUS AUTHORISES TRADING, and nothing here can send an order: this module imports no
 client, broker, store or configuration, a test pins that, and every spec carries
@@ -19,7 +29,7 @@ state is explicit, it is never re-evaluated, and its rejection is not weakened.
 
 The evaluators are deliberately conservative about what they accept: a stale recorder, a broken
 evidence chain, a mixed stream, or fewer than 90 settlements (or too small an effective sample size) is INSUFFICIENT, and
-PROSPECTIVELY_VALIDATED needs a registration timestamp that precedes the evidence it is judged on.
+PROSPECTIVE_MARKET_EDGE_SUPPORTED needs a registration timestamp that precedes the evidence it is judged on.
 """
 from __future__ import annotations
 
@@ -38,7 +48,9 @@ class Status(str, Enum):
     ECONOMICALLY_UNATTRACTIVE = "ECONOMICALLY_UNATTRACTIVE"
     EXECUTION_UNATTRACTIVE = "EXECUTION_UNATTRACTIVE"
     RISK_UNACCEPTABLE = "RISK_UNACCEPTABLE"
-    PROSPECTIVELY_VALIDATED = "PROSPECTIVELY_VALIDATED"
+    PROSPECTIVE_MARKET_EDGE_SUPPORTED = "PROSPECTIVE_MARKET_EDGE_SUPPORTED"
+    ECONOMICALLY_RECONCILED = "ECONOMICALLY_RECONCILED"
+    EXECUTION_READY = "EXECUTION_READY"
 
 
 EXECUTED_BY_ENGINE = "EXECUTED_BY_ENGINE"            # paper/testnet only; live is locked
@@ -48,6 +60,16 @@ FROZEN_ABSENT = "FROZEN_ABSENT"
 
 MIN_SETTLEMENTS = 90                # 30 days of settlements (serially dependent: the ESS gate in funding_eval also applies)
 PROSPECTIVE_SETTLEMENTS = 270       # 90 days after registration
+#: A prospective market-edge claim must survive some UNPRICED cost: the modelled net must exceed the lowest screen by
+#: at least this many bps of round-trip cost (a screening control, not a measurement of latency or impact).
+MIN_UNKNOWN_COST_HEADROOM_BPS = 2.0
+#: Account-level floors for ECONOMICALLY_RECONCILED (screening controls).
+MIN_ACCOUNT_SETTLEMENTS = 90
+MIN_ACCOUNT_ROUND_TRIPS = 3
+RECONCILIATION_REQUIREMENTS = (
+    "account_fee_schedule", "product_account_qualification", "account_funding_settlements", "fills_and_fee_records",
+    "execution_and_operational_costs", "capital_and_collateral", "venue_margin_and_liquidation_rules",
+    "account_economics")
 
 
 @dataclass(frozen=True)
@@ -241,19 +263,131 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
         return Evaluation(spec.key, spec.origin, Status.ECONOMICALLY_UNATTRACTIVE,
                           [f"net {ret if ret is None else round(ret, 2)}%/yr on economic capital (lower-bound funding) is below the lowest "
                            f"{TE.PROVISIONAL} screen of {lowest}%"], m)
+    headroom = unknown_cost_headroom_bps(econ, lowest)
+    m["unknown_cost_headroom_bps_round_trip"] = headroom
+    gaps = reconciliation_gaps(ev, spec)
+    m["reconciliation_gaps"] = gaps
+    unpriced = ", ".join(m["unpriced_inputs"]) or "none"
+    market_edge = _prospective_market_edge(ev, lowest, headroom)
+    if market_edge is None:
+        return Evaluation(spec.key, spec.origin, Status.RESEARCH_CANDIDATE,
+                          [f"passes the {TE.PROVISIONAL} screens on MODELLED costs only (unpriced inputs: {unpriced}); "
+                           "in-sample recorded evidence, not prospectively confirmed; authorises nothing",
+                           f"not account profit: {len(gaps)} account-level requirement(s) are unmet"], m)
+    if gaps:
+        return Evaluation(spec.key, spec.origin, Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED,
+                          ["registered before the evidence; the screens re-run on post-registration PUBLIC market data ONLY still pass, "
+                           f"with {headroom:.1f} bps of round-trip headroom for the unpriced inputs ({unpriced})",
+                           "this is a statement about the public market, NOT about any account's profit: public funding is not account "
+                           "cash, a modelled fill is not an execution, a predicted rebate is not a rebate received",
+                           "unmet for ECONOMICALLY_RECONCILED: " + "; ".join(gaps)], m)
+    auth = ev.get("execution_authorisation") or {}
+    if (auth.get("owner_authorised") is True and isinstance(auth.get("reference"), str) and auth["reference"].strip()
+            and auth.get("scope") == spec.key):
+        return Evaluation(spec.key, spec.origin, Status.EXECUTION_READY,
+                          ["economically reconciled from account records AND a separate owner execution-authorisation record "
+                           f"({auth['reference']!r}) names this strategy. This engine authorises nothing: ready is not permission"], m)
+    return Evaluation(spec.key, spec.origin, Status.ECONOMICALLY_RECONCILED,
+                      ["every account-level requirement is met and the account-settled economics clear the lowest screen; "
+                       "there is no separate execution-authorisation record, so this is NOT execution-ready"], m)
+
+
+def unknown_cost_headroom_bps(econ: Mapping[str, Any], lowest_hurdle_pct: float) -> Optional[float]:
+    """How many bps of ADDITIONAL round-trip cost (on the hedged notional) the modelled net can absorb before the
+    annualised return on economic capital falls to the lowest screen. It is arithmetic on the modelled ledger, not an
+    estimate of what latency or impact actually cost. None when the inputs are missing."""
+    try:
+        net = float(econ["net_pnl_usd"])
+        cap = float(econ["capital"]["economic_capital_usd"])
+        n = float(econ["capital"]["hedged_notional_usd"])
+        hold = float(econ["position"]["hold_days"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (math.isfinite(net) and cap > 0 and n > 0 and hold > 0):
+        return None
+    required = cap * (lowest_hurdle_pct / 100.0) * hold / 365.0
+    return (net - required) / n * 1e4
+
+
+def _prospective_market_edge(ev: Mapping[str, Any], lowest: float, headroom: Optional[float]) -> Optional[bool]:
     pro = ev.get("prospective") or {}
     post = pro.get("post_registration_annualised_pct_on_economic_capital")
+    grade = integrity_grade(ev)
     if (pro.get("registered_ms") and pro.get("first_evidence_ms") and pro["registered_ms"] < pro["first_evidence_ms"]
             and pro.get("n_after_registration", 0) >= PROSPECTIVE_SETTLEMENTS
             and pro.get("post_registration_ess", 0) >= PROSPECTIVE_SETTLEMENTS / 9.0
-            and post is not None and post >= lowest):
-        return Evaluation(spec.key, spec.origin, Status.PROSPECTIVELY_VALIDATED,
-                          ["registered before the evidence; the screens re-run on post-registration settlements ONLY still pass; "
-                           "authorises nothing"], m)
-    unpriced = ", ".join(m["unpriced_inputs"]) or "none"
-    return Evaluation(spec.key, spec.origin, Status.RESEARCH_CANDIDATE,
-                      [f"passes the {TE.PROVISIONAL} screens on MODELLED costs only (unpriced inputs: {unpriced}); "
-                       "recorded evidence, not prospectively validated; authorises nothing"], m)
+            and post is not None and post >= lowest
+            and grade == "ANCHORED"
+            and headroom is not None and headroom >= MIN_UNKNOWN_COST_HEADROOM_BPS):
+        return True
+    return None
+
+
+def integrity_grade(ev: Mapping[str, Any]) -> str:
+    """ANCHORED only when every chained evidence file has a current or lagging external anchor that matches; anything
+    else is NOT_FULLY_ANCHORED (or CONFLICT). Absent integrity detail is NOT anchored."""
+    i = ev.get("integrity") or {}
+    chained = (i.get("files_total") or 0) - (i.get("files_legacy_pre_chain") or 0)
+    if i.get("files_anchor_conflict"):
+        return "CONFLICT"
+    if chained > 0 and (i.get("files_anchored_current") or 0) + (i.get("files_anchored_lagging") or 0) == chained:
+        return "ANCHORED"
+    return "NOT_FULLY_ANCHORED"
+
+
+def _num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def reconciliation_gaps(ev: Mapping[str, Any], spec: Optional[StrategySpec] = None) -> List[str]:
+    """Every account-level requirement that is NOT met, as readable strings; empty means the account evidence is complete.
+    Nothing in this repository produces ``ev['account']``: until account reconciliation tooling exists and is run by the
+    owner, every one of these is a gap, by design. A structurally complete object is necessary, not sufficient: its values
+    are claims by whoever assembled it."""
+    gaps: List[str] = []
+    a = ev.get("account") or {}
+    econ = ev.get("economics") or {}
+    fs = a.get("fee_schedule") or {}
+    if not (fs.get("provenance") == "ACCOUNT_VERIFIED" and _num(fs.get("taker_bps")) and fs["taker_bps"] > 0 and _num(fs.get("maker_bps"))):
+        gaps.append("account_fee_schedule: the account's real taker/maker rates are not read from the account (published defaults are not them)")
+    q = a.get("product_qualification") or {}
+    if not (q.get("verdict") == "QUALIFIED" and q.get("environment") == "mainnet" and q.get("product") == "BTCUSDT linear"
+            and isinstance(q.get("evidence_ref"), str) and q["evidence_ref"].strip()):
+        gaps.append("product_account_qualification: no QUALIFIED verdict for this account and product (EU is unqualified)")
+    st = a.get("funding_settlements") or {}
+    if not (st.get("source") == "ACCOUNT_SETTLED" and st.get("reconciled") is True and st.get("unreconciled") == 0
+            and isinstance(st.get("settlements_reconciled"), int) and st["settlements_reconciled"] >= MIN_ACCOUNT_SETTLEMENTS):
+        gaps.append(f"account_funding_settlements: fewer than {MIN_ACCOUNT_SETTLEMENTS} ACCOUNT_SETTLED funding rows reconciled, "
+                    "or any unreconciled (a public funding print is not account cash)")
+    fl = a.get("fills") or {}
+    if not (fl.get("evidence_class") == "ACCOUNT_EXECUTION" and fl.get("reconciled") is True
+            and isinstance(fl.get("fills"), int) and fl["fills"] >= 2 * MIN_ACCOUNT_ROUND_TRIPS
+            and isinstance(fl.get("fee_records"), int) and fl["fee_records"] >= fl["fills"]
+            and isinstance(fl.get("round_trips"), int) and fl["round_trips"] >= MIN_ACCOUNT_ROUND_TRIPS):
+        gaps.append("fills_and_fee_records: no reconciled ACCOUNT_EXECUTION fills with a fee record each (a modelled fill is not an execution)")
+    xc = a.get("execution_costs") or {}
+    prov = xc.get("provenance") or {}
+    needed = ("latency", "market_impact", "slippage")
+    mode = (ev.get("execution") or {}).get("mode", "taker")
+    if mode in ("maker", "hybrid"):
+        needed += ("maker_fill_probability", "adverse_selection")
+    if econ.get("unknowns") or any(prov.get(k) != "MEASURED" for k in needed):
+        gaps.append("execution_and_operational_costs: " + ("unpriced inputs remain (" + ", ".join(econ.get("unknowns") or []) + "); " if econ.get("unknowns") else "")
+                    + "not every input is MEASURED (" + ", ".join(k for k in needed if prov.get(k) != "MEASURED") + ")")
+    cc = a.get("capital") or {}
+    if not (cc.get("reconciled") is True and cc.get("source") == "ACCOUNT_READ"):
+        gaps.append("capital_and_collateral: balances and collateral are not reconciled against an account read")
+    vr = a.get("venue_rules") or {}
+    if not (vr.get("verified") is True and isinstance(vr.get("source"), str) and vr["source"].strip()):
+        gaps.append("venue_margin_and_liquidation_rules: initial/maintenance margin, haircuts and liquidation rules are ASSUMED, not verified")
+    ae = ev.get("account_economics") or {}
+    lowest = min(TE.SCREENING_HURDLES_PCT)
+    ret = (ae.get("returns") or {}).get("annualised_pct_on_economic_capital")
+    if not ((ae.get("funding") or {}).get("source") == "ACCOUNT_SETTLED" and (ae.get("fees") or {}).get("verified") is True
+            and not ae.get("unknowns") and _num(ret) and ret >= lowest):
+        gaps.append("account_economics: the ledger is not computed from ACCOUNT_SETTLED funding with verified fees and no unknown input, "
+                    f"or it does not clear the lowest {TE.PROVISIONAL} screen")
+    return gaps
 
 
 def basis_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:

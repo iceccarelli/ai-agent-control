@@ -40,6 +40,16 @@ GENESIS = "00" * 32
 MAX_UNCHAINED = 1
 #: Rows adopted by `reseal_tail` over a file's life. A few crashes are normal; many means rows were injected.
 MAX_RESEALED_PER_FILE = 3
+#: An external anchor this many rows (or fewer) behind the chain's head is LAGGING (the monitor copies the head hourly,
+#: the recorder appends every five minutes); further behind it is STALE and the unwitnessed tail is long.
+MAX_ANCHOR_LAG_ROWS = 48
+
+#: verify() anchor_status values, weakest to strongest. Only ANCHORED_CURRENT means the newest anchor is the chain's head.
+UNANCHORED = "UNANCHORED"
+STALE_ANCHOR = "STALE_ANCHOR"
+ANCHORED_LAGGING = "ANCHORED_LAGGING"
+ANCHORED_CURRENT = "ANCHORED_CURRENT"
+ANCHOR_CONFLICT = "ANCHOR_CONFLICT"
 
 
 def canonical(row: Mapping[str, Any]) -> bytes:
@@ -275,27 +285,61 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
                 add("HEAD_MISMATCH", "the head file does not match the chain's last entry")
     elif head is not None and not chain and head.get("n"):
         add("TRUNCATED", "the chain is empty but the head records rows")
-    # 3. external anchors
-    for a in anchors or ():
-        n, hd = a.get("n"), a.get("head")
-        if not isinstance(n, int) or n < 1:
-            continue
+    # 3. external anchors: EVERY valid anchor must match the chain at its row; the LATEST decides the status
+    valid_anchors = [a for a in (anchors or ()) if isinstance(a, Mapping) and isinstance(a.get("n"), int)
+                     and not isinstance(a.get("n"), bool) and a["n"] >= 1 and isinstance(a.get("head"), str)]
+    anchor_conflict = False
+    for a in valid_anchors:
+        n, hd = a["n"], a["head"]
         if n > len(chain):
             add("TRUNCATED", f"an external anchor records {n} rows; only {len(chain)} are chained")
+            anchor_conflict = True
         elif chain[n - 1]["h"] != hd:
             add("ANCHOR_MISMATCH", f"chain head at row {n} differs from the external anchor")
+            anchor_conflict = True
     resealed = sum(1 for e in chain if e.get("resealed"))
     if unchained > MAX_UNCHAINED:
         add("UNCHAINED_TAIL_EXCESS", f"{unchained} unchained rows; a crash can leave at most {MAX_UNCHAINED}", len(chain))
     if resealed > MAX_RESEALED_PER_FILE:
         add("RESEALED_EXCESS", f"{resealed} rows were adopted by reseal (more than {MAX_RESEALED_PER_FILE} crashes' worth)")
     serious = [i for i in issues if i["code"] != "UNCHAINED_TAIL"]
-    return {"path": os.path.basename(path), "ok": not issues, "tamper_evident_ok": not serious,
-            "anchored": bool(anchors), "resealed_rows": resealed, "sidecar_torn_tail": side_torn,
+    internally_consistent = not serious
+    latest = max((a["n"] for a in valid_anchors), default=None)
+    lag = None if latest is None or latest > len(chain) else len(chain) - latest
+    if anchor_conflict:
+        anchor_status = ANCHOR_CONFLICT
+    elif latest is None:
+        anchor_status = UNANCHORED
+    elif not internally_consistent:
+        anchor_status = "UNVERIFIABLE_CHAIN_BROKEN"
+    elif lag == 0:
+        anchor_status = ANCHORED_CURRENT
+    elif lag <= MAX_ANCHOR_LAG_ROWS:
+        anchor_status = ANCHORED_LAGGING
+    else:
+        anchor_status = STALE_ANCHOR
+    return {"path": os.path.basename(path), "ok": not issues,
+            # three DIFFERENT statements, never one Boolean:
+            "internally_consistent": internally_consistent,           # the chained prefix verifies (no mutation/removal/reorder/...)
+            "fully_chained": internally_consistent and unchained == 0,   # AND every row in the file has a chain entry
+            "economic_evidence_eligible": not issues,                 # AND no issue of any kind: the only state a calculation may rest on
+            "verified_prefix_rows": len(chain) if internally_consistent else 0,   # the rows a reader may ADMIT; unchained rows are never among them
+            "tamper_evident_ok": internally_consistent,               # deprecated alias of internally_consistent (it tolerates an unchained tail)
+            "anchor_status": anchor_status, "chain_rows": len(chain), "latest_anchor_rows": latest, "anchor_lag_rows": lag,
+            "anchored": anchor_status in (ANCHORED_CURRENT, ANCHORED_LAGGING), "resealed_rows": resealed, "sidecar_torn_tail": side_torn,
             "torn_aside_bytes": (os.path.getsize(path + ".torn") if os.path.exists(path + ".torn") else 0),
             "n_rows": len(lines), "n_chained": len(chain), "unchained_tail": unchained,
             "head": None if not chain else {"n": chain[-1]["n"], "head": chain[-1]["h"]},
             "quarantined_lines": quarantined, "issues": issues}
+
+
+def admitted_rows(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> Tuple[List[Any], Dict[str, Any]]:
+    """The rows a statistic may use from this file, with the verification that decided it: only the chained prefix of a
+    file whose chain is internally consistent. A row without a chain entry is NEVER admitted, and a file that fails
+    verification admits nothing. Read-only: this never repairs."""
+    v = verify(path, anchors)
+    lines, _ = read_lines(path)
+    return rows_of(lines[:v["verified_prefix_rows"]]), v
 
 
 def reseal_tail(path: str) -> int:

@@ -159,7 +159,7 @@ Run on the recorder's data directory (or a copy; it never writes there):
   Two things it cannot do at ~100 settlements: identify a slow persistent level hidden under noise (measured coverage
   0.7-0.85 there) and predict a level shift. So the economics carry the LEAST favourable of the window's and the most
   recent third's lower bounds, a drift below the window is flagged, and a `RESEARCH_CANDIDATE` is a research flag, never
-  a validated edge: only `PROSPECTIVELY_VALIDATED` (screens re-run on post-registration data alone) is evidence of one.
+  a validated edge: only `PROSPECTIVE_MARKET_EDGE_SUPPORTED` (screens re-run on post-registration data alone) is evidence of one.
 * **Money:** two returns (on hedged notional, on fully allocated economic capital), the 10/15/20 %/yr
   screens labelled `PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED`, and an explicit list of UNKNOWN
   inputs (latency, the account's real fee tier, venue margin rules). Replace them with the owner's.
