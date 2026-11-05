@@ -46,6 +46,7 @@ import datetime as dt
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config as _config
+import fingerprint as _fingerprint
 import venues as _venues
 from bybit_connection import BybitAPIError, BybitClient
 from memory import TradingMemory
@@ -337,6 +338,7 @@ class TradingBot:
                 "policy": self._policy_health(),
                 "observation_status": self.observation_status,
                 "market_feed": TradingBot._market_feed_status(self),
+                "fingerprint": _fingerprint.runtime_fingerprint(self.cfg),
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -729,9 +731,16 @@ class TradingBot:
 
             env = self._market_feed_environment()
             directory = str(getattr(self.cfg, "MARKET_FEED_DIR", "") or "")
-            store = _mst.MarketStore(directory, environment=env)
+            reserve_mb = getattr(self.cfg, "MARKET_FEED_MIN_FREE_MB", 256)
+            retention = getattr(self.cfg, "MARKET_FEED_RETENTION_DAYS", 1)
+            store = _mst.MarketStore(
+                directory, environment=env,
+                min_free_bytes=(int(reserve_mb) * 1024 * 1024
+                                if isinstance(reserve_mb, int) and not isinstance(reserve_mb, bool) else 0))
             engine = _me.Engine(_ms.MarketState(self.carry.perp_symbol, environment=env), store)
-            fcfg = _mf.FeedConfig(symbol=self.carry.perp_symbol, environment=env)
+            fcfg = _mf.FeedConfig(
+                symbol=self.carry.perp_symbol, environment=env,
+                retention_days=retention if isinstance(retention, int) and not isinstance(retention, bool) else 0)
             factory = self._market_feed_factory or (lambda url: _mt.PublicWebSocket(url))
             rest = _mr.PublicRest(_mr.urllib_transport(), base_url=fcfg.rest_base)
             feed = _mf.Feed(fcfg, engine, factory, rest)

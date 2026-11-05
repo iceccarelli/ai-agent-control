@@ -589,6 +589,17 @@ class Config:
     #: operator OUTSIDE the trading database and outside source trees.
     MARKET_FEED_ENABLED: bool = False
     MARKET_FEED_DIR: str = ""
+    #: Provenance for the health fingerprint, set by the image build / the platform.
+    #: Informational only: nothing decides anything from them.
+    BUILD_COMMIT: str = ""
+    FLY_IMAGE_REF: str = ""
+    #: The feed writes ~200 bytes per input and measured ~1.5 GB per day on mainnet
+    #: BTCUSDT (depth 50, both products). It shares the volume with the ledger on a
+    #: one-volume deployment, so it keeps a free-space RESERVE (it stops writing, and
+    #: entries stop, long before the ledger could be starved) and prunes whole closed
+    #: UTC days past the retention. 0 days = keep everything (an operator decision).
+    MARKET_FEED_MIN_FREE_MB: int = 256
+    MARKET_FEED_RETENTION_DAYS: int = 1
     #: What the capital behind the hedge could earn elsewhere, as a fraction
     #: per year on the hedged notional, charged like financing in the entry
     #: economics. 0.0 (the default) changes nothing: the repo holds no rate
@@ -1086,6 +1097,10 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_EXECUTION_MODE=parse_execution_mode(env),
         MARKET_FEED_ENABLED=parse_bool(env.get("MARKET_FEED_ENABLED"), False),
         MARKET_FEED_DIR=parse_str(env, "MARKET_FEED_DIR", ""),
+        BUILD_COMMIT=parse_str(env, "BUILD_COMMIT", ""),
+        FLY_IMAGE_REF=parse_str(env, "FLY_IMAGE_REF", ""),
+        MARKET_FEED_MIN_FREE_MB=parse_int(env, "MARKET_FEED_MIN_FREE_MB", 256, low=0, high=10_000_000),
+        MARKET_FEED_RETENTION_DAYS=parse_int(env, "MARKET_FEED_RETENTION_DAYS", 1, low=0, high=3650),
         CARRY_EXECUTION_STYLE=parse_execution_style(env),
         CARRY_MAKER_WAIT_S=parse_maker_wait(env),
         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),

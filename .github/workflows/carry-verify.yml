@@ -117,6 +117,9 @@ jobs:
           tests/test_open_crash_real_stack.py
           tests/test_secret_scan.py
           tests/test_suite_isolation.py
+          tests/test_md_storage_policy.py
+          tests/test_frozen_and_lineage.py
+          tests/test_fingerprint.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
           tests/test_paper_agent_certification.py

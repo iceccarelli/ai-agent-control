@@ -157,7 +157,8 @@ class MarketStore:
     """Open (creating) a store directory and append/iterate its records."""
 
     def __init__(self, directory: str, *, commit_every: int = 200,
-                 commit_interval_s: float = 1.0, environment: Optional[str] = None) -> None:
+                 commit_interval_s: float = 1.0, environment: Optional[str] = None,
+                 min_free_bytes: int = 0) -> None:
         bad = _forbidden(directory)
         if bad:
             raise StoreError(f"refusing market-data store at {directory!r}: it is inside {bad}")
@@ -172,6 +173,14 @@ class MarketStore:
         self.commit_interval_s = commit_interval_s
         self._lock_fd: Optional[int] = None
         self._latest_day: str = ""
+        #: Free space on the volume below which the store stops writing (0 = no
+        #: reserve). The feed shares its volume with the trading ledger on a
+        #: one-volume deployment; a feed that fills the disk would take the ledger's
+        #: writes down with it. Refusing HERE is the defined, early failure: the
+        #: engine records a store fault, entries stop, held positions are unaffected.
+        self.min_free_bytes = max(0, int(min_free_bytes))
+        self._free_checked_at = float("-inf")
+        self._free_ok_cached = True
         #: "mainnet" | "testnet" | None (a read-only handle that does not care). A
         #: store holds ONE environment: mainnet and testnet prices must never meet.
         self.environment = self._check_environment(environment)
@@ -280,6 +289,7 @@ class MarketStore:
             raise StoreError("payload must be the exact text received")
         data = payload.encode("utf-8")
         sha = hashlib.sha256(data).hexdigest()
+        self._require_free_space()
         with self._lock:
             # Never back to an earlier segment: a wall clock stepped backwards (or a
             # thread racing across midnight) must not interleave two files.
@@ -299,6 +309,36 @@ class MarketStore:
                 self._commit_locked()
             return Record(rid, kind, int(wall_ms), float(mono_s), category, conn_id, topic,
                           payload, sha, chain)
+
+    def free_bytes(self) -> int:
+        st = os.statvfs(self.dir)
+        return int(st.f_bavail) * int(st.f_frsize)
+
+    def _require_free_space(self) -> None:
+        """Raise StoreError when the volume is below the reserve. Looked at most once a
+        second (a statvfs per frame would cost more than the frame); a failed look is
+        itself a refusal, never 'assume there is room'."""
+        if not self.min_free_bytes:
+            return
+        now = time.monotonic()
+        if now - self._free_checked_at >= 1.0:
+            self._free_checked_at = now
+            try:
+                self._free_ok_cached = self.free_bytes() >= self.min_free_bytes
+            except OSError:
+                self._free_ok_cached = False
+        if not self._free_ok_cached:
+            raise StoreError(f"free space on the market-data volume is below the "
+                             f"{self.min_free_bytes}-byte reserve; not writing")
+
+    def apply_retention(self, now_ms: int, retention_days: int) -> List[str]:
+        """Prune whole closed segments older than `retention_days` UTC days (0 = keep
+        everything). The chain checkpoint is written by `prune_segments_before`, so
+        the retained log still verifies and replays from it."""
+        if retention_days <= 0:
+            return []
+        cutoff = _utc_day(int(now_ms) - int(retention_days) * 86_400_000)
+        return self.prune_segments_before(cutoff)
 
     def _commit_locked(self) -> None:
         if self._conn is not None and self._pending:
