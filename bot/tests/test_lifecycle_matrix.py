@@ -90,7 +90,8 @@ def test_the_money_path_imports_no_recorder_or_analytics_module(module):
 
 
 NEW_ANALYTICS = {"evidence_chain", "evidence_stats", "capacity_schema", "funding_eval", "recorder_reliability",
-                 "trade_economics", "opportunity_engine", "profitability_report", "state_backup", "venue_qualification"}
+                 "trade_economics", "opportunity_engine", "profitability_report", "state_backup", "venue_qualification",
+                 "strategy_measure", "anchor_archive", "image_manifest", "statistical_power", "capital_survival"}
 
 
 def _imports_of(path):

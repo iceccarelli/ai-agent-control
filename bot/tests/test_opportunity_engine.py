@@ -1,6 +1,7 @@
 import ast
 import json
 import os
+import random
 
 import pytest
 
@@ -69,7 +70,7 @@ def test_the_module_imports_nothing_that_can_reach_an_order_a_store_or_the_netwo
             imported |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom):
             imported.add((n.module or "").split(".")[0])
-    allowed = {"__future__", "math", "dataclasses", "enum", "typing", "evidence_stats", "trade_economics"}
+    allowed = {"__future__", "math", "dataclasses", "enum", "typing", "evidence_stats", "trade_economics", "funding_eval", "strategy_measure"}
     assert imported <= allowed, imported - allowed
 
 
@@ -139,32 +140,175 @@ def test_the_slice_57_hypothesis_is_never_proven_by_its_own_thin_historical_pass
     assert e.metrics["q2_mean_net_r"] < 0.1 * e.metrics["q1_mean_net_r"]
 
 
-def _basis_rows(days, amp):
+GOOD_EV = None
+
+
+def good_ev():
+    global GOOD_EV
+    if GOOD_EV is None:
+        GOOD_EV = bundle(funding=4.0)["carry"]
+    return GOOD_EV
+
+
+def brows(spec_rows, step_s=300):
+    return [{"at_ms": START + int(i * step_s * 1000), "basis_bps": b} for i, b in enumerate(spec_rows)]
+
+
+def snapback_basis(n_spikes=60, quiet=63, seed=3):
+    rng = random.Random(seed)
     out = []
-    for d in range(days):
-        for k in range(24):
-            t = START + d * 86_400_000 + k * 3_600_000
-            r = clone(BASE, d * 24 + k + 1, t, 0.6, ((t // H8) + 1) * H8)
-            r["basis_bps"] = amp if (k // 6) % 2 else -amp
-            out.append(r)
+    for _ in range(n_spikes):
+        out += [1.0, 1.5, 28.0 + rng.gauss(0, 2), 26.0 + rng.gauss(0, 2), 3.0, 1.0, 1.2] + [1.0 + rng.gauss(0, 0.3) for _ in range(quiet)]
     return out
 
 
-def test_basis_needs_two_weeks_and_a_range_wider_than_cost():
+def test_basis_needs_two_weeks_a_cost_and_trustworthy_evidence_before_it_is_graded():
     spec = OE.REGISTRY["basis_convergence/v1"]
-    assert OE.evaluate_basis(spec, _basis_rows(3, 20.0), round_trip_cost_bps=11.4).status == OE.Status.INSUFFICIENT_EVIDENCE
-    assert OE.evaluate_basis(spec, _basis_rows(20, 2.0), round_trip_cost_bps=11.4).status == OE.Status.ECONOMICALLY_UNATTRACTIVE
-    ok = OE.evaluate_basis(spec, _basis_rows(20, 20.0), round_trip_cost_bps=11.4)
-    assert ok.status == OE.Status.RESEARCH_CANDIDATE and "unmeasured" in ok.reasons[0]
-    assert OE.evaluate_basis(spec, _basis_rows(20, 20.0), round_trip_cost_bps=None).status == OE.Status.INSUFFICIENT_EVIDENCE
+    ev = good_ev()
+    assert "days of basis" in OE.evaluate_basis(spec, brows(snapback_basis(10, 20)), round_trip_cost_bps=11.4, ev=ev).reasons[0]
+    full = brows(snapback_basis())
+    assert (full[-1]["at_ms"] - full[0]["at_ms"]) / 86_400_000 >= 14
+    assert OE.evaluate_basis(spec, full, round_trip_cost_bps=None, ev=ev).status == OE.Status.INSUFFICIENT_EVIDENCE
+    assert OE.evaluate_basis(spec, full, round_trip_cost_bps=11.4, ev=dict(ev, environment="testnet")).status == OE.Status.INSUFFICIENT_EVIDENCE
+    assert OE.evaluate_basis(spec, full, round_trip_cost_bps=11.4, ev=dict(ev, chain_ok=False)).status == OE.Status.INSUFFICIENT_EVIDENCE
 
 
-def test_a_cross_section_needs_more_than_one_recorded_symbol_and_hypotheses_stay_unrun():
+def test_a_basis_that_really_snaps_back_far_beyond_cost_is_a_candidate_with_its_episodes_reported():
+    e = OE.evaluate_basis(OE.REGISTRY["basis_convergence/v1"], brows(snapback_basis()), round_trip_cost_bps=11.4, ev=good_ev())
+    assert e.status == OE.Status.RESEARCH_CANDIDATE and "family-wise" in e.reasons[0] and e.authorizes_trading is False
+    v = [x for x in e.metrics["variants"] if x["ok"]]
+    assert v and all(x["episodes"] >= OE.MIN_EPISODES for x in v) and e.metrics["family_trials"] == OE.FAMILY_TRIALS
+    assert e.metrics["exploratory_screen"]["p95_bps"] - e.metrics["exploratory_screen"]["p05_bps"] > 0        # the range screen is shown, not graded
+
+
+def test_NULL_a_basis_that_does_not_revert_never_becomes_a_candidate_even_when_its_range_exceeds_cost():
+    hits = 0
+    for sd in range(12):
+        rng = random.Random(900 + sd)
+        b, path = 0.0, []
+        for _ in range(20 * 288):
+            b = max(-60.0, min(60.0, b + rng.gauss(0, 4.0)))          # a reflected random walk: wide range, no reversion
+            path.append(b)
+        e = OE.evaluate_basis(OE.REGISTRY["basis_convergence/v1"], brows(path), round_trip_cost_bps=11.4, ev=good_ev())
+        hits += e.status == OE.Status.RESEARCH_CANDIDATE
+        assert e.metrics["exploratory_screen"]["p95_bps"] - e.metrics["exploratory_screen"]["p05_bps"] > 11.4        # the old screen would have said yes
+    assert hits <= 1
+
+
+def test_the_range_screen_alone_is_never_graded_a_square_wave_has_no_variance_to_judge():
+    rows = brows([20.0 if (k // 72) % 2 else -20.0 for k in range(20 * 288)])
+    e = OE.evaluate_basis(OE.REGISTRY["basis_convergence/v1"], rows, round_trip_cost_bps=11.4, ev=good_ev())
+    assert e.status in (OE.Status.INSUFFICIENT_EVIDENCE, OE.Status.RESEARCH_CANDIDATE)
+    assert e.status != OE.Status.RESEARCH_CANDIDATE or any(v["lo"] and v["lo"] > 0 for v in e.metrics["variants"])
+
+
+def price_rows(prices, step_ms=300_000):
+    return [{"at_ms": START + i * step_ms, "perp_mid": p} for i, p in enumerate(prices)]
+
+
+def walk(rets, p0=60000.0):
+    p = [p0]
+    for r in rets:
+        p.append(p[-1] * (1 + r))
+    return p
+
+
+def trending(n, rng, persist=0.98, dsd=0.00012, sd=0.001):
+    mu, out = 0.0, []
+    for _ in range(n):
+        mu = persist * mu + rng.gauss(0, dsd)
+        out.append(mu + rng.gauss(0, sd))
+    return out
+
+
+def test_the_directional_evaluators_refuse_short_history_and_a_missing_cost():
+    ev = good_ev()
+    short = price_rows(walk(trending(20 * 288, random.Random(1))))
+    for fn, key in ((OE.evaluate_trend, "btc_trend_following/v1"), (OE.evaluate_mean_reversion, "btc_mean_reversion/v1")):
+        e = fn(OE.REGISTRY[key], ev, short, 5.7)
+        assert e.status == OE.Status.INSUFFICIENT_EVIDENCE and "fresh holdout" in " ".join(e.reasons)
+        long_ = price_rows(walk(trending(100 * 288, random.Random(1))))
+        assert fn(OE.REGISTRY[key], ev, long_, None).status == OE.Status.INSUFFICIENT_EVIDENCE
+        assert fn(OE.REGISTRY[key], dict(ev, reliability_verdict="STALE"), long_, 5.7).status == OE.Status.INSUFFICIENT_EVIDENCE
+
+
+def test_trend_is_a_candidate_where_persistent_drift_really_exists_and_reversion_never_is_there():
+    """Measured at the family-wise alpha over 100 days of 5-minute bars: the trend variants are a candidate in about 5 of 6 worlds
+    with a real, persistent drift (power is NOT 100 %: that is the price of the multiple-testing correction), and the
+    mean-reversion hypothesis is never a candidate on the same prices."""
+    ev = good_ev()
+    t_hits = m_hits = m_unattractive = 0
+    for sd in range(6):
+        rows = price_rows(walk(trending(100 * 288, random.Random(40 + sd), dsd=0.0002)))
+        t = OE.evaluate_trend(OE.REGISTRY["btc_trend_following/v1"], ev, rows, 0.5)
+        m = OE.evaluate_mean_reversion(OE.REGISTRY["btc_mean_reversion/v1"], ev, rows, 0.5)
+        t_hits += t.status == OE.Status.RESEARCH_CANDIDATE
+        m_hits += m.status == OE.Status.RESEARCH_CANDIDATE
+        m_unattractive += m.status == OE.Status.ECONOMICALLY_UNATTRACTIVE
+        assert "beat zero AND buy-and-hold" in t.metrics["baseline"] and t.authorizes_trading is False
+    assert t_hits >= 3 and m_hits == 0 and m_unattractive >= 4, (t_hits, m_hits, m_unattractive)
+
+
+def test_NULL_neither_directional_hypothesis_becomes_a_candidate_on_a_random_walk():
+    ev = good_ev()
+    hits = 0
+    for sd in range(8):
+        rows = price_rows(walk([random.Random(700 + sd).gauss(0, 0.001) for _ in range(100 * 288)]))
+        for fn, key in ((OE.evaluate_trend, "btc_trend_following/v1"), (OE.evaluate_mean_reversion, "btc_mean_reversion/v1")):
+            hits += fn(OE.REGISTRY[key], ev, rows, 0.5).status == OE.Status.RESEARCH_CANDIDATE
+    assert hits <= 1
+
+
+def test_microstructure_cannot_be_measured_on_rows_that_do_not_carry_imbalance_and_says_why():
+    e = OE.evaluate_microstructure(OE.REGISTRY["microstructure_imbalance/v1"], good_ev(), price_rows(walk([0.0] * 400)), 0.5)
+    assert e.status == OE.Status.INSUFFICIENT_EVIDENCE and "NOT_RECORDED" in " ".join(e.reasons)
+
+
+def test_microstructure_is_measured_when_the_imbalance_is_recorded():
+    rng = random.Random(5)
+    imb = [rng.uniform(-1, 1) for _ in range(6000)]
+    mid = [60000.0]
+    for i in range(5999):
+        mid.append(mid[-1] * (1 + 12.0 * imb[i] / 1e4 + rng.gauss(0, 0.001)))
+    rows = [dict(r, book={"imbalance": x}) for r, x in zip(price_rows(mid), imb)]
+    e = OE.evaluate_microstructure(OE.REGISTRY["microstructure_imbalance/v1"], good_ev(), rows, 1.0)
+    assert e.status == OE.Status.RESEARCH_CANDIDATE and e.metrics["variants"][0]["fill_assumption"].startswith("AT THE MID")
+
+
+def test_the_regime_modifier_needs_a_trustworthy_funding_series_first():
+    e = OE.evaluate_regime(OE.REGISTRY["regime_classifier/v1"], good_ev(), price_rows(walk([0.001] * 100)), {"status": "INSUFFICIENT"})
+    assert e.status == OE.Status.INSUFFICIENT_EVIDENCE and "funding evaluation is not OK" in " ".join(e.reasons)
+
+
+def test_a_cross_section_needs_more_than_one_recorded_symbol():
     spec = OE.REGISTRY["cross_sectional_funding/v1"]
-    e = OE.evaluate_cross_sectional(spec, {"BTCUSDT": [1]})
-    assert e.status == OE.Status.INSUFFICIENT_EVIDENCE and "only ['BTCUSDT']" in e.reasons[0]
-    for k in ("btc_trend_following/v1", "btc_mean_reversion/v1", "microstructure_imbalance/v1", "regime_classifier/v1"):
-        assert OE.evaluate_unrun(OE.REGISTRY[k]).status == OE.Status.INSUFFICIENT_EVIDENCE
+    e = OE.evaluate_cross_sectional(spec, good_ev(), {"BTCUSDT": [1]})
+    assert e.status == OE.Status.INSUFFICIENT_EVIDENCE and "recorder is configured for one symbol" in " ".join(e.reasons)
+
+
+def test_a_multi_instrument_recording_is_measured_with_each_instruments_own_cost():
+    from test_strategy_measure import multi_rows
+    rows = multi_rows(random.Random(9), 120, informative=True)
+    e = OE.evaluate_cross_sectional(OE.REGISTRY["cross_sectional_funding/v1"], good_ev(), rows)
+    assert e.status == OE.Status.RESEARCH_CANDIDATE and "rank information coefficient" in " ".join(e.reasons)
+    assert set(e.metrics["measured"]["round_trip_cost_bps"]) == {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"}
+
+
+def test_every_remaining_hypothesis_has_a_declared_variant_grid_and_the_family_is_counted_once():
+    assert OE.FAMILY_TRIALS == 3 + 3 + 3 + 3 + 3 + 1 and OE.FAMILY_ALPHA == pytest.approx(0.05 / OE.FAMILY_TRIALS)
+    for k in ("basis_convergence/v1", "btc_trend_following/v1", "btc_mean_reversion/v1", "microstructure_imbalance/v1",
+              "regime_classifier/v1", "cross_sectional_funding/v1"):
+        assert k in OE.PREDECLARED
+
+
+def test_evaluate_all_never_labels_an_unimplemented_hypothesis_as_working():
+    out = {o["strategy"]: o for o in OE.evaluate_all(bundle(funding=4.0))}
+    assert out["funding_carry_fade/v1"]["status"] is None
+    for k, o in out.items():
+        assert o["authorizes_trading"] is False and o["order_path_connected"] is False
+        assert o["status"] not in ("ECONOMICALLY_RECONCILED", "EXECUTION_READY", "PROSPECTIVE_MARKET_EDGE_SUPPORTED"), k
+    assert out["microstructure_imbalance/v1"]["status"] == "INSUFFICIENT_EVIDENCE"
+    assert out["cross_sectional_funding/v1"]["status"] == "INSUFFICIENT_EVIDENCE"
 
 
 @pytest.mark.parametrize("kw,needle", [

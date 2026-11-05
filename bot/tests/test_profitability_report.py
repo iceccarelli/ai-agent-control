@@ -211,3 +211,41 @@ def test_a_set_aside_torn_row_appears_in_the_report(tmp_path):
 def test_nonsense_cli_arguments_are_refused_before_any_allocation(tmp_path, flag, value):
     with pytest.raises(SystemExit):
         PR.main(["--dir", str(tmp_path), flag, value])
+
+
+# ---- Phase 3 and 6 in the report: what it would take, and what exposure survives ----
+
+def test_the_report_says_how_many_settlements_it_would_take_to_tell_the_edge_from_noise(tmp_path):
+    rows = series(BASE, 100, lambda T, t: 4.0, noisy(4.0, 0.5))
+    rep = report(lay_down(tmp_path, rows), rows)
+    pw = rep["required_observations"]
+    assert pw["status"] == "OK" and pw["n_hypotheses"] == 16 and pw["adjust"] == "holm"
+    need = [r["required_raw_settlements"] for r in pw["table"]]
+    assert need == sorted(need, reverse=True) and all(n > 0 for n in need)            # a bigger edge needs fewer observations
+    assert all(r["available_joined_settlements"] == rep["funding_evaluation"]["joined"] for r in pw["table"])
+    text = PR.render(rep)
+    assert "6b POWER" in text and "effective" in text and "ASSUMED" in pw["reading"]
+
+
+def test_without_variance_there_is_nothing_to_size_a_study_from(tmp_path):
+    rows = series(BASE, 100, lambda T, t: 4.0, lambda T: 4.0)
+    pw = report(lay_down(tmp_path, rows), rows)["required_observations"]
+    assert pw["status"] == "INSUFFICIENT" and "variance" in pw["reason"]
+
+
+def test_the_exposure_ceiling_is_zero_with_every_reason_named_whatever_the_funding_looks_like(tmp_path):
+    rows = series(BASE, 100, lambda T, t: 4.0, noisy(4.0, 0.5))
+    rep = report(lay_down(tmp_path, rows), rows)
+    ex = rep["exposure_recommendation"]
+    rec = ex["recommendation"]
+    assert rec["max_leverage"] == 0.0 and rec["authorizes_trading"] is False and rec["label"].startswith("ZERO")
+    assert "VENUE_RULES_ASSUMED_NOT_VERIFIED" in rec["reasons"] and "FEE_TIER_UNVERIFIED" in rec["reasons"]
+    assert ex["venue_rules_status"] == "ASSUMED_NOT_VENUE_VERIFIED"
+    assert "6c EXPOSURE" in PR.render(rep) and "ZERO" in PR.render(rep)
+
+
+def test_when_the_economics_are_withheld_the_exposure_is_zero_and_no_survival_table_is_built(tmp_path):
+    rows = series(BASE, 9, lambda T, t: 6.0, noisy(6.0, 0.4))
+    ex = report(lay_down(tmp_path, rows), rows)["exposure_recommendation"]
+    assert ex["table"] is None and ex["recommendation"]["max_leverage"] == 0.0
+    assert "FUNDING_EVIDENCE_INSUFFICIENT" in ex["recommendation"]["reasons"]

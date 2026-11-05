@@ -39,6 +39,8 @@ from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import evidence_stats as ES
+import funding_eval as FE
+import strategy_measure as SM
 import trade_economics as TE
 
 
@@ -104,6 +106,27 @@ _RISK = {"min_liquidation_headroom_pct": 20.0, "max_single_settlement_loss_bps":
          "min_fillable_share": 0.9, "max_round_trip_cost_bps": 15.0}
 _COMMON_REJECT = ("insufficient or untrustworthy evidence", "net edge below the lowest screening hurdle",
                   "execution cost or fillability destroys the edge", "risk limits breached")
+
+#: PREDECLARED variants. They are fixed here, before any evaluation, and are never tuned to the data. Every variant listed is
+#: examined in every evaluation run, so a result is judged against the WHOLE family: the significance level of each interval is
+#: ``FAMILY_ALPHA`` = 0.05 divided by the number of variants across ALL hypotheses (Bonferroni), not by the number that won.
+PREDECLARED: Dict[str, Dict[str, Any]] = {
+    "basis_convergence/v1": {"theta_in_cost_multiples": (1.5, 2.0, 3.0), "theta_out_fraction_of_in": 0.25, "max_hold_h": 24.0},
+    "btc_trend_following/v1": {"ema_bars": ((12, 48), (48, 192), (96, 384))},
+    "btc_mean_reversion/v1": {"zscore_bars": ((48, 2.0, 0.5), (96, 2.0, 0.5), (288, 2.5, 0.5))},
+    "microstructure_imbalance/v1": {"horizon_snapshots": (1, 3, 12), "theta": 0.6},
+    "regime_classifier/v1": {"vol_window_bars": 288, "min_history_bars": 576, "regimes": ("LOW", "MID", "HIGH")},
+    "cross_sectional_funding/v1": {"top_k": 1, "hold_settlements": 21, "offset_min": 30},
+}
+FAMILY_TRIALS = (len(PREDECLARED["basis_convergence/v1"]["theta_in_cost_multiples"]) + len(PREDECLARED["btc_trend_following/v1"]["ema_bars"])
+                 + len(PREDECLARED["btc_mean_reversion/v1"]["zscore_bars"]) + len(PREDECLARED["microstructure_imbalance/v1"]["horizon_snapshots"])
+                 + len(PREDECLARED["regime_classifier/v1"]["regimes"]) + 1)
+FAMILY_ALPHA = 0.05 / FAMILY_TRIALS
+#: Floors below which a measured edge is not even described (screening controls, not proofs).
+MIN_EPISODES = 30
+MIN_SPAN_DAYS = 14                  # basis episodes
+MIN_DIRECTIONAL_DAYS = 90           # trend / mean reversion: a quarter of bars, whatever the cadence
+MIN_ALIGNED_SETTLEMENTS = 90
 
 REGISTRY: Dict[str, StrategySpec] = {s.key: s for s in (
     StrategySpec(
@@ -405,28 +428,188 @@ def basis_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
             "lag1_autocorr_per_snapshot": rho, "half_life_snapshots": half}
 
 
-def evaluate_basis(spec: StrategySpec, rows: Sequence[Mapping[str, Any]], *, round_trip_cost_bps: Optional[float]) -> Evaluation:
-    st = basis_stats(rows)
-    if st.get("n", 0) < 3 or st.get("independent_days", 0) < 14:
-        return _insufficient(spec, f"{st.get('independent_days', 0)} independent days of basis recorded; at least 14 needed", **st)
-    if round_trip_cost_bps is None:
-        return _insufficient(spec, "no measured round-trip cost", **st)
-    spread_capture = st["p95_bps"] - st["p05_bps"]
-    if spread_capture <= round_trip_cost_bps:
+def _evidence_reasons(ev: Mapping[str, Any]) -> List[str]:
+    """The reasons the RECORDED evidence cannot support any screen (the same gates every evaluator applies first)."""
+    reasons: List[str] = []
+    if not ev.get("validation_ok"):
+        reasons.append("evidence stream failed validation or holds no schema-v2 rows")
+    if not ev.get("chain_ok"):
+        reasons.append("evidence is not completely chained and consistent (an unchained row or a failed chain)")
+    if ev.get("reliability_verdict") != "HEALTHY":
+        reasons.append(f"recorder is {ev.get('reliability_verdict')}: only HEALTHY evidence can support a screen")
+    if ev.get("environment") != "mainnet":
+        reasons.append(f"evidence environment is {ev.get('environment')!r}: only mainnet evidence can support a mainnet claim")
+    return reasons
+
+
+def _grade(spec: StrategySpec, family: Sequence[Mapping[str, Any]], what: str, metrics: Dict[str, Any]) -> Evaluation:
+    """Map the measured variants of ONE hypothesis to a status. ``family`` holds, per variant, ``mean`` and the interval
+    (already at the FAMILY alpha) of the quantity that must be positive. A candidate needs a variant whose lower bound is
+    above zero; a hypothesis whose every adequately sampled variant has a non-positive mean is unattractive; anything else
+    cannot be told from zero. Never above RESEARCH_CANDIDATE: no registration or prospective path exists for these yet."""
+    sampled = [f for f in family if f.get("ok")]
+    metrics = dict(metrics, family_trials=FAMILY_TRIALS, family_alpha=FAMILY_ALPHA)
+    if not sampled:
+        return _insufficient(spec, f"no predeclared variant has enough {what} to be judged", **metrics)
+    winners = [f for f in sampled if f["lo"] is not None and f["lo"] > 0]
+    if winners:
+        best = max(winners, key=lambda f: f["lo"])
+        return Evaluation(spec.key, spec.origin, Status.RESEARCH_CANDIDATE,
+                          [f"variant {best['label']} has a lower bound above zero at the family-wise level (alpha {FAMILY_ALPHA:.4f} for "
+                           f"{FAMILY_TRIALS} predeclared variants across all hypotheses); in-sample, not prospectively confirmed; authorises nothing",
+                           "net of the stated costs only; unpriced inputs and account-level facts are unresolved"], metrics)
+    if all(f["mean"] is not None and f["mean"] <= 0 for f in sampled):
         return Evaluation(spec.key, spec.origin, Status.ECONOMICALLY_UNATTRACTIVE,
-                          [f"the 5-95% basis range ({spread_capture:.1f} bps) does not exceed the round-trip cost "
-                           f"({round_trip_cost_bps:.1f} bps)"], st)
-    return Evaluation(spec.key, spec.origin, Status.RESEARCH_CANDIDATE,
-                      ["in-sample basis range exceeds cost; episodes, convergence time and adverse widening still unmeasured"], st)
+                          [f"every adequately sampled variant ({len(sampled)}) has a non-positive mean net of costs"], metrics)
+    return _insufficient(spec, "a positive mean in at least one variant cannot be told from zero at the family-wise level", **metrics)
 
 
-def evaluate_cross_sectional(spec: StrategySpec, rows_by_symbol: Mapping[str, Sequence[Mapping[str, Any]]]) -> Evaluation:
+def evaluate_basis(spec: StrategySpec, rows: Sequence[Mapping[str, Any]], *, round_trip_cost_bps: Optional[float],
+                   ev: Optional[Mapping[str, Any]] = None) -> Evaluation:
+    """Measure real convergence episodes under each predeclared threshold. The 5-95 % range exceeding the cost is only an
+    exploratory screen (``basis_stats``) and is reported, never graded."""
+    st = basis_stats(rows)
+    reasons = _evidence_reasons(ev) if ev is not None else []
+    if round_trip_cost_bps is None:
+        reasons.append("no measured round-trip cost")
+    span = (rows[-1]["at_ms"] - rows[0]["at_ms"]) / 86_400_000.0 if len(rows) >= 2 else 0.0
+    if span < MIN_SPAN_DAYS:
+        reasons.append(f"{span:.1f} days of basis recorded; at least {MIN_SPAN_DAYS} needed")
+    if reasons:
+        return _insufficient(spec, *reasons, exploratory_screen=st)
+    g = PREDECLARED[spec.key]
+    fam = []
+    for mult in g["theta_in_cost_multiples"]:
+        tin = round_trip_cost_bps * mult
+        res = SM.basis_episodes(rows, SM.BasisParams(tin, tin * g["theta_out_fraction_of_in"], g["max_hold_h"] * 3600.0, round_trip_cost_bps),
+                                alpha=FAMILY_ALPHA)
+        ci = res["net"]["ci"]
+        fam.append({"label": f"theta_in={mult}x cost", "ok": res["episodes"] >= MIN_EPISODES, "mean": res["net"]["mean"],
+                    "lo": ci.get("lo") if ci.get("status") == "OK" else None, "episodes": res["episodes"],
+                    "failure_share": res["failure_share"], "adverse_widening_bps": res["adverse_widening_bps"],
+                    "hold_hours": res["hold_hours"]})
+    return _grade(spec, fam, f"episodes ({MIN_EPISODES} needed)", {"variants": fam, "exploratory_screen": st,
+                                                                    "reading": "basis P&L only; funding earned during the hold is not added"})
+
+
+def _mid_series(rows: Sequence[Mapping[str, Any]]) -> Tuple[List[float], float]:
+    mids, ts = [], []
+    for r in rows:
+        m = r.get("perp_mid")
+        if SM._fin(m) and m > 0:
+            mids.append(float(m))
+            ts.append(r["at_ms"])
+    if len(ts) < 3:
+        return mids, 0.0
+    dts = sorted(b - a for a, b in zip(ts, ts[1:]) if b > a)
+    med_s = dts[len(dts) // 2] / 1000.0
+    return mids, (365.0 * 86400.0 / med_s if med_s > 0 else 0.0)
+
+
+def _directional(spec: StrategySpec, ev: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], make_rule, variants, cost_bps: Optional[float]) -> Evaluation:
+    reasons = _evidence_reasons(ev)
+    mids, bars_per_year = _mid_series(rows)
+    span = (rows[-1]["at_ms"] - rows[0]["at_ms"]) / 86_400_000.0 if len(rows) >= 2 else 0.0
+    if span < MIN_DIRECTIONAL_DAYS:
+        reasons.append(f"{span:.1f} days of price recorded; at least {MIN_DIRECTIONAL_DAYS} needed (already-examined history is not a fresh holdout)")
+    if cost_bps is None:
+        reasons.append("no measured one-way cost: a directional result without it is not an edge")
+    if reasons:
+        return _insufficient(spec, *reasons, days=span)
+    fam = []
+    for v in variants:
+        rule = make_rule(v)
+        warm = max(v[0] if isinstance(v[0], int) else 0, v[1] if len(v) > 1 and isinstance(v[1], int) else 0, 1)
+        res = SM.run_directional(mids, rule, one_way_cost_bps=cost_bps, bars_per_year=bars_per_year, eval_start=warm * 3, alpha=FAMILY_ALPHA)
+        if res.get("status") != "MEASURED":
+            continue
+        net, exc = res["net_per_bar"], res["excess_vs_hold_per_bar"]
+        lo = net["ci"].get("lo") if net["ci"].get("status") == "OK" else None
+        lo_x = exc["ci"].get("lo") if exc["ci"].get("status") == "OK" else None
+        both = lo if (lo is not None and lo_x is not None and lo_x > 0) else (None if lo is None else min(lo, lo_x if lo_x is not None else -1.0))
+        fam.append({"label": str(v), "ok": res["bars"] >= 5000, "mean": net["mean"], "lo": both, "net_annualised_pct": res["net_annualised_pct"],
+                    "hold_annualised_pct": res["hold_annualised_pct"], "max_drawdown_pct": res["max_drawdown_pct"]})
+    return _grade(spec, fam, "bars (5000 needed)", {"variants": fam, "days": span, "baseline": "buy-and-hold over the same window; "
+                                                      "a variant must beat zero AND buy-and-hold"})
+
+
+def evaluate_trend(spec: StrategySpec, ev: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], cost_bps: Optional[float]) -> Evaluation:
+    return _directional(spec, ev, rows, lambda v: SM.EMACross(*v), PREDECLARED[spec.key]["ema_bars"], cost_bps)
+
+
+def evaluate_mean_reversion(spec: StrategySpec, ev: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], cost_bps: Optional[float]) -> Evaluation:
+    return _directional(spec, ev, rows, lambda v: SM.ZScoreReversion(*v), PREDECLARED[spec.key]["zscore_bars"], cost_bps)
+
+
+def evaluate_microstructure(spec: StrategySpec, ev: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], cost_bps: Optional[float]) -> Evaluation:
+    reasons = _evidence_reasons(ev)
+    imb = [(r.get("book") or {}).get("imbalance") for r in rows]
+    if not rows or any(not SM._fin(x) for x in imb):
+        reasons.append("NOT_RECORDED: the capacity rows carry level counts, not top-of-book imbalance; the full-depth log holds it but "
+                       "no extraction into evidence rows exists, so this hypothesis cannot be measured on recorded data")
+    if cost_bps is None:
+        reasons.append("no measured one-way cost")
+    if reasons:
+        return _insufficient(spec, *reasons)
+    mids, _ = _mid_series(rows)
+    fam = []
+    g = PREDECLARED[spec.key]
+    for h in g["horizon_snapshots"]:
+        res = SM.imbalance_trades(imb, mids, horizon=h, theta=g["theta"], one_way_cost_bps=cost_bps, alpha=FAMILY_ALPHA)
+        ci = res["net_bps_per_trade"]["ci"]
+        fam.append({"label": f"horizon={h}", "ok": res["trades"] >= MIN_EPISODES, "mean": res["net_bps_per_trade"]["mean"],
+                    "lo": ci.get("lo") if ci.get("status") == "OK" else None, "trades": res["trades"], "fill_assumption": res["fill_assumption"]})
+    return _grade(spec, fam, f"trades ({MIN_EPISODES} needed)", {"variants": fam})
+
+
+def evaluate_regime(spec: StrategySpec, ev: Mapping[str, Any], rows: Sequence[Mapping[str, Any]], fe: Optional[Mapping[str, Any]]) -> Evaluation:
+    reasons = _evidence_reasons(ev)
+    if not fe or fe.get("status") != "OK":
+        reasons.append("the funding evaluation is not OK: there is no trustworthy per-settlement series to condition")
+    if reasons:
+        return _insufficient(spec, *reasons)
+    g = PREDECLARED[spec.key]
+    mids, _ = _mid_series(rows)
+    labels_row = SM.regime_labels(mids, window=g["vol_window_bars"], min_history=g["min_history_bars"])
+    ts = [r["at_ms"] for r in rows if SM._fin(r.get("perp_mid")) and r["perp_mid"] > 0]
+    labels, values = [], []
+    for rec in FE.join(rows)["joined"]:
+        cut = rec["settlement_ms"] - 30 * 60_000                       # the label known 30 minutes before the settlement
+        idx = max((i for i, t in enumerate(ts) if t <= cut), default=None)
+        labels.append(labels_row[idx] if idx is not None and idx < len(labels_row) else None)
+        values.append(rec["realised_bps"])
+    res = SM.regime_conditioning(labels, values, alpha=FAMILY_ALPHA)
+    if res.get("status") != "MEASURED":
+        return _insufficient(spec, res.get("reason", "regime conditioning not measurable"), **{k: v for k, v in res.items() if k != "reason"})
+    if res["improves_out_of_sample"]:
+        return Evaluation(spec.key, spec.origin, Status.RESEARCH_CANDIDATE,
+                          ["conditioning on the chosen regime improved the second half at the family-wise level; a modifier: it changes the "
+                           "carry's economics only if confirmed prospectively"], res)
+    return _insufficient(spec, "no out-of-sample improvement from conditioning on a volatility regime was detected", **res)
+
+
+def evaluate_cross_sectional(spec: StrategySpec, ev: Mapping[str, Any], rows_by_symbol: Mapping[str, Sequence[Mapping[str, Any]]]) -> Evaluation:
     syms = sorted(s for s, r in rows_by_symbol.items() if r)
-    if len(syms) < 2:
-        return _insufficient(spec, f"only {syms or 'no symbols'} recorded; a cross-section needs at least two on one clock",
-                             symbols=syms)
-    return _insufficient(spec, "a per-symbol funding/depth evaluation pipeline for a second instrument is not implemented; "
-                               "recording more symbols is the prerequisite", symbols=syms)
+    reasons = _evidence_reasons(ev)
+    if len(syms) < 3:
+        reasons.append(f"{len(syms)} instrument(s) recorded ({syms or 'none'}); the recorder is configured for one symbol, so a cross-section "
+                       "needs a multi-instrument recording first (at least 3, each with its own depth and fee schedule)")
+    if reasons:
+        return _insufficient(spec, *reasons, symbols=syms)
+    g = PREDECLARED[spec.key]
+    res = SM.cross_sectional_funding(rows_by_symbol, baseline="BTCUSDT", k=g["top_k"], hold_settlements=g["hold_settlements"],
+                                     offset_min=g["offset_min"], alpha=FAMILY_ALPHA)
+    if res.get("status") != "MEASURED":
+        return _insufficient(spec, res.get("reason", "not measurable"), symbols=syms)
+    e = res["net_edge_bps_per_settlement_vs_baseline"]
+    ic = res["rank_information_coefficient"]
+    fam = [{"label": "top-1 vs BTC", "ok": res["aligned_settlements"] >= MIN_ALIGNED_SETTLEMENTS, "mean": e["mean"],
+            "lo": e["ci"].get("lo") if e["ci"].get("status") == "OK" else None}]
+    ev_out = _grade(spec, fam, f"aligned settlements ({MIN_ALIGNED_SETTLEMENTS} needed)", {"measured": res})
+    if ev_out.status == Status.RESEARCH_CANDIDATE:
+        ev_out.reasons.append(f"rank information coefficient {ic['mean']:.2f}: a high-funding instrument beats BTC whatever the forecast skill; "
+                              "the coefficient says whether the FORECASTS add anything")
+    return ev_out
 
 
 def evaluate_btc_fade(spec: StrategySpec, slice57: Optional[Mapping[str, Any]]) -> Evaluation:
@@ -465,6 +648,9 @@ def frozen(spec: StrategySpec) -> Dict[str, Any]:
 
 def evaluate_all(bundle: Mapping[str, Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    carry = bundle.get("carry") or {}
+    rt = carry.get("round_trip_cost_bps")
+    one_way = None if rt is None else rt / 2.0         # the overlay's round trip is perpetual-only: half of it is one trade
     for key, spec in REGISTRY.items():
         if spec.origin == FROZEN_ABSENT:
             out.append(frozen(spec))
@@ -483,10 +669,17 @@ def evaluate_all(bundle: Mapping[str, Any]) -> List[Dict[str, Any]]:
         elif key == "funding_carry_fade_btc/v1":
             out.append(evaluate_btc_fade(spec, bundle.get("slice57")).as_dict())
         elif key == "basis_convergence/v1":
-            out.append(evaluate_basis(spec, bundle.get("rows") or [],
-                                      round_trip_cost_bps=(bundle.get("carry") or {}).get("round_trip_cost_bps")).as_dict())
+            out.append(evaluate_basis(spec, bundle.get("rows") or [], round_trip_cost_bps=carry.get("round_trip_cost_bps"), ev=carry).as_dict())
         elif key == "cross_sectional_funding/v1":
-            out.append(evaluate_cross_sectional(spec, bundle.get("rows_by_symbol") or {}).as_dict())
+            out.append(evaluate_cross_sectional(spec, carry, bundle.get("rows_by_symbol") or {}).as_dict())
+        elif key == "btc_trend_following/v1":
+            out.append(evaluate_trend(spec, carry, bundle.get("rows") or [], one_way).as_dict())
+        elif key == "btc_mean_reversion/v1":
+            out.append(evaluate_mean_reversion(spec, carry, bundle.get("rows") or [], one_way).as_dict())
+        elif key == "microstructure_imbalance/v1":
+            out.append(evaluate_microstructure(spec, carry, bundle.get("rows") or [], one_way).as_dict())
+        elif key == "regime_classifier/v1":
+            out.append(evaluate_regime(spec, carry, bundle.get("rows") or [], carry.get("funding_eval")).as_dict())
         else:
             out.append(evaluate_unrun(spec).as_dict())
     return out

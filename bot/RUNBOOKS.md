@@ -146,7 +146,9 @@ Run on the recorder's data directory (or a copy; it never writes there):
 
     python3 tools/profitability_report.py --dir /data/market --history /data/monitor/monitor.jsonl --notional 100000 --hold-days 30
 
-* **Integrity:** every capacity row is validated against `capacity/2`; the sidecar chain is checked
+* **Integrity (separate states, no single flag):** every capacity row is validated against `capacity/2`; a row with no chain entry
+  is never admitted and blocks the economics block; each file is graded ANCHORED_CURRENT / ANCHORED_LAGGING / STALE_ANCHOR /
+  UNANCHORED / ANCHOR_CONFLICT by its LATEST anchor; and the sidecar chain is checked
   against the head copied into `monitor.jsonl` (a second copy on the same volume: external to the evidence directory, not to the machine, until you archive it off the machine). A broken chain in ANY file,
   a mixed stream, a regression, a duplicate or more than 1 % rejected rows withholds the economics block entirely; the report says so.
 * **Dependence:** unique settlements, not snapshots, are the unit, and settlements are themselves serially dependent:
@@ -163,6 +165,10 @@ Run on the recorder's data directory (or a copy; it never writes there):
 * **Money:** two returns (on hedged notional, on fully allocated economic capital), the 10/15/20 %/yr
   screens labelled `PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED`, and an explicit list of UNKNOWN
   inputs (latency, the account's real fee tier, venue margin rules). Replace them with the owner's.
+* **What a status means:** `PROSPECTIVE_MARKET_EDGE_SUPPORTED` is a statement about the PUBLIC market. `ECONOMICALLY_RECONCILED` needs account
+  records (real fee schedule, reconciled account funding settlements, real fills with fee records, measured costs, verified
+  margin rules) that nothing in this repository produces yet, so no run of this report can reach it; `EXECUTION_READY` additionally needs a
+  separate owner authorisation record. No status authorises trading.
 * **Never** read it as realised cash: no cash settlement is read from the venue by this tool.
 
 ## 16. Operational verification (owner, read-only; run before and after any deploy decision)
@@ -189,6 +195,43 @@ the run, `production-image`, `shadow-runtime-image`, `secret-scan`, `dependency-
 up-to-date branches; require code-owner review; disallow force pushes and deletions. Do not allow
 administrators to bypass if the owner wants the gate to bind the owner too. Read the exact check names from
 a recent run before saving the rule: a required check that never reports blocks every merge.
+
+## 18. Does the RUNNING recorder contain this code? (owner, read-only; merging a PR does not change a running machine)
+A running Fly machine changes only when an image is built and deployed. Merging PR #217 changes the repository, not
+`carry-drill`. To establish what is actually running, from a checkout of the commit you want to compare:
+
+    python3 bot/tools/image_manifest.py expected > expected.txt        # reads only the repository
+    python3 bot/tools/image_manifest.py command                         # prints ONE read-only command; run it yourself, save its output as actual.txt
+    python3 bot/tools/image_manifest.py compare --expected expected.txt --actual actual.txt
+    fly image show -a carry-drill                                       # record the registry image and digest beside the result
+    fly status -a carry-drill                                           # machine id, version, restarts
+
+`compare` reports per file MATCH / DIFFERENT / MISSING_ON_MACHINE for the files that ARE the recorder (the recorder,
+monitor, supervisor, feed, capacity, chain and schema modules) and a verdict. An image built before this change lacks
+several of them, which shows as MISSING_ON_MACHINE: that is the expected answer, and it means the old recorder is still
+running. The drill image carries no commit label, so the tool compares bytes, not tags. **A recorder release is a
+separate step from any trading-engine release and needs your explicit authorisation; nothing in this PR requests it.**
+
+## 19. External anchor archive (owner; moves the chain head off the recorder machine)
+Chain heads copied into `monitor.jsonl` sit on the same volume as the evidence. To make a rewrite detectable by someone who
+controls that volume, keep the heads where the machine cannot reach:
+
+    fly ssh console -a carry-drill -C "tail -n 400 /data/monitor/monitor.jsonl" > monitor_tail.jsonl     # read-only fetch, no secret in it
+    python3 bot/tools/anchor_archive.py append --history monitor_tail.jsonl --archive anchors.jsonl        # on YOUR machine
+    python3 bot/tools/anchor_archive.py latest --archive anchors.jsonl                                     # prints the archive head
+
+Do this at least daily (the monitor's history is bounded). Store the printed **archive head** (one 64-hex value) and its entry
+count somewhere the recorder machine cannot reach: a password-manager note, a mail to yourself, a private repository.
+`append` refuses, and writes nothing, if a file's anchor goes BACKWARDS (the evidence was truncated) or the same row count
+reappears with a different head (the chain was rewritten). Then, on a copy of `/data/market` on your machine:
+
+    python3 bot/tools/profitability_report.py --dir <copy> --history monitor_tail.jsonl --anchor-archive anchors.jsonl \
+        --archive-head <the value you stored> --archive-entries <its count>
+
+The report then says `EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE` only if the archive is exactly what you recorded (or has
+only grown). The tool cannot see where you keep the value: that remains your claim, and it is printed as one. An automated version
+(a scheduled job that runs the read-only fetch and appends to a private repository) is possible but needs your decision about
+where the secrets for it live; it is not part of this PR.
 
 ## Backups: what is not done
 Nothing here schedules a backup, stores one off-volume, or has restored one. That needs the owner.

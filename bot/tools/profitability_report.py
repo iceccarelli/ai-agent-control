@@ -41,12 +41,15 @@ BOT = os.path.dirname(HERE)
 if BOT not in sys.path:
     sys.path.insert(0, BOT)
 
+import anchor_archive as AA       # noqa: E402
+import capital_survival as CAP    # noqa: E402
 import capacity_schema as CS      # noqa: E402
 import evidence_chain as EC       # noqa: E402
 import evidence_stats as ES       # noqa: E402
 import funding_eval as FE         # noqa: E402
 import opportunity_engine as OE   # noqa: E402
 import recorder_reliability as RR # noqa: E402
+import statistical_power as SP    # noqa: E402
 import trade_economics as TE      # noqa: E402
 
 ASSUMED_VENUE_RULES = {"collateral_haircut": 0.10, "initial_margin_rate": 0.10, "maintenance_margin_rate": 0.005,
@@ -81,10 +84,67 @@ def anchors_from_history(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]
     return out
 
 
+
+def _power_section(fe: Optional[Dict[str, Any]], notional_usd: float, hold_days: float) -> Dict[str, Any]:
+    """How many settlements it would take to tell funding that clears the lowest screening hurdle from noise, at the family-wise
+    alpha, from the observed variance and dependence. A statement about WHAT WOULD BE NEEDED, not a result."""
+    if not fe or fe["realised_bps"].get("sd") in (None, 0) or not fe["realised_bps"].get("ess_ratio"):
+        return {"status": "INSUFFICIENT", "reason": "no joined settlements with variance and a measured effective sample size yet"}
+    rb = fe["realised_bps"]
+    n_settle = max(1.0, hold_days * 3.0)
+    lowest = min(TE.SCREENING_HURDLES_PCT)
+    # mean funding per settlement (bps of hedged notional) at which an ILLUSTRATIVE position (inventory = notional, 10 % reserve)
+    # earns the lowest screen after an ASSUMED 11.4 bps round trip: reserve-inclusive capital x hurdle x hold / 365, plus the cost
+    threshold = (1.1 * lowest / 100.0 * hold_days / 365.0 * 1e4 + 11.4) / n_settle
+    rows = []
+    for edge in (0.1, 0.25, 0.5):
+        r = SP.required_observations(rb["sd"], edge, alpha=0.05, power=0.8, n_hypotheses=OE.FAMILY_TRIALS, adjust="holm",
+                                     ess_ratio=rb["ess_ratio"])
+        rows.append({"edge_above_threshold_bps_per_settlement": edge, "status": r["status"],
+                     "required_effective_n": r.get("required_effective_n"), "required_raw_settlements": r.get("required_raw_n"),
+                     "required_days": None if r.get("required_raw_n") is None else r["required_raw_n"] / 3.0,
+                     "available_joined_settlements": fe["joined"], "available_effective_n": rb.get("ess")})
+    return {"status": "OK", "threshold_bps_per_settlement": threshold, "observed_sd_bps": rb["sd"], "ess_ratio": rb["ess_ratio"],
+            "alpha": 0.05, "power": 0.8, "n_hypotheses": OE.FAMILY_TRIALS, "adjust": "holm", "table": rows,
+            "reading": (f"to show mean funding exceeds {threshold:.2f} bps/settlement (what the illustrative position needs to earn the lowest "
+                        f"{TE.PROVISIONAL} screen after an ASSUMED 11.4 bps round trip) by the edge in each row, at the family-wise level and 80% power, "
+                        "given the variance and dependence OBSERVED so far; only as good as that sd and ESS ratio"),
+            "classes": {"threshold": "ASSUMED (illustrative position and cost)", "sd_and_ess_ratio": "ESTIMATED", "counts": "CALCULATED"}}
+
+
+def _exposure_section(fe, economics, withheld, accepted, notional_usd, hold_days, total_cost) -> Dict[str, Any]:
+    """The capital-survival recommendation. It is ALLOWED to be, and today is, ZERO exposure; every reason is listed. Leverage
+    levels above 1x are analysis only and are never recommended."""
+    status = fe["status"] if fe else None
+    if economics is None or fe is None or not accepted:
+        rec = CAP.recommend_exposure({}, edge_lower_bound=None, funding_evidence_status=status)
+        return {"recommendation": rec, "table": None, "reading": "ZERO exposure: the evidence gates for the economics block are not cleared, so no "
+                "survival table is built from it"}
+    res = economics["result"]
+    f_lo = economics["inputs"]["funding_used_bps_per_settlement"]
+    edge_lb = f_lo - (res.get("breakeven_funding_bps_per_settlement") or 0.0)
+    costs = TE.Costs(perp_entry_fee_bps=accepted[-1]["fees"]["perp_taker_bps"], perp_exit_fee_bps=accepted[-1]["fees"]["perp_taker_bps"],
+                     spread_bps=0.0, fee_provenance="UNVERIFIED")
+    inputs = CAP.CarryInputs(capital_usd=notional_usd, hold_days=hold_days, funding_bps_path=[f_lo] * max(1, int(round(hold_days * 3))),
+                             costs=costs, reserve_frac_of_notional=0.1)
+    table = CAP.survival_table(inputs)
+    rec = CAP.recommend_exposure(table, edge_lower_bound=edge_lb, funding_evidence_status=status)
+    return {"recommendation": rec, "edge_lower_bound_bps_per_settlement_over_breakeven": edge_lb,
+            "stress_survival_limit_analysis_only": table.get("stress_survival_limit"), "venue_rules_status": table.get("venue_rules_status"),
+            "reading": "a research ceiling on exposure, never an instruction; levels above 1x are analysis only"}
+
+
 def build(directory: str, *, now_ms: int, history: Optional[str] = None, notional_usd: float = 100_000.0,
-          hold_days: float = 30.0, artifacts_dir: Optional[str] = None) -> Dict[str, Any]:
+          hold_days: float = 30.0, artifacts_dir: Optional[str] = None, anchor_archive: Optional[str] = None,
+          archive_head: Optional[str] = None, archive_entries: Optional[int] = None) -> Dict[str, Any]:
     paths = sorted(p for p in glob.glob(os.path.join(directory, "capacity-*.jsonl")))
     anchors = anchors_from_history(history)
+    archive = None
+    if anchor_archive:
+        archive = AA.verify(anchor_archive, owner_held_head=archive_head, owner_held_entries=archive_entries)
+        entries, _problems = AA.read_archive(anchor_archive)
+        for fname, lst in AA.anchors_by_file(entries).items():          # entries before any break in the archive's own chain
+            anchors.setdefault(fname, []).extend(lst)
     files: List[Dict[str, Any]] = []
     all_rows: List[Any] = []
     blockers: List[str] = []
@@ -138,6 +198,10 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         return sum(1 for f in files if f["state"] != "LEGACY_PRE_CHAIN" and f["chain"][key] == value)
 
     chain_files = [f for f in files if f["state"] != "LEGACY_PRE_CHAIN"]
+    if archive and archive["problems"]:
+        blockers.append("the anchor archive fails its own chain: " + "; ".join(archive["problems"][:2]))
+    if archive and archive["owner_held_head_matches"] is False:
+        blockers.append("the anchor archive does NOT match the head the owner stored off-machine")
     summary = {
         "validated_rows": val["n_valid_rows"], "rejected_rows": val["n_rejected"],
         "legacy_quarantined_rows": val["n_legacy_quarantined"],
@@ -153,7 +217,9 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         "files_unanchored": _count("anchor_status", "UNANCHORED"),
         "files_anchor_conflict": _count("anchor_status", "ANCHOR_CONFLICT"),
         "max_anchor_lag_rows": max((f["chain"]["anchor_lag_rows"] for f in chain_files if f["chain"]["anchor_lag_rows"] is not None), default=None),
-        "anchor_location": ("SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE" if any(f["external_anchors"] for f in files) else "NONE"),
+        "anchor_location": ((archive or {}).get("location") if archive and archive["location"] != "NO_ARCHIVE" else
+                            "SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE" if any(f["external_anchors"] for f in files) else "NONE"),
+        "anchor_archive": archive,
         "economic_evidence_blockers": blockers,
         "economic_evidence_eligible": bool(chain_files) and not blockers and val["stream_ok"],
     }
@@ -205,6 +271,8 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                                 "funding_used_is": fe["realised_bps"]["conservative_lo_is"] + " of the realised public mean",
                                 "venue_rules": ASSUMED_VENUE_RULES},
                      "result": TE.compute(pos, costs, [f_lo] * n_settle, funding_source="PUBLIC_REALISED")}
+    power = _power_section(fe, notional_usd, hold_days)
+    exposure = _exposure_section(fe, economics, withheld, accepted, notional_usd, hold_days, total_cost)
     bundle = {"carry": {"validation_ok": val["stream_ok"], "chain_ok": summary["economic_evidence_eligible"], "integrity": summary, "environment": env,
                         "reliability_verdict": rel["verdict"], "funding_eval": fe or {}, "economics": economics["result"] if economics else {},
                         "fillable_share": fillable, "round_trip_cost_bps": total_cost, "prospective": {}},
@@ -227,6 +295,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                      "wording": "'book-fillable snapshots' = snapshots in which the DISPLAYED book could fill the size; "
                                 "not executable liquidity"},
         "economics": economics, "economics_withheld_because": withheld,
+        "required_observations": power, "exposure_recommendation": exposure,
         "opportunities": OE.evaluate_all(bundle),
         "authorizes_trading": False,
     }
@@ -301,6 +370,18 @@ def render(rep: Dict[str, Any]) -> str:
         out.append("    screens (" + TE.PROVISIONAL + "), on modelled costs only: " + ", ".join(f"{h['hurdle_apr_pct']:g}% -> {'meets' if h['meets'] else 'misses'}" for h in res["hurdles"]))
     else:
         out.append("6 ECONOMICS   WITHHELD: " + "; ".join(rep["economics_withheld_because"]))
+    pw = rep["required_observations"]
+    if pw.get("status") == "OK":
+        out.append(f"6b POWER      {pw['reading']}")
+        for row in pw["table"]:
+            out.append(f"    edge +{row['edge_above_threshold_bps_per_settlement']:g} bps: {row['required_effective_n']} effective = "
+                       f"{row['required_raw_settlements']} settlements ({_f(row['required_days'], 0)} days) needed; have "
+                       f"{row['available_joined_settlements']} joined, ESS {_f(row['available_effective_n'], 1)}")
+    else:
+        out.append(f"6b POWER      {pw.get('reason')}")
+    ex = rep["exposure_recommendation"]["recommendation"]
+    out.append(f"6c EXPOSURE   research ceiling {ex['max_leverage']:g}x ({ex['label']}); " + ("reasons: " + ", ".join(ex["reasons"]) if ex["reasons"] else "no blocking reason")
+               + "; not an instruction")
     out.append("7 OPPORTUNITIES")
     for o in rep["opportunities"]:
         out.append(f"    {o['strategy']:<34} {o['origin']:<26} {o['status'] or 'FROZEN_ABSENT (never re-evaluated)'}")
@@ -314,6 +395,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dir", required=True)
     ap.add_argument("--history", default=None, help="monitor.jsonl: its copied chain heads are anchors (same volume; archive it off the machine to make them external)")
+    ap.add_argument("--anchor-archive", default=None, help="tools/anchor_archive.py archive kept off the recorder machine")
+    ap.add_argument("--archive-head", default=None, help="the archive head you stored somewhere the recorder machine cannot reach")
+    ap.add_argument("--archive-entries", type=int, default=None, help="the entry count at the time you stored it (a longer archive is then accepted)")
     ap.add_argument("--notional", type=float, default=100_000.0)
     ap.add_argument("--hold-days", type=float, default=30.0)
     ap.add_argument("--now-ms", type=int, default=None)
@@ -324,7 +408,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not (math.isfinite(a.notional) and a.notional > 0):
         ap.error("--notional must be a finite positive number of USD")
     now = a.now_ms if a.now_ms is not None else int(time.time() * 1000)
-    rep = build(a.dir, now_ms=now, history=a.history, notional_usd=a.notional, hold_days=a.hold_days)
+    rep = build(a.dir, now_ms=now, history=a.history, notional_usd=a.notional, hold_days=a.hold_days,
+                anchor_archive=a.anchor_archive, archive_head=a.archive_head, archive_entries=a.archive_entries)
     print(json.dumps(rep, indent=2, sort_keys=True, default=str) if a.json else render(rep))
     return 0
 

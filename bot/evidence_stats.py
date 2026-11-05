@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import random
+from operator import mul as _mul
 from statistics import NormalDist
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -50,12 +51,19 @@ def effective_sample_size(xs: Sequence[float]) -> Optional[float]:
     n = len(xs)
     if n < 2:
         return float(n) if n else None
-    if len(set(xs)) == 1 or (max(xs) - min(xs)) <= 1e-12 * max(1.0, abs(sum(xs) / n)):
+    mean_ = sum(xs) / n
+    if len(set(xs)) == 1 or (max(xs) - min(xs)) <= 1e-12 * max(1.0, abs(mean_)):
+        return 1.0
+    xc = [x - mean_ for x in xs]                      # centred once; each lag is then one C-level pass
+    den = sum(map(_mul, xc, xc))
+    if den <= 0:
         return 1.0
     s = 0.0
     for k in range(1, n // 2 + 1):
-        rho = autocorr(xs, k)
-        if rho is None or rho <= 0:
+        if n < k + 2:
+            break
+        rho = sum(map(_mul, xc, xc[k:])) / den
+        if rho <= 0:
             break
         s += (1 - k / n) * rho
     return max(1.0, min(float(n), n / (1.0 + 2.0 * s)))
