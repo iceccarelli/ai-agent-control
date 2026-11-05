@@ -277,23 +277,27 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
          (econ.get("returns") or {}).get("annualised_pct_on_economic_capital"),
          "round_trip_cost_bps": ev.get("round_trip_cost_bps"), "fillable_share": ev.get("fillable_share"),
          "worst_realised_settlement_bps": worst, "liquidation_headroom_pct": liq}
-    if liq is not None and liq < risk["min_liquidation_headroom_pct"]:
+    if not _num(liq):
+        return Evaluation(spec.key, spec.origin, Status.RISK_UNACCEPTABLE, ["liquidation headroom is missing or not a finite number"], m)
+    if liq < risk["min_liquidation_headroom_pct"]:
         return Evaluation(spec.key, spec.origin, Status.RISK_UNACCEPTABLE,
                           [f"liquidation headroom {liq:.1f}% < {risk['min_liquidation_headroom_pct']}%"], m)
-    if not cap.get("initial_margin_sufficient", False):
+    if cap.get("initial_margin_sufficient") is not True:
         return Evaluation(spec.key, spec.origin, Status.RISK_UNACCEPTABLE, ["initial margin not sufficient"], m)
-    if worst is not None and worst < -risk["max_single_settlement_loss_bps"]:
+    if not _num(worst):
+        return Evaluation(spec.key, spec.origin, Status.RISK_UNACCEPTABLE, ["the worst realised settlement is missing or not finite"], m)
+    if worst < -risk["max_single_settlement_loss_bps"]:
         return Evaluation(spec.key, spec.origin, Status.RISK_UNACCEPTABLE,
                           [f"a settlement paid {worst:.1f} bps against the position"], m)
-    if (ev.get("fillable_share") is None or ev["fillable_share"] < risk["min_fillable_share"]
-            or ev.get("round_trip_cost_bps") is None or ev["round_trip_cost_bps"] > risk["max_round_trip_cost_bps"]):
+    fs_, rt_ = ev.get("fillable_share"), ev.get("round_trip_cost_bps")
+    if not (_num(fs_) and _num(rt_)) or fs_ < risk["min_fillable_share"] or rt_ > risk["max_round_trip_cost_bps"]:
         return Evaluation(spec.key, spec.origin, Status.EXECUTION_UNATTRACTIVE,
-                          ["book-fillable share or round-trip cost outside the declared limits"], m)
+                          ["book-fillable share or round-trip cost missing, not finite, or outside the declared limits"], m)
     ret = m["annualised_pct_on_economic_capital"]
     lowest = min(TE.SCREENING_HURDLES_PCT)
-    if ret is None or ret < lowest:
+    if not _num(ret) or ret < lowest:
         return Evaluation(spec.key, spec.origin, Status.ECONOMICALLY_UNATTRACTIVE,
-                          [f"net {ret if ret is None else round(ret, 2)}%/yr on economic capital (lower-bound funding) is below the lowest "
+                          [f"net {ret if not _num(ret) else round(ret, 2)}%/yr on economic capital (lower-bound funding) is below the lowest "
                            f"{TE.PROVISIONAL} screen of {lowest}%"], m)
     headroom = unknown_cost_headroom_bps(econ, lowest)
     m["unknown_cost_headroom_bps_round_trip"] = headroom
@@ -314,7 +318,8 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
                            "cash, a modelled fill is not an execution, a predicted rebate is not a rebate received",
                            "unmet for ECONOMICALLY_RECONCILED: " + "; ".join(gaps)], m)
     auth = ev.get("execution_authorisation") or {}
-    if (auth.get("owner_authorised") is True and isinstance(auth.get("reference"), str) and auth["reference"].strip()
+    ref = auth.get("reference")
+    if (auth.get("owner_authorised") is True and isinstance(ref, str) and len(ref.strip()) >= 8 and any(c.isalnum() for c in ref)
             and auth.get("scope") == spec.key):
         return Evaluation(spec.key, spec.origin, Status.EXECUTION_READY,
                           ["economically reconciled from account records AND a separate owner execution-authorisation record "
@@ -341,29 +346,36 @@ def unknown_cost_headroom_bps(econ: Mapping[str, Any], lowest_hurdle_pct: float)
     return (net - required) / n * 1e4
 
 
+EXTERNAL_ARCHIVE = "EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE"
+
+
 def _prospective_market_edge(ev: Mapping[str, Any], lowest: float, headroom: Optional[float]) -> Optional[bool]:
+    """Every claim is typed and finite: a string, a bool, a NaN or an infinity is not a registration time or a count. NOTHING in
+    this repository registers a hypothesis or derives these figures from rows, and the report supplies none, so this is
+    unreachable from the CLI today; it is the gate a future registration mechanism must satisfy, not evidence."""
     pro = ev.get("prospective") or {}
-    post = pro.get("post_registration_annualised_pct_on_economic_capital")
-    grade = integrity_grade(ev)
-    if (pro.get("registered_ms") and pro.get("first_evidence_ms") and pro["registered_ms"] < pro["first_evidence_ms"]
-            and pro.get("n_after_registration", 0) >= PROSPECTIVE_SETTLEMENTS
-            and pro.get("post_registration_ess", 0) >= PROSPECTIVE_SETTLEMENTS / 9.0
-            and post is not None and post >= lowest
-            and grade == "ANCHORED"
-            and headroom is not None and headroom >= MIN_UNKNOWN_COST_HEADROOM_BPS):
+    reg, first = pro.get("registered_ms"), pro.get("first_evidence_ms")
+    n_after, ess, post = pro.get("n_after_registration"), pro.get("post_registration_ess"), pro.get("post_registration_annualised_pct_on_economic_capital")
+    if (type(reg) is int and type(first) is int and 0 < reg < first
+            and type(n_after) is int and n_after >= PROSPECTIVE_SETTLEMENTS
+            and _num(ess) and ess >= PROSPECTIVE_SETTLEMENTS / 9.0
+            and _num(post) and post >= lowest
+            and integrity_grade(ev) == "ANCHORED"
+            and _num(headroom) and headroom >= MIN_UNKNOWN_COST_HEADROOM_BPS):
         return True
     return None
 
 
 def integrity_grade(ev: Mapping[str, Any]) -> str:
-    """ANCHORED only when every chained evidence file has a current or lagging external anchor that matches; anything
-    else is NOT_FULLY_ANCHORED (or CONFLICT). Absent integrity detail is NOT anchored."""
+    """ANCHORED only when every chained evidence file has a current or lagging anchor that matches AND the anchors are held in
+    an archive whose head matches a value the OWNER stored off the machine. Copies in ``monitor.jsonl`` sit on the recorder's own
+    volume, so they grade ANCHORED_SAME_VOLUME_ONLY, which is not enough. Absent detail is NOT anchored."""
     i = ev.get("integrity") or {}
     chained = (i.get("files_total") or 0) - (i.get("files_legacy_pre_chain") or 0)
-    if i.get("files_anchor_conflict"):
+    if i.get("files_anchor_conflict") or i.get("files_missing_but_anchored"):
         return "CONFLICT"
     if chained > 0 and (i.get("files_anchored_current") or 0) + (i.get("files_anchored_lagging") or 0) == chained:
-        return "ANCHORED"
+        return "ANCHORED" if i.get("anchor_location") == EXTERNAL_ARCHIVE else "ANCHORED_SAME_VOLUME_ONLY"
     return "NOT_FULLY_ANCHORED"
 
 
@@ -371,48 +383,63 @@ def _num(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+MAX_PLAUSIBLE_FEE_BPS = 100.0       # a per-side perpetual fee beyond 1 % is a unit error, not a tier
+
+
 def reconciliation_gaps(ev: Mapping[str, Any], spec: Optional[StrategySpec] = None) -> List[str]:
     """Every account-level requirement that is NOT met, as readable strings; empty means the account evidence is complete.
-    Nothing in this repository produces ``ev['account']``: until account reconciliation tooling exists and is run by the
-    owner, every one of these is a gap, by design. A structurally complete object is necessary, not sufficient: its values
-    are claims by whoever assembled it."""
+    Nothing in this repository produces ``ev['account']``: until account reconciliation tooling exists and is run by the owner,
+    every one of these is a gap, by design. A structurally complete object is necessary, NOT sufficient: its values are claims by
+    whoever assembled it. So every field is type-strict (a bool is not an int, a string is not a number), bounded, and CROSS-CHECKED
+    against the account ledger it is supposed to have produced; an unknown execution mode is treated as maker/hybrid, never as
+    taker."""
     gaps: List[str] = []
     a = ev.get("account") or {}
     econ = ev.get("economics") or {}
+    ae = ev.get("account_economics") or {}
+    ledger_n = (ae.get("capital") or {}).get("hedged_notional_usd")
+    ledger_taker = None
+    if _num(ledger_n) and ledger_n > 0 and _num((ae.get("components_usd") or {}).get("perp_entry_fee_usd")):
+        ledger_taker = -ae["components_usd"]["perp_entry_fee_usd"] / ledger_n * 1e4
     fs = a.get("fee_schedule") or {}
-    if not (fs.get("provenance") == "ACCOUNT_VERIFIED" and _num(fs.get("taker_bps")) and fs["taker_bps"] > 0 and _num(fs.get("maker_bps"))):
-        gaps.append("account_fee_schedule: the account's real taker/maker rates are not read from the account (published defaults are not them)")
+    if not (fs.get("provenance") == "ACCOUNT_VERIFIED" and _num(fs.get("taker_bps")) and 0 < fs["taker_bps"] <= MAX_PLAUSIBLE_FEE_BPS
+            and _num(fs.get("maker_bps")) and -MAX_PLAUSIBLE_FEE_BPS <= fs["maker_bps"] <= fs["taker_bps"]
+            and (ae.get("fees") or {}).get("verified") is True
+            and ledger_taker is not None and abs(ledger_taker - fs["taker_bps"]) <= 1e-6 * max(1.0, fs["taker_bps"])):
+        gaps.append("account_fee_schedule: the account's real taker/maker rates are not read from the account, are implausible, or "
+                    "differ from the fee the account ledger charged (published defaults are not them)")
     q = a.get("product_qualification") or {}
     if not (q.get("verdict") == "QUALIFIED" and q.get("environment") == "mainnet" and q.get("product") == "BTCUSDT linear"
-            and isinstance(q.get("evidence_ref"), str) and q["evidence_ref"].strip()):
+            and isinstance(q.get("evidence_ref"), str) and len(q["evidence_ref"].strip()) >= 4):
         gaps.append("product_account_qualification: no QUALIFIED verdict for this account and product (EU is unqualified)")
     st = a.get("funding_settlements") or {}
-    if not (st.get("source") == "ACCOUNT_SETTLED" and st.get("reconciled") is True and st.get("unreconciled") == 0
-            and isinstance(st.get("settlements_reconciled"), int) and st["settlements_reconciled"] >= MIN_ACCOUNT_SETTLEMENTS):
-        gaps.append(f"account_funding_settlements: fewer than {MIN_ACCOUNT_SETTLEMENTS} ACCOUNT_SETTLED funding rows reconciled, "
-                    "or any unreconciled (a public funding print is not account cash)")
+    ledger_settle = (ae.get("funding") or {}).get("settlements")
+    if not (st.get("source") == "ACCOUNT_SETTLED" and st.get("reconciled") is True and type(st.get("unreconciled")) is int
+            and st["unreconciled"] == 0 and type(st.get("settlements_reconciled")) is int
+            and st["settlements_reconciled"] >= MIN_ACCOUNT_SETTLEMENTS and st["settlements_reconciled"] == ledger_settle):
+        gaps.append(f"account_funding_settlements: fewer than {MIN_ACCOUNT_SETTLEMENTS} ACCOUNT_SETTLED funding rows reconciled, any "
+                    "unreconciled, or a count that differs from the account ledger (a public funding print is not account cash)")
     fl = a.get("fills") or {}
     if not (fl.get("evidence_class") == "ACCOUNT_EXECUTION" and fl.get("reconciled") is True
-            and isinstance(fl.get("fills"), int) and fl["fills"] >= 2 * MIN_ACCOUNT_ROUND_TRIPS
-            and isinstance(fl.get("fee_records"), int) and fl["fee_records"] >= fl["fills"]
-            and isinstance(fl.get("round_trips"), int) and fl["round_trips"] >= MIN_ACCOUNT_ROUND_TRIPS):
+            and all(type(fl.get(k)) is int for k in ("fills", "fee_records", "round_trips"))
+            and fl["fills"] >= 2 * MIN_ACCOUNT_ROUND_TRIPS and fl["fee_records"] >= fl["fills"] and fl["round_trips"] >= MIN_ACCOUNT_ROUND_TRIPS):
         gaps.append("fills_and_fee_records: no reconciled ACCOUNT_EXECUTION fills with a fee record each (a modelled fill is not an execution)")
     xc = a.get("execution_costs") or {}
     prov = xc.get("provenance") or {}
     needed = ("latency", "market_impact", "slippage")
     mode = (ev.get("execution") or {}).get("mode", "taker")
-    if mode in ("maker", "hybrid"):
+    if mode != "taker":                      # maker, hybrid, or ANY unrecognised value: fail closed
         needed += ("maker_fill_probability", "adverse_selection")
-    if econ.get("unknowns") or any(prov.get(k) != "MEASURED" for k in needed):
-        gaps.append("execution_and_operational_costs: " + ("unpriced inputs remain (" + ", ".join(econ.get("unknowns") or []) + "); " if econ.get("unknowns") else "")
+    if econ.get("unknowns") or ae.get("unknowns") or any(prov.get(k) != "MEASURED" for k in needed):
+        gaps.append("execution_and_operational_costs: " + ("unpriced inputs remain (" + ", ".join(econ.get("unknowns") or ae.get("unknowns") or []) + "); "
+                    if (econ.get("unknowns") or ae.get("unknowns")) else "")
                     + "not every input is MEASURED (" + ", ".join(k for k in needed if prov.get(k) != "MEASURED") + ")")
     cc = a.get("capital") or {}
     if not (cc.get("reconciled") is True and cc.get("source") == "ACCOUNT_READ"):
         gaps.append("capital_and_collateral: balances and collateral are not reconciled against an account read")
     vr = a.get("venue_rules") or {}
-    if not (vr.get("verified") is True and isinstance(vr.get("source"), str) and vr["source"].strip()):
+    if not (vr.get("verified") is True and isinstance(vr.get("source"), str) and len(vr["source"].strip()) >= 4):
         gaps.append("venue_margin_and_liquidation_rules: initial/maintenance margin, haircuts and liquidation rules are ASSUMED, not verified")
-    ae = ev.get("account_economics") or {}
     lowest = min(TE.SCREENING_HURDLES_PCT)
     ret = (ae.get("returns") or {}).get("annualised_pct_on_economic_capital")
     if not ((ae.get("funding") or {}).get("source") == "ACCOUNT_SETTLED" and (ae.get("fees") or {}).get("verified") is True

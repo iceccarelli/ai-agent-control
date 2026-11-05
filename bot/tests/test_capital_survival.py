@@ -996,6 +996,12 @@ def table(kind="good"):
     return copy.deepcopy(_TABLES[kind])
 
 
+def NE1():
+    """N / E of the 1x book: the research ceiling is stated in hedged notional over FULLY ALLOCATED economic capital, so with a
+    reserve it is below 1.0 (1 / (1 + reserve fraction)), never above."""
+    return next(b for b in table()["books"] if b["leverage"] == 1.0)["capital"]["notional_over_economic_capital"]
+
+
 def rec(t=None, **kw):
     d = dict(edge_lower_bound=0.2, funding_evidence_status="OK")
     d.update(kw)
@@ -1004,7 +1010,7 @@ def rec(t=None, **kw):
 
 def test_all_favourable_inputs_give_the_research_ceiling_of_exactly_1x_and_no_authority():
     r = rec()
-    assert r["max_leverage"] == 1.0 and r["reasons"] == [] and r["zero_exposure"] is False
+    assert r["max_leverage"] == pytest.approx(NE1()) and r["reasons"] == [] and r["zero_exposure"] is False
     assert r["authorizes_trading"] is False and r["levels_above_1x"] == "NOT_RECOMMENDABLE"
     assert r["limiting_factor"] == "HARD_CAP_1X" and r["venue_rules_status"] == "VENUE_VERIFIED"
     assert table()["stress_survival_limit"] == 3.0                     # the book could survive more; the ceiling still stops at 1.0
@@ -1050,7 +1056,7 @@ def test_zero_exposure_when_the_1x_book_was_never_stress_tested():
 def test_stress_that_only_breaks_higher_levels_does_not_zero_the_1x_ceiling():
     t = table()
     assert t["books"][-1]["stress"]["survives_all"] is False and t["books"][0]["stress"]["survives_all"] is True
-    assert rec(t)["max_leverage"] == 1.0
+    assert rec(t)["max_leverage"] == pytest.approx(NE1())
 
 
 def test_zero_exposure_when_the_venue_rules_are_only_assumed():
@@ -1062,8 +1068,8 @@ def test_zero_exposure_when_the_venue_rules_are_only_assumed():
 def test_zero_exposure_when_financing_is_unknown():
     r = rec(financing_status="FINANCING_UNKNOWN")
     assert r["max_leverage"] == 0.0 and r["reasons"] == ["FINANCING_UNKNOWN"] and r["financing_status"] == "FINANCING_UNKNOWN"
-    assert rec(financing_status="SCENARIO_RATES_SUPPLIED")["max_leverage"] == 1.0
-    assert rec(financing_status="NOT_REQUIRED")["max_leverage"] == 1.0
+    assert rec(financing_status="SCENARIO_RATES_SUPPLIED")["max_leverage"] == pytest.approx(NE1())
+    assert rec(financing_status="NOT_REQUIRED")["max_leverage"] == pytest.approx(NE1())
 
 
 def test_zero_exposure_when_the_fee_tier_is_unverified():
@@ -1099,7 +1105,7 @@ def test_all_inputs_favourable_but_venue_rules_only_assumed_is_still_zero_end_to
     assert r["max_leverage"] == 0.0 and r["reasons"] == ["VENUE_RULES_ASSUMED_NOT_VERIFIED"] and r["label"] == "ZERO_EXPOSURE"
     verified = CS.recommend_exposure(CS.survival_table(inputs()), edge_lower_bound=e["edge_lower_bound_bps"],
                                      funding_evidence_status="OK", kelly_fractional=k, financing_status="NOT_REQUIRED")
-    assert verified["max_leverage"] == 1.0                           # same inputs, only the rules differ
+    assert verified["max_leverage"] == pytest.approx(NE1())                           # same inputs, only the rules differ
 
 
 def test_a_table_labelled_assumed_stays_assumed_even_if_the_stored_rules_claim_otherwise():
@@ -1149,7 +1155,7 @@ def test_kelly_never_lifts_the_ceiling_above_1x():
         r = rec(kelly_fractional=k)
         assert r["max_leverage"] <= 1.0
     r = rec(kelly_fractional=50.0)
-    assert r["max_leverage"] == 1.0 and r["limiting_factor"] == "HARD_CAP_1X" and r["limits"]["kelly_fractional"] == 50.0
+    assert r["max_leverage"] == pytest.approx(NE1()) and r["limiting_factor"] == "HARD_CAP_1X" and r["limits"]["kelly_fractional"] == 50.0
 
 
 def test_a_smaller_kelly_fraction_lowers_the_ceiling_and_is_named_as_the_limit():
@@ -1162,11 +1168,11 @@ def test_kelly_never_lifts_the_ceiling_above_the_stress_survival_limit():
     assert rec(t, kelly_fractional=50.0)["max_leverage"] == 0.0
     t = table("limit_1x")                                              # 1x survives, 1.25x does not
     assert t["stress_survival_limit"] == 1.0
-    assert rec(t, kelly_fractional=50.0)["max_leverage"] == 1.0
+    assert rec(t, kelly_fractional=50.0)["max_leverage"] == pytest.approx(NE1())
     capped = table()
     capped["stress_survival_limit"] = 0.5                              # hand-set to test the min(): the ceiling follows it
     r = rec(capped, kelly_fractional=50.0)
-    assert r["max_leverage"] == 0.5 and r["limiting_factor"] == "STRESS_SURVIVAL_LIMIT"
+    assert r["max_leverage"] == pytest.approx(0.5 * NE1()) and r["limiting_factor"] == "STRESS_SURVIVAL_LIMIT"
 
 
 def test_a_zero_survival_limit_with_no_stress_reason_is_still_zero_exposure():
@@ -1193,7 +1199,7 @@ def test_the_ceiling_is_never_above_1x_whatever_the_combination_and_zero_wheneve
 
 def test_evidence_of_a_great_edge_does_not_scale_the_ceiling_there_is_no_automatic_scaling():
     base = rec(edge_lower_bound=0.01, kelly_fractional=None)["max_leverage"]
-    assert rec(edge_lower_bound=1e12, kelly_fractional=1e12)["max_leverage"] == base == 1.0
+    assert rec(edge_lower_bound=1e12, kelly_fractional=1e12)["max_leverage"] == base == pytest.approx(NE1())
     banned = re.compile(r"scale|scaling|auto|size|sizing|order|trade|execute|submit|place|ramp|escalat|promote", re.I)
     public = [n for n in dir(CS) if not n.startswith("_") and callable(getattr(CS, n))
               and getattr(getattr(CS, n), "__module__", None) == "capital_survival"]
@@ -1334,3 +1340,17 @@ def test_module_level_constants_are_the_documented_ones():
     assert CS.assumed_venue_rules().verified is False and CS.assumed_venue_rules().source == ""
     doc = " ".join(CS.__doc__.split())
     assert "hedged notional / fully allocated economic capital" in doc and "FINANCING" in doc and "ASSUMED_NOT_VENUE_VERIFIED" in doc
+
+
+def test_the_ceiling_never_permits_more_notional_than_the_one_x_book_holds_per_unit_of_economic_capital():
+    """The third review: with a 10 % reserve the old cap of 1.0 permitted N / E = 1.0, i.e. N / C = 1.11 and financed notional. The cap is
+    now the 1x book's own N / E (0.909 here), and a larger reserve lowers it further."""
+    for rho in (0.0, 0.1, 0.25, 0.5):
+        t = CS.survival_table(inputs(reserve_frac_of_notional=rho), scenarios=[CS.StressScenario("calm")])
+        r = CS.recommend_exposure(t, edge_lower_bound=0.2, funding_evidence_status="OK", financing_status="NOT_REQUIRED") \
+            if False else CS.recommend_exposure(dict(t, venue_rules_status=CS.VERIFIED_VENUE_RULES, fee_provenance=CS.FEES_VERIFIED),
+                                                edge_lower_bound=0.2, funding_evidence_status="OK")
+        ne1 = next(b for b in t["books"] if b["leverage"] == 1.0)["capital"]["notional_over_economic_capital"]
+        assert ne1 == pytest.approx(1.0 / (1.0 + rho))
+        assert r["max_leverage"] <= ne1 + 1e-12, (rho, r)
+        assert r["limits"]["hard_cap"] == pytest.approx(ne1)

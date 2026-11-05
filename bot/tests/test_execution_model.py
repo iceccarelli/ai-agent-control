@@ -1244,3 +1244,13 @@ def test_the_scenario_itself_is_validated():
         run(scenario(fees=(5.5, 10.0)))
     with pytest.raises(TypeError):
         EM.compare_execution_modes({"mode": "overlay"})
+
+
+def test_the_provenance_tripwire_refuses_more_than_the_word_simulated():
+    """A tripwire, not a proof (an account record cannot prove where it came from), but it should not be defeated by the obvious synonyms."""
+    base = dict(order_id="o", symbol="BTCUSDT", market="spot", side="buy", intent=EM.MAKER_POST_ONLY, status="FILLED",
+                qty_requested=1.0, qty_filled=1.0, submitted_ms=1.0, terminal_ms=2.0, avg_fill_price=1.0)
+    EM.AccountExecutionRecord(**{**base, "source": "venue"})
+    for src in ("paper", "mock", "replay", "fake", "monte_carlo", "generated", "SimFill_v2", "estimated fills", "derived from model", "Paper trading"):
+        with pytest.raises(EM.EvidenceClassError):
+            EM.AccountExecutionRecord(**{**base, "source": src})

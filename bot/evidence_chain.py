@@ -19,13 +19,16 @@ the monitor, every ``monitor.jsonl`` line the external watcher reads). `verify` 
   HEAD_MISSING / HEAD_MISMATCH / ANCHOR_MISMATCH   the head cannot be verified
 
 Honest limits:
+  * A row adopted by ``reseal_tail`` was written without a chain entry; it is chained afterwards and marked, and ``admitted_rows``
+    leaves it OUT of every statistic (a crash costs one row of evidence; a forged row is never evidence).
   * A writer with access to every file AND to the anchors can forge a consistent history. The
     anchors copied into ``monitor.jsonl`` are a SECOND COPY ON THE SAME VOLUME: they are external to
     the evidence directory, not to the machine. They become genuinely external only when the owner
     archives ``monitor.jsonl`` (or the printed head) off the machine. Without any anchor a consistent
     truncation of the tail cannot be detected, and the report says "UNANCHORED".
-  * Each day's chain starts from the all-zero genesis; there is no link between days. Removing a
-    whole day (file and sidecars) shows as a gap in the reliability report, not as a chain failure.
+  * Each day's chain starts from the all-zero genesis; there is no link between days. Removing a whole day (file and sidecars)
+    is NOT a chain failure. It is caught only by an anchor for that file (the report then lists it as missing but anchored) or,
+    if no anchor exists, by the reliability report's gap/completeness measures, which a small removal can stay under.
 Pure standard library.
 """
 from __future__ import annotations
@@ -326,7 +329,8 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
             "verified_prefix_rows": len(chain) if internally_consistent else 0,   # the rows a reader may ADMIT; unchained rows are never among them
             "tamper_evident_ok": internally_consistent,               # deprecated alias of internally_consistent (it tolerates an unchained tail)
             "anchor_status": anchor_status, "chain_rows": len(chain), "latest_anchor_rows": latest, "anchor_lag_rows": lag,
-            "anchored": anchor_status in (ANCHORED_CURRENT, ANCHORED_LAGGING), "resealed_rows": resealed, "sidecar_torn_tail": side_torn,
+            "anchored": anchor_status in (ANCHORED_CURRENT, ANCHORED_LAGGING), "resealed_rows": resealed,
+            "resealed_indices": [i for i, e in enumerate(chain) if e.get("resealed")], "sidecar_torn_tail": side_torn,
             "torn_aside_bytes": (os.path.getsize(path + ".torn") if os.path.exists(path + ".torn") else 0),
             "n_rows": len(lines), "n_chained": len(chain), "unchained_tail": unchained,
             "head": None if not chain else {"n": chain[-1]["n"], "head": chain[-1]["h"]},
@@ -339,7 +343,8 @@ def admitted_rows(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = No
     verification admits nothing. Read-only: this never repairs."""
     v = verify(path, anchors)
     lines, _ = read_lines(path)
-    return rows_of(lines[:v["verified_prefix_rows"]]), v
+    skip = set(v["resealed_indices"])           # a row ADOPTED by a repair was never chained when written: visible, counted, not evidence
+    return [r for i, r in enumerate(rows_of(lines[:v["verified_prefix_rows"]])) if i not in skip], v
 
 
 def reseal_tail(path: str) -> int:

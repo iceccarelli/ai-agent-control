@@ -24,7 +24,8 @@ def position(**kw):
 
 
 ANCHORED = {"files_total": 1, "files_legacy_pre_chain": 0, "files_anchored_current": 1, "files_anchored_lagging": 0,
-            "files_stale_anchor": 0, "files_unanchored": 0, "files_anchor_conflict": 0}
+            "files_stale_anchor": 0, "files_unanchored": 0, "files_anchor_conflict": 0, "files_missing_but_anchored": [],
+            "anchor_location": "EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE"}
 NOT_ANCHORED = dict(ANCHORED, files_anchored_current=0, files_unanchored=1)
 PRO_OK = {"registered_ms": START - 1, "first_evidence_ms": START, "n_after_registration": 270,
           "post_registration_ess": 60.0, "post_registration_annualised_pct_on_economic_capital": 14.0}
@@ -354,7 +355,7 @@ def full_account():
     return {
         "fee_schedule": {"provenance": "ACCOUNT_VERIFIED", "taker_bps": 5.5, "maker_bps": 2.0},
         "product_qualification": {"verdict": "QUALIFIED", "environment": "mainnet", "product": "BTCUSDT linear", "evidence_ref": "owner-ref-1"},
-        "funding_settlements": {"source": "ACCOUNT_SETTLED", "reconciled": True, "unreconciled": 0, "settlements_reconciled": 120},
+        "funding_settlements": {"source": "ACCOUNT_SETTLED", "reconciled": True, "unreconciled": 0, "settlements_reconciled": 90},
         "fills": {"evidence_class": "ACCOUNT_EXECUTION", "reconciled": True, "fills": 12, "fee_records": 12, "round_trips": 6},
         "execution_costs": {"provenance": {"latency": "MEASURED", "market_impact": "MEASURED", "slippage": "MEASURED"}},
         "capital": {"reconciled": True, "source": "ACCOUNT_READ"},
@@ -420,6 +421,12 @@ def _drop(path):
     ("account settlements are the public print", lambda a: (a["funding_settlements"].update(source="PUBLIC_REALISED"), a)[1], "account_funding_settlements"),
     ("an unreconciled settlement", lambda a: (a["funding_settlements"].update(unreconciled=1), a)[1], "account_funding_settlements"),
     ("too few settlements", lambda a: (a["funding_settlements"].update(settlements_reconciled=30), a)[1], "account_funding_settlements"),
+    ("settlement count differs from the ledger", lambda a: (a["funding_settlements"].update(settlements_reconciled=120), a)[1], "account_funding_settlements"),
+    ("unreconciled is False not 0", lambda a: (a["funding_settlements"].update(unreconciled=False), a)[1], "account_funding_settlements"),
+    ("an absurd taker fee", lambda a: (a["fee_schedule"].update(taker_bps=1e12), a)[1], "account_fee_schedule"),
+    ("maker above taker", lambda a: (a["fee_schedule"].update(maker_bps=9.0), a)[1], "account_fee_schedule"),
+    ("fee differs from the ledger", lambda a: (a["fee_schedule"].update(taker_bps=4.0), a)[1], "account_fee_schedule"),
+    ("fills counts as bools", lambda a: (a["fills"].update(fills=True), a)[1], "fills_and_fee_records"),
     ("fills are modelled, not executions", lambda a: (a["fills"].update(evidence_class="SIMULATED_FILL"), a)[1], "fills_and_fee_records"),
     ("fills without fee records", lambda a: (a["fills"].update(fee_records=3), a)[1], "fills_and_fee_records"),
     ("latency UNKNOWN", lambda a: (a["execution_costs"]["provenance"].update(latency="UNKNOWN"), a)[1], "execution_and_operational_costs"),
@@ -519,3 +526,59 @@ def test_simulated_or_derived_results_can_never_be_passed_off_as_account_fills()
     spec = OE.REGISTRY["maker_hybrid_execution/v1"]
     with pytest.raises(EM.EvidenceClassError):
         OE.evaluate_execution(spec, dict(good_ev(), account_execution_records=[{"qty_filled": 1.0, "source": "simulated"}]))
+
+
+def test_an_unrecognised_execution_mode_is_treated_as_maker_never_as_taker():
+    for mode in ("Maker", "MAKER", "hybrid ", "post_only", "", None, 3):
+        acct = full_account()
+        acct["execution_costs"]["provenance"].update(maker_fill_probability="ASSUMED", adverse_selection="ASSUMED")
+        st, e = status(reconciled(account=acct, execution={"mode": mode}))
+        assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED, mode
+    assert status(reconciled(account=full_account(), execution={"mode": "taker"}))[0] == OE.Status.ECONOMICALLY_RECONCILED
+
+
+def test_the_fee_the_account_claims_must_be_the_fee_its_own_ledger_charged():
+    acct = full_account()
+    acct["fee_schedule"].update(taker_bps=1.0, maker_bps=0.5)                       # a flattering claim; the ledger charged 5.5
+    st, e = status(reconciled(account=acct))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and any("differ from the fee the account ledger charged" in g for g in e.metrics["reconciliation_gaps"])
+
+
+def test_authorisation_needs_a_real_reference_not_a_placeholder():
+    for ref in ("-", "x", "1234567", "        ", "!!!!!!!!!"):
+        assert status(reconciled(authorisation={"owner_authorised": True, "reference": ref, "scope": "carry_overlay_taker/v1"}))[0] == OE.Status.ECONOMICALLY_RECONCILED, ref
+
+
+@pytest.mark.parametrize("bad", ["a", True, float("inf"), float("nan"), -1])
+def test_prospective_claims_must_be_typed_finite_and_ordered(bad):
+    for field in ("registered_ms", "first_evidence_ms", "n_after_registration", "post_registration_ess", "post_registration_annualised_pct_on_economic_capital"):
+        pro = dict(PRO_OK)
+        pro[field] = bad
+        assert status(bundle(funding=4.0, prospective=pro, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE, (field, bad)
+    pro = dict(PRO_OK, registered_ms="a", first_evidence_ms="b")
+    assert status(bundle(funding=4.0, prospective=pro, integrity=ANCHORED))[0] == OE.Status.RESEARCH_CANDIDATE
+
+
+def test_anchors_on_the_recorders_own_volume_do_not_grade_as_anchored():
+    same = dict(ANCHORED, anchor_location="SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE")
+    assert OE.integrity_grade({"integrity": same}) == "ANCHORED_SAME_VOLUME_ONLY"
+    assert status(bundle(funding=4.0, prospective=PRO_OK, integrity=same))[0] == OE.Status.RESEARCH_CANDIDATE
+    assert OE.integrity_grade({"integrity": dict(ANCHORED, files_missing_but_anchored=["capacity-20261103.jsonl"])}) == "CONFLICT"
+
+
+@pytest.mark.parametrize("field,value", [("fillable_share", float("nan")), ("round_trip_cost_bps", float("nan")), ("fillable_share", None)])
+def test_non_finite_execution_inputs_fail_closed(field, value):
+    b = bundle(funding=4.0)
+    b["carry"][field] = value
+    assert status(b)[0] == OE.Status.EXECUTION_UNATTRACTIVE
+
+
+def test_non_finite_risk_and_return_inputs_fail_closed():
+    for path, expect in ((("liquidation", "conservative_adverse_move_pct"), OE.Status.RISK_UNACCEPTABLE),
+                         (("returns", "annualised_pct_on_economic_capital"), OE.Status.ECONOMICALLY_UNATTRACTIVE)):
+        b = bundle(funding=4.0)
+        b["carry"]["economics"][path[0]][path[1]] = float("nan")
+        assert status(b)[0] == expect, path
+    b = bundle(funding=4.0)
+    b["carry"]["funding_eval"]["realised_bps"]["min"] = float("nan")
+    assert status(b)[0] == OE.Status.RISK_UNACCEPTABLE

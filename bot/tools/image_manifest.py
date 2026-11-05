@@ -25,6 +25,7 @@ record it beside this result.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import os
@@ -35,15 +36,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
 
-#: Paths relative to the application directory (``bot/`` in the repository, ``/app`` in the image). Every one is COPYed by
-#: Dockerfile.drill (a test pins that), so a mismatch is about content, never about a file the image was never meant to hold.
-#: The CRITICAL files are the ones whose bytes ARE the recorder implementation.
-CRITICAL = ("tools/market_recorder.py", "tools/runner_monitor.py", "tools/runner_supervisor.py", "md_feed.py", "md_capacity.py",
-            "evidence_chain.py", "capacity_schema.py")
-SUPPORTING = ("md_engine.py", "md_state.py", "md_store.py", "md_economics.py", "evidence_stats.py", "funding_eval.py",
-              "recorder_reliability.py", "trade_economics.py", "opportunity_engine.py", "tools/capacity_summary.py",
-              "tools/profitability_report.py", "tools/anchor_archive.py")
-FILES = CRITICAL + SUPPORTING
+#: Paths are relative to the application directory (``bot/`` in the repository, ``/app`` in the image). The RECORDER FILES are the
+#: static import closure of the three recorder-side entry points, computed from the repository at ``expected`` time, so a parser, book or
+#: store module the recorder imports is compared too (an earlier version compared a hand-picked 19 files and could say "contains the
+#: recorder" while the book code differed). The REPORT TOOLS are listed after a marker and only the owner's analysis uses them.
+ENTRY_POINTS = ("tools/market_recorder.py", "tools/runner_monitor.py", "tools/runner_supervisor.py")
+REPORT_TOOLS = ("tools/profitability_report.py", "tools/anchor_archive.py", "tools/capacity_summary.py")
+MARKER = "# report-tools (not part of the recorder)"
 
 _LINE = re.compile(r"^([0-9a-f]{64})\s+\*?(\S+)\s*$")
 _MISSING = re.compile(r"sha256sum:\s+(\S+?):\s+No such file or directory")
@@ -57,23 +56,56 @@ def _sha(path: str) -> str:
     return h.hexdigest()
 
 
-def expected_listing(root: str = BOT) -> str:
-    lines = []
-    for rel in FILES:
+def _imports(path: str) -> List[str]:
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    out: List[str] = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            out += [a.name.split(".")[0] for a in n.names]
+        elif isinstance(n, ast.ImportFrom) and n.level == 0:
+            out.append((n.module or "").split(".")[0])
+    return out
+
+
+def closure(root: str = BOT, entries: Sequence[str] = ENTRY_POINTS) -> List[str]:
+    """The files of ``root`` the entry points import, transitively (a module is a file of ``root`` or ``root/tools``; anything else is
+    the standard library or a third party and is not ours to compare)."""
+    seen: Dict[str, None] = {}
+    todo = list(entries)
+    while todo:
+        rel = todo.pop()
+        if rel in seen:
+            continue
         p = os.path.join(root, rel)
         if not os.path.isfile(p):
             raise SystemExit(f"the repository has no {rel}: run this from a checkout that contains the recorder")
-        lines.append(f"{_sha(p)}  {rel}")
+        seen[rel] = None
+        for mod in _imports(p):
+            for cand in (f"{mod}.py", f"tools/{mod}.py"):
+                if os.path.isfile(os.path.join(root, cand)) and cand not in seen:
+                    todo.append(cand)
+    return sorted(seen)
+
+
+def file_sets(root: str = BOT) -> Tuple[List[str], List[str]]:
+    rec = closure(root)
+    return rec, [f for f in REPORT_TOOLS if f not in rec]
+
+
+def expected_listing(root: str = BOT) -> str:
+    rec, tools = file_sets(root)
+    lines = [f"{_sha(os.path.join(root, f))}  {f}" for f in rec] + [MARKER]
+    lines += [f"{_sha(os.path.join(root, f))}  {f}" for f in tools if os.path.isfile(os.path.join(root, f))]
     return "\n".join(lines) + "\n"
 
 
-def machine_command(app: str = "carry-drill") -> str:
-    files = " ".join(FILES)
-    return f"fly ssh console -a {app} -C \"sh -c 'cd /app && sha256sum {files} 2>&1'\""
+def machine_command(app: str = "carry-drill", root: str = BOT) -> str:
+    rec, tools = file_sets(root)
+    return f"fly ssh console -a {app} -C \"sh -c 'cd /app && sha256sum {' '.join(rec + tools)} 2>&1'\""
 
 
 def parse(text: str) -> Tuple[Dict[str, str], List[str]]:
-    """``({path: sha256}, [paths reported missing])``. Any other line (a banner, a warning) is ignored."""
+    """``({path: sha256}, [paths reported missing])``. Any other line (a banner, a warning, the marker) is ignored."""
     have: Dict[str, str] = {}
     missing: List[str] = []
     for ln in text.splitlines():
@@ -87,52 +119,66 @@ def parse(text: str) -> Tuple[Dict[str, str], List[str]]:
     return have, missing
 
 
+def _split_expected(text: str) -> Tuple[List[str], List[str]]:
+    rec: List[str] = []
+    tools: List[str] = []
+    cur = rec
+    for ln in text.splitlines():
+        if ln.strip() == MARKER:
+            cur = tools
+            continue
+        m = _LINE.match(ln.strip())
+        if m:
+            cur.append(m.group(2))
+    return rec, tools
+
+
 def compare(expected_text: str, actual_text: str) -> Dict[str, Any]:
     want, _ = parse(expected_text)
+    rec_files, tool_files = _split_expected(expected_text)
     got, missing = parse(actual_text)
     rows: List[Dict[str, str]] = []
-    for rel in FILES:
-        if rel not in want:
-            rows.append({"file": rel, "status": "NOT_IN_EXPECTED_LISTING"})
-        elif rel in got:
-            rows.append({"file": rel, "status": "MATCH" if got[rel] == want[rel] else "DIFFERENT"})
+    for rel in rec_files + tool_files:
+        part = "recorder" if rel in rec_files else "report_tool"
+        if rel in got:
+            st = "MATCH" if got[rel] == want[rel] else "DIFFERENT"
         elif rel in missing:
-            rows.append({"file": rel, "status": "MISSING_ON_MACHINE"})
+            st = "MISSING_ON_MACHINE"
         else:
-            rows.append({"file": rel, "status": "NOT_REPORTED_BY_MACHINE"})
-    status = {r["file"]: r["status"] for r in rows}
-    critical_ok = all(status.get(f) == "MATCH" for f in CRITICAL)
-    all_ok = all(r["status"] == "MATCH" for r in rows)
+            st = "NOT_REPORTED_BY_MACHINE"
+        rows.append({"file": rel, "part": part, "status": st})
+    recorder_ok = bool(rec_files) and all(r["status"] == "MATCH" for r in rows if r["part"] == "recorder")
+    all_ok = bool(rows) and all(r["status"] == "MATCH" for r in rows)
     if all_ok:
         verdict = "IDENTICAL_TO_EXPECTED"
-    elif critical_ok:
-        verdict = "RECORDER_FILES_IDENTICAL_SUPPORTING_FILES_DIFFER"
+    elif recorder_ok:
+        verdict = "RECORDER_FILES_IDENTICAL_REPORT_TOOLS_DIFFER"
     elif not got and not missing:
         verdict = "NOTHING_REPORTED_BY_MACHINE"
     else:
         verdict = "DOES_NOT_CONTAIN_THIS_RECORDER_IMPLEMENTATION"
-    return {"verdict": verdict, "rows": rows,
-            "contains_this_recorder_implementation": critical_ok,
+    return {"verdict": verdict, "rows": rows, "contains_this_recorder_implementation": recorder_ok,
+            "recorder_files_compared": len(rec_files),
             "differing": [r["file"] for r in rows if r["status"] != "MATCH"],
-            "note": "byte-for-byte file comparison; it does not identify the commit or the image digest"}
+            "note": "byte-for-byte comparison of the recorder's whole import closure; it does not identify the commit or the image digest"}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     e = sub.add_parser("expected"); e.add_argument("--root", default=BOT)
-    c = sub.add_parser("command"); c.add_argument("--app", default="carry-drill")
+    c = sub.add_parser("command"); c.add_argument("--app", default="carry-drill"); c.add_argument("--root", default=BOT)
     cp = sub.add_parser("compare"); cp.add_argument("--expected", required=True); cp.add_argument("--actual", required=True)
     a = ap.parse_args(argv)
     if a.cmd == "expected":
         sys.stdout.write(expected_listing(a.root))
         return 0
     if a.cmd == "command":
-        print(machine_command(a.app))
+        print(machine_command(a.app, a.root))
         return 0
     res = compare(open(a.expected, encoding="utf-8").read(), open(a.actual, encoding="utf-8").read())
     print(json.dumps(res, indent=2, sort_keys=True))
-    return 0 if res["verdict"] in ("IDENTICAL_TO_EXPECTED", "RECORDER_FILES_IDENTICAL_SUPPORTING_FILES_DIFFER") else 1
+    return 0 if res["verdict"] in ("IDENTICAL_TO_EXPECTED", "RECORDER_FILES_IDENTICAL_REPORT_TOOLS_DIFFER") else 1
 
 
 if __name__ == "__main__":

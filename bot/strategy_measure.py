@@ -67,18 +67,24 @@ class BasisParams:
 
 def basis_episodes(rows: Sequence[Mapping[str, Any]], p: BasisParams, *, alpha: float = 0.05) -> Dict[str, Any]:
     """Measure ACTUAL convergence episodes on time-ordered rows carrying ``at_ms`` and ``basis_bps`` (mark minus spot mid, in
-    bps of spot). Long spot / short perp when the perp is rich; the basis P&L of an episode is entry basis minus exit basis,
-    less the round-trip cost. Funding earned during the hold is deliberately NOT added: it belongs to the carry hypothesis and
-    is measured there. An episode that straddles a data gap is excluded and counted, not interpolated. After closing, a new
-    episode needs the basis to fall below ``theta_in`` first, so episodes do not overlap or chain.
+    bps of spot). Long spot / short perp when the perp is rich.
 
-    A percentile range that exceeds fees is only an exploratory screen; this measures what happened after each entry."""
+    NO LOOKAHEAD AT THE FILL. A signal is seen at snapshot i; the position is entered at the basis of the NEXT recorded snapshot
+    (i+1), and an exit signal seen at snapshot j is filled at the basis of j+1. Filling at the snapshot that triggered the signal
+    would book the very extreme that caused it, which turns pure noise into a "convergence" profit (an independent review
+    measured a 12-of-12 false-positive rate on i.i.d. noise that way). One recording cadence of latency is conservative: a real
+    order would be placed within seconds. The basis P&L of an episode is entry-fill basis minus exit-fill basis, less the
+    round-trip cost. Funding earned during the hold is deliberately NOT added: it belongs to the carry hypothesis. An episode that
+    straddles a data gap is excluded and counted, not interpolated. After closing, a new episode needs the basis to fall below
+    ``theta_in`` first, so episodes do not overlap or chain. A percentile range that exceeds fees is only an exploratory screen."""
     cost = _need_cost(p.round_trip_cost_bps, "round_trip_cost_bps")
     if not (_fin(p.theta_in_bps) and _fin(p.theta_out_bps) and p.theta_out_bps < p.theta_in_bps and p.max_hold_s > 0):
         raise ValueError("theta_out must be below theta_in and max_hold_s positive")
     eps: List[Dict[str, Any]] = []
     gap_broken = 0
+    state = "FLAT"                     # FLAT | PENDING_ENTRY | OPEN | PENDING_EXIT
     open_: Optional[Dict[str, Any]] = None
+    outcome: Optional[str] = None
     armed = True
     last_t: Optional[int] = None
     usable = 0
@@ -89,25 +95,29 @@ def basis_episodes(rows: Sequence[Mapping[str, Any]], p: BasisParams, *, alpha: 
         usable += 1
         if last_t is not None and t < last_t:
             raise ValueError("rows must be time-ordered")
-        if open_ is not None and last_t is not None and (t - last_t) > p.max_gap_s * 1000:
+        if state != "FLAT" and last_t is not None and (t - last_t) > p.max_gap_s * 1000:
             gap_broken += 1
-            open_, armed = None, False
+            state, open_, outcome, armed = "FLAT", None, None, False
         last_t = t
-        if open_ is not None:
+        if state == "PENDING_ENTRY":                                   # this snapshot is the entry FILL
+            open_ = {"t": t, "b": b, "max": b}
+            state = "OPEN"
+        elif state == "PENDING_EXIT":                                  # this snapshot is the exit FILL
+            eps.append({"entry_ms": open_["t"], "exit_ms": t, "hold_h": (t - open_["t"]) / 3_600_000.0, "entry_bps": open_["b"],
+                        "exit_bps": b, "outcome": outcome, "adverse_widening_bps": open_["max"] - open_["b"],
+                        "gross_bps": open_["b"] - b, "net_bps": open_["b"] - b - cost})
+            state, open_, outcome, armed = "FLAT", None, None, False
+        elif state == "OPEN":
             open_["max"] = max(open_["max"], b)
-            held = (t - open_["t"]) / 1000.0
-            outcome = "CONVERGED" if b <= p.theta_out_bps else ("FAILED_TO_CONVERGE" if held >= p.max_hold_s else None)
-            if outcome:
-                eps.append({"entry_ms": open_["t"], "exit_ms": t, "hold_h": held / 3600.0, "entry_bps": open_["b"], "exit_bps": b,
-                            "outcome": outcome, "adverse_widening_bps": open_["max"] - open_["b"],
-                            "gross_bps": open_["b"] - b, "net_bps": open_["b"] - b - cost})
-                open_, armed = None, False
-        else:
+            if b <= p.theta_out_bps:
+                state, outcome = "PENDING_EXIT", "CONVERGED"
+            elif (t - open_["t"]) / 1000.0 >= p.max_hold_s:
+                state, outcome = "PENDING_EXIT", "FAILED_TO_CONVERGE"
+        else:                                                          # FLAT
             if b < p.theta_in_bps:
                 armed = True
             elif armed:
-                open_ = {"t": t, "b": b, "max": b}
-                armed = False
+                state, armed = "PENDING_ENTRY", False
     nets = [e["net_bps"] for e in eps]
     conv = [e for e in eps if e["outcome"] == "CONVERGED"]
     fail = [e for e in eps if e["outcome"] != "CONVERGED"]
@@ -115,8 +125,9 @@ def basis_episodes(rows: Sequence[Mapping[str, Any]], p: BasisParams, *, alpha: 
     return {
         "params": {"theta_in_bps": p.theta_in_bps, "theta_out_bps": p.theta_out_bps, "max_hold_s": p.max_hold_s,
                    "round_trip_cost_bps": cost, "max_gap_s": p.max_gap_s},
+        "fill_rule": "entry and exit are filled at the NEXT recorded snapshot after the signal (conservative: one cadence of latency)",
         "usable_snapshots": usable, "span_days": span_days, "episodes": len(eps), "converged": len(conv), "failed": len(fail),
-        "excluded_by_data_gap": gap_broken, "still_open_at_end": open_ is not None,
+        "excluded_by_data_gap": gap_broken, "still_open_at_end": state != "FLAT",
         "failure_share": (len(fail) / len(eps)) if eps else None,
         "hold_hours": {"mean": ES.mean([e["hold_h"] for e in eps]), "max": max((e["hold_h"] for e in eps), default=None)} if eps else None,
         "adverse_widening_bps": {"mean": ES.mean([e["adverse_widening_bps"] for e in eps]),
@@ -222,7 +233,8 @@ def run_directional(prices: Sequence[float], rule: Any, *, one_way_cost_bps: flo
         "net_annualised_pct": ES.mean(net) * ann * 100.0, "hold_annualised_pct": ES.mean(hold) * ann * 100.0,
         "position_changes_per_bar": turns / max(1, n - 1), "max_drawdown_pct": mdd * 100.0,
         "one_way_cost_bps": cost * 1e4,
-        "reading": "net of the stated one-way cost; the rule saw prices up to t only; no parameter was fitted",
+        "reading": "net of the stated one-way cost; the rule saw prices up to t only; no parameter was fitted; perpetual funding "
+                   "payments and receipts while holding are NOT modelled (a directional perp pays or receives funding)",
     }
     return res
 

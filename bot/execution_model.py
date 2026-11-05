@@ -623,7 +623,9 @@ class AccountExecutionRecord:
             if not (isinstance(v, str) and v.strip()):
                 raise ValueError(f"{n} must be a non-empty string")
         words = self.source.upper().replace("_", " ").replace("-", " ").replace("/", " ").split()
-        if any(w.startswith("SIMULAT") or w in ("SIM", "SYNTHETIC", "BACKTEST", "MODELLED", "MODELED") for w in words):
+        if any(w.startswith(("SIMUL", "SIMFILL", "MONTE")) or w in ("SIM", "SYNTHETIC", "BACKTEST", "MODELLED", "MODELED", "PAPER", "MOCK",
+                                                                   "REPLAY", "FAKE", "GENERATED", "PREDICTED", "ESTIMATED", "DERIVED", "CARLO")
+               for w in words):
             raise EvidenceClassError("a simulated source cannot be an ACCOUNT_EXECUTION record")
         if self.market not in ("linear_perp", "spot"):
             raise ValueError("market must be 'linear_perp' or 'spot'")

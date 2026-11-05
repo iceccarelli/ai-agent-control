@@ -69,7 +69,9 @@ permanent regime shift, and independently resampled series lose their cross-depe
 
 KELLY is a research input only: ``fractional_kelly`` uses the LOWER confidence bound of the mean
 edge, so a non-positive bound gives 0. ``recommend_exposure`` returns ``max_leverage`` of 0.0
-(ZERO EXPOSURE) or a research ceiling that is never above 1.0 and never above the Kelly or the
+(ZERO EXPOSURE) or a research ceiling stated in hedged notional over FULLY ALLOCATED economic capital (N / E): never above the 1x
+book's own N / E = 1 / (1 + reserve fraction) (the hard cap and the survival limit are levels of L = N / C and are converted with
+it, so a reserve lowers the ceiling and the ceiling can never permit financed notional), never above the Kelly or the
 stress-survival limit, with ``authorizes_trading = False`` always.
 """
 from __future__ import annotations
@@ -828,7 +830,14 @@ def recommend_exposure(table: Mapping[str, Any], *, edge_lower_bound: Optional[f
     limit = float(limit) if _fin(limit) else 0.0
     if limit <= 0.0 and not any(r.startswith("STRESS_") for r in reasons):
         reasons.append("STRESS_SURVIVAL_LIMIT_ZERO")
-    caps = {"HARD_CAP_1X": MAX_RECOMMENDED_LEVERAGE, "STRESS_SURVIVAL_LIMIT": limit}
+    # The ceiling is stated in N / E (hedged notional over FULLY ALLOCATED economic capital). The hard cap and the survival limit are
+    # levels of L = N / C, and with a reserve E > C, so they are converted with the 1x book's own N / E: a cap of "1x" must not let
+    # N / E exceed what the 1x book itself has (1 / (1 + reserve fraction)), or the ceiling would permit financed notional.
+    one_x = next((b for b in table.get("books") or [] if isinstance(b, Mapping) and b.get("leverage") == 1.0), None)
+    ne1 = ((one_x or {}).get("capital") or {}).get("notional_over_economic_capital")
+    to_ne = float(ne1) if _fin(ne1) and 0.0 < ne1 <= 1.0 else 1.0
+    limit = limit * to_ne
+    caps = {"HARD_CAP_1X": MAX_RECOMMENDED_LEVERAGE * to_ne, "STRESS_SURVIVAL_LIMIT": limit}
     if kelly_fractional is not None and _fin(kelly_fractional):
         caps["KELLY"] = float(kelly_fractional)
     limiting = min(caps, key=lambda k: (caps[k], k != "HARD_CAP_1X"))
@@ -838,7 +847,7 @@ def recommend_exposure(table: Mapping[str, Any], *, edge_lower_bound: Optional[f
         "label": ZERO_EXPOSURE if ceiling == 0.0 else "RESEARCH_CEILING_NOT_AN_INSTRUCTION",
         "zero_exposure": ceiling == 0.0, "reasons": reasons,
         "limiting_factor": None if reasons else limiting,
-        "limits": {"hard_cap": MAX_RECOMMENDED_LEVERAGE, "stress_survival_limit": limit,
+        "limits": {"hard_cap": MAX_RECOMMENDED_LEVERAGE * to_ne, "stress_survival_limit": limit, "units": "N / E (hedged notional over economic capital)",
                    "kelly_fractional": kelly_fractional},
         "levels_above_1x": NOT_RECOMMENDABLE, "venue_rules_status": rules_status,
         "stress_failures_at_1x": failing, "financing_status": fin,

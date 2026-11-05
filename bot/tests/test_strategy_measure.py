@@ -55,20 +55,23 @@ def brow(t_s, b):
 P = SM.BasisParams(theta_in_bps=10.0, theta_out_bps=4.0, max_hold_s=3600.0, round_trip_cost_bps=8.0)
 
 
-def test_a_converging_episode_is_measured_by_hand():
+def test_a_converging_episode_is_measured_by_hand_with_fills_at_the_next_snapshot():
     rows = [brow(i * 300, b) for i, b in enumerate([1, 1, 12, 14, 9, 3, 2, 1])]
     r = SM.basis_episodes(rows, P)
     assert r["episodes"] == 1 and r["converged"] == 1 and r["failed"] == 0
     e = r["episodes_list"][0]
-    assert e["entry_bps"] == 12 and e["exit_bps"] == 3 and e["adverse_widening_bps"] == 2          # peaked at 14
-    assert e["gross_bps"] == 9 and e["net_bps"] == pytest.approx(1.0) and e["hold_h"] == pytest.approx(0.25)
+    # signal seen at 12; the entry FILL is the next snapshot (14); the exit signal is seen at 3; the exit FILL is the next (2)
+    assert e["entry_bps"] == 14 and e["exit_bps"] == 2 and e["gross_bps"] == 12 and e["net_bps"] == pytest.approx(4.0)
+    assert e["adverse_widening_bps"] == 0 and e["hold_h"] == pytest.approx(0.25)
+    assert "NEXT recorded snapshot" in r["fill_rule"]
 
 
-def test_failure_to_converge_is_closed_at_the_max_hold_at_the_then_basis():
-    rows = [brow(0, 1), brow(300, 12)] + [brow(300 + 300 * k, 13) for k in range(1, 14)]            # 65 min above theta_out
+def test_failure_to_converge_is_closed_after_the_max_hold_at_the_next_snapshots_basis():
+    rows = [brow(0, 1), brow(300, 12)] + [brow(600 + 300 * k, 13) for k in range(16)]
     r = SM.basis_episodes(rows, P)
     assert r["episodes"] == 1 and r["failed"] == 1 and r["failure_share"] == 1.0
-    assert r["episodes_list"][0]["outcome"] == "FAILED_TO_CONVERGE" and r["episodes_list"][0]["net_bps"] == pytest.approx(12 - 13 - 8)
+    e = r["episodes_list"][0]
+    assert e["outcome"] == "FAILED_TO_CONVERGE" and e["net_bps"] == pytest.approx(13 - 13 - 8)
 
 
 def test_a_data_gap_excludes_the_episode_rather_than_interpolating_across_it():
@@ -78,10 +81,16 @@ def test_a_data_gap_excludes_the_episode_rather_than_interpolating_across_it():
 
 
 def test_episodes_do_not_chain_the_basis_must_fall_below_entry_before_a_new_one_opens():
-    rows = [brow(i * 300, b) for i, b in enumerate([1, 12, 3, 12, 12, 3, 1, 12, 3])]
-    r = SM.basis_episodes(rows, P)
-    assert r["episodes"] == 2                                              # the 12s right after an exit at 3 do not re-open at once
-    assert r["converged"] == 2
+    two = [brow(i * 300, b) for i, b in enumerate([1, 12, 12, 3, 3, 1, 12, 12, 3, 3])]
+    assert SM.basis_episodes(two, P)["episodes"] == 2
+    chained = [brow(i * 300, b) for i, b in enumerate([1, 12, 12, 3, 12, 12, 3, 3])]       # exits at 12; 12 again must not re-open at once
+    r = SM.basis_episodes(chained, P)
+    assert r["episodes"] == 1 and r["episodes_list"][0]["exit_bps"] == 12
+
+
+def test_a_signal_on_the_last_snapshot_has_no_fill_and_is_reported_open_not_booked():
+    r = SM.basis_episodes([brow(0, 1), brow(300, 12)], P)
+    assert r["episodes"] == 0 and r["still_open_at_end"] is True
 
 
 def test_the_cost_is_required_and_malformed_parameters_refuse():
@@ -384,3 +393,22 @@ def test_the_kernels_import_only_the_standard_library_and_the_pure_evidence_modu
         elif isinstance(n, ast.ImportFrom):
             got.add((n.module or "").split(".")[0])
     assert got <= {"__future__", "math", "dataclasses", "typing", "evidence_stats", "funding_eval"}, got
+
+
+def test_NULL_i_i_d_noise_basis_never_becomes_a_candidate_whatever_its_range():
+    """The failure the third review found: filling at the signal snapshot booked the extreme itself, so pure noise showed +15 bps per
+    episode with a lower bound of +11 bps in 12 of 12 seeds. With next-snapshot fills the episodes net about minus the cost."""
+    import opportunity_engine as OE
+    from test_opportunity_engine import good_ev, brows
+    cands = 0
+    nets = []
+    for s in range(60):
+        rng = random.Random(4000 + s)
+        path = [rng.gauss(0, 10.0) for _ in range(20 * 288)]
+        e = OE.evaluate_basis(OE.REGISTRY["basis_convergence/v1"], brows(path), round_trip_cost_bps=11.0, ev=good_ev())
+        cands += e.status == OE.Status.RESEARCH_CANDIDATE
+        r = SM.basis_episodes(brows(path), SM.BasisParams(16.5, 4.1, 86400.0, 11.0))
+        if r["episodes"] >= 30:
+            nets.append(r["net"]["mean"])
+    assert cands == 0
+    assert nets and sum(nets) / len(nets) < -8.0, sum(nets) / len(nets)        # about minus the 11 bps cost, not plus 15

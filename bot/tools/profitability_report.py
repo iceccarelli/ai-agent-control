@@ -20,10 +20,13 @@ weak one:
 
 No status authorises trading. The venue rules used for liquidation headroom (haircut, margin
 rates) are ASSUMED and labelled so: they are not read from the exchange. The economics block uses the
-LOWER confidence bound of realised funding, never the forecast, and is WITHHELD (not printed with a
-caveat) unless the evidence is valid, the chain verifies for EVERY file, the recorder is HEALTHY, the
-evidence is mainnet, and the funding evaluation passes both its count and its effective-sample-size
-floors. A number the gates have not cleared is not shown.
+LOWER confidence bound of realised funding (the lower of the window's and the most recent third's),
+never the forecast, and is WITHHELD (not printed with a caveat) unless the evidence is valid, EVERY chained
+file is complete and consistent (an unchained row, a broken chain, an anchored file that has lost its sidecars or its rows,
+or an anchored file that has been removed all block it; a pre-chain LEGACY file with no v2 rows and no anchor is listed and
+does not), the recorder is HEALTHY, the evidence is mainnet, and the funding evaluation passes both its
+count and its effective-sample-size floors and the engine's 90-settlement floor. Rows adopted by a repair
+are left out of every statistic. A number the gates have not cleared is not shown.
 """
 from __future__ import annotations
 
@@ -65,6 +68,21 @@ def _json(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+CAPACITY_RETENTION_DAYS = 365       # the recorder's default capacity retention; an older anchored file may have been pruned
+
+
+def _file_day_ms(name: str) -> Optional[int]:
+    """UTC midnight (ms) of ``capacity-YYYYMMDD.jsonl``, or None."""
+    import calendar
+    m = name[9:17] if name.startswith("capacity-") and name.endswith(".jsonl") else ""
+    if len(m) != 8 or not m.isdigit():
+        return None
+    try:
+        return int(calendar.timegm((int(m[:4]), int(m[4:6]), int(m[6:8]), 0, 0, 0))) * 1000
+    except (ValueError, OverflowError):
+        return None
+
+
 def anchors_from_history(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     if not path:
@@ -75,6 +93,8 @@ def anchors_from_history(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]
                 try:
                     r = json.loads(line)
                 except ValueError:
+                    continue
+                if not isinstance(r, dict):
                     continue
                 f, h, n = r.get("recorder_chain_file"), r.get("recorder_chain_head"), r.get("recorder_chain_n")
                 if isinstance(f, str) and isinstance(h, str) and isinstance(n, int):
@@ -99,13 +119,13 @@ def _power_section(fe: Optional[Dict[str, Any]], notional_usd: float, hold_days:
     rows = []
     for edge in (0.1, 0.25, 0.5):
         r = SP.required_observations(rb["sd"], edge, alpha=0.05, power=0.8, n_hypotheses=OE.FAMILY_TRIALS, adjust="holm",
-                                     ess_ratio=rb["ess_ratio"])
+                                     ess_ratio=rb["ess_ratio"], two_sided=True, method="t")
         rows.append({"edge_above_threshold_bps_per_settlement": edge, "status": r["status"],
                      "required_effective_n": r.get("required_effective_n"), "required_raw_settlements": r.get("required_raw_n"),
                      "required_days": None if r.get("required_raw_n") is None else r["required_raw_n"] / 3.0,
                      "available_joined_settlements": fe["joined"], "available_effective_n": rb.get("ess")})
     return {"status": "OK", "threshold_bps_per_settlement": threshold, "observed_sd_bps": rb["sd"], "ess_ratio": rb["ess_ratio"],
-            "alpha": 0.05, "power": 0.8, "n_hypotheses": OE.FAMILY_TRIALS, "adjust": "holm", "table": rows,
+            "alpha": 0.05, "power": 0.8, "n_hypotheses": OE.FAMILY_TRIALS, "adjust": "holm", "two_sided": True, "method": "t", "table": rows,
             "reading": (f"to show mean funding exceeds {threshold:.2f} bps/settlement (what the illustrative position needs to earn the lowest "
                         f"{TE.PROVISIONAL} screen after an ASSUMED 11.4 bps round trip) by the edge in each row, at the family-wise level and 80% power, "
                         "given the variance and dependence OBSERVED so far; only as good as that sd and ESS ratio"),
@@ -156,7 +176,9 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         lines, quarantined = EC.read_lines(p)
         every = EC.rows_of(lines)
         v2_any = any(isinstance(r, dict) and r.get("schema") == CS.SCHEMA for r in every)
-        pre_chain = (not os.path.exists(p + ".chain")) and not v2_any
+        # "legacy" is only a file with NO sidecar, NO v2 rows and NO anchor ever recorded for it: an anchored file that lost its
+        # sidecar or its rows is a deletion/replacement, not a legacy file
+        pre_chain = (not os.path.exists(p + ".chain")) and not v2_any and not anchors.get(base)
         if pre_chain:
             # a legacy file from before the chain existed: only schema-less rows, which never enter a statistic and
             # cannot be "tampered into" evidence. It is listed, counted as legacy, and does not block anything.
@@ -177,6 +199,16 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                                                     "anchor_lag_rows", "torn_aside_bytes")},
                       "external_anchors": len(anchors.get(base, []))})
         all_rows.extend(admitted)
+    # a file the anchors know about that is no longer there (inside the capacity retention) was removed, not pruned
+    present = {os.path.basename(p) for p in paths}
+    missing_anchored: List[str] = []
+    for fname in sorted(anchors):
+        if fname in present:
+            continue
+        day = _file_day_ms(fname)
+        if day is not None and day >= now_ms - (CAPACITY_RETENTION_DAYS + 1) * 86_400_000:
+            missing_anchored.append(fname)
+            blockers.append(f"{fname}: anchors exist for this file but it is gone (inside the {CAPACITY_RETENTION_DAYS}-day retention): removed, not pruned")
     val = CS.validate_stream(all_rows)
     accepted = val["accepted"]
     status = _json(os.path.join(directory, "recorder_status.json"))
@@ -208,6 +240,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         "unchained_rows": sum(f["chain"]["unchained_tail"] for f in chain_files),
         "resealed_rows": sum(f["chain"]["resealed_rows"] for f in chain_files),
         "torn_lines_quarantined": sum(len(f["quarantined_lines"]) for f in files),
+        "files_missing_but_anchored": missing_anchored,
         "files_total": len(files), "files_legacy_pre_chain": len(files) - len(chain_files),
         "files_internally_verified": sum(1 for f in chain_files if f["chain"]["internally_consistent"]),
         "files_fully_chained": sum(1 for f in chain_files if f["chain"]["fully_chained"]),

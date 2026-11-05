@@ -34,6 +34,12 @@ modelling choice supplied by the caller). An unknown input is never replaced by 
 ``UnknownInputError`` or the result is INSUFFICIENT with the reason.
 
 KNOWN LIMITS (also stated in the results that depend on them)
+  * NO PRODUCTION CALLER USES ``evaluate_under_plan`` yet; it is a framework, not a gate. Two limits found by independent review:
+    (a) the window check proves the data reach both ENDS of the declared window, not that the INTERIOR is complete, so
+    selectively dropping observations inside it is not refused (supply and check a declared cadence or count yourself, and
+    treat the evidence chain as the guard on what rows exist); (b) the p-value uses an ESS-adjusted t with se = sd / sqrt(ESS), which
+    over-rejects on short persistent series at the adjusted level (measured: 0.76 % against 0.31 % nominal at AR(0.8), n = 200,
+    16 hypotheses, Holm), so require a larger ESS than ``MIN_ESS_FOR_SUPPORT`` before relying on it.
   * Sample sizes are conditional on the supplied sd and dependence. Understate either and the study is
     underpowered; the framework cannot know.
   * The AR(1) design effect (1+rho)/(1-rho) is the large-n value (slightly conservative at finite n); a

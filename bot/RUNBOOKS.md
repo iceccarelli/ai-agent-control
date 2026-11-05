@@ -149,7 +149,7 @@ Run on the recorder's data directory (or a copy; it never writes there):
 * **Integrity (separate states, no single flag):** every capacity row is validated against `capacity/2`; a row with no chain entry
   is never admitted and blocks the economics block; each file is graded ANCHORED_CURRENT / ANCHORED_LAGGING / STALE_ANCHOR /
   UNANCHORED / ANCHOR_CONFLICT by its LATEST anchor; and the sidecar chain is checked
-  against the head copied into `monitor.jsonl` (a second copy on the same volume: external to the evidence directory, not to the machine, until you archive it off the machine). A broken chain in ANY file,
+  against the head copied into `monitor.jsonl` (a second copy on the same volume: external to the evidence directory, not to the machine, until you archive it off the machine). A broken chain in ANY chained file, an anchored file that lost its sidecars or rows, an anchored file that is gone,
   a mixed stream, a regression, a duplicate or more than 1 % rejected rows withholds the economics block entirely; the report says so.
 * **Dependence:** unique settlements, not snapshots, are the unit, and settlements are themselves serially dependent:
   a claim needs the effective sample size (>= 30) as well as the count (>= 30 joined, >= 90 for a candidate).
@@ -161,7 +161,9 @@ Run on the recorder's data directory (or a copy; it never writes there):
   Two things it cannot do at ~100 settlements: identify a slow persistent level hidden under noise (measured coverage
   0.7-0.85 there) and predict a level shift. So the economics carry the LEAST favourable of the window's and the most
   recent third's lower bounds, a drift below the window is flagged, and a `RESEARCH_CANDIDATE` is a research flag, never
-  a validated edge: only `PROSPECTIVE_MARKET_EDGE_SUPPORTED` (screens re-run on post-registration data alone) is evidence of one.
+  a validated edge. `PROSPECTIVE_MARKET_EDGE_SUPPORTED` is the gate a future pre-registration mechanism must satisfy (typed, finite claims,
+  screens re-run on post-registration data alone, anchors held off the machine); no registration mechanism exists and this report supplies none,
+  so it is unreachable from the CLI today.
 * **Money:** two returns (on hedged notional, on fully allocated economic capital), the 10/15/20 %/yr
   screens labelled `PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED`, and an explicit list of UNKNOWN
   inputs (latency, the account's real fee tier, venue margin rules). Replace them with the owner's.
@@ -215,8 +217,8 @@ A running Fly machine changes only when an image is built and deployed. Merging 
     fly image show -a carry-drill                                       # record the registry image and digest beside the result
     fly status -a carry-drill                                           # machine id, version, restarts
 
-`compare` reports per file MATCH / DIFFERENT / MISSING_ON_MACHINE for the files that ARE the recorder (the recorder,
-monitor, supervisor, feed, capacity, chain and schema modules) and a verdict. An image built before this change lacks
+`compare` reports per file MATCH / DIFFERENT / MISSING_ON_MACHINE for the recorder's whole static import closure (computed from the
+entry points: recorder, monitor, supervisor and every module they import, including the book, wire, store and transport code) and a verdict. An image built before this change lacks
 several of them, which shows as MISSING_ON_MACHINE: that is the expected answer, and it means the old recorder is still
 running. The drill image carries no commit label, so the tool compares bytes, not tags. **A recorder release is a
 separate step from any trading-engine release and needs your explicit authorisation; nothing in this PR requests it.**
