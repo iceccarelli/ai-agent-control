@@ -31,6 +31,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import carry_costs as _costs
 import execution_cost_estimate as _est
+import md_economics as _mde
 import strategy_evidence as _se
 
 ENFORCE, OBSERVE = "enforce", "observe"
@@ -74,7 +75,8 @@ class EntryBenefitGate:
                  income_haircut_fraction: float = 0.0,
                  evidence_provider: Optional[Callable[[], Any]] = None,
                  strategy_id: str = "btc_funding_carry",
-                 cost_policy: _est.CostSamplePolicy = _est.DEFAULT_POLICY) -> None:
+                 cost_policy: _est.CostSamplePolicy = _est.DEFAULT_POLICY,
+                 latency_allowance_bps: Optional[float] = None) -> None:
         if mode not in MODES:
             raise ValueError(f"entry-benefit mode must be one of {MODES}, "
                              f"not {mode!r}")
@@ -87,6 +89,14 @@ class EntryBenefitGate:
         self.evidence_provider = evidence_provider
         self.strategy_id = str(strategy_id)
         self.cost_policy = cost_policy
+        #: The owner's allowance, in bps of notional over the round trip, for the
+        #: price moving between the decision and the fill. None = not supplied:
+        #: the live-book walk is then only a lower bound and is not used as a cost.
+        if latency_allowance_bps is not None and not (
+                _finite(latency_allowance_bps) and latency_allowance_bps >= 0):
+            raise ValueError("latency_allowance_bps must be a finite number >= 0")
+        self.latency_allowance_bps = (None if latency_allowance_bps is None
+                                      else float(latency_allowance_bps))
 
     # -- identity of the rule, so a trace can be tied to what produced it -------
     def fingerprint(self) -> str:
@@ -98,16 +108,50 @@ class EntryBenefitGate:
             "min_sigma": _se.MIN_SIGMA_MULTIPLE,
             "settlements_per_day": SETTLEMENTS_PER_DAY,
             "cost_policy": vars(self.cost_policy),
+            "latency_allowance_bps": self.latency_allowance_bps,
+            "depth_source": _mde.DEPTH_SOURCE,
             "evidence_policy": vars(_se.DEFAULT_POLICY)}
         raw = json.dumps(body, sort_keys=True, default=str).encode()
         return hashlib.sha256(raw).hexdigest()[:16]
+
+    def _with_live_depth(self, est: Dict[str, Any], snapshot: Any, execution_mode: str,
+                         notional_usd: Any, mark: Any):
+        """Fold the live book's measured costs into the execution-cost estimate.
+
+        Where the book's own fills AND the live book both measure a cost, the WORSE
+        of the two is used (a past fill cannot show what the book offers now, and
+        the book cannot show what fills actually cost). Where only the live book
+        measures it, it is used with the owner's latency allowance, and is
+        UNAVAILABLE without one. A snapshot without depth leaves `est` untouched."""
+        detail = getattr(snapshot, "detail", None)
+        depth = detail.get("depth") if isinstance(detail, dict) else None
+        if not isinstance(depth, dict):
+            return est, None
+        dc = _mde.depth_costs(depth, mode=str(execution_mode), notional_usd=notional_usd,
+                              ref_price=mark, latency_allowance_bps=self.latency_allowance_bps)
+        trace = dc.as_dict()
+        merged = dict(est)
+        if dc.status != _mde.MEASURED:
+            trace["used"] = False
+            return merged, trace
+        if est.get("status") == _est.MEASURED:
+            merged["spread_bps"] = max(float(est["spread_bps"]), dc.spread_bps)
+            merged["slippage_bps"] = max(float(est["slippage_bps"]),
+                                         dc.slippage_bps + dc.latency_allowance_bps)
+            merged["cost_source"] = "WORSE_OF_OWN_FILLS_AND_LIVE_BOOK"
+        else:
+            merged.update(status=_est.MEASURED, reasons=[], spread_bps=dc.spread_bps,
+                          slippage_bps=dc.slippage_bps + dc.latency_allowance_bps,
+                          cost_source=_mde.DEPTH_SOURCE)
+        trace["used"] = True
+        return merged, trace
 
     def check(self, *, now_ms: int, entries: Any, execution_mode: str,
               perp_symbol: str, spot_symbol: str, mark: float, spot: float,
               funding_history: List[float], last_print_ms: Optional[int],
               round_trip_bps: Any, borrow_apr: Any, opportunity_cost_apr: Any,
               notional_usd: Any, execution_style: str = "taker",
-              mechanical_reason: str = "") -> EntryBenefitResult:
+              mechanical_reason: str = "", snapshot: Any = None) -> EntryBenefitResult:
         """The verdict for opening NOW. Pure given its arguments."""
         enforcing = self.mode == ENFORCE
         history = [float(x) for x in funding_history if _finite(x)]
@@ -132,6 +176,8 @@ class EntryBenefitGate:
                          if str(execution_style) == "maker_first"
                          else ("market",)),
             policy=self.cost_policy)
+
+        est, depth_trace = self._with_live_depth(est, snapshot, execution_mode, notional_usd, mark)
 
         verdict_obj = None
         if self.evidence_provider is not None:
@@ -231,6 +277,8 @@ class EntryBenefitGate:
                     "status": est["status"], "reasons": est["reasons"],
                     "spread_bps": est["spread_bps"],
                     "slippage_bps": est["slippage_bps"],
+                    "cost_source": est.get("cost_source", "OWN_FILLS"),
+                    "live_depth": depth_trace,
                     "legs": [{k: l[k] for k in ("leg", "status", "n",
                                                 "n_in_size_band", "period_ms",
                                                 "newest_age_days", "rejected")}

@@ -33,7 +33,9 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      venue_fees.py ws_transport.py protective_restart.py execution_record.py \
      entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py \
      carry_evidence.py performance_analytics.py owner_policy.py \
-     margin_facts.py ./
+     margin_facts.py \
+     md_book.py md_broker.py md_economics.py md_engine.py md_events.py md_feed.py md_rest.py \
+     md_state.py md_store.py md_transport.py md_wire.py ./
 COPY signals/ ./signals/
 
 # carry_shadow.py is the forward-shadow runtime: the real CarryEngine against a
@@ -57,7 +59,7 @@ COPY signals/ ./signals/
 # tests/test_image_ships_the_tools.py compares the two lists now.
 COPY tools/connector_check.py tools/session_tail.py \
      tools/drill.py tools/fund_demo.py tools/carry_performance.py \
-     tools/owner_policy_check.py tools/execution_samples_report.py ./tools/
+     tools/owner_policy_check.py tools/execution_samples_report.py tools/md_run.py ./tools/
 
 # Run unprivileged. State lives on a mounted volume owned by this user.
 RUN useradd --create-home --shell /usr/sbin/nologin bot \

@@ -508,6 +508,15 @@ class TestConcurrencyStructure:
             src = open(os.path.join(REPO, module), encoding="utf-8").read()
             assert src.count("daemon=True") >= len(starts)
             assert 'name="health"' in src and 'name="private-ws"' in src
+        elif module == "md_feed.py":
+            # The public market-data feed: exactly its worker threads and its view
+            # logger, every one a named daemon, driven by a stop event and joined in
+            # `Feed.stop`. Nothing else in the repository may start a thread.
+            src = open(os.path.join(REPO, module), encoding="utf-8").read()
+            assert len(starts) == 2, f"md_feed.py starts {len(starts)} threads, expected 2"
+            assert src.count("daemon=True") >= len(starts)
+            assert 'name=f"md-' in src and 'name="md-views"' in src
+            assert "t.join(" in src and "stop.set()" in src and "_stop.set()" in src
         else:
             assert starts == [], f"{module} spawns a thread at {starts}"
 

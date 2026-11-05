@@ -174,6 +174,13 @@ class TradingBot:
         #: died). Never set to "HEALTHY" merely because a tick ran — see
         #: `_absorb_ws_observations`.
         self._observation_state = "DISABLED"
+        #: The public market-data feed (md_feed), only when MARKET_FEED_ENABLED.
+        #: "DISABLED" | "RUNNING" | "FAILED_TO_START". When enabled, the carry
+        #: book's snapshots come from it and from nothing else (no REST fallback).
+        self.market_feed: Any = None
+        self.market_feed_broker: Any = None
+        self._market_feed_state = "DISABLED"
+        self._market_feed_factory: Any = None
         #: The delta-neutral carry book. When present it OWNS the cycle and the
         #: directional strategy is not consulted at all — see `tick`. The two
         #: are mutually exclusive by construction, not by convention, because a
@@ -328,11 +335,16 @@ class TradingBot:
                 "memory": self._memory_health(),
                 "policy": self._policy_health(),
                 "observation_status": self.observation_status,
+                "market_feed": TradingBot._market_feed_status(self),
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
 
     #: Class-level defaults so a bot built without __init__ (tests, tools) works.
+    market_feed: Any = None
+    market_feed_broker: Any = None
+    _market_feed_state = "DISABLED"
+    _market_feed_factory: Any = None
     _last_tick_ok_epoch = 0.0
     _tick_failures = 0
     #: A loop is called stalled after this many consecutive failed cycles, or when
@@ -663,12 +675,104 @@ class TradingBot:
         # observation path is only worth having once REST has confirmed
         # there is nothing left to observe cold.
         self._start_private_ws()
+        self._start_market_feed()
         # State what this process is before it does anything. Research is
         # closed and nothing has cleared Stage 1; the log must say so rather
         # than leave a reader to infer capability from silence.
         logger.warning("%s", _project_status.current(self.cfg).summary_line())
         self.session.start(reconciled=self._reconciled)
         return True
+
+    def _market_feed_enabled(self) -> bool:
+        """True only for a real ``True`` in the config. A test double's
+        auto-created attribute (or any truthy non-bool) must not move where a
+        trading engine reads its market."""
+        return getattr(getattr(self, "cfg", None), "MARKET_FEED_ENABLED", False) is True
+
+    def _market_feed_environment(self) -> str:
+        """Whose prices the feed must carry: the venue the account client talks to.
+        Bybit DEMO trading runs on REAL mainnet market data with simulated matching,
+        so a demo engine is fed mainnet prices, never testnet's."""
+        venue = getattr(getattr(self, "cfg", None), "BYBIT_VENUE", None)
+        if isinstance(venue, str) and venue.strip().lower() in ("mainnet", "demo"):
+            return "mainnet"
+        if isinstance(venue, str) and venue.strip().lower() == "testnet":
+            return "testnet"
+        return "testnet" if bool(getattr(self.cfg, "USE_TESTNET", True)) else "mainnet"
+
+    def _start_market_feed(self) -> None:
+        """Start the public market-data feed, only when MARKET_FEED_ENABLED and a
+        carry book exists. Public endpoints, no credentials. A feed that cannot
+        start is a carry book with no market view: every snapshot is refused
+        (never a silent fall-back to another source) and held pairs fall to the
+        viewless venue-position watch."""
+        if self.carry is None or not self._market_feed_enabled():
+            self._market_feed_state = "DISABLED"
+            return
+        try:
+            import md_broker as _mb
+            import md_engine as _me
+            import md_feed as _mf
+            import md_rest as _mr
+            import md_state as _ms
+            import md_store as _mst
+            import md_transport as _mt
+
+            env = self._market_feed_environment()
+            directory = str(getattr(self.cfg, "MARKET_FEED_DIR", "") or "")
+            store = _mst.MarketStore(directory, environment=env)
+            engine = _me.Engine(_ms.MarketState(self.carry.perp_symbol, environment=env), store)
+            fcfg = _mf.FeedConfig(symbol=self.carry.perp_symbol, environment=env)
+            factory = self._market_feed_factory or (lambda url: _mt.PublicWebSocket(url))
+            rest = _mr.PublicRest(_mr.urllib_transport(), base_url=fcfg.rest_base)
+            feed = _mf.Feed(fcfg, engine, factory, rest)
+            self.market_feed_broker = _mb.LiveFeedBroker(
+                feed.view, self.carry.broker, expected_environment=env,
+                perp_symbol=self.carry.perp_symbol, spot_symbol=self.carry.spot_symbol)
+            feed.start()
+            self.market_feed = feed
+            self._market_feed_state = "RUNNING"
+            logger.warning("market feed RUNNING (%s, public endpoints, store %s)", env, directory)
+        except Exception:  # noqa: BLE001
+            logger.exception("market feed failed to start; the carry book has no market view")
+            self.market_feed = None
+            self.market_feed_broker = None
+            self._market_feed_state = "FAILED_TO_START"
+
+    def _market_feed_status(self) -> str:
+        """RUNNING only while every feed thread is alive and the log is writable."""
+        state = getattr(self, "_market_feed_state", "DISABLED")
+        feed = getattr(self, "market_feed", None)
+        if state != "RUNNING" or feed is None:
+            return state
+        try:
+            st = feed.status()
+        except Exception:  # noqa: BLE001
+            return "DEGRADED"
+        if not st.get("threads_alive") or st.get("store_fault"):
+            return "DEGRADED"
+        return "RUNNING"
+
+    def _stop_market_feed(self) -> None:
+        feed, self.market_feed = self.market_feed, None
+        if feed is not None:
+            try:
+                feed.stop()
+            except Exception:  # noqa: BLE001
+                logger.warning("market feed did not stop cleanly", exc_info=True)
+        if self._market_feed_state == "RUNNING":
+            self._market_feed_state = "STOPPED"
+
+    def _snapshot_source(self) -> Any:
+        """What `take_snapshot` reads: the live feed when it is enabled, else the
+        account broker (REST polling, unchanged). An enabled feed that is not
+        running raises instead of falling back."""
+        if not self._market_feed_enabled():
+            return self.carry.broker
+        if self.market_feed_broker is None or self._market_feed_state != "RUNNING":
+            from md_state import MarketUnusable, MONITOR
+            raise MarketUnusable(MONITOR, [f"feed:{self._market_feed_state}"])
+        return self.market_feed_broker
 
     def _start_private_ws(self) -> None:
         """Start the private-WS observer thread, only when explicitly
@@ -1057,7 +1161,7 @@ class TradingBot:
                     getattr(self, "cfg", None), "REQUEST_TIMEOUT_SECONDS", 10.0)),
                 recv_window_ms=float(getattr(
                     getattr(self, "cfg", None), "BYBIT_RECV_WINDOW_MS", 5000)),
-                attempts=4,                         # _request(retries=3) + the first
+                attempts=_BC.REQUEST_ATTEMPTS,      # the transport's own worst case
                 max_wait_s=max(2.0, float(_BC.RATE_LIMIT_MAX_WAIT_S)))
             recovery = _recovery.resolve_unresolved_orders(
                 getattr(broker, "inner", broker), self.store,
@@ -1355,7 +1459,7 @@ class TradingBot:
             # market without that check.
             try:
                 from market_snapshot import take_snapshot
-                view = take_snapshot(self.carry.broker, perp_symbol=symbol,
+                view = take_snapshot(self._snapshot_source(), perp_symbol=symbol,
                                      spot_symbol=self.carry.spot_symbol)
                 view.assert_fresh()
             except Exception as exc:  # noqa: BLE001
@@ -1399,9 +1503,14 @@ class TradingBot:
                         "reason": str(watched.reason),
                         "state": watched.state.value,
                         "at_ms": int(time.time() * 1000)}
-                    logger.critical(
-                        "carry book HALTED without a market view: %s",
-                        watched.reason)
+                    if getattr(watched.state, "name", "") == "HALTED":
+                        logger.critical(
+                            "carry book HALTED without a market view: %s",
+                            watched.reason)
+                    else:
+                        logger.warning(
+                            "carry book acted without a market view: %s (%s)",
+                            watched.reason, watched.state.value)
                 return
             mark, spot = view.perp_mark, view.spot_mark
             # An accounting journal that cannot be written down is a book whose
@@ -1915,6 +2024,7 @@ class TradingBot:
         # WS stops FIRST: signal it, wait for the thread to actually exit,
         # before anything it might still try to touch (the store) closes.
         self._stop_private_ws()
+        self._stop_market_feed()
         # Close the session record BEFORE the store closes, so SESSION_END has
         # somewhere to land. It is best-effort either way.
         try:
@@ -2163,7 +2273,7 @@ def close_absence_window_s(cfg: Any) -> float:
     return _recovery.absence_window_s(
         request_timeout_s=float(getattr(cfg, "REQUEST_TIMEOUT_SECONDS", 10.0)),
         recv_window_ms=float(getattr(cfg, "BYBIT_RECV_WINDOW_MS", 5000)),
-        attempts=4,                                 # _request(retries=3) + the first
+        attempts=_BC.REQUEST_ATTEMPTS,              # the transport's own worst case
         max_wait_s=max(2.0, float(_BC.RATE_LIMIT_MAX_WAIT_S)))
 
 

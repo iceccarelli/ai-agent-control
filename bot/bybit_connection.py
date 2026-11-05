@@ -99,6 +99,11 @@ __all__ = [
     "TESTNET_WS_PRIVATE",
 ]
 
+#: Retries after the first try for an ordinary request (`_request(retries=...)` loops
+#: `while attempt <= retries`). The restart resolver's proof that a request never
+#: landed is derived from this, so it is one name, not a number copied into main.
+DEFAULT_REQUEST_RETRIES = 3
+
 MAINNET_REST = "https://api.bybit.com"
 TESTNET_REST = "https://api-testnet.bybit.com"
 #: Bybit DEMO TRADING (0046). A separate module from testnet: it runs against
@@ -627,7 +632,7 @@ class BybitClient:
         params: Optional[Mapping[str, Any]] = None,
         body: Optional[Mapping[str, Any]] = None,
         signed: bool = False,
-        retries: int = 3,
+        retries: int = DEFAULT_REQUEST_RETRIES,
         timeout_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         """One transport for every call. Returns the WHOLE parsed v5 envelope
@@ -781,6 +786,8 @@ class BybitClient:
         assert last_error is not None
         raise last_error
 
+    #: Worst-case tries for one request at the default retry count.
+    REQUEST_ATTEMPTS = DEFAULT_REQUEST_RETRIES + 1
     RATE_LIMIT_MAX_WAIT_S = 5.0
     READ_COOLDOWN_AFTER_403_S = 30.0
     #: The ONLY reads a 403 pauses: market-data and cost reads that merely

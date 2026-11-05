@@ -129,6 +129,18 @@ jobs:
           tests/test_mainnet_public.py
           tests/test_overlay_economics.py
           tests/test_overlay_economics_v3.py
+          tests/test_md_wire_book_state.py
+          tests/test_md_store_replay_feed.py
+          tests/test_md_rest_transport.py
+          tests/test_md_integration.py
+          tests/test_md_boundaries_cli.py
+          tests/test_md_review_fixes.py
+          tests/test_pair_gate_sees_the_real_order.py
+          tests/test_absence_window_follows_the_transport.py
+          tests/test_md_economics.py
+          tests/test_candidate_carry_depth_v1.py
+          tests/test_entry_benefit_depth.py
+          tests/test_close_viewless_tick.py
           tests/test_mainnet_collect.py
           tests/test_mainnet_protocol.py
           tests/test_monitor_self_heal.py

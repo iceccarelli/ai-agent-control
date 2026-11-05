@@ -1246,7 +1246,8 @@ class CarryEngine:
             last_print_ms=self._last_print_ms, round_trip_bps=round_trip,
             borrow_apr=self.borrow_apr,
             opportunity_cost_apr=self.opportunity_cost_apr,
-            notional_usd=notional_usd, mechanical_reason="CLEARED")
+            notional_usd=notional_usd, mechanical_reason="CLEARED",
+            snapshot=self.snapshot)
         self.last_entry_trace = dict(result.trace)
         self._persist_trace(self.last_entry_trace)
         if result.allowed:
@@ -1880,8 +1881,13 @@ class CarryEngine:
         # THE PAIR GATE, before the first leg. Ordered by damage inside
         # CarryRisk: a tripped kill switch outranks a stale price, both outrank
         # a cap. Never skipped: its absence refused above.
+        #
+        # The gate is shown the notional of the order ABOUT TO BE SENT (the sized
+        # quantity at the mark), not this engine's own cap constant: handing it the
+        # constant made its cap check a comparison of a number with itself, so a
+        # sizing bug could never trip it.
         gate = self.pair_risk.gate_open(
-            notional_usd=self.max_notional_usd, snapshot=self.snapshot,
+            notional_usd=qty * mark, snapshot=self.snapshot,
             has_open_pair=self.position is not None,
             now=self._gate_now(timestamp_ms))
         if not gate:
@@ -2974,6 +2980,14 @@ class CarryEngine:
         is the only order this path can send."""
         if self.position is None or self.state is BookState.HALTED:
             return None
+        if (self.state is BookState.UNWINDING and self.close_executor is not None
+                and self.execution_mode == OVERLAY):
+            # A staged close is in flight. The venue's short is SUPPOSED to be
+            # smaller than the size recorded at the open (a partial fill), so the
+            # drift check below would halt on the close's own progress and strand
+            # the remainder. The close needs no mark and no view: step it exactly
+            # as the normal tick does.
+            return self._staged_close(self.position, self._close_reason)
         mismatch = self._check_venue_position()
         if mismatch is not None:
             return mismatch
