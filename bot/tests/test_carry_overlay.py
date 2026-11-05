@@ -95,6 +95,24 @@ class Venue:
         return self.inventory
 
 
+class ReadsItsShort(Venue):
+    """A venue that also tracks and reports the short it holds. FLAT is the venue's
+    word, so every test that expects a close to end FLAT needs a position read-back."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.short = 0.0
+
+    def place_market(self, *, symbol, side, qty, product):
+        out = super().place_market(symbol=symbol, side=side, qty=qty, product=product)
+        if product == "linear" and out:
+            self.short += out["filled_qty"] if side == "Sell" else -out["filled_qty"]
+        return out
+
+    def get_perp_position(self, symbol):
+        return self.short
+
+
 def snap(perp=MARK, spot=MARK):
     return MarketSnapshot(perp_mark=perp, spot_mark=spot, funding_bps=3.0,
                           margin_multiple=5.0, observed_at_s=time.time())
@@ -135,7 +153,7 @@ class TestTheOverlayNeverTradesTheClientsSpot:
         assert e.position.spot.fee is None
 
     def test_unwinding_buys_the_perp_back_and_sells_nothing(self):
-        v = Venue()
+        v = ReadsItsShort()
         e = engine(v)
         open_pair(e)
         v.orders.clear()
@@ -534,7 +552,7 @@ class TestACoverReductionSnappedToALot:
         """The client withdrew 0.0015 BTC; the buy-back is snapped down to one
         0.001 lot and fills completely. The 0.0005 left over is below one lot
         (the same shortfall the engine already tolerates), not a short fill."""
-        v = Venue(inventory=0.011,
+        v = ReadsItsShort(inventory=0.011,
                   lot={"qty_step": 0.001, "min_qty": 0.001, "min_notional": 5.0})
         kills = []
         e = engine(v, cap=1100.0, kill_switch=kills.append)
@@ -598,7 +616,7 @@ class TestACoverShortfallBelowOneLotAtOneLotSize:
         """At the production cap the whole hedge is ONE lot, so the 'below a
         lot is dust' rule meant the cover check never fired: the client could
         hold 0.0002 BTC against a 0.001 short and the book reported HEDGED."""
-        v = Venue(inventory=0.001, lot=self.LOT)
+        v = ReadsItsShort(inventory=0.001, lot=self.LOT)
         e = engine(v, cap=100.0)
         assert open_pair(e).action == "opened"
         assert e.position.perp.filled_qty == pytest.approx(0.001)

@@ -49,7 +49,8 @@ class FakeBroker:
                  order_lag_reads: int = 0, order_unreadable_reads: int = 0,
                  exec_mismatch: bool = False, hide_orders: bool = False,
                  trusting: bool = False, position_says_long: bool = False,
-                 exit_allowed: bool = True, ack_claims_fill: bool = False):
+                 exit_allowed: bool = True, ack_claims_fill: bool = False,
+                 external_flatten_after_send: bool = False):
         self.clock = clock
         self.net = -float(short)
         self.initial_short = float(short)
@@ -68,6 +69,9 @@ class FakeBroker:
         self.position_says_long = position_says_long
         self.exit_allowed = exit_allowed
         self.ack_claims_fill = ack_claims_fill
+        #: something that is NOT us (a liquidation, a manual trade) takes the whole
+        #: remaining short away right after our first order fills
+        self.external_flatten_after_send = external_flatten_after_send
         self.crash_after_accept: set = set()       # link ids: venue accepts, process dies
         self.crash_before_send: set = set()        # link ids: process dies before the request leaves
         self._x = 0
@@ -149,6 +153,8 @@ class FakeBroker:
         self._x += 1
         execs = [(f"x{self._x}", got)] if got > 0 else []
         self.orders[link] = {"qty": qty, "filled": got, "execs": execs, "status": status}
+        if self.external_flatten_after_send:
+            self.net = 0.0
         if link in self.crash_after_accept:
             raise Crash(f"died after the venue accepted {link}")
         if mode == "lost":

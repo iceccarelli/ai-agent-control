@@ -2198,6 +2198,9 @@ class CarryEngine:
     #: cleared whenever the engine itself sends a perp order. A close the venue
     #: reports since then, with no order of ours in between, was not ours.
     _venue_verified_ms: Optional[int] = None
+    #: Extra reads of the venue's position after a legacy overlay close whose first
+    #: read-back failed, before the book gives up and halts as UNWIND_UNCONFIRMED.
+    UNWIND_CONFIRM_READS = 3
 
     def _short_left_after_close(self, fill_left: float) -> Optional[float]:
         """The perp short still open after a close, as the venue reports it,
@@ -2227,6 +2230,18 @@ class CarryEngine:
                     break
         remaining = 0.0 if remaining <= QTY_DUST else remaining
         return max(floor, remaining)
+
+    def _confirmed_short_left(self, fill_left: float) -> Optional[float]:
+        """`_short_left_after_close`, retried a bounded number of times when the
+        venue cannot be read. None means the position is UNKNOWN: the caller must
+        not call the book flat on fill arithmetic."""
+        remaining = self._short_left_after_close(max(0.0, fill_left))
+        for _ in range(self.UNWIND_CONFIRM_READS):
+            if remaining is not None:
+                break
+            time.sleep(self.UNWIND_REREAD_WAIT_S)
+            remaining = self._short_left_after_close(max(0.0, fill_left))
+        return remaining
 
     def check_venue_flat_while_flat(self, perp_held: Optional[float]
                                     ) -> Optional[CarryDecision]:
@@ -2755,6 +2770,22 @@ class CarryEngine:
         remaining = (self._short_left_after_close(max(0.0, fill_left))
                      if perp is not None and perp.filled_qty > 0 else None)
         perp_left = remaining if remaining is not None else fill_left
+        if (self.execution_mode == OVERLAY and perp is not None
+                and perp.filled_qty > 0 and remaining is None):
+            # The close filled, but the venue's own position cannot be read, so
+            # FLAT would rest on fill arithmetic alone - an inference, not a
+            # confirmation. Look again a bounded number of times; a read that
+            # keeps failing is an UNKNOWN position, never a flat one.
+            remaining = self._confirmed_short_left(fill_left)
+            if remaining is None:
+                return self._halt(
+                    "UNWIND_UNCONFIRMED",
+                    f"{reason} - the perp buy-back filled {perp.filled_qty:.10g} "
+                    f"(the fills leave {max(0.0, fill_left):.10g} short) but the "
+                    "venue's position could not be read afterwards, so the book "
+                    "is NOT declared flat. The position is kept as recorded for "
+                    "a human to confirm against the venue.")
+            perp_left = remaining
         if self.execution_mode == OVERLAY:
             # The long side is the client's inventory. Closing the hedge means
             # buying the perp back and nothing else: selling their BTC would
@@ -3117,6 +3148,15 @@ class CarryEngine:
                 "is naked SHORT")
 
         remaining = hedged - closed.filled_qty
+        # FLAT needs the venue's own position, not the arithmetic of one fill.
+        confirmed = self._confirmed_short_left(max(0.0, remaining))
+        if confirmed is None:
+            return self._halt(
+                "INVENTORY_CLOSE_UNCONFIRMED",
+                f"the buy-back filled {closed.filled_qty:.10g} against a "
+                f"{hedged:.10g} short but the venue's position could not be "
+                "read afterwards; the book is NOT declared flat")
+        remaining = max(remaining, confirmed) if confirmed > QTY_DUST else remaining
         if remaining <= QTY_DUST:
             self.position = None
             self.state = BookState.FLAT

@@ -111,6 +111,7 @@ jobs:
           tests/test_venues_registry.py
           tests/test_venue_qualification.py
           tests/test_venue_guards_generalise.py
+          tests/test_open_crash_real_stack.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
           tests/test_paper_agent_certification.py

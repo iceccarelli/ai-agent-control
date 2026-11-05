@@ -179,7 +179,7 @@ def candle(eng, *, ms, print_ms=None):
 
 class TestAPartialCloseIsNotAClose:
     def test_overlay_a_half_filled_buy_back_halts_and_keeps_the_residual(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         assert v.perp_short == pytest.approx(1.0)
@@ -196,7 +196,7 @@ class TestAPartialCloseIsNotAClose:
         assert eng.position.perp.filled_qty == pytest.approx(v.perp_short)
 
     def test_the_residual_is_written_down_so_a_restart_can_see_it(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.close_fill = 0.5
@@ -209,7 +209,7 @@ class TestAPartialCloseIsNotAClose:
         assert last["position"]["perp"]["filled_qty"] == pytest.approx(0.5)
 
     def test_a_partial_close_trips_the_kill_switch(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.close_fill = 0.5
@@ -219,7 +219,7 @@ class TestAPartialCloseIsNotAClose:
 
     def test_a_halted_book_opens_nothing_on_the_next_candle(self):
         """The failure this prevents: FLAT plus a live short is a second pair."""
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.close_fill = 0.5
@@ -233,7 +233,7 @@ class TestAPartialCloseIsNotAClose:
 
     def test_a_complete_buy_back_still_goes_flat(self):
         """The regression guard: a full close is unchanged."""
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.margin = 1.1
@@ -244,7 +244,7 @@ class TestAPartialCloseIsNotAClose:
         assert v.perp_short == pytest.approx(0.0)
 
     def test_acquire_a_half_filled_close_halts_on_either_leg(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v, mode=ACQUIRE)
         candle(eng, ms=1_000)
         assert v.spot_long == pytest.approx(eng.position.spot_held_qty)
@@ -289,7 +289,7 @@ class TestAPartialCloseIsNotAClose:
 
 class TestTheOverlayKeepsCheckingItsInventory:
     def test_inventory_withdrawn_entirely_closes_the_hedge(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.inventory = 0.0                     # the client moves their BTC out
@@ -300,8 +300,32 @@ class TestTheOverlayKeepsCheckingItsInventory:
         assert eng.position is None
         assert v.perp_short == pytest.approx(0.0)
 
+    def test_a_buy_back_the_venue_cannot_confirm_does_not_take_the_book_flat(self, monkeypatch):
+        monkeypatch.setattr(CarryEngine, "UNWIND_REREAD_WAIT_S", 0.0)
+
+        class NoReadBack(_VenueReadsItsShort):
+            closed = False
+
+            def place_market(self, *, symbol, side, qty, product):
+                out = super().place_market(symbol=symbol, side=side, qty=qty, product=product)
+                if product == "linear" and side == "Buy":
+                    self.closed = True            # from here the position list is down
+                return out
+
+            def get_perp_position(self, symbol):
+                if self.closed:
+                    raise RuntimeError("position list unreadable")
+                return self.perp_short
+        v = NoReadBack()
+        eng = build(v)
+        candle(eng, ms=1_000)
+        v.inventory = 0.0
+        d = candle(eng, ms=61_000, print_ms=61_000)
+        assert d.reason == "INVENTORY_CLOSE_UNCONFIRMED"
+        assert eng.state is BookState.HALTED and eng.position is not None
+
     def test_inventory_halved_reduces_the_hedge_to_what_is_covered(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.inventory = 0.5
@@ -314,7 +338,7 @@ class TestTheOverlayKeepsCheckingItsInventory:
         assert eng.position.delta_qty == pytest.approx(0.0)
 
     def test_a_book_whose_inventory_is_intact_is_left_alone(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         before = len(v.orders)
@@ -324,7 +348,7 @@ class TestTheOverlayKeepsCheckingItsInventory:
         assert len(v.orders) == before, "it traded against an intact inventory"
 
     def test_an_unreadable_inventory_halts_rather_than_assuming(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.inventory_boom = True
@@ -334,7 +358,7 @@ class TestTheOverlayKeepsCheckingItsInventory:
         assert d.reason == "INVENTORY_UNREADABLE"
 
     def test_inventory_gone_and_the_buy_back_refused_halts(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.inventory = 0.0
@@ -347,7 +371,7 @@ class TestTheOverlayKeepsCheckingItsInventory:
     def test_a_shortfall_below_one_venue_lot_does_not_halt_the_book(self):
         """Dust is not an incident, and halting on it would make the gate
         unusable. There is no order that would reduce it."""
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.inventory = 1.0 - 0.0005            # half a lot uncovered
@@ -363,7 +387,7 @@ class TestTheOverlayKeepsCheckingItsInventory:
     def test_acquire_mode_never_asks_about_inventory(self):
         """In acquire the book bought its own spot; the client's wallet is not
         the hedge, and reading it would be a gate on somebody else's money."""
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v, mode=ACQUIRE)
         candle(eng, ms=1_000)
         before = v.inventory_calls
@@ -371,7 +395,7 @@ class TestTheOverlayKeepsCheckingItsInventory:
         assert v.inventory_calls == before
 
     def test_the_reduced_hedge_is_written_down(self):
-        v = Venue()
+        v = _VenueReadsItsShort()
         eng = build(v)
         candle(eng, ms=1_000)
         v.inventory = 0.5
@@ -495,17 +519,33 @@ def test_a_refused_buy_back_keeps_the_position_and_halts(mode):
     assert eng.position is not None and eng.state is BookState.HALTED
 
 
-def test_an_unreadable_venue_position_still_closes_the_recorded_short():
+def test_an_unreadable_venue_position_after_the_close_is_unknown_not_flat(monkeypatch):
+    """The buy-back filled in full, but the venue's position cannot be read afterwards.
+    Fill arithmetic alone used to take the book FLAT. FLAT is the venue's word, so after
+    a bounded number of re-reads the book HALTS as UNWIND_UNCONFIRMED, still holding the
+    position it recorded, with the kill switch engaged for a human to confirm."""
+    monkeypatch.setattr(CarryEngine, "UNWIND_REREAD_WAIT_S", 0.0)
+
     class Unreadable(_VenueReadsItsShort):
+        reads = 0
+
         def get_perp_position(self, symbol):
-            raise RuntimeError("position list unreadable")
+            if self.orders:                       # the pre-close read works; the read-back does not
+                Unreadable.reads += 1
+                raise RuntimeError("position list unreadable")
+            return self.perp_short
     v = Unreadable()
     eng = build(v, mode=OVERLAY)
     candle(eng, ms=1_000)
     v.margin = 1.1
     d = candle(eng, ms=61_000, print_ms=1_000)
-    assert d.action == "unwound", (d.action, d.reason)
-    assert v.perp_short < 1e-6
+    assert d.reason == "UNWIND_UNCONFIRMED", (d.action, d.reason)
+    assert eng.state is BookState.HALTED and eng.position is not None
+    assert eng.tripped, "an unconfirmed position did not call a human"
+    assert Unreadable.reads > 1                   # re-read a bounded number of times, not once
+    sent = len(v.orders)
+    candle(eng, ms=121_000, print_ms=121_000)
+    assert len(v.orders) == sent                  # and a halted book sends nothing more
 
 
 def test_an_overlay_partial_close_never_records_more_spot_than_the_client_holds():
