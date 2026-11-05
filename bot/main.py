@@ -46,6 +46,8 @@ import datetime as dt
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import config as _config
+import fingerprint as _fingerprint
+import venues as _venues
 from bybit_connection import BybitAPIError, BybitClient
 from memory import TradingMemory
 from persistence import StateStore
@@ -336,6 +338,7 @@ class TradingBot:
                 "policy": self._policy_health(),
                 "observation_status": self.observation_status,
                 "market_feed": TradingBot._market_feed_status(self),
+                "fingerprint": _fingerprint.runtime_fingerprint(self.cfg),
             }
         except Exception as exc:  # noqa: BLE001
             return {"healthy": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -553,6 +556,13 @@ class TradingBot:
                 self.store.record_execution_environment(environment)
         except Exception:  # noqa: BLE001
             logger.exception("could not record the execution environment")
+            if _venues.requires_live_authorisation(getattr(self.cfg, "BYBIT_VENUE", None)):
+                # On a real-money venue an unlabelled database is the one place
+                # the performance report would have to guess whether its cash is
+                # real. Refuse to start rather than run unlabelled.
+                logger.critical("startup blocked: the execution environment of a "
+                                "real-money venue could not be recorded")
+                return False
         live_armed, live_why = _config.is_live_authorized(self.cfg)
         logger.warning(
             "mode: %s | testnet=%s paper=%s | %s",
@@ -694,11 +704,12 @@ class TradingBot:
         Bybit DEMO trading runs on REAL mainnet market data with simulated matching,
         so a demo engine is fed mainnet prices, never testnet's."""
         venue = getattr(getattr(self, "cfg", None), "BYBIT_VENUE", None)
-        if isinstance(venue, str) and venue.strip().lower() in ("mainnet", "demo"):
-            return "mainnet"
-        if isinstance(venue, str) and venue.strip().lower() == "testnet":
-            return "testnet"
-        return "testnet" if bool(getattr(self.cfg, "USE_TESTNET", True)) else "mainnet"
+        try:
+            return _venues.feed_environment(venue)
+        except ValueError:
+            # No flag fall-back: a name the registry does not know, or has not
+            # qualified, must not silently pick a price source.
+            raise _config.ConfigError(f"no market-data environment for venue {venue!r}")
 
     def _start_market_feed(self) -> None:
         """Start the public market-data feed, only when MARKET_FEED_ENABLED and a
@@ -720,9 +731,18 @@ class TradingBot:
 
             env = self._market_feed_environment()
             directory = str(getattr(self.cfg, "MARKET_FEED_DIR", "") or "")
-            store = _mst.MarketStore(directory, environment=env)
+            reserve_mb = getattr(self.cfg, "MARKET_FEED_MIN_FREE_MB", 256)
+            retention = getattr(self.cfg, "MARKET_FEED_RETENTION_DAYS", 1)
+            # A value that is not a whole number falls back to the DEFAULT reserve, never
+            # to "no reserve"; retention falls back to keeping everything (nothing deleted).
+            if not isinstance(reserve_mb, int) or isinstance(reserve_mb, bool) or reserve_mb < 0:
+                reserve_mb = 256
+            store = _mst.MarketStore(directory, environment=env,
+                                     min_free_bytes=int(reserve_mb) * 1024 * 1024)
             engine = _me.Engine(_ms.MarketState(self.carry.perp_symbol, environment=env), store)
-            fcfg = _mf.FeedConfig(symbol=self.carry.perp_symbol, environment=env)
+            fcfg = _mf.FeedConfig(
+                symbol=self.carry.perp_symbol, environment=env,
+                retention_days=retention if isinstance(retention, int) and not isinstance(retention, bool) else 0)
             factory = self._market_feed_factory or (lambda url: _mt.PublicWebSocket(url))
             rest = _mr.PublicRest(_mr.urllib_transport(), base_url=fcfg.rest_base)
             feed = _mf.Feed(fcfg, engine, factory, rest)
@@ -796,7 +816,7 @@ class TradingBot:
             transport_factory = self._ws_transport_factory
             if transport_factory is None:
                 import ws_transport as _wt
-                url = self.client.ws_private_url
+                url = self.client.private_ws_url()
                 transport_factory = lambda: _wt.PrivateWebSocket(url)  # noqa: E731
 
             evidence_path = self._ws_evidence_path or str(getattr(
@@ -2125,15 +2145,31 @@ def carry_orders_permitted_for(cfg: Any, client: Any, *,
     allowed, why = carry_orders_permitted(cfg, exit=exit)
     if allowed is not True:
         return (allowed, why)
+    raw_url = getattr(client, "base_url", "")
+    url = str(raw_url or "").rstrip("/")
+    venue = getattr(cfg, "BYBIT_VENUE", None)
     if bool(cfg.USE_TESTNET):
-        from bybit_connection import MAINNET_REST
-        url = str(getattr(client, "base_url", "") or "").rstrip("/")
-        if url == MAINNET_REST:
-            return (False, f"sandbox config (USE_TESTNET=1) but the client "
-                           f"targets the mainnet host {MAINNET_REST}")
+        # No LIVE venue's host may be the target of a sandbox config, whichever
+        # live venue it is (not only the literal mainnet).
+        for name in _venues.live_names():
+            if url and url == _venues.rest_for(name):
+                return (False, f"sandbox config (USE_TESTNET=1) but the client "
+                               f"targets the {name} host {url}")
         if not url:
             return (False, "sandbox config (USE_TESTNET=1) but the client "
                            "states no host: the venue it talks to is unknown")
+    if isinstance(venue, str) and venue.strip() and isinstance(raw_url, str):
+        # The config names its venue, so the client's REST host must be exactly
+        # that venue's: an injected client for a different venue is refused. (A
+        # client that states no string URL at all is a test double; the real
+        # client always has one and its transport re-checks the host per request.)
+        try:
+            want = _venues.rest_for(venue)
+        except ValueError as exc:
+            return (False, f"the configured venue is not usable: {exc}")
+        if url and url != want:
+            return (False, f"config venue {venue!r} expects {want} but the "
+                           f"client targets {url}")
     return (True, why)
 
 
@@ -2155,8 +2191,13 @@ def execution_environment_of(cfg: Any) -> str:
     """What kind of money this process's execution records are. Sandbox
     flags default to the safe answer when absent; only an explicit
     USE_TESTNET=0 and PAPER_TRADING=0 is mainnet."""
-    if bool(getattr(cfg, "USE_TESTNET", True)):
-        return "testnet"
+    venue = getattr(cfg, "BYBIT_VENUE", None)
+    named = isinstance(venue, str) and venue.strip() != ""
+    # A sandbox label needs BOTH the flag and the registry to say sandbox. Either
+    # one saying "real money" (or an unknown/unqualified name) wins: the label
+    # never reads safer than the more dangerous of the two.
+    if bool(getattr(cfg, "USE_TESTNET", True)) and (not named or _venues.is_sandbox(venue)):
+        return _venues.execution_environment(venue) if named else "testnet"
     if bool(getattr(cfg, "PAPER_TRADING", True)):
         return "paper"
     return "mainnet"

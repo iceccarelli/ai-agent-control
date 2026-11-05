@@ -41,6 +41,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Mapping, Optional, Tuple
 
+import venues as _venues
+
 __all__ = [
     "Config",
     "ConfigError",
@@ -280,7 +282,7 @@ def parse_maker_wait(env: Mapping[str, str]) -> float:
 #: money is real; the other two are sandboxes and every safety gate treats
 #: them identically, because USE_TESTNET is DERIVED from this rather than
 #: competing with it (0046).
-BYBIT_VENUES = ("mainnet", "testnet", "demo")
+BYBIT_VENUES = _venues.qualified_names()
 
 
 def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
@@ -299,12 +301,18 @@ def parse_venue(env: Mapping[str, str]) -> Tuple[str, bool]:
         sandbox = parse_safety_bool(stated, "USE_TESTNET", True)
         return ("testnet" if sandbox else "mainnet"), sandbox
     venue = str(raw).strip().lower()
-    if venue not in BYBIT_VENUES:
+    if venue in _venues.unqualified():
         raise ConfigError(
-            f"BYBIT_VENUE={raw!r} is not one of {BYBIT_VENUES}. Refusing "
+            f"BYBIT_VENUE={raw!r}: {_venues.unqualified()[venue].reason}. Refusing; "
+            "see venue_qualification for the evidence that would be needed.")
+    if venue not in _venues.qualified_names():
+        raise ConfigError(
+            f"BYBIT_VENUE={raw!r} is not one of {_venues.qualified_names()}. Refusing "
             "rather than defaulting: this decides which exchange the keys "
             "authenticate against.")
-    sandbox = venue != "mainnet"
+    # Whether a venue is a sandbox is a fact in the registry, not "anything that
+    # is not mainnet": a venue added later defaults to needing live authorisation.
+    sandbox = _venues.is_sandbox(venue)
     if stated is not None and str(stated).strip() != "":
         if parse_safety_bool(stated, "USE_TESTNET", True) != sandbox:
             raise ConfigError(
@@ -325,7 +333,7 @@ def parse_int(
     else:
         try:
             value = int(float(str(raw).strip()))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):     # "inf" overflows int(), it is not an integer
             raise ConfigError(f"{name}={raw!r} is not an integer")
     if not (low <= value <= high):
         raise ConfigError(f"{name}={value} is outside [{low}, {high}]")
@@ -581,6 +589,17 @@ class Config:
     #: operator OUTSIDE the trading database and outside source trees.
     MARKET_FEED_ENABLED: bool = False
     MARKET_FEED_DIR: str = ""
+    #: Provenance for the health fingerprint, set by the image build / the platform.
+    #: Informational only: nothing decides anything from them.
+    BUILD_COMMIT: str = ""
+    FLY_IMAGE_REF: str = ""
+    #: The feed writes ~200 bytes per input and measured ~1.5 GB per day on mainnet
+    #: BTCUSDT (depth 50, both products). It shares the volume with the ledger on a
+    #: one-volume deployment, so it keeps a free-space RESERVE (it stops writing, and
+    #: entries stop, long before the ledger could be starved) and prunes whole closed
+    #: UTC days past the retention. 0 days = keep everything (an operator decision).
+    MARKET_FEED_MIN_FREE_MB: int = 256
+    MARKET_FEED_RETENTION_DAYS: int = 1
     #: What the capital behind the hedge could earn elsewhere, as a fraction
     #: per year on the hedged notional, charged like financing in the entry
     #: economics. 0.0 (the default) changes nothing: the repo holds no rate
@@ -1078,6 +1097,10 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         CARRY_EXECUTION_MODE=parse_execution_mode(env),
         MARKET_FEED_ENABLED=parse_bool(env.get("MARKET_FEED_ENABLED"), False),
         MARKET_FEED_DIR=parse_str(env, "MARKET_FEED_DIR", ""),
+        BUILD_COMMIT=parse_str(env, "BUILD_COMMIT", ""),
+        FLY_IMAGE_REF=parse_str(env, "FLY_IMAGE_REF", ""),
+        MARKET_FEED_MIN_FREE_MB=parse_int(env, "MARKET_FEED_MIN_FREE_MB", 256, low=0, high=10_000_000),
+        MARKET_FEED_RETENTION_DAYS=parse_int(env, "MARKET_FEED_RETENTION_DAYS", 1, low=0, high=3650),
         CARRY_EXECUTION_STYLE=parse_execution_style(env),
         CARRY_MAKER_WAIT_S=parse_maker_wait(env),
         PAPER_SESSION_LOG_PATH=parse_str(env, "PAPER_SESSION_LOG_PATH", ""),

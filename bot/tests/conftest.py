@@ -186,3 +186,37 @@ def pytest_collection_modifyitems(items):
     for item in items:
         if item.nodeid.endswith(target):
             item.add_marker(pytest.mark.data_freshness)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_test_opens_the_tracked_state_database():
+    """No test may open the database file that is tracked in the repository.
+
+    `bot/state/trading_state.db` is a real file in a checkout (and in an
+    operator's, where it may be a live ledger). `STATE_DB_PATH` defaults to a path
+    that resolves to it, so a test or tool that forgets to pass a temp path would
+    read, migrate or WRITE it. The suite refuses that at the one place every SQLite
+    open passes through. A test that needs a database uses `tmp_path`.
+    """
+    import sqlite3
+
+    tracked = os.path.realpath(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state"))
+    real_connect = sqlite3.connect
+
+    def guarded(database, *args, **kwargs):
+        try:
+            target = os.path.realpath(os.fspath(database))
+        except TypeError:
+            target = ""
+        if target == tracked or target.startswith(tracked + os.sep):
+            raise AssertionError(
+                f"a test tried to open {target}: the tracked state directory is "
+                "never a test database. Use tmp_path.")
+        return real_connect(database, *args, **kwargs)
+
+    sqlite3.connect = guarded
+    try:
+        yield
+    finally:
+        sqlite3.connect = real_connect

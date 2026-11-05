@@ -58,6 +58,7 @@ THE RULES THIS MODULE ENFORCES
 
 from __future__ import annotations
 
+import venues as _venues
 import hashlib
 import hmac
 import json
@@ -97,6 +98,9 @@ __all__ = [
     "VENUE_REST",
     "MAINNET_WS_PRIVATE",
     "TESTNET_WS_PRIVATE",
+    "DEMO_WS_PRIVATE",
+    "VENUE_WS_PRIVATE",
+    "VENUE_HOSTS",
 ]
 
 #: Retries after the first try for an ordinary request (`_request(retries=...)` loops
@@ -104,30 +108,29 @@ __all__ = [
 #: landed is derived from this, so it is one name, not a number copied into main.
 DEFAULT_REQUEST_RETRIES = 3
 
-MAINNET_REST = "https://api.bybit.com"
-TESTNET_REST = "https://api-testnet.bybit.com"
+#: Every host below is DERIVED from `venues`, the one registry that also says which
+#: venues are real money. There is no second table to drift out of step.
+MAINNET_REST = _venues.rest_for("mainnet")
+TESTNET_REST = _venues.rest_for("testnet")
 #: Bybit DEMO TRADING (0046). A separate module from testnet: it runs against
 #: REAL mainnet market data with simulated matching, and its wallet is funded
 #: by `POST /v5/account/demo-apply-money` rather than a 24-hour web faucet.
 #: Real marks, real basis, real funding prints, no real money.
-DEMO_REST = "https://api-demo.bybit.com"
+DEMO_REST = _venues.rest_for("demo")
 
 #: The only mapping from a venue name to a URL. One table, so there is exactly
 #: one answer to "which exchange am I pointed at".
-VENUE_REST = {"mainnet": MAINNET_REST, "testnet": TESTNET_REST,
-              "demo": DEMO_REST}
-MAINNET_WS_PRIVATE = "wss://stream.bybit.com/v5/private"
-TESTNET_WS_PRIVATE = "wss://stream-testnet.bybit.com/v5/private"
-DEMO_WS_PRIVATE = "wss://stream-demo.bybit.com/v5/private"
-VENUE_WS_PRIVATE = {"mainnet": MAINNET_WS_PRIVATE, "testnet": TESTNET_WS_PRIVATE,
-                    "demo": DEMO_WS_PRIVATE}
+VENUE_REST = {n: _venues.rest_for(n) for n in _venues.qualified_names()}
+MAINNET_WS_PRIVATE = _venues.ws_private_for("mainnet")
+TESTNET_WS_PRIVATE = _venues.ws_private_for("testnet")
+DEMO_WS_PRIVATE = _venues.ws_private_for("demo")
+VENUE_WS_PRIVATE = {n: _venues.ws_private_for(n) for n in _venues.qualified_names()}
 
 #: The one hostname each venue may be reached on. The request path checks the
 #: URL it is ACTUALLY about to send against this, so a base_url that was
 #: reassigned, subclassed or monkey-patched after construction cannot carry a
 #: testnet-labelled client to the production host (or the reverse).
-VENUE_HOSTS = {"mainnet": "api.bybit.com", "testnet": "api-testnet.bybit.com",
-               "demo": "api-demo.bybit.com"}
+VENUE_HOSTS = _venues.rest_hosts()
 
 #: Endpoints that can open or enlarge exposure. On mainnet these leave the
 #: process only when live trading is authorised in the config the client was
@@ -167,12 +170,14 @@ def resolve_client_venue(cfg: Any) -> str:
                 "rather than choosing an exchange")
         return "testnet" if sandbox else "mainnet"
     venue = str(raw).strip().lower()
-    if venue not in VENUE_REST:
+    if venue in _venues.unqualified():
+        raise ValueError(f"BYBIT_VENUE={raw!r}: {_venues.unqualified()[venue].reason}; refusing")
+    if venue not in _venues.qualified_names():
         raise ValueError(
-            f"BYBIT_VENUE={raw!r} is not one of {sorted(VENUE_REST)}; "
+            f"BYBIT_VENUE={raw!r} is not one of {sorted(_venues.qualified_names())}; "
             "refusing rather than guessing which exchange to authenticate "
             "against")
-    if sandbox is not None and sandbox != (venue != "mainnet"):
+    if sandbox is not None and sandbox != _venues.is_sandbox(venue):
         raise ValueError(
             f"BYBIT_VENUE={venue!r} and USE_TESTNET={stated!r} disagree about "
             "whether this is a sandbox; refusing")
@@ -460,12 +465,12 @@ class BybitClient:
         # contradicts itself or states nothing (resolve_client_venue). USE_TESTNET
         # is then the DERIVED sandbox flag every safety gate already reads.
         venue = resolve_client_venue(self.cfg)
-        self.testnet = venue != "mainnet"
+        self.testnet = _venues.is_sandbox(venue)
         self.venue = venue
-        self.base_url = VENUE_REST[venue]
+        self.base_url = _venues.rest_for(venue)
         # By venue, like REST: demo credentials are only valid on the demo
         # stream, which is not the testnet one.
-        self.ws_private_url = VENUE_WS_PRIVATE[venue]
+        self.ws_private_url = _venues.ws_private_for(venue)
         #: "spot" or "linear". THE fork this client is built around — see the
         #: class docstring. Read from config once, here, so no call site can
         #: disagree with another about which product it is trading.
@@ -515,11 +520,27 @@ class BybitClient:
         """
         from urllib.parse import urlsplit
         parts = urlsplit(url)
-        if parts.scheme != "https" or parts.hostname != VENUE_HOSTS.get(
-                self.venue):
+        try:
+            want = _venues.get(self.venue).host
+        except ValueError:
+            want = None
+        if parts.scheme != "https" or want is None or parts.hostname != want:
             raise PermanentAPIError(
                 f"endpoint host {parts.hostname!r} is not the {self.venue} "
-                f"host {VENUE_HOSTS.get(self.venue)!r}; nothing was sent")
+                f"host {want!r}; nothing was sent")
+
+    def private_ws_url(self) -> str:
+        """The private-stream URL, checked against this venue's own stream host
+        immediately before it is used. The signed auth frame goes to whatever host
+        is connected, so the host is asserted, not assumed."""
+        from urllib.parse import urlsplit
+        parts = urlsplit(self.ws_private_url)
+        want = _venues.get(self.venue).ws_private_host
+        if parts.scheme != "wss" or parts.hostname != want:
+            raise PermanentAPIError(
+                f"private stream host {parts.hostname!r} is not the {self.venue} "
+                f"stream host {want!r}; no credential was sent")
+        return self.ws_private_url
 
     def describe(self) -> Dict[str, Any]:
         """What this client is pointed at, with no secret in it.
@@ -664,14 +685,15 @@ class BybitClient:
         method = method.upper()
         url = f"{self.base_url}{endpoint}"
         self._assert_endpoint_matches_venue(url)
-        if self.venue == "mainnet" and endpoint in EXPOSURE_ENDPOINTS:
+        if (_venues.requires_live_authorisation(self.venue)
+                and endpoint in EXPOSURE_ENDPOINTS):
             import config as _config
             armed, why = _config.is_live_authorized(self.cfg)
             if armed is not True:
-                logger.critical("%s REFUSED at the transport: mainnet without "
-                                "live authorisation (%s)", endpoint, why)
+                logger.critical("%s REFUSED at the transport: %s without "
+                                "live authorisation (%s)", endpoint, self.venue, why)
                 raise PermanentAPIError(
-                    f"LIVE_NOT_AUTHORIZED: {endpoint} on mainnet ({why})")
+                    f"LIVE_NOT_AUTHORIZED: {endpoint} on {self.venue} ({why})")
         # Count order submissions at the one place every call passes through.
         # Incremented before the attempt, not after a success: an order whose
         # response was lost still left the process, and a session log that
@@ -1325,7 +1347,7 @@ class BybitClient:
 
     def _submit(self, body: Dict[str, Any], oid: str, purpose: str) -> OrderResult:
         """Send an order, mapping every outcome onto a truthful OrderResult."""
-        if self.venue == "mainnet":
+        if _venues.requires_live_authorisation(self.venue):
             # Defence in depth at the transport: the startup gate and the
             # per-order gate of the carry book are not the only things between
             # a caller and the real exchange. A mainnet order leaves this
@@ -1335,8 +1357,8 @@ class BybitClient:
             armed, why = _config.is_live_authorized(self.cfg)
             if armed is not True:
                 self.store.update_order_status(oid, "rejected")
-                logger.critical("order %s REFUSED at the transport: mainnet "
-                                "without live authorisation (%s)", oid, why)
+                logger.critical("order %s REFUSED at the transport: %s "
+                                "without live authorisation (%s)", oid, self.venue, why)
                 return OrderResult(order_link_id=oid,
                                    reason="LIVE_NOT_AUTHORIZED")
         try:

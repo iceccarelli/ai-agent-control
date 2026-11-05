@@ -421,6 +421,30 @@ class SettlementEvidence:
 _SEND = object()
 
 
+def _payload_conflict(row: Optional[Dict[str, Any]], symbol: str, side: str,
+                      qty: float) -> str:
+    """Why an order id already on file is NOT this request ('' when it is, or when
+    there is no row to compare). Symbol and side must match exactly; the quantity
+    to within a part in 1e9, so a re-render of the same number is not a conflict."""
+    if not row:
+        return ""
+    diffs = []
+    if str(row.get("symbol", "")) != str(symbol):
+        diffs.append(f"symbol {row.get('symbol')!r} vs {symbol!r}")
+    if str(row.get("side", "")).lower() != str(side).lower():
+        diffs.append(f"side {row.get('side')!r} vs {side!r}")
+    try:
+        have = float(row.get("qty"))
+        # Only a request for MORE than was recorded is a different order. A re-send of
+        # the same id for what is left of a partly filled order is smaller, and is the
+        # same order.
+        if float(qty) > have + 1e-9 * max(1.0, abs(have)):
+            diffs.append(f"qty {have!r} vs {qty!r}")
+    except (TypeError, ValueError):
+        diffs.append("recorded qty unreadable")
+    return "; ".join(diffs)
+
+
 class _OrderTrail:
     """One carry order's trip through the durable lifecycle log.
 
@@ -466,7 +490,19 @@ class _OrderTrail:
                 "carry order sent") from exc
         if new:
             return _SEND
-        return self._resume(log.get_order(link), link, product, symbol, qty)
+        row = log.get_order(link)
+        conflict = _payload_conflict(row, symbol, side, float(qty_text))
+        if conflict:
+            # The id is on file for a DIFFERENT order. Sending, or even "resuming",
+            # would attribute that order's venue state to this request; the caller
+            # asked for something else and nothing is sent.
+            # NOT a refusal: "refused" tells the caller the order provably never
+            # existed. This id is on file and may have reached the venue, so the
+            # outcome is unknown and nothing is sent.
+            raise OrderOutcomeUnknown(
+                f"order id {link} is already recorded for a different order "
+                f"({conflict}); nothing was sent and the recorded order's state is unknown")
+        return self._resume(row, link, product, symbol, qty)
 
     def _resume(self, row: Optional[Dict[str, Any]], link: str, product: str,
                 symbol: str, qty: float) -> Any:

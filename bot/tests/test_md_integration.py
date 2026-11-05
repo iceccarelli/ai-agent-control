@@ -246,6 +246,7 @@ def test_book_depth_matches_the_shape_the_ledger_reads(frozen_time):
 def bare_bot(tmp_path, *, enabled=True, directory=None, testnet=True):
     bot = object.__new__(app.TradingBot)
     bot.cfg = types.SimpleNamespace(MARKET_FEED_ENABLED=enabled, USE_TESTNET=testnet,
+                                    BYBIT_VENUE="testnet" if testnet else "mainnet",
                                     MARKET_FEED_DIR=str(tmp_path / "feed") if directory is None else directory)
     broker = Account()
     bot.carry = types.SimpleNamespace(perp_symbol="BTCUSDT", spot_symbol="BTCUSDT", broker=broker)

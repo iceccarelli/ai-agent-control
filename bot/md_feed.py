@@ -43,10 +43,11 @@ import md_engine as EN
 import md_events as E
 import md_rest as R
 import md_store as ST
+import venues as _venues
 import ws_transport as WT
 
-WS_BASE_MAINNET = "wss://stream.bybit.com"
-WS_BASE_TESTNET = "wss://stream-testnet.bybit.com"
+WS_BASE_MAINNET = "wss://" + _venues.get("mainnet").ws_private_host
+WS_BASE_TESTNET = "wss://" + _venues.get("testnet").ws_private_host
 #: environment -> (websocket base, REST base). The feed's environment must equal
 #: the engine's venue: testnet prices never drive a mainnet book or the reverse.
 ENDPOINTS = {"mainnet": (WS_BASE_MAINNET, R.MAINNET), "testnet": (WS_BASE_TESTNET, R.TESTNET)}
@@ -80,6 +81,11 @@ class FeedConfig:
     funding_retry_s: float = 60.0
     specs_refresh_s: float = 3600.0
     view_log_interval_s: float = 5.0
+    #: UTC days of closed segments to keep (0 = keep all, an operator decision), and how
+    #: often retention is applied. A segment is only ever removed whole and from the
+    #: oldest end, with a chain checkpoint, so the rest still verifies.
+    retention_days: int = 0
+    retention_every_s: float = 3600.0
     recv_timeout_s: float = 1.0
 
     def __post_init__(self) -> None:
@@ -441,6 +447,7 @@ class Feed:
         self._threads: List[threading.Thread] = []
         self._stop = threading.Event()
         self.view_errors = 0
+        self.retention_errors = 0
 
     def view(self):
         """The current validated view (not logged)."""
@@ -453,7 +460,7 @@ class Feed:
 
     def status(self) -> Dict[str, Any]:
         return {"threads_alive": self.alive(), "store_fault": self.engine.state.store_fault,
-                "view_errors": self.view_errors,
+                "view_errors": self.view_errors, "retention_errors": self.retention_errors,
                 "streams": {c: {"connected": w.ws is not None, "reconnects": w.reconnects,
                                 "errors": w.errors, "last_error": w.last_error,
                                 "binary_frames": w.binary_frames} for c, w in self.streams.items()},
@@ -462,11 +469,28 @@ class Feed:
                                                         "last_error": self.rest.last_error}}
 
     def _view_logger(self) -> None:
+        next_retention = self.mono()
         while not self._stop.wait(self.cfg.view_log_interval_s):
             try:
                 self.engine.log_view(self.mono(), self.wall_ms())
             except Exception:  # noqa: BLE001
                 self.view_errors += 1
+            if self.cfg.retention_days > 0 and self.mono() >= next_retention:
+                next_retention = self.mono() + self.cfg.retention_every_s
+                self.apply_retention()
+
+    def apply_retention(self) -> List[str]:
+        """Prune old segments under the engine's lock so no append interleaves with it.
+        A pruning failure is counted and reported, never raised into the feed."""
+        store = self.engine.store
+        if store is None or self.cfg.retention_days <= 0:
+            return []
+        try:
+            with self.engine.lock:
+                return store.apply_retention(self.wall_ms(), self.cfg.retention_days)
+        except Exception:  # noqa: BLE001
+            self.retention_errors += 1
+            return []
 
     def start(self) -> None:
         self.engine.start_session(self.wall_ms, self.mono)

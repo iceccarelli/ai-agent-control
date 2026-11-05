@@ -30,7 +30,7 @@ COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.p
      policy.py position_sizing.py private_ws_consumer.py project_status.py \
      promotion_gate.py pure_indicators.py risk_management.py session_log.py \
      shadow.py shadow_strategy.py technical_analysis.py trading_engine.py \
-     venue_fees.py ws_transport.py protective_restart.py execution_record.py \
+     venue_fees.py venues.py fingerprint.py ws_transport.py protective_restart.py execution_record.py \
      entry_benefit_gate.py execution_cost_estimate.py strategy_evidence.py \
      carry_evidence.py performance_analytics.py owner_policy.py \
      margin_facts.py \
@@ -70,6 +70,9 @@ USER bot
 # anchors, breaker state and open positions — every brake the bot has.
 VOLUME ["/app/state"]
 ENV STATE_DB_PATH=/app/state/trading_state.db
+# Provenance only (shown in /health): `docker build --build-arg BUILD_COMMIT=$(git rev-parse HEAD)`.
+ARG BUILD_COMMIT=unknown
+ENV BUILD_COMMIT=$BUILD_COMMIT
 
 # Safe by default. Going live requires all four of USE_TESTNET=0,
 # PAPER_TRADING=0, LIVE_TRADING_ACK=I_UNDERSTAND and real credentials,

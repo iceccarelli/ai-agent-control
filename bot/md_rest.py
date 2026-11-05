@@ -43,8 +43,12 @@ ALLOWED_ENDPOINTS = (
     "/v5/market/recent-trade",
 )
 
-MAINNET = "https://api.bybit.com"
-TESTNET = "https://api-testnet.bybit.com"
+import venues as _venues
+
+#: Public market-data hosts are the registry's REST hosts for the two feed
+#: environments, so the feed cannot point somewhere the trading client could not.
+MAINNET = _venues.rest_for("mainnet")
+TESTNET = _venues.rest_for("testnet")
 
 #: Bybit's documented IP-limit ban window after exceeding the rate limit.
 IP_BAN_WINDOW_S = 600.0

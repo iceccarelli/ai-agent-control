@@ -74,6 +74,33 @@ def test_flat_with_none_of_our_fills_is_reported_unexplained_and_sends_nothing(t
     assert sends(rig) == 0
 
 
+def test_flat_after_only_a_sliver_of_our_fills_is_not_called_our_close(tmp_path):
+    """Our reduce-only buy filled 0.001 of a 0.0100 short, then something else took
+    the rest and the venue reads flat. Fills above dust used to be enough to call that
+    an explained close; the other 0.009 left the book some way we cannot account for."""
+    rig = Rig(tmp_path, 0.0100, policy=POL, modes=["partial:0.1"], external_flatten_after_send=True)
+    last, _ = rig.run(dt=DT)
+    assert last.status == CE.FLAT and last.explained is False
+    assert last.detail.get("flat_unexplained") is True
+    assert last.detail["started_short"] == pytest.approx(0.0100)
+    assert last.filled == pytest.approx(0.001)
+
+
+def test_the_boundary_at_production_size_one_lot_of_two_is_not_a_close(tmp_path):
+    """At one or two lots a tolerance of a lot would call half a close a close."""
+    rig = Rig(tmp_path, 0.0020, policy=POL, modes=["partial:0.5"], external_flatten_after_send=True)
+    last, _ = rig.run(dt=DT)
+    assert last.status == CE.FLAT and last.explained is False
+    assert last.filled == pytest.approx(0.001) and last.detail["started_short"] == pytest.approx(0.0020)
+
+
+def test_flat_after_fills_that_cover_the_whole_short_is_still_explained(tmp_path):
+    rig = Rig(tmp_path, 0.0100, policy=POL, modes=["partial:0.6", "full"])
+    last, _ = rig.run(dt=DT)
+    invariants(rig, last, expect_flat=True)
+    assert last.explained is True and last.filled == pytest.approx(0.0100)
+
+
 # -- acknowledgement faults ----------------------------------------------------------------
 
 def test_a_lost_acknowledgement_is_found_by_lookup_and_nothing_is_sent_twice(tmp_path):

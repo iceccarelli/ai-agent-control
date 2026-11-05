@@ -47,6 +47,9 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import venues as _venues  # noqa: E402
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 
@@ -145,7 +148,8 @@ def template(*, app: str = "carry-book", region: str = "fra",
              volume: str = "carry_state", memory_mb: int = 512,
              book_mode: str = "carry", borrow_apr: str = "0.0",
              execution_mode: str = "overlay",
-             execution_style: str = "taker") -> Dict[str, Any]:
+             execution_style: str = "taker",
+             entry_benefit_mode: str = "enforce") -> Dict[str, Any]:
     """One machine. No public port. A disk. Comes back when it dies."""
     return {
         "app": app,
@@ -166,6 +170,7 @@ def template(*, app: str = "carry-book", region: str = "fra",
             "CARRY_BORROW_APR": borrow_apr,
             "CARRY_EXECUTION_MODE": execution_mode,
             "CARRY_EXECUTION_STYLE": execution_style,
+            "CARRY_ENTRY_BENEFIT_MODE": entry_benefit_mode,
             # SAFE BY DEFAULT, and not changeable by pushing this file: a
             # value here that armed live trading is refused by check().
             "USE_TESTNET": "1",
@@ -295,10 +300,12 @@ def check(cfg: Dict[str, Any]) -> List[str]:
                 "the repository. Arming is a deliberate act with four "
                 "independent conditions; `git push` is not one of them.")
 
-    if str(env.get("BYBIT_VENUE", "")).strip().lower() == "mainnet":
+    venue = str(env.get("BYBIT_VENUE", "")).strip().lower()
+    if venue and venue not in _venues.sandbox_names():
         problems.append(
-            "env BYBIT_VENUE='mainnet' would point the process at the live "
-            "exchange from a file in the repository.")
+            f"env BYBIT_VENUE={venue!r} is not a registered sandbox venue "
+            f"{_venues.sandbox_names()}: a live, unqualified or unknown venue "
+            "must never be selected from a file in the repository.")
 
     # -- the book gets what build_bot demands ----------------------------
     if env.get("BOOK_MODE") == "carry":
@@ -359,6 +366,17 @@ def _value(v: Any) -> str:
     return '"' + str(v).replace('"', '\\"') + '"'
 
 
+#: Comments rendered above an `[env]` key. They live here, with the generator, so a
+#: re-render never deletes the explanation of a value.
+ENV_COMMENTS = {
+    "CARRY_ENTRY_BENEFIT_MODE": (
+        "The entry net-benefit gate refuses an entry until real execution samples and\n"
+        "a strategy-evidence verdict exist. Stated here so the deployment does not rely\n"
+        "on the code default; whether this app should instead run \"observe\" (record\n"
+        "what would be refused, let the entry continue) is the owner's decision."),
+}
+
+
 def to_toml(cfg: Dict[str, Any]) -> str:
     """Just enough TOML for this document. `tomllib` reads it back, and a test
     asserts the round trip, so the renderer cannot drift from the checker."""
@@ -374,6 +392,8 @@ def to_toml(cfg: Dict[str, Any]) -> str:
             if flat or not nested:
                 lines.append(f"\n[{key}]")
                 for k, v in flat.items():
+                    if key == "env" and k in ENV_COMMENTS:
+                        lines.extend("# " + c for c in ENV_COMMENTS[k].split("\n"))
                     lines.append(f"{k} = {_value(v)}")
             for name, spec in nested.items():
                 lines.append(f"\n[{key}.{name}]")
@@ -403,44 +423,52 @@ HEADER = """\
 
 COMMANDS = """\
 # ---------------------------------------------------------------- Phase D --
-# Everything below is run ONCE, by a human, from the repo's bot/ directory.
-# Nothing here trades: the image ships PAPER_TRADING=1 and the promotion gate
-# is unsigned, so the carry broker refuses every order until both change.
+# PRINTED, NEVER RUN, by this tool. Everything below is run ONCE, by a human, from
+# the repo's bot/ directory. Nothing here trades: the image ships PAPER_TRADING=1 and
+# the promotion gate is unsigned, so the carry broker refuses every order until
+# both change. Each step has a side effect on a real Fly account; read the whole
+# list before running the first.
 
 cd bot
 
-# 1. the app and the disk. --no-deploy first: the volume must exist before a
-#    machine tries to mount it.
-fly launch --no-deploy --name carry-book --region fra --copy-config
-fly volumes create carry_state --region fra --size 1 --yes
+# 0. confirm the generated config is the committed one (read-only).
+python3 tools/fly_stack.py --check
 
-# 2. THE OUTBOUND IP. Bybit keys are pinned to an address; this is that
-#    address. App-scoped, so it survives machine recreation and deploys.
-#    ~$3.60/month for the IPv4.
-fly ips allocate-egress --region fra
-fly ips list                      # <- pin the Bybit key to the IPv4 shown
+# 1. the app and the disk. `fly launch` is NOT used: it rewrites fly.toml (it did,
+#    once: 0050). The app is created empty and the committed fly.toml is used as is.
+fly apps create carry-book
+fly volumes create carry_state --app carry-book --region fra --size 1 --yes
 
-# 3. credentials, encrypted, injected at runtime, never in a layer or a file.
-fly secrets set BYBIT_API_KEY=... BYBIT_API_SECRET=...
+# 2. THE OUTBOUND IP. Bybit keys are pinned to an address. Fly's egress-IP command
+#    and its scope (app-wide or per machine) have changed between flyctl releases:
+#    read `fly ips allocate-egress --help` and the current Fly docs FIRST, confirm
+#    the scope covers a machine recreated by a deploy, and only then run it.
+#    It bills monthly. The address you pin the exchange key to must be the one
+#    `fly ips list --app carry-book` shows afterwards.
 
-# 4. deploy. --strategy immediate is also in fly.toml; passed again because
-#    this is the flag that stops Fly running two books at once.
-fly deploy --strategy immediate
-fly logs
+# 3. credentials, encrypted, injected at runtime, never in a layer or a file. Use a
+#    key with the LEAST permission the next step needs (read-only for a qualification
+#    read) and an IP allowlist containing only the address from step 2.
+fly secrets set --app carry-book BYBIT_API_KEY=... BYBIT_API_SECRET=...
+
+# 4. deploy ONE machine. --strategy immediate is also in fly.toml; --ha=false stops
+#    Fly creating a second machine, and two machines is two books.
+fly deploy --app carry-book --strategy immediate --ha=false \
+    --build-arg BUILD_COMMIT=$(git rev-parse HEAD)   # shown in /health for drift checks
+fly logs --app carry-book
 
 # 5. CAN THIS MACHINE REACH THE VENUE? The question a drill has to answer
 #    before it can mean anything. Read-only; places nothing.
-fly ssh console -C "python3 tools/connector_check.py --require-bybit-testnet"
+fly ssh console --app carry-book -C "python3 tools/connector_check.py --require-bybit-testnet"
 
 # 6. the four invariants, printed from inside the running image.
-fly ssh console -C "python3 tools/session_tail.py"
+fly ssh console --app carry-book -C "python3 tools/session_tail.py"
 
-# 7. only now, and only after testnet BTC is in the wallet, does the book get
-#    a venue to talk to. PAPER_TRADING=0 with USE_TESTNET=1 is TESTNET ONLY:
-#    _carry_orders_permitted returns (True, "TESTNET"); mainnet additionally
-#    requires live authorisation AND a signed promotion gate, and the gate is
-#    False.
-fly secrets set PAPER_TRADING=0     # USE_TESTNET stays 1
+# 7. NOT HERE. This app (carry-book) stays PAPER_TRADING=1 and USE_TESTNET=1. A
+#    testnet drill that sends orders is a different app (carry-drill, fly.drill.toml)
+#    and needs the owner's explicit, separate authorisation; the printed commands
+#    for it come from tools/drill.py, not from this file. Mainnet needs live
+#    authorisation AND a signed promotion gate, and the gate is not signed.
 """
 
 

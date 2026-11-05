@@ -1,0 +1,65 @@
+# Repository hygiene scans. Offline except for the vulnerability database lookup.
+#
+# secret-scan   tools/secret_scan.py over `git ls-files`. Prints file:line:rule and
+#               never the matched text (CI logs are public).
+# dependency-audit  pip-audit against the FULL resolved set (pins and transitive
+#               packages, from `pip freeze` after an install) and a CycloneDX SBOM, kept as
+#               a build artefact. A known-vulnerable pin turns this job red on
+#               purpose: it is a finding to triage, not a flake.
+#
+# NO CREDENTIALS, NO TRADING: no secret is read, no exchange is contacted, and
+# nothing here can place an order.
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  secret-scan:
+    name: secret scan (tracked files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Scan tracked files for credential shapes
+        run: python bot/tools/secret_scan.py
+
+  dependency-audit:
+    name: dependency audit and SBOM
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the dependencies exactly as the application does
+        working-directory: bot
+        run: |
+          python -m pip install -r requirements.txt -c constraints.txt
+          python -m pip freeze --exclude-editable > "$RUNNER_TEMP/frozen.txt"
+          echo "audited set: $(wc -l < "$RUNNER_TEMP/frozen.txt") packages (the pins AND everything they pulled in)"
+      - name: Install the auditor
+        run: python -m pip install "pip-audit==2.9.0"
+      - name: Audit the full resolved set
+        run: python -m pip_audit -r "$RUNNER_TEMP/frozen.txt" --no-deps --progress-spinner off
+      - name: Write the SBOM
+        run: python -m pip_audit -r "$RUNNER_TEMP/frozen.txt" --no-deps --progress-spinner off -f cyclonedx-json -o "$RUNNER_TEMP/sbom.cdx.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: ${{ runner.temp }}/sbom.cdx.json

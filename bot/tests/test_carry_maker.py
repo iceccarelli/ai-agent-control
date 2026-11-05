@@ -63,6 +63,7 @@ class Venue:
         self.post_only_rejected = post_only_rejected
         self.book = book or {"bid": BID, "ask": ASK}
         self.calls = []          # ("maker"|"taker"|"cancel", side, qty, price)
+        self.short = 0.0
 
     # -- execution ---------------------------------------------------------
     def place_post_only(self, *, symbol, side, qty, price, product):
@@ -70,6 +71,8 @@ class Venue:
         if self.post_only_rejected:
             return None
         filled = qty if self.maker_fills else qty * self.maker_partial
+        if product == "linear":
+            self.short += filled if side == "Sell" else -filled
         return {"filled_qty": filled, "avg_price": price,
                 "order_link_id": f"m{len(self.calls)}",
                 "fee": filled * price * 2.0 / 1e4, "maker": True,
@@ -77,6 +80,8 @@ class Venue:
 
     def place_market(self, *, symbol, side, qty, product):
         self.calls.append(("taker", side, qty, None))
+        if product == "linear":
+            self.short += qty if side == "Sell" else -qty
         return {"filled_qty": qty, "avg_price": MARK,
                 "order_link_id": f"t{len(self.calls)}",
                 "fee": qty * MARK * 5.5 / 1e4, "maker": False,
@@ -94,6 +99,10 @@ class Venue:
         return dict(self.book)
 
     # -- the rest of the adapter ------------------------------------------
+    def get_perp_position(self, symbol):
+        """What the venue itself holds: FLAT is its word, read back after a close."""
+        return self.short
+
     def get_margin_multiple(self, symbol):
         return 5.0
 

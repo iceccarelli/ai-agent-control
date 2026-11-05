@@ -32,9 +32,15 @@ H8 = 8 * 3600 * 1000
 class Venue:
     def __init__(self):
         self.orders = []
+        self.perp_short = 0.0
+
+    def get_perp_position(self, symbol):
+        return self.perp_short
 
     def place_market(self, *, symbol, side, qty, product):
         self.orders.append((side, product, qty))
+        if product == "linear":
+            self.perp_short += qty if side == "Sell" else -qty
         return {"filled_qty": qty, "avg_price": MARK, "order_link_id": "x",
                 "fee": qty * MARK * 5.5 / 1e4}
 
