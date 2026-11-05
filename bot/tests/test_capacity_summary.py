@@ -78,3 +78,41 @@ def test_it_summarises_a_row_produced_by_the_real_capacity_module(tmp_path):
     text = CS.render(s)
     assert "size USD" in text and "in-sample" in text
     assert CS.main(["--dir", str(tmp_path), "--json"]) == 0
+
+
+# -- the regime verdict ----------------------------------------------------------------------------------
+
+def _days(n_hours, funding, cost=11.0):
+    return [synth(h * 3_600_000, funding, cost_small=cost) for h in range(n_hours + 1)]
+
+
+def test_regime_arithmetic_is_gross_minus_amortised_cost(tmp_path):
+    rows = _days(100, 0.65)
+    r = CS.regime(rows, hurdle_apr_pct=2.0, hold_settlements=21, notional_usd=10_000.0)
+    gross = 0.65 * 3 * 365 / 100.0
+    cost = 11.0 * (365.0 / 7.0) / 100.0
+    assert r["gross_apr_pct"] == pytest.approx(gross) and r["cost_apr_pct"] == pytest.approx(cost)
+    assert r["net_apr_pct"] == pytest.approx(gross - cost)
+
+
+def test_open_when_net_clears_the_hurdle_closed_when_it_does_not():
+    rows = _days(100, 0.65)                  # gross 7.12 %/yr; cost 1.34 %/yr at a 30 d hold, 5.74 %/yr at 7 d
+    assert CS.regime(rows, hurdle_apr_pct=2.0, hold_settlements=90, notional_usd=10_000.0)["verdict"] == "OPEN"
+    assert CS.regime(rows, hurdle_apr_pct=6.9, hold_settlements=90, notional_usd=10_000.0)["verdict"] == "CLOSED"
+    # a short hold pays the cost many times a year: the same funding no longer clears the same hurdle
+    assert CS.regime(rows, hurdle_apr_pct=2.0, hold_settlements=21, notional_usd=10_000.0)["verdict"] == "CLOSED"
+
+
+def test_a_short_window_or_no_hurdle_is_insufficient_never_open():
+    assert CS.regime(_days(10, 5.0), hurdle_apr_pct=1.0, notional_usd=10_000.0)["verdict"] == "INSUFFICIENT"
+    assert CS.regime(_days(100, 5.0), hurdle_apr_pct=None, notional_usd=10_000.0)["verdict"] == "INSUFFICIENT"
+    assert CS.regime([], hurdle_apr_pct=1.0)["verdict"] == "INSUFFICIENT"
+    assert CS.regime(_days(100, 5.0), hurdle_apr_pct=1.0, notional_usd=123.0)["verdict"] == "INSUFFICIENT"
+
+
+def test_negative_funding_is_closed_and_the_cli_prints_the_verdict(tmp_path, capsys):
+    rows = _days(100, -0.5)
+    write(tmp_path, rows)
+    assert CS.main(["--dir", str(tmp_path), "--hurdle-apr", "1", "--regime-notional", "10000"]) == 0
+    out = capsys.readouterr().out
+    assert "REGIME at $10,000" in out and "CLOSED" in out and "in-sample" in out

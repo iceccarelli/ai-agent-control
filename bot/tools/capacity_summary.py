@@ -103,6 +103,53 @@ def summarise(rows: Sequence[Dict[str, Any]], *, hold_settlements: float = 21.0)
     }
 
 
+def regime(rows: Sequence[Dict[str, Any]], *, hurdle_apr_pct: Optional[float], hold_settlements: float = 21.0,
+           notional_usd: float = 100_000.0, min_hours: float = 72.0) -> Dict[str, Any]:
+    """Is the recorded mainnet funding regime paying more than the owner's hurdle, after the
+    cost of getting in and out, annualised? A verdict about the WINDOW, not a forecast.
+
+        gross APR   = mean forecast (bps / settlement) x 3 x 365
+        cost APR    = round-trip cost at `notional_usd` x (365 / hold days)   [paid once per hold]
+        net APR     = gross - cost
+        OPEN        net APR >= hurdle      CLOSED  net APR < hurdle
+        INSUFFICIENT the window is shorter than `min_hours`, or the hurdle was not supplied
+
+    The hurdle is the owner's (what the same capital earns elsewhere, plus the premium for the
+    risks the tool cannot see). Nothing here chooses it."""
+    if not rows:
+        return {"verdict": "INSUFFICIENT", "why": "no capacity rows"}
+    hours = (rows[-1]["at_ms"] - rows[0]["at_ms"]) / 3_600_000.0
+    fc = [r["funding_forecast_bps_per_settlement"] for r in rows
+          if isinstance(r.get("funding_forecast_bps_per_settlement"), (int, float))]
+    costs = []
+    for r in rows:
+        for p in r["curve"]:
+            if float(p["notional_usd"]) == float(notional_usd) and p.get("status") == "MEASURED":
+                costs.append(p["total_round_trip_bps"])
+    if not fc or not costs:
+        return {"verdict": "INSUFFICIENT", "why": f"no measured cost / forecast at ${notional_usd:,.0f}",
+                "window_hours": round(hours, 2)}
+    mean_f, cost = statistics.fmean(fc), statistics.fmean(costs)
+    hold_days = hold_settlements / SETTLEMENTS_PER_DAY
+    gross_apr = mean_f * SETTLEMENTS_PER_DAY * 365.0 / 100.0
+    cost_apr = cost * (365.0 / hold_days) / 100.0
+    net_apr = gross_apr - cost_apr
+    out: Dict[str, Any] = {
+        "window_hours": round(hours, 2), "notional_usd": notional_usd, "hold_days": hold_days,
+        "mean_forecast_bps_per_settlement": mean_f, "mean_round_trip_cost_bps": cost,
+        "gross_apr_pct": gross_apr, "cost_apr_pct": cost_apr, "net_apr_pct": net_apr,
+        "hurdle_apr_pct": hurdle_apr_pct, "min_hours": min_hours}
+    if hurdle_apr_pct is None:
+        out.update(verdict="INSUFFICIENT", why="no hurdle supplied (--hurdle-apr): the tool does not choose one")
+    elif hours < min_hours:
+        out.update(verdict="INSUFFICIENT", why=f"window {hours:.1f} h is shorter than {min_hours:g} h")
+    else:
+        out["verdict"] = "OPEN" if net_apr >= hurdle_apr_pct else "CLOSED"
+    out["caveat"] = ("a statement about the recorded window using the venue's forecast, in-sample; "
+                     "latency, borrow, capital cost and funding sign changes are not in it")
+    return out
+
+
 def render(s: Dict[str, Any]) -> str:
     if not s.get("samples"):
         return s["note"]
@@ -128,17 +175,37 @@ def render(s: Dict[str, Any]) -> str:
     return "\n".join(out)
 
 
+def _render_regime(r: Optional[Dict[str, Any]]) -> str:
+    if not r:
+        return ""
+    if "net_apr_pct" not in r:
+        return f"\nREGIME: {r['verdict']} ({r.get('why')})"
+    return (f"\nREGIME at ${r['notional_usd']:,.0f}, hold {r['hold_days']:.1f} d: gross {r['gross_apr_pct']:.2f}%/yr "
+            f"- cost {r['cost_apr_pct']:.2f}%/yr = net {r['net_apr_pct']:+.2f}%/yr vs hurdle "
+            f"{'n/a' if r['hurdle_apr_pct'] is None else '%.2f%%/yr' % r['hurdle_apr_pct']} -> {r['verdict']}"
+            + (f" ({r['why']})" if r.get("why") else "") + "\n" + r["caveat"])
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--dir", required=True)
     ap.add_argument("--hold-settlements", type=float, default=21.0)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--regime", action="store_true", help="also print the regime verdict")
+    ap.add_argument("--hurdle-apr", type=float, default=None,
+                    help="the owner's hurdle in %%/yr, NET of trading costs; implies --regime")
+    ap.add_argument("--regime-notional", type=float, default=100_000.0)
+    ap.add_argument("--min-hours", type=float, default=72.0)
     a = ap.parse_args(argv)
     if not (a.hold_settlements > 0):
         print("--hold-settlements must be positive", file=sys.stderr)
         return 3
-    s = summarise(load_rows(a.dir), hold_settlements=a.hold_settlements)
-    print(json.dumps(s, indent=2, sort_keys=True) if a.json else render(s))
+    rows = load_rows(a.dir)
+    s = summarise(rows, hold_settlements=a.hold_settlements)
+    if a.hurdle_apr is not None or a.regime:
+        s["regime"] = regime(rows, hurdle_apr_pct=a.hurdle_apr, hold_settlements=a.hold_settlements,
+                             notional_usd=a.regime_notional, min_hours=a.min_hours)
+    print(json.dumps(s, indent=2, sort_keys=True) if a.json else render(s) + _render_regime(s.get("regime")))
     return 0 if s.get("samples") else 2
 
 
