@@ -169,6 +169,15 @@ Run on the recorder's data directory (or a copy; it never writes there):
   records (real fee schedule, reconciled account funding settlements, real fills with fee records, measured costs, verified
   margin rules) that nothing in this repository produces yet, so no run of this report can reach it; `EXECUTION_READY` additionally needs a
   separate owner authorisation record. No status authorises trading.
+* **What it would take (6b) and what exposure survives (6c):** from the variance and dependence observed so far, the report prints how many
+  settlements it would take to separate funding that earns the lowest screen from noise at the family-wise level (an illustrative
+  position and an assumed 11.4 bps round trip: labelled ASSUMED). The exposure line is a research ceiling from an offline stress
+  simulation (basis shock, funding reversal, gap, liquidity, correlated stackings) with ASSUMED venue rules and an unverified fee tier; it
+  is allowed to be, and today is, ZERO, with every reason named. Levels above 1x are analysis only.
+* **The other hypotheses (7):** basis convergence is measured as real EPISODES (entry, convergence or failure, adverse widening, net), trend and
+  mean reversion are predeclared rules fed one price at a time against buy-and-hold, and all 16 predeclared variants are judged
+  together (alpha 0.05/16). They are INSUFFICIENT on a few days of data by design; microstructure cannot be measured until imbalance is recorded and
+  a cross-section until more than one symbol is. None is above RESEARCH_CANDIDATE.
 * **Never** read it as realised cash: no cash settlement is read from the venue by this tool.
 
 ## 16. Operational verification (owner, read-only; run before and after any deploy decision)
