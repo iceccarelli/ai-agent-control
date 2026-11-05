@@ -132,6 +132,16 @@ jobs:
           tests/test_market_recorder.py
           tests/test_runner_supervisor.py
           tests/test_capacity_summary.py
+          tests/test_capacity_schema.py
+          tests/test_evidence_chain.py
+          tests/test_evidence_stats.py
+          tests/test_funding_eval.py
+          tests/test_recorder_reliability.py
+          tests/test_trade_economics.py
+          tests/test_opportunity_engine.py
+          tests/test_lifecycle_matrix.py
+          tests/test_state_backup.py
+          tests/test_profitability_report.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
           tests/test_paper_agent_certification.py

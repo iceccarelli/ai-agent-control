@@ -125,7 +125,61 @@ the bot's state, as the authority.
   `fly volumes extend <id> -s <GB>`) or lower `--recorder-retention-days` in the image CMD.
 - **Never:** delete files under `/data/market` by hand; the log is hash-chained and prunes itself by day.
 
-## Backups (not yet automated)
-A safe backup is an **online SQLite backup** (`sqlite3 trading_state.db ".backup 'copy.db'"`
-taken from inside the machine), encrypted, stored **off** the volume, with a restore
-rehearsed on a throwaway machine. None of that is done by the repository; it needs the owner.
+## Backups
+`tools/state_backup.py` is the tooling; scheduling and storage are the owner's. It opens the ledger
+**read-only**, takes SQLite's online backup (safe beside the writer), checks the copy, and writes a
+manifest (SHA-256 and per-table row COUNTS, never contents). It refuses an out-dir on the source's own
+directory: a backup beside the ledger on the same volume is not a backup.
+
+    # on the machine, to a scratch dir, then copy OFF the volume (owner):
+    python3 tools/state_backup.py backup  --db <PATH-TO-LEDGER> --out-dir <DIR>
+    python3 tools/state_backup.py verify  --backup <DIR>/<file>
+    # the rehearsal that proves it restores, on a disposable machine/dir (never the live one):
+    python3 tools/state_backup.py restore --backup <FILE> --into <NEW-EMPTY-DIR>
+
+Encrypt the file before it leaves the machine (`age -r <recipient> -o x.db.age x.db`, or
+`openssl enc -aes-256-cbc -pbkdf2 -in x.db -out x.db.enc`) and keep the manifest beside it. A backup that
+has not been restored once is a hope, not a backup. **No schedule is installed by the repository.**
+
+## 15. Is the evidence trustworthy, and is it profitable? (read-only, offline)
+Run on the recorder's data directory (or a copy; it never writes there):
+
+    python3 tools/profitability_report.py --dir /data/market --history /data/monitor/monitor.jsonl --notional 100000 --hold-days 30
+
+* **Integrity:** every capacity row is validated against `capacity/2`; the sidecar chain is checked
+  against the head copied into `monitor.jsonl` (an anchor the recorder cannot rewrite). A broken chain,
+  a mixed stream, a regression or a duplicate means the numbers are not used; the report says so.
+* **Independence:** unique settlements, not snapshots, are the unit. `INSUFFICIENT` is the honest answer
+  below the floor; it is not an error to fix by waiting less.
+* **Money:** two returns (on hedged notional, on fully allocated economic capital), the 10/15/20 %/yr
+  screens labelled `PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED`, and an explicit list of UNKNOWN
+  inputs (latency, the account's real fee tier, venue margin rules). Replace them with the owner's.
+* **Never** read it as realised cash: no cash settlement is read from the venue by this tool.
+
+## 16. Operational verification (owner, read-only; run before and after any deploy decision)
+`carry-drill` and `carry-book` are separate apps. Do not assume either is up; look.
+
+    fly status -a carry-drill                      # machine state, restarts, image
+    fly machine status <id> -a carry-drill         # image digest, last start, checks
+    fly volumes list -a carry-drill                # size, attached machine
+    fly ssh console -a carry-drill -C "df -h /data"                         # disk reserve
+    fly ssh console -a carry-drill -C "cat /data/market/recorder_status.json"
+    fly ssh console -a carry-drill -C "cat /data/market/supervisor_status.json"
+    fly ssh console -a carry-drill -C "tail -n 3 /data/monitor/monitor.jsonl"
+    gh run list --workflow carry-watch --limit 5   # alert freshness
+
+Record: image digest and build commit (the `/health` fingerprint), restarts since last look, free MB vs the
+512 MB reserve, recorder state, newest capacity row age, and whether the newest chain head matches the
+monitor's copy. The 365-day capacity retention is separate from the 2-day market-event retention; do not
+shorten one to fix the other. Do not scale the authoritative book horizontally.
+
+## 17. GitHub branch protection (owner; this repository does not change settings)
+On `main`: require a pull request; require these status checks (names as the Actions UI shows them):
+`carry-correctness (3.11)`, `carry-correctness (3.12)`, `rest-of-suite (3.11)` and `(3.12)` as listed in
+the run, `production-image`, `shadow-runtime-image`, `secret-scan`, `dependency-audit`; require
+up-to-date branches; require code-owner review; disallow force pushes and deletions. Do not allow
+administrators to bypass if the owner wants the gate to bind the owner too. Read the exact check names from
+a recent run before saving the rule: a required check that never reports blocks every merge.
+
+## Backups: what is not done
+Nothing here schedules a backup, stores one off-volume, or has restored one. That needs the owner.

@@ -115,6 +115,26 @@ def evaluate_eu(evidence: Any) -> Qualification:
         if keyp.get("read_only") is not True:
             missing.append("key_permissions.read_only_qualification_key")
 
+    fee = evidence.get("fee_rates")
+    if not isinstance(fee, Mapping):
+        missing.append("fee_rates")
+    else:
+        tk, mk = fee.get("taker_fee_rate"), fee.get("maker_fee_rate")
+        ok_num = lambda x: isinstance(x, (int, float)) and not isinstance(x, bool) and x == x and abs(x) < 1   # noqa: E731
+        if not (_non_empty(fee.get("source")) and ok_num(tk) and ok_num(mk)) or tk < 0:
+            reasons.append("FEE_RATES_INVALID: the account's taker/maker rates must be finite fractions read from the account")
+        elif fee.get("symbol") != "BTCUSDT" or fee.get("category") != "linear":
+            reasons.append("FEE_RATES_FOR_WRONG_INSTRUMENT")
+
+    col = evidence.get("collateral_rules")
+    if not isinstance(col, Mapping):
+        missing.append("collateral_rules")
+    else:
+        ratio = col.get("collateral_ratio")
+        if col.get("coin") != "BTC" or not _non_empty(col.get("source")) or not isinstance(col.get("margin_collateral"), bool) \
+                or not (isinstance(ratio, (int, float)) and not isinstance(ratio, bool) and 0 < ratio <= 1):
+            reasons.append("COLLATERAL_RULES_INVALID: BTC collateral ratio in (0, 1] and the margin-collateral flag are required")
+
     sup = evidence.get("support_confirmation")
     if not (isinstance(sup, Mapping) and _non_empty(sup.get("reference")) and _non_empty(sup.get("statement"))):
         missing.append("support_confirmation")
@@ -130,5 +150,7 @@ OWNER_COMMANDS: Dict[str, str] = {
     "instruments_linear_btcusdt": "curl -sS 'https://api.bybit.eu/v5/market/instruments-info?category=linear&symbol=BTCUSDT'  # public, no key",
     "instruments_spot_btcusdt": "curl -sS 'https://api.bybit.eu/v5/market/instruments-info?category=spot&symbol=BTCUSDT'  # public, no key",
     "key_permissions": "a READ-ONLY key, signed GET https://api.bybit.eu/v5/user/query-api  # run by the owner; paste only the redacted permissions/ips/readOnly fields",
+    "fee_rates": "a READ-ONLY key, signed GET https://api.bybit.eu/v5/account/fee-rate?category=linear&symbol=BTCUSDT  # the account's REAL taker/maker rates; paste only those numbers",
+    "collateral_rules": "a READ-ONLY key, signed GET https://api.bybit.eu/v5/account/collateral-info?currency=BTC  # collateral ratio and whether BTC can be margin collateral",
     "support_confirmation": "Bybit EU support ticket asking in writing whether BTCUSDT linear perpetual is available to this account via API",
 }

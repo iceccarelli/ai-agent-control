@@ -15,7 +15,8 @@ BOT = os.path.dirname(HERE)
 ENTRY = ["runner_monitor", "run_outcomes", "carry_preflight", "unattended_drill",
          "next_settlement", "recon_summary", "drill", "close_testnet_short",
          "drill_final_state", "evidence_reconcile", "runner_alerts", "mainnet_public",
-         "market_recorder", "runner_supervisor", "capacity_summary"]
+         "market_recorder", "runner_supervisor", "capacity_summary",
+         "profitability_report", "state_backup"]
 
 
 def _read(name):

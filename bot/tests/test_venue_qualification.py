@@ -16,6 +16,10 @@ def good():
         "instruments_linear_btcusdt": {"retCode": 0, "status": "Trading"},
         "key_permissions": {"read_only": True, "ip_restricted": True, "ips": ["203.0.113.7"],
                             "permissions": {"ContractTrade": ["Order", "Position"], "Spot": ["SpotTrade"], "Wallet": []}},
+        "fee_rates": {"source": "GET /v5/account/fee-rate", "category": "linear", "symbol": "BTCUSDT",
+                      "taker_fee_rate": 0.00055, "maker_fee_rate": 0.0002},
+        "collateral_rules": {"source": "GET /v5/account/collateral-info", "coin": "BTC", "collateral_ratio": 0.9,
+                             "margin_collateral": True},
         "support_confirmation": {"reference": "TICKET-REDACTED", "statement": "derivatives are available to this account"},
     }
 
@@ -29,7 +33,7 @@ def test_complete_consistent_evidence_qualifies_but_never_authorises_orders():
 def test_nothing_collected_is_unverified_and_names_everything_missing():
     r = Q.evaluate_eu({})
     assert r.verdict == Q.UNVERIFIED and not r.reasons
-    assert {"rest_host", "instruments_linear_btcusdt", "key_permissions", "support_confirmation",
+    assert {"rest_host", "instruments_linear_btcusdt", "key_permissions", "support_confirmation", "fee_rates", "collateral_rules",
             "official_docs_urls", "ws_public_host", "ws_private_host"} <= set(r.missing)
 
 
@@ -42,6 +46,11 @@ def test_nothing_collected_is_unverified_and_names_everything_missing():
     (lambda e: e["key_permissions"]["permissions"].update(Wallet=["Withdraw"]), "WITHDRAW_PERMISSION_PRESENT"),
     (lambda e: e["key_permissions"].update(ip_restricted=False), "KEY_NOT_IP_RESTRICTED"),
     (lambda e: e["key_permissions"].update(ips=[]), "KEY_NOT_IP_RESTRICTED"),
+    (lambda e: e["fee_rates"].update(taker_fee_rate=float("nan")), "FEE_RATES_INVALID"),
+    (lambda e: e["fee_rates"].update(taker_fee_rate=-0.1), "FEE_RATES_INVALID"),
+    (lambda e: e["fee_rates"].update(symbol="ETHUSDT"), "FEE_RATES_FOR_WRONG_INSTRUMENT"),
+    (lambda e: e["collateral_rules"].update(collateral_ratio=1.5), "COLLATERAL_RULES_INVALID"),
+    (lambda e: e["collateral_rules"].update(coin="USDT"), "COLLATERAL_RULES_INVALID"),
 ])
 def test_contradicting_evidence_is_not_qualified_with_the_reason(mutate, needle):
     e = copy.deepcopy(good())
@@ -87,3 +96,11 @@ def test_the_owner_commands_are_read_only_and_name_no_secret():
         low = cmd.lower()
         assert "post" not in low and "order/create" not in low and "withdraw" not in low
     assert all("api.bybit.eu" in c or "ticket" in c.lower() for c in Q.OWNER_COMMANDS.values())
+
+
+@pytest.mark.parametrize("field", ["fee_rates", "collateral_rules"])
+def test_missing_fee_or_collateral_evidence_alone_leaves_it_unverified(field):
+    e = good()
+    del e[field]
+    r = Q.evaluate_eu(e)
+    assert r.verdict == Q.UNVERIFIED and r.missing == (field,) and r.authorises_orders is False

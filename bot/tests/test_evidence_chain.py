@@ -127,3 +127,15 @@ def test_editing_the_sidecar_to_hide_a_mutation_is_caught_by_its_own_chain(tmp_p
     es[2]["r"] = EC.row_hash(open(p, "rb").read().split(b"\n")[2])     # re-hash the row but not the chain
     open(cp, "w").write("".join(json.dumps(e, sort_keys=True) + "\n" for e in es))
     assert "SIDECAR_INCONSISTENT" in codes(EC.verify(p))
+
+
+def test_bulk_write_produces_exactly_what_row_by_row_append_produces(tmp_path):
+    a = str(tmp_path / "a.jsonl")
+    b = str(tmp_path / "b.jsonl")
+    for r in rows(9):
+        EC.append(a, r)
+    assert EC.bulk_write(b, rows(9)) == (9, EC.verify(a)["head"]["head"])
+    assert open(a, "rb").read() == open(b, "rb").read() and open(a + ".chain").read() == open(b + ".chain").read()
+    assert EC.verify(b)["ok"]
+    with pytest.raises(FileExistsError):
+        EC.bulk_write(b, rows(1))

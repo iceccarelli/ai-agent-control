@@ -38,7 +38,7 @@ def test_the_numbers_are_the_arithmetic_of_the_rows(tmp_path):
     assert small["breakeven_settlements_at_mean_forecast"] == pytest.approx(11.0 / 0.625)
     assert small["net_bps_after_hold_at_mean_forecast"] == pytest.approx(21 * 0.625 - 11.0)
     # forecast x 21 >= 11 needs forecast >= 0.5238: rows with 1.0, 1.5 qualify, 0.5 and -0.5 do not
-    assert small["share_of_samples_where_forecast_x_hold_covers_cost"] == 0.5
+    assert small["share_of_snapshots_where_forecast_projection_covers_estimated_cost"] == 0.5
     assert s["max_displayed_fillable_notional_usd"] == 1_000_000.0
 
 
@@ -46,7 +46,7 @@ def test_a_size_the_book_cannot_fill_is_reported_as_not_fillable_not_priced(tmp_
     write(tmp_path, [synth(0, 1.0, big_ok=False), synth(60_000, 1.0, big_ok=False)])
     s = CS.summarise(CS.load_rows(str(tmp_path)))
     big = next(r for r in s["by_size"] if r["notional_usd"] == 1_000_000.0)
-    assert big["fillable_share"] == 0.0 and "mean_total_round_trip_bps" not in big
+    assert big["book_fillable_snapshot_share"] == 0.0 and "mean_total_round_trip_bps" not in big
     assert "not fillable" in CS.render(s)
 
 
@@ -54,7 +54,7 @@ def test_negative_mean_funding_gives_no_breakeven_and_no_invented_net(tmp_path):
     write(tmp_path, [synth(0, -1.0), synth(60_000, -2.0)])
     small = next(r for r in CS.summarise(CS.load_rows(str(tmp_path)))["by_size"] if r["notional_usd"] == 10_000.0)
     assert "breakeven_settlements_at_mean_forecast" not in small and "net_bps_after_hold_at_mean_forecast" not in small
-    assert small["share_of_samples_where_forecast_x_hold_covers_cost"] == 0.0
+    assert small["share_of_snapshots_where_forecast_projection_covers_estimated_cost"] == 0.0
 
 
 def test_a_torn_last_line_and_foreign_files_do_not_hide_the_good_rows(tmp_path):

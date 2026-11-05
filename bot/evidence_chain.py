@@ -244,3 +244,23 @@ def reseal_tail(path: str) -> int:
     if n:
         _atomic(hpath, json.dumps({"n": n, "head": prev}, sort_keys=True))
     return sealed
+
+
+def bulk_write(path: str, rows: Sequence[Mapping[str, Any]]) -> Tuple[int, str]:
+    """Write many rows and their chain in one pass (offline tooling and tests). Produces the same
+    bytes `append` would have produced row by row. Refuses to touch an existing file."""
+    cpath, hpath = _paths(path)
+    if os.path.exists(path) or os.path.exists(cpath):
+        raise FileExistsError(path)
+    prev, n = GENESIS, 0
+    with open(path, "wb") as rf, open(cpath, "w", encoding="utf-8") as cf:
+        for row in rows:
+            raw = canonical(row)
+            r = row_hash(raw)
+            prev = link(prev, r)
+            n += 1
+            rf.write(raw + b"\n")
+            cf.write(json.dumps({"n": n, "r": r, "h": prev}, sort_keys=True) + "\n")
+    if n:
+        _atomic(hpath, json.dumps({"n": n, "head": prev}, sort_keys=True))
+    return n, prev
