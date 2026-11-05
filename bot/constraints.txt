@@ -3,6 +3,6 @@
 # Install with:  pip install -r requirements.txt -c constraints.txt
 # requirements.txt keeps the ranges; this file pins what was actually tested.
 requests==2.34.2
-numpy==2.4.4
+numpy==2.4.6
 scipy==1.17.1
 scikit-learn==1.8.0
