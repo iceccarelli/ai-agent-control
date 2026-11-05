@@ -1,7 +1,7 @@
 # Runtime dependencies. Deliberately short: every dependency is attack surface
 # and a source of version drift.
 requests>=2.31,<3          # the only HTTP client, used solely by RequestsTransport
-numpy>=1.24,<3             # indicator math
+numpy>=2.5.4,<3             # indicator math
 
 # Optional. kelly_log_opt uses scipy's bounded minimiser when present and falls
 # back to a golden-section search when it is not, so the bot runs without it.
