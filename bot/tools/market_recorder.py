@@ -68,12 +68,17 @@ class Recorder:
 
     def __init__(self, engine: EN.Engine, feed: F.Feed, directory: str, *, environment: str,
                  min_free_bytes: int = 0, retention_days: int = 0,
+                 capacity_retention_days: int = 365,
                  notionals: Sequence[float] = MC.DEFAULT_NOTIONALS,
                  wall_ms: Callable[[], int] = lambda: int(time.time() * 1000),
                  mono: Callable[[], float] = time.monotonic) -> None:
         self.engine, self.feed, self.dir = engine, feed, os.path.abspath(directory)
         self.environment = environment
         self.min_free_bytes, self.retention_days = int(min_free_bytes), int(retention_days)
+        #: The capacity curve is ~0.7 MB a day against ~1.5 GB a day for the depth log, and it
+        #: is the multi-week record of whether funding PERSISTS, which the capital decision
+        #: rests on. It is therefore kept far longer than the depth log (default a year).
+        self.capacity_retention_days = int(capacity_retention_days)
         self.notionals = tuple(notionals)
         self.wall_ms, self.mono = wall_ms, mono
         self.started_ms = self.wall_ms()
@@ -109,10 +114,11 @@ class Recorder:
             return None
 
     def prune_capacity(self) -> List[str]:
-        """Delete capacity files older than the retention (0 = keep). Small files, by day."""
-        if self.retention_days <= 0:
+        """Delete capacity files older than THEIR retention (0 = keep). Small files, by day;
+        independent of the depth log's retention."""
+        if self.capacity_retention_days <= 0:
             return []
-        cutoff = ST._utc_day(self.wall_ms() - self.retention_days * DAY_MS)
+        cutoff = ST._utc_day(self.wall_ms() - self.capacity_retention_days * DAY_MS)
         removed = []
         for name in sorted(os.listdir(self.dir)):
             if name.startswith("capacity-") and name.endswith(".jsonl") and name[9:17] < cutoff:
@@ -144,6 +150,7 @@ class Recorder:
             "store": {"records": store.count(), "segments": len(store.segments()),
                       "free_bytes": free, "min_free_bytes": self.min_free_bytes,
                       "retention_days": self.retention_days,
+                      "capacity_retention_days": self.capacity_retention_days,
                       "fault": self.engine.state.store_fault},
             "entry_refusals": view_refusals,
             "capacity": {"rows": self.capacity_rows, "errors": self.capacity_errors,
@@ -190,7 +197,7 @@ class Recorder:
 
 
 def build(directory: str, *, environment: str = "mainnet", symbol: str = "BTCUSDT",
-          min_free_mb: int = 512, retention_days: int = 2,
+          min_free_mb: int = 512, retention_days: int = 2, capacity_retention_days: int = 365,
           transport_factory: Optional[Callable[[str], Any]] = None,
           rest_client: Optional[R.PublicRest] = None, use_rest: bool = True,
           proxy_url: Optional[str] = None, ca_file: Optional[str] = None) -> Recorder:
@@ -203,7 +210,8 @@ def build(directory: str, *, environment: str = "mainnet", symbol: str = "BTCUSD
         rest_client = R.PublicRest(R.urllib_transport(proxy_url, ca_file), base_url=cfg.rest_base)
     feed = F.Feed(cfg, engine, factory, rest_client)
     return Recorder(engine, feed, directory, environment=environment,
-                    min_free_bytes=min_free, retention_days=int(retention_days))
+                    min_free_bytes=min_free, retention_days=int(retention_days),
+                    capacity_retention_days=int(capacity_retention_days))
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -212,7 +220,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--environment", choices=("mainnet", "testnet"), default="mainnet")
     ap.add_argument("--symbol", default="BTCUSDT")
     ap.add_argument("--min-free-mb", type=int, default=512)
-    ap.add_argument("--retention-days", type=int, default=2)
+    ap.add_argument("--retention-days", type=int, default=2,
+                    help="UTC days of the (large) depth log to keep")
+    ap.add_argument("--capacity-retention-days", type=int, default=365,
+                    help="UTC days of the (small) capacity curve files to keep; 0 = keep all")
     ap.add_argument("--status-every", type=float, default=30.0)
     ap.add_argument("--capacity-every", type=float, default=300.0)
     ap.add_argument("--no-rest", action="store_true")
@@ -228,7 +239,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     signal.signal(signal.SIGINT, handler)
 
     rec = build(a.dir, environment=a.environment, symbol=a.symbol, min_free_mb=a.min_free_mb,
-                retention_days=a.retention_days, use_rest=not a.no_rest,
+                retention_days=a.retention_days, capacity_retention_days=a.capacity_retention_days, use_rest=not a.no_rest,
                 proxy_url=a.proxy_url, ca_file=a.ca_file)
     rec.start()
     try:

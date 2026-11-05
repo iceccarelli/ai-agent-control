@@ -71,17 +71,31 @@ def test_status_is_atomic_complete_and_secret_free(tmp_path):
         assert word not in text
 
 
-def test_old_capacity_files_are_pruned_by_retention_but_today_is_kept(tmp_path):
+def test_capacity_files_outlive_the_depth_log_and_are_pruned_by_their_own_retention(tmp_path):
+    """The depth log keeps 1 day here; the capacity curve (the persistence record) must not follow it."""
     rec, _, wall = make(tmp_path, retention_days=1)
     d = str(tmp_path / "md")
-    for day in ("20200101", "20200102"):
+    yesterday = ST._utc_day(wall - 86_400_000)
+    ancient = "20200101"
+    for day in (ancient, yesterday):
         open(os.path.join(d, f"capacity-{day}.jsonl"), "w").write("{}\n")
     rec.capture_capacity()
+    assert rec.capacity_retention_days == 365 and rec.retention_days == 1
     removed = rec.prune_capacity()
-    assert sorted(removed) == ["capacity-20200101.jsonl", "capacity-20200102.jsonl"]
+    assert removed == [f"capacity-{ancient}.jsonl"]              # only the truly old one
+    assert os.path.exists(os.path.join(d, f"capacity-{yesterday}.jsonl"))
     assert os.path.exists(rec._capacity_path(wall))
-    rec.retention_days = 0
-    assert rec.prune_capacity() == []
+    rec.capacity_retention_days = 0
+    assert rec.prune_capacity() == []                            # 0 keeps everything
+
+
+def test_the_service_flag_sets_the_capacity_retention_and_the_status_reports_it(tmp_path):
+    rec = MR.build(str(tmp_path / "svc"), capacity_retention_days=90, use_rest=False)
+    try:
+        assert rec.capacity_retention_days == 90
+        assert rec.status()["store"]["capacity_retention_days"] == 90
+    finally:
+        rec.engine.store.close()
 
 
 def test_the_run_loop_writes_status_and_capacity_then_stops_cleanly(tmp_path):
