@@ -135,7 +135,11 @@ def test_a_lost_response_is_resolved_by_the_brokers_readback_and_booked_once(tmp
     assert len(http.creates) == 1                # never sent twice
     assert http.net == 0
     assert eng.state is BookState.FLAT and tripped == []
-    assert len(journal.entries) == 1             # the readback result was booked, once
+    kinds = [e.kind for e in journal.entries]
+    assert kinds.count("perp_close") == 1        # the readback result was booked, once (never twice)
+    # This rig hands the engine a position the journal never saw opened, so there is no spot reference for the hedged coin: its inventory leg is
+    # recorded as UNBOOKED (a $0 marker), not silently dropped. That marker is the only other entry.
+    assert kinds == ["perp_close", "inventory_unbooked"]
 
 
 def test_a_request_that_never_left_is_not_assumed_to_have_failed_and_not_resent_early(tmp_path):
