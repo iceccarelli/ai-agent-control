@@ -100,6 +100,7 @@ SEVERITY_HARD = AR.SEVERITY_HARD
 SEVERITY_GAP = AR.SEVERITY_GAP
 
 #: Gaps that leave part of the history unexplained: the ledger is INCOMPLETE and no positive conclusion is drawn.
+FLOW_SNAPSHOT_ENVELOPE = 0.25           # BTC flow value vs snapshot prices when no public bar covers it (coarse gross-error check only)
 CHECK_GAPS = ("PERP_CHECKS_UNRUN", "FEE_CURRENCY_NOT_STATED", "DUPLICATE_IDENTICAL_DROPPED", "SNAPSHOT_PRICE_CHECK_NOT_RUN", "FLOW_PRICE_CHECK_NOT_RUN")
 
 
@@ -773,6 +774,11 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
             px = abs(f.usd_value / f.amount)
             if rng is None:
                 flow_unchecked += 1
+                # No public bar: a gross mispricing (the value cancels out of the bridge, so 'unexplained' can never catch it) must still not
+                # read as profit. The supplier's own snapshot prices bound it, widened for drift between snapshots. Coarse by design.
+                snap_px = [x.btc_price for x in snaps if x.btc_price]
+                if snap_px and not (min(snap_px) * (1 - FLOW_SNAPSHOT_ENVELOPE) <= px <= max(snap_px) * (1 + FLOW_SNAPSHOT_ENVELOPE)):
+                    flow_off.append(f"{f.flow_id}: {px:.2f} outside the snapshot price envelope {min(snap_px):.2f}..{max(snap_px):.2f} (no public bar)")
             elif not (rng[0] * (1 - AR.PRICE_RANGE_TOL) <= px <= rng[1] * (1 + AR.PRICE_RANGE_TOL)):
                 flow_off.append(f"{f.flow_id}: {px:.2f} outside {rng[0]:.2f}..{rng[1]:.2f}")
     _flag(flags, "BTC_FLOW_VALUE_OFF_PUBLIC_BAR", SEVERITY_HARD, len(flow_off),

@@ -1300,3 +1300,23 @@ def test_the_bridges_unexplained_line_is_the_usdt_residual_by_identity_and_a_btc
     (tmp_path / "b").mkdir()
     rep2 = ledger(w2, tmp_path / "b", snapshots=snaps2)
     assert rep2["equity_bridge"]["unexplained_usd"] == pytest.approx(0.0, abs=1e-6) and "EQUITY_RESIDUAL" in hard(rep2)
+
+
+def test_a_grossly_mispriced_btc_flow_is_rejected_even_when_no_public_bar_covers_the_period(tmp_path):
+    # The flow's USD value cancels out of the bridge, so 'unexplained' cannot catch it: with no public history a 0.5 BTC deposit valued at 1 USD
+    # used to read as +40 % profit. The snapshot price envelope now bounds it.
+    w = World()
+    w.flows = [{"flow_id": "D", "ts_ms": w.t_open + HOUR, "coin": "BTC", "amount": 0.5, "kind": "DEPOSIT", "usd_value": 1.0}]
+    inp = OL.load_manifest(w.write(tmp_path))
+    inp.perp_kwargs["spot_range"] = None
+    rep = OL.build(inp)
+    assert "BTC_FLOW_VALUE_OFF_PUBLIC_BAR" in hard(rep)
+    assert rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+
+
+def test_a_sane_btc_flow_without_a_public_bar_is_not_rejected_by_the_envelope(tmp_path):
+    w = World()
+    w.flows = [{"flow_id": "D", "ts_ms": w.t_open + HOUR, "coin": "BTC", "amount": 0.5, "kind": "DEPOSIT", "usd_value": 0.5 * w.p0}]
+    inp = OL.load_manifest(w.write(tmp_path))
+    inp.perp_kwargs["spot_range"] = None
+    assert "BTC_FLOW_VALUE_OFF_PUBLIC_BAR" not in hard(OL.build(inp))
