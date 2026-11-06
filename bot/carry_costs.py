@@ -423,6 +423,13 @@ def breakeven_funding_bps_per_settlement(
     """Smallest flat funding, in bps per 8h settlement, that earns back the
     costs after holding `settlements_held` settlements.
 
+    COST RECOVERY, NOT A HURDLE. This is the funding at which the trade merely
+    breaks even; it carries no return on capital. The funding that earns a
+    declared annual hurdle on fully allocated capital is larger (about 9x for a
+    10 % hurdle over a 30-day hold: `carry_prospective.required_bps`). A gate
+    that passes on this number has shown cost recovery only; never quote it as
+    "beats the hurdle".
+
         break_even = round_trip_bps / N + borrow_bps_per_day / 3
 
     Only costs the caller states appear: the round trip (two perp legs for the

@@ -110,6 +110,7 @@ class EntryBenefitGate:
             "cost_policy": vars(self.cost_policy),
             "latency_allowance_bps": self.latency_allowance_bps,
             "depth_source": _mde.DEPTH_SOURCE,
+            "live_book_cannot_fill_size": "REFUSES",
             "evidence_policy": vars(_se.DEFAULT_POLICY)}
         raw = json.dumps(body, sort_keys=True, default=str).encode()
         return hashlib.sha256(raw).hexdigest()[:16]
@@ -133,6 +134,11 @@ class EntryBenefitGate:
         merged = dict(est)
         if dc.status != _mde.MEASURED:
             trace["used"] = False
+            if any(str(x).endswith("DEPTH_INSUFFICIENT") for x in dc.reasons):
+                # The displayed book cannot fill the planned size. Past small fills say nothing about a size the book cannot absorb, and the cost
+                # beyond the displayed depth is unknown: UNKNOWN is not the own-fills figure. Refuse (stricter only; nothing is relaxed).
+                merged.update(status=_est.UNAVAILABLE,
+                              reasons=list(merged.get("reasons") or []) + ["LIVE_BOOK_CANNOT_FILL_SIZE"])
             return merged, trace
         if est.get("status") == _est.MEASURED:
             merged["spread_bps"] = max(float(est["spread_bps"]), dc.spread_bps)

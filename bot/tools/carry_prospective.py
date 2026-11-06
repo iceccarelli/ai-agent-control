@@ -4,6 +4,10 @@ changes no engine status.
 
     python3 tools/carry_prospective.py --funding PRINTS.jsonl [--hurdle-pct 10] [--now-ms MS] [--json]
 
+This CLI reports PROGRESS and can never evaluate. The ONE supported way to evaluate the closed window is ``tools/trial_journal.py evaluate``: it keeps every
+look in a locked, durable, hash-chained journal checked against an external anchor. ``evaluate()`` below is the PURE calculation (it takes whatever ledger
+it is handed, so it is for research tests, not for the official look).
+
 Why. Everything the historical teardown says is in-sample, over heavily overlapping starts, with a regime that has since changed. The only evidence that can
 change the verdict is data that did not exist when the plan below was written. This module fixes, BEFORE any such data exist:
 
@@ -188,7 +192,10 @@ def _load(path: str) -> List[Tuple[int, float]]:
     out = []
     for i, r in enumerate(rows):
         try:
-            out.append((int(float(r["ts_ms"])), float(r["funding_bps"])))
+            ts = float(r["ts_ms"])
+            if not math.isfinite(ts) or ts != int(ts):
+                raise ValueError("a settlement time is a whole millisecond and is never snapped")
+            out.append((int(ts), float(r["funding_bps"])))
         except (KeyError, ValueError, TypeError, OverflowError) as exc:
             raise AR.RecordError(f"{os.path.basename(path)} row {i + 1}: needs ts_ms and funding_bps") from exc
     return out

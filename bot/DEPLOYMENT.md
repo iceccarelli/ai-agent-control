@@ -102,7 +102,8 @@ Run continuously for **at least 48 hours**. Required at the end:
 
 ```bash
 export USE_TESTNET=1 PAPER_TRADING=0
-export LIVE_TRADING_ACK=I_UNDERSTAND
+# LIVE_TRADING_ACK stays UNSET. It is one of the four conditions for real-money authority and a testnet
+# run never needs it; the testnet drill (tools/drill.py session_refusal) refuses to start if it is set.
 ```
 
 Real order mechanics, no real money. Verify **on the exchange, not in the logs**:

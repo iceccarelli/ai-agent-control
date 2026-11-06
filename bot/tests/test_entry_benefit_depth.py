@@ -101,3 +101,27 @@ def test_a_book_too_thin_for_the_size_is_not_extrapolated(snap):
 def test_an_invalid_latency_allowance_is_refused_at_construction(bad):
     with pytest.raises(ValueError):
         G.EntryBenefitGate(latency_allowance_bps=bad)
+
+
+MEASURED_OWN_FILLS = {"status": EST.MEASURED, "legs": [], "spread_bps": 0.2, "slippage_bps": 0.1, "reasons": [], "policy": {}, "emergency_exit": {}}
+
+
+@pytest.mark.parametrize("allowance", [None, 2.0])
+def test_own_fills_measured_on_small_orders_do_not_license_a_size_the_live_book_cannot_fill(snap, monkeypatch, allowance):
+    # Independent review (reproduced): past small fills priced a 0.3 bps round trip, and a $500M order against a book showing a few BTC was
+    # allowed through unchanged, because the live walk was discarded exactly when the book could not fill the size.
+    monkeypatch.setattr(G._est, "estimate_round_trip", lambda e, **kw: dict(MEASURED_OWN_FILLS))
+    gate = G.EntryBenefitGate(mode=G.ENFORCE, latency_allowance_bps=allowance)
+    r = gate.check(now_ms=int(snap.observed_at_s * 1000), entries=[], execution_mode="overlay", perp_symbol="BTCUSDT", spot_symbol="BTCUSDT",
+                   mark=snap.perp_mark, spot=snap.spot_mark, funding_history=RICH, last_print_ms=snap.funding_print_ms, round_trip_bps=11.0,
+                   borrow_apr=0.0, opportunity_cost_apr=0.0, notional_usd=5e8, snapshot=snap)
+    assert not r.allowed and r.reason == G.BENEFIT_UNAVAILABLE
+    ec = r.trace["inputs"]["execution_cost"]
+    assert "LIVE_BOOK_CANNOT_FILL_SIZE" in ec["reasons"] and ec["live_depth"]["used"] is False
+
+
+def test_a_size_the_book_can_fill_is_unchanged_by_that_rule(snap, monkeypatch):
+    monkeypatch.setattr(G._est, "estimate_round_trip", lambda e, **kw: dict(MEASURED_OWN_FILLS))
+    r = check(G.EntryBenefitGate(mode=G.ENFORCE, latency_allowance_bps=2.0), snap)           # $100 against a deep book
+    assert "LIVE_BOOK_CANNOT_FILL_SIZE" not in r.trace["inputs"]["execution_cost"]["reasons"]
+    assert r.trace["inputs"]["execution_cost"]["live_depth"]["used"] is True
