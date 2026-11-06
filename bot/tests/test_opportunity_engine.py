@@ -24,7 +24,7 @@ def position(**kw):
 
 
 ANCHORED = {"files_total": 1, "files_legacy_pre_chain": 0, "files_anchored_current": 1, "files_anchored_lagging": 0,
-            "files_stale_anchor": 0, "files_unanchored": 0, "files_anchor_conflict": 0, "files_missing_but_anchored": [],
+            "files_anchored_by_archive": 1, "files_stale_anchor": 0, "files_unanchored": 0, "files_anchor_conflict": 0, "files_missing_but_anchored": [],
             "anchor_location": "EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE"}
 NOT_ANCHORED = dict(ANCHORED, files_anchored_current=0, files_unanchored=1)
 PRO_OK = {"registered_ms": START - 1, "first_evidence_ms": START, "n_after_registration": 270,
@@ -377,8 +377,7 @@ def reconciled(account=None, account_economics_=None, authorisation=None, execut
     c["account_economics"] = account_economics() if account_economics_ is None else account_economics_
     if authorisation is not None:
         c["execution_authorisation"] = authorisation
-    if execution is not None:
-        c["execution"] = execution
+    c["execution"] = {"mode": "taker"} if execution is None else execution
     if economics is not None:
         c["economics"] = economics
     return b
@@ -503,6 +502,18 @@ def test_integrity_grade_is_anchored_only_when_every_chained_file_has_a_matching
     assert OE.integrity_grade({}) == "NOT_FULLY_ANCHORED"
 
 
+def test_integrity_grade_needs_the_archive_itself_to_anchor_every_chained_file():
+    two = dict(ANCHORED, files_total=2, files_anchored_current=2)
+    assert OE.integrity_grade({"integrity": dict(two, files_anchored_by_archive=2)}) == "ANCHORED"
+    for by_archive in (1, 0, None, True, "2", 2.0, -1):
+        assert OE.integrity_grade({"integrity": dict(two, files_anchored_by_archive=by_archive)}) == "ANCHORED_SAME_VOLUME_ONLY", by_archive
+    gone = dict(two)
+    gone.pop("files_anchored_by_archive")
+    assert OE.integrity_grade({"integrity": gone}) == "ANCHORED_SAME_VOLUME_ONLY"           # an older object that cannot say is not anchored
+    assert OE.integrity_grade({"integrity": dict(two, files_anchored_by_archive=2, anchor_location="SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE")}) \
+        == "ANCHORED_SAME_VOLUME_ONLY"
+
+
 def test_no_default_input_to_the_report_can_reach_economic_reconciliation_or_readiness():
     """The report builds no account section: whatever the public evidence, the best it can say is a research candidate."""
     st, e = status(bundle(funding=4.0))
@@ -582,3 +593,117 @@ def test_non_finite_risk_and_return_inputs_fail_closed():
     b = bundle(funding=4.0)
     b["carry"]["funding_eval"]["realised_bps"]["min"] = float("nan")
     assert status(b)[0] == OE.Status.RISK_UNACCEPTABLE
+
+
+# ---- the ledger is recomputed, not trusted (delta review M3, L3-L5) ----
+
+def _ae(**kw):
+    """The account ledger, with its components or claims altered after computing it (the way a hand-assembled object would be)."""
+    import copy
+    ae = copy.deepcopy(account_economics())
+    for key, val in kw.items():
+        if key == "components":
+            ae["components_usd"].update(val)
+        elif key == "capital":
+            ae["capital"].update(val)
+        elif key == "liquidation":
+            ae["liquidation"] = val if not isinstance(val, dict) else dict(ae["liquidation"], **val)
+        elif key == "returns":
+            ae["returns"].update(val)
+        else:
+            ae[key] = val
+    return ae
+
+
+def _gaps(**kw):
+    st, e = status(reconciled(account_economics_=_ae(**kw)))
+    return st, e.metrics["reconciliation_gaps"]
+
+
+def test_the_untouched_ledger_is_self_consistent_and_clears():
+    st, gaps = _gaps()
+    assert st == OE.Status.ECONOMICALLY_RECONCILED and gaps == []
+    assert OE._ledger_is_self_consistent(account_economics()) is True
+    assert OE._ledger_return(account_economics()) == pytest.approx(account_economics()["returns"]["annualised_pct_on_economic_capital"])
+
+
+def test_a_zero_exit_fee_in_the_ledger_cannot_lift_the_return_over_the_hurdle():
+    # the entry leg is charged at the claimed taker rate; the exit leg is claimed free. Only checking the entry leg let this through.
+    ae = account_economics()
+    n = ae["capital"]["hedged_notional_usd"]
+    assert ae["components_usd"]["perp_exit_fee_usd"] == pytest.approx(-n * 5.5 / 1e4)
+    st, gaps = _gaps(components={"perp_exit_fee_usd": 0.0})
+    assert any("account_fee_schedule" in g for g in gaps)         # (the net no longer sums either: both defects are named)
+    assert st != OE.Status.ECONOMICALLY_RECONCILED
+
+
+def test_spot_leg_fees_in_an_overlay_ledger_are_a_gap_not_silently_accepted():
+    st, gaps = _gaps(components={"spot_entry_fee_usd": -5.0})
+    assert any("account_fee_schedule" in g for g in gaps) and st != OE.Status.ECONOMICALLY_RECONCILED
+
+
+@pytest.mark.parametrize("kw", [
+    {"net_pnl_usd": None}, {"net_pnl_usd": -5000.0}, {"reconciles": False}, {"capital": {"initial_margin_sufficient": False}},
+    {"liquidation": None}, {"liquidation": {"conservative_adverse_move_pct": 1.0}}, {"liquidation": {"conservative_adverse_move_pct": float("nan")}},
+    {"returns": {"annualised_pct_on_economic_capital": 1e30}}, {"returns": {"annualised_pct_on_economic_capital": float("nan")}},
+    {"components": {"funding_income_usd": 10 ** 400}}, {"net_pnl_usd": 10 ** 400}, {"components": {"basis_pnl_usd": "1"}},
+    {"capital": {"economic_capital_usd": 0.0}}, {"position": {"hold_days": 0.0}}])
+def test_a_ledger_that_does_not_recompute_from_its_own_components_is_not_reconciled(kw):
+    st, gaps = _gaps(**kw)
+    assert st != OE.Status.ECONOMICALLY_RECONCILED, kw
+    assert any("account_economics" in g for g in gaps), (kw, gaps)
+
+
+def test_round_trips_cannot_exceed_what_the_fills_can_form():
+    acct = full_account()
+    acct["fills"].update(fills=12, fee_records=12, round_trips=10 ** 9)
+    st, e = status(reconciled(account=acct))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and any("fills_and_fee_records" in g for g in e.metrics["reconciliation_gaps"])
+
+
+def test_a_missing_execution_mode_is_treated_as_maker_not_taker():
+    st, e = status(reconciled(execution={}))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED
+    assert any("maker_fill_probability" in g for g in e.metrics["reconciliation_gaps"])
+    acct = full_account()
+    acct["execution_costs"]["provenance"].update(maker_fill_probability="MEASURED", adverse_selection="MEASURED")
+    acct["fee_schedule"]["maker_bps"] = 5.5          # (so that both legs sit at a real rate for either reading of the mode)
+    assert status(reconciled(account=acct, execution={}))[0] == OE.Status.ECONOMICALLY_RECONCILED
+
+
+@pytest.mark.parametrize("field", ["fee_schedule", "product_qualification", "funding_settlements", "fills", "execution_costs", "capital", "venue_rules"])
+@pytest.mark.parametrize("junk", [True, 7, "x", [1], None])
+def test_a_non_object_container_is_a_gap_never_an_exception(field, junk):
+    acct = full_account()
+    acct[field] = junk
+    st, e = status(reconciled(account=acct))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and e.metrics["reconciliation_gaps"]
+
+
+@pytest.mark.parametrize("junk", [True, 7, "x", [1], 0])      # (None means "use the default" in the reconciled() helper)
+def test_non_object_ledger_and_account_are_gaps_never_exceptions(junk):
+    for kw in ({"account": junk}, {"account_economics_": junk}):
+        st, e = status(reconciled(**kw))
+        assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and e.metrics["reconciliation_gaps"]
+
+
+def test_an_integer_beyond_float_range_is_not_a_number_and_never_raises():
+    huge = 10 ** 400
+    assert OE._num(huge) is False and OE._num(-huge) is False and OE._num(True) is False and OE._num(1) and OE._num(1.5)
+    acct = full_account()
+    acct["fee_schedule"]["taker_bps"] = huge
+    assert status(reconciled(account=acct))[0] == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED
+
+
+@pytest.mark.parametrize("ref", ["xxxxxxxx", "11111111", "placeholder", "TODO-TODO", "none none", "aaaaaaaaaaaa", "test-test-test", "pending-1", "n/a n/a n/a",
+                                 "short", "", None, 12345678, "        "])
+def test_a_placeholder_authorisation_reference_does_not_make_anything_execution_ready(ref):
+    auth = {"owner_authorised": True, "reference": ref, "scope": "carry_overlay_taker/v1"}
+    assert status(reconciled(authorisation=auth))[0] == OE.Status.ECONOMICALLY_RECONCILED
+
+
+@pytest.mark.parametrize("ref", ["OWNER-AUTH-2026-11-05", "decision 2026-11-05 / ticket 4471", "authorisation-9b3f7c"])
+def test_a_reference_shaped_like_a_record_is_still_only_a_pointer(ref):
+    auth = {"owner_authorised": True, "reference": ref, "scope": "carry_overlay_taker/v1"}
+    st, e = status(reconciled(authorisation=auth))
+    assert st == OE.Status.EXECUTION_READY and e.authorizes_trading is False

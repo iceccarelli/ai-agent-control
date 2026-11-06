@@ -220,7 +220,10 @@ A running Fly machine changes only when an image is built and deployed. Merging 
 `compare` reports per file MATCH / DIFFERENT / MISSING_ON_MACHINE for the recorder's whole static import closure (computed from the
 entry points: recorder, monitor, supervisor and every module they import, including the book, wire, store and transport code) and a verdict. An image built before this change lacks
 several of them, which shows as MISSING_ON_MACHINE: that is the expected answer, and it means the old recorder is still
-running. The drill image carries no commit label, so the tool compares bytes, not tags. **A recorder release is a
+running. The closure includes packages (`signals/`) and LAZY imports: the monitor imports the shadow engine inside a function, so the
+trading-engine files that ship in the same image are compared too, and an engine-only edit therefore shows as DIFFERENT even though the
+recorder's common path never runs it. Read such a DIFFERENT as "the image is not this commit", not as "the recorder is broken", and
+decide the release separately. The drill image carries no commit label, so the tool compares bytes, not tags. **A recorder release is a
 separate step from any trading-engine release and needs your explicit authorisation; nothing in this PR requests it.**
 
 ## 19. External anchor archive (owner; moves the chain head off the recorder machine)

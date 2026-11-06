@@ -160,3 +160,39 @@ def test_an_archive_anchor_catches_a_consistently_truncated_evidence_file(tmp_pa
     EC.bulk_write(p, rows[: len(rows) - 50])                                      # cut, and every sidecar rewritten to match
     rep = PR.build(d, now_ms=rows[-1]["at_ms"] + 60_000, anchor_archive=arc)
     assert rep["integrity"]["summary"]["files_anchor_conflict"] == 1 and rep["economics"] is None
+
+
+def test_a_file_only_the_recorders_own_volume_anchors_cannot_borrow_the_archives_location(tmp_path):
+    """The archive knows file A only; monitor.jsonl anchors A and the newest day B. Both verify, the location is the owner-matched
+    archive, and the grade must still not be ANCHORED: B has no external anchor."""
+    import opportunity_engine as OE
+    rows = series(base_row(), 6, lambda T, t: 0.6, noisy(0.6, 0.1))
+    d = lay(tmp_path, rows)
+    a = os.path.join(d, "capacity-20261104.jsonl")
+    b = os.path.join(d, "capacity-20261105.jsonl")
+    EC.bulk_write(b, rows)
+    ca, cb = EC._read_chain(a), EC._read_chain(b)
+    both = history(tmp_path, [line("capacity-20261104.jsonl", len(ca), ca[-1]["h"]), line("capacity-20261105.jsonl", len(cb), cb[-1]["h"])], "both.jsonl")
+    only_a = history(tmp_path, [line("capacity-20261104.jsonl", len(ca), ca[-1]["h"])], "only_a.jsonl")
+    arc = str(tmp_path / "anchors.jsonl")
+    AA.append(only_a, arc)
+    head = AA.verify(arc)["archive_head"]
+    s = PR.build(d, now_ms=rows[-1]["at_ms"] + 60_000, history=both, anchor_archive=arc, archive_head=head)["integrity"]["summary"]
+    assert s["anchor_location"] == "EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE"
+    assert s["files_anchored_current"] + s["files_anchored_lagging"] == 2           # the merged anchors verify both files
+    assert s["files_anchored_by_archive"] == 1                                      # ... but the archive anchors one
+    assert OE.integrity_grade({"integrity": s}) == "ANCHORED_SAME_VOLUME_ONLY"
+    # once the archive also holds B, the grade is ANCHORED
+    AA.append(both, arc)
+    head2 = AA.verify(arc)["archive_head"]
+    s2 = PR.build(d, now_ms=rows[-1]["at_ms"] + 60_000, history=both, anchor_archive=arc, archive_head=head2)["integrity"]["summary"]
+    assert s2["files_anchored_by_archive"] == 2 and OE.integrity_grade({"integrity": s2}) == "ANCHORED"
+
+
+def test_without_an_archive_no_file_is_anchored_by_one(tmp_path):
+    rows = series(base_row(), 6, lambda T, t: 0.6, noisy(0.6, 0.1))
+    d = lay(tmp_path, rows)
+    chain = EC._read_chain(os.path.join(d, "capacity-20261104.jsonl"))
+    hist = history(tmp_path, [line("capacity-20261104.jsonl", len(chain), chain[-1]["h"])])
+    s = PR.build(d, now_ms=rows[-1]["at_ms"] + 60_000, history=hist)["integrity"]["summary"]
+    assert s["files_anchored_by_archive"] == 0 and s["anchor_location"] == "SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE"

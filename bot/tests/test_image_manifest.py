@@ -39,7 +39,9 @@ def test_every_compared_file_exists_here_and_is_copied_into_the_drill_image():
     docker = open(os.path.join(BOT, "Dockerfile.drill"), encoding="utf-8").read()
     for rel in REC + TOOLS:
         assert os.path.isfile(os.path.join(BOT, rel)), rel
-        assert re.search(r"(?<![\w/.-])" + re.escape(rel) + r"(?![\w.-])", docker), f"{rel} is not COPYed by Dockerfile.drill"
+        top = rel.split("/")[0] + "/"
+        whole_dir = "/" in rel and not rel.startswith("tools/") and re.search(r"^COPY\s+" + re.escape(top) + r"\s", docker, re.M)
+        assert whole_dir or re.search(r"(?<![\w/.-])" + re.escape(rel) + r"(?![\w.-])", docker), f"{rel} is not COPYed by Dockerfile.drill"
 
 
 def test_the_expected_listing_is_exactly_what_sha256sum_would_print_with_a_marker_between_the_two_parts():
@@ -111,3 +113,16 @@ def test_the_cli_exit_codes(tmp_path, capsys):
     act.write_text(machine_output(alter=("md_book.py",)))
     assert IM.main(["compare", "--expected", str(exp), "--actual", str(act)]) == 1
     assert IM.main(["command"]) == 0 and "fly ssh console" in capsys.readouterr().out
+
+
+def test_a_package_the_recorder_imports_is_compared_file_by_file_not_missed():
+    """`from signals import x` is a file of the package (and its __init__), not an unresolvable name (delta review L9)."""
+    assert "signals/__init__.py" in REC and "signals/funding_carry_fade_btc_v1.py" in REC
+    imports = IM._imports(os.path.join(BOT, "shadow.py"))
+    assert "signals" in imports and "signals.funding_carry_fade_btc_v1" in imports
+    assert IM._candidates("signals.funding_carry_fade_btc_v1")[0] == "signals/funding_carry_fade_btc_v1.py"
+
+
+def test_the_closure_counts_lazy_imports_and_says_so():
+    assert "LAZY imports count" in IM.closure.__doc__
+    assert "carry_engine.py" in REC           # reached through runner_monitor's function-level import of carry_shadow: a file the process may load

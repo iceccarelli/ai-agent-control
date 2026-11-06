@@ -312,6 +312,26 @@ def test_a_snapshot_cannot_pair_a_view_with_an_event_that_arrived_after_it(tmp_p
     assert rec._source_of(rec.engine)["store_record_id"] == landed["ids"][0]
 
 
+def test_the_read_only_mapping_refuses_every_ordinary_mutation_including_re_initialisation():
+    m = F.ReadOnlyMapping({"a": 1, "b": 2})
+    assert dict(m) == {"a": 1, "b": 2} and len(m) == 2 and m["a"] == 1
+    with pytest.raises(TypeError):
+        m["a"] = 99
+    with pytest.raises(TypeError):
+        del m["a"]
+    with pytest.raises(TypeError):
+        m.a = 1
+    with pytest.raises(TypeError):
+        del m._d
+    with pytest.raises(TypeError, match="already initialised"):
+        m.__init__({"a": 99})                                      # re-running the constructor must not replace the contents
+    assert dict(m) == {"a": 1, "b": 2}
+    src = {"x": 1}
+    n = F.ReadOnlyMapping(src)
+    src["x"] = 2
+    assert n["x"] == 1                                             # a copy: the caller's dict is not a window into it
+
+
 def test_the_snapshot_is_immutable_and_carries_the_clock_the_row_uses(tmp_path):
     rec, store, wall = make(tmp_path)
     snap = rec.feed.snapshot(rec._source_of, wall_ms=rec.wall_ms)

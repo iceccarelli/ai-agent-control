@@ -129,6 +129,21 @@ class UnknownParameterError(ValueError):
         super().__init__("UNKNOWN parameters, refusing to default them: " + ", ".join(self.unknown))
 
 
+_UNREAL_STEMS = ("simul", "simfill", "monte", "carlo", "synthetic", "backtest", "model", "mock", "replay", "fake", "generat", "predict",
+                 "estimat", "deriv", "shadow", "dry", "stub", "fixture", "hypothet", "project", "assum", "paper", "dummy", "sample",
+                 "placeholder", "example", "forecast", "scenario", "illustrat", "imagin", "invent")
+_UNREAL_TOKENS = ("sim", "sims", "mc", "gen", "est", "tbd", "todo")
+
+
+def _unreal_source(source: str) -> bool:
+    """True when the free-text source of an 'account execution' names something that is not the venue's own record. Tokens are
+    matched by their STEM (so 'mocked', 'faked', 'backtested', 'replayed', 'dry-run', 'hypothetical', 'projected' all count), which is
+    still a tripwire, not a proof of origin: the repository cannot see where a number came from, and an owner who wants to mislead
+    it can use any other word. What it stops is the careless label."""
+    tokens = "".join(c if (c.isascii() and c.isalnum()) else " " for c in source.lower()).split()
+    return any(t.startswith(_UNREAL_STEMS) or t in _UNREAL_TOKENS for t in tokens)
+
+
 class EvidenceClassError(ValueError):
     """An object of the wrong evidence class was offered where another is required."""
 
@@ -622,11 +637,8 @@ class AccountExecutionRecord:
             v = getattr(self, n)
             if not (isinstance(v, str) and v.strip()):
                 raise ValueError(f"{n} must be a non-empty string")
-        words = self.source.upper().replace("_", " ").replace("-", " ").replace("/", " ").split()
-        if any(w.startswith(("SIMUL", "SIMFILL", "MONTE")) or w in ("SIM", "SYNTHETIC", "BACKTEST", "MODELLED", "MODELED", "PAPER", "MOCK",
-                                                                   "REPLAY", "FAKE", "GENERATED", "PREDICTED", "ESTIMATED", "DERIVED", "CARLO")
-               for w in words):
-            raise EvidenceClassError("a simulated source cannot be an ACCOUNT_EXECUTION record")
+        if _unreal_source(self.source):
+            raise EvidenceClassError("a simulated, mocked, modelled or otherwise non-venue source cannot be an ACCOUNT_EXECUTION record")
         if self.market not in ("linear_perp", "spot"):
             raise ValueError("market must be 'linear_perp' or 'spot'")
         if self.side not in ("buy", "sell"):

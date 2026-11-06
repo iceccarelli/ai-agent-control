@@ -83,16 +83,28 @@ def _file_day_ms(name: str) -> Optional[int]:
         return None
 
 
+def _utc_day(ms: float) -> str:
+    import time
+    return time.strftime("%Y%m%d", time.gmtime(ms / 1000.0))
+
+
+def _capacity_retention_days(status: Optional[Dict[str, Any]]) -> int:
+    """The retention the RECORDER is actually running with (it writes it to recorder_status.json), else its default. 0 means the
+    recorder keeps everything. A value that is not a non-negative int is not believed."""
+    v = (status or {}).get("capacity_retention_days")
+    return v if type(v) is int and v >= 0 else CAPACITY_RETENTION_DAYS
+
+
 def anchors_from_history(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
     out: Dict[str, List[Dict[str, Any]]] = {}
     if not path:
         return out
     try:
-        with open(path, encoding="utf-8") as fh:
+        with open(path, encoding="utf-8", errors="replace") as fh:         # bytes that are not UTF-8 must not stop the report
             for line in fh:
                 try:
                     r = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):                       # a deeply nested line is junk, not a crash
                     continue
                 if not isinstance(r, dict):
                     continue
@@ -160,11 +172,13 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     paths = sorted(p for p in glob.glob(os.path.join(directory, "capacity-*.jsonl")))
     anchors = anchors_from_history(history)
     archive = None
+    archive_only: Dict[str, List[Dict[str, Any]]] = {}
     if anchor_archive:
         archive = AA.verify(anchor_archive, owner_held_head=archive_head, owner_held_entries=archive_entries)
         entries, _problems = AA.read_archive(anchor_archive)
         for fname, lst in AA.anchors_by_file(entries).items():          # entries before any break in the archive's own chain
             anchors.setdefault(fname, []).extend(lst)
+            archive_only[fname] = list(lst)
     files: List[Dict[str, Any]] = []
     all_rows: List[Any] = []
     blockers: List[str] = []
@@ -190,7 +204,11 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
                 codes = ",".join(sorted({i["code"] for i in ver["issues"]})) or "unknown"
                 blockers.append(f"{base}: {ver['unchained_tail']} unchained row(s)" if state == "UNCHAINED_TAIL"
                                 else f"{base}: chain issues {codes}")
+        # anchors per SOURCE: a file counts as externally anchored only when the ARCHIVE alone anchors it (copies in monitor.jsonl
+        # sit on the recorder's volume, and merging the two must not let them stand in for an archive that never saw this file)
+        by_archive = (EC.verify(p, archive_only.get(base))["anchor_status"] if (archive and not pre_chain) else None)
         files.append({"file": base, "rows": len(every), "admitted_rows": len(admitted), "state": state,
+                      "archive_anchor_status": by_archive,
                       "schema_v2_rows": sum(1 for r in every if isinstance(r, dict) and r.get("schema") == CS.SCHEMA),
                       "quarantined_lines": quarantined,
                       "chain": {k: ver[k] for k in ("ok", "internally_consistent", "fully_chained", "economic_evidence_eligible",
@@ -202,13 +220,17 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     # a file the anchors know about that is no longer there (inside the capacity retention) was removed, not pruned
     present = {os.path.basename(p) for p in paths}
     missing_anchored: List[str] = []
+    retention = _capacity_retention_days(_json(os.path.join(directory, "recorder_status.json")))
+    cutoff_day = _utc_day(now_ms - retention * 86_400_000) if retention > 0 else None
     for fname in sorted(anchors):
         if fname in present:
             continue
-        day = _file_day_ms(fname)
-        if day is not None and day >= now_ms - (CAPACITY_RETENTION_DAYS + 1) * 86_400_000:
+        # the recorder prunes a day only when its date is strictly BEFORE the date of (now - retention); a file on or after that date
+        # (or any file, when the recorder keeps everything) cannot have been pruned
+        if _file_day_ms(fname) is not None and (cutoff_day is None or fname[9:17] >= cutoff_day):
             missing_anchored.append(fname)
-            blockers.append(f"{fname}: anchors exist for this file but it is gone (inside the {CAPACITY_RETENTION_DAYS}-day retention): removed, not pruned")
+            kept = f"the {retention}-day retention" if retention > 0 else "a recorder that keeps every day"
+            blockers.append(f"{fname}: anchors exist for this file but it is gone (inside {kept}): removed, not pruned")
     val = CS.validate_stream(all_rows)
     accepted = val["accepted"]
     status = _json(os.path.join(directory, "recorder_status.json"))
@@ -249,6 +271,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         "files_stale_anchor": _count("anchor_status", "STALE_ANCHOR"),
         "files_unanchored": _count("anchor_status", "UNANCHORED"),
         "files_anchor_conflict": _count("anchor_status", "ANCHOR_CONFLICT"),
+        "files_anchored_by_archive": sum(1 for f in chain_files if f.get("archive_anchor_status") in ("ANCHORED_CURRENT", "ANCHORED_LAGGING")),
         "max_anchor_lag_rows": max((f["chain"]["anchor_lag_rows"] for f in chain_files if f["chain"]["anchor_lag_rows"] is not None), default=None),
         "anchor_location": ((archive or {}).get("location") if archive and archive["location"] != "NO_ARCHIVE" else
                             "SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE" if any(f["external_anchors"] for f in files) else "NONE"),

@@ -61,11 +61,21 @@ MAX_BACKOFF_EXPONENT = 16
 
 
 class ReadOnlyMapping(collections.abc.Mapping):
-    """An immutable copy of a mapping: reads work, any assignment raises TypeError."""
+    """An immutable copy of a mapping: reads work, any assignment raises TypeError, and a second ``__init__`` is refused. It is
+    immutable against accident and against ordinary code; it is NOT a defence against code that deliberately reaches into ``_d``
+    (Python has no such thing), and nothing in this repository does."""
     __slots__ = ("_d",)
 
     def __init__(self, d: Any) -> None:
-        object.__setattr__(self, "_d", dict(d))
+        try:
+            object.__getattribute__(self, "_d")
+        except AttributeError:
+            object.__setattr__(self, "_d", dict(d))
+            return
+        raise TypeError("read-only: already initialised")
+
+    def __delattr__(self, *_a: Any) -> None:
+        raise TypeError("read-only")
 
     def __getitem__(self, k: Any) -> Any:
         return self._d[k]

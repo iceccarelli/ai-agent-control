@@ -836,6 +836,10 @@ def recommend_exposure(table: Mapping[str, Any], *, edge_lower_bound: Optional[f
     one_x = next((b for b in table.get("books") or [] if isinstance(b, Mapping) and b.get("leverage") == 1.0), None)
     ne1 = ((one_x or {}).get("capital") or {}).get("notional_over_economic_capital")
     to_ne = float(ne1) if _fin(ne1) and 0.0 < ne1 <= 1.0 else 1.0
+    if not (_fin(ne1) and 0.0 < ne1 <= 1.0):
+        # without the 1x book's own N / E the caps cannot be converted into the ceiling's units: say so and recommend ZERO, rather
+        # than silently treating N / E as 1 (which would state a ceiling above the true one whenever a reserve is held)
+        reasons.append("NOTIONAL_OVER_ECONOMIC_CAPITAL_UNKNOWN")
     limit = limit * to_ne
     caps = {"HARD_CAP_1X": MAX_RECOMMENDED_LEVERAGE * to_ne, "STRESS_SURVIVAL_LIMIT": limit}
     if kelly_fractional is not None and _fin(kelly_fractional):

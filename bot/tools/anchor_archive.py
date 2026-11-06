@@ -53,11 +53,11 @@ def extract_anchors(history_path: str) -> List[Dict[str, Any]]:
     """Every (file, n, head) triple in a monitor history, in order, with the line's own timestamp. Malformed lines
     are skipped (a torn last line must not hide the ones before it)."""
     out: List[Dict[str, Any]] = []
-    with open(history_path, encoding="utf-8") as fh:
+    with open(history_path, encoding="utf-8", errors="replace") as fh:       # bytes that are not UTF-8 must not stop the archive
         for line in fh:
             try:
                 r = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):                              # a deeply nested line is junk, not a crash
                 continue
             if not isinstance(r, dict):
                 continue

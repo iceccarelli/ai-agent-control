@@ -66,6 +66,38 @@ def test_a_converging_episode_is_measured_by_hand_with_fills_at_the_next_snapsho
     assert "NEXT recorded snapshot" in r["fill_rule"]
 
 
+def test_a_basis_that_converged_at_the_signal_but_blew_out_before_the_exit_fill_is_a_failure_with_its_real_excursion():
+    # signal at 3 (<= theta_out 4); by the exit FILL (next snapshot) the basis is 40. It did not converge at the price obtained.
+    rows = [brow(i * 300, b) for i, b in enumerate([1, 12, 14, 3, 40, 1, 1])]
+    r = SM.basis_episodes(rows, P)
+    assert r["episodes"] == 1 and r["converged"] == 0 and r["failed"] == 1 and r["failure_share"] == 1.0
+    e = r["episodes_list"][0]
+    assert e["entry_bps"] == 14 and e["exit_bps"] == 40 and e["outcome"] == "REVERTED_BEFORE_EXIT_FILL"
+    assert e["net_bps"] == pytest.approx(14 - 40 - 8) and e["adverse_widening_bps"] == 26      # the excursion includes the exit fill itself
+    assert r["adverse_widening_bps"]["max"] == 26
+
+
+def test_the_exit_fill_exactly_at_the_exit_threshold_still_counts_as_converged():
+    rows = [brow(i * 300, b) for i, b in enumerate([1, 12, 14, 3, 4.0, 1, 1])]
+    e = SM.basis_episodes(rows, P)["episodes_list"][0]
+    assert e["outcome"] == "CONVERGED" and e["exit_bps"] == 4.0 and e["adverse_widening_bps"] == 0
+
+
+def test_every_converged_episode_exits_at_or_below_the_threshold_on_a_noisy_ar_basis():
+    rng = random.Random(11)
+    b, rows = 0.0, []
+    for i in range(6000):
+        b = 0.9 * b + rng.gauss(0, 10.0)
+        rows.append(brow(i * 300, b))
+    r = SM.basis_episodes(rows, P)
+    assert r["episodes"] > 100
+    for e in r["episodes_list"]:
+        if e["outcome"] == "CONVERGED":
+            assert e["exit_bps"] <= P.theta_out_bps
+        assert e["adverse_widening_bps"] >= max(0.0, e["exit_bps"] - e["entry_bps"])
+    assert r["converged"] + r["failed"] == r["episodes"]
+
+
 def test_failure_to_converge_is_closed_after_the_max_hold_at_the_next_snapshots_basis():
     rows = [brow(0, 1), brow(300, 12)] + [brow(600 + 300 * k, 13) for k in range(16)]
     r = SM.basis_episodes(rows, P)

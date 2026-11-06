@@ -103,6 +103,9 @@ def basis_episodes(rows: Sequence[Mapping[str, Any]], p: BasisParams, *, alpha: 
             open_ = {"t": t, "b": b, "max": b}
             state = "OPEN"
         elif state == "PENDING_EXIT":                                  # this snapshot is the exit FILL
+            open_["max"] = max(open_["max"], b)                        # the adverse excursion includes the basis AT the fill
+            if outcome == "CONVERGED" and b > p.theta_out_bps:         # the basis moved back out during the one-cadence fill latency:
+                outcome = "REVERTED_BEFORE_EXIT_FILL"                  # it did not converge at the price actually obtained, so it is a failure
             eps.append({"entry_ms": open_["t"], "exit_ms": t, "hold_h": (t - open_["t"]) / 3_600_000.0, "entry_bps": open_["b"],
                         "exit_bps": b, "outcome": outcome, "adverse_widening_bps": open_["max"] - open_["b"],
                         "gross_bps": open_["b"] - b, "net_bps": open_["b"] - b - cost})

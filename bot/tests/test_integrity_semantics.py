@@ -353,3 +353,74 @@ def test_a_head_that_records_more_rows_than_the_chain_holds_is_a_truncation(tmp_
     open(p + ".head", "w").write(json.dumps({"n": head["n"] + 5, "head": head["head"]}))
     v = EC.verify(p)
     assert any(i["code"] == "TRUNCATED" for i in v["issues"]) and v["internally_consistent"] is False
+
+
+# ---------------- the retention test uses the recorder's own retention and its own day comparison (delta review L1) ----------------
+
+def _gone_anchor(tmp_path, d, rows, day, retention=None):
+    """An anchor for a day-file that is not on disk, with the recorder's status stating `retention` (None = no status file)."""
+    if retention is not None:
+        with open(os.path.join(d, "recorder_status.json"), "w") as fh:
+            json.dump({"capacity_retention_days": retention}, fh)
+    h = tmp_path / "monitor.jsonl"
+    h.write_text(json.dumps({"recorder_chain_file": f"capacity-{day}.jsonl", "recorder_chain_n": 5, "recorder_chain_head": "ab" * 32}) + "\n")
+    return report(d, rows, history=str(h))["integrity"]["summary"]
+
+
+def _now(rows):
+    return rows[-1]["at_ms"] + 60_000
+
+
+@pytest.mark.parametrize("age_days,blocks", [(0, True), (2, True), (3, True), (4, False), (30, False)])
+def test_a_shorter_recorder_retention_is_honoured_and_the_boundary_day_is_not_prunable(tmp_path, age_days, blocks):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    day = PR._utc_day(_now(rows) - age_days * 86_400_000)
+    s = _gone_anchor(tmp_path, d, rows, day, retention=3)
+    assert bool(s["files_missing_but_anchored"]) is blocks, (age_days, s["files_missing_but_anchored"])
+    assert s["economic_evidence_eligible"] is (not blocks)
+
+
+def test_with_no_status_file_the_default_retention_applies_and_a_recent_removal_blocks(tmp_path):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    s = _gone_anchor(tmp_path, d, rows, PR._utc_day(_now(rows) - 100 * 86_400_000))
+    assert s["files_missing_but_anchored"] and not s["economic_evidence_eligible"]
+    s = _gone_anchor(tmp_path, d, rows, PR._utc_day(_now(rows) - 400 * 86_400_000))
+    assert s["files_missing_but_anchored"] == []
+
+
+def test_a_recorder_that_keeps_everything_cannot_have_pruned_any_anchored_day(tmp_path):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    s = _gone_anchor(tmp_path, d, rows, "20240101", retention=0)
+    assert s["files_missing_but_anchored"] == ["capacity-20240101.jsonl"] and not s["economic_evidence_eligible"]
+    assert any("keeps every day" in b for b in s["economic_evidence_blockers"])
+
+
+@pytest.mark.parametrize("junk", [True, "3", -1, 3.5, None, [3]])
+def test_a_retention_value_that_is_not_a_nonnegative_int_is_not_believed(tmp_path, junk):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    with open(os.path.join(d, "recorder_status.json"), "w") as fh:
+        json.dump({"capacity_retention_days": junk}, fh)
+    assert PR._capacity_retention_days({"capacity_retention_days": junk}) == PR.CAPACITY_RETENTION_DAYS
+    s = _gone_anchor(tmp_path, d, rows, PR._utc_day(_now(rows) - 100 * 86_400_000))
+    assert s["files_missing_but_anchored"]
+
+
+# ---------------- hostile bytes in monitor.jsonl are skipped, not a crash (delta review L2) ----------------
+
+def test_invalid_utf8_and_a_deeply_nested_line_in_the_history_do_not_stop_the_report_or_the_archive(tmp_path):
+    import anchor_archive as AA
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    f = os.path.join(d, "capacity-20261104.jsonl")
+    good = json.dumps({"recorder_chain_file": os.path.basename(f), "recorder_chain_n": EC.verify(f)["n_chained"],
+                       "recorder_chain_head": EC._read_chain(f)[-1]["h"]}).encode()
+    h = tmp_path / "monitor.jsonl"
+    h.write_bytes(b"\xff\xfe not utf-8 \x80\n" + b"[" * 200_000 + b"]" * 200_000 + b"\n" + good + b"\n")
+    s = report(d, rows, history=str(h))["integrity"]["summary"]
+    assert s["files_anchored_current"] == 1                          # the one good line survived the junk before it
+    anchors = AA.extract_anchors(str(h))
+    assert len(anchors) == 1 and anchors[0]["file"] == os.path.basename(f)

@@ -1016,6 +1016,29 @@ def test_all_favourable_inputs_give_the_research_ceiling_of_exactly_1x_and_no_au
     assert table()["stress_survival_limit"] == 3.0                     # the book could survive more; the ceiling still stops at 1.0
 
 
+@pytest.mark.parametrize("bad", [None, 0, 0.0, -0.5, 1.5, float("nan"), float("inf"), "0.6", True, [0.6]])
+def test_a_one_x_book_without_a_valid_notional_over_economic_capital_is_zero_exposure_with_a_reason(bad):
+    # a hand-built or older table: the caps cannot be converted into N / E, and a silent factor of 1.0 would state a ceiling ABOVE the
+    # true one whenever a reserve is held (reserve 0.5 -> the true cap is 0.667)
+    t = table()
+    for b in t["books"]:
+        if b["leverage"] == 1.0:
+            if bad is None:
+                b["capital"].pop("notional_over_economic_capital", None)
+            else:
+                b["capital"]["notional_over_economic_capital"] = bad
+    r = rec(t)
+    assert r["max_leverage"] == 0.0 and r["zero_exposure"] is True and r["limiting_factor"] is None
+    assert "NOTIONAL_OVER_ECONOMIC_CAPITAL_UNKNOWN" in r["reasons"] and r["authorizes_trading"] is False
+
+
+def test_a_table_with_no_one_x_book_at_all_is_zero_exposure_with_the_same_reason():
+    t = table()
+    t["books"] = [b for b in t["books"] if b["leverage"] != 1.0]
+    r = rec(t)
+    assert r["max_leverage"] == 0.0 and "NOTIONAL_OVER_ECONOMIC_CAPITAL_UNKNOWN" in r["reasons"]
+
+
 @pytest.mark.parametrize("edge", [0.0, -0.001, -5.0])
 def test_zero_exposure_when_the_lower_bound_edge_is_not_positive(edge):
     r = rec(edge_lower_bound=edge)
@@ -1347,9 +1370,8 @@ def test_the_ceiling_never_permits_more_notional_than_the_one_x_book_holds_per_u
     now the 1x book's own N / E (0.909 here), and a larger reserve lowers it further."""
     for rho in (0.0, 0.1, 0.25, 0.5):
         t = CS.survival_table(inputs(reserve_frac_of_notional=rho), scenarios=[CS.StressScenario("calm")])
-        r = CS.recommend_exposure(t, edge_lower_bound=0.2, funding_evidence_status="OK", financing_status="NOT_REQUIRED") \
-            if False else CS.recommend_exposure(dict(t, venue_rules_status=CS.VERIFIED_VENUE_RULES, fee_provenance=CS.FEES_VERIFIED),
-                                                edge_lower_bound=0.2, funding_evidence_status="OK")
+        r = CS.recommend_exposure(dict(t, venue_rules_status=CS.VERIFIED_VENUE_RULES, fee_provenance=CS.FEES_VERIFIED),
+                                  edge_lower_bound=0.2, funding_evidence_status="OK")
         ne1 = next(b for b in t["books"] if b["leverage"] == 1.0)["capital"]["notional_over_economic_capital"]
         assert ne1 == pytest.approx(1.0 / (1.0 + rho))
         assert r["max_leverage"] <= ne1 + 1e-12, (rho, r)

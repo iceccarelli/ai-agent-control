@@ -260,7 +260,7 @@ def test_adoption_over_a_files_life_is_capped(tmp_path):
         prev = EC.GENESIS
         for i, ln in enumerate(EC.read_lines(q)[0], 1):
             r = EC.row_hash(ln)
-            prev = EC.link(prev, r)
+            prev = EC.link(prev, r, resealed=True)
             fh.write(json.dumps({"n": i, "r": r, "h": prev, "resealed": True}, sort_keys=True) + "\n")
     EC.bulk_write(q + "x", [])               # (no-op helper call: keeps the file layout identical to production)
     assert EC.verify(q)["resealed_rows"] == 2
@@ -287,3 +287,76 @@ def test_a_head_file_of_the_wrong_shape_is_reported_not_raised(tmp_path, head):
     v = EC.verify(p)                                                              # must not raise
     assert "HEAD_MISSING" in codes(v) and v["tamper_evident_ok"] is False
     assert EC.repair(p)["appendable"] in (True, False)                            # and repair must not raise either
+
+
+# ---- the resealed mark is part of the hash (a flipped flag must not make a valid row disappear, nor an adopted row count) ----
+
+def _rewrite_chain(path, fn):
+    entries = [json.loads(ln) for ln in open(path + ".chain").read().splitlines()]
+    fn(entries)
+    with open(path + ".chain", "w") as fh:
+        for e in entries:
+            fh.write(json.dumps(e, sort_keys=True) + "\n")
+
+
+def test_flipping_the_resealed_flag_on_interior_entries_is_caught_not_a_silent_row_removal(tmp_path):
+    p = write(tmp_path, 12)
+    anchor = [{"n": 12, "head": EC.verify(p)["head"]["head"]}]
+    clean_rows, clean_v = EC.admitted_rows(p, anchor)
+    assert len(clean_rows) == 12 and clean_v["economic_evidence_eligible"] and clean_v["anchor_status"] == EC.ANCHORED_CURRENT
+
+    def flip(entries):
+        for i in (3, 5, 7):
+            entries[i]["resealed"] = True
+    _rewrite_chain(p, flip)
+    v = EC.verify(p, anchor)
+    assert "SIDECAR_INCONSISTENT" in codes(v)
+    assert v["economic_evidence_eligible"] is False and v["internally_consistent"] is False
+    assert v["anchor_status"] != EC.ANCHORED_CURRENT
+    rows_, _ = EC.admitted_rows(p, anchor)
+    assert rows_ == []                                    # fail closed: nothing is admitted from a file whose sidecar does not recompute
+
+
+def test_stripping_the_mark_from_an_adopted_entry_is_caught(tmp_path):
+    p = write(tmp_path, 4)
+    open(p, "ab").write(EC.canonical({"adopted": True}) + b"\n")
+    assert EC.reseal_tail(p) == 1
+    _, v = EC.admitted_rows(p)
+    assert v["ok"] and v["resealed_rows"] == 1
+
+    def strip(entries):
+        entries[-1].pop("resealed")
+    _rewrite_chain(p, strip)
+    v2 = EC.verify(p)
+    assert "SIDECAR_INCONSISTENT" in codes(v2) and v2["economic_evidence_eligible"] is False
+    assert EC.admitted_rows(p)[0] == []
+
+
+@pytest.mark.parametrize("value", [False, 1, 0, "true", "yes", None, [], {}])
+def test_the_mark_is_exactly_true_or_absent(tmp_path, value):
+    p = write(tmp_path, 4)
+
+    def put(entries):
+        entries[2]["resealed"] = value
+    _rewrite_chain(p, put)
+    v = EC.verify(p)
+    assert "SIDECAR_INCONSISTENT" in codes(v) and v["economic_evidence_eligible"] is False
+
+
+def test_a_legitimate_repair_still_verifies_counts_and_is_excluded_after_the_change(tmp_path):
+    p = write(tmp_path, 5)
+    for k in range(2):
+        open(p, "ab").write(EC.canonical({"crash": k}) + b"\n")
+        assert EC.reseal_tail(p) == 1
+    rows_, v = EC.admitted_rows(p)
+    assert v["ok"] and v["resealed_rows"] == 2 and v["resealed_indices"] == [5, 6]
+    assert len(rows_) == 5 and all("crash" not in r for r in rows_)
+    n, _h = EC.append(p, {"after": True})                # normal appends continue to chain normally after a reseal
+    assert n == 8 and EC.verify(p)["ok"]
+
+
+def test_an_entry_without_the_mark_hashes_exactly_as_before():
+    a, b = "ab" * 32, "cd" * 32
+    import hashlib
+    assert EC.link(a, b) == hashlib.sha256(bytes.fromhex(a) + bytes.fromhex(b)).hexdigest()
+    assert EC.link(a, b, resealed=True) != EC.link(a, b)

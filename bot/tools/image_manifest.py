@@ -57,19 +57,33 @@ def _sha(path: str) -> str:
 
 
 def _imports(path: str) -> List[str]:
+    """Every dotted module name the file imports, with each parent package and each ``from pkg import name`` target as a candidate
+    (``from signals import x`` -> ``signals`` and ``signals.x``, which may be a module or only an attribute: the caller keeps what
+    is a file)."""
     tree = ast.parse(open(path, encoding="utf-8").read())
     out: List[str] = []
     for n in ast.walk(tree):
         if isinstance(n, ast.Import):
-            out += [a.name.split(".")[0] for a in n.names]
-        elif isinstance(n, ast.ImportFrom) and n.level == 0:
-            out.append((n.module or "").split(".")[0])
+            for a in n.names:
+                parts = a.name.split(".")
+                out += [".".join(parts[:i]) for i in range(1, len(parts) + 1)]
+        elif isinstance(n, ast.ImportFrom) and n.level == 0 and n.module:
+            parts = n.module.split(".")
+            out += [".".join(parts[:i]) for i in range(1, len(parts) + 1)]
+            out += [f"{n.module}.{a.name}" for a in n.names if a.name != "*"]
     return out
 
 
+def _candidates(mod: str) -> List[str]:
+    rel = mod.replace(".", "/")
+    return [f"{rel}.py", f"{rel}/__init__.py", f"tools/{rel}.py"]
+
+
 def closure(root: str = BOT, entries: Sequence[str] = ENTRY_POINTS) -> List[str]:
-    """The files of ``root`` the entry points import, transitively (a module is a file of ``root`` or ``root/tools``; anything else is
-    the standard library or a third party and is not ours to compare)."""
+    """The files of ``root`` the entry points import, transitively (a module is a file of ``root`` or ``root/tools``, a package is its
+    ``__init__.py`` and the submodules imported from it (and their siblings in the same package, no further); anything else is the standard library or a third party and is not ours to
+    compare). LAZY imports count: a function-level ``import x`` is a file the process may load, so a change to it is a real difference
+    between the image and the repository even when the common path never runs it."""
     seen: Dict[str, None] = {}
     todo = list(entries)
     while todo:
@@ -80,8 +94,13 @@ def closure(root: str = BOT, entries: Sequence[str] = ENTRY_POINTS) -> List[str]
         if not os.path.isfile(p):
             raise SystemExit(f"the repository has no {rel}: run this from a checkout that contains the recorder")
         seen[rel] = None
+        # a file INSIDE a package (signals/...) is compared, and so are its siblings it imports; what it reaches outside the package is
+        # research tooling the drill image does not ship and the recorder never loads, so it is not followed
+        pkg = rel.split("/")[0] + "/" if ("/" in rel and not rel.startswith("tools/")) else None
         for mod in _imports(p):
-            for cand in (f"{mod}.py", f"tools/{mod}.py"):
+            for cand in _candidates(mod):
+                if pkg and not cand.startswith(pkg):
+                    continue
                 if os.path.isfile(os.path.join(root, cand)) and cand not in seen:
                     todo.append(cand)
     return sorted(seen)

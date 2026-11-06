@@ -20,7 +20,10 @@ the monitor, every ``monitor.jsonl`` line the external watcher reads). `verify` 
 
 Honest limits:
   * A row adopted by ``reseal_tail`` was written without a chain entry; it is chained afterwards and marked, and ``admitted_rows``
-    leaves it OUT of every statistic (a crash costs one row of evidence; a forged row is never evidence).
+    leaves it OUT of every statistic (a crash costs one row of evidence). The mark is part of the entry's hash, so adding it to
+    an ordinary entry (to make a row vanish) or removing it from an adopted one (to make an adopted row count) breaks the
+    sidecar. That is all it proves: a writer who can append to the file and its sidecar can still chain a forged NEW row, and
+    only an external anchor taken before the forgery shows it.
   * A writer with access to every file AND to the anchors can forge a consistent history. The
     anchors copied into ``monitor.jsonl`` are a SECOND COPY ON THE SAME VOLUME: they are external to
     the evidence directory, not to the machine. They become genuinely external only when the owner
@@ -63,8 +66,13 @@ def row_hash(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def link(prev_hex: str, r_hex: str) -> str:
-    return hashlib.sha256(bytes.fromhex(prev_hex) + bytes.fromhex(r_hex)).hexdigest()
+RESEAL_MARK = b"RESEALED"
+
+
+def link(prev_hex: str, r_hex: str, resealed: bool = False) -> str:
+    """Next chain value. A resealed entry (a row adopted after a crash) hashes a fixed mark in as well, so the mark cannot be
+    added to or removed from an entry without the sidecar failing to recompute."""
+    return hashlib.sha256(bytes.fromhex(prev_hex) + bytes.fromhex(r_hex) + (RESEAL_MARK if resealed else b"")).hexdigest()
 
 
 def _paths(path: str) -> Tuple[str, str]:
@@ -241,8 +249,10 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
         side_ok = False
     for i, e in enumerate(chain):
         try:
-            recomputes = e.get("n") == i + 1 and link(prev, e["r"]) == e["h"]
-        except ValueError:                       # r / h are not hex
+            marked = "resealed" in e             # absent, or exactly True: any other value is not something the writer produces
+            recomputes = (e.get("n") == i + 1 and (not marked or e["resealed"] is True)
+                          and link(prev, e["r"], marked) == e["h"])
+        except (ValueError, TypeError):          # r / h are not hex
             recomputes = False
         if not recomputes:
             add("SIDECAR_INCONSISTENT", f"chain entry {i + 1} does not recompute", i)
@@ -366,7 +376,7 @@ def reseal_tail(path: str) -> int:
     with open(cpath, "a", encoding="utf-8") as fh:
         for ln in lines[len(chain):]:
             r = row_hash(ln)
-            prev = link(prev, r)
+            prev = link(prev, r, resealed=True)
             n += 1
             fh.write(json.dumps({"n": n, "r": r, "h": prev, "resealed": True}, sort_keys=True) + "\n")
             sealed += 1

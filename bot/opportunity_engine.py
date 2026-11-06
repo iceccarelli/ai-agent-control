@@ -317,16 +317,30 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
                            "this is a statement about the public market, NOT about any account's profit: public funding is not account "
                            "cash, a modelled fill is not an execution, a predicted rebate is not a rebate received",
                            "unmet for ECONOMICALLY_RECONCILED: " + "; ".join(gaps)], m)
-    auth = ev.get("execution_authorisation") or {}
+    auth = _d(ev.get("execution_authorisation"))
     ref = auth.get("reference")
-    if (auth.get("owner_authorised") is True and isinstance(ref, str) and len(ref.strip()) >= 8 and any(c.isalnum() for c in ref)
-            and auth.get("scope") == spec.key):
+    if auth.get("owner_authorised") is True and _real_reference(ref) and auth.get("scope") == spec.key:
         return Evaluation(spec.key, spec.origin, Status.EXECUTION_READY,
                           ["economically reconciled from account records AND a separate owner execution-authorisation record "
                            f"({auth['reference']!r}) names this strategy. This engine authorises nothing: ready is not permission"], m)
     return Evaluation(spec.key, spec.origin, Status.ECONOMICALLY_RECONCILED,
                       ["every account-level requirement is met and the account-settled economics clear the lowest screen; "
                        "there is no separate execution-authorisation record, so this is NOT execution-ready"], m)
+
+
+_PLACEHOLDER_WORDS = ("placeholder", "todo", "tbd", "none", "null", "n/a", "na/na", "test", "dummy", "example", "sample", "fake", "xxxx", "lorem",
+                      "changeme", "unknown", "pending")
+
+
+def _real_reference(ref: Any) -> bool:
+    """A reference that could point at a record: at least 8 characters, at least 5 DISTINCT letters or digits, and none of the words
+    people type when they have not got one. This is a speed bump against typing 'xxxxxxxx', not proof that a record exists: the
+    engine cannot open the owner's authorisation, and authorises nothing either way."""
+    if not isinstance(ref, str):
+        return False
+    r = ref.strip()
+    low = r.lower()
+    return (len(r) >= 8 and len({c for c in low if c.isalnum()}) >= 5 and not any(w in low for w in _PLACEHOLDER_WORDS))
 
 
 def unknown_cost_headroom_bps(econ: Mapping[str, Any], lowest_hurdle_pct: float) -> Optional[float]:
@@ -375,12 +389,29 @@ def integrity_grade(ev: Mapping[str, Any]) -> str:
     if i.get("files_anchor_conflict") or i.get("files_missing_but_anchored"):
         return "CONFLICT"
     if chained > 0 and (i.get("files_anchored_current") or 0) + (i.get("files_anchored_lagging") or 0) == chained:
-        return "ANCHORED" if i.get("anchor_location") == EXTERNAL_ARCHIVE else "ANCHORED_SAME_VOLUME_ONLY"
+        # ANCHORED needs the ARCHIVE alone to anchor every chained file: anchors from both sources are merged for verification, so
+        # a file that only monitor.jsonl (the recorder's own volume) anchors must not borrow the archive's location. A report that
+        # does not say how many files the archive anchors (an older object) is not anchored.
+        by_archive = i.get("files_anchored_by_archive")
+        if i.get("anchor_location") == EXTERNAL_ARCHIVE and type(by_archive) is int and by_archive == chained:
+            return "ANCHORED"
+        return "ANCHORED_SAME_VOLUME_ONLY"
     return "NOT_FULLY_ANCHORED"
 
 
 def _num(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:                    # an int beyond float range (any JSON document can carry one) is not a usable number
+        return False
+
+
+def _d(x: Any) -> Mapping[str, Any]:
+    """A container the caller claims is an object. Anything else is an EMPTY one, so every requirement that reads from it fails
+    closed instead of raising."""
+    return x if isinstance(x, Mapping) else {}
 
 
 MAX_PLAUSIBLE_FEE_BPS = 100.0       # a per-side perpetual fee beyond 1 % is a unit error, not a tier
@@ -394,59 +425,102 @@ def reconciliation_gaps(ev: Mapping[str, Any], spec: Optional[StrategySpec] = No
     against the account ledger it is supposed to have produced; an unknown execution mode is treated as maker/hybrid, never as
     taker."""
     gaps: List[str] = []
-    a = ev.get("account") or {}
-    econ = ev.get("economics") or {}
-    ae = ev.get("account_economics") or {}
-    ledger_n = (ae.get("capital") or {}).get("hedged_notional_usd")
-    ledger_taker = None
-    if _num(ledger_n) and ledger_n > 0 and _num((ae.get("components_usd") or {}).get("perp_entry_fee_usd")):
-        ledger_taker = -ae["components_usd"]["perp_entry_fee_usd"] / ledger_n * 1e4
-    fs = a.get("fee_schedule") or {}
+    a = _d(ev.get("account"))
+    econ = _d(ev.get("economics"))
+    ae = _d(ev.get("account_economics"))
+    comp = _d(ae.get("components_usd"))
+    ledger_n = _d(ae.get("capital")).get("hedged_notional_usd")
+    mode = _d(ev.get("execution")).get("mode")            # a MISSING mode is unknown, and unknown is treated as maker/hybrid
+    fs = _d(a.get("fee_schedule"))
+
+    def leg_bps(name: str) -> Optional[float]:
+        v = comp.get(name)
+        return (-v / ledger_n * 1e4) if (_num(v) and _num(ledger_n) and ledger_n > 0) else None
+
+    def at_a_real_rate(bps: Optional[float], rates: Sequence[Any]) -> bool:
+        return bps is not None and any(_num(r) and abs(bps - r) <= 1e-6 * max(1.0, abs(r)) for r in rates)
+
+    # BOTH perpetual legs must have been charged at a rate the account really has (taker only, unless the mode is stated taker-less
+    # and then taker OR maker); the spot legs of an overlay are zero, and anything else cannot be checked against a perp schedule
+    allowed = (fs.get("taker_bps"),) if mode == "taker" else (fs.get("taker_bps"), fs.get("maker_bps"))
+    legs_ok = (at_a_real_rate(leg_bps("perp_entry_fee_usd"), allowed) and at_a_real_rate(leg_bps("perp_exit_fee_usd"), allowed)
+               and comp.get("spot_entry_fee_usd") == 0 and comp.get("spot_exit_fee_usd") == 0)
     if not (fs.get("provenance") == "ACCOUNT_VERIFIED" and _num(fs.get("taker_bps")) and 0 < fs["taker_bps"] <= MAX_PLAUSIBLE_FEE_BPS
             and _num(fs.get("maker_bps")) and -MAX_PLAUSIBLE_FEE_BPS <= fs["maker_bps"] <= fs["taker_bps"]
-            and (ae.get("fees") or {}).get("verified") is True
-            and ledger_taker is not None and abs(ledger_taker - fs["taker_bps"]) <= 1e-6 * max(1.0, fs["taker_bps"])):
+            and _d(ae.get("fees")).get("verified") is True and legs_ok):
         gaps.append("account_fee_schedule: the account's real taker/maker rates are not read from the account, are implausible, or "
-                    "differ from the fee the account ledger charged (published defaults are not them)")
-    q = a.get("product_qualification") or {}
+                    "differ from the fee the account ledger charged on EITHER perpetual leg (published defaults are not them; spot-leg "
+                    "fees cannot be checked against a perpetual schedule)")
+    q = _d(a.get("product_qualification"))
     if not (q.get("verdict") == "QUALIFIED" and q.get("environment") == "mainnet" and q.get("product") == "BTCUSDT linear"
             and isinstance(q.get("evidence_ref"), str) and len(q["evidence_ref"].strip()) >= 4):
         gaps.append("product_account_qualification: no QUALIFIED verdict for this account and product (EU is unqualified)")
-    st = a.get("funding_settlements") or {}
-    ledger_settle = (ae.get("funding") or {}).get("settlements")
+    st = _d(a.get("funding_settlements"))
+    ledger_settle = _d(ae.get("funding")).get("settlements")
     if not (st.get("source") == "ACCOUNT_SETTLED" and st.get("reconciled") is True and type(st.get("unreconciled")) is int
             and st["unreconciled"] == 0 and type(st.get("settlements_reconciled")) is int
             and st["settlements_reconciled"] >= MIN_ACCOUNT_SETTLEMENTS and st["settlements_reconciled"] == ledger_settle):
         gaps.append(f"account_funding_settlements: fewer than {MIN_ACCOUNT_SETTLEMENTS} ACCOUNT_SETTLED funding rows reconciled, any "
                     "unreconciled, or a count that differs from the account ledger (a public funding print is not account cash)")
-    fl = a.get("fills") or {}
+    fl = _d(a.get("fills"))
     if not (fl.get("evidence_class") == "ACCOUNT_EXECUTION" and fl.get("reconciled") is True
             and all(type(fl.get(k)) is int for k in ("fills", "fee_records", "round_trips"))
-            and fl["fills"] >= 2 * MIN_ACCOUNT_ROUND_TRIPS and fl["fee_records"] >= fl["fills"] and fl["round_trips"] >= MIN_ACCOUNT_ROUND_TRIPS):
-        gaps.append("fills_and_fee_records: no reconciled ACCOUNT_EXECUTION fills with a fee record each (a modelled fill is not an execution)")
-    xc = a.get("execution_costs") or {}
-    prov = xc.get("provenance") or {}
+            and fl["fills"] >= 2 * MIN_ACCOUNT_ROUND_TRIPS and fl["fee_records"] >= fl["fills"] and fl["round_trips"] >= MIN_ACCOUNT_ROUND_TRIPS
+            and fl["round_trips"] <= fl["fills"] // 2):
+        gaps.append("fills_and_fee_records: no reconciled ACCOUNT_EXECUTION fills with a fee record each, or more round trips than "
+                    "the fills can form (a modelled fill is not an execution)")
+    xc = _d(a.get("execution_costs"))
+    prov = _d(xc.get("provenance"))
     needed = ("latency", "market_impact", "slippage")
-    mode = (ev.get("execution") or {}).get("mode", "taker")
-    if mode != "taker":                      # maker, hybrid, or ANY unrecognised value: fail closed
+    if mode != "taker":                      # maker, hybrid, MISSING, or any unrecognised value: fail closed
         needed += ("maker_fill_probability", "adverse_selection")
     if econ.get("unknowns") or ae.get("unknowns") or any(prov.get(k) != "MEASURED" for k in needed):
         gaps.append("execution_and_operational_costs: " + ("unpriced inputs remain (" + ", ".join(econ.get("unknowns") or ae.get("unknowns") or []) + "); "
                     if (econ.get("unknowns") or ae.get("unknowns")) else "")
                     + "not every input is MEASURED (" + ", ".join(k for k in needed if prov.get(k) != "MEASURED") + ")")
-    cc = a.get("capital") or {}
+    cc = _d(a.get("capital"))
     if not (cc.get("reconciled") is True and cc.get("source") == "ACCOUNT_READ"):
         gaps.append("capital_and_collateral: balances and collateral are not reconciled against an account read")
-    vr = a.get("venue_rules") or {}
+    vr = _d(a.get("venue_rules"))
     if not (vr.get("verified") is True and isinstance(vr.get("source"), str) and len(vr["source"].strip()) >= 4):
         gaps.append("venue_margin_and_liquidation_rules: initial/maintenance margin, haircuts and liquidation rules are ASSUMED, not verified")
     lowest = min(TE.SCREENING_HURDLES_PCT)
-    ret = (ae.get("returns") or {}).get("annualised_pct_on_economic_capital")
-    if not ((ae.get("funding") or {}).get("source") == "ACCOUNT_SETTLED" and (ae.get("fees") or {}).get("verified") is True
-            and not ae.get("unknowns") and _num(ret) and ret >= lowest):
+    if not ((_d(ae.get("funding")).get("source") == "ACCOUNT_SETTLED" and _d(ae.get("fees")).get("verified") is True
+             and not ae.get("unknowns") and _ledger_is_self_consistent(ae) and _ledger_return(ae) is not None and _ledger_return(ae) >= lowest)):
         gaps.append("account_economics: the ledger is not computed from ACCOUNT_SETTLED funding with verified fees and no unknown input, "
+                    "does not recompute from its own components (net, return, margin sufficiency, liquidation headroom), "
                     f"or it does not clear the lowest {TE.PROVISIONAL} screen")
     return gaps
+
+
+def _ledger_return(ae: Mapping[str, Any]) -> Optional[float]:
+    """The annualised return on economic capital RECOMPUTED from the ledger's own net, capital and holding period, never the figure
+    the object claims. None when any input is missing or not a usable number."""
+    cap = _d(ae.get("capital")).get("economic_capital_usd")
+    hold = _d(ae.get("position")).get("hold_days")
+    net = ae.get("net_pnl_usd")
+    if not (_num(cap) and cap > 0 and _num(hold) and hold > 0 and _num(net)):
+        return None
+    return net / cap * 365.0 / hold * 100.0
+
+
+def _ledger_is_self_consistent(ae: Mapping[str, Any]) -> bool:
+    """A ledger that claims to have reconciled must: sum its components to its net, say it reconciles, agree with its own claimed
+    return, have enough initial margin and clear the risk limit's liquidation headroom."""
+    comp = _d(ae.get("components_usd"))
+    net = ae.get("net_pnl_usd")
+    if not comp or not _num(net) or not all(_num(v) for v in comp.values()):
+        return False
+    if ae.get("reconciles") is not True or not math.isclose(sum(comp.values()), net, rel_tol=1e-9, abs_tol=1e-6):
+        return False
+    if _d(ae.get("capital")).get("initial_margin_sufficient") is not True:
+        return False
+    liq = _d(ae.get("liquidation")).get("conservative_adverse_move_pct")
+    if not (_num(liq) and liq >= _RISK["min_liquidation_headroom_pct"]):
+        return False
+    claimed = _d(ae.get("returns")).get("annualised_pct_on_economic_capital")
+    recomputed = _ledger_return(ae)
+    return _num(claimed) and recomputed is not None and math.isclose(claimed, recomputed, rel_tol=1e-6, abs_tol=1e-6)
 
 
 def basis_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:
