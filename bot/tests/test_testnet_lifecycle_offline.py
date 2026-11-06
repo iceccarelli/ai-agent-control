@@ -827,3 +827,42 @@ def test_every_request_of_a_whole_run_stays_on_the_testnet_host_and_signed_and_n
     assert armed is not True
     # the only exposure endpoints used are the two the client gates, and only /order/create was needed
     assert set(p for p in v.requests_by_path if p in bc.EXPOSURE_ENDPOINTS) == {CREATE}
+
+
+# ======================================================================================
+# 8b. a hostile or mis-united venue answer is refused through the WHOLE stack (adversarial review: the new reader refusals were only unit-tested)
+# ======================================================================================
+
+@pytest.mark.parametrize("how,reason", [
+    ("funding_as_percent", "MARKET_VIEW_UNUSABLE"),          # fundingRate "0.5": a unit slip / wrong field, 5000 bps
+    ("interval_4h", "MARKET_VIEW_UNUSABLE"),                 # fundingIntervalHour "4": every downstream number assumes 8h
+    ("fee_other_symbol", None),                              # an ETHUSDT fee row for BTCUSDT
+    ("fee_in_percent", None),                                # takerFeeRate in percent: 100x too large. NOTE: the OLD broker also stood aside here (the cost gate
+                                                             # refuses a 1100 bps round trip): an OVER-priced fee is the conservative direction. The dangerous
+                                                             # direction (under-priced: the wrong-symbol row of zeros) is fee_other_symbol, which the old code let through.
+])
+def test_a_mis_united_or_wrong_row_from_the_venue_stops_the_entry_with_zero_orders(world, how, reason):
+    """Each case is a real venue-shaped answer with ONE wrong thing. The real BybitClient and CarryBroker read it, refuse it, and the
+    engine places no order and stays FLAT: the cost/funding number it would have priced is never invented."""
+    w = world(mode="overlay")
+    w.boot()                                   # the hostile answer is in place BEFORE the first tick: the fee tier is read once and cached
+    v = w.venue
+    if how == "funding_as_percent":
+        v.funding_rate = 0.5
+    elif how == "interval_4h":
+        v.funding_interval_hour = "4"
+    elif how == "fee_other_symbol":
+        v.fee_row_symbol = "ETHUSDT"
+    elif how == "fee_in_percent":
+        v.fee_scale = 100.0
+    decisions = [w.tick(), w.tick(), w.tick()]           # the first tick of a new database stands aside; the next ones would enter
+    for d in decisions:
+        assert d["action"] in ("skipped", "stand_aside", "halted"), d
+    assert v.requests_by_path[CREATE] == 0 and v.orders == {} and v.net_position() == 0.0, decisions
+    assert w.bot.carry.state is BookState.FLAT, decisions
+    if reason:
+        assert decisions[-1]["reason"] == reason, decisions
+    # CONTROL: the same bot on a clean venue enters, so the refusal above was about the answer and not a broken harness.
+    clean = world(mode="overlay")
+    clean.open()
+    assert clean.venue.requests_by_path[CREATE] >= 1 and clean.venue.net_position() < 0.0

@@ -235,7 +235,9 @@ def test_a_funding_reader_reads_the_interval_the_ticker_states_and_refuses_anyth
     row = dict(TICKER, fundingRate="0.0001")
     assert broker(**{"/v5/market/tickers": [row]}).get_funding_bps(SYM) == pytest.approx(1.0)
     assert broker(**{"/v5/market/tickers": [dict(row, fundingIntervalHour="8")]}).get_funding_bps(SYM) == pytest.approx(1.0)
-    for interval in ("4", "1", "2", "0", "", "abc"):
+    for interval in ("", "  "):                                                  # a blank field is UNSTATED, as for fundingCap: accepted (BTCUSDT states "8")
+        assert broker(**{"/v5/market/tickers": [dict(row, fundingIntervalHour=interval)]}).get_funding_bps(SYM) == pytest.approx(1.0)
+    for interval in ("4", "1", "2", "0", "abc"):
         with pytest.raises(PairIncident, match="interval"):
             broker(**{"/v5/market/tickers": [dict(row, fundingIntervalHour=interval)]}).get_funding_bps(SYM)
 
@@ -261,3 +263,44 @@ def test_a_crossed_or_locked_touch_is_refused_not_returned_with_a_negative_sprea
     with pytest.raises(PairIncident, match="crossed|locked"):
         broker(**{"/v5/market/tickers": [dict(TICKER, bid1Price=bid, ask1Price=ask)]}).get_book_top(SYM, "linear")
     assert broker(**{"/v5/market/tickers": [dict(TICKER, bid1Price="99", ask1Price="100")]}).get_book_top(SYM, "linear") == {"bid": 99.0, "ask": 100.0}
+
+
+# -- the same field on the SETTLED-print path (adversarial review, reproduced: the bounds guarded only the ticker forecast) --------------------------
+
+PRINT = {"symbol": SYM, "fundingRate": "0.0001", "fundingRateTimestamp": "1700000000000"}
+
+
+@pytest.mark.parametrize("raw", ["0.5", "-0.5", "1", "0.0501"])
+def test_the_settled_print_the_engine_keys_on_refuses_an_implausible_rate(raw):
+    # Reproduced: /v5/market/funding/history serving "0.5" returned (5000.0, ts) while the same 0.5 on the ticker was refused.
+    ok = broker(**{"/v5/market/funding/history": [PRINT]}).get_funding_print(SYM)
+    assert ok == (pytest.approx(1.0), 1700000000000)
+    with pytest.raises(PairIncident, match="implausible|unit"):
+        broker(**{"/v5/market/funding/history": [dict(PRINT, fundingRate=raw)]}).get_funding_print(SYM)
+
+
+@pytest.mark.parametrize("raw", ["0.5", "-1"])
+def test_the_funding_history_reader_refuses_an_implausible_rate_instead_of_seeding_the_gate_with_it(raw):
+    good = broker(**{"/v5/market/funding/history": [PRINT]}).get_funding_history(SYM)
+    assert good == [(pytest.approx(1.0), 1700000000000)]
+    with pytest.raises(PairIncident, match="implausible|unit"):
+        broker(**{"/v5/market/funding/history": [dict(PRINT, fundingRate=raw), PRINT]}).get_funding_history(SYM)
+
+
+def test_the_funding_history_range_reader_marks_an_implausible_rate_as_incomplete_evidence():
+    t = 1700000000000
+    for raw, complete in (("0.0001", True), ("0.5", False)):
+        h = broker(**{"/v5/market/funding/history": [dict(PRINT, fundingRate=raw)]}).get_funding_history_range(SYM, t - 1000, t + 1000)
+        assert (not any("implausible" in e for e in h.errors)) == complete, h.errors
+        if not complete:
+            assert not h.complete and h.prints == []
+
+
+def test_an_out_of_window_settlement_row_without_funding_is_out_of_window_not_an_incomplete_evidence_error():
+    # Review LOW: the no-funding check ran before the window check, so a row the venue returned OUTSIDE the asked window and that states no funding
+    # poisoned the evidence. The window comes first; an in-window funding-less row stays an error (see the test above).
+    inside = settlement()
+    outside = settlement(id="s2", transactionTime=str(T_SETTLE + 10_000_000), funding="", change="")
+    ev = broker(**{"/v5/account/transaction-log": [inside, outside]}).get_funding_evidence(SYM, T_SETTLE - 1000, T_SETTLE + 1000)
+    assert not any("carries no funding" in e for e in ev.errors)
+    assert [p["id"] for p in ev.payments] == ["s1"]

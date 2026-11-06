@@ -1490,6 +1490,12 @@ class CarryBroker:
     #: The engine's income, staleness and break-even arithmetic assume an 8-hour funding interval (3 settlements a day).
     _ASSUMED_FUNDING_INTERVAL_H = 8
 
+    @classmethod
+    def _rate_is_plausible(cls, rate: float) -> bool:
+        """A funding rate is a FRACTION per settlement; no instrument this book trades ever exceeds 5 % in one. Anything above is a unit slip, the wrong
+        field or a hostile row, and must never reach a decision (shared by the ticker forecast and every settled-print reader)."""
+        return math.isfinite(rate) and abs(rate) <= cls._MAX_PLAUSIBLE_FUNDING_RATE
+
     def get_funding_bps(self, symbol: str) -> float:
         """Current 8h funding on the perp, in basis points.
 
@@ -1521,7 +1527,7 @@ class CarryBroker:
         # The same row states the funding interval. Every number downstream (income per day, break-even, the staleness of the last print) assumes
         # 8 hours, so a different interval is refused rather than priced as if it were eight (reproduced: the field was ignored).
         interval = row.get("fundingIntervalHour")
-        if interval is not None:
+        if interval is not None and str(interval).strip() != "":
             try:
                 hours = float(interval)
             except (TypeError, ValueError):
@@ -1709,6 +1715,10 @@ class CarryBroker:
         if not math.isfinite(rate) or stamp <= 0:
             raise PairIncident(
                 f"settled funding print for {symbol} is unusable: {row!r}")
+        if not self._rate_is_plausible(rate):
+            raise PairIncident(
+                f"settled funding print for {symbol} is implausible ({rate!r} as a "
+                f"fraction per settlement): a unit slip or a wrong field")
         return rate * 1e4, stamp
 
     def get_margin_mode(self) -> str:
@@ -1973,6 +1983,10 @@ class CarryBroker:
             except (KeyError, TypeError, ValueError):
                 continue
             if math.isfinite(rate) and stamp > 0:
+                if not self._rate_is_plausible(rate):
+                    raise PairIncident(
+                        f"funding history row for {symbol} is implausible ({rate!r} as a "
+                        f"fraction per settlement): refusing to seed the entry gate with it")
                 out.append((rate * 1e4, stamp))
         out.sort(key=lambda entry: entry[1])
         return out
@@ -2045,6 +2059,11 @@ class CarryBroker:
                     continue
                 if not math.isfinite(rate) or stamp <= 0:
                     out.errors.append("a funding row is unusable")
+                    bad = True
+                    continue
+                if not self._rate_is_plausible(rate):
+                    out.errors.append(
+                        f"a funding row is implausible ({rate!r} as a fraction per settlement)")
                     bad = True
                     continue
                 if str(row.get("symbol", symbol)) != symbol:
@@ -2190,7 +2209,14 @@ class CarryBroker:
             return "wrong_category"
         raw = row.get("funding")
         if raw is None or str(raw).strip() == "":
-            return "no_funding"
+            # The window first: a row the venue returned OUTSIDE the asked interval is not this evidence's concern whatever it states.
+            try:
+                stamp = int(row["transactionTime"])
+                outside = ((start_ms is not None and stamp < start_ms)
+                           or (end_ms is not None and stamp > end_ms))
+            except (KeyError, TypeError, ValueError):
+                outside = False
+            return "out_of_window" if outside else "no_funding"
         try:
             usd = float(raw)
             stamp = int(row["transactionTime"])

@@ -173,6 +173,10 @@ class SyntheticVenue(bc.Transport):
         self.spot = float(spot if spot is not None else mark)
         self.half_spread = 0.0001           # bid/ask = price * (1 -/+ 1 bp)
         self.funding_rate = float(funding_rate)     # the NEXT settlement's rate (ticker)
+        #: hostile-venue options, all off by default: a ticker that states a funding interval, and a fee-rate row that names another symbol / is in percent
+        self.funding_interval_hour: Optional[str] = None
+        self.fee_row_symbol: Optional[str] = None
+        self.fee_scale: float = 1.0
         self.fee = {("linear", "taker"): perp_taker, ("linear", "maker"): perp_maker,
                     ("spot", "taker"): spot_taker, ("spot", "maker"): spot_maker}
         self.spot_buy_fee_in = spot_buy_fee_in
@@ -439,6 +443,8 @@ class SyntheticVenue(bc.Transport):
             row.update({"markPrice": _num(self.mark), "indexPrice": _num(self.spot),
                         "fundingRate": _num(self.funding_rate),
                         "nextFundingTime": str(self._now() + 8 * 3600 * 1000)})
+            if self.funding_interval_hour is not None:
+                row["fundingIntervalHour"] = self.funding_interval_hour
         return self._ok({"category": category, "list": [row]})
 
     def _instruments(self, q, b):
@@ -477,9 +483,9 @@ class SyntheticVenue(bc.Transport):
 
     def _fee_rate(self, q, b):
         category = q.get("category", "")
-        return self._ok({"list": [{"symbol": q.get("symbol", ""),
-                                   "takerFeeRate": _num(self.fee[(category, "taker")]),
-                                   "makerFeeRate": _num(self.fee[(category, "maker")])}]})
+        return self._ok({"list": [{"symbol": self.fee_row_symbol or q.get("symbol", ""),
+                                   "takerFeeRate": _num(self.fee[(category, "taker")] * self.fee_scale),
+                                   "makerFeeRate": _num(self.fee[(category, "maker")] * self.fee_scale)}]})
 
     def _account_info(self, q, b):
         return self._ok({"marginMode": self.margin_mode, "unifiedMarginStatus": 4,
