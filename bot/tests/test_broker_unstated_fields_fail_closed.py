@@ -296,11 +296,13 @@ def test_the_funding_history_range_reader_marks_an_implausible_rate_as_incomplet
             assert not h.complete and h.prints == []
 
 
-def test_an_out_of_window_settlement_row_without_funding_is_out_of_window_not_an_incomplete_evidence_error():
-    # Review LOW: the no-funding check ran before the window check, so a row the venue returned OUTSIDE the asked window and that states no funding
-    # poisoned the evidence. The window comes first; an in-window funding-less row stays an error (see the test above).
+def test_an_out_of_window_settlement_row_without_funding_is_classified_by_the_window_and_the_evidence_stays_incomplete():
+    # The window check now comes before the no-funding check, so such a row is REPORTED as what it is (out of the asked interval) and not as a
+    # funding-less settlement. It does NOT make the evidence complete: a row outside the requested interval was always an error and still is
+    # (deliberate: the venue answered something other than what was asked). An in-window funding-less row is the separate error tested above.
     inside = settlement()
     outside = settlement(id="s2", transactionTime=str(T_SETTLE + 10_000_000), funding="", change="")
     ev = broker(**{"/v5/account/transaction-log": [inside, outside]}).get_funding_evidence(SYM, T_SETTLE - 1000, T_SETTLE + 1000)
-    assert not any("carries no funding" in e for e in ev.errors)
+    assert ev.errors == ["a settlement row lies outside the requested interval"]
+    assert ev.rejected == {"out_of_window": 1} and not ev.complete
     assert [p["id"] for p in ev.payments] == ["s1"]
