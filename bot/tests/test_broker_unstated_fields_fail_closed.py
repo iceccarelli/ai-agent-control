@@ -179,3 +179,85 @@ def test_a_spot_holding_with_no_or_ambiguous_coin_row_is_unreadable(coins):
     with pytest.raises(PairIncident):
         broker(**{"/v5/account/wallet-balance": [{"coin": coins}]}
                )._holding(SYM, "spot")
+
+
+# -- independent data-integrity audit (reproduced): money readers that accepted the wrong row, the wrong unit or the wrong interval ----------------
+
+FEE = {"symbol": SYM, "makerFeeRate": "0.0002", "takerFeeRate": "0.00055"}
+
+
+def test_a_good_fee_row_reads_in_basis_points_and_a_row_that_names_no_symbol_is_still_accepted():
+    r = broker(**{"/v5/account/fee-rate": [FEE]}).get_fee_rates(SYM, "linear")
+    assert r["taker_bps"] == pytest.approx(5.5) and r["maker_bps"] == pytest.approx(2.0)
+    assert broker(**{"/v5/account/fee-rate": [without(FEE, "symbol")]}).get_fee_rates(SYM, "linear")["taker_bps"] == pytest.approx(5.5)
+
+
+def test_a_fee_row_for_another_symbol_is_refused_and_not_read_as_free():
+    # Reproduced: [{symbol: ETHUSDT, maker 0, taker 0}] for BTCUSDT returned 0 bps and was cached for the life of the process, so the cost gate
+    # priced the round trip at nothing.
+    wrong = dict(FEE, symbol="ETHUSDT", makerFeeRate="0", takerFeeRate="0")
+    with pytest.raises(PairIncident, match="ETHUSDT"):
+        broker(**{"/v5/account/fee-rate": [wrong]}).get_fee_rates(SYM, "linear")
+
+
+@pytest.mark.parametrize("field,value", [("takerFeeRate", "0.055"), ("makerFeeRate", "0.055"), ("takerFeeRate", "1"), ("takerFeeRate", "0.0101")])
+def test_a_fee_in_percent_instead_of_a_fraction_is_refused_not_read_as_hundreds_of_bps(field, value):
+    # Reproduced: takerFeeRate "0.055" (percent) read as 550 bps without complaint.
+    with pytest.raises(PairIncident, match="implausible"):
+        broker(**{"/v5/account/fee-rate": [dict(FEE, **{field: value})]}).get_fee_rates(SYM, "linear")
+
+
+T_SETTLE = 1_700_000_000_000
+
+
+def settlement(**over):
+    row = {"symbol": SYM, "type": "SETTLEMENT", "category": "linear", "id": "s1", "transactionTime": str(T_SETTLE), "funding": "-1.2",
+           "change": "-1.2", "size": "-0.1", "currency": "USDT"}
+    row.update(over)
+    return row
+
+
+def test_a_settlement_row_without_a_funding_field_makes_the_evidence_incomplete_instead_of_vanishing():
+    # Reproduced: {type SETTLEMENT, change "-1.2", no funding} was skipped with no error and no rejection, so complete=True and payments=[]: a charged
+    # settlement became "no settlement".
+    good = broker(**{"/v5/account/transaction-log": [settlement()]}).get_funding_evidence(SYM, T_SETTLE - 1000, T_SETTLE + 1000)
+    assert good.complete and len(good.payments) == 1 and good.payments[0]["usd"] == pytest.approx(-1.2)
+    for missing in (without(settlement(), "funding"), settlement(funding=""), settlement(funding=None)):
+        ev = broker(**{"/v5/account/transaction-log": [missing]}).get_funding_evidence(SYM, T_SETTLE - 1000, T_SETTLE + 1000)
+        assert not ev.complete and any("funding" in e for e in ev.errors), ev.errors
+        assert ev.payments == []
+    zero = broker(**{"/v5/account/transaction-log": [settlement(funding="0", change="0")]}).get_funding_evidence(SYM, T_SETTLE - 1000, T_SETTLE + 1000)
+    assert zero.complete and zero.payments[0]["usd"] == 0.0                    # a stated zero is a legitimate zero
+
+
+def test_a_funding_reader_reads_the_interval_the_ticker_states_and_refuses_anything_but_eight_hours():
+    # Reproduced: fundingIntervalHour was ignored, so a 4h/1h instrument was priced as 8h (income understated 2x-8x, staleness check loosened).
+    row = dict(TICKER, fundingRate="0.0001")
+    assert broker(**{"/v5/market/tickers": [row]}).get_funding_bps(SYM) == pytest.approx(1.0)
+    assert broker(**{"/v5/market/tickers": [dict(row, fundingIntervalHour="8")]}).get_funding_bps(SYM) == pytest.approx(1.0)
+    for interval in ("4", "1", "2", "0", "", "abc"):
+        with pytest.raises(PairIncident, match="interval"):
+            broker(**{"/v5/market/tickers": [dict(row, fundingIntervalHour=interval)]}).get_funding_bps(SYM)
+
+
+@pytest.mark.parametrize("raw", ["0.4", "-0.4", "1", "0.0501", "", "abc"])
+def test_an_implausible_or_unparseable_funding_rate_is_a_pair_incident_not_thousands_of_bps_or_a_bare_valueerror(raw):
+    # Reproduced: "1" returned 10000 bps, "-0.4" returned -4000 bps, "" raised a bare ValueError.
+    with pytest.raises(PairIncident):
+        broker(**{"/v5/market/tickers": [dict(TICKER, fundingRate=raw)]}).get_funding_bps(SYM)
+
+
+def test_a_funding_rate_beyond_the_venues_own_cap_in_the_same_row_is_refused():
+    row = dict(TICKER, fundingCap="0.00333")
+    assert broker(**{"/v5/market/tickers": [dict(row, fundingRate="0.00333")]}).get_funding_bps(SYM) == pytest.approx(33.3)
+    with pytest.raises(PairIncident, match="cap"):
+        broker(**{"/v5/market/tickers": [dict(row, fundingRate="0.01")]}).get_funding_bps(SYM)
+    with pytest.raises(PairIncident):
+        broker(**{"/v5/market/tickers": [dict(row, fundingRate="0.0001", fundingCap="abc")]}).get_funding_bps(SYM)
+
+
+@pytest.mark.parametrize("bid,ask", [("100", "99"), ("100", "100")])
+def test_a_crossed_or_locked_touch_is_refused_not_returned_with_a_negative_spread(bid, ask):
+    with pytest.raises(PairIncident, match="crossed|locked"):
+        broker(**{"/v5/market/tickers": [dict(TICKER, bid1Price=bid, ask1Price=ask)]}).get_book_top(SYM, "linear")
+    assert broker(**{"/v5/market/tickers": [dict(TICKER, bid1Price="99", ask1Price="100")]}).get_book_top(SYM, "linear") == {"bid": 99.0, "ask": 100.0}

@@ -199,8 +199,11 @@ class TestTheVenueReader:
         assert len(c.params) == 2                          # two pages
 
     def test_other_symbols_and_trade_rows_are_ignored(self):
+        # A TRADE row is not a settlement and is ignored. (It used to be modelled as a SETTLEMENT row with a blank funding field; a real venue never
+        # sends that, and a SETTLEMENT row that does not state its funding now makes the evidence incomplete: see
+        # test_a_settlement_row_without_a_funding_field_makes_the_evidence_incomplete_instead_of_vanishing.)
         c = Log([row(1, "0.5", 1_000), row(2, "9", 2_000, symbol="ETHUSDT"),
-                 row(3, "", 3_000)])
+                 row(3, "", 3_000, type="TRADE")])
         got = broker(c).get_funding_payments("BTCUSDT", 0, 5_000)
         assert [g["id"] for g in got] == ["S1"]
 
