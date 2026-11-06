@@ -625,7 +625,7 @@ def _gaps(**kw):
 def test_the_untouched_ledger_is_self_consistent_and_clears():
     st, gaps = _gaps()
     assert st == OE.Status.ECONOMICALLY_RECONCILED and gaps == []
-    assert OE._ledger_is_self_consistent(account_economics()) is True
+    assert OE._ledger_is_self_consistent(account_economics(), 3.8, 0.5) is True
     assert OE._ledger_return(account_economics()) == pytest.approx(account_economics()["returns"]["annualised_pct_on_economic_capital"])
 
 
@@ -769,12 +769,12 @@ def test_ROUND3_a_ledger_whose_pieces_contradict_each_other_is_not_reconciled_ev
 
 
 def test_ROUND3_the_untouched_ledger_still_passes_every_re_derivation():
-    assert OE._ledger_is_self_consistent(account_economics()) is True
+    assert OE._ledger_is_self_consistent(account_economics(), 3.8, 0.5) is True
     for hold, n in ((30.0, 90), (7.0, 21), (5.8, 17), (90.0, 270)):
         pos = position(hold_days=hold)
         costs = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.3, slippage_bps=0.1, impact_bps=0.2, latency_bps=0.1,
                          conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0, fee_provenance="ACCOUNT_VERIFIED")
-        assert OE._ledger_is_self_consistent(TE.compute(pos, costs, [3.8] * n, funding_source="ACCOUNT_SETTLED")), (hold, n)
+        assert OE._ledger_is_self_consistent(TE.compute(pos, costs, [3.8] * n, funding_source="ACCOUNT_SETTLED"), 3.8, 0.5), (hold, n)
 
 
 def test_ROUND3_numbers_beyond_float_range_and_odd_unknowns_never_raise():
@@ -782,7 +782,7 @@ def test_ROUND3_numbers_beyond_float_range_and_odd_unknowns_never_raise():
     ae = copy.deepcopy(account_economics())
     ae["components_usd"]["funding_income_usd"] = ae["components_usd"]["basis_pnl_usd"] = 10 ** 308
     ae["net_pnl_usd"] = 1.0
-    assert OE._ledger_is_self_consistent(ae) is False
+    assert OE._ledger_is_self_consistent(ae, 3.8, 0.5) is False
     st, e = status(reconciled(account_economics_=ae))
     assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and e.metrics["reconciliation_gaps"]
     for junk in (5, [1, 2], {"a": 1}, "borrow", [None], (1,), True):
@@ -834,3 +834,90 @@ def test_ROUND3_a_natural_reference_that_merely_contains_a_placeholder_word_is_a
                                  "TBD / TBD", "unknown unknown", "ref-ref-ref-1", "sample sample 1"])
 def test_ROUND3_a_reference_made_only_of_placeholder_words_is_refused(ref):
     assert OE._real_reference(ref) is False
+
+
+# ---- fourth review: cost lines are costs, the capital block is a real position, funding is the public market's ----
+
+def _cost_line(key, value):
+    return lambda ae: ae["components_usd"].__setitem__(key, value)
+
+
+@pytest.mark.parametrize("key", ["spread_usd", "slippage_usd", "market_impact_usd", "latency_usd", "conversion_usd", "transfer_usd", "custody_usd",
+                                 "operational_usd", "borrow_usd"])
+def test_ROUND4_a_cost_line_with_the_sign_of_income_inflates_nothing(key):
+    ae = _resynced(_cost_line(key, 50_000.0))
+    assert OE._ledger_is_self_consistent(ae, 3.8, 0.5) is False
+    st, e = status(reconciled(account_economics_=ae))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and any("account_economics" in g for g in e.metrics["reconciliation_gaps"])
+
+
+def test_ROUND4_a_taker_ledger_that_paid_no_spread_at_all_is_not_a_measurement():
+    assert OE._ledger_is_self_consistent(_resynced(_cost_line("spread_usd", 0.0)), 3.8, 0.5) is False
+
+
+def test_ROUND4_the_unknowns_key_must_be_present_and_empty():
+    for value in (None, ["latency"], 0, "", [[]]):
+        ae = _resynced(lambda a, v=value: a.__setitem__("unknowns", v))
+        assert OE._ledger_is_self_consistent(ae, 3.8, 0.5) is False, value
+    ae = _resynced(lambda a: a.pop("unknowns"))
+    assert OE._ledger_is_self_consistent(ae, 3.8, 0.5) is False
+
+
+@pytest.mark.parametrize("name,mutate", [
+    ("a negative reserve that shrinks economic capital to a tenth", lambda ae: (ae["capital"].update(reserve_usd=-99_000.0, economic_capital_usd=1_000.0))),
+    ("a negative posted margin offset by reserve", lambda ae: ae["capital"].update(margin_posted_extra_usd=-5_000.0, reserve_usd=15_000.0)),
+    ("a negative inventory", lambda ae: ae["capital"].update(btc_inventory_usd=-100.0, economic_capital_usd=9_900.0)),
+    ("inventory 1,000 behind a 100,000 notional with the collateral unchanged", lambda ae: ae["capital"].update(btc_inventory_usd=1_000.0, reserve_usd=0.0, economic_capital_usd=1_000.0)),
+    ("inventory 20,000 behind a 100,000 notional (a naked 80,000 short)", lambda ae: ae["capital"].update(btc_inventory_usd=20_000.0, reserve_usd=0.0, economic_capital_usd=20_000.0, available_collateral_usd=18_000.0)),
+    ("available collateral above inventory + margin", lambda ae: ae["capital"].update(available_collateral_usd=500_000.0)),
+    ("available collateral below the posted margin", lambda ae: ae["capital"].update(margin_posted_extra_usd=50_000.0, economic_capital_usd=160_000.0, available_collateral_usd=10_000.0)),
+    ("an initial margin of a hundredth of a cent", lambda ae: ae["capital"].update(required_initial_margin_usd=0.0001)),
+    ("economic capital below the available collateral", lambda ae: ae["capital"].update(economic_capital_usd=50_000.0, reserve_usd=-60_000.0)),
+])
+def test_ROUND4_a_capital_block_no_real_position_can_have_is_not_reconciled(name, mutate):
+    ae = _resynced(mutate)
+    assert OE._ledger_is_self_consistent(ae, 3.8, 0.5) is False, name
+    st, e = status(reconciled(account_economics_=ae))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED, name
+
+
+def test_ROUND4_initial_margin_sufficiency_is_checked_on_its_own_not_only_through_the_liquidation_bound():
+    def m(ae):
+        ae["capital"].update(available_collateral_usd=25_000.0, required_initial_margin_usd=30_000.0, initial_margin_sufficient=True)
+        ae["liquidation"]["conservative_adverse_move_pct"] = 24.5
+    assert OE._ledger_is_self_consistent(_resynced(m), 3.8, 0.5) is False
+
+
+@pytest.mark.parametrize("name,mutate", [
+    ("ten times the funding path with the line matched", lambda ae: (ae["funding"].update(sum_bps=ae["funding"]["sum_bps"] * 10),
+                                                                     ae["components_usd"].update(funding_income_usd=ae["components_usd"]["funding_income_usd"] * 10))),
+    ("six times the funding path with the line matched", lambda ae: (ae["funding"].update(sum_bps=ae["funding"]["sum_bps"] * 6),
+                                                                     ae["components_usd"].update(funding_income_usd=ae["components_usd"]["funding_income_usd"] * 6))),
+    ("a per-settlement mean beyond any venue print (40 bps)", lambda ae: (ae["funding"].update(sum_bps=40.0 * 90),
+                                                                          ae["components_usd"].update(funding_income_usd=100_000.0 * 40.0 * 90 / 1e4))),
+])
+def test_ROUND4_funding_the_public_market_never_paid_is_not_reconciled(name, mutate):
+    ae = _resynced(mutate)
+    assert OE._ledger_is_self_consistent(ae, 3.8, 0.5) is False, name
+    st, _e = status(reconciled(account_economics_=ae))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED, name
+
+
+def test_ROUND4_without_the_public_realised_mean_the_funding_cannot_be_cross_checked_and_is_a_gap():
+    ae = account_economics()
+    for pm, psd in ((None, None), (float("nan"), 0.5), (3.8, None), (3.8, float("inf")), ("3.8", 0.5), (True, 0.5)):
+        assert OE._ledger_is_self_consistent(ae, pm, psd) is False, (pm, psd)
+    assert OE._ledger_is_self_consistent(ae, 3.8, 0.5) is True
+    assert OE._ledger_is_self_consistent(ae, 3.0, 0.1) is True              # 0.8 bps from the public mean: inside the 2 bps floor
+    assert OE._ledger_is_self_consistent(ae, 0.6, 0.1) is False             # 3.2 bps away with a tight public distribution
+
+
+@pytest.mark.parametrize("ref", ["TODO1234", "TBD12345678", "test12345", "pending123", "placeholder1", "none12345", "todo_1234", "TODO-1234"])
+def test_ROUND4_a_typed_placeholder_glued_to_digits_is_still_a_placeholder(ref):
+    assert OE._real_reference(ref) is False
+
+
+@pytest.mark.parametrize("ref", ["decision/approval-2026-11-05", "OWNER-AUTH-2026-11-05", "sample-size-approval-77", "ticket 4471 / owner decision",
+                                 "authorisation9b3f7c"])
+def test_ROUND4_natural_references_survive_the_letters_only_tokenisation(ref):
+    assert OE._real_reference(ref) is True

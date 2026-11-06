@@ -256,25 +256,26 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
         reasons.append(f"recorder is {ev.get('reliability_verdict')}: only HEALTHY evidence can support a screen")
     if ev.get("environment") != "mainnet":
         reasons.append(f"evidence environment is {ev.get('environment')!r}: only mainnet evidence can support a mainnet claim")
-    fe = ev.get("funding_eval") or {}
+    fe = _d(ev.get("funding_eval"))
     n = fe.get("joined", 0)
-    ess = (fe.get("realised_bps") or {}).get("ess")
+    n = n if (isinstance(n, int) and not isinstance(n, bool)) else 0              # a non-integer count is no settlements
+    ess = _d(fe.get("realised_bps")).get("ess")
     if n < MIN_SETTLEMENTS:
         reasons.append(f"{n} settlements joined to a realised print; at least {MIN_SETTLEMENTS} needed")
     if fe.get("status") != "OK":
-        reasons.extend(fe.get("status_reasons") or ["funding evaluation is not OK"])
-    if (ev.get("economics") or {}).get("funding", {}).get("source") != "PUBLIC_REALISED":
+        reasons.extend(_names(fe.get("status_reasons")) or ["funding evaluation is not OK"])
+    if _d(_d(ev.get("economics")).get("funding")).get("source") != "PUBLIC_REALISED":
         reasons.append("economics were not computed from the realised public funding print")
     if reasons:
         return _insufficient(spec, *reasons, settlements_joined=n, effective_sample_size=ess)
-    econ = ev.get("economics") or {}
-    cap = econ.get("capital") or {}
+    econ = _d(ev.get("economics"))
+    cap = _d(econ.get("capital"))
     risk = spec.risk_limits
-    liq = (econ.get("liquidation") or {}).get("conservative_adverse_move_pct")
-    worst = (fe.get("realised_bps") or {}).get("min")
-    m = {"settlements_joined": n, "effective_sample_size": ess, "unpriced_inputs": list(econ.get("unknowns") or []),
+    liq = _d(econ.get("liquidation")).get("conservative_adverse_move_pct")
+    worst = _d(fe.get("realised_bps")).get("min")
+    m = {"settlements_joined": n, "effective_sample_size": ess, "unpriced_inputs": _names(econ.get("unknowns")),
          "annualised_pct_on_economic_capital":
-         (econ.get("returns") or {}).get("annualised_pct_on_economic_capital"),
+         _d(econ.get("returns")).get("annualised_pct_on_economic_capital"),
          "round_trip_cost_bps": ev.get("round_trip_cost_bps"), "fillable_share": ev.get("fillable_share"),
          "worst_realised_settlement_bps": worst, "liquidation_headroom_pct": liq}
     if not _num(liq):
@@ -341,7 +342,8 @@ def _real_reference(ref: Any) -> bool:
         return False
     r = ref.strip()
     low = r.lower().replace("n/a", "na")
-    words = [t for t in "".join(c if c.isalnum() else " " for c in low).split() if not t.isdigit()]
+    # LETTER runs only: 'todo1234' is the word 'todo' glued to digits, not a reference
+    words = "".join(c if ("a" <= c <= "z") else " " for c in low).split()
     return len(r) >= 8 and len({c for c in low if c.isalnum()}) >= 5 and bool(words) and not all(w in _PLACEHOLDER_TOKENS for w in words)
 
 
@@ -499,8 +501,11 @@ def reconciliation_gaps(ev: Mapping[str, Any], spec: Optional[StrategySpec] = No
     if not (vr.get("verified") is True and isinstance(vr.get("source"), str) and len(vr["source"].strip()) >= 4):
         gaps.append("venue_margin_and_liquidation_rules: initial/maintenance margin, haircuts and liquidation rules are ASSUMED, not verified")
     lowest = min(TE.SCREENING_HURDLES_PCT)
+    fe_real = _d(_d(ev.get("funding_eval")).get("realised_bps"))
+    public_mean_bps, public_sd_bps = fe_real.get("mean"), fe_real.get("sd")
     if not ((_d(ae.get("funding")).get("source") == "ACCOUNT_SETTLED" and _d(ae.get("fees")).get("verified") is True
-             and not ae.get("unknowns") and _ledger_is_self_consistent(ae) and _ledger_return(ae) is not None and _ledger_return(ae) >= lowest)):
+             and not ae.get("unknowns") and _ledger_is_self_consistent(ae, public_mean_bps, public_sd_bps) and _ledger_return(ae) is not None
+             and _ledger_return(ae) >= lowest)):
         gaps.append("account_economics: the ledger is not computed from ACCOUNT_SETTLED funding with verified fees and no unknown input, "
                     "does not recompute from its own components (net, return, margin sufficiency, liquidation headroom), "
                     f"or it does not clear the lowest {TE.PROVISIONAL} screen")
@@ -529,12 +534,23 @@ def _close(a: float, b: float) -> bool:
     return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-6)
 
 
-def _ledger_is_self_consistent(ae: Mapping[str, Any]) -> bool:
-    """A ledger that claims to have reconciled is RE-DERIVED from its own inputs, not read: its components are exactly the ones the engine
-    writes and sum to its net; the funding line equals the notional times its own funding path; the economic capital equals inventory +
-    posted margin + reserve; margin sufficiency and the liquidation headroom follow from its own collateral and notional; the settlement
-    count matches the holding period; its claimed return equals the return recomputed from net, capital and hold; a rebate is not accepted
-    (nothing here can tie one to a fill); and the basis P&L stays inside what a BTC perp/spot basis can be. Never raises."""
+_COST_COMPONENTS = ("spread_usd", "slippage_usd", "market_impact_usd", "latency_usd", "conversion_usd", "transfer_usd", "custody_usd",
+                    "operational_usd", "borrow_usd")
+MAX_PLAUSIBLE_FUNDING_BPS_PER_SETTLEMENT = 30.0    # the committed Bybit BTCUSDT history's largest print is 11.3 bps
+MIN_INITIAL_MARGIN_FRACTION = 0.005                # the loosest initial margin a BTCUSDT linear position can have on the venue is above this (ASSUMED)
+
+
+def _ledger_is_self_consistent(ae: Mapping[str, Any], public_mean_bps: Any = None, public_sd_bps: Any = None) -> bool:
+    """A ledger that claims to have reconciled is RE-DERIVED from its own inputs, not read, and its inputs must be ones a real position can
+    have. Components: exactly the ones the engine writes, summing to the net; every cost line is a COST (<= 0) and the spread a taker
+    crossed is strictly negative; no rebate (nothing here ties one to a fill); the basis P&L is bounded to what a BTC perp/spot basis can
+    be. Funding: the funding line equals the notional times the ledger's own funding path, that path's per-settlement mean is a plausible
+    venue figure AND within a few standard deviations of the PUBLIC realised mean the evidence layer measured (an account that was paid ten
+    times the public print is not describing the public market). Capital: a positive inventory covering at least half the perpetual notional
+    (the engine's hedge ratio is at most 2), non-negative posted margin and reserve, economic capital = inventory + margin + reserve and at
+    least the available collateral, which lies between the posted margin and inventory + margin; an initial margin of at least the venue's
+    loosest rate; sufficiency and the liquidation headroom follow from the ledger's own collateral and notional. The settlement count matches the
+    hold and the claimed return equals the return recomputed from net, capital and hold. Never raises."""
     try:
         comp = _d(ae.get("components_usd"))
         net = ae.get("net_pnl_usd")
@@ -543,21 +559,31 @@ def _ledger_is_self_consistent(ae: Mapping[str, Any]) -> bool:
             return False
         if ae.get("reconciles") is not True or not _close(math.fsum(float(v) for v in comp.values()), float(net)):
             return False
+        if ae.get("unknowns") != [] or any(comp[k] > 0 for k in _COST_COMPONENTS) or not comp["spread_usd"] < 0:
+            return False
         n, pn = cap_d.get("hedged_notional_usd"), pos_d.get("notional_usd")
         inv, extra, reserve = cap_d.get("btc_inventory_usd"), cap_d.get("margin_posted_extra_usd"), cap_d.get("reserve_usd")
         ecap, avail, req = cap_d.get("economic_capital_usd"), cap_d.get("available_collateral_usd"), cap_d.get("required_initial_margin_usd")
         if not all(_num(v) for v in (n, pn, inv, extra, reserve, ecap, avail, req)) or n <= 0 or not _close(n, pn):
             return False
-        if not _close(ecap, inv + extra + reserve):
+        if not (inv > 0 and extra >= 0 and reserve >= 0 and inv >= n / 2.0 and _close(ecap, inv + extra + reserve)):
+            return False
+        eps = 1e-6 * max(1.0, inv)
+        if not (ecap >= avail - eps and extra - eps <= avail <= inv + extra + eps and avail > 0):
             return False
         sum_bps, settlements, hold = fund_d.get("sum_bps"), fund_d.get("settlements"), pos_d.get("hold_days")
-        if not (_num(sum_bps) and type(settlements) is int and _num(hold) and hold > 0):
+        if not (_num(sum_bps) and type(settlements) is int and settlements > 0 and _num(hold) and hold > 0):
+            return False
+        mean_bps = sum_bps / settlements
+        if abs(mean_bps) > MAX_PLAUSIBLE_FUNDING_BPS_PER_SETTLEMENT:
+            return False
+        if not (_num(public_mean_bps) and _num(public_sd_bps) and abs(mean_bps - public_mean_bps) <= max(2.0, 3.0 * public_sd_bps)):
             return False
         if not _close(comp["funding_income_usd"], n * sum_bps / 1e4) or abs(settlements - 3.0 * hold) > 1.0:
             return False
         if comp["rebates_usd"] != 0 or abs(comp["basis_pnl_usd"]) > n * MAX_PLAUSIBLE_BASIS_BPS_OF_NOTIONAL / 1e4:
             return False
-        if cap_d.get("initial_margin_sufficient") is not True or not avail >= req:
+        if cap_d.get("initial_margin_sufficient") is not True or not (avail >= req and req >= MIN_INITIAL_MARGIN_FRACTION * n):
             return False
         liq = _d(ae.get("liquidation")).get("conservative_adverse_move_pct")
         if not (_num(liq) and liq >= _RISK["min_liquidation_headroom_pct"] and liq <= avail / n * 100.0 + 1e-9):

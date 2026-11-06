@@ -447,3 +447,20 @@ def test_invalid_utf8_and_a_deeply_nested_line_in_the_history_do_not_stop_the_re
     assert s["files_anchored_current"] == 1                          # the one good line survived the junk before it
     anchors = AA.extract_anchors(str(h))
     assert len(anchors) == 1 and anchors[0]["file"] == os.path.basename(f)
+
+
+@pytest.mark.parametrize("args", [["--capacity-retention-days", "-1"], ["--capacity-retention-days", "99999"], ["--archive-entries", "0"]])
+def test_ROUND4_the_command_line_refuses_bad_numbers_before_reading_anything(tmp_path, capsys, args):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    with pytest.raises(SystemExit) as exc:
+        PR.main(["--dir", d, "--now-ms", str(_now(rows))] + args)
+    assert exc.value.code == 2 and "must be" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("bad", [True, False, 1.0, 0, -1, "1"])
+def test_ROUND4_the_archive_entry_count_is_validated_once_and_a_bool_or_float_is_refused(tmp_path, bad):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    with pytest.raises(ValueError, match="archive_entries"):
+        PR.build(d, now_ms=_now(rows), anchor_archive=str(tmp_path / "a.jsonl"), archive_head="ab" * 32, archive_entries=bad)

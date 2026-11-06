@@ -255,9 +255,10 @@ shorter retention, pass the same number here or every legitimately pruned day wi
 A chain sidecar written by an EARLIER revision of this branch (an adoption entry whose hash lacks the mark) does not verify: the entry
 is indistinguishable from an ordinary one with the flag flipped onto it, and an anchor cannot tell them apart. Nothing deployed has ever
 written one (`evidence_chain.py` first appears in this change), so there is nothing to migrate; a development file would be excluded,
-visibly, as SIDECAR_INCONSISTENT. An automated version
-(a scheduled job that runs the read-only fetch and appends to a private repository) is possible but needs your decision about
-where the secrets for it live; it is not part of this PR.
+visibly, as SIDECAR_INCONSISTENT.
+
+An automated version of the archive step (a scheduled job that runs the read-only fetch and appends to a private repository) is possible
+but needs your decision about where the secrets for it live; it is not part of this PR.
 
 ## Backups: what is not done
 Nothing here schedules a backup, stores one off-volume, or has restored one. That needs the owner.

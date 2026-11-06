@@ -129,25 +129,35 @@ class UnknownParameterError(ValueError):
         super().__init__("UNKNOWN parameters, refusing to default them: " + ", ".join(self.unknown))
 
 
-_UNREAL_STEMS = ("simul", "simfill", "monte", "carlo", "synthetic", "synthes", "backtest", "mock", "replay", "fake", "generat", "predict",
-                 "estimat", "shadow", "dry", "stub", "fixture", "hypothet", "assum", "paper", "dummy", "placeholder", "example",
-                 "forecast", "illustrat", "imagin", "fabricat", "sandbox", "demo", "invented")
-#: whole words only: stems like 'deriv' (Bybit's own 'derivatives'), 'invent' ('inventory'), 'project', 'sample', 'model' and 'scenario'
-#: (and 'sample', 'scenario') would block a real venue or account label, so only their unambiguous forms are listed
-_UNREAL_TOKENS = ("sim", "sims", "mc", "gen", "tbd", "todo", "derived", "projected", "modelled", "modeled", "modelling")
-#: matched inside the source with every separator removed, so 'back-test', 'back test' and 're-played' are caught
-_UNREAL_SQUASHED = ("backtest", "replay", "montecarlo", "simulat", "synthetic", "paperfill", "papertrad")
+_UNREAL_STEMS = ("simul", "simfill", "monte", "carlo", "synthetic", "synthes", "backtest", "mock", "replay", "fake", "predict",
+                 "estimat", "shadow", "dry", "stub", "fixture", "hypothet", "assum", "dummy", "placeholder", "example",
+                 "forecast", "illustrat", "imagin", "fabricat", "sandbox", "invented", "emulat", "artificial", "fiction", "reconstruct",
+                 "inferred", "canned", "playback")
+#: whole words only: stems like 'deriv' (Bybit's own 'derivatives'), 'invent' ('inventory'), 'project', 'paper' ('paperless'), 'demo'
+#: ('demonstrated'), 'generat' ('exchange-generated statement'), 'mc' and 'gen' would block a real venue label
+_UNREAL_TOKENS = ("sim", "sims", "tbd", "todo", "derived", "projected", "modelled", "modeled", "modelling", "demo", "demos", "paper", "virtual", "random",
+                  "generated", "generator")      # ('generated' was a blocked word before this change and stays one: a real label can say 'exported')
+#: matched in the source with every separator removed, but only where a keyword STARTS at a word boundary: 'back-test', 're-played',
+#: 'test data', 'model output' are caught while 'callback testnet export' and 'newspaper trade history' are not
+_UNREAL_SQUASHED = ("backtest", "replay", "montecarlo", "simulat", "synthetic", "papertrad", "paperfill", "madeup", "goldenfile", "testdata",
+                    "testfill", "modeloutput", "scenariofill", "samplerow", "calculatedfill", "randomfill", "virtualfill")
 
 
 def _unreal_source(source: str) -> bool:
     """True when the free-text source of an 'account execution' names something that is not the venue's own record. Tokens are matched by
-    their STEM (mocked, faked, dry-run, hypothetical, ...) and the whole string is matched with separators removed (back-test, re-played).
-    It is a tripwire, not a proof of origin: the repository cannot see where a number came from, and an owner who wants to mislead it can
-    use any other word. What it stops is the careless label. 'testnet' is NOT blocked: a testnet account's fills are real account
-    records of that environment, and the environment is established separately (product qualification names mainnet)."""
+    their STEM (mocked, faked, dry-run, hypothetical, ...), a few as whole words, and the whole string is matched with separators removed
+    at word starts (back-test, re-played, test data). It is a tripwire, not a proof of origin: the repository cannot see where a number
+    came from, and an owner who wants to mislead it can use any other word (a homoglyph, a euphemism). What it stops is the careless
+    label. 'testnet' is NOT blocked: a testnet account's fills are real account records of that environment, and the environment is
+    established separately (product qualification names mainnet)."""
     tokens = "".join(c if (c.isascii() and c.isalnum()) else " " for c in source.lower()).split()
     squashed = "".join(tokens)
-    return (any(t.startswith(_UNREAL_STEMS) or t in _UNREAL_TOKENS for t in tokens) or any(k in squashed for k in _UNREAL_SQUASHED))
+    starts, at = [], 0
+    for t in tokens:
+        starts.append(at)
+        at += len(t)
+    return (any(t.startswith(_UNREAL_STEMS) or t in _UNREAL_TOKENS for t in tokens)
+            or any(squashed.startswith(k, off) for k in _UNREAL_SQUASHED for off in starts))
 
 
 class EvidenceClassError(ValueError):

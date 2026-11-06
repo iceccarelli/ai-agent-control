@@ -398,6 +398,20 @@ def test_a_flag_flipped_onto_an_ordinary_entry_is_not_rescued_by_a_covering_anch
     assert "SIDECAR_INCONSISTENT" in codes(v) and EC.admitted_rows(p, anchor)[0] == []
 
 
+def _rechain(path):
+    """Rewrite the sidecar so that every h is recomputed from the (edited) entries: only the entry's own shape can now be what fails."""
+    entries = [json.loads(ln) for ln in open(path + ".chain").read().splitlines()]
+    prev = EC.GENESIS
+    with open(path + ".chain", "w") as fh:
+        for e in entries:
+            try:
+                e["h"] = EC.link(prev, e["r"], "resealed" in e)
+            except ValueError:
+                pass
+            prev = e["h"]
+            fh.write(json.dumps(e, sort_keys=True) + "\n")
+
+
 @pytest.mark.parametrize("field,value", [("r", "ab" * 31), ("r", "ab" * 33), ("h", "cd" * 31), ("h", "cd" * 33), ("r", " " + "ab" * 32), ("h", "AB" * 32 + "\n")])
 def test_chain_entries_must_carry_exactly_64_hex_characters(tmp_path, field, value):
     p = write(tmp_path, 4)
@@ -407,6 +421,46 @@ def test_chain_entries_must_carry_exactly_64_hex_characters(tmp_path, field, val
     _rewrite_chain(p, put)
     v = EC.verify(p)
     assert "SIDECAR_INCONSISTENT" in codes(v) and v["economic_evidence_eligible"] is False
+
+
+def test_the_64_hex_rule_is_what_rejects_a_well_chained_entry_of_the_wrong_length(tmp_path):
+    p = write(tmp_path, 4)
+    r_ok = EC._read_chain(p)[1]["r"]
+
+    def short(entries):
+        entries[1]["r"] = r_ok[:-2]                   # a 62-hex 'r' (even length, valid hex, so fromhex accepts it)
+    _rewrite_chain(p, short)
+    _rechain(p)                                       # ... chained consistently, so only its LENGTH is wrong
+    assert "SIDECAR_INCONSISTENT" in codes(EC.verify(p))
+
+
+@pytest.mark.parametrize("value", [False, 0, None, "true", 1, "", [], {}, "True"])
+def test_the_mark_on_an_adopted_entry_must_be_exactly_true(tmp_path, value):
+    p = write(tmp_path, 3)
+    open(p, "ab").write(EC.canonical({"adopted": True}) + b"\n")
+    assert EC.reseal_tail(p) == 1
+
+    def put(entries):
+        entries[-1]["resealed"] = value
+    _rewrite_chain(p, put)
+    _rechain(p)                                        # hash recomputed with the mark present: only the VALUE of the mark is wrong
+    v = EC.verify(p)
+    assert "SIDECAR_INCONSISTENT" in codes(v) and EC.admitted_rows(p)[0] == []
+
+
+def test_a_deeply_nested_last_chain_line_without_a_newline_is_torn_not_a_crash(tmp_path):
+    p = write(tmp_path, 3)
+    with open(p + ".chain", "ab") as fh:
+        fh.write(b"[" * 200_000 + b"]" * 200_000)       # no trailing newline: the 'last line' branch
+    chain, torn, corrupt = EC._read_chain_ex(p)
+    assert torn is True and len(chain) == 3
+
+
+def test_a_deeply_nested_unparseable_final_row_is_set_aside_by_repair(tmp_path):
+    p = write(tmp_path, 3)
+    with open(p, "ab") as fh:
+        fh.write(b"[" * 200_000 + b"]" * 200_000 + b"\n")
+    assert EC._set_aside_bad_tail(p) > 0
 
 
 def test_deeply_nested_json_in_any_evidence_file_is_a_finding_not_a_crash(tmp_path):

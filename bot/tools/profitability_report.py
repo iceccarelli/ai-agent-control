@@ -177,13 +177,15 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     archive = None
     archive_only: Dict[str, List[Dict[str, Any]]] = {}
     if anchor_archive:
+        if archive_entries is not None and (type(archive_entries) is not int or archive_entries < 1):
+            raise ValueError("archive_entries must be an integer >= 1 (the entry count when the owner stored the head)")
         archive = AA.verify(anchor_archive, owner_held_head=archive_head, owner_held_entries=archive_entries)
         entries, _problems = AA.read_archive(anchor_archive)
         for fname, lst in AA.anchors_by_file(entries).items():          # entries before any break in the archive's own chain
             anchors.setdefault(fname, []).extend(lst)
         # an archive that has GROWN since the owner stored its head is accepted, but only the entries inside the stored prefix are pinned by
         # the owner; later ones are not external evidence of anything (an attacker with the archive could append them)
-        pinned = entries[:archive_entries] if (archive_head and type(archive_entries) is int and archive_entries >= 1) else entries
+        pinned = entries[:archive_entries] if (archive_head and archive_entries is not None) else entries
         for fname, lst in AA.anchors_by_file(pinned).items():
             archive_only[fname] = list(lst)
     files: List[Dict[str, Any]] = []
@@ -470,6 +472,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--now-ms", type=int, default=None)
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
+    if not (0 <= a.capacity_retention_days <= 36_500):
+        ap.error("--capacity-retention-days must be between 0 and 36500")
+    if a.archive_entries is not None and a.archive_entries < 1:
+        ap.error("--archive-entries must be at least 1")
     if not (math.isfinite(a.hold_days) and 0 < a.hold_days <= 3650):
         ap.error("--hold-days must be a finite number of days in (0, 3650]")
     if not (math.isfinite(a.notional) and a.notional > 0):
