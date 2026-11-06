@@ -531,3 +531,42 @@ class TestAFailureBeforeTheUnwindStillTriesToClose:
         closing = [o for o in venue.orders if o[0] == "Buy" and o[1] == "linear"]
         assert closing, "no closing order was attempted after the failed pair"
         assert report["still_open"] is True       # the venue still reads non-flat
+
+
+class TestAnUnarmedPreflightIsStillARequest:
+    """Reproduced by the testnet-path audit: with BYBIT_VENUE=mainnet an UNARMED `drill.main([])` sent its first request to api.bybit.com, because the venue
+    check ran only for --arm / --hold-for-settlement. A preflight reads the venue too; it must never be the one that reaches mainnet or demo."""
+
+    def _bot(self, monkeypatch, venue, use_testnet, base_url, paper=True):
+        import types
+        cfg = types.SimpleNamespace(BYBIT_VENUE=venue, USE_TESTNET=use_testnet, PAPER_TRADING=paper, LIVE_TRADING_ACK="", STATE_DB_PATH="")
+        broker = types.SimpleNamespace(client=types.SimpleNamespace(base_url=base_url))
+        bot = types.SimpleNamespace(cfg=cfg, carry=types.SimpleNamespace(broker=broker))
+        monkeypatch.setattr(D, "_load_bot", lambda *a, **k: bot)
+        calls = []
+        monkeypatch.setattr(D, "run_drill", lambda **kw: calls.append(kw) or (_ for _ in ()).throw(AssertionError("the venue must not be reached")))
+        return calls
+
+    @pytest.mark.parametrize("venue,use_testnet,url", [
+        ("mainnet", False, "https://api.bybit.com"),
+        ("demo", False, "https://api-demo.bybit.com"),
+        ("testnet", True, "https://api.bybit.com"),                      # a testnet name on a mainnet host
+        ("testnet", True, ""),
+    ])
+    def test_it_refuses_before_any_venue_read(self, monkeypatch, capsys, venue, use_testnet, url):
+        calls = self._bot(monkeypatch, venue, use_testnet, url)
+        assert D.main([]) == 3
+        assert calls == [] and "REFUSED" in capsys.readouterr().err
+
+    def test_an_unarmed_preflight_on_the_testnet_host_still_runs(self, monkeypatch):
+        from bybit_connection import TESTNET_REST
+        calls = self._bot(monkeypatch, "testnet", True, TESTNET_REST, paper=True)       # paper on is fine for a read-only look
+        with pytest.raises(AssertionError, match="must not be reached"):
+            D.main([])                                                   # it got as far as run_drill: the refusal did not fire
+        assert len(calls) == 1
+
+    def test_armed_behaviour_is_unchanged(self, monkeypatch, capsys):
+        from bybit_connection import TESTNET_REST
+        calls = self._bot(monkeypatch, "testnet", True, TESTNET_REST, paper=True)
+        assert D.main(["--arm"]) == 3 and calls == []                    # PAPER_TRADING is on: refused as before
+        assert "PAPER_TRADING" in capsys.readouterr().err

@@ -508,23 +508,15 @@ def funding_status(statement: Dict[str, Any], rows: int, evidence_complete: bool
     return UNCONFIRMED
 
 
-def session_refusal(cfg: Any, client: Any = None) -> Optional[str]:
-    """Why a hold session must not start here, or None.
-
-    The cash ledger is TESTNET evidence: mainnet, demo, paper and any live
-    authorisation are all refused up front, before a single order could be
-    considered (the order gate would also refuse per order).
-    """
+def venue_refusal(cfg: Any, client: Any = None) -> Optional[str]:
+    """Why this process must not talk to the venue AT ALL as a drill (not even to read), or None. Applies to EVERY run, armed or not: a preflight is
+    still a request, and it must never be the one that reaches mainnet, demo or an unstated host. Found by the testnet-path audit: an unarmed run
+    with BYBIT_VENUE=mainnet sent its first request to api.bybit.com before anything refused."""
     if str(getattr(cfg, "BYBIT_VENUE", "")).lower() != "testnet":
         return (f"BYBIT_VENUE={getattr(cfg, 'BYBIT_VENUE', None)!r}: a hold "
                 "session runs on the testnet venue only")
     if not bool(getattr(cfg, "USE_TESTNET", False)):
         return "USE_TESTNET is not set: refusing a non-testnet configuration"
-    if bool(getattr(cfg, "PAPER_TRADING", True)):
-        return ("PAPER_TRADING is on: a paper fill is not venue evidence and "
-                "the carry book has no paper venue")
-    if str(getattr(cfg, "LIVE_TRADING_ACK", "") or ""):
-        return "a live-trading acknowledgement is present: refusing"
     if client is not None:
         # POSITIVE identification: the client must say it talks to the testnet
         # host. A missing, demo, custom or mainnet URL is not testnet evidence.
@@ -534,6 +526,24 @@ def session_refusal(cfg: Any, client: Any = None) -> Optional[str]:
             return (f"the client's host is {url or 'unstated'!r}, not the "
                     f"testnet host {TESTNET_REST}")
     return None
+
+
+def session_refusal(cfg: Any, client: Any = None) -> Optional[str]:
+    """Why a hold session must not start here, or None.
+
+    The cash ledger is TESTNET evidence: mainnet, demo, paper and any live
+    authorisation are all refused up front, before a single order could be
+    considered (the order gate would also refuse per order).
+    """
+    why = venue_refusal(cfg, None)
+    if why:
+        return why
+    if bool(getattr(cfg, "PAPER_TRADING", True)):
+        return ("PAPER_TRADING is on: a paper fill is not venue evidence and "
+                "the carry book has no paper venue")
+    if str(getattr(cfg, "LIVE_TRADING_ACK", "") or ""):
+        return "a live-trading acknowledgement is present: refusing"
+    return venue_refusal(cfg, client)
 
 
 EXECUTION_RECORDS_SCHEMA = "execution_records/1"
@@ -1601,6 +1611,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.hold_for_settlement or args.arm:
         why_not = session_refusal(bot.cfg, getattr(
             unwrap_broker(bot.carry.broker), "client", None))
+        if why_not:
+            print(f"REFUSED: {why_not}", file=sys.stderr)
+            return 3
+    else:
+        # An unarmed preflight still reads the venue. It must never be the thing that reaches mainnet, demo or a host that is not the testnet.
+        why_not = venue_refusal(bot.cfg, getattr(unwrap_broker(bot.carry.broker), "client", None))
         if why_not:
             print(f"REFUSED: {why_not}", file=sys.stderr)
             return 3
