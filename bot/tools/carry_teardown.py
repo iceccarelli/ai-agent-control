@@ -352,7 +352,9 @@ def waterfall(funding_bps: float, hold_days: float, round_trip_bps: float, reser
             "components_usd": r["components_usd"], "net_pnl_usd": r["net_pnl_usd"],
             "annualised_pct_on_notional": r["returns"]["annualised_pct_on_notional"],
             "annualised_pct_on_economic_capital": r["returns"]["annualised_pct_on_economic_capital"],
-            "unknown_inputs": r["unknowns"], "unknown_inputs_tag": "UNKNOWN"}
+            "unknown_inputs": r["unknowns"], "unknown_inputs_tag": "UNKNOWN",
+            "net_is_optimistic_bound": r["net_is_optimistic_bound"],
+            "hurdle_verdicts": {str(h["hurdle_apr_pct"]): h["verdict"] for h in r["hurdles"]}}
 
 
 def build(funding_path: Optional[str] = None, perp_path: Optional[str] = None, spot_path: Optional[str] = None, *,
@@ -469,7 +471,7 @@ def render(rep: Dict[str, Any]) -> str:
     o.append("5 LEDGER (trade_economics) for one $100k position, 30-day hold, per funding regime  [SIMULATED; inputs tagged]")
     for name, w in rep["waterfalls"].items():
         o.append(f"    {name:<22} funding {w['inputs']['funding_bps_per_settlement']['value']:.3f} bps: net ${w['net_pnl_usd']:.0f}  = {w['annualised_pct_on_notional']:.2f} %/yr on notional, "
-                 f"{w['annualised_pct_on_economic_capital']:.2f} %/yr on economic capital; unpriced: {', '.join(w['unknown_inputs'])}")
+                 f"{w['annualised_pct_on_economic_capital']:.2f} %/yr on economic capital  [OPTIMISTIC BOUND: unpriced costs counted as zero: {', '.join(w['unknown_inputs'])}]")
     o.append("")
     s = rep["future_study_sizing"]
     o.append("6 SIZING A PROSPECTIVE STUDY  [SIMULATED, from ESTIMATED recent-regime sd and ESS ratio]")

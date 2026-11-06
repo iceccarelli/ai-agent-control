@@ -420,3 +420,14 @@ def test_an_integer_beyond_float_range_in_a_history_row_is_a_data_error(row):
         CT.parse_funding([row])
     with pytest.raises(CT.DataError):
         CT.parse_klines([[10 ** 400, "1", "1", "1", "1"]])
+
+
+def test_the_ledger_section_labels_its_numbers_an_optimistic_bound_and_gives_the_hurdle_verdicts():
+    rep = CT.build()
+    for name, w in rep["waterfalls"].items():
+        assert w["net_is_optimistic_bound"] is True and w["unknown_inputs"], name
+        assert set(w["hurdle_verdicts"]) == {"10.0", "15.0", "20.0"}
+    # at the last year's 0.259 bps even the optimistic bound fails every screen: that failure is conclusive
+    assert set(rep["waterfalls"]["last_365d"]["hurdle_verdicts"].values()) == {"FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND"}
+    text = CT.render(rep)
+    assert "OPTIMISTIC BOUND" in text
