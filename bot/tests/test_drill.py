@@ -570,3 +570,17 @@ class TestAnUnarmedPreflightIsStillARequest:
         calls = self._bot(monkeypatch, "testnet", True, TESTNET_REST, paper=True)
         assert D.main(["--arm"]) == 3 and calls == []                    # PAPER_TRADING is on: refused as before
         assert "PAPER_TRADING" in capsys.readouterr().err
+
+
+    def test_a_broker_that_names_no_client_is_refused_armed_or_not(self, monkeypatch, capsys):
+        # Independent hostile review (reproduced): getattr(broker, "client", None) was None, venue_refusal skipped its host check, and the run reached the venue.
+        import types
+        cfg = types.SimpleNamespace(BYBIT_VENUE="testnet", USE_TESTNET=True, PAPER_TRADING=False, LIVE_TRADING_ACK="", STATE_DB_PATH="")
+        bot = types.SimpleNamespace(cfg=cfg, carry=types.SimpleNamespace(broker=types.SimpleNamespace()))
+        monkeypatch.setattr(D, "_load_bot", lambda *a, **k: bot)
+        reached = []
+        monkeypatch.setattr(D, "run_drill", lambda **kw: reached.append(kw))
+        for argv in ([], ["--arm"]):
+            assert D.main(argv) == 3
+            assert "names no client" in capsys.readouterr().err
+        assert reached == []

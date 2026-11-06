@@ -499,7 +499,7 @@ def test_the_module_touches_no_network_process_or_database():
             imported |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom) and n.module:
             imported.add(n.module.split(".")[0])
-    assert imported <= {"__future__", "argparse", "errno", "fcntl", "hashlib", "json", "os", "re", "stat", "sys", "time", "typing", "account_review", "carry_prospective",
+    assert imported <= {"__future__", "argparse", "errno", "fcntl", "hashlib", "json", "math", "os", "re", "stat", "sys", "time", "typing", "account_review", "carry_prospective",
                         "statistical_power"}, imported
     calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert not calls & {"exec", "eval", "compile", "__import__"}
@@ -838,3 +838,43 @@ def test_when_the_lowest_observed_fill_already_flips_the_break_even_says_so(tmp_
     s = TJ.evaluate_logged(cherry, 10.0, str(tmp_path / "j.jsonl"), first_look=True)["selection_sensitivity"]
     assert s["flipped_by_lowest_observed_fill"] is True and s["breakeven_fill_bps"] == s["lowest_observed_fill_bps"]
     assert "already not supported" in s["breakeven_note"]
+
+
+# ============================================================================================ hostile review of this phase
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 1e9, -1e9, True, "5"])
+def test_an_unusable_venue_floor_is_refused_before_the_one_shot_look_is_journaled(tmp_path, bad):
+    # Reproduced: a NaN floor was journaled with the look and then crashed the report, losing the anchor of a look that cannot be repeated.
+    j = tmp_path / "looks.jsonl"
+    with pytest.raises(TJ.JournalError, match="venue funding floor"):
+        TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(j), first_look=True, venue_floor_bps=bad)
+    assert not j.exists()                                                        # nothing was spent
+
+
+def test_the_cli_refuses_a_nan_floor_without_spending_the_look_and_prints_the_anchor_first_when_it_does_run(tmp_path, capsys):
+    (tmp_path / "w").mkdir()
+    f = tmp_path / "w" / "funding.jsonl"
+    f.write_text("".join(json.dumps({"ts_ms": t, "funding_bps": v}) + "\n" for t, v in window_prints(0.3, seed=1)))
+    j = str(tmp_path / "w" / "looks.jsonl")
+    assert TJ.main(["evaluate", "--funding", str(f), "--journal", j, "--first-look", "--allow-unanchored", "--venue-funding-floor-bps", "nan"]) == 2
+    assert not os.path.exists(j)
+    capsys.readouterr()
+    assert TJ.main(["evaluate", "--funding", str(f), "--journal", j, "--first-look", "--allow-unanchored", "--venue-funding-floor-bps", "-33.3"]) == 0
+    err = capsys.readouterr().err
+    assert err.lstrip().startswith("ANCHOR TO RECORD NOW")                       # the irreplaceable line comes before anything that could fail
+
+
+def test_the_break_even_status_tells_the_four_situations_apart(tmp_path):
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    a = TJ.evaluate_logged(full, 10.0, str(tmp_path / "a.jsonl"), first_look=True)["selection_sensitivity"]
+    assert a["breakeven_status"] == "NOTHING_MISSING" and a["breakeven_fill_bps"] is None
+    b = TJ.evaluate_logged(cherry, 10.0, str(tmp_path / "b.jsonl"), first_look=True)["selection_sensitivity"]
+    assert b["breakeven_status"] == "ALREADY_FLIPPED_AT_LOWEST_OBSERVED"
+    f2 = window_prints(2.0, seed=3)
+    keep = set(sorted(f2, key=lambda x: x[1])[87:])
+    c = TJ.evaluate_logged([p for p in f2 if p in keep], 10.0, str(tmp_path / "c.jsonl"), first_look=True)["selection_sensitivity"]
+    assert c["breakeven_status"] == "FLIPS_AT" and c["breakeven_fill_bps"] is not None
+    nosupport = window_prints(0.1, seed=3)
+    keep2 = set(sorted(nosupport, key=lambda x: x[1])[87:])
+    d = TJ.evaluate_logged([p for p in nosupport if p in keep2], 10.0, str(tmp_path / "d.jsonl"), first_look=True)["selection_sensitivity"]
+    assert d["breakeven_status"] == "REGISTERED_VERDICT_NOT_SUPPORTED" and d["breakeven_fill_bps"] is None

@@ -1608,18 +1608,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             file=sys.stderr)
         return 2
 
+    drill_client = getattr(unwrap_broker(bot.carry.broker), "client", None)
+    if drill_client is None:
+        # FAIL CLOSED: a broker that names no client cannot be shown to talk to the testnet host, and every positive-identification check below would
+        # be skipped for it (reproduced by the independent hostile review). close_testnet_short already refuses this case.
+        print("REFUSED: the broker names no client, so the host it would talk to cannot be identified as the testnet", file=sys.stderr)
+        return 3
     if args.hold_for_settlement or args.arm:
-        why_not = session_refusal(bot.cfg, getattr(
-            unwrap_broker(bot.carry.broker), "client", None))
-        if why_not:
-            print(f"REFUSED: {why_not}", file=sys.stderr)
-            return 3
+        why_not = session_refusal(bot.cfg, drill_client)
     else:
         # An unarmed preflight still reads the venue. It must never be the thing that reaches mainnet, demo or a host that is not the testnet.
-        why_not = venue_refusal(bot.cfg, getattr(unwrap_broker(bot.carry.broker), "client", None))
-        if why_not:
-            print(f"REFUSED: {why_not}", file=sys.stderr)
-            return 3
+        why_not = venue_refusal(bot.cfg, drill_client)
+    if why_not:
+        print(f"REFUSED: {why_not}", file=sys.stderr)
+        return 3
 
     if args.arm:
         engaged, why = book_kill_switch(

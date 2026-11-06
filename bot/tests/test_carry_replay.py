@@ -345,10 +345,11 @@ class TestTheReplayDoesNotPresentAnUnchargedSpreadAsATotal:
         assert report["impact_bps_per_leg"] == 0.0
         assert "NO SPREAD, SLIPPAGE OR IMPACT IS CHARGED" in report["execution_cost_warning"]
         joined = " ".join(report["not_modelled"]).lower()
-        for term in ("half-spread and slippage", "market impact beyond the declared haircut", "upper bound"):
+        for term in ("half-spread and slippage", "market impact beyond the declared haircut", "omits the costs named here", "four legs"):
             assert term in joined, term
+        assert "upper bound" not in joined and "upper bound" not in report["execution_cost_warning"].lower()
 
     def test_a_declared_impact_removes_the_zero_charge_warning(self):
         report = rp.replay(rows(30), notional=100_000.0, borrow_apr=0.0, impact_bps=1.0)
         assert report["impact_bps_per_leg"] == 1.0 and report["execution_cost_warning"] is None
-        assert "upper bound" in " ".join(report["not_modelled"]).lower()          # a declared haircut is still not a measured cost
+        assert "not a total" in " ".join(report["not_modelled"]).lower()          # a declared haircut is still not a measured cost

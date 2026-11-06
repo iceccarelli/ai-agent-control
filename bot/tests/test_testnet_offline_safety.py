@@ -107,9 +107,8 @@ def test_a_testnet_client_whose_base_url_is_altered_refuses_before_the_transport
     venue = RecordingVenue()
     c = client_for("testnet", True, store, venue)
     c.base_url = hostile_url                                           # the worst case: something rewrote the URL after construction
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(bc.PermanentAPIError, match="is not the testnet host|not https|host"):
         c.get_equity()
-    assert not isinstance(exc.value, NetworkAttempted)
     assert venue.requests == [], "a request reached the transport on a foreign host"
 
 
@@ -124,13 +123,18 @@ def test_demo_and_testnet_are_different_hosts_and_the_drill_refuses_demo(store):
 
 def test_contradictory_or_unknown_venue_settings_refuse_construction(store):
     for venue, flag in (("mainnet", True), ("testnet", False), ("eu", False), ("nonsense", True)):
-        with pytest.raises(Exception):
+        with pytest.raises(ValueError):
             client_for(venue, flag, store)
 
 
 # ---------------------------------------------------------------- no mainnet orders
 
-@pytest.mark.parametrize("endpoint", sorted(bc.EXPOSURE_ENDPOINTS))
+def test_the_live_gated_exposure_endpoints_are_exactly_the_ones_this_file_exercises():
+    # The test below is parametrised over the set; if the set were emptied it would pass vacuously. Pin the set itself.
+    assert set(bc.EXPOSURE_ENDPOINTS) == {"/v5/order/create", "/v5/position/set-leverage"}
+
+
+@pytest.mark.parametrize("endpoint", ["/v5/order/create", "/v5/position/set-leverage"])
 def test_a_mainnet_client_cannot_create_an_order_or_change_leverage_without_live_authorisation(store, endpoint):
     venue = RecordingVenue()
     c = client_for("mainnet", False, store, venue)                      # constructing a mainnet client is allowed; USING it for exposure is not
@@ -144,6 +148,13 @@ def test_live_authorisation_is_not_granted_by_a_testnet_configuration_or_by_the_
     armed, why = config.is_live_authorized(cfg("testnet", True))
     assert armed is not True and why
     assert os.environ.get("LIVE_TRADING_ACK") is None
+
+
+def test_a_testnet_named_venue_without_the_testnet_flag_is_refused_by_the_drill(store):
+    class OnTestnetHost:
+        base_url = bc.TESTNET_REST
+    assert D.venue_refusal(cfg("testnet", False), OnTestnetHost()) is not None              # the flag, not only the name, must say testnet
+    assert D.venue_refusal(cfg("testnet", True), OnTestnetHost()) is None
 
 
 def test_the_drill_refuses_a_live_acknowledgement_even_on_the_testnet_host(store):
@@ -189,6 +200,7 @@ def test_the_socket_guard_really_fails_a_test_that_touches_the_network():
 
 
 def test_state_lives_only_in_a_temporary_database(store, tmp_path):
-    assert os.path.dirname(store.path if hasattr(store, "path") else str(tmp_path / "s.db")).startswith(str(tmp_path))
-    protected = os.path.join(BOT, "state", "trading_state.db")
-    assert not os.path.abspath(str(tmp_path / "s.db")) == os.path.abspath(protected)
+    actual = os.path.abspath(store.path)
+    assert actual == os.path.abspath(str(tmp_path / "s.db")) and actual.startswith(os.path.abspath(str(tmp_path)) + os.sep)
+    protected = os.path.abspath(os.path.join(BOT, "state", "trading_state.db"))
+    assert actual != protected and not actual.startswith(os.path.join(BOT, "state") + os.sep)

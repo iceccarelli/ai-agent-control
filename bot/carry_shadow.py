@@ -1027,19 +1027,24 @@ def compute_economics(con: sqlite3.Connection,
     if slip_unavailable:
         unavailable.append(f"slippage on {slip_unavailable} fill(s)")
     # Costs this book does not charge AT ALL (found undisclosed by the economic-cost audit). Listing them is what keeps the headline from reading as a total.
+    # The SIGN of each omitted item is not established (latency, partial fills and the hedge mismatch can move the net either way; the fee tier is the public
+    # base tier, so a better account tier would make the modelled fees too high), so this number is NOT called an upper or a lower bound.
     excluded_not_charged = ["opportunity cost of the client's BTC", "custody", "latency / the price moving between decision and fill",
                             "rebalancing", "partial fills (every simulated fill is complete)",
+                            "spot-leg half-spread (acquire mode: no spot bid/ask is observed)",
                             "hedge mismatch (the spot buy fee is booked in USD; the hedge quantity is not reduced by a base-coin fee)"]
     cost_completeness = {
-        "MEASURED": ["half-spread on each perp fill, from the book observed at that fill"] if fills else [],
-        "ESTIMATED": ["funding (the settled print x mark)"],
-        "ASSUMED": ["fees (public base tier)", "financing (borrow APR, 0 unless configured)"],
+        "ESTIMATED": (["perp half-spread on each fill, from the book observed at that fill (UNAVAILABLE for a fill with no bid/ask)"] if fills else [])
+                     + ["funding (the settled print x mark)"],
+        "ASSUMED": ["fees (public base tier; a better account tier would lower them)", "financing (borrow APR, 0 unless configured)"],
         "UNKNOWN": list(unavailable),
         "EXCLUDED_NOT_CHARGED": excluded_not_charged,
         "complete": False,
-        "reading": ("every cost class above UNKNOWN and EXCLUDED_NOT_CHARGED is absent from net_realised_usd, so it is an UPPER bound on modelled net, "
-                    "never a total and never account P&L"),
+        "reading": ("net_realised_usd OMITS the costs listed under UNKNOWN and EXCLUDED_NOT_CHARGED, and the signs of those omissions are not all established, "
+                    "so it is neither an upper nor a lower bound and never a total or account P&L"),
     }
+    # (the MEASURED class is empty by design: nothing here is read from an account, and the half-spread is an estimate from an observed book)
+    cost_completeness["MEASURED"] = []
     return {
         "label": "MODELLED NET ECONOMICS - NOT REAL ACCOUNT P&L",
         "fills": len(fills), "funding_prints_booked": len(fund),
@@ -1063,7 +1068,7 @@ def compute_economics(con: sqlite3.Connection,
         "unavailable_components_excluded": unavailable,
         "cost_completeness": cost_completeness,
         "net_is_partial": True,
-        "net_is_upper_bound": True,
+        "net_omits_costs_sign_not_established": True,
         "open_perp_qty": abs(perp_open),
     }
 

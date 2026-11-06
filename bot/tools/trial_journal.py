@@ -31,6 +31,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -53,6 +54,7 @@ _LINE_GENESIS = hashlib.sha256(b"trial_journal.lines.v2").hexdigest()
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 LOCK_TIMEOUT_S = 30.0
+MAX_FLOOR_BPS = 1000.0
 
 # anchor states (``inspect``)
 NEVER_INITIALISED = "NEVER_INITIALISED"
@@ -371,7 +373,8 @@ def _selection_sensitivity(prints: Sequence[Tuple[float, float]], hurdle_pct: fl
     out: Dict[str, Any] = {"method": "FILL OF MISSING SETTLEMENTS WITH ONE VALUE - a sensitivity check, NOT a worst-case bound", "missing_settlements": len(missing),
                            "registered_verdict": registered.get("verdict")}
     if not missing:
-        out.update(flipped_by_lowest_observed_fill=False, breakeven_fill_bps=None, note="no settlement is missing: nothing could have been left out")
+        out.update(flipped_by_lowest_observed_fill=False, breakeven_fill_bps=None, breakeven_status="NOTHING_MISSING",
+                   note="no settlement is missing: nothing could have been left out")
         return out
     low = min(have.values())
 
@@ -382,13 +385,17 @@ def _selection_sensitivity(prints: Sequence[Tuple[float, float]], hurdle_pct: fl
         out["lowest_observed_fill_bps"] = low
         out["lowest_observed_fill_verdict"] = verdict_at(low)
         out["flipped_by_lowest_observed_fill"] = bool(supported and "SUPPORTED" not in out["lowest_observed_fill_verdict"])
+        out["breakeven_status"] = "REGISTERED_VERDICT_NOT_SUPPORTED"
+        out["breakeven_fill_bps"] = None
         if supported:
             lo_fill = low - 50.0
             if "SUPPORTED" in verdict_at(lo_fill):
                 out["breakeven_fill_bps"] = None
+                out["breakeven_status"] = "STILL_SUPPORTED_50_BPS_BELOW_LOWEST_OBSERVED"
                 out["breakeven_note"] = "still supported even with every missing settlement 50 bps below the lowest observed print"
             elif out["flipped_by_lowest_observed_fill"]:
                 out["breakeven_fill_bps"] = low
+                out["breakeven_status"] = "ALREADY_FLIPPED_AT_LOWEST_OBSERVED"
                 out["breakeven_note"] = "already not supported at the lowest observed print"
             else:
                 hi, lo_ = low, lo_fill
@@ -399,6 +406,7 @@ def _selection_sensitivity(prints: Sequence[Tuple[float, float]], hurdle_pct: fl
                     else:
                         lo_ = mid
                 out["breakeven_fill_bps"] = hi
+                out["breakeven_status"] = "FLIPS_AT"
                 out["breakeven_note"] = ("the registered verdict stops being supported if the missing settlements averaged about this (assuming a monotone verdict); "
                                          "compare it with what funding can legally print")
         if venue_floor_bps is not None:
@@ -423,6 +431,10 @@ def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, jo
     operator did not say ``first_look``; or the prints differ from those of the FIRST look (unless ``accept_data_revision``, which is itself recorded in
     the chain). Each look's data digest is chained, so a changed or reduced data set can be seen afterwards. ``now_ms`` can only move the clock earlier."""
     AR._refuse_protected(journal_path)
+    if venue_floor_bps is not None and (isinstance(venue_floor_bps, bool) or not isinstance(venue_floor_bps, (int, float))
+                                        or not math.isfinite(venue_floor_bps) or abs(venue_floor_bps) > MAX_FLOOR_BPS):
+        # Checked BEFORE the look is journaled: a closed-window look is one-shot, and an unusable report option must never spend it.
+        raise JournalError(f"the venue funding floor must be a finite number of bps within +/-{MAX_FLOOR_BPS:g}, not {venue_floor_bps!r}")
     binding = data_binding(prints, hurdle_pct, False)
     with _Lock(journal_path, lock_timeout_s):
         existed = os.path.lexists(journal_path)
@@ -541,8 +553,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (JournalError, SP.StatisticalPowerError, AR.RecordError, OSError) as exc:
         print(f"trial_journal: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(rep, indent=2, sort_keys=True, allow_nan=False, default=str))
     j = rep["journal"]
+    print(f"ANCHOR TO RECORD NOW, IN A RECORD HELD BY SOMEONE THE JOURNAL'S WRITER CANNOT INFLUENCE (off-host, append-only):  {j['n_trials']} {j['head']}\n"
+          f"When you verify later, take the anchor with the HIGHEST count from that record: an older anchor still verifies a truncated journal.", file=sys.stderr)
     sens = rep["selection_sensitivity"]
     if sens.get("flipped_by_lowest_observed_fill"):
         print("\nWARNING: " + sens["note"], file=sys.stderr)
@@ -550,8 +563,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"\nNOTE: {sens['missing_settlements']} settlement(s) are missing. {sens.get('note', '')}", file=sys.stderr)
     if j["data"]["revision"]:
         print("\nWARNING: this look used a DATA REVISION (the prints differ from the first look's); the revision is permanently recorded in the chain.", file=sys.stderr)
-    print(f"\nANCHOR TO RECORD NOW, IN A RECORD HELD BY SOMEONE THE JOURNAL'S WRITER CANNOT INFLUENCE (off-host, append-only):  {j['n_trials']} {j['head']}\n"
-          f"When you verify later, take the anchor with the HIGHEST count from that record: an older anchor still verifies a truncated journal.", file=sys.stderr)
+    try:
+        print(json.dumps(rep, indent=2, sort_keys=True, allow_nan=False, default=str))
+    except ValueError as exc:                                          # the look is journaled and its anchor is already printed above
+        print(f"trial_journal: the report could not be serialised ({exc}); the look IS recorded, use the anchor printed above", file=sys.stderr)
+        return 2
     return 0
 
 

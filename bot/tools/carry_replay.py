@@ -1107,7 +1107,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "execution_mode": execution_mode, "execution_style": execution_style,
         "impact_bps_per_leg": impact_bps,
         "execution_cost_warning": (
-            "NO SPREAD, SLIPPAGE OR IMPACT IS CHARGED (impact 0.00 bps/leg): every market order fills at the bar price, so this net is an upper bound"
+            "NO SPREAD, SLIPPAGE OR IMPACT IS CHARGED (impact 0.00 bps/leg): every market order fills at the bar price, so this net omits those costs (it is not a total)"
             if not impact_bps else None),
         "margin_multiple": margin_multiple,
         "liquidation": liquidation_report,
@@ -1163,9 +1163,9 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             "number (INVENTORY F4)",
             "partial fills, rate limits, venue rejections",
             "half-spread and slippage: a market order fills at the bar price (a mid) plus ONLY the declared per-leg impact haircut; the broker's "
-            "declared touch spread is never charged (about 0.013 bp per round trip at the stock spread)",
+            "declared touch spread is never charged (about 0.013 bp per round trip at the stock spread in overlay mode, two perp legs; about 0.026 in acquire mode, four legs)",
             "market impact beyond the declared haircut, adverse selection of resting orders, and the exit book being worse than the entry book",
-            "cost completeness: this net is an UPPER bound on modelled net, not a total",
+            "cost completeness: this net omits the costs named here and its sign of error is not established; it is not a total",
         ] + ([] if liquidation is not None else [
             "the production liquidation-distance gate: the corpus holds no "
             "liqPrice, leverage, collateral or accountMMRate"]),
@@ -1343,7 +1343,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(f"    fees       ${r['fees_usd']:12,.2f}")
     print(f"    borrow     ${r['borrow_usd']:12,.2f}")
     print(f"    = NET      ${r['net_usd']:12,.2f}   "
-          f"{r['net_annualised_pct']:+.2f}%/yr   (modelled; an UPPER bound, see not_modelled)")
+          f"{r['net_annualised_pct']:+.2f}%/yr   (modelled; omits the costs under not_modelled, not a total)")
     print(f"    opportunity cost of the capital  ${r['opportunity_cost_usd']:12,.2f}   "
           f"-> net after it ${r['net_after_opportunity_cost_usd']:12,.2f}")
     if r.get("execution_cost_warning"):

@@ -922,17 +922,23 @@ class TestAverageCostAcrossAFlip:
         assert qty == pytest.approx(-1.0) and avg == pytest.approx(100.0)
 
 
-def test_the_shadow_net_names_every_cost_class_and_is_an_upper_bound_never_a_total(tmp_path):
+def test_the_shadow_net_names_every_cost_class_and_does_not_claim_a_bound_it_cannot_support(tmp_path):
     # Economic-cost audit: only market impact and liquidation distance were listed as excluded; opportunity cost, custody, latency, rebalancing,
-    # partial fills and the hedge mismatch were absent from the net AND from the disclosure.
+    # partial fills, the spot half-spread and the hedge mismatch were absent from the net AND from the disclosure. The independent hostile review then
+    # showed that "upper bound" was itself an over-claim: latency, partial fills and the hedge mismatch can move the net either way, and the fee tier is
+    # the public base tier, so the omissions have no established sign.
     rt = runtime(tmp_path)
     run_all(rt, series(n_hold=12))
     e = rt.economics()
     cc = e["cost_completeness"]
-    assert e["net_is_upper_bound"] is True and e["net_is_partial"] is True and cc["complete"] is False
+    assert e["net_omits_costs_sign_not_established"] is True and e["net_is_partial"] is True and cc["complete"] is False
+    assert "net_is_upper_bound" not in e
     assert set(cc) >= {"MEASURED", "ESTIMATED", "ASSUMED", "UNKNOWN", "EXCLUDED_NOT_CHARGED", "complete", "reading"}
+    assert cc["MEASURED"] == []                                                  # nothing here is read from an account
     excluded = " | ".join(cc["EXCLUDED_NOT_CHARGED"])
-    for omitted in ("opportunity cost", "custody", "latency", "rebalancing", "partial fills", "hedge mismatch"):
+    for omitted in ("opportunity cost", "custody", "latency", "rebalancing", "partial fills", "spot-leg half-spread", "hedge mismatch"):
         assert omitted in excluded, omitted
-    assert "market_impact" in cc["UNKNOWN"] and "UPPER bound" in cc["reading"]
+    assert "market_impact" in cc["UNKNOWN"]
+    assert "neither an upper nor a lower bound" in cc["reading"] and "OMITS" in cc["reading"]
+    assert "above UNKNOWN" not in cc["reading"]                                  # the garbled sentence is gone
     assert e["label"].startswith("MODELLED") and "NOT REAL ACCOUNT P&L" in e["label"]

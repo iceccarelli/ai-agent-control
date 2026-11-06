@@ -35,6 +35,13 @@ QTY = 0.001                              # what the fake wallet sizes to at $100
 FEE = QTY * MARK * 5.5 / 1e4             # the fake venue's per-leg fee
 
 
+
+def _testnet_client():
+    """What a real broker's client says about itself: the testnet host, and nothing else the drill's positive identification would accept."""
+    from bybit_connection import TESTNET_REST
+    return types.SimpleNamespace(base_url=TESTNET_REST)
+
+
 class CapVenue(Venue):
     """A fake venue that can also be read back, as CarryBroker can."""
 
@@ -208,6 +215,7 @@ class TestAnInterruptIsAnOutcomeNotATraceback:
         cfg = types.SimpleNamespace(BYBIT_VENUE="testnet", USE_TESTNET=True,
                                     PAPER_TRADING=False, LIVE_TRADING_ACK="",
                                     STATE_DB_PATH="")
+        venue.client = _testnet_client()          # the drill now refuses a broker that names no client (fail closed)
         bot = types.SimpleNamespace(cfg=cfg, carry=types.SimpleNamespace(broker=venue))
         monkeypatch.setattr(D, "_load_bot", lambda *a, **k: bot)
         monkeypatch.setattr(D.InterruptGuard, "install", lambda self: None)
@@ -391,8 +399,10 @@ class TestTheCaptureIsWiredIntoTheDrill:
         cfg = types.SimpleNamespace(BYBIT_VENUE="testnet", USE_TESTNET=True,
                                     PAPER_TRADING=False, LIVE_TRADING_ACK="",
                                     STATE_DB_PATH="")
+        broker = CapVenue()
+        broker.client = _testnet_client()
         bot = types.SimpleNamespace(cfg=cfg, carry=types.SimpleNamespace(
-            broker=CapVenue()))
+            broker=broker))
         monkeypatch.setattr(D, "_load_bot", lambda *a, **k: bot)
         monkeypatch.setattr(D.InterruptGuard, "install", lambda self: None)
         real = D.run_drill

@@ -242,8 +242,9 @@ def allocate(opportunities: Sequence[Opportunity], limits: AllocationLimits, *,
     expected return. FAIL-CLOSED: ``evidence=None`` (the default) gives EVERY
     strategy zero with ``NO_STRATEGY_EVIDENCE``; a forgotten argument can never
     allocate. The only way to price opportunities without evidence is the explicit
-    ``unevidenced_research_only=True``, which exists for tests of the arithmetic and
-    is pinned by a test to appear in no non-test module.
+    ``unevidenced_research_only=True``, which exists for tests of the arithmetic. A test
+    scans every non-test module for that literal name; it cannot see a keyword built
+    dynamically, so this is a tripwire, not a proof.
     """
     plan_reasons: List[str] = []
     free = _num(getattr(limits.free_capital_usd, "value", None))

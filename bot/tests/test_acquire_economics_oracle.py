@@ -132,7 +132,7 @@ def test_the_hand_example_in_the_module_docstring_is_what_the_engine_and_the_cor
     eng, _py, cpp = three_ways(q, rs, 100_000.0)
     assert eng["basis_usd"] == pytest.approx(1998.0, abs=1e-6) and cpp["basis"] == pytest.approx(2000.0, abs=1e-6)
     assert eng["fees_usd"] == pytest.approx(-339.6601, abs=1e-6) and cpp["fees"] == pytest.approx(339.9, abs=1e-6)
-    assert eng["funding_usd"] == pytest.approx(517.2822, abs=1e-6)             # 0.999 * (9 * 100000 + 8 * 118000 - 3 * 118000) * 3e-4 ... see the oracle
+    assert eng["funding_usd"] == pytest.approx(517.2822, abs=1e-6)             # 0.999 * (270 + 283.2 - 35.4): 9 prints at 100000 and 8 at 118000 earn +3 bps, the last 3 at 118000 pay -1 bp
 
 
 def test_flat_basis_is_the_one_case_where_the_gross_basis_error_vanishes_and_the_funding_error_does_not():
