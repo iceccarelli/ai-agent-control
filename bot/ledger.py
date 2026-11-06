@@ -953,6 +953,13 @@ def _perp_moved_within(journal: Journal, lo_ms: int, hi_ms: int) -> bool:
                for e in journal.entries)
 
 
+def _venue_fill_ms(e: "Entry") -> Optional[int]:
+    """The venue's own time of the fill behind a booking, when it was kept."""
+    ex = e.fee_raw.get("execution") if isinstance(e.fee_raw, dict) else None
+    v = ex.get("fill_ms") if isinstance(ex, dict) else None
+    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+
+
 def _payment_identity(p: Dict[str, Any]) -> tuple:
     """What makes two settlement rows the SAME payment.
 
@@ -989,20 +996,52 @@ def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
     t = int(p["ms"])
     before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
     after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
+    size = p.get("size")
+    held = after
     if (abs(after - before) > DUST[PERP]
             or _perp_moved_within(journal, t - ATTRIBUTION_SLACK_MS,
                                   t + ATTRIBUTION_SLACK_MS)):
-        return ("the book's position changed within a minute of this "
-                "settlement; ownership cannot be established")
-    if abs(after) <= DUST[PERP]:
+        # The journal's stamps are the bot's clock, a little AFTER the real
+        # fill, and a FUNDING_INVERTED exit is decided at the first tick after
+        # the settlement it reacts to (up to a minute later): so a book that
+        # exits right after a settlement was still in the position through it,
+        # and the venue charged it. The venue's signed `size` is the position
+        # it charged. If that is exactly the position the book ENTERED the
+        # window with (a short), the book held it at the settlement and the
+        # payment is its own. A row sized like the position the book is in
+        # AFTER the window is not accepted: the engine enters after the print,
+        # so a row matching the new entry is the case that must stay refused.
+        if (size is not None and before < -DUST[PERP]
+                and abs(float(size) - before)
+                <= max(SIZE_ABS_TOL, SIZE_REL_TOL * abs(before))):
+            # A fill is stamped when it was BOOKED, never before it happened,
+            # so a movement stamped at or before the settlement happened before
+            # it: the position at the settlement is then not `before`, and a
+            # row that says it is contradicts the journal. Only movements
+            # stamped AFTER the settlement are left for the row to place.
+            # (Likewise a fill the VENUE timed at or before it, when the
+            # booking kept the venue's time.)
+            moves = [e for e in journal.entries
+                     if t - ATTRIBUTION_SLACK_MS < e.ms <= t + ATTRIBUTION_SLACK_MS
+                     and any(l.account == PERP and abs(l.qty or 0.0) > DUST[PERP]
+                             for l in e.lines)]
+            if any(e.ms <= t or (_venue_fill_ms(e) is not None
+                                 and _venue_fill_ms(e) <= t) for e in moves):
+                return ("a fill booked at or before this settlement changed "
+                        "the position, which the venue row's size does not "
+                        "reflect; ownership cannot be established")
+            held = before
+        else:
+            return ("the book's position changed within a minute of this "
+                    "settlement; ownership cannot be established")
+    if abs(held) <= DUST[PERP]:
         return "the book held no perp position at this settlement"
-    size = p.get("size")
     if size is None:
         return ("the venue row carries no position size, so the payment "
                 "cannot be matched to the book's position")
     # SIGNED: a short is negative. A long of the same size is not ours.
-    if abs(float(size) - after) > max(SIZE_ABS_TOL, SIZE_REL_TOL * abs(after)):
-        return (f"venue position {float(size)} != the book's {after}; part of "
+    if abs(float(size) - held) > max(SIZE_ABS_TOL, SIZE_REL_TOL * abs(held)):
+        return (f"venue position {float(size)} != the book's {held}; part of "
                 "it is not this book's")
     return None
 

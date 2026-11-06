@@ -706,6 +706,75 @@ def capital_lines(net_annualised_pct: float,
             "figure): " + "; ".join(parts)]
 
 
+def denominator_report(trades: Sequence[Dict[str, Any]], rows: Sequence[Any], *, net_usd: float, funding_usd: float, years: float, notional: float,
+                       margin_fractions: Sequence[float] = (0.0, 0.10, 1.0)) -> Dict[str, Any]:
+    """The same net, expressed on the bases it could honestly be quoted on. REPORT ONLY: it reads the trade rows and the corpus rows the replay already
+    produced and changes no decision, trade or existing figure.
+
+    Why. ``net_annualised_pct`` divides by the FIXED entry notional, but the engine books each print's funding on the MARK (rate x qty x mark at that
+    print), so a rising BTC price makes the hedge larger than the base it is divided by, and the headline follows the price path. Three readings:
+
+      * ``on_entry_notional``      : the headline, unchanged (net / fixed notional / years).
+      * ``drift_neutral``          : the funding re-priced at the entry price of each trade (net - funding + sum rate x qty x entry_perp), over the same
+                                     fixed notional. It does not move with BTC's path; it is a yield on the notional first deployed, not a return on capital.
+      * ``on_avg_marked_notional`` : net over the time-averaged MARKED hedged notional (sum qty x mark over the held prints / held prints), the capital the
+                                     hedge actually ties up while it is on, reserved for the whole window; ``by_margin`` adds an ASSUMED margin fraction of
+                                     that notional on top (the corpus has no venue margin data).
+
+    ``reconciles`` states whether recomputing the funding as rate x qty x mark over the held prints reproduces the engine's own ``funding_usd``; when it
+    does not (a size change inside a trade, for instance) nothing here is claimed."""
+    held_prints = 0
+    marked_dollar_prints = 0.0
+    entry_dollar_prints = 0.0
+    funding_marked = 0.0
+    funding_entry = 0.0
+    last = len(rows) - 1
+    for t in trades:
+        i0, n, q, ep = int(t["entry_index"]), int(t["prints_held"]), float(t["qty"]), float(t["entry_perp"])
+        for k in range(i0 + 1, min(i0 + n, last) + 1):
+            r = rows[k]
+            held_prints += 1
+            marked_dollar_prints += q * float(r.perp)
+            entry_dollar_prints += q * ep
+            funding_marked += float(r.rate) * q * float(r.perp)
+            funding_entry += float(r.rate) * q * ep
+    tol = max(0.01, 1e-6 * abs(funding_usd))
+    out: Dict[str, Any] = {
+        "reconciles": abs(funding_marked - funding_usd) <= tol,
+        "funding_recomputed_at_mark_usd": funding_marked, "funding_at_entry_notional_usd": funding_entry,
+        "held_prints": held_prints,
+        "reading": "REPORT ONLY. The headline net_annualised_pct is on a fixed entry notional while funding is booked on the mark; quote it only beside these. "
+                   "A return on capital needs the capital the hedge actually tied up, which is the marked notional plus margin the venue requires (not in the corpus).",
+    }
+    if not (years > 0 and notional > 0):
+        return dict(out, on_entry_notional_pct=None, drift_neutral_pct=None, on_avg_marked_notional_pct=None)
+    out["on_entry_notional_pct"] = 100.0 * net_usd / notional / years
+    if held_prints and out["reconciles"]:
+        avg_marked = marked_dollar_prints / held_prints
+        out.update({
+            "marked_over_entry_ratio": marked_dollar_prints / entry_dollar_prints,
+            "avg_marked_hedged_notional_usd": avg_marked,
+            "net_at_entry_notional_usd": net_usd - funding_usd + funding_entry,
+            "drift_neutral_pct": 100.0 * (net_usd - funding_usd + funding_entry) / notional / years,
+            "on_avg_marked_notional_pct": 100.0 * net_usd / avg_marked / years,
+            "by_margin": {m: 100.0 * net_usd / (avg_marked * (1.0 + m)) / years for m in margin_fractions},
+        })
+    else:
+        out.update({"drift_neutral_pct": None, "on_avg_marked_notional_pct": None, "by_margin": {}})
+    return out
+
+
+def denominator_lines(d: Dict[str, Any]) -> List[str]:
+    if d.get("drift_neutral_pct") is None:
+        return ["  return bases: not claimed (the funding could not be reproduced from the held prints)"]
+    by = "; ".join(f"{100.0 * m:.0f}% margin -> {v:+.2f}%/yr" for m, v in d["by_margin"].items())
+    return [f"  return bases: {d['on_entry_notional_pct']:+.2f}%/yr on the fixed entry notional (the headline); "
+            f"{d['drift_neutral_pct']:+.2f}%/yr with funding priced at each entry (does not follow BTC's path); "
+            f"{d['on_avg_marked_notional_pct']:+.2f}%/yr on the average MARKED hedged notional (${d['avg_marked_hedged_notional_usd']:,.0f}, "
+            f"{d['marked_over_entry_ratio']:.3f}x entry)",
+            "    on marked notional + assumed margin: " + by]
+
+
 def concentration_lines(c: Dict[str, Any], *, years: float,
                         notional: float, borrow_apr: float = 0.0) -> List[str]:
     """The printed form of :func:`trade_concentration`. Empty when there is
@@ -1046,6 +1115,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         "fees_usd": -fees_usd, "borrow_usd": -borrow_usd,
         "net_usd": net,
         "net_annualised_pct": 100.0 * net / notional / years,
+        "denominators": denominator_report(trades, rows, net_usd=net, funding_usd=funding_usd, years=years, notional=notional),
         "market_exposure_pct": 100.0 * held / span_days,
         "actions": actions, "reasons": reasons,
         # THE JOURNAL'S OWN ANSWER, built from balanced double-entry postings
@@ -1271,6 +1341,8 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"({r['maker_fills']} maker), in market "
           f"{r['market_exposure_pct']:.1f}%")
     for line in capital_lines(r["net_annualised_pct"]):
+        print(line)
+    for line in denominator_lines(r["denominators"]):
         print(line)
     for line in concentration_lines(r["concentration"], years=r["years"],
                                     notional=r["notional_usd"],

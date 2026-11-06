@@ -375,7 +375,10 @@ class Book:
     """Signed perpetual position over time, rebuilt only from the fills. Fills with the SAME millisecond are one event: their net is
     what the position becomes, so the order in which an exporter happened to list them (or sort their ids) changes nothing."""
 
-    def __init__(self, fills: Sequence[Fill]):
+    def __init__(self, fills: Sequence[Fill], opening_qty: float = 0.0, opening_ms: Optional[int] = None):
+        """``opening_qty`` (signed, short < 0) is the position carried INTO the period at ``opening_ms``: the book does not start flat."""
+        self.opening_qty = 0.0 if abs(opening_qty) <= DUST_QTY else float(opening_qty)
+        self.opening_ms = opening_ms
         self.fills = list(fills)
         self.groups: List[List[Fill]] = []
         for f in self.fills:
@@ -384,7 +387,7 @@ class Book:
             else:
                 self.groups.append([f])
         self.times = [g[0].ts_ms for g in self.groups]
-        cum, q = [], 0.0
+        cum, q = [], self.opening_qty
         for g in self.groups:
             q += sum(f.signed_qty for f in g)
             if abs(q) <= DUST_QTY:
@@ -395,7 +398,7 @@ class Book:
     def qty_at(self, t: int) -> float:
         """Position after every fill with ts <= t."""
         i = bisect.bisect_right(self.times, t)
-        return self.cum[i - 1] if i else 0.0
+        return self.cum[i - 1] if i else self.opening_qty
 
     def window_positions(self, t: int) -> List[float]:
         """Every position the book held at some instant of [t - slack, t + slack]: the one entering the window and the one after each
@@ -406,6 +409,9 @@ class Book:
     def lifecycles(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         cur: Optional[Dict[str, Any]] = None
+        if self.opening_qty != 0.0:                                  # a position carried in is a lifecycle that began before the records
+            cur = {"start_ms": self.opening_ms, "end_ms": None, "fills": [], "min_qty": min(0.0, self.opening_qty), "max_qty": max(0.0, self.opening_qty),
+                   "carried_in": True}
         for g, q in zip(self.groups, self.cum):
             if cur is None:
                 cur = {"start_ms": g[0].ts_ms, "end_ms": None, "fills": [], "min_qty": 0.0, "max_qty": 0.0}
@@ -420,16 +426,27 @@ class Book:
         return out
 
 
-def classify_settlement(book: Book, t: int) -> str:
+def classify_settlement(book: Book, t: int, row: Optional["FundingRow"] = None) -> str:
     """held | flat | ambiguous. HELD when the book was in a position of one sign at EVERY instant of the minute either side, however many
     fills (rebalances, a tiny pair of trades) happened inside it: it was provably in the position through the settlement, a funding
     row is required and a missing one is a gap. FLAT when it held nothing throughout. AMBIGUOUS only when the book opened, closed or
-    flipped inside that window, so its position at the settlement cannot be established from the fills."""
+    flipped inside that window, so its position at the settlement cannot be established from the fills.
+
+    One ambiguity the VENUE's own row resolves, mirroring ``ledger._attribution_problem``: a book that closes (or reduces) a short a few seconds AFTER a
+    settlement was still short through it, and the venue charged that settlement on the short. When the funding row's signed position equals the
+    position the book ENTERED the window with (a short), that position was the venue's at the settlement, so it is HELD. A row that matches only the
+    position AFTER the window (an entry shortly after the print) is not accepted: the engine enters after the print by construction, so a row sized like
+    the new entry is the suspicious case, and it stays ambiguous. These timestamps are the exchange's, so the rule also requires that EVERY change in the
+    window came after the settlement: a fill at or before it contradicts a row that states the earlier position."""
     pos = book.window_positions(t)
     if all(p < 0.0 for p in pos) or all(p > 0.0 for p in pos):
         return "held"
     if all(p == 0.0 for p in pos):
         return "flat"
+    if row is not None and pos[0] < 0.0 and _close_enough(row.position_qty, pos[0]):
+        lo, hi = bisect.bisect_right(book.times, t - SLACK_MS), bisect.bisect_right(book.times, t + SLACK_MS)
+        if all(ts > t for ts in book.times[lo:hi]):              # exchange timestamps: every change in the window came AFTER the settlement
+            return "held"
     return "ambiguous"
 
 
@@ -477,26 +494,39 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
            bar_open: Optional[Mapping[int, float]] = None, bar_range: Optional[Mapping[int, Tuple[float, float]]] = None,
            spot_range: Optional[Mapping[int, Tuple[float, float]]] = None, spot_open: Optional[Mapping[int, float]] = None,
            caller_histories: Sequence[str] = (), digests: Optional[Mapping[str, str]] = None,
-           ignored_columns: Optional[Mapping[str, Sequence[str]]] = None) -> Dict[str, Any]:
-    """Cross-check the fills and funding rows and report what they prove. Pure function of its inputs."""
+           ignored_columns: Optional[Mapping[str, Sequence[str]]] = None, opening_qty: float = 0.0, opening_ms: Optional[int] = None,
+           closing_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Cross-check the fills and funding rows and report what they prove. Pure function of its inputs.
+
+    ``opening_qty`` / ``opening_ms``: the signed perpetual position the book already held when the period began (short < 0). Without it the book is
+    assumed flat at the first fill, so a settlement before that fill would be an unattributed row; WITH it, settlements strictly after
+    ``opening_ms`` are owed a funding row from the first one. ``closing_ms`` extends the settlements owed to the end of the period even when the last
+    fill is earlier (an open position keeps earning, and a missing last row must be seen)."""
+    if not (isinstance(opening_qty, (int, float)) and not isinstance(opening_qty, bool) and math.isfinite(opening_qty) and abs(opening_qty) <= MAX_QTY):
+        raise RecordError("opening_qty must be a finite signed quantity")
+    carried = abs(opening_qty) > DUST_QTY
+    if carried and not (isinstance(opening_ms, int) and not isinstance(opening_ms, bool)):
+        raise RecordError("an opening position needs opening_ms")
     for name, v in (("taker_bps", taker_bps), ("maker_bps", maker_bps)):
         if v is not None and not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and -10 <= v <= 100):
             raise RecordError(f"{name} must be a finite number of bps between -10 and 100")
     if capital_usd is not None and not (isinstance(capital_usd, (int, float)) and not isinstance(capital_usd, bool)
                                         and math.isfinite(capital_usd) and capital_usd > 0):
         raise RecordError("capital_usd must be positive and finite")
-    if not fills:
+    if not fills and not carried:
         raise RecordError("there are no fills")
     flags: List[Dict[str, Any]] = []
-    book = Book(fills)
+    book = Book(fills, opening_qty if carried else 0.0, opening_ms if carried else None)
     lifecycles = book.lifecycles()
     funding_by_grid = {f.grid_ms: f for f in funding}
 
     # ---- which settlements was the book provably in a position through
-    first_ms, last_fill_ms = fills[0].ts_ms, fills[-1].ts_ms
-    horizon = max(last_fill_ms, funding[-1].grid_ms if funding else last_fill_ms)
-    grid = list(range(((first_ms + SETTLE_MS - 1) // SETTLE_MS) * SETTLE_MS, horizon + 1, SETTLE_MS))
-    cls = {t: classify_settlement(book, t) for t in grid}
+    first_ms = opening_ms if carried else fills[0].ts_ms
+    last_fill_ms = fills[-1].ts_ms if fills else first_ms
+    horizon = max(last_fill_ms, funding[-1].grid_ms if funding else last_fill_ms, closing_ms or 0)
+    grid_start = (first_ms // SETTLE_MS + 1) * SETTLE_MS if carried else ((first_ms + SETTLE_MS - 1) // SETTLE_MS) * SETTLE_MS
+    grid = list(range(grid_start, horizon + 1, SETTLE_MS))
+    cls = {t: classify_settlement(book, t, funding_by_grid.get(t)) for t in grid}
     held = [t for t in grid if cls[t] == "held"]
     ambiguous = [t for t in grid if cls[t] == "ambiguous"]
     missing = [t for t in held if t not in funding_by_grid]
@@ -509,6 +539,9 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
     long_lcs = [lc for lc in lifecycles if lc["max_qty"] > DUST_QTY]
     _flag(flags, "LONG_EXPOSURE", SEVERITY_HARD, len(long_lcs), "the fills put the perpetual long at some point: this is not a short-carry book; "
           "those lifecycles are excluded from the economics", [_iso(lc["start_ms"]) for lc in long_lcs])
+    _flag(flags, "CARRIED_IN_POSITION", "INFO", 1 if carried else 0,
+          "the book held a position when the period began; its settlements are owed from the first one after the opening instant, and its entry is outside "
+          "the records (so it is not a complete round trip)")
     open_lcs = [lc for lc in lifecycles if lc["end_ms"] is None]
     _flag(flags, "OPEN_LIFECYCLE", SEVERITY_GAP, len(open_lcs), "the book is not flat at the end of the records: that round trip is unrealised and excluded",
           [_iso(lc["start_ms"]) for lc in open_lcs])
@@ -627,6 +660,11 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
         sells = [f for f in fl if f.side == "Sell"]
         if lc["max_qty"] > DUST_QTY:
             row["status"] = "EXCLUDED_LONG_EXPOSURE"
+            trips.append(row)
+            continue
+        if lc.get("carried_in"):
+            row["status"] = "EXCLUDED_CARRIED_IN" if lc["end_ms"] is not None else "EXCLUDED_CARRIED_IN_STILL_OPEN"
+            row["note"] = "the position was opened before this period: its entry (and so its basis) is outside the records, its settlements and its closing are inside"
             trips.append(row)
             continue
         if lc["end_ms"] is None:
@@ -841,14 +879,12 @@ def _committed_digest(name: str) -> Optional[str]:
         return None
 
 
-def run(fills_path: str, funding_path: str, *, symbol: str = "BTCUSDT", taker_bps: Optional[float] = None, maker_bps: Optional[float] = None,
-        capital_usd: Optional[float] = None, public_path: Optional[str] = None, perp_path: Optional[str] = None, spot_path: Optional[str] = None,
-        use_default_history: bool = True) -> Dict[str, Any]:
-    f_rows, f_dig = read_rows(fills_path)
-    g_rows, g_dig = read_rows(funding_path)
-    fills, f_ign = parse_fills(f_rows, symbol)
-    funding, g_ign = parse_funding(g_rows, symbol)
-    digests = {"fills": f_dig, "funding": g_dig}
+def load_histories(symbol: str = "BTCUSDT", public_path: Optional[str] = None, perp_path: Optional[str] = None, spot_path: Optional[str] = None,
+                   use_default_history: bool = True) -> Tuple[Dict[str, Any], Dict[str, str]]:
+    """The public histories ``review`` compares the records with, as keyword arguments for it, plus their sha256 digests. The committed
+    BTCUSDT files are the default; a path the caller names is checked, digested and (when it is not the committed file) marked as the caller's
+    through ``caller_histories``. Shared by ``run`` and by the owner ledger, so both read the market the same way."""
+    digests: Dict[str, str] = {}
     default_ok = use_default_history and symbol == "BTCUSDT"
     public = bar_open = bar_range = spot_range = spot_open = None
     caller: List[str] = []
@@ -871,9 +907,21 @@ def run(fills_path: str, funding_path: str, *, symbol: str = "BTCUSDT", taker_bp
     for given, key in ((public_path, "public_funding"), (perp_path, "perp_4h"), (spot_path, "spot_4h")):
         if given and digests.get(key) != _committed_digest(names[key]):
             caller.append(f"{key} ({os.path.basename(given)}, sha256 {str(digests.get(key))[:16]}...)")
-    return review(fills, funding, taker_bps=taker_bps, maker_bps=maker_bps, capital_usd=capital_usd, public=public, bar_open=bar_open,
-                  bar_range=bar_range, spot_range=spot_range, spot_open=spot_open, caller_histories=caller, digests=digests,
-                  ignored_columns={"fills": f_ign, "funding": g_ign})
+    return ({"public": public, "bar_open": bar_open, "bar_range": bar_range, "spot_range": spot_range, "spot_open": spot_open,
+             "caller_histories": caller}, digests)
+
+
+def run(fills_path: str, funding_path: str, *, symbol: str = "BTCUSDT", taker_bps: Optional[float] = None, maker_bps: Optional[float] = None,
+        capital_usd: Optional[float] = None, public_path: Optional[str] = None, perp_path: Optional[str] = None, spot_path: Optional[str] = None,
+        use_default_history: bool = True) -> Dict[str, Any]:
+    f_rows, f_dig = read_rows(fills_path)
+    g_rows, g_dig = read_rows(funding_path)
+    fills, f_ign = parse_fills(f_rows, symbol)
+    funding, g_ign = parse_funding(g_rows, symbol)
+    kw, hist_digests = load_histories(symbol, public_path, perp_path, spot_path, use_default_history)
+    digests = {"fills": f_dig, "funding": g_dig, **hist_digests}
+    return review(fills, funding, taker_bps=taker_bps, maker_bps=maker_bps, capital_usd=capital_usd, digests=digests,
+                  ignored_columns={"fills": f_ign, "funding": g_ign}, **kw)
 
 
 def render(rep: Mapping[str, Any]) -> str:

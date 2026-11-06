@@ -1569,7 +1569,7 @@ def evaluate_under_plan(plan: EvaluationPlan, observations_with_timestamps: Iter
     floor_binds = ess < MIN_ESS_FOR_SUPPORT
     powered_by_n = req.get("status") == "OK" and ess + 1e-9 >= req["required_effective_n_exact"]
     powered = powered_by_n and not floor_binds
-    z_obs = _zu(pval)
+    z_obs = _zu(min(max(pval, 1e-300), 1.0 - 2.0 ** -53))     # a p-value of exactly 1 (a mean far BELOW zero) must report a very negative z, not crash
     emax = expected_max_null(m_used)
     need = req.get("required_effective_n")
     floor_note = (f" Below {MIN_ESS_FOR_SUPPORT:g} effective observations the ESS estimate and the t approximation are "

@@ -151,6 +151,10 @@ jobs:
           tests/test_carry_teardown.py
           tests/test_trade_economics_honesty.py
           tests/test_account_review.py
+          tests/test_owner_ledger.py
+          tests/test_bybit_v5_records.py
+          tests/test_engine_vs_reconciliation.py
+          tests/test_carry_prospective.py
           tests/test_execution_model.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py

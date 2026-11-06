@@ -462,10 +462,28 @@ class TestSignedOwnershipAtTheSettlementInstant:
                                               size=-0.5)], ms=T0 + 3 * H)
         assert out["unattributed"] == 1             # the book held 0.2 then
 
-    def test_a_fill_within_a_minute_of_the_settlement_is_ambiguous(self):
+    def test_a_fill_booked_just_after_the_settlement_is_claimed_only_if_the_venue_row_states_the_position_before_it(self):
+        """A reduction booked 30 s AFTER the settlement: the bot's stamp lags the real fill, so the journal alone cannot say whether the book was
+        0.5 or 0.3 at the settlement. The VENUE'S signed size can: a row stating the position the book entered the window with (-0.5) is the book's
+        payment (a FUNDING_INVERTED exit is decided at the first tick after the print it reacts to, so this is the ordinary exit). A row stating
+        anything else is not claimed."""
         j = hedged(0.5)
         fill(j, "close", T0 + 3 * H + 30_000, "c", 0.2)
+        assert self.book(j, size=-0.5)["booked"] == 1               # the venue charged the full -0.5 short
+        j2 = hedged(0.5)
+        fill(j2, "close", T0 + 3 * H + 30_000, "c", 0.2)
+        assert self.book(j2, size=-0.3)["unattributed"] == 1        # a row sized like the position AFTER the fill: not accepted
+        j3 = hedged(0.5)
+        fill(j3, "close", T0 + 3 * H + 30_000, "c", 0.2)
+        assert self.book(j3, size=-1.5)["unattributed"] == 1        # matches neither side
+
+    def test_a_fill_booked_before_the_settlement_makes_a_row_naming_the_earlier_position_a_contradiction(self):
+        j = hedged(0.5)
+        fill(j, "close", T0 + 3 * H - 30_000, "c", 0.2)             # booked 30 s BEFORE: it happened before, so the book held 0.3
         assert self.book(j, size=-0.5)["unattributed"] == 1
+        j2 = hedged(0.5)
+        fill(j2, "close", T0 + 3 * H - 30_000, "c", 0.2)
+        assert self.book(j2, size=-0.3)["unattributed"] == 1        # still within the window of a movement: not claimed either
 
 
 # --------------------------------------------------------------------------
@@ -886,15 +904,18 @@ class TestBoundariesAndCorruption:
 
     @pytest.mark.parametrize("offset,claimed", [
         (0, False), (-L.ATTRIBUTION_SLACK_MS + 1, False),
-        (L.ATTRIBUTION_SLACK_MS, False),
         # A fill is stamped when it was BOOKED, which is never before it
         # happened. One stamped exactly a slack BEFORE the settlement therefore
         # happened at or before that instant, and the position is the same
-        # through the whole window; one stamped a slack AFTER may have happened
-        # earlier, so it is not claimed.
+        # through the whole window. One stamped a slack AFTER may have
+        # happened earlier, so the journal alone cannot place it; here the
+        # venue row states the position BEFORE the add (-0.5), which places the
+        # add after the settlement, so the payment is claimed (it was refused
+        # outright before the row's size was used).
+        (L.ATTRIBUTION_SLACK_MS, True),
         (-L.ATTRIBUTION_SLACK_MS, True), (-L.ATTRIBUTION_SLACK_MS - 1, True),
         (L.ATTRIBUTION_SLACK_MS + 1, True)])
-    def test_a_settlement_within_the_slack_of_a_fill_is_never_claimed(
+    def test_a_settlement_within_the_slack_of_a_fill_is_claimed_only_when_the_journal_and_the_row_agree(
             self, offset, claimed):
         j = hedged(0.5)
         t = T0 + 5 * H
@@ -903,6 +924,13 @@ class TestBoundariesAndCorruption:
         size = -0.5 if t < t + offset else -0.6
         out = L.book_funding_payments(j, [pay(1, 1.0, t, size=size)], ms=t + 2 * H)
         assert (out["booked"] == 1) is claimed, (offset, out)
+
+    def test_an_add_booked_a_slack_after_the_settlement_is_not_claimed_when_the_row_states_the_position_after_it(self):
+        j = hedged(0.5)
+        t = T0 + 5 * H
+        fill(j, "open", t + L.ATTRIBUTION_SLACK_MS, "add", 0.1)
+        out = L.book_funding_payments(j, [pay(1, 1.0, t, size=-0.6)], ms=t + 2 * H)
+        assert out["booked"] == 0 and out["unattributed"] == 1       # a row sized like the NEW position is the suspicious one
 
     def test_out_of_order_or_corrupt_persisted_rows_are_refused_not_repaired(self):
         j = hedged()

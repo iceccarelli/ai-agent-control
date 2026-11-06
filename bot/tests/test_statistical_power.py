@@ -1577,3 +1577,14 @@ def test_public_functions_are_pure_repeated_calls_agree_and_inputs_are_not_mutat
     plan = make_plan(n=100)
     sp.evaluate_under_plan(plan, obs, sp.mean_statistic, expected_digest=sp.plan_digest(plan), ledger=sp.TrialLedger())
     assert obs == snapshot
+
+
+def test_a_series_far_below_zero_is_evaluated_not_crashed():
+    """REPRODUCED: a mean far below zero gives a one-sided p-value of exactly 1.0, and converting it to a z score raised StatisticsError instead of returning
+    NO_EDGE_DETECTED / INSUFFICIENT_POWER, so the one outcome that matters most for a rejected strategy could not be evaluated."""
+    import random as _r
+    rng = _r.Random(11)
+    obs = [(float(i), -5.0 + rng.gauss(0.0, 0.2)) for i in range(300)]
+    plan = sp.EvaluationPlan("s", "v1", {"k": 1}, (0.0, 300.0), "mean", 0.05, 0.8, 0.1, 1, 7)
+    out = sp.evaluate_under_plan(plan, obs, sp.mean_statistic, expected_digest=sp.plan_digest(plan), ledger=sp.TrialLedger())
+    assert out["verdict"] in (sp.NO_EDGE_DETECTED, sp.INSUFFICIENT_POWER) and out["p_value"] == 1.0 and out["z_observed"] < -5.0

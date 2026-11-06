@@ -1250,3 +1250,93 @@ def test_ROUND2_13_the_near_zero_rate_tolerance_is_tested_against_a_real_zero_pr
     (tmp_path / "b").mkdir()
     g[idx]["payment_usd"] = 0.5                                     # 5,000x the rounding noise
     assert "PAYMENT_DISAGREES_WITH_MARK" in hard(review_rows(f, g, tmp_path / "b", taker_bps=5.5))
+
+
+# ================================================================================================================================
+# A period that starts with a position already open and ends with one still open (the owner ledger needs both)
+# ================================================================================================================================
+
+def _carried(n=12, **kw):
+    """The closing leg of a trip only, plus the position the book already held when the period began."""
+    f, g, e = make_trip(n=n, **kw)
+    t_open = f[0]["ts_ms"]
+    fills, _ = AR.parse_fills(f[1:], "BTCUSDT")
+    funding, _ = AR.parse_funding(g, "BTCUSDT")
+    return fills, funding, t_open, -f[0]["qty"]
+
+
+def _review_carried(fills, funding, t_open, qty, **kw):
+    return AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN, opening_qty=qty, opening_ms=t_open, **kw)
+
+
+def test_OPENING_a_carried_in_short_owes_a_row_for_every_settlement_after_the_opening_instant_and_none_before():
+    fills, funding, t_open, q = _carried()
+    rep = _review_carried(fills, funding, t_open, q)
+    assert hard(rep) == [] and rep["settlements"]["held"] == 12 and rep["settlements"]["missing"] == 0
+    assert [t["status"] for t in rep["round_trips"]] == ["EXCLUDED_CARRIED_IN"]
+    assert rep["economics"]["tag"] == "UNKNOWN"                          # its entry basis is outside the records
+    info = [f for f in rep["flags"] if f["code"] == "CARRIED_IN_POSITION"]
+    assert info and info[0]["severity"] == "INFO"
+
+
+def test_OPENING_the_same_records_without_the_opening_position_are_unattributed_funding():
+    fills, funding, _t, _q = _carried()
+    rep = AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN)
+    assert "UNATTRIBUTED_FUNDING" in hard(rep)                          # flat before the first fill, yet paid: exactly the false alarm the opening position removes
+
+
+def test_OPENING_a_settlement_exactly_at_the_opening_instant_belongs_to_the_opening_balance():
+    fills, funding, _t, q = _carried()
+    first = funding[0].grid_ms
+    rep = _review_carried(fills, funding[1:], first, q)                  # the period opens AT the first settlement; its row is not in the period
+    assert hard(rep) == [] and rep["settlements"]["missing"] == 0 and rep["settlements"]["held"] == 11
+    rep2 = _review_carried(fills, funding[1:], first - 1000, q)           # opened a second earlier: that settlement is owed and absent
+    assert rep2["settlements"]["missing"] == 1 and "MISSING_SETTLEMENT" in codes(rep2, AR.SEVERITY_GAP)
+
+
+def test_OPENING_a_carried_in_long_is_not_a_carry_book():
+    fills, funding, t_open, _q = _carried()
+    rep = _review_carried(fills, funding, t_open, +0.5)
+    assert "LONG_EXPOSURE" in hard(rep)
+
+
+def test_OPENING_a_carried_in_position_with_no_fills_at_all_still_checks_its_settlements():
+    _f, funding, t_open, q = _carried()
+    rep = AR.review([], funding, taker_bps=5.5, public=PUB, bar_open=OPEN, opening_qty=q, opening_ms=t_open, closing_ms=funding[-1].grid_ms + 3600_000)
+    assert hard(rep) == [] and rep["settlements"]["held"] == 12 and rep["settlements"]["missing"] == 0
+    rep2 = AR.review([], funding[:-1], taker_bps=5.5, public=PUB, bar_open=OPEN, opening_qty=q, opening_ms=t_open, closing_ms=funding[-1].grid_ms + 3600_000)
+    assert rep2["settlements"]["missing"] == 1                            # the last row is missing and the position never closed
+
+
+def test_CLOSING_ms_extends_the_owed_settlements_to_the_end_of_the_period():
+    f, g, _ = make_trip(n=12)
+    fills, _ = AR.parse_fills(f[:1], "BTCUSDT")                           # opened, never closed within the records
+    funding, _ = AR.parse_funding(g[:-1], "BTCUSDT")                      # ... and the last settlement's row is absent
+    without = AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN)
+    with_close = AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN, closing_ms=g[-1]["ts_ms"] + 3600_000)
+    assert without["settlements"]["missing"] == 0                         # silent: no later record forces the question
+    assert with_close["settlements"]["missing"] == 1                      # the period's end does
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), True, 1e9, "0.5", None])
+def test_OPENING_qty_is_validated(bad):
+    fills, funding, t_open, _q = _carried()
+    with pytest.raises(AR.RecordError):
+        AR.review(fills, funding, opening_qty=bad, opening_ms=t_open)
+
+
+def test_OPENING_a_nonzero_position_needs_its_time():
+    fills, funding, _t, q = _carried()
+    with pytest.raises(AR.RecordError, match="opening_ms"):
+        AR.review(fills, funding, opening_qty=q)
+    with pytest.raises(AR.RecordError, match="opening_ms"):
+        AR.review(fills, funding, opening_qty=q, opening_ms=True)
+
+
+def test_OPENING_zero_changes_nothing_at_all():
+    f, g, _ = make_trip()
+    fills, _ = AR.parse_fills(f, "BTCUSDT")
+    funding, _ = AR.parse_funding(g, "BTCUSDT")
+    a = AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN)
+    b = AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN, opening_qty=0.0, opening_ms=None, closing_ms=None)
+    assert json.dumps(a, sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str)

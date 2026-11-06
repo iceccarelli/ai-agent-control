@@ -119,22 +119,30 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
     lo = lc.start_ms - L.ATTRIBUTION_SLACK_MS
     hi = end + L.ATTRIBUTION_SLACK_MS
     in_life = [t for t in hist_prints if lo <= t <= hi]
+    flags = L.lifecycle_flags(journal, lc)
+    booked = flags["booked"]
+    attributed = [e for e in booked if e.basis == "venue"]
+    unattributed, conflicts = flags["unattributed"], flags["conflicts"]
+    row_ms = [int(e.fee_raw["venue_ms"]) for e in booked]
+    attributed_ms = [int(e.fee_raw["venue_ms"]) for e in attributed]
+
     held, ambiguous, pending = [], [], []
     for t in in_life:
         if t > judged_to:
             pending.append(t)
             continue
         kind = _classify_print(journal, t)
+        if kind == "ambiguous" and any(abs(t - r) <= L.PRINT_MATCH_TOLERANCE_MS for r in attributed_ms):
+            # The journal's stamps could not place the book's exit before or
+            # after this settlement, but the venue's own signed row matched the
+            # position the book entered the window with and was booked
+            # (ledger._attribution_problem): the book was in the position
+            # through it, so it is an expected settlement WITH its row.
+            kind = "held"
         if kind == "held":
             held.append(t)
         elif kind == "ambiguous":
             ambiguous.append(t)
-
-    flags = L.lifecycle_flags(journal, lc)
-    booked = flags["booked"]
-    attributed = [e for e in booked if e.basis == "venue"]
-    unattributed, conflicts = flags["unattributed"], flags["conflicts"]
-    row_ms = [int(e.fee_raw["venue_ms"]) for e in booked]
 
     matched, missing, orphan_rows = _match(held, row_ms)
     flagged_missing, unread = flags["missing"], flags["unread"]

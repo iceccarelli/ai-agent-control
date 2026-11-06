@@ -741,3 +741,16 @@ class TestBorrowAccrualSurvivesARestart:
         assert len(journal.entries) == 1
         bot._accrue_carry_borrow(journal, 100_000.0)   # next tick, <1h later
         assert len(journal.entries) == 1, "the journaled hours were booked again"
+
+
+def test_the_status_reports_the_hedged_pair_net_and_the_inventory_mark_beside_the_cash_net(tmp_path):
+    """`net_usd` is the CASH net (funding - fees + perp realised) and excludes the inventory mark, so on its own it overstates a hedge's loss or gain;
+    the hedged result is `pair_net_usd`. Both, and the mark between them, must reach the operator surface from the same statement."""
+    venue, journal, engine, bot = _hedged(tmp_path)
+    bot.cfg = mock.Mock(USE_TESTNET=True, PAPER_TRADING=False)
+    acct = bot.carry_status()["accounting"]
+    st = journal.statement(now_ms=int(__import__("time").time() * 1000))
+    assert acct["net_usd"] == pytest.approx(st["net_usd"])
+    assert acct["pair_net_usd"] == pytest.approx(st["pair_net_usd"])
+    assert acct["inventory_mark_usd"] == pytest.approx(st["inventory_mark_usd"])
+    assert acct["pair_net_usd"] == pytest.approx(acct["net_usd"] + acct["inventory_mark_usd"], abs=1e-6)
