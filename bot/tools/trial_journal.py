@@ -1,23 +1,26 @@
-"""The ONE supported route for evaluating the frozen prospective plan: a durable, tamper-evident journal of every look.
+"""The ONE supported route for evaluating the frozen prospective plan: a durable, locked, hash-chained journal of every look.
 
 Why it exists. ``statistical_power.TrialLedger`` lives in memory. Three evaluations with three fresh ledgers each report ``n_trials == 1``, and a ledger
 rebuilt one entry shorter verifies, so the Holm correction inside ``carry_prospective.evaluate`` is only as honest as the ledger it is handed.
 ``carry_prospective.evaluate`` stays the PURE calculation (research tests call it with synthetic ledgers); this module is the operator route and
 is the only one that evaluates a closed window: ``python tools/trial_journal.py evaluate ...``. ``carry_prospective``'s own CLI reports progress and
-can never evaluate.
+can never evaluate. (Nothing can stop someone running the pure function with a throwaway ledger to PREVIEW a result: such a look is not counted.)
 
-What it guarantees, and what it does not.
-  * Every look is one hash-chained JSON line, replayed through ``TrialLedger.record`` on load so every hash is RECOMPUTED; no stored hash is trusted.
+What the code enforces, and what it cannot.
+  * Every look is one JSON line, hash-chained; the ledger is replayed through ``TrialLedger.record`` on load so every hash is RECOMPUTED. The hashes are
+    plain unkeyed SHA-256: they detect accidental damage and naive edits, NOT a writer who rebuilds a consistent journal. Anyone who can write the
+    journal can delete it and rebuild a perfectly valid one (``--first-look`` on an empty directory), and it will verify as UNANCHORED.
   * One exclusive ``flock`` on ``<journal>.lock`` is held across load -> evaluate -> append, so two evaluators cannot claim the same trial index.
-    The size read under the lock is compared again just before the append (compare-and-append) so a writer that ignored the lock is detected, not
-    silently interleaved. ``flock`` is advisory and is unreliable on network file systems: keep the journal on a local disk.
-    The lock file is never deleted (removing it is itself a race). A crashed holder releases the lock when its process dies.
-  * A write is looped to completion and fsynced; any failure raises and the look is NOT reported as made. A journal that may hold a partial line is
-    never repaired or truncated here: the next load refuses it, preserving the evidence, until a human reconciles it.
-  * Edits, reordering, a torn last line and a forged hash are caught with no extra input. Removal of the TAIL, or of the whole journal, is caught
-    only against an ANCHOR (count + head hash) kept where the writer cannot reach: an anchor next to the journal protects against nothing, so an
-    anchor file in the journal's directory is refused. Without an anchor the route refuses unless the operator says so explicitly, and then the
-    report states the limit. A hash on the same disk is not tamper-proof storage.
+    The size and inode read under the lock are compared again just before the append (compare-and-append). ``flock`` is advisory and is unreliable on
+    network file systems: keep the journal on a local disk. The lock file is never deleted (removing it is itself a race).
+  * A write is looped to completion and fsynced; any failure raises and the look is not reported. A journal that may hold a partial line is never
+    repaired or truncated here: the next load refuses it, preserving the evidence, until a human reconciles it.
+  * Removal of the TAIL, a rebuilt journal, or deletion of the whole file is detected ONLY against an ANCHOR (count + head hash) that is (a) held by
+    someone the journal's writer cannot influence AND (b) the LATEST one. This module cannot know either. What it checks is only that the anchor file
+    is not in the journal's own directory, which is a string comparison and NOT a trust boundary: a different directory, a subdirectory, or a file
+    typed on the command line from shell history all pass. A STALE anchor verifies a truncated journal (3 looks, cut to 1, checked against the n=1
+    anchor: VERIFIED_AT_ANCHOR) and the evaluation then records 2 looks instead of 4. Custody and freshness are the operator's procedure
+    (see ``main`` output), not something enforced here.
 
 Offline. The only files opened are the journal, its lock file and an operator-named anchor file. No network, process or database is touched.
 """
@@ -28,6 +31,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -50,6 +54,7 @@ _LINE_GENESIS = hashlib.sha256(b"trial_journal.lines.v2").hexdigest()
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 MAX_JOURNAL_BYTES = 8 * 1024 * 1024
 LOCK_TIMEOUT_S = 30.0
+MAX_FLOOR_BPS = 1000.0
 
 # anchor states (``inspect``)
 NEVER_INITIALISED = "NEVER_INITIALISED"
@@ -93,7 +98,7 @@ def read_anchor_file(path: str, journal_path: str) -> SP.LedgerAnchor:
     """``<count> <head>`` on one line. Refused when it sits in the journal's own directory: it would be no independent protection."""
     if os.path.dirname(os.path.realpath(path)) == os.path.dirname(os.path.realpath(journal_path)):
         raise JournalError("the anchor file is in the journal's directory: whoever can rewrite the journal can rewrite that, so it protects nothing. "
-                           "Keep the anchor somewhere the writer cannot reach and give it here from a copy outside that directory")
+                           "Give the anchor from a record held by someone the journal's writer cannot influence (this check only compares directories; it is not independent custody)")
     AR._refuse_protected(path)
     fd = _open_regular(path, os.O_RDONLY, create=False)
     try:
@@ -348,33 +353,78 @@ def inspect(journal_path: str, anchor: Optional[SP.LedgerAnchor] = None) -> Dict
 
 # ------------------------------------------------------------------------------------------------ the operator route
 
-def _selection_sensitivity(prints: Sequence[Tuple[float, float]], hurdle_pct: float, shadow: SP.TrialLedger, now_ms: Optional[int], registered: Dict[str, Any]) -> Dict[str, Any]:
-    """REPORT ONLY; it changes no verdict. The registered test tolerates missing settlements down to the coverage floor, and a missing settlement is not
-    random if the operator chose which to leave out. So the same test is re-run on a shadow copy of the ledger with every missing settlement filled with the
-    LOWEST observed print. A 'supported' verdict that does not survive that is flagged as dependent on which prints are present."""
+def _selection_sensitivity(prints: Sequence[Tuple[float, float]], hurdle_pct: float, raw: bytes, now_ms: Optional[int], registered: Dict[str, Any],
+                           venue_floor_bps: Optional[float] = None) -> Dict[str, Any]:
+    """REPORT ONLY; it changes no verdict, and it is NOT a worst-case bound.
+
+    The registered test tolerates missing settlements down to the coverage floor, and a missing settlement is not random if the operator chose which to
+    leave out. This re-runs the same test on throwaway copies of the ledger with every missing settlement filled by ONE value:
+      * the LOWEST OBSERVED print (``lowest_observed_*``). What it shows: whether the verdict survives the missing prints being as low as the lowest one
+        you supplied. What it does NOT show: robustness. An unobserved settlement can legally print far BELOW every observed one, so 'not flipped' here
+        is not evidence that the verdict is safe against missing data (reproduced: SUPPORTED at the lowest observed fill, flipped at -2 bps);
+      * the BREAK-EVEN fill (``breakeven_fill_bps``): the single value the missing settlements could all have taken for the registered verdict to stop
+        being supported (bisection, assuming the verdict is monotone in the fill and searching 50 bps below the lowest observed print). Read it
+        against what you know funding can print; this module has no venue floor and invents none;
+      * an OWNER-SUPPLIED floor (``venue_floor_*``), only when given: the same test with the missing settlements filled at that value."""
     have = {int(t): float(v) for t, v in prints}
     grid = [CP.WINDOW_START_MS + i * CP.SETTLE_MS for i in range(CP.WINDOW_DAYS * CP.PER_DAY)]
     missing = [t for t in grid if t not in have]
-    out: Dict[str, Any] = {"missing_settlements": len(missing), "filled_with": "LOWEST OBSERVED PRINT", "registered_verdict": registered.get("verdict")}
+    supported = "SUPPORTED" in str(registered.get("verdict"))
+    out: Dict[str, Any] = {"method": "FILL OF MISSING SETTLEMENTS WITH ONE VALUE - a sensitivity check, NOT a worst-case bound", "missing_settlements": len(missing),
+                           "registered_verdict": registered.get("verdict")}
     if not missing:
-        out.update(worst_case_verdict=registered.get("verdict"), selection_sensitive=False, note="no settlement is missing: nothing could have been left out")
+        out.update(flipped_by_lowest_observed_fill=False, breakeven_fill_bps=None, breakeven_status="NOTHING_MISSING",
+                   note="no settlement is missing: nothing could have been left out")
         return out
     low = min(have.values())
+
+    def verdict_at(fill: float) -> str:
+        shadow = _replay(raw).ledger
+        return str(CP.evaluate([(t, have.get(t, fill)) for t in grid], hurdle_pct, shadow, now_ms).get("verdict"))
     try:
-        worst = CP.evaluate([(t, have.get(t, low)) for t in grid], hurdle_pct, shadow, now_ms)
-        out["worst_case_verdict"] = worst.get("verdict")
-        supported = "SUPPORTED" in str(registered.get("verdict"))
-        out["selection_sensitive"] = bool(supported and "SUPPORTED" not in str(worst.get("verdict")))
-        out["note"] = ("DO NOT RELY: the registered verdict is 'supported' only because of which settlements are present" if out["selection_sensitive"] else
-                       "the verdict is not changed by filling the missing settlements with the lowest observed print")
+        out["lowest_observed_fill_bps"] = low
+        out["lowest_observed_fill_verdict"] = verdict_at(low)
+        out["flipped_by_lowest_observed_fill"] = bool(supported and "SUPPORTED" not in out["lowest_observed_fill_verdict"])
+        out["breakeven_status"] = "REGISTERED_VERDICT_NOT_SUPPORTED"
+        out["breakeven_fill_bps"] = None
+        if supported:
+            lo_fill = low - 50.0
+            if "SUPPORTED" in verdict_at(lo_fill):
+                out["breakeven_fill_bps"] = None
+                out["breakeven_status"] = "STILL_SUPPORTED_50_BPS_BELOW_LOWEST_OBSERVED"
+                out["breakeven_note"] = "still supported even with every missing settlement 50 bps below the lowest observed print"
+            elif out["flipped_by_lowest_observed_fill"]:
+                out["breakeven_fill_bps"] = low
+                out["breakeven_status"] = "ALREADY_FLIPPED_AT_LOWEST_OBSERVED"
+                out["breakeven_note"] = "already not supported at the lowest observed print"
+            else:
+                hi, lo_ = low, lo_fill
+                for _ in range(24):
+                    mid = (hi + lo_) / 2.0
+                    if "SUPPORTED" in verdict_at(mid):
+                        hi = mid
+                    else:
+                        lo_ = mid
+                out["breakeven_fill_bps"] = hi
+                out["breakeven_status"] = "FLIPS_AT"
+                out["breakeven_note"] = ("the registered verdict stops being supported if the missing settlements averaged about this (assuming a monotone verdict); "
+                                         "compare it with what funding can legally print")
+        if venue_floor_bps is not None:
+            out["venue_floor_fill_bps"] = float(venue_floor_bps)
+            out["venue_floor_source"] = "OWNER_SUPPLIED_UNVERIFIED"
+            out["venue_floor_fill_verdict"] = verdict_at(float(venue_floor_bps))
+        out["note"] = ("DO NOT RELY: the registered verdict is 'supported' only because of which settlements are present" if out["flipped_by_lowest_observed_fill"] else
+                       "NOT a worst case: unobserved settlements could legally print below the lowest observed one. 'Not flipped' does NOT show the verdict is robust "
+                       "to missing data; read breakeven_fill_bps")
     except SP.StatisticalPowerError as exc:
-        out.update(worst_case_verdict=None, selection_sensitive=None, note=f"the worst-case fill could not be evaluated: {exc}")
+        out.update(flipped_by_lowest_observed_fill=None, breakeven_fill_bps=None, breakeven_status="NOT_EVALUATED",
+                   note=f"the sensitivity check could not be evaluated: {exc}")
     return out
 
 
 def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, journal_path: str, *, anchor: Optional[SP.LedgerAnchor] = None,
                     first_look: bool = False, allow_unanchored: bool = False, accept_data_revision: bool = False, now_ms: Optional[int] = None,
-                    lock_timeout_s: float = LOCK_TIMEOUT_S) -> Dict[str, Any]:
+                    lock_timeout_s: float = LOCK_TIMEOUT_S, venue_floor_bps: Optional[float] = None) -> Dict[str, Any]:
     """``carry_prospective.evaluate`` with the trial ledger loaded from, and the new look appended to, the journal, all under one lock.
 
     Refuses (nothing is appended, nothing falls back to an empty in-memory ledger) when: the journal is corrupt, shortened, removed or rewritten;
@@ -382,6 +432,10 @@ def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, jo
     operator did not say ``first_look``; or the prints differ from those of the FIRST look (unless ``accept_data_revision``, which is itself recorded in
     the chain). Each look's data digest is chained, so a changed or reduced data set can be seen afterwards. ``now_ms`` can only move the clock earlier."""
     AR._refuse_protected(journal_path)
+    if venue_floor_bps is not None and (isinstance(venue_floor_bps, bool) or not isinstance(venue_floor_bps, (int, float))
+                                        or not math.isfinite(venue_floor_bps) or abs(venue_floor_bps) > MAX_FLOOR_BPS):
+        # Checked BEFORE the look is journaled: a closed-window look is one-shot, and an unusable report option must never spend it.
+        raise JournalError(f"the venue funding floor must be a finite number of bps within +/-{MAX_FLOOR_BPS:g}, not {venue_floor_bps!r}")
     binding = data_binding(prints, hurdle_pct, False)
     with _Lock(journal_path, lock_timeout_s):
         existed = os.path.lexists(journal_path)
@@ -443,9 +497,9 @@ def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, jo
             if fd >= 0:
                 os.close(fd)
     try:                                                             # the look is already journaled: nothing in this REPORT-ONLY step may lose its report or anchor
-        sens = _selection_sensitivity(prints, hurdle_pct, _replay(raw).ledger, now_ms, rep)
+        sens = _selection_sensitivity(prints, hurdle_pct, raw, now_ms, rep, venue_floor_bps)
     except Exception as exc:                                         # noqa: BLE001  (deliberately broad: see above)
-        sens = {"selection_sensitive": None, "worst_case_verdict": None, "note": f"the selection-sensitivity check could not be evaluated ({type(exc).__name__}): "
+        sens = {"flipped_by_lowest_observed_fill": None, "breakeven_fill_bps": None, "breakeven_status": "NOT_EVALUATED", "note": f"the selection-sensitivity check could not be evaluated ({type(exc).__name__}): "
                                                                                 "treat the verdict as NOT checked for selection"}
     n_after = before + 1
     rep = dict(rep)
@@ -479,12 +533,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.add_argument("--journal", required=True, help="local journal file (kept on a local disk, not a network share)")
         p.add_argument("--anchor-n", type=int, default=None)
         p.add_argument("--anchor-head", default=None)
-        p.add_argument("--anchor-file", default=None, help="file holding '<count> <head>', kept OUTSIDE the journal's directory")
+        p.add_argument("--anchor-file", default=None, help="file holding '<count> <head>' (refused if in the journal's directory; that check is NOT a trust boundary: the anchor must come from an independent, up-to-date record)")
         if name == "evaluate":
             p.add_argument("--funding", required=True, help="local .jsonl/.csv of settled prints: ts_ms, funding_bps")
             p.add_argument("--hurdle-pct", type=float, default=10.0)
             p.add_argument("--first-look", action="store_true", help="nothing has ever been recorded: create the journal")
             p.add_argument("--allow-unanchored", action="store_true", help="evaluate without an external anchor (the report states the limit)")
+            p.add_argument("--venue-funding-floor-bps", type=float, default=None,
+                           help="OWNER-SUPPLIED lowest funding a settlement can print (bps); the sensitivity check also fills missing settlements with it. Not verified here")
             p.add_argument("--accept-data-revision", action="store_true", help="the prints differ from the first look's: record that revision in the chain and evaluate")
     a = ap.parse_args(argv)
     try:
@@ -494,15 +550,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(rep, indent=2, sort_keys=True))
             return 0 if rep["ok_to_evaluate"] else 3
         rep = evaluate_logged(CP._load(a.funding), a.hurdle_pct, a.journal, anchor=anchor, first_look=a.first_look, allow_unanchored=a.allow_unanchored,
-                              accept_data_revision=a.accept_data_revision)
+                              accept_data_revision=a.accept_data_revision, venue_floor_bps=a.venue_funding_floor_bps)
     except (JournalError, SP.StatisticalPowerError, AR.RecordError, OSError) as exc:
         print(f"trial_journal: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(rep, indent=2, sort_keys=True, allow_nan=False, default=str))
     j = rep["journal"]
-    if rep["selection_sensitivity"].get("selection_sensitive"):
-        print("\nWARNING: " + rep["selection_sensitivity"]["note"], file=sys.stderr)
-    print(f"\nRECORD THIS ANCHOR OUTSIDE THE JOURNAL'S HOST NOW:  {j['n_trials']} {j['head']}", file=sys.stderr)
+    print(f"ANCHOR TO RECORD NOW, IN A RECORD HELD BY SOMEONE THE JOURNAL'S WRITER CANNOT INFLUENCE (off-host, append-only):  {j['n_trials']} {j['head']}\n"
+          f"When you verify later, take the anchor with the HIGHEST count from that record: an older anchor still verifies a truncated journal.", file=sys.stderr)
+    sens = rep["selection_sensitivity"]
+    if sens.get("flipped_by_lowest_observed_fill"):
+        print("\nWARNING: " + sens["note"], file=sys.stderr)
+    elif sens.get("missing_settlements"):
+        print(f"\nNOTE: {sens['missing_settlements']} settlement(s) are missing. {sens.get('note', '')}", file=sys.stderr)
+    if j["data"]["revision"]:
+        print("\nWARNING: this look used a DATA REVISION (the prints differ from the first look's); the revision is permanently recorded in the chain.", file=sys.stderr)
+    try:
+        print(json.dumps(rep, indent=2, sort_keys=True, allow_nan=False, default=str))
+    except ValueError as exc:                                          # the look is journaled and its anchor is already printed above
+        print(f"trial_journal: the report could not be serialised ({exc}); the look IS recorded, use the anchor printed above", file=sys.stderr)
+        return 2
     return 0
 
 

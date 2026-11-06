@@ -479,7 +479,9 @@ def test_the_cli_verifies_evaluates_and_prints_the_anchor_to_keep(tmp_path, caps
     assert TJ.main(["evaluate", "--funding", str(f), "--journal", str(j)]) == 2          # refuses: no first-look declaration
     assert TJ.main(["evaluate", "--funding", str(f), "--journal", str(j), "--first-look", "--allow-unanchored"]) == 0
     err = capsys.readouterr().err
-    n, head = err.strip().splitlines()[-1].split()[-2:]
+    line = next(x for x in err.splitlines() if x.startswith("ANCHOR TO RECORD NOW"))
+    assert "HIGHEST count" in err and "WRITER CANNOT INFLUENCE" in line
+    n, head = line.split()[-2:]
     assert n == "1" and len(head) == 64
     anchor = tmp_path / "away" / "anchor.txt"
     anchor.write_text(f"{n} {head}\n")
@@ -497,7 +499,7 @@ def test_the_module_touches_no_network_process_or_database():
             imported |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom) and n.module:
             imported.add(n.module.split(".")[0])
-    assert imported <= {"__future__", "argparse", "errno", "fcntl", "hashlib", "json", "os", "re", "stat", "sys", "time", "typing", "account_review", "carry_prospective",
+    assert imported <= {"__future__", "argparse", "errno", "fcntl", "hashlib", "json", "math", "os", "re", "stat", "sys", "time", "typing", "account_review", "carry_prospective",
                         "statistical_power"}, imported
     calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert not calls & {"exec", "eval", "compile", "__import__"}
@@ -580,14 +582,14 @@ def test_dropping_the_lowest_prints_passes_the_frozen_floor_but_is_flagged_and_c
     rep = TJ.evaluate_logged(cherry, 10.0, str(j2), first_look=True)
     assert "SUPPORTED" in rep["verdict"] and CP.coverage(cherry, CP.WINDOW_END_MS)["coverage"] >= CP.MIN_COVERAGE
     s = rep["selection_sensitivity"]                                       # ... and the report says so instead of hiding it
-    assert s["selection_sensitive"] is True and "SUPPORTED" not in str(s["worst_case_verdict"]) and s["missing_settlements"] == 86
+    assert s["flipped_by_lowest_observed_fill"] is True and "SUPPORTED" not in str(s["lowest_observed_fill_verdict"]) and s["missing_settlements"] == 86
     assert "DO NOT RELY" in s["note"]
 
 
-def test_a_complete_data_set_cannot_be_selection_sensitive(tmp_path):
+def test_a_complete_data_set_has_nothing_missing_to_fill(tmp_path):
     full, _ = _null_true_prints_with_the_lowest_dropped()
     rep = TJ.evaluate_logged(full, 10.0, str(tmp_path / "j.jsonl"), first_look=True)
-    assert rep["selection_sensitivity"]["selection_sensitive"] is False and rep["selection_sensitivity"]["missing_settlements"] == 0
+    assert rep["selection_sensitivity"]["flipped_by_lowest_observed_fill"] is False and rep["selection_sensitivity"]["missing_settlements"] == 0
 
 
 def test_the_data_digest_is_in_the_chain_so_it_cannot_be_edited_afterwards(tmp_path):
@@ -739,12 +741,12 @@ def test_the_selection_check_changes_neither_the_journal_nor_the_ledger_and_cann
     j = tmp_path / "looks.jsonl"
     rep = TJ.evaluate_logged(cherry, 10.0, str(j), first_look=True)
     on_disk = j.read_bytes()
-    assert len(on_disk.splitlines()) == 1 and rep["selection_sensitivity"]["selection_sensitive"] is True    # the shadow evaluation ran ...
+    assert len(on_disk.splitlines()) == 1 and rep["selection_sensitivity"]["flipped_by_lowest_observed_fill"] is True    # the shadow evaluation ran ...
     assert TJ.inspect(str(j))["n_trials"] == 1 and j.read_bytes() == on_disk                                  # ... and wrote nothing
     monkeypatch.setattr(TJ, "_selection_sensitivity", lambda *a, **k: (_ for _ in ()).throw(ZeroDivisionError("boom")))
     j2 = tmp_path / "second.jsonl"
     rep2 = TJ.evaluate_logged(cherry, 10.0, str(j2), first_look=True)
-    assert rep2["journal"]["n_trials"] == 1 and rep2["selection_sensitivity"]["selection_sensitive"] is None
+    assert rep2["journal"]["n_trials"] == 1 and rep2["selection_sensitivity"]["flipped_by_lowest_observed_fill"] is None
     assert "NOT checked for selection" in rep2["selection_sensitivity"]["note"]
 
 
@@ -764,3 +766,148 @@ def test_a_waiting_evaluator_really_relocks_the_file_at_the_path_when_its_lock_f
     assert rc == 3 and parsed(out)["refused"] == "JournalLockError"
     assert a.wait(timeout=60) == 0
     assert TJ.inspect(str(j))["n_trials"] == 2
+
+
+# ============================================================================================ third review: custody wording and what the sensitivity check is
+
+def test_the_sensitivity_check_is_named_for_what_it_is_and_reports_the_break_even_fill(tmp_path):
+    # Reproduced by the red team: SUPPORTED at the lowest observed fill, yet a legal lower fill flips it. The old key said 'worst_case'.
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    rep = TJ.evaluate_logged(cherry, 10.0, str(tmp_path / "j.jsonl"), first_look=True, venue_floor_bps=-33.3)
+    s = rep["selection_sensitivity"]
+    assert "worst" not in json.dumps(s).lower().replace("not a worst-case bound", "").replace("not a worst case", "")
+    assert "NOT a worst-case bound" in s["method"]
+    assert s["lowest_observed_fill_bps"] == min(v for _, v in cherry)
+    be = s["breakeven_fill_bps"]
+    assert be is not None and be <= s["lowest_observed_fill_bps"] + 1e-9                 # the verdict needs the missing prints to be at least this low to flip
+    assert s["venue_floor_fill_bps"] == -33.3 and s["venue_floor_source"] == "OWNER_SUPPLIED_UNVERIFIED"
+    assert s["venue_floor_fill_verdict"] is not None
+
+
+def test_a_verdict_that_survives_the_lowest_observed_fill_is_not_called_robust(tmp_path):
+    # window_prints(2.0, seed=3) minus its 87 lowest: SUPPORTED at the lowest observed fill (reproduced), flips only at about -2 bps.
+    full = window_prints(2.0, seed=3)
+    keep = set(sorted(full, key=lambda x: x[1])[87:])
+    rep = TJ.evaluate_logged([p for p in full if p in keep], 10.0, str(tmp_path / "j.jsonl"), first_look=True)
+    s = rep["selection_sensitivity"]
+    assert "SUPPORTED" in rep["verdict"] and s["flipped_by_lowest_observed_fill"] is False
+    assert "NOT a worst case" in s["note"] and "does NOT show the verdict is robust" in s["note"]
+    assert s["breakeven_fill_bps"] is not None and s["breakeven_fill_bps"] < s["lowest_observed_fill_bps"]       # a legal lower fill flips it
+
+
+def test_the_module_does_not_claim_an_independent_trust_boundary_it_does_not_enforce():
+    text = open(TJ.__file__, encoding="utf-8").read()
+    for claim in ("tamper-evident", "kept where the writer cannot reach", "somewhere the writer cannot reach", "OUTSIDE THE JOURNAL'S HOST"):
+        assert claim not in text, claim
+    assert "NOT a trust boundary" in text and "STALE anchor verifies a truncated journal" in text
+
+
+def test_a_stale_anchor_verifies_a_truncated_journal_which_is_why_the_operator_must_use_the_highest_count(tmp_path):
+    j = tmp_path / "looks.jsonl"
+    a1 = anchor_of(look(j, 1, first_look=True))
+    look(j, 2)
+    look(j, 3)
+    lines = j.read_text().splitlines(keepends=True)
+    j.write_text(lines[0])                                              # rolled back to the first look
+    assert TJ.inspect(str(j), a1)["status"] == TJ.VERIFIED_AT_ANCHOR    # the code CANNOT know a1 is stale: the documented limit, pinned
+    rep = look(j, 4, anchor=a1)
+    assert rep["journal"]["n_trials"] == 2                              # two looks were lost to the rollback
+
+
+def _independent_verdict(prints_present, fill):
+    # Independent of the module under test: the registered test on an EMPTY throwaway ledger (a first look), missing settlements filled at ``fill``.
+    have = dict(prints_present)
+    grid = [CP.WINDOW_START_MS + i * CP.SETTLE_MS for i in range(CP.WINDOW_DAYS * CP.PER_DAY)]
+    return CP.evaluate([(t, have.get(t, fill)) for t in grid], 10.0, SP.TrialLedger())["verdict"]
+
+
+def test_the_break_even_fill_really_is_where_the_verdict_flips_and_the_owner_floor_is_really_used(tmp_path):
+    full = window_prints(2.0, seed=3)                                    # SUPPORTED, and still SUPPORTED at the lowest observed fill (reproduced)
+    keep = set(sorted(full, key=lambda x: x[1])[87:])
+    present = [p for p in full if p in keep]
+    s = TJ.evaluate_logged(present, 10.0, str(tmp_path / "j.jsonl"), first_look=True, venue_floor_bps=-33.3)["selection_sensitivity"]
+    be = s["breakeven_fill_bps"]
+    assert s["flipped_by_lowest_observed_fill"] is False and be < s["lowest_observed_fill_bps"]
+    assert "SUPPORTED" in _independent_verdict(present, be + 0.01) and "SUPPORTED" not in _independent_verdict(present, be - 0.01)    # the flip point, both sides
+    assert s["venue_floor_fill_verdict"] == _independent_verdict(present, -33.3) and "SUPPORTED" not in s["venue_floor_fill_verdict"]
+    assert s["lowest_observed_fill_verdict"] == _independent_verdict(present, s["lowest_observed_fill_bps"])
+
+
+def test_when_the_lowest_observed_fill_already_flips_the_break_even_says_so(tmp_path):
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    s = TJ.evaluate_logged(cherry, 10.0, str(tmp_path / "j.jsonl"), first_look=True)["selection_sensitivity"]
+    assert s["flipped_by_lowest_observed_fill"] is True and s["breakeven_fill_bps"] == s["lowest_observed_fill_bps"]
+    assert "already not supported" in s["breakeven_note"]
+
+
+# ============================================================================================ hostile review of this phase
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf"), 1e9, -1e9, True, "5"])
+def test_an_unusable_venue_floor_is_refused_before_the_one_shot_look_is_journaled(tmp_path, bad):
+    # Reproduced: a NaN floor was journaled with the look and then crashed the report, losing the anchor of a look that cannot be repeated.
+    j = tmp_path / "looks.jsonl"
+    with pytest.raises(TJ.JournalError, match="venue funding floor"):
+        TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(j), first_look=True, venue_floor_bps=bad)
+    assert not j.exists()                                                        # nothing was spent
+
+
+def test_the_cli_refuses_a_nan_floor_without_spending_the_look_and_prints_the_anchor_first_when_it_does_run(tmp_path, capsys):
+    (tmp_path / "w").mkdir()
+    f = tmp_path / "w" / "funding.jsonl"
+    f.write_text("".join(json.dumps({"ts_ms": t, "funding_bps": v}) + "\n" for t, v in window_prints(0.3, seed=1)))
+    j = str(tmp_path / "w" / "looks.jsonl")
+    assert TJ.main(["evaluate", "--funding", str(f), "--journal", j, "--first-look", "--allow-unanchored", "--venue-funding-floor-bps", "nan"]) == 2
+    assert not os.path.exists(j)
+    capsys.readouterr()
+    assert TJ.main(["evaluate", "--funding", str(f), "--journal", j, "--first-look", "--allow-unanchored", "--venue-funding-floor-bps", "-33.3"]) == 0
+    err = capsys.readouterr().err
+    assert err.lstrip().startswith("ANCHOR TO RECORD NOW")                       # the irreplaceable line comes before anything that could fail
+
+
+def test_the_break_even_status_tells_the_four_situations_apart(tmp_path):
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    a = TJ.evaluate_logged(full, 10.0, str(tmp_path / "a.jsonl"), first_look=True)["selection_sensitivity"]
+    assert a["breakeven_status"] == "NOTHING_MISSING" and a["breakeven_fill_bps"] is None
+    b = TJ.evaluate_logged(cherry, 10.0, str(tmp_path / "b.jsonl"), first_look=True)["selection_sensitivity"]
+    assert b["breakeven_status"] == "ALREADY_FLIPPED_AT_LOWEST_OBSERVED"
+    f2 = window_prints(2.0, seed=3)
+    keep = set(sorted(f2, key=lambda x: x[1])[87:])
+    c = TJ.evaluate_logged([p for p in f2 if p in keep], 10.0, str(tmp_path / "c.jsonl"), first_look=True)["selection_sensitivity"]
+    assert c["breakeven_status"] == "FLIPS_AT" and c["breakeven_fill_bps"] is not None
+    nosupport = window_prints(0.1, seed=3)
+    keep2 = set(sorted(nosupport, key=lambda x: x[1])[87:])
+    d = TJ.evaluate_logged([p for p in nosupport if p in keep2], 10.0, str(tmp_path / "d.jsonl"), first_look=True)["selection_sensitivity"]
+    assert d["breakeven_status"] == "REGISTERED_VERDICT_NOT_SUPPORTED" and d["breakeven_fill_bps"] is None
+
+
+@pytest.mark.parametrize("floor,ok", [(1000.0, True), (-1000.0, True), (999.999, True), (1000.0001, False), (-1000.0001, False)])
+def test_the_venue_floor_bound_is_inclusive_at_exactly_1000_bps(tmp_path, floor, ok):
+    j = tmp_path / "looks.jsonl"
+    if ok:
+        rep = TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(j), first_look=True, venue_floor_bps=floor)
+        assert rep["journal"]["n_trials"] == 1
+    else:
+        with pytest.raises(TJ.JournalError, match="venue funding floor"):
+            TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(j), first_look=True, venue_floor_bps=floor)
+        assert not j.exists()
+
+
+def test_the_fifth_breakeven_status_branch_and_the_keys_when_the_check_cannot_run(tmp_path, monkeypatch):
+    # With realistic dispersion the STILL_SUPPORTED branch is practically unreachable (filling even a few settlements 50 bps low inflates the variance so far
+    # that the registered test loses power), so its LOGIC is tested with a stubbed evaluator that always says supported. Say so rather than pretend.
+    strong = window_prints(10.0, seed=3)
+    keep = set(sorted(strong, key=lambda x: x[1])[87:])
+    present = [p for p in strong if p in keep]
+    real = CP.evaluate
+    monkeypatch.setattr(CP, "evaluate", lambda *a, **k: {"verdict": "EDGE_SUPPORTED_AFTER_ADJUSTMENT"})
+    out = TJ._selection_sensitivity(present, 10.0, b"", None, {"verdict": "EDGE_SUPPORTED_AFTER_ADJUSTMENT"})
+    assert out["breakeven_status"] == "STILL_SUPPORTED_50_BPS_BELOW_LOWEST_OBSERVED" and out["breakeven_fill_bps"] is None
+    assert out["flipped_by_lowest_observed_fill"] is False
+    # and when the check itself cannot run, the keys still exist (both fallbacks)
+    monkeypatch.setattr(CP, "evaluate", lambda *a, **k: (_ for _ in ()).throw(SP.DataIntegrityError("boom")))
+    out = TJ._selection_sensitivity(present, 10.0, b"", None, {"verdict": "EDGE_SUPPORTED_AFTER_ADJUSTMENT"})
+    assert out["breakeven_status"] == "NOT_EVALUATED" and out["breakeven_fill_bps"] is None and out["flipped_by_lowest_observed_fill"] is None
+    monkeypatch.setattr(CP, "evaluate", real)
+    monkeypatch.setattr(TJ, "_selection_sensitivity", lambda *a, **k: (_ for _ in ()).throw(ZeroDivisionError("boom")))
+    rep = TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(tmp_path / "j.jsonl"), first_look=True)
+    assert rep["selection_sensitivity"]["breakeven_status"] == "NOT_EVALUATED" and rep["selection_sensitivity"]["breakeven_fill_bps"] is None

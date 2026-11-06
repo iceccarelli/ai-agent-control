@@ -249,3 +249,19 @@ def test_when_the_economics_are_withheld_the_exposure_is_zero_and_no_survival_ta
     ex = report(lay_down(tmp_path, rows), rows)["exposure_recommendation"]
     assert ex["table"] is None and ex["recommendation"]["max_leverage"] == 0.0
     assert "FUNDING_EVIDENCE_INSUFFICIENT" in ex["recommendation"]["reasons"]
+
+
+def test_the_survival_table_never_prices_an_unknown_spread_at_zero(monkeypatch):
+    # Reproduced by the economic-cost audit: _exposure_section passed Costs(spread_bps=0.0), and capital_survival counts 0.0 as PRICED, so the
+    # stress exit cost silently lost its spread (5.5 bps instead of 9.5 with a 3 bp spread and 1 bp slippage). UNKNOWN stays None.
+    import capital_survival as CAP
+    import profitability_report as PR
+    seen = {}
+    monkeypatch.setattr(CAP, "survival_table", lambda inputs: seen.setdefault("inputs", inputs) and {})
+    monkeypatch.setattr(CAP, "recommend_exposure", lambda *a, **k: {"recommended_exposure": 0.0})
+    fe = {"status": "OK", "joined": 10}
+    economics = {"result": {"breakeven_funding_bps_per_settlement": 0.1}, "inputs": {"funding_used_bps_per_settlement": 1.0}}
+    PR._exposure_section(fe, economics, [], [{"fees": {"perp_taker_bps": 5.5}}], 100000.0, 3.0, 0.0)
+    assert seen["inputs"].costs.spread_bps is None
+    bps, unpriced = CAP._exit_cost(seen["inputs"].costs)
+    assert "spread_bps" in unpriced and "slippage_bps" in unpriced and bps == 5.5       # the fee is known; the spread and slippage are listed as unpriced, not zero

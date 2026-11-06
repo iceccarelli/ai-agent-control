@@ -158,7 +158,7 @@ def _exposure_section(fe, economics, withheld, accepted, notional_usd, hold_days
     f_lo = economics["inputs"]["funding_used_bps_per_settlement"]
     edge_lb = f_lo - (res.get("breakeven_funding_bps_per_settlement") or 0.0)
     costs = TE.Costs(perp_entry_fee_bps=accepted[-1]["fees"]["perp_taker_bps"], perp_exit_fee_bps=accepted[-1]["fees"]["perp_taker_bps"],
-                     spread_bps=0.0, fee_provenance="UNVERIFIED")
+                     spread_bps=None, fee_provenance="UNVERIFIED")      # UNKNOWN is None: a 0.0 here is "priced at zero" to capital_survival
     inputs = CAP.CarryInputs(capital_usd=notional_usd, hold_days=hold_days, funding_bps_path=[f_lo] * max(1, int(round(hold_days * 3))),
                              costs=costs, reserve_frac_of_notional=0.1)
     table = CAP.survival_table(inputs)

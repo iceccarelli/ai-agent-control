@@ -333,3 +333,23 @@ class TestAcquireFeeNetAccounting:
         assert result["basis"] == pytest.approx(-1.0)
         assert result["fees"] == pytest.approx(311.449)
         assert result["net"] == pytest.approx(-292.449)
+
+
+class TestTheReplayDoesNotPresentAnUnchargedSpreadAsATotal:
+    """Economic-cost audit (hand-computed): flat 100000 corpus, overlay, 100k notional, one trade, impact 0: the broker declares a touch of
+    99999.935/100000.065 yet both market legs fill at exactly 100000.0, so basis is 0.0 (a charged half-spread would be -0.13) and fees are 110.0.
+    The dollars are tiny; the headline must still say what it leaves out."""
+
+    def test_zero_impact_is_flagged_and_the_unmodelled_costs_are_named(self):
+        report = rp.replay(rows(30), notional=100_000.0, borrow_apr=0.0)
+        assert report["impact_bps_per_leg"] == 0.0
+        assert "NO SPREAD, SLIPPAGE OR IMPACT IS CHARGED" in report["execution_cost_warning"]
+        joined = " ".join(report["not_modelled"]).lower()
+        for term in ("half-spread and slippage", "market impact beyond the declared haircut", "omits the costs named here", "four legs"):
+            assert term in joined, term
+        assert "upper bound" not in joined and "upper bound" not in report["execution_cost_warning"].lower()
+
+    def test_a_declared_impact_removes_the_zero_charge_warning(self):
+        report = rp.replay(rows(30), notional=100_000.0, borrow_apr=0.0, impact_bps=1.0)
+        assert report["impact_bps_per_leg"] == 1.0 and report["execution_cost_warning"] is None
+        assert "not a total" in " ".join(report["not_modelled"]).lower()          # a declared haircut is still not a measured cost
