@@ -878,3 +878,36 @@ def test_the_break_even_status_tells_the_four_situations_apart(tmp_path):
     keep2 = set(sorted(nosupport, key=lambda x: x[1])[87:])
     d = TJ.evaluate_logged([p for p in nosupport if p in keep2], 10.0, str(tmp_path / "d.jsonl"), first_look=True)["selection_sensitivity"]
     assert d["breakeven_status"] == "REGISTERED_VERDICT_NOT_SUPPORTED" and d["breakeven_fill_bps"] is None
+
+
+@pytest.mark.parametrize("floor,ok", [(1000.0, True), (-1000.0, True), (999.999, True), (1000.0001, False), (-1000.0001, False)])
+def test_the_venue_floor_bound_is_inclusive_at_exactly_1000_bps(tmp_path, floor, ok):
+    j = tmp_path / "looks.jsonl"
+    if ok:
+        rep = TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(j), first_look=True, venue_floor_bps=floor)
+        assert rep["journal"]["n_trials"] == 1
+    else:
+        with pytest.raises(TJ.JournalError, match="venue funding floor"):
+            TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(j), first_look=True, venue_floor_bps=floor)
+        assert not j.exists()
+
+
+def test_the_fifth_breakeven_status_branch_and_the_keys_when_the_check_cannot_run(tmp_path, monkeypatch):
+    # With realistic dispersion the STILL_SUPPORTED branch is practically unreachable (filling even a few settlements 50 bps low inflates the variance so far
+    # that the registered test loses power), so its LOGIC is tested with a stubbed evaluator that always says supported. Say so rather than pretend.
+    strong = window_prints(10.0, seed=3)
+    keep = set(sorted(strong, key=lambda x: x[1])[87:])
+    present = [p for p in strong if p in keep]
+    real = CP.evaluate
+    monkeypatch.setattr(CP, "evaluate", lambda *a, **k: {"verdict": "EDGE_SUPPORTED_AFTER_ADJUSTMENT"})
+    out = TJ._selection_sensitivity(present, 10.0, b"", None, {"verdict": "EDGE_SUPPORTED_AFTER_ADJUSTMENT"})
+    assert out["breakeven_status"] == "STILL_SUPPORTED_50_BPS_BELOW_LOWEST_OBSERVED" and out["breakeven_fill_bps"] is None
+    assert out["flipped_by_lowest_observed_fill"] is False
+    # and when the check itself cannot run, the keys still exist (both fallbacks)
+    monkeypatch.setattr(CP, "evaluate", lambda *a, **k: (_ for _ in ()).throw(SP.DataIntegrityError("boom")))
+    out = TJ._selection_sensitivity(present, 10.0, b"", None, {"verdict": "EDGE_SUPPORTED_AFTER_ADJUSTMENT"})
+    assert out["breakeven_status"] == "NOT_EVALUATED" and out["breakeven_fill_bps"] is None and out["flipped_by_lowest_observed_fill"] is None
+    monkeypatch.setattr(CP, "evaluate", real)
+    monkeypatch.setattr(TJ, "_selection_sensitivity", lambda *a, **k: (_ for _ in ()).throw(ZeroDivisionError("boom")))
+    rep = TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(tmp_path / "j.jsonl"), first_look=True)
+    assert rep["selection_sensitivity"]["breakeven_status"] == "NOT_EVALUATED" and rep["selection_sensitivity"]["breakeven_fill_bps"] is None

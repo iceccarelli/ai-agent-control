@@ -417,7 +417,8 @@ def _selection_sensitivity(prints: Sequence[Tuple[float, float]], hurdle_pct: fl
                        "NOT a worst case: unobserved settlements could legally print below the lowest observed one. 'Not flipped' does NOT show the verdict is robust "
                        "to missing data; read breakeven_fill_bps")
     except SP.StatisticalPowerError as exc:
-        out.update(flipped_by_lowest_observed_fill=None, note=f"the sensitivity check could not be evaluated: {exc}")
+        out.update(flipped_by_lowest_observed_fill=None, breakeven_fill_bps=None, breakeven_status="NOT_EVALUATED",
+                   note=f"the sensitivity check could not be evaluated: {exc}")
     return out
 
 
@@ -498,7 +499,7 @@ def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, jo
     try:                                                             # the look is already journaled: nothing in this REPORT-ONLY step may lose its report or anchor
         sens = _selection_sensitivity(prints, hurdle_pct, raw, now_ms, rep, venue_floor_bps)
     except Exception as exc:                                         # noqa: BLE001  (deliberately broad: see above)
-        sens = {"flipped_by_lowest_observed_fill": None, "note": f"the selection-sensitivity check could not be evaluated ({type(exc).__name__}): "
+        sens = {"flipped_by_lowest_observed_fill": None, "breakeven_fill_bps": None, "breakeven_status": "NOT_EVALUATED", "note": f"the selection-sensitivity check could not be evaluated ({type(exc).__name__}): "
                                                                                 "treat the verdict as NOT checked for selection"}
     n_after = before + 1
     rep = dict(rep)
