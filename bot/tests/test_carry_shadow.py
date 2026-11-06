@@ -920,3 +920,19 @@ class TestAverageCostAcrossAFlip:
             [("Sell", 2.0, 100.0), ("Buy", 1.0, 98.0)], short=True)
         assert realised == pytest.approx(2.0)
         assert qty == pytest.approx(-1.0) and avg == pytest.approx(100.0)
+
+
+def test_the_shadow_net_names_every_cost_class_and_is_an_upper_bound_never_a_total(tmp_path):
+    # Economic-cost audit: only market impact and liquidation distance were listed as excluded; opportunity cost, custody, latency, rebalancing,
+    # partial fills and the hedge mismatch were absent from the net AND from the disclosure.
+    rt = runtime(tmp_path)
+    run_all(rt, series(n_hold=12))
+    e = rt.economics()
+    cc = e["cost_completeness"]
+    assert e["net_is_upper_bound"] is True and e["net_is_partial"] is True and cc["complete"] is False
+    assert set(cc) >= {"MEASURED", "ESTIMATED", "ASSUMED", "UNKNOWN", "EXCLUDED_NOT_CHARGED", "complete", "reading"}
+    excluded = " | ".join(cc["EXCLUDED_NOT_CHARGED"])
+    for omitted in ("opportunity cost", "custody", "latency", "rebalancing", "partial fills", "hedge mismatch"):
+        assert omitted in excluded, omitted
+    assert "market_impact" in cc["UNKNOWN"] and "UPPER bound" in cc["reading"]
+    assert e["label"].startswith("MODELLED") and "NOT REAL ACCOUNT P&L" in e["label"]

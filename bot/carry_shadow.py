@@ -1026,6 +1026,20 @@ def compute_economics(con: sqlite3.Connection,
     unavailable = ["market_impact", "liquidation_distance"]
     if slip_unavailable:
         unavailable.append(f"slippage on {slip_unavailable} fill(s)")
+    # Costs this book does not charge AT ALL (found undisclosed by the economic-cost audit). Listing them is what keeps the headline from reading as a total.
+    excluded_not_charged = ["opportunity cost of the client's BTC", "custody", "latency / the price moving between decision and fill",
+                            "rebalancing", "partial fills (every simulated fill is complete)",
+                            "hedge mismatch (the spot buy fee is booked in USD; the hedge quantity is not reduced by a base-coin fee)"]
+    cost_completeness = {
+        "MEASURED": ["half-spread on each perp fill, from the book observed at that fill"] if fills else [],
+        "ESTIMATED": ["funding (the settled print x mark)"],
+        "ASSUMED": ["fees (public base tier)", "financing (borrow APR, 0 unless configured)"],
+        "UNKNOWN": list(unavailable),
+        "EXCLUDED_NOT_CHARGED": excluded_not_charged,
+        "complete": False,
+        "reading": ("every cost class above UNKNOWN and EXCLUDED_NOT_CHARGED is absent from net_realised_usd, so it is an UPPER bound on modelled net, "
+                    "never a total and never account P&L"),
+    }
     return {
         "label": "MODELLED NET ECONOMICS - NOT REAL ACCOUNT P&L",
         "fills": len(fills), "funding_prints_booked": len(fund),
@@ -1047,7 +1061,9 @@ def compute_economics(con: sqlite3.Connection,
         "net_realised_usd": realised_net,
         "net_including_unrealised_usd": net_with_unrealised,
         "unavailable_components_excluded": unavailable,
+        "cost_completeness": cost_completeness,
         "net_is_partial": True,
+        "net_is_upper_bound": True,
         "open_perp_qty": abs(perp_open),
     }
 
