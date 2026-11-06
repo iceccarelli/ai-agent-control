@@ -4,6 +4,10 @@ changes no engine status.
 
     python3 tools/carry_prospective.py --funding PRINTS.jsonl [--hurdle-pct 10] [--now-ms MS] [--json]
 
+This CLI reports PROGRESS and can never evaluate. The ONE supported way to evaluate the closed window is ``tools/trial_journal.py evaluate``: it keeps every
+look in a locked, durable, hash-chained journal checked against an external anchor. ``evaluate()`` below is the PURE calculation (it takes whatever ledger
+it is handed, so it is for research tests, not for the official look).
+
 Why. Everything the historical teardown says is in-sample, over heavily overlapping starts, with a regime that has since changed. The only evidence that can
 change the verdict is data that did not exist when the plan below was written. This module fixes, BEFORE any such data exist:
 
