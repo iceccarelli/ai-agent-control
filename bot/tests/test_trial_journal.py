@@ -700,3 +700,67 @@ def test_a_same_size_copy_swapped_in_under_the_lock_is_caught_before_anything_is
     with pytest.raises(TJ.JournalError, match="replaced or renamed while it was held"):
         look(j, 2)
     assert j.read_bytes() == original and (tmp_path / "aside.jsonl").read_bytes() == original
+
+
+# ============================================================================================ second independent review (fresh reviewer)
+
+def test_a_failed_first_append_leaves_an_empty_file_that_does_not_demand_an_anchor_and_a_retry_works(tmp_path):
+    j = tmp_path / "looks.jsonl"
+    rc, out, _ = child(j, 1, mode="enospc", first_look=True, allow_unanchored=True)
+    assert rc == 3 and j.exists() and j.stat().st_size == 0
+    assert TJ.inspect(str(j))["status"] == TJ.NEVER_INITIALISED
+    rep = TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(j), first_look=True)          # no allow_unanchored needed
+    assert rep["journal"]["n_trials"] == 1
+    with pytest.raises(TJ.JournalError, match="first_look"):                                    # an EMPTY file is not an excuse to skip first_look
+        TJ.evaluate_logged(window_prints(0.3, seed=2), 10.0, str(tmp_path / "e.jsonl.x"))
+
+
+def test_an_empty_journal_against_a_recorded_anchor_is_shortened_not_a_fresh_start(tmp_path):
+    j = tmp_path / "looks.jsonl"
+    anchor = anchor_of(look(j, 1, first_look=True))
+    j.write_bytes(b"")
+    os.chmod(j, 0o600)
+    assert TJ.inspect(str(j), anchor)["status"] == TJ.SHORTENED
+    with pytest.raises(TJ.JournalError, match="SHORTENED"):
+        look(j, 2, anchor=anchor, first_look=True)
+
+
+def test_a_journal_ahead_of_its_anchor_can_be_evaluated_and_the_new_anchor_walks_forward(tmp_path):
+    j = tmp_path / "looks.jsonl"
+    a1 = anchor_of(look(j, 1, first_look=True))
+    look(j, 2)                                                           # a look whose anchor was never recorded
+    rep = look(j, 3, anchor=a1, allow_unanchored=False)
+    assert rep["journal"]["state_before"] == TJ.VERIFIED_AHEAD_OF_ANCHOR and rep["journal"]["n_trials"] == 3
+    assert TJ.inspect(str(j), anchor_of(rep))["status"] == TJ.VERIFIED_AT_ANCHOR
+
+
+def test_the_selection_check_changes_neither_the_journal_nor_the_ledger_and_cannot_lose_the_report(tmp_path, monkeypatch):
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    j = tmp_path / "looks.jsonl"
+    rep = TJ.evaluate_logged(cherry, 10.0, str(j), first_look=True)
+    on_disk = j.read_bytes()
+    assert len(on_disk.splitlines()) == 1 and rep["selection_sensitivity"]["selection_sensitive"] is True    # the shadow evaluation ran ...
+    assert TJ.inspect(str(j))["n_trials"] == 1 and j.read_bytes() == on_disk                                  # ... and wrote nothing
+    monkeypatch.setattr(TJ, "_selection_sensitivity", lambda *a, **k: (_ for _ in ()).throw(ZeroDivisionError("boom")))
+    j2 = tmp_path / "second.jsonl"
+    rep2 = TJ.evaluate_logged(cherry, 10.0, str(j2), first_look=True)
+    assert rep2["journal"]["n_trials"] == 1 and rep2["selection_sensitivity"]["selection_sensitive"] is None
+    assert "NOT checked for selection" in rep2["selection_sensitivity"]["note"]
+
+
+def test_a_waiting_evaluator_really_relocks_the_file_at_the_path_when_its_lock_file_is_replaced(tmp_path):
+    # Real processes, no fakes. A waits on the lock file's old inode; the file is unlinked and the holder leaves. A must end up holding the lock on the
+    # NEW file, so a third evaluator D is shut out while A works. If A stayed on the stale inode, D would walk straight in.
+    j = tmp_path / "looks.jsonl"
+    look(j, 1, first_look=True)
+    holder = TJ._Lock(str(j), 5.0)
+    holder.__enter__()
+    a = child(j, 2, wait=False, allow_unanchored=True, mode="slow", sleep=4)
+    time.sleep(1.5)                                                      # A has opened the old lock file and is waiting on it
+    os.unlink(str(j) + ".lock")
+    holder.__exit__()                                                    # releasing the old inode: A wakes up on a file that is no longer at the path
+    time.sleep(1.0)
+    rc, out, _ = child(j, 3, allow_unanchored=True, lock_timeout=0.5)
+    assert rc == 3 and parsed(out)["refused"] == "JournalLockError"
+    assert a.wait(timeout=60) == 0
+    assert TJ.inspect(str(j))["n_trials"] == 2

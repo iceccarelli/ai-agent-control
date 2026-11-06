@@ -298,6 +298,8 @@ def _state(rp: Optional[_Replayed], existed: bool, anchor: Optional[SP.LedgerAnc
             return REMOVED, f"no journal exists but an anchor says {anchor.n} look(s) were accepted: the journal was removed"
         return NEVER_INITIALISED, "no journal and no anchor: nothing has ever been recorded here"
     assert rp is not None
+    if not rp.line_heads and anchor is None:                             # a 0-byte file (a failed first append) records nothing: it is not a history
+        return NEVER_INITIALISED, "the journal file is empty and no anchor exists: nothing has ever been recorded here"
     if anchor is None:
         return UNANCHORED, ("the journal verifies internally, but with no external anchor, removal of its last entries (or a rebuild from the start) cannot be detected")
     n = len(rp.line_heads)
@@ -426,7 +428,7 @@ def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, jo
             try:
                 _write_all(fd, line)
                 _os_fsync(fd)
-                if created:
+                if created or size == 0:
                     dfd = os.open(os.path.dirname(os.path.abspath(journal_path)) or ".", os.O_RDONLY | os.O_DIRECTORY)
                     try:
                         _os_fsync(dfd)
@@ -440,11 +442,11 @@ def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, jo
         finally:
             if fd >= 0:
                 os.close(fd)
-    try:
-        shadow = _replay(raw).ledger
-    except SP.LedgerTamperError:
-        shadow = SP.TrialLedger()
-    sens = _selection_sensitivity(prints, hurdle_pct, shadow, now_ms, rep)
+    try:                                                             # the look is already journaled: nothing in this REPORT-ONLY step may lose its report or anchor
+        sens = _selection_sensitivity(prints, hurdle_pct, _replay(raw).ledger, now_ms, rep)
+    except Exception as exc:                                         # noqa: BLE001  (deliberately broad: see above)
+        sens = {"selection_sensitive": None, "worst_case_verdict": None, "note": f"the selection-sensitivity check could not be evaluated ({type(exc).__name__}): "
+                                                                                "treat the verdict as NOT checked for selection"}
     n_after = before + 1
     rep = dict(rep)
     rep["selection_sensitivity"] = sens
