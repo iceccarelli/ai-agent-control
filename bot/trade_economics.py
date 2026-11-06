@@ -146,8 +146,28 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
     ret_notional = ann(net / N) * 100.0
     ret_capital = ann(net / economic_capital) * 100.0
     hedged_total_bps = (sum(c for k, c in comp.items() if c < 0) / N) * 1e4
+    # Explicit costs only: fees, spread, slippage, impact, latency, conversion, transfer, custody, operational and borrow,
+    # less rebates. Funding paid and an adverse basis are P&L, not costs, and are NOT in this number (the legacy
+    # ``cost_bps_of_notional_round_trip`` below adds them whenever they are negative and ignores them when positive).
+    explicit_cost_bps = -(sum(c for k, c in comp.items() if k not in ("funding_income_usd", "basis_pnl_usd")) / N) * 1e4
+    # An unpriced cost is counted as ZERO above, so with any unknown the net, the returns and the break-even are
+    # OPTIMISTIC bounds: the true cost can only be higher. A failure on this bound is conclusive; a pass is not.
+    incomplete = bool(unknowns)
+    # A holding period that does not match the funding path makes the annualised figures meaningless in either direction
+    # (a 30-day hold with 3 prints reads -1 %/yr, a 3-day hold with 90 prints +52 %/yr), so it is reported and disables
+    # every "meets" verdict rather than being annualised silently.
+    expected_settlements = hold * SETTLEMENTS_PER_DAY
+    path_matches_hold = abs(n_settle - expected_settlements) <= 1.0
     out: Dict[str, Any] = {
         "components_usd": comp, "net_pnl_usd": net,
+        "net_is_optimistic_bound": incomplete,
+        "net_reading": ("OPTIMISTIC BOUND: " + str(len(set(unknowns))) + " unpriced cost(s) are counted as zero, so the true "
+                        "net is this or LOWER" if incomplete else "net of every declared cost"),
+        "consistency": {"funding_path_matches_hold": path_matches_hold, "settlements_in_path": n_settle,
+                        "settlements_expected_from_hold": expected_settlements,
+                        "reading": ("consistent" if path_matches_hold else
+                                    "INCONSISTENT: the annualised returns are not meaningful and no hurdle is reported as met")},
+        "explicit_cost_bps_of_notional": explicit_cost_bps,
         "reconciles": math.isclose(net, sum(comp.values()), rel_tol=0, abs_tol=1e-9),
         "unknowns": sorted(set(unknowns)),
         "position": {"hold_days": hold, "notional_usd": N},
@@ -174,15 +194,24 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
             "note": "CONSERVATIVE: treats collateral as static and ignores the hedge's offsetting "
                     "gain on the BTC inventory; basis shock, gaps and fees are not included"},
         "cost_bps_of_notional_round_trip": -hedged_total_bps,
+        "cost_bps_of_notional_round_trip_includes": "every negative component, including funding PAID and an ADVERSE basis; "
+                                                    "see explicit_cost_bps_of_notional for costs alone",
         "breakeven_funding_bps_per_settlement": ((-(sum(c for k, c in comp.items() if k != "funding_income_usd") / N) * 1e4) / n_settle
                                                   if n_settle else None),
+        "breakeven_is_lower_bound": incomplete,
         "alternative_return": {"apr_pct": alternative_return_apr_pct if alternative_return_apr_pct is not None else UNSPECIFIED,
                                "currency": "USD", "capital_denominator": "economic_capital",
                                "risk_premium_pct": risk_premium_pct if risk_premium_pct is not None else UNSPECIFIED},
         "hurdles": [{"hurdle_apr_pct": h, "status": PROVISIONAL,
-                     "annualised_pct_on_economic_capital": ret_capital, "meets": ret_capital >= h,
-                     "meets_means": "meets on the MODELLED costs only" if unknowns else "meets on all declared costs",
-                     "incomplete": bool(unknowns), "unpriced_inputs": sorted(set(unknowns)),
+                     "annualised_pct_on_economic_capital": ret_capital, "meets": path_matches_hold and ret_capital >= h,
+                     "meets_means": ("not evaluated: the funding path does not match the holding period" if not path_matches_hold
+                                     else "meets on the MODELLED costs only" if unknowns else "meets on all declared costs"),
+                     "incomplete": incomplete, "unpriced_inputs": sorted(set(unknowns)),
+                     "verdict": ("INCONSISTENT_INPUT" if not path_matches_hold
+                                 else (("FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND" if incomplete else "FAILS_ON_ALL_DECLARED_COSTS")
+                                       if ret_capital < h
+                                       else ("PASSES_ONLY_ON_MODELLED_COSTS" if incomplete else "MEETS_ON_ALL_DECLARED_COSTS"))),
+                     "conclusive": path_matches_hold and (ret_capital < h or not incomplete),
                      "margin_pct_points": ret_capital - h} for h in SCREENING_HURDLES_PCT],
         "reading": "arithmetic on declared inputs; a pass is not a profitability claim",
     }
