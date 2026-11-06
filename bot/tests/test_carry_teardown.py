@@ -231,7 +231,7 @@ def ev(**kw):
 
 
 def test_capital_is_zero_and_nothing_is_authorised_in_every_branch_of_the_ladder():
-    cases = [ev(prospective_settlements=10), ev(effective_sample_size=5), ev(upper_bound_bps=0.9), ev(lower_bound_bps=1.0),
+    cases = [ev(prospective_settlements=10), ev(effective_sample_size=5), ev(mean_bps=0.5, lower_bound_bps=0.2, upper_bound_bps=0.9), ev(lower_bound_bps=1.0),
              ev(prospective_settlements=120), ev(), ev(account_reconciled=True), ev(account_reconciled=True, owner_authorisation=True),
              {}, ev(lower_bound_bps=None), ev(upper_bound_bps=None)]
     steps = []
@@ -242,6 +242,28 @@ def test_capital_is_zero_and_nothing_is_authorised_in_every_branch_of_the_ladder
     assert steps == ["CONTINUE_RESEARCH", "CONTINUE_RESEARCH", "REJECT_OR_SUSPEND", "CONTINUE_RESEARCH", "RESEARCH_CANDIDATE_REVIEW",
                      "PROSPECTIVE_EDGE_REVIEW", "ECONOMIC_RECONCILIATION_REQUIRED", "EXECUTION_READINESS_REVIEW", "CONTINUE_RESEARCH",
                      "CONTINUE_RESEARCH", "PROSPECTIVE_EDGE_REVIEW"]
+
+
+@pytest.mark.parametrize("bad", [
+    {"prospective_settlements": float("nan")}, {"effective_sample_size": float("nan")}, {"prospective_settlements": "300"}, {"effective_sample_size": True},
+    {"prospective_settlements": -1}, {"mean_bps": float("inf")}, {"lower_bound_bps": float("nan")}, {"upper_bound_bps": "1.6"},
+    {"lower_bound_bps": 1.6, "upper_bound_bps": 1.2}, {"prospective_settlements": 10 ** 400}, {"upper_bound_bps": 10 ** 400}])
+def test_unusable_evidence_is_never_a_step_up_even_with_both_flags_true(bad):
+    d = CT.decide(ev(account_reconciled=True, owner_authorisation=True, **bad), REQ)
+    assert d["step"] == "CONTINUE_RESEARCH" and "not usable" in d["reasons"][0]
+    assert d["capital_recommendation"] == "ZERO" and d["authorizes_trading"] is False
+
+
+@pytest.mark.parametrize("flag", ["no", "false", "yes", "true", 1, 0, "False", [], None])
+def test_the_two_gates_are_exactly_True_not_truthy(flag):
+    assert CT.decide(ev(account_reconciled=flag), REQ)["step"] == "PROSPECTIVE_EDGE_REVIEW"
+    assert CT.decide(ev(account_reconciled=True, owner_authorisation=flag), REQ)["step"] == "ECONOMIC_RECONCILIATION_REQUIRED"
+
+
+@pytest.mark.parametrize("req", [float("nan"), float("inf"), 0.0, -1.0, "1.1", None, True, 10 ** 400])
+def test_a_bad_requirement_is_refused_not_compared(req):
+    with pytest.raises(ValueError):
+        CT.decide(ev(), req)
 
 
 def test_rejection_needs_the_evidence_to_rule_the_requirement_out_not_merely_a_low_mean():
@@ -329,3 +351,72 @@ def test_the_tool_imports_only_the_pure_modules_and_reads_no_runtime_state():
     assert got <= {"__future__", "argparse", "datetime", "gzip", "json", "math", "os", "sys", "typing", "evidence_stats", "statistical_power", "trade_economics"}, got
     for forbidden in ("trading_state", "testnet_session_evidence", "runs/", ".env", "requests", "urllib", "socket"):
         assert forbidden not in src, forbidden
+
+
+# ---- the rolling-start arithmetic is per ENTRY notional of a fixed BTC quantity (independent review, finding 10) ----
+
+def _world(price_path, rate_bps=1.0, n=40):
+    """n settlements at a flat funding rate with the spot and perp opens/closes following price_path (one price per 4h bar)."""
+    base = 1_700_000_000_000 // CT.SETTLE_MS * CT.SETTLE_MS
+    ts = [base + i * CT.SETTLE_MS for i in range(n)]
+    perp, spot = {}, {}
+    for j in range(2 * n + 4):
+        t0 = base - CT.BAR_MS + j * CT.BAR_MS
+        p = price_path(t0)
+        perp[t0] = (p, p)                    # (open, close): perp == spot, so the basis is zero everywhere
+        spot[t0] = (p, p)
+    return ts, [rate_bps] * n, perp, spot
+
+
+def test_funding_follows_a_fixed_quantity_so_a_price_rise_raises_it_per_entry_notional():
+    flat = _world(lambda t: 60000.0)
+    rise = _world(lambda t: 60000.0 * (1.0 + (t - 1_700_000_000_000) / (40 * CT.SETTLE_MS) * 0.5))      # +50 % across the sample
+    rf = CT.rolling_starts(*flat, hold_days=3, costs_bps=(0.0,))
+    rr = CT.rolling_starts(*rise, hold_days=3, costs_bps=(0.0,))
+    assert rf["funding_only"]["mean_bps"] == pytest.approx(9.0)            # 9 settlements x 1.0 bps, price flat
+    assert rr["funding_only"]["mean_bps"] > 9.0                            # the same quantity is worth more, so it earns more per entry notional
+
+
+def test_the_exit_basis_is_normalised_by_the_entry_spot_not_the_exit_spot():
+    # perp - spot = +60 at the exit bar open (0.1 % of 60000) while the price has doubled by then; per ENTRY notional that is 60 / 60000 = 10 bps
+    # (dividing by the exit spot, 120000, would say 5 bps)
+    base = 1_700_000_000_000 // CT.SETTLE_MS * CT.SETTLE_MS
+    ts = [base + i * CT.SETTLE_MS for i in range(3)]
+    perp, spot = {}, {}
+    for j in range(12):
+        t0 = base - CT.BAR_MS + j * CT.BAR_MS
+        spot[t0] = (60000.0, 60000.0)
+        perp[t0] = (60000.0, 60000.0)
+    b_out = ts[2]
+    spot[b_out] = (120000.0, 120000.0)
+    perp[b_out] = (120060.0, 120060.0)
+    r = CT.rolling_starts(ts, [0.0, 0.0, 0.0], perp, spot, hold_days=1, costs_bps=(0.0,))
+    assert r["windows"] == 1
+    assert r["funding_plus_basis"]["mean_bps"] == pytest.approx(0.0 - (60.0 / 60000.0 * 1e4))       # basis_in 0, basis_out +10 bps: -10
+
+
+def test_a_missing_settlement_bar_excludes_the_window_instead_of_bridging_it():
+    ts, f, perp, spot = _world(lambda t: 60000.0)
+    del perp[ts[4]]
+    r = CT.rolling_starts(ts, f, perp, spot, hold_days=1, costs_bps=(0.0,))
+    assert r["excluded"] >= 1
+
+
+def test_a_history_shorter_than_a_year_is_a_clean_error_not_an_index_error(tmp_path):
+    import gzip
+    rows = [{"fundingRate": "0.0001", "fundingRateTimestamp": str(1_700_000_000_000 // CT.SETTLE_MS * CT.SETTLE_MS + i * CT.SETTLE_MS)} for i in range(50)]
+    fp = tmp_path / "f.json.gz"
+    with gzip.open(fp, "wt") as fh:
+        json.dump(rows, fh)
+    with pytest.raises(CT.DataError, match="at least 365 days"):
+        CT.build(str(fp))
+    assert CT.main(["--funding", str(fp)]) in (0, 2)
+
+
+@pytest.mark.parametrize("row", [{"fundingRate": 10 ** 400, "fundingRateTimestamp": "1700000000000"},
+                                 {"fundingRate": "0.0001", "fundingRateTimestamp": 10 ** 400}])
+def test_an_integer_beyond_float_range_in_a_history_row_is_a_data_error(row):
+    with pytest.raises(CT.DataError):
+        CT.parse_funding([row])
+    with pytest.raises(CT.DataError):
+        CT.parse_klines([[10 ** 400, "1", "1", "1", "1"]])

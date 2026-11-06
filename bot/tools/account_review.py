@@ -3,7 +3,7 @@
 
     python3 tools/account_review.py --fills FILLS.jsonl --funding FUNDING.jsonl [--symbol BTCUSDT]
                                     [--taker-bps X --maker-bps Y] [--capital-usd C]
-                                    [--public-funding F.json.gz] [--perp-4h K.json.gz] [--json]
+                                    [--public-funding F.json.gz] [--perp-4h K.json.gz] [--spot-4h S.json.gz] [--json]
 
 Why it exists. Everything else in this repository reasons about the PUBLIC market. Whether the carry earns money is decided by
 what an ACCOUNT was actually charged and paid: the fills with their fee records, the funding settlements it received, the fee
@@ -45,7 +45,9 @@ import argparse
 import bisect
 import csv
 import datetime
+import gzip
 import hashlib
+import io
 import json
 import math
 import os
@@ -74,6 +76,19 @@ POSITION_ABS_TOL = 1e-6
 RATE_TOL_BPS = 0.002
 FEE_TOL_BPS = 0.25
 MIN_TS_MS, MAX_TS_MS = 10 ** 12, 4 * 10 ** 12
+MIN_QTY, MAX_QTY = 1e-6, 1e5           # BTC: below one micro-BTC is dust, above 100,000 is a unit error
+MAX_PRICE = 1e7
+MAX_USD = 1e9
+MAX_FEE_FRACTION = 0.05                 # a fee above 5 % of the fill's notional is a unit error, not a tier
+SPOT_REF_MAX_DEVIATION = 0.02           # the spot mid and the perp fill of one hedge leg differ by basis, which is bps, not percent
+PRICE_RANGE_TOL = 0.003                 # a fill must sit inside the public 4h bar's low..high, widened by this
+RATE_PRINT_NOISE = 5e-9                 # funding rates are printed to 8 decimals: the rounding a payment may legitimately carry
+MIN_MARK_CHECK_RATE = 1e-6              # below 0.01 bps the implied mark is dominated by the rate's rounding: bound the payment instead
+MAX_BYTES = 256 * 1024 * 1024
+BAR_MS = CT.BAR_MS
+PROTECTED_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm", ".sqlite3-wal",
+                      ".sqlite3-shm", ".pem", ".key", ".p12", ".pfx", ".env", ".keystore", ".jks")
+PROTECTED_SUBSTRINGS = ("trading_state", "testnet_session_evidence", "credential", "secret", "id_rsa", "id_ed25519", "id_ecdsa", ".netrc")
 MIN_ACCOUNT_SETTLEMENTS = 90            # the opportunity engine's floors for ECONOMICALLY_RECONCILED
 MIN_ACCOUNT_ROUND_TRIPS = 3
 MIN_TRIPS_FOR_INTERVAL = 8
@@ -97,54 +112,91 @@ class RecordError(ValueError):
 # ---------------------------------------------------------------- reading
 
 def _refuse_protected(path: str) -> str:
-    """Never read runtime state, evidence or secrets, whatever the caller names. Returns the resolved path."""
+    """Never read runtime state, evidence or secrets, whatever the caller names. Returns the resolved path. Symlinks resolve first; a
+    file with more than one hard link is refused (a hard link can give a protected file another name); the name tests are substring
+    tests on the resolved basename (so ``trading_state.db.jsonl`` and ``testnet_session_evidence_2026.jsonl`` are protected too)."""
     real = os.path.realpath(path)
     base = os.path.basename(real).lower()
     parts = [p.lower() for p in real.split(os.sep) if p]
-    if (base.endswith((".db", ".db-wal", ".db-shm", ".sqlite", ".sqlite3", ".pem", ".key")) or base.startswith(".env")
-            or base == "testnet_session_evidence.jsonl" or "runs" in parts or ("state" in parts and "bot" in parts)):
-        raise RecordError(f"refusing to read {os.path.basename(real)!r}: runtime state, evidence and credentials are never inputs")
+    named = (base.endswith(PROTECTED_SUFFIXES) or base.startswith(".env") or any(w in base for w in PROTECTED_SUBSTRINGS)
+             or "runs" in parts or ("state" in parts and "bot" in parts))
+    linked = False
+    try:
+        linked = os.stat(real).st_nlink > 1
+    except OSError:
+        pass
+    if named or linked:
+        raise RecordError(f"refusing to read {os.path.basename(real)!r}: runtime state, evidence and credentials are never inputs"
+                          + (" (the file has more than one hard link)" if linked and not named else ""))
     return real
 
 
-def _digest(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _no_duplicate_keys(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise RecordError(f"duplicate key {k!r} in one record: which value is meant is not decidable")
+        out[k] = v
+    return out
+
+
+def _bad_constant(name: str) -> Any:
+    raise RecordError(f"{name} is not a number")
+
+
+def _read_bytes(real: str, label: str) -> bytes:
+    if not os.path.isfile(real):
+        raise RecordError(f"{label!r} is not a file")
+    with open(real, "rb") as fh:
+        data = fh.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise RecordError(f"{label!r} is larger than {MAX_BYTES // (1024 * 1024)} MB")
+    return data
 
 
 def read_rows(path: str) -> Tuple[List[Dict[str, Any]], str]:
-    """Rows of a .jsonl or .csv file (nothing else) and the file's sha256."""
+    """Rows of a .jsonl or .csv file (nothing else) and the sha256 of the very bytes that were parsed (one read, so no race)."""
     real = _refuse_protected(path)
-    if not os.path.isfile(real):
-        raise RecordError(f"{os.path.basename(path)!r} is not a file")
+    label = os.path.basename(path)
     lower = real.lower()
-    rows: List[Dict[str, Any]] = []
+    if not lower.endswith((".csv", ".jsonl", ".ndjson")):
+        raise RecordError(f"{label!r}: only .jsonl, .ndjson and .csv are read")
+    data = _read_bytes(real, label)
     try:
-        if lower.endswith(".csv"):
-            with open(real, "r", encoding="utf-8", newline="") as fh:
-                rows = [dict(r) for r in csv.DictReader(fh)]
-        elif lower.endswith((".jsonl", ".ndjson")):
-            with open(real, "r", encoding="utf-8") as fh:
-                for n, line in enumerate(fh, 1):
-                    if not line.strip():
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        raise RecordError(f"{os.path.basename(path)} line {n}: not JSON ({exc.msg})") from exc
-                    if not isinstance(obj, dict):
-                        raise RecordError(f"{os.path.basename(path)} line {n}: not an object")
-                    rows.append(obj)
-        else:
-            raise RecordError(f"{os.path.basename(path)!r}: only .jsonl, .ndjson and .csv are read")
+        text = data.decode("utf-8-sig")                     # a BOM from a spreadsheet export is tolerated
     except UnicodeDecodeError as exc:
-        raise RecordError(f"{os.path.basename(path)!r} is not UTF-8 text") from exc
+        raise RecordError(f"{label!r} is not UTF-8 text") from exc
+    rows: List[Dict[str, Any]] = []
+    if lower.endswith(".csv"):
+        try:
+            for n, r in enumerate(csv.DictReader(io.StringIO(text), strict=True), 2):
+                if None in r or any(v is None for v in r.values()):
+                    raise RecordError(f"{label} line {n}: the row has a different number of fields from the header")
+                rows.append(dict(r))
+        except csv.Error as exc:
+            raise RecordError(f"{label}: not valid CSV ({exc})") from exc
+    else:
+        for n, line in enumerate(text.splitlines(), 1):
+            if not line.strip():
+                continue
+            try:
+                obj = json.loads(line, object_pairs_hook=_no_duplicate_keys, parse_constant=_bad_constant)
+            except json.JSONDecodeError as exc:
+                raise RecordError(f"{label} line {n}: not JSON ({exc.msg})") from exc
+            except RecursionError as exc:
+                raise RecordError(f"{label} line {n}: nested too deeply") from exc
+            except RecordError as exc:
+                raise RecordError(f"{label} line {n}: {exc}") from exc
+            if not isinstance(obj, dict):
+                raise RecordError(f"{label} line {n}: not an object")
+            rows.append(obj)
     if not rows:
-        raise RecordError(f"{os.path.basename(path)!r} holds no records")
-    return rows, _digest(real)
+        raise RecordError(f"{label!r} holds no records")
+    return rows, _sha(data)
 
 
 # ---------------------------------------------------------------- typed parsing
@@ -152,12 +204,15 @@ def read_rows(path: str) -> Tuple[List[Dict[str, Any]], str]:
 def _num(v: Any, name: str, where: str) -> float:
     if isinstance(v, bool):
         raise RecordError(f"{where}: {name} is a boolean")
-    if isinstance(v, (int, float)):
-        x = float(v)
-    elif isinstance(v, str) and _NUM.match(v.strip()):
-        x = float(v.strip())
-    else:
-        raise RecordError(f"{where}: {name} is not a number ({v!r})")
+    try:
+        if isinstance(v, (int, float)):
+            x = float(v)
+        elif isinstance(v, str) and _NUM.match(v.strip()):
+            x = float(v.strip())
+        else:
+            raise RecordError(f"{where}: {name} is not a number ({v!r})")
+    except OverflowError as exc:
+        raise RecordError(f"{where}: {name} is beyond any plausible magnitude") from exc
     if not math.isfinite(x):
         raise RecordError(f"{where}: {name} is not finite")
     return x
@@ -174,6 +229,12 @@ def _str(v: Any, name: str, where: str) -> str:
     if not isinstance(v, str) or not v.strip():
         raise RecordError(f"{where}: {name} is missing")
     return v.strip()
+
+
+def _bounded(x: float, lo: float, hi: float, name: str, where: str) -> float:
+    if not (lo <= x <= hi):
+        raise RecordError(f"{where}: {name} {x!r} is outside the plausible range {lo}..{hi} (a unit error?)")
+    return x
 
 
 @dataclass(frozen=True)
@@ -219,7 +280,7 @@ def _missing(rows: Sequence[Mapping[str, Any]], required: Sequence[str], what: s
 def parse_fills(rows: Sequence[Mapping[str, Any]], symbol: str) -> Tuple[List[Fill], List[str]]:
     _missing(rows, FILL_REQUIRED, "fills")
     known = set(FILL_REQUIRED) | set(FILL_OPTIONAL)
-    ignored = sorted({k for r in rows for k in r} - known)
+    ignored = sorted({str(k) for r in rows for k in r} - known)
     out: List[Fill] = []
     seen = set()
     for i, r in enumerate(rows):
@@ -236,28 +297,28 @@ def parse_fills(rows: Sequence[Mapping[str, Any]], symbol: str) -> Tuple[List[Fi
         liq = _str(r.get("liquidity"), "liquidity", w).lower()
         if liq not in ("taker", "maker"):
             raise RecordError(f"{w}: liquidity {liq!r} is not taker or maker")
-        qty, price = _num(r.get("qty"), "qty", w), _num(r.get("price"), "price", w)
-        if qty <= 0 or price <= 0:
-            raise RecordError(f"{w}: qty and price must be positive")
+        qty = _bounded(_num(r.get("qty"), "qty", w), MIN_QTY, MAX_QTY, "qty", w)
+        price = _bounded(_num(r.get("price"), "price", w), 1e-6, MAX_PRICE, "price", w)
+        fee = _bounded(_num(r.get("fee_usd"), "fee_usd", w), -MAX_USD, MAX_USD, "fee_usd", w)
+        if abs(fee) > MAX_FEE_FRACTION * qty * price:
+            raise RecordError(f"{w}: fee_usd {fee} is more than {MAX_FEE_FRACTION:.0%} of the fill's notional: a unit error, not a fee tier")
         opt: Dict[str, Optional[float]] = {}
         for name in FILL_OPTIONAL:
             raw = r.get(name)
             if raw is None or (isinstance(raw, str) and not raw.strip()):
                 opt[name] = None
             else:
-                v = _num(raw, name, w)
-                if v <= 0:
-                    raise RecordError(f"{w}: {name} must be positive")
-                opt[name] = v
-        out.append(Fill(eid, _ts(r.get("ts_ms"), w), side, qty, price, _num(r.get("fee_usd"), "fee_usd", w), liq,
-                        opt["ref_price"], opt["spot_ref"]))
+                opt[name] = _bounded(_num(raw, name, w), 1e-6, MAX_PRICE, name, w)
+        if opt["ref_price"] is not None and abs(opt["ref_price"] / price - 1.0) > 0.05:
+            raise RecordError(f"{w}: ref_price is more than 5% from the fill price: a decision-time mid is not that far from the fill")
+        out.append(Fill(eid, _ts(r.get("ts_ms"), w), side, qty, price, fee, liq, opt["ref_price"], opt["spot_ref"]))
     out.sort(key=lambda f: (f.ts_ms, f.exec_id))
     return out, ignored
 
 
 def parse_funding(rows: Sequence[Mapping[str, Any]], symbol: str) -> Tuple[List[FundingRow], List[str]]:
     _missing(rows, FUNDING_REQUIRED, "funding")
-    ignored = sorted({k for r in rows for k in r} - set(FUNDING_REQUIRED))
+    ignored = sorted({str(k) for r in rows for k in r} - set(FUNDING_REQUIRED))
     out: List[FundingRow] = []
     seen, seen_grid = set(), set()
     for i, r in enumerate(rows):
@@ -278,7 +339,8 @@ def parse_funding(rows: Sequence[Mapping[str, Any]], symbol: str) -> Tuple[List[
         rate = _num(r.get("rate"), "rate", w)
         if abs(rate) > MAX_ABS_RATE:
             raise RecordError(f"{w}: rate {rate} exceeds {MAX_ABS_RATE} per settlement; is it a percentage or in bps?")
-        out.append(FundingRow(eid, t, grid, _num(r.get("position_qty"), "position_qty", w), rate, _num(r.get("payment_usd"), "payment_usd", w)))
+        out.append(FundingRow(eid, t, grid, _bounded(_num(r.get("position_qty"), "position_qty", w), -MAX_QTY, MAX_QTY, "position_qty", w), rate,
+                              _bounded(_num(r.get("payment_usd"), "payment_usd", w), -MAX_USD, MAX_USD, "payment_usd", w)))
     out.sort(key=lambda f: f.grid_ms)
     return out, ignored
 
@@ -286,14 +348,21 @@ def parse_funding(rows: Sequence[Mapping[str, Any]], symbol: str) -> Tuple[List[
 # ---------------------------------------------------------------- the book rebuilt from the fills
 
 class Book:
-    """Signed perpetual position over time, rebuilt only from the fills."""
+    """Signed perpetual position over time, rebuilt only from the fills. Fills with the SAME millisecond are one event: their net is
+    what the position becomes, so the order in which an exporter happened to list them (or sort their ids) changes nothing."""
 
     def __init__(self, fills: Sequence[Fill]):
         self.fills = list(fills)
-        self.times = [f.ts_ms for f in self.fills]
-        cum, q = [], 0.0
+        self.groups: List[List[Fill]] = []
         for f in self.fills:
-            q += f.signed_qty
+            if self.groups and self.groups[-1][0].ts_ms == f.ts_ms:
+                self.groups[-1].append(f)
+            else:
+                self.groups.append([f])
+        self.times = [g[0].ts_ms for g in self.groups]
+        cum, q = [], 0.0
+        for g in self.groups:
+            q += sum(f.signed_qty for f in g)
             if abs(q) <= DUST_QTY:
                 q = 0.0
             cum.append(q)
@@ -304,19 +373,22 @@ class Book:
         i = bisect.bisect_right(self.times, t)
         return self.cum[i - 1] if i else 0.0
 
-    def moved_within(self, lo: int, hi: int) -> bool:
-        return bisect.bisect_right(self.times, hi) > bisect.bisect_left(self.times, lo)
+    def window_positions(self, t: int) -> List[float]:
+        """Every position the book held at some instant of [t - slack, t + slack]: the one entering the window and the one after each
+        event inside it."""
+        lo, hi = bisect.bisect_left(self.times, t - SLACK_MS), bisect.bisect_right(self.times, t + SLACK_MS)
+        return [self.qty_at(t - SLACK_MS)] + self.cum[lo:hi]
 
     def lifecycles(self) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         cur: Optional[Dict[str, Any]] = None
-        for f, q in zip(self.fills, self.cum):
+        for g, q in zip(self.groups, self.cum):
             if cur is None:
-                cur = {"start_ms": f.ts_ms, "end_ms": None, "fills": [], "min_qty": 0.0, "max_qty": 0.0}
-            cur["fills"].append(f)
+                cur = {"start_ms": g[0].ts_ms, "end_ms": None, "fills": [], "min_qty": 0.0, "max_qty": 0.0}
+            cur["fills"].extend(g)
             cur["min_qty"], cur["max_qty"] = min(cur["min_qty"], q), max(cur["max_qty"], q)
             if q == 0.0:
-                cur["end_ms"] = f.ts_ms
+                cur["end_ms"] = g[0].ts_ms
                 out.append(cur)
                 cur = None
         if cur is not None:
@@ -325,13 +397,20 @@ class Book:
 
 
 def classify_settlement(book: Book, t: int) -> str:
-    """held | flat | ambiguous, from the fills alone (the same rule the ledger uses, a minute either side)."""
-    if book.moved_within(t - SLACK_MS, t + SLACK_MS):
-        return "ambiguous"
-    before, after = book.qty_at(t - SLACK_MS), book.qty_at(t + SLACK_MS)
-    if before == 0.0 and after == 0.0:
+    """held | flat | ambiguous. HELD when the book was in a position of one sign at EVERY instant of the minute either side, however many
+    fills (rebalances, a tiny pair of trades) happened inside it: it was provably in the position through the settlement, a funding
+    row is required and a missing one is a gap. FLAT when it held nothing throughout. AMBIGUOUS only when the book opened, closed or
+    flipped inside that window, so its position at the settlement cannot be established from the fills."""
+    pos = book.window_positions(t)
+    if all(p < 0.0 for p in pos) or all(p > 0.0 for p in pos):
+        return "held"
+    if all(p == 0.0 for p in pos):
         return "flat"
-    return "held" if (before < 0.0 and after < 0.0) or (before > 0.0 and after > 0.0) else "ambiguous"
+    return "ambiguous"
+
+
+def _close_enough(stated: float, actual: float) -> bool:
+    return abs(stated - actual) <= max(POSITION_ABS_TOL, POSITION_REL_TOL * abs(actual))
 
 
 # ---------------------------------------------------------------- the review
@@ -360,9 +439,18 @@ def _interval(xs: Sequence[float]) -> Dict[str, Any]:
             "reading": "indicative only: round trips are serially dependent and few, so the true coverage is lower"}
 
 
+#: Gaps that can hide a loss or a cost (a dropped settlement, an excluded trip, a basis that is not known): the review is INCOMPLETE.
+STRUCTURAL_GAPS = ("MISSING_SETTLEMENT", "OPEN_LIFECYCLE", "NO_SPOT_REFERENCE", "AMBIGUOUS_SETTLEMENT", "FUNDING_ROW_IN_AMBIGUOUS_WINDOW",
+                   "ROUND_TRIP_WITHOUT_SETTLEMENT")
+#: Gaps where the records were not compared with the public market or the stated tier: consistent among themselves, UNCHECKED outside.
+CHECK_GAPS = ("RATE_CHECK_NOT_RUN", "RATE_CHECK_PARTIAL", "MARK_CHECK_NOT_RUN", "MARK_CHECK_PARTIAL", "PRICE_CHECK_NOT_RUN", "PRICE_CHECK_PARTIAL",
+              "SPOT_REF_CHECK_NOT_RUN", "SPOT_REF_CHECK_PARTIAL", "FEE_TIER_NOT_STATED", "FEE_TIER_MISSING_FOR_CLASS")
+
+
 def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: Optional[float] = None, maker_bps: Optional[float] = None,
            capital_usd: Optional[float] = None, public: Optional[Mapping[int, float]] = None,
-           bar_open: Optional[Mapping[int, float]] = None, digests: Optional[Mapping[str, str]] = None,
+           bar_open: Optional[Mapping[int, float]] = None, bar_range: Optional[Mapping[int, Tuple[float, float]]] = None,
+           spot_range: Optional[Mapping[int, Tuple[float, float]]] = None, digests: Optional[Mapping[str, str]] = None,
            ignored_columns: Optional[Mapping[str, Sequence[str]]] = None) -> Dict[str, Any]:
     """Cross-check the fills and funding rows and report what they prove. Pure function of its inputs."""
     for name, v in (("taker_bps", taker_bps), ("maker_bps", maker_bps)):
@@ -378,7 +466,7 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
     lifecycles = book.lifecycles()
     funding_by_grid = {f.grid_ms: f for f in funding}
 
-    # ---- which settlements were the book provably short through
+    # ---- which settlements was the book provably in a position through
     first_ms, last_fill_ms = fills[0].ts_ms, fills[-1].ts_ms
     horizon = max(last_fill_ms, funding[-1].grid_ms if funding else last_fill_ms)
     grid = list(range(((first_ms + SETTLE_MS - 1) // SETTLE_MS) * SETTLE_MS, horizon + 1, SETTLE_MS))
@@ -388,7 +476,7 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
     missing = [t for t in held if t not in funding_by_grid]
     off_book = [f for f in funding if cls.get(f.grid_ms) == "flat" or f.grid_ms not in cls]
     in_ambiguous = [f for f in funding if cls.get(f.grid_ms) == "ambiguous"]
-    _flag(flags, "MISSING_SETTLEMENT", SEVERITY_GAP, len(missing), "the book was short through these settlements but the funding file has no row",
+    _flag(flags, "MISSING_SETTLEMENT", SEVERITY_GAP, len(missing), "the book was in a position through these settlements but the funding file has no row",
           [_iso(t) for t in missing])
     _flag(flags, "UNATTRIBUTED_FUNDING", SEVERITY_HARD, len(off_book),
           "funding rows at moments the fills say the book was flat (or outside the fills' span)", [_iso(f.grid_ms) for f in off_book])
@@ -400,20 +488,23 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
           [_iso(lc["start_ms"]) for lc in open_lcs])
 
     # ---- row-level cross-checks (rows the fills say the book held through)
-    pos_bad, rate_bad, rate_unchecked, mark_bad, mark_unchecked, sign_bad, sign_n = [], [], 0, [], 0, [], 0
-    sign_agree = 0
+    pos_bad: List[int] = []
+    rate_bad: List[int] = []
+    mark_bad: List[int] = []
+    sign_bad: List[int] = []
+    rate_unchecked = mark_unchecked = sign_n = sign_agree = 0
     for f in funding:
         if cls.get(f.grid_ms) != "held":
             continue
-        implied = book.qty_at(f.grid_ms - SLACK_MS)
-        if abs(f.position_qty - implied) > max(POSITION_ABS_TOL, POSITION_REL_TOL * abs(implied)):
+        if not any(_close_enough(f.position_qty, q) for q in book.window_positions(f.grid_ms)):
             pos_bad.append(f.grid_ms)
+        pos = f.position_qty
         if public is not None and f.grid_ms in public:
             if abs(f.rate * 1e4 - public[f.grid_ms]) > RATE_TOL_BPS:
                 rate_bad.append(f.grid_ms)
         else:
             rate_unchecked += 1
-        expect_sign = -implied * f.rate
+        expect_sign = -pos * f.rate
         if abs(expect_sign) > 0 and abs(f.payment_usd) > 0:
             sign_n += 1
             if (expect_sign > 0) == (f.payment_usd > 0):
@@ -421,25 +512,34 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
             else:
                 sign_bad.append(f.grid_ms)
         mark = bar_open.get(f.grid_ms) if bar_open is not None else None
-        if mark and abs(f.rate) > 1e-12 and abs(implied) > DUST_QTY:
-            implied_mark = f.payment_usd / (-implied * f.rate)
-            if not (implied_mark > 0 and abs(implied_mark - mark) / mark <= MARK_TOLERANCE):
+        if mark and abs(pos) > DUST_QTY:
+            if abs(f.rate) >= MIN_MARK_CHECK_RATE:
+                implied_mark = f.payment_usd / (-pos * f.rate)
+                ok = implied_mark > 0 and abs(implied_mark - mark) / mark <= MARK_TOLERANCE
+            else:                                           # a (near-)zero rate pays (near-)nothing: any real payment is wrong
+                ok = abs(f.payment_usd) <= abs(pos) * mark * (abs(f.rate) + RATE_PRINT_NOISE) * (1 + MARK_TOLERANCE) + 1e-6
+            if not ok:
                 mark_bad.append(f.grid_ms)
-        elif abs(f.rate) > 1e-12:
+        else:
             mark_unchecked += 1
     inverted = sign_n >= 3 and sign_agree == 0
     _flag(flags, "SIGN_CONVENTION_INVERTED", SEVERITY_HARD, 1 if inverted else 0,
           "every funding payment has the opposite sign to position x rate: the file's sign convention is not 'received > 0'; it is NOT flipped here")
     if not inverted:
         _flag(flags, "FUNDING_SIGN_WRONG", SEVERITY_HARD, len(sign_bad), "payment sign contradicts position x rate", [_iso(t) for t in sign_bad])
-    _flag(flags, "POSITION_MISMATCH", SEVERITY_HARD, len(pos_bad), "the position the funding row states differs from the position the fills imply",
-          [_iso(t) for t in pos_bad])
+    _flag(flags, "POSITION_MISMATCH", SEVERITY_HARD, len(pos_bad), "the position the funding row states matches no position the fills put the book in "
+          "at that settlement", [_iso(t) for t in pos_bad])
     _flag(flags, "RATE_DISAGREES_WITH_PUBLIC", SEVERITY_HARD, len(rate_bad), "the funding rate differs from the public print at that settlement",
           [_iso(t) for t in rate_bad])
     _flag(flags, "PAYMENT_DISAGREES_WITH_MARK", SEVERITY_HARD, len(mark_bad),
-          f"payment / (position x rate) is not within {MARK_TOLERANCE:.0%} of the 4h bar open at the settlement", [_iso(t) for t in mark_bad])
+          f"payment is not position x rate x the 4h bar open at the settlement (within {MARK_TOLERANCE:.0%}; a zero rate pays nothing)", [_iso(t) for t in mark_bad])
 
-    # ---- fees
+    # ---- fills against the public market, fees against the stated tier
+    price_bad: List[str] = []
+    price_unchecked = 0
+    spot_implausible: List[str] = []
+    spot_outside: List[str] = []
+    spot_unchecked = spot_present = 0
     fee_rows: Dict[str, List[float]] = {"taker": [], "maker": []}
     fee_bad: List[str] = []
     for fl in fills:
@@ -448,8 +548,29 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
         sched = taker_bps if fl.liquidity == "taker" else maker_bps
         if sched is not None and abs(eff - sched) > FEE_TOL_BPS:
             fee_bad.append(fl.exec_id)
+        bar = fl.ts_ms - fl.ts_ms % BAR_MS
+        rng = bar_range.get(bar) if bar_range is not None else None
+        if rng is None:
+            price_unchecked += 1
+        elif not (rng[0] * (1 - PRICE_RANGE_TOL) <= fl.price <= rng[1] * (1 + PRICE_RANGE_TOL)):
+            price_bad.append(fl.exec_id)
+        if fl.spot_ref is not None:
+            spot_present += 1
+            if abs(fl.price / fl.spot_ref - 1.0) > SPOT_REF_MAX_DEVIATION:
+                spot_implausible.append(fl.exec_id)
+            srng = spot_range.get(bar) if spot_range is not None else None
+            if srng is None:
+                spot_unchecked += 1
+            elif not (srng[0] * (1 - PRICE_RANGE_TOL) <= fl.spot_ref <= srng[1] * (1 + PRICE_RANGE_TOL)):
+                spot_outside.append(fl.exec_id)
     _flag(flags, "FEE_DISAGREES_WITH_TIER", SEVERITY_HARD, len(fee_bad),
           f"a fill's fee differs from the stated tier by more than {FEE_TOL_BPS} bps", fee_bad)
+    _flag(flags, "FILL_PRICE_OUTSIDE_PUBLIC_RANGE", SEVERITY_HARD, len(price_bad),
+          f"a fill price is outside the public 4h bar's low..high (widened {PRICE_RANGE_TOL:.1%})", price_bad)
+    _flag(flags, "SPOT_REF_IMPLAUSIBLE", SEVERITY_HARD, len(spot_implausible),
+          f"spot_ref differs from the perp fill price by more than {SPOT_REF_MAX_DEVIATION:.0%}: a basis is bps, not percent", spot_implausible)
+    _flag(flags, "SPOT_REF_OUTSIDE_PUBLIC_RANGE", SEVERITY_HARD, len(spot_outside),
+          f"spot_ref is outside the public spot 4h bar's low..high (widened {PRICE_RANGE_TOL:.1%})", spot_outside)
     fees = {liq: ({"n": len(v), "mean_bps": sum(v) / len(v), "min_bps": min(v), "max_bps": max(v)} if v else {"n": 0})
             for liq, v in fee_rows.items()}
     slips = [((f.price - f.ref_price) if f.side == "Buy" else (f.ref_price - f.price)) / f.ref_price * 1e4 for f in fills if f.ref_price]
@@ -461,8 +582,8 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
     trips: List[Dict[str, Any]] = []
     for lc in lifecycles:
         fl = lc["fills"]
-        row: Dict[str, Any] = {"start": _iso(lc["start_ms"]), "end": _iso(lc["end_ms"]) if lc["end_ms"] is not None else None,
-                               "fills": len(fl)}
+        row: Dict[str, Any] = {"start": _iso(lc["start_ms"]), "end": _iso(lc["end_ms"]) if lc["end_ms"] is not None else None, "fills": len(fl)}
+        sells = [f for f in fl if f.side == "Sell"]
         if lc["max_qty"] > DUST_QTY:
             row["status"] = "EXCLUDED_LONG_EXPOSURE"
             trips.append(row)
@@ -471,11 +592,14 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
             row["status"] = "EXCLUDED_OPEN"
             trips.append(row)
             continue
+        if not sells:
+            row["status"] = "EXCLUDED_NO_SHORT_ENTRY"
+            trips.append(row)
+            continue
         window = [t for t in held if lc["start_ms"] < t < lc["end_ms"]]
         got = [funding_by_grid[t] for t in window if t in funding_by_grid]
         miss = [t for t in window if t not in funding_by_grid]
         amb = [t for t in ambiguous if lc["start_ms"] - SLACK_MS <= t <= lc["end_ms"] + SLACK_MS]
-        sells = [f for f in fl if f.side == "Sell"]
         notional = sum(f.notional for f in sells)
         fees_usd = sum(f.fee_usd for f in fl)
         funding_usd = sum(f.payment_usd for f in got)
@@ -489,7 +613,13 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
                     "funding_usd": funding_usd, "fees_usd": fees_usd, "perp_pnl_usd": perp_pnl, "basis_pnl_usd": basis,
                     "fee_bps_of_notional": fees_usd / notional * 1e4,
                     "funding_bps_of_notional": funding_usd / notional * 1e4})
-        if miss:
+        if not all(math.isfinite(row[k]) for k in ("entry_notional_usd", "funding_usd", "fees_usd", "perp_pnl_usd", "fee_bps_of_notional",
+                                                    "funding_bps_of_notional")) or (basis is not None and not math.isfinite(basis)):
+            row["status"] = "EXCLUDED_NON_FINITE"
+        elif not window:
+            row["status"] = "EXCLUDED_NO_SETTLEMENT_SPANNED"
+            row["note"] = "closed without spanning any settlement: not a carry round trip, but its fees and basis are real costs, shown here and not hidden"
+        elif miss:
             row["status"] = "INCOMPLETE_FUNDING"
         elif basis is None:
             row["status"] = "NET_UNKNOWN_NO_SPOT_REFERENCE"
@@ -498,11 +628,21 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
         else:
             net = funding_usd + basis - fees_usd
             row.update({"status": "COMPLETE", "net_usd": net, "net_bps_of_notional": net / notional * 1e4,
-                        "basis_bps_of_notional": basis / notional * 1e4,
-                        "annualised_pct_on_notional": (net / notional) * 365.0 / hold_days * 100.0 if hold_days > 0 else None})
-            if capital_usd:
-                row["annualised_pct_on_stated_capital"] = (net / capital_usd) * 365.0 / hold_days * 100.0 if hold_days > 0 else None
+                        "basis_bps_of_notional": basis / notional * 1e4})
+            if hold_days >= 1.0:                                    # annualising a few hours or minutes is not a rate
+                row["annualised_pct_on_notional"] = (net / notional) * 365.0 / hold_days * 100.0
+                if capital_usd:
+                    row["annualised_pct_on_stated_capital"] = (net / capital_usd) * 365.0 / hold_days * 100.0
+            else:
+                row["annualised_pct_on_notional"] = None
+                row["annualisation_note"] = "held under one day: not annualised"
+            if not all(math.isfinite(row[k]) for k in ("net_usd", "net_bps_of_notional", "basis_bps_of_notional")):
+                row["status"] = "EXCLUDED_NON_FINITE"
         trips.append(row)
+    _flag(flags, "NON_FINITE_RESULT", SEVERITY_HARD, sum(1 for t in trips if t["status"] == "EXCLUDED_NON_FINITE"),
+          "a round trip's arithmetic is not finite: the records are outside any plausible range")
+    _flag(flags, "ROUND_TRIP_WITHOUT_SETTLEMENT", SEVERITY_GAP, sum(1 for t in trips if t["status"] == "EXCLUDED_NO_SETTLEMENT_SPANNED"),
+          "closed round trips that spanned no settlement: excluded from the carry economics, but their costs are real and are shown per trip")
     complete = [t for t in trips if t["status"] == "COMPLETE"]
     n_set_rec = sum(t["settlements_recorded"] for t in complete)
 
@@ -521,7 +661,7 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
                                                   "no net is stated (funding - fees alone is shown per lifecycle, marked as excluding basis)"}
 
     # ---- actual against assumed
-    fee_trips = [t for t in trips if "fee_bps_of_notional" in t]
+    fee_trips = [t for t in trips if "fee_bps_of_notional" in t and t["status"] != "EXCLUDED_NON_FINITE"]
     actual_fee_bps = (sum(t["fees_usd"] for t in fee_trips) / sum(t["entry_notional_usd"] for t in fee_trips) * 1e4) if fee_trips else None
     pub_same = [public[t] for t in held if public is not None and t in public and t in funding_by_grid]
     rec_bps = [funding_by_grid[t].rate * 1e4 for t in held if public is not None and t in public and t in funding_by_grid]
@@ -534,29 +674,43 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
                    "complete_round_trips": len(complete), "engine_floor_round_trips": MIN_ACCOUNT_ROUND_TRIPS,
                    "meets_engine_floors": n_set_rec >= MIN_ACCOUNT_SETTLEMENTS and len(complete) >= MIN_ACCOUNT_ROUND_TRIPS,
                    "reading": "the floors are screens, not proof; they apply to records read from the account, which these are not"}
+    # ---- what was NOT compared with anything outside the file: each is a named gap, and any of them stops the review short of CONSISTENT
     if bar_open is None:
         _flag(flags, "MARK_CHECK_NOT_RUN", SEVERITY_GAP, 1, "no 4h price history was supplied: the payment-vs-mark check did not run")
-    elif mark_unchecked:
+    else:
         _flag(flags, "MARK_CHECK_PARTIAL", SEVERITY_GAP, mark_unchecked, "settlements with no 4h bar in the supplied history were not mark-checked")
     if public is None:
         _flag(flags, "RATE_CHECK_NOT_RUN", SEVERITY_GAP, 1, "no public funding history was supplied: the rate was not compared with the public print")
-    elif rate_unchecked:
+    else:
         _flag(flags, "RATE_CHECK_PARTIAL", SEVERITY_GAP, rate_unchecked, "settlements the public history does not cover were not rate-checked")
+    if bar_range is None:
+        _flag(flags, "PRICE_CHECK_NOT_RUN", SEVERITY_GAP, 1, "no 4h price history was supplied: fill prices were not compared with the public market")
+    else:
+        _flag(flags, "PRICE_CHECK_PARTIAL", SEVERITY_GAP, price_unchecked, "fills in a period the supplied price history does not cover were not price-checked")
+    if spot_present and spot_range is None:
+        _flag(flags, "SPOT_REF_CHECK_NOT_RUN", SEVERITY_GAP, 1, "no public spot history was supplied: spot_ref was only checked against the perp price")
+    elif spot_present:
+        _flag(flags, "SPOT_REF_CHECK_PARTIAL", SEVERITY_GAP, spot_unchecked, "spot_ref values in a period the spot history does not cover were not range-checked")
+    classes = [c for c in ("taker", "maker") if fee_rows[c]]
     if taker_bps is None and maker_bps is None:
         _flag(flags, "FEE_TIER_NOT_STATED", SEVERITY_GAP, 1, "no fee tier was stated: fees are reported as charged but not compared with the tier")
-    _flag(flags, "AMBIGUOUS_SETTLEMENT", SEVERITY_GAP, len(ambiguous), "a fill within a minute of the settlement: ownership cannot be established, "
-          "counted as neither held nor missing", [_iso(t) for t in ambiguous])
+    else:
+        no_tier = [c for c in classes if (taker_bps if c == "taker" else maker_bps) is None]
+        _flag(flags, "FEE_TIER_MISSING_FOR_CLASS", SEVERITY_GAP, len(no_tier), "fills of a liquidity class with no stated tier were not compared with one", no_tier)
+    _flag(flags, "AMBIGUOUS_SETTLEMENT", SEVERITY_GAP, len(ambiguous), "the book opened, closed or flipped within a minute of the settlement: its position at "
+          "the settlement cannot be established, so it is counted as neither held nor missing", [_iso(t) for t in ambiguous])
     _flag(flags, "FUNDING_ROW_IN_AMBIGUOUS_WINDOW", SEVERITY_GAP, len(in_ambiguous), "a funding row at an ambiguous settlement: kept out of the totals",
           [_iso(f.grid_ms) for f in in_ambiguous])
     _flag(flags, "NO_SPOT_REFERENCE", SEVERITY_GAP, sum(1 for t in trips if t["status"] == "NET_UNKNOWN_NO_SPOT_REFERENCE"),
           "closed round trips whose fills lack a spot_ref: basis P&L, hence the net, is UNKNOWN")
 
-    hard = [f for f in flags if f["severity"] == SEVERITY_HARD]
-    gaps = [f for f in flags if f["severity"] == SEVERITY_GAP]
-    if hard:
+    gap_codes = {f["code"] for f in flags if f["severity"] == SEVERITY_GAP}
+    if any(f["severity"] == SEVERITY_HARD for f in flags):
         verdict = "REJECTED_RECORDS_CONTRADICT"
-    elif not complete or any(f["code"] in ("MISSING_SETTLEMENT", "OPEN_LIFECYCLE") for f in gaps):
+    elif not complete or gap_codes & set(STRUCTURAL_GAPS):
         verdict = "INCOMPLETE"
+    elif gap_codes & set(CHECK_GAPS):
+        verdict = "CONSISTENT_UNCHECKED_AGAINST_PUBLIC"
     elif not sufficiency["meets_engine_floors"]:
         verdict = "CONSISTENT_BUT_TOO_SMALL"
     else:
@@ -573,6 +727,7 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
             "the same records read from the account by the repository's own ledger and reconciliation tooling, not from an export",
             "the account's fee tier read in the exchange UI and stated with --taker-bps / --maker-bps",
             "a spot_ref on every fill (the overlay's spot mid at the moment of each perp fill) so the basis P&L is exact",
+            "public funding and 4h price history covering the whole span, so every rate, payment and price is compared with the market",
             "the sha256 values above archived off the machine at the time the review is issued"],
     }
 
@@ -583,30 +738,63 @@ def _iso(ms: int) -> str:
 
 # ---------------------------------------------------------------- orchestration and CLI
 
+def _read_history(path: Optional[str], default_name: str, use_default: bool) -> Tuple[Any, Optional[str]]:
+    """The parsed JSON of a public history file and its sha256, or ``(None, None)`` when none applies. A path the caller NAMED goes through
+    the protected-path refusal and an extension check; the committed default history does not (it is the repository's own file, and a
+    checkout under a directory called ``runs`` must not block it)."""
+    if path:
+        real = _refuse_protected(path)
+        if not real.lower().endswith((".json", ".json.gz")):
+            raise RecordError(f"{os.path.basename(path)!r}: a public history is a .json or .json.gz file")
+    elif use_default:
+        real = os.path.join(CT.STUDY, default_name)
+        if not os.path.isfile(real):
+            return None, None
+    else:
+        return None, None
+    data = _read_bytes(real, os.path.basename(real))
+    try:
+        raw = gzip.decompress(data) if real.lower().endswith(".gz") else data
+        return json.loads(raw), _sha(data)
+    except (OSError, EOFError, ValueError, RecursionError) as exc:
+        raise RecordError(f"{os.path.basename(real)!r} is not a readable public history ({type(exc).__name__})") from exc
+
+
+def _ranges(rows: Any) -> Dict[int, Tuple[float, float]]:
+    """``{bar start: (low, high)}`` from raw 4h kline rows ``[start, open, high, low, close, ...]`` (already validated by parse_klines)."""
+    out: Dict[int, Tuple[float, float]] = {}
+    for r in rows:
+        out[int(r[0])] = (float(r[3]), float(r[2]))
+    return out
+
+
 def run(fills_path: str, funding_path: str, *, symbol: str = "BTCUSDT", taker_bps: Optional[float] = None, maker_bps: Optional[float] = None,
-        capital_usd: Optional[float] = None, public_path: Optional[str] = None, perp_path: Optional[str] = None,
+        capital_usd: Optional[float] = None, public_path: Optional[str] = None, perp_path: Optional[str] = None, spot_path: Optional[str] = None,
         use_default_history: bool = True) -> Dict[str, Any]:
     f_rows, f_dig = read_rows(fills_path)
     g_rows, g_dig = read_rows(funding_path)
     fills, f_ign = parse_fills(f_rows, symbol)
     funding, g_ign = parse_funding(g_rows, symbol)
-    public = bar_open = None
     digests = {"fills": f_dig, "funding": g_dig}
-    pub_p = public_path or (os.path.join(CT.STUDY, "funding_BTCUSDT.json.gz") if use_default_history and symbol == "BTCUSDT" else None)
-    perp_p = perp_path or (os.path.join(CT.STUDY, "linear_BTCUSDT_240.json.gz") if use_default_history and symbol == "BTCUSDT" else None)
+    default_ok = use_default_history and symbol == "BTCUSDT"
+    public = bar_open = bar_range = spot_range = None
     try:
-        if pub_p:
-            ts, bps = CT.parse_funding(CT._open_json(_refuse_protected(pub_p)))
-            public = dict(zip(ts, bps))
-            digests["public_funding"] = _digest(pub_p)
-        if perp_p:
-            bars = CT.parse_klines(CT._open_json(_refuse_protected(perp_p)))
-            bar_open = {t: o for t, (o, _c) in bars.items()}
-            digests["perp_4h"] = _digest(perp_p)
+        pub, d = _read_history(public_path, "funding_BTCUSDT.json.gz", default_ok)
+        if pub is not None:
+            ts, bps = CT.parse_funding(pub)
+            public, digests["public_funding"] = dict(zip(ts, bps)), d
+        perp, d = _read_history(perp_path, "linear_BTCUSDT_240.json.gz", default_ok)
+        if perp is not None:
+            bars = CT.parse_klines(perp)
+            bar_open, bar_range, digests["perp_4h"] = {t: o for t, (o, _c) in bars.items()}, _ranges(perp), d
+        spot, d = _read_history(spot_path, "spot_BTCUSDT_240.json.gz", default_ok)
+        if spot is not None:
+            CT.parse_klines(spot)
+            spot_range, digests["spot_4h"] = _ranges(spot), d
     except CT.DataError as exc:
         raise RecordError(f"price/funding history unusable: {exc}") from exc
     return review(fills, funding, taker_bps=taker_bps, maker_bps=maker_bps, capital_usd=capital_usd, public=public, bar_open=bar_open,
-                  digests=digests, ignored_columns={"fills": f_ign, "funding": g_ign})
+                  bar_range=bar_range, spot_range=spot_range, digests=digests, ignored_columns={"fills": f_ign, "funding": g_ign})
 
 
 def render(rep: Mapping[str, Any]) -> str:
@@ -665,15 +853,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--capital-usd", type=float)
     ap.add_argument("--public-funding")
     ap.add_argument("--perp-4h")
+    ap.add_argument("--spot-4h")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     try:
         rep = run(a.fills, a.funding, symbol=a.symbol, taker_bps=a.taker_bps, maker_bps=a.maker_bps, capital_usd=a.capital_usd,
-                  public_path=a.public_funding, perp_path=a.perp_4h)
-    except (RecordError, CT.DataError, OSError) as exc:
+                  public_path=a.public_funding, perp_path=a.perp_4h, spot_path=a.spot_4h)
+        out = json.dumps(rep, indent=2, sort_keys=True, allow_nan=False) if a.json else render(rep)
+    except (RecordError, CT.DataError, OSError, ValueError, OverflowError, ZeroDivisionError) as exc:
         print(f"account_review: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(rep, indent=2, sort_keys=True) if a.json else render(rep))
+    print(out)
     return 0
 
 

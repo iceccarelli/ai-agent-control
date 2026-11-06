@@ -153,6 +153,7 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
     # An unpriced cost is counted as ZERO above, so with any unknown the net, the returns and the break-even are
     # OPTIMISTIC bounds: the true cost can only be higher. A failure on this bound is conclusive; a pass is not.
     incomplete = bool(unknowns)
+    fees_verified = costs.fee_provenance == "ACCOUNT_VERIFIED"
     # A holding period that does not match the funding path makes the annualised figures meaningless in either direction
     # (a 30-day hold with 3 prints reads -1 %/yr, a 3-day hold with 90 prints +52 %/yr), so it is reported and disables
     # every "meets" verdict rather than being annualised silently.
@@ -166,7 +167,7 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
         "consistency": {"funding_path_matches_hold": path_matches_hold, "settlements_in_path": n_settle,
                         "settlements_expected_from_hold": expected_settlements,
                         "reading": ("consistent" if path_matches_hold else
-                                    "INCONSISTENT: the annualised returns are not meaningful and no hurdle is reported as met")},
+                                    "INCONSISTENT: the annualised returns are not meaningful; read meets_if_consistent / verdict, not meets")},
         "explicit_cost_bps_of_notional": explicit_cost_bps,
         "reconciles": math.isclose(net, sum(comp.values()), rel_tol=0, abs_tol=1e-9),
         "unknowns": sorted(set(unknowns)),
@@ -203,16 +204,22 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
                                "currency": "USD", "capital_denominator": "economic_capital",
                                "risk_premium_pct": risk_premium_pct if risk_premium_pct is not None else UNSPECIFIED},
         "hurdles": [{"hurdle_apr_pct": h, "status": PROVISIONAL,
-                     "annualised_pct_on_economic_capital": ret_capital, "meets": path_matches_hold and ret_capital >= h,
-                     "meets_means": ("not evaluated: the funding path does not match the holding period" if not path_matches_hold
-                                     else "meets on the MODELLED costs only" if unknowns else "meets on all declared costs"),
+                     # the LEGACY fields keep their original values; the fields after them are the honest reading
+                     "annualised_pct_on_economic_capital": ret_capital, "meets": ret_capital >= h,
+                     "meets_means": "meets on the MODELLED costs only" if unknowns else "meets on all declared costs",
                      "incomplete": incomplete, "unpriced_inputs": sorted(set(unknowns)),
+                     "margin_pct_points": ret_capital - h,
+                     "consistent_input": path_matches_hold,
+                     "meets_if_consistent": path_matches_hold and ret_capital >= h,
                      "verdict": ("INCONSISTENT_INPUT" if not path_matches_hold
                                  else (("FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND" if incomplete else "FAILS_ON_ALL_DECLARED_COSTS")
                                        if ret_capital < h
-                                       else ("PASSES_ONLY_ON_MODELLED_COSTS" if incomplete else "MEETS_ON_ALL_DECLARED_COSTS"))),
-                     "conclusive": path_matches_hold and (ret_capital < h or not incomplete),
-                     "margin_pct_points": ret_capital - h} for h in SCREENING_HURDLES_PCT],
+                                       else ("PASSES_ONLY_ON_MODELLED_COSTS" if incomplete
+                                             else ("MEETS_ON_DECLARED_COSTS_FEES_NOT_ACCOUNT_VERIFIED" if not fees_verified
+                                                   else "MEETS_ON_ALL_DECLARED_COSTS")))),
+                     # a failure is conclusive whenever the input is consistent (costs only rise); a pass is conclusive only with every
+                     # cost declared AND the fees read from the account
+                     "conclusive": path_matches_hold and (ret_capital < h or (not incomplete and fees_verified))} for h in SCREENING_HURDLES_PCT],
         "reading": "arithmetic on declared inputs; a pass is not a profitability claim",
     }
     return out

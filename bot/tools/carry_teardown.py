@@ -66,6 +66,16 @@ class DataError(ValueError):
     """The supplied history is not usable evidence."""
 
 
+def _fin(x: Any) -> bool:
+    """A real, finite number (not a bool); an int beyond float range is not one and must not raise."""
+    if not isinstance(x, (int, float)) or isinstance(x, bool):
+        return False
+    try:
+        return math.isfinite(x)
+    except OverflowError:
+        return False
+
+
 # ---------------------------------------------------------------- loading and validation
 
 def _open_json(path: str) -> Any:
@@ -83,7 +93,7 @@ def parse_funding(rows: Any) -> Tuple[List[int], List[float]]:
     for i, r in enumerate(rows):
         try:
             t, x = int(r["fundingRateTimestamp"]), float(r["fundingRate"]) * 1e4
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise DataError(f"funding row {i} is malformed: {exc!r}") from exc
         if not math.isfinite(x) or abs(x) > 300.0:
             raise DataError(f"funding row {i}: {x} bps is not a plausible per-settlement rate")
@@ -105,7 +115,7 @@ def parse_klines(rows: Any) -> Dict[int, Tuple[float, float]]:
     for i, r in enumerate(rows):
         try:
             t, o, c = int(r[0]), float(r[1]), float(r[4])
-        except (IndexError, TypeError, ValueError) as exc:
+        except (IndexError, TypeError, ValueError, OverflowError) as exc:
             raise DataError(f"kline row {i} is malformed: {exc!r}") from exc
         if not (math.isfinite(o) and math.isfinite(c) and o > 0 and c > 0) or t % BAR_MS != 0:
             raise DataError(f"kline row {i} is not a valid 4h bar")
@@ -198,7 +208,9 @@ def rolling_starts(ts: Sequence[int], f: Sequence[float], perp: Mapping[int, Tup
     Entry is at the close of the 4h bar that ENDS at the first settlement being collected; exit is at the OPEN of the bar that
     STARTS at the last settlement collected, so the position is held through every settlement counted and no later price is used.
     A window with a missing settlement or a missing bar is excluded and counted, never bridged. The P&L is
-    funding + (entry basis - exit basis) - cost, in bps of hedged notional (short perp, long spot)."""
+    funding + (entry basis - exit basis) - cost, in bps of the ENTRY hedged notional (short perp, long spot). The hedge is a fixed BTC
+    quantity: funding is rate x the perp open at each settlement (so it grows when the price rises) and the exit basis is divided by the
+    ENTRY spot. Costs stay a constant bps of entry notional (the exit leg's notional differs by the price ratio: a stated approximation)."""
     m = hold_days * PER_DAY
     idx = {t: i for i, t in enumerate(ts)}
     funding_only: List[float] = []
@@ -216,9 +228,15 @@ def rolling_starts(ts: Sequence[int], f: Sequence[float], perp: Mapping[int, Tup
         if b_in not in perp or b_in not in spot or b_out not in perp or b_out not in spot:
             excluded += 1
             continue
-        basis_in = (perp[b_in][1] - spot[b_in][1]) / spot[b_in][1] * 1e4
-        basis_out = (perp[b_out][0] - spot[b_out][0]) / spot[b_out][0] * 1e4
-        fund = sum(f[i:i + m])
+        if any(ts[k] not in perp for k in range(i, i + m)):               # funding is marked at the perp open of each settlement
+            excluded += 1
+            continue
+        s_in = spot[b_in][1]                                              # the hedge is a FIXED BTC quantity Q = N / s_in
+        # Every term is in bps of the ENTRY notional N = Q * s_in, so a price move between entry and exit scales the exit basis and the
+        # funding by the same factor it scales the position's value: (P_out - S_out) / s_in, and rate * mark_k / s_in.
+        basis_in = (perp[b_in][1] - s_in) / s_in * 1e4
+        basis_out = (perp[b_out][0] - spot[b_out][0]) / s_in * 1e4
+        fund = sum(f[k] * (perp[ts[k]][0] / s_in) for k in range(i, i + m))
         funding_only.append(fund)
         with_basis.append(fund + (basis_in - basis_out))
         starts.append(ts[i])
@@ -226,7 +244,7 @@ def rolling_starts(ts: Sequence[int], f: Sequence[float], perp: Mapping[int, Tup
         for k in range(i, i + m):                                         # worst (highest) basis seen at a bar OPEN during the hold
             bk = ts[k]
             if bk in perp and bk in spot:
-                worst = max(worst, (perp[bk][0] - spot[bk][0]) / spot[bk][0] * 1e4)
+                worst = max(worst, (perp[bk][0] - spot[bk][0]) / s_in * 1e4)
         adverse.append(worst - basis_in)
     if not funding_only:
         return {"windows": 0, "excluded": excluded, "hold_days": hold_days}
@@ -283,10 +301,18 @@ def decide(evidence: Mapping[str, Any], required_bps: float) -> Dict[str, Any]:
     lowest screening hurdle. ``evidence`` keys: prospective_settlements, effective_sample_size, mean_bps, lower_bound_bps,
     upper_bound_bps, account_reconciled (bool), owner_authorisation (bool). Capital is ZERO in every branch except the last, and the
     last only asks for a SEPARATE owner review: this function authorises nothing."""
-    n = evidence.get("prospective_settlements") or 0
-    ess = evidence.get("effective_sample_size") or 0
-    lo, hi, mean = evidence.get("lower_bound_bps"), evidence.get("upper_bound_bps"), evidence.get("mean_bps")
+    if not (_fin(required_bps) and required_bps > 0):
+        raise ValueError("required_bps must be a positive finite number")
     out = {"capital_recommendation": "ZERO", "authorizes_trading": False, "required_bps": required_bps, "reasons": []}
+    n, ess = evidence.get("prospective_settlements", 0), evidence.get("effective_sample_size", 0)
+    lo, hi, mean = evidence.get("lower_bound_bps"), evidence.get("upper_bound_bps"), evidence.get("mean_bps")
+    bad = [k for k, v in (("prospective_settlements", n), ("effective_sample_size", ess)) if not (_fin(v) and v >= 0)]
+    bad += [k for k, v in (("lower_bound_bps", lo), ("upper_bound_bps", hi), ("mean_bps", mean)) if v is not None and not _fin(v)]
+    if lo is not None and hi is not None and not bad and lo > hi:
+        bad.append("lower_bound_bps > upper_bound_bps")
+    if bad:                                              # unusable evidence is never a step up: the lowest rung that is not a rejection
+        out.update(step="CONTINUE_RESEARCH", reasons=["the evidence is not usable (missing, non-finite, mistyped or inverted): " + ", ".join(bad)])
+        return out
     if n < 90 or ess < 30:
         out.update(step="CONTINUE_RESEARCH", reasons=[f"{n} prospective settlements and an effective sample size of {ess}: below the 90 / 30 floors"])
         return out
@@ -300,10 +326,10 @@ def decide(evidence: Mapping[str, Any], required_bps: float) -> Dict[str, Any]:
     if n < 270:
         out.update(step="RESEARCH_CANDIDATE_REVIEW", reasons=["lower bound clears the requirement in the screening window; not yet 270 prospective settlements"])
         return out
-    if not evidence.get("account_reconciled"):
+    if evidence.get("account_reconciled") is not True:           # exactly True: "no" / "false" / 1 are not a reconciliation
         out.update(step="PROSPECTIVE_EDGE_REVIEW", reasons=["public-market edge supported prospectively; no account fees, fills or settlements reconcile it"])
         return out
-    if not evidence.get("owner_authorisation"):
+    if evidence.get("owner_authorisation") is not True:
         out.update(step="ECONOMIC_RECONCILIATION_REQUIRED", reasons=["reconciled economics exist; a separate owner authorisation does not"])
         return out
     out.update(step="EXECUTION_READINESS_REVIEW", reasons=["every gate is met; this asks for a SEPARATE owner review and authorises nothing"])
@@ -332,6 +358,8 @@ def waterfall(funding_bps: float, hold_days: float, round_trip_bps: float, reser
 def build(funding_path: Optional[str] = None, perp_path: Optional[str] = None, spot_path: Optional[str] = None, *,
           round_trip_bps: float = DEFAULT_ROUND_TRIP_BPS, reserve: float = 0.10, owner: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     ts, f, perp, spot = load_study(funding_path, perp_path, spot_path)
+    if len(ts) < 365 * PER_DAY:
+        raise DataError(f"{len(ts)} funding prints: the teardown needs at least 365 days ({365 * PER_DAY}) to compare the recent regime")
     st = settlement_stats(ts, f)
     first_recent = ts[-365 * PER_DAY]
     recent_mean = st["last_365d"]["mean_bps"]
@@ -391,7 +419,8 @@ def build(funding_path: Optional[str] = None, perp_path: Optional[str] = None, s
                      "tick-level basis", "queue/fill behaviour", "account funding settlements", "future funding regime"],
         "limits": ["in-sample public history, not a forecast", "4h klines: intra-bar basis excursions are invisible",
                    "the 11.4 bps round trip is the published schedule, not the owner's tier", "overlapping windows are not independent samples",
-                   "no tick-level execution, queue or latency model", "the holding rule is mechanical (no entry filter), a filtered rule would need pre-registration"],
+                   "no tick-level execution, queue or latency model", "the holding rule is mechanical (no entry filter), a filtered rule would need pre-registration",
+                   "the rolling-start simulation holds a FIXED BTC quantity (funding at each settlement's perp open, exit basis over the ENTRY spot); costs stay a constant bps of entry notional"],
     }
 
 

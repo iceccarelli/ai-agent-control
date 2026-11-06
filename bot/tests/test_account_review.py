@@ -7,6 +7,7 @@ account, no order, no network and no runtime state is involved; every file lives
 from __future__ import annotations
 
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -30,6 +31,27 @@ TS, F, PERP, _SPOT = CT.load_study()
 PUB = dict(zip(TS, F))
 OPEN = {t: o for t, (o, _c) in PERP.items()}
 K0 = 2000
+
+
+_REAL_READ_HISTORY = AR._read_history
+
+
+@pytest.fixture(autouse=True)
+def _read_the_committed_history_once(monkeypatch):
+    """The three committed public histories are the same on every call; parse them once per session, not once per test."""
+    real = _REAL_READ_HISTORY
+
+    def cached(path, default_name, use_default):
+        if path is None and use_default:
+            key = default_name
+            if key not in _HISTORY:
+                _HISTORY[key] = real(path, default_name, use_default)
+            return _HISTORY[key]
+        return real(path, default_name, use_default)
+    monkeypatch.setattr(AR, "_read_history", cached)
+
+
+_HISTORY = {}
 
 
 def _open_at(ms: int) -> float:
@@ -250,6 +272,7 @@ def test_without_a_public_history_the_rate_check_is_a_named_gap_not_a_pass(tmp_p
     fills, funding, _ = make_trip()
     rep = review_rows(fills, funding, tmp_path, taker_bps=5.5, use_default_history=False)
     assert "RATE_CHECK_NOT_RUN" in codes(rep, AR.SEVERITY_GAP) and "MARK_CHECK_NOT_RUN" in codes(rep, AR.SEVERITY_GAP)
+    assert rep["verdict"] == "CONSISTENT_UNCHECKED_AGAINST_PUBLIC"
 
 
 def test_every_payment_sign_inverted_is_flagged_and_not_silently_flipped(tmp_path):
@@ -346,6 +369,7 @@ def test_a_fill_within_a_minute_of_a_settlement_makes_it_ambiguous_not_missing(t
     t = rep["round_trips"][0]
     assert t["settlements_held"] == 11 and t["settlements_ambiguous"] >= 1
     assert t["funding_usd"] == pytest.approx(sum(r["payment_usd"] for r in funding[1:]))      # the ambiguous row is kept out of the totals
+    assert rep["verdict"] == "INCOMPLETE"                       # ... and a review that had to leave a settlement out says it is not complete
 
 
 def test_records_beyond_the_public_history_are_a_partial_check_not_a_failure(tmp_path):
@@ -353,6 +377,7 @@ def test_records_beyond_the_public_history_are_a_partial_check_not_a_failure(tmp
     short = {t: v for t, v in PUB.items() if t < TS[K0 + 6]}
     rep = AR.review(*AR.parse_fills(fills, "BTCUSDT")[:1], AR.parse_funding(funding, "BTCUSDT")[0], taker_bps=5.5, public=short, bar_open=OPEN)
     assert "RATE_CHECK_PARTIAL" in codes(rep, AR.SEVERITY_GAP) and "RATE_DISAGREES_WITH_PUBLIC" not in hard(rep)
+    assert rep["verdict"] == "CONSISTENT_UNCHECKED_AGAINST_PUBLIC"          # a partial check is never reported as a pass
 
 
 # --------------------------------------------------------------------------------------------------------- statistics
@@ -551,8 +576,8 @@ def test_module_imports_nothing_that_can_reach_a_network_a_database_or_a_process
             imported |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
-    allowed = {"__future__", "argparse", "bisect", "csv", "datetime", "hashlib", "json", "math", "os", "re", "sys", "dataclasses", "typing",
-               "statistical_power", "carry_teardown"}
+    allowed = {"__future__", "argparse", "bisect", "csv", "datetime", "gzip", "hashlib", "io", "json", "math", "os", "re", "sys", "dataclasses",
+               "typing", "statistical_power", "carry_teardown"}
     assert imported <= allowed, sorted(imported - allowed)
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     plain = {n.func.id for n in calls if isinstance(n.func, ast.Name)}
@@ -560,8 +585,9 @@ def test_module_imports_nothing_that_can_reach_a_network_a_database_or_a_process
     assert not (plain & {"exec", "eval", "compile", "__import__"}), plain
     assert not (attrs & {"system", "popen", "connect", "urlopen", "unlink", "rmtree", "rename", "write", "writelines", "mkdir", "makedirs",
                          "chmod", "listdir", "walk", "scandir"}), attrs
-    # no direct os.<function>() call at all: only os.path.* helpers and os.sep are used
-    assert not [n for n in calls if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == "os"]
+    # no direct os.<function>() call except os.stat (the hard-link test): otherwise only os.path.* helpers and os.sep are used
+    direct = {n.func.attr for n in calls if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == "os"}
+    assert direct <= {"stat"}, direct
     # nothing here opens a file for writing
     for n in ast.walk(tree):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "open":
@@ -604,3 +630,398 @@ def test_render_lists_every_flag_and_the_upgrade_path(tmp_path):
         assert f["code"] in text
     assert all(u in text for u in rep["what_would_upgrade_this"])
     assert math.isfinite(rep["round_trips"][0]["fee_bps_of_notional"])
+
+
+# ================================================================================================================================
+# The independent review's findings, each reproduced as a failing scenario before the fix (HIGH 1-2, MEDIUM 3-6, LOW 8-13)
+# ================================================================================================================================
+
+def shifted(fills, funding, n_settlements):
+    """The same records moved n settlements later in time (their prices and rates are kept): used to put perfectly consistent records
+    OUTSIDE the committed public history, which ends 2026-09-09."""
+    d = n_settlements * SETTLE
+    return ([dict(r, ts_ms=r["ts_ms"] + d) for r in fills], [dict(r, ts_ms=r["ts_ms"] + d) for r in funding])
+
+
+def three_trips(shift=0):
+    allf, allg = [], []
+    for i, k in enumerate((2000, 2100, 2200)):
+        f, g, _ = make_trip(k, 31, tag=f"t{i}")
+        allf += f
+        allg += g
+    return shifted(allf, allg, shift) if shift else (allf, allg)
+
+
+def test_FINDING_1_records_beyond_the_public_history_are_never_called_consistent(tmp_path):
+    f, g = three_trips(shift=3000)                     # 2022-06 + 3000 x 8h puts them after the committed history's last print
+    assert f[0]["ts_ms"] > TS[-1]
+    # invent 3 bp rates (three times the largest print of the last year) and pay accordingly: nothing public can contradict them
+    for r in g:
+        r["rate"] = 0.0003
+        r["payment_usd"] = 0.5 * 90000.0 * 0.0003
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert rep["verdict"] == "CONSISTENT_UNCHECKED_AGAINST_PUBLIC"
+    assert {"RATE_CHECK_PARTIAL", "MARK_CHECK_PARTIAL", "PRICE_CHECK_PARTIAL"} <= set(codes(rep, AR.SEVERITY_GAP))
+    assert rep["sufficiency"]["meets_engine_floors"] is True            # the floors alone must not be what makes it 'consistent'
+
+
+def test_FINDING_1_with_no_history_and_no_tier_nothing_is_compared_and_the_verdict_says_so(tmp_path):
+    f, g = three_trips()
+    rep = review_rows(f, g, tmp_path, use_default_history=False)
+    assert rep["verdict"] == "CONSISTENT_UNCHECKED_AGAINST_PUBLIC"
+    assert {"RATE_CHECK_NOT_RUN", "MARK_CHECK_NOT_RUN", "PRICE_CHECK_NOT_RUN", "SPOT_REF_CHECK_NOT_RUN", "FEE_TIER_NOT_STATED"} <= set(codes(rep))
+
+
+def test_FINDING_1_another_symbol_gets_no_default_history_and_so_no_clean_verdict(tmp_path):
+    f, g = three_trips()
+    for r in f + g:
+        r["symbol"] = "ETHUSDT"
+    rep = review_rows(f, g, tmp_path, symbol="ETHUSDT", taker_bps=5.5)
+    assert rep["verdict"] == "CONSISTENT_UNCHECKED_AGAINST_PUBLIC" and "RATE_CHECK_NOT_RUN" in codes(rep)
+
+
+def test_the_fully_checked_clean_case_is_the_only_way_to_CONSISTENT_NOT_VERIFIED(tmp_path):
+    f, g = three_trips()
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert rep["verdict"] == "CONSISTENT_NOT_VERIFIED" and [c for c in codes(rep, AR.SEVERITY_GAP)] == []
+
+
+def _first_negative_settlement(k_lo=100, k_hi=1500, span=12):
+    """A window of `span` settlements that contains a negative print (so dropping it flatters the book)."""
+    for k in range(k_lo, k_hi):
+        if min(F[k:k + span]) < -0.5 and TS[k + span - 1] - TS[k] == (span - 1) * SETTLE:
+            return k, next(j for j in range(span) if F[k + j] < -0.5)
+    raise AssertionError("no negative window")
+
+
+def test_FINDING_2_a_tiny_trade_pair_near_a_settlement_does_not_hide_it_when_the_book_is_short_throughout(tmp_path):
+    k, j = _first_negative_settlement()
+    f, g, _ = make_trip(k, 12, tag="n")
+    t = TS[k + j]
+    p = _open_at(t)
+    pair = [{"exec_id": "x-b", "ts_ms": t - 30_000, "symbol": "BTCUSDT", "side": "Buy", "qty": 0.001, "price": p, "fee_usd": 0.001 * p * 5.5 / 1e4,
+             "liquidity": "taker", "spot_ref": p},
+            {"exec_id": "x-s", "ts_ms": t - 20_000, "symbol": "BTCUSDT", "side": "Sell", "qty": 0.001, "price": p, "fee_usd": 0.001 * p * 5.5 / 1e4,
+             "liquidity": "taker", "spot_ref": p}]
+    honest = review_rows(f + pair, g, tmp_path, taker_bps=5.5)
+    assert hard(honest) == [] and honest["settlements"]["missing"] == 0 and honest["settlements"]["ambiguous"] == 0
+    dropped = [r for i, r in enumerate(g) if i != j]                  # remove the negative settlement's row
+    (tmp_path / "d").mkdir()
+    rep = review_rows(f + pair, dropped, tmp_path / "d", taker_bps=5.5)
+    assert rep["settlements"]["missing"] == 1 and "MISSING_SETTLEMENT" in codes(rep, AR.SEVERITY_GAP)
+    assert rep["verdict"] == "INCOMPLETE" and rep["round_trips"][0]["status"] == "INCOMPLETE_FUNDING"
+
+
+def test_FINDING_2_a_real_open_near_a_settlement_is_still_ambiguous_and_makes_the_review_incomplete(tmp_path):
+    f, g, _ = make_trip(lead_ms=30_000)
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert rep["settlements"]["ambiguous"] == 1 and rep["verdict"] == "INCOMPLETE"
+
+
+def test_the_stated_position_may_be_the_one_before_or_after_a_rebalance_inside_the_minute(tmp_path):
+    f, g, _ = make_trip(n=6)
+    t = TS[K0 + 2]
+    p = _open_at(t)
+
+    def leg(eid, side, dt):
+        return {"exec_id": eid, "ts_ms": t + dt, "symbol": "BTCUSDT", "side": side, "qty": 0.1, "price": p, "fee_usd": 0.1 * p * 5.5 / 1e4,
+                "liquidity": "taker", "spot_ref": p}
+    pair = [leg("r-1", "Sell", -15_000), leg("r-2", "Buy", 15_000)]            # short 0.5 -> 0.6 -> 0.5 across the settlement
+    for stated in (-0.5, -0.6):
+        gg = [dict(r) for r in g]
+        gg[2]["position_qty"] = stated
+        gg[2]["payment_usd"] = -stated * OPEN[t] * gg[2]["rate"]
+        d = tmp_path / str(stated).replace("-", "m").replace(".", "_")
+        d.mkdir()
+        rep = review_rows(f + pair, gg, d, taker_bps=5.5)
+        assert "POSITION_MISMATCH" not in hard(rep), stated
+    gg = [dict(r) for r in g]
+    gg[2]["position_qty"] = -0.9
+    (tmp_path / "bad").mkdir()
+    assert "POSITION_MISMATCH" in hard(review_rows(f + pair, gg, tmp_path / "bad", taker_bps=5.5))
+
+
+def test_FINDING_3_a_spot_reference_far_from_the_fill_is_rejected(tmp_path):
+    for factor in (0.5, 0.95, 1.05, 2.0):
+        f, g, _ = make_trip()
+        for r in f:
+            r["spot_ref"] = r["price"] * factor
+        d = tmp_path / str(factor).replace(".", "_")
+        d.mkdir()
+        rep = review_rows(f, g, d, taker_bps=5.5)
+        assert "SPOT_REF_IMPLAUSIBLE" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT", factor
+
+
+def test_FINDING_3_a_spot_reference_inside_two_percent_but_outside_the_public_spot_bar_is_rejected(tmp_path):
+    f, g, _ = make_trip()
+    for r in f:
+        r["spot_ref"] = r["price"] * 1.015                          # a basis of -150 bps: not impossible in a day, impossible against the bar
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert "SPOT_REF_OUTSIDE_PUBLIC_RANGE" in hard(rep) and "SPOT_REF_IMPLAUSIBLE" not in hard(rep)
+
+
+def test_FINDING_3_a_fill_price_far_from_the_public_bar_is_rejected(tmp_path):
+    f, g, _ = make_trip()
+    f[0]["price"] *= 1.3
+    f[0]["spot_ref"] = f[0]["price"]
+    f[0]["fee_usd"] = f[0]["qty"] * f[0]["price"] * 5.5 / 1e4
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert "FILL_PRICE_OUTSIDE_PUBLIC_RANGE" in hard(rep)
+
+
+def test_FINDING_3_fabricated_trips_that_span_no_settlement_are_not_carry_round_trips_and_do_not_pad_the_counts(tmp_path):
+    real_f, real_g, e = make_trip(2000, 95, tag="real")
+    fakes = []
+    for i in range(2):
+        t0 = TS[K0 + 200 + 10 * i] + 3600_000
+        p = _open_at(t0)
+        for side, dt, suffix, ps in (("Sell", 0, "s", p), ("Buy", 600_000, "b", p * (1 - 0.0005))):      # a 5 bp 'profit' in ten minutes
+            fakes.append({"exec_id": f"fake{i}-{suffix}", "ts_ms": t0 + dt, "symbol": "BTCUSDT", "side": side, "qty": 0.5, "price": ps,
+                          "fee_usd": 0.5 * ps * 5.5 / 1e4, "liquidity": "taker", "spot_ref": p})
+    rep = review_rows(real_f + fakes, real_g, tmp_path, taker_bps=5.5)
+    stat = [t["status"] for t in rep["round_trips"]]
+    assert stat.count("COMPLETE") == 1 and stat.count("EXCLUDED_NO_SETTLEMENT_SPANNED") == 2
+    assert rep["sufficiency"]["complete_round_trips"] == 1 and rep["sufficiency"]["meets_engine_floors"] is False
+    assert hard(rep) == [], rep["flags"]
+    assert "ROUND_TRIP_WITHOUT_SETTLEMENT" in codes(rep, AR.SEVERITY_GAP) and rep["verdict"] == "INCOMPLETE"
+    fake_rows = [t for t in rep["round_trips"] if t["status"] == "EXCLUDED_NO_SETTLEMENT_SPANNED"]
+    assert all("annualised_pct_on_notional" not in t and "net_usd" not in t for t in fake_rows)      # their costs are shown, no rate is invented
+
+
+def test_FINDING_3_a_trip_under_a_day_is_not_annualised(tmp_path):
+    f, g, _ = make_trip(n=1)
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    t = rep["round_trips"][0]
+    assert t["status"] == "COMPLETE" and t["annualised_pct_on_notional"] is None and "not annualised" in t["annualisation_note"]
+
+
+def test_FINDING_4_dropping_the_spot_reference_from_the_losing_trip_cannot_improve_the_verdict(tmp_path):
+    allf, allg = [], []
+    for i, k in enumerate((2000, 2100, 2200)):
+        f, g, _ = make_trip(k, 31, tag=f"t{i}", b_in=0.0, b_out=40.0 if i == 1 else 0.0)        # trip 1 widens 40 bps against the hedge
+        if i == 1:
+            for r in f:
+                r.pop("spot_ref")
+        allf += f
+        allg += g
+    rep = review_rows(allf, allg, tmp_path, taker_bps=5.5)
+    assert "NO_SPOT_REFERENCE" in codes(rep, AR.SEVERITY_GAP) and rep["verdict"] == "INCOMPLETE"
+    assert rep["economics"]["complete_round_trips"] == 2
+
+
+def test_FINDING_4_relabelling_fills_as_maker_without_a_maker_tier_is_a_named_gap(tmp_path):
+    f, g, _ = make_trip()
+    for r in f:
+        r["liquidity"] = "maker"
+        r["fee_usd"] = -r["qty"] * r["price"] * 16.5 / 1e4                 # a 16.5 bp rebate nobody can check
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert "FEE_TIER_MISSING_FOR_CLASS" in codes(rep, AR.SEVERITY_GAP)
+    assert rep["verdict"] != "CONSISTENT_NOT_VERIFIED"
+
+
+def test_FINDING_5_a_funding_row_with_a_zero_rate_pays_nothing(tmp_path):
+    z = next(i for i, x in enumerate(F) if x == 0.0)
+    k = max(0, z - 3)
+    f, g, _ = make_trip(k, 8, tag="z")
+    idx = next(j for j, r in enumerate(g) if r["rate"] == 0.0)
+    ok = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert "PAYMENT_DISAGREES_WITH_MARK" not in hard(ok)
+    g[idx]["payment_usd"] = 5000.0
+    (tmp_path / "x").mkdir()
+    rep = review_rows(f, g, tmp_path / "x", taker_bps=5.5)
+    assert "PAYMENT_DISAGREES_WITH_MARK" in hard(rep)
+
+
+def test_a_near_zero_rate_tolerates_the_eight_decimal_rounding_but_not_a_real_payment(tmp_path):
+    f, g, _ = make_trip(n=6)
+    g[1]["rate"] = 1e-8                                                    # printed rate 0.00000001
+    g[1]["payment_usd"] = 0.5 * OPEN[g[1]["ts_ms"]] * 1e-8
+    assert "PAYMENT_DISAGREES_WITH_MARK" not in hard(review_rows(f, g, tmp_path, taker_bps=5.5, use_default_history=False))
+    (tmp_path / "b").mkdir()
+    g[1]["payment_usd"] = 50.0
+    rep = review_rows(f, g, tmp_path / "b", taker_bps=5.5)
+    assert "PAYMENT_DISAGREES_WITH_MARK" in hard(rep) or "RATE_DISAGREES_WITH_PUBLIC" in hard(rep)
+
+
+@pytest.mark.parametrize("bad", [{"qty": 1e300}, {"price": 1e10}, {"qty": 1e-9}, {"qty": 10 ** 400}, {"price": 10 ** 400}, {"fee_usd": 1e12},
+                                 {"fee_usd": 10 ** 400}, {"fee_usd": 5000.0}, {"ref_price": 90000.0 * 1.2}, {"spot_ref": 1e12}])
+def test_FINDING_6_magnitudes_are_bounded_and_overflow_is_a_record_error(bad):
+    with pytest.raises(AR.RecordError):
+        AR.parse_fills([_fill(**bad)], "BTCUSDT")
+
+
+@pytest.mark.parametrize("bad", [{"payment_usd": 1e12}, {"position_qty": 1e9}, {"payment_usd": 10 ** 400}, {"position_qty": -10 ** 400}])
+def test_FINDING_6_funding_magnitudes_are_bounded(bad):
+    with pytest.raises(AR.RecordError):
+        AR.parse_funding([_fund(**bad)], "BTCUSDT")
+
+
+def test_FINDING_6_the_json_output_is_always_valid_json(tmp_path, capsys):
+    f, g, _ = make_trip()
+    fp, gp = write_jsonl(tmp_path / "fills.jsonl", f), write_jsonl(tmp_path / "funding.jsonl", g)
+    assert AR.main(["--fills", fp, "--funding", gp, "--json"]) == 0
+
+    def refuse(c):
+        raise AssertionError(f"non-JSON constant {c}")
+    json.loads(capsys.readouterr().out, parse_constant=refuse)
+
+
+def test_FINDING_8_the_order_of_same_millisecond_fills_does_not_change_the_review(tmp_path):
+    def build(buy_id, sell_id):
+        f, g, _ = make_trip(n=6, qty=1.0)
+        t1 = f[1]["ts_ms"]
+        p = f[1]["price"]
+        close = [{"exec_id": buy_id, "ts_ms": t1, "symbol": "BTCUSDT", "side": "Buy", "qty": 1.5, "price": p, "fee_usd": 1.5 * p * 5.5 / 1e4,
+                  "liquidity": "taker", "spot_ref": f[1]["spot_ref"]},
+                 {"exec_id": sell_id, "ts_ms": t1, "symbol": "BTCUSDT", "side": "Sell", "qty": 0.5, "price": p, "fee_usd": 0.5 * p * 5.5 / 1e4,
+                  "liquidity": "taker", "spot_ref": f[1]["spot_ref"]}]
+        return [f[0]] + close, g
+    out = []
+    for i, ids in enumerate((("a-buy", "z-sell"), ("z-buy", "a-sell"))):
+        f, g = build(*ids)
+        d = tmp_path / str(i)
+        d.mkdir()
+        rep = review_rows(f, g, d, taker_bps=5.5)
+        out.append((rep["verdict"], [t["status"] for t in rep["round_trips"]], codes(rep), rep["round_trips"][0].get("net_usd")))
+    assert out[0] == out[1] and out[0][1] == ["COMPLETE"] and "LONG_EXPOSURE" not in out[0][2]
+
+
+def test_FINDING_8_a_same_millisecond_close_and_reopen_is_one_lifecycle_whatever_the_ids(tmp_path):
+    book_a = AR.Book(AR.parse_fills([_fill(exec_id="a", side="Sell", qty=1.0, ts_ms=1_700_000_000_000),
+                                     _fill(exec_id="z-buy", side="Buy", qty=1.0, ts_ms=1_700_000_100_000),
+                                     _fill(exec_id="a-sell", side="Sell", qty=1.0, ts_ms=1_700_000_100_000),
+                                     _fill(exec_id="b", side="Buy", qty=1.0, ts_ms=1_700_000_200_000)], "BTCUSDT")[0])
+    book_b = AR.Book(AR.parse_fills([_fill(exec_id="a", side="Sell", qty=1.0, ts_ms=1_700_000_000_000),
+                                     _fill(exec_id="a-buy", side="Buy", qty=1.0, ts_ms=1_700_000_100_000),
+                                     _fill(exec_id="z-sell", side="Sell", qty=1.0, ts_ms=1_700_000_100_000),
+                                     _fill(exec_id="b", side="Buy", qty=1.0, ts_ms=1_700_000_200_000)], "BTCUSDT")[0])
+    la, lb = book_a.lifecycles(), book_b.lifecycles()
+    assert len(la) == len(lb) == 1 and la[0]["end_ms"] == lb[0]["end_ms"] == 1_700_000_200_000
+    assert book_a.cum == book_b.cum
+
+
+def test_FINDING_9_nothing_is_called_consistent_on_a_default_run_beyond_the_history_even_when_the_floors_are_met(tmp_path):
+    f, g = three_trips(shift=3000)
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert rep["sufficiency"]["meets_engine_floors"] is True and rep["verdict"] != "CONSISTENT_NOT_VERIFIED"
+
+
+def test_FINDING_11_hostile_inputs_exit_with_a_message_not_a_traceback(tmp_path, capsys):
+    f, g, _ = make_trip()
+    gp = write_jsonl(tmp_path / "funding.jsonl", g)
+    cases = []
+    cases.append(write_jsonl(tmp_path / "dust.jsonl", [_fill(qty=1e-9)]))
+    cases.append(write_jsonl(tmp_path / "big.jsonl", [_fill(qty=10 ** 400)]))
+    csvp = tmp_path / "extra.csv"
+    csvp.write_text("exec_id,ts_ms,symbol\na,1700000000000,BTCUSDT,EXTRA\n")
+    cases.append(str(csvp))
+    short = tmp_path / "short.csv"
+    short.write_text("exec_id,ts_ms,symbol,side\na,1700000000000\n")
+    cases.append(str(short))
+    for c in cases:
+        assert AR.main(["--fills", c, "--funding", gp]) == 2, c
+        assert "account_review:" in capsys.readouterr().err
+    fp = write_jsonl(tmp_path / "fills.jsonl", f)
+    notjson = tmp_path / "pub.json"
+    notjson.write_text("this is not json")
+    assert AR.main(["--fills", fp, "--funding", gp, "--public-funding", str(notjson)]) == 2
+    assert "not a readable public history" in capsys.readouterr().err
+    bad_gz = tmp_path / "bad.json.gz"
+    bad_gz.write_bytes(b"not gzip at all")
+    assert AR.main(["--fills", fp, "--funding", gp, "--perp-4h", str(bad_gz)]) == 2
+    assert AR.main(["--fills", fp, "--funding", gp, "--perp-4h", str(tmp_path / "missing.json")]) == 2
+
+
+def test_FINDING_11_a_deeply_nested_record_is_a_message_not_a_recursion_error(tmp_path):
+    p = tmp_path / "deep.jsonl"
+    p.write_text("[" * 200_000 + "]" * 200_000 + "\n")
+    with pytest.raises(AR.RecordError):
+        AR.read_rows(str(p))
+    q = tmp_path / "deep2.jsonl"
+    q.write_text('{"a": ' + "[" * 200_000 + "]" * 200_000 + "}\n")
+    with pytest.raises(AR.RecordError, match="nested too deeply|not JSON"):
+        AR.read_rows(str(q))
+
+
+def test_FINDING_12_symlinks_hard_links_and_rotated_names_are_refused(tmp_path):
+    f, g, _ = make_trip()
+    ok = write_jsonl(tmp_path / "funding.jsonl", g)
+    secret = tmp_path / "trading_state.db"
+    write_jsonl(secret, f)
+    link = tmp_path / "sl.jsonl"
+    os.symlink(secret, link)
+    chain = tmp_path / "sl2.jsonl"
+    os.symlink(link, chain)
+    hard_link = tmp_path / "fills.jsonl"
+    os.link(secret, hard_link)
+    for p in (link, chain, hard_link):
+        with pytest.raises(AR.RecordError, match="refusing to read"):
+            AR.run(str(p), ok)
+    for name in ("trading_state.db.jsonl", "Trading_State.DB", "testnet_session_evidence_2026.jsonl", "prod.env", "credentials.csv",
+                 "my_secrets.jsonl", "id_rsa.jsonl", "x.p12", "x.pfx", "trading_state.db-journal", "state.sqlite-wal", "state.sqlite3-shm", ".netrc.jsonl"):
+        p = tmp_path / name
+        p.write_text("{}\n")
+        with pytest.raises(AR.RecordError, match="refusing to read"):
+            AR.read_rows(str(p))
+
+
+def test_FINDING_12_a_file_that_merely_has_two_hard_links_is_refused_even_with_an_innocent_name(tmp_path):
+    f, g, _ = make_trip()
+    one = tmp_path / "a.jsonl"
+    write_jsonl(one, f)
+    two = tmp_path / "b.jsonl"
+    os.link(one, two)
+    with pytest.raises(AR.RecordError, match="hard link"):
+        AR.read_rows(str(one))
+
+
+def test_FINDING_12_the_committed_default_history_is_not_blocked_by_a_checkout_under_a_directory_called_runs(tmp_path, monkeypatch):
+    study = tmp_path / "runs" / "study"
+    study.mkdir(parents=True)
+    (study / "funding_BTCUSDT.json.gz").write_bytes(gzip.compress(b"[]"))
+    monkeypatch.setattr(AR.CT, "STUDY", str(study))
+    data, digest = _REAL_READ_HISTORY(None, "funding_BTCUSDT.json.gz", True)
+    assert data == [] and len(digest) == 64
+    with pytest.raises(AR.RecordError, match="refusing to read"):
+        _REAL_READ_HISTORY(str(study / "funding_BTCUSDT.json.gz"), "x", True)       # but a path the CALLER names under runs/ is refused
+
+
+def test_FINDING_13_a_duplicate_key_inside_one_record_is_an_error(tmp_path):
+    p = tmp_path / "dup.jsonl"
+    p.write_text('{"exec_id": "a", "qty": 100, "qty": 0.1}\n')
+    with pytest.raises(AR.RecordError, match="duplicate key"):
+        AR.read_rows(str(p))
+
+
+@pytest.mark.parametrize("line", ['{"qty": NaN}', '{"qty": Infinity}', '{"qty": -Infinity}'])
+def test_FINDING_13_json_constants_that_are_not_numbers_are_errors(tmp_path, line):
+    p = tmp_path / "c.jsonl"
+    p.write_text(line + "\n")
+    with pytest.raises(AR.RecordError, match="not a number"):
+        AR.read_rows(str(p))
+
+
+def test_FINDING_13_a_utf8_bom_csv_is_read_and_the_digest_is_of_the_bytes_parsed(tmp_path):
+    p = tmp_path / "bom.csv"
+    raw = b"\xef\xbb\xbfexec_id,ts_ms\nA,1\n"
+    p.write_bytes(raw)
+    rows, digest = AR.read_rows(str(p))
+    assert rows == [{"exec_id": "A", "ts_ms": "1"}] and digest == hashlib.sha256(raw).hexdigest()
+
+
+def test_the_basis_is_the_perp_pnl_plus_the_overlay_pnl_computed_independently_from_the_spot_references(tmp_path):
+    """An expected value that does not re-use the tool's own basis formula: perp P&L = -sum(signed qty x fill price); the overlay BTC's
+    P&L over the same dates = +sum(signed qty x spot_ref); their sum is the tool's basis P&L."""
+    rng = random.Random(21)
+    for i in range(25):
+        f, g, _ = make_trip(rng.randint(100, 3000), rng.randint(2, 20), qty=rng.uniform(0.05, 4.0), b_in=rng.uniform(-30, 30), b_out=rng.uniform(-30, 30),
+                            tag=f"i{i}")
+        sq = [(-r["qty"] if r["side"] == "Sell" else r["qty"], r["price"], r["spot_ref"]) for r in f]
+        perp_pnl = -sum(q * p for q, p, _s in sq)
+        overlay_pnl = sum(q * s for q, _p, s in sq)
+        d = tmp_path / f"v{i}"
+        d.mkdir()
+        rep = review_rows(f, g, d, taker_bps=5.5)
+        t = rep["round_trips"][0]
+        assert t["perp_pnl_usd"] == pytest.approx(perp_pnl, rel=1e-9, abs=1e-6)
+        assert t["basis_pnl_usd"] == pytest.approx(perp_pnl + overlay_pnl, rel=1e-9, abs=1e-6)

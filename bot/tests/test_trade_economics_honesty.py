@@ -9,7 +9,8 @@ Three defects found by an independent economics red team, each reproduced before
 * the annualisation used the declared holding period without checking it against the funding path (a 30-day hold with 3 prints
   read -1 %/yr; a 3-day hold with 90 prints read +52 %/yr).
 
-All fields added are additive; the legacy keys keep their values.
+All fields added are additive; the legacy keys (``meets``, ``meets_means``, ``cost_bps_of_notional_round_trip``, the returns, the
+break-even) keep their values, which a fuzz below checks against the legacy formulas. The honest reading is in the new fields.
 """
 from __future__ import annotations
 
@@ -73,22 +74,39 @@ def test_hurdle_verdicts_distinguish_a_conclusive_failure_from_an_inconclusive_p
     # the unknown-cost ledger at 0.65 bps clears nothing at 10 %: a failure on an OPTIMISTIC bound is conclusive.
     fail = TE.compute(pos(), open_costs(), [0.65] * 90)["hurdles"]
     assert all(h["verdict"] == "FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND" and h["conclusive"] is True for h in fail)
-    assert all(h["meets"] is False for h in fail)
+    assert all(h["meets"] is False and h["meets_if_consistent"] is False for h in fail)
     # a rich funding path passes on the modelled costs but a pass with unknowns is NOT conclusive
     rich = TE.compute(pos(), open_costs(), [4.0] * 90)["hurdles"]
     assert all(h["meets"] is True and h["verdict"] == "PASSES_ONLY_ON_MODELLED_COSTS" and h["conclusive"] is False for h in rich)
-    # fully priced: both outcomes are conclusive
-    pass_full = TE.compute(pos(), complete_costs(), [4.0] * 90)["hurdles"]
+    # fully priced but the fees are not read from the account: the pass is still not conclusive
+    declared = TE.compute(pos(), complete_costs(), [4.0] * 90)["hurdles"]
+    assert all(h["verdict"] == "MEETS_ON_DECLARED_COSTS_FEES_NOT_ACCOUNT_VERIFIED" and h["conclusive"] is False for h in declared)
+    # fully priced AND account-verified fees: both outcomes are conclusive
+    pass_full = TE.compute(pos(), complete_costs(fee_provenance="ACCOUNT_VERIFIED"), [4.0] * 90)["hurdles"]
     assert all(h["verdict"] == "MEETS_ON_ALL_DECLARED_COSTS" and h["conclusive"] is True for h in pass_full)
     fail_full = TE.compute(pos(), complete_costs(), [0.3] * 90)["hurdles"]
     assert all(h["verdict"] == "FAILS_ON_ALL_DECLARED_COSTS" and h["conclusive"] is True for h in fail_full)
 
 
-def test_legacy_fields_keep_their_values():
+def test_legacy_fields_keep_their_values_for_consistent_and_inconsistent_inputs_alike():
+    import random
+    rng = random.Random(5)
+    for _ in range(300):
+        hold = rng.choice([1.0, 3.0, 5.8, 7.0, 30.0, 90.0])
+        n = rng.choice([3, 17, 21, 90, 270, int(round(hold * 3)), int(round(hold * 3))])
+        path = [rng.uniform(-2, 3) for _ in range(n)]
+        known = rng.random() < 0.5
+        r = TE.compute(pos(hold), complete_costs() if known else open_costs(), path)
+        ann = r["returns"]["annualised_pct_on_economic_capital"]
+        assert ann == pytest.approx((r["net_pnl_usd"] / 110_000.0) * 365.0 / hold * 100.0)
+        for h in r["hurdles"]:
+            assert h["meets"] is (ann >= h["hurdle_apr_pct"])                              # the legacy field, whatever the path length
+            assert h["meets_means"] == ("meets on all declared costs" if known else "meets on the MODELLED costs only")
+            assert h["incomplete"] is (not known) and h["margin_pct_points"] == pytest.approx(ann - h["hurdle_apr_pct"])
+            assert h["meets_if_consistent"] is (h["meets"] and r["consistency"]["funding_path_matches_hold"])
     r = TE.compute(pos(), open_costs(), [0.65] * 90)
-    ann = r["returns"]["annualised_pct_on_economic_capital"]
-    assert ann == pytest.approx((r["net_pnl_usd"] / 110_000.0) * 365.0 / 30.0 * 100.0)
     assert r["breakeven_funding_bps_per_settlement"] == pytest.approx(11.0 / 90.0)
+    assert r["cost_bps_of_notional_round_trip"] == pytest.approx(11.0)
     for h in r["hurdles"]:
         assert {"hurdle_apr_pct", "status", "annualised_pct_on_economic_capital", "meets", "meets_means", "incomplete",
                 "unpriced_inputs", "margin_pct_points"} <= set(h)
@@ -133,18 +151,20 @@ def test_explicit_cost_ties_to_the_closed_form_for_random_inputs():
 
 # ---- hold / path consistency -----------------------------------------------------------------------------------------------
 
-def test_a_30_day_hold_with_three_prints_is_inconsistent_and_meets_nothing():
+def test_a_30_day_hold_with_three_prints_is_inconsistent_and_meets_nothing_that_can_be_trusted():
     r = TE.compute(pos(30), complete_costs(), [5.0] * 3)
     assert r["consistency"]["funding_path_matches_hold"] is False
     assert r["consistency"]["settlements_expected_from_hold"] == pytest.approx(90.0)
     assert "INCONSISTENT" in r["consistency"]["reading"]
-    assert all(h["meets"] is False and h["verdict"] == "INCONSISTENT_INPUT" and h["conclusive"] is False for h in r["hurdles"])
+    assert all(h["consistent_input"] is False and h["meets_if_consistent"] is False and h["verdict"] == "INCONSISTENT_INPUT"
+               and h["conclusive"] is False for h in r["hurdles"])
 
 
-def test_a_3_day_hold_with_90_prints_cannot_report_a_hurdle_as_met():
+def test_a_3_day_hold_with_90_prints_cannot_pass_a_hurdle_by_the_trusted_fields():
     r = TE.compute(pos(3), complete_costs(), [0.65] * 90)
     assert r["returns"]["annualised_pct_on_economic_capital"] > 20          # the nonsense annualisation is still shown, not hidden
-    assert all(h["meets"] is False and h["verdict"] == "INCONSISTENT_INPUT" for h in r["hurdles"])
+    assert all(h["meets"] is True for h in r["hurdles"][:1])                # (the legacy field is unchanged: it cannot be trusted here)
+    assert all(h["meets_if_consistent"] is False and h["verdict"] == "INCONSISTENT_INPUT" for h in r["hurdles"])
 
 
 @pytest.mark.parametrize("hold,n", [(30, 90), (30, 89), (30, 91), (5.8, 17), (5.8, 18), (7, 21), (1, 3), (90, 270)])
