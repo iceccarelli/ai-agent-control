@@ -192,7 +192,10 @@ def _load(path: str) -> List[Tuple[int, float]]:
     out = []
     for i, r in enumerate(rows):
         try:
-            out.append((int(float(r["ts_ms"])), float(r["funding_bps"])))
+            ts = float(r["ts_ms"])
+            if not math.isfinite(ts) or ts != int(ts):
+                raise ValueError("a settlement time is a whole millisecond and is never snapped")
+            out.append((int(ts), float(r["funding_bps"])))
         except (KeyError, ValueError, TypeError, OverflowError) as exc:
             raise AR.RecordError(f"{os.path.basename(path)} row {i + 1}: needs ts_ms and funding_bps") from exc
     return out

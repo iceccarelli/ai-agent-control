@@ -35,6 +35,7 @@ def _clock(monkeypatch):
 
 def look(path, seed=1, **kw):
     kw.setdefault("allow_unanchored", True)
+    kw.setdefault("accept_data_revision", True)          # most tests use different seeds (different prints) per look; the data rule has its own tests
     return TJ.evaluate_logged(window_prints(0.3, seed=seed), 10.0, str(path), **kw)
 
 
@@ -64,6 +65,15 @@ DRIVER = textwrap.dedent('''
         def full(fd, data):
             raise OSError(errno.ENOSPC, "No space left on device")
         TJ._os_write = full
+    elif cfg["mode"] == "dir_fsync_fails":
+        calls = []
+        real_fsync = os.fsync
+        def second(fd):
+            calls.append(fd)
+            if len(calls) == 2:
+                raise OSError(errno.EIO, "Input/output error")
+            real_fsync(fd)
+        TJ._os_fsync = second
     elif cfg["mode"] == "fsync_fails":
         def bad(fd):
             raise OSError(errno.EIO, "Input/output error")
@@ -77,7 +87,8 @@ DRIVER = textwrap.dedent('''
     anchor = SP.LedgerAnchor(*cfg["anchor"]) if cfg.get("anchor") else None
     try:
         rep = TJ.evaluate_logged(window_prints(0.3, seed=cfg["seed"]), 10.0, cfg["journal"], anchor=anchor, first_look=cfg.get("first_look", False),
-                                 allow_unanchored=cfg.get("allow_unanchored", False), lock_timeout_s=cfg.get("lock_timeout", 30.0))
+                                 allow_unanchored=cfg.get("allow_unanchored", False), accept_data_revision=cfg.get("accept_data_revision", True),
+                                 lock_timeout_s=cfg.get("lock_timeout", 30.0))
     except Exception as exc:
         print(json.dumps({{"refused": type(exc).__name__, "why": str(exc)}}))
         sys.exit(3)
@@ -286,7 +297,7 @@ def test_a_failed_write_or_fsync_is_an_error_never_a_reported_look(tmp_path, mod
     look(j, 1, first_look=True)
     before = j.read_bytes()
     rc, out, _ = child(j, 2, mode=mode, allow_unanchored=True)
-    assert rc == 3 and parsed(out)["refused"] == "JournalWriteError" and "NOT made" in parsed(out)["why"]
+    assert rc == 3 and parsed(out)["refused"] == "JournalWriteError" and "MAY OR MAY NOT" in parsed(out)["why"]
     assert "journal" not in parsed(out)
     if mode == "enospc":
         assert j.read_bytes() == before
@@ -432,6 +443,7 @@ def test_the_journal_route_is_the_same_calculation_as_the_pure_function(tmp_path
     pure = CP.evaluate(prints, 10.0, SP.TrialLedger())
     logged = TJ.evaluate_logged(prints, 10.0, str(tmp_path / "looks.jsonl"), first_look=True)
     logged.pop("journal")
+    logged.pop("selection_sensitivity")
     assert json.dumps(logged, sort_keys=True, default=str) == json.dumps(pure, sort_keys=True, default=str)
 
 
@@ -441,7 +453,7 @@ def test_a_second_look_is_corrected_for_the_first_across_a_restart(tmp_path):
     rc, out, err = child(j, 2, allow_unanchored=True)
     assert rc == 0, err
     pure_second = CP.evaluate(window_prints(0.3, seed=2), 10.0, SP.TrialLedger())
-    after_restart = TJ.evaluate_logged(window_prints(0.3, seed=2), 10.0, str(j), allow_unanchored=True)
+    after_restart = TJ.evaluate_logged(window_prints(0.3, seed=2), 10.0, str(j), allow_unanchored=True, accept_data_revision=True)
     assert after_restart["journal"]["n_trials"] == 3 and first["journal"]["n_trials"] == 1
     assert json.dumps(after_restart, default=str) != json.dumps(pure_second, default=str)       # carrying the earlier looks changes the corrected result's trial count
 
@@ -485,7 +497,206 @@ def test_the_module_touches_no_network_process_or_database():
             imported |= {a.name.split(".")[0] for a in n.names}
         elif isinstance(n, ast.ImportFrom) and n.module:
             imported.add(n.module.split(".")[0])
-    assert imported <= {"__future__", "argparse", "errno", "fcntl", "json", "os", "re", "stat", "sys", "time", "typing", "account_review", "carry_prospective",
+    assert imported <= {"__future__", "argparse", "errno", "fcntl", "hashlib", "json", "os", "re", "stat", "sys", "time", "typing", "account_review", "carry_prospective",
                         "statistical_power"}, imported
     calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert not calls & {"exec", "eval", "compile", "__import__"}
+
+
+# ============================================================================================ independent security review (reproduced hangs and races)
+
+def _run_cli(args, timeout=10):
+    return subprocess.run([sys.executable, os.path.join(BOT, "tools", "trial_journal.py"), *args], capture_output=True, text=True, timeout=timeout)
+
+
+def test_a_fifo_as_journal_or_anchor_is_refused_not_a_hang(tmp_path):
+    (tmp_path / "w").mkdir()
+    (tmp_path / "away").mkdir()
+    fifo_j, fifo_a = tmp_path / "w" / "fifo.jsonl", tmp_path / "away" / "anchor"
+    os.mkfifo(fifo_j)
+    os.mkfifo(fifo_a)
+    r = _run_cli(["verify", "--journal", str(fifo_j)])                                  # timeout=10 turns a hang into a test failure
+    assert r.returncode == 2 and "not a regular file" in r.stderr
+    j = tmp_path / "w" / "x.jsonl"
+    r = _run_cli(["verify", "--journal", str(j), "--anchor-file", str(fifo_a)])
+    assert r.returncode == 2 and "not a regular file" in r.stderr
+
+
+def test_an_oversized_or_non_utf8_anchor_file_is_refused(tmp_path):
+    (tmp_path / "w").mkdir()
+    (tmp_path / "away").mkdir()
+    j = tmp_path / "w" / "looks.jsonl"
+    f = tmp_path / "away" / "anchor.txt"
+    f.write_text("1 " + "0" * 64 + " " * 5000 + "junk\n")
+    os.chmod(f, 0o600)
+    with pytest.raises(TJ.JournalError, match="larger than any anchor"):
+        TJ.read_anchor_file(str(f), str(j))
+    f.write_bytes(b"\xff\xfe")
+    with pytest.raises(TJ.JournalError, match="UTF-8"):
+        TJ.read_anchor_file(str(f), str(j))
+
+
+def test_the_open_is_relative_to_a_verified_directory_so_a_swapped_ancestor_cannot_redirect_it(tmp_path, monkeypatch):
+    # Swap the journal's directory for a link to a protected-looking tree in the window between the checks and the open.
+    good = tmp_path / "good"
+    good.mkdir()
+    evil = tmp_path / "bot" / "state"
+    evil.mkdir(parents=True)
+    real_open = os.open
+    swapped = {"done": False}
+
+    def swapping_open(path, flags, *a, **k):
+        if not swapped["done"] and str(path) == str(good) and flags & os.O_DIRECTORY:
+            swapped["done"] = True
+            good.rmdir()
+            os.symlink(evil, good)                                         # the directory the caller named becomes a link just before it is opened
+        return real_open(path, flags, *a, **k)
+    monkeypatch.setattr(os, "open", swapping_open)
+    with pytest.raises((TJ.JournalError, _AR.RecordError, OSError)):
+        look(good / "looks.jsonl", 1, first_look=True)
+    assert list(evil.iterdir()) == []                                      # nothing was created under the protected tree
+
+
+# ============================================================================================ data binding (the reproduced selection attack)
+
+REQUIRED_10 = 1.1312328767              # the funding the 10 % hurdle requires per settlement (closed form, written out in test_carry_prospective)
+
+
+def _null_true_prints_with_the_lowest_dropped(seed=9, k=86):
+    full = window_prints(REQUIRED_10, seed=seed)                          # the true mean equals the requirement: the null is TRUE
+    keep = set(sorted(full, key=lambda x: x[1])[k:])
+    return full, [p for p in full if p in keep]
+
+
+def test_dropping_the_lowest_prints_passes_the_frozen_floor_but_is_flagged_and_cannot_be_swapped_in_silently(tmp_path):
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    j = tmp_path / "looks.jsonl"
+    honest = TJ.evaluate_logged(full, 10.0, str(j), first_look=True)
+    assert "SUPPORTED" not in honest["verdict"]                           # the full data: no edge, as the truth is
+    with pytest.raises(TJ.JournalError, match="data digest differs"):    # the cherry-picked set cannot be swapped in as a later look
+        TJ.evaluate_logged(cherry, 10.0, str(j), allow_unanchored=True)
+    assert TJ.inspect(str(j))["n_trials"] == 1
+    j2 = tmp_path / "cherry.jsonl"                                          # evaluated alone, the registered verdict is wrongly favourable ...
+    rep = TJ.evaluate_logged(cherry, 10.0, str(j2), first_look=True)
+    assert "SUPPORTED" in rep["verdict"] and CP.coverage(cherry, CP.WINDOW_END_MS)["coverage"] >= CP.MIN_COVERAGE
+    s = rep["selection_sensitivity"]                                       # ... and the report says so instead of hiding it
+    assert s["selection_sensitive"] is True and "SUPPORTED" not in str(s["worst_case_verdict"]) and s["missing_settlements"] == 86
+    assert "DO NOT RELY" in s["note"]
+
+
+def test_a_complete_data_set_cannot_be_selection_sensitive(tmp_path):
+    full, _ = _null_true_prints_with_the_lowest_dropped()
+    rep = TJ.evaluate_logged(full, 10.0, str(tmp_path / "j.jsonl"), first_look=True)
+    assert rep["selection_sensitivity"]["selection_sensitive"] is False and rep["selection_sensitivity"]["missing_settlements"] == 0
+
+
+def test_the_data_digest_is_in_the_chain_so_it_cannot_be_edited_afterwards(tmp_path):
+    j = tmp_path / "looks.jsonl"
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    TJ.evaluate_logged(full, 10.0, str(j), first_look=True)
+    row = json.loads(j.read_text())
+    assert row["data"]["n_prints"] == len(full) and len(row["data"]["sha256"]) == 64 and row["data"]["revision"] is False
+    row["data"]["sha256"] = TJ.data_binding(cherry, 10.0, False)["sha256"]
+    j.write_text(json.dumps(row, sort_keys=True) + "\n")
+    info = TJ.inspect(str(j))
+    assert info["status"] == TJ.CORRUPT and "hash chain" in info["why"]
+
+
+def test_the_same_data_may_be_looked_at_again_and_an_accepted_revision_is_recorded_in_the_chain(tmp_path):
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    j = tmp_path / "looks.jsonl"
+    TJ.evaluate_logged(full, 10.0, str(j), first_look=True)
+    again = TJ.evaluate_logged(full, 10.0, str(j), allow_unanchored=True)
+    assert again["journal"]["data"]["revision"] is False and again["journal"]["n_trials"] == 2
+    rev = TJ.evaluate_logged(cherry, 10.0, str(j), allow_unanchored=True, accept_data_revision=True)
+    assert rev["journal"]["data"]["revision"] is True
+    assert [json.loads(x)["data"]["revision"] for x in j.read_text().splitlines()] == [False, False, True]
+
+
+def test_the_cli_refuses_changed_data_unless_told_and_says_so(tmp_path, capsys):
+    full, cherry = _null_true_prints_with_the_lowest_dropped()
+    (tmp_path / "w").mkdir()
+    f1, f2 = tmp_path / "w" / "full.jsonl", tmp_path / "w" / "cherry.jsonl"
+    for f, pr in ((f1, full), (f2, cherry)):
+        f.write_text("".join(json.dumps({"ts_ms": t, "funding_bps": v}) + "\n" for t, v in pr))
+    j = str(tmp_path / "w" / "looks.jsonl")
+    assert TJ.main(["evaluate", "--funding", str(f1), "--journal", j, "--first-look", "--allow-unanchored"]) == 0
+    assert TJ.main(["evaluate", "--funding", str(f2), "--journal", j, "--allow-unanchored"]) == 2
+    assert "data digest differs" in capsys.readouterr().err
+    assert TJ.main(["evaluate", "--funding", str(f2), "--journal", j, "--allow-unanchored", "--accept-data-revision"]) == 0
+
+
+def test_a_fractional_settlement_time_is_refused_not_snapped(tmp_path):
+    f = tmp_path / "p.jsonl"
+    f.write_text(json.dumps({"ts_ms": CP.WINDOW_START_MS + 0.9, "funding_bps": 1.0}) + "\n")
+    with pytest.raises(_AR.RecordError, match="needs ts_ms"):
+        CP._load(str(f))
+
+
+# ============================================================================================ POSIX findings from the independent review
+
+def test_an_append_that_would_land_on_a_renamed_inode_is_refused_not_reported(tmp_path, monkeypatch):
+    j = tmp_path / "looks.jsonl"
+    look(j, 1, first_look=True)
+    real = CP.evaluate
+
+    def rotate(*a, **k):
+        os.rename(j, tmp_path / "aside.jsonl")                              # the journal is rotated away while the lock is held ...
+        j.write_bytes(b"")                                                  # ... and an empty file takes its place
+        os.chmod(j, 0o600)
+        return real(*a, **k)
+    monkeypatch.setattr(CP, "evaluate", rotate)
+    with pytest.raises(TJ.JournalError, match="replaced or renamed|ignored the lock"):
+        look(j, 2)
+    assert (tmp_path / "looks.jsonl").read_bytes() == b""                   # nothing was claimed anywhere
+
+
+def test_a_lock_taken_on_a_stale_inode_is_dropped_and_retaken_on_the_file_at_the_path(tmp_path, monkeypatch):
+    j = tmp_path / "looks.jsonl"
+    calls = []
+    real = TJ._same_inode
+
+    def once_stale(fd, path):
+        calls.append(path)
+        return False if len(calls) == 1 else real(fd, path)
+    monkeypatch.setattr(TJ, "_same_inode", once_stale)
+    look(j, 1, first_look=True)
+    assert len([c for c in calls if c.endswith(".lock")]) >= 2 and TJ.inspect(str(j))["n_trials"] == 1
+
+
+def test_a_reader_that_meets_a_partial_line_rechecks_under_the_lock_before_calling_it_corrupt(tmp_path, monkeypatch):
+    j = tmp_path / "looks.jsonl"
+    look(j, 1, first_look=True)
+    whole = j.read_bytes()
+    real, calls = TJ._read_journal, []
+
+    def torn_then_whole(path):
+        calls.append(1)
+        return whole[:-5] if len(calls) == 1 else real(path)                # the first read raced a writer's append
+    monkeypatch.setattr(TJ, "_read_journal", torn_then_whole)
+    assert TJ.inspect(str(j))["status"] == TJ.UNANCHORED and len(calls) == 2
+    monkeypatch.setattr(TJ, "_read_journal", lambda path: whole[:-5])         # a partial line that persists is still corrupt
+    assert TJ.inspect(str(j))["status"] == TJ.CORRUPT
+
+
+def test_a_failed_directory_fsync_on_first_create_is_a_write_error_not_a_raw_oserror(tmp_path):
+    rc, out, _ = child(tmp_path / "looks.jsonl", 1, mode="dir_fsync_fails", first_look=True, allow_unanchored=True)
+    assert rc == 3 and parsed(out)["refused"] == "JournalWriteError" and "MAY OR MAY NOT" in parsed(out)["why"]
+
+
+def test_a_same_size_copy_swapped_in_under_the_lock_is_caught_before_anything_is_written(tmp_path, monkeypatch):
+    # Same bytes, different inode: only the inode comparison (not the size check) can see it, and it must fire BEFORE the append.
+    j = tmp_path / "looks.jsonl"
+    look(j, 1, first_look=True)
+    original = j.read_bytes()
+    real = CP.evaluate
+
+    def swap(*a, **k):
+        os.rename(j, tmp_path / "aside.jsonl")
+        j.write_bytes(original)
+        os.chmod(j, 0o600)
+        return real(*a, **k)
+    monkeypatch.setattr(CP, "evaluate", swap)
+    with pytest.raises(TJ.JournalError, match="replaced or renamed while it was held"):
+        look(j, 2)
+    assert j.read_bytes() == original and (tmp_path / "aside.jsonl").read_bytes() == original
