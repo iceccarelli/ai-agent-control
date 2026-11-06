@@ -165,10 +165,15 @@ def progress(prints: Sequence[Tuple[float, float]], now_ms: int, hurdle_pct: flo
     }
 
 
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 def evaluate(prints: Sequence[Tuple[float, float]], hurdle_pct: float, ledger: "SP.TrialLedger", now_ms: Optional[int] = None) -> Dict[str, Any]:
     """Run the registered test ONCE the window has closed. Every call is recorded as a trial; refusals record nothing. ``now_ms`` is the clock the
     window is judged against (the wall clock when omitted): before the window ends nothing is evaluated, so prints dated in the future cannot be used."""
-    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    # ``now_ms`` can only move the clock EARLIER: it is clamped to the real clock, so passing the window's end cannot manufacture a closed window.
+    now = _now_ms() if now_ms is None else min(int(now_ms), _now_ms())
     if now < WINDOW_END_MS:
         raise SP.WindowCoverageError(f"the registered window has not closed (it ends {AR._iso(WINDOW_END_MS)}): an evaluation of part of it is a peek, and is refused")
     plan = registered_plan(hurdle_pct)
@@ -184,7 +189,7 @@ def _load(path: str) -> List[Tuple[int, float]]:
     for i, r in enumerate(rows):
         try:
             out.append((int(float(r["ts_ms"])), float(r["funding_bps"])))
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, OverflowError) as exc:
             raise AR.RecordError(f"{os.path.basename(path)} row {i + 1}: needs ts_ms and funding_bps") from exc
     return out
 

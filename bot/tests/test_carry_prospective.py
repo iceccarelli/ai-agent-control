@@ -25,6 +25,12 @@ H8 = CP.SETTLE_MS
 CLOSED = CP.WINDOW_END_MS + 1                       # a clock after the window has closed
 
 
+@pytest.fixture(autouse=True)
+def _wall_clock_after_the_window(monkeypatch):
+    # evaluate() clamps its now_ms argument to the real clock; the tests that need a closed window move that clock, not the argument.
+    monkeypatch.setattr(CP, "_now_ms", lambda: CLOSED)
+
+
 def window_prints(mean_bps, *, n=None, seed=1, drop=(), sd=0.4, rho=0.8):
     """Settled prints for the registered window: an AR(1) series around ``mean_bps`` with the given dependence, on the 8h grid."""
     n = n if n is not None else CP.WINDOW_DAYS * CP.PER_DAY
@@ -200,3 +206,14 @@ def test_the_coverage_floor_is_not_below_what_the_planning_inputs_need():
     rep = CP.progress([], CP.WINDOW_START_MS - 1)
     assert CP.MIN_COVERAGE >= rep["needed_settlements_for_min_edge"] / (CP.WINDOW_DAYS * CP.PER_DAY) or rep["needed_exceeds_window"]
     assert "NOT under test" in CP.PARAMETERS["statistic_scope"]
+
+
+def test_now_ms_cannot_manufacture_a_closed_window_before_the_real_clock_gets_there(monkeypatch):
+    # Passing the window's end as now_ms used to run the test on prints that cannot exist yet (a reproduced bypass).
+    monkeypatch.setattr(CP, "_now_ms", lambda: CP.WINDOW_START_MS - 86_400_000)
+    fabricated = window_prints(2.5, seed=3)
+    for claimed in (CP.WINDOW_END_MS, CP.WINDOW_END_MS + 10 ** 9, None):
+        ledger = SP.TrialLedger()
+        with pytest.raises(SP.WindowCoverageError):
+            CP.evaluate(fabricated, 10.0, ledger, claimed)
+        assert ledger.n_trials == 0

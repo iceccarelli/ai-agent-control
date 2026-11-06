@@ -1162,6 +1162,11 @@ def apply_column_map(rows: Sequence[Mapping[str, Any]], column_map: Mapping[str,
     row stays traceable to its source row by position."""
     if not isinstance(column_map, Mapping) or not column_map:
         raise RecordError(f"{label}: column_map must be a non-empty object")
+    if constants is not None and not isinstance(constants, Mapping):
+        raise RecordError(f"{label}: constants must be an object")
+    for canon, spec in column_map.items():
+        if not (isinstance(spec, str) or (isinstance(spec, Mapping) and isinstance(spec.get("transform", []), (str, list, tuple)))):
+            raise RecordError(f"{label}: the column_map entry for {canon!r} must be a column name or an object with column/transform")
     out: List[Dict[str, Any]] = []
     for i, r in enumerate(rows):
         w = f"{label} row {i + 1}"

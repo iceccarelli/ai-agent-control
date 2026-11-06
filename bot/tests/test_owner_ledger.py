@@ -1320,3 +1320,9 @@ def test_a_sane_btc_flow_without_a_public_bar_is_not_rejected_by_the_envelope(tm
     inp = OL.load_manifest(w.write(tmp_path))
     inp.perp_kwargs["spot_range"] = None
     assert "BTC_FLOW_VALUE_OFF_PUBLIC_BAR" not in hard(OL.build(inp))
+
+
+@pytest.mark.parametrize("spec", [5, None, ["a"], {"column": "A", "transform": 7}])
+def test_a_malformed_column_map_entry_is_a_clean_refusal_not_a_traceback(spec):
+    with pytest.raises(OL.RecordError):
+        OL.apply_column_map([{"A": "1"}], {"exec_id": spec}, None, "x.csv")
