@@ -1577,4 +1577,3 @@ def trade_economics_costs_for_taker(comparison: Mapping[str, Any]) -> _te.Costs:
                      spread_bps=c["spread"], slippage_bps=c["slippage"], impact_bps=c["impact"],
                      latency_bps=c["delay"], fee_provenance="ACCOUNT_VERIFIED" if verified else "UNVERIFIED",
                      maker_taker="taker")
-
