@@ -261,7 +261,9 @@ def _returns_view(r: Mapping[str, Any]) -> Dict[str, Any]:
             "economic_capital_usd": r["capital"]["economic_capital_usd"],
             "components_usd": dict(r["components_usd"]), "unpriced_inputs": list(r["unknowns"]),
             "hurdles": [{"hurdle_apr_pct": h["hurdle_apr_pct"], "status": h["status"], "meets": h["meets"],
-                         "incomplete": h["incomplete"]} for h in r["hurdles"]]}
+                         "incomplete": h["incomplete"], "consistent_input": h["consistent_input"],
+                         "meets_if_consistent": h["meets_if_consistent"], "verdict": h["verdict"],
+                         "conclusive": h["conclusive"]} for h in r["hurdles"]]}
 
 
 def leverage_book(inputs: CarryInputs, leverage: float) -> Dict[str, Any]:

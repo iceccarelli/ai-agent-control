@@ -1376,3 +1376,23 @@ def test_the_ceiling_never_permits_more_notional_than_the_one_x_book_holds_per_u
         assert ne1 == pytest.approx(1.0 / (1.0 + rho))
         assert r["max_leverage"] <= ne1 + 1e-12, (rho, r)
         assert r["limits"]["hard_cap"] == pytest.approx(ne1)
+
+
+def test_the_economics_view_forwards_the_honest_hurdle_reading_not_only_the_legacy_meets():
+    t = table()
+    rows = []
+
+    def collect(x):
+        if isinstance(x, dict):
+            if "hurdles" in x and isinstance(x["hurdles"], list):
+                rows.extend(x["hurdles"])
+            for v in x.values():
+                collect(v)
+        elif isinstance(x, list):
+            for v in x:
+                collect(v)
+    collect(t)
+    assert rows, "no hurdle rows in the survival table"
+    for h in rows:
+        assert {"consistent_input", "meets_if_consistent", "verdict", "conclusive"} <= set(h), h
+        assert h["meets_if_consistent"] is (h["meets"] and h["consistent_input"])
