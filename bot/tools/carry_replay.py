@@ -1147,9 +1147,7 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
         # The replay's net is the PAIR's (both legs valued); the journal's
         # cash net excludes the inventory mark, so the pair figure is the one
         # that must agree with it.
-        "ledger_agrees": abs(
-            statement["pair_net_usd"] + unrealised_usd - net) < max(
-                0.01, 1e-6 * abs(net)),
+        "ledger_agrees": ledger_agrees(statement, unrealised_usd, net),
         "halted_at_ms": halted_at,
         "trade_rows": trades,
         "concentration": trade_concentration(
@@ -1170,6 +1168,15 @@ def replay(rows: Sequence[Any], *, notional: float, borrow_apr: float,
             "the production liquidation-distance gate: the corpus holds no "
             "liqPrice, leverage, collateral or accountMMRate"]),
     }
+
+
+def ledger_agrees(statement: Dict[str, Any], unrealised_usd: float, net: float) -> Any:
+    """True/False when the journal's PAIR net plus the open mark equals the replay's net; None (unknown, not agreement) when the journal withheld its pair
+    net because an inventory leg was not valued."""
+    pair = statement["pair_net_usd"]
+    if pair is None:
+        return None
+    return abs(pair + unrealised_usd - net) < max(0.01, 1e-6 * abs(net))
 
 
 def _liquidation_report(liquidation: Optional[LiquidationInputs],

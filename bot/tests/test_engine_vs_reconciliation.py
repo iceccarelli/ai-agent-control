@@ -273,3 +273,97 @@ def test_account_review_resolves_an_exit_after_the_settlement_by_the_rows_stated
 def test_the_two_reconcilers_share_one_attribution_slack_and_one_position_tolerance_family():
     assert AR.SLACK_MS == L.ATTRIBUTION_SLACK_MS and AR.SLACK_MS == R.L.ATTRIBUTION_SLACK_MS
     assert L.SIZE_REL_TOL >= AR.POSITION_REL_TOL         # the ledger is never stricter than the reviewer on what counts as the same position
+
+
+# ============================================================================================ phantom profit: an unbooked inventory leg (independent audit, reproduced)
+
+def _overlay_cycle(*, spot_read_fails: bool, price_close: float, fail_at_close_only: bool = False):
+    """A 0.1 BTC overlay short at 100,000 closed at ``price_close``; the public spot read fails at the open when asked to."""
+    clock = _Clock(S0)
+    v = _Venue(clock)
+    if spot_read_fails:
+        def boom(symbol):
+            raise RuntimeError("spot read failed")
+        v.get_spot_mark = boom
+    j = L.Journal()
+    lb = L.LedgerBroker(v, j, ms=lambda: clock.ms, book_overlay_inventory=True)
+    lb.place_market(symbol="BTCUSDT", side="Sell", qty=0.1, product="linear")
+    clock.ms += 3_600_000
+    v.mark = price_close
+    if not spot_read_fails:
+        v.spot = price_close
+    if fail_at_close_only:
+        def boom_now(symbol):
+            raise RuntimeError("spot read failed at the close")
+        v.get_spot_mark = boom_now
+    lb.place_market(symbol="BTCUSDT", side="Buy", qty=0.1, product="linear")
+    return j, clock
+
+
+def test_an_overlay_cycle_whose_inventory_leg_could_not_be_booked_does_not_report_a_pair_net_that_equals_the_cash_net():
+    # BTC falls 100,000 -> 99,000. HAND: the 0.1 BTC short gains +100.00; the 0.1 BTC the client owns loses -100.00; fees are 0.1*100000*5.5e-4 = 5.50
+    # and 0.1*99000*5.5e-4 = 5.445, so the HEDGED PAIR's result is -10.945. The ledger used to report pair_net_usd = +89.055 (the cash net, with the
+    # inventory leg silently missing): +100 of phantom profit that carry_performance.hedged_pair (-10.945) disagreed with.
+    j, clock = _overlay_cycle(spot_read_fails=True, price_close=99_000.0)
+    st = j.statement(now_ms=clock.ms)
+    assert st["net_usd"] == pytest.approx(89.055, abs=1e-6)                      # the CASH net is true and stays reported as cash
+    assert st["inventory_leg_booked"] is False
+    assert st["pair_net_usd"] is None                                              # unknown, not a number that happens to equal the cash net
+    assert st["inventory_mark_usd"] == 0
+
+
+def test_when_the_inventory_leg_is_booked_the_pair_net_is_the_cash_net_plus_the_mark_and_the_flag_says_so():
+    # Control, same hand arithmetic with the spot read working and spot following the perp: mark = 0.1 * (99,000 - 100,000) = -100.00.
+    j, clock = _overlay_cycle(spot_read_fails=False, price_close=99_000.0)
+    st = j.statement(now_ms=clock.ms)
+    assert st["inventory_leg_booked"] is True
+    assert st["inventory_mark_usd"] == pytest.approx(-100.0, abs=1e-6)
+    assert st["pair_net_usd"] == pytest.approx(st["net_usd"] + st["inventory_mark_usd"], abs=1e-9)
+    assert st["pair_net_usd"] == pytest.approx(-10.945, abs=1e-6)                   # the hedged pair lost exactly its fees
+
+
+def test_an_unbooked_leg_survives_a_restart_and_a_period_cut_only_sees_its_own_marker():
+    j, clock = _overlay_cycle(spot_read_fails=True, price_close=99_000.0)
+    again = L.Journal.from_rows(j.to_rows()) if hasattr(j, "to_rows") else j
+    assert again.statement(now_ms=clock.ms)["pair_net_usd"] is None
+    assert j.statement(from_ms=clock.ms + 10_000_000, now_ms=clock.ms + 20_000_000)["inventory_leg_booked"] is True      # a later empty period has no marker
+
+
+def test_the_replay_cross_check_says_unknown_instead_of_crashing_or_agreeing_when_the_pair_net_is_unknown():
+    import carry_replay as CR
+    assert CR.ledger_agrees({"pair_net_usd": None}, 5.0, 5.0) is None                   # unknown is not agreement
+    assert CR.ledger_agrees({"pair_net_usd": 10.0}, 5.0, 15.0) is True
+    assert CR.ledger_agrees({"pair_net_usd": 10.0}, 5.0, 16.0) is False
+
+
+def test_a_spot_read_that_fails_only_at_the_close_also_withholds_the_pair_net():
+    # The second skip path: the entry reference exists, the close-time read fails, so the leg cannot be valued.
+    j, clock = _overlay_cycle(spot_read_fails=False, price_close=99_000.0, fail_at_close_only=True)
+    st = j.statement(now_ms=clock.ms)
+    assert st["inventory_leg_booked"] is False and st["pair_net_usd"] is None and st["inventory_legs_unbooked"] == 1
+    assert st["net_usd"] == pytest.approx(89.055, abs=1e-6)
+
+
+def test_a_valuation_that_raises_also_withholds_the_pair_net_and_never_unbooks_the_close(monkeypatch):
+    # The third skip path: the swallowed exception. The close itself stays booked.
+    def raises(*a, **k):
+        raise RuntimeError("valuation exploded")
+    monkeypatch.setattr(L, "revalue_inventory", raises)
+    j, clock = _overlay_cycle(spot_read_fails=False, price_close=99_000.0)
+    st = j.statement(now_ms=clock.ms)
+    assert st["inventory_leg_booked"] is False and st["pair_net_usd"] is None
+    assert [e.kind for e in j.entries].count("perp_close") == 1 and st["realised_usd"] == pytest.approx(100.0, abs=1e-6)
+
+
+def test_one_cycle_posts_one_marker_however_many_paths_skip():
+    j, clock = _overlay_cycle(spot_read_fails=True, price_close=99_000.0)
+    assert [e.kind for e in j.entries].count("inventory_unbooked") == 1
+
+
+def test_the_unbooked_marker_is_idempotent_per_cycle_reference():
+    j = L.Journal()
+    for _ in range(3):
+        L.mark_inventory_unbooked(j, ms=S0, ref="close-1", why="x")
+    L.mark_inventory_unbooked(j, ms=S0 + 1, ref="close-2", why="y")
+    assert [e.ref for e in j.entries] == ["invunbooked:close-1", "invunbooked:close-2"]
+    assert j.statement(now_ms=S0 + 10)["inventory_legs_unbooked"] == 2
