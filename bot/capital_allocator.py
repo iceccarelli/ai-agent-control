@@ -230,7 +230,8 @@ def incremental_tail_risk(book: float, tail: float, rho: float) -> float:
 
 def allocate(opportunities: Sequence[Opportunity], limits: AllocationLimits, *,
              risk_aversion: float,
-             evidence: Optional[Mapping[str, Any]] = None) -> Allocation:
+             evidence: Optional[Mapping[str, Any]] = None,
+             unevidenced_research_only: bool = False) -> Allocation:
     """Return a plan (possibly all zero). Reserves NOTHING; see module doc.
 
     ``evidence`` maps strategy_id -> ``strategy_evidence.EvidenceVerdict``. When
@@ -238,8 +239,11 @@ def allocate(opportunities: Sequence[Opportunity], limits: AllocationLimits, *,
     if its verdict is a genuine EvidenceVerdict with verdict ALLOCATE for that
     same strategy_id. BLOCK, INSUFFICIENT, a missing entry or anything that is
     not an EvidenceVerdict forces zero for that strategy, whatever its stated
-    expected return. ``None`` is the legacy no-evidence call, kept only so the
-    pure allocator tests still run; it is not a way to assert evidence.
+    expected return. FAIL-CLOSED: ``evidence=None`` (the default) gives EVERY
+    strategy zero with ``NO_STRATEGY_EVIDENCE``; a forgotten argument can never
+    allocate. The only way to price opportunities without evidence is the explicit
+    ``unevidenced_research_only=True``, which exists for tests of the arithmetic and
+    is pinned by a test to appear in no non-test module.
     """
     plan_reasons: List[str] = []
     free = _num(getattr(limits.free_capital_usd, "value", None))
@@ -275,6 +279,8 @@ def allocate(opportunities: Sequence[Opportunity], limits: AllocationLimits, *,
             reasons.append(NO_STRATEGY_CAP)
         if evidence is not None:
             reasons.extend(_evidence_reasons(op.strategy_id, evidence))
+        elif not unevidenced_research_only:
+            reasons.append(f"{NO_STRATEGY_EVIDENCE}:{op.strategy_id}")
         if reasons:
             results[oid] = OpportunityResult(oid, op.strategy_id, 0.0, False,
                                              tuple(reasons))

@@ -6,6 +6,7 @@ is a claim about any strategy's economics. Offline.
 """
 from __future__ import annotations
 
+import functools
 import math
 import os
 import sys
@@ -18,6 +19,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import capital_allocator as ca                          # noqa: E402
 
 SRC = "test-fixture"
+
+# These tests exercise the ARITHMETIC of the allocator, not strategy evidence; that opt-out is explicit and is pinned (below) to appear in no
+# non-test module. The default call (no evidence) is fail-closed.
+_alloc = functools.partial(ca.allocate, unevidenced_research_only=True)
 
 
 def S(v):
@@ -56,12 +61,12 @@ def test_risk_aversion_is_required():
 
 
 def test_zero_allocation_when_nothing_offered():
-    a = ca.allocate([], limits(), risk_aversion=1.0)
+    a = _alloc([], limits(), risk_aversion=1.0)
     assert a.total_allocated_usd == 0.0 and a.allocated() == {}
 
 
 def test_zero_allocation_when_risk_outweighs_return():
-    a = ca.allocate([opp("a", expected_net_return_usd=1.0, tail_risk_usd=50.0)],
+    a = _alloc([opp("a", expected_net_return_usd=1.0, tail_risk_usd=50.0)],
                     limits(), risk_aversion=1.0)
     r = by_id(a)["a"]
     assert r.allocated_usd == 0.0 and r.reasons == (ca.NO_RISK_ADJUSTED_VALUE,)
@@ -70,7 +75,7 @@ def test_zero_allocation_when_risk_outweighs_return():
 
 @pytest.mark.parametrize("name", ca.REQUIRED_INPUTS)
 def test_every_missing_input_makes_it_ineligible(name):
-    a = ca.allocate([opp("a", **{name: None})], limits(), risk_aversion=1.0)
+    a = _alloc([opp("a", **{name: None})], limits(), risk_aversion=1.0)
     r = by_id(a)["a"]
     assert not r.eligible and r.allocated_usd == 0.0
     assert f"{ca.MISSING_INPUT}:{name}" in r.reasons
@@ -80,7 +85,7 @@ def test_every_missing_input_makes_it_ineligible(name):
 def test_every_unsourced_input_makes_it_ineligible(name):
     good = opp("x")
     val = good.inputs[name].value
-    a = ca.allocate([opp("a", **{name: ca.Sourced(val, "  ")})], limits(),
+    a = _alloc([opp("a", **{name: ca.Sourced(val, "  ")})], limits(),
                     risk_aversion=1.0)
     assert f"{ca.UNSOURCED_INPUT}:{name}" in by_id(a)["a"].reasons
 
@@ -97,7 +102,7 @@ def test_every_unsourced_input_makes_it_ineligible(name):
     ({"liquidity_usd": 50.0}, ca.EXCEEDS_LIQUIDITY),
 ])
 def test_invalid_inputs_are_ineligible(over, code):
-    a = ca.allocate([opp("a", **over)], limits(), risk_aversion=1.0)
+    a = _alloc([opp("a", **over)], limits(), risk_aversion=1.0)
     r = by_id(a)["a"]
     assert not r.eligible and any(x.split(":")[0] == code for x in r.reasons)
 
@@ -105,12 +110,12 @@ def test_invalid_inputs_are_ineligible(over, code):
 def test_missing_correlation_group_is_ineligible():
     o = opp("a")
     o = ca.Opportunity("a", "carry", None, o.inputs)
-    r = by_id(ca.allocate([o], limits(), risk_aversion=1.0))["a"]
+    r = by_id(_alloc([o], limits(), risk_aversion=1.0))["a"]
     assert f"{ca.MISSING_INPUT}:correlation_group" in r.reasons
 
 
 def test_negative_expected_net_gets_nothing():
-    a = ca.allocate([opp("neg", expected_net_return_usd=-5.0, tail_risk_usd=0.0),
+    a = _alloc([opp("neg", expected_net_return_usd=-5.0, tail_risk_usd=0.0),
                      opp("zero", expected_net_return_usd=0.0, tail_risk_usd=0.0)],
                     limits(), risk_aversion=0.0)
     for oid in ("neg", "zero"):
@@ -119,7 +124,7 @@ def test_negative_expected_net_gets_nothing():
 
 
 def test_strategy_without_a_cap_gets_nothing():
-    a = ca.allocate([opp("a", strategy="unknown")], limits(), risk_aversion=1.0)
+    a = _alloc([opp("a", strategy="unknown")], limits(), risk_aversion=1.0)
     assert ca.NO_STRATEGY_CAP in by_id(a)["a"].reasons
 
 
@@ -127,7 +132,7 @@ def test_capital_exhaustion_takes_best_first():
     ops = [opp("a", expected_net_return_usd=10.0),
            opp("b", expected_net_return_usd=20.0),
            opp("c", expected_net_return_usd=15.0)]
-    a = ca.allocate(ops, limits(free_capital_usd=S(250.0)), risk_aversion=0.0)
+    a = _alloc(ops, limits(free_capital_usd=S(250.0)), risk_aversion=0.0)
     got = a.allocated()
     assert got == {"b": 100.0, "c": 100.0}
     assert by_id(a)["a"].reasons == (ca.FREE_CAPITAL_EXHAUSTED,)
@@ -137,7 +142,7 @@ def test_capital_exhaustion_takes_best_first():
 def test_capital_time_basis_prefers_shorter_lockup():
     ops = [opp("long", expected_net_return_usd=20.0, capital_duration_days=30.0),
            opp("short", expected_net_return_usd=10.0, capital_duration_days=5.0)]
-    a = ca.allocate(ops, limits(free_capital_usd=S(100.0)), risk_aversion=0.0)
+    a = _alloc(ops, limits(free_capital_usd=S(100.0)), risk_aversion=0.0)
     assert a.allocated() == {"short": 100.0}
     assert by_id(a)["short"].score == pytest.approx(10.0 / (100.0 * 5.0))
 
@@ -151,8 +156,8 @@ def test_correlated_pair_second_is_penalised_and_capped():
     ops_unc = [opp("a", correlation={"book": -1.0, "b": -1.0}, tail_risk_usd=8.0),
                opp("b", correlation={"book": -1.0, "a": -1.0}, tail_risk_usd=8.0,
                    expected_net_return_usd=9.0)]
-    a_corr = ca.allocate(ops, limits(), risk_aversion=1.0)
-    a_unc = ca.allocate(ops_unc, limits(), risk_aversion=1.0)
+    a_corr = _alloc(ops, limits(), risk_aversion=1.0)
+    a_unc = _alloc(ops_unc, limits(), risk_aversion=1.0)
     rb_corr, rb_unc = by_id(a_corr)["b"], by_id(a_unc)["b"]
     assert rb_corr.incremental_tail_risk_usd == pytest.approx(8.0)
     assert rb_unc.incremental_tail_risk_usd == pytest.approx(-8.0)
@@ -161,11 +166,11 @@ def test_correlated_pair_second_is_penalised_and_capped():
     ops_mixed = [opp("a", correlation={"book": 0.0, "b": -1.0}, tail_risk_usd=8.0),
                  opp("b", correlation={"book": 0.0, "a": -1.0}, tail_risk_usd=8.0,
                      expected_net_return_usd=9.0)]
-    rb_mixed = by_id(ca.allocate(ops_mixed, limits(), risk_aversion=1.0))["b"]
+    rb_mixed = by_id(_alloc(ops_mixed, limits(), risk_aversion=1.0))["b"]
     assert rb_mixed.incremental_tail_risk_usd == pytest.approx(
         math.sqrt(8.0 ** 2 + 8.0 ** 2) - 8.0)
     # concentration cap: same group, cap fits only one
-    a_cap = ca.allocate(ops, limits(max_group_usd=150.0), risk_aversion=1.0)
+    a_cap = _alloc(ops, limits(max_group_usd=150.0), risk_aversion=1.0)
     assert len(a_cap.allocated()) == 1
     assert by_id(a_cap)["b"].reasons == (ca.CONCENTRATION_CAP,)
 
@@ -173,7 +178,7 @@ def test_correlated_pair_second_is_penalised_and_capped():
 def test_unstated_pairwise_correlation_is_taken_at_worst_case():
     ops = [opp("a", tail_risk_usd=8.0), opp("b", tail_risk_usd=8.0,
                                             expected_net_return_usd=9.0)]
-    a = ca.allocate(ops, limits(), risk_aversion=1.0)
+    a = _alloc(ops, limits(), risk_aversion=1.0)
     assert by_id(a)["b"].incremental_tail_risk_usd == pytest.approx(8.0)
 
 
@@ -184,7 +189,7 @@ def test_unstated_pairwise_correlation_is_taken_at_worst_case():
     ({"max_total_drawdown_contribution": 0.015}, ca.DRAWDOWN_CAP),
 ])
 def test_caps(lim, code):
-    a = ca.allocate([opp("a"), opp("b", expected_net_return_usd=9.0)],
+    a = _alloc([opp("a"), opp("b", expected_net_return_usd=9.0)],
                     limits(**lim), risk_aversion=0.0)
     assert a.allocated() == {"a": 100.0}
     assert by_id(a)["b"].reasons == (code,)
@@ -192,9 +197,9 @@ def test_caps(lim, code):
 
 def test_ties_are_broken_deterministically():
     ops = [opp("z"), opp("m"), opp("a")]
-    first = ca.allocate(ops, limits(free_capital_usd=S(100.0)), risk_aversion=0.0)
+    first = _alloc(ops, limits(free_capital_usd=S(100.0)), risk_aversion=0.0)
     for perm in ([ops[1], ops[2], ops[0]], [ops[2], ops[0], ops[1]]):
-        again = ca.allocate(perm, limits(free_capital_usd=S(100.0)),
+        again = _alloc(perm, limits(free_capital_usd=S(100.0)),
                             risk_aversion=0.0)
         assert again == first
     assert first.allocated() == {"a": 100.0}
@@ -207,13 +212,13 @@ def test_ties_are_broken_deterministically():
     {"max_total_usd": float("nan")},
 ])
 def test_invalid_limits_allocate_nothing(lim):
-    a = ca.allocate([opp("a")], limits(**lim), risk_aversion=1.0)
+    a = _alloc([opp("a")], limits(**lim), risk_aversion=1.0)
     assert a.total_allocated_usd == 0.0 and a.reasons
     assert all(x.startswith(ca.LIMITS_INVALID) for x in a.reasons)
 
 
 def test_invalid_risk_aversion_allocates_nothing():
-    a = ca.allocate([opp("a")], limits(), risk_aversion=float("nan"))
+    a = _alloc([opp("a")], limits(), risk_aversion=float("nan"))
     assert a.total_allocated_usd == 0.0
 
 
@@ -229,7 +234,7 @@ def test_allocation_does_not_reserve(tmp_path):
         free = res.free_capital_usd(avail, "acct", now=now)
         before = store._query(
             "SELECT COUNT(*) AS n FROM capital_reservation")[0]["n"]
-        a = ca.allocate([opp("a"), opp("b")],
+        a = _alloc([opp("a"), opp("b")],
                         limits(free_capital_usd=S(free.detail["free_usd"])),
                         risk_aversion=0.0)
         assert a.total_allocated_usd == 200.0
@@ -251,3 +256,24 @@ def test_incremental_tail_risk_formula():
     assert ca.incremental_tail_risk(3.0, 4.0, 0.0) == pytest.approx(2.0)
     assert ca.incremental_tail_risk(3.0, 4.0, 1.0) == pytest.approx(4.0)
     assert math.isfinite(ca.incremental_tail_risk(5.0, 5.0, -1.0))
+
+
+def test_the_default_call_with_no_evidence_allocates_nothing():
+    # Reproduced by the capital-survival audit: allocate(evidence=None) used to return 100 USD ALLOCATED for a valid opportunity with no evidence at all.
+    a = ca.allocate([opp("a")], limits(), risk_aversion=1.0)
+    r = by_id(a)["a"]
+    assert r.allocated_usd == 0.0 and any(x.startswith(ca.NO_STRATEGY_EVIDENCE) for x in r.reasons)
+    assert not a.allocated()
+    assert _alloc([opp("a")], limits(), risk_aversion=1.0).allocated()          # the explicit research opt-out still prices the arithmetic
+
+
+def test_the_research_opt_out_is_not_used_by_any_non_test_module():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    offenders = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ("tests", "state", "runs", "__pycache__", ".git", "lib", "node_modules")]
+        for f in files:
+            if f.endswith(".py") and f != "capital_allocator.py":
+                if "unevidenced_research_only" in open(os.path.join(dirpath, f), encoding="utf-8", errors="replace").read():
+                    offenders.append(os.path.join(dirpath, f))
+    assert offenders == []
