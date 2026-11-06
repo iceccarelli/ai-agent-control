@@ -217,3 +217,15 @@ def test_now_ms_cannot_manufacture_a_closed_window_before_the_real_clock_gets_th
         with pytest.raises(SP.WindowCoverageError):
             CP.evaluate(fabricated, 10.0, ledger, claimed)
         assert ledger.n_trials == 0
+
+
+def test_the_entry_gates_break_even_is_cost_recovery_and_is_far_below_the_funding_a_hurdle_requires():
+    # Two different "required funding" numbers exist and must never be read as one (found by the financial-definition audit):
+    # the gate's break-even recovers the 11.4 bps round trip over a 90-settlement hold; the 10 % hurdle on fully allocated capital needs ~9x more.
+    import carry_costs as CC
+    breakeven = CC.breakeven_funding_bps_per_settlement(3 * 30, round_trip_bps=11.4)
+    hurdle = CP.required_bps(10.0)
+    assert breakeven == pytest.approx(11.4 / 90.0)
+    assert hurdle == pytest.approx(1.1312328767, abs=1e-9)
+    assert hurdle / breakeven > 8.5                                         # a gate pass is not a hurdle pass
+    assert CP.required_bps(15.0) > hurdle > CP.required_bps(5.0) > breakeven
