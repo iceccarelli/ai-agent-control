@@ -9,10 +9,14 @@ nothing else, no network, no credential) and answers:
 
   * how long and how densely the market was observed;
   * the venue's funding FORECAST per settlement on MAINNET: how often it is positive, and
-    how often it would pay for a round trip held ``--hold-settlements`` settlements;
+    how often the forecast PROJECTION covers the ESTIMATED cost of a round trip held
+    ``--hold-settlements`` settlements (a projection, never a realised outcome);
   * the round-trip cost at each trade size (book + published taker fees, a lower bound),
     and the settlements needed to break even at the window's mean forecast;
-  * the largest size the displayed book fills at all.
+  * the largest size the displayed book could fill ("book-fillable snapshots": displayed, not executable).
+
+THE STRICT, INTEGRITY-CHECKED VIEW is ``tools/profitability_report.py``; this is the quick view and
+treats every row it can read as a row.
 
 THIS IS DESCRIPTIVE AND IN-SAMPLE. The forecast is the venue's estimate for the NEXT
 settlement, not a settled payment; it is sampled from the same window it is summarised over.
@@ -74,7 +78,7 @@ def summarise(rows: Sequence[Dict[str, Any]], *, hold_settlements: float = 21.0)
         pts = sizes[n]
         ok = [p for p in pts if p.get("status") == "MEASURED"]
         costs = [p["total_round_trip_bps"] for p in ok]
-        row: Dict[str, Any] = {"notional_usd": n, "fillable_share": len(ok) / len(pts)}
+        row: Dict[str, Any] = {"notional_usd": n, "book_fillable_snapshot_share": len(ok) / len(pts)}
         if costs:
             c = statistics.fmean(costs)
             row.update(mean_total_round_trip_bps=c, p95_total_round_trip_bps=_q(costs, 0.95),
@@ -85,7 +89,7 @@ def summarise(rows: Sequence[Dict[str, Any]], *, hold_settlements: float = 21.0)
             share = None
             if fc:
                 share = sum(1 for f in fc if f * hold_settlements >= c) / len(fc)
-            row["share_of_samples_where_forecast_x_hold_covers_cost"] = share
+            row["share_of_snapshots_where_forecast_projection_covers_estimated_cost"] = share
         table.append(row)
     return {
         "samples": len(rows), "window_hours": round((last - first) / 3_600_000.0, 2),
@@ -160,17 +164,19 @@ def render(s: Dict[str, Any]) -> str:
         out.append(f"funding forecast per settlement (bps): mean {f['mean']:+.3f}, median {f['median']:+.3f}, "
                    f"min {f['min']:+.3f}, max {f['max']:+.3f}, positive {f['share_positive']:.0%} of the time")
     out.append(f"hold assumed: {s['hold_settlements']:g} settlements ({s['hold_days']:.1f} days)")
-    out.append(f"{'size USD':>12} {'fills':>6} {'cost bps':>9} {'p95':>7} {'breakeven':>10} {'net bps/hold':>13} {'covers':>7}")
+    out.append("book-fillable = snapshots in which the DISPLAYED book could fill the size (not executable liquidity); "
+               "proj-covers = share of snapshots where the forecast PROJECTION covers the ESTIMATED cost (not a realised outcome)")
+    out.append(f"{'size USD':>12} {'book-fillable':>13} {'cost bps':>9} {'p95':>7} {'breakeven':>10} {'net bps/hold':>13} {'proj-covers':>11}")
     for r in s["by_size"]:
         if "mean_total_round_trip_bps" not in r:
-            out.append(f"{r['notional_usd']:>12,.0f} {r['fillable_share']:>6.0%}   (not fillable on the displayed book)")
+            out.append(f"{r['notional_usd']:>12,.0f} {r['book_fillable_snapshot_share']:>13.0%}   (not fillable on the displayed book)")
             continue
         be = r.get("breakeven_settlements_at_mean_forecast")
         net = r.get("net_bps_after_hold_at_mean_forecast")
-        cov = r.get("share_of_samples_where_forecast_x_hold_covers_cost")
-        out.append(f"{r['notional_usd']:>12,.0f} {r['fillable_share']:>6.0%} {r['mean_total_round_trip_bps']:>9.2f} "
+        cov = r.get("share_of_snapshots_where_forecast_projection_covers_estimated_cost")
+        out.append(f"{r['notional_usd']:>12,.0f} {r['book_fillable_snapshot_share']:>13.0%} {r['mean_total_round_trip_bps']:>9.2f} "
                    f"{r['p95_total_round_trip_bps']:>7.2f} {('%.1f' % be) if be else 'n/a':>10} "
-                   f"{('%+.1f' % net) if net is not None else 'n/a':>13} {('%.0f%%' % (cov * 100)) if cov is not None else 'n/a':>7}")
+                   f"{('%+.1f' % net) if net is not None else 'n/a':>13} {('%.0f%%' % (cov * 100)) if cov is not None else 'n/a':>11}")
     out.append("in-sample and descriptive; not a return and not an out-of-sample result")
     return "\n".join(out)
 

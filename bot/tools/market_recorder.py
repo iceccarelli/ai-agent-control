@@ -41,8 +41,10 @@ BOT = os.path.dirname(HERE)
 if BOT not in sys.path:
     sys.path.insert(0, BOT)
 
+import evidence_chain as EC  # noqa: E402
 import md_capacity as MC   # noqa: E402
 import md_engine as EN     # noqa: E402
+import md_events as E      # noqa: E402
 import md_feed as F        # noqa: E402
 import md_rest as R        # noqa: E402
 import md_state as S       # noqa: E402
@@ -87,23 +89,68 @@ class Recorder:
         self.last_capacity_ms: Optional[int] = None
         self.last_capacity_error = ""
         self.capacity_max_fillable: Optional[float] = None
+        self.chain_head: Optional[Dict[str, Any]] = None      # {"file", "n", "head"} of the newest row
+        self._resealed = 0
+        self._repairs = 0
         os.makedirs(self.dir, exist_ok=True)
 
     # -- capacity ----------------------------------------------------------------------------------------
     def _capacity_path(self, now_ms: int) -> str:
         return os.path.join(self.dir, "capacity-" + ST._utc_day(now_ms) + ".jsonl")
 
-    def capture_capacity(self) -> Optional[Dict[str, Any]]:
-        """Append one cost curve for the current view. Never raises."""
-        now = self.wall_ms()
+    @staticmethod
+    def _source_of(engine: Any) -> Dict[str, Any]:
+        """The market event a view is computed at: the log's newest record id and the books' update ids / sequence numbers
+        (what the venue stamped). Called by ``Feed.snapshot`` INSIDE the engine lock, in the same hold as the view, so the
+        identifiers can never belong to a later event than the numbers they accompany."""
+        st = engine.state
+        out: Dict[str, Any] = {"store_record_id": max(0, getattr(engine.store, "_next_id", 1) - 1)}
+        for key, cat in (("perp", E.LINEAR), ("spot", E.SPOT)):
+            bk = st.books.get(cat)
+            out[f"{key}_update_id"] = None if bk is None else getattr(bk, "update_id", None)
+            out[f"{key}_seq"] = None if bk is None else getattr(bk, "seq", None)
+        return out
+
+    def _health(self) -> Dict[str, Any]:
+        fs = self.feed.status()
+        streams = fs.get("streams") or {}
         try:
-            view = self.feed.view()
-            row = MC.capacity_row(view, now_ms=now, notionals=self.notionals)
+            free = self.engine.store.free_bytes()
+        except Exception:  # noqa: BLE001
+            free = None
+        rest = fs.get("rest") or {}
+        return {"uptime_s": round((self.wall_ms() - self.started_ms) / 1000.0, 1),
+                "linear_reconnects": (streams.get(E.LINEAR) or {}).get("reconnects"),
+                "spot_reconnects": (streams.get(E.SPOT) or {}).get("reconnects"),
+                "linear_connected": (streams.get(E.LINEAR) or {}).get("connected"),
+                "spot_connected": (streams.get(E.SPOT) or {}).get("connected"),
+                "rest_errors": rest.get("errors"), "rest_bootstrapped": rest.get("bootstrapped"),
+                "book_rejections": sum(int(v) for v in (self.engine.state.rejections or {}).values()),
+                "store_fault": self.engine.state.store_fault,
+                "free_bytes": free, "min_free_bytes": self.min_free_bytes}
+
+    def capture_capacity(self) -> Optional[Dict[str, Any]]:
+        """Append one chained cost curve for the current view. Never raises."""
+        try:
+            snap = self.feed.snapshot(self._source_of, wall_ms=self.wall_ms)          # view + ids + clocks: ONE read under the engine lock
+            view, now = snap.view, snap.wall_ms
+            row = MC.capacity_row(view, now_ms=now, notionals=self.notionals,
+                                  source=snap.source, health=self._health())
             # the view's own verdict is recorded with the curve: a curve taken from a view the
             # entry gate would refuse is still data, but it must say so
             row["entry_refusals"] = list(view.refusals(S.ENTRY))
-            with open(self._capacity_path(now), "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+            path = self._capacity_path(now)
+            try:
+                n, head = EC.append(path, row)
+            except EC.ChainDesync:
+                # a crash or a full disk between the row and its chain entry: repair it VISIBLY
+                # (a torn row is set aside in <file>.torn, an unchained row is sealed with a
+                # `resealed` mark), then try once more. Never append over a disagreement.
+                self._repairs += 1
+                if not EC.repair(path)["appendable"]:
+                    raise
+                n, head = EC.append(path, row)
+            self.chain_head = {"file": os.path.basename(path), "n": n, "head": head}
             self.capacity_rows += 1
             self.last_capacity_ms = now
             self.capacity_max_fillable = row["max_displayed_fillable_notional_usd"]
@@ -121,10 +168,11 @@ class Recorder:
         cutoff = ST._utc_day(self.wall_ms() - self.capacity_retention_days * DAY_MS)
         removed = []
         for name in sorted(os.listdir(self.dir)):
-            if name.startswith("capacity-") and name.endswith(".jsonl") and name[9:17] < cutoff:
+            if name.startswith("capacity-") and ".jsonl" in name and name[9:17] < cutoff:
                 try:
-                    os.remove(os.path.join(self.dir, name))
-                    removed.append(name)
+                    os.remove(os.path.join(self.dir, name))     # the file and its .chain / .head siblings
+                    if name.endswith(".jsonl"):
+                        removed.append(name)
                 except OSError:
                     pass
         return removed
@@ -155,7 +203,9 @@ class Recorder:
             "entry_refusals": view_refusals,
             "capacity": {"rows": self.capacity_rows, "errors": self.capacity_errors,
                          "last_ms": self.last_capacity_ms, "last_error": self.last_capacity_error,
-                         "max_displayed_fillable_notional_usd": self.capacity_max_fillable},
+                         "max_displayed_fillable_notional_usd": self.capacity_max_fillable,
+                         "chain_head": self.chain_head, "resealed_rows_at_start": self._resealed,
+                         "repairs_while_running": self._repairs},
         }
 
     def write_status(self) -> Dict[str, Any]:
@@ -165,6 +215,17 @@ class Recorder:
 
     # -- lifecycle ---------------------------------------------------------------------------------------
     def start(self) -> None:
+        # a crash between a row and its chain entry leaves an unchained tail: seal it visibly
+        try:
+            # every capacity file, not just today's: a crash near midnight leaves YESTERDAY's head behind
+            for name in sorted(os.listdir(self.dir)):
+                if name.startswith("capacity-") and name.endswith(".jsonl"):
+                    path = os.path.join(self.dir, name)
+                    if EC.needs_repair(path):
+                        r = EC.repair(path)
+                        self._resealed += r["rows_resealed"]
+        except Exception:  # noqa: BLE001 - evidence repair must not stop collection
+            pass
         self.feed.start()
         self.write_status()
 

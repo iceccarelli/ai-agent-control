@@ -439,7 +439,8 @@ class TradingBot:
                 st = journal.statement(now_ms=int(time.time() * 1000))
                 status["accounting"] = {
                     k: st.get(k) for k in (
-                        "net_basis", "net_usd", "fees_usd", "funding_usd",
+                        "net_basis", "net_usd", "pair_net_usd", "inventory_mark_usd",
+                        "fees_usd", "funding_usd",
                         "fees_confirmed", "funding_confirmed",
                         "funding_reconciled", "funding_unread",
                         "funding_unattributed", "funding_estimated_entries",
@@ -2510,10 +2511,13 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         bot.carry_journal = (_ledger.Journal.from_rows(_rows) if _rows
                              else _ledger.Journal())
         if _rows:
+            _st = bot.carry_journal.statement()
             logger.warning(
-                "carry ledger: resumed %d entries, realised net $%.2f",
-                len(bot.carry_journal.entries),
-                bot.carry_journal.statement()["net_usd"])
+                "carry ledger: resumed %d entries, CASH net $%.2f (funding - "
+                "fees + perp realised; excludes the inventory mark), hedged "
+                "pair net $%.2f",
+                len(bot.carry_journal.entries), _st["net_usd"],
+                _st["pair_net_usd"])
 
         bot.carry = CarryEngine(
             broker=_ledger.LedgerBroker(

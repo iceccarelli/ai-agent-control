@@ -143,3 +143,66 @@ class TestReturnOnTotalCapital:
     def test_an_unusable_fraction_is_refused(self):
         with pytest.raises(ValueError):
             rp.return_on_total_capital(8.0, (-0.1,))
+
+
+# ---------------------------------------------------------------------------------------------------------------- return denominators
+from types import SimpleNamespace as _NS  # noqa: E402
+
+
+def _row(perp, rate):
+    return _NS(perp=perp, rate=rate)
+
+
+def test_the_return_bases_by_hand_for_one_trade_whose_price_rises():
+    # entered at index 0 at 100, three prints held (indices 1..3) while the perp marks 110, 120, 130; rate 1 bp per print; qty 1
+    rows_ = [_row(100.0, 0.0), _row(110.0, 1e-4), _row(120.0, 1e-4), _row(130.0, 1e-4)]
+    t = trade(0, 3, funding=0.0, perp=(100.0, 130.0), qty=1.0)
+    funding_at_mark = 1e-4 * (110.0 + 120.0 + 130.0)                     # 0.036: what the engine books (rate x qty x MARK)
+    funding_at_entry = 1e-4 * 100.0 * 3                                   # 0.030: the same prints priced at the entry
+    net = funding_at_mark - 0.01                                          # 0.01 of fees
+    out = rp.denominator_report([dict(t, funding=funding_at_mark)], rows_, net_usd=net, funding_usd=funding_at_mark, years=1.0, notional=100.0)
+    assert out["reconciles"] is True and out["held_prints"] == 3
+    assert out["funding_recomputed_at_mark_usd"] == pytest.approx(0.036) and out["funding_at_entry_notional_usd"] == pytest.approx(0.030)
+    assert out["avg_marked_hedged_notional_usd"] == pytest.approx(120.0) and out["marked_over_entry_ratio"] == pytest.approx(1.2)
+    assert out["on_entry_notional_pct"] == pytest.approx(100.0 * 0.026 / 100.0)                       # the headline, unchanged
+    assert out["drift_neutral_pct"] == pytest.approx(100.0 * (0.026 - 0.036 + 0.030) / 100.0)        # 0.020
+    assert out["on_avg_marked_notional_pct"] == pytest.approx(100.0 * 0.026 / 120.0)
+    assert out["by_margin"][1.0] == pytest.approx(100.0 * 0.026 / 240.0) and out["by_margin"][0.0] == pytest.approx(out["on_avg_marked_notional_pct"])
+
+
+def test_at_a_constant_price_every_basis_agrees():
+    rows_ = [_row(100.0, 0.0)] + [_row(100.0, 2e-4)] * 5
+    t = trade(0, 5, funding=0.0, perp=(100.0, 100.0), qty=2.0)
+    f = 2e-4 * 2.0 * 100.0 * 5
+    out = rp.denominator_report([dict(t, funding=f, prints_held=5)], rows_, net_usd=f, funding_usd=f, years=1.0, notional=200.0)
+    assert out["marked_over_entry_ratio"] == pytest.approx(1.0)
+    assert out["drift_neutral_pct"] == pytest.approx(out["on_entry_notional_pct"]) == pytest.approx(out["on_avg_marked_notional_pct"])
+
+
+def test_a_falling_price_makes_the_headline_understate_and_the_drift_neutral_figure_exceed_it():
+    rows_ = [_row(100.0, 0.0), _row(90.0, 1e-4), _row(80.0, 1e-4)]
+    t = trade(0, 2, funding=0.0, perp=(100.0, 80.0), qty=1.0)
+    f = 1e-4 * (90.0 + 80.0)
+    out = rp.denominator_report([dict(t, funding=f, prints_held=2)], rows_, net_usd=f, funding_usd=f, years=1.0, notional=100.0)
+    assert out["marked_over_entry_ratio"] < 1.0 and out["drift_neutral_pct"] > out["on_entry_notional_pct"]
+
+
+def test_when_the_funding_cannot_be_reproduced_from_the_held_prints_nothing_is_claimed():
+    rows_ = [_row(100.0, 0.0), _row(110.0, 1e-4), _row(120.0, 1e-4)]
+    t = trade(0, 2, funding=0.0, perp=(100.0, 120.0), qty=1.0)
+    out = rp.denominator_report([dict(t, prints_held=2)], rows_, net_usd=1.0, funding_usd=0.5, years=1.0, notional=100.0)        # the engine's funding is not rate x qty x mark
+    assert out["reconciles"] is False and out["drift_neutral_pct"] is None and out["on_avg_marked_notional_pct"] is None
+    assert "not claimed" in rp.denominator_lines(out)[0]
+    empty = rp.denominator_report([], rows_, net_usd=0.0, funding_usd=0.0, years=1.0, notional=100.0)
+    assert empty["held_prints"] == 0 and empty["drift_neutral_pct"] is None
+
+
+def test_the_real_replay_reports_the_bases_and_the_headline_is_untouched():
+    data = rows(120, rate=0.0006)
+    report = rp.replay(data, notional=100_000.0, borrow_apr=0.0)
+    d = report["denominators"]
+    assert report["net_annualised_pct"] == pytest.approx(d["on_entry_notional_pct"])
+    assert d["reconciles"] is True, d                        # the engine's own funding IS rate x qty x mark over the held prints
+    assert d["funding_recomputed_at_mark_usd"] == pytest.approx(report["funding_usd"], abs=1e-6)
+    assert d["marked_over_entry_ratio"] > 1.0                # the synthetic corpus rises 0.02 % a print
+    assert d["drift_neutral_pct"] < d["on_entry_notional_pct"]

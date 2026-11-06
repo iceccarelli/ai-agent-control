@@ -125,7 +125,140 @@ the bot's state, as the authority.
   `fly volumes extend <id> -s <GB>`) or lower `--recorder-retention-days` in the image CMD.
 - **Never:** delete files under `/data/market` by hand; the log is hash-chained and prunes itself by day.
 
-## Backups (not yet automated)
-A safe backup is an **online SQLite backup** (`sqlite3 trading_state.db ".backup 'copy.db'"`
-taken from inside the machine), encrypted, stored **off** the volume, with a restore
-rehearsed on a throwaway machine. None of that is done by the repository; it needs the owner.
+## Backups
+`tools/state_backup.py` is the tooling; scheduling and storage are the owner's. It opens the ledger
+**read-only**, takes SQLite's online backup (safe beside the writer), checks the copy, and writes a
+manifest (SHA-256 and per-table row COUNTS, never contents). It refuses an out-dir on the source's own
+directory: a backup beside the ledger on the same volume is not a backup.
+
+    # on the machine, to a scratch dir, then copy OFF the volume (owner):
+    python3 tools/state_backup.py backup  --db <PATH-TO-LEDGER> --out-dir <DIR>
+    python3 tools/state_backup.py verify  --backup <DIR>/<file>
+    # the rehearsal that proves it restores, on a disposable machine/dir (never the live one):
+    python3 tools/state_backup.py restore --backup <FILE> --into <NEW-EMPTY-DIR>
+
+Encrypt the file before it leaves the machine (`age -r <recipient> -o x.db.age x.db`, or
+`openssl enc -aes-256-cbc -pbkdf2 -in x.db -out x.db.enc`) and keep the manifest beside it. A backup that
+has not been restored once is a hope, not a backup. **No schedule is installed by the repository.**
+
+## 15. Is the evidence trustworthy, and is it profitable? (read-only, offline)
+Run on the recorder's data directory (or a copy; it never writes there):
+
+    python3 tools/profitability_report.py --dir /data/market --history /data/monitor/monitor.jsonl --notional 100000 --hold-days 30
+
+* **Integrity (separate states, no single flag):** every capacity row is validated against `capacity/2`; a row with no chain entry
+  is never admitted and blocks the economics block; each file is graded ANCHORED_CURRENT / ANCHORED_LAGGING / STALE_ANCHOR /
+  UNANCHORED / ANCHOR_CONFLICT by its LATEST anchor; and the sidecar chain is checked
+  against the head copied into `monitor.jsonl` (a second copy on the same volume: external to the evidence directory, not to the machine, until you archive it off the machine). A broken chain in ANY chained file, an anchored file that lost its sidecars or rows, an anchored file that is gone,
+  a mixed stream, a regression, a duplicate or more than 1 % rejected rows withholds the economics block entirely; the report says so.
+* **Dependence:** unique settlements, not snapshots, are the unit, and settlements are themselves serially dependent:
+  a claim needs the effective sample size (>= 30) as well as the count (>= 30 joined, >= 90 for a candidate).
+  `INSUFFICIENT` is the honest answer below the floor; a constant funding history has no variance to test and stays INSUFFICIENT.
+* **How far to trust the interval (measured, not assumed):** the interval is the widest of a block bootstrap and three
+  analytic intervals, and a claim also needs the effective sample size (the LOWER of an autocorrelation estimate and a
+  batch-means estimate) to be >= 30. Among series the gate accepts, simulation gives the true mean inside the interval
+  about 0.88-0.99 of the time for first-order persistence up to 0.8, and the lower bound above the truth about 3 %.
+  Two things it cannot do at ~100 settlements: identify a slow persistent level hidden under noise (measured coverage
+  0.7-0.85 there) and predict a level shift. So the economics carry the LEAST favourable of the window's and the most
+  recent third's lower bounds, a drift below the window is flagged, and a `RESEARCH_CANDIDATE` is a research flag, never
+  a validated edge. `PROSPECTIVE_MARKET_EDGE_SUPPORTED` is the gate a future pre-registration mechanism must satisfy (typed, finite claims,
+  screens re-run on post-registration data alone, anchors held off the machine); no registration mechanism exists and this report supplies none,
+  so it is unreachable from the CLI today.
+* **Money:** two returns (on hedged notional, on fully allocated economic capital), the 10/15/20 %/yr
+  screens labelled `PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED`, and an explicit list of UNKNOWN
+  inputs (latency, the account's real fee tier, venue margin rules). Replace them with the owner's.
+* **What a status means:** `PROSPECTIVE_MARKET_EDGE_SUPPORTED` is a statement about the PUBLIC market. `ECONOMICALLY_RECONCILED` needs account
+  records (real fee schedule, reconciled account funding settlements, real fills with fee records, measured costs, verified
+  margin rules) that nothing in this repository produces yet, so no run of this report can reach it; `EXECUTION_READY` additionally needs a
+  separate owner authorisation record. No status authorises trading.
+* **What it would take (6b) and what exposure survives (6c):** from the variance and dependence observed so far, the report prints how many
+  settlements it would take to separate funding that earns the lowest screen from noise at the family-wise level (an illustrative
+  position and an assumed 11.4 bps round trip: labelled ASSUMED). The exposure line is a research ceiling from an offline stress
+  simulation (basis shock, funding reversal, gap, liquidity, correlated stackings) with ASSUMED venue rules and an unverified fee tier; it
+  is allowed to be, and today is, ZERO, with every reason named. Levels above 1x are analysis only.
+* **The other hypotheses (7):** basis convergence is measured as real EPISODES (entry, convergence or failure, adverse widening, net), trend and
+  mean reversion are predeclared rules fed one price at a time against buy-and-hold, and all 16 predeclared variants are judged
+  together (alpha 0.05/16). They are INSUFFICIENT on a few days of data by design; microstructure cannot be measured until imbalance is recorded and
+  a cross-section until more than one symbol is. None is above RESEARCH_CANDIDATE.
+* **Never** read it as realised cash: no cash settlement is read from the venue by this tool.
+
+## 16. Operational verification (owner, read-only; run before and after any deploy decision)
+`carry-drill` and `carry-book` are separate apps. Do not assume either is up; look.
+
+    fly status -a carry-drill                      # machine state, restarts, image
+    fly machine status <id> -a carry-drill         # image digest, last start, checks
+    fly volumes list -a carry-drill                # size, attached machine
+    fly ssh console -a carry-drill -C "df -h /data"                         # disk reserve
+    fly ssh console -a carry-drill -C "cat /data/market/recorder_status.json"
+    fly ssh console -a carry-drill -C "cat /data/market/supervisor_status.json"
+    fly ssh console -a carry-drill -C "tail -n 3 /data/monitor/monitor.jsonl"
+    gh run list --workflow carry-watch --limit 5   # alert freshness
+
+Record: image digest and build commit (the `/health` fingerprint), restarts since last look, free MB vs the
+512 MB reserve, recorder state, newest capacity row age, and whether the newest chain head matches the
+monitor's copy. The 365-day capacity retention is separate from the 2-day market-event retention; do not
+shorten one to fix the other. Do not scale the authoritative book horizontally.
+
+## 17. GitHub branch protection (owner; this repository does not change settings)
+On `main`: require a pull request; require these status checks (names as the Actions UI shows them):
+`carry-correctness (3.11)`, `carry-correctness (3.12)`, `rest-of-suite (3.11)` and `(3.12)` as listed in
+the run, `production-image`, `shadow-runtime-image`, `secret-scan`, `dependency-audit`; require
+up-to-date branches; require code-owner review; disallow force pushes and deletions. Do not allow
+administrators to bypass if the owner wants the gate to bind the owner too. Read the exact check names from
+a recent run before saving the rule: a required check that never reports blocks every merge.
+
+## 18. Does the RUNNING recorder contain this code? (owner, read-only; merging a PR does not change a running machine)
+A running Fly machine changes only when an image is built and deployed. Merging PR #217 changes the repository, not
+`carry-drill`. To establish what is actually running, from a checkout of the commit you want to compare:
+
+    python3 bot/tools/image_manifest.py expected > expected.txt        # reads only the repository
+    python3 bot/tools/image_manifest.py command                         # prints ONE read-only command; run it yourself, save its output as actual.txt
+    python3 bot/tools/image_manifest.py compare --expected expected.txt --actual actual.txt
+    fly image show -a carry-drill                                       # record the registry image and digest beside the result
+    fly status -a carry-drill                                           # machine id, version, restarts
+
+`compare` reports per file MATCH / DIFFERENT / MISSING_ON_MACHINE for the recorder's whole static import closure (computed from the
+entry points: recorder, monitor, supervisor and every module they import, including the book, wire, store and transport code) and a verdict. An image built before this change lacks
+several of them, which shows as MISSING_ON_MACHINE: that is the expected answer, and it means the old recorder is still
+running. The closure includes packages (`signals/`) and LAZY imports: the monitor imports the shadow engine inside a function, so the
+trading-engine files that ship in the same image are compared too, and an engine-only edit therefore shows as DIFFERENT even though the
+recorder's common path never runs it. Read such a DIFFERENT as "the image is not this commit", not as "the recorder is broken", and
+decide the release separately. The drill image carries no commit label, so the tool compares bytes, not tags. **A recorder release is a
+separate step from any trading-engine release and needs your explicit authorisation; nothing in this PR requests it.**
+
+## 19. External anchor archive (owner; moves the chain head off the recorder machine)
+Chain heads copied into `monitor.jsonl` sit on the same volume as the evidence. To make a rewrite detectable by someone who
+controls that volume, keep the heads where the machine cannot reach:
+
+    fly ssh console -a carry-drill -C "tail -n 400 /data/monitor/monitor.jsonl" > monitor_tail.jsonl     # read-only fetch, no secret in it
+    python3 bot/tools/anchor_archive.py append --history monitor_tail.jsonl --archive anchors.jsonl        # on YOUR machine
+    python3 bot/tools/anchor_archive.py latest --archive anchors.jsonl                                     # prints the archive head
+
+Do this at least daily (the monitor's history is bounded). Store the printed **archive head** (one 64-hex value) and its entry
+count somewhere the recorder machine cannot reach: a password-manager note, a mail to yourself, a private repository.
+`append` refuses, and writes nothing, if a file's anchor goes BACKWARDS (the evidence was truncated) or the same row count
+reappears with a different head (the chain was rewritten). Then, on a copy of `/data/market` on your machine:
+
+    python3 bot/tools/profitability_report.py --dir <copy> --history monitor_tail.jsonl --anchor-archive anchors.jsonl \
+        --archive-head <the value you stored> --archive-entries <its count>
+
+The report then says `EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE` only if the archive is exactly what you recorded (or has
+only grown). When it has grown, only the entries inside the prefix you stored count as anchored by the archive (`anchored by the ARCHIVE
+itself: N of M chained files` in the report; the grade is ANCHORED only when that equals M): entries appended later are not pinned by you.
+The tool cannot see where you keep the value: that remains your claim, and it is printed as one.
+
+The report decides which anchored day-files that are gone were "removed" and which were merely "pruned" from the capacity retention YOU
+state (`--capacity-retention-days`, default 365, the recorder's own default; 0 = the recorder keeps everything). It is never read from
+the evidence directory, because whoever can delete a day of evidence can also edit a file next to it. If you run the recorder with a
+shorter retention, pass the same number here or every legitimately pruned day will block the economics.
+
+A chain sidecar written by an EARLIER revision of this branch (an adoption entry whose hash lacks the mark) does not verify: the entry
+is indistinguishable from an ordinary one with the flag flipped onto it, and an anchor cannot tell them apart. Nothing deployed has ever
+written one (`evidence_chain.py` first appears in this change), so there is nothing to migrate; a development file would be excluded,
+visibly, as SIDECAR_INCONSISTENT.
+
+An automated version of the archive step (a scheduled job that runs the read-only fetch and appends to a private repository) is possible
+but needs your decision about where the secrets for it live; it is not part of this PR.
+
+## Backups: what is not done
+Nothing here schedules a backup, stores one off-volume, or has restored one. That needs the owner.

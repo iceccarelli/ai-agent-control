@@ -28,6 +28,15 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 import md_economics as ME
 
+#: The capacity record schema. v2 adds provenance (venue/environment/category/symbol, the
+#: source market-event identity, exchange and local clocks, funding clock, book depth, fee
+#: provenance, model version) so a row can be validated, chained and traced to the log.
+#: v1 rows (no `schema` key) predate it and are quarantined by `capacity_schema`.
+SCHEMA = "capacity/2"
+MODEL_VERSION = "md_capacity/2"
+VENUE = "bybit"
+CATEGORY = "linear"
+
 #: Position sizes (USD notional) the curve is evaluated at.
 DEFAULT_NOTIONALS = (1_000.0, 10_000.0, 50_000.0, 100_000.0, 500_000.0, 1_000_000.0, 5_000_000.0)
 
@@ -37,10 +46,15 @@ def _fin(x: Any) -> bool:
 
 
 def capacity_row(view: Any, *, now_ms: int, notionals: Sequence[float] = DEFAULT_NOTIONALS,
-                 fees: Optional[ME.FeeSchedule] = None, mode: str = ME.OVERLAY) -> Dict[str, Any]:
+                 fees: Optional[ME.FeeSchedule] = None, mode: str = ME.OVERLAY,
+                 source: Optional[Mapping[str, Any]] = None,
+                 health: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """One record: the market at this instant and the cost curve across sizes.
 
-    ``view`` is a ``md_state.MarketView``. The record is plain JSON-able data."""
+    ``view`` is a ``md_state.MarketView``. ``source`` names the market event this view was
+    computed at (the log's record id and the books' update ids / sequence numbers) and
+    ``health`` is the recorder's own condition at that instant. The record is plain
+    JSON-able data."""
     fees = fees or ME.FeeSchedule.published_default()
     ref = view.perp_mid if _fin(getattr(view, "perp_mid", None)) else None
     funding_bps = None if view.funding_rate is None else float(view.funding_rate) * 1e4
@@ -78,8 +92,31 @@ def capacity_row(view: Any, *, now_ms: int, notionals: Sequence[float] = DEFAULT
             breakeven_settlements=(total_bps / funding_bps) if funding_bps and funding_bps > 0 else None)
         max_fillable = float(notional)
         curve.append(point)
-    return {
-        "at_ms": int(now_ms), "environment": view.environment, "symbol": view.symbol, "mode": mode,
+    src = dict(source or {})
+    rid = src.get("store_record_id")
+    lp = getattr(view, "last_funding_print", None)
+    row = {
+        "schema": SCHEMA, "model_version": MODEL_VERSION, "venue": VENUE,
+        "category": CATEGORY, "environment": view.environment, "symbol": view.symbol, "mode": mode,
+        "row_id": None if rid is None else f"{view.environment}:{view.symbol}:{int(rid)}",
+        "source": {"store_record_id": rid, "perp_update_id": src.get("perp_update_id"),
+                   "perp_seq": src.get("perp_seq"), "spot_update_id": src.get("spot_update_id"),
+                   "spot_seq": src.get("spot_seq")},
+        "at_ms": int(now_ms),                       # local receive/observation time of this row
+        "times": {"observed_wall_ms": getattr(view, "observed_wall_ms", None),
+                  "perp_book_exch_ts_ms": view.perp_book_exch_ts_ms,
+                  "spot_book_exch_ts_ms": view.spot_book_exch_ts_ms,
+                  "perp_book_age_s": view.perp_book_age_s, "leg_span_s": view.leg_span_s,
+                  "clock_skew_ms": view.clock_skew_ms},
+        "funding": {"forecast_bps": funding_bps, "next_settlement_ms": view.next_funding_ms,
+                    "interval_h": view.funding_interval_h,
+                    "last_print_bps": None if lp is None else float(lp[0]) * 1e4,
+                    "last_print_settled_ms": None if lp is None else int(lp[1])},
+        "book": {"perp_bid_levels": len(view.perp_bids), "perp_ask_levels": len(view.perp_asks),
+                 "spot_bid_levels": len(view.spot_bids), "spot_ask_levels": len(view.spot_asks),
+                 "perp_best_bid": view.perp_bid, "perp_best_ask": view.perp_ask},
+        "fees": {"source": fees.source, "perp_taker_bps": fees.perp_taker_bps,
+                 "spot_taker_bps": fees.spot_taker_bps},
         "perp_mark": view.perp_mark, "perp_mid": ref, "basis_bps": basis_bps,
         "funding_forecast_bps_per_settlement": funding_bps, "next_funding_ms": view.next_funding_ms,
         "fee_source": fees.source, "latency_bps": "UNKNOWN (not added)",
@@ -89,6 +126,9 @@ def capacity_row(view: Any, *, now_ms: int, notionals: Sequence[float] = DEFAULT
                     "breakeven_settlements": ME.ESTIMATED, "latency_borrow_account_tier": ME.UNKNOWN},
         "note": "lower bound on cost; says nothing about profit",
     }
+    if health is not None:
+        row["recorder"] = dict(health)
+    return row
 
 
 def affordable_notional(row: Mapping[str, Any], budget_bps: float) -> Optional[float]:

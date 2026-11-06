@@ -31,6 +31,13 @@ The gate refuses when entry basis exceeds the carry you expect to collect over
 the hold. Paying 30 bps of basis to collect 9 bps of funding is a decision
 nobody would make explicitly, so it must not be reachable implicitly.
 
+(Reading it precisely: the premium branch is a SYMMETRIC bound on |basis|, not
+a sign-specific cost. A perp at a premium converges back to spot in the short's
+favour; a perp at a discount converges against it. The rule bounds how far the
+basis may sit from zero relative to the carry, in both directions, and on the
+public history it has never bound: no print exceeds +24 bps against a smallest
+reachable budget of 47 bps, so a replay with it removed is bit-identical.)
+
 GATE 2 — COST OF CAPITAL
 ========================
 Borrow was 57% of gross income. The spot leg is financed and the engine has
@@ -122,6 +129,27 @@ FUNDING_PERIODS_PER_DAY = 3
 #: predicted at entry, so in aggregate that optimism is offset by a conservative
 #: funding expectation, and 69% of completed trades still lost money after fees:
 #: the profit sits in a minority of long holds that cannot be told apart at entry.
+#:
+#: PROVENANCE OF THE FIGURES ABOVE (re-measured 2026-11-06, in-sample; the
+#: constant is deliberately NOT changed here). They describe the engine with the
+#: hold test UNWIRED: 76-77 entries, median 5.83 d, mean 17.2 d, 68% losing, net
+#: $29,889 (+7.28%/yr on $100k). The hold test then WIRED (this constant, 5.8 d)
+#: refuses 28 of those entries, and the same audit at HEAD reads 49 entries,
+#: median 9.67 d, mean 23.9 d, 52% losing, net $33,050 (+8.05%/yr). So 5.8 is
+#: population-CONDITIONAL: 76 of the 77 unwired entries would fail today's test
+#: at their own entry print (median smoothed funding 0.28 bps against the 0.647
+#: threshold), i.e. the "demonstrated" median comes from trades almost entirely
+#: outside the population that now consumes it, and re-measuring it on the gated
+#: population gives a different number (9.67), which is a different gate. There
+#: is no fixed point (feeding each run's median back oscillates between 5.8 and
+#: ~9). The constant is the STRICTER of the two, so the stale provenance makes
+#: the gate more conservative than documented, not looser; raising it to the new
+#: median would admit ~65 entries instead of 49 and is a human decision that must
+#: not be tuned in-sample. Note also that the three horizons in one decision are
+#: not the same: `evaluate_entry` amortises over ASSUMED_HOLD_DAYS (30 d) and
+#: bounds basis by net_edge x 30 d, while the break-even below uses this 5.8 d;
+#: on the funding level the gate is pessimistic, on the basis budget it is
+#: optimistic.
 #:
 #: The sensitivity is not academic. At a 7-day hold the round trip alone is
 #: 4.43 bps/day against 1.80 bps/day of carry at MIN_ENTRY_FUNDING_BPS: the
@@ -348,9 +376,13 @@ def evaluate_entry(*, funding_prints_bps: Sequence[float], perp: float,
             amortised_round_trip_bps_per_day=round_trip_per_day,
             net_edge_bps_per_day=net_edge, entry_basis_bps=entry_basis,
             basis_budget_bps=basis_budget, smoothed_funding_bps=smoothed,
-            detail={"note": "short perp + long spot earns the basis it SHEDS. "
-                            "Opening into a wide basis is paying up front for "
-                            "carry you have not collected yet."})
+            detail={"note": "a symmetric basis-risk bound, not a sign-specific "
+                            "cost: an entry basis further from zero than the "
+                            "carry expected over the hold can cover is refused. "
+                            "(A premium converges in the short's favour, "
+                            "hedge_basis_pnl_bps > 0 on convergence; the bound "
+                            "is kept because the premium can also widen before "
+                            "it converges, and it is mirrored in the C++ core.)"})
 
     # The same budget, the other way: a perp trading at a DISCOUNT converges
     # back to spot by costing the short, so an entry basis below minus the

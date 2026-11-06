@@ -32,6 +32,7 @@ No credentials, no private channel, no order path.
 """
 from __future__ import annotations
 
+import collections.abc
 import json
 import random
 import threading
@@ -57,6 +58,49 @@ SUBSCRIBE_CHUNK = 10
 #: 2**16 seconds is far past any cap; bounding the exponent keeps the arithmetic finite
 #: however long the venue stays unreachable.
 MAX_BACKOFF_EXPONENT = 16
+
+
+class ReadOnlyMapping(collections.abc.Mapping):
+    """An immutable copy of a mapping: reads work, any assignment raises TypeError, and a second ``__init__`` is refused. It is
+    immutable against accident and against ordinary code; it is NOT a defence against code that deliberately reaches into ``_d``
+    (Python has no such thing), and nothing in this repository does."""
+    __slots__ = ("_d",)
+
+    def __init__(self, d: Any) -> None:
+        try:
+            object.__getattribute__(self, "_d")
+        except AttributeError:
+            object.__setattr__(self, "_d", dict(d))
+            return
+        raise TypeError("read-only: already initialised")
+
+    def __delattr__(self, *_a: Any) -> None:
+        raise TypeError("read-only")
+
+    def __getitem__(self, k: Any) -> Any:
+        return self._d[k]
+
+    def __iter__(self):
+        return iter(self._d)
+
+    def __len__(self) -> int:
+        return len(self._d)
+
+    def __setattr__(self, *_a: Any) -> None:
+        raise TypeError("read-only")
+
+    def __repr__(self) -> str:
+        return f"ReadOnlyMapping({self._d!r})"
+
+
+@dataclass(frozen=True)
+class MarketSnapshot:
+    """A view, the identifiers of the market events it reflects, and the wall/monotonic clocks it was taken at: one
+    read, one instant. Immutable; ``source`` is a read-only mapping."""
+    view: Any
+    source: Any
+    wall_ms: int
+    mono_s: float
 
 
 @dataclass(frozen=True)
@@ -453,6 +497,17 @@ class Feed:
         """The current validated view (not logged)."""
         with self.engine.lock:
             return self.engine.state.view(self.mono(), self.wall_ms())
+
+    def snapshot(self, identify, wall_ms=None):
+        """ONE immutable snapshot: the validated view, the event identifiers it was computed at and the clocks, all read
+        under the engine lock that every market event is applied under. Reading the view and then, separately, the
+        identifiers lets an event land in between, and the row would then name a later event than the one its numbers
+        came from. ``identify(engine)`` is called while the lock is held and must only READ ids."""
+        with self.engine.lock:
+            mono, wall = self.mono(), int((wall_ms or self.wall_ms)())
+            view = self.engine.state.view(mono, wall)
+            ids = dict(identify(self.engine))
+        return MarketSnapshot(view=view, source=ReadOnlyMapping(ids), wall_ms=wall, mono_s=mono)
 
     def alive(self) -> bool:
         """Every worker thread is running. A dead thread is a feed that will never recover."""
