@@ -21,7 +21,7 @@ listed and ignored):
 What it checks (each failure is a named flag with a count, never a silent repair):
   * every number is finite, every id unique, every time plausible; a funding row is snapped to the 8h UTC grid only within 60 s;
   * the position is rebuilt from the fills; each 8h settlement the book was provably short through must have exactly one funding
-    row; a row at a moment the book was flat is unattributed; a fill within a minute of a settlement makes it ambiguous (counted
+    row; a row at a moment the book was flat is unattributed; a settlement is ambiguous only if the book opened, closed or flipped inside the minute either side (counted
     on neither side);
   * the position the funding row states equals the position the fills imply;
   * the funding rate equals the public print at that time (when a public history covers it);
@@ -45,14 +45,15 @@ import argparse
 import bisect
 import csv
 import datetime
-import gzip
 import hashlib
 import io
 import json
 import math
 import os
 import re
+import stat
 import sys
+import zlib
 from dataclasses import dataclass
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -70,7 +71,7 @@ DAY_MS = 86_400_000
 SLACK_MS = 60_000                       # the ledger's attribution slack: a fill this close to a settlement makes it ambiguous
 DUST_QTY = 1e-8
 MAX_ABS_RATE = 0.03                     # 300 bps per settlement; anything larger is a unit error
-MARK_TOLERANCE = 0.02                   # payment-implied mark vs the 4h bar open: a consistency screen, not a precision check
+MARK_TOLERANCE = 0.005                  # payment-implied mark vs the 4h bar open (the settlement instant IS a bar open): a consistency screen
 POSITION_REL_TOL = 1e-3
 POSITION_ABS_TOL = 1e-6
 RATE_TOL_BPS = 0.002
@@ -80,7 +81,10 @@ MIN_QTY, MAX_QTY = 1e-6, 1e5           # BTC: below one micro-BTC is dust, above
 MAX_PRICE = 1e7
 MAX_USD = 1e9
 MAX_FEE_FRACTION = 0.05                 # a fee above 5 % of the fill's notional is a unit error, not a tier
-SPOT_REF_MAX_DEVIATION = 0.02           # the spot mid and the perp fill of one hedge leg differ by basis, which is bps, not percent
+SPOT_REF_MAX_DEVIATION = 0.005          # the spot mid and the perp fill of one hedge leg differ by basis: the committed history's largest 4h basis is 23.5 bps
+BASIS_SCREEN_BPS = 30.0                 # a claimed basis must be within this of the public 4h-bar-open basis of the fill's bar
+PLACEHOLDER_REL = 1e-9                  # spot_ref equal to the fill price (to rounding) is a copy of the price, not a spot mid
+MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
 PRICE_RANGE_TOL = 0.003                 # a fill must sit inside the public 4h bar's low..high, widened by this
 RATE_PRINT_NOISE = 5e-9                 # funding rates are printed to 8 decimals: the rounding a payment may legitimately carry
 MIN_MARK_CHECK_RATE = 1e-6              # below 0.01 bps the implied mark is dominated by the rate's rounding: bound the payment instead
@@ -88,7 +92,9 @@ MAX_BYTES = 256 * 1024 * 1024
 BAR_MS = CT.BAR_MS
 PROTECTED_SUFFIXES = (".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3", ".sqlite-wal", ".sqlite-shm", ".sqlite3-wal",
                       ".sqlite3-shm", ".pem", ".key", ".p12", ".pfx", ".env", ".keystore", ".jks")
-PROTECTED_SUBSTRINGS = ("trading_state", "testnet_session_evidence", "credential", "secret", "id_rsa", "id_ed25519", "id_ecdsa", ".netrc")
+PROTECTED_SUBSTRINGS = ("trading_state", "testnet_session_evidence", "id_rsa", "id_ed25519", "id_ecdsa", ".netrc")
+#: whole name TOKENS (split on anything that is not a letter or digit): 'secret_fills.csv' is a secret, 'secretary.csv' and 'credit.csv' are not
+PROTECTED_TOKENS = ("secret", "secrets", "credential", "credentials", "evidence", "env", "apikey", "apitoken", "passwd", "password", "passwords")
 MIN_ACCOUNT_SETTLEMENTS = 90            # the opportunity engine's floors for ECONOMICALLY_RECONCILED
 MIN_ACCOUNT_ROUND_TRIPS = 3
 MIN_TRIPS_FOR_INTERVAL = 8
@@ -102,7 +108,7 @@ FUNDING_REQUIRED = ("exec_id", "ts_ms", "symbol", "position_qty", "rate", "payme
 SEVERITY_HARD = "HARD"                  # the records contradict each other or the public market: do not rely on them
 SEVERITY_GAP = "GAP"                    # the records are silent where they must not be: the result is incomplete
 
-_NUM = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$")
+_NUM = re.compile(r"^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$", re.ASCII)       # ASCII digits only
 
 
 class RecordError(ValueError):
@@ -118,8 +124,10 @@ def _refuse_protected(path: str) -> str:
     real = os.path.realpath(path)
     base = os.path.basename(real).lower()
     parts = [p.lower() for p in real.split(os.sep) if p]
+    toks = [t for t in re.split(r"[^a-z0-9]+", base) if t]
     named = (base.endswith(PROTECTED_SUFFIXES) or base.startswith(".env") or any(w in base for w in PROTECTED_SUBSTRINGS)
-             or "runs" in parts or ("state" in parts and "bot" in parts))
+             or any(t in PROTECTED_TOKENS for t in toks) or ("api" in toks and ("key" in toks or "token" in toks))
+             or any(p == "runs" or p.startswith(("runs-", "runs_", "runs.")) for p in parts) or ("state" in parts and "bot" in parts))
     linked = False
     try:
         linked = os.stat(real).st_nlink > 1
@@ -148,10 +156,16 @@ def _bad_constant(name: str) -> Any:
     raise RecordError(f"{name} is not a number")
 
 
-def _read_bytes(real: str, label: str) -> bytes:
+def _read_bytes(real: str, label: str, strict_links: bool = True) -> bytes:
+    """Read a regular file once. The checks run on the OPEN file (fstat), so a hard link made after the name check is still seen."""
     if not os.path.isfile(real):
         raise RecordError(f"{label!r} is not a file")
     with open(real, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise RecordError(f"{label!r} is not a regular file")
+        if strict_links and st.st_nlink > 1:
+            raise RecordError(f"refusing to read {label!r}: the file has more than one hard link")
         data = fh.read(MAX_BYTES + 1)
     if len(data) > MAX_BYTES:
         raise RecordError(f"{label!r} is larger than {MAX_BYTES // (1024 * 1024)} MB")
@@ -173,14 +187,18 @@ def read_rows(path: str) -> Tuple[List[Dict[str, Any]], str]:
     rows: List[Dict[str, Any]] = []
     if lower.endswith(".csv"):
         try:
-            for n, r in enumerate(csv.DictReader(io.StringIO(text), strict=True), 2):
+            reader = csv.DictReader(io.StringIO(text), strict=True)
+            header = list(reader.fieldnames or [])
+            if len(set(header)) != len(header):
+                raise RecordError(f"{label}: duplicate column names in the header: which column is meant is not decidable")
+            for n, r in enumerate(reader, 2):
                 if None in r or any(v is None for v in r.values()):
                     raise RecordError(f"{label} line {n}: the row has a different number of fields from the header")
                 rows.append(dict(r))
         except csv.Error as exc:
             raise RecordError(f"{label}: not valid CSV ({exc})") from exc
     else:
-        for n, line in enumerate(text.splitlines(), 1):
+        for n, line in enumerate(text.split("\n"), 1):          # NOT splitlines(): U+2028 and friends are not record separators
             if not line.strip():
                 continue
             try:
@@ -256,6 +274,12 @@ class Fill:
     @property
     def notional(self) -> float:
         return self.qty * self.price
+
+    @property
+    def spot_ref_is_copy(self) -> bool:
+        """A spot reference equal to the fill price (to rounding) is the price copied into the column, not a spot mid: the public basis
+        is never exactly zero, so a zero basis on every fill is a placeholder and proves nothing."""
+        return self.spot_ref is not None and abs(self.price / self.spot_ref - 1.0) <= PLACEHOLDER_REL
 
 
 @dataclass(frozen=True)
@@ -440,17 +464,19 @@ def _interval(xs: Sequence[float]) -> Dict[str, Any]:
 
 
 #: Gaps that can hide a loss or a cost (a dropped settlement, an excluded trip, a basis that is not known): the review is INCOMPLETE.
-STRUCTURAL_GAPS = ("MISSING_SETTLEMENT", "OPEN_LIFECYCLE", "NO_SPOT_REFERENCE", "AMBIGUOUS_SETTLEMENT", "FUNDING_ROW_IN_AMBIGUOUS_WINDOW",
-                   "ROUND_TRIP_WITHOUT_SETTLEMENT")
+STRUCTURAL_GAPS = ("MISSING_SETTLEMENT", "OPEN_LIFECYCLE", "NO_SPOT_REFERENCE", "SPOT_REF_IS_A_COPY_OF_THE_PRICE", "AMBIGUOUS_SETTLEMENT",
+                   "FUNDING_ROW_IN_AMBIGUOUS_WINDOW", "ROUND_TRIP_WITHOUT_SETTLEMENT")
 #: Gaps where the records were not compared with the public market or the stated tier: consistent among themselves, UNCHECKED outside.
+#: Any GAP code that is not listed here counts as STRUCTURAL: an unclassified gap must never be the one that lets a verdict through.
 CHECK_GAPS = ("RATE_CHECK_NOT_RUN", "RATE_CHECK_PARTIAL", "MARK_CHECK_NOT_RUN", "MARK_CHECK_PARTIAL", "PRICE_CHECK_NOT_RUN", "PRICE_CHECK_PARTIAL",
-              "SPOT_REF_CHECK_NOT_RUN", "SPOT_REF_CHECK_PARTIAL", "FEE_TIER_NOT_STATED", "FEE_TIER_MISSING_FOR_CLASS")
+              "SPOT_REF_CHECK_NOT_RUN", "SPOT_REF_CHECK_PARTIAL", "FEE_TIER_NOT_STATED", "FEE_TIER_MISSING_FOR_CLASS", "PUBLIC_HISTORY_CALLER_SUPPLIED")
 
 
 def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: Optional[float] = None, maker_bps: Optional[float] = None,
            capital_usd: Optional[float] = None, public: Optional[Mapping[int, float]] = None,
            bar_open: Optional[Mapping[int, float]] = None, bar_range: Optional[Mapping[int, Tuple[float, float]]] = None,
-           spot_range: Optional[Mapping[int, Tuple[float, float]]] = None, digests: Optional[Mapping[str, str]] = None,
+           spot_range: Optional[Mapping[int, Tuple[float, float]]] = None, spot_open: Optional[Mapping[int, float]] = None,
+           caller_histories: Sequence[str] = (), digests: Optional[Mapping[str, str]] = None,
            ignored_columns: Optional[Mapping[str, Sequence[str]]] = None) -> Dict[str, Any]:
     """Cross-check the fills and funding rows and report what they prove. Pure function of its inputs."""
     for name, v in (("taker_bps", taker_bps), ("maker_bps", maker_bps)):
@@ -540,6 +566,9 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
     spot_implausible: List[str] = []
     spot_outside: List[str] = []
     spot_unchecked = spot_present = 0
+    basis_off: List[str] = []
+    basis_unchecked = 0
+    copies: List[str] = []
     fee_rows: Dict[str, List[float]] = {"taker": [], "maker": []}
     fee_bad: List[str] = []
     for fl in fills:
@@ -558,6 +587,15 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
             spot_present += 1
             if abs(fl.price / fl.spot_ref - 1.0) > SPOT_REF_MAX_DEVIATION:
                 spot_implausible.append(fl.exec_id)
+            if fl.spot_ref_is_copy:
+                copies.append(fl.exec_id)
+            po, so = (bar_open.get(bar) if bar_open is not None else None), (spot_open.get(bar) if spot_open is not None else None)
+            if po and so:
+                public_basis = (po - so) / so * 1e4
+                if abs((fl.price / fl.spot_ref - 1.0) * 1e4 - public_basis) > BASIS_SCREEN_BPS:
+                    basis_off.append(fl.exec_id)
+            else:
+                basis_unchecked += 1
             srng = spot_range.get(bar) if spot_range is not None else None
             if srng is None:
                 spot_unchecked += 1
@@ -569,6 +607,9 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
           f"a fill price is outside the public 4h bar's low..high (widened {PRICE_RANGE_TOL:.1%})", price_bad)
     _flag(flags, "SPOT_REF_IMPLAUSIBLE", SEVERITY_HARD, len(spot_implausible),
           f"spot_ref differs from the perp fill price by more than {SPOT_REF_MAX_DEVIATION:.0%}: a basis is bps, not percent", spot_implausible)
+    _flag(flags, "BASIS_OFF_PUBLIC_BAR", SEVERITY_HARD, len(basis_off),
+          f"the basis a fill's spot_ref implies is more than {BASIS_SCREEN_BPS:g} bps from the public 4h-bar-open basis of that bar "
+          f"(the committed history's largest is 23.5 bps)", basis_off)
     _flag(flags, "SPOT_REF_OUTSIDE_PUBLIC_RANGE", SEVERITY_HARD, len(spot_outside),
           f"spot_ref is outside the public spot 4h bar's low..high (widened {PRICE_RANGE_TOL:.1%})", spot_outside)
     fees = {liq: ({"n": len(v), "mean_bps": sum(v) / len(v), "min_bps": min(v), "max_bps": max(v)} if v else {"n": 0})
@@ -596,15 +637,15 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
             row["status"] = "EXCLUDED_NO_SHORT_ENTRY"
             trips.append(row)
             continue
-        window = [t for t in held if lc["start_ms"] < t < lc["end_ms"]]
+        window = held[bisect.bisect_right(held, lc["start_ms"]):bisect.bisect_left(held, lc["end_ms"])]      # held is sorted: O(log n) per lifecycle
         got = [funding_by_grid[t] for t in window if t in funding_by_grid]
         miss = [t for t in window if t not in funding_by_grid]
-        amb = [t for t in ambiguous if lc["start_ms"] - SLACK_MS <= t <= lc["end_ms"] + SLACK_MS]
+        amb = ambiguous[bisect.bisect_left(ambiguous, lc["start_ms"] - SLACK_MS):bisect.bisect_right(ambiguous, lc["end_ms"] + SLACK_MS)]
         notional = sum(f.notional for f in sells)
         fees_usd = sum(f.fee_usd for f in fl)
         funding_usd = sum(f.payment_usd for f in got)
         perp_pnl = sum(f.notional for f in sells) - sum(f.notional for f in fl if f.side == "Buy")
-        have_spot = all(f.spot_ref for f in fl)
+        have_spot = all(f.spot_ref and not f.spot_ref_is_copy for f in fl)
         basis = (sum(f.qty * (f.price - f.spot_ref) for f in sells) - sum(f.qty * (f.price - f.spot_ref) for f in fl if f.side == "Buy")
                  ) if have_spot else None
         hold_days = (lc["end_ms"] - lc["start_ms"]) / DAY_MS
@@ -623,6 +664,8 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
             row["status"] = "INCOMPLETE_FUNDING"
         elif basis is None:
             row["status"] = "NET_UNKNOWN_NO_SPOT_REFERENCE"
+            if any(f.spot_ref_is_copy for f in fl):
+                row["note"] = "a spot_ref equal to the fill price is a copy of the price, not a spot mid: the basis is unknown"
             row["cash_only_usd"] = funding_usd - fees_usd
             row["cash_only_note"] = "funding - fees only; EXCLUDES basis P&L, so it is not a net edge"
         else:
@@ -655,7 +698,14 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
                      "net_usd": sum(t["net_usd"] for t in complete), "funding_usd": sum(t["funding_usd"] for t in complete),
                      "fees_usd": sum(t["fees_usd"] for t in complete), "basis_pnl_usd": sum(t["basis_pnl_usd"] for t in complete),
                      "mean_net_bps_of_notional": m, "sd_net_bps_of_notional": sd, **_interval(nets),
-                     "notional_weighted_net_bps": sum(t["net_usd"] for t in complete) / tot_n * 1e4}
+                     "notional_weighted_net_bps": sum(t["net_usd"] for t in complete) / tot_n * 1e4,
+                     "net_is_upper_bound": True,
+                     "excludes": ["spot-leg fees and spread (an overlay trades none; an acquisition would)", "borrow and financing", "transfers and conversion",
+                                  "operational cost", "the opportunity cost of the BTC held", "tax", "any cost not in the fills and funding files"],
+                     "basis_unverifiable_bps_per_round_trip": 2 * BASIS_SCREEN_BPS,
+                     "basis_reading": (f"the basis comes from the supplier's spot_ref values; the public-bar screen cannot exclude an error of up to "
+                                       f"{BASIS_SCREEN_BPS:g} bps on each of the entry and the exit, so a round-trip net smaller than "
+                                       f"{2 * BASIS_SCREEN_BPS:g} bps is not distinguishable from zero by this review")}
     else:
         economics = {"tag": "UNKNOWN", "reading": "no round trip has every settlement recorded AND a spot reference on every fill: "
                                                   "no net is stated (funding - fees alone is shown per lifecycle, marked as excluding basis)"}
@@ -701,13 +751,18 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
           "the settlement cannot be established, so it is counted as neither held nor missing", [_iso(t) for t in ambiguous])
     _flag(flags, "FUNDING_ROW_IN_AMBIGUOUS_WINDOW", SEVERITY_GAP, len(in_ambiguous), "a funding row at an ambiguous settlement: kept out of the totals",
           [_iso(f.grid_ms) for f in in_ambiguous])
+    _flag(flags, "SPOT_REF_IS_A_COPY_OF_THE_PRICE", SEVERITY_GAP, len(copies),
+          "fills whose spot_ref equals the fill price: a copy of the price in the column, not a spot mid; those round trips have no basis", copies)
+    _flag(flags, "PUBLIC_HISTORY_CALLER_SUPPLIED", SEVERITY_GAP, len(caller_histories),
+          "these 'public' histories are not the committed Bybit files: their authenticity is the supplier's, so the checks against them prove "
+          "consistency with that file only", list(caller_histories))
     _flag(flags, "NO_SPOT_REFERENCE", SEVERITY_GAP, sum(1 for t in trips if t["status"] == "NET_UNKNOWN_NO_SPOT_REFERENCE"),
           "closed round trips whose fills lack a spot_ref: basis P&L, hence the net, is UNKNOWN")
 
     gap_codes = {f["code"] for f in flags if f["severity"] == SEVERITY_GAP}
     if any(f["severity"] == SEVERITY_HARD for f in flags):
         verdict = "REJECTED_RECORDS_CONTRADICT"
-    elif not complete or gap_codes & set(STRUCTURAL_GAPS):
+    elif not complete or (gap_codes - set(CHECK_GAPS)):         # anything not explicitly a check gap is structural
         verdict = "INCOMPLETE"
     elif gap_codes & set(CHECK_GAPS):
         verdict = "CONSISTENT_UNCHECKED_AGAINST_PUBLIC"
@@ -752,11 +807,19 @@ def _read_history(path: Optional[str], default_name: str, use_default: bool) -> 
             return None, None
     else:
         return None, None
-    data = _read_bytes(real, os.path.basename(real))
+    data = _read_bytes(real, os.path.basename(real), strict_links=bool(path))
     try:
-        raw = gzip.decompress(data) if real.lower().endswith(".gz") else data
+        if real.lower().endswith(".gz"):
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            raw = d.decompress(data, MAX_DECOMPRESSED_BYTES + 1)
+            if len(raw) > MAX_DECOMPRESSED_BYTES or d.unconsumed_tail:
+                raise RecordError(f"{os.path.basename(real)!r} expands to more than {MAX_DECOMPRESSED_BYTES // (1024 * 1024)} MB")
+        else:
+            raw = data
         return json.loads(raw), _sha(data)
-    except (OSError, EOFError, ValueError, RecursionError) as exc:
+    except RecordError:
+        raise
+    except (OSError, EOFError, ValueError, RecursionError, zlib.error) as exc:
         raise RecordError(f"{os.path.basename(real)!r} is not a readable public history ({type(exc).__name__})") from exc
 
 
@@ -768,6 +831,16 @@ def _ranges(rows: Any) -> Dict[int, Tuple[float, float]]:
     return out
 
 
+def _committed_digest(name: str) -> Optional[str]:
+    p = os.path.join(CT.STUDY, name)
+    if not os.path.isfile(p):
+        return None
+    try:
+        return _sha(_read_bytes(p, name, strict_links=False))
+    except (OSError, RecordError):
+        return None
+
+
 def run(fills_path: str, funding_path: str, *, symbol: str = "BTCUSDT", taker_bps: Optional[float] = None, maker_bps: Optional[float] = None,
         capital_usd: Optional[float] = None, public_path: Optional[str] = None, perp_path: Optional[str] = None, spot_path: Optional[str] = None,
         use_default_history: bool = True) -> Dict[str, Any]:
@@ -777,24 +850,30 @@ def run(fills_path: str, funding_path: str, *, symbol: str = "BTCUSDT", taker_bp
     funding, g_ign = parse_funding(g_rows, symbol)
     digests = {"fills": f_dig, "funding": g_dig}
     default_ok = use_default_history and symbol == "BTCUSDT"
-    public = bar_open = bar_range = spot_range = None
+    public = bar_open = bar_range = spot_range = spot_open = None
+    caller: List[str] = []
+    names = {"public_funding": "funding_BTCUSDT.json.gz", "perp_4h": "linear_BTCUSDT_240.json.gz", "spot_4h": "spot_BTCUSDT_240.json.gz"}
     try:
-        pub, d = _read_history(public_path, "funding_BTCUSDT.json.gz", default_ok)
+        pub, d = _read_history(public_path, names["public_funding"], default_ok)
         if pub is not None:
             ts, bps = CT.parse_funding(pub)
             public, digests["public_funding"] = dict(zip(ts, bps)), d
-        perp, d = _read_history(perp_path, "linear_BTCUSDT_240.json.gz", default_ok)
+        perp, d = _read_history(perp_path, names["perp_4h"], default_ok)
         if perp is not None:
             bars = CT.parse_klines(perp)
             bar_open, bar_range, digests["perp_4h"] = {t: o for t, (o, _c) in bars.items()}, _ranges(perp), d
-        spot, d = _read_history(spot_path, "spot_BTCUSDT_240.json.gz", default_ok)
+        spot, d = _read_history(spot_path, names["spot_4h"], default_ok)
         if spot is not None:
-            CT.parse_klines(spot)
-            spot_range, digests["spot_4h"] = _ranges(spot), d
+            bars = CT.parse_klines(spot)
+            spot_open, spot_range, digests["spot_4h"] = {t: o for t, (o, _c) in bars.items()}, _ranges(spot), d
     except CT.DataError as exc:
         raise RecordError(f"price/funding history unusable: {exc}") from exc
+    for given, key in ((public_path, "public_funding"), (perp_path, "perp_4h"), (spot_path, "spot_4h")):
+        if given and digests.get(key) != _committed_digest(names[key]):
+            caller.append(f"{key} ({os.path.basename(given)}, sha256 {str(digests.get(key))[:16]}...)")
     return review(fills, funding, taker_bps=taker_bps, maker_bps=maker_bps, capital_usd=capital_usd, public=public, bar_open=bar_open,
-                  bar_range=bar_range, spot_range=spot_range, digests=digests, ignored_columns={"fills": f_ign, "funding": g_ign})
+                  bar_range=bar_range, spot_range=spot_range, spot_open=spot_open, caller_histories=caller, digests=digests,
+                  ignored_columns={"fills": f_ign, "funding": g_ign})
 
 
 def render(rep: Mapping[str, Any]) -> str:
@@ -827,6 +906,8 @@ def render(rep: Mapping[str, Any]) -> str:
         a(f"  ECONOMICS over {e['complete_round_trips']} complete round trip(s), {e['settlements_in_them']} settlements: net {e['net_usd']:.2f} USD "
           f"(funding {e['funding_usd']:.2f}, basis {e['basis_pnl_usd']:.2f}, fees -{e['fees_usd']:.2f}); mean {e['mean_net_bps_of_notional']:.2f} bps per round trip")
         a("    " + (f"95% interval {e['interval'][0]:.2f}..{e['interval'][1]:.2f} bps ({e['reading']})" if e.get("interval") else e["reason"]))
+        a("    UPPER BOUND: excludes " + "; ".join(e["excludes"]))
+        a("    " + e["basis_reading"])
     else:
         a(f"  ECONOMICS UNKNOWN: {e['reading']}")
     su = rep["sufficiency"]

@@ -241,7 +241,7 @@ def test_capital_is_zero_and_nothing_is_authorised_in_every_branch_of_the_ladder
         assert d["capital_recommendation"] == "ZERO" and d["authorizes_trading"] is False and d["step"] in CT.LADDER
     assert steps == ["CONTINUE_RESEARCH", "CONTINUE_RESEARCH", "REJECT_OR_SUSPEND", "CONTINUE_RESEARCH", "RESEARCH_CANDIDATE_REVIEW",
                      "PROSPECTIVE_EDGE_REVIEW", "ECONOMIC_RECONCILIATION_REQUIRED", "EXECUTION_READINESS_REVIEW", "CONTINUE_RESEARCH",
-                     "CONTINUE_RESEARCH", "PROSPECTIVE_EDGE_REVIEW"]
+                     "CONTINUE_RESEARCH", "CONTINUE_RESEARCH"]
 
 
 @pytest.mark.parametrize("bad", [
@@ -410,7 +410,7 @@ def test_a_history_shorter_than_a_year_is_a_clean_error_not_an_index_error(tmp_p
         json.dump(rows, fh)
     with pytest.raises(CT.DataError, match="at least 365 days"):
         CT.build(str(fp))
-    assert CT.main(["--funding", str(fp)]) in (0, 2)
+    assert CT.main(["--funding", str(fp)]) == 2
 
 
 @pytest.mark.parametrize("row", [{"fundingRate": 10 ** 400, "fundingRateTimestamp": "1700000000000"},
@@ -427,7 +427,116 @@ def test_the_ledger_section_labels_its_numbers_an_optimistic_bound_and_gives_the
     for name, w in rep["waterfalls"].items():
         assert w["net_is_optimistic_bound"] is True and w["unknown_inputs"], name
         assert set(w["hurdle_verdicts"]) == {"10.0", "15.0", "20.0"}
-    # at the last year's 0.259 bps even the optimistic bound fails every screen: that failure is conclusive
-    assert set(rep["waterfalls"]["last_365d"]["hurdle_verdicts"].values()) == {"FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND"}
+    # at the last year's 0.259 bps even the optimistic bound fails every screen, but at the ASSUMED fee schedule: not account-verified,
+    # so the failure is stated as a failure on the declared fees, never as proof
+    assert set(rep["waterfalls"]["last_365d"]["hurdle_verdicts"].values()) == {"FAILS_ON_THE_DECLARED_FEES_NOT_ACCOUNT_VERIFIED"}
     text = CT.render(rep)
     assert "OPTIMISTIC BOUND" in text
+
+
+# ---- second-round review: one window formula everywhere, a stricter ladder, owner inputs validated, no tracebacks ----
+
+def _usd_window(ts, f, perp, spot, i, m):
+    """The independent check: $1 of entry notional, a FIXED BTC quantity, everything in USD, then converted to bps."""
+    b_in, b_out = ts[i] - CT.BAR_MS, ts[i + m - 1]
+    p_in, s_in = perp[b_in][1], spot[b_in][1]            # entry: the close of the bar that ENDS at the first settlement
+    p_out, s_out = perp[b_out][0], spot[b_out][0]        # exit: the open of the bar that STARTS at the last settlement
+    q = 1.0 / s_in                                      # BTC held per $1 of entry notional
+    funding = sum(f[k] / 1e4 * q * perp[ts[k]][0] for k in range(i, i + m))
+    perp_pnl = q * (p_in - p_out)                        # short the perp
+    spot_pnl = q * (s_out - s_in)                        # long the BTC
+    return (funding + perp_pnl + spot_pnl) * 1e4
+
+
+def test_the_window_arithmetic_equals_an_independent_usd_simulation_on_the_committed_history():
+    ts, f, perp, spot = CT.load_study()
+    m = 30 * CT.PER_DAY
+    checked = 0
+    for i in range(0, len(ts) - m, 211):
+        if ts[i + m - 1] - ts[i] != (m - 1) * CT.SETTLE_MS:
+            continue
+        w = CT._window(ts, f, perp, spot, i, m)
+        if w is None:
+            continue
+        assert w[0] + w[1] - w[2] == pytest.approx(_usd_window(ts, f, perp, spot, i, m), abs=1e-6)
+        checked += 1
+    assert checked >= 15
+
+
+def test_the_yearly_thirty_day_table_is_the_same_arithmetic_as_rolling_starts():
+    import datetime
+    ts, f, perp, spot = CT.load_study()
+    rep = CT.build()
+    m = 30 * CT.PER_DAY
+    for y in ("2023", "2024", "2025"):
+        lo = int(datetime.datetime(int(y), 1, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+        hi = int(datetime.datetime(int(y) + 1, 1, 1, tzinfo=datetime.timezone.utc).timestamp() * 1000)
+        vals = [_usd_window(ts, f, perp, spot, i, m) - CT.DEFAULT_ROUND_TRIP_BPS for i in range(len(ts) - m + 1)
+                if lo <= ts[i] < hi and ts[i + m - 1] - ts[i] == (m - 1) * CT.SETTLE_MS and CT._window(ts, f, perp, spot, i, m) is not None]
+        row = rep["thirty_day_outcome_by_start_year"]["by_year"][y]
+        assert row["windows"] == len(vals) and row["mean_net_bps"] == pytest.approx(sum(vals) / len(vals), abs=1e-6), y
+
+
+def test_the_adverse_basis_widening_is_the_worst_open_basis_minus_the_entry_basis():
+    ts, f, perp, spot, = _world(lambda t: 60000.0, n=6)
+    # widen the perp over the spot at one settlement open in the middle of the hold
+    mid = ts[2]
+    perp[mid] = (60000.0 + 60.0, perp[mid][1])
+    r = CT.rolling_starts(ts, f, perp, spot, hold_days=1, costs_bps=(0.0,))
+    assert r["adverse_basis_widening_bps"]["max"] == pytest.approx(60.0 / 60000.0 * 1e4)
+
+
+@pytest.mark.parametrize("bad", [
+    {"effective_sample_size": 5000, "prospective_settlements": 100}, {"mean_bps": 99.0}, {"mean_bps": -50.0}, {"mean_bps": None},
+    {"upper_bound_bps": None}, {"lower_bound_bps": None}])
+def test_incoherent_or_incomplete_evidence_cannot_climb_the_ladder(bad):
+    d = CT.decide(ev(account_reconciled=True, owner_authorisation=True, **bad), REQ)
+    assert d["step"] in ("CONTINUE_RESEARCH",) and d["capital_recommendation"] == "ZERO"
+
+
+def test_a_missing_key_or_a_non_mapping_evidence_is_the_lowest_step():
+    for e in (None, [], "x", 5, {}):
+        assert CT.decide(e, REQ)["step"] == "CONTINUE_RESEARCH"
+    base = ev()
+    base.pop("mean_bps")
+    assert CT.decide(base, REQ)["step"] == "CONTINUE_RESEARCH"
+
+
+@pytest.mark.parametrize("key,val", [("min_acceptable_net_return_pct_on_capital", float("nan")), ("max_capital_at_risk_usd", float("inf")),
+                                     ("max_tolerable_drawdown_pct", -5.0), ("max_round_trip_cost_bps", "11"), ("alternative_return_pct", float("nan")),
+                                     ("max_capital_at_risk_usd", 10 ** 400), ("max_round_trip_cost_bps", True)])
+def test_owner_inputs_must_be_real_numbers(key, val):
+    with pytest.raises(ValueError):
+        CT.kill_criteria({key: val}, {10.0: 1.1})
+
+
+def test_a_negative_alternative_return_is_a_legitimate_owner_input():
+    assert CT.kill_criteria({"alternative_return_pct": -1.5}, {10.0: 1.1})["alternative_return_pct"]["value"] == -1.5
+
+
+def test_the_command_line_never_prints_a_traceback(tmp_path, capsys):
+    import gzip
+    bad = {"notjson.json": b"this is not json", "bad.json.gz": b"not gzip", "dir.json": None}
+    for name, content in bad.items():
+        p = tmp_path / name
+        if content is None:
+            p.mkdir()
+        else:
+            p.write_bytes(content)
+        assert CT.main(["--funding", str(p)]) == 2, name
+        assert "refusing:" in capsys.readouterr().err
+    assert CT.main(["--funding", str(tmp_path / "missing.json")]) == 2
+    capsys.readouterr()
+    dict_rows = tmp_path / "dictrows.json.gz"
+    with gzip.open(dict_rows, "wt") as fh:
+        json.dump([{"a": 1}], fh)
+    assert CT.main(["--perp-4h", str(dict_rows)]) == 2
+    capsys.readouterr()
+    base = 1_700_000_000_000 // CT.SETTLE_MS * CT.SETTLE_MS
+    const = tmp_path / "const.json.gz"
+    with gzip.open(const, "wt") as fh:
+        json.dump([{"fundingRate": "0.0001", "fundingRateTimestamp": str(base + i * CT.SETTLE_MS)} for i in range(1500)], fh)
+    assert CT.main(["--funding", str(const)]) == 2                    # a constant history has no variance to size a study from
+    capsys.readouterr()
+    assert CT.main(["--owner-hurdle-pct", "nan", "--json"]) == 2
+    assert "finite number" in capsys.readouterr().err

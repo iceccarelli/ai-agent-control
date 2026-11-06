@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import re
 import sys
 
 import pytest
@@ -299,11 +300,14 @@ def test_a_payment_far_from_position_times_mark_times_rate_is_rejected(tmp_path)
     assert "PAYMENT_DISAGREES_WITH_MARK" in hard(review_rows(fills, funding, tmp_path, taker_bps=5.5))
 
 
-def test_a_one_percent_payment_deviation_is_inside_the_stated_tolerance(tmp_path):
+def test_a_payment_within_the_half_percent_tolerance_passes_and_one_percent_does_not(tmp_path):
     fills, funding, _ = make_trip()
     i = next(j for j, r in enumerate(funding) if abs(r["rate"]) > 1e-9)
-    funding[i]["payment_usd"] *= 1.01
+    funding[i]["payment_usd"] *= 1.003
     assert "PAYMENT_DISAGREES_WITH_MARK" not in hard(review_rows(fills, funding, tmp_path, taker_bps=5.5))
+    (tmp_path / "x").mkdir()
+    funding[i]["payment_usd"] *= 1.01 / 1.003
+    assert "PAYMENT_DISAGREES_WITH_MARK" in hard(review_rows(fills, funding, tmp_path / "x", taker_bps=5.5))      # 1 % is outside 0.5 %
 
 
 def test_fees_must_match_the_stated_tier(tmp_path):
@@ -576,8 +580,8 @@ def test_module_imports_nothing_that_can_reach_a_network_a_database_or_a_process
             imported |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
-    allowed = {"__future__", "argparse", "bisect", "csv", "datetime", "gzip", "hashlib", "io", "json", "math", "os", "re", "sys", "dataclasses",
-               "typing", "statistical_power", "carry_teardown"}
+    allowed = {"__future__", "argparse", "bisect", "csv", "datetime", "hashlib", "io", "json", "math", "os", "re", "stat", "sys", "zlib",
+               "dataclasses", "typing", "statistical_power", "carry_teardown"}
     assert imported <= allowed, sorted(imported - allowed)
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)]
     plain = {n.func.id for n in calls if isinstance(n.func, ast.Name)}
@@ -587,7 +591,7 @@ def test_module_imports_nothing_that_can_reach_a_network_a_database_or_a_process
                          "chmod", "listdir", "walk", "scandir"}), attrs
     # no direct os.<function>() call except os.stat (the hard-link test): otherwise only os.path.* helpers and os.sep are used
     direct = {n.func.attr for n in calls if isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name) and n.func.value.id == "os"}
-    assert direct <= {"stat"}, direct
+    assert direct <= {"stat", "fstat"}, direct
     # nothing here opens a file for writing
     for n in ast.walk(tree):
         if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "open":
@@ -752,12 +756,13 @@ def test_FINDING_3_a_spot_reference_far_from_the_fill_is_rejected(tmp_path):
         assert "SPOT_REF_IMPLAUSIBLE" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT", factor
 
 
-def test_FINDING_3_a_spot_reference_inside_two_percent_but_outside_the_public_spot_bar_is_rejected(tmp_path):
+def test_FINDING_3_a_spot_reference_inside_the_deviation_cap_but_far_from_the_public_basis_is_rejected(tmp_path):
     f, g, _ = make_trip()
     for r in f:
-        r["spot_ref"] = r["price"] * 1.015                          # a basis of -150 bps: not impossible in a day, impossible against the bar
+        r["spot_ref"] = r["price"] / 1.004                         # a basis of +40 bps on every fill: under the 0.5 % cap, far above any 4h basis
     rep = review_rows(f, g, tmp_path, taker_bps=5.5)
-    assert "SPOT_REF_OUTSIDE_PUBLIC_RANGE" in hard(rep) and "SPOT_REF_IMPLAUSIBLE" not in hard(rep)
+    assert "BASIS_OFF_PUBLIC_BAR" in hard(rep) and "SPOT_REF_IMPLAUSIBLE" not in hard(rep)
+    assert rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
 
 
 def test_FINDING_3_a_fill_price_far_from_the_public_bar_is_rejected(tmp_path):
@@ -798,7 +803,7 @@ def test_FINDING_3_a_trip_under_a_day_is_not_annualised(tmp_path):
 def test_FINDING_4_dropping_the_spot_reference_from_the_losing_trip_cannot_improve_the_verdict(tmp_path):
     allf, allg = [], []
     for i, k in enumerate((2000, 2100, 2200)):
-        f, g, _ = make_trip(k, 31, tag=f"t{i}", b_in=0.0, b_out=40.0 if i == 1 else 0.0)        # trip 1 widens 40 bps against the hedge
+        f, g, _ = make_trip(k, 31, tag=f"t{i}", b_in=3.0, b_out=22.0 if i == 1 else 3.0)        # trip 1 widens 22 bps against the hedge
         if i == 1:
             for r in f:
                 r.pop("spot_ref")
@@ -1025,3 +1030,223 @@ def test_the_basis_is_the_perp_pnl_plus_the_overlay_pnl_computed_independently_f
         t = rep["round_trips"][0]
         assert t["perp_pnl_usd"] == pytest.approx(perp_pnl, rel=1e-9, abs=1e-6)
         assert t["basis_pnl_usd"] == pytest.approx(perp_pnl + overlay_pnl, rel=1e-9, abs=1e-6)
+
+
+# ================================================================================================================================
+# Second-round review: the basis is the one free variable, 'public' histories are the caller's, and a verdict must not default open
+# ================================================================================================================================
+
+def _raw_committed(name):
+    with gzip.open(os.path.join(CT.STUDY, name), "rt") as fh:
+        return json.load(fh)
+
+
+def _write_gz(path, obj):
+    with gzip.open(path, "wt") as fh:
+        json.dump(obj, fh)
+    return str(path)
+
+
+def test_ROUND2_1_a_fabricated_basis_at_the_edge_of_the_deviation_cap_is_rejected_against_the_public_basis(tmp_path):
+    f, g, _ = make_trip()
+    for r in f:
+        r["spot_ref"] = r["price"] / 1.0049              # 49 bps: inside the 0.5 % cap, ~45 bps from what the public bar shows
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert "BASIS_OFF_PUBLIC_BAR" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+
+
+def test_ROUND2_1_what_the_basis_screen_cannot_exclude_is_stated_next_to_the_net(tmp_path):
+    f, g = three_trips()
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    e = rep["economics"]
+    assert e["net_is_upper_bound"] is True and e["basis_unverifiable_bps_per_round_trip"] == 2 * AR.BASIS_SCREEN_BPS
+    assert any("borrow" in x for x in e["excludes"]) and any("opportunity cost" in x for x in e["excludes"])
+    assert "not distinguishable from zero" in e["basis_reading"]
+    text = AR.render(rep)
+    assert "UPPER BOUND: excludes" in text and "not distinguishable from zero" in text
+
+
+def test_ROUND2_1_a_spot_reference_copied_from_the_price_is_no_reference(tmp_path):
+    f, g, _ = make_trip()
+    for r in f:
+        r["spot_ref"] = r["price"]
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    t = rep["round_trips"][0]
+    assert t["status"] == "NET_UNKNOWN_NO_SPOT_REFERENCE" and t["basis_pnl_usd"] is None and "copy of the price" in t["note"]
+    assert {"SPOT_REF_IS_A_COPY_OF_THE_PRICE", "NO_SPOT_REFERENCE"} <= set(codes(rep, AR.SEVERITY_GAP)) and rep["verdict"] == "INCOMPLETE"
+
+
+def test_ROUND2_1_copying_the_price_into_only_the_losing_trip_cannot_improve_the_verdict(tmp_path):
+    allf, allg = [], []
+    for i, k in enumerate((2000, 2100, 2200)):
+        f, g, _ = make_trip(k, 31, tag=f"t{i}", b_in=3.0, b_out=22.0 if i == 1 else 3.0)
+        if i == 1:
+            for r in f:
+                r["spot_ref"] = r["price"]
+        allf += f
+        allg += g
+    rep = review_rows(allf, allg, tmp_path, taker_bps=5.5)
+    assert rep["verdict"] == "INCOMPLETE" and rep["economics"]["complete_round_trips"] == 2
+
+
+def test_ROUND2_2_a_caller_supplied_history_is_marked_and_stops_the_top_verdict(tmp_path):
+    f, g = three_trips()
+    funding_rows = _raw_committed("funding_BTCUSDT.json.gz")
+    altered = [dict(r) for r in funding_rows]
+    altered[0]["fundingRate"] = "0.00009999"                          # one print changed: not the committed file any more
+    pub = _write_gz(tmp_path / "pub.json.gz", altered)
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5, public_path=pub)
+    assert "PUBLIC_HISTORY_CALLER_SUPPLIED" in codes(rep, AR.SEVERITY_GAP) and rep["verdict"] == "CONSISTENT_UNCHECKED_AGAINST_PUBLIC"
+    # the committed file itself, given by path, is recognised by its digest and is not flagged
+    (tmp_path / "same").mkdir()
+    same = os.path.join(CT.STUDY, "funding_BTCUSDT.json.gz")
+    rep2 = review_rows(f, g, tmp_path / "same", taker_bps=5.5, public_path=same)
+    assert "PUBLIC_HISTORY_CALLER_SUPPLIED" not in codes(rep2) and rep2["verdict"] == "CONSISTENT_NOT_VERIFIED"
+
+
+def test_ROUND2_2_klines_whose_high_and_low_do_not_bracket_the_bar_are_refused_not_vacuous(tmp_path, capsys):
+    f, g, _ = make_trip()
+    fp, gp = write_jsonl(tmp_path / "fills.jsonl", f), write_jsonl(tmp_path / "funding.jsonl", g)
+    bars = _raw_committed("linear_BTCUSDT_240.json.gz")
+    for label, mutate in (("inf_high", lambda r: [r[0], r[1], "Infinity", "0", r[4]]), ("neg_low", lambda r: [r[0], r[1], "1e999", "-1e999", r[4]]),
+                          ("none_high", lambda r: [r[0], r[1], None, r[3], r[4]]), ("dict_row", lambda r: {"a": 1}), ("short_row", lambda r: r[:3]),
+                          ("low_above_open", lambda r: [r[0], r[1], r[2], str(float(r[1]) * 2), r[4]])):
+        path = _write_gz(tmp_path / f"{label}.json.gz", [mutate(r) if i == 0 else r for i, r in enumerate(bars)])
+        assert AR.main(["--fills", fp, "--funding", gp, "--perp-4h", path]) == 2, label
+        assert "account_review:" in capsys.readouterr().err
+    with pytest.raises(CT.DataError):
+        CT.parse_klines([{"a": 1}])
+
+
+def test_ROUND2_5_every_gap_code_the_module_can_emit_is_classified_and_an_unknown_one_blocks_the_top_verdict():
+    src = open(AR.__file__, encoding="utf-8").read()
+    emitted = set(re.findall(r'_flag\(flags, "([A-Z_]+)", SEVERITY_GAP', src))
+    assert emitted, "found no GAP flags"
+    assert emitted <= set(AR.STRUCTURAL_GAPS) | set(AR.CHECK_GAPS), sorted(emitted - set(AR.STRUCTURAL_GAPS) - set(AR.CHECK_GAPS))
+    # default-closed: a code in neither list is structural (the verdict code subtracts the CHECK list, not the other way round)
+    assert "gap_codes - set(CHECK_GAPS)" in src
+
+
+def test_ROUND2_9_path_names_secret_as_a_token_not_as_a_substring_and_the_evidence_names_the_repos_tools_write(tmp_path):
+    for name in ("secretary_fills.csv", "credit_suisse_export.csv", "fills_2026.jsonl", "environment.csv"):
+        p = tmp_path / name
+        p.write_text("{}\n")
+        AR._refuse_protected(str(p))                                            # no exception: these are ordinary names
+    for name in ("secret_sauce_fills.csv", "my-credentials.csv", "evidence.jsonl", "ws_evidence.jsonl", "testnet_conformance_evidence.jsonl",
+                 "close_evidence.jsonl", "env.csv", "api_token.csv", "api-key.jsonl", "apikey.csv"):
+        p = tmp_path / name
+        p.write_text("{}\n")
+        with pytest.raises(AR.RecordError, match="refusing to read"):
+            AR._refuse_protected(str(p))
+    for d in ("runs", "runs-2026", "runs_old", "runs.bak"):
+        (tmp_path / d).mkdir()
+        p = tmp_path / d / "fills.jsonl"
+        p.write_text("{}\n")
+        with pytest.raises(AR.RecordError, match="refusing to read"):
+            AR._refuse_protected(str(p))
+
+
+def test_ROUND2_9_a_hard_link_made_after_the_name_check_is_caught_on_the_open_file(tmp_path):
+    p = tmp_path / "late.jsonl"
+    p.write_text("{}\n")
+    AR._refuse_protected(str(p))                                                # the name and link count are fine at check time
+    os.link(p, tmp_path / "other_name")                                         # ... and the file gains a second name before it is opened
+    with pytest.raises(AR.RecordError, match="hard link"):
+        AR._read_bytes(str(p), "late.jsonl")
+    assert AR._read_bytes(str(p), "late.jsonl", strict_links=False) == b"{}\n"
+
+
+def test_ROUND2_10_duplicate_csv_headers_unicode_separators_and_non_ascii_digits(tmp_path):
+    dup = tmp_path / "dup.csv"
+    dup.write_text("exec_id,price,price\na,1,2\n")
+    with pytest.raises(AR.RecordError, match="duplicate column"):
+        AR.read_rows(str(dup))
+    sep = tmp_path / "sep.jsonl"
+    sep.write_text(json.dumps({"exec_id": "a b", "x": 1}, ensure_ascii=False) + "\n")           # U+2028 INSIDE a string is one record
+    rows, _ = AR.read_rows(str(sep))
+    assert len(rows) == 1 and rows[0]["exec_id"] == "a b"
+    joined = tmp_path / "joined.jsonl"
+    joined.write_text('{"a": 1} {"a": 2}\n')                                                    # two objects joined by U+2028 are NOT two rows
+    with pytest.raises(AR.RecordError):
+        AR.read_rows(str(joined))
+    with pytest.raises(AR.RecordError):
+        AR.parse_fills([_fill(qty="١٢٣")], "BTCUSDT")
+
+
+def test_ROUND2_11_a_compressed_history_that_expands_past_the_cap_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setattr(AR, "MAX_DECOMPRESSED_BYTES", 1000)
+    p = tmp_path / "bomb.json.gz"
+    p.write_bytes(gzip.compress(b"[" + b"0," * 5000 + b"0]"))
+    with pytest.raises(AR.RecordError, match="expands to more than"):
+        _REAL_READ_HISTORY(str(p), "x", False)
+
+
+def test_ROUND2_mutant_a_close_and_reopen_at_different_milliseconds_inside_the_minute_is_ambiguous(tmp_path):
+    f, g, _ = make_trip(n=6)
+    t = TS[K0 + 2]
+    p = _open_at(t)
+
+    def leg(eid, side, dt):
+        return {"exec_id": eid, "ts_ms": t + dt, "symbol": "BTCUSDT", "side": side, "qty": 0.5, "price": p, "fee_usd": 0.5 * p * 5.5 / 1e4,
+                "liquidity": "taker", "spot_ref": p / 1.0003}
+    rep = review_rows(f + [leg("c-1", "Buy", -40_000), leg("c-2", "Sell", 10_000)], g, tmp_path, taker_bps=5.5)
+    assert rep["settlements"]["ambiguous"] == 1 and rep["verdict"] == "INCOMPLETE"       # flat in the middle of the window: not provably held
+
+
+def test_ROUND2_mutant_one_missing_spot_ref_makes_the_whole_trip_net_unknown(tmp_path):
+    f, g, _ = make_trip()
+    f[1].pop("spot_ref")
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert rep["round_trips"][0]["status"] == "NET_UNKNOWN_NO_SPOT_REFERENCE" and rep["verdict"] == "INCOMPLETE"
+
+
+def test_ROUND2_mutant_a_partial_spot_history_is_a_named_check_gap():
+    fl, _ = AR.parse_fills(make_trip()[0], "BTCUSDT")
+    fu, _ = AR.parse_funding(make_trip()[1], "BTCUSDT")
+    rep = AR.review(fl, fu, taker_bps=5.5, public=PUB, bar_open=OPEN, bar_range={}, spot_range={}, spot_open={})
+    assert "SPOT_REF_CHECK_PARTIAL" in codes(rep, AR.SEVERITY_GAP) and "PRICE_CHECK_PARTIAL" in codes(rep, AR.SEVERITY_GAP)
+
+
+def test_ROUND2_mutant_complete_trips_plus_an_open_lifecycle_is_incomplete(tmp_path):
+    f, g = three_trips()
+    t = TS[K0 + 900]
+    p = _open_at(t)
+    f = f + [{"exec_id": "open-1", "ts_ms": t, "symbol": "BTCUSDT", "side": "Sell", "qty": 0.5, "price": p, "fee_usd": 0.5 * p * 5.5 / 1e4,
+              "liquidity": "taker", "spot_ref": p / 1.0003}]
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert "OPEN_LIFECYCLE" in codes(rep, AR.SEVERITY_GAP) and rep["verdict"] == "INCOMPLETE" and rep["sufficiency"]["complete_round_trips"] == 3
+
+
+def test_ROUND2_mutant_maker_fills_are_compared_with_the_maker_tier_not_the_taker_tier(tmp_path):
+    def maker_trip(fee_bps):
+        f, g, _ = make_trip(fee_bps=fee_bps, liquidity="maker")
+        return f, g
+    f, g = maker_trip(2.0)
+    assert "FEE_DISAGREES_WITH_TIER" not in hard(review_rows(f, g, tmp_path, taker_bps=5.5, maker_bps=2.0))
+    (tmp_path / "a").mkdir()
+    assert "FEE_DISAGREES_WITH_TIER" in hard(review_rows(f, g, tmp_path / "a", taker_bps=2.0, maker_bps=5.5))     # swapped tiers
+
+
+def test_ROUND2_mutant_a_residual_below_the_dust_threshold_still_closes_the_lifecycle(tmp_path):
+    f, g, _ = make_trip()
+    f[1]["qty"] = f[0]["qty"] + 1e-9
+    f[1]["fee_usd"] = f[1]["qty"] * f[1]["price"] * 5.5 / 1e4
+    rep = review_rows(f, g, tmp_path, taker_bps=5.5)
+    assert rep["round_trips"][0]["status"] == "COMPLETE" and "OPEN_LIFECYCLE" not in codes(rep)
+
+
+def test_ROUND2_mutant_the_interval_uses_n_minus_one_degrees_of_freedom():
+    iv = AR._interval([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0])
+    half = 2.306004 * math.sqrt(60.0 / 8.0) / 3.0                  # t(0.975, df 8) x s / sqrt(n); df 9 would give 2.2622
+    assert iv["interval"] == pytest.approx([5.0 - half, 5.0 + half], abs=1e-4)
+
+
+def test_ROUND2_13_the_near_zero_rate_tolerance_is_tested_against_a_real_zero_print(tmp_path):
+    z = next(i for i, x in enumerate(F) if x == 0.0)
+    f, g, _ = make_trip(max(0, z - 3), 8, tag="z")
+    idx = next(j for j, r in enumerate(g) if r["rate"] == 0.0)
+    g[idx]["payment_usd"] = 1e-4                                    # inside the 8-decimal rounding noise for 0.5 BTC
+    assert "PAYMENT_DISAGREES_WITH_MARK" not in hard(review_rows(f, g, tmp_path, taker_bps=5.5))
+    (tmp_path / "b").mkdir()
+    g[idx]["payment_usd"] = 0.5                                     # 5,000x the rounding noise
+    assert "PAYMENT_DISAGREES_WITH_MARK" in hard(review_rows(f, g, tmp_path / "b", taker_bps=5.5))

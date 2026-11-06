@@ -71,10 +71,13 @@ def test_the_bound_is_really_optimistic_pricing_the_unknowns_only_lowers_net():
 
 
 def test_hurdle_verdicts_distinguish_a_conclusive_failure_from_an_inconclusive_pass():
-    # the unknown-cost ledger at 0.65 bps clears nothing at 10 %: a failure on an OPTIMISTIC bound is conclusive.
+    # the unknown-cost ledger at 0.65 bps clears nothing at 10 %; a failure is conclusive only if the fees are the account's own.
     fail = TE.compute(pos(), open_costs(), [0.65] * 90)["hurdles"]
-    assert all(h["verdict"] == "FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND" and h["conclusive"] is True for h in fail)
+    assert all(h["verdict"] == "FAILS_ON_THE_DECLARED_FEES_NOT_ACCOUNT_VERIFIED" and h["conclusive"] is False for h in fail)      # the fee tier is a guess
     assert all(h["meets"] is False and h["meets_if_consistent"] is False for h in fail)
+    verified_open = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, fee_provenance="ACCOUNT_VERIFIED")
+    fail_v = TE.compute(pos(), verified_open, [0.65] * 90)["hurdles"]
+    assert all(h["verdict"] == "FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND" and h["conclusive"] is True for h in fail_v)         # real fees, unpriced costs only raise it
     # a rich funding path passes on the modelled costs but a pass with unknowns is NOT conclusive
     rich = TE.compute(pos(), open_costs(), [4.0] * 90)["hurdles"]
     assert all(h["meets"] is True and h["verdict"] == "PASSES_ONLY_ON_MODELLED_COSTS" and h["conclusive"] is False for h in rich)
@@ -85,7 +88,9 @@ def test_hurdle_verdicts_distinguish_a_conclusive_failure_from_an_inconclusive_p
     pass_full = TE.compute(pos(), complete_costs(fee_provenance="ACCOUNT_VERIFIED"), [4.0] * 90)["hurdles"]
     assert all(h["verdict"] == "MEETS_ON_ALL_DECLARED_COSTS" and h["conclusive"] is True for h in pass_full)
     fail_full = TE.compute(pos(), complete_costs(), [0.3] * 90)["hurdles"]
-    assert all(h["verdict"] == "FAILS_ON_ALL_DECLARED_COSTS" and h["conclusive"] is True for h in fail_full)
+    assert all(h["verdict"] == "FAILS_ON_THE_DECLARED_FEES_NOT_ACCOUNT_VERIFIED" and h["conclusive"] is False for h in fail_full)
+    fail_full_v = TE.compute(pos(), complete_costs(fee_provenance="ACCOUNT_VERIFIED"), [0.3] * 90)["hurdles"]
+    assert all(h["verdict"] == "FAILS_ON_ALL_DECLARED_COSTS" and h["conclusive"] is True for h in fail_full_v)
 
 
 def test_legacy_fields_keep_their_values_for_consistent_and_inconsistent_inputs_alike():

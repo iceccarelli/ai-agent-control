@@ -114,11 +114,13 @@ def parse_klines(rows: Any) -> Dict[int, Tuple[float, float]]:
     out: Dict[int, Tuple[float, float]] = {}
     for i, r in enumerate(rows):
         try:
-            t, o, c = int(r[0]), float(r[1]), float(r[4])
-        except (IndexError, TypeError, ValueError, OverflowError) as exc:
+            t, o, h, lo, c = int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4])
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError) as exc:
             raise DataError(f"kline row {i} is malformed: {exc!r}") from exc
-        if not (math.isfinite(o) and math.isfinite(c) and o > 0 and c > 0) or t % BAR_MS != 0:
+        if not all(math.isfinite(x) and x > 0 for x in (o, h, lo, c)) or t % BAR_MS != 0:
             raise DataError(f"kline row {i} is not a valid 4h bar")
+        if not (lo <= min(o, c) and max(o, c) <= h):
+            raise DataError(f"kline row {i}: low/high do not bracket the open and close")
         if t in out:
             raise DataError("duplicate kline start times")
         out[t] = (o, c)
@@ -201,6 +203,28 @@ def settlement_stats(ts: Sequence[int], f: Sequence[float], baseline_bps: float 
     return out
 
 
+def _window(ts: Sequence[int], f: Sequence[float], perp: Mapping[int, Tuple[float, float]], spot: Mapping[int, Tuple[float, float]],
+            i: int, m: int) -> Optional[Tuple[float, float, float, float]]:
+    """One holding window of ``m`` settlements starting at index ``i``, for a FIXED BTC quantity, every term in bps of the ENTRY notional
+    N = Q * s_in: ``(funding, basis_in, basis_out, worst_basis)``. Entry is at the close of the 4h bar that ENDS at the first settlement,
+    exit at the open of the bar that STARTS at the last, so no later price is used. None when any bar the window needs is missing."""
+    b_in, b_out = ts[i] - BAR_MS, ts[i + m - 1]
+    if b_in not in perp or b_in not in spot or b_out not in perp or b_out not in spot:
+        return None
+    if any(ts[k] not in perp for k in range(i, i + m)):               # funding is marked at the perp open of each settlement
+        return None
+    s_in = spot[b_in][1]
+    basis_in = (perp[b_in][1] - s_in) / s_in * 1e4
+    basis_out = (perp[b_out][0] - spot[b_out][0]) / s_in * 1e4        # (P_out - S_out) / s_in: the exit basis over the ENTRY spot
+    fund = sum(f[k] * (perp[ts[k]][0] / s_in) for k in range(i, i + m))   # rate x the perp open at each settlement, per entry notional
+    worst = basis_in
+    for k in range(i, i + m):                                         # worst (highest) basis seen at a bar OPEN during the hold
+        bk = ts[k]
+        if bk in spot:
+            worst = max(worst, (perp[bk][0] - spot[bk][0]) / s_in * 1e4)
+    return fund, basis_in, basis_out, worst
+
+
 def rolling_starts(ts: Sequence[int], f: Sequence[float], perp: Mapping[int, Tuple[float, float]], spot: Mapping[int, Tuple[float, float]],
                    hold_days: int, *, first_start_ms: Optional[int] = None, costs_bps: Sequence[float] = COST_SCENARIOS_BPS) -> Dict[str, Any]:
     """Hold the hedge for ``hold_days`` from EVERY possible start settlement and report the distribution of what it would have earned.
@@ -224,27 +248,14 @@ def rolling_starts(ts: Sequence[int], f: Sequence[float], perp: Mapping[int, Tup
             continue
         if first_start_ms is not None and ts[i] < first_start_ms:
             continue
-        b_in, b_out = ts[i] - BAR_MS, ts[i + m - 1]
-        if b_in not in perp or b_in not in spot or b_out not in perp or b_out not in spot:
+        w = _window(ts, f, perp, spot, i, m)
+        if w is None:                                                      # a bar the window needs is missing: excluded, never bridged
             excluded += 1
             continue
-        if any(ts[k] not in perp for k in range(i, i + m)):               # funding is marked at the perp open of each settlement
-            excluded += 1
-            continue
-        s_in = spot[b_in][1]                                              # the hedge is a FIXED BTC quantity Q = N / s_in
-        # Every term is in bps of the ENTRY notional N = Q * s_in, so a price move between entry and exit scales the exit basis and the
-        # funding by the same factor it scales the position's value: (P_out - S_out) / s_in, and rate * mark_k / s_in.
-        basis_in = (perp[b_in][1] - s_in) / s_in * 1e4
-        basis_out = (perp[b_out][0] - spot[b_out][0]) / s_in * 1e4
-        fund = sum(f[k] * (perp[ts[k]][0] / s_in) for k in range(i, i + m))
+        fund, basis_in, basis_out, worst = w
         funding_only.append(fund)
         with_basis.append(fund + (basis_in - basis_out))
         starts.append(ts[i])
-        worst = basis_in
-        for k in range(i, i + m):                                         # worst (highest) basis seen at a bar OPEN during the hold
-            bk = ts[k]
-            if bk in perp and bk in spot:
-                worst = max(worst, (perp[bk][0] - spot[bk][0]) / s_in * 1e4)
         adverse.append(worst - basis_in)
     if not funding_only:
         return {"windows": 0, "excluded": excluded, "hold_days": hold_days}
@@ -281,6 +292,8 @@ def kill_criteria(owner: Optional[Mapping[str, Any]], required_by_hurdle: Mappin
     }
     for k, why in owner_fields.items():
         v = owner.get(k)
+        if v is not None and k != "max_operational_risk" and not (_fin(v) and (v >= 0 or k == "alternative_return_pct")):
+            raise ValueError(f"{k} must be a finite number{'' if k == 'alternative_return_pct' else ' >= 0'}, got {v!r}")
         out[k] = ({"value": v, "tag": "ASSUMED", "provenance": "OWNER_SUPPLIED", "meaning": why} if v is not None else
                   {"value": None, "tag": "UNKNOWN", "provenance": "OWNER_INPUT_MISSING", "meaning": why})
     out["scenario_hurdles_pct"] = {"tag": "ASSUMED", "provenance": "PROVISIONAL_SCREENING_HURDLE_NOT_OWNER_APPROVED",
@@ -303,6 +316,8 @@ def decide(evidence: Mapping[str, Any], required_bps: float) -> Dict[str, Any]:
     last only asks for a SEPARATE owner review: this function authorises nothing."""
     if not (_fin(required_bps) and required_bps > 0):
         raise ValueError("required_bps must be a positive finite number")
+    if not isinstance(evidence, Mapping):
+        evidence = {}
     out = {"capital_recommendation": "ZERO", "authorizes_trading": False, "required_bps": required_bps, "reasons": []}
     n, ess = evidence.get("prospective_settlements", 0), evidence.get("effective_sample_size", 0)
     lo, hi, mean = evidence.get("lower_bound_bps"), evidence.get("upper_bound_bps"), evidence.get("mean_bps")
@@ -310,8 +325,15 @@ def decide(evidence: Mapping[str, Any], required_bps: float) -> Dict[str, Any]:
     bad += [k for k, v in (("lower_bound_bps", lo), ("upper_bound_bps", hi), ("mean_bps", mean)) if v is not None and not _fin(v)]
     if lo is not None and hi is not None and not bad and lo > hi:
         bad.append("lower_bound_bps > upper_bound_bps")
+    if not bad and _fin(n) and _fin(ess) and ess > n:
+        bad.append("effective_sample_size > prospective_settlements (an effective sample cannot exceed the sample)")
+    if not bad and mean is not None and lo is not None and hi is not None and not (lo <= mean <= hi):
+        bad.append("mean_bps outside [lower_bound_bps, upper_bound_bps]")
     if bad:                                              # unusable evidence is never a step up: the lowest rung that is not a rejection
         out.update(step="CONTINUE_RESEARCH", reasons=["the evidence is not usable (missing, non-finite, mistyped or inverted): " + ", ".join(bad)])
+        return out
+    if n >= 90 and ess >= 30 and (lo is None or hi is None or mean is None):
+        out.update(step="CONTINUE_RESEARCH", reasons=["mean, lower bound and upper bound are all needed to read the evidence; one is missing"])
         return out
     if n < 90 or ess < 30:
         out.update(step="CONTINUE_RESEARCH", reasons=[f"{n} prospective settlements and an effective sample size of {ess}: below the 90 / 30 floors"])
@@ -381,11 +403,9 @@ def build(funding_path: Optional[str] = None, perp_path: Optional[str] = None, s
         vals = []
         for i in range(len(ts) - m + 1):
             if lo_ms <= ts[i] < hi_ms and ts[i + m - 1] - ts[i] == (m - 1) * SETTLE_MS:
-                b_in, b_out = ts[i] - BAR_MS, ts[i + m - 1]
-                if b_in in perp and b_in in spot and b_out in perp and b_out in spot:
-                    bi = (perp[b_in][1] - spot[b_in][1]) / spot[b_in][1] * 1e4
-                    bo = (perp[b_out][0] - spot[b_out][0]) / spot[b_out][0] * 1e4
-                    vals.append(sum(f[i:i + m]) + bi - bo - round_trip_bps)
+                w = _window(ts, f, perp, spot, i, m)
+                if w is not None:
+                    vals.append(w[0] + w[1] - w[2] - round_trip_bps)
         by_year_30[str(y)] = None if not vals else {"windows": len(vals), "mean_net_bps": sum(vals) / len(vals), "share_net_positive": sum(1 for v in vals if v > 0) / len(vals),
                                                     "annualised_net_pct_on_capital_at_mean": vals and (sum(vals) / len(vals)) / 1e4 * 365 / 30 * 100 / (1 + reserve)}
     grid = {str(h): {str(x): net_return(x, h, round_trip_bps, reserve) for x in (-1.0, -0.5, 0.0, 0.26, 0.5, 0.57, 1.0, 1.095, 2.0, 3.0)} for h in (7, 30, 90, 180)}
@@ -506,10 +526,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                "max_round_trip_cost_bps": a.owner_max_round_trip_bps}.items() if v is not None}
     try:
         rep = build(a.funding, a.perp_4h, a.spot_4h, round_trip_bps=a.round_trip_bps, reserve=a.reserve, owner=owner)
-    except DataError as exc:
-        print(f"refusing: {exc}", file=sys.stderr)
+        out = json.dumps(rep, indent=2, sort_keys=True, default=str, allow_nan=False) if a.json else render(rep)
+    except (DataError, OSError, ValueError, KeyError, TypeError, OverflowError, EOFError, RecursionError) as exc:
+        # DataError, a missing/unreadable file, a non-JSON or bad-gzip history, a row of the wrong shape, a constant history (no variance to
+        # size a study from), a NaN owner input: a message and exit 2, never a traceback
+        print(f"refusing: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    print(json.dumps(rep, indent=2, sort_keys=True, default=str) if a.json else render(rep))
+    print(out)
     return 0
 
 

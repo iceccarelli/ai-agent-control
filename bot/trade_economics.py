@@ -151,7 +151,8 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
     # ``cost_bps_of_notional_round_trip`` below adds them whenever they are negative and ignores them when positive).
     explicit_cost_bps = -(sum(c for k, c in comp.items() if k not in ("funding_income_usd", "basis_pnl_usd")) / N) * 1e4
     # An unpriced cost is counted as ZERO above, so with any unknown the net, the returns and the break-even are
-    # OPTIMISTIC bounds: the true cost can only be higher. A failure on this bound is conclusive; a pass is not.
+    # OPTIMISTIC bounds: the true cost can only be higher. So a failure survives the unpriced costs, but only if the declared fees are the
+    # account's own (an unverified fee tier can be above the real one); a pass is conclusive only with every cost declared.
     incomplete = bool(unknowns)
     fees_verified = costs.fee_provenance == "ACCOUNT_VERIFIED"
     # A holding period that does not match the funding path makes the annualised figures meaningless in either direction
@@ -212,14 +213,16 @@ def compute(position: Position, costs: Costs, funding_bps: Sequence[float], *,
                      "consistent_input": path_matches_hold,
                      "meets_if_consistent": path_matches_hold and ret_capital >= h,
                      "verdict": ("INCONSISTENT_INPUT" if not path_matches_hold
-                                 else (("FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND" if incomplete else "FAILS_ON_ALL_DECLARED_COSTS")
+                                 else (("FAILS_EVEN_ON_AN_OPTIMISTIC_BOUND" if (incomplete and fees_verified) else
+                                        "FAILS_ON_ALL_DECLARED_COSTS" if fees_verified else
+                                        "FAILS_ON_THE_DECLARED_FEES_NOT_ACCOUNT_VERIFIED")
                                        if ret_capital < h
                                        else ("PASSES_ONLY_ON_MODELLED_COSTS" if incomplete
                                              else ("MEETS_ON_DECLARED_COSTS_FEES_NOT_ACCOUNT_VERIFIED" if not fees_verified
                                                    else "MEETS_ON_ALL_DECLARED_COSTS")))),
-                     # a failure is conclusive whenever the input is consistent (costs only rise); a pass is conclusive only with every
-                     # cost declared AND the fees read from the account
-                     "conclusive": path_matches_hold and (ret_capital < h or (not incomplete and fees_verified))} for h in SCREENING_HURDLES_PCT],
+                     # a verdict is conclusive only when the fees are the account's own: declared fees can be above the real tier, so
+                     # a failure on them is not proof either (unpriced costs only RAISE the cost, which is why a failure survives them)
+                     "conclusive": path_matches_hold and fees_verified and (ret_capital < h or not incomplete)} for h in SCREENING_HURDLES_PCT],
         "reading": "arithmetic on declared inputs; a pass is not a profitability claim",
     }
     return out
