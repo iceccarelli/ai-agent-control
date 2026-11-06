@@ -355,16 +355,18 @@ def test_a_head_that_records_more_rows_than_the_chain_holds_is_a_truncation(tmp_
     assert any(i["code"] == "TRUNCATED" for i in v["issues"]) and v["internally_consistent"] is False
 
 
-# ---------------- the retention test uses the recorder's own retention and its own day comparison (delta review L1) ----------------
+# ---------------- the retention test uses the OWNER's stated retention and the recorder's own day comparison (delta review L1, third review M2) ----------------
 
-def _gone_anchor(tmp_path, d, rows, day, retention=None):
-    """An anchor for a day-file that is not on disk, with the recorder's status stating `retention` (None = no status file)."""
-    if retention is not None:
+def _gone_anchor(tmp_path, d, rows, day, retention=None, status=None):
+    """An anchor for a day-file that is not on disk. `retention` is the owner's --capacity-retention-days (None = the default 365); `status` is
+    written into the evidence directory's recorder_status.json to show that nothing there is believed."""
+    if status is not None:
         with open(os.path.join(d, "recorder_status.json"), "w") as fh:
-            json.dump({"capacity_retention_days": retention}, fh)
+            json.dump(status, fh)
     h = tmp_path / "monitor.jsonl"
     h.write_text(json.dumps({"recorder_chain_file": f"capacity-{day}.jsonl", "recorder_chain_n": 5, "recorder_chain_head": "ab" * 32}) + "\n")
-    return report(d, rows, history=str(h))["integrity"]["summary"]
+    kw = {} if retention is None else {"capacity_retention_days": retention}
+    return PR.build(d, now_ms=rows[-1]["at_ms"] + 60_000, history=str(h), **kw)["integrity"]["summary"]
 
 
 def _now(rows):
@@ -372,7 +374,7 @@ def _now(rows):
 
 
 @pytest.mark.parametrize("age_days,blocks", [(0, True), (2, True), (3, True), (4, False), (30, False)])
-def test_a_shorter_recorder_retention_is_honoured_and_the_boundary_day_is_not_prunable(tmp_path, age_days, blocks):
+def test_a_shorter_stated_retention_is_honoured_and_the_boundary_day_is_not_prunable(tmp_path, age_days, blocks):
     rows = long_rows(100)
     d = lay_down(tmp_path, rows)
     day = PR._utc_day(_now(rows) - age_days * 86_400_000)
@@ -381,7 +383,7 @@ def test_a_shorter_recorder_retention_is_honoured_and_the_boundary_day_is_not_pr
     assert s["economic_evidence_eligible"] is (not blocks)
 
 
-def test_with_no_status_file_the_default_retention_applies_and_a_recent_removal_blocks(tmp_path):
+def test_with_no_stated_retention_the_default_applies_and_a_recent_removal_blocks(tmp_path):
     rows = long_rows(100)
     d = lay_down(tmp_path, rows)
     s = _gone_anchor(tmp_path, d, rows, PR._utc_day(_now(rows) - 100 * 86_400_000))
@@ -398,15 +400,36 @@ def test_a_recorder_that_keeps_everything_cannot_have_pruned_any_anchored_day(tm
     assert any("keeps every day" in b for b in s["economic_evidence_blockers"])
 
 
-@pytest.mark.parametrize("junk", [True, "3", -1, 3.5, None, [3]])
-def test_a_retention_value_that_is_not_a_nonnegative_int_is_not_believed(tmp_path, junk):
+@pytest.mark.parametrize("status", [{"capacity_retention_days": 1}, {"store": {"capacity_retention_days": 1}}, {"capacity_retention_days": 0},
+                                    {"capacity_retention_days": 10 ** 30}, {"store": {"capacity_retention_days": 10 ** 30}}])
+def test_a_status_file_in_the_evidence_directory_cannot_shorten_the_retention_or_crash_the_report(tmp_path, status):
+    """Whoever can delete a day of evidence can edit a status file next to it, so the report believes only the owner's argument."""
     rows = long_rows(100)
     d = lay_down(tmp_path, rows)
-    with open(os.path.join(d, "recorder_status.json"), "w") as fh:
-        json.dump({"capacity_retention_days": junk}, fh)
-    assert PR._capacity_retention_days({"capacity_retention_days": junk}) == PR.CAPACITY_RETENTION_DAYS
-    s = _gone_anchor(tmp_path, d, rows, PR._utc_day(_now(rows) - 100 * 86_400_000))
-    assert s["files_missing_but_anchored"]
+    s = _gone_anchor(tmp_path, d, rows, PR._utc_day(_now(rows) - 100 * 86_400_000), status=status)
+    assert s["files_missing_but_anchored"] and s["economic_evidence_eligible"] is False
+
+
+@pytest.mark.parametrize("bad", [True, "3", -1, 3.5, None, 10 ** 30, 36_501, float("nan")])
+def test_a_retention_argument_that_is_not_a_sane_integer_is_refused(tmp_path, bad):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    with pytest.raises(ValueError):
+        PR.build(d, now_ms=_now(rows), capacity_retention_days=bad)
+
+
+def test_the_command_line_takes_the_retention_from_the_owner(tmp_path, capsys):
+    rows = long_rows(100)
+    d = lay_down(tmp_path, rows)
+    day = PR._utc_day(_now(rows) - 100 * 86_400_000)
+    h = tmp_path / "monitor.jsonl"
+    h.write_text(json.dumps({"recorder_chain_file": f"capacity-{day}.jsonl", "recorder_chain_n": 5, "recorder_chain_head": "ab" * 32}) + "\n")
+    base = ["--dir", d, "--history", str(h), "--now-ms", str(_now(rows)), "--json"]
+    assert PR.main(base) == 0
+    blocked = json.loads(capsys.readouterr().out)["integrity"]["summary"]
+    assert blocked["files_missing_but_anchored"] == [f"capacity-{day}.jsonl"]            # 365 days: a 100-day-old day cannot have been pruned
+    assert PR.main(base + ["--capacity-retention-days", "30"]) == 0
+    assert json.loads(capsys.readouterr().out)["integrity"]["summary"]["files_missing_but_anchored"] == []     # the owner says 30: it was pruned
 
 
 # ---------------- hostile bytes in monitor.jsonl are skipped, not a crash (delta review L2) ----------------

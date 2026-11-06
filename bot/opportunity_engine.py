@@ -328,19 +328,21 @@ def evaluate_carry(spec: StrategySpec, ev: Mapping[str, Any]) -> Evaluation:
                        "there is no separate execution-authorisation record, so this is NOT execution-ready"], m)
 
 
-_PLACEHOLDER_WORDS = ("placeholder", "todo", "tbd", "none", "null", "n/a", "na/na", "test", "dummy", "example", "sample", "fake", "xxxx", "lorem",
-                      "changeme", "unknown", "pending")
+_PLACEHOLDER_TOKENS = frozenset(("placeholder", "todo", "tbd", "none", "null", "na", "dummy", "example", "sample", "fake", "lorem", "changeme",
+                                 "unknown", "pending", "test", "testing", "tmp", "temp", "foo", "bar", "baz", "asdf", "qwerty", "reference", "ref"))
 
 
 def _real_reference(ref: Any) -> bool:
-    """A reference that could point at a record: at least 8 characters, at least 5 DISTINCT letters or digits, and none of the words
-    people type when they have not got one. This is a speed bump against typing 'xxxxxxxx', not proof that a record exists: the
-    engine cannot open the owner's authorisation, and authorises nothing either way."""
+    """A reference that could point at a record: at least 8 characters, at least 5 DISTINCT letters or digits, and NOT made only of the
+    words people type when they have not got one ('TODO-TODO', 'pending-1', 'n/a n/a'). A placeholder word inside a real phrase
+    ('sample-size-approval-77') is fine. This is a speed bump against typing 'xxxxxxxx', not proof that a record exists: the engine
+    cannot open the owner's authorisation, and authorises nothing either way."""
     if not isinstance(ref, str):
         return False
     r = ref.strip()
-    low = r.lower()
-    return (len(r) >= 8 and len({c for c in low if c.isalnum()}) >= 5 and not any(w in low for w in _PLACEHOLDER_WORDS))
+    low = r.lower().replace("n/a", "na")
+    words = [t for t in "".join(c if c.isalnum() else " " for c in low).split() if not t.isdigit()]
+    return len(r) >= 8 and len({c for c in low if c.isalnum()}) >= 5 and bool(words) and not all(w in _PLACEHOLDER_TOKENS for w in words)
 
 
 def unknown_cost_headroom_bps(econ: Mapping[str, Any], lowest_hurdle_pct: float) -> Optional[float]:
@@ -352,7 +354,7 @@ def unknown_cost_headroom_bps(econ: Mapping[str, Any], lowest_hurdle_pct: float)
         cap = float(econ["capital"]["economic_capital_usd"])
         n = float(econ["capital"]["hedged_notional_usd"])
         hold = float(econ["position"]["hold_days"])
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         return None
     if not (math.isfinite(net) and cap > 0 and n > 0 and hold > 0):
         return None
@@ -367,7 +369,7 @@ def _prospective_market_edge(ev: Mapping[str, Any], lowest: float, headroom: Opt
     """Every claim is typed and finite: a string, a bool, a NaN or an infinity is not a registration time or a count. NOTHING in
     this repository registers a hypothesis or derives these figures from rows, and the report supplies none, so this is
     unreachable from the CLI today; it is the gate a future registration mechanism must satisfy, not evidence."""
-    pro = ev.get("prospective") or {}
+    pro = _d(ev.get("prospective"))
     reg, first = pro.get("registered_ms"), pro.get("first_evidence_ms")
     n_after, ess, post = pro.get("n_after_registration"), pro.get("post_registration_ess"), pro.get("post_registration_annualised_pct_on_economic_capital")
     if (type(reg) is int and type(first) is int and 0 < reg < first
@@ -384,11 +386,14 @@ def integrity_grade(ev: Mapping[str, Any]) -> str:
     """ANCHORED only when every chained evidence file has a current or lagging anchor that matches AND the anchors are held in
     an archive whose head matches a value the OWNER stored off the machine. Copies in ``monitor.jsonl`` sit on the recorder's own
     volume, so they grade ANCHORED_SAME_VOLUME_ONLY, which is not enough. Absent detail is NOT anchored."""
-    i = ev.get("integrity") or {}
-    chained = (i.get("files_total") or 0) - (i.get("files_legacy_pre_chain") or 0)
+    i = _d(ev.get("integrity"))
+    chained = ((i.get("files_total") if type(i.get("files_total")) is int else 0)
+               - (i.get("files_legacy_pre_chain") if type(i.get("files_legacy_pre_chain")) is int else 0))
     if i.get("files_anchor_conflict") or i.get("files_missing_but_anchored"):
         return "CONFLICT"
-    if chained > 0 and (i.get("files_anchored_current") or 0) + (i.get("files_anchored_lagging") or 0) == chained:
+    cur = i.get("files_anchored_current") if type(i.get("files_anchored_current")) is int else 0
+    lag = i.get("files_anchored_lagging") if type(i.get("files_anchored_lagging")) is int else 0
+    if chained > 0 and cur + lag == chained:
         # ANCHORED needs the ARCHIVE alone to anchor every chained file: anchors from both sources are merged for verification, so
         # a file that only monitor.jsonl (the recorder's own volume) anchors must not borrow the archive's location. A report that
         # does not say how many files the archive anchors (an older object) is not anchored.
@@ -406,6 +411,11 @@ def _num(x: Any) -> bool:
         return math.isfinite(x)
     except OverflowError:                    # an int beyond float range (any JSON document can carry one) is not a usable number
         return False
+
+
+def _names(x: Any) -> List[str]:
+    """A list of names the caller claims, as strings; anything else is no names (the caller still sees that something was claimed)."""
+    return [v for v in x if isinstance(v, str)] if isinstance(x, (list, tuple)) else []
 
 
 def _d(x: Any) -> Mapping[str, Any]:
@@ -440,16 +450,19 @@ def reconciliation_gaps(ev: Mapping[str, Any], spec: Optional[StrategySpec] = No
     def at_a_real_rate(bps: Optional[float], rates: Sequence[Any]) -> bool:
         return bps is not None and any(_num(r) and abs(bps - r) <= 1e-6 * max(1.0, abs(r)) for r in rates)
 
-    # BOTH perpetual legs must have been charged at a rate the account really has (taker only, unless the mode is stated taker-less
-    # and then taker OR maker); the spot legs of an overlay are zero, and anything else cannot be checked against a perp schedule
-    allowed = (fs.get("taker_bps"),) if mode == "taker" else (fs.get("taker_bps"), fs.get("maker_bps"))
+    # BOTH perpetual legs must have been charged at the account's TAKER rate. A leg at the maker rate would need the fill's liquidity
+    # to be tied to the ledger (fee records vs fills), which nothing here can do, so it is a gap, not a pass: this check never lets a
+    # status rise because a schedule HAS a lower rate. The spot legs of an overlay are zero; anything else cannot be checked against
+    # a perpetual schedule.
+    allowed = (fs.get("taker_bps"),)
     legs_ok = (at_a_real_rate(leg_bps("perp_entry_fee_usd"), allowed) and at_a_real_rate(leg_bps("perp_exit_fee_usd"), allowed)
                and comp.get("spot_entry_fee_usd") == 0 and comp.get("spot_exit_fee_usd") == 0)
     if not (fs.get("provenance") == "ACCOUNT_VERIFIED" and _num(fs.get("taker_bps")) and 0 < fs["taker_bps"] <= MAX_PLAUSIBLE_FEE_BPS
             and _num(fs.get("maker_bps")) and -MAX_PLAUSIBLE_FEE_BPS <= fs["maker_bps"] <= fs["taker_bps"]
             and _d(ae.get("fees")).get("verified") is True and legs_ok):
         gaps.append("account_fee_schedule: the account's real taker/maker rates are not read from the account, are implausible, or "
-                    "differ from the fee the account ledger charged on EITHER perpetual leg (published defaults are not them; spot-leg "
+                    "differ from the fee the account ledger charged on EITHER perpetual leg, which must be the taker rate (published defaults are not them; a maker-rate "
+                    "leg cannot be tied to a maker fill here; spot-leg "
                     "fees cannot be checked against a perpetual schedule)")
     q = _d(a.get("product_qualification"))
     if not (q.get("verdict") == "QUALIFIED" and q.get("environment") == "mainnet" and q.get("product") == "BTCUSDT linear"
@@ -474,8 +487,9 @@ def reconciliation_gaps(ev: Mapping[str, Any], spec: Optional[StrategySpec] = No
     needed = ("latency", "market_impact", "slippage")
     if mode != "taker":                      # maker, hybrid, MISSING, or any unrecognised value: fail closed
         needed += ("maker_fill_probability", "adverse_selection")
-    if econ.get("unknowns") or ae.get("unknowns") or any(prov.get(k) != "MEASURED" for k in needed):
-        gaps.append("execution_and_operational_costs: " + ("unpriced inputs remain (" + ", ".join(econ.get("unknowns") or ae.get("unknowns") or []) + "); "
+    unknowns = _names(econ.get("unknowns")) or _names(ae.get("unknowns"))
+    if unknowns or econ.get("unknowns") or ae.get("unknowns") or any(prov.get(k) != "MEASURED" for k in needed):
+        gaps.append("execution_and_operational_costs: " + (("unpriced inputs remain (" + ", ".join(unknowns or ["unreadable"]) + "); ")
                     if (econ.get("unknowns") or ae.get("unknowns")) else "")
                     + "not every input is MEASURED (" + ", ".join(k for k in needed if prov.get(k) != "MEASURED") + ")")
     cc = _d(a.get("capital"))
@@ -504,23 +518,55 @@ def _ledger_return(ae: Mapping[str, Any]) -> Optional[float]:
     return net / cap * 365.0 / hold * 100.0
 
 
+#: exactly the components ``trade_economics.compute`` writes: an unnamed extra line (``mystery_income_usd``) is a claim with no origin
+_LEDGER_COMPONENTS = frozenset(("funding_income_usd", "basis_pnl_usd", "rebates_usd", "perp_entry_fee_usd", "perp_exit_fee_usd", "spot_entry_fee_usd",
+                                "spot_exit_fee_usd", "spread_usd", "slippage_usd", "market_impact_usd", "latency_usd", "conversion_usd", "transfer_usd",
+                                "custody_usd", "operational_usd", "borrow_usd"))
+MAX_PLAUSIBLE_BASIS_BPS_OF_NOTIONAL = 100.0       # entry + exit basis on a BTC perp/spot pair: the largest 4h basis in the committed history is 23.5 bps
+
+
+def _close(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-6)
+
+
 def _ledger_is_self_consistent(ae: Mapping[str, Any]) -> bool:
-    """A ledger that claims to have reconciled must: sum its components to its net, say it reconciles, agree with its own claimed
-    return, have enough initial margin and clear the risk limit's liquidation headroom."""
-    comp = _d(ae.get("components_usd"))
-    net = ae.get("net_pnl_usd")
-    if not comp or not _num(net) or not all(_num(v) for v in comp.values()):
+    """A ledger that claims to have reconciled is RE-DERIVED from its own inputs, not read: its components are exactly the ones the engine
+    writes and sum to its net; the funding line equals the notional times its own funding path; the economic capital equals inventory +
+    posted margin + reserve; margin sufficiency and the liquidation headroom follow from its own collateral and notional; the settlement
+    count matches the holding period; its claimed return equals the return recomputed from net, capital and hold; a rebate is not accepted
+    (nothing here can tie one to a fill); and the basis P&L stays inside what a BTC perp/spot basis can be. Never raises."""
+    try:
+        comp = _d(ae.get("components_usd"))
+        net = ae.get("net_pnl_usd")
+        cap_d, pos_d, fund_d = _d(ae.get("capital")), _d(ae.get("position")), _d(ae.get("funding"))
+        if set(comp) != _LEDGER_COMPONENTS or not all(_num(v) for v in comp.values()) or not _num(net):
+            return False
+        if ae.get("reconciles") is not True or not _close(math.fsum(float(v) for v in comp.values()), float(net)):
+            return False
+        n, pn = cap_d.get("hedged_notional_usd"), pos_d.get("notional_usd")
+        inv, extra, reserve = cap_d.get("btc_inventory_usd"), cap_d.get("margin_posted_extra_usd"), cap_d.get("reserve_usd")
+        ecap, avail, req = cap_d.get("economic_capital_usd"), cap_d.get("available_collateral_usd"), cap_d.get("required_initial_margin_usd")
+        if not all(_num(v) for v in (n, pn, inv, extra, reserve, ecap, avail, req)) or n <= 0 or not _close(n, pn):
+            return False
+        if not _close(ecap, inv + extra + reserve):
+            return False
+        sum_bps, settlements, hold = fund_d.get("sum_bps"), fund_d.get("settlements"), pos_d.get("hold_days")
+        if not (_num(sum_bps) and type(settlements) is int and _num(hold) and hold > 0):
+            return False
+        if not _close(comp["funding_income_usd"], n * sum_bps / 1e4) or abs(settlements - 3.0 * hold) > 1.0:
+            return False
+        if comp["rebates_usd"] != 0 or abs(comp["basis_pnl_usd"]) > n * MAX_PLAUSIBLE_BASIS_BPS_OF_NOTIONAL / 1e4:
+            return False
+        if cap_d.get("initial_margin_sufficient") is not True or not avail >= req:
+            return False
+        liq = _d(ae.get("liquidation")).get("conservative_adverse_move_pct")
+        if not (_num(liq) and liq >= _RISK["min_liquidation_headroom_pct"] and liq <= avail / n * 100.0 + 1e-9):
+            return False
+        claimed = _d(ae.get("returns")).get("annualised_pct_on_economic_capital")
+        recomputed = _ledger_return(ae)
+        return _num(claimed) and recomputed is not None and math.isclose(claimed, recomputed, rel_tol=1e-6, abs_tol=1e-6)
+    except (OverflowError, ValueError, TypeError, ArithmeticError):
         return False
-    if ae.get("reconciles") is not True or not math.isclose(sum(comp.values()), net, rel_tol=1e-9, abs_tol=1e-6):
-        return False
-    if _d(ae.get("capital")).get("initial_margin_sufficient") is not True:
-        return False
-    liq = _d(ae.get("liquidation")).get("conservative_adverse_move_pct")
-    if not (_num(liq) and liq >= _RISK["min_liquidation_headroom_pct"]):
-        return False
-    claimed = _d(ae.get("returns")).get("annualised_pct_on_economic_capital")
-    recomputed = _ledger_return(ae)
-    return _num(claimed) and recomputed is not None and math.isclose(claimed, recomputed, rel_tol=1e-6, abs_tol=1e-6)
 
 
 def basis_stats(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Any]:

@@ -3,6 +3,8 @@ import json
 import os
 import random
 
+import math
+
 import pytest
 
 import funding_eval as FE
@@ -707,3 +709,128 @@ def test_a_reference_shaped_like_a_record_is_still_only_a_pointer(ref):
     auth = {"owner_authorised": True, "reference": ref, "scope": "carry_overlay_taker/v1"}
     st, e = status(reconciled(authorisation=auth))
     assert st == OE.Status.EXECUTION_READY and e.authorizes_trading is False
+
+
+# ---- third review: the ledger is RE-DERIVED from its own inputs; a maker rate never lifts a status; hostile numbers never raise ----
+
+def _resynced(mutate):
+    """A ledger altered by `mutate`, then its net and its claimed return re-synced to the altered components, so that ONLY a check that
+    re-derives the pieces from the ledger's own inputs can still see the contradiction."""
+    import copy
+    ae = copy.deepcopy(account_economics())
+    mutate(ae)
+    ae["net_pnl_usd"] = math.fsum(ae["components_usd"].values())
+    ae["returns"]["annualised_pct_on_economic_capital"] = OE._ledger_return(ae)
+    return ae
+
+
+def _bump(key, factor=None, add=None):
+    def m(ae):
+        ae["components_usd"][key] = ae["components_usd"][key] * factor if factor is not None else ae["components_usd"][key] + add
+    return m
+
+
+def _rescale_notional(ae):
+    ae["capital"]["hedged_notional_usd"] = 1000.0
+    for k in ("perp_entry_fee_usd", "perp_exit_fee_usd"):
+        ae["components_usd"][k] = -1000.0 * 5.5 / 1e4                 # the fees now look like 5.5 bps of 1,000; the position and funding stay at 100,000
+
+
+def _set(path, value):
+    def m(ae):
+        d = ae
+        for k in path[:-1]:
+            d = d[k]
+        d[path[-1]] = value
+    return m
+
+
+@pytest.mark.parametrize("name,mutate", [
+    ("funding line x10 against its own funding path", _bump("funding_income_usd", factor=10.0)),
+    ("notional shrunk, fee legs rescaled to match", _rescale_notional),
+    ("hold of 3 days against 90 settlements", _set(("position", "hold_days"), 3.0)),
+    ("economic capital a tenth of inventory + margin + reserve", _set(("capital", "economic_capital_usd"), 11_000.0)),
+    ("margin 'sufficient' with 1 USD of collateral against 5,000 required", lambda ae: ae["capital"].update(available_collateral_usd=1.0, required_initial_margin_usd=5000.0)),
+    ("liquidation headroom 89.5 % with 1 USD of collateral", lambda ae: ae["capital"].update(available_collateral_usd=1.0, required_initial_margin_usd=0.5)),
+    ("a +50,000 rebate in a taker ledger", _bump("rebates_usd", add=50_000.0)),
+    ("an unnamed extra income line", lambda ae: ae["components_usd"].update(mystery_income_usd=50_000.0)),
+    ("a +50,000 basis P&L nobody can verify", _bump("basis_pnl_usd", add=50_000.0)),
+    ("a missing component", lambda ae: ae["components_usd"].pop("borrow_usd")),
+    ("position notional differs from the capital block's", _set(("position", "notional_usd"), 50_000.0)),
+])
+def test_ROUND3_a_ledger_whose_pieces_contradict_each_other_is_not_reconciled_even_when_net_and_return_are_re_synced(name, mutate):
+    ae = _resynced(mutate)
+    st, e = status(reconciled(account_economics_=ae))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED, name
+    assert any("account_economics" in g for g in e.metrics["reconciliation_gaps"]), (name, e.metrics["reconciliation_gaps"])
+    # and an authorisation record cannot lift it
+    auth = {"owner_authorised": True, "reference": "OWNER-AUTH-2026-11-05", "scope": "carry_overlay_taker/v1"}
+    assert status(reconciled(account_economics_=ae, authorisation=auth))[0] == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED, name
+
+
+def test_ROUND3_the_untouched_ledger_still_passes_every_re_derivation():
+    assert OE._ledger_is_self_consistent(account_economics()) is True
+    for hold, n in ((30.0, 90), (7.0, 21), (5.8, 17), (90.0, 270)):
+        pos = position(hold_days=hold)
+        costs = TE.Costs(perp_entry_fee_bps=5.5, perp_exit_fee_bps=5.5, spread_bps=0.3, slippage_bps=0.1, impact_bps=0.2, latency_bps=0.1,
+                         conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0, fee_provenance="ACCOUNT_VERIFIED")
+        assert OE._ledger_is_self_consistent(TE.compute(pos, costs, [3.8] * n, funding_source="ACCOUNT_SETTLED")), (hold, n)
+
+
+def test_ROUND3_numbers_beyond_float_range_and_odd_unknowns_never_raise():
+    import copy
+    ae = copy.deepcopy(account_economics())
+    ae["components_usd"]["funding_income_usd"] = ae["components_usd"]["basis_pnl_usd"] = 10 ** 308
+    ae["net_pnl_usd"] = 1.0
+    assert OE._ledger_is_self_consistent(ae) is False
+    st, e = status(reconciled(account_economics_=ae))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and e.metrics["reconciliation_gaps"]
+    for junk in (5, [1, 2], {"a": 1}, "borrow", [None], (1,), True):
+        bad = copy.deepcopy(account_economics())
+        bad["unknowns"] = junk
+        st, e = status(reconciled(account_economics_=bad))
+        assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED, junk          # claiming unknowns of any shape blocks, and never raises
+    assert OE.unknown_cost_headroom_bps({"net_pnl_usd": 10 ** 400, "capital": {"economic_capital_usd": 1, "hedged_notional_usd": 1}, "position": {"hold_days": 1}}, 10) is None
+    for junk in (True, 7, "x", [1], 10 ** 400):
+        assert OE.integrity_grade({"integrity": junk}) == "NOT_FULLY_ANCHORED"
+        # a hostile object claiming a count never raises and never reaches ANCHORED (no files_anchored_by_archive, no external location)
+        assert OE.integrity_grade({"integrity": {"files_total": junk, "files_anchored_current": junk}}) in ("NOT_FULLY_ANCHORED", "ANCHORED_SAME_VOLUME_ONLY")
+
+
+@pytest.mark.parametrize("mode", ["maker", "hybrid", None, "unknown-mode"])
+def test_ROUND3_a_ledger_charged_at_the_maker_rate_never_lifts_the_status(mode):
+    maker_costs = TE.Costs(perp_entry_fee_bps=2.0, perp_exit_fee_bps=2.0, spread_bps=0.3, slippage_bps=0.1, impact_bps=0.2, latency_bps=0.1,
+                           conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0, fee_provenance="ACCOUNT_VERIFIED",
+                           maker_taker="maker")
+    ledger = TE.compute(position(), maker_costs, [3.8] * 90, funding_source="ACCOUNT_SETTLED")
+    acct = full_account()
+    acct["fee_schedule"].update(taker_bps=5.5, maker_bps=2.0)
+    acct["execution_costs"]["provenance"].update(maker_fill_probability="MEASURED", adverse_selection="MEASURED")
+    execution = {} if mode is None else {"mode": mode}
+    st, e = status(reconciled(account=acct, account_economics_=ledger, execution=execution))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED
+    assert any("account_fee_schedule" in g for g in e.metrics["reconciliation_gaps"])
+
+
+def test_ROUND3_hybrid_with_one_maker_leg_is_still_a_gap():
+    costs = TE.Costs(perp_entry_fee_bps=2.0, perp_exit_fee_bps=5.5, spread_bps=0.3, slippage_bps=0.1, impact_bps=0.2, latency_bps=0.1,
+                     conversion_bps=0.0, transfer_usd=0.0, custody_apr=0.0, operational_usd=0.0, borrow_apr=0.0, fee_provenance="ACCOUNT_VERIFIED")
+    acct = full_account()
+    acct["execution_costs"]["provenance"].update(maker_fill_probability="MEASURED", adverse_selection="MEASURED")
+    st, e = status(reconciled(account=acct, account_economics_=TE.compute(position(), costs, [3.8] * 90, funding_source="ACCOUNT_SETTLED"),
+                              execution={"mode": "hybrid"}))
+    assert st == OE.Status.PROSPECTIVE_MARKET_EDGE_SUPPORTED and any("account_fee_schedule" in g for g in e.metrics["reconciliation_gaps"])
+
+
+@pytest.mark.parametrize("ref", ["decision/approval-2026-11-05", "authorisation/audit-4471", "owner-attestation-4471", "latest-approval-4471",
+                                 "unknown-risk-signoff-12", "exampleco-auth-7788", "sample-size-approval-77", "ticket 4471 / owner decision"])
+def test_ROUND3_a_natural_reference_that_merely_contains_a_placeholder_word_is_accepted(ref):
+    assert OE._real_reference(ref) is True
+    auth = {"owner_authorised": True, "reference": ref, "scope": "carry_overlay_taker/v1"}
+    assert status(reconciled(authorisation=auth))[0] == OE.Status.EXECUTION_READY
+
+
+@pytest.mark.parametrize("ref", ["TODO-TODO", "pending-1", "n/a n/a n/a", "test-test-test", "xxxxxxxx", "placeholder", "none none", "11111111", "short",
+                                 "TBD / TBD", "unknown unknown", "ref-ref-ref-1", "sample sample 1"])
+def test_ROUND3_a_reference_made_only_of_placeholder_words_is_refused(ref):
+    assert OE._real_reference(ref) is False

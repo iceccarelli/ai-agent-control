@@ -82,7 +82,7 @@ def read_archive(path: str) -> Tuple[List[Dict[str, Any]], List[str]]:
     for i, raw in enumerate(data.split(b"\n")[:-1], 1):
         try:
             e = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             problems.append(f"LINE_{i}_NOT_JSON")
             break
         ok = (isinstance(e, dict) and e.get("schema") == SCHEMA and e.get("seq") == i and e.get("prev") == prev

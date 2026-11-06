@@ -360,3 +360,71 @@ def test_an_entry_without_the_mark_hashes_exactly_as_before():
     import hashlib
     assert EC.link(a, b) == hashlib.sha256(bytes.fromhex(a) + bytes.fromhex(b)).hexdigest()
     assert EC.link(a, b, resealed=True) != EC.link(a, b)
+
+
+# ---- third review: no leniency for an unmarked-hash resealed entry (an anchor cannot tell it from a flipped flag), strict hex, hostile JSON ----
+
+def _legacy_resealed_file(tmp_path):
+    """A sidecar as an EARLIER revision of this branch wrote a crash adoption: the entry carries resealed=true but its hash omits the mark."""
+    p = write(tmp_path, 4)
+    open(p, "ab").write(EC.canonical({"adopted": True}) + b"\n")
+    chain = EC._read_chain(p)
+    r = EC.row_hash(EC.read_lines(p)[0][-1])
+    h = EC.link(chain[-1]["h"], r)                          # the OLD formula: no mark in the hash
+    with open(p + ".chain", "a") as fh:
+        fh.write(json.dumps({"n": 5, "r": r, "h": h, "resealed": True}, sort_keys=True) + "\n")
+    return p, h
+
+
+def test_a_legacy_format_resealed_entry_is_inconsistent_and_an_anchor_does_not_vouch_for_it(tmp_path):
+    p, h = _legacy_resealed_file(tmp_path)
+    v = EC.verify(p)
+    assert "SIDECAR_INCONSISTENT" in codes(v) and v["economic_evidence_eligible"] is False
+    covering = [{"n": 5, "head": h}]
+    v2 = EC.verify(p, covering)
+    assert "SIDECAR_INCONSISTENT" in codes(v2) and EC.admitted_rows(p, covering)[0] == []
+    # that is the point (next test): the entry is byte-for-byte what an ORDINARY entry with the flag flipped onto it looks like
+
+
+def test_a_flag_flipped_onto_an_ordinary_entry_is_not_rescued_by_a_covering_anchor(tmp_path):
+    p = write(tmp_path, 8)
+    head = EC.verify(p)["head"]
+    anchor = [{"n": head["n"], "head": head["head"]}]
+
+    def flip(entries):
+        entries[3]["resealed"] = True                      # hash unchanged: exactly the legacy shape
+    _rewrite_chain(p, flip)
+    v = EC.verify(p, anchor)
+    assert "SIDECAR_INCONSISTENT" in codes(v) and EC.admitted_rows(p, anchor)[0] == []
+
+
+@pytest.mark.parametrize("field,value", [("r", "ab" * 31), ("r", "ab" * 33), ("h", "cd" * 31), ("h", "cd" * 33), ("r", " " + "ab" * 32), ("h", "AB" * 32 + "\n")])
+def test_chain_entries_must_carry_exactly_64_hex_characters(tmp_path, field, value):
+    p = write(tmp_path, 4)
+
+    def put(entries):
+        entries[1][field] = value
+    _rewrite_chain(p, put)
+    v = EC.verify(p)
+    assert "SIDECAR_INCONSISTENT" in codes(v) and v["economic_evidence_eligible"] is False
+
+
+def test_deeply_nested_json_in_any_evidence_file_is_a_finding_not_a_crash(tmp_path):
+    deep = b"[" * 200_000 + b"]" * 200_000
+    p = write(tmp_path, 4)
+    with open(p + ".chain", "ab") as fh:
+        fh.write(deep + b"\n")
+    v = EC.verify(p)                                       # the sidecar line is junk: corrupt, reported, no RecursionError
+    assert "SIDECAR_CORRUPT" in codes(v)
+    (tmp_path / "q").mkdir()
+    q = write(tmp_path / "q", 4)
+    open(q + ".head", "wb").write(deep)
+    assert EC.head_of(q) is None
+    r = str(tmp_path / "capacity-20261110.jsonl")
+    open(r, "wb").write(EC.canonical({"ok": 1}) + b"\n" + deep + b"\n" + EC.canonical({"ok": 2}) + b"\n")
+    lines, quarantined = EC.read_lines(r)
+    assert EC.rows_of(lines)[1] is None and len(lines) == 3
+    s2 = str(tmp_path / "capacity-20261111.jsonl")
+    open(s2, "wb").write(EC.canonical({"ok": 1}) + b"\n" + deep + b"\n")
+    lines2, q2 = EC.read_lines(s2)
+    assert q2 and q2[0]["reason"] == "final line is not valid JSON"

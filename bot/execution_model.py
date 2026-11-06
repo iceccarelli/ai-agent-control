@@ -129,19 +129,25 @@ class UnknownParameterError(ValueError):
         super().__init__("UNKNOWN parameters, refusing to default them: " + ", ".join(self.unknown))
 
 
-_UNREAL_STEMS = ("simul", "simfill", "monte", "carlo", "synthetic", "backtest", "model", "mock", "replay", "fake", "generat", "predict",
-                 "estimat", "deriv", "shadow", "dry", "stub", "fixture", "hypothet", "project", "assum", "paper", "dummy", "sample",
-                 "placeholder", "example", "forecast", "scenario", "illustrat", "imagin", "invent")
-_UNREAL_TOKENS = ("sim", "sims", "mc", "gen", "est", "tbd", "todo")
+_UNREAL_STEMS = ("simul", "simfill", "monte", "carlo", "synthetic", "synthes", "backtest", "mock", "replay", "fake", "generat", "predict",
+                 "estimat", "shadow", "dry", "stub", "fixture", "hypothet", "assum", "paper", "dummy", "placeholder", "example",
+                 "forecast", "illustrat", "imagin", "fabricat", "sandbox", "demo", "invented")
+#: whole words only: stems like 'deriv' (Bybit's own 'derivatives'), 'invent' ('inventory'), 'project', 'sample', 'model' and 'scenario'
+#: (and 'sample', 'scenario') would block a real venue or account label, so only their unambiguous forms are listed
+_UNREAL_TOKENS = ("sim", "sims", "mc", "gen", "tbd", "todo", "derived", "projected", "modelled", "modeled", "modelling")
+#: matched inside the source with every separator removed, so 'back-test', 'back test' and 're-played' are caught
+_UNREAL_SQUASHED = ("backtest", "replay", "montecarlo", "simulat", "synthetic", "paperfill", "papertrad")
 
 
 def _unreal_source(source: str) -> bool:
-    """True when the free-text source of an 'account execution' names something that is not the venue's own record. Tokens are
-    matched by their STEM (so 'mocked', 'faked', 'backtested', 'replayed', 'dry-run', 'hypothetical', 'projected' all count), which is
-    still a tripwire, not a proof of origin: the repository cannot see where a number came from, and an owner who wants to mislead
-    it can use any other word. What it stops is the careless label."""
+    """True when the free-text source of an 'account execution' names something that is not the venue's own record. Tokens are matched by
+    their STEM (mocked, faked, dry-run, hypothetical, ...) and the whole string is matched with separators removed (back-test, re-played).
+    It is a tripwire, not a proof of origin: the repository cannot see where a number came from, and an owner who wants to mislead it can
+    use any other word. What it stops is the careless label. 'testnet' is NOT blocked: a testnet account's fills are real account
+    records of that environment, and the environment is established separately (product qualification names mainnet)."""
     tokens = "".join(c if (c.isascii() and c.isalnum()) else " " for c in source.lower()).split()
-    return any(t.startswith(_UNREAL_STEMS) or t in _UNREAL_TOKENS for t in tokens)
+    squashed = "".join(tokens)
+    return (any(t.startswith(_UNREAL_STEMS) or t in _UNREAL_TOKENS for t in tokens) or any(k in squashed for k in _UNREAL_SQUASHED))
 
 
 class EvidenceClassError(ValueError):

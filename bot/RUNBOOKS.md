@@ -243,7 +243,19 @@ reappears with a different head (the chain was rewritten). Then, on a copy of `/
         --archive-head <the value you stored> --archive-entries <its count>
 
 The report then says `EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE` only if the archive is exactly what you recorded (or has
-only grown). The tool cannot see where you keep the value: that remains your claim, and it is printed as one. An automated version
+only grown). When it has grown, only the entries inside the prefix you stored count as anchored by the archive (`anchored by the ARCHIVE
+itself: N of M chained files` in the report; the grade is ANCHORED only when that equals M): entries appended later are not pinned by you.
+The tool cannot see where you keep the value: that remains your claim, and it is printed as one.
+
+The report decides which anchored day-files that are gone were "removed" and which were merely "pruned" from the capacity retention YOU
+state (`--capacity-retention-days`, default 365, the recorder's own default; 0 = the recorder keeps everything). It is never read from
+the evidence directory, because whoever can delete a day of evidence can also edit a file next to it. If you run the recorder with a
+shorter retention, pass the same number here or every legitimately pruned day will block the economics.
+
+A chain sidecar written by an EARLIER revision of this branch (an adoption entry whose hash lacks the mark) does not verify: the entry
+is indistinguishable from an ordinary one with the flag flipped onto it, and an anchor cannot tell them apart. Nothing deployed has ever
+written one (`evidence_chain.py` first appears in this change), so there is nothing to migrate; a development file would be excluded,
+visibly, as SIDECAR_INCONSISTENT. An automated version
 (a scheduled job that runs the read-only fetch and appends to a private repository) is possible but needs your decision about
 where the secrets for it live; it is not part of this PR.
 

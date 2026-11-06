@@ -64,7 +64,7 @@ def _json(path: str) -> Optional[Dict[str, Any]]:
         with open(path, encoding="utf-8") as fh:
             v = json.load(fh)
         return v if isinstance(v, dict) else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
 
 
@@ -88,11 +88,13 @@ def _utc_day(ms: float) -> str:
     return time.strftime("%Y%m%d", time.gmtime(ms / 1000.0))
 
 
-def _capacity_retention_days(status: Optional[Dict[str, Any]]) -> int:
-    """The retention the RECORDER is actually running with (it writes it to recorder_status.json), else its default. 0 means the
-    recorder keeps everything. A value that is not a non-negative int is not believed."""
-    v = (status or {}).get("capacity_retention_days")
-    return v if type(v) is int and v >= 0 else CAPACITY_RETENTION_DAYS
+def _retention_days(value: Any) -> int:
+    """The capacity retention the OWNER says the recorder runs with (``--capacity-retention-days``; 365 is the recorder's default, 0 means it
+    keeps everything). It is deliberately NOT read from the evidence directory: whoever can delete a day of evidence can also edit a status
+    file there, and the missing-anchored-file test is the only thing that notices a deleted day."""
+    if type(value) is not int or not (0 <= value <= 36_500):
+        raise ValueError("capacity_retention_days must be an integer between 0 and 36500")
+    return value
 
 
 def anchors_from_history(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
@@ -168,7 +170,8 @@ def _exposure_section(fe, economics, withheld, accepted, notional_usd, hold_days
 
 def build(directory: str, *, now_ms: int, history: Optional[str] = None, notional_usd: float = 100_000.0,
           hold_days: float = 30.0, artifacts_dir: Optional[str] = None, anchor_archive: Optional[str] = None,
-          archive_head: Optional[str] = None, archive_entries: Optional[int] = None) -> Dict[str, Any]:
+          archive_head: Optional[str] = None, archive_entries: Optional[int] = None,
+          capacity_retention_days: int = CAPACITY_RETENTION_DAYS) -> Dict[str, Any]:
     paths = sorted(p for p in glob.glob(os.path.join(directory, "capacity-*.jsonl")))
     anchors = anchors_from_history(history)
     archive = None
@@ -178,6 +181,10 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
         entries, _problems = AA.read_archive(anchor_archive)
         for fname, lst in AA.anchors_by_file(entries).items():          # entries before any break in the archive's own chain
             anchors.setdefault(fname, []).extend(lst)
+        # an archive that has GROWN since the owner stored its head is accepted, but only the entries inside the stored prefix are pinned by
+        # the owner; later ones are not external evidence of anything (an attacker with the archive could append them)
+        pinned = entries[:archive_entries] if (archive_head and type(archive_entries) is int and archive_entries >= 1) else entries
+        for fname, lst in AA.anchors_by_file(pinned).items():
             archive_only[fname] = list(lst)
     files: List[Dict[str, Any]] = []
     all_rows: List[Any] = []
@@ -220,7 +227,7 @@ def build(directory: str, *, now_ms: int, history: Optional[str] = None, notiona
     # a file the anchors know about that is no longer there (inside the capacity retention) was removed, not pruned
     present = {os.path.basename(p) for p in paths}
     missing_anchored: List[str] = []
-    retention = _capacity_retention_days(_json(os.path.join(directory, "recorder_status.json")))
+    retention = _retention_days(capacity_retention_days)
     cutoff_day = _utc_day(now_ms - retention * 86_400_000) if retention > 0 else None
     for fname in sorted(anchors):
         if fname in present:
@@ -380,7 +387,8 @@ def render(rep: Dict[str, Any]) -> str:
                f"completely chained {sm['files_fully_chained']}")
     out.append(f"    anchors (copies in monitor.jsonl, {sm['anchor_location'].replace('_', ' ').lower()}): current {sm['files_anchored_current']}, "
                f"lagging {sm['files_anchored_lagging']} (max lag {sm['max_anchor_lag_rows']} rows), STALE {sm['files_stale_anchor']}, "
-               f"UNANCHORED {sm['files_unanchored']}, CONFLICT {sm['files_anchor_conflict']}"
+               f"UNANCHORED {sm['files_unanchored']}, CONFLICT {sm['files_anchor_conflict']}; anchored by the ARCHIVE itself: "
+               f"{sm['files_anchored_by_archive']} of {sm['files_total'] - sm['files_legacy_pre_chain']} chained files"
                + ("  - a consistent truncation of the unanchored newest rows would not be detected" if sm["files_unanchored"] or sm["files_stale_anchor"] else ""))
     out.append(f"    economic-evidence eligible (every chained file complete and consistent, stream valid): {sm['economic_evidence_eligible']}"
                + ("" if sm["economic_evidence_eligible"] else "  <- " + "; ".join(sm["economic_evidence_blockers"][:3])))
@@ -454,6 +462,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--anchor-archive", default=None, help="tools/anchor_archive.py archive kept off the recorder machine")
     ap.add_argument("--archive-head", default=None, help="the archive head you stored somewhere the recorder machine cannot reach")
     ap.add_argument("--archive-entries", type=int, default=None, help="the entry count at the time you stored it (a longer archive is then accepted)")
+    ap.add_argument("--capacity-retention-days", type=int, default=CAPACITY_RETENTION_DAYS,
+                    help="the capacity retention the recorder runs with (its --capacity-retention-days; 0 = keeps everything); decides which anchored "
+                         "files that are gone are 'removed' and which 'pruned'")
     ap.add_argument("--notional", type=float, default=100_000.0)
     ap.add_argument("--hold-days", type=float, default=30.0)
     ap.add_argument("--now-ms", type=int, default=None)
@@ -465,7 +476,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ap.error("--notional must be a finite positive number of USD")
     now = a.now_ms if a.now_ms is not None else int(time.time() * 1000)
     rep = build(a.dir, now_ms=now, history=a.history, notional_usd=a.notional, hold_days=a.hold_days,
-                anchor_archive=a.anchor_archive, archive_head=a.archive_head, archive_entries=a.archive_entries)
+                anchor_archive=a.anchor_archive, archive_head=a.archive_head, archive_entries=a.archive_entries,
+                capacity_retention_days=a.capacity_retention_days)
     print(json.dumps(rep, indent=2, sort_keys=True, default=str) if a.json else render(rep))
     return 0
 

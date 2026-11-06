@@ -196,3 +196,37 @@ def test_without_an_archive_no_file_is_anchored_by_one(tmp_path):
     hist = history(tmp_path, [line("capacity-20261104.jsonl", len(chain), chain[-1]["h"])])
     s = PR.build(d, now_ms=rows[-1]["at_ms"] + 60_000, history=hist)["integrity"]["summary"]
     assert s["files_anchored_by_archive"] == 0 and s["anchor_location"] == "SAME_VOLUME_COPY_NOT_VERIFIED_OFF_MACHINE"
+
+
+def test_ROUND3_only_the_archive_entries_the_owner_pinned_count_as_external_anchors(tmp_path):
+    """The archive may have grown since the owner stored its head. Entries appended after the stored prefix are not pinned by the owner, so
+    they must not make a file 'anchored by the archive' (the owner-pinned prefix alone says STALE)."""
+    import opportunity_engine as OE
+    rows = series(base_row(), 6, lambda T, t: 0.6, noisy(0.6, 0.1))
+    d = lay(tmp_path, rows)
+    p = os.path.join(d, "capacity-20261104.jsonl")
+    chain = EC._read_chain(p)
+    assert len(chain) > 60                                        # so that an anchor at row 1 is far behind (stale)
+    arc = str(tmp_path / "anchors.jsonl")
+    AA.append(history(tmp_path, [line("capacity-20261104.jsonl", 1, chain[0]["h"])], "first.jsonl"), arc)
+    held = AA.verify(arc)["archive_head"]
+    AA.append(history(tmp_path, [line("capacity-20261104.jsonl", len(chain), chain[-1]["h"])], "later.jsonl"), arc)       # appended AFTER the owner stored `held`
+    now = rows[-1]["at_ms"] + 60_000
+    s = PR.build(d, now_ms=now, anchor_archive=arc, archive_head=held, archive_entries=1)["integrity"]["summary"]
+    assert s["anchor_location"] == "EXTERNAL_ARCHIVE_HEAD_MATCHES_OWNER_HELD_VALUE"      # the prefix the owner stored is intact
+    assert s["files_anchored_current"] + s["files_anchored_lagging"] == 1                  # the merged anchors do cover the file
+    assert s["files_anchored_by_archive"] == 0                                              # ... but not through anything the owner pinned
+    assert OE.integrity_grade({"integrity": s}) == "ANCHORED_SAME_VOLUME_ONLY"
+    head_now = AA.verify(arc)["archive_head"]                                               # once the owner stores the NEW head, the later entry is pinned
+    s2 = PR.build(d, now_ms=now, anchor_archive=arc, archive_head=head_now)["integrity"]["summary"]
+    assert s2["files_anchored_by_archive"] == 1 and OE.integrity_grade({"integrity": s2}) == "ANCHORED"
+
+
+def test_ROUND3_the_rendered_report_says_how_many_files_the_archive_itself_anchors(tmp_path):
+    rows = series(base_row(), 6, lambda T, t: 0.6, noisy(0.6, 0.1))
+    d = lay(tmp_path, rows)
+    p = os.path.join(d, "capacity-20261104.jsonl")
+    chain = EC._read_chain(p)
+    hist = history(tmp_path, [line("capacity-20261104.jsonl", len(chain), chain[-1]["h"])])
+    text = PR.render(PR.build(d, now_ms=rows[-1]["at_ms"] + 60_000, history=hist))
+    assert "anchored by the ARCHIVE itself: 0 of 1 chained files" in text

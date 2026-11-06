@@ -3,7 +3,8 @@
 For ``capacity-YYYYMMDD.jsonl`` the recorder also writes
 
   ``<file>.chain``  one line per evidence row: ``{"n": i, "r": sha256(row line), "h": chain}``
-                    where ``chain_i = sha256(chain_{i-1} || r_i)`` from an all-zero genesis;
+                    where ``chain_i = sha256(chain_{i-1} || r_i)`` from an all-zero genesis, and for an entry that adopted an
+                    unchained row after a crash (``"resealed": true``) ``chain_i = sha256(chain_{i-1} || r_i || "RESEALED")``;
   ``<file>.head``   the latest ``{"n": count, "head": chain_n}``, replaced atomically.
 
 and publishes the head OUTSIDE the evidence directory (``recorder_status.json`` and, through
@@ -107,7 +108,7 @@ def _read_chain_ex(path: str) -> Tuple[List[Dict[str, Any]], bool, bool]:
             continue
         try:
             e = json.loads(raw)
-        except ValueError:
+        except (ValueError, RecursionError):
             corrupt = True
             return out, torn, corrupt
         if not (isinstance(e, dict) and isinstance(e.get("n"), int) and isinstance(e.get("r"), str)
@@ -123,7 +124,7 @@ def _read_chain_ex(path: str) -> Tuple[List[Dict[str, Any]], bool, bool]:
                 out.append(e)                # complete entry whose newline was lost
             else:
                 corrupt = True
-        except ValueError:
+        except (ValueError, RecursionError):
             torn = True
     return out, torn, corrupt
 
@@ -204,7 +205,7 @@ def read_lines(path: str) -> Tuple[List[bytes], List[Dict[str, Any]]]:
     if lines:
         try:
             json.loads(lines[-1])
-        except ValueError:
+        except (ValueError, RecursionError):
             quarantined.append({"line": len(lines), "reason": "final line is not valid JSON", "bytes": len(lines[-1])})
             lines.pop()
     return lines, quarantined
@@ -215,7 +216,7 @@ def rows_of(lines: Sequence[bytes]) -> List[Any]:
     for ln in lines:
         try:
             out.append(json.loads(ln))
-        except ValueError:
+        except (ValueError, RecursionError):
             out.append(None)                # an interior corrupt line stays visible as None
     return out
 
@@ -228,15 +229,22 @@ def head_of(path: str) -> Optional[Dict[str, Any]]:
         ok = (isinstance(h, dict) and isinstance(h.get("n"), int) and not isinstance(h.get("n"), bool)
               and isinstance(h.get("head"), str))
         return h if ok else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return None
 
 
 def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    """Every check in this module's docstring. There is deliberately NO leniency for a resealed entry whose hash lacks the mark: such an
+    entry is byte-for-byte what an ORDINARY entry with the flag flipped onto it looks like, and an external anchor cannot tell them apart
+    (the anchor is the chain head, which does not contain the flag), so accepting it would reopen the hole the mark in the hash closes.
+    No such file exists in production: ``evidence_chain`` first appears in this change, so nothing deployed has ever written one; a file
+    from an earlier revision of this branch would verify as SIDECAR_INCONSISTENT and its day be excluded, visibly."""
     lines, quarantined = read_lines(path)
     chain, side_torn, side_corrupt = _read_chain_ex(path)
     head = head_of(path)
     issues: List[Dict[str, Any]] = []
+    valid_anchors = [a for a in (anchors or ()) if isinstance(a, Mapping) and isinstance(a.get("n"), int)
+                     and not isinstance(a.get("n"), bool) and a["n"] >= 1 and isinstance(a.get("head"), str)]
 
     def add(code: str, detail: str, index: Optional[int] = None) -> None:
         issues.append({"code": code, "detail": detail, "index": index})
@@ -250,8 +258,8 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
     for i, e in enumerate(chain):
         try:
             marked = "resealed" in e             # absent, or exactly True: any other value is not something the writer produces
-            recomputes = (e.get("n") == i + 1 and (not marked or e["resealed"] is True)
-                          and link(prev, e["r"], marked) == e["h"])
+            well_formed = (e.get("n") == i + 1 and (not marked or e["resealed"] is True) and len(e["r"]) == 64 and len(e["h"]) == 64)
+            recomputes = well_formed and link(prev, e["r"], marked) == e["h"]
         except (ValueError, TypeError):          # r / h are not hex
             recomputes = False
         if not recomputes:
@@ -299,8 +307,6 @@ def verify(path: str, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> 
     elif head is not None and not chain and head.get("n"):
         add("TRUNCATED", "the chain is empty but the head records rows")
     # 3. external anchors: EVERY valid anchor must match the chain at its row; the LATEST decides the status
-    valid_anchors = [a for a in (anchors or ()) if isinstance(a, Mapping) and isinstance(a.get("n"), int)
-                     and not isinstance(a.get("n"), bool) and a["n"] >= 1 and isinstance(a.get("head"), str)]
     anchor_conflict = False
     for a in valid_anchors:
         n, hd = a["n"], a["head"]
@@ -429,7 +435,7 @@ def _set_aside_bad_tail(path: str) -> int:
     try:
         json.loads(last)
         return 0
-    except ValueError:
+    except (ValueError, RecursionError):
         pass
     with open(path + ".torn", "ab") as fh:
         fh.write(last + b"\n")
