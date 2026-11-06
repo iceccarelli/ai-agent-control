@@ -70,11 +70,17 @@ LIMITS = (
     "own statement line, so a record's timestamp or a swap between two equal-size records is not detected",
     "paper and testnet exports have the same shape as live ones and are not detected: the owner must supply only live-account records",
     "the strategy figure is exact only for complete round trips whose fills carry a spot reference, and that reference is the supplier's",
+    "the BTC leg of the bridge is only as good as the snapshot BTC prices: they are checked against the public 4h bar's low..high widened 0.3 % (a wide band, "
+    "hundreds of USD per BTC) and ONLY where a bar covers the instant; the committed history ends 2026-09-09, so for later periods they are the supplier's word "
+    "(SNAPSHOT_PRICE_CHECK_NOT_RUN) unless a public spot 4h kline file covering the period is named in the manifest",
+    "when the statement, the funding, the fees and the flows are all read from ONE transaction-log file, their cross-checks agree by construction: an independent "
+    "execution list (and, for balances, snapshots from a different source) is what makes them independent",
     "the venue's own cost-basis convention for realised P&L is assumed to be average entry; a different convention shows up as a REALISED_NOT_IN_STATEMENT gap",
 )
 DAY_MS = AR.DAY_MS
 YEAR_DAYS = 365.0
 MIN_ANNUALISE_DAYS = 30.0
+EDGE_MS = 3_600_000
 EXTERNAL_KINDS = ("DEPOSIT", "WITHDRAWAL", "TRANSFER_IN", "TRANSFER_OUT", "INTERNAL_IN", "INTERNAL_OUT")
 INTERNAL_KINDS = ("INTERNAL_IN", "INTERNAL_OUT")
 # account_review findings that limit the STRATEGY's attributable P&L but not the account-level reconciliation (a basis needs a spot reference; an open
@@ -236,6 +242,7 @@ def parse_external_flows(rows: Sequence[Mapping[str, Any]], label: str = "extern
     for i, r in enumerate(rows):
         w = f"{label} row {i + 1}"
         coin = _str(r.get("coin"), "coin", w).upper()
+        coin = "USDT" if coin == "USD" else coin             # one settlement currency: a USD-labelled row must not escape the USDT chain and its anchors
         if coin not in COINS:
             raise RecordError(f"{w}: coin {coin!r} is not one of {', '.join(COINS)}: only the assets of this operation are accepted")
         kind = _str(r.get("kind"), "kind", w).upper()
@@ -270,6 +277,7 @@ def parse_cash_lines(rows: Sequence[Mapping[str, Any]], label: str = "cash_lines
     for i, r in enumerate(rows):
         w = f"{label} row {i + 1}"
         coin = _str(r.get("coin"), "coin", w).upper()
+        coin = "USDT" if coin == "USD" else coin
         if coin not in COINS:
             raise RecordError(f"{w}: coin {coin!r} is not one of {', '.join(COINS)}")
         cat = _str(r.get("category"), "category", w).upper()
@@ -406,6 +414,15 @@ def irr(e0: float, e1: float, flows: Sequence[Tuple[int, float]], t0: int, t1: i
     return {"method": "IRR", "annual_rate": (lo + hi) / 2.0, "note": "the first root found in [-99 %, +5000 %]; with flows of both signs a cash-flow series can have more than one"}
 
 
+def annualise(period_return: float, days: Optional[float]) -> Tuple[Optional[float], Optional[str]]:
+    """A simple annual figure in percent, or (None, why) for a window under ``MIN_ANNUALISE_DAYS`` (a few days of noise multiplied by a hundred)."""
+    if days is None or days <= 0:
+        return None, "no window"
+    if days < MIN_ANNUALISE_DAYS:
+        return None, f"the window is shorter than {MIN_ANNUALISE_DAYS:g} days: an annual figure would extrapolate noise"
+    return period_return * YEAR_DAYS / days * 100.0, None
+
+
 def linked_returns(snaps: Sequence[Snapshot], flows: Sequence[Tuple[int, float]]) -> Optional[Dict[str, Any]]:
     """Chain-linked modified-Dietz returns between consecutive snapshots. It is the time-weighted answer only when a snapshot exists at
     every flow; with flows between snapshots it is an approximation, and it says so. None with fewer than three snapshots."""
@@ -420,9 +437,13 @@ def linked_returns(snaps: Sequence[Snapshot], flows: Sequence[Tuple[int, float]]
             return None
         growth *= 1.0 + d["period_return"]
         parts.append(d["period_return"])
-    years = _years(snaps[0].ts_ms, snaps[-1].ts_ms)
-    return {"method": "LINKED_MODIFIED_DIETZ", "period_return": growth - 1.0, "sub_periods": len(parts), "annualised_simple_pct":
-            (growth - 1.0) / years * 100.0 if years > 0 else None, "note": "time-weighted only if every external flow sits at a snapshot time"}
+    days = (snaps[-1].ts_ms - snaps[0].ts_ms) / DAY_MS
+    annual, why = annualise(growth - 1.0, days)
+    out = {"method": "LINKED_MODIFIED_DIETZ", "period_return": growth - 1.0, "sub_periods": len(parts), "annualised_simple_pct": annual,
+           "note": "time-weighted only if every external flow sits at a snapshot time"}
+    if why:
+        out["annualised_why_not"] = why
+    return out
 
 
 # ---------------------------------------------------------------- the ledger
@@ -511,7 +532,7 @@ def _order_group(group: Sequence[Dict[str, Any]], prev_bal: Optional[float]) -> 
     return None if found is None else [group[i] for i in found]
 
 
-def _chain(lines: Sequence[CashLine], coin: str) -> Dict[str, Any]:
+def _chain(lines: Sequence[CashLine], coin: str, seed: Optional[float] = None) -> Dict[str, Any]:
     """The running balance of one currency. Lines that share a ``row_id`` are one venue row (their changes add up and exactly ONE carries the
     balance). Returns the breaks (where a balance does not follow from the one before), the rows with NO balance (the chain cannot cover them),
     the balance the first row started from and the last row left, so the caller can anchor the chain to the snapshots."""
@@ -537,7 +558,9 @@ def _chain(lines: Sequence[CashLine], coin: str) -> Dict[str, Any]:
     prev_id: Optional[str] = None
     start: Optional[float] = None
     for g in groups:
-        order = _order_group(g, prev_bal)
+        order = _order_group(g, prev_bal if prev_bal is not None else seed)      # the first group is tried from the snapshot's balance, then from nothing
+        if order is None and prev_bal is None and seed is not None:
+            order = _order_group(g, None)
         if order is None:
             breaks.append(f"{coin}:{prev_id or 'start'}->{g[0]['id']}")
             order = _order_group(g, None) or sorted(g, key=lambda v: v["seq"])      # re-synchronise: one defect is one break, not every later row
@@ -551,6 +574,11 @@ def _chain_breaks(lines: Sequence[CashLine], coin: str) -> List[str]:
     return _chain(lines, coin)["breaks"]
 
 
+def _same(a: Optional[float], b: Optional[float], tol: float) -> bool:
+    """The same figure stated twice (an API value and a UI value rounded to cents): equal within the anchoring tolerance; a field one copy omits is compatible."""
+    return a is None or b is None or abs(a - b) <= max(tol, 1e-9 * max(abs(a), abs(b)))
+
+
 _SNAP_NUMERIC = ("usdt", "btc", "btc_price", "perp_upl_usd", "perp_mark", "perp_qty", "perp_avg_entry", "equity_usd", "other_usd", "margin_posted_usd", "reserve_usd")
 
 
@@ -562,7 +590,7 @@ def _snapshot_dedupe(snaps: List[Snapshot], flags: List[Dict[str, Any]]) -> List
     dropped: List[str] = []
     for sn in snaps:
         if out and out[-1].ts_ms == sn.ts_ms:
-            if any(getattr(out[-1], f) != getattr(sn, f) for f in _SNAP_NUMERIC):
+            if any(not _same(getattr(out[-1], f), getattr(sn, f), 1e-8 if f in ("btc", "perp_qty") else 0.01) for f in _SNAP_NUMERIC):
                 clash.append(f"{out[-1].snapshot_id}/{sn.snapshot_id}")
             else:
                 dropped.append(sn.snapshot_id)
@@ -610,8 +638,13 @@ def _snapshot_checks(snaps: Sequence[Snapshot], hist: Mapping[str, Any], flags: 
     _flag(flags, "SNAPSHOT_INCONSISTENT", SEVERITY_HARD, len(upl_bad), "a snapshot's unrealised P&L is not its stated position x (mark - average entry)", upl_bad)
     _flag(flags, "PERP_MARK_MISSING", SEVERITY_GAP, len(no_mark), "a snapshot states an open perpetual position but no perp_mark: its unrealised P&L cannot be checked", no_mark)
     _flag(flags, "SNAPSHOT_POSITION_UNSTATED", SEVERITY_GAP, len(upl_unstated), "a snapshot states an unrealised P&L but not the position it belongs to", upl_unstated)
-    _flag(flags, "OTHER_ASSETS_PRESENT", SEVERITY_GAP, len(other),
-          "a snapshot holds assets the ledger does not model (other_usd): their value moves are shown as their own bridge line, not explained, so no conclusive result", other)
+    if other and len({round(sn.other_usd, 6) for sn in snaps}) == 1:
+        _flag(flags, "OTHER_ASSETS_PRESENT", "INFO", len(other),
+              "every snapshot states the same value for assets the ledger does not model (other_usd): it cancels in the bridge, and is the supplier's word", other)
+    else:
+        _flag(flags, "OTHER_ASSETS_PRESENT", SEVERITY_GAP, len(other),
+              "a snapshot holds assets the ledger does not model (other_usd) whose value differs between snapshots: the move is shown as its own bridge line, not explained, "
+              "so no conclusive result", other)
     _flag(flags, "SNAPSHOT_PRICE_OFF_PUBLIC_BAR", SEVERITY_HARD, len(price_bad) + len(mark_bad),
           f"a snapshot's price is outside the public 4h bar's low..high (widened {tol:.1%}): the owned BTC would be mis-valued", price_bad + mark_bad)
     _flag(flags, "SNAPSHOT_PRICE_CHECK_NOT_RUN", SEVERITY_GAP, 1 if price_unchecked else 0,
@@ -623,7 +656,7 @@ def _merge_flow_prices(flows: Sequence[ExternalFlow]) -> List[ExternalFlow]:
     A flow that differs in anything else is left for the duplicate rule to refuse."""
     by_id: Dict[str, ExternalFlow] = {}
     out: List[ExternalFlow] = []
-    for f in flows:
+    for f in sorted(flows, key=lambda x: x.usd_value is None):         # priced copies first, so the order the files were listed in cannot matter
         prev = by_id.get(f.flow_id)
         if prev is not None and (prev.ts_ms, prev.coin, prev.amount, prev.kind, prev.transfer_id) == (f.ts_ms, f.coin, f.amount, f.kind, f.transfer_id) \
                 and (prev.usd_value is None) != (f.usd_value is None):
@@ -677,15 +710,21 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
             for x in coll:
                 ts = x.grid_ms if label == "funding" else x.ts_ms
                 if not in_window(ts):
-                    outside.append(f"{label}:{getter(x)}")
+                    edge = min(abs(ts - t0), abs(ts - t1)) <= EDGE_MS
+                    outside.append(f"{label}:{getter(x)}" + ("@edge" if edge else ""))
         fills = [x for x in fills if in_window(x.ts_ms)]
         funding = [x for x in funding if in_window(x.grid_ms)]
         spot = [x for x in spot if in_window(x.ts_ms)]
         ext = [x for x in ext if in_window(x.ts_ms)]
         lines = [x for x in lines if in_window(x.ts_ms)]
-    _flag(flags, "RECORDS_OUTSIDE_WINDOW", SEVERITY_GAP, len(outside),
-          "records outside (opening snapshot, closing snapshot] were excluded from the period: an export wider than the period is normal, but a record on the "
-          "wrong side of a boundary is a boundary error, so they are listed", outside)
+    near, far = [], []
+    for tag in outside:
+        (near if tag.endswith("@edge") else far).append(tag[:-5] if tag.endswith("@edge") else tag)
+    _flag(flags, "RECORDS_OUTSIDE_WINDOW", SEVERITY_GAP, len(near),
+          "records within an hour of a snapshot but on the wrong side of it were excluded from the period (opening snapshot, closing snapshot]: a record on the wrong "
+          "side of a boundary is a boundary error, so they are listed", near)
+    _flag(flags, "RECORDS_BEYOND_WINDOW_IGNORED", "INFO", len(far),
+          "records more than an hour outside the period were ignored: an export wider than the period is normal", far)
 
     # ---- the perpetual side, reusing the position/funding checks of account_review (with the position carried in and the period's end)
     opening_qty = (s0.perp_qty if (s0 and s0.perp_qty is not None) else 0.0)
@@ -774,7 +813,7 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         for coin in COINS:
             cl = [l for l in lines if l.coin == coin]
             if cl:
-                chains[coin] = _chain(cl, coin)
+                chains[coin] = _chain(cl, coin, (s0.usdt if coin == "USDT" else s0.btc if coin == "BTC" else None) if s0 is not None else None)
                 stmt["continuity_breaks"] += chains[coin]["breaks"]
                 stmt["unchained_rows"] += chains[coin]["unchained"]
         _flag(flags, "STATEMENT_GAP", SEVERITY_GAP, len(stmt["continuity_breaks"]),
@@ -800,14 +839,23 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         fund_lines = math.fsum(l.change for l in lines if l.category == "FUNDING" and l.coin in USD_COINS)
         stmt["fee_total"], stmt["funding_total"] = fee_lines, fund_lines
         tol = lambda ref: max(0.01, 1e-6 * abs(ref))                                                     # noqa: E731
-        # a spot fee in USDT sits inside the SPOT line's change on the venue's own log (change = cashFlow - fee), and in a FEE line on other layouts: it is
-        # expected where the statement carries it, never in both
-        spot_fee_in_spot_lines = any(l.category == "SPOT" and l.coin in USD_COINS for l in lines)
-        expected_fee_lines = perp_fees + (0.0 if spot_fee_in_spot_lines else spot_usd_fee)
-        if fills and abs(fee_lines - expected_fee_lines) > tol(perp_fees):
+        # A spot fee in USDT is either inside the SPOT line's change (the venue's own log: change = cashFlow - fee) or on a separate FEE line. Either layout is
+        # accepted, but ONE layout must explain both the fee total and the spot cash.
+        stmt_spot_usd = math.fsum(l.change for l in lines if l.category == "SPOT" and l.coin in USD_COINS)
+        stmt_spot_btc = math.fsum(l.change for l in lines if l.category == "SPOT" and l.coin == "BTC")
+        spot_net = spot_sell_cash - spot_buy_cash
+        tol_fee, tol_spot = tol(perp_fees + spot_usd_fee), tol(spot_buy_cash + spot_sell_cash)
+        fee_a, spot_a = abs(fee_lines - perp_fees) <= tol_fee, abs(stmt_spot_usd - (spot_net - spot_usd_fee)) <= tol_spot      # fee inside the SPOT line
+        fee_b, spot_b = abs(fee_lines - (perp_fees + spot_usd_fee)) <= tol_fee, abs(stmt_spot_usd - spot_net) <= tol_spot       # fee on its own FEE line
+        layout_ok = (fee_a and spot_a) or (fee_b and spot_b)
+        if fills and not (fee_a or fee_b):
             _flag(flags, "EXECUTION_NOT_IN_STATEMENT", SEVERITY_GAP, 1,
-                  f"fees in the statement ({fee_lines:.6f}) differ from the executions' fees ({expected_fee_lines:.6f}): an execution is missing "
-                  "from one of the two, or a fee is mis-signed or mis-valued")
+                  f"fees in the statement ({fee_lines:.6f}) differ from the executions' fees ({perp_fees:.6f}, or {perp_fees + spot_usd_fee:.6f} with the spot USDT fee): an "
+                  "execution is missing from one of the two, or a fee is mis-signed or mis-valued")
+        elif fills and not layout_ok and (spot_a or spot_b):
+            _flag(flags, "EXECUTION_NOT_IN_STATEMENT", SEVERITY_GAP, 1,
+                  "the statement's fees and its spot cash are explained by different layouts of the spot USDT fee (inside the SPOT line vs on its own FEE line): "
+                  "one of the two is missing or double counted")
         if funding and abs(fund_lines - funding_net) > tol(funding_net):
             _flag(flags, "FUNDING_NOT_IN_STATEMENT", SEVERITY_GAP, 1,
                   f"funding in the statement ({fund_lines:.6f}) differs from the settlements' payments ({funding_net:.6f}): a settlement is missing from one of the two")
@@ -825,10 +873,7 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
             _flag(flags, "REALISED_NOT_IN_STATEMENT", SEVERITY_GAP, 1,
                   f"realised cash flow in the statement ({stmt_trade:.6f}) differs from the realised P&L the executions imply under average-entry accounting "
                   f"({perp_real_for_check:.6f}): an execution is missing, or the venue's cost basis differs from the convention assumed here")
-        stmt_spot_usd = math.fsum(l.change for l in lines if l.category == "SPOT" and l.coin in USD_COINS)
-        stmt_spot_btc = math.fsum(l.change for l in lines if l.category == "SPOT" and l.coin == "BTC")
-        if abs(stmt_spot_usd - (spot_sell_cash - spot_buy_cash - spot_usd_fee)) > tol(spot_buy_cash + spot_sell_cash) \
-                or abs(stmt_spot_btc - spot_btc_delta) * (spot[0].price if spot else 1.0) > tol(spot_buy_cash + spot_sell_cash):
+        if not (spot_a or spot_b) or abs(stmt_spot_btc - spot_btc_delta) * (spot[0].price if spot else 1.0) > tol_spot:
             _flag(flags, "SPOT_NOT_IN_STATEMENT", SEVERITY_GAP, 1,
                   f"spot cash in the statement (USDT {stmt_spot_usd:.6f}, BTC {stmt_spot_btc:.8f}) differs from the spot trades' effect "
                   f"(USDT {spot_sell_cash - spot_buy_cash - spot_usd_fee:.6f}, BTC {spot_btc_delta:.8f})")
@@ -898,11 +943,12 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         unexplained = None if explained is None else d_equity - explained
         bridge = {
             "opening_equity_usd": s0.components_equity, "closing_equity_usd": s1.components_equity, "change_in_equity_usd": d_equity,
-            "external_flows_usd": ext_usd, "perp_realised_usd": perp_real, "perp_fees_usd": -perp_fees, "funding_net_usd": funding_net,
+            "external_flows_usd": ext_usd, "external_flows_complete": not btc_unpriced, "perp_realised_usd": perp_real, "perp_fees_usd": -perp_fees, "funding_net_usd": funding_net,
             "interest_usd": interest_usd, "other_cash_lines_usd": other_usd_lines, "change_in_perp_unrealised_usd": d_upl,
             "change_in_other_assets_usd": d_other,
             "btc_economic_pnl_usd": btc_economic, "explained_change_usd": explained, "unexplained_usd": unexplained,
             "btc_flows_unpriced": btc_unpriced,
+            "btc_leg_price_sensitivity_usd_per_1pct": 0.01 * (abs(v0) + abs(v1)),
             "reading": "deposits and withdrawals are external_flows_usd and are NOT profit; perp_realised is cash; change_in_perp_unrealised is NOT cash; "
                        "change_in_other_assets_usd is value the ledger does not explain; btc_economic_pnl is the price move on the BTC held plus the cost of trading "
                        "it, net of BTC flows valued when they happened (withheld while any BTC flow is unpriced)",
@@ -946,7 +992,7 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         dietz = modified_dietz(s0.components_equity, s1.components_equity, flows_ts, t0, t1)
         returns = {"status": "COMPUTED", "account_money_weighted": dietz,
                    "account_irr": irr(s0.components_equity, s1.components_equity, flows_ts, t0, t1) or {"method": "IRR", "annual_rate": None, "why_not": "no root in [-99 %, +5000 %] a year"},
-                   "account_linked": linked_returns(snaps, flows_ts),
+                   "account_linked": linked_returns([x for x in snaps if x.snapshot_id not in {m.split(":", 1)[0] for m in mid_bad}], flows_ts),
                    "time_weighted_exact": "UNAVAILABLE: needs the account value immediately before each external flow",
                    "alternative_return_pct": alternative_return_pct if alternative_return_pct is not None else "UNSTATED (owner input)"}
     strategy: Dict[str, Any] = {"status": "NOT_COMPUTED"}
@@ -966,8 +1012,9 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
     capital: Dict[str, Any] = {"status": "NOT_COMPUTED"}
     if s0 is not None and s1 is not None:
         pts = []
+        bad_ids = {m.split(":", 1)[0] for m in mid_bad}                    # a middle snapshot that does not reconcile is not used to average capital or to chain returns
         for s in snaps:
-            if s.ts_ms < t0 or s.ts_ms > t1:
+            if s.ts_ms < t0 or s.ts_ms > t1 or s.snapshot_id in bad_ids:
                 continue
             btc_v = s.btc * s.btc_price
             pts.append((s.ts_ms, btc_v + (s.margin_posted_usd or 0.0) + (s.reserve_usd or 0.0), s.margin_posted_usd is not None and s.reserve_usd is not None))
@@ -981,10 +1028,16 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         capital = {"status": "COMPUTED", "average_economic_capital_usd": avg_capital, "snapshots_used": len(pts),
                    "definition": "BTC inventory value + margin posted beyond it + reserve, trapezoid-averaged over the snapshots"}
         if avg_capital and avg_capital > 0 and window_days and window_days > 0:
-            capital["account_return_on_capital_period"] = (bridge["change_in_equity_usd"] - ext_usd) / avg_capital if bridge else None
+            # with a BTC flow of unknown value the contribution is unknown, so the account's own return is not stated (the deposit would read as profit)
+            capital["account_return_on_capital_period"] = ((bridge["change_in_equity_usd"] - ext_usd) / avg_capital) if (bridge and not unpriced_btc) else None
+            if unpriced_btc:
+                capital["account_return_withheld"] = "a BTC deposit/withdrawal has no USD value"
             if strategy.get("status") == "COMPUTED":
                 capital["strategy_return_on_capital_period"] = strategy["net_usd"] / avg_capital
-                capital["strategy_return_on_capital_annualised_simple_pct"] = strategy["net_usd"] / avg_capital * YEAR_DAYS / window_days * 100.0
+                ann, why = annualise(strategy["net_usd"] / avg_capital, window_days)
+                capital["strategy_return_on_capital_annualised_simple_pct"] = ann
+                if why:
+                    capital["annualised_why_not"] = why
         if perp is not None and fills:
             capital["return_on_hedged_notional"] = _hedged_notional_return(fills, funding, perp_rep, window_days, t0, t1, opening_qty, strategy)
 
@@ -1046,7 +1099,10 @@ def _hedged_notional_return(fills, funding, perp_rep, window_days, t0, t1, openi
     out = {"average_short_notional_usd": avg, "priced_at": "the most recent fill price (approximation)"}
     if avg and avg > 0 and strategy.get("status") == "COMPUTED" and window_days:
         out["strategy_return_period"] = strategy["net_usd"] / avg
-        out["strategy_return_annualised_simple_pct"] = strategy["net_usd"] / avg * YEAR_DAYS / window_days * 100.0
+        ann, why = annualise(strategy["net_usd"] / avg, window_days)
+        out["strategy_return_annualised_simple_pct"] = ann
+        if why:
+            out["annualised_why_not"] = why
     return out
 
 
@@ -1251,7 +1307,7 @@ def render(rep: Mapping[str, Any]) -> str:
         a("  EQUITY BRIDGE (USD)")
         for k in ("opening_equity_usd", "external_flows_usd", "perp_realised_usd", "perp_fees_usd", "funding_net_usd", "interest_usd", "other_cash_lines_usd",
                   "change_in_perp_unrealised_usd", "change_in_other_assets_usd", "btc_economic_pnl_usd", "unexplained_usd", "closing_equity_usd"):
-            a(f"    {k:32s} " + (f"{b[k]:>16,.2f}" if b[k] is not None else f"{'WITHHELD (unpriced BTC flow)':>16s}"))
+            a(f"    {k:32s} " + (f"{b[k]:>16,.2f}" if b[k] is not None else f"{'WITHHELD (unpriced BTC flow)':>16s}") + ("   PARTIAL: an unpriced BTC flow is not in this figure" if k == "external_flows_usd" and not b.get("external_flows_complete", True) else ""))
         a("    " + b["reading"])
         res = rep["residuals"]
         a("  RESIDUALS (closing snapshot minus what the records imply): " + ", ".join(f"{k} {v:+.4f}" for k, v in res.items() if isinstance(v, float) and math.isfinite(v)))
