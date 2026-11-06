@@ -272,7 +272,7 @@ good-looking number before the window closes is not a result. Everything below i
    moves to a different funding interval is refused: the plan is an 8-hour plan), merges overlapping pages, never overwrites `--out`, and reports gaps
    without filling them. Use `--out` in a new file each time.
 3. **Progress, without evaluating:** `python3 tools/carry_prospective.py --funding prints.jsonl`. This records nothing and cannot evaluate.
-4. **Evaluate only once, after the window closes (2027-11-07):**
+4. **Evaluate after the window closes (2027-11-07); the closed-window evaluation is the official look, and every look is journaled and counted:**
    `python3 tools/trial_journal.py evaluate --funding prints.jsonl --journal <path on a LOCAL disk> --first-look --allow-unanchored` for the first look,
    then record the printed `ANCHOR TO RECORD NOW` line **off the machine that holds the journal, in a record someone with write access to that machine
    cannot alter** (a printed page, a mail to another person, a commit in another organisation's repository). On every later look pass the anchor with the

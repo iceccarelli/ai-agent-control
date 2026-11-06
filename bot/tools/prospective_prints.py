@@ -10,7 +10,7 @@ What it does. Reads one or more LOCAL files that an operator saved from the publ
     GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=BTCUSDT&startTime=<ms>&endTime=<ms>&limit=200
 
 (<= 200 rows a page, ordering unspecified, so page by ``endTime`` and save each response as it came). It makes no request and reads no credential. It checks
-retCode 0, category linear, symbol BTCUSDT on every row, a finite rate within the per-settlement plausibility bound, a whole-millisecond timestamp ON the 8-hour
+the response ENVELOPE (a bare list of rows is refused), integer retCode 0, category linear, symbol BTCUSDT on every row, a finite rate within the per-settlement plausibility bound, a whole-millisecond timestamp ON the 8-hour
 UTC grid (a symbol that moves to a 4-hour interval is REFUSED, because the registered plan is an 8-hour plan), no timestamp in the future, and merges pages:
 an identical duplicate is dropped, a CONFLICTING duplicate is an error. Only settlements inside the registered window are written; anything before it is counted
 and reported but never written (the plan is future-only), and a gap is reported, never filled. The output is created exclusively (an existing file is never
@@ -23,10 +23,12 @@ dropped print was a legitimate outage or a selection is not knowable from here: 
 from __future__ import annotations
 
 import argparse
+import decimal
 import hashlib
 import json
 import math
 import os
+import re
 import stat
 import sys
 import time
@@ -43,6 +45,7 @@ SYMBOL = "BTCUSDT"
 MAX_ABS_BPS = 300.0                      # the same plausibility bound the teardown applies to one settlement
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_PAGE_ROWS = 200
+_PLAIN_DECIMAL = re.compile(r"^-?[0-9]+(\.[0-9]+)?$", re.ASCII)       # the venue emits plain decimal strings: no padding, underscores or exponents
 
 
 def _now_ms() -> int:
@@ -81,15 +84,15 @@ def _reject_constant(name: str) -> Any:
 
 
 def _rows(doc: Any, label: str) -> List[Dict[str, Any]]:
-    if isinstance(doc, dict):
-        if doc.get("retCode") != 0 or isinstance(doc.get("retCode"), bool):
-            raise PrintsError(f"{label}: retCode is {doc.get('retCode')!r}, not 0")
-        res = doc.get("result")
-        if not isinstance(res, dict) or res.get("category") != "linear":
-            raise PrintsError(f"{label}: result.category must be 'linear'")
-        rows = res.get("list")
-    else:
-        rows = doc
+    if not isinstance(doc, dict):
+        raise PrintsError(f"{label}: not a V5 response envelope (a bare list of rows skips the retCode and category checks and is refused)")
+    code = doc.get("retCode")
+    if isinstance(code, bool) or not isinstance(code, int) or code != 0:
+        raise PrintsError(f"{label}: retCode is {code!r}, not the integer 0")
+    res = doc.get("result")
+    if not isinstance(res, dict) or res.get("category") != "linear":
+        raise PrintsError(f"{label}: result.category must be 'linear'")
+    rows = res.get("list")
     if not isinstance(rows, list):
         raise PrintsError(f"{label}: no list of funding rows")
     if len(rows) > MAX_PAGE_ROWS:
@@ -97,7 +100,7 @@ def _rows(doc: Any, label: str) -> List[Dict[str, Any]]:
     return rows
 
 
-def _one(row: Any, label: str, now_ms: int) -> Tuple[int, float]:
+def _one(row: Any, label: str, now_ms: int) -> Tuple[int, decimal.Decimal]:
     if not isinstance(row, dict) or set(row) - {"symbol", "fundingRate", "fundingRateTimestamp"} or not {"fundingRate", "fundingRateTimestamp"} <= set(row):
         raise PrintsError(f"{label}: a row is not a V5 funding row (symbol, fundingRate, fundingRateTimestamp)")
     if row.get("symbol") != SYMBOL:
@@ -106,21 +109,23 @@ def _one(row: Any, label: str, now_ms: int) -> Tuple[int, float]:
     if isinstance(raw_rate, bool) or not isinstance(raw_rate, str) or isinstance(raw_ts, bool) or not isinstance(raw_ts, (str, int)):
         raise PrintsError(f"{label}: fundingRate must be the venue's string and the timestamp a string or integer")
     try:
-        rate = float(raw_rate)
+        if not _PLAIN_DECIMAL.match(raw_rate):
+            raise ValueError(f"fundingRate {raw_rate!r} is not a plain decimal string")
         ts_text = str(raw_ts)
         if not ts_text.isascii() or not ts_text.isdigit():
             raise ValueError("timestamp is not whole milliseconds")
         ts = int(ts_text)
-    except (ValueError, OverflowError) as exc:
+        exact = decimal.Decimal(raw_rate) * 10000                                 # the venue's FRACTION -> basis points, exactly, here and nowhere else
+    except (ValueError, OverflowError, decimal.InvalidOperation) as exc:
         raise PrintsError(f"{label}: unreadable value ({exc})") from exc
-    bps = rate * 1e4                                                             # the venue's FRACTION -> basis points, done here and nowhere else
+    bps = float(exact)
     if not math.isfinite(bps) or abs(bps) > MAX_ABS_BPS:
         raise PrintsError(f"{label}: {bps} bps is not a plausible per-settlement rate")
     if ts % CP.SETTLE_MS != 0:
         raise PrintsError(f"{label}: timestamp {ts} is not on the 8-hour UTC settlement grid (a changed funding interval is refused: the plan is an 8-hour plan)")
     if ts > now_ms:
         raise PrintsError(f"{label}: timestamp {ts} is in the future; a settlement that has not happened is not an observation")
-    return ts, bps
+    return ts, exact
 
 
 def build(paths: Sequence[str], now_ms: Optional[int] = None) -> Dict[str, Any]:
@@ -128,7 +133,7 @@ def build(paths: Sequence[str], now_ms: Optional[int] = None) -> Dict[str, Any]:
     if not paths:
         raise PrintsError("no input files")
     now = _now_ms() if now_ms is None else min(int(now_ms), _now_ms())       # a caller can only move the clock EARLIER, never claim a later one
-    merged: Dict[int, float] = {}
+    merged: Dict[int, decimal.Decimal] = {}
     digests: List[Dict[str, Any]] = []
     for p in paths:
         data, digest = _read(p)
@@ -139,15 +144,17 @@ def build(paths: Sequence[str], now_ms: Optional[int] = None) -> Dict[str, Any]:
             raise PrintsError(f"{label}: not valid UTF-8 JSON") from exc
         n = 0
         for row in _rows(doc, label):
-            ts, bps = _one(row, label, now)
-            if ts in merged and merged[ts] != bps:
-                raise PrintsError(f"{label}: settlement {AR._iso(ts)} appears with two different rates ({merged[ts]} and {bps} bps)")
-            merged[ts] = bps
+            ts, exact = _one(row, label, now)
+            if ts in merged and merged[ts] != exact:
+                raise PrintsError(f"{label}: settlement {AR._iso(ts)} appears with two different rates ({merged[ts]} and {exact} bps)")
+            merged[ts] = exact
             n += 1
         digests.append({"file": label, "sha256": digest, "rows": n})
     before = sorted(t for t in merged if t < CP.WINDOW_START_MS)
+    if not any(CP.WINDOW_START_MS <= t < CP.WINDOW_END_MS for t in merged):
+        raise PrintsError("no settlement inside the registered window was found: nothing is written (an empty prints file would look like a run that found no data)")
     after = sorted(t for t in merged if t >= CP.WINDOW_END_MS)
-    inside = sorted((t, v) for t, v in merged.items() if CP.WINDOW_START_MS <= t < CP.WINDOW_END_MS)
+    inside = sorted((t, float(v)) for t, v in merged.items() if CP.WINDOW_START_MS <= t < CP.WINDOW_END_MS)
     cov = CP.coverage(inside, now)
     return {"prints": inside, "report": {
         "inputs": digests, "distinct_settlements_read": len(merged), "written": len(inside),
@@ -160,6 +167,9 @@ def build(paths: Sequence[str], now_ms: Optional[int] = None) -> Dict[str, Any]:
 def write(prints: Sequence[Tuple[int, float]], out_path: str) -> str:
     """Exclusive create (never overwrites), mode 0600; returns the SHA-256 of what was written."""
     AR._refuse_protected(out_path)
+    parent = os.path.dirname(os.path.abspath(out_path))
+    if os.path.islink(parent) or not os.path.isdir(parent):
+        raise PrintsError("the output directory must be a real directory, not a link")
     body = "".join(json.dumps({"ts_ms": t, "funding_bps": v}, sort_keys=True, allow_nan=False) + "\n" for t, v in prints).encode("utf-8")
     try:
         fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
