@@ -260,5 +260,30 @@ visibly, as SIDECAR_INCONSISTENT.
 An automated version of the archive step (a scheduled job that runs the read-only fetch and appends to a private repository) is possible
 but needs your decision about where the secrets for it live; it is not part of this PR.
 
+## 20. The prospective evaluation of the BTC funding carry (owner; opens 2026-11-07, closes 2027-11-07)
+This is the only evidence that can change the verdict (`REJECT_OR_SUSPEND`, capital ZERO). Nothing in this section authorises capital, and a
+good-looking number before the window closes is not a result. Everything below is offline; the one network step is yours.
+
+1. **Save the public responses as they come.** On a machine you control, request
+   `GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=BTCUSDT&startTime=<ms>&endTime=<ms>&limit=200`
+   (at most 200 rows a page, ordering unspecified: page by `endTime`) and save each response UNEDITED. Keep them.
+2. **Make the registered input.** `python3 tools/prospective_prints.py --in page1.json --in page2.json ... --out prints.jsonl`. It converts the
+   venue's fraction to basis points itself (never type a unit), refuses anything that is not a clean BTCUSDT print on the 8-hour grid (a symbol that
+   moves to a different funding interval is refused: the plan is an 8-hour plan), merges overlapping pages, never overwrites `--out`, and reports gaps
+   without filling them. Use `--out` in a new file each time.
+3. **Progress, without evaluating:** `python3 tools/carry_prospective.py --funding prints.jsonl`. This records nothing and cannot evaluate.
+4. **Evaluate after the window closes (2027-11-07); the closed-window evaluation is the official look, and every look is journaled and counted:**
+   `python3 tools/trial_journal.py evaluate --funding prints.jsonl --journal <path on a LOCAL disk> --first-look --allow-unanchored` for the first look,
+   then record the printed `ANCHOR TO RECORD NOW` line **off the machine that holds the journal, in a record someone with write access to that machine
+   cannot alter** (a printed page, a mail to another person, a commit in another organisation's repository). On every later look pass the anchor with the
+   HIGHEST count from that record (`--anchor-n/--anchor-head`, or `--anchor-file` from a copy outside the journal's directory). Be clear about what the code
+   can and cannot do: it only refuses an anchor file in the journal's own directory, which is not a trust boundary; a stale anchor verifies a truncated
+   journal; and anyone who can write the journal can delete it and rebuild a valid one. The custody is the procedure, not the code.
+5. **Read the whole report, not the verdict.** `selection_sensitivity` is NOT a worst case: if settlements are missing, compare `breakeven_fill_bps` with
+   the lowest funding a settlement can legally print (you supply it with `--venue-funding-floor-bps`; this repository holds no verified figure). A
+   verdict that is "supported" only because of which settlements are present is flagged `DO NOT RELY`. `INSUFFICIENT_POWER` is "not enough data", not "no edge".
+6. **Do not change the plan, the coverage floor, the hurdles or the prints after looking.** A different data set is a data revision
+   (`--accept-data-revision`), it is recorded permanently in the chain, and it is a different test.
+
 ## Backups: what is not done
 Nothing here schedules a backup, stores one off-volume, or has restored one. That needs the owner.

@@ -156,6 +156,7 @@ jobs:
           tests/test_engine_vs_reconciliation.py
           tests/test_carry_prospective.py
           tests/test_trial_journal.py
+          tests/test_prospective_prints.py
           tests/test_execution_model.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
