@@ -956,8 +956,10 @@ def _perp_moved_within(journal: Journal, lo_ms: int, hi_ms: int) -> bool:
 def _venue_fill_ms(e: "Entry") -> Optional[int]:
     """The venue's own time of the fill behind a booking, when it was kept."""
     ex = e.fee_raw.get("execution") if isinstance(e.fee_raw, dict) else None
-    v = ex.get("fill_ms") if isinstance(ex, dict) else None
-    return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
+    if not isinstance(ex, dict) or not str(ex.get("fill_ms_basis") or "").startswith("venue"):
+        return None                       # a time on the bot's own clock (no stated venue basis) is not the venue's
+    v = ex.get("fill_ms")
+    return (int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v > 0 else None)
 
 
 def _payment_identity(p: Dict[str, Any]) -> tuple:
@@ -997,6 +999,12 @@ def _attribution_problem(journal: Journal, p: Dict[str, Any]) -> Optional[str]:
     before = _perp_qty_at(journal, t - ATTRIBUTION_SLACK_MS)
     after = _perp_qty_at(journal, t + ATTRIBUTION_SLACK_MS)
     size = p.get("size")
+    try:
+        size = None if size is None else float(size)
+        if size is not None and not math.isfinite(size):
+            size = None
+    except (TypeError, ValueError):
+        size = None                      # a size that is not a number is no size: the row cannot be matched to the book
     held = after
     if (abs(after - before) > DUST[PERP]
             or _perp_moved_within(journal, t - ATTRIBUTION_SLACK_MS,

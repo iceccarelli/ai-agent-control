@@ -958,3 +958,70 @@ class TestBoundariesAndCorruption:
             json.loads(json.dumps(j.to_rows()))))[0]
         assert again.start_ms == before.start_ms == T0
         assert again.id == before.id
+
+
+# ============================================================================================ regressions from the independent review
+# The exit-after-the-settlement rule (ledger._attribution_problem) and its mirror in funding_reconcile. Each of these pins a branch an earlier version left unpinned.
+
+def _book_at(j, t, size, **kw):
+    return L.book_funding_payments(j, [pay(1, 1.0, t, size=size, **kw)], ms=t + 2 * H)
+
+
+class TestExitAfterTheSettlementRule:
+    t = T0 + 5 * H
+
+    def test_a_move_booked_exactly_at_the_settlement_contradicts_a_row_naming_the_earlier_position(self):
+        j = hedged(0.5)
+        fill(j, "open", self.t, "add", 0.1)
+        assert _book_at(j, self.t, -0.5)["unattributed"] == 1
+
+    @pytest.mark.parametrize("fill_ms,claimed", [(-5_000, False), (0, False), (1, True)])
+    def test_a_move_booked_after_the_settlement_but_timed_by_the_venue_at_or_before_it_is_refused(self, fill_ms, claimed):
+        j = hedged(0.5)
+        L.perp_close(j, ms=self.t + 30_000, ref="c", qty=0.5, price=MARK, entry_price=MARK, fee_usd=0.1, fee_status="confirmed",
+                     fee_raw={"execution": {"fill_ms": self.t + fill_ms, "fill_ms_basis": "venue_updated_time"}})
+        assert (_book_at(j, self.t, -0.5)["booked"] == 1) is claimed
+
+    def test_a_fill_time_on_the_bots_own_clock_is_not_treated_as_the_venues(self):
+        j = hedged(0.5)
+        L.perp_close(j, ms=self.t + 30_000, ref="c", qty=0.5, price=MARK, entry_price=MARK, fee_usd=0.1, fee_status="confirmed",
+                     fee_raw={"execution": {"fill_ms": self.t - 5_000, "fill_ms_basis": ""}})          # no stated venue basis: ignored, not trusted
+        assert _book_at(j, self.t, -0.5)["booked"] == 1
+        for bad in (float("inf"), float("nan"), "abc", True, -1):
+            j2 = hedged(0.5)
+            L.perp_close(j2, ms=self.t + 30_000, ref="c", qty=0.5, price=MARK, entry_price=MARK, fee_usd=0.1, fee_status="confirmed",
+                         fee_raw={"execution": {"fill_ms": bad, "fill_ms_basis": "venue_updated_time"}})
+            _book_at(j2, self.t, -0.5)                                                                    # never raises
+
+    def test_a_long_book_closed_just_after_the_settlement_is_not_claimed_by_the_short_rule(self):
+        j = L.Journal()
+        j.post(L.Entry(ms=T0, kind="perp_open", ref="L1", lines=[L.Line(L.PERP, 0.0, qty=+0.5), L.Line(L.FEES, 0.1), L.Line(L.USDT, -0.1, qty=-0.1)], fee_status="confirmed"))
+        j.post(L.Entry(ms=self.t + 30_000, kind="perp_close", ref="L2", lines=[L.Line(L.PERP, 0.0, qty=-0.5), L.Line(L.FEES, 0.1), L.Line(L.USDT, -0.1, qty=-0.1)],
+                       fee_status="confirmed"))
+        assert _book_at(j, self.t, +0.5)["unattributed"] == 1
+
+    @pytest.mark.parametrize("size", ["abc", float("nan"), float("inf"), None, 0.0])
+    def test_a_size_that_is_not_a_usable_number_never_raises_and_is_never_claimed(self, size):
+        j = hedged(0.5)
+        fill(j, "close", self.t + 30_000, "c", 0.5)
+        assert _book_at(j, self.t, size)["unattributed"] == 1
+
+    def test_a_lifecycle_that_opened_after_the_settlement_does_not_inherit_the_previous_lifecycles_row(self):
+        """REPRODUCED by the review: A held 0.5 short through t1 and t2 and closed 10 s after t2; B reopened 0.5 at t2 + 40 s. The row for t2 belongs to A.
+        B's window (start - 60 s) also contains t2, and B was reported FULLY_RECONCILED having 'matched' a settlement it never held."""
+        t1, t2 = T0 + 4 * H, T0 + 12 * H
+        j = L.Journal()
+        L.perp_open(j, ms=T0, ref="o", qty=0.5, price=MARK, fee_usd=0.1, fee_status="confirmed")
+        L.perp_close(j, ms=t2 + 10_000, ref="c", qty=0.5, price=MARK, entry_price=MARK, fee_usd=0.1, fee_status="confirmed")
+        L.perp_open(j, ms=t2 + 40_000, ref="r", qty=0.5, price=MARK, fee_usd=0.1, fee_status="confirmed")
+        L.perp_close(j, ms=t2 + 8 * H + H, ref="c2", qty=0.5, price=MARK, entry_price=MARK, fee_usd=0.1, fee_status="confirmed")
+        rows = [pay(1, 1.0, t1, size=-0.5), pay(2, -4.0, t2, size=-0.5), pay(3, 1.0, t2 + 8 * H, size=-0.5)]
+        out = L.book_funding_payments(j, rows, ms=t2 + 9 * H)
+        assert out["booked"] == 3 and out["unattributed"] == 0
+        now = t2 + 3 * 86_400_000
+        hist = CB.FundingHistory(start_ms=T0 - H, end_ms=now, prints=[(1.0, t1), (-4.0, t2), (1.0, t2 + 8 * H)])
+        ev = CB.SettlementEvidence(start_ms=T0 - H, end_ms=now, payments=rows)
+        a, b = [R.assess_lifecycle(j, lc, history=hist, evidence=ev, now_ms=now) for lc in L.lifecycles(j)]
+        assert a["evidence"]["expected_settlements"] == 2 and a["evidence"]["matched_settlements"] == 2           # A held t1 and t2, and had both rows
+        assert b["evidence"]["expected_settlements"] == 1 and b["evidence"]["matched_settlements"] == 1           # B held only the settlement after it opened
+        assert "OWNERSHIP_AMBIGUOUS_AT_SETTLEMENT" in b["reasons"] and b["state"] == "PROVISIONAL"            # the print it opened just after stays ambiguous

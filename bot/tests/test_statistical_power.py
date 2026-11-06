@@ -1588,3 +1588,13 @@ def test_a_series_far_below_zero_is_evaluated_not_crashed():
     plan = sp.EvaluationPlan("s", "v1", {"k": 1}, (0.0, 300.0), "mean", 0.05, 0.8, 0.1, 1, 7)
     out = sp.evaluate_under_plan(plan, obs, sp.mean_statistic, expected_digest=sp.plan_digest(plan), ledger=sp.TrialLedger())
     assert out["verdict"] in (sp.NO_EDGE_DETECTED, sp.INSUFFICIENT_POWER) and out["p_value"] == 1.0 and out["z_observed"] < -5.0
+
+
+def test_selection_adjusted_best_survives_a_best_p_value_of_exactly_one():
+    """The p == 1 conversion to z was fixed in evaluate_under_plan; the second site (selection_adjusted_best) crashed the same way on a ledger whose best trial
+    has p == 1 (every look at a strategy whose mean is far below its requirement)."""
+    ledger = sp.TrialLedger()
+    for i in range(3):
+        ledger.record("s", f"h{i}", "w", -5.0, pvalue=1.0, n_obs=100)
+    out = sp.selection_adjusted_best(ledger, alpha=0.05)
+    assert out["status"] == "OK" and out["z_best"] < -5.0 if "z_best" in out else out["status"] in ("OK", "NO_PVALUES")

@@ -132,12 +132,16 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
             pending.append(t)
             continue
         kind = _classify_print(journal, t)
-        if kind == "ambiguous" and any(abs(t - r) <= L.PRINT_MATCH_TOLERANCE_MS for r in attributed_ms):
+        if (kind == "ambiguous" and lc.start_ms <= t
+                and any(abs(t - r) <= L.PRINT_MATCH_TOLERANCE_MS for r in attributed_ms)):
             # The journal's stamps could not place the book's exit before or
             # after this settlement, but the venue's own signed row matched the
             # position the book entered the window with and was booked
             # (ledger._attribution_problem): the book was in the position
-            # through it, so it is an expected settlement WITH its row.
+            # through it, so it is an expected settlement WITH its row. Only for a
+            # lifecycle that was already open at the settlement: one that opened
+            # within the slack AFTER it did not hold it (the engine enters after
+            # the print), and must not inherit the previous lifecycle's row.
             kind = "held"
         if kind == "held":
             held.append(t)

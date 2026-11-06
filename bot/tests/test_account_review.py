@@ -1340,3 +1340,11 @@ def test_OPENING_zero_changes_nothing_at_all():
     a = AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN)
     b = AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN, opening_qty=0.0, opening_ms=None, closing_ms=None)
     assert json.dumps(a, sort_keys=True, default=str) == json.dumps(b, sort_keys=True, default=str)
+
+
+def test_a_fill_dated_before_the_carried_in_position_is_refused_as_a_double_count(tmp_path):
+    f, g, _ = make_trip(n=6)
+    fills, _ = AR.parse_fills(f, "BTCUSDT")
+    funding, _ = AR.parse_funding(g, "BTCUSDT")
+    with pytest.raises(AR.RecordError, match="before the opening instant"):
+        AR.review(fills, funding, taker_bps=5.5, public=PUB, bar_open=OPEN, opening_qty=-0.5, opening_ms=fills[0].ts_ms + 1_000, closing_ms=fills[-1].ts_ms + 1)

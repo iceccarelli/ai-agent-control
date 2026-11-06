@@ -515,6 +515,9 @@ def review(fills: Sequence[Fill], funding: Sequence[FundingRow], *, taker_bps: O
         raise RecordError("capital_usd must be positive and finite")
     if not fills and not carried:
         raise RecordError("there are no fills")
+    if carried and opening_ms is not None and any(f.ts_ms < opening_ms for f in fills):
+        raise RecordError("a fill is dated before the opening instant: the position carried in already contains it, so counting it again would double the "
+                          "position (supply only the fills after the opening snapshot)")
     flags: List[Dict[str, Any]] = []
     book = Book(fills, opening_qty if carried else 0.0, opening_ms if carried else None)
     lifecycles = book.lifecycles()

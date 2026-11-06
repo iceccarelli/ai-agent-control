@@ -64,8 +64,17 @@ import bybit_v5_records as BV5  # noqa: E402
 
 RecordError = AR.RecordError
 PROVENANCE = "OWNER_SUPPLIED_UNVERIFIED"
+#: What a reconciled verdict does NOT establish, stated once and carried in every report.
+LIMITS = (
+    "the cross-checks are on TOTALS per record family (fees, funding, realised, flows, spot) and on settlement ownership, not a match of each execution to its "
+    "own statement line, so a record's timestamp or a swap between two equal-size records is not detected",
+    "paper and testnet exports have the same shape as live ones and are not detected: the owner must supply only live-account records",
+    "the strategy figure is exact only for complete round trips whose fills carry a spot reference, and that reference is the supplier's",
+    "the venue's own cost-basis convention for realised P&L is assumed to be average entry; a different convention shows up as a REALISED_NOT_IN_STATEMENT gap",
+)
 DAY_MS = AR.DAY_MS
 YEAR_DAYS = 365.0
+MIN_ANNUALISE_DAYS = 30.0
 EXTERNAL_KINDS = ("DEPOSIT", "WITHDRAWAL", "TRANSFER_IN", "TRANSFER_OUT", "INTERNAL_IN", "INTERNAL_OUT")
 INTERNAL_KINDS = ("INTERNAL_IN", "INTERNAL_OUT")
 # account_review findings that limit the STRATEGY's attributable P&L but not the account-level reconciliation (a basis needs a spot reference; an open
@@ -85,11 +94,7 @@ SEVERITY_HARD = AR.SEVERITY_HARD
 SEVERITY_GAP = AR.SEVERITY_GAP
 
 #: Gaps that leave part of the history unexplained: the ledger is INCOMPLETE and no positive conclusion is drawn.
-STRUCTURAL_GAPS = ("NO_OPENING_SNAPSHOT", "NO_CLOSING_SNAPSHOT", "OPENING_POSITION_UNKNOWN", "UNPAIRED_INTERNAL_TRANSFER", "UNCLASSIFIED_CASH_LINE",
-                   "STATEMENT_GAP", "EXECUTION_NOT_IN_STATEMENT", "FUNDING_NOT_IN_STATEMENT", "UNPRICED_BTC_FLOW", "UNPRICED_BTC_FEE",
-                   "NO_STATEMENT", "PERP_RECORDS_INCOMPLETE", "SPOT_INVENTORY_UNEXPLAINED", "RECORDS_OUTSIDE_WINDOW")
-#: Gaps where the records agree with each other but could not be compared with the public market.
-CHECK_GAPS = ("PERP_CHECKS_UNRUN", "FEE_CURRENCY_NOT_STATED", "DUPLICATE_IDENTICAL_DROPPED", "CAPITAL_COMPONENTS_UNSTATED", "TWO_POINT_CAPITAL_AVERAGE")
+CHECK_GAPS = ("PERP_CHECKS_UNRUN", "FEE_CURRENCY_NOT_STATED", "DUPLICATE_IDENTICAL_DROPPED", "SNAPSHOT_PRICE_CHECK_NOT_RUN", "FLOW_PRICE_CHECK_NOT_RUN")
 
 
 # ---------------------------------------------------------------- small helpers
@@ -247,6 +252,8 @@ def parse_external_flows(rows: Sequence[Mapping[str, Any]], label: str = "extern
             _bounded(usd, -MAX_USD, MAX_USD, "usd_value", w)
             if usd != 0 and (usd > 0) != (amount > 0):
                 raise RecordError(f"{w}: usd_value and amount have opposite signs")
+            if usd == 0 and coin == "BTC":
+                raise RecordError(f"{w}: a BTC flow of {amount} cannot be worth 0 USD: leave usd_value out if it is unknown (it is then reported as unpriced)")
         if coin in USD_COINS:
             usd = amount if usd is None else usd
             if not math.isclose(usd, amount, rel_tol=1e-9, abs_tol=1e-6):
@@ -348,7 +355,9 @@ def _years(t0: int, t1: int) -> float:
 
 def modified_dietz(e0: float, e1: float, flows: Sequence[Tuple[int, float]], t0: int, t1: int) -> Optional[Dict[str, Any]]:
     """Money-weighted return over the period: (E1 - E0 - F) / (E0 + sum w_i F_i), w_i = (T - t_i) / T. Flows are contributions (+ into the
-    account). None when the denominator is not positive (an account that starts empty and is funded mid-period needs the flows as capital)."""
+    account). None when the denominator is not positive (an account that starts empty and is funded mid-period needs the flows as capital).
+    ``base_small`` marks a base under a tenth of the balances (an early withdrawal that leaves almost nothing at work): the ratio is then
+    arithmetically valid but not a meaningful rate, and it is never annualised. A window under 30 days is never annualised either."""
     if t1 <= t0:
         return None
     big_t = float(t1 - t0)
@@ -358,15 +367,22 @@ def modified_dietz(e0: float, e1: float, flows: Sequence[Tuple[int, float]], t0:
         return None
     r = (e1 - e0 - f_total) / denom
     years = _years(t0, t1)
-    return {"method": "MODIFIED_DIETZ", "period_return": r, "capital_base_usd": denom, "days": big_t / DAY_MS,
-            "annualised_simple_pct": r / years * 100.0 if years > 0 else None}
+    days = big_t / DAY_MS
+    small = denom < 0.1 * max(abs(e0), abs(e1))
+    annual = r / years * 100.0 if (years > 0 and days >= MIN_ANNUALISE_DAYS and not small) else None
+    out = {"method": "MODIFIED_DIETZ", "period_return": r, "capital_base_usd": denom, "days": days, "annualised_simple_pct": annual, "base_small": small}
+    if annual is None:
+        out["annualised_why_not"] = ("the capital at work is under a tenth of the balances: the ratio is not a meaningful rate" if small
+                                     else f"the window is shorter than {MIN_ANNUALISE_DAYS:g} days: an annual figure would extrapolate noise")
+    return out
 
 
 def irr(e0: float, e1: float, flows: Sequence[Tuple[int, float]], t0: int, t1: int) -> Optional[Dict[str, Any]]:
     """The annual internal rate of return that equates the opening balance plus contributions with the closing balance plus withdrawals.
-    Bisection on NPV; None when there is no sign change (no unique answer) or the period is shorter than a day."""
-    if t1 - t0 < DAY_MS:
-        return None
+    Bisection on NPV over [-99 %, +5000 %] a year; None when there is no sign change in that range (no answer is stated), and no annual rate
+    for a window shorter than ``MIN_ANNUALISE_DAYS`` (the rate would extrapolate a few days of noise to a year)."""
+    if t1 - t0 < MIN_ANNUALISE_DAYS * DAY_MS:
+        return {"method": "IRR", "annual_rate": None, "why_not": f"the window is shorter than {MIN_ANNUALISE_DAYS:g} days: an annual rate would extrapolate noise"}
     cfs = [(0.0, -e0)] + [((t - t0) / DAY_MS / YEAR_DAYS, -f) for t, f in flows] + [(_years(t0, t1), e1)]
 
     def npv(rate: float) -> float:
@@ -387,7 +403,7 @@ def irr(e0: float, e1: float, flows: Sequence[Tuple[int, float]], t0: int, t1: i
             hi = mid
         else:
             lo, flo = mid, fm
-    return {"method": "IRR", "annual_rate": (lo + hi) / 2.0}
+    return {"method": "IRR", "annual_rate": (lo + hi) / 2.0, "note": "the first root found in [-99 %, +5000 %]; with flows of both signs a cash-flow series can have more than one"}
 
 
 def linked_returns(snaps: Sequence[Snapshot], flows: Sequence[Tuple[int, float]]) -> Optional[Dict[str, Any]]:
@@ -462,60 +478,178 @@ def _perp_dedupe(items: Sequence[Any], name: str, flags: List[Dict[str, Any]]) -
     return list(seen.values())
 
 
-def _chain_breaks(lines: Sequence[CashLine], coin: str) -> List[str]:
-    """Where the running balance of one currency does not follow from the changes. Lines that share a ``row_id`` are one venue row (their changes add up
-    and exactly one of them carries the balance); rows stamped in the same millisecond have no recoverable order, so every order of such a group
-    (up to 6 rows; the order given beyond that) is tried and the group passes if ONE order chains from the previous balance. A break is reported
-    between the last good row and the first row that cannot follow."""
+def _seq(src: str) -> int:
+    """The row's position in its file, from the ``label#n`` source tag (numeric, so #10 follows #9)."""
+    try:
+        return int(src.rsplit("#", 1)[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _order_group(group: Sequence[Dict[str, Any]], prev_bal: Optional[float]) -> Optional[List[Dict[str, Any]]]:
+    """An order of rows stamped in the SAME millisecond in which every balance follows from the one before (and the first from ``prev_bal`` when
+    it is known). Rows in one millisecond have no recoverable order, so a depth-first walk finds one if it exists; a node budget bounds the work."""
+    n = len(group)
+    budget = [20000]
+
+    def ok(cur: Optional[float], a: Dict[str, Any]) -> bool:
+        return cur is None or math.isclose(a["bal"] - a["change"], cur, rel_tol=1e-9, abs_tol=1e-6)
+
+    def walk(cur: Optional[float], used: int, path: List[int]) -> Optional[List[int]]:
+        if len(path) == n:
+            return path
+        budget[0] -= 1
+        if budget[0] < 0:
+            return None
+        for i in range(n):
+            if not used >> i & 1 and ok(cur, group[i]):
+                r = walk(group[i]["bal"], used | 1 << i, path + [i])
+                if r is not None:
+                    return r
+        return None
+    found = walk(prev_bal, 0, [])
+    return None if found is None else [group[i] for i in found]
+
+
+def _chain(lines: Sequence[CashLine], coin: str) -> Dict[str, Any]:
+    """The running balance of one currency. Lines that share a ``row_id`` are one venue row (their changes add up and exactly ONE carries the
+    balance). Returns the breaks (where a balance does not follow from the one before), the rows with NO balance (the chain cannot cover them),
+    the balance the first row started from and the last row left, so the caller can anchor the chain to the snapshots."""
     steps: Dict[str, Dict[str, Any]] = {}
     for l in lines:
-        st = steps.setdefault(l.row_id or l.line_id, {"id": l.row_id or l.line_id, "ts": l.ts_ms, "change": 0.0, "bal": None, "n_bal": 0, "src": l.src})
+        st = steps.setdefault(l.row_id or l.line_id, {"id": l.row_id or l.line_id, "ts": l.ts_ms, "change": 0.0, "bal": None, "n_bal": 0, "seq": _seq(l.src)})
         st["change"] += l.change
         st["ts"] = max(st["ts"], l.ts_ms)
+        st["seq"] = min(st["seq"], _seq(l.src))
         if l.cash_balance is not None:
             st["bal"] = l.cash_balance
             st["n_bal"] += 1
-    ordered = sorted((v for v in steps.values() if v["n_bal"] == 1), key=lambda v: (v["ts"], v["src"]))
+    unchained = [f"{coin}:{v['id']}" for v in steps.values() if v["n_bal"] == 0]
     breaks: List[str] = [f"{coin}:{v['id']}:more_than_one_balance_in_a_row" for v in steps.values() if v["n_bal"] > 1]
+    ordered = sorted((v for v in steps.values() if v["n_bal"] == 1), key=lambda v: (v["ts"], v["seq"]))
     groups: List[List[Dict[str, Any]]] = []
     for v in ordered:
         if groups and groups[-1][0]["ts"] == v["ts"]:
             groups[-1].append(v)
         else:
             groups.append([v])
-
-    def follows(prev_bal: Optional[float], a: Dict[str, Any]) -> bool:
-        return prev_bal is None or math.isclose(a["bal"] - a["change"], prev_bal, rel_tol=1e-9, abs_tol=1e-6)
-
-    def chains(order: Sequence[Dict[str, Any]], prev_bal: Optional[float]) -> bool:
-        for a in order:
-            if not follows(prev_bal, a):
-                return False
-            prev_bal = a["bal"]
-        return True
-
-    import itertools
     prev_bal: Optional[float] = None
     prev_id: Optional[str] = None
+    start: Optional[float] = None
     for g in groups:
-        orders = itertools.permutations(g) if len(g) <= 6 else [tuple(g)]
-        found = next((o for o in orders if chains(o, prev_bal)), None)
-        if found is None:
+        order = _order_group(g, prev_bal)
+        if order is None:
             breaks.append(f"{coin}:{prev_id or 'start'}->{g[0]['id']}")
-            # re-synchronise on this group's own chain so one defect is one break, not every later row
-            found = next((o for o in (itertools.permutations(g) if len(g) <= 6 else [tuple(g)]) if chains(o, None)), tuple(g))
-        prev_bal, prev_id = found[-1]["bal"], found[-1]["id"]
-    return breaks
+            order = _order_group(g, None) or sorted(g, key=lambda v: v["seq"])      # re-synchronise: one defect is one break, not every later row
+        if start is None:
+            start = order[0]["bal"] - order[0]["change"]
+        prev_bal, prev_id = order[-1]["bal"], order[-1]["id"]
+    return {"breaks": breaks, "unchained": unchained, "start": start, "end": prev_bal, "steps": len(ordered)}
+
+
+def _chain_breaks(lines: Sequence[CashLine], coin: str) -> List[str]:
+    return _chain(lines, coin)["breaks"]
+
+
+_SNAP_NUMERIC = ("usdt", "btc", "btc_price", "perp_upl_usd", "perp_mark", "perp_qty", "perp_avg_entry", "equity_usd", "other_usd", "margin_posted_usd", "reserve_usd")
+
+
+def _snapshot_dedupe(snaps: List[Snapshot], flags: List[Dict[str, Any]]) -> List[Snapshot]:
+    """Two snapshots at one instant that DIFFER are two statements about the same moment: which is the balance is not decidable (a HARD
+    contradiction, not a tie broken by an id's spelling). Identical ones are one."""
+    out: List[Snapshot] = []
+    clash: List[str] = []
+    dropped: List[str] = []
+    for sn in snaps:
+        if out and out[-1].ts_ms == sn.ts_ms:
+            if any(getattr(out[-1], f) != getattr(sn, f) for f in _SNAP_NUMERIC):
+                clash.append(f"{out[-1].snapshot_id}/{sn.snapshot_id}")
+            else:
+                dropped.append(sn.snapshot_id)
+            continue
+        out.append(sn)
+    _flag(flags, "SNAPSHOT_DUPLICATE_TIMESTAMP", SEVERITY_HARD, len(clash), "two snapshots at the same instant disagree: which one is the balance cannot be decided", clash)
+    _flag(flags, "DUPLICATE_IDENTICAL_DROPPED", SEVERITY_GAP, len(dropped), "snapshots: identical repeats were dropped once each", dropped)
+    return out
+
+
+def _bar(ts: int) -> int:
+    return ts - ts % AR.BAR_MS
+
+
+def _snapshot_checks(snaps: Sequence[Snapshot], hist: Mapping[str, Any], flags: List[Dict[str, Any]]) -> None:
+    """A snapshot must agree with the position it states, hold no assets the ledger cannot explain, and carry prices a 4h public bar allows."""
+    upl_bad, no_mark, upl_unstated, other, price_bad, mark_bad = [], [], [], [], [], []
+    price_unchecked = 0
+    spot_range, perp_range = hist.get("spot_range"), hist.get("bar_range")
+    tol = AR.PRICE_RANGE_TOL
+    for sn in snaps:
+        if sn.other_usd:
+            other.append(sn.snapshot_id)
+        if sn.perp_qty is None:
+            if sn.perp_upl_usd:
+                upl_unstated.append(sn.snapshot_id)
+        elif abs(sn.perp_qty) > AR.DUST_QTY:
+            if sn.perp_mark is None:
+                no_mark.append(sn.snapshot_id)
+            elif sn.perp_avg_entry is not None:
+                expect = sn.perp_qty * (sn.perp_mark - sn.perp_avg_entry)
+                if abs(sn.perp_upl_usd - expect) > max(1.0, 1e-4 * abs(sn.perp_qty) * sn.perp_mark):
+                    upl_bad.append(f"{sn.snapshot_id}: stated {sn.perp_upl_usd:.2f}, position implies {expect:.2f}")
+        elif abs(sn.perp_upl_usd) > 1.0:
+            upl_bad.append(f"{sn.snapshot_id}: stated {sn.perp_upl_usd:.2f} on a flat position")
+        rng = spot_range.get(_bar(sn.ts_ms)) if spot_range is not None else None
+        if rng is None:
+            price_unchecked += 1
+        elif not (rng[0] * (1 - tol) <= sn.btc_price <= rng[1] * (1 + tol)):
+            price_bad.append(f"{sn.snapshot_id}: btc_price {sn.btc_price:.2f} outside {rng[0]:.2f}..{rng[1]:.2f}")
+        if sn.perp_mark is not None and perp_range is not None:
+            prng = perp_range.get(_bar(sn.ts_ms))
+            if prng is not None and not (prng[0] * (1 - tol) <= sn.perp_mark <= prng[1] * (1 + tol)):
+                mark_bad.append(f"{sn.snapshot_id}: perp_mark {sn.perp_mark:.2f} outside {prng[0]:.2f}..{prng[1]:.2f}")
+    _flag(flags, "SNAPSHOT_INCONSISTENT", SEVERITY_HARD, len(upl_bad), "a snapshot's unrealised P&L is not its stated position x (mark - average entry)", upl_bad)
+    _flag(flags, "PERP_MARK_MISSING", SEVERITY_GAP, len(no_mark), "a snapshot states an open perpetual position but no perp_mark: its unrealised P&L cannot be checked", no_mark)
+    _flag(flags, "SNAPSHOT_POSITION_UNSTATED", SEVERITY_GAP, len(upl_unstated), "a snapshot states an unrealised P&L but not the position it belongs to", upl_unstated)
+    _flag(flags, "OTHER_ASSETS_PRESENT", SEVERITY_GAP, len(other),
+          "a snapshot holds assets the ledger does not model (other_usd): their value moves are shown as their own bridge line, not explained, so no conclusive result", other)
+    _flag(flags, "SNAPSHOT_PRICE_OFF_PUBLIC_BAR", SEVERITY_HARD, len(price_bad) + len(mark_bad),
+          f"a snapshot's price is outside the public 4h bar's low..high (widened {tol:.1%}): the owned BTC would be mis-valued", price_bad + mark_bad)
+    _flag(flags, "SNAPSHOT_PRICE_CHECK_NOT_RUN", SEVERITY_GAP, 1 if price_unchecked else 0,
+          f"{price_unchecked} snapshot price(s) lie outside the public history or no history was loaded: they are the supplier's word")
+
+
+def _merge_flow_prices(flows: Sequence[ExternalFlow]) -> List[ExternalFlow]:
+    """The same flow supplied twice, once without a USD value (the txlog adapter cannot price a BTC transfer) and once with: one flow, priced.
+    A flow that differs in anything else is left for the duplicate rule to refuse."""
+    by_id: Dict[str, ExternalFlow] = {}
+    out: List[ExternalFlow] = []
+    for f in flows:
+        prev = by_id.get(f.flow_id)
+        if prev is not None and (prev.ts_ms, prev.coin, prev.amount, prev.kind, prev.transfer_id) == (f.ts_ms, f.coin, f.amount, f.kind, f.transfer_id) \
+                and (prev.usd_value is None) != (f.usd_value is None):
+            priced = prev if prev.usd_value is not None else f
+            out[out.index(prev)] = priced
+            by_id[f.flow_id] = priced
+            continue
+        by_id.setdefault(f.flow_id, f)
+        out.append(f)
+    return out
 
 
 def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD, residual_tolerance_rel: float = RESIDUAL_TOLERANCE_REL,
           alternative_return_pct: Optional[float] = None) -> Dict[str, Any]:
     flags: List[Dict[str, Any]] = [dict(f, examples=list(f.get("examples", []))) for f in inp.adapter_flags]
-    snaps = list(inp.snapshots)
+    snaps = _snapshot_dedupe(sorted(inp.snapshots, key=lambda x: (x.ts_ms, x.snapshot_id)), flags)
     fills = _perp_dedupe(inp.fills, "perp_executions", flags)
     funding = _perp_dedupe(inp.funding, "funding", flags)
+    by_grid: Dict[int, List[str]] = {}
+    for fr in funding:
+        by_grid.setdefault(fr.grid_ms, []).append(fr.exec_id)
+    dup_settle = [f"{AR._iso(g)}: {', '.join(ids)}" for g, ids in sorted(by_grid.items()) if len(ids) > 1]
+    _flag(flags, "SETTLEMENT_DUPLICATED_UNDER_DIFFERENT_IDS", SEVERITY_HARD, len(dup_settle),
+          "one settlement appears under more than one id: counting both would double the funding, counting one is a guess", dup_settle)
     spot = _dedupe(inp.spot, lambda s: s.trade_id, "spot_trades", flags)
-    ext = _dedupe(inp.flows, lambda f: f.flow_id, "external_flows", flags)
+    ext = _dedupe(_merge_flow_prices(inp.flows), lambda f: f.flow_id, "external_flows", flags)
     lines = _dedupe(inp.lines, lambda l: l.line_id, "cash_lines", flags)
 
     # ---- the two instants the period is measured between
@@ -530,6 +664,8 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         if s.equity_usd is not None and not math.isclose(s.equity_usd, s.components_equity, rel_tol=1e-6, abs_tol=max(1.0, 1e-6 * abs(s.equity_usd))):
             _flag(flags, "SNAPSHOT_INCONSISTENT", SEVERITY_HARD, 1,
                   f"snapshot {s.snapshot_id}: the stated equity {s.equity_usd} differs from usdt + btc x price + upl + other = {s.components_equity:.6f}", [s.snapshot_id])
+
+    _snapshot_checks(snaps, inp.perp_kwargs, flags)
 
     def in_window(ts: int) -> bool:
         return t0 is not None and t1 is not None and t0 < ts <= t1
@@ -590,6 +726,20 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
     spot_sell_cash = math.fsum(s.notional for s in spot if s.side == "Sell")
     spot_btc_delta = math.fsum(s.qty if s.side == "Buy" else -s.qty for s in spot) - math.fsum(s.btc_fee for s in spot)
     spot_usd_fee = math.fsum(s.usd_fee for s in spot)
+    flow_off, flow_unchecked = [], 0
+    spot_rng = inp.perp_kwargs.get("spot_range")
+    for f in ext:
+        if f.coin == "BTC" and f.usd_value is not None and f.kind not in INTERNAL_KINDS:
+            rng = spot_rng.get(_bar(f.ts_ms)) if spot_rng is not None else None
+            px = abs(f.usd_value / f.amount)
+            if rng is None:
+                flow_unchecked += 1
+            elif not (rng[0] * (1 - AR.PRICE_RANGE_TOL) <= px <= rng[1] * (1 + AR.PRICE_RANGE_TOL)):
+                flow_off.append(f"{f.flow_id}: {px:.2f} outside {rng[0]:.2f}..{rng[1]:.2f}")
+    _flag(flags, "BTC_FLOW_VALUE_OFF_PUBLIC_BAR", SEVERITY_HARD, len(flow_off),
+          f"a BTC deposit/withdrawal is valued outside the public spot 4h bar's low..high (widened {AR.PRICE_RANGE_TOL:.1%}): the value decides how profit is split "
+          "between 'contributed' and 'earned', so a wrong one moves profit across that line", flow_off)
+    _flag(flags, "FLOW_PRICE_CHECK_NOT_RUN", SEVERITY_GAP, 1 if flow_unchecked else 0, f"{flow_unchecked} BTC flow value(s) could not be compared with a public bar")
     unpriced_btc = [f.flow_id for f in ext if f.coin == "BTC" and f.usd_value is None and f.kind not in INTERNAL_KINDS]
     _flag(flags, "UNPRICED_BTC_FLOW", SEVERITY_GAP, len(unpriced_btc),
           "BTC deposits/withdrawals with no usd_value: no price is invented for a flow, so capital contributed is unknown", unpriced_btc)
@@ -615,23 +765,48 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
     other_usd_lines = math.fsum(l.change for l in lines if l.category == "OTHER" and l.coin in USD_COINS)
 
     # ---- statement coverage: the account's own lines are the independent record of every cash movement
-    stmt = {"present": bool(lines), "continuity_breaks": [], "fee_total": None, "funding_total": None}
+    stmt = {"present": bool(lines), "continuity_breaks": [], "unchained_rows": [], "anchored": False, "fee_total": None, "funding_total": None}
+    chains: Dict[str, Dict[str, Any]] = {}
     if not lines:
         _flag(flags, "NO_STATEMENT", SEVERITY_GAP, 1,
               "no account statement (cash_lines) was supplied: nothing independent of the executions confirms that every fee, settlement and transfer is present")
     else:
         for coin in COINS:
-            stmt["continuity_breaks"] += _chain_breaks([l for l in lines if l.coin == coin], coin)
+            cl = [l for l in lines if l.coin == coin]
+            if cl:
+                chains[coin] = _chain(cl, coin)
+                stmt["continuity_breaks"] += chains[coin]["breaks"]
+                stmt["unchained_rows"] += chains[coin]["unchained"]
         _flag(flags, "STATEMENT_GAP", SEVERITY_GAP, len(stmt["continuity_breaks"]),
               "the statement's running balance does not follow from its own changes between these consecutive lines: a line is missing, altered or out of order",
               stmt["continuity_breaks"])
+        _flag(flags, "STATEMENT_UNCHAINED", SEVERITY_GAP, len(stmt["unchained_rows"]),
+              "statement rows carry no running balance: the chain cannot vouch for them, so cash they moved is unconfirmed", stmt["unchained_rows"])
+        anchor_bad: List[str] = []
+        if s0 is not None and s1 is not None:
+            for coin, field_, tol_c in (("USDT", "usdt", 0.01), ("BTC", "btc", 1e-8)):
+                ch = chains.get(coin)
+                if ch and ch["start"] is not None:
+                    if abs(ch["start"] - getattr(s0, field_)) > max(tol_c, 1e-9 * abs(ch["start"])):
+                        anchor_bad.append(f"{coin} opening: the statement starts from {ch['start']:.8f}, snapshot {s0.snapshot_id} says {getattr(s0, field_):.8f}")
+                    if abs(ch["end"] - getattr(s1, field_)) > max(tol_c, 1e-9 * abs(ch["end"])):
+                        anchor_bad.append(f"{coin} closing: the statement ends at {ch['end']:.8f}, snapshot {s1.snapshot_id} says {getattr(s1, field_):.8f}")
+        _flag(flags, "STATEMENT_NOT_ANCHORED", SEVERITY_GAP, len(anchor_bad),
+              "the statement's balances do not tie to the snapshots at the period's ends: a self-consistent chain that starts or ends elsewhere vouches for nothing", anchor_bad)
+        usdt_chain = chains.get("USDT")
+        stmt["anchored"] = bool(usdt_chain and usdt_chain["start"] is not None and not usdt_chain["breaks"] and not usdt_chain["unchained"]
+                                and not [m for m in anchor_bad if m.startswith("USDT")])
         fee_lines = math.fsum(-l.change for l in lines if l.category in ("FEE", "REBATE") and l.coin in USD_COINS)     # a rebate line nets against fees
         fund_lines = math.fsum(l.change for l in lines if l.category == "FUNDING" and l.coin in USD_COINS)
         stmt["fee_total"], stmt["funding_total"] = fee_lines, fund_lines
         tol = lambda ref: max(0.01, 1e-6 * abs(ref))                                                     # noqa: E731
-        if fills and abs(fee_lines - (perp_fees + spot_usd_fee)) > tol(perp_fees):
+        # a spot fee in USDT sits inside the SPOT line's change on the venue's own log (change = cashFlow - fee), and in a FEE line on other layouts: it is
+        # expected where the statement carries it, never in both
+        spot_fee_in_spot_lines = any(l.category == "SPOT" and l.coin in USD_COINS for l in lines)
+        expected_fee_lines = perp_fees + (0.0 if spot_fee_in_spot_lines else spot_usd_fee)
+        if fills and abs(fee_lines - expected_fee_lines) > tol(perp_fees):
             _flag(flags, "EXECUTION_NOT_IN_STATEMENT", SEVERITY_GAP, 1,
-                  f"fees in the statement ({fee_lines:.6f}) differ from the executions' fees + spot USD fees ({perp_fees + spot_usd_fee:.6f}): an execution is missing "
+                  f"fees in the statement ({fee_lines:.6f}) differ from the executions' fees ({expected_fee_lines:.6f}): an execution is missing "
                   "from one of the two, or a fee is mis-signed or mis-valued")
         if funding and abs(fund_lines - funding_net) > tol(funding_net):
             _flag(flags, "FUNDING_NOT_IN_STATEMENT", SEVERITY_GAP, 1,
@@ -661,58 +836,116 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         _flag(flags, "OTHER_CASH_LINES_PRESENT", SEVERITY_GAP, len(other_lines),
               "statement lines the supplier called OTHER: cash that is neither a fee, a settlement, a trade, interest nor a flow is unattributed, and is counted in "
               "the bridge as operating cost/income only so that it cannot hide", other_lines)
+        pos_interest = [l.line_id for l in lines if l.category == "INTEREST" and l.change > 0]
+        _flag(flags, "INTEREST_UNEXPECTED", SEVERITY_GAP, len(pos_interest),
+              "a positive INTEREST line: interest on a borrow is a cost, so a credit labelled interest is unexplained income", pos_interest)
+        btc_unmodelled = [l.line_id for l in lines if l.coin == "BTC" and l.category not in ("SPOT", "EXTERNAL")]
+        _flag(flags, "BTC_LINES_UNMODELLED", SEVERITY_GAP, len(btc_unmodelled),
+              "BTC statement lines other than spot trades and transfers (fees, interest, funding...) enter no model: their effect is unexplained", btc_unmodelled)
+        internal_unbalanced = [c for c in COINS if abs(math.fsum(l.change for l in lines if l.category == "INTERNAL" and l.coin == c)) > 1e-9]
+        _flag(flags, "INTERNAL_LINES_UNBALANCED", SEVERITY_GAP, len(internal_unbalanced),
+              "INTERNAL statement lines must net to zero per currency: a net movement is money that crossed the account's boundary unrecorded", internal_unbalanced)
 
-    # ---- the closing components rebuilt from the opening snapshot and the records, against the closing snapshot
+    # ---- the closing components rebuilt from the opening snapshot and the records, against the closing snapshot (and every snapshot between)
     bridge: Optional[Dict[str, Any]] = None
-    residuals: Dict[str, float] = {}
+    residuals: Dict[str, Any] = {}
+    mid_bad: List[str] = []
+    bridge_unexplained_big = False
+    eq_breach = part_breach = False
+    res_big: Dict[str, float] = {}
     if s0 is not None and s1 is not None:
-        usdt_model = s0.usdt + usdt_ext + (perp["realised_usd"] if perp else 0.0) - perp_fees + funding_net + interest_usd + other_usd_lines \
-            - spot_buy_cash + spot_sell_cash - spot_usd_fee
-        btc_model = s0.btc + btc_ext + spot_btc_delta
-        qty_model = perp["qty"] if perp else opening_qty
-        avg_model = perp["avg_entry"] if perp else (opening_avg or 0.0)
-        upl_model = qty_model * (s1.mark - avg_model) if qty_model != 0 else 0.0
-        equity_model = usdt_model + btc_model * s1.btc_price + upl_model + s1.other_usd
-        residuals = {"usdt": s1.usdt - usdt_model, "btc_qty": s1.btc - btc_model, "perp_qty": (s1.perp_qty - qty_model) if s1.perp_qty is not None else float("nan"),
-                     "perp_unrealised_usd": s1.perp_upl_usd - upl_model, "equity_usd": s1.components_equity - equity_model}
+        def components_at(sn: Snapshot) -> Dict[str, float]:
+            T = sn.ts_ms
+            f_ = [x for x in fills if x.ts_ms <= T]
+            try:
+                pp = perp_average_entry(f_, opening_qty, opening_avg)
+            except RecordError:
+                pp = None
+            sp_ = [x for x in spot if x.ts_ms <= T]
+            ex_ = [x for x in external_only if x.ts_ms <= T]
+            ln_ = [x for x in lines if x.ts_ms <= T]
+            usdt_m = (s0.usdt + math.fsum(x.amount for x in ex_ if x.coin in USD_COINS) + (pp["realised_usd"] if pp else 0.0) - math.fsum(x.fee_usd for x in f_)
+                      + math.fsum(x.payment_usd for x in funding if x.grid_ms <= T)
+                      + math.fsum(x.change for x in ln_ if x.category in ("INTEREST", "OTHER") and x.coin in USD_COINS)
+                      - math.fsum(x.notional for x in sp_ if x.side == "Buy") + math.fsum(x.notional for x in sp_ if x.side == "Sell") - math.fsum(x.usd_fee for x in sp_))
+            btc_m = s0.btc + math.fsum(x.amount for x in ex_ if x.coin == "BTC") + math.fsum(x.qty if x.side == "Buy" else -x.qty for x in sp_) - math.fsum(x.btc_fee for x in sp_)
+            q_m = pp["qty"] if pp else opening_qty
+            a_m = pp["avg_entry"] if pp else (opening_avg or 0.0)
+            upl_m = q_m * (sn.mark - a_m) if q_m != 0 else 0.0
+            eq_m = usdt_m + btc_m * sn.btc_price + upl_m + sn.other_usd
+            return {"usdt": usdt_m, "btc": btc_m, "qty": q_m, "upl": upl_m, "equity": eq_m}
+
+        c1 = components_at(s1)
+        qty_model = c1["qty"]
+        residuals = {"usdt": s1.usdt - c1["usdt"], "btc_qty": s1.btc - c1["btc"], "perp_qty": (s1.perp_qty - qty_model) if s1.perp_qty is not None else None,
+                     "perp_unrealised_usd": s1.perp_upl_usd - c1["upl"], "equity_usd": s1.components_equity - c1["equity"]}
         tol_eq = max(residual_tolerance_usd, residual_tolerance_rel * max(abs(s0.components_equity), abs(s1.components_equity)))
+        # With a statement whose USDT chain is intact and anchored to both snapshots, the cash is independently known to the cent, so a cash residual
+        # that a tolerance scaled to the WHOLE equity (the owned BTC included) would hide is not allowed to hide.
+        gross = math.fsum(abs(l.change) for l in lines if l.coin in USD_COINS) + math.fsum(abs(f.amount) for f in external_only if f.coin in USD_COINS)
+        cash_tol = max(0.01, 1e-6 * gross) if stmt["anchored"] else tol_eq
         residuals["tolerance_usd"] = tol_eq
+        residuals["cash_tolerance_usd"] = cash_tol
+        btc_unpriced = bool(unpriced_btc)
         btc_pnl_invested = spot_buy_cash + spot_usd_fee - spot_sell_cash + btc_ext_usd         # (a fee paid in BTC leaves with the BTC: it is in V1)
         v0, v1 = s0.btc * s0.btc_price, s1.btc * s1.btc_price
-        btc_economic = v1 - v0 - btc_pnl_invested
+        btc_economic = None if btc_unpriced else v1 - v0 - btc_pnl_invested
         perp_real = perp["realised_usd"] if perp else 0.0
         d_upl = s1.perp_upl_usd - s0.perp_upl_usd
-        explained = ext_usd + perp_real - perp_fees + funding_net + interest_usd + other_usd_lines + d_upl + btc_economic
+        d_other = s1.other_usd - s0.other_usd
+        explained = None if btc_unpriced else ext_usd + perp_real - perp_fees + funding_net + interest_usd + other_usd_lines + d_upl + d_other + btc_economic
         d_equity = s1.components_equity - s0.components_equity
+        unexplained = None if explained is None else d_equity - explained
         bridge = {
             "opening_equity_usd": s0.components_equity, "closing_equity_usd": s1.components_equity, "change_in_equity_usd": d_equity,
             "external_flows_usd": ext_usd, "perp_realised_usd": perp_real, "perp_fees_usd": -perp_fees, "funding_net_usd": funding_net,
             "interest_usd": interest_usd, "other_cash_lines_usd": other_usd_lines, "change_in_perp_unrealised_usd": d_upl,
-            "btc_economic_pnl_usd": btc_economic, "explained_change_usd": explained, "unexplained_usd": d_equity - explained,
+            "change_in_other_assets_usd": d_other,
+            "btc_economic_pnl_usd": btc_economic, "explained_change_usd": explained, "unexplained_usd": unexplained,
+            "btc_flows_unpriced": btc_unpriced,
             "reading": "deposits and withdrawals are external_flows_usd and are NOT profit; perp_realised is cash; change_in_perp_unrealised is NOT cash; "
-                       "btc_economic_pnl is the price move on the BTC held plus the cost of trading it, net of BTC flows valued when they happened",
+                       "change_in_other_assets_usd is value the ledger does not explain; btc_economic_pnl is the price move on the BTC held plus the cost of trading "
+                       "it, net of BTC flows valued when they happened (withheld while any BTC flow is unpriced)",
         }
-        res_big = {k: v for k, v in residuals.items() if k not in ("tolerance_usd",) and isinstance(v, float) and math.isfinite(v)}
-        coverage_ok = not any(f["severity"] == SEVERITY_GAP and f["code"] not in CHECK_GAPS for f in flags)           # default closed: an unlisted gap is open
+        res_big = {k: v for k, v in residuals.items() if k not in ("tolerance_usd", "cash_tolerance_usd") and isinstance(v, float) and math.isfinite(v)}
         eq_breach = abs(residuals["equity_usd"]) > tol_eq
-        part_breach = abs(residuals["usdt"]) > tol_eq or abs(residuals["btc_qty"]) * s1.btc_price > tol_eq or abs(residuals["perp_unrealised_usd"]) > tol_eq \
-            or (math.isfinite(residuals["perp_qty"]) and abs(residuals["perp_qty"]) > AR.POSITION_ABS_TOL)
+        part_breach = abs(residuals["usdt"]) > cash_tol or abs(residuals["btc_qty"]) * s1.btc_price > cash_tol or abs(residuals["perp_unrealised_usd"]) > tol_eq \
+            or (residuals["perp_qty"] is not None and abs(residuals["perp_qty"]) > AR.POSITION_ABS_TOL)
+        bridge_unexplained_big = unexplained is not None and abs(unexplained) > tol_eq
+        for sn in snaps[1:-1]:
+            cm = components_at(sn)
+            if (abs(sn.usdt - cm["usdt"]) > cash_tol or abs(sn.btc - cm["btc"]) * sn.btc_price > cash_tol or abs(sn.perp_upl_usd - cm["upl"]) > tol_eq
+                    or abs(sn.components_equity - cm["equity"]) > tol_eq):
+                mid_bad.append(f"{sn.snapshot_id}: usdt {sn.usdt - cm['usdt']:+.4f}, btc {sn.btc - cm['btc']:+.8f}, equity {sn.components_equity - cm['equity']:+.4f}")
+        # Every gap above is final. A residual is a contradiction between two complete records only if nothing is still open; otherwise it is an
+        # incomplete history. (Default closed: any gap not listed as a mere check keeps the coverage open.)
+        coverage_ok = not any(f["severity"] == SEVERITY_GAP and f["code"] not in CHECK_GAPS for f in flags)
+        sev = SEVERITY_GAP if not coverage_ok else SEVERITY_HARD
+        verdict_text = ("Coverage gaps are open, so this is an incomplete history rather than a contradiction." if not coverage_ok else
+                        "Nothing is open in the coverage checks, so the records contradict the balances.")
         if eq_breach or part_breach:
-            _flag(flags, "EQUITY_RESIDUAL", SEVERITY_GAP if not coverage_ok else SEVERITY_HARD, 1,
+            _flag(flags, "EQUITY_RESIDUAL", sev, 1,
                   "the closing snapshot differs from what the opening snapshot and the records imply: " +
-                  ", ".join(f"{k} {v:+.6f}" for k, v in res_big.items()) + f" (tolerance {tol_eq:.2f} USD). "
-                  + ("Coverage gaps are open, so this is an incomplete history rather than a contradiction." if not coverage_ok else
-                     "Nothing is open in the coverage checks, so the records contradict the balances."))
+                  ", ".join(f"{k} {v:+.6f}" for k, v in res_big.items()) + f" (tolerance {tol_eq:.2f} USD, cash {cash_tol:.2f}). " + verdict_text)
+        if bridge_unexplained_big:
+            _flag(flags, "BRIDGE_UNEXPLAINED", sev, 1,
+                  f"the change in equity is not explained by the bridge's lines: {unexplained:+.6f} USD is left over (tolerance {tol_eq:.2f}). " + verdict_text)
+        _flag(flags, "MIDDLE_SNAPSHOT_UNRECONCILED", sev, len(mid_bad),
+              "a snapshot between the ends disagrees with what the records imply at its own instant: it cannot be used to average capital or to chain returns", mid_bad)
         if s1.perp_qty is None and perp is not None and perp["qty"] != 0:
             _flag(flags, "OPENING_POSITION_UNKNOWN", SEVERITY_GAP, 1, "the closing snapshot does not state the perpetual position while the executions leave one open")
 
     # ---- returns, strategy contribution, economic capital
     window_days = (t1 - t0) / DAY_MS if (t0 is not None and t1 is not None) else None
     returns: Dict[str, Any] = {"status": "NOT_COMPUTED"}
-    if s0 is not None and s1 is not None and bridge is not None:
+    if s0 is not None and s1 is not None and bridge is not None and unpriced_btc:
+        returns = {"status": "WITHHELD_UNPRICED_BTC_FLOW", "why": "a BTC deposit/withdrawal has no USD value, so the capital contributed is unknown and any return would be invented",
+                   "alternative_return_pct": alternative_return_pct if alternative_return_pct is not None else "UNSTATED (owner input)"}
+    elif s0 is not None and s1 is not None and bridge is not None:
         flows_ts = sorted(usd_flow_by_ts)
         dietz = modified_dietz(s0.components_equity, s1.components_equity, flows_ts, t0, t1)
-        returns = {"status": "COMPUTED", "account_money_weighted": dietz, "account_irr": irr(s0.components_equity, s1.components_equity, flows_ts, t0, t1),
+        returns = {"status": "COMPUTED", "account_money_weighted": dietz,
+                   "account_irr": irr(s0.components_equity, s1.components_equity, flows_ts, t0, t1) or {"method": "IRR", "annual_rate": None, "why_not": "no root in [-99 %, +5000 %] a year"},
                    "account_linked": linked_returns(snaps, flows_ts),
                    "time_weighted_exact": "UNAVAILABLE: needs the account value immediately before each external flow",
                    "alternative_return_pct": alternative_return_pct if alternative_return_pct is not None else "UNSTATED (owner input)"}
@@ -741,10 +974,10 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         area = math.fsum((b[1] + a[1]) / 2.0 * (b[0] - a[0]) for a, b in zip(pts, pts[1:]))
         avg_capital = area / (pts[-1][0] - pts[0][0]) if len(pts) >= 2 and pts[-1][0] > pts[0][0] else None
         if not all(p[2] for p in pts):
-            _flag(flags, "CAPITAL_COMPONENTS_UNSTATED", SEVERITY_GAP, 1,
+            _flag(flags, "CAPITAL_COMPONENTS_UNSTATED", "INFO", 1,
                   "margin_posted_usd / reserve_usd are not stated on every snapshot: the economic capital is the BTC value alone and the return on it is an upper bound")
         if len(pts) == 2:
-            _flag(flags, "TWO_POINT_CAPITAL_AVERAGE", SEVERITY_GAP, 1, "only two snapshots: the average capital is the mean of two instants, not a time integral")
+            _flag(flags, "TWO_POINT_CAPITAL_AVERAGE", "INFO", 1, "only two snapshots: the average capital is the mean of two instants, not a time integral")
         capital = {"status": "COMPUTED", "average_economic_capital_usd": avg_capital, "snapshots_used": len(pts),
                    "definition": "BTC inventory value + margin posted beyond it + reserve, trapezoid-averaged over the snapshots"}
         if avg_capital and avg_capital > 0 and window_days and window_days > 0:
@@ -774,7 +1007,8 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
                               "records are not live evidence)",
         "REJECTED_RECORDS_CONTRADICT": "the records contradict each other or the balances: no result is stated",
         "INCOMPLETE": "part of the history is unexplained: no positive conclusion is drawn; the figures shown are what the records contain",
-        "RECONCILED_BUT_UNCHECKED": "the records reconcile to the balances but some checks against the public market were not possible",
+        "RECONCILED_BUT_UNCHECKED": "the records reconcile to the balances but some checks could not run (against the public market, an assumed fee currency, dropped "
+                                    "duplicate records or unchecked snapshot/flow prices: see the flags)",
         "RECONCILED_NOT_AUTHENTICATED": "the records reconcile to the balances within tolerance; they are the owner's files and have not been authenticated against the exchange",
     }[verdict]
     return {
@@ -786,7 +1020,7 @@ def build(inp: Inputs, *, residual_tolerance_usd: float = RESIDUAL_TOLERANCE_USD
         "equity_bridge": bridge, "residuals": residuals, "statement": stmt, "returns": returns, "strategy_contribution": strategy,
         "economic_capital": capital, "perp_review": ({"verdict": perp_rep["verdict"], "round_trips": perp_rep["round_trips"], "settlements": perp_rep["settlements"],
                                                       "sufficiency": perp_rep["sufficiency"]} if perp_rep else None),
-        "perp_position": perp, "flags": flags,
+        "perp_position": perp, "flags": flags, "limits": list(LIMITS),
         "custody": {"inputs_sha256": dict(inp.digests), "ignored_columns": {k: list(v) for k, v in inp.ignored.items()},
                     "adapters": {a: BV5.DOC_BASIS[a] for a in inp.adapters_used}, "undocumented_by_the_venue": list(BV5.UNDOCUMENTED) if inp.adapters_used else [],
                     "authenticity": "UNVERIFIED_BY_DESIGN: a digest proves the bytes are unchanged since ingestion, not that the exchange produced them",
@@ -1016,8 +1250,8 @@ def render(rep: Mapping[str, Any]) -> str:
     if b:
         a("  EQUITY BRIDGE (USD)")
         for k in ("opening_equity_usd", "external_flows_usd", "perp_realised_usd", "perp_fees_usd", "funding_net_usd", "interest_usd", "other_cash_lines_usd",
-                  "change_in_perp_unrealised_usd", "btc_economic_pnl_usd", "unexplained_usd", "closing_equity_usd"):
-            a(f"    {k:32s} {b[k]:>16,.2f}")
+                  "change_in_perp_unrealised_usd", "change_in_other_assets_usd", "btc_economic_pnl_usd", "unexplained_usd", "closing_equity_usd"):
+            a(f"    {k:32s} " + (f"{b[k]:>16,.2f}" if b[k] is not None else f"{'WITHHELD (unpriced BTC flow)':>16s}"))
         a("    " + b["reading"])
         res = rep["residuals"]
         a("  RESIDUALS (closing snapshot minus what the records imply): " + ", ".join(f"{k} {v:+.4f}" for k, v in res.items() if isinstance(v, float) and math.isfinite(v)))
@@ -1027,8 +1261,13 @@ def render(rep: Mapping[str, Any]) -> str:
     r = rep["returns"]
     if r.get("status") == "COMPUTED":
         d = r["account_money_weighted"]
-        a("  RETURNS: " + (f"modified Dietz {d['period_return'] * 100:.4f} % over {d['days']:.1f} days (capital base {d['capital_base_usd']:,.0f})" if d else "money-weighted: not computable")
-          + (f"; IRR {r['account_irr']['annual_rate'] * 100:.2f} %/yr" if r.get("account_irr") else "") + f"; alternative return {r['alternative_return_pct']}")
+        irr_ = r.get("account_irr") or {}
+        a("  RETURNS: " + (f"modified Dietz {d['period_return'] * 100:.4f} % over {d['days']:.1f} days (capital base {d['capital_base_usd']:,.0f}"
+                           + (", base small: not a meaningful rate" if d.get("base_small") else "") + ")" if d else "money-weighted: not computable")
+          + (f"; IRR {irr_['annual_rate'] * 100:.2f} %/yr" if irr_.get("annual_rate") is not None else f"; no annual rate ({irr_.get('why_not', 'n/a')})")
+          + f"; alternative return {r['alternative_return_pct']}")
+    elif str(r.get("status", "")).startswith("WITHHELD"):
+        a(f"  RETURNS: withheld. {r['why']}")
     c = rep["economic_capital"]
     if c.get("status") == "COMPUTED":
         a(f"  ECONOMIC CAPITAL (average): {c['average_economic_capital_usd']}")
@@ -1040,6 +1279,9 @@ def render(rep: Mapping[str, Any]) -> str:
         a(f"    [{f['severity']}] {f['code']} x{f['count']}: {f['detail']}" + (f"  e.g. {', '.join(map(str, f['examples']))}" if f["examples"] else ""))
     if not rep["flags"]:
         a("    none")
+    a("  WHAT THIS DOES NOT ESTABLISH")
+    for lim in rep.get("limits", []):
+        a("    - " + lim)
     a("  CUSTODY: " + rep["custody"]["authenticity"])
     for k, v in rep["custody"]["inputs_sha256"].items():
         a(f"    sha256 {k:40s} {v}")

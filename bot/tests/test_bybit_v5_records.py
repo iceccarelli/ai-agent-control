@@ -181,7 +181,7 @@ def _row(**kw):
 
 def test_a_long_pays_a_positive_rate_and_a_short_receives_it_with_the_documented_feerate_flip():
     long_ = BV.transaction_log_to_records([_row()], "f")
-    assert long_["funding"] == [{"exec_id": "1|t1|1700000000000", "ts_ms": "1700000000000", "symbol": "BTCUSDT", "position_qty": 0.5, "rate": 0.0001, "payment_usd": -3.0}]
+    assert long_["funding"] == [{"exec_id": "1|t1|1700000000000|USDT", "ts_ms": "1700000000000", "symbol": "BTCUSDT", "position_qty": 0.5, "rate": 0.0001, "payment_usd": -3.0}]
     short = BV.transaction_log_to_records([_row(side="Sell", size="-0.5", feeRate="-0.0001", funding="3", change="3", cashBalance="1003")], "f")
     assert short["funding"][0]["position_qty"] == -0.5 and short["funding"][0]["rate"] == pytest.approx(0.0001) and short["funding"][0]["payment_usd"] == 3.0
     assert [(l["category"], l["change"], l["cash_balance"]) for l in short["cash_lines"]] == [("FUNDING", 3.0, 1003.0)]
@@ -254,7 +254,7 @@ def test_transfers_are_external_flows_with_the_sign_checked_and_a_btc_transfer_s
 def test_a_trade_row_is_split_into_lines_that_share_one_running_balance():
     out = BV.transaction_log_to_records([_row(type="TRADE", side="Buy", funding="0", cashFlow="25", fee="1.5", change="23.5", cashBalance="1023.5")], "f")
     cats = [(l["category"], l["change"], l["cash_balance"], l["row_id"]) for l in out["cash_lines"]]
-    assert cats == [("TRADE", 25.0, None, "1|t1|1700000000000"), ("FEE", -1.5, 1023.5, "1|t1|1700000000000")]
+    assert cats == [("TRADE", 25.0, None, "1|t1|1700000000000|USDT"), ("FEE", -1.5, 1023.5, "1|t1|1700000000000|USDT")]
     rebate = BV.transaction_log_to_records([_row(type="TRADE", side="Buy", funding="0", cashFlow="0", fee="-0.4", change="0.4", cashBalance="1000.4")], "f")
     assert [(l["category"], l["change"]) for l in rebate["cash_lines"]] == [("REBATE", 0.4)]
     with pytest.raises(AR.RecordError, match="funding"):
@@ -294,3 +294,46 @@ def test_the_adapter_module_does_no_io_and_imports_nothing_that_can_reach_the_ou
 def test_every_documented_gap_is_listed_and_every_adapter_names_its_source():
     assert set(BV.DOC_BASIS) == set(BV.ADAPTERS) and all(u.startswith("https://bybit-exchange.github.io/docs/v5/") for u in BV.DOC_BASIS.values())
     assert len(BV.UNDOCUMENTED) >= 8
+
+
+# ============================================================================================ regressions from the independent review
+
+def _spot_sell_world(tmp_path, fee_coin="USDT"):
+    """A txlog that also carries a spot Sell of 0.1 BTC with its fee in USDT: the venue writes one row per currency leg, both with the same id/tradeId/time."""
+    w = World()
+    t = w.t_open + 2 * HOUR
+    price = 100_000.0 * 0 + __import__("test_account_review")._open_at(t)
+    qty, fee = 0.1, 0.1 * 0.001 * __import__("test_account_review")._open_at(t) * 10
+    usdt_delta = qty * price - fee
+    log = api_txlog(w)
+    for r in log:
+        if int(r["transactionTime"]) >= t:
+            r["cashBalance"] = repr(float(r["cashBalance"]) + usdt_delta)
+    legs = [{"id": "77", "tradeId": "sp1", "transactionTime": str(t), "category": "spot", "symbol": "BTCUSDT", "currency": "BTC", "type": "TRADE", "side": "Sell", "size": "0",
+             "feeRate": "0.001", "funding": "0", "fee": "0", "cashFlow": repr(-qty), "change": repr(-qty), "cashBalance": repr(w.btc0 - qty)},
+            {"id": "77", "tradeId": "sp1", "transactionTime": str(t), "category": "spot", "symbol": "BTCUSDT", "currency": "USDT", "type": "TRADE", "side": "Sell", "size": "0",
+             "feeRate": "0.001", "funding": "0", "fee": repr(fee), "cashFlow": repr(qty * price), "change": repr(usdt_delta), "cashBalance": None}]
+    # the USDT leg's running balance is whatever the chain says at its position
+    before = [r for r in log if int(r["transactionTime"]) < t]
+    legs[1]["cashBalance"] = repr((float(before[-1]["cashBalance"]) if before else w.usdt0) + usdt_delta)
+    log = sorted(log + legs, key=lambda r: int(r["transactionTime"]))
+    w.spot = [{"trade_id": "sp1", "ts_ms": t, "symbol": "BTCUSDT", "side": "Sell", "qty": qty, "price": price, "fee": fee, "fee_coin": fee_coin}]
+    spot_exec = [{"execId": "sp1", "execTime": str(t), "symbol": "BTCUSDT", "side": "Sell", "execQty": repr(qty), "execPrice": repr(price), "execFee": repr(fee),
+                  "feeCurrency": fee_coin, "execType": "Trade"}]
+    return w, log, spot_exec
+
+
+def test_a_txlog_with_a_usdt_fee_spot_sell_reconciles_and_both_currency_legs_load(tmp_path):
+    w, log, spot_exec = _spot_sell_world(tmp_path)
+    rep = run(w, tmp_path, txlog=log, snaps=w.snapshots(), extra=[("spot.jsonl", spot_exec, "bybit_v5_spot_execution")])
+    codes_ = codes(rep)
+    assert "EXECUTION_NOT_IN_STATEMENT" not in codes_ and "SPOT_NOT_IN_STATEMENT" not in codes_, rep["flags"]
+    assert hard(rep) == [] and rep["residuals"]["usdt"] == pytest.approx(0.0, abs=1e-6) and rep["residuals"]["btc_qty"] == pytest.approx(0.0, abs=1e-9)
+    assert rep["verdict"] in ("RECONCILED_BUT_UNCHECKED", "RECONCILED_NOT_AUTHENTICATED"), rep["flags"]
+
+
+def test_the_two_legs_of_one_spot_trade_have_distinct_row_keys():
+    legs = BV.transaction_log_to_records([_row(type="TRADE", category="spot", currency="BTC", side="Sell", funding="0", fee="0", cashFlow="-0.1", change="-0.1", cashBalance="0.9"),
+                                          _row(type="TRADE", category="spot", currency="USDT", side="Sell", funding="0", fee="1", cashFlow="101", change="100", cashBalance="1100")], "f")
+    ids = [l["line_id"] for l in legs["cash_lines"]]
+    assert len(ids) == len(set(ids)) == 2 and {l["row_id"].rsplit("|", 1)[1] for l in legs["cash_lines"]} == {"BTC", "USDT"}

@@ -22,6 +22,7 @@ import carry_prospective as CP  # noqa: E402
 import statistical_power as SP  # noqa: E402
 
 H8 = CP.SETTLE_MS
+CLOSED = CP.WINDOW_END_MS + 1                       # a clock after the window has closed
 
 
 def window_prints(mean_bps, *, n=None, seed=1, drop=(), sd=0.4, rho=0.8):
@@ -67,18 +68,18 @@ def test_the_window_opens_after_the_plan_was_written_and_after_all_the_historica
 def test_historical_data_cannot_be_fed_in_even_mixed_with_valid_future_data():
     prints = [(CP.WINDOW_START_MS - H8, 5.0)] + window_prints(2.0)
     with pytest.raises(SP.WindowViolation):
-        CP.evaluate(prints, 10.0, SP.TrialLedger())
+        CP.evaluate(prints, 10.0, SP.TrialLedger(), CLOSED)
     ledger = SP.TrialLedger()
     with pytest.raises(SP.PlanError):
-        CP.evaluate([(CP.WINDOW_START_MS - 10 * H8 + i * H8, 5.0) for i in range(100)], 10.0, ledger)      # entirely historical
+        CP.evaluate([(CP.WINDOW_START_MS - 10 * H8 + i * H8, 5.0) for i in range(100)], 10.0, ledger, CLOSED)      # entirely historical
     assert ledger.n_trials == 0                                     # a refusal records nothing
 
 
 def test_a_rich_funding_regime_passes_a_poor_one_does_not_and_neither_authorises_anything():
     ledger = SP.TrialLedger()
-    rich = CP.evaluate(window_prints(2.5, seed=3), 10.0, ledger)          # mean 2.5 bps: 1.37 above the 1.131 required
+    rich = CP.evaluate(window_prints(2.5, seed=3), 10.0, ledger, CLOSED)          # mean 2.5 bps: 1.37 above the 1.131 required
     assert rich["verdict"] == "EDGE_SUPPORTED_AFTER_ADJUSTMENT", rich
-    poor = CP.evaluate(window_prints(0.26, seed=4), 10.0, ledger)          # the last year's level: far below it
+    poor = CP.evaluate(window_prints(0.26, seed=4), 10.0, ledger, CLOSED)          # the last year's level: far below it
     assert poor["verdict"] in ("NO_EDGE_DETECTED", "INSUFFICIENT_POWER") and poor["verdict"] != "EDGE_SUPPORTED_AFTER_ADJUSTMENT"
     assert ledger.n_trials == 2                                             # both looks are counted, winners and losers
     for r in (rich, poor):
@@ -87,14 +88,14 @@ def test_a_rich_funding_regime_passes_a_poor_one_does_not_and_neither_authorises
 
 
 def test_a_small_gap_is_reported_not_filled_and_a_large_one_refuses_the_evaluation():
-    ok = window_prints(2.5, seed=5, drop=range(10, 60))                     # 50 of 1095 missing: 95.4 % coverage
+    ok = window_prints(2.5, seed=5, drop=range(10, 60))                     # 50 of 1095 missing: 95.4 % coverage, above the declared floor
     cov = CP.coverage(ok, CP.WINDOW_END_MS)
     assert cov["expected"] == 1095 and cov["missing"] == 50 and cov["observed"] == 1045 and cov["coverage"] == pytest.approx(1045 / 1095)
-    assert CP.evaluate(ok, 10.0, SP.TrialLedger())["available_raw_n"] == 1045         # evaluated on what exists; nothing interpolated
-    bad = window_prints(2.5, seed=5, drop=range(10, 200))                   # 190 missing: 82.6 %
+    assert CP.evaluate(ok, 10.0, SP.TrialLedger(), CLOSED)["available_raw_n"] == 1045         # evaluated on what exists; nothing interpolated
+    bad = window_prints(2.5, seed=5, drop=range(10, 200))                   # 190 missing: 82.6 %, below the declared floor
     ledger = SP.TrialLedger()
     with pytest.raises(SP.DataIntegrityError, match="coverage"):
-        CP.evaluate(bad, 10.0, ledger)
+        CP.evaluate(bad, 10.0, ledger, CLOSED)
     assert ledger.n_trials == 0
 
 
@@ -159,3 +160,43 @@ def test_the_module_reads_one_file_and_imports_nothing_that_reaches_the_network_
                         "statistical_power", "evidence_stats"}, imported
     calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
     assert not calls & {"open", "exec", "eval", "compile", "__import__"}
+
+
+# ============================================================================================ regressions from the independent review
+
+def test_the_registered_window_cannot_be_evaluated_before_it_closes_even_with_prints_dated_in_the_future():
+    ledger = SP.TrialLedger()
+    with pytest.raises(SP.WindowCoverageError, match="has not closed"):
+        CP.evaluate(window_prints(2.5, seed=3), 10.0, ledger, CP.WINDOW_END_MS - 1)
+    with pytest.raises(SP.WindowCoverageError):
+        CP.evaluate(window_prints(2.5, seed=3), 10.0, ledger, CP.WINDOW_START_MS - 1)
+    assert ledger.n_trials == 0
+
+
+def test_two_prints_at_one_settlement_time_are_refused_not_counted_twice():
+    prints = window_prints(2.0, n=10)
+    with pytest.raises(SP.DataIntegrityError, match="share one settlement time"):
+        CP.observations(prints + [prints[3]], 10.0)
+    with pytest.raises(SP.DataIntegrityError):
+        CP.progress(prints + [prints[3]], CP.WINDOW_START_MS + 10 * H8)
+
+
+def test_prints_dated_after_now_are_not_observations_yet():
+    prints = window_prints(2.0, n=50)
+    rep = CP.progress(prints, CP.WINDOW_START_MS + 18 * H8)
+    assert rep["coverage"]["expected"] == 18 and rep["coverage"]["observed"] == 18 and rep["coverage"]["future_dated_ignored"] == 32 and rep["coverage"]["missing"] == 0
+
+
+def test_the_dependence_estimate_uses_time_order_not_file_order():
+    ordered = window_prints(2.0, n=200, seed=7, rho=0.97)
+    shuffled = list(ordered)
+    random.Random(1).shuffle(shuffled)
+    now = CP.WINDOW_START_MS + 200 * H8
+    a, b = CP.progress(ordered, now), CP.progress(shuffled, now)
+    assert a["ess_ratio"] == pytest.approx(b["ess_ratio"]) and a["still_required"] == b["still_required"]
+
+
+def test_the_coverage_floor_is_not_below_what_the_planning_inputs_need():
+    rep = CP.progress([], CP.WINDOW_START_MS - 1)
+    assert CP.MIN_COVERAGE >= rep["needed_settlements_for_min_edge"] / (CP.WINDOW_DAYS * CP.PER_DAY) or rep["needed_exceeds_window"]
+    assert "NOT under test" in CP.PARAMETERS["statistic_scope"]

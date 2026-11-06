@@ -298,16 +298,31 @@ def test_a_missing_execution_leaves_the_balances_unexplained_and_is_not_a_clean_
 
 
 def test_a_balance_residual_with_open_coverage_gaps_is_an_incomplete_history_and_with_none_a_contradiction(tmp_path):
-    full = World()
-    snaps = full.snapshots()
-    for s in snaps:
-        s["usdt"] += 250.0                                                        # the account shows 250 USD more than the records can explain, at both instants
-    snaps[0]["usdt"] -= 250.0                                                     # ... but only at the close: an unexplained inflow
+    # BTC that appears in the account with no trade and no transfer behind it, while every coverage check is closed (a statement agrees with the records):
+    # the records contradict the balances
     w = World()
-    w.lines = _statement(w)                                                       # a statement exists and agrees with the records: coverage has no open gap
-    w.flows = []
+    w.lines = _statement(w)
+    snaps = w.snapshots()
+    snaps[1]["btc"] += 0.01
     rep = ledger(w, tmp_path, snapshots=snaps)
     assert "EQUITY_RESIDUAL" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+    assert rep["residuals"]["btc_qty"] == pytest.approx(0.01, abs=1e-9)
+    # the same discrepancy with NO statement: coverage is open, so it is an incomplete history, never a contradiction
+    w2 = World()
+    snaps2 = w2.snapshots()
+    snaps2[1]["btc"] += 0.01
+    (tmp_path / "b").mkdir()
+    rep2 = ledger(w2, tmp_path / "b", snapshots=snaps2)
+    assert "EQUITY_RESIDUAL" in codes(rep2, OL.SEVERITY_GAP) and "EQUITY_RESIDUAL" not in hard(rep2) and rep2["verdict"] == "INCOMPLETE"
+
+
+def test_a_statement_that_ends_somewhere_other_than_the_closing_snapshot_is_not_anchored_and_vouches_for_nothing(tmp_path):
+    w = World()
+    w.lines = _statement(w)
+    snaps = w.snapshots()
+    snaps[1]["usdt"] += 250.0                                                    # the snapshot shows 250 USD the statement's own chain does not reach
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert "STATEMENT_NOT_ANCHORED" in codes(rep, OL.SEVERITY_GAP) and rep["verdict"] == "INCOMPLETE" and rep["statement"]["anchored"] is False
     assert rep["residuals"]["usdt"] == pytest.approx(250.0, abs=1e-6)
 
 
@@ -726,34 +741,57 @@ def test_malformed_external_flows_are_errors(row):
         OL.parse_external_flows([row])
 
 
-def test_a_fuzz_of_mutated_worlds_only_ever_raises_a_record_error_and_never_claims_a_clean_pass(tmp_path):
+def test_a_fuzz_of_mutated_worlds_never_reaches_a_reconciled_verdict_and_the_unmutated_world_does(tmp_path):
     rng = random.Random(9)
     base = World()
+    base.lines = _statement(base)
+    (tmp_path / "ctl").mkdir()
+    control = ledger(base, tmp_path / "ctl")
+    assert control["verdict"] == "RECONCILED_NOT_AUTHENTICATED", control["flags"]              # POSITIVE CONTROL: the clean world does reach the top rung
     snaps_ok = base.snapshots()
-    for k in range(60):
+    n_run = 0
+    for k in range(80):
         w = World()
         d = tmp_path / f"f{k}"
         d.mkdir()
-        w.lines = _statement(w) if rng.random() < 0.5 else []
-        mut = rng.choice(["drop_fill", "drop_funding", "dup_fill", "flip_sign", "shift_ts", "zero_fee", "none"])
-        if mut == "drop_fill" and w.fills:
+        w.lines = _statement(w) if rng.random() < 0.6 else []
+        mut = rng.choice(["drop_fill", "drop_funding", "dup_fill", "flip_sign", "shift_far", "zero_fee", "inflate_fee"])
+        if mut == "drop_fill":
             w.fills.pop(rng.randrange(len(w.fills)))
         elif mut == "drop_funding":
             w.funding.pop(rng.randrange(len(w.funding)))
         elif mut == "dup_fill":
-            w.fills.append(dict(w.fills[0]))
+            w.extra_files = [("execs2.jsonl", [dict(w.fills[0], price=w.fills[0]["price"] * 1.001)], "perp_executions")]       # same id, different content
         elif mut == "flip_sign":
             w.funding[rng.randrange(len(w.funding))]["payment_usd"] *= -1
-        elif mut == "shift_ts":
-            w.fills[1]["ts_ms"] += rng.choice([1, 59_000, 61_000, 3 * HOUR])
+        elif mut == "shift_far":
+            w.fills[1]["ts_ms"] += 3 * HOUR
         elif mut == "zero_fee":
             w.fills[0]["fee_usd"] = 0.0
+        elif mut == "inflate_fee":
+            w.fills[1]["fee_usd"] += 3.0
         try:
             rep = ledger(w, d, snapshots=copy.deepcopy(snaps_ok))
         except OL.RecordError:
             continue
-        if mut != "none":
-            assert rep["verdict"] != "RECONCILED_NOT_AUTHENTICATED", (k, mut, rep["flags"])
+        n_run += 1
+        assert not rep["verdict"].startswith("RECONCILED"), (k, mut, [(f["code"], f["severity"]) for f in rep["flags"]])
+    assert n_run >= 40                                                                          # most mutants load and are judged; they are not all refused at the door
+
+
+def test_a_fill_time_wrong_by_seconds_that_moves_no_money_is_not_detectable_and_the_ledger_says_so_in_its_limits(tmp_path):
+    """A STATED LIMIT, pinned so it cannot be forgotten: the checks are on totals and on settlement ownership, not on each record's time. Moving the closing
+    fill by 1 ms or a minute changes no cash and no settlement the book was in, so nothing contradicts it."""
+    w = World()
+    w.lines = _statement(w)
+    w.fills[1]["ts_ms"] += 61_000
+    for l in w.lines:
+        if l["ts_ms"] == w.fills[1]["ts_ms"] - 61_000:
+            l["ts_ms"] += 61_000
+    rep = ledger(w, tmp_path)
+    assert rep["verdict"] == "RECONCILED_NOT_AUTHENTICATED"
+    assert any("TOTALS" in lim and "not a match of each execution" in lim for lim in rep["limits"])
+    assert "WHAT THIS DOES NOT ESTABLISH" in OL.render(rep)
 
 
 def test_the_module_reads_files_only_and_imports_nothing_that_can_reach_a_network_a_database_or_a_process():
@@ -808,3 +846,235 @@ def test_the_command_line_prints_text_and_strict_json_and_a_message_on_error(tmp
     assert doc["authorizes_trading"] is False and doc["returns"]["alternative_return_pct"] == 4.5
     assert OL.main(["--manifest", str(tmp_path / "missing.json")]) == 2
     assert "owner_ledger:" in capsys.readouterr().err
+
+
+# ============================================================================================ regressions from the independent review
+# Each of these FAILED against the first version of the ledger (a reconciled verdict, or a headline return, that the records did not support).
+
+def _clean_with_statement(tmp_path, **mod):
+    w = World()
+    w.lines = _statement(w)
+    return w, ledger(w, tmp_path, **mod)
+
+
+def test_value_held_outside_the_modelled_assets_is_a_bridge_line_and_a_gap_never_a_balancing_item(tmp_path):
+    w = World()
+    w.lines = _statement(w)
+    snaps = w.snapshots()
+    snaps[1]["other_usd"] = 3000.0                                             # 3,000 USD of something the ledger does not model appeared by the close
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert "OTHER_ASSETS_PRESENT" in codes(rep, OL.SEVERITY_GAP) and not rep["verdict"].startswith("RECONCILED")
+    assert rep["equity_bridge"]["change_in_other_assets_usd"] == 3000.0 and rep["equity_bridge"]["unexplained_usd"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_an_unexplained_bridge_residual_blocks_the_verdict_even_when_the_components_balance(tmp_path):
+    w = World()
+    w.lines = _statement(w)
+    snaps = w.snapshots()
+    snaps[1]["equity_usd"] = None
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert "BRIDGE_UNEXPLAINED" not in codes(rep) and rep["verdict"] == "RECONCILED_NOT_AUTHENTICATED"                 # the clean case has none
+    # an opening unrealised P&L that its own position does not produce moves equity without a trade: it is a snapshot that contradicts itself
+    snaps2 = w.snapshots()
+    snaps2[0]["perp_upl_usd"] = -3000.0
+    (tmp_path / "b").mkdir()
+    rep2 = ledger(w, tmp_path / "b", snapshots=snaps2)
+    assert "SNAPSHOT_INCONSISTENT" in hard(rep2) and rep2["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+
+
+def test_a_stated_unrealised_pnl_must_equal_the_position_it_belongs_to_at_either_end(tmp_path):
+    w = World()
+    sell = w.fills[0]
+    w.fills = w.fills[:1]
+    w.funding_sum = sum(r["payment_usd"] for r in w.funding)
+    mark1 = _open_at(w.t_close)
+    good_upl = -w.qty * (mark1 - sell["price"])
+    snaps = w.snapshots(usdt1=w.usdt0 - sell["fee_usd"] + w.funding_sum)
+    snaps[1].update(perp_upl_usd=good_upl + 400.0, perp_qty=-w.qty, perp_avg_entry=sell["price"], perp_mark=mark1)       # 400 USD more than -0.5 x (mark - entry)
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert "SNAPSHOT_INCONSISTENT" in hard(rep)
+
+
+def test_a_missing_perp_mark_on_an_open_position_is_a_gap_not_a_false_contradiction(tmp_path):
+    w = World()
+    sell = w.fills[0]
+    w.fills = w.fills[:1]
+    w.funding_sum = sum(r["payment_usd"] for r in w.funding)
+    mark1 = _open_at(w.t_close)
+    snaps = w.snapshots(usdt1=w.usdt0 - sell["fee_usd"] + w.funding_sum)
+    snaps[1].update(perp_upl_usd=-w.qty * (mark1 - sell["price"]), perp_qty=-w.qty, perp_avg_entry=sell["price"])          # perp_mark omitted
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert "PERP_MARK_MISSING" in codes(rep, OL.SEVERITY_GAP) and "EQUITY_RESIDUAL" not in hard(rep) and rep["verdict"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("factor", [1.10, 0.90])
+def test_a_snapshot_btc_price_outside_the_public_bar_is_refused_not_trusted(tmp_path, factor):
+    w = World()
+    w.lines = _statement(w)
+    snaps = w.snapshots()
+    snaps[1]["btc_price"] *= factor                                            # the supplier marks the owned BTC 10 % away from the market
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert "SNAPSHOT_PRICE_OFF_PUBLIC_BAR" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+
+
+def test_a_btc_flow_valued_at_zero_or_far_from_the_market_cannot_move_profit_across_the_contribution_line(tmp_path):
+    w = World()
+    ts = w.t_open + HOUR
+    w.flows = [{"flow_id": "D", "ts_ms": ts, "coin": "BTC", "amount": 1.0, "kind": "DEPOSIT", "usd_value": 0.0}]
+    with pytest.raises(OL.RecordError, match="cannot be worth 0 USD"):
+        OL.load_manifest(w.write(tmp_path))
+    w2 = World()
+    w2.flows = [{"flow_id": "D", "ts_ms": ts, "coin": "BTC", "amount": 1.0, "kind": "DEPOSIT", "usd_value": 1.0}]
+    (tmp_path / "b").mkdir()
+    rep = ledger(w2, tmp_path / "b")
+    assert "BTC_FLOW_VALUE_OFF_PUBLIC_BAR" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+
+
+def test_while_a_btc_flow_is_unpriced_no_return_and_no_btc_pnl_is_stated(tmp_path):
+    w = World()
+    w.flows = [{"flow_id": "D", "ts_ms": w.t_open + HOUR, "coin": "BTC", "amount": 1.0, "kind": "DEPOSIT"}]
+    rep = ledger(w, tmp_path)
+    assert rep["returns"]["status"] == "WITHHELD_UNPRICED_BTC_FLOW" and rep["equity_bridge"]["btc_economic_pnl_usd"] is None
+    assert rep["equity_bridge"]["unexplained_usd"] is None and "UNPRICED_BTC_FLOW" in codes(rep, OL.SEVERITY_GAP)
+    text = OL.render(rep)
+    assert "RETURNS: withheld" in text and "modified Dietz" not in text
+
+
+def test_the_same_btc_transfer_supplied_unpriced_and_then_priced_is_one_priced_flow(tmp_path):
+    w = World()
+    ts = w.t_open + HOUR
+    price = _open_at(ts)
+    flow = {"flow_id": "D", "ts_ms": ts, "coin": "BTC", "amount": 0.25, "kind": "DEPOSIT"}
+    merged = OL._merge_flow_prices([OL.parse_external_flows([flow])[0][0], OL.parse_external_flows([dict(flow, usd_value=0.25 * price)])[0][0]])
+    assert len(merged) == 1 and merged[0].usd_value == pytest.approx(0.25 * price)
+    different = OL._merge_flow_prices([OL.parse_external_flows([flow])[0][0], OL.parse_external_flows([dict(flow, amount=0.3, usd_value=0.3 * price)])[0][0]])
+    assert len(different) == 2                                               # a flow that differs in more than the price is left for the duplicate rule
+
+
+def test_a_statement_with_no_running_balance_proves_nothing_and_says_so(tmp_path):
+    w = World()
+    w.lines = _statement(w)
+    for l in w.lines:
+        l["cash_balance"] = None
+    rep = ledger(w, tmp_path)
+    assert "STATEMENT_UNCHAINED" in codes(rep, OL.SEVERITY_GAP) and rep["verdict"] == "INCOMPLETE" and rep["statement"]["anchored"] is False
+
+
+def test_a_self_consistent_statement_that_starts_and_ends_elsewhere_is_not_anchored(tmp_path):
+    w = World()
+    w.lines = _statement(w)
+    for l in w.lines:
+        l["cash_balance"] += 12_345.0                                          # the whole chain shifted: every step still follows from the one before
+    rep = ledger(w, tmp_path)
+    assert rep["statement"]["continuity_breaks"] == [] and "STATEMENT_NOT_ANCHORED" in codes(rep, OL.SEVERITY_GAP) and rep["verdict"] == "INCOMPLETE"
+
+
+def test_an_unrecorded_cost_larger_than_the_periods_income_is_not_hidden_by_a_large_equity(tmp_path):
+    """At about 1.06M of equity a tolerance scaled to the equity is over 100 USD; the statement is cent-exact, and 80 USD of unrecorded cost exceeds the
+    funding the window earned (about 18 USD)."""
+    w = World(usdt0=1_000_000.0)
+    w.lines = _statement(w)
+    snaps = w.snapshots()
+    snaps[1]["usdt"] -= 80.0
+    rep = ledger(w, tmp_path, snapshots=snaps)
+    assert not rep["verdict"].startswith("RECONCILED") and rep["residuals"]["usdt"] == pytest.approx(-80.0, abs=1e-6)
+    assert rep["residuals"]["tolerance_usd"] > 80.0                          # the equity-scaled tolerance WOULD have hidden it
+    good = World(usdt0=1_000_000.0)
+    good.lines = _statement(good)
+    (tmp_path / "g").mkdir()
+    assert ledger(good, tmp_path / "g")["verdict"] == "RECONCILED_NOT_AUTHENTICATED"
+
+
+def test_a_positive_interest_line_is_unexplained_income(tmp_path):
+    w = World()
+    w.lines = _statement(w) + [{"line_id": "I", "ts_ms": w.t_open + 4 * HOUR, "coin": "USDT", "category": "INTEREST", "change": 5000.0, "cash_balance": None, "ref_id": None}]
+    w.interest = 5000.0
+    rep = ledger(w, tmp_path)
+    assert "INTEREST_UNEXPECTED" in codes(rep, OL.SEVERITY_GAP) and not rep["verdict"].startswith("RECONCILED")
+
+
+def test_btc_statement_lines_other_than_spot_and_transfers_are_flagged_and_internal_lines_must_net_to_zero(tmp_path):
+    w = World()
+    w.lines = _statement(w) + [{"line_id": "B", "ts_ms": w.t_open + 4 * HOUR, "coin": "BTC", "category": "INTEREST", "change": -0.001, "cash_balance": None, "ref_id": None},
+                               {"line_id": "N", "ts_ms": w.t_open + 5 * HOUR, "coin": "USDT", "category": "INTERNAL", "change": 70.0, "cash_balance": None, "ref_id": None}]
+    rep = ledger(w, tmp_path)
+    assert "BTC_LINES_UNMODELLED" in codes(rep, OL.SEVERITY_GAP) and "INTERNAL_LINES_UNBALANCED" in codes(rep, OL.SEVERITY_GAP)
+
+
+def _same_ms_rows(order, t=1_700_000_000_000):
+    bal, rows = 500.0, []
+    for i in range(8):
+        bal -= 1.0 + i
+        rows.append((i, bal, -(1.0 + i)))
+    out = [OL.CashLine(f"l{i}", t, "USDT", "FEE", ch, b, None, f"s#{i + 1}", None) for i, b, ch in rows]
+    return [out[i] for i in order]
+
+
+@pytest.mark.parametrize("order", [list(range(8)), list(reversed(range(8))), [3, 0, 7, 1, 6, 2, 5, 4]])
+def test_eight_rows_in_one_millisecond_chain_in_whichever_order_the_file_lists_them(order):
+    ch = OL._chain(_same_ms_rows(order), "USDT")
+    assert ch["breaks"] == [] and ch["unchained"] == [] and ch["steps"] == 8
+    assert ch["start"] == pytest.approx(500.0) and ch["end"] == pytest.approx(500.0 - sum(1.0 + i for i in range(8)))
+
+
+def test_file_position_is_numeric_so_row_ten_follows_row_nine():
+    assert OL._seq("label#10") > OL._seq("label#9") and OL._seq("label") == 0
+
+
+def test_a_third_snapshot_that_contradicts_the_records_is_refused_and_does_not_earn_the_top_rung(tmp_path):
+    w = World()
+    w.lines = _statement(w)
+    mid = {"snapshot_id": "mid", "ts_ms": (w.t_open + w.t_close) // 2, "usdt": 1.0, "btc": 0.001, "btc_price": _open_at((w.t_open + w.t_close) // 2),
+           "perp_upl_usd": 0.0, "perp_qty": 0.0}
+    rep = ledger(w, tmp_path, snapshots=w.snapshots() + [mid])
+    assert "MIDDLE_SNAPSHOT_UNRECONCILED" in codes(rep) and not rep["verdict"].startswith("RECONCILED")
+
+
+def test_two_snapshots_at_one_instant_that_disagree_are_a_contradiction_and_identical_ones_are_one(tmp_path):
+    w = World()
+    snaps = w.snapshots()
+    twin = dict(snaps[1], snapshot_id="close2", usdt=snaps[1]["usdt"] + 4.0)
+    rep = ledger(w, tmp_path, snapshots=snaps + [twin])
+    assert "SNAPSHOT_DUPLICATE_TIMESTAMP" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+    (tmp_path / "b").mkdir()
+    same = ledger(w, tmp_path / "b", snapshots=snaps + [dict(snaps[1], snapshot_id="close2")])
+    assert "SNAPSHOT_DUPLICATE_TIMESTAMP" not in codes(same) and same["records"]["snapshots"] == 2
+
+
+def test_the_json_output_works_when_the_closing_snapshot_omits_the_position(tmp_path, capsys):
+    w = World()
+    snaps = w.snapshots()
+    del snaps[1]["perp_qty"]
+    man = w.write(tmp_path, snapshots=snaps)
+    assert OL.main(["--manifest", man, "--json"]) == 0
+    doc = json.loads(capsys.readouterr().out)
+    assert doc["residuals"]["perp_qty"] is None
+
+
+def test_one_settlement_under_two_ids_is_a_contradiction_not_double_funding(tmp_path):
+    w = World()
+    w.extra_files = [("funding2.jsonl", [dict(w.funding[0], exec_id="alias-of-first")], "funding")]
+    rep = ledger(w, tmp_path)
+    assert "SETTLEMENT_DUPLICATED_UNDER_DIFFERENT_IDS" in hard(rep) and rep["verdict"] == "REJECTED_RECORDS_CONTRADICT"
+
+
+def test_the_dietz_base_guard_and_the_minimum_annualising_window():
+    day = 86_400_000
+    t0 = 1_700_000_000_000
+    # 1,000 -> 1,100 with a 999.99999 withdrawal almost at the start: the capital at work is nothing, the ratio is not a rate
+    d = OL.modified_dietz(1000.0, 1100.0, [(t0 + 1000, -999.99999)], t0, t0 + 100 * day)
+    assert d["base_small"] is True and d["annualised_simple_pct"] is None and "tenth" in d["annualised_why_not"]
+    # four days of -1.25 % must not become a -68 %/yr figure
+    short = OL.modified_dietz(1000.0, 987.5, [], t0, t0 + 4 * day)
+    assert short["annualised_simple_pct"] is None and "30 days" in short["annualised_why_not"]
+    r = OL.irr(1000.0, 987.5, [], t0, t0 + 4 * day)
+    assert r["annual_rate"] is None and "30 days" in r["why_not"]
+    ok = OL.modified_dietz(1000.0, 1100.0, [], t0, t0 + 100 * day)
+    assert ok["base_small"] is False and ok["annualised_simple_pct"] == pytest.approx(10.0 / (100 / 365.0))
+
+
+def test_capital_notes_describe_the_return_figure_and_do_not_lower_the_reconciliation_verdict(tmp_path):
+    w, rep = _clean_with_statement(tmp_path)
+    assert rep["verdict"] == "RECONCILED_NOT_AUTHENTICATED"
+    sev = {f["code"]: f["severity"] for f in rep["flags"]}
+    assert sev.get("TWO_POINT_CAPITAL_AVERAGE") == "INFO"

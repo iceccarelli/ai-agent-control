@@ -51,7 +51,7 @@ HOLD_DAYS = 30.0
 ROUND_TRIP_BPS = CT.DEFAULT_ROUND_TRIP_BPS                           # ASSUMED, unverified against any account
 RESERVE = 0.10
 MIN_EDGE_BPS = 0.25                                                  # excess over the required funding worth detecting (bps per settlement)
-MIN_COVERAGE = 0.90
+MIN_COVERAGE = 0.92                                                  # above the share (91.05 %) the planning inputs themselves need to reach the required n
 MIN_OBSERVATIONS_FOR_OBSERVED_DEPENDENCE = 90
 #: planning inputs used only until the window holds enough data of its own: the last 365 days of the public history (ESTIMATED, not a promise)
 PLANNING_SD_BPS = 0.45
@@ -59,7 +59,8 @@ PLANNING_ESS_RATIO = 0.031
 
 PARAMETERS: Dict[str, Any] = {
     "instrument": "BTCUSDT linear perpetual, short, against owned BTC (overlay: no spot trade)",
-    "frozen_signal": "funding_carry_fade_v1 is NOT used; the engine's EWMA entry gate and FUNDING_INVERTED exit run unchanged",
+    "statistic_scope": "the unconditional mean settled print against the funding the hurdle requires: the engine's entry gate and exit rule are NOT under test here, "
+                       "and funding_carry_fade_v1 is not used",
     "observation": "settled funding print, bps per 8h settlement, minus the funding the declared hurdle requires",
     "hold_days": HOLD_DAYS, "round_trip_bps": ROUND_TRIP_BPS, "round_trip_bps_status": "ASSUMED_UNVERIFIED_OWNER_FEE_TIER",
     "reserve_fraction": RESERVE, "hurdles_pct": list(HURDLES_PCT), "hurdles_status": "PROVISIONAL_NOT_OWNER_APPROVED",
@@ -86,9 +87,9 @@ def plan_for(hurdle_pct: float) -> "SP.EvaluationPlan":
 
 #: SHA-256 of each plan as registered on 2026-11-06. Computed once from ``plan_for`` and pinned here.
 PINNED_DIGESTS: Dict[float, str] = {
-    10.0: "b34245f397973bf406cfd7a91b4f0c10098ef739ed60f383c6569fa5c33071ac",
-    15.0: "473f11f44841fcf9d38071c64b68a0c76154450878873c2f2d8b9b1c959d8e14",
-    20.0: "9b17b80868f19b6cfdd27cf55426d1cca08b6a328eaeecca7d7cbc4e250f5642",
+    10.0: "de6afe80fba7ec37dbf622647ba505bcf1719b30c147351feb2f436fd28bada9",
+    15.0: "1d58583367e1445c36b8aaed4d0acdcd86bffdcc2be8431e791f61a67704e95d",
+    20.0: "55be467befe95d98812e31b4bc157923bf527706415a09c5c0447471d6d52249",
 }
 
 
@@ -109,6 +110,9 @@ def _clean(prints: Sequence[Tuple[float, float]]) -> List[Tuple[int, float]]:
         if int(ts) % SETTLE_MS != 0:
             raise SP.DataIntegrityError(f"print {i + 1}: {int(ts)} is not on the 8h UTC settlement grid; a settlement is never snapped")
         out.append((int(ts), float(bps)))
+    stamps = [t for t, _ in out]
+    if len(set(stamps)) != len(stamps):
+        raise SP.DataIntegrityError("two prints share one settlement time: which is the print is not decidable, and counting both would double a settlement")
     return out
 
 
@@ -119,13 +123,13 @@ def observations(prints: Sequence[Tuple[float, float]], hurdle_pct: float) -> Li
 
 def coverage(prints: Sequence[Tuple[float, float]], now_ms: int) -> Dict[str, Any]:
     """Settlements that should exist in [window start, min(now, window end)) against those supplied. Nothing is filled in."""
-    pts = [ts for ts, _ in _clean(prints) if WINDOW_START_MS <= ts < WINDOW_END_MS]
     horizon = min(int(now_ms), WINDOW_END_MS)
-    expected = max(0, (horizon - WINDOW_START_MS + SETTLE_MS - 1) // SETTLE_MS)
-    have = set(pts)
+    inwin = [ts for ts, _ in _clean(prints) if WINDOW_START_MS <= ts < WINDOW_END_MS]
+    expected = max(0, (horizon - WINDOW_START_MS + SETTLE_MS - 1) // SETTLE_MS)        # the settlements whose time has passed
+    have = {ts for ts in inwin if ts < horizon}                                           # a print dated in the future is not an observation yet
     missing = [WINDOW_START_MS + i * SETTLE_MS for i in range(expected) if WINDOW_START_MS + i * SETTLE_MS not in have]
     return {"expected": expected, "observed": len(have), "missing": len(missing), "coverage": (len(have) / expected) if expected else None,
-            "first_missing": [AR._iso(t) for t in missing[:5]]}
+            "future_dated_ignored": len(inwin) - len(have), "first_missing": [AR._iso(t) for t in missing[:5]]}
 
 
 def progress(prints: Sequence[Tuple[float, float]], now_ms: int, hurdle_pct: float = 10.0) -> Dict[str, Any]:
@@ -133,8 +137,9 @@ def progress(prints: Sequence[Tuple[float, float]], now_ms: int, hurdle_pct: flo
     the plan needs, and how long that takes. Before the window opens the answer is that nothing of the evaluation exists yet."""
     plan = registered_plan(hurdle_pct)
     cov = coverage(prints, now_ms)
-    inwin = [(ts, v) for ts, v in observations(prints, hurdle_pct) if WINDOW_START_MS <= ts < WINDOW_END_MS]
-    vals = [v for _, v in inwin]
+    due = min(int(now_ms), WINDOW_END_MS)
+    inwin = sorted((ts, v) for ts, v in observations(prints, hurdle_pct) if WINDOW_START_MS <= ts < min(due, WINDOW_END_MS))
+    vals = [v for _, v in inwin]                 # in TIME order: the dependence estimate is meaningless on a shuffled series
     observed_dep = len(vals) >= MIN_OBSERVATIONS_FOR_OBSERVED_DEPENDENCE
     import evidence_stats as ES
     if observed_dep:
@@ -160,8 +165,12 @@ def progress(prints: Sequence[Tuple[float, float]], now_ms: int, hurdle_pct: flo
     }
 
 
-def evaluate(prints: Sequence[Tuple[float, float]], hurdle_pct: float, ledger: "SP.TrialLedger") -> Dict[str, Any]:
-    """Run the registered test ONCE the window has closed. Every call is recorded as a trial; refusals record nothing."""
+def evaluate(prints: Sequence[Tuple[float, float]], hurdle_pct: float, ledger: "SP.TrialLedger", now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Run the registered test ONCE the window has closed. Every call is recorded as a trial; refusals record nothing. ``now_ms`` is the clock the
+    window is judged against (the wall clock when omitted): before the window ends nothing is evaluated, so prints dated in the future cannot be used."""
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if now < WINDOW_END_MS:
+        raise SP.WindowCoverageError(f"the registered window has not closed (it ends {AR._iso(WINDOW_END_MS)}): an evaluation of part of it is a peek, and is refused")
     plan = registered_plan(hurdle_pct)
     cov = coverage(prints, WINDOW_END_MS)
     if cov["coverage"] is None or cov["coverage"] < MIN_COVERAGE:

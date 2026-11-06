@@ -1006,7 +1006,7 @@ def selection_adjusted_best(ledger: TrialLedger, *, alpha: float, adjust: str = 
     best = min(with_p, key=lambda t: (t.pvalue, -t.statistic, t.index))
     adj = adjust_pvalues(ledger.pvalues(), adjust, alpha=alpha_, n_tested=n)
     best_adj = adj["adjusted"][best.index]
-    z_best = _zu(max(best.pvalue, 1e-300))
+    z_best = _zu(min(max(best.pvalue, 1e-300), 1.0 - 2.0 ** -53))
     emax = expected_max_null(n)
     survives = bool(adj["reject"][best.index])
     beats = z_best > emax

@@ -15,8 +15,8 @@ Bybit publishes no column list for it, so a UI export is read only through an ex
 documented API names above; this module never guesses a column.
 
 Everything the documentation does not settle is refused or surfaced, never assumed. The list is in ``UNDOCUMENTED`` and travels in every report.
-Each output row keeps the venue's own identifiers (``exec_id`` is ``execId``; a log row's id is ``id|tradeId|transactionTime``, because the documentation's own
-example repeats an ``id``), so every canonical record is traceable to one raw line.
+Each output row keeps the venue's own identifiers (``exec_id`` is ``execId``; a log row's id is ``id|tradeId|transactionTime|currency``, because the documentation's own
+example repeats an ``id`` and a spot trade writes one row per currency leg), so every canonical record is traceable to one raw line.
 """
 from __future__ import annotations
 
@@ -155,7 +155,7 @@ def transaction_log_to_records(rows: Sequence[Mapping[str, Any]], label: str, sy
         _need(r, ("id", "transactionTime", "type", "currency", "change", "cashBalance", "cashFlow", "funding", "fee"), w)
         cur = _s(r, "currency", w).upper()
         typ = _s(r, "type", w).upper()
-        rid = f"{_s(r, 'id', w)}|{str(r.get('tradeId') or '').strip()}|{r.get('transactionTime')}"
+        rid = f"{_s(r, 'id', w)}|{str(r.get('tradeId') or '').strip()}|{r.get('transactionTime')}|{cur}"
         if cur not in _ASSETS:
             _note(notes, "ADAPTER_SKIPPED_ROWS", "GAP", f"{rid}:{cur}",
                   "rows in currencies other than USDT/BTC were not mapped: whatever they did to the account is not explained here, so the balances can no longer be reconciled")
