@@ -4,6 +4,7 @@
     python3 tools/state_backup.py backup  --db  PATH --out-dir DIR
     python3 tools/state_backup.py verify  --backup FILE
     python3 tools/state_backup.py restore --backup FILE --into NEWDIR
+    python3 tools/state_backup.py promote --restored FILE --live-db PATH --confirm-owner      # machine STOPPED; keeps the old file
 
 * ``backup`` opens the source READ-ONLY (``mode=ro``, percent-encoded URI) and copies a consistent
   snapshot with SQLite's online backup API (safe while the writer runs). The source database file
@@ -16,7 +17,7 @@
 * ``verify`` recomputes the hash and counts and re-runs the integrity check.
 * ``restore`` writes ONLY into a new or empty directory, refuses anything that looks like a
   live state directory or that already holds a database, and re-verifies what it wrote. It is
-  the rehearsal that proves a backup can be restored; it never replaces a live database.
+  the rehearsal that proves a backup can be restored; it never replaces a live database. ``promote`` is the separate, owner-confirmed, cold-only step that does.
 
 ENCRYPTION is not done here (the standard library has no authenticated encryption): encrypt the
 backup file before it leaves the machine, e.g. ``age -r <recipient> -o x.db.age x.db`` or
@@ -36,7 +37,7 @@ import sys
 import time
 from typing import Any, Dict, Optional, Sequence
 
-TOOL_VERSION = 1
+TOOL_VERSION = 2
 MANIFEST_SUFFIX = ".manifest.json"
 
 
@@ -60,9 +61,16 @@ def _inspect(path: str) -> Dict[str, Any]:
         integrity = [r[0] for r in con.execute("PRAGMA integrity_check")]
         tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
         counts = {t: con.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0] for t in tables}
+        max_rowid: Dict[str, Any] = {}
+        for t in tables:
+            try:
+                max_rowid[t] = con.execute(f'SELECT MAX(rowid) FROM "{t}"').fetchone()[0]
+            except sqlite3.DatabaseError:
+                max_rowid[t] = None                      # a WITHOUT ROWID table has none
+        user_version = con.execute("PRAGMA user_version").fetchone()[0]
     finally:
         con.close()
-    return {"integrity": integrity, "integrity_ok": integrity == ["ok"], "tables": counts}
+    return {"integrity": integrity, "integrity_ok": integrity == ["ok"], "tables": counts, "max_rowid": max_rowid, "user_version": user_version}
 
 
 def backup(db: str, out_dir: str, *, now: Optional[float] = None) -> Dict[str, Any]:
@@ -94,7 +102,8 @@ def backup(db: str, out_dir: str, *, now: Optional[float] = None) -> Dict[str, A
     manifest = {"tool_version": TOOL_VERSION, "created_utc": stamp, "backup_file": os.path.basename(dest),
                 "source_basename": os.path.basename(db), "bytes": os.path.getsize(dest), "sha256": _sha256(dest),
                 "integrity_ok": info["integrity_ok"], "tables": info["tables"],
-                "note": "row counts only; no contents are recorded; encrypt the file before it leaves the machine"}
+                "max_rowid": info["max_rowid"], "user_version": info["user_version"],
+                "note": "row counts, newest row ids and the schema version only; no contents are recorded; encrypt the file before it leaves the machine"}
     with open(dest + MANIFEST_SUFFIX, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=True)
     if not info["integrity_ok"]:
@@ -121,7 +130,15 @@ def verify(backup_file: str) -> Dict[str, Any]:
         problems.append(f"integrity_check: {info['integrity'][:3]}")
     if info["tables"] != manifest.get("tables"):
         problems.append("table row counts differ from the manifest")
-    return {"ok": not problems, "problems": problems, "tables": info["tables"], "sha256": manifest.get("sha256")}
+    warnings = []
+    if "max_rowid" not in manifest or "user_version" not in manifest:
+        warnings.append("the manifest predates newest-row and schema-version markers (tool_version < 2): only hash, counts and integrity were checked")
+    else:
+        if info["max_rowid"] != manifest["max_rowid"]:
+            problems.append("newest row ids differ from the manifest")
+        if info["user_version"] != manifest["user_version"]:
+            problems.append("schema version (PRAGMA user_version) differs from the manifest")
+    return {"ok": not problems, "problems": problems, "warnings": warnings, "tables": info["tables"], "sha256": manifest.get("sha256")}
 
 
 def restore(backup_file: str, into: str) -> Dict[str, Any]:
@@ -140,10 +157,68 @@ def restore(backup_file: str, into: str) -> Dict[str, Any]:
     os.makedirs(target)
     out = os.path.join(target, "restored-state.db")      # never the live file name
     shutil.copyfile(backup_file, out)
+    shutil.copyfile(backup_file + MANIFEST_SUFFIX, out + MANIFEST_SUFFIX)       # so `promote` can verify exactly what it is asked to install
     got = _inspect(out)
     ok = got["integrity_ok"] and got["tables"] == v["tables"] and _sha256(out) == v["sha256"]
     return {"ok": ok, "restored_to": out, "tables": got["tables"],
             "note": "a rehearsal: this is a disposable copy; nothing on the live volume was touched"}
+
+
+def promote(restored: str, live_db: str, *, confirm_owner: bool, now: Optional[float] = None) -> Dict[str, Any]:
+    """Install a RESTORED database as the live one. Cold only; never deletes anything.
+
+    Refuses unless: the owner confirmed in words (``confirm_owner``); the restored file verifies against the manifest beside it; the live path's directory
+    is a real directory and the live file is a regular file (or absent); no ``-wal``/``-shm`` side file exists (a writer is, or was uncleanly, there);
+    and an exclusive SQLite lock on the live file can be taken right now (nothing else has it open). Then the old file is RENAMED to
+    ``<live>.replaced-<UTC stamp>`` (kept, never deleted), the restored copy is written beside the live file, fsynced and renamed into place, and the
+    result is verified again at the live path. A machine must be STOPPED first; this tool does not stop, start or restart anything."""
+    if not confirm_owner:
+        raise SystemExit("refusing: promoting a restored database onto the live path needs --confirm-owner (the owner's explicit act)")
+    v = verify(restored)
+    if not v["ok"]:
+        raise SystemExit(f"refusing: the restored file does not verify: {v['problems']}")
+    live_dir = os.path.dirname(os.path.abspath(live_db))
+    if os.path.islink(live_dir) or not os.path.isdir(live_dir):
+        raise SystemExit("refusing: the live database's directory must be a real directory")
+    if os.path.lexists(live_db) and (os.path.islink(live_db) or not os.path.isfile(live_db)):
+        raise SystemExit("refusing: the live path exists and is not a regular file")
+    for side in ("-wal", "-shm", "-journal"):
+        if os.path.lexists(live_db + side):
+            raise SystemExit(f"refusing: {os.path.basename(live_db)}{side} exists - stop the machine and let it close the database cleanly first")
+    if os.path.exists(live_db):
+        try:
+            con = sqlite3.connect(live_db, timeout=0.0)
+            try:
+                con.execute("BEGIN EXCLUSIVE")
+                con.execute("ROLLBACK")
+            finally:
+                con.close()
+        except sqlite3.OperationalError as exc:
+            raise SystemExit(f"refusing: the live database is in use or unreadable ({exc}); stop the machine first")
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(time.time() if now is None else now))
+    kept = None
+    staged = os.path.join(live_dir, f".promote-{stamp}-{os.getpid()}.tmp")
+    shutil.copyfile(restored, staged)
+    try:
+        fd = os.open(staged, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if os.path.exists(live_db):
+            kept = f"{live_db}.replaced-{stamp}"
+            if os.path.lexists(kept):
+                raise SystemExit(f"refusing: {os.path.basename(kept)} already exists")
+            os.rename(live_db, kept)
+        os.replace(staged, live_db)
+    except BaseException:
+        if os.path.lexists(staged):
+            os.remove(staged)
+        raise
+    got = _inspect(live_db)
+    ok = got["integrity_ok"] and got["tables"] == v["tables"] and _sha256(live_db) == v["sha256"]
+    return {"ok": ok, "live": live_db, "previous_kept_as": kept, "tables": got["tables"],
+            "note": "the previous database was renamed, not deleted; start the machine only after you have checked this result"}
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -152,7 +227,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     b = sub.add_parser("backup"); b.add_argument("--db", required=True); b.add_argument("--out-dir", required=True)
     v = sub.add_parser("verify"); v.add_argument("--backup", required=True)
     r = sub.add_parser("restore"); r.add_argument("--backup", required=True); r.add_argument("--into", required=True)
+    pr = sub.add_parser("promote"); pr.add_argument("--restored", required=True); pr.add_argument("--live-db", required=True)
+    pr.add_argument("--confirm-owner", action="store_true")
     a = ap.parse_args(argv)
+    if a.cmd == "promote":
+        res = promote(a.restored, a.live_db, confirm_owner=a.confirm_owner)
+        print(json.dumps(res, indent=2, sort_keys=True))
+        return 0 if res.get("ok") else 1
     if a.cmd == "backup":
         res = backup(a.db, a.out_dir)
     elif a.cmd == "verify":

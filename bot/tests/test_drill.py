@@ -67,6 +67,12 @@ class Venue:
         if not self.reachable:
             raise RuntimeError("venue unreachable")
 
+    position_mode = "one_way"          # a test sets "hedge" to prove the drill refuses before sending anything
+
+    def get_position_mode(self, symbol):
+        self._live()
+        return self.position_mode
+
     def get_mark(self, symbol):
         self._live()
         return MARK

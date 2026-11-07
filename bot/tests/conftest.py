@@ -220,3 +220,32 @@ def _no_test_opens_the_tracked_state_database():
         yield
     finally:
         sqlite3.connect = real_connect
+
+
+@pytest.fixture(autouse=True)
+def _drill_entry_ledger_per_test(request, tmp_path, monkeypatch):
+    """The drill claims one armed entry per UTC day in a ledger file it is told to use, and refuses when none is named. Tests that arm a drill do not
+    name one, so each gets a fresh temporary ledger (no test can consume another's day). A test of the real refusal marks itself
+    ``real_entry_ledger`` and sees the original function."""
+    if request.node.get_closest_marker("real_entry_ledger"):
+        yield
+        return
+    import sys
+    bot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for extra in (bot, os.path.join(bot, "tools")):
+        if extra not in sys.path:
+            sys.path.insert(0, extra)
+    try:
+        import drill
+    except Exception:                                               # noqa: BLE001 - a test session that cannot import the drill has nothing to patch
+        yield
+        return
+    original = drill.claim_entry_slot
+    ledger = str(tmp_path / "drill_entries_per_test.jsonl")
+
+    def with_ledger(path, now_ms, max_per_day=None):
+        return original(path or ledger, now_ms, max_per_day)
+
+    with_ledger.__wrapped__ = original
+    monkeypatch.setattr(drill, "claim_entry_slot", with_ledger)
+    yield
