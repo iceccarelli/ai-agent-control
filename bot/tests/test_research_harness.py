@@ -1,6 +1,7 @@
 """The research harness must make bad strategies die: look-ahead, survivorship, uncounted variants, overfit-by-search, zero costs, leaky splits."""
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -34,7 +35,7 @@ def spec(name="cross_sectional_funding"):
 
 def pit_universe():
     return RH.PointInTimeUniverse({"AAA": {"listed_ms": 0, "delisted_ms": 5_000}, "BBB": {"listed_ms": 0}, "CCC": {"listed_ms": 1_000, "delisted_ms": 9_000}},
-                                  membership_source="exchange_listing_records", includes_delisted=True)
+                                  membership_source=PIT_SRC, includes_delisted=True, observed_from_ms=0, observed_to_ms=10_000)
 
 
 def survivors():
@@ -42,12 +43,39 @@ def survivors():
 
 
 CLEAN = RH.LeakAudit(True, 10, ())
-SHA = "ab" * 32
+SHA = hashlib.sha256(b"harness fixture input data").hexdigest()
+PIT_SRC = "exchange_instruments_info_snapshots_with_status_history"
 
 
 def planted_edge(n=2000, mean=5.0, sd=10.0, seed=1):
     r = random.Random(seed)
     return [r.gauss(mean, sd) for _ in range(n)]
+
+
+
+# ------------------------------------------------------------------ helpers for the train-only selection log
+N_ROWS = 1000
+
+
+def variant_rets():
+    return {"v": planted_edge(n=N_ROWS, mean=5.0, seed=1), "w": planted_edge(n=N_ROWS, mean=4.0, seed=2)}
+
+
+def honest_log(folds, vr, off=0):
+    log, oos = [], []
+    for k, f in enumerate(folds):
+        means = {n: sum(r[off + t] for t in f.train) / len(f.train) for n, r in vr.items()}
+        pick = max(means, key=lambda n: (means[n], n))
+        log.append({"fold": k, "chosen": pick, "train_window": [f.train[0], f.train[-1]]})
+        oos.extend(vr[pick][off + t] for t in f.test)
+    return log, oos
+
+
+def oos_ev(L, folds, vr=None, log=None, oos=None, **kw):
+    vr = vr or variant_rets()
+    hl, ho = honest_log(folds, vr)
+    return RH.oos_evidence(spec=spec(), oos_returns=oos if oos is not None else ho, ledger=L, universe=pit_universe(), leak=CLEAN, folds=folds, n=N_ROWS, label_horizon=5,
+                           embargo=5, data_sha256=SHA, selection_log=log if log is not None else hl, variant_returns=vr, **kw)
 
 
 # ------------------------------------------------------------------ universe / survivorship
@@ -81,8 +109,8 @@ def test_survivor_universe_is_not_point_in_time_even_with_dates():
     assert not s.point_in_time
     assert any("SURVIVOR_BASED" in p for p in s.survivorship_problems())
     assert pit_universe().point_in_time
-    no_delistings = RH.PointInTimeUniverse({"AAA": {"listed_ms": 0, "delisted_ms": 5_000}, "BBB": {"listed_ms": 0}}, membership_source="exchange_listing_records",
-                                           includes_delisted=False)
+    no_delistings = RH.PointInTimeUniverse({"AAA": {"listed_ms": 0, "delisted_ms": 5_000}, "BBB": {"listed_ms": 0}}, membership_source=PIT_SRC,
+                                           includes_delisted=False, observed_from_ms=0, observed_to_ms=10_000)
     assert not no_delistings.point_in_time and "SOURCE_DOES_NOT_RECORD_DELISTED_SYMBOLS" in no_delistings.survivorship_problems()
 
 
@@ -90,12 +118,12 @@ def test_survivorship_is_caught_in_the_evidence():
     """A real, planted, significant edge on a survivor universe must NOT be counted."""
     L = RH.VariantLedger(fam())
     st = L.record("v", {"k": 1}, planted_edge())
-    ev = RH.historical_evidence(stats=st, selection=L.selection(), universe=survivors(), leak=CLEAN, data_sha256=SHA)
+    ev = RH.historical_evidence(spec=spec(), stats=st, ledger=L, universe=survivors(), leak=CLEAN, data_sha256=SHA)
     assert ev.metrics["universe_point_in_time"] is False
     assert ev.result == SV.INCONCLUSIVE, ev
     ok, why = SV.counted(ev, spec())
     assert not ok and why == "INCONCLUSIVE"
-    forced = SV.EvidenceItem(ev.stage, SV.PASS, ev.provenance, ev.metrics, ev.data_sha256)
+    forced = dataclasses.replace(ev, result=SV.PASS)             # same stamps, forced PASS: only the metrics can stop it
     assert SV.counted(forced, spec()) == (False, "UNIVERSE_NOT_POINT_IN_TIME")
 
 
@@ -103,7 +131,7 @@ def test_positive_control_a_clean_planted_edge_is_counted():
     """The guards are not simply always-on: clean data + real edge + PIT universe -> PASS and counted."""
     L = RH.VariantLedger(fam())
     st = L.record("v", {"k": 1}, planted_edge())
-    ev = RH.historical_evidence(stats=st, selection=L.selection(), universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
+    ev = RH.historical_evidence(spec=spec(), stats=st, ledger=L, universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
     assert ev.result == SV.PASS, ev.metrics
     assert SV.counted(ev, spec()) == (True, None)
     m = ev.metrics
@@ -167,9 +195,9 @@ def test_look_ahead_is_caught_in_the_evidence():
     L = RH.VariantLedger(fam())
     st = L.record("v", {"k": 1}, planted_edge())
     leaky = RH.LeakAudit(False, 50, (3, 9))
-    ev = RH.historical_evidence(stats=st, selection=L.selection(), universe=pit_universe(), leak=leaky, data_sha256=SHA)
+    ev = RH.historical_evidence(spec=spec(), stats=st, ledger=L, universe=pit_universe(), leak=leaky, data_sha256=SHA)
     assert ev.metrics["uses_future_information"] is True and ev.result == SV.INCONCLUSIVE
-    forced = SV.EvidenceItem(ev.stage, SV.PASS, ev.provenance, ev.metrics, ev.data_sha256)
+    forced = dataclasses.replace(ev, result=SV.PASS)             # same stamps, forced PASS: only the metrics can stop it
     assert SV.counted(forced, spec()) == (False, "LOOK_AHEAD_NOT_RULED_OUT")
 
 
@@ -259,7 +287,7 @@ def test_overfit_by_search_pure_noise_is_not_significant_after_correction():
         rets[j] = [r.gauss(0, 1) for _ in range(500)]
         L.record(f"noise{j}", {"j": j}, rets[j])
     sel = L.selection()
-    ev = RH.historical_evidence(stats=RH.significance(rets[int(sel["best_variant"][5:])]), selection=sel, universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
+    ev = RH.historical_evidence(spec=spec(), stats=RH.significance(rets[int(sel["best_variant"][5:])]), ledger=L, universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
     assert ev.result != SV.PASS, f"noise winner passed: {sel}"
 
 
@@ -302,10 +330,11 @@ def test_walk_forward_refuses_a_short_embargo():
 def test_oos_evidence_flags_a_leaky_split():
     L = RH.VariantLedger(fam())
     L.record("v", {"k": 1}, planted_edge())
+    L.record("w", {"k": 2}, planted_edge(seed=2))
     folds = RH.walk_forward_folds(1000, 300, 100, 5, 5)
     leaky = [RH.Fold(tuple(range(0, 450)), folds[0].test)] + folds[1:]        # train reaches into the test window
-    ok = RH.oos_evidence(oos_returns=planted_edge(), ledger=L, universe=pit_universe(), leak=CLEAN, folds=folds, n=1000, label_horizon=5, embargo=5, data_sha256=SHA)
-    bad = RH.oos_evidence(oos_returns=planted_edge(), ledger=L, universe=pit_universe(), leak=CLEAN, folds=leaky, n=1000, label_horizon=5, embargo=5, data_sha256=SHA)
+    ok = oos_ev(L, folds)
+    bad = oos_ev(L, leaky)
     assert ok.result == SV.PASS and ok.metrics["uses_future_information"] is False, ok.metrics
     assert bad.metrics["uses_future_information"] is True and bad.result != SV.PASS
 
@@ -382,6 +411,236 @@ def test_cross_sectional_funding_demo_is_killed_honestly():
 def test_demo_cannot_be_promoted_even_if_the_numbers_were_great():
     """Replace the demo's evidence with a significant one: the non-PIT universe still keeps it from counting."""
     r = RH.cross_sectional_funding_demo(DATA, family=fam())
-    forged = SV.EvidenceItem("historical_test", SV.PASS, "offline_backtest", dict(r["historical"].metrics, p_adjusted=0.0001), r["historical"].data_sha256)
+    forged = dataclasses.replace(r["historical"], result=SV.PASS, metrics=dict(r["historical"].metrics, p_adjusted=0.0001))
     v = SV.evaluate(spec("cross_sectional_funding"), [forged])
     assert v.verdict == SV.INSUFFICIENT_DATA and v.stages["historical_test"] == "NOT_COUNTED:UNIVERSE_NOT_POINT_IN_TIME", (v.verdict, v.stages)
+
+
+# ================================================================== red-team round
+# ---- (6) family key normalisation and persistence
+@pytest.mark.parametrize("a,b", [("fam", "fam "), ("fam", "FAM"), ("fam x", "  Fam   X\t"), ("Straße", "STRASSE")])
+def test_family_key_is_normalised(a, b):
+    a, b = a + uuid.uuid4().hex[:6], b + uuid.uuid4().hex[:6]
+    sfx = uuid.uuid4().hex
+    A, B = RH.VariantLedger(a.split()[0][:0] + "fx_" + sfx), RH.VariantLedger(" FX_" + sfx.upper() + " ")
+    assert A.family == B.family == "fx_" + sfx
+    A.record_rejected("n", {"i": 1}, "r")
+    assert B.n_variants == 1 and RH.VariantLedger("Fx_" + sfx).n_variants == 1
+
+
+def test_family_spellings_share_one_count_and_empty_is_refused():
+    sfx = uuid.uuid4().hex
+    one = RH.VariantLedger(f"My Fam {sfx}")
+    for i in range(3):
+        one.record_rejected(f"r{i}", {"i": i}, "x")
+    for spelling in (f"my fam {sfx}", f"MY   FAM {sfx} ", f"\tmy\u00a0fam {sfx}"):
+        assert RH.VariantLedger(spelling).n_variants == 3, spelling
+    for bad in ("", "   ", "\t\n", None, 5):
+        with pytest.raises(RH.HarnessError):
+            RH.VariantLedger(bad)
+
+
+def _restart():
+    RH._FAMILY_HIGH_WATER.clear()
+    RH._PATH_HIGH_WATER.clear()
+
+
+def test_ledger_persists_across_a_restart_and_only_grows(tmp_path):
+    p = str(tmp_path / "variants.jsonl")
+    f = fam()
+    r = random.Random(4)
+    L = RH.VariantLedger(f, path=p)
+    for i in range(3):
+        L.record(f"v{i}", {"i": i}, [r.gauss(0, 1) for _ in range(100)])
+    L.record_rejected("bad", {"i": 9}, "failed sanity")
+    assert L.n_variants == 4
+    sel_before = L.selection()
+    _restart()                                                          # a new process: the in-memory counter is gone
+    L2 = RH.VariantLedger(f.upper(), path=p)
+    assert L2.n_variants == 4 and L2.selection() == sel_before
+    L2.record("v_new", {"i": 5}, [r.gauss(0, 1) for _ in range(100)])
+    assert L2.n_variants == 5
+    _restart()
+    assert RH.VariantLedger(f, path=p).n_variants == 5
+    # a ledger for another family cannot adopt this file
+    with pytest.raises(RH.HarnessError):
+        RH.VariantLedger(fam(), path=p)
+
+
+def test_persisted_ledger_detects_truncation_and_edits(tmp_path):
+    import shutil
+    p = str(tmp_path / "v.jsonl")
+    f = fam()
+    L = RH.VariantLedger(f, path=p)
+    r = random.Random(5)
+    for i in range(4):
+        L.record(f"v{i}", {"i": i}, [r.gauss(0, 1) for _ in range(100)])
+    good = {n: open(p + n, "rb").read() for n in ("", ".chain", ".head")}
+
+    def reset():
+        _restart()
+        for n, b in good.items():
+            open(p + n, "wb").write(b)
+
+    reset()
+    assert RH.VariantLedger(f, path=p).n_variants == 4                  # positive control
+    # 1. last row dropped from the data file only
+    reset()
+    rows = good[""].split(b"\n")[:-1]
+    open(p, "wb").write(b"\n".join(rows[:-1]) + b"\n")
+    with pytest.raises(RH.HarnessError):
+        RH.VariantLedger(f, path=p)
+    # 2. torn (half-written) last line
+    reset()
+    open(p, "wb").write(good[""][:-20])
+    with pytest.raises(RH.HarnessError):
+        RH.VariantLedger(f, path=p)
+    # 3. a row edited in place (the p-value made better)
+    reset()
+    open(p, "wb").write(good[""].replace(b'"n_obs":100', b'"n_obs":101', 1))
+    with pytest.raises(RH.HarnessError):
+        RH.VariantLedger(f, path=p)
+    # 4. a middle row deleted
+    reset()
+    open(p, "wb").write(b"\n".join(rows[:1] + rows[2:]) + b"\n")
+    with pytest.raises(RH.HarnessError):
+        RH.VariantLedger(f, path=p)
+    # 5. data file, sidecar and head all truncated together: internally consistent, caught by the caller's external anchor
+    reset()
+    chain = good[".chain"].split(b"\n")[:-1]
+    open(p, "wb").write(b"\n".join(rows[:2]) + b"\n")
+    open(p + ".chain", "wb").write(b"\n".join(chain[:2]) + b"\n")
+    import json as _j
+    open(p + ".head", "w").write(_j.dumps({"n": 2, "head": _j.loads(chain[1])["h"]}, sort_keys=True))
+    anchor = {"n": 4, "head": _j.loads(chain[3])["h"]}
+    with pytest.raises(RH.HarnessError):
+        RH.VariantLedger(f, path=p, anchors=[anchor])
+    # 6. in-process: a file shorter than the count this process already saw for it is refused even without an anchor
+    reset()
+    RH.VariantLedger(f, path=p)
+    open(p, "wb").write(b"\n".join(rows[:2]) + b"\n")
+    open(p + ".chain", "wb").write(b"\n".join(chain[:2]) + b"\n")
+    open(p + ".head", "w").write(_j.dumps({"n": 2, "head": _j.loads(chain[1])["h"]}, sort_keys=True))
+    with pytest.raises(RH.HarnessError):
+        RH.VariantLedger(f, path=p)
+
+
+def test_evidence_takes_n_variants_from_the_ledger_not_a_free_integer():
+    L = RH.VariantLedger(fam())
+    st = L.record("v", {"k": 1}, planted_edge())
+    for i in range(4):
+        L.record_rejected(f"r{i}", {"i": i}, "dropped")
+    with pytest.raises(TypeError):
+        RH.historical_evidence(spec=spec(), stats=st, selection={"best_p_adjusted": 0.0, "alpha": 0.05, "n_variants_tested": 1, "best_variant": "v"},
+                               universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
+    ev = RH.historical_evidence(spec=spec(), stats=st, ledger=L, universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
+    assert ev.metrics["n_variants_tested"] == 5 == L.n_variants
+    # stats that are not the ledger's best variant's are refused
+    with pytest.raises(RH.HarnessError):
+        RH.historical_evidence(spec=spec(), stats=RH.significance(planted_edge(seed=77)), ledger=L, universe=pit_universe(), leak=CLEAN, data_sha256=SHA)
+    with pytest.raises(TypeError):
+        RH._build("historical_test", stats=st, p_adjusted=0.0, alpha=0.05, n_variants=1, universe=pit_universe(), leak=CLEAN, data_sha256=SHA,
+                  provenance="x", split_clean=True, extra={})
+
+
+# ---- (7) survivorship
+FAKE_DELIST = {"AAA": {"listed_ms": 0, "delisted_ms": 5_000}, "BBB": {"listed_ms": 0}}
+
+
+def test_arbitrary_membership_source_is_not_point_in_time():
+    for src in ("trust_me", "exchange_listing_records", "survivors_but_with_delistings", PIT_SRC.upper(), PIT_SRC + "x"):
+        u = RH.PointInTimeUniverse(FAKE_DELIST, membership_source=src, includes_delisted=True, observed_from_ms=0, observed_to_ms=10_000)
+        assert not u.point_in_time and any("NOT_ALLOWLISTED" in p for p in u.survivorship_problems()), src
+    for src in RH.PIT_SOURCE_KINDS:
+        assert RH.PointInTimeUniverse(FAKE_DELIST, membership_source=src, includes_delisted=True, observed_from_ms=0, observed_to_ms=10_000).point_in_time
+    assert set(RH.PIT_SOURCE_KINDS) >= {"exchange_instruments_info_snapshots_with_status_history", "recorded_universe_snapshots"}
+
+
+def test_pit_needs_an_observed_window_and_a_delisting_inside_it_or_an_attestation():
+    def mk(members, **kw):
+        return RH.PointInTimeUniverse(members, membership_source=PIT_SRC, includes_delisted=True, **kw)
+    assert "OBSERVED_WINDOW_MISSING" in mk(FAKE_DELIST).survivorship_problems()
+    assert mk(FAKE_DELIST, observed_from_ms=0, observed_to_ms=10_000).point_in_time                       # control
+    # the one delisting is dated OUTSIDE the observed window: not evidence the source records delistings in it
+    out = mk(FAKE_DELIST, observed_from_ms=6_000, observed_to_ms=10_000)
+    assert not out.point_in_time and any("NO_DELISTING_EVENT_IN_OBSERVED_WINDOW" in p for p in out.survivorship_problems())
+    nobody = {"AAA": {"listed_ms": 0}, "BBB": {"listed_ms": 0}}
+    assert not mk(nobody, observed_from_ms=0, observed_to_ms=10_000).point_in_time
+    att = {"no_delistings_observed_in_window": True, "snapshot_sha256": ["cd" * 32, "ef" * 32]}
+    assert mk(nobody, observed_from_ms=0, observed_to_ms=10_000, no_delistings_attestation=att).point_in_time
+    for bad in ({"no_delistings_observed_in_window": True, "snapshot_sha256": []}, {"no_delistings_observed_in_window": True},
+                {"no_delistings_observed_in_window": True, "snapshot_sha256": ["nothex"]}, {"no_delistings_observed_in_window": False, "snapshot_sha256": ["cd" * 32]},
+                {"no_delistings_observed_in_window": "yes", "snapshot_sha256": ["cd" * 32]}):
+        assert not mk(nobody, observed_from_ms=0, observed_to_ms=10_000, no_delistings_attestation=bad).point_in_time, bad
+    # an attestation that contradicts a delisting present in the window is not accepted
+    assert not mk(FAKE_DELIST, observed_from_ms=0, observed_to_ms=10_000, no_delistings_attestation=att).point_in_time
+    with pytest.raises(RH.HarnessError):
+        mk(FAKE_DELIST, observed_from_ms=10, observed_to_ms=10)
+    with pytest.raises(RH.HarnessError):
+        mk(FAKE_DELIST, observed_from_ms=0)
+
+
+def test_fake_delisted_symbol_with_arbitrary_source_cannot_make_a_pit_pass():
+    L = RH.VariantLedger(fam())
+    st = L.record("v", {"k": 1}, planted_edge())
+    u = RH.PointInTimeUniverse(FAKE_DELIST, membership_source="whatever_i_say", includes_delisted=True, observed_from_ms=0, observed_to_ms=10_000)
+    ev = RH.historical_evidence(spec=spec(), stats=st, ledger=L, universe=u, leak=CLEAN, data_sha256=SHA)
+    assert ev.metrics["universe_point_in_time"] is False and ev.result == SV.INCONCLUSIVE
+
+
+# ---- (8) selection log: train-only selection is recomputed
+def _two_variant_ledger():
+    L = RH.VariantLedger(fam())
+    for n, r in variant_rets().items():
+        L.record(n, {"n": n}, r)
+    return L
+
+
+def test_oos_with_an_honest_selection_log_passes():
+    folds = RH.walk_forward_folds(N_ROWS, 300, 100, 5, 5)
+    ev = oos_ev(_two_variant_ledger(), folds)
+    assert ev.result == SV.PASS and ev.metrics["selection_log_verified"] is True and ev.metrics["n_variants_tested"] == 2
+
+
+def test_oos_refuses_a_selection_not_a_function_of_the_train_window():
+    folds = RH.walk_forward_folds(N_ROWS, 300, 100, 5, 5)
+    L = _two_variant_ledger()
+    vr = variant_rets()
+    log, oos = honest_log(folds, vr)
+    # control: the log picks both variants somewhere or at least is consistent
+    other = "w" if log[1]["chosen"] == "v" else "v"
+    # (a) a variant picked with hindsight (the one that wins on the TEST window), logged as if chosen on train
+    peek = [dict(e) for e in log]
+    peek[1]["chosen"] = other
+    oos_peek = []
+    for k, f in enumerate(folds):
+        oos_peek.extend(vr[peek[k]["chosen"]][t] for t in f.test)
+    with pytest.raises(RH.HarnessError):
+        oos_ev(L, folds, vr, log=peek, oos=oos_peek)
+    # (b) honest log but returns that are not the chosen variants' test returns
+    with pytest.raises(RH.HarnessError):
+        oos_ev(L, folds, vr, log=log, oos=[x + 1.0 for x in oos])
+    with pytest.raises(RH.HarnessError):
+        oos_ev(L, folds, vr, log=log, oos=oos[:-1])
+    # (c) a log that names a train window other than the fold's
+    wrong = [dict(e) for e in log]
+    wrong[0]["train_window"] = [0, wrong[0]["train_window"][1] + 50]
+    with pytest.raises(RH.HarnessError):
+        oos_ev(L, folds, vr, log=wrong)
+    # (d) missing / extra / unknown-variant / malformed entries, or no log at all
+    for bad in (log[:-1], log + [log[-1]], [dict(e, chosen="ghost") for e in log], [dict(e, fold=7) for e in log], [], "x", [1]):
+        with pytest.raises(RH.HarnessError):
+            oos_ev(L, folds, vr, log=bad)
+    with pytest.raises(RH.HarnessError):
+        RH.oos_evidence(spec=spec(), oos_returns=oos, ledger=L, universe=pit_universe(), leak=CLEAN, folds=folds, n=N_ROWS, label_horizon=5, embargo=5, data_sha256=SHA,
+                        selection_log=None, variant_returns=vr)
+    with pytest.raises(TypeError):
+        RH.oos_evidence(spec=spec(), oos_returns=oos, ledger=L, universe=pit_universe(), leak=CLEAN, folds=folds, n=N_ROWS, label_horizon=5, embargo=5, data_sha256=SHA)
+
+
+def test_oos_selection_variant_must_be_counted_in_the_ledger():
+    folds = RH.walk_forward_folds(N_ROWS, 300, 100, 5, 5)
+    L = RH.VariantLedger(fam())
+    L.record("v", {"n": "v"}, variant_rets()["v"])           # "w" was tried but never counted
+    with pytest.raises(RH.HarnessError):
+        oos_ev(L, folds)

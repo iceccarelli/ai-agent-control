@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -39,15 +40,28 @@ class EconomicModelError(ValueError):
     """An input the model refuses (never silently repaired)."""
 
 
+# One canonical spelling of a number: ASCII digits, optional sign, optional fraction, optional exponent of at most two digits.
+# Python's own Decimal()/int() also accept underscores ('1_0' == 10), surrounding spaces and non-ASCII digits; none of that enters the model.
+_NUMBER_RE = re.compile(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]{1,2})?", re.ASCII)
+MAX_NUMBER_CHARS = 64
+MAX_ADJUSTED_EXPONENT = 30        # |adjusted exponent| above this (1e30, 1e-30) is a unit slip or an attack, not a venue quantity
+
+
 def to_decimal(x: Any) -> Decimal:
     if isinstance(x, bool) or isinstance(x, float):
         raise EconomicModelError(f"floats/bools are refused for exact arithmetic: {x!r} (pass a str, int or Decimal)")
-    try:
-        d = Decimal(x) if isinstance(x, (int, Decimal)) else Decimal(str(x).strip())
-    except Exception as exc:
-        raise EconomicModelError(f"not a decimal: {x!r}") from exc
+    if isinstance(x, str):
+        if len(x) > MAX_NUMBER_CHARS or not _NUMBER_RE.fullmatch(x):
+            raise EconomicModelError(f"not a canonical decimal (ASCII digits, optional sign/fraction/short exponent only): {x!r}")
+        d = Decimal(x)
+    elif isinstance(x, (int, Decimal)):
+        d = Decimal(x)
+    else:
+        raise EconomicModelError(f"not a decimal: {type(x).__name__} (pass a str, int or Decimal)")
     if not d.is_finite():
         raise EconomicModelError(f"non-finite: {x!r}")
+    if d != 0 and abs(d.adjusted()) > MAX_ADJUSTED_EXPONENT:
+        raise EconomicModelError(f"magnitude out of bounds (|exponent| > {MAX_ADJUSTED_EXPONENT}): {x!r}")
     return d
 
 
@@ -517,6 +531,8 @@ class Scenario:
     adverse_move_bps: Quantity = field(default_factory=lambda: unknown("bps"))      # move a residual exposure is exposed to
     adverse_selection_bps: Quantity = field(default_factory=lambda: unknown("bps"))  # per maker leg round trip
     margin_usd: Quantity = field(default_factory=lambda: unknown("usd"))
+    # probability that ONE maker leg fills; required (explicit, with provenance) for any maker leg, else the maker leg's cost is UNKNOWN
+    maker_fill_probability: Quantity = field(default_factory=lambda: unknown("probability"))
 
 
 @dataclass(frozen=True)
@@ -575,8 +591,13 @@ def _leg_costs(leg: Leg, notional: Decimal, scn: Scenario) -> Tuple[Quantity, Qu
     if op:
         return fee, unknown("bps"), unknown("bps"), blockers + [f"{leg.name}:{x}" for x in op]
     exit_side = "sell" if leg.side == "buy" else "buy"
-    if leg.role == "maker":                                  # no crossing; the price of not crossing is adverse selection
-        return fee, Quantity(Decimal(0), "derived", "bps"), Quantity(Decimal(0), "derived", "bps"), blockers
+    if leg.role == "maker":
+        # not crossing is only free if the order fills: the zero spread/slippage is as strong as the stated fill probability and never "derived"
+        p = scn.maker_fill_probability
+        if not p.known:
+            return fee, unknown("bps"), unknown("bps"), blockers + [f"{leg.name}:MAKER_FILL_PROBABILITY_UNKNOWN"]
+        zero = Quantity(Decimal(0), p.provenance, "bps")
+        return fee, zero, zero, blockers
     ent = walk_book(leg.book, leg.side, qty, now_ms=scn.now_ms, max_age_ms=scn.max_book_age_ms)
     ext = walk_book(leg.book, exit_side, qty, now_ms=scn.now_ms, max_age_ms=scn.max_book_age_ms)
     for w in (ent, ext):
@@ -604,11 +625,22 @@ def evaluate_chain(scn: Scenario) -> ChainResult:
             blockers.append(f"{leg.name}:NOT_TRADING")
     maker_legs = sum(1 for l in scn.legs if l.role == "maker")
     adverse = (scn.adverse_selection_bps * Decimal(maker_legs)) if maker_legs else Quantity(Decimal(0), "derived", "bps")
+    p_fill = scn.maker_fill_probability
+    if p_fill.known and not (Decimal(0) < p_fill.value <= Decimal(1)):
+        raise EconomicModelError(f"maker_fill_probability must lie in (0, 1], got {p_fill.value}")
+    if not maker_legs:
+        maker_fill = Quantity(Decimal(0), "derived", "bps")
+    elif p_fill.known and scn.gross_edge_bps.known:
+        # every maker leg must fill (independently) for the trade to exist: the expected edge forgone is (1 - p^k) of the gross edge
+        maker_fill = (Quantity(Decimal(1), "measured") - Quantity(p_fill.value ** maker_legs, p_fill.provenance)) * \
+            Quantity(max(scn.gross_edge_bps.value, Decimal(0)), scn.gross_edge_bps.provenance, "bps")
+    else:
+        maker_fill = unknown("bps")
     hold_frac = to_decimal(scn.hold_days) / Decimal(365) * BPS
     hedge_err = abs(Quantity(Decimal(1), "measured") - scn.hedge_ratio) * scn.adverse_move_bps
     comps: Dict[str, Quantity] = {
         "fees": qsum(fees, "bps"), "spread": qsum(spreads, "bps"), "slippage": qsum(slips, "bps"),
-        "adverse_selection": adverse, "impact": scn.impact_bps, "basis": scn.basis_cost_bps,
+        "adverse_selection": adverse, "maker_fill": maker_fill, "impact": scn.impact_bps, "basis": scn.basis_cost_bps,
         "borrow": scn.borrow_apr * hold_frac, "opportunity_cost": scn.opportunity_cost_apr * hold_frac,
         "hedge_error": hedge_err,
     }
@@ -616,7 +648,7 @@ def evaluate_chain(scn: Scenario) -> ChainResult:
     theo = scn.gross_edge_bps
     exe = (theo - comps["fees"] - comps["spread"] - comps["slippage"]) if executable else unknown("bps")
     cap = exe
-    for k in ("adverse_selection", "impact", "basis", "borrow", "opportunity_cost", "hedge_error"):
+    for k in ("adverse_selection", "maker_fill", "impact", "basis", "borrow", "opportunity_cost", "hedge_error"):
         cap = cap - comps[k]
     stages = {"THEORETICAL": theo, "EXECUTABLE": exe, "CAPTURABLE": cap, "REALISED": unknown("bps")}
     util = (Quantity(n, "measured", "usd") / scn.margin_usd) if scn.margin_usd.known else unknown("ratio")
@@ -839,12 +871,24 @@ def realised_result(*, fills: Sequence[Fill], expected_fill_ids: Sequence[str], 
 
 @dataclass(frozen=True)
 class ProfitAudit:
-    status: str        # CONFIRMED | PHANTOM_UNKNOWN_COMPONENTS | UNOBSERVED_COMPONENTS | MISMATCH
+    status: str        # CONFIRMED | INCOMPLETE_NO_COMPONENTS | PHANTOM_UNKNOWN_COMPONENTS | UNOBSERVED_COMPONENTS | MISMATCH
     detail: Tuple[str, ...]
 
 
+MAX_AUDIT_TOLERANCE = Decimal("0.05")      # quote-currency units (rounding dust); a wider tolerance would let a reported number confirm itself
+
+
 def audit_reported_profit(reported: Any, components: Mapping[str, Quantity], tolerance: Any = "0.01") -> ProfitAudit:
-    """A reported profit is only CONFIRMED when every component is known AND observed and they sum to it."""
+    """A reported profit is only CONFIRMED when at least one component exists, every component is known AND observed, and they sum to it.
+    ``tolerance`` must lie in [0, MAX_AUDIT_TOLERANCE]; anything else is refused (not clamped)."""
+    tol = to_decimal(tolerance)
+    if tol < 0 or tol > MAX_AUDIT_TOLERANCE:
+        raise EconomicModelError(f"audit tolerance {tol} outside [0, {MAX_AUDIT_TOLERANCE}]")
+    rep_d = to_decimal(reported)
+    if not isinstance(components, Mapping) or not all(isinstance(q, Quantity) for q in components.values()):
+        raise EconomicModelError("components must be a mapping of Quantity")
+    if not components:
+        return ProfitAudit("INCOMPLETE_NO_COMPONENTS", ("no components were checked",))
     unk = tuple(sorted(k for k, q in components.items() if not q.known))
     if unk:
         return ProfitAudit("PHANTOM_UNKNOWN_COMPONENTS", unk)
@@ -852,8 +896,8 @@ def audit_reported_profit(reported: Any, components: Mapping[str, Quantity], tol
     if soft:
         return ProfitAudit("UNOBSERVED_COMPONENTS", soft)
     total = sum((q.value for q in components.values()), Decimal(0))
-    if abs(total - to_decimal(reported)) > to_decimal(tolerance):
-        return ProfitAudit("MISMATCH", (f"sum={total}", f"reported={to_decimal(reported)}"))
+    if abs(total - rep_d) > tol:
+        return ProfitAudit("MISMATCH", (f"sum={total}", f"reported={rep_d}"))
     return ProfitAudit("CONFIRMED", ())
 
 
@@ -873,10 +917,32 @@ def _prov_label(qs: Sequence[Quantity]) -> str:
     return "economic_model:weakest=" + (weakest(*known) if known else "unknown")
 
 
-def cost_model_evidence(chain: ChainResult, *, recorded_ms: int = 0, data_sha256: Optional[str] = None,
-                        assumed_counts_as_unknown: bool = True):
-    """PASS only with zero unknown (and, strictly, zero ASSUMED) cost inputs and a positive net edge. Unknowns -> INCONCLUSIVE;
-    a fully known non-positive edge -> FAIL (killing is easy)."""
+_HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
+
+
+def _input_hash(data_sha256: Any, own: Optional[str] = None) -> str:
+    """The hash of the caller's REAL input data. Required; never defaulted to the scenario's own digest (that would certify itself)."""
+    if not isinstance(data_sha256, str) or not _HEX64.fullmatch(data_sha256):
+        raise EconomicModelError("data_sha256 is required: the lowercase SHA-256 of the caller's real input data")
+    if own is not None and data_sha256 == own:
+        raise EconomicModelError("data_sha256 equals the scenario's own digest: evidence must be bound to the input data, not to itself")
+    return data_sha256
+
+
+def _stamp(spec: Mapping[str, Any]) -> Dict[str, str]:
+    """candidate_id + spec_digest of the exact spec this evidence is about; ``strategy_verdict.counted`` refuses a PASS that does not match its spec."""
+    sv = _sv()
+    if not isinstance(spec, Mapping) or not isinstance(spec.get("candidate_id"), str) or not spec["candidate_id"]:
+        raise EconomicModelError("evidence must be built against a candidate spec with a candidate_id")
+    return {"candidate_id": spec["candidate_id"], "spec_digest": sv.spec_digest(spec)}
+
+
+def cost_model_evidence(chain: ChainResult, *, spec: Mapping[str, Any], data_sha256: Optional[str] = None, recorded_ms: int = 0):
+    """PASS only with zero unknown and zero ASSUMED cost inputs and a positive net edge (an assumed input is ALWAYS unknown for a PASS: its number is in
+    the metrics, never in the result). Unknowns -> INCONCLUSIVE; a fully known non-positive edge -> FAIL (killing is easy).
+    ``data_sha256`` is the caller's real input-data hash and is required."""
+    sha = _input_hash(data_sha256, chain.digest)
+    stamp = _stamp(spec)
     sv = _sv()
     unk = list(chain.unknown_inputs)
     if not chain.executable:
@@ -890,7 +956,7 @@ def cost_model_evidence(chain: ChainResult, *, recorded_ms: int = 0, data_sha256
         result, count, edge_v = sv.INCONCLUSIVE, max(len(unk), 1), None
     elif edge.value <= 0:
         result, count, edge_v = sv.FAIL, 0, float(edge.value)
-    elif assumed and assumed_counts_as_unknown:
+    elif assumed:
         result, count, edge_v = sv.INCONCLUSIVE, len(assumed), float(edge.value)
     else:
         result, count, edge_v = sv.PASS, 0, float(edge.value)
@@ -898,11 +964,13 @@ def cost_model_evidence(chain: ChainResult, *, recorded_ms: int = 0, data_sha256
                "unknown_names": unk, "assumed_names": assumed, "executable": chain.executable, "blockers": list(chain.blockers),
                "components_bps": {k: (None if not q.known else str(q.value)) for k, q in chain.components.items()}}
     return sv.EvidenceItem(stage="cost_model", result=result, provenance=_prov_label(list(chain.components.values())),
-                           metrics=metrics, data_sha256=data_sha256 or chain.digest, recorded_ms=recorded_ms)
+                           metrics=metrics, data_sha256=sha, recorded_ms=recorded_ms, **stamp)
 
 
-def capacity_evidence(capacity: Quantity, *, floor_bps: Any, min_viable_capacity_usd: Any, data_sha256: str,
-                      recorded_ms: int = 0, assumed_counts_as_unknown: bool = True):
+def capacity_evidence(capacity: Quantity, *, spec: Mapping[str, Any], floor_bps: Any, min_viable_capacity_usd: Any, data_sha256: Optional[str] = None,
+                      recorded_ms: int = 0):
+    sha = _input_hash(data_sha256)
+    stamp = _stamp(spec)
     sv = _sv()
     need = to_decimal(min_viable_capacity_usd)
     metrics: Dict[str, Any] = {"capacity_usd": as_float(capacity), "edge_floor_bps": float(to_decimal(floor_bps)),
@@ -911,9 +979,9 @@ def capacity_evidence(capacity: Quantity, *, floor_bps: Any, min_viable_capacity
         result = sv.INCONCLUSIVE
     elif capacity.value < need:
         result = sv.FAIL
-    elif capacity.provenance == "assumed" and assumed_counts_as_unknown:
+    elif capacity.provenance == "assumed":
         result = sv.INCONCLUSIVE
     else:
         result = sv.PASS
     return sv.EvidenceItem(stage="capacity_test", result=result, provenance=_prov_label([capacity]), metrics=metrics,
-                           data_sha256=data_sha256, recorded_ms=recorded_ms)
+                           data_sha256=sha, recorded_ms=recorded_ms, **stamp)

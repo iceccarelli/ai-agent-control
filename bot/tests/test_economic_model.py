@@ -5,6 +5,8 @@ Book depth: bids 0.5@49990, 1.5@49980; asks 0.5@50010, 1.5@50020.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import sys
 from decimal import Decimal as D
@@ -26,7 +28,10 @@ import strategy_verdict as SV  # noqa: E402
 
 NOW = 1_700_000_000_000
 H = 3_600_000
-SPEC = {"capacity_model": {"min_viable_capacity_usd": 100.0}}
+INPUT_SHA = hashlib.sha256(b"economic fixture input data").hexdigest()
+with open(os.path.join(BOT, "research", "candidates", "cross_sectional_funding.json"), encoding="utf-8") as _f:
+    SPEC = json.load(_f)
+SPEC["capacity_model"]["min_viable_capacity_usd"] = 100.0           # a real, valid candidate spec (candidate_id + digest are stamped on evidence)
 
 
 def perp(**kw):
@@ -181,7 +186,7 @@ def test_partial_hedge_costs_edge():
 
 def test_maker_rebate_leg():
     # maker rebate -1 bp: fees = 2*(-0.0001)*1e4 = -2 ; no spread/slippage ; adverse selection 3 per maker leg
-    r = EM.evaluate_chain(overlay(fee=tier(maker="-0.0001"), adverse_selection_bps=q("3"),
+    r = EM.evaluate_chain(overlay(fee=tier(maker="-0.0001"), adverse_selection_bps=q("3"), maker_fill_probability=q("1"),
                                   legs=(EM.Leg("perp", perp(), "sell", book(), tier(maker="-0.0001"), role="maker"),)))
     assert r.components["fees"].value == D("-2.0000") and r.components["spread"].value == 0 and r.components["adverse_selection"].value == D("3")
     assert r.stages["EXECUTABLE"].value == D("32")                       # 30 + 2
@@ -217,28 +222,28 @@ def test_capacity_exact():
 
 # ---------------------------------------------------------------- evidence for strategy_verdict
 def test_cost_model_evidence_counts_only_when_whole():
-    item = EM.cost_model_evidence(EM.evaluate_chain(overlay(opportunity_cost_apr=q("0.0", "measured"))), recorded_ms=1)
+    item = EM.cost_model_evidence(EM.evaluate_chain(overlay(opportunity_cost_apr=q("0.0", "measured"))), spec=SPEC, data_sha256=INPUT_SHA, recorded_ms=1)
     assert item.result == SV.PASS and item.metrics["unknown_cost_inputs"] == 0
     assert item.metrics["net_edge_bps_after_costs"] == 11.5                         # 13 - 0.5 - 1
     assert SV.counted(item, SPEC) == (True, None)
-    unk = EM.cost_model_evidence(EM.evaluate_chain(overlay(basis_cost_bps=EM.unknown("bps"))))
+    unk = EM.cost_model_evidence(EM.evaluate_chain(overlay(basis_cost_bps=EM.unknown("bps"))), spec=SPEC, data_sha256=INPUT_SHA)
     assert unk.result == SV.INCONCLUSIVE and unk.metrics["unknown_cost_inputs"] == 1 and unk.metrics["net_edge_bps_after_costs"] is None
     assert SV.counted(unk, SPEC)[0] is False
-    neg = EM.cost_model_evidence(EM.evaluate_chain(overlay(rate="0.00001")))        # gross 3 bps -> deeply negative, fully known
+    neg = EM.cost_model_evidence(EM.evaluate_chain(overlay(rate="0.00001")), spec=SPEC, data_sha256=INPUT_SHA)        # gross 3 bps -> deeply negative, fully known
     assert neg.result == SV.FAIL and SV.counted(neg, SPEC) == (True, None)
-    assumed = EM.cost_model_evidence(EM.evaluate_chain(overlay(fee=tier(source="assumed", observed=None))))
+    assumed = EM.cost_model_evidence(EM.evaluate_chain(overlay(fee=tier(source="assumed", observed=None))), spec=SPEC, data_sha256=INPUT_SHA)
     assert assumed.result == SV.INCONCLUSIVE and assumed.metrics["unknown_cost_inputs"] == 1   # strict: ASSUMED is not evidence
 
 
 def test_capacity_evidence():
     base = dict(impact_bps=q("0"), basis_cost_bps=q("0"), opportunity_cost_apr=q("0", "measured"))
     cap = EM.capacity_usd(overlay(**base), "12.5")
-    sha = "ab" * 32
-    ok = EM.capacity_evidence(cap, floor_bps="12.5", min_viable_capacity_usd=1000, data_sha256=sha)
+    sha = INPUT_SHA
+    ok = EM.capacity_evidence(cap, floor_bps="12.5", min_viable_capacity_usd=1000, spec=SPEC, data_sha256=sha)
     assert ok.result == SV.PASS and ok.metrics["capacity_usd"] == 66699.99 and SV.counted(ok, SPEC) == (True, None)
-    low = EM.capacity_evidence(cap, floor_bps="12.5", min_viable_capacity_usd=70000, data_sha256=sha)
+    low = EM.capacity_evidence(cap, floor_bps="12.5", min_viable_capacity_usd=70000, spec=SPEC, data_sha256=sha)
     assert low.result == SV.FAIL
-    assert EM.capacity_evidence(EM.unknown("usd"), floor_bps=1, min_viable_capacity_usd=1, data_sha256=sha).result == SV.INCONCLUSIVE
+    assert EM.capacity_evidence(EM.unknown("usd"), floor_bps=1, min_viable_capacity_usd=1, spec=SPEC, data_sha256=sha).result == SV.INCONCLUSIVE
 
 
 # ---------------------------------------------------------------- realised

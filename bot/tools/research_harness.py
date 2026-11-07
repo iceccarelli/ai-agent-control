@@ -25,7 +25,9 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -34,15 +36,17 @@ for _p in (BOT, os.path.join(BOT, "tools")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import evidence_chain as EC  # noqa: E402
 import evidence_stats as ES  # noqa: E402
 import statistical_power as SP  # noqa: E402
 import strategy_verdict as SV  # noqa: E402
 
 GAPS = (
-    "the variant family count is process-local: a NEW process starts at zero unless the caller anchors/persists the ledger (VariantLedger.anchor)",
+    "the variant family count survives a restart only if the caller gives VariantLedger a path (append-only hash-chained JSONL); a deleted file plus sidecars is caught only with the caller's external anchors=",
     "AsOfView makes the future unreachable through its API; Python cannot stop deliberate reflection into the caller's own full arrays",
     "detect_lookahead catches leaks visible as a difference between full-history and truncated-history features; a leak through a label is for audit_split",
-    "PointInTimeUniverse trusts the membership source's own claim that it records delistings; the harness cannot verify it against the exchange",
+    "PointInTimeUniverse accepts only allow-listed source KINDS and a delisting inside the observed window (or a hash-tied no-delisting attestation); the harness cannot verify either against the exchange",
+    "the selection log is verified by recomputing a best-train-mean selector; a different (documented) selection rule needs its own selector= and is only as honest as that function",
 )
 
 MS_8H = 8 * 3600 * 1000
@@ -78,12 +82,21 @@ def _int_ms(x: Any, name: str) -> int:
 
 #: Sources whose membership list is built from what survived to today: never point in time.
 NON_PIT_SOURCES = ("hand_picked", "hand_picked_survivors", "current_listing", "current_top_n", "survivors", "unknown")
+#: The ONLY source kinds accepted as point in time (documented kinds that record status history / dated snapshots). Anything else is not PIT.
+PIT_SOURCE_KINDS = ("exchange_instruments_info_snapshots_with_status_history", "recorded_universe_snapshots")
+_HEX64 = re.compile(r"[0-9a-f]{64}", re.ASCII)
 
 
 class PointInTimeUniverse:
-    """Membership as of timestamps: ``members = {symbol: {"listed_ms": int, "delisted_ms": int | None}}``. Active on [listed_ms, delisted_ms)."""
+    """Membership as of timestamps: ``members = {symbol: {"listed_ms": int, "delisted_ms": int | None}}``. Active on [listed_ms, delisted_ms).
 
-    def __init__(self, members: Mapping[str, Mapping[str, Any]], *, membership_source: str, includes_delisted: bool) -> None:
+    Point in time requires ALL of: an allow-listed ``membership_source`` kind, ``includes_delisted``, an observed window
+    [observed_from_ms, observed_to_ms], and either at least one delisting event dated inside that window or an explicit
+    ``no_delistings_attestation = {"no_delistings_observed_in_window": True, "snapshot_sha256": [64-hex, ...]}`` tied to snapshot hashes."""
+
+    def __init__(self, members: Mapping[str, Mapping[str, Any]], *, membership_source: str, includes_delisted: bool,
+                 observed_from_ms: Optional[int] = None, observed_to_ms: Optional[int] = None,
+                 no_delistings_attestation: Optional[Mapping[str, Any]] = None) -> None:
         if not isinstance(members, Mapping) or isinstance(members, (str, bytes)):
             raise SurvivorshipError("a universe needs {symbol: {listed_ms, delisted_ms}} with as-of dates; a bare symbol list has none and is refused")
         if not members:
@@ -101,6 +114,15 @@ class PointInTimeUniverse:
                 if hi <= lo:
                     raise HarnessError(f"{sym}: delisted_ms must be after listed_ms")
             self._m[str(sym)] = (lo, hi)
+        if (observed_from_ms is None) != (observed_to_ms is None):
+            raise HarnessError("observed_from_ms and observed_to_ms must be given together")
+        if observed_from_ms is not None:
+            _int_ms(observed_from_ms, "observed_from_ms")
+            _int_ms(observed_to_ms, "observed_to_ms")
+            if observed_to_ms <= observed_from_ms:
+                raise HarnessError("observed_to_ms must be after observed_from_ms")
+        self.observed_from_ms, self.observed_to_ms = observed_from_ms, observed_to_ms
+        self.no_delistings_attestation = dict(no_delistings_attestation) if isinstance(no_delistings_attestation, Mapping) else None
         self.membership_source = membership_source.strip()
         self.includes_delisted = bool(includes_delisted)
 
@@ -126,15 +148,30 @@ class PointInTimeUniverse:
         if hi is not None and t >= hi:
             raise UniverseError(f"{symbol} queried at {t} at/after its delisting at {hi}")
 
+    def _attestation_ok(self) -> bool:
+        a = self.no_delistings_attestation
+        if not a or a.get("no_delistings_observed_in_window") is not True:
+            return False
+        h = a.get("snapshot_sha256")
+        return isinstance(h, (list, tuple)) and len(h) > 0 and all(isinstance(x, str) and _HEX64.fullmatch(x) for x in h)
+
     def survivorship_problems(self) -> List[str]:
         """Why this universe is NOT point in time. Empty = point in time (as far as its own source says)."""
         out: List[str] = []
         if self.membership_source in NON_PIT_SOURCES:
             out.append(f"MEMBERSHIP_SOURCE_IS_SURVIVOR_BASED:{self.membership_source}")
+        if self.membership_source not in PIT_SOURCE_KINDS:
+            out.append(f"MEMBERSHIP_SOURCE_NOT_ALLOWLISTED:{self.membership_source}")
         if not self.includes_delisted:
             out.append("SOURCE_DOES_NOT_RECORD_DELISTED_SYMBOLS")
-        if all(hi is None for _lo, hi in self._m.values()) and len(self._m) < 10:
-            out.append("NO_MEMBER_EVER_DELISTED_IN_A_SMALL_UNIVERSE")
+        if self.observed_from_ms is None:
+            out.append("OBSERVED_WINDOW_MISSING")
+        else:
+            inside = [s for s, (_lo, hi) in self._m.items() if hi is not None and self.observed_from_ms <= hi <= self.observed_to_ms]
+            if inside and self.no_delistings_attestation is not None:
+                out.append("ATTESTATION_CONTRADICTS_DELISTING_IN_WINDOW")
+            elif not inside and not self._attestation_ok():
+                out.append("NO_DELISTING_EVENT_IN_OBSERVED_WINDOW_AND_NO_VALID_ATTESTATION")
         return out
 
     @property
@@ -267,26 +304,79 @@ def walk_forward_folds(n: int, train_min: int, test_len: int, label_horizon: int
 # ---------------------------------------------------------------- the variant counter
 
 _FAMILY_HIGH_WATER: Dict[str, int] = {}
+_PATH_HIGH_WATER: Dict[str, int] = {}
+
+
+def normalise_family(family: Any) -> str:
+    """The ONE key a family is counted under: NFKC, whitespace collapsed (incl. non-breaking), casefolded. Empty is refused."""
+    if not isinstance(family, str):
+        raise HarnessError("a variant ledger needs a family name")
+    key = " ".join(unicodedata.normalize("NFKC", family).split()).casefold()
+    if not key:
+        raise HarnessError("a variant ledger needs a family name")
+    return key
 
 
 class VariantLedger:
     """Counts EVERY attempted variant of a research family, including ones rejected before they were ever tested (recorded with p = 1).
 
     Monotone and unresettable: there is no reset/clear/remove; the hash-chained ``TrialLedger`` underneath detects tampering; and a NEW VariantLedger for
-    a family already seen in this process starts from that family's high-water mark, so building a fresh object does not erase the search."""
+    a family already seen in this process starts from that family's high-water mark. The family key is normalised ('fam', 'fam ', 'FAM' are one family).
 
-    def __init__(self, family: str) -> None:
-        if not isinstance(family, str) or not family.strip():
-            raise HarnessError("a variant ledger needs a family name")
-        self.family = family
-        self._carried = _FAMILY_HIGH_WATER.get(family, 0)
+    With ``path`` the ledger is persisted as an append-only, hash-chained JSONL file (``evidence_chain``): it is verified on load (a truncated, edited,
+    reordered or torn file raises HarnessError), replayed, and every later record is appended, so the count survives a restart and only grows.
+    ``anchors`` (``[{"n", "head"}]`` kept OUTSIDE the file) additionally catches a file+sidecar truncated together."""
+
+    def __init__(self, family: str, *, path: Optional[str] = None, anchors: Optional[Sequence[Mapping[str, Any]]] = None) -> None:
+        self.family = normalise_family(family)
+        self.path = os.path.abspath(path) if path is not None else None
         self._tl = SP.TrialLedger()
+        self._persisted = 0
+        if self.path is None:
+            self._carried = _FAMILY_HIGH_WATER.get(self.family, 0)
+        else:
+            self._carried = 0
+            self._load(anchors)
         self._sync()
+
+    def _load(self, anchors: Optional[Sequence[Mapping[str, Any]]]) -> None:
+        if not (os.path.exists(self.path) or anchors):
+            return
+        v = EC.verify(self.path, anchors)
+        if not v["ok"] or not v["fully_chained"]:
+            raise HarnessError(f"variant ledger file failed verification: {[i['code'] for i in v['issues']] or 'unchained tail'}")
+        lines, quarantined = EC.read_lines(self.path)
+        if quarantined:
+            raise HarnessError("variant ledger file has a torn or unparseable final line")
+        for i, row in enumerate(EC.rows_of(lines)):
+            if not isinstance(row, dict) or row.get("kind") != "variant" or row.get("seq") != i:
+                raise HarnessError(f"variant ledger row {i} is malformed or out of sequence")
+            if row.get("family") != self.family:
+                raise HarnessError(f"variant ledger row {i} belongs to family {row.get('family')!r}, not {self.family!r}")
+            try:
+                self._tl.record(row["strategy_id"], row["params_hash"], row["window_id"], row["statistic"], pvalue=row["pvalue"], n_obs=row["n_obs"])
+            except (KeyError, SP.StatisticalPowerError) as exc:
+                raise HarnessError(f"variant ledger row {i} is not a valid trial: {exc}") from exc
+        seen = _PATH_HIGH_WATER.get(self.path, 0)
+        if self._tl.n_trials < seen:
+            raise HarnessError(f"variant ledger file holds {self._tl.n_trials} variants but this process already saw {seen}: truncated")
+        self._persisted = self._tl.n_trials
+
+    def _persist(self) -> None:
+        if self.path is None:
+            return
+        t = self._tl.trials[-1]
+        EC.append(self.path, {"kind": "variant", "seq": self._persisted, "family": self.family, "strategy_id": t.strategy_id, "params_hash": t.params_hash,
+                              "window_id": t.window_id, "statistic": t.statistic, "pvalue": t.pvalue, "n_obs": t.n_obs})
+        self._persisted += 1
+        _PATH_HIGH_WATER[self.path] = max(_PATH_HIGH_WATER.get(self.path, 0), self._persisted)
 
     def _sync(self) -> None:
         total = self._carried + self._tl.n_trials
         if total > _FAMILY_HIGH_WATER.get(self.family, 0):
             _FAMILY_HIGH_WATER[self.family] = total
+        if self.path is not None:
+            _PATH_HIGH_WATER[self.path] = max(_PATH_HIGH_WATER.get(self.path, 0), self._tl.n_trials)
 
     @property
     def n_variants(self) -> int:
@@ -298,6 +388,17 @@ class VariantLedger:
     def carried_prior_variants(self) -> int:
         return self._carried
 
+    def variant_names(self) -> Tuple[str, ...]:
+        """Names of the variants that were actually TESTED (rejected ones are counted but cannot be selected)."""
+        self._tl.verify()
+        return tuple(sorted({t.strategy_id for t in self._tl.trials if t.window_id != "rejected"}))
+
+    def best_trial(self) -> Any:
+        pv = self._tl.pvalues()
+        if not pv:
+            raise HarnessError("no variants recorded")
+        return self._tl.trials[min(range(len(pv)), key=lambda i: (pv[i], i))]
+
     def anchor(self) -> SP.LedgerAnchor:
         return self._tl.anchor()
 
@@ -308,6 +409,7 @@ class VariantLedger:
         """Count a variant AND test it. Returns its significance statistics."""
         st = significance(returns, ci=False)
         self._tl.record(name, SP.params_hash(params), window_id, st["mean"] if st["mean"] is not None else 0.0, pvalue=st["p_one_sided"], n_obs=st["n"])
+        self._persist()
         self._sync()
         st["variant"] = name
         return st
@@ -317,6 +419,7 @@ class VariantLedger:
         if not isinstance(reason, str) or not reason.strip():
             raise HarnessError("a rejected variant needs a reason")
         self._tl.record(name, SP.params_hash({**dict(params), "_rejected": reason}), "rejected", 0.0, pvalue=None, n_obs=0)
+        self._persist()
         self._sync()
 
     def _refuse(self, *_a: Any, **_k: Any) -> None:
@@ -427,8 +530,15 @@ def _guards(universe: PointInTimeUniverse, leak: LeakAudit, split_clean: bool = 
     return (not probs), uses_future, notes
 
 
+def _stamp(spec: Mapping[str, Any]) -> Dict[str, str]:
+    """candidate_id + spec_digest of the exact specification this evidence is about (``counted`` refuses a PASS that does not match its spec)."""
+    if not isinstance(spec, Mapping) or not isinstance(spec.get("candidate_id"), str) or not spec["candidate_id"]:
+        raise HarnessError("evidence must be built against a candidate spec with a candidate_id")
+    return {"candidate_id": spec["candidate_id"], "spec_digest": SV.spec_digest(spec)}
+
+
 def _build(stage: str, *, stats: Mapping[str, Any], p_adjusted: float, alpha: float, n_variants: int, universe: PointInTimeUniverse, leak: LeakAudit,
-           data_sha256: str, provenance: str, split_clean: bool, extra: Mapping[str, Any]) -> SV.EvidenceItem:
+           data_sha256: str, provenance: str, split_clean: bool, extra: Mapping[str, Any], spec: Mapping[str, Any]) -> SV.EvidenceItem:
     pit, uses_future, notes = _guards(universe, leak, split_clean)
     n_ind = int(stats["independent_observations"])
     mean = stats["mean"]
@@ -445,28 +555,82 @@ def _build(stage: str, *, stats: Mapping[str, Any], p_adjusted: float, alpha: fl
                "uses_future_information": bool(uses_future), "universe_point_in_time": bool(pit), "alpha": alpha, "p_adjusted": p_adjusted,
                "mean_net_per_settlement_bps": mean, "ess": stats["ess"], "n_raw": stats["n"], "guard_notes": notes}
     metrics.update(dict(extra))
-    return SV.EvidenceItem(stage=stage, result=result, provenance=provenance, metrics=metrics, data_sha256=data_sha256)
+    return SV.EvidenceItem(stage=stage, result=result, provenance=provenance, metrics=metrics, data_sha256=data_sha256, **_stamp(spec))
 
 
-def historical_evidence(*, stats: Mapping[str, Any], selection: Mapping[str, Any], universe: PointInTimeUniverse, leak: LeakAudit, data_sha256: str,
-                        provenance: str = "offline_backtest", extra: Optional[Mapping[str, Any]] = None) -> SV.EvidenceItem:
-    """Historical_test evidence for the BEST variant of a family, judged against the whole family (``VariantLedger.selection``)."""
+def historical_evidence(*, stats: Mapping[str, Any], ledger: VariantLedger, spec: Mapping[str, Any], universe: PointInTimeUniverse, leak: LeakAudit,
+                        data_sha256: str, alpha: float = 0.05, method: str = "holm", provenance: str = "offline_backtest",
+                        extra: Optional[Mapping[str, Any]] = None) -> SV.EvidenceItem:
+    """Historical_test evidence for the BEST variant of a family, judged against the whole family. ``n_variants_tested`` and the adjusted p come from the
+    LEDGER (never a free integer), and ``stats`` must be the ledger's best variant's own statistics."""
+    selection = ledger.selection(alpha=alpha, method=method)
+    best = ledger.best_trial()
+    if stats.get("n") != best.n_obs or stats.get("mean") is None or best.statistic is None or \
+            not math.isclose(float(stats["mean"]), float(best.statistic), rel_tol=1e-9, abs_tol=1e-12):
+        raise HarnessError("stats are not the ledger's best variant's statistics (n/mean differ from the recorded trial)")
     return _build("historical_test", stats=stats, p_adjusted=selection["best_p_adjusted"], alpha=selection["alpha"], n_variants=selection["n_variants_tested"],
-                  universe=universe, leak=leak, data_sha256=data_sha256, provenance=provenance, split_clean=True,
+                  universe=universe, leak=leak, data_sha256=data_sha256, provenance=provenance, split_clean=True, spec=spec,
                   extra={"best_variant": selection["best_variant"], **dict(extra or {})})
 
 
-def oos_evidence(*, oos_returns: Sequence[float], ledger: VariantLedger, universe: PointInTimeUniverse, leak: LeakAudit, folds: Sequence[Fold], n: int,
-                 label_horizon: int, embargo: int, data_sha256: str, alpha: float = 0.05, provenance: str = "offline_walk_forward",
-                 extra: Optional[Mapping[str, Any]] = None) -> SV.EvidenceItem:
-    """Out-of-sample evidence from STITCHED test-window returns. The p-value is adjusted over the ledger's whole family (the selection procedure was one of
-    the family's attempts). The folds are re-audited here; a leaking fold makes ``uses_future_information`` True."""
+class SelectionLogError(HarnessError):
+    """The per-fold selection log is missing, malformed, or not a function of each fold's train window."""
+
+
+def train_only_best(train_returns: Mapping[str, Sequence[float]]) -> str:
+    """The reference selector: highest mean return over the TRAIN window, ties to the greater name."""
+    return max(train_returns, key=lambda k: (sum(train_returns[k]) / len(train_returns[k]), k))
+
+
+def verify_selection_log(*, selection_log: Any, variant_returns: Mapping[str, Sequence[float]], folds: Sequence[Fold], oos_returns: Sequence[float],
+                         tested_variants: Sequence[str], index_offset: int = 0,
+                         selector: Callable[[Mapping[str, Sequence[float]]], str] = train_only_best) -> None:
+    """Each fold's chosen variant must be what ``selector`` returns from the TRAIN returns alone, the log's train window must be the fold's, every chosen
+    variant must be a counted (tested) variant, and ``oos_returns`` must be exactly the chosen variants' TEST-window returns, in order. Raises otherwise."""
+    if not isinstance(selection_log, (list, tuple)) or len(selection_log) != len(folds) or not folds:
+        raise SelectionLogError("selection_log must hold exactly one entry per fold")
+    if not isinstance(variant_returns, Mapping) or not variant_returns:
+        raise SelectionLogError("variant_returns (every variant's full return series) is required to recompute the selection")
+    lengths = {len(v) for v in variant_returns.values()}
+    if len(lengths) != 1:
+        raise SelectionLogError("variant return series differ in length")
+    rows = lengths.pop()
+    unknown_names = [k for k in variant_returns if k not in set(tested_variants)]
+    if unknown_names:
+        raise SelectionLogError(f"variants {unknown_names} are not counted in the variant ledger")
+    expected: List[float] = []
+    for k, (f, e) in enumerate(zip(folds, selection_log)):
+        if not isinstance(e, Mapping) or e.get("fold") != k or not isinstance(e.get("chosen"), str) or e.get("chosen") not in variant_returns:
+            raise SelectionLogError(f"fold {k}: malformed entry or unknown variant")
+        if list(e.get("train_window") or ()) != [f.train[0], f.train[-1]]:
+            raise SelectionLogError(f"fold {k}: logged train window {e.get('train_window')!r} is not the fold's [{f.train[0]}, {f.train[-1]}]")
+        idx_tr = [index_offset + t for t in f.train]
+        idx_te = [index_offset + t for t in f.test]
+        if min(idx_tr) < 0 or max(idx_tr + idx_te) >= rows:
+            raise SelectionLogError(f"fold {k}: indices outside the return series")
+        recomputed = selector({n: [r[i] for i in idx_tr] for n, r in variant_returns.items()})
+        if recomputed != e["chosen"]:
+            raise SelectionLogError(f"fold {k}: chosen {e['chosen']!r} is not what the train window alone selects ({recomputed!r})")
+        expected.extend(variant_returns[e["chosen"]][i] for i in idx_te)
+    if list(oos_returns) != expected:
+        raise SelectionLogError("oos_returns are not the chosen variants' test-window returns")
+
+
+def oos_evidence(*, oos_returns: Sequence[float], ledger: VariantLedger, spec: Mapping[str, Any], universe: PointInTimeUniverse, leak: LeakAudit,
+                 folds: Sequence[Fold], n: int, label_horizon: int, embargo: int, data_sha256: str, selection_log: Sequence[Mapping[str, Any]],
+                 variant_returns: Mapping[str, Sequence[float]], index_offset: int = 0,
+                 selector: Callable[[Mapping[str, Sequence[float]]], str] = train_only_best, alpha: float = 0.05,
+                 provenance: str = "offline_walk_forward", extra: Optional[Mapping[str, Any]] = None) -> SV.EvidenceItem:
+    """Out-of-sample evidence from STITCHED test-window returns. The p-value is adjusted over the ledger's whole family. The folds are re-audited here
+    (a leaking fold makes ``uses_future_information`` True) and the ``selection_log`` is RECOMPUTED from the train windows (SelectionLogError otherwise)."""
+    verify_selection_log(selection_log=selection_log, variant_returns=variant_returns, folds=folds, oos_returns=oos_returns,
+                         tested_variants=ledger.variant_names(), index_offset=index_offset, selector=selector)
     st = significance(oos_returns)
     clean = bool(folds) and all(SP.audit_split(list(f.train), list(f.test), n, label_horizon, embargo)["clean"] for f in folds)
     m = ledger.n_variants
     adj = SP.adjust_pvalues([st["p_one_sided"]], "holm", alpha=alpha, n_tested=m)["adjusted"][0]
     return _build("oos_test", stats=st, p_adjusted=adj, alpha=alpha, n_variants=m, universe=universe, leak=leak, data_sha256=data_sha256, provenance=provenance,
-                  split_clean=clean, extra={"n_folds": len(folds), **dict(extra or {})})
+                  split_clean=clean, spec=spec, extra={"n_folds": len(folds), "selection_log_verified": True, **dict(extra or {})})
 
 
 # ---------------------------------------------------------------- the demonstration: cross-sectional funding on 3 hand-picked survivors
@@ -514,7 +678,12 @@ def _variant_returns(grid: List[int], series: Mapping[str, PITSeries], rates: Ma
     return ret
 
 
-def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0.05) -> Dict[str, Any]:
+def _load_spec(name: str) -> Dict[str, Any]:
+    with open(os.path.join(BOT, "research", "candidates", name + ".json"), encoding="utf-8") as f:
+        return json.load(f)
+
+
+def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0.05, spec: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """Run the whole harness over the committed Binance 3-symbol funding history. Returns the evidence items, the selection, the universe audit and numbers.
     The universe is three hand-picked survivors: the harness marks it NOT point in time and the evidence says so."""
     files = {s: os.path.join(data_dir, "real_funding_full", "funding", fn) for s, fn in FUNDING_FILES.items()}
@@ -523,6 +692,7 @@ def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0
     series = {s: PITSeries([g * MS_8H for g in grid], [raw[s][g] for g in grid]) for s in raw}
     universe = PointInTimeUniverse({s: {"listed_ms": grid[0] * MS_8H} for s in raw}, membership_source="hand_picked_survivors", includes_delisted=False)
     vl = VariantLedger(family)
+    spec = spec if spec is not None else _load_spec("cross_sectional_funding")
     per_variant: Dict[str, List[float]] = {}
     for L in LOOKBACKS:
         for H in HOLDS:
@@ -537,7 +707,7 @@ def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0
     sha = sha256_files(sorted(files.values()))
     sel = vl.selection(alpha=alpha, method="holm")
     best = sel["best_variant"]
-    hist = historical_evidence(stats=significance(per_variant[best][max(LOOKBACKS):]), selection=sel, universe=universe, leak=leak, data_sha256=sha,
+    hist = historical_evidence(stats=significance(per_variant[best][max(LOOKBACKS):]), ledger=vl, spec=spec, universe=universe, leak=leak, data_sha256=sha, alpha=alpha,
                                extra={"funding_leg_only": True, "gross_mean_note": "price legs unhedged and unmeasured; not a P&L claim"})
     # walk-forward: re-select the best variant on each train window, trade it on the next test window
     h_max, emb = max(HOLDS), max(HOLDS)
@@ -545,13 +715,16 @@ def cross_sectional_funding_demo(data_dir: str, *, family: str, alpha: float = 0
     folds = walk_forward_folds(n - start, train_min=1095, test_len=365, label_horizon=h_max, embargo=emb)
     oos: List[float] = []
     chosen: List[str] = []
-    for f in folds:
+    log: List[Dict[str, Any]] = []
+    for k, f in enumerate(folds):
         tr0, tr1 = start + f.train[0], start + f.train[-1] + 1
         pick = max(per_variant, key=lambda k: (sum(per_variant[k][tr0:tr1]) / (tr1 - tr0), k))
         chosen.append(pick)
+        log.append({"fold": k, "chosen": pick, "train_window": [f.train[0], f.train[-1]]})
         oos.extend(per_variant[pick][start + f.test[0]:start + f.test[-1] + 1])
-    oos_ev = oos_evidence(oos_returns=oos, ledger=vl, universe=universe, leak=leak, folds=folds, n=n - start, label_horizon=h_max, embargo=emb,
-                          data_sha256=sha, alpha=alpha, extra={"selected_per_fold": chosen})
+    oos_ev = oos_evidence(oos_returns=oos, ledger=vl, spec=spec, universe=universe, leak=leak, folds=folds, n=n - start, label_horizon=h_max, embargo=emb,
+                          data_sha256=sha, alpha=alpha, selection_log=log, variant_returns={k: v[:] for k, v in per_variant.items()}, index_offset=start,
+                          extra={"selected_per_fold": chosen})
     return {"family": family, "grid_settlements": n, "universe_point_in_time": universe.point_in_time, "survivorship_problems": universe.survivorship_problems(),
             "selection": sel, "historical": hist, "oos": oos_ev, "n_folds": len(folds), "leak_audit": leak,
             "best_gross_mean_bps": sum(per_variant[best][start:]) / (n - start), "oos_n": len(oos), "data_sha256": sha}
@@ -565,8 +738,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if not a.demo_cross_sectional_funding:
         ap.print_help()
         return 2
-    spec = json.load(open(os.path.join(BOT, "research", "candidates", "cross_sectional_funding.json"), encoding="utf-8"))
-    r = cross_sectional_funding_demo(a.data_dir, family="cli_demo_cross_sectional_funding")
+    spec = _load_spec("cross_sectional_funding")
+    r = cross_sectional_funding_demo(a.data_dir, family="cli_demo_cross_sectional_funding", spec=spec)
     v = SV.evaluate(spec, [r["historical"], r["oos"]])
     print(json.dumps({"universe_point_in_time": r["universe_point_in_time"], "problems": r["survivorship_problems"], "selection": r["selection"],
                       "historical": {"result": r["historical"].result, "metrics": dict(r["historical"].metrics)},
