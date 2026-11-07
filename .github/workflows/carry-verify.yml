@@ -164,6 +164,7 @@ jobs:
           tests/test_drill_stops.py
           tests/test_hypothesis_registry_integrity.py
           tests/test_md_seal.py
+          tests/test_testnet_certificate.py
           tests/test_state_backup_promote.py
           tests/test_execution_model.py
           tests/test_live_gate_recomputed.py
