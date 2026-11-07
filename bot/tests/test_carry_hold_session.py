@@ -20,10 +20,11 @@ from carry_broker import FundingHistory, SettlementEvidence  # noqa: E402
 from test_drill import Venue  # noqa: E402
 
 
+# 0.03 = what a 0.001 BTC short really receives at the fixture's 3 bp print on a $100k mark (0.001 x 100000 x 0.0003); the reconciler screens the row's magnitude.
 class HoldVenue(Venue):
     """A venue that pays one settlement while the pair is held, if told to."""
 
-    def __init__(self, clock, *, pay_after_s=250.0, usd=4.25, sign="confirmed",
+    def __init__(self, clock, *, pay_after_s=250.0, usd=0.03, sign="confirmed",
                  evidence_down_after_close=False, **kw):
         super().__init__(**kw)
         self.clock = clock
@@ -106,7 +107,7 @@ class TestAFullCycleThatBooksRealFunding:
         assert data["flat"] is True
         assert data["funding_status"] == D.CONFIRMED
         assert data["funding_settlements"] == 1
-        assert data["funding_venue_usd"] == pytest.approx(4.25)
+        assert data["funding_venue_usd"] == pytest.approx(0.03)
         assert data["funding_confirmed"] is True
         assert data["fees_confirmed"] in (True, False)      # stated, not assumed
         assert D.drill_exit_code(report, hold=True) == 0
@@ -127,7 +128,7 @@ class TestInsideTheDeliveryGraceItIsPendingNeverConfirmed:
         data = json.load(open(ledger))
         assert data["funding_status"] == D.PENDING
         assert data["funding_confirmed"] is False
-        assert data["funding_venue_usd"] == pytest.approx(4.25)
+        assert data["funding_venue_usd"] == pytest.approx(0.03)
         assert D.drill_exit_code(report, hold=True) == 5
 
 
