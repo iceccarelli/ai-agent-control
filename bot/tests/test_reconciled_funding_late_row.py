@@ -36,9 +36,10 @@ def pay(i, t, usd, size=-0.5):
             "size": size, "symbol": SYM, "sign": "confirmed"}
 
 
+# 0.2 bps x 0.5 BTC x $100k = $1.00: the rate the fixtures' $1 settlement rows are consistent with (the magnitude screen compares row with rate x qty x price)
 def hist(prints, a, b):
     return CB.FundingHistory(start_ms=a, end_ms=b,
-                             prints=[(1.0, int(t)) for t in prints])
+                             prints=[(0.2, int(t)) for t in prints])
 
 
 def evid(rows, a, b):

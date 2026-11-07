@@ -21,6 +21,7 @@ ALLOWED = {
     "tools/reserved_holdout.py": 1,      # a disable switch
     "tools/testnet_session.py": 1,       # BYBIT_VENUE guard for the testnet session
     "tools/operator_paper_daily.py": 1,  # hands env to config
+    "tools/owner_console.py": 1,         # offline read-out: hands os.environ to config.is_live_authorized, secrets reported as set/unset only
     "tools/runner_alerts.py": 1,         # alert transport settings
     "tools/runner_monitor.py": 4,        # credential presence, alert settings
     "tools/unattended_drill.py": 3,      # credential presence, testnet env

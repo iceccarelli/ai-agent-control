@@ -481,6 +481,8 @@ class Journal:
                              - acc[OPENING].usd * -1.0)
         if not math.isfinite(net):
             raise LedgerError("net is not finite")
+        fees_confirmed_all = all(fee_counts[k] == 0 for k in ("unknown", "unresolved", "unlabelled"))
+        funding_confirmed_all = funding_reconciled and all(fund_counts[k] == 0 for k in ("engine_estimate", "unattributed", "unread"))
         return {
             "funding_usd": funding_usd,
             "fees_usd": fees_usd,
@@ -496,6 +498,9 @@ class Journal:
             "inventory_leg_booked": inventory_unbooked == 0,
             "inventory_legs_unbooked": inventory_unbooked,
             "pair_net_usd": None if inventory_unbooked else net + inventory_mark_usd,
+            # pair_net_usd is a NUMBER whenever the legs are booked, but it is a confirmed hedged result only when the inventory leg was valued, every fee
+            # is venue-stated, funding is reconciled and the period traded at all. Anything less is provisional, whatever the number looks like.
+            "pair_net_confirmed": bool(inventory_unbooked == 0 and fees_confirmed_all and funding_confirmed_all and sum(fee_counts.values()) > 0),
             "fees_unknown": fee_counts["unknown"],
             "fees_unresolved": fee_counts["unresolved"],
             "fees_unlabelled": fee_counts["unlabelled"],

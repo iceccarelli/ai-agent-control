@@ -267,6 +267,9 @@ good-looking number before the window closes is not a result. Everything below i
 1. **Save the public responses as they come.** On a machine you control, request
    `GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=BTCUSDT&startTime=<ms>&endTime=<ms>&limit=200`
    (at most 200 rows a page, ordering unspecified: page by `endTime`) and save each response UNEDITED. Keep them.
+   Or let `python3 tools/funding_capture.py --start-ms <ms> --out-dir <NEW dir>` do exactly that loop: one unauthenticated GET per page to the registry host, no redirects,
+   each body written byte-for-byte (never overwritten, mode 0600) plus a `manifest.json` with every page's SHA-256 and the gaps on the 8-hour grid (reported, never filled). It is
+   never run by tests or CI; you run it. Its pages feed step 2 unchanged.
 2. **Make the registered input.** `python3 tools/prospective_prints.py --in page1.json --in page2.json ... --out prints.jsonl`. It converts the
    venue's fraction to basis points itself (never type a unit), refuses anything that is not a clean BTCUSDT print on the 8-hour grid (a symbol that
    moves to a different funding interval is refused: the plan is an 8-hour plan), merges overlapping pages, never overwrites `--out`, and reports gaps
@@ -284,6 +287,12 @@ good-looking number before the window closes is not a result. Everything below i
    verdict that is "supported" only because of which settlements are present is flagged `DO NOT RELY`. `INSUFFICIENT_POWER` is "not enough data", not "no edge".
 6. **Do not change the plan, the coverage floor, the hurdles or the prints after looking.** A different data set is a data revision
    (`--accept-data-revision`), it is recorded permanently in the chain, and it is a different test.
+
+### Owner read-out (offline)
+`python3 tools/owner_console.py [--funding prints.jsonl] [--backup FILE]` prints, in one place and without a request or a credential value: whether real money is armed
+(`config.is_live_authorized`), the prospective evaluation's progress and the age of the newest print, what capital is (zero until a strategy has an ALLOCATE verdict),
+four separate eligibility questions (research / simulated / testnet / owner-authorised), a backup's verification, and the actual-vs-modelled P&L lines. Each section has
+one status word: VERIFIED, ESTIMATED, PROVISIONAL, STALE or UNAVAILABLE. UNAVAILABLE is "nothing supplied", never "fine". It exits 3 if the environment arms live.
 
 ## Backups: what is not done
 Nothing here schedules a backup, stores one off-volume, or has restored one. That needs the owner.

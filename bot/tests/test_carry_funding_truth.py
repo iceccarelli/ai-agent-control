@@ -60,7 +60,7 @@ def reconcile(j, prints, *, now_ms, start=None, rows=(), rates=None):
     import funding_reconcile as R
     lo = T0 - 3_600_000 if start is None else start
     hist = FundingHistory(start_ms=lo, end_ms=now_ms,
-                          prints=[((rates or {}).get(int(t), 3.0), int(t))
+                          prints=[((rates or {}).get(int(t), 0.5), int(t))
                                   for t in sorted(prints)])
     ev = SettlementEvidence(start_ms=lo, end_ms=now_ms, payments=list(rows),
                             windows=1, pages=1, rows_returned=len(rows))
@@ -92,7 +92,7 @@ class TestBookingFromVenuePayments:
         # pays then), so the synthetic print carries that sign
         reconcile(j, [T0 + 3_600_000, T0 + 2 * 3_600_000], now_ms=T0 + 20 * H,
                   rows=[pay(1, 4.25), pay(2, -1.5, ms=T0 + 2 * 3_600_000)],
-                  rates={T0 + 2 * 3_600_000: -3.0})
+                  rates={T0 + 2 * 3_600_000: -0.6})
         st = j.statement()
         assert st["funding_confirmed"] is True and st["net_basis"] == "confirmed"
 
@@ -292,17 +292,18 @@ class TestTickBooksWhatTheVenuePaid:
             self, tmp_path):
         venue, journal, bot, store, qty = self._hedged(tmp_path)
         t = opened_ms(journal) + 1_800_000
-        venue.settlements.append(row(1, "0.1234", t, size=str(-qty)))
+        paid = f"{0.6 * qty * MARK * 3.0 / 1e4:.8f}"   # inside the magnitude bracket of the 3 bp print but visibly NOT the engine's own estimate
+        venue.settlements.append(row(1, paid, t, size=str(-qty)))
         venue.prints = [t]                    # the public print it belongs to
         tick(bot, 4, after_open=True)
         st = journal.statement()
-        assert st["funding_usd"] == pytest.approx(0.1234)    # the venue's figure
-        assert st["funding_venue_usd"] == pytest.approx(0.1234)
+        assert st["funding_usd"] == pytest.approx(float(paid))    # the venue's figure
+        assert st["funding_venue_usd"] == pytest.approx(float(paid))
         assert st["funding_confirmed"] is True
         # the engine DID accrue its own estimate (qty * mark * 3 bps), and none
         # of it reached the journal
         assert bot._carry_estimated_funding == pytest.approx(qty * MARK * 3e-4)
-        assert bot._carry_estimated_funding > 10 * st["funding_usd"]
+        assert bot._carry_estimated_funding > 1.2 * st["funding_usd"]      # the estimate is NOT what was booked (a 10x gap would now be a reconciliation contradiction)
         kinds = [e.kind for e in journal.entries]
         assert kinds.count("funding") == 1
 
@@ -449,7 +450,8 @@ class TestACompleteAnswerIsRequired:
         assert L.check_funding_completeness(
             j, self.prints(), now_ms=T0 + 30 * H) == 0
         reconcile(j, self.prints(), now_ms=T0 + 30 * H, rows=[
-            pay(1, 1.0, ms=T0 + 8 * H), pay(2, 1.0, ms=T0 + 16 * H)])
+            pay(1, 1.0, ms=T0 + 8 * H), pay(2, 1.0, ms=T0 + 16 * H)],
+            rates={T0 + 8 * H: 0.2, T0 + 16 * H: 0.2})          # 0.2 bp x 0.5 BTC x $100k = the $1.00 rows
         assert j.statement()["funding_confirmed"] is True
 
     def test_nothing_is_owed_while_flat_or_inside_the_delivery_grace(self):
@@ -551,7 +553,7 @@ class TestTickFlagsAMissingSettlementAndBooksTheLateRow:
     def test_with_its_row_present_nothing_is_flagged(self, tmp_path):
         venue, journal, bot, store, qty, opened = self._hedged_ten_hours_ago(
             tmp_path)
-        venue.settlements.append(row(1, "0.5", opened + H, size=str(-qty)))
+        venue.settlements.append(row(1, f"{qty * MARK * 3.0 / 1e4:.8f}", opened + H, size=str(-qty)))
         tick(bot, 4)
         st = journal.statement()
         assert st["funding_unread"] == 0 and st["funding_confirmed"] is True
