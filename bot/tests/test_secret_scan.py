@@ -69,3 +69,24 @@ def test_a_clean_result_says_how_much_it_did_not_scan(tmp_path, capsys):
     f.write_bytes(b"a" * (SS.MAX_BYTES + 1))
     SS.main([str(f)])
     assert "1 not scanned" in capsys.readouterr().out
+
+
+def test_a_reviewed_fixture_is_bound_to_its_CONTENT_not_only_its_count(tmp_path, monkeypatch):
+    """Red team: the allowlist was keyed on (file, rule, count), so swapping the one reviewed fake literal for a real credential kept the count at 1 and the scan stayed green.
+    (The literals are assembled at run time so this test file does not itself contain a credential-shaped assignment.)"""
+    reviewed_value = "Kq8Zw3Rt7Yp2Lm9X" + "c4Vb6Nh1Jd5Wa7Ge"
+    swapped_value = "Zk8Qw3Rt7Yp2Lm9X" + "c4Vb6Nh1Jd5Sa0Gf"
+    f = tmp_path / "bot" / "tests" / "fx.py"; f.parent.mkdir(parents=True)
+    f.write_text(f'API_KEY = "{reviewed_value}"\n')
+    key = ("bot/tests/fx.py", "credential-assignment")
+    found = SS.scan_paths([str(f)])
+    assert [r for _p, _n, r in found] == ["credential-assignment"]
+    monkeypatch.setitem(SS.REVIEWED_FIXTURES, key, 1)
+    monkeypatch.setitem(SS.REVIEWED_DIGESTS, key, SS.group_digest(found))
+    assert SS.apply_reviewed(SS.scan_paths([str(f)]), str(tmp_path)) == []                       # the reviewed content is accepted (positive control)
+    f.write_text(f'API_KEY = "{swapped_value}"\n')                                              # the same count, DIFFERENT content
+    again = SS.apply_reviewed(SS.scan_paths([str(f)]), str(tmp_path))
+    assert [r for _p, _n, r in again] == ["credential-assignment"]
+    monkeypatch.delitem(SS.REVIEWED_DIGESTS, key)                                                # a count with no content digest reviews nothing
+    f.write_text(f'API_KEY = "{reviewed_value}"\n')
+    assert SS.apply_reviewed(SS.scan_paths([str(f)]), str(tmp_path))

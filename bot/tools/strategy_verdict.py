@@ -100,7 +100,7 @@ def spec_problems(spec: Mapping[str, Any]) -> List[str]:
             elif v == 0 and e["provenance"] not in ("measured", "venue_stated"):
                 problems.append(f"ZERO_COST_WITHOUT_MEASUREMENT:{model}.{c}")        # a zero fee/slippage must be a real, stated zero
     cap = spec.get("capacity_model")
-    if isinstance(cap, dict) and not isinstance(cap.get("min_viable_capacity_usd"), (int, float)):
+    if isinstance(cap, dict) and not _finite_pos(cap.get("min_viable_capacity_usd")):
         problems.append("CAPACITY_MODEL_NEEDS_min_viable_capacity_usd")
     if "OOS_protocol" in spec and isinstance(spec["OOS_protocol"], dict) and not _nonempty(spec["OOS_protocol"].get("train_test_boundary")):
         problems.append("OOS_PROTOCOL_NEEDS_train_test_boundary")
@@ -116,31 +116,68 @@ class EvidenceItem:
     data_sha256: Optional[str] = None
     recorded_ms: int = 0
     status: Optional[str] = None            # for reconciled_owner_result: the importer's status word
+    candidate_id: Optional[str] = None      # which candidate this evidence is ABOUT
+    spec_digest: Optional[str] = None       # the exact specification it was gathered against (a spec edited afterwards invalidates it)
+
+    def __post_init__(self) -> None:
+        # Metrics are normalised ONCE into a plain JSON dict: a dict/Mapping subclass whose .get lies, or a NaN/inf/non-JSON value, cannot reach the verdict logic.
+        try:
+            plain = json.loads(json.dumps(dict(self.metrics), allow_nan=False))
+        except (TypeError, ValueError) as exc:
+            raise SpecError(f"evidence metrics are not plain finite JSON: {type(exc).__name__}") from exc
+        if not isinstance(plain, dict):
+            raise SpecError("evidence metrics must be an object")
+        object.__setattr__(self, "metrics", plain)
 
 
 def evidence_from_dict(d: Mapping[str, Any]) -> EvidenceItem:
     if not isinstance(d, Mapping) or d.get("stage") not in LADDER or d.get("result") not in (PASS, FAIL, INCONCLUSIVE):
         raise SpecError(f"not an evidence item: {d!r}")
     return EvidenceItem(stage=d["stage"], result=d["result"], provenance=str(d.get("provenance") or ""), metrics=dict(d.get("metrics") or {}),
-                        data_sha256=d.get("data_sha256"), recorded_ms=int(d.get("recorded_ms") or 0), status=d.get("status"))
+                        data_sha256=d.get("data_sha256"), recorded_ms=int(d.get("recorded_ms") or 0), status=d.get("status"),
+                        candidate_id=d.get("candidate_id"), spec_digest=d.get("spec_digest"))
 
 
 def _is_hex64(x: Any) -> bool:
     return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
 
 
-def counted(item: EvidenceItem, spec: Mapping[str, Any]) -> Tuple[bool, Optional[str]]:
-    """Does this item count as a PASS/FAIL at its stage? (ok, why_not). A FAIL always counts (killing is easy); a PASS must earn it."""
+WEAK_PROVENANCE = frozenset({"unknown", "assumed", "modelled", "modeled", "estimated", "n/a", "none", "todo", "tbd", "x"})
+MAX_PLAUSIBLE_EDGE_BPS = 500.0          # a per-round-trip NET edge above this after real costs is a unit slip or a forgery until proven otherwise
+OBSERVED_STAGES = ("prospective_observation", "execution_validation", "reconciled_owner_result")
+
+
+def _finite_pos(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and x > 0
+
+
+def _registry_entry(registry: Optional[Mapping[str, Any]], cid: str) -> Optional[Mapping[str, Any]]:
+    if registry is None:
+        return None
+    for t in registry.get("trials", []):
+        if t.get("trial_id") == cid:
+            return t
+    return None
+
+
+def counted(item: EvidenceItem, spec: Mapping[str, Any], registry: Optional[Mapping[str, Any]] = None) -> Tuple[bool, Optional[str]]:
+    """Does this item count as a PASS/FAIL at its stage? (ok, why_not). A FAIL always counts (killing is easy); a PASS must earn it: it must be about THIS candidate and THIS spec,
+    carry real provenance, and (for the observed stages) be backed by a registration that verifies and PRE-DATES the observation."""
     if item.result == FAIL:
         return True, None
     if item.result == INCONCLUSIVE:
         return False, "INCONCLUSIVE"
-    if not item.provenance.strip():
-        return False, "PASS_WITHOUT_PROVENANCE"
+    prov = item.provenance.strip()
+    if len(prov) < 6 or prov.lower() in WEAK_PROVENANCE:
+        return False, "PASS_WITHOUT_REAL_PROVENANCE"
+    if item.candidate_id != spec.get("candidate_id"):
+        return False, "EVIDENCE_NOT_ABOUT_THIS_CANDIDATE"
+    if item.spec_digest != spec_digest(spec):
+        return False, "EVIDENCE_GATHERED_AGAINST_A_DIFFERENT_SPEC"
     m = item.metrics
     s = item.stage
-    if s in OFFLINE_STAGES and not _is_hex64(item.data_sha256):
-        return False, "OFFLINE_PASS_WITHOUT_DATA_HASH"
+    if s in OFFLINE_STAGES and (not _is_hex64(item.data_sha256) or len(set(item.data_sha256)) < 8):
+        return False, "OFFLINE_PASS_WITHOUT_REAL_DATA_HASH"
     if s in ("historical_test", "oos_test"):
         n = m.get("independent_observations")
         if isinstance(n, bool) or not isinstance(n, int) or n < MIN_OBSERVATIONS[s]:
@@ -153,26 +190,50 @@ def counted(item: EvidenceItem, spec: Mapping[str, Any]) -> Tuple[bool, Optional
         if m.get("universe_point_in_time") is not True:
             return False, "UNIVERSE_NOT_POINT_IN_TIME"
     if s == "cost_model":
-        if m.get("unknown_cost_inputs") != 0:
+        unk = m.get("unknown_cost_inputs")
+        if type(unk) is not int or unk != 0:                           # exactly the integer 0: not False, not 0.0, not None
             return False, "UNKNOWN_COST_INPUTS"
         edge = m.get("net_edge_bps_after_costs")
-        if isinstance(edge, bool) or not isinstance(edge, (int, float)) or not math.isfinite(edge) or edge <= 0:
+        if not _finite_pos(edge):
             return False, "NET_EDGE_NOT_POSITIVE_AFTER_COSTS"
+        if edge > MAX_PLAUSIBLE_EDGE_BPS:
+            return False, "NET_EDGE_IMPLAUSIBLY_LARGE"
     if s == "capacity_test":
         cap, need = m.get("capacity_usd"), (spec.get("capacity_model") or {}).get("min_viable_capacity_usd")
-        if not isinstance(cap, (int, float)) or isinstance(cap, bool) or not isinstance(need, (int, float)) or cap < need:
+        if not _finite_pos(cap) or not _finite_pos(need) or cap < need:
             return False, "CAPACITY_BELOW_MINIMUM_VIABLE"
+    if s in OBSERVED_STAGES:
+        entry = _registry_entry(registry, str(spec.get("candidate_id")))
+        if registry is None or entry is None:
+            return False, "NEEDS_A_REGISTERED_CANDIDATE(registry not supplied or candidate not in it)"
+        import hypothesis_registry as hr
+        if hr.verify(registry):
+            return False, "REGISTRY_FAILS_ITS_INTEGRITY_CHECK"
+        reg_ms = _utc_ms(entry.get("registered_utc"))
+        start = m.get("observation_started_ms")
+        if reg_ms is None or isinstance(start, bool) or not isinstance(start, int) or start <= reg_ms:
+            return False, "OBSERVATION_DID_NOT_START_AFTER_REGISTRATION"
     if s == "prospective_observation":
-        if m.get("registered_before_observation") is not True or m.get("complete") is not True:
-            return False, "PROSPECTIVE_NOT_REGISTERED_OR_NOT_COMPLETE"
+        if m.get("complete") is not True:
+            return False, "PROSPECTIVE_NOT_COMPLETE"
     if s == "execution_validation":
         if m.get("venue") not in ("testnet", "mainnet") or m.get("fills_measured") is not True or m.get("fees_measured") is not True:
             return False, "EXECUTION_NOT_MEASURED_AT_A_VENUE"
     if s == "reconciled_owner_result":
         net = m.get("net_usd_after_all_costs")
-        if item.status != "RECONCILED" or isinstance(net, bool) or not isinstance(net, (int, float)) or not math.isfinite(net) or net <= 0:
+        if item.status != "RECONCILED" or not isinstance(net, (int, float)) or isinstance(net, bool) or not math.isfinite(net) or net <= 0:
             return False, "OWNER_RESULT_NOT_RECONCILED_OR_NOT_POSITIVE"
+        if not _is_hex64(m.get("import_report_sha256")):
+            return False, "OWNER_RESULT_NOT_TIED_TO_AN_IMPORT_REPORT_HASH"
     return True, None
+
+
+def _utc_ms(text: Any) -> Optional[int]:
+    import datetime
+    try:
+        return int(datetime.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -189,7 +250,7 @@ class VerdictResult:
                 "spec_problems": self.spec_problems}
 
 
-def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem]) -> VerdictResult:
+def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem], *, registry: Optional[Mapping[str, Any]] = None) -> VerdictResult:
     """The verdict for a candidate given ALL its evidence. Deterministic; the same inputs give the same answer; later evidence never rescues an earlier FAIL."""
     problems = spec_problems(spec)
     stages: Dict[str, str] = {s: "MISSING" for s in LADDER}
@@ -204,13 +265,15 @@ def evaluate(spec: Mapping[str, Any], evidence: Sequence[EvidenceItem]) -> Verdi
     # declared rejection conditions that fired are reported as FAIL evidence at a stage named 'rejection' (any stage's metrics may carry them)
     for e in evidence:
         fired = e.metrics.get("rejection_conditions_fired")
-        if isinstance(fired, list) and fired:
-            reasons.append("REJECTION_CONDITION_FIRED:" + "|".join(str(x) for x in fired))
+        if fired not in (None, [], "", 0, False, {}):                    # ANY non-empty claim kills (a string or a count is not a way to hide one)
+            reasons.append("REJECTION_CONDITION_FIRED:" + (("|".join(str(x) for x in fired)) if isinstance(fired, list) else str(fired)))
+        if e.stage == "hypothesis" and e.result == FAIL:
+            reasons.append("REJECTION_CONDITION_FIRED:hypothesis FAILED")
     for stage in LADDER[1:]:
         verdicts = []
         notes = []
         for e in by_stage[stage]:
-            ok, why = counted(e, spec)
+            ok, why = counted(e, spec, registry)
             if ok:
                 verdicts.append(e.result)
             else:
@@ -278,7 +341,34 @@ def register_candidate(registry: Dict[str, Any], spec: Mapping[str, Any], *, cod
 def record_evidence(registry: Dict[str, Any], candidate_id: str, item: EvidenceItem) -> None:
     import hypothesis_registry as hr
     hr.add_evidence(registry, candidate_id, STAGE_TO_REGISTRY_LEVEL[item.stage], result=f"{item.stage}:{item.result}", provenance=item.provenance or "none",
-                    details={"metrics": dict(item.metrics), "data_sha256": item.data_sha256, "status": item.status})
+                    details={"metrics": dict(item.metrics), "data_sha256": item.data_sha256, "status": item.status, "candidate_id": item.candidate_id or candidate_id,
+                             "spec_digest": item.spec_digest})
+
+
+def evidence_from_registry(registry: Mapping[str, Any], candidate_id: str) -> List[EvidenceItem]:
+    """EVERY evidence item recorded for the candidate in the sealed registry (written by ``record_evidence``). Evaluating from the registry makes dropping an inconvenient FAIL
+    impossible without tripping the registry's own integrity check."""
+    entry = _registry_entry(registry, candidate_id)
+    if entry is None:
+        raise SpecError(f"candidate {candidate_id!r} is not registered")
+    out: List[EvidenceItem] = []
+    for ev in entry.get("evidence", []):
+        stage, _, result = str(ev.get("result", "")).partition(":")
+        d = ev.get("details") or {}
+        if stage not in LADDER or result not in (PASS, FAIL, INCONCLUSIVE):
+            continue
+        out.append(EvidenceItem(stage=stage, result=result, provenance=str(ev.get("provenance") or ""), metrics=d.get("metrics") or {}, data_sha256=d.get("data_sha256"),
+                                status=d.get("status"), candidate_id=d.get("candidate_id"), spec_digest=d.get("spec_digest")))
+    return out
+
+
+def evaluate_registered(registry: Mapping[str, Any], spec: Mapping[str, Any]) -> VerdictResult:
+    """The verdict from the REGISTRY's evidence only. Refuses a registry that fails its integrity check."""
+    import hypothesis_registry as hr
+    bad = hr.verify(registry)
+    if bad:
+        raise SpecError("the registry fails its integrity check: " + "; ".join(bad[:3]))
+    return evaluate(spec, evidence_from_registry(registry, str(spec["candidate_id"])), registry=registry)
 
 
 def spec_digest(spec: Mapping[str, Any]) -> str:
@@ -314,6 +404,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--candidate", help="candidate JSON (see REQUIRED_SPEC_FIELDS); omit with --btc to describe the frozen BTC experiment")
     ap.add_argument("--evidence", default=None, help="JSONL of evidence items {stage,result,provenance,metrics,data_sha256}")
     ap.add_argument("--btc", action="store_true")
+    ap.add_argument("--registry", default=None, help="evaluate from the SEALED registry's evidence for this candidate (a dropped FAIL cannot be hidden)")
     a = ap.parse_args(argv)
     try:
         spec = btc_carry_candidate() if a.btc else json.load(open(a.candidate, encoding="utf-8"))
@@ -321,7 +412,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     except (OSError, ValueError, TypeError, SpecError) as exc:
         print(f"strategy_verdict: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
-    res = evaluate(spec, ev)
+    try:
+        if a.registry:
+            import hypothesis_registry as hr
+            res = evaluate_registered(hr.load(a.registry), spec)
+        else:
+            res = evaluate(spec, ev)
+    except (SpecError, ValueError, OSError) as exc:
+        print(f"strategy_verdict: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
     print(json.dumps(res.as_dict(), indent=2, sort_keys=True))
     return 0
 

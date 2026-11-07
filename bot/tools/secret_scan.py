@@ -15,6 +15,7 @@ repository stores everywhere and teach people to ignore the tool.
 from __future__ import annotations
 
 import os
+import hashlib
 import re
 import subprocess
 import sys
@@ -59,6 +60,17 @@ REVIEWED_FIXTURES = {
     ("bot/tests/test_testnet_action_manifest.py", "credential-assignment"): 1,
 }
 
+#: The content digest of each reviewed group (see ``group_digest``). Regenerate ONLY after a human has read the flagged lines again.
+REVIEWED_DIGESTS = {
+    ("bot/tests/test_close_testnet_experiment.py", "credential-assignment"): "613f434ab8805d7a3aab38fd7b5aad86db5b4b30762f3fc80e00e6562447251b",
+    ("bot/tests/test_memory.py", "credential-assignment"): "5caa1bf4e449b05d20fb3f90f6be6ed78cb2c933d4f9e27f402c980521d6c172",
+    ("bot/tests/test_owner_tools.py", "credential-assignment"): "8d4449ac924a67c46e5fc9dc174449d75ca554508cde81b52b3b73af83991a74",
+    ("bot/tests/test_paper_agent_certification.py", "credential-assignment"): "9826c59e492f697037b325c57d438a4bbc2b8ee2cd544de7b1f6569893df04b1",
+    ("bot/tests/test_project_status.py", "credential-assignment"): "2e26b54c73ad4c545245975a65aa611ebfca508c25421869e5921834294d32a9",
+    ("bot/tests/test_testnet_action_manifest.py", "credential-assignment"): "fa5186263142bd8bc66d67a44d2083c2c14538fb9002f1b0357dda631d2088d3",
+    ("bot/tools/testnet_action_manifest.py", "credential-assignment"): "8e33765a20632892946e42a21aac81b09bd75e4c895de12a5c53e4b56e90f07b",
+}
+
 #: Files that are binary or generated and carry no reviewable text.
 SKIP_SUFFIXES = (".gz", ".so", ".png", ".jpg", ".pdf", ".zip", ".db", ".pyc")
 MAX_BYTES = 2_000_000
@@ -73,7 +85,11 @@ def tracked_files(root: str) -> Optional[List[str]]:
     return [os.path.join(root, p) for p in out.decode("utf-8", "replace").split("\0") if p]
 
 
-def scan_text(text: str) -> List[Tuple[int, str]]:
+#: sha256 of the FLAGGED LINE's text for the findings of the last scan, keyed (path, line, rule). Used only to bind a reviewed fixture to the exact content that was reviewed.
+LINE_DIGESTS: dict = {}
+
+
+def scan_text(text: str, _path: Optional[str] = None) -> List[Tuple[int, str]]:
     """`[(line_number, rule)]`. The matched text is never returned."""
     hits: List[Tuple[int, str]] = []
     for number, line in enumerate(text.splitlines(), 1):
@@ -86,6 +102,8 @@ def scan_text(text: str) -> List[Tuple[int, str]]:
             if rule == "credential-assignment" and _PLACEHOLDER.search(m.group(1)):
                 continue
             hits.append((number, rule))
+            if _path is not None:
+                LINE_DIGESTS[(_path, number, rule)] = hashlib.sha256(line.strip().encode("utf-8")).hexdigest()
     return hits
 
 
@@ -97,6 +115,7 @@ SKIPPED: List[str] = []
 def scan_paths(paths: Iterable[str]) -> List[Tuple[str, int, str]]:
     found: List[Tuple[str, int, str]] = []
     SKIPPED.clear()
+    LINE_DIGESTS.clear()
     for path in paths:
         if path.endswith(SKIP_SUFFIXES) or not os.path.isfile(path):
             continue
@@ -109,18 +128,25 @@ def scan_paths(paths: Iterable[str]) -> List[Tuple[str, int, str]]:
         except (OSError, UnicodeDecodeError):
             SKIPPED.append(path)
             continue
-        found.extend((path, n, rule) for n, rule in scan_text(text))
+        found.extend((path, n, rule) for n, rule in scan_text(text, path))
     return found
 
 
+def group_digest(items: List[Tuple[str, int, str]]) -> str:
+    """One digest over the flagged lines of a (file, rule) group, order-independent. A finding with no recorded line digest makes the group unreviewable."""
+    parts = sorted(LINE_DIGESTS.get(i, "?") for i in items)
+    return hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+
+
 def apply_reviewed(found: List[Tuple[str, int, str]], root: str) -> List[Tuple[str, int, str]]:
-    """Drop findings that exactly match a reviewed fixture entry (file, rule, count)."""
+    """Drop findings that exactly match a reviewed fixture entry: same file, same rule, same COUNT and the same CONTENT (a digest of the flagged lines). Replacing a reviewed fake
+    with a different literal, real or not, changes the digest and the finding is reported again."""
     grouped: dict = {}
     for item in found:
         grouped.setdefault((os.path.relpath(item[0], root), item[2]), []).append(item)
     kept: List[Tuple[str, int, str]] = []
     for key, items in grouped.items():
-        if REVIEWED_FIXTURES.get(key) == len(items):
+        if REVIEWED_FIXTURES.get(key) == len(items) and REVIEWED_DIGESTS.get(key) == group_digest(items):
             continue
         kept.extend(items)
     return kept
