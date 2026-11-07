@@ -422,6 +422,29 @@ def _selection_sensitivity(prints: Sequence[Tuple[float, float]], hurdle_pct: fl
     return out
 
 
+MAX_PLAUSIBLE_ABS_BPS = 300.0        # the same per-settlement bound prospective_prints applies to the raw venue value
+MIN_PLAUSIBLE_MEDIAN_ABS_BPS = 0.01  # the venue's own baseline is 1 bp; a series whose typical print is 1/100 of that is fractions, not basis points
+MIN_UNITS_SAMPLE = 30
+
+
+def screen_units(prints: Sequence[Tuple[float, float]]) -> None:
+    """Refuses a prints file that is evidently in the wrong unit BEFORE a look is spent on it. The registered evaluator reads ``funding_bps`` without any
+    unit check, so a file in fractions (÷10^4) silently reads as 'no edge' and a file in 10^-8 units reads as 'insufficient power', and either is journaled
+    as a look. ``tools/prospective_prints.py`` is the producer that cannot make this mistake; this is the last line for a hand-made file."""
+    vals = [float(v) for _t, v in prints]
+    if any(not math.isfinite(v) for v in vals):
+        raise JournalError("the prints hold a non-finite funding value")
+    worst = max((abs(v) for v in vals), default=0.0)
+    if worst > MAX_PLAUSIBLE_ABS_BPS:
+        raise JournalError(f"a funding print of {worst:g} bps is not a plausible per-settlement rate (bound {MAX_PLAUSIBLE_ABS_BPS:g}): wrong unit or a corrupt row; "
+                           "nothing is journaled. Make the file with tools/prospective_prints.py")
+    if len(vals) >= MIN_UNITS_SAMPLE:
+        mid = sorted(abs(v) for v in vals)[len(vals) // 2]
+        if mid < MIN_PLAUSIBLE_MEDIAN_ABS_BPS:
+            raise JournalError(f"the median |funding| is {mid:g} bps, 1/100 of the venue's 1 bp baseline or less: this looks like a file in FRACTIONS, not basis points; "
+                               "nothing is journaled. Make the file with tools/prospective_prints.py")
+
+
 def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, journal_path: str, *, anchor: Optional[SP.LedgerAnchor] = None,
                     first_look: bool = False, allow_unanchored: bool = False, accept_data_revision: bool = False, now_ms: Optional[int] = None,
                     lock_timeout_s: float = LOCK_TIMEOUT_S, venue_floor_bps: Optional[float] = None) -> Dict[str, Any]:
@@ -436,6 +459,7 @@ def evaluate_logged(prints: Sequence[Tuple[float, float]], hurdle_pct: float, jo
                                         or not math.isfinite(venue_floor_bps) or abs(venue_floor_bps) > MAX_FLOOR_BPS):
         # Checked BEFORE the look is journaled: a closed-window look is one-shot, and an unusable report option must never spend it.
         raise JournalError(f"the venue funding floor must be a finite number of bps within +/-{MAX_FLOOR_BPS:g}, not {venue_floor_bps!r}")
+    screen_units(prints)
     binding = data_binding(prints, hurdle_pct, False)
     with _Lock(journal_path, lock_timeout_s):
         existed = os.path.lexists(journal_path)

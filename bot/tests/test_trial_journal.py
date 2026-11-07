@@ -911,3 +911,26 @@ def test_the_fifth_breakeven_status_branch_and_the_keys_when_the_check_cannot_ru
     monkeypatch.setattr(TJ, "_selection_sensitivity", lambda *a, **k: (_ for _ in ()).throw(ZeroDivisionError("boom")))
     rep = TJ.evaluate_logged(window_prints(0.3, seed=1), 10.0, str(tmp_path / "j.jsonl"), first_look=True)
     assert rep["selection_sensitivity"]["breakeven_status"] == "NOT_EVALUATED" and rep["selection_sensitivity"]["breakeven_fill_bps"] is None
+
+
+# ---------------------------------------------------------------- unit screen on a hand-made file (reproduced: fractions were evaluated and journaled as a look)
+
+@pytest.mark.parametrize("scale,refused", [(1.0, False), (1e-4, True), (1e4, True), (1e-8, True)])
+def test_a_prints_file_in_the_wrong_unit_is_refused_before_a_look_is_spent(tmp_path, scale, refused):
+    base = window_prints(1.0, seed=3)
+    scaled = [(t, v * scale) for t, v in base]
+    j = tmp_path / "j.jsonl"
+    if refused:
+        with pytest.raises(TJ.JournalError, match="FRACTIONS|plausible"):
+            TJ.evaluate_logged(scaled, 10.0, str(j), first_look=True)
+        assert not j.exists(), "a refused file must not create or extend the journal"
+    else:
+        TJ.evaluate_logged(scaled, 10.0, str(j), first_look=True)       # positive control: the real scale is accepted
+
+
+def test_a_single_absurd_print_is_refused(tmp_path):
+    base = window_prints(0.3, seed=3)
+    with pytest.raises(TJ.JournalError, match="plausible"):
+        TJ.evaluate_logged(base[:-1] + [(base[-1][0], 1e9)], 10.0, str(tmp_path / "j.jsonl"), first_look=True)
+    with pytest.raises(TJ.JournalError):
+        TJ.screen_units([(1, float("nan"))])
