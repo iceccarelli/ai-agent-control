@@ -1,5 +1,48 @@
 {
-  "git_commit": "348404ef276ff6fb5eb819a676e3e159ced93469-dirty",
+  "git_commit": "7ad37d237a73888afb0cc13b30dab5b9a362bc21-dirty",
+  "integrity": {
+    "entries": {
+      "btc_alt_spillover_v1": "af9cd5550924cf38abbfba56e4e580ae1d72b06a035f0b624ee12e6786fcd8f8",
+      "btc_alt_spillover_v1@ETHUSDT": "26dbeaadc4b9a48d4d25ab4bd5e4c7401355b12897028eed0cc21f892cbf3f64",
+      "btc_alt_spillover_v1@SOLUSDT": "f6c1a2700913ee11a1d4417cf2576c9da4b8a648044b3bb1e811b72802eebf00",
+      "btcusdt_funding_carry_overlay@prospective-1": "d2e313715dc4aa7b03eb60d84ec7be9180e4cb68c837a32fb19c913fd0e8599e",
+      "carry_cost_gates_v1@BTCUSDT": "eca5a528d74f7248f9a447554f498b653d8a0656ecf7aebe5de89f3bedb4749a",
+      "carry_entry_gate_v1@BTCUSDT": "c85529315236f5d7d451d8f6ecf0695646d6ccaeb50f4b7716daf3a1d53874a8",
+      "carry_overlay_v1@BTCUSDT": "cab21252d61f38201f19b0266e23cdd1de7a26951e4ab95ded8fda5e733d177e",
+      "carry_rule_sweep@59feb30d2328": "187f4c663747c8dc81de20a7a9c3fc6cd8a27ce8664d381769c2f0fb5c2bb62f",
+      "carry_rule_sweep@d7d7d4141a05": "0f5c62b38640f36230742c07e0bc2883fd4a8e8ed64ada04bc96b1d834c7a33f",
+      "carry_ungated_v1@BTCUSDT": "ec32a8e4772790ea86f7389d61ac77a8484fd313e0e628bae8fd29198204ff38",
+      "carry_walkforward@69b08ab2ab84": "728e97e426fba65a874126a9755c9bdcb6340a275a7aa5dfc81bb512e422a6b3",
+      "closed_analyser": "1fd20f0b643e7d3a0a2400f0a08039415a45d50cd345574a5418793dada713d0",
+      "closed_regression@BTCUSD": "b700af8354825df353c93988686a36cd4f2bd8e1c1258eae0fc5497d03a86ede",
+      "compression_breakout_v1": "d917408b0178a4683a6447c96ec59568ef6d20e308632005ab9223328e4a847c",
+      "compression_breakout_v1@BTCUSD": "dc6a3047f149a2d1db3118b3929f115a6ac6e6b739b1b325bb5c67f48f14d2df",
+      "donchian_breakout_v1": "74ada6a88055eb3e3f5288eb0746fb1b65d8ebb4e7e7a8296da66716b0fe006a",
+      "donchian_breakout_v1@BTCUSD": "a2d0aee193f8af23c655fe953fba8e300fd32c2485dfd74cda04cd22e0639ccc",
+      "donchian_regression@BTCUSD": "8adbfad72cda72f2635649068d51cb1fd9718e895c906c9cf14eab0d0e11c6c1",
+      "edge_real_1h@BTCUSD": "906a3cca843d96221e423e6f246900b808a994174c27f9301b9665852d959b3f",
+      "edge_real_4h@BTCUSD": "6c191744fc84cff98f751deed49e1daab48f858dc370f8393d344ac12f2f78f1",
+      "edge_recheck@BTCUSD": "e95bdc8989054e440d87e3d8aa9a4941ecb3ada02f4a3b7a5c749a2ca6fde0ea",
+      "funding_carry_fade_btc_v1": "712e558a1f9cd3ecb89bd04ed576c09885038885cd2190a2de27d8dd58777384",
+      "funding_carry_fade_btc_v1@BTCUSDT_OOS": "4afe32323421df20d292c5817c08a90d976dcc77412720645d498ed3953f084e",
+      "funding_carry_fade_v1": "d78b6bd048f687078bc47e87ada9e0b8cb9f018fffbff455e74eaeb2cba1c2e7",
+      "funding_carry_fade_v1@BTCUSDT": "f4fe14f9c7fb03430f6586757e24dadc83a6dfb6f53010de05adadf9037c40e7",
+      "funding_carry_fade_v1@ETHUSDT": "71786ccf2025a1a2262f7a05f69ac1671fcfcfe1fc72ecc566662fc36d041ba6",
+      "funding_carry_fade_v1@SOLUSDT": "1d441b118b784597186681540e92980af64a4bd42e702ca7e0a6ab19d55eb171",
+      "mainnet_public_protocol_v1": "4adefd8fcd20c0d84c74cbaab63c4553d6a16ca5c6bfcbf49c8078b851083b62",
+      "open_gap_fade_v1": "a8d946b494762f1831a5e9f0469472e8ee1d3120de59fdada500a680bfc99e20",
+      "post_shock_fade_v1": "d4fcacc8666a66dae550f0441a4f350cc14e23045aac3e54049665ce1962f654",
+      "post_shock_fade_v1@BTCUSD": "d8082fc4663afb5cdb41bb33fb3a18442c1342593420dd36cd9f4fe7527c5138",
+      "range_location_fade_v1": "77444f98d44dc0bfd5cf822fcbbb74391052172ee575b7d46b74fe013cc5c3c0",
+      "sign_flip_momentum_v1": "aa42a55c9c9dbc5fc4e89a99e7ffa70a5abd0e7b6d1f1496cdc8c7c13478d03e",
+      "sign_flip_momentum_v1@BTCUSD": "2ec4b14a13342b8618c48493cd02d067604258ca699070c1ae1508eb251156fe",
+      "sign_flip_momentum_v1@ETHUSDT": "aaaf1fd8b820bb820b32144a585335440929e3a7a28348b63d6b602e4ee766c5",
+      "sign_flip_momentum_v1@SOLUSDT": "2e137e1eec69f71bd97a32a6c6c49ebce879c291bc9eb12fa44b201e288af326",
+      "technical_analysis": "44c3ec1c5d9388c697b688b7a06672e0a0ca15fc988c960c6bc44841cfc54fbd",
+      "ts_momentum_v1": "43c1bd11ade06f2c38d42a786510e3a8a25d7a47a53dd701b8e8263f43a26ac6"
+    },
+    "scheme": "sha256-per-entry/1"
+  },
   "schema": "hypothesis_registry/1",
   "search_width": {
     "basis": "The gated rule never reads entry_bps (it decides on the EWMA of funding, the cost of capital and the basis budget), so carry_rule_sweep@59feb30d2328's 1,440 cells are 60 distinct rules printed 24 times. carry_rule_sweep@d7d7d4141a05 (540 cells) and carry_walkforward@69b08ab2ab84 range over the same axes (hold_days x negative_exit_prints x ewma_alpha): 540 distinct rules, which the walk-forward scored in 38 refit windows, so its 20,520 is 540 x 38 SCORINGS, not 20,520 rules. Source: the 'THE DEFECT THIS ALSO FIXES' section of tools/carry_walkforward.py.",
@@ -284,8 +327,50 @@
       "recorded_utc": "2026-10-27T06:53:10Z",
       "status": "protocol_declared",
       "trial_id": "mainnet_public_protocol_v1"
+    },
+    {
+      "amendments": [],
+      "code_sha": "tools/carry_prospective.py (pinned by PINNED_DIGESTS; see tools/frozen_proof.py)",
+      "costs": "as in the registered plan parameters (assumed, not measured); see carry_prospective.PARAMETERS",
+      "data_window": {
+        "days": 365,
+        "end_ms": 1825545600000,
+        "start_ms": 1794009600000
+      },
+      "evidence": [],
+      "family": "funding_carry",
+      "hypothesis_id": "btc_funding_carry_net_of_costs_exceeds_hurdle",
+      "input_data_sha256": {
+        "registered_plan_digests_by_hurdle_pct": {
+          "10": "de6afe80fba7ec37dbf622647ba505bcf1719b30c147351feb2f436fd28bada9",
+          "15": "1d58583367e1445c36b8aaed4d0acdcd86bffdcc2be8431e791f61a67704e95d",
+          "20": "55be467befe95d98812e31b4bc157923bf527706415a09c5c0447471d6d52249"
+        }
+      },
+      "mechanism": "a delta-neutral short BTCUSDT linear perpetual against owned BTC receives positive funding; the registered question is whether mean excess funding per 8h settlement exceeds the hurdle-implied requirement after the plan's costs",
+      "multiple_testing_family": "the three registered hurdles (Holm)",
+      "note": "FROZEN. This entry only links the plan into the registry; it changes nothing in it.",
+      "parameter_grid": {
+        "hurdles_pct": [
+          10.0,
+          15.0,
+          20.0
+        ]
+      },
+      "prospective_period": "1794009600000..1825545600000",
+      "recorded_utc": "2026-11-07T14:55:21Z",
+      "registered_utc": "2026-11-07T14:55:21Z",
+      "source": "tools/carry_prospective.py",
+      "statistical_design": "one-sided t on mean excess funding, Holm over 3 hurdles, alpha 0.05, power 0.8, ESS-adjusted; coverage floor 0.92; evaluated only through tools/trial_journal.py",
+      "status": "registered",
+      "strategy": "btcusdt_funding_carry_overlay",
+      "train_test": "none: prospective only; no data before the window is evaluated",
+      "trial_id": "btcusdt_funding_carry_overlay@prospective-1",
+      "universe": [
+        "BTCUSDT"
+      ]
     }
   ],
-  "updated_utc": "2026-10-27T06:53:10Z",
+  "updated_utc": "2026-11-07T14:55:21Z",
   "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }
