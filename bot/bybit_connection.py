@@ -296,6 +296,13 @@ class PermanentAPIError(BybitAPIError):
     """Never retry. Retrying an insufficient-balance error just wastes time."""
 
 
+class OrderNotSent(PermanentAPIError):
+    """The order was refused LOCALLY, before any byte reached the transport (the entry authority, or the live-authorisation gate at the transport). Unlike a timeout or a 5xx,
+    its fate is KNOWN: it does not exist at the venue. ``not_sent`` lets a caller classify it as a definite rejection instead of an unknown outcome that would halt the book
+    and block restart (reproduced: a refused entry left the carry book unable to restart)."""
+    not_sent = True
+
+
 # ---------------------------------------------------------------------------
 # transport
 # ---------------------------------------------------------------------------
@@ -657,18 +664,18 @@ class BybitClient:
         through it and is not made weaker or stronger by it."""
         import entry_authority as _ea
         if not isinstance(body, dict):
-            raise PermanentAPIError("ENTRY_REFUSED: ORDER_BODY_NOT_AN_OBJECT")
+            raise OrderNotSent("ENTRY_REFUSED: ORDER_BODY_NOT_AN_OBJECT")
         if not _ea.increases_exposure(body):
             return
         authority = self.entry_authority if self.entry_authority is not None else DEFAULT_ENTRY_AUTHORITY
         if authority is None:
             logger.critical("order REFUSED at the transport: this client has no entry authority (%s)", self.venue)
-            raise PermanentAPIError("ENTRY_REFUSED: NO_ENTRY_AUTHORITY")
+            raise OrderNotSent("ENTRY_REFUSED: NO_ENTRY_AUTHORITY")
         try:
             authority.authorize(body, venue=self.venue)
         except _ea.EntryRefused as exc:
             logger.critical("order REFUSED at the transport by the entry authority: %s", ", ".join(exc.reasons))
-            raise PermanentAPIError(str(exc)) from exc
+            raise OrderNotSent(str(exc)) from exc
 
     def _request(
         self,
@@ -717,7 +724,7 @@ class BybitClient:
             if armed is not True:
                 logger.critical("%s REFUSED at the transport: %s without "
                                 "live authorisation (%s)", endpoint, self.venue, why)
-                raise PermanentAPIError(
+                raise OrderNotSent(
                     f"LIVE_NOT_AUTHORIZED: {endpoint} on {self.venue} ({why})")
         # Count order submissions at the one place every call passes through.
         # Incremented before the attempt, not after a success: an order whose

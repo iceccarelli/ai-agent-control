@@ -314,3 +314,12 @@ def test_an_order_refused_by_ANY_check_reserves_nothing(store, tmp_path):
         c2._request("POST", "/v5/order/create", body=order(orderLinkId="Q"), signed=True)
     led2 = tmp_path / "x" / "state" / "entry_reservations.jsonl"
     assert not led2.exists() or led2.read_text().strip() == ""
+
+
+def test_a_local_refusal_is_a_known_not_sent_outcome_not_an_unknown_one():
+    """Reproduced: a transport-level refusal (ret_code 0) was read by CarryBroker as 'the request may still land', which halted the book and blocked restart."""
+    from carry_broker import CarryBroker
+    assert CarryBroker._definitively_rejected(bc.OrderNotSent("ENTRY_REFUSED: X")) is True
+    assert CarryBroker._definitively_rejected(bc.PermanentAPIError("HTTP 400")) is False          # no venue retCode: still unknown
+    assert CarryBroker._definitively_rejected(bc.TransientAPIError("HTTP 500")) is False
+    assert issubclass(bc.OrderNotSent, bc.PermanentAPIError)                                      # existing handlers that catch PermanentAPIError keep working
