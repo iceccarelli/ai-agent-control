@@ -172,6 +172,7 @@ jobs:
           tests/test_funding_cap_event_path.py
           tests/test_supabase_migrations.py
           tests/test_owner_import.py
+          tests/test_strategy_verdict.py
           tests/test_md_broker_funding_interval.py
           tests/test_entry_authority_e2e.py
           tests/test_state_backup_promote.py
