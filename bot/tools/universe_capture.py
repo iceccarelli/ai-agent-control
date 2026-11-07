@@ -32,6 +32,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -39,6 +40,7 @@ sys.path.insert(0, BOT)
 sys.path.insert(0, os.path.join(BOT, "tools"))
 
 import account_review as AR  # noqa: E402  (the one protected-name rule)
+import runtime_capability as RC  # noqa: E402  (the role model only: pure, signs nothing, sends nothing)
 import venues  # noqa: E402
 
 SCHEMA_VERSION = 1
@@ -56,11 +58,11 @@ PERP_TYPE = "LinearPerpetual"
 QUOTE = "USDT"
 MAX_FUNDING_INTERVAL_MIN = 24 * 60
 
-_SYMBOL = re.compile(r"^[A-Z0-9]{2,24}$", re.ASCII)
-_DEC = re.compile(r"^[0-9]+(\.[0-9]+)?$", re.ASCII)
-_SDEC = re.compile(r"^-?[0-9]+(\.[0-9]+)?$", re.ASCII)
-_UINT = re.compile(r"^[0-9]{1,19}$", re.ASCII)
-_CURSOR = re.compile(r"^[A-Za-z0-9%._~=+/:,-]{1,512}$", re.ASCII)
+_SYMBOL = re.compile(r"^[A-Z0-9]{2,24}\Z", re.ASCII)
+_DEC = re.compile(r"^[0-9]+(\.[0-9]+)?\Z", re.ASCII)
+_SDEC = re.compile(r"^-?[0-9]+(\.[0-9]+)?\Z", re.ASCII)
+_UINT = re.compile(r"^[0-9]{1,19}\Z", re.ASCII)
+_CURSOR = re.compile(r"^[A-Za-z0-9%._~=+/:,-]{1,512}\Z", re.ASCII)
 
 
 class CaptureError(ValueError):
@@ -80,7 +82,7 @@ def request_url(path: str, cursor: Optional[str] = None) -> str:
     if path == PATH_INSTRUMENTS:
         q = [("category", CATEGORY), ("limit", PAGE_LIMIT)]
         if cursor:
-            if not _CURSOR.match(cursor):
+            if not _CURSOR.fullmatch(cursor):
                 raise CaptureError("refusing a cursor that is not a short printable token")
             q.append(("cursor", cursor))
     elif path == PATH_TICKERS:
@@ -97,23 +99,43 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def http_fetch(url: str) -> bytes:
-    """The only network primitive: one unauthenticated GET, no redirects, bounded body. Tests never reach it."""
+class _UrllibTransport:
+    """The innermost transport: one GET through urllib with no redirects. Only ever reached THROUGH ``CapabilityTransport`` (see ``_transport``)."""
+
+    def request(self, method: str, url: str, *, headers: Dict[str, str], body: Optional[str], timeout: float) -> bytes:
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, method="GET", headers=dict(headers))
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    raise CaptureError(f"HTTP {resp.status}")
+                data = resp.read(MAX_BODY_BYTES + 1)
+        except (urllib.error.URLError, OSError) as exc:
+            raise CaptureError(f"request failed ({type(exc).__name__})") from exc
+        if len(data) > MAX_BODY_BYTES:
+            raise CaptureError("response larger than any universe page")
+        return data
+
+
+def _transport() -> "RC.CapabilityTransport":
+    return RC.CapabilityTransport(_UrllibTransport(), RC.Capability.for_role(RC.PUBLIC_COLLECTOR, venue="mainnet"))
+
+
+def http_request(method: Any, url: Any, *, headers: Any = None, body: Any = None) -> bytes:
+    """The only network primitive; the ``public_collector`` role refuses anything but an unsigned GET of a public market path BEFORE a connection is opened."""
     base = _base()
-    if not any(url.startswith(base + p + "?") for p in (PATH_INSTRUMENTS, PATH_TICKERS)):
+    if not isinstance(url, str) or not any(url.startswith(base + p + "?") for p in (PATH_INSTRUMENTS, PATH_TICKERS)):
         raise CaptureError("refusing a URL that is not the registry host and a pinned universe path")
-    opener = urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json", "User-Agent": "universe-capture/1"})
+    hdrs = {"Accept": "application/json", "User-Agent": "universe-capture/1"} if headers is None else headers
     try:
-        with opener.open(req, timeout=TIMEOUT_S) as resp:
-            if resp.status != 200:
-                raise CaptureError(f"HTTP {resp.status}")
-            body = resp.read(MAX_BODY_BYTES + 1)
-    except (urllib.error.URLError, OSError) as exc:
-        raise CaptureError(f"request failed ({type(exc).__name__})") from exc
-    if len(body) > MAX_BODY_BYTES:
-        raise CaptureError("response larger than any universe page")
-    return body
+        return _transport().request(method, url, headers=hdrs, body=body, timeout=TIMEOUT_S)
+    except RC.CapabilityRefused as exc:
+        raise CaptureError(f"refused by the public_collector role: {exc.code}") from exc
+
+
+def http_fetch(url: str) -> bytes:
+    """One unauthenticated GET through ``http_request`` (so through the role). Tests never reach it."""
+    return http_request("GET", url)
 
 
 def _create_exclusive(path: str, data: bytes) -> None:
@@ -156,10 +178,10 @@ def _envelope(body: bytes, label: str) -> Tuple[Dict[str, Any], List[Any], str, 
     nxt = res.get("nextPageCursor", "")
     if nxt is None:
         nxt = ""
-    if not isinstance(nxt, str) or (nxt and not _CURSOR.match(nxt)):
+    if not isinstance(nxt, str) or (nxt and not _CURSOR.fullmatch(nxt)):
         raise CaptureError(f"{label}: nextPageCursor is not a short printable token")
     t = doc.get("time")
-    t = int(t) if isinstance(t, int) and not isinstance(t, bool) and t > 0 else (int(t) if isinstance(t, str) and _UINT.match(t) else None)
+    t = int(t) if isinstance(t, int) and not isinstance(t, bool) and t > 0 else (int(t) if isinstance(t, str) and _UINT.fullmatch(t) else None)
     return res, res["list"], nxt, t
 
 
@@ -179,7 +201,7 @@ def _dec(row: Dict[str, Any], *path: str, positive: bool = True, signed: bool = 
         if required:
             raise ValueError(f"missing {name}")
         return None
-    if not isinstance(cur, str) or not (_SDEC if signed else _DEC).match(cur):
+    if not isinstance(cur, str) or not (_SDEC if signed else _DEC).fullmatch(cur):
         raise ValueError(f"{name} is not a decimal string")
     if positive and not float(cur) > 0:
         raise ValueError(f"{name} must be > 0")
@@ -188,7 +210,7 @@ def _dec(row: Dict[str, Any], *path: str, positive: bool = True, signed: bool = 
 
 def _uint(row: Dict[str, Any], key: str) -> int:
     v = row.get(key)
-    if isinstance(v, bool) or not (isinstance(v, int) and v >= 0 or isinstance(v, str) and _UINT.match(v)):
+    if isinstance(v, bool) or not (isinstance(v, int) and v >= 0 or isinstance(v, str) and _UINT.fullmatch(v)):
         raise ValueError(f"{key} is not a whole number")
     return int(v)
 
@@ -198,7 +220,7 @@ def normalize_instrument(row: Any) -> Tuple[Optional[Dict[str, Any]], Optional[s
     if not isinstance(row, dict):
         return None, "not_an_object", ""
     sym = row.get("symbol")
-    if not isinstance(sym, str) or not _SYMBOL.match(sym):
+    if not isinstance(sym, str) or not _SYMBOL.fullmatch(sym):
         return None, "bad_symbol", str(sym)[:24]
     if row.get("contractType") != PERP_TYPE:
         return None, f"not_perpetual:{str(row.get('contractType'))[:24]}", sym
@@ -234,16 +256,25 @@ _TICKER_KEEP = ("markPrice", "indexPrice", "lastPrice", "fundingRate", "nextFund
                 "openInterest", "openInterestValue", "volume24h", "turnover24h")
 
 
+MAX_TURNOVER = 10 ** 15                 # a 24h USDT turnover above this is a poisoned response, not a market
+
+
+def _bounded_turnover(v: str) -> bool:
+    return len(v) <= 64 and _DEC.fullmatch(v) is not None and Decimal(v) <= MAX_TURNOVER
+
+
 def _tickers(rows: List[Any], label: str) -> Tuple[Dict[str, Dict[str, Any]], int]:
     out: Dict[str, Dict[str, Any]] = {}
     dups = 0
     for r in rows:
-        if not isinstance(r, dict) or not isinstance(r.get("symbol"), str) or not _SYMBOL.match(r["symbol"]):
+        if not isinstance(r, dict) or not isinstance(r.get("symbol"), str) or not _SYMBOL.fullmatch(r["symbol"]):
             raise CaptureError(f"{label}: a ticker row has no sane symbol")
         t = {k: r.get(k) for k in _TICKER_KEEP if r.get(k) not in (None, "")}
         for k, v in t.items():
             if not isinstance(v, str):
                 raise CaptureError(f"{label}: {r['symbol']} {k} is not a string")
+        if "turnover24h" in t and not _bounded_turnover(t["turnover24h"]):
+            raise CaptureError(f"{label}: {r['symbol']} turnover24h is not a bounded non-negative decimal")
         if r["symbol"] in out:
             if out[r["symbol"]] != t:
                 raise CaptureError(f"{label}: ticker {r['symbol']} appears twice with different values; nothing is merged")

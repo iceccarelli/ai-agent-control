@@ -425,7 +425,7 @@ def test_module_has_no_order_capability_or_credentials_by_ast():
         elif isinstance(n, ast.ImportFrom):
             imported.add(n.module or "")
     assert imported == {"__future__", "argparse", "hashlib", "json", "os", "re", "shutil", "sys", "time", "urllib.error", "urllib.parse", "urllib.request", "decimal", "typing",
-                        "evidence_chain", "universe_capture", "venues"}
+                        "evidence_chain", "universe_capture", "venues", "runtime_capability"}
     assert not any(any(f in i for f in ("bybit_connection", "carry_broker", "hmac", "broker", "signing", "secrets")) for i in imported)
     strings = [n.value for n in ast.walk(tree) if isinstance(n, ast.Constant) and isinstance(n.value, str)]
     v5 = {s for s in strings if s.startswith("/v5/")}
@@ -648,3 +648,141 @@ def test_cli_seal_check_backup_restore(tmp_path, root, capsys):
     assert MC.main(["check", "--root", str(root), "--manifest", man]) == 1
     assert MC.main(["seal", "--root", str(root), "--manifest", str(root / "in.jsonl")]) == 2
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------- red-team hardening: patterns, now_ms, turnover, and the real network primitive
+
+@pytest.mark.parametrize("name,sample", [("_SYMBOL", "BTCUSDT"), ("_DEC", "1.5"), ("_SDEC", "-1.5"), ("_UINT", "123"), ("_CYCLE", "cycle-123"), ("_HEX", "a" * 64)])
+def test_every_pattern_refuses_a_trailing_newline(name, sample):
+    pat = getattr(MC, name)
+    assert pat.match(sample) and pat.fullmatch(sample)
+    assert pat.match(sample + "\n") is None and pat.fullmatch(sample + "\n") is None
+
+
+def test_a_symbol_with_a_trailing_newline_is_refused_everywhere(root):
+    base_tick = tick("BTCUSDT")
+    for bad in ("BTCUSDT\n", "EVIL\n"):
+        with pytest.raises(MC.CollectorError):
+            MC.request_url(MC.PATH_BOOK, symbol=bad, limit=5)
+        with pytest.raises(MC.CollectorError):
+            MC.request_url(MC.PATH_TRADES, symbol=bad, limit=5)
+        body = lst([dict(base_tick, symbol=bad)], T0).replace(b"linear", b"linear")
+        rows_, info = MC.validate_tickers(body)
+        assert rows_ == {} and info["rejects"].get("bad_symbol") == 1
+        with pytest.raises(MC.CollectorError):
+            MC.select_symbols({bad: {"turnover24h": "5"}}, {bad}, 3)
+
+
+@pytest.mark.parametrize("bad", [10 ** 16, 10 ** 17, 10 ** 30, 0, -1, True, False, 1.5, "1800000000000", None, 10 ** 14])
+def test_a_hostile_now_ms_is_refused_before_any_directory_is_created(tmp_path, bad):
+    out = tmp_path / "never"
+    with pytest.raises(MC.CollectorError):
+        MC.run_once(str(out), bad, lambda u: b"", lambda: T0, sleep=lambda _s: None, free_bytes_fn=lambda _p: 1 << 40)
+    assert not out.exists()
+
+
+@pytest.mark.parametrize("bad", [10 ** 16, -5, True, 1.5, "7"])
+def test_seal_and_backup_refuse_a_hostile_now_ms(tmp_path, root, bad):
+    with pytest.raises(MC.CollectorError):
+        MC.seal_cycles(str(root), str(tmp_path / "m.json"), now_ms=bad)
+    with pytest.raises(MC.CollectorError):
+        MC.backup_cycles(str(root), str(tmp_path / "d"), str(tmp_path / "r"), now_ms=bad)
+    assert not (tmp_path / "d").exists()
+
+
+@pytest.mark.parametrize("bad", ["9" * 40, "1e999", "99999999999999999999999", "1" + "0" * 16, "NaN", "Infinity", "-1", "1_000"])
+def test_a_poisoned_turnover_cannot_steer_selection(bad):
+    body = lst([tick("BTCUSDT", turnover="1000"), tick("ETHUSDT", turnover=bad)], T0)
+    rows_, info = MC.validate_tickers(body)
+    assert "BTCUSDT" in rows_ and "ETHUSDT" not in rows_ and info["rejected_symbols"]["ETHUSDT"] == "invalid:turnover24h"
+    with pytest.raises(MC.CollectorError):                          # and the pure selector refuses it if handed one directly
+        MC.select_symbols({"ETHUSDT": {"turnover24h": bad}}, {"ETHUSDT"}, 3)
+
+
+def test_a_sane_large_turnover_still_selects():
+    assert MC.select_symbols({"BTCUSDT": {"turnover24h": "98765432109.5"}}, {"BTCUSDT"}, 3)[0]["symbol"] == "BTCUSDT"
+
+
+def _tripwire(monkeypatch):
+    hits = []
+
+    def boom(*a, **k):
+        hits.append(a)
+        raise AssertionError("a socket/urlopen was touched")
+    import urllib.request as ur
+    monkeypatch.setattr(ur.OpenerDirector, "open", boom)
+    monkeypatch.setattr(ur, "urlopen", boom)
+    monkeypatch.setattr(ur, "build_opener", boom)
+    monkeypatch.setattr(socket.socket, "connect", boom)
+    monkeypatch.setattr(socket, "create_connection", boom)
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
+    return hits
+
+
+def test_the_real_network_primitive_consults_the_public_collector_capability(monkeypatch):
+    hits = _tripwire(monkeypatch)
+    base = venues.rest_for("mainnet")
+    good = f"{base}/v5/market/orderbook?category=linear&symbol=BTCUSDT&limit=5"
+    for method, url, headers, body in (
+        ("POST", good, None, None),
+        ("POST", f"{base}/v5/order/create", {"X-BAPI-SIGN": "s"}, "{}"),
+        ("GET", good, {"X-BAPI-API-KEY": "k"}, None),
+        ("GET", good, {"X-BAPI-SIGN ": "s"}, None),
+        ("GET", good, [("Cookie", "a=b")], None),
+        ("GET", good, None, "body"),
+        ("GET", f"{base}/v5/account/wallet-balance?accountType=UNIFIED", None, None),
+        ("GET", f"{base}/v5/user/query-api", None, None),
+        ("GET", f"{base}/v5/market/orderbook?category=linear&api_key=K", None, None),
+        ("GET", f"{base}/v5/market/ord\nerbook?category=linear", None, None),
+        ("GET", "https://evil.example/v5/market/orderbook?category=linear", None, None),
+    ):
+        with pytest.raises(MC.CollectorError):
+            MC.http_request(method, url, headers=headers, body=body)
+    assert hits == []
+
+
+def test_http_fetch_refuses_control_characters_and_never_opens_a_connection(monkeypatch):
+    hits = _tripwire(monkeypatch)
+    base = venues.rest_for("mainnet")
+    for bad in (f"{base}/v5/market/orderbook?category=linear&symbol=BTCUSDT\n", f"{base}/v5/market/orderbook?category=linear&symbol=BT\tC",
+                f"{base}/v5/market/orderbook?category=linear&symbol=BTC USDT"):
+        with pytest.raises(MC.CollectorError):
+            MC.http_fetch(bad)
+    assert hits == []
+
+
+def test_a_legal_request_passes_the_capability_and_reaches_the_opener(monkeypatch):
+    seen = []
+
+    class R:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n):
+            return b"{}"
+
+    import urllib.request as ur
+    monkeypatch.setattr(ur.OpenerDirector, "open", lambda self, req, timeout=None: (seen.append((req.get_method(), req.full_url, dict(req.header_items()))), R())[1])
+    base = venues.rest_for("mainnet")
+    for p, q in ((MC.PATH_BOOK, "category=linear&symbol=BTCUSDT&limit=5"), (MC.PATH_TRADES, "category=linear&symbol=BTCUSDT&limit=5"),
+                 (UC.PATH_TICKERS, "category=linear"), (UC.PATH_INSTRUMENTS, "category=linear&limit=1000&cursor=a%3Db")):
+        assert MC.http_fetch(f"{base}{p}?{q}") == b"{}"
+    assert [s[0] for s in seen] == ["GET"] * 4
+    assert not any(k.lower() in ("authorization", "cookie") or k.lower().startswith("x-bapi") for s in seen for k in s[2])
+
+
+def test_the_collector_builds_its_transport_from_the_public_collector_role_and_imports_nothing_that_signs():
+    src = open(os.path.join(BOT, "tools", "market_collector.py")).read()
+    assert "PUBLIC_COLLECTOR" in src and "CapabilityTransport" in src
+    imps = set()
+    for n in ast.walk(ast.parse(src)):
+        if isinstance(n, ast.Import):
+            imps |= {a.name.split(".")[0] for a in n.names}
+        elif isinstance(n, ast.ImportFrom):
+            imps.add((n.module or "").split(".")[0])
+    assert not imps & {"hmac", "bybit_connection", "carry_broker", "entry_authority", "requests", "http"}

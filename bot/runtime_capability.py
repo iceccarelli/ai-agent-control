@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from typing import Any, FrozenSet, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import venues as _venues
 
@@ -39,14 +39,18 @@ TESTNET_CREDENTIAL_CLASS = "testnet_dedicated"
 #: Public market data (unsigned GET).
 PUBLIC_MARKET_PATHS: FrozenSet[str] = frozenset({
     "/v5/market/time", "/v5/market/tickers", "/v5/market/orderbook", "/v5/market/kline",
-    "/v5/market/instruments-info", "/v5/market/funding/history",
+    "/v5/market/instruments-info", "/v5/market/funding/history", "/v5/market/recent-trade",
 })
 
 #: Account READ paths (signed GET). Nothing here can move money or change state.
 ACCOUNT_READ_PATHS: FrozenSet[str] = frozenset({
     "/v5/account/wallet-balance", "/v5/account/fee-rate", "/v5/account/info", "/v5/position/list", "/v5/position/closed-pnl",
-    "/v5/order/realtime", "/v5/order/history", "/v5/execution/list", "/v5/user/query-api",
+    "/v5/order/realtime", "/v5/order/history", "/v5/execution/list",
 })
+
+#: Signed GETs that are allowed on the TESTNET host only. ``/v5/user/query-api`` names an API key (its permissions/ips); the owner's testnet preflight
+#: (``tools/testnet_action_manifest.py`` ``account_identity``; pinned by ``test_every_preflight_read_is_allowed_for_the_monitor_role...``) reads it. Off testnet no role may.
+TESTNET_ONLY_READ_PATHS: FrozenSet[str] = frozenset({"/v5/user/query-api"})
 
 #: Signed POSTs the executor may send. Amend, batch create/amend, transfers, withdrawals and API-key management are deliberately absent.
 EXECUTOR_POST_PATHS: FrozenSet[str] = frozenset({
@@ -58,9 +62,17 @@ FORBIDDEN_FAMILIES: Tuple[str, ...] = ("/v5/asset/", "/v5/user/", "/v5/account/w
                                        "/v5/lending", "/v5/broker/", "/v5/affiliate/", "/v5/earn/")
 _FORBIDDEN_WORDS = ("withdraw", "transfer", "deposit", "sub-member", "create-sub", "api-key", "apikey", "universal")
 
-_CANONICAL = re.compile(r"^/v5(/[a-z0-9]+(-[a-z0-9]+)*)+$")
+_CANONICAL = re.compile(r"/v5(/[a-z0-9]+(-[a-z0-9]+)*)+")
 _CREDENTIAL_ENV = re.compile(r"^BYBIT_.*(KEY|SECRET|TOKEN)", re.IGNORECASE)
-_SIGNED_HEADERS = ("x-bapi-api-key", "x-bapi-sign", "x-bapi-sign-type", "x-bapi-timestamp", "authorization", "x-api-key")
+_SIGNED_HEADERS = ("x-bapi-api-key", "x-bapi-sign", "x-bapi-sign-type", "x-bapi-timestamp", "authorization", "x-api-key", "cookie", "proxy-authorization",
+                   "x-sign", "x-signature")
+#: Any header whose name CONTAINS one of these carries (or may carry) a credential: treated as signed.
+_CREDENTIAL_HEADER_WORDS = ("bapi", "sign", "auth", "token", "secret", "cookie", "apikey", "api-key", "password", "passphrase", "credential")
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9a-z-]+")
+#: Exact (separator-stripped) or substring markers of a credential carried in a query string.
+_CREDENTIAL_QUERY_EXACT = frozenset({"sign", "key", "auth", "authorization", "apikey", "sig"})
+_CREDENTIAL_QUERY_WORDS = ("apikey", "secret", "token", "signature", "password", "passphrase", "credential", "bapi", "accesskey")
+_URL_CHARS = re.compile(r"[\x21-\x7e]+")
 
 
 class CapabilityRefused(Exception):
@@ -117,7 +129,7 @@ class Capability:
             return "NO_VENUE_ACCESS: evidence_backup may not make any HTTP request"
         if not isinstance(method, str) or method not in ("GET", "POST"):
             return "METHOD_REFUSED"
-        if not isinstance(endpoint, str) or not _CANONICAL.match(endpoint):
+        if not isinstance(endpoint, str) or not _CANONICAL.fullmatch(endpoint):
             return "ENDPOINT_NOT_CANONICAL"
         if not isinstance(signed, bool):
             return "SIGNED_FLAG_NOT_BOOLEAN"
@@ -127,7 +139,8 @@ class Capability:
             return "EXECUTOR_NOT_TESTNET"
         if any(endpoint.startswith(f) for f in FORBIDDEN_FAMILIES if f != "/v5/user/") or any(w in endpoint for w in _FORBIDDEN_WORDS):
             return "ENDPOINT_FORBIDDEN"
-        if endpoint.startswith("/v5/user/") and endpoint not in ACCOUNT_READ_PATHS:
+        testnet_read = endpoint in TESTNET_ONLY_READ_PATHS and self.host == _venues.get("testnet").host
+        if endpoint.startswith("/v5/user/") and endpoint not in ACCOUNT_READ_PATHS and not testnet_read:
             return "ENDPOINT_FORBIDDEN"
         if self.role == PUBLIC_COLLECTOR:
             if method != "GET":
@@ -139,12 +152,12 @@ class Capability:
             if method != "GET":
                 return "MONITOR_GET_ONLY"
             if signed:
-                return None if endpoint in ACCOUNT_READ_PATHS else "ENDPOINT_NOT_ALLOWED"
+                return None if endpoint in ACCOUNT_READ_PATHS or testnet_read else "ENDPOINT_NOT_ALLOWED"
             return None if endpoint in PUBLIC_MARKET_PATHS else "ENDPOINT_NOT_ALLOWED"
         # testnet_executor
         if method == "GET":
             if signed:
-                return None if endpoint in ACCOUNT_READ_PATHS else "ENDPOINT_NOT_ALLOWED"
+                return None if endpoint in ACCOUNT_READ_PATHS or testnet_read else "ENDPOINT_NOT_ALLOWED"
             return None if endpoint in PUBLIC_MARKET_PATHS else "ENDPOINT_NOT_ALLOWED"
         if not signed:
             return "POST_MUST_BE_SIGNED"
@@ -156,8 +169,61 @@ class Capability:
             raise CapabilityRefused(code, f"role={self.role} {method} {endpoint!r} signed={signed!r} host={host!r}")
 
 
-def _header_says_signed(headers: Optional[Mapping[str, Any]]) -> bool:
-    return any(isinstance(k, str) and k.lower() in _SIGNED_HEADERS for k in (headers or {}))
+def _text(v: Any, what: str) -> str:
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            v = bytes(v).decode("ascii")
+        except UnicodeDecodeError:
+            raise CapabilityRefused("HEADERS_REFUSED", f"{what} is not ASCII") from None
+    if not isinstance(v, str):
+        raise CapabilityRefused("HEADERS_REFUSED", f"{what} is not text")
+    return v
+
+
+def _normalize_headers(headers: Any) -> Tuple[dict, bool]:
+    """(headers as one str->str dict exactly as they will be SENT, whether any carries a credential). Refuses anything it cannot parse."""
+    if headers is None:
+        return {}, False
+    if isinstance(headers, Mapping):
+        pairs = list(headers.items())
+    elif isinstance(headers, (list, tuple)):
+        pairs = []
+        for p in headers:
+            if not isinstance(p, (list, tuple)) or len(p) != 2:
+                raise CapabilityRefused("HEADERS_REFUSED", "a header entry is not a (name, value) pair")
+            pairs.append((p[0], p[1]))
+    else:
+        raise CapabilityRefused("HEADERS_REFUSED", f"headers of type {type(headers).__name__} cannot be parsed")
+    out: dict = {}
+    signed = False
+    seen = set()
+    for k, v in pairs:
+        name = _text(k, "a header name").strip()
+        value = _text(v, "a header value")
+        key = name.casefold()
+        if not _HEADER_NAME.fullmatch(key):
+            raise CapabilityRefused("HEADERS_REFUSED", f"header name {name!r} is not a plain token")
+        if any(c in value for c in "\r\n\x00"):
+            raise CapabilityRefused("HEADERS_REFUSED", f"header {name!r} value has a control character")
+        if key in seen:
+            raise CapabilityRefused("HEADERS_REFUSED", f"header {name!r} appears twice")
+        seen.add(key)
+        out[name] = value
+        if key in _SIGNED_HEADERS or any(w in key for w in _CREDENTIAL_HEADER_WORDS):
+            signed = True
+    return out, signed
+
+
+def _query_has_credential(query: str) -> bool:
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=False, max_num_fields=64)
+    except ValueError:
+        raise CapabilityRefused("URL_REFUSED", "query string cannot be parsed") from None
+    for k, _v in pairs:
+        n = re.sub(r"[-_.\s]", "", k.casefold())
+        if n in _CREDENTIAL_QUERY_EXACT or any(w in n for w in _CREDENTIAL_QUERY_WORDS):
+            return True
+    return False
 
 
 class CapabilityTransport:
@@ -170,18 +236,24 @@ class CapabilityTransport:
     def __getattr__(self, name: str) -> Any:
         return getattr(self._inner, name)
 
-    def request(self, method: Any, url: Any, *, headers: Optional[Mapping[str, str]] = None, body: Optional[str] = None, timeout: Any = None, **kw: Any) -> Any:
+    def request(self, method: Any, url: Any, *, headers: Any = None, body: Optional[str] = None, timeout: Any = None, **kw: Any) -> Any:
         if kw:
             raise CapabilityRefused("UNKNOWN_TRANSPORT_ARGUMENTS", str(sorted(kw)))
         if not isinstance(url, str):
             raise CapabilityRefused("URL_REFUSED", "not a string")
+        if not _URL_CHARS.fullmatch(url):                    # BEFORE parsing: urlsplit silently strips \n \t \r, so what is checked would not be what is sent
+            raise CapabilityRefused("URL_REFUSED", "control, whitespace or non-ASCII character in the URL")
         parts = urlsplit(url)
         host_raw = parts.netloc
-        if parts.scheme != "https" or "@" in host_raw or ":" in host_raw or host_raw != host_raw.strip() or parts.fragment or parts.username or parts.password:
+        if parts.scheme != "https" or "@" in host_raw or ":" in host_raw or host_raw != host_raw.strip() or parts.fragment or parts.username or parts.password \
+                or "\\" in url:
             raise CapabilityRefused("URL_REFUSED", f"scheme/userinfo/port/fragment in {url!r}")
         if method == "POST" and parts.query:
             raise CapabilityRefused("URL_REFUSED", "query string on a POST")
         if method == "GET" and body:
             raise CapabilityRefused("URL_REFUSED", "body on a GET")
-        self.capability.enforce(method, parts.path, _header_says_signed(headers), host_raw)
-        return self._inner.request(method, url, headers=headers if headers is not None else {}, body=body, timeout=timeout)
+        if _query_has_credential(parts.query):
+            raise CapabilityRefused("URL_REFUSED", "a credential-looking query parameter (credentials travel in signed headers only)")
+        clean, signed = _normalize_headers(headers)
+        self.capability.enforce(method, parts.path, signed, host_raw)
+        return self._inner.request(method, url, headers=clean, body=body, timeout=timeout)

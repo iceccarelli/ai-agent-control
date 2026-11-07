@@ -50,6 +50,7 @@ sys.path.insert(0, os.path.join(BOT, "tools"))
 
 import evidence_chain as EC  # noqa: E402
 import universe_capture as UC  # noqa: E402
+import runtime_capability as RC  # noqa: E402  (the role model only: pure, signs nothing, sends nothing)
 import venues  # noqa: E402
 
 SCHEMA_VERSION = 1
@@ -64,6 +65,8 @@ TIMEOUT_S = 15.0
 PAUSE_S = 0.25
 SKEW_WARN_MS = UC.SKEW_WARN_MS
 DEFAULT_MAX_SYMBOLS = 20
+MAX_TURNOVER = Decimal(10) ** 15                  # a 24h USDT turnover above this is a poisoned response, not a market (BTC is ~1e10)
+MAX_MS = 10 ** 14                                  # a millisecond clock below year ~5138; also keeps ``cycle-<ms>`` inside _CYCLE's 16 digits
 DEFAULT_DEPTH = 50
 DEFAULT_TRADES = 100
 MAX_DEPTH = 200
@@ -77,12 +80,12 @@ DEFAULT_MAX_BYTES = 50 << 30
 LOG_NAME = "cycles.jsonl"
 COMPLETE = "COMPLETE"
 
-_SYMBOL = re.compile(r"^[A-Z0-9]{2,24}$", re.ASCII)
-_DEC = re.compile(r"^[0-9]+(\.[0-9]+)?$", re.ASCII)
-_SDEC = re.compile(r"^-?[0-9]+(\.[0-9]+)?$", re.ASCII)
-_UINT = re.compile(r"^[0-9]{1,19}$", re.ASCII)
-_CYCLE = re.compile(r"^cycle-[0-9]{1,16}$", re.ASCII)
-_HEX = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+_SYMBOL = re.compile(r"^[A-Z0-9]{2,24}\Z", re.ASCII)
+_DEC = re.compile(r"^[0-9]+(\.[0-9]+)?\Z", re.ASCII)
+_SDEC = re.compile(r"^-?[0-9]+(\.[0-9]+)?\Z", re.ASCII)
+_UINT = re.compile(r"^[0-9]{1,19}\Z", re.ASCII)
+_CYCLE = re.compile(r"^cycle-[0-9]{1,16}\Z", re.ASCII)
+_HEX = re.compile(r"^[0-9a-f]{64}\Z", re.ASCII)
 
 
 class CollectorError(ValueError):
@@ -114,7 +117,7 @@ def request_url(path: str, *, symbol: Optional[str] = None, limit: Optional[int]
     """Constants + one validated symbol + one bounded integer. Anything else is refused."""
     if path not in (PATH_BOOK, PATH_TRADES):
         raise CollectorError("refusing a path that is not a pinned per-symbol public path")
-    if not isinstance(symbol, str) or not _SYMBOL.match(symbol):
+    if not isinstance(symbol, str) or not _SYMBOL.fullmatch(symbol):
         raise CollectorError("refusing a symbol that is not a short upper-case token")
     cap = MAX_DEPTH if path == PATH_BOOK else MAX_TRADES
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= cap:
@@ -128,27 +131,49 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def http_fetch(url: str) -> bytes:
-    """One unauthenticated GET, no redirects, bounded body, host from the registry. Tests never reach it."""
+class _UrllibTransport:
+    """The innermost transport: one GET through urllib with no redirects. Only ever reached THROUGH ``CapabilityTransport`` (see ``_transport``)."""
+
+    def request(self, method: str, url: str, *, headers: Mapping[str, str], body: Optional[str], timeout: float) -> bytes:
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, method="GET", headers=dict(headers))
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                if resp.status != 200:
+                    raise CollectorError(f"HTTP {resp.status}")
+                body_b = resp.read(MAX_BODY_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                raise RateLimited("HTTP 429") from exc
+            raise CollectorError(f"HTTP {exc.code}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise CollectorError(f"request failed ({type(exc).__name__})") from exc
+        if len(body_b) > MAX_BODY_BYTES:
+            raise CollectorError("response larger than any market page")
+        return body_b
+
+
+def _transport() -> "RC.CapabilityTransport":
+    """The collector's ONLY network path: the urllib transport behind the ``public_collector`` role (unsigned GET of public market paths on the registry host)."""
+    return RC.CapabilityTransport(_UrllibTransport(), RC.Capability.for_role(RC.PUBLIC_COLLECTOR, venue="mainnet"))
+
+
+def http_request(method: Any, url: Any, *, headers: Any = None, body: Any = None) -> bytes:
+    """The only network primitive. The role refuses (BEFORE a connection is opened) any POST, signed/credential-carrying or unparseable header, body,
+    credential-looking query parameter, control character, other host or non-allow-listed path; the pinned-path check below is a second, stricter fence."""
     base = _base()
-    if not any(url.startswith(base + p + "?") for p in PUBLIC_PATHS):
+    if not isinstance(url, str) or not any(url.startswith(base + p + "?") for p in PUBLIC_PATHS):
         raise CollectorError("refusing a URL that is not the registry host and a pinned public market path")
-    opener = urllib.request.build_opener(_NoRedirect)
-    req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json", "User-Agent": "market-collector/1"})
+    hdrs = {"Accept": "application/json", "User-Agent": "market-collector/1"} if headers is None else headers
     try:
-        with opener.open(req, timeout=TIMEOUT_S) as resp:
-            if resp.status != 200:
-                raise CollectorError(f"HTTP {resp.status}")
-            body = resp.read(MAX_BODY_BYTES + 1)
-    except urllib.error.HTTPError as exc:
-        if exc.code == 429:
-            raise RateLimited("HTTP 429") from exc
-        raise CollectorError(f"HTTP {exc.code}") from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise CollectorError(f"request failed ({type(exc).__name__})") from exc
-    if len(body) > MAX_BODY_BYTES:
-        raise CollectorError("response larger than any market page")
-    return body
+        return _transport().request(method, url, headers=hdrs, body=body, timeout=TIMEOUT_S)
+    except RC.CapabilityRefused as exc:
+        raise CollectorError(f"refused by the public_collector role: {exc.code}") from exc
+
+
+def http_fetch(url: str) -> bytes:
+    """One unauthenticated GET through ``http_request`` (so through the role). Tests never reach it."""
+    return http_request("GET", url)
 
 
 def _sha(data: bytes) -> str:
@@ -200,8 +225,8 @@ class _Fetcher:
 
 # ---------------------------------------------------------------- validation (counted rejects, never silent drops)
 
-def _dec(v: Any, *, signed: bool = False, positive: bool = False, nonneg: bool = False) -> Optional[Decimal]:
-    if not isinstance(v, str) or not (_SDEC if signed else _DEC).match(v):
+def _dec(v: Any, *, signed: bool = False, positive: bool = False, nonneg: bool = False, bounded: bool = False) -> Optional[Decimal]:
+    if not isinstance(v, str) or len(v) > 64 or not (_SDEC if signed else _DEC).fullmatch(v):
         return None
     try:
         d = Decimal(v)
@@ -210,6 +235,8 @@ def _dec(v: Any, *, signed: bool = False, positive: bool = False, nonneg: bool =
     if positive and not d > 0:
         return None
     if nonneg and d < 0:
+        return None
+    if bounded and not (d.is_finite() and 0 <= d <= MAX_TURNOVER):
         return None
     return d
 
@@ -222,7 +249,7 @@ def _venue_time(doc: Any) -> Optional[int]:
     t = doc.get("time") if isinstance(doc, dict) else None
     if isinstance(t, int) and not isinstance(t, bool) and t > 0:
         return t
-    if isinstance(t, str) and _UINT.match(t):
+    if isinstance(t, str) and _UINT.fullmatch(t):
         return int(t)
     return None
 
@@ -261,7 +288,7 @@ def validate_book(body: bytes, symbol: str, depth: int) -> Dict[str, Any]:
     if res.get("s") != symbol:
         _bump(rej, "wrong_symbol")
     ts = res.get("ts")
-    if isinstance(ts, bool) or not (isinstance(ts, int) and ts > 0 or isinstance(ts, str) and _UINT.match(ts)):
+    if isinstance(ts, bool) or not (isinstance(ts, int) and ts > 0 or isinstance(ts, str) and _UINT.fullmatch(ts)):
         _bump(rej, "bad_ts")
     sides: Dict[str, List[Tuple[Decimal, str]]] = {}
     for key, name in (("b", "bid"), ("a", "ask")):
@@ -324,7 +351,7 @@ def validate_trades(body: bytes, symbol: str, limit: int, recv_ms: int) -> Dict[
             _bump(rej, "not_an_object")
             continue
         eid, price, size, side, t = r.get("execId"), r.get("price"), r.get("size"), r.get("side"), r.get("time")
-        tt = int(t) if isinstance(t, str) and _UINT.match(t) else (t if isinstance(t, int) and not isinstance(t, bool) and t > 0 else None)
+        tt = int(t) if isinstance(t, str) and _UINT.fullmatch(t) else (t if isinstance(t, int) and not isinstance(t, bool) and t > 0 else None)
         if r.get("symbol") != symbol:
             _bump(rej, "wrong_symbol")
             continue
@@ -366,7 +393,7 @@ def validate_tickers(body: bytes) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, 
     raw_by_symbol: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         sym = r.get("symbol") if isinstance(r, dict) else None
-        if not isinstance(sym, str) or not _SYMBOL.match(sym):
+        if not isinstance(sym, str) or not _SYMBOL.fullmatch(sym):
             _bump(info["rejects"], "bad_symbol")
             continue
         if sym in raw_by_symbol:
@@ -386,7 +413,7 @@ def validate_tickers(body: bytes) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, 
         vals: Dict[str, Any] = {}
         for k, kw in (("markPrice", {"positive": True}), ("indexPrice", {"positive": True}), ("fundingRate", {"signed": True}),
                       ("openInterest", {"nonneg": True}), ("bid1Price", {"positive": True}), ("ask1Price", {"positive": True}),
-                      ("volume24h", {"nonneg": True}), ("turnover24h", {"nonneg": True})):
+                      ("volume24h", {"nonneg": True}), ("turnover24h", {"nonneg": True, "bounded": True})):
             v = r.get(k)
             if v in (None, ""):
                 why = f"missing:{k}"
@@ -416,7 +443,17 @@ def select_symbols(tickers: Mapping[str, Mapping[str, Any]], eligible: Set[str],
     """``turnover24h_desc_symbol_asc_v1``: highest 24h turnover first, ties by symbol. Pure function of THIS cycle's ticker snapshot and universe."""
     if isinstance(max_symbols, bool) or not isinstance(max_symbols, int) or max_symbols < 0:
         raise CollectorError("max_symbols must be a non-negative whole number")
-    cand = [(Decimal(t["turnover24h"]), s) for s, t in tickers.items() if s in eligible and Decimal(t["turnover24h"]) > 0]
+    cand = []
+    for s, t in tickers.items():
+        if s not in eligible:
+            continue
+        if not isinstance(s, str) or not _SYMBOL.fullmatch(s):
+            raise CollectorError("refusing to select a symbol that is not a short upper-case token")
+        d = _dec(t.get("turnover24h"), nonneg=True, bounded=True)
+        if d is None:
+            raise CollectorError(f"{s}: turnover24h is not a bounded non-negative decimal")
+        if d > 0:
+            cand.append((d, s))
     cand.sort(key=lambda c: (-c[0], c[1]))
     return [{"symbol": s, "turnover24h": tickers[s]["turnover24h"]} for _, s in cand[:max_symbols]]
 
@@ -528,7 +565,7 @@ def verify_cycle_dir(cycle_dir: str) -> List[str]:
 
 
 def cycle_dirs(root: str, *, complete_only: bool = True) -> List[str]:
-    names = sorted(n for n in os.listdir(root) if _CYCLE.match(n) and os.path.isdir(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n)))
+    names = sorted(n for n in os.listdir(root) if _CYCLE.fullmatch(n) and os.path.isdir(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n)))
     if complete_only:
         names = [n for n in names if os.path.isfile(os.path.join(root, n, COMPLETE))]
     return names
@@ -547,6 +584,12 @@ def _refuse(status: str, **kw: Any) -> Dict[str, Any]:
     return {"status": status, **kw}
 
 
+def _check_ms(name: str, v: Any) -> int:
+    if isinstance(v, bool) or not isinstance(v, int) or not 0 < v < MAX_MS:
+        raise CollectorError(f"{name} must be a positive whole number below {MAX_MS}")
+    return v
+
+
 def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fetch, clock: Callable[[], int] = lambda: int(time.time() * 1000), *,
              sleep: Callable[[float], None] = time.sleep, max_symbols: int = DEFAULT_MAX_SYMBOLS, depth: int = DEFAULT_DEPTH,
              trades_limit: int = DEFAULT_TRADES, interval_ms: int = DEFAULT_INTERVAL_MS, reserve_bytes: int = DEFAULT_RESERVE_BYTES,
@@ -554,8 +597,7 @@ def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fe
              max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S) -> Dict[str, Any]:
     """ONE capture cycle into a NEW directory. Returns a report; refusals (storage, a broken log, a non-advancing clock) are reported, not raised."""
     for name, v in (("now_ms", now_ms), ("interval_ms", interval_ms)):
-        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
-            raise CollectorError(f"{name} must be a positive whole number")
+        _check_ms(name, v)
     if not 0 <= max_symbols <= 500 or not 1 <= depth <= MAX_DEPTH or not 1 <= trades_limit <= MAX_TRADES:
         raise CollectorError("max_symbols/depth/trades_limit out of bounds")
     root = os.path.abspath(out_root)
@@ -733,7 +775,7 @@ def _describe_cycle(root: str, name: str) -> Dict[str, Any]:
 
 def seal_cycles(root: str, manifest: str, *, now_ms: Optional[int] = None, accept_problems: bool = False) -> Dict[str, Any]:
     """Append one chained row describing every COMPLETE cycle not yet sealed (and the ids in cycles.jsonl now). REFUSES over existing problems."""
-    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    now = int(time.time() * 1000) if now_ms is None else _check_ms("now_ms", now_ms)
     if os.path.dirname(os.path.abspath(manifest)) == os.path.abspath(root):
         raise SealError("the seal manifest must not live in the collector's own directory: it is the outside memory")
     if os.path.isfile(manifest) and not accept_problems:
@@ -827,7 +869,7 @@ def copy_cycle_dir(src: str, dst: str) -> None:
 def backup_cycles(src: str, dest: str, receipts: str, copy_fn: Callable[[str, str], None] = copy_cycle_dir, *, now_ms: Optional[int] = None) -> Dict[str, Any]:
     """Copy every COMPLETE, self-consistent, recorded cycle to ``dest`` (never overwriting), re-hash the COPY, then write a chained receipt.
     A corrupt copy is set aside as ``.REJECTED`` and gets no receipt."""
-    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    now = int(time.time() * 1000) if now_ms is None else _check_ms("now_ms", now_ms)
     rs, rd = os.path.realpath(src), os.path.realpath(dest)
     if rd == rs or rd.startswith(rs + os.sep):
         raise SealError("the backup destination is the collector's own directory: a copy beside the original is lost with it")

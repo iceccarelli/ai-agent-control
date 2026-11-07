@@ -340,3 +340,46 @@ def test_cli_diff_and_protected_inputs_are_refused(tmp_path, capsys):
     assert UC.main(["diff", u, u]) == 0 and '"listed": []' in capsys.readouterr().out
     assert UC.main(["diff", str(tmp_path / "trading_state.db"), u]) == 2
     assert UC.main(["capture", "--out-dir", str(tmp_path / "run1")]) == 2         # not empty: refused before any network use
+
+
+# ---------------------------------------------------------------- red-team hardening
+
+@pytest.mark.parametrize("name,sample", [("_SYMBOL", "BTCUSDT"), ("_DEC", "1.5"), ("_SDEC", "-1.5"), ("_UINT", "123"), ("_CURSOR", "abc123")])
+def test_every_pattern_refuses_a_trailing_newline(name, sample):
+    pat = getattr(UC, name)
+    assert pat.match(sample) and pat.fullmatch(sample)
+    assert pat.match(sample + "\n") is None and pat.fullmatch(sample + "\n") is None
+
+
+def test_a_cursor_or_symbol_with_a_trailing_newline_is_refused(tmp_path):
+    with pytest.raises(UC.CaptureError):
+        UC.request_url(UC.PATH_INSTRUMENTS, "abc\n")
+    norm, why, sym = UC.normalize_instrument(inst("BTCUSDT\n"))
+    assert norm is None
+    with pytest.raises(UC.CaptureError):
+        run(tmp_path, Venue({"": env([inst("BTCUSDT")])}, [tick("BTCUSDT\n")]))
+
+
+@pytest.mark.parametrize("bad", ["9" * 40, "1" + "0" * 16, "NaN", "-1", "1e5", "1_0"])
+def test_a_poisoned_ticker_turnover_is_refused(tmp_path, bad):
+    with pytest.raises(UC.CaptureError):
+        run(tmp_path, Venue({"": env([inst("BTCUSDT")])}, [tick("BTCUSDT", turnover24h=bad)]))
+
+
+def test_universe_http_fetch_consults_the_public_collector_capability(monkeypatch):
+    import urllib.request as ur
+    hits = []
+
+    def boom(*a, **k):
+        hits.append(a)
+        raise AssertionError("opened")
+    monkeypatch.setattr(ur.OpenerDirector, "open", boom)
+    monkeypatch.setattr(ur, "build_opener", boom)
+    base = venues.rest_for("mainnet")
+    for method, url, headers, body in (("POST", f"{base}/v5/market/tickers?category=linear", None, None),
+                                       ("GET", f"{base}/v5/market/tickers?category=linear", {"X-BAPI-SIGN": "s"}, None),
+                                       ("GET", f"{base}/v5/market/tick\ners?category=linear", None, None),
+                                       ("GET", f"{base}/v5/market/tickers?category=linear&sign=S", None, None)):
+        with pytest.raises(UC.CaptureError):
+            UC.http_request(method, url, headers=headers, body=body)
+    assert hits == []

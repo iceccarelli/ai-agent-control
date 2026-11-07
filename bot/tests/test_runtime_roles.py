@@ -183,3 +183,105 @@ def test_public_market_data_modules_do_not_import_signing_or_the_client():
 def test_venue_registry_is_the_only_host_source():
     src = open(os.path.join(BOT, "runtime_capability.py")).read()
     assert "bybit.com" not in src and "bybit.eu" not in src
+
+
+# ---- red-team bypasses: header forms, control characters, credential query params ----------------------------------------------------------------------------
+URL_OK = f"https://{TN}/v5/market/time"
+
+BAD_HEADERS = [
+    ("trailing space", {"X-BAPI-SIGN ": "x"}),
+    ("trailing tab", {"x-bapi-api-key\t": "k"}),
+    ("list of tuples", [("X-BAPI-SIGN", "x"), ("X-BAPI-API-KEY", "k")]),
+    ("tuple of tuples", (("x-bapi-sign", "x"),)),
+    ("bytes key", {b"X-BAPI-SIGN": "x"}),
+    ("bytes key trailing space", {b"x-bapi-sign ": "x"}),
+    ("cookie", {"Cookie": "session=1"}),
+    ("proxy-authorization", {"Proxy-Authorization": "Basic x"}),
+    ("x-sign", {"X-Sign": "x"}),
+    ("authorization upper", {"AUTHORIZATION": "Bearer x"}),
+    ("authorization mixed+space", {" AuthoriZation ": "Bearer x"}),
+    ("non-str key", {1: "x"}),
+    ("non-ascii key", {"x-bapi-signé": "x"}),
+    ("bytes undecodable", {b"\xff\xfe": "x"}),
+    ("inner whitespace key", {"x bapi sign": "x"}),
+    ("newline in key", {"Accept\nX-BAPI-SIGN": "x"}),
+    ("unparseable: a string", "X-BAPI-SIGN: x"),
+    ("unparseable: ints", 5),
+    ("unparseable: odd pair", [("a", "b", "c")]),
+    ("unparseable: list of str", ["X-BAPI-SIGN"]),
+]
+
+
+@pytest.mark.parametrize("name,headers", BAD_HEADERS, ids=[b[0] for b in BAD_HEADERS])
+def test_every_header_form_that_signs_or_cannot_be_parsed_is_refused_for_the_collector(name, headers):
+    t, spy = wrap(RC.PUBLIC_COLLECTOR)
+    with pytest.raises(RC.CapabilityRefused):
+        t.request("GET", URL_OK, headers=headers, body=None, timeout=1)
+    assert spy.calls == []
+
+
+def test_benign_header_forms_still_pass():
+    t, spy = wrap(RC.PUBLIC_COLLECTOR)
+    for h in (None, {}, {"Accept": "application/json", "User-Agent": "x/1"}, [("Accept", "application/json")], {b"Accept": b"x"}):
+        t.request("GET", URL_OK, headers=h, body=None, timeout=1)
+    assert len(spy.calls) == 5
+
+
+@pytest.mark.parametrize("name,headers", [b for b in BAD_HEADERS if b[0] in ("trailing space", "list of tuples", "bytes key", "cookie")])
+def test_signed_header_forms_are_seen_as_signed_by_the_monitor_too(name, headers):
+    # signed monitor reads are legal: the forms must be DETECTED (a signed read of an unsigned-only path is refused, a public path stays public)
+    t, spy = wrap(RC.READ_ONLY_MONITOR)
+    try:
+        t.request("GET", f"https://{TN}/v5/market/time", headers=headers, body=None, timeout=1)
+    except RC.CapabilityRefused:
+        pass
+    assert spy.calls == []                        # signed (or unparseable) request to a PUBLIC path: refused
+
+
+@pytest.mark.parametrize("url", [
+    f"https://{TN}/v5/market/ti\nme", f"https://{TN}/v5/market/ti\tme", f"https://{TN}/v5/market/ti\rme", f"https://{TN[:3]}\n{TN[3:]}/v5/market/time",
+    f"https://{TN}/v5/market/time\n", f"https://{TN}/v5/market/time ", f" https://{TN}/v5/market/time", f"https://{TN}/v5/market/time?a=b c",
+    f"https://{TN}/v5/market/t\x00ime", f"https://{TN}/v5/market/t\x7fime", f"https://{TN}/v5/market/tiéme", f"https://{TN}\\@evil.example/v5/market/time",
+    f"https://{TN}/v5/market/time?x= ", f"ht\ntps://{TN}/v5/market/time",
+])
+def test_urls_with_control_whitespace_or_non_ascii_characters_are_refused_before_parsing(url):
+    for role in (RC.PUBLIC_COLLECTOR, RC.READ_ONLY_MONITOR, RC.TESTNET_EXECUTOR):
+        t, spy = wrap(role)
+        with pytest.raises(RC.CapabilityRefused):
+            t.request("GET", url, headers={}, body=None, timeout=1)
+        assert spy.calls == []
+
+
+@pytest.mark.parametrize("q", ["api_key=K", "sign=S", "signature=S", "apikey=K", "token=T", "secret=S", "API_KEY=K", "Api-Key=K", "X-BAPI-SIGN=s", "access_token=t",
+                               "category=linear&api%5Fkey=K", "category=linear&%73ign=S", "api_secret=s", "key=k", "password=p"])
+def test_credential_looking_query_params_are_refused(q):
+    for role in (RC.PUBLIC_COLLECTOR, RC.READ_ONLY_MONITOR):
+        t, spy = wrap(role)
+        with pytest.raises(RC.CapabilityRefused):
+            t.request("GET", f"https://{TN}/v5/market/tickers?category=linear&{q}", headers={}, body=None, timeout=1)
+        assert spy.calls == []
+
+
+def test_ordinary_query_params_still_pass():
+    t, spy = wrap(RC.PUBLIC_COLLECTOR)
+    t.request("GET", f"https://{TN}/v5/market/kline?category=linear&symbol=BTCUSDT&interval=60&limit=200&cursor=a%3Db", headers={}, body=None, timeout=1)
+    assert len(spy.calls) == 1
+
+
+def test_monitor_cannot_read_the_api_key_endpoint_off_testnet():
+    for venue in ("mainnet", "demo"):
+        mon = RC.Capability.for_role(RC.READ_ONLY_MONITOR, venue=venue)
+        assert mon.check("GET", "/v5/user/query-api", True, mon.host) == "ENDPOINT_FORBIDDEN"
+    mon = RC.Capability.for_role(RC.READ_ONLY_MONITOR, venue="testnet")        # the owner's testnet preflight (testnet_action_manifest) names it
+    assert mon.check("GET", "/v5/user/query-api", True, mon.host) is None
+    assert "/v5/user/query-api" not in RC.ACCOUNT_READ_PATHS
+
+
+def test_a_trailing_newline_endpoint_is_not_canonical():
+    c = RC.Capability.for_role(RC.PUBLIC_COLLECTOR, venue="testnet")
+    assert c.check("GET", "/v5/market/time\n", False, c.host) == "ENDPOINT_NOT_CANONICAL"
+    assert c.check("GET", "/v5/market/time", False, c.host + "\n") == "HOST_REFUSED"
+
+
+def test_recent_trade_is_a_public_market_path():
+    assert "/v5/market/recent-trade" in RC.PUBLIC_MARKET_PATHS

@@ -56,7 +56,7 @@ BAD_FORMS = [
     "/v5/market/tickers?category=linear", "/v5/market/Tickers", "/v5/market/tickers/", "/v5/", "/v5", "/", "", "/v6/order/create",
     "/v5/order/create-", "/v5/-order/create", "/v5/order/creatе", "/v5/market/time/..",
 ]
-UNKNOWN = ["/v5/market/recent-trade", "/v5/market/open-interest", "/v5/account/unknown", "/v5/order/unknown", "/v5/position/switch-isolated", "/other/path",
+UNKNOWN = ["/v5/market/insurance", "/v5/market/open-interest", "/v5/account/unknown", "/v5/order/unknown", "/v5/position/switch-isolated", "/other/path",
            "/v5/position/confirm-pending-mmr", "/v5/account/borrow"]
 ROLE_CAPS = [COLLECTOR, MONITOR, BACKUP, EXECUTOR]
 
