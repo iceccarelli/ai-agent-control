@@ -252,3 +252,11 @@ def test_a_closed_day_that_gained_a_record_is_altered(world):
     con.commit(); con.close()
     probs = SL.check(world["md"], world["manifest"])["problems"]
     assert any("ALTERED" in p and "records" in p for p in probs), probs
+
+
+def test_a_bit_flipped_segment_is_reported_by_the_deep_check_not_raised(world):
+    """Reproduced by the lifecycle worker: check(deep=True) on a bit-flipped original raised sqlite3.DatabaseError instead of returning ok=False."""
+    seal(world)
+    _flip(seg(world, 1))
+    res = SL.check(world["md"], world["manifest"], deep=True)
+    assert res["ok"] is False and any("unreadable" in p or "ALTERED" in p or "chain mismatch" in p for p in res["problems"])

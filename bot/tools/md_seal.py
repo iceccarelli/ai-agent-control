@@ -149,7 +149,10 @@ def check(directory: str, manifest: str, *, deep: bool = False) -> Dict[str, Any
             if _sha256(os.path.join(directory, name)) != closed[-1]["sha256"]:
                 problems.append(f"{name}: ALTERED (a closed day's file hash changed)")
         if deep:
-            problems += [f"{name}: {p}" for p in recompute_chain(os.path.join(directory, name))]
+            try:
+                problems += [f"{name}: {p}" for p in recompute_chain(os.path.join(directory, name))]
+            except sqlite3.DatabaseError as exc:                    # a bit-flipped segment is a PROBLEM to report, not an exception to crash the caller (reproduced by the lifecycle worker)
+                problems.append(f"{name}: unreadable on deep check ({type(exc).__name__})")
     return {"ok": not problems, "problems": problems, "rows_checked": len(rows)}
 
 
