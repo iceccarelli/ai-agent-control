@@ -323,3 +323,17 @@ def test_a_local_refusal_is_a_known_not_sent_outcome_not_an_unknown_one():
     assert CarryBroker._definitively_rejected(bc.PermanentAPIError("HTTP 400")) is False          # no venue retCode: still unknown
     assert CarryBroker._definitively_rejected(bc.TransientAPIError("HTTP 500")) is False
     assert issubclass(bc.OrderNotSent, bc.PermanentAPIError)                                      # existing handlers that catch PermanentAPIError keep working
+
+
+def test_the_reservation_limit_is_a_window_not_a_lifetime_so_the_book_does_not_wedge(tmp_path):
+    """Found in review: nothing marks a reservation resolved, so a lifetime count refused every entry after the first pair, forever."""
+    st = EA.ReservationStore(str(tmp_path / "l.jsonl"))
+    t0 = 1_800_000_000_000
+    mk = lambda link: EA.OrderIntent("linear", "BTCUSDT", "Sell", "0.001", False, link)
+    assert st.reserve(mk("P1"), now_ms=t0) is None and st.reserve(mk("P2"), now_ms=t0 + 1000) is None
+    assert st.reserve(mk("P3"), now_ms=t0 + 2000) == "TOO_MANY_UNRESOLVED_ENTRIES"          # concurrent entries are still bounded
+    later = t0 + EA.RESERVATION_WINDOW_MS + 1
+    assert st.reserve(mk("P4"), now_ms=later) is None                                       # a new pair, long after, is allowed
+    assert st.reserve(mk("P1"), now_ms=later) is None                                       # an identical resend of an OLD id is still recognised
+    other = EA.OrderIntent("linear", "BTCUSDT", "Sell", "0.5", False, "P1")
+    assert st.reserve(other, now_ms=later) == "RESERVATION_CONFLICT_SAME_ID_DIFFERENT_ORDER"   # and a different order under it is still a conflict forever

@@ -40,6 +40,10 @@ import risk_policy as RP
 #: The engine sizes qty from the mark at decision time; the order is checked against the mark at SEND time. A cap check looser than this would be meaningless; tighter would
 #: refuse sizing-correct orders that moved a few bps. 2%.
 NOTIONAL_TOLERANCE = 1.02
+#: Distinct entry reservations counted within this window bound CONCURRENT entries (a pair's two legs, plus a retry). It is a window, not a lifetime count: nothing in the book
+#: marks a reservation 'resolved', so counting unresolved-forever rows would refuse every entry after the first pair (found in review). The reservation ledger itself is never
+#: pruned: an old id still conflicts with a different order that reuses it.
+RESERVATION_WINDOW_MS = 15 * 60 * 1000
 MAX_UNRESOLVED_ENTRIES = 2        # one carry pair is two legs; a third distinct unresolved entry is not a retry of either
 
 
@@ -157,8 +161,9 @@ def risk_policy_check(provider: Callable[[], Tuple[Optional[RP.Policy], RP.State
 class ReservationStore:
     """Append-only, flock-serialised ledger of entry reservations shared by every process that names the same path. The reservation is written BEFORE the order is sent."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, *, window_ms: int = RESERVATION_WINDOW_MS) -> None:
         self.path = path
+        self.window_ms = int(window_ms)
 
     def reserve(self, i: OrderIntent, *, max_unresolved: int = MAX_UNRESOLVED_ENTRIES, now_ms: Optional[int] = None) -> Optional[str]:
         """None if reserved (or an identical resend); else a refusal code."""
@@ -185,7 +190,7 @@ class ReservationStore:
                 if (prior.get("symbol"), prior.get("side"), prior.get("qty"), prior.get("category")) == (i.symbol, i.side, i.qty, i.category):
                     return None                                        # an identical resend: how a lost acknowledgement is resolved
                 return "RESERVATION_CONFLICT_SAME_ID_DIFFERENT_ORDER"
-            unresolved = [r for r in rows if not r.get("resolved")]
+            unresolved = [r for r in rows if not r.get("resolved") and isinstance(r.get("at_ms"), int) and now - r["at_ms"] <= self.window_ms]
             if len(unresolved) >= max_unresolved:
                 return "TOO_MANY_UNRESOLVED_ENTRIES"
             os.write(fd, (json.dumps({"link": i.order_link_id, "symbol": i.symbol, "side": i.side, "qty": i.qty, "category": i.category,
