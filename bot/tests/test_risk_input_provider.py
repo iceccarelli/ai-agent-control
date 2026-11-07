@@ -62,12 +62,18 @@ def snap(age=10.0, mark=60000.0):
     return SimpleNamespace(perp_mark=mark, observed_at_s=NOW - age)
 
 
+def stamped(v, age=1.0):
+    """A getter value with its as-of time (ms), `age` seconds before NOW."""
+    return (v, int((NOW - age) * 1000))
+
+
 def make(broker=None, **kw):
     args = dict(broker=broker or FakeBroker(), perp_symbol="BTCUSDT", spot_symbol="BTCUSDT", snapshot_getter=lambda: snap(),
-                opened_ms_getter=lambda: int((NOW - 36000) * 1000), halted_getter=lambda: False,
-                ledger_reads={"trade_loss_usd": lambda: 0.1, "loss_today_usd": lambda: 0.2, "strategy_drawdown_usd": lambda: 0.5, "portfolio_drawdown_usd": lambda: 0.6},
+                opened_ms_getter=lambda: int((NOW - 36000) * 1000), halted_getter=lambda: stamped(False),
+                ledger_reads={"trade_loss_usd": lambda: stamped(0.1), "loss_today_usd": lambda: stamped(0.2), "strategy_drawdown_usd": lambda: stamped(0.5),
+                              "portfolio_drawdown_usd": lambda: stamped(0.6)},
                 funding_getter=lambda: (0.5, int((NOW - 3600) * 1000)),
-                correlation_set={"btc_perp": lambda: 60.0, "eth_perp": lambda: 10.0},
+                correlation_set={"btc_perp": lambda: stamped(60.0), "eth_perp": lambda: stamped(10.0)},
                 equity_reader=lambda: 120.0, now_s=lambda: NOW)
     args.update(kw)
     return RIP.RiskInputProvider(**args)
@@ -129,7 +135,7 @@ CASES = [
     ("margin zero", dict(b=dict(margin=0.0)), ["margin_multiple"], "margin_multiple"),
     ("book raises", dict(b=dict(book=RuntimeError("x"))), ["liquidity_usd"], "orderbook"),
     ("book stale", dict(b=dict(book={"bids": [(1.0, 1.0)], "asks": [(2.0, 1.0)], "venue_ts_ms": int((NOW - 60) * 1000)})), ["liquidity_usd"], "stale"),
-    ("book empty side", dict(b=dict(book={"bids": [], "asks": [(2.0, 1.0)], "venue_ts_ms": None})), ["liquidity_usd"], "empty side"),
+    ("book empty side", dict(b=dict(book={"bids": [], "asks": [(2.0, 1.0)], "venue_ts_ms": int((NOW - 1) * 1000)})), ["liquidity_usd"], "empty side"),
     ("open orders unreadable", dict(b=dict(orders=RuntimeError("x"))), ["operational_fault"], "open orders"),
     ("snapshot stale", dict(p=dict(snapshot_getter=lambda: snap(age=300.0))), ["exposure_usd", "unhedged_usd", "leverage"], "stale"),
     ("snapshot missing", dict(p=dict(snapshot_getter=lambda: None)), ["exposure_usd", "unhedged_usd", "leverage", "data_age_s"], "snapshot"),
@@ -144,16 +150,33 @@ CASES = [
     ("opened_ms raises", dict(p=dict(opened_ms_getter=lambda: 1 / 0)), ["hold_hours"], "opened_ms"),
     ("opened_ms not wired", dict(p=dict(opened_ms_getter=None)), ["hold_hours"], "opened_ms"),
     ("ledger read raises", dict(p=dict(ledger_reads={"trade_loss_usd": lambda: 1 / 0})), ["trade_loss_usd"], "trade_loss_usd"),
-    ("ledger value negative", dict(p=dict(ledger_reads={"trade_loss_usd": lambda: -1.0})), ["trade_loss_usd"], "trade_loss_usd"),
-    ("ledger value nan", dict(p=dict(ledger_reads={"trade_loss_usd": lambda: float("nan")})), ["trade_loss_usd"], "trade_loss_usd"),
+    ("ledger value negative", dict(p=dict(ledger_reads={"trade_loss_usd": lambda: stamped(-1.0)})), ["trade_loss_usd"], "trade_loss_usd"),
+    ("ledger value nan", dict(p=dict(ledger_reads={"trade_loss_usd": lambda: stamped(float("nan"))})), ["trade_loss_usd"], "trade_loss_usd"),
     ("funding stale", dict(p=dict(funding_getter=lambda: (0.5, int((NOW - 86400) * 1000)))), ["recent_mean_funding_bps"], "stale"),
     ("funding not wired", dict(p=dict(funding_getter=None)), ["recent_mean_funding_bps"], "funding"),
     ("funding raises", dict(p=dict(funding_getter=lambda: 1 / 0)), ["recent_mean_funding_bps"], "funding"),
     ("funding malformed", dict(p=dict(funding_getter=lambda: "0.5")), ["recent_mean_funding_bps"], "funding"),
-    ("correlation member unknown", dict(p=dict(correlation_set={"a": lambda: 1.0, "b": lambda: None})), ["correlated_exposure_usd"], "b"),
+    ("correlation member unknown", dict(p=dict(correlation_set={"a": lambda: stamped(1.0), "b": lambda: stamped(None)})), ["correlated_exposure_usd"], "b"),
     ("correlation member raises", dict(p=dict(correlation_set={"a": lambda: 1 / 0})), ["correlated_exposure_usd"], "a"),
     ("no correlation set", dict(p=dict(correlation_set=None)), ["correlated_exposure_usd"], "no declared correlation set"),
     ("halted not stated", dict(p=dict(halted_getter=lambda: None)), ["operational_fault"], "halted"),
+    # ---- freshness / unknown-age / odd venue numbers (red-team fixes)
+    ("book without venue timestamp", dict(b=dict(book={"bids": [(1.0, 1.0)], "asks": [(2.0, 1.0)], "venue_ts_ms": None})), ["liquidity_usd"], "age is unknown"),
+    ("book timestamp key absent", dict(b=dict(book={"bids": [(1.0, 1.0)], "asks": [(2.0, 1.0)]})), ["liquidity_usd"], "age is unknown"),
+    ("book timestamp in the future", dict(b=dict(book={"bids": [(1.0, 1.0)], "asks": [(2.0, 1.0)], "venue_ts_ms": int((NOW + 100) * 1000)})), ["liquidity_usd"], "future"),
+    ("ledger bare value, no as-of", dict(p=dict(ledger_reads={"trade_loss_usd": lambda: 0.1})), ["trade_loss_usd"], "no as-of"),
+    ("ledger stale", dict(p=dict(ledger_reads={"loss_today_usd": lambda: stamped(0.1, age=3600.0)})), ["loss_today_usd"], "stale"),
+    ("ledger as-of in the future", dict(p=dict(ledger_reads={"loss_today_usd": lambda: stamped(0.1, age=-100.0)})), ["loss_today_usd"], "future"),
+    ("ledger as-of garbage", dict(p=dict(ledger_reads={"loss_today_usd": lambda: (0.1, "now")})), ["loss_today_usd"], "not a time"),
+    ("ledger as-of zero", dict(p=dict(ledger_reads={"loss_today_usd": lambda: (0.1, 0)})), ["loss_today_usd"], "not a time"),
+    ("halted bare bool, no as-of", dict(p=dict(halted_getter=lambda: False)), ["operational_fault"], "no as-of"),
+    ("halted stale", dict(p=dict(halted_getter=lambda: stamped(False, age=600.0))), ["operational_fault"], "stale"),
+    ("correlation member bare value", dict(p=dict(correlation_set={"a": lambda: 1.0})), ["correlated_exposure_usd"], "no as-of"),
+    ("correlation member stale", dict(p=dict(correlation_set={"a": lambda: stamped(1.0, age=3600.0)})), ["correlated_exposure_usd"], "stale"),
+    ("negative spot is not a clean zero", dict(b=dict(spot=-0.001)), ["unhedged_usd"], "spot_inventory"),
+    ("book state unknown name", dict(p=dict(book_state_getter=lambda: stamped("???"))), ["operational_fault"], "not a known BookState"),
+    ("book state stale", dict(p=dict(book_state_getter=lambda: stamped("HEDGED", age=600.0))), ["operational_fault"], "stale"),
+    ("book state bare", dict(p=dict(book_state_getter=lambda: "HEDGED")), ["operational_fault"], "no as-of"),
     ("halted not wired", dict(p=dict(halted_getter=None)), ["operational_fault"], "halted"),
 ]
 
@@ -171,7 +194,44 @@ def test_unknown_paths_are_none_never_zero_and_say_why(label, cfg, none_fields, 
 
 
 def test_halted_book_is_a_fault_true_not_unknown():
-    assert make(halted_getter=lambda: True).state().operational_fault is True
+    assert make(halted_getter=lambda: stamped(True)).state().operational_fault is True
+
+
+@pytest.mark.parametrize("name,expected", [("HALTED", True), ("DRIFTED", True), ("UNWINDING", True), ("OPENING", True), ("FLAT", False), ("HEDGED", False)])
+def test_operational_fault_per_book_state(name, expected):
+    """DECISION: a book that is HALTED, DRIFTED (held but unhedged-drifting), UNWINDING or OPENING is not a clean state -> fault True. Only FLAT/HEDGED with a readable
+    open-orders list is fault False. (No test-justified reason to treat DRIFTED/UNWINDING as clean was found: the carry engine itself refuses new work in those states.)"""
+    assert make(book_state_getter=lambda: stamped(name)).state().operational_fault is expected
+    enum_like = SimpleNamespace(name=name)
+    assert make(book_state_getter=lambda: stamped(enum_like)).state().operational_fault is expected
+
+
+def test_clean_book_state_still_needs_readable_open_orders():
+    assert make(FakeBroker(orders=RuntimeError("x")), book_state_getter=lambda: stamped("HEDGED")).state().operational_fault is None
+    assert make(FakeBroker(orders=RuntimeError("x")), book_state_getter=lambda: stamped("DRIFTED")).state().operational_fault is True
+
+
+def test_pending_notional_is_added_to_exposure_and_leverage():
+    p = make()
+    assert p.state().exposure_usd == pytest.approx(60.0)
+    st = p.state(pending_notional_usd=25.0)
+    assert st.exposure_usd == pytest.approx(85.0) and st.leverage == pytest.approx(85.0 / 120.0)
+    assert p.explain()["exposure_usd"]["value"] == pytest.approx(85.0)
+    flat = make(FakeBroker(perp_net=0.0, spot=0.0)).state(pending_notional_usd=40.0)
+    assert flat.exposure_usd == pytest.approx(40.0)                      # a flat book entering 40 is 40 of exposure, not 0
+    # policy sees it: 60 + 50 > max_exposure 100
+    assert "BREACH:max_exposure_usd" in RP.evaluate(POLICY, make().state(pending_notional_usd=50.0)).reasons
+
+
+@pytest.mark.parametrize("bad", [-1.0, float("nan"), float("inf"), "10", True])
+def test_bad_pending_notional_makes_exposure_unknown_not_zero(bad):
+    p = make()
+    st = p.state(pending_notional_usd=bad)
+    assert st.exposure_usd is None and st.leverage is None and "pending_notional_usd" in p.unknown_reasons["exposure_usd"]
+
+
+def test_book_with_timestamp_is_fresh_and_age_is_reported():
+    assert make().explain()["liquidity_usd"]["age_s"] == 2.0
 
 
 def test_state_never_raises_even_if_measurement_itself_blows_up():

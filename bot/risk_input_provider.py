@@ -12,6 +12,12 @@ Rules this module holds to, each pinned by tests/test_risk_input_provider.py:
     module does not re-derive them. Before a position exists the venue has no liquidation price and no margin ratio, so BOTH ARE UNKNOWN while flat: an entry-time policy
     that requires them refuses until the owner decides how a pre-open measurement should work. This module will not invent one.
   * correlated_exposure_usd is UNKNOWN unless a declared correlation set is supplied; then it is the labelled sum over that set.
+  * FRESHNESS IS EXPLICIT for every getter-supplied value (ledger figures, book state / halted flag, correlation members, funding): the getter returns ``(value, as_of_ms)``. A bare
+    value, a missing/invalid as-of time, a time in the future or one older than the stated max age makes the field None. A venue book with no ``venue_ts_ms`` has UNKNOWN age: liquidity None.
+  * operational_fault, per BookState: HALTED -> True. DRIFTED / UNWINDING / OPENING -> True (a held-but-drifted, unwinding or half-opened book is NOT a clean state; the entry
+    authority must not add exposure on top of it). FLAT / HEDGED -> False only when the open-orders list is readable. Any other / unreadable state -> None.
+  * a negative venue spot number is UNKNOWN for unhedged_usd (it would be a spot short; never turned into a clean 0).
+  * ``state(pending_notional_usd=...)``: the order's OWN notional is added to exposure_usd (and therefore leverage), so the policy sees POST-trade exposure.
 
 Reads only. No order endpoint is touched.
 """
@@ -29,6 +35,13 @@ MAX_BOOK_AGE_S = 10.0
 MAX_FUNDING_AGE_S = 12 * 3600.0
 #: A snapshot stamped further in the future than this is a broken clock, not a fresh one.
 MAX_FUTURE_SKEW_S = 5.0
+#: Max age of getter-supplied values whose getter states an as-of time.
+MAX_LEDGER_AGE_S = 300.0
+MAX_STATE_AGE_S = 30.0
+MAX_CORRELATION_AGE_S = 60.0
+#: BookState names that are a clean (no operational fault) state once the open-orders list is readable, and those that are a fault.
+CLEAN_BOOK_STATES = frozenset({"FLAT", "HEDGED"})
+FAULT_BOOK_STATES = frozenset({"HALTED", "DRIFTED", "UNWINDING", "OPENING"})
 
 #: Every State field, in policy order (operational_fault last).
 FIELDS: Tuple[str, ...] = (
@@ -75,10 +88,11 @@ class RiskInputProvider:
     perp_symbol/spot_symbol
     snapshot_getter   () -> MarketSnapshot-like (perp_mark, observed_at_s) or None. The mark and ``data_age_s`` come from its own timestamps.
     opened_ms_getter  () -> the open time (epoch ms) of the held position from the venue/ledger, or None.
-    halted_getter     () -> True/False if the book states HALTED, or None when it does not know.
-    ledger_reads      {field: () -> Optional[float]} for trade_loss_usd / loss_today_usd / strategy_drawdown_usd / portfolio_drawdown_usd. A field with no entry is UNKNOWN.
+    book_state_getter () -> (BookState or its name, as_of_ms) or None. Preferred over halted_getter.
+    halted_getter     () -> (True/False, as_of_ms) or None (legacy form: used only when no book_state_getter). True means HALTED; False means only "not halted" (no state detail).
+    ledger_reads      {field: () -> (Optional[float], as_of_ms)} for trade_loss_usd / loss_today_usd / strategy_drawdown_usd / portfolio_drawdown_usd. A field with no entry is UNKNOWN.
     funding_getter    () -> (mean_funding_bps, as_of_ms) or None.
-    correlation_set   {label: () -> Optional[float exposure_usd]}: the DECLARED set. None/empty means correlated exposure is UNKNOWN.
+    correlation_set   {label: () -> (Optional[float exposure_usd], as_of_ms)}: the DECLARED set. None/empty means correlated exposure is UNKNOWN.
     equity_reader     () -> equity USD (default: the venue wallet's totalEquity). Must raise or return a positive finite number.
     now_s             clock (default time.time).
     """
@@ -86,19 +100,24 @@ class RiskInputProvider:
     def __init__(self, *, broker: Any, perp_symbol: str, spot_symbol: str,
                  snapshot_getter: Callable[[], Any],
                  opened_ms_getter: Optional[Callable[[], Optional[int]]] = None,
-                 halted_getter: Optional[Callable[[], Optional[bool]]] = None,
-                 ledger_reads: Optional[Mapping[str, Callable[[], Optional[float]]]] = None,
+                 halted_getter: Optional[Callable[[], Any]] = None,
+                 book_state_getter: Optional[Callable[[], Any]] = None,
+                 ledger_reads: Optional[Mapping[str, Callable[[], Any]]] = None,
                  funding_getter: Optional[Callable[[], Optional[Tuple[float, int]]]] = None,
-                 correlation_set: Optional[Mapping[str, Callable[[], Optional[float]]]] = None,
+                 correlation_set: Optional[Mapping[str, Callable[[], Any]]] = None,
                  equity_reader: Optional[Callable[[], float]] = None,
                  now_s: Callable[[], float] = time.time,
                  max_snapshot_age_s: float = MAX_SNAPSHOT_AGE_S,
                  max_book_age_s: float = MAX_BOOK_AGE_S,
-                 max_funding_age_s: float = MAX_FUNDING_AGE_S) -> None:
+                 max_funding_age_s: float = MAX_FUNDING_AGE_S,
+                 max_ledger_age_s: float = MAX_LEDGER_AGE_S,
+                 max_state_age_s: float = MAX_STATE_AGE_S,
+                 max_correlation_age_s: float = MAX_CORRELATION_AGE_S) -> None:
         self.broker = broker
         self.perp_symbol, self.spot_symbol = perp_symbol, spot_symbol
         self.snapshot_getter = snapshot_getter
-        self.opened_ms_getter, self.halted_getter = opened_ms_getter, halted_getter
+        self.opened_ms_getter, self.halted_getter, self.book_state_getter = opened_ms_getter, halted_getter, book_state_getter
+        self.max_ledger_age_s, self.max_state_age_s, self.max_correlation_age_s = max_ledger_age_s, max_state_age_s, max_correlation_age_s
         self.ledger_reads = dict(ledger_reads or {})
         self.funding_getter = funding_getter
         self.correlation_set = dict(correlation_set or {})
@@ -110,10 +129,13 @@ class RiskInputProvider:
 
     # -- public -----------------------------------------------------------------------------------------------------------------------------------------------
 
-    def state(self) -> RP.State:
-        """Never raises. Any unexpected failure leaves the whole state UNKNOWN and says why."""
+    def state(self, pending_notional_usd: Optional[float] = None) -> RP.State:
+        """Never raises. Any unexpected failure leaves the whole state UNKNOWN and says why.
+
+        ``pending_notional_usd``: the notional of the order being decided; added to exposure_usd so the policy evaluates POST-trade exposure. None means no pending order. A supplied value
+        that is not a finite non-negative number makes exposure_usd (and leverage) UNKNOWN."""
         try:
-            facts = self._measure()
+            facts = self._measure(pending_notional_usd)
         except Exception as exc:  # noqa: BLE001 - the contract is: never raise out of state()
             facts = {f: self._fact(None, "provider", None, f"PROVIDER_ERROR:{type(exc).__name__}") for f in FIELDS}
         self._last = facts
@@ -142,7 +164,26 @@ class RiskInputProvider:
         except Exception as exc:  # noqa: BLE001
             return None, f"{label} read raised {type(exc).__name__}: {exc}"
 
-    def _measure(self) -> Dict[str, Dict[str, Any]]:
+    def _stamped(self, label: str, fn: Callable[[], Any], now: float, max_age_s: float) -> Tuple[Any, Optional[float], str]:
+        """Read a getter that must return ``(value, as_of_ms)``. (value, age_s, '') or (None, age_or_None, why)."""
+        got, why = self._read(label, fn)
+        if got is None:
+            return None, None, why or f"{label}: source returned nothing"
+        if not (isinstance(got, tuple) and len(got) == 2):
+            return None, None, f"{label}: no as-of time supplied (getter must return (value, as_of_ms))"
+        value, as_of_ms = got
+        as_of = _num(as_of_ms, minimum=0.0, strict=True)
+        if as_of is None:
+            return None, None, f"{label}: as-of time {as_of_ms!r} is not a time"
+        age = now - as_of / 1000.0
+        if age < -MAX_FUTURE_SKEW_S:
+            return None, None, f"{label}: as-of time is in the future"
+        age = max(0.0, age)
+        if age > max_age_s:
+            return None, age, f"{label}: {age:.1f}s old, limit {max_age_s:.0f}s (stale)"
+        return value, age, ""
+
+    def _measure(self, pending_notional_usd: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
         now = float(self.now_s())
         out: Dict[str, Dict[str, Any]] = {}
         F = self._fact
@@ -173,14 +214,24 @@ class RiskInputProvider:
 
         # ---- venue quantities (never the journal)
         perp_net, why_perp = self._read("perp position", lambda: self._finite_or_unknown(self.broker.get_perp_net_qty(self.perp_symbol), "perp_net_qty"))
-        spot_qty, why_spot = self._read("spot inventory", lambda: self._finite_or_unknown(self.broker.get_spot_inventory(self.spot_symbol), "spot_inventory"))
+        spot_qty, why_spot = self._read("spot inventory", lambda: self._finite_or_unknown(self.broker.get_spot_inventory(self.spot_symbol), "spot_inventory", nonneg=True))
         if perp_net is not None:
             perp_net = float(perp_net)
         if spot_qty is not None:
             spot_qty = float(spot_qty)
 
-        if perp_net is not None and mark is not None:
-            out["exposure_usd"] = F(abs(perp_net) * mark, "venue perp qty x snapshot perp_mark", age)
+        pending = 0.0
+        why_pending = ""
+        if pending_notional_usd is not None:
+            pn = _num(pending_notional_usd, minimum=0.0)
+            if pn is None:
+                why_pending = f"pending_notional_usd {pending_notional_usd!r} is not a finite non-negative number"
+            else:
+                pending = pn
+        if why_pending:
+            out["exposure_usd"] = F(None, "venue perp qty x snapshot perp_mark + pending order notional", None, why_pending)
+        elif perp_net is not None and mark is not None:
+            out["exposure_usd"] = F(abs(perp_net) * mark + pending, "venue perp qty x snapshot perp_mark + pending order notional", age)
         else:
             out["exposure_usd"] = F(None, "venue perp qty x snapshot perp_mark", None, why_perp or snap_why or "UNKNOWN")
         if perp_net is not None and spot_qty is not None and mark is not None:
@@ -251,24 +302,24 @@ class RiskInputProvider:
             if fn is None:
                 out[name] = F(None, "ledger", None, f"no ledger source wired for {name}")
                 continue
-            v, why = self._read(name, fn)
+            v, l_age, why = self._stamped(name, fn, now, self.max_ledger_age_s)
             n = _num(v, minimum=0.0)
-            out[name] = F(n, "ledger", None, why or f"{name} unstated or not a non-negative finite number")
+            out[name] = F(n, "ledger (with as-of time)", l_age, why or f"{name} unstated or not a non-negative finite number")
 
         # ---- funding
         out["recent_mean_funding_bps"] = self._funding(now)
 
         # ---- correlated exposure: only over a DECLARED set
-        out["correlated_exposure_usd"] = self._correlated()
+        out["correlated_exposure_usd"] = self._correlated(now)
 
         # ---- operational fault: halted flag AND a readable open-orders list
-        out["operational_fault"] = self._fault()
+        out["operational_fault"] = self._fault(now)
         return {f: out[f] for f in FIELDS}
 
     @staticmethod
-    def _finite_or_unknown(x: Any, what: str, *, strict: bool = False) -> float:
+    def _finite_or_unknown(x: Any, what: str, *, strict: bool = False, nonneg: bool = False) -> float:
         v = _num(x)
-        if v is None or (strict and v <= 0):
+        if v is None or (strict and v <= 0) or (nonneg and v < 0):
             raise _Unknown(f"{what} is {x!r}")
         return v
 
@@ -278,11 +329,13 @@ class RiskInputProvider:
         if not isinstance(book, Mapping):
             return self._fact(None, src, None, why or "orderbook unavailable")
         ts = _num(book.get("venue_ts_ms"), minimum=0.0, strict=True)
-        age = 0.0
-        if ts is not None:
-            age = max(0.0, now - ts / 1000.0)
-            if age > self.max_book_age_s:
-                return self._fact(None, src, age, f"orderbook: {age:.1f}s old, limit {self.max_book_age_s:.0f}s (stale)")
+        if ts is None:
+            return self._fact(None, src, None, "orderbook: no venue timestamp, so its age is unknown (not fresh)")
+        if ts / 1000.0 - now > MAX_FUTURE_SKEW_S:
+            return self._fact(None, src, None, "orderbook: venue timestamp is in the future (broken clock)")
+        age = max(0.0, now - ts / 1000.0)
+        if age > self.max_book_age_s:
+            return self._fact(None, src, age, f"orderbook: {age:.1f}s old, limit {self.max_book_age_s:.0f}s (stale)")
         try:
             sides = []
             for key in ("bids", "asks"):
@@ -321,30 +374,38 @@ class RiskInputProvider:
             return self._fact(None, src, age, f"funding: {age:.0f}s old, limit {self.max_funding_age_s:.0f}s (stale)")
         return self._fact(mean_n, src, age)
 
-    def _correlated(self) -> Dict[str, Any]:
+    def _correlated(self, now: float) -> Dict[str, Any]:
         if not self.correlation_set:
             return self._fact(None, "declared correlation set", None, "no declared correlation set: correlation safety is not measured")
         total, labels = 0.0, sorted(self.correlation_set)
         for label in labels:
-            v, why = self._read(label, self.correlation_set[label])
+            v, _age, why = self._stamped(label, self.correlation_set[label], now, self.max_correlation_age_s)
             n = _num(v, minimum=0.0)
             if n is None:
                 return self._fact(None, f"declared correlation set {labels}", None, why or f"member {label!r} exposure unstated")
             total += n
         return self._fact(total, f"sum over declared correlation set {labels}", None)
 
-    def _fault(self) -> Dict[str, Any]:
-        src = "carry state HALTED flag + readable open-orders list"
-        if self.halted_getter is None:
+    def _fault(self, now: float) -> Dict[str, Any]:
+        src = "carry BookState (+ HALTED flag) + readable open-orders list"
+        if self.book_state_getter is not None:
+            st, st_age, why = self._stamped("book_state", self.book_state_getter, now, self.max_state_age_s)
+            name = getattr(st, "name", st) if st is not None else None
+            if not isinstance(name, str) or (name not in FAULT_BOOK_STATES and name not in CLEAN_BOOK_STATES):
+                return self._fact(None, src, st_age, why or f"book state {st!r} is not a known BookState")
+            if name in FAULT_BOOK_STATES:
+                return self._fact(True, src, st_age)
+        elif self.halted_getter is not None:
+            halted, st_age, why = self._stamped("halted_state", self.halted_getter, now, self.max_state_age_s)
+            if halted is None:
+                return self._fact(None, src, st_age, why or "the book did not state whether it is halted")
+            if not isinstance(halted, bool):
+                return self._fact(None, src, st_age, f"halted flag {halted!r} is not a boolean")
+            if halted:
+                return self._fact(True, src, st_age)
+        else:
             return self._fact(None, src, None, "no halted-state source wired")
-        halted, why = self._read("halted_state", self.halted_getter)
-        if halted is None:
-            return self._fact(None, src, None, why or "the book did not state whether it is halted")
-        if not isinstance(halted, bool):
-            return self._fact(None, src, None, f"halted flag {halted!r} is not a boolean")
-        if halted:
-            return self._fact(True, src, None)
         orders, why_o = self._read("open orders", lambda: self.broker.get_open_carry_orders(self.spot_symbol, self.perp_symbol))
         if orders is None:
             return self._fact(None, src, None, why_o or "open orders unreadable")      # cannot say there is no fault
-        return self._fact(False, src, 0.0)
+        return self._fact(False, src, st_age)

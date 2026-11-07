@@ -13,8 +13,9 @@ The pin is of what exists, not of what is desirable: see ``NOT_THROUGH_REQUEST``
 from __future__ import annotations
 
 import ast
-import glob
 import os
+
+import pytest
 from typing import Dict, List, Set, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,9 +27,30 @@ ORDER_CALLS = frozenset({"place_order", "place_market", "place_post_only", "plac
 HTTP_MODULES = frozenset({"urllib.request", "urllib.error", "requests", "http.client", "httpx", "aiohttp", "socket", "websocket", "websockets", "urllib3"})
 
 
+SKIP_DIRS = frozenset({"tests", "state", "__pycache__", ".git", ".venv"})
+#: names that mark an order-creating endpoint (as a substring of any string constant / folded string). ``/v5/order/cancel`` and the read endpoints are deliberately not listed;
+#: the bare prefix IS listed because a path built as ``"/v5/order/" + "create"`` must not escape.
+ORDER_ENDPOINT_MARKERS = ("/v5/order/create", "/v5/order/amend", "/v5/order/", "v5/order")
+_BATCH_OK = ("/v5/order/cancel", "/v5/order/realtime", "/v5/order/history", "/v5/order/execution-list")
+#: modules whose mere import is flagged: process spawning (curl, a shell, a second Python) is a way around the transport.
+PROCESS_MODULES = frozenset({"subprocess", "pty", "multiprocessing", "pexpect"})
+OS_PROCESS_ATTRS = frozenset({"system", "popen", "execl", "execle", "execlp", "execlpe", "execv", "execve", "execvp", "execvpe", "spawnl", "spawnle", "spawnlp", "spawnlpe",
+                              "spawnv", "spawnve", "spawnvp", "spawnvpe", "posix_spawn", "posix_spawnp", "startfile", "fork", "forkpty", "Popen", "create_subprocess_exec",
+                              "create_subprocess_shell"})
+WEAK_REASONS = frozenset({"dynamic-attr", "dict-access"})
+ORDER_REASONS = frozenset({"order-attr", "order-name", "order-call", "endpoint", "dynamic-attr!"})
+DYNAMIC_ACCESS_FUNCS = frozenset({"getattr", "setattr", "delattr", "hasattr", "vars"})
+DYNAMIC_CODE_FUNCS = frozenset({"eval", "exec", "compile"})
+WRAPPERS = frozenset({"partial", "partialmethod", "attrgetter", "methodcaller", "wraps"})
+
+
 def _sources() -> List[str]:
-    files = sorted(glob.glob(os.path.join(BOT, "*.py")) + glob.glob(os.path.join(BOT, "tools", "*.py")))
-    return [f for f in files if os.path.basename(f) != "conftest.py"]
+    """Every .py under bot/ except tests/ (and state/, which no test may open, and caches)."""
+    out: List[str] = []
+    for root, dirs, files in os.walk(BOT):
+        dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+        out += [os.path.join(root, f) for f in sorted(files) if f.endswith(".py") and f != "conftest.py"]
+    return sorted(out)
 
 
 def _rel(path: str) -> str:
@@ -44,12 +66,53 @@ def _is_http(mod: str) -> bool:
     return any(mod == m or mod.startswith(m + ".") for m in HTTP_MODULES)
 
 
-def _scan(path: str) -> Tuple[Set[str], Set[str]]:
-    """(sites, http_imports) for one file."""
+def _order_looking(text: str) -> bool:
+    """An attribute name that is, or builds, one of the order-call names (``place_*``, ``_submit`` exactly). ``orders_submitted`` (a counter) is not one."""
+    low = text.lower().strip()
+    return low == "_submit" or "place_" in low or any(c in low for c in ORDER_CALLS if c != "_submit")
+
+
+def _endpoint_hit(text: str) -> bool:
+    text = text.replace("/docs/v5/order", "/docs/v5-order")        # a documentation URL (bybit-exchange.github.io/docs/v5/order/execution) is prose, not an endpoint
+    if not any(m in text for m in ORDER_ENDPOINT_MARKERS):
+        return False
+    return not any(text.startswith(ok) for ok in _BATCH_OK)
+
+
+def _fold(node: ast.AST, env: Dict[str, str]):
+    """Resolve a string built from constants: literal, ``+``, ``%``/``.format`` of constants, f-string of constants, ``''.join([..])``, a module-level constant name. Else None."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return node.value
+        if isinstance(node.value, bytes):
+            return node.value.decode("latin-1")
+        return None
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        l, r = _fold(node.left, env), _fold(node.right, env)
+        if isinstance(node.op, ast.Add):
+            return l + r if l is not None and r is not None else None
+        return l if l is not None and "%" not in l else None
+    if isinstance(node, ast.JoinedStr):
+        parts = [_fold(v, env) if not isinstance(v, ast.FormattedValue) else _fold(v.value, env) for v in node.values]
+        return "".join(parts) if all(p is not None for p in parts) else None
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "join" and len(node.args) == 1:
+        sep = _fold(node.func.value, env)
+        if sep is not None and isinstance(node.args[0], (ast.List, ast.Tuple)):
+            parts = [_fold(e, env) for e in node.args[0].elts]
+            return sep.join(parts) if all(p is not None for p in parts) else None
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "format":
+        base = _fold(node.func.value, env)
+        return base if base is not None and "{" not in base else None
+    return None
+
+
+def _scan_detail(path: str) -> Tuple[Dict[str, Set[str]], Set[str]]:
+    """({site: {reason, ...}}, http_imports) for one file. ``site`` is ``file:qualified.scope``."""
     tree = ast.parse(open(path, encoding="utf-8").read(), filename=path)
     parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
-    # module-level names bound to the create path (``CREATE = "/v5/order/create"`` or ``CREATE, CANCEL = "/v5/order/create", ...``)
-    aliases: Set[str] = set()
+    env: Dict[str, str] = {}                       # module-level names bound to a foldable string
     for node in tree.body:
         if isinstance(node, ast.Assign):
             for tgt in node.targets:
@@ -59,8 +122,10 @@ def _scan(path: str) -> Tuple[Set[str], Set[str]]:
                 elif isinstance(tgt, (ast.Tuple, ast.List)) and isinstance(node.value, (ast.Tuple, ast.List)) and len(tgt.elts) == len(node.value.elts):
                     pairs = list(zip(tgt.elts, node.value.elts))
                 for t, v in pairs:
-                    if isinstance(t, ast.Name) and isinstance(v, ast.Constant) and v.value == CREATE_PATH:
-                        aliases.add(t.id)
+                    folded = _fold(v, env)
+                    if isinstance(t, ast.Name) and folded is not None:
+                        env[t.id] = folded
+    aliases = {k for k, v in env.items() if _endpoint_hit(v)}
 
     def scope(node: ast.AST) -> str:
         names: List[str] = []
@@ -71,27 +136,141 @@ def _scan(path: str) -> Tuple[Set[str], Set[str]]:
             cur = parents.get(cur)
         return ".".join(reversed(names)) or "<module>"
 
-    sites: Set[str] = set()
+    sites: Dict[str, Set[str]] = {}
     http: Set[str] = set()
     rel = _rel(path)
+
+    weak: Dict[str, Set[str]] = {}       # generic reflection with a non-literal name: only counts in a file that is already order-capable (else it is dataclass/config plumbing)
+
+    def hit(node: ast.AST, reason: str) -> None:
+        if reason in WEAK_REASONS:
+            weak.setdefault(f"{rel}:{scope(node)}", set()).add(reason)
+        else:
+            sites.setdefault(f"{rel}:{scope(node)}", set()).add(reason)
+
+    def dyn_name_arg(arg: ast.AST) -> bool:
+        """True when a name argument is non-literal (cannot be proven benign) or resolves to an order-looking name."""
+        folded = _fold(arg, env)
+        return folded is None or _order_looking(folded)
+
+    def import_target(mod: str, node: ast.AST) -> None:
+        if _is_http(mod):
+            http.add(f"{mod}@{scope(node)}")
+        if mod.split(".")[0] in PROCESS_MODULES or mod == "os.system":
+            hit(node, "process")
+
     for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
+        if isinstance(node, ast.Attribute):
+            if node.attr in ORDER_CALLS:                                   # a read, a call, a store: any mention of the order-call name
+                hit(node, "order-attr")
+            if node.attr in OS_PROCESS_ATTRS:
+                hit(node, "process")
+            if node.attr == "__dict__" and not isinstance(parents.get(node), (ast.Call, ast.Attribute, ast.Subscript)):
+                hit(node, "dict-access")                                   # ``d = c.__dict__`` hands out every attribute by name
+            if node.attr == "__dict__":
+                par = parents.get(node)
+                if isinstance(par, ast.Subscript) and par.value is node and dyn_name_arg(par.slice):
+                    hit(node, "dict-access")
+                if isinstance(par, ast.Attribute):
+                    gp = parents.get(par)
+                    if isinstance(gp, ast.Call) and gp.func is par and gp.args and dyn_name_arg(gp.args[0]):
+                        hit(node, "dict-access")
+        elif isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load) and node.id in ORDER_CALLS:
+                hit(node, "order-name")
+            elif isinstance(node.ctx, ast.Load) and node.id in aliases:
+                hit(node, "endpoint")
+            elif isinstance(node.ctx, ast.Load) and node.id in DYNAMIC_ACCESS_FUNCS | DYNAMIC_CODE_FUNCS | {"__import__"}:
+                par = parents.get(node)
+                if not (isinstance(par, ast.Call) and par.func is node):   # the function passed around as a value (map(getattr, ..), alias = getattr)
+                    hit(node, "dynamic-ref")
+        elif isinstance(node, ast.Call):
             fn = node.func
             name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else None
             if name in ORDER_CALLS:
-                sites.add(f"{rel}:{scope(node)}")
-        elif isinstance(node, ast.Constant) and node.value == CREATE_PATH and not _is_docstring(node, parents):
-            sites.add(f"{rel}:{scope(node)}")
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id in aliases:
-            sites.add(f"{rel}:{scope(node)}")
+                hit(node, "order-call")
+            if name in DYNAMIC_ACCESS_FUNCS and isinstance(fn, ast.Name):
+                if name == "vars":
+                    hit(node, "dict-access")
+                elif len(node.args) >= 2 and _fold(node.args[1], env) is not None and _order_looking(_fold(node.args[1], env)):
+                    hit(node, "dynamic-attr!")                          # a literal / folded order-looking name: always flagged
+                elif len(node.args) >= 2 and dyn_name_arg(node.args[1]):
+                    par = parents.get(node)
+                    if isinstance(par, ast.Call) and par.func is node:
+                        hit(node, "dynamic-attr!")                      # getattr(x, non_literal)(...): the result is called
+                    elif name in ("setattr", "delattr"):
+                        hit(node, "dynamic-attr!")                      # a non-literal setattr/delattr can swap or hide a method
+                    else:
+                        hit(node, "dynamic-attr")
+                elif len(node.args) < 2:
+                    hit(node, "dynamic-attr")
+            if name in DYNAMIC_CODE_FUNCS and isinstance(fn, ast.Name):
+                hit(node, "dynamic-code")
+            if name in ("join", "format"):
+                folded_call = _fold(node, env)
+                if folded_call is not None and _endpoint_hit(folded_call):
+                    hit(node, "endpoint")
+            if name in WRAPPERS:
+                for a in list(node.args) + [k.value for k in node.keywords]:
+                    folded = _fold(a, env)
+                    if (folded is not None and _order_looking(folded)) or (isinstance(a, ast.Name) and a.id in DYNAMIC_ACCESS_FUNCS):
+                        hit(node, "wrapper")
+            if name in ("import_module", "__import__") or (isinstance(fn, ast.Attribute) and fn.attr == "__import__"):
+                arg0 = node.args[0] if node.args else None
+                folded = _fold(arg0, env) if arg0 is not None else None
+                if folded is None:
+                    hit(node, "dynamic-import")
+                else:
+                    import_target(folded, node)
+            if name == "find_spec" or name == "spec_from_file_location" or name == "load_module":
+                hit(node, "dynamic-import")
+            if name in OS_PROCESS_ATTRS and isinstance(fn, ast.Name):
+                hit(node, "process")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)) and not _is_docstring(node, parents):
+            text = node.value if isinstance(node.value, str) else node.value.decode("latin-1")
+            if _endpoint_hit(text):
+                hit(node, "endpoint")
+        elif isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+            folded = _fold(node, env)
+            if folded is not None and _endpoint_hit(folded):
+                hit(node, "endpoint")
+        elif isinstance(node, ast.JoinedStr):
+            folded = _fold(node, env)
+            if folded is not None and _endpoint_hit(folded):
+                hit(node, "endpoint")
         elif isinstance(node, ast.Import):
-            http.update(f"{a.name}@{scope(node)}" for a in node.names if _is_http(a.name))
+            for a in node.names:
+                import_target(a.name, node)
         elif isinstance(node, ast.ImportFrom) and node.module:
-            if _is_http(node.module):
-                http.add(f"{node.module}@{scope(node)}")
-            elif node.module == "urllib" and any(a.name in ("request", "error") for a in node.names):
+            import_target(node.module, node)
+            if node.module == "urllib" and any(a.name in ("request", "error") for a in node.names):
                 http.add(f"urllib.request@{scope(node)}")
+            if node.module == "os" and any(a.name in OS_PROCESS_ATTRS for a in node.names):
+                hit(node, "process")
+            if node.module == "importlib" or any(a.name in ORDER_CALLS for a in node.names):
+                if any(a.name in ORDER_CALLS for a in node.names):
+                    hit(node, "order-name")
+            if node.module in ("importlib", "importlib.util") and any(a.name in ("import_module", "__import__") for a in node.names):
+                pass                                                    # the call itself is judged above
+    if any(r in ORDER_REASONS for rs in sites.values() for r in rs):
+        for k, v in weak.items():
+            sites.setdefault(k, set()).update(v)
     return sites, http
+
+
+def _scan(path: str) -> Tuple[Set[str], Set[str]]:
+    """(sites, http_imports) for one file."""
+    detail, http = _scan_detail(path)
+    return set(detail), http
+
+
+def _order_sites(sites: Set[str]) -> Set[str]:
+    """Sites that can build or send an order (everything except the reviewed process-spawn sites)."""
+    return {s for s in sites if not EXPECTED_SITES.get(s, "").startswith("PROCESS_")}
+
+
+#: modules that both open a connection AND spawn processes (reviewed): a public-data reader that runs ``git``; the drill supervisor's HTTP probe that spawns pinned drill tools.
+PROCESS_AND_HTTP_FILES = frozenset({"carry_shadow.py", "tools/unattended_drill.py"})
 
 
 def _inventory() -> Tuple[Set[str], Dict[str, Set[str]]]:
@@ -145,6 +324,32 @@ EXPECTED_SITES: Dict[str, str] = {
     "tools/linear_stop_venue_drill.py:run_induce_naked.open_position": "CLIENT_CALLER",
     "tools/linear_stop_venue_drill.py:run_margin_doc.attach": "CLIENT_CALLER",
     "tools/linear_stop_venue_drill.py:run_margin_doc.open_position": "CLIENT_CALLER",
+    "backtest.py:walk_forward": "SIMULATOR",         # reviewed: ``BacktestConfig(**cfg.__dict__)`` copies a config in the simulator module; no order name involved
+    "bybit_connection.py:BybitClient.get_instrument_filters": "TRANSPORT",    # reviewed: ``getattr(filters, name)`` over fixed instrument-filter field names (reads)
+    "carry_engine.py:CarryEngine._tick_book": "BROKER_CALLER",    # reviewed: ``getattr(view, "perp_book" if .. else "spot_book")`` reads a snapshot's book; no order name
+    "ledger.py:LedgerBroker._read_touch": "BROKER_CALLER",        # reviewed: getattr(self.inner, name) over the two literal READ names get_book_depth / get_book_top
+    "runtime_capability.py:CapabilityTransport.__getattr__": "READER",   # reviewed: the guard proxy delegates unknown attributes to the inner transport; ``request`` is defined on the proxy and is the guarded path
+    "tools/close_testnet_experiment.py:execute_run": "GATEWAY",   # reviewed: ``getattr(lab, spec["fn"])()`` over the static EXPERIMENTS table (fn names e1..e10); every order goes through Lab.place / Gateway.request
+    "tools/close_testnet_experiment.py:compute_sizing": "GATEWAY",       # reviewed: getattr(inst, name) over instrument-filter field names
+    "tools/close_testnet_experiment.py:static_refusal": "GATEWAY",       # reviewed: getattr(cfg, name) over the BYBIT_API_KEY / BYBIT_API_SECRET names
+    # process spawning, reviewed one by one: none of these builds an order request; children that can trade are the pinned tools above and run their own entry authority
+    "carry_shadow.py:<module>": "PROCESS_GIT",                    # imports subprocess; runs ``git rev-parse`` / ``git status`` for the build id
+    "tools/carry_core.py:<module>": "PROCESS_GIT",                # ``make -C cpp`` to build the native core
+    "tools/carry_oos_audit.py:<module>": "PROCESS_GIT",           # ``git -C repo ...`` provenance
+    "tools/data_freshness_check.py:<module>": "PROCESS_UNUSED",   # imports subprocess, no spawn call in the file
+    "tools/fetch_real_data.py:<module>": "PROCESS_GIT",           # ``git clone --depth 1`` of the public corpus repo
+    "tools/oos_stability_q1q2.py:<module>": "PROCESS_UNUSED",     # imports subprocess, no spawn call in the file
+    "tools/provenance.py:<module>": "PROCESS_GIT",                # git head / status
+    "tools/runner_supervisor.py:<module>": "PROCESS_SUPERVISOR",  # supervises monitor/recorder command lines given by the operator
+    "tools/runner_supervisor.py:Supervisor.__init__": "PROCESS_SUPERVISOR",
+    "tools/runner_supervisor.py:Supervisor._spawn": "PROCESS_SUPERVISOR",
+    "tools/runner_supervisor.py:Supervisor._terminate": "PROCESS_SUPERVISOR",
+    "tools/runner_supervisor.py:main": "PROCESS_SUPERVISOR",
+    "tools/secret_scan.py:<module>": "PROCESS_GIT",               # ``git ls-files``
+    "tools/shadow_replay.py:<module>": "PROCESS_UNUSED",          # imports subprocess, no spawn call in the file
+    "tools/train_policy.py:<module>": "PROCESS_GIT",              # git rev for the training fingerprint
+    "tools/unattended_drill.py:<module>": "PROCESS_SUPERVISOR",   # runs the testnet drill tools (incl. close_testnet_short --arm) as children; each child is a pinned tool under its own authority
+    "tools/unattended_drill.py:run_child": "PROCESS_SUPERVISOR",
     "runtime_capability.py:<module>": "READER",       # reviewed: the role allow-lists NAME the order endpoint as a string; the module imports no client/transport and sends nothing
     "trading_engine.py:TradingEngine._emergency_close": "CLIENT_CALLER",
     "trading_engine.py:TradingEngine._enter": "CLIENT_CALLER",
@@ -196,21 +401,22 @@ def test_the_set_of_order_create_sites_is_exactly_the_pinned_allow_list():
     new, gone = sorted(sites - set(EXPECTED_SITES)), sorted(set(EXPECTED_SITES) - sites)
     assert not new, f"NEW order-capable site(s) {new}: review them, then add to EXPECTED_SITES with a role"
     assert not gone, f"pinned site(s) {gone} no longer exist: remove them from EXPECTED_SITES on purpose"
-    assert set(EXPECTED_SITES.values()) <= {"TRANSPORT", "BROKER_SEND", "BROKER_CALLER", "CLIENT_CALLER", "GATEWAY", "READER", "SIMULATOR"}
+    assert set(EXPECTED_SITES.values()) <= {"TRANSPORT", "BROKER_SEND", "BROKER_CALLER", "CLIENT_CALLER", "GATEWAY", "READER", "SIMULATOR", "PROCESS_GIT", "PROCESS_UNUSED", "PROCESS_SUPERVISOR"}
 
 
 def test_http_capable_modules_are_pinned_and_only_the_transport_is_also_order_capable():
     sites, http = _inventory()
     assert set(http) == EXPECTED_HTTP_FILES, (sorted(set(http) - EXPECTED_HTTP_FILES), sorted(EXPECTED_HTTP_FILES - set(http)))
-    order_files = {s.split(":")[0] for s in sites}
+    order_files = {s.split(":")[0] for s in _order_sites(sites)}
     assert order_files & set(http) == ORDER_CAPABLE_HTTP_FILES
+    assert {s.split(":")[0] for s in sites} & set(http) == ORDER_CAPABLE_HTTP_FILES | PROCESS_AND_HTTP_FILES
     # inside the transport module the connection is made in one place: RequestsTransport (urllib.request/requests nowhere else in it)
     assert http["bybit_connection.py"] == {"requests@RequestsTransport.__init__"}
 
 
 def test_no_order_capable_module_builds_its_own_transport():
     sites, http = _inventory()
-    for rel in {s.split(":")[0] for s in sites} - set(ORDER_CAPABLE_HTTP_FILES):
+    for rel in {s.split(":")[0] for s in _order_sites(sites)} - set(ORDER_CAPABLE_HTTP_FILES):
         assert rel not in http, f"{rel} can send orders AND opens its own connection"
 
 
@@ -270,6 +476,96 @@ def test_scanner_detects_a_new_opening_path(tmp_path):
     f.write_text('import requests\ndef sneaky(c):\n    c.place_order(1)\n    requests.post("x", json={"p": "/v5/order/create"})\n')
     sites, http = _scan(str(f))
     assert any(s.endswith(":sneaky") for s in sites) and http
+
+
+#: Positive controls for the scanner ITSELF: every blind-spot form found by the red team (plus the obvious siblings) must be CAUGHT, with the stated reason.
+BLIND_SPOT_FIXTURES = {
+    "alias of the bound method": ("def f(c):\n    po = c.place_order\n    po({})\n", "order-attr"),
+    "bare attribute read, never called": ("def f(c):\n    return c.place_market\n", "order-attr"),
+    "attribute store (monkeypatch)": ("def f(c, g):\n    c._submit = g\n", "order-attr"),
+    "from-import of an order name": ("from x import place_order\n", "order-name"),
+    "bare name read": ("def f(place_order):\n    return place_order\n", "order-name"),
+    "getattr with a concatenated name": ("def f(c):\n    getattr(c, 'place_' + 'order')({})\n", "dynamic-attr!"),
+    "getattr with an f-string name": ("def f(c):\n    getattr(c, f'{\"place\"}_order')({})\n", "dynamic-attr!"),
+    "getattr with a literal order name": ("def f(c):\n    return getattr(c, 'place_post_only', None)\n", "dynamic-attr!"),
+    "getattr with a non-literal name, result called": ("def f(c, n):\n    getattr(c, n)({})\n", "dynamic-attr!"),
+    "setattr with a non-literal name": ("def f(c, n, g):\n    setattr(c, n, g)\n", "dynamic-attr!"),
+    "getattr passed as a value": ("def f(c):\n    g = getattr\n    return g(c, 'x')\n", "dynamic-ref"),
+    "functools.partial of the method": ("import functools\ndef f(c):\n    functools.partial(c.place_order, {})()\n", "order-attr"),
+    "partial over a built name": ("import functools\ndef f(c):\n    return functools.partial(getattr, c, 'place_' + 'order')\n", "wrapper"),
+    "operator.attrgetter of the name": ("import operator\ndef f(c):\n    return operator.attrgetter('place_order')(c)\n", "wrapper"),
+    "lambda wrapping the method": ("def f(c):\n    return lambda **k: c.place_order(**k)\n", "order-attr"),
+    "importlib with a concatenated module": ("import importlib\ndef f():\n    return importlib.import_module('url' + 'lib.request')\n", "http"),
+    "importlib with a non-literal module": ("import importlib\ndef f(n):\n    return importlib.import_module(n)\n", "dynamic-import"),
+    "__import__ of an http module": ("def f():\n    return __import__('requests').post('https://x')\n", "http"),
+    "__import__ with a non-literal": ("def f(n):\n    return __import__(n)\n", "dynamic-import"),
+    "subprocess curl": ("import subprocess\ndef f():\n    subprocess.run(['curl', '-X', 'POST', 'https://api.bybit.com/v5/order/' + 'create'])\n", "process"),
+    "subprocess via __import__": ("def f():\n    return __import__('sub' + 'process')\n", "process"),
+    "os.system": ("import os\ndef f():\n    os.system('curl x')\n", "process"),
+    "os.popen": ("import os\ndef f():\n    os.popen('curl x')\n", "process"),
+    "os.execv": ("import os\ndef f():\n    os.execv('/usr/bin/curl', ['curl'])\n", "process"),
+    "from os import system": ("from os import system\n", "process"),
+    "eval of a string": ("def f(s):\n    return eval(s)\n", "dynamic-code"),
+    "path built by concatenation": ("def f(c):\n    c._request('POST', '/v5/order/' + 'create', body={})\n", "endpoint"),
+    "path built with a split literal": ("def f(c):\n    c._request('POST', '/v5/or' + 'der/cre' + 'ate')\n", "endpoint"),
+    "path built with join": ("def f(c):\n    c._request('POST', ''.join(['/v5/', 'order/', 'create']))\n", "endpoint"),
+    "path built from a module-level piece": ("P = '/v5/order/'\ndef f(c):\n    c._request('POST', P + 'create')\n", "endpoint"),
+    "path as an f-string with a variable tail": ("def f(c, t):\n    c._request('POST', f'/v5/order/{t}')\n", "endpoint"),
+    "batch endpoint": ("def f(c):\n    c._request('POST', '/v5/order/create-batch')\n", "endpoint"),
+    "amend endpoint": ("def f(c):\n    c._request('POST', '/v5/order/amend')\n", "endpoint"),
+    "__dict__ lookup by non-literal name": ("def f(c, n):\n    return c.__dict__[n]\n", "dict-access"),
+    "__dict__ handed out": ("def f(c):\n    d = c.__dict__\n    return d\n", "dict-access"),
+}
+
+
+@pytest.mark.parametrize("label", sorted(BLIND_SPOT_FIXTURES))
+def test_scanner_catches_every_known_blind_spot_form(tmp_path, label):
+    src, reason = BLIND_SPOT_FIXTURES[label]
+    f = tmp_path / "evil.py"
+    # the weak reflection reasons only count in an already order-capable file, so give those fixtures one
+    f.write_text(src + ("\ndef _anchor(c):\n    c.place_order(1)\n" if reason == "dict-access" else ""))
+    detail, http = _scan_detail(str(f))
+    if reason == "http":
+        assert http, (label, detail)
+    else:
+        assert any(reason in rs for site, rs in detail.items() if not site.endswith(":_anchor")), (label, detail)
+    sites, _ = _scan(str(f))
+    assert sites or http
+
+
+def test_benign_code_is_not_flagged_by_the_scanner(tmp_path):
+    """Negative control: the scanner is not a blanket alarm. Doc URLs, counters, urllib.parse and literal getattr are quiet."""
+    f = tmp_path / "ok.py"
+    f.write_text(
+        '"""docstring mentioning /v5/order/create and place_order"""\n'
+        'from urllib.parse import urlencode\n'
+        'SRC = "https://bybit-exchange.github.io/docs/v5/order/execution"\n'
+        'CANCEL = "/v5/order/cancel"\n'
+        'def f(c, cfg, n):\n'
+        '    getattr(cfg, "ENTRIES_ENABLED", True)\n'
+        '    getattr(cfg, n, None)\n'
+        '    return int(getattr(c, "orders_submitted", 0)), CANCEL, SRC, urlencode({})\n')
+    assert _scan_detail(str(f)) == ({}, set())
+
+
+def test_scan_covers_every_python_file_under_bot_except_tests_and_state():
+    rels = {_rel(f) for f in _sources()}
+    assert "main.py" in rels and "tools/secret_scan.py" in rels and "signals/funding_carry_fade_v1.py" in rels
+    assert not [r for r in rels if r.startswith(("tests/", "state/"))]
+    on_disk = set()
+    for root, dirs, files in os.walk(BOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        on_disk |= {_rel(os.path.join(root, f)) for f in files if f.endswith(".py") and f != "conftest.py"}
+    assert rels == on_disk
+
+
+def test_no_non_python_script_under_bot_names_the_create_endpoint_or_shells_out_to_it():
+    for root, dirs, files in os.walk(BOT):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for name in files:
+            if name.endswith((".sh", ".bash")):
+                text = open(os.path.join(root, name), encoding="utf-8", errors="replace").read()
+                assert "/v5/order" not in text, name
 
 
 if __name__ == "__main__":      # `python tests/test_order_path_inventory.py` prints the live inventory for review
