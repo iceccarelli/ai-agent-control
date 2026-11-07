@@ -337,3 +337,118 @@ def test_the_reservation_limit_is_a_window_not_a_lifetime_so_the_book_does_not_w
     assert st.reserve(mk("P1"), now_ms=later) is None                                       # an identical resend of an OLD id is still recognised
     other = EA.OrderIntent("linear", "BTCUSDT", "Sell", "0.5", False, "P1")
     assert st.reserve(other, now_ms=later) == "RESERVATION_CONFLICT_SAME_ID_DIFFERENT_ORDER"   # and a different order under it is still a conflict forever
+
+
+# ---------------------------------------------------------------- red-team reproductions (a327b75)
+
+@pytest.mark.parametrize("endpoint", ["/v5/order/create?x=1", "/v5/order/create/", "/V5/order/create", "/v5/order//create", "/v5/order/create#f", "/v5/order/create ", "/v5/order/../order/create"])
+def test_a_non_canonical_write_endpoint_is_refused_before_the_transport(store, endpoint):
+    """Reproduced: POST '/v5/order/create?x=1' skipped both the live gate and the authority (exact string match) and reached the transport."""
+    c, v = client(store)
+    with pytest.raises(bc.OrderNotSent, match="ENDPOINT_REFUSED"):
+        c._request("POST", endpoint, body=order(), signed=True)
+    assert v.requests == [] and c.orders_submitted == 0
+
+
+def test_the_live_gate_cannot_be_skipped_by_a_query_string_on_a_mainnet_client(store):
+    class MainnetCfg(Cfg):
+        BYBIT_VENUE = "mainnet"
+        USE_TESTNET = False
+    v = Recorder()
+    c = bc.BybitClient(config=MainnetCfg(), store=store, transport=v)
+    with pytest.raises(bc.OrderNotSent):
+        c._request("POST", "/v5/order/create?x=1", body=order(), signed=True)
+    with pytest.raises(bc.OrderNotSent, match="LIVE_NOT_AUTHORIZED"):
+        c._request("POST", "/v5/order/create", body=order(), signed=True)
+    assert v.requests == []
+
+
+@pytest.mark.parametrize("endpoint", ["/v5/order/amend", "/v5/order/create-batch", "/v5/order/amend-batch"])
+def test_unused_order_write_endpoints_are_denied(store, endpoint):
+    c, v = client(store)
+    with pytest.raises(bc.OrderNotSent, match="ENDPOINT_REFUSED"):
+        c._request("POST", endpoint, body=order(), signed=True)
+    assert v.requests == []
+
+
+def test_cancel_and_reads_still_work(store):
+    c, v = client(store)
+    c._request("POST", "/v5/order/cancel", body={"category": "linear", "symbol": "BTCUSDT", "orderLinkId": "Z"}, signed=True) if False else None
+    c._request("GET", "/v5/account/wallet-balance", params={"accountType": "UNIFIED"}, signed=True)
+    assert v.requests
+
+
+def test_a_marketable_limit_sell_cannot_declare_a_tiny_notional(store, tmp_path):
+    """Reproduced: Limit Sell 100 BTC at price '1' declared $100 and was sent under a $102 cap."""
+    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD))
+    with pytest.raises(bc.OrderNotSent, match="NOTIONAL_ABOVE_CAP"):
+        c._request("POST", "/v5/order/create", body=order(orderType="Limit", qty="100", price="1", timeInForce="PostOnly"), signed=True)
+    assert sent_orders(v) == []
+    c._request("POST", "/v5/order/create", body=order(orderType="Limit", qty="0.001", price="99900", timeInForce="PostOnly", orderLinkId="LM1"), signed=True)   # control
+    assert len(sent_orders(v)) == 1
+
+
+def test_a_limit_buy_is_costed_at_its_own_price_and_a_limit_sell_without_a_mark_refuses(store, tmp_path):
+    c, v = client(store, build(tmp_path, policy=POLICY, state=GOOD))
+    with pytest.raises(bc.OrderNotSent, match="NOTIONAL_ABOVE_CAP"):
+        c._request("POST", "/v5/order/create", body=order(category="spot", side="Buy", orderType="Limit", qty="1", price="100000", orderLinkId="LB1"), signed=True)
+    c2, v2 = client(store, build(tmp_path / "n", policy=POLICY, state=GOOD, mark=lambda s: None))
+    with pytest.raises(bc.OrderNotSent, match="NO_PRICE_FOR_NOTIONAL"):
+        c2._request("POST", "/v5/order/create", body=order(orderType="Limit", qty="0.001", price="100000", orderLinkId="LB2"), signed=True)
+
+
+def test_a_local_refusal_through_place_order_is_recorded_rejected_not_unknown(store):
+    """Reproduced: a bare client's place_order stored the refused order as status=unknown and listed it in unresolved_orders()."""
+    c, v = client(store)
+    r = c.place_order(symbol="BTCUSDT", side="Buy", qty="0.001", order_link_id="PO1")
+    assert not r.ok and r.reason and "NO_ENTRY_AUTHORITY" in r.reason
+    assert store.get_order("PO1")["status"] == "rejected"
+    assert "PO1" not in [x["order_link_id"] for x in store.unresolved_orders()]
+    assert sent_orders(v) == []
+
+
+@pytest.mark.parametrize("extra", [{"isLeverage": 1}, {"isLeverage": "1"}])
+def test_a_margin_spot_sell_is_exposure_not_an_exit(extra):
+    assert EA.increases_exposure(order(category="spot", side="Sell", **extra)) is True
+    assert EA.increases_exposure(order(category="spot", side="Sell", isLeverage=0)) is False
+    assert EA.increases_exposure(order(category="spot", side="Sell")) is False
+
+
+@pytest.mark.parametrize("flag", [1, "TRUE ", "True", "yes", "1", 1.0])
+def test_only_the_exact_reduce_only_forms_make_an_order_an_exit(flag):
+    assert EA.increases_exposure(order(side="Buy", reduceOnly=flag)) is True
+    assert EA.increases_exposure(order(side="Buy", reduceOnly=True)) is False and EA.increases_exposure(order(side="Buy", reduceOnly="true")) is False
+
+
+def test_a_dict_subclass_that_lies_is_refused_and_an_authority_that_errors_does_not_approve(store, tmp_path):
+    class Liar(dict):
+        def get(self, k, d=None):
+            return True if k == "reduceOnly" else super().get(k, d)
+    c, v = client(store)
+    with pytest.raises(bc.OrderNotSent, match="PLAIN_OBJECT"):
+        c._request("POST", "/v5/order/create", body=Liar(order(side="Buy")), signed=True)
+    class Boom:
+        def authorize(self, body, *, venue):
+            raise OSError("disk")
+    c2, v2 = client(store, Boom())
+    with pytest.raises(bc.OrderNotSent, match="AUTHORITY_ERROR:OSError"):
+        c2._request("POST", "/v5/order/create", body=order(), signed=True)
+    assert v.requests == [] and v2.requests == []
+
+
+def test_resolve_appends_never_replaces_and_frees_the_window(tmp_path):
+    st = EA.ReservationStore(str(tmp_path / "l.jsonl"))
+    mk = lambda link: EA.OrderIntent("linear", "BTCUSDT", "Sell", "0.001", False, link)
+    t0 = 1_800_000_000_000
+    assert st.reserve(mk("A"), now_ms=t0) is None and st.reserve(mk("B"), now_ms=t0) is None
+    assert st.reserve(mk("C"), now_ms=t0) == "TOO_MANY_UNRESOLVED_ENTRIES"
+    ino = os.stat(st.path).st_ino
+    st.resolve("A")
+    assert os.stat(st.path).st_ino == ino                                        # same file: nothing was swapped from under a waiting reserve()
+    assert st.reserve(mk("C"), now_ms=t0) is None                                # a resolved entry frees a slot inside the window
+
+
+def test_a_symlinked_policy_file_is_not_a_policy(tmp_path):
+    real = tmp_path / "real.json"; real.write_text(json.dumps(dataclasses.asdict(POLICY)))
+    link = tmp_path / "link.json"; os.symlink(real, link)
+    assert EA.load_policy(str(real)).approved_by_owner is True and EA.load_policy(str(link)) is None

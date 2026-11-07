@@ -62,6 +62,7 @@ import venues as _venues
 import hashlib
 import hmac
 import json
+import re
 import logging
 import math
 import threading
@@ -143,6 +144,11 @@ EXPOSURE_ENDPOINTS = frozenset({"/v5/order/create", "/v5/position/set-leverage"}
 #: The authority a client consults when it was given none of its own (see ``entry_authority``). None in production: a bare client REFUSES to open anything. Only the test
 #: suite's conftest sets it (to a permissive stand-in that exists nowhere in production code), and the tests of the guard itself opt out of that.
 DEFAULT_ENTRY_AUTHORITY: Any = None
+
+#: Order endpoints that can ADD or ENLARGE exposure but that nothing in this repository uses. They are refused outright (``OrderNotSent``) rather than left to a gate that matches
+#: only ``/v5/order/create``: an amend can raise a quantity, a batch create is an order create. Using one needs a reviewed code change, not a flag.
+DENIED_ORDER_ENDPOINTS = frozenset({"/v5/order/amend", "/v5/order/create-batch", "/v5/order/amend-batch"})
+_NONCANONICAL = re.compile(r"[?#\s]|//|/\.\.|[A-Z]|/$")
 
 
 def resolve_client_venue(cfg: Any) -> str:
@@ -663,19 +669,23 @@ class BybitClient:
         """Every order that is not provably an exit passes the entry authority; a client without one refuses (``NO_ENTRY_AUTHORITY``). A reduce-only exit does not pass
         through it and is not made weaker or stronger by it."""
         import entry_authority as _ea
-        if not isinstance(body, dict):
-            raise OrderNotSent("ENTRY_REFUSED: ORDER_BODY_NOT_AN_OBJECT")
-        if not _ea.increases_exposure(body):
+        if type(body) is not dict:                                  # a dict SUBCLASS can lie about .get(); only a plain dict is read
+            raise OrderNotSent("ENTRY_REFUSED: ORDER_BODY_NOT_A_PLAIN_OBJECT")
+        snapshot = dict(body)                                       # decided on a copy: what is judged is what was captured
+        if not _ea.increases_exposure(snapshot):
             return
         authority = self.entry_authority if self.entry_authority is not None else DEFAULT_ENTRY_AUTHORITY
         if authority is None:
             logger.critical("order REFUSED at the transport: this client has no entry authority (%s)", self.venue)
             raise OrderNotSent("ENTRY_REFUSED: NO_ENTRY_AUTHORITY")
         try:
-            authority.authorize(body, venue=self.venue)
+            authority.authorize(snapshot, venue=self.venue)
         except _ea.EntryRefused as exc:
             logger.critical("order REFUSED at the transport by the entry authority: %s", ", ".join(exc.reasons))
             raise OrderNotSent(str(exc)) from exc
+        except Exception as exc:                                    # noqa: BLE001 - an authority that errors is an authority that did not approve
+            logger.critical("order REFUSED: the entry authority raised %s", type(exc).__name__)
+            raise OrderNotSent(f"ENTRY_REFUSED: AUTHORITY_ERROR:{type(exc).__name__}") from exc
 
     def _request(
         self,
@@ -715,6 +725,10 @@ class BybitClient:
         decision-time book) is held to a wall-clock bound.
         """
         method = method.upper()
+        if method != "GET" and (_NONCANONICAL.search(endpoint) or endpoint in DENIED_ORDER_ENDPOINTS):
+            # The exposure guards below compare the endpoint string EXACTLY; a query string, case or slash variant would sail past both the live gate and the entry
+            # authority (reproduced: POST '/v5/order/create?x=1' on a mainnet-venue client reached the transport). A write endpoint must be canonical and supported.
+            raise OrderNotSent(f"ENDPOINT_REFUSED: {endpoint!r} is not a canonical, supported write endpoint")
         url = f"{self.base_url}{endpoint}"
         self._assert_endpoint_matches_venue(url)
         if (_venues.requires_live_authorisation(self.venue)
@@ -1398,6 +1412,11 @@ class BybitClient:
             payload = self._request(
                 "POST", "/v5/order/create", body=body, signed=True
             )
+        except OrderNotSent as exc:
+            # Refused LOCALLY before a byte left the process: the order does not exist at the venue. Recording it 'unknown' (ret_code 0 is in UNKNOWN_OUTCOME_RET_CODES)
+            # left a refused entry listed as possibly live (reproduced).
+            self.store.update_order_status(oid, "rejected")
+            return OrderResult(order_link_id=oid, reason=str(exc))
         except PermanentAPIError as exc:
             if self._looks_like_duplicate_link_id(exc):
                 # Attempt N-1 landed and the transport lost the reply. The

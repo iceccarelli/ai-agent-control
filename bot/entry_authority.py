@@ -67,7 +67,8 @@ class OrderIntent:
 
 
 def _truthy(v: Any) -> bool:
-    return v is True or (isinstance(v, str) and v.strip().lower() == "true") or (isinstance(v, int) and not isinstance(v, bool) and v == 1)
+    """Only the boolean True or the exact string "true" is reduce-only. 1, "TRUE ", "yes" are NOT: how the venue reads a non-boolean is unverified, so it is treated as an entry."""
+    return v is True or v == "true"
 
 
 def increases_exposure(body: Mapping[str, Any]) -> bool:
@@ -80,6 +81,9 @@ def increases_exposure(body: Mapping[str, Any]) -> bool:
     if _truthy(body.get("reduceOnly")) and category in ("linear", "inverse"):
         return False
     if category == "spot" and side == "sell":
+        lev = body.get("isLeverage")
+        if lev not in (None, "", 0, "0", False):
+            return True                                            # a spot sell with margin leverage can open a short: not an exit
         return False
     return True
 
@@ -129,12 +133,23 @@ def notional_cap_check(max_usd: float, mark_provider: Optional[Callable[[str], O
             return "ORDER_QTY_OR_PRICE_UNPARSABLE"
         if not qty.is_finite() or qty <= 0:
             return "ORDER_QTY_INVALID"
-        if px is None and mark_provider is not None:
+        mark: Optional[Decimal] = None
+        if mark_provider is not None:
             try:
                 m = mark_provider(i.symbol)
             except Exception:                                      # noqa: BLE001
                 m = None
-            px = Decimal(str(m)) if isinstance(m, (int, float)) and math.isfinite(m) and m > 0 else None
+            if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and m > 0:
+                mark = Decimal(str(m))
+        side = i.side.strip().lower()
+        if px is None:
+            px = mark                                              # a market order: priced at the mark
+        elif side == "sell":
+            # A limit SELL can fill at the best bid however low its limit: declaring price "1" must not make 100 BTC look like $100. Cost it at the larger of limit and mark.
+            if mark is None:
+                return "NO_PRICE_FOR_NOTIONAL"
+            px = max(px, mark)
+        # a limit BUY cannot fill above its limit: its own price is the worst case
         if px is None or not px.is_finite() or px <= 0:
             return "NO_PRICE_FOR_NOTIONAL"
         return None if float(qty * px) <= float(max_usd) else "NOTIONAL_ABOVE_CAP"
@@ -184,13 +199,15 @@ class ReservationStore:
                 except ValueError:
                     return "RESERVATION_LEDGER_UNREADABLE"            # refuse rather than guess what was already reserved
                 rows.append(row)
+            resolved = {r["link"] for r in rows if r.get("event") == "resolve"}
+            rows = [r for r in rows if r.get("event") != "resolve"]
             same = [r for r in rows if r["link"] == i.order_link_id]
             if same:
                 prior = same[0]
                 if (prior.get("symbol"), prior.get("side"), prior.get("qty"), prior.get("category")) == (i.symbol, i.side, i.qty, i.category):
                     return None                                        # an identical resend: how a lost acknowledgement is resolved
                 return "RESERVATION_CONFLICT_SAME_ID_DIFFERENT_ORDER"
-            unresolved = [r for r in rows if not r.get("resolved") and isinstance(r.get("at_ms"), int) and now - r["at_ms"] <= self.window_ms]
+            unresolved = [r for r in rows if r["link"] not in resolved and not r.get("resolved") and isinstance(r.get("at_ms"), int) and now - r["at_ms"] <= self.window_ms]
             if len(unresolved) >= max_unresolved:
                 return "TOO_MANY_UNRESOLVED_ENTRIES"
             os.write(fd, (json.dumps({"link": i.order_link_id, "symbol": i.symbol, "side": i.side, "qty": i.qty, "category": i.category,
@@ -201,21 +218,12 @@ class ReservationStore:
             os.close(fd)
 
     def resolve(self, order_link_id: str) -> None:
-        """Mark a reservation resolved (filled/cancelled/rejected and reconciled). Rewrites atomically under the lock; never deletes a row."""
-        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        """Mark a reservation resolved by APPENDING a resolution row under the same lock (never rewrites or replaces the file, so a reserve() waiting on the lock cannot append to an orphaned inode)."""
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            with open(self.path, encoding="utf-8") as fh:
-                rows = [json.loads(x) for x in fh.read().splitlines() if x.strip()]
-            for r in rows:
-                if r.get("link") == order_link_id:
-                    r["resolved"] = True
-            tmp = f"{self.path}.{os.getpid()}.tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write("".join(json.dumps(r, sort_keys=True) + "\n" for r in rows))
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, self.path)
+            os.write(fd, (json.dumps({"link": order_link_id, "event": "resolve", "at_ms": int(time.time() * 1000)}, sort_keys=True) + "\n").encode("utf-8"))
+            os.fsync(fd)
         finally:
             os.close(fd)
 
@@ -267,8 +275,8 @@ POLICY_FIELDS = tuple(f for f in RP.Policy.__dataclass_fields__)
 def load_policy(path: Optional[str]) -> Optional[RP.Policy]:
     """The owner's approved policy from a JSON file, or None. STRICT: every field present, no unknown field, numbers finite, and ``approved_by_owner`` literally true.
     A missing/unreadable/malformed file is None (= refusal), never a default policy."""
-    if not path or not os.path.isfile(path):
-        return None
+    if not path or os.path.islink(path) or not os.path.isfile(path):
+        return None                                                # a symlinked policy file is not an owner-written one
     try:
         with open(path, encoding="utf-8") as fh:
             doc = json.load(fh)

@@ -613,11 +613,15 @@ def _assemble(base, rep, flags, fills, funding, spot, snaps, unvalued, stale, an
     settlements = (rep.get("perp_review") or {}).get("settlements") or {}
     missing_settle = settlements.get("missing", 0) or 0
     net = None
+    partial_net = None
     if all(v is not None for v in fig.values()):
         net = math.fsum(fig.values())
     elif fig["perp_realised_usd"] is not None:
-        net = math.fsum(v for v in fig.values() if v is not None)
-    realised = {"status": realised_status, "figures": fig, "net_realised_cash_usd": net, "settlements": settlements,
+        # A component that is UNKNOWN (interest, other statement lines: no wallet/transaction anchor) is not zero. The sum of what IS known is reported only as a labelled
+        # partial; it is never the net or the headline (found in review: a PROVISIONAL report headlined +476.275 that omitted interest and every other cash line).
+        partial_net = math.fsum(v for v in fig.values() if v is not None)
+    realised = {"status": realised_status, "figures": fig, "net_realised_cash_usd": net, "partial_net_of_known_components_usd": partial_net,
+                "unknown_components": sorted(k for k, v in fig.items() if v is None), "settlements": settlements,
                 "components": "perp realised (average entry) + perp fees + funding + interest + other statement lines; deposits and withdrawals are not profit"}
     # inventory / derivative valuation
     if unvalued:

@@ -324,7 +324,10 @@ def test_missing_mark_leaves_the_inventory_unvalued_never_zero(tmp_path):
     assert "INVENTORY_UNVALUED" in flag_codes(rep)
     # the cash leg that needs no mark is still shown, but unanchored to balances: PROVISIONAL, not RECONCILED
     assert rep["status"] == "PROVISIONAL" and rep["layers"]["realised_cash"]["status"] == "PROVISIONAL"
-    close(rep["headline_profit_usd"], 476.275)
+    # CHANGED in integration review: this used to assert headline_profit_usd == 476.275 here. That figure omitted interest and every other statement line (unknown, not zero), so a
+    # PROVISIONAL account headlined a profit it could not support. The known components are now reported only as a labelled partial.
+    assert rep["headline_profit_usd"] is None
+    close(rep["layers"]["realised_cash"]["partial_net_of_known_components_usd"], 476.275)
 
 
 def test_only_the_closing_mark_missing_leaves_the_26h_old_opening_mark_stale_and_the_total_withheld(tmp_path):
@@ -568,3 +571,15 @@ def test_the_status_of_every_report_in_this_module_is_in_the_vocabulary_and_neve
         assert r["status"] != "VERIFIED"
         for layer in r["layers"].values():
             assert layer["status"] in OI.STATUSES and layer["status"] != "VERIFIED"
+
+
+def test_unknown_components_are_not_zero_so_a_partial_sum_is_never_the_headline(tmp_path):
+    """Found in review: with no wallet files the report was PROVISIONAL yet headlined +476.275, silently omitting interest and every other cash line."""
+    import owner_import as OI
+    import fixtures_owner_import as F
+    pairs = F.lay_out(tmp_path, F.Trip(), with_wallets=False)
+    rep = OI.run_import(pairs)
+    layer = rep["layers"]["realised_cash"]
+    assert rep["headline_profit_usd"] is None and layer["net_realised_cash_usd"] is None
+    assert set(layer["unknown_components"]) == {"interest_usd", "other_cash_lines_usd"}
+    assert isinstance(layer["partial_net_of_known_components_usd"], float)            # reported, labelled, never the headline
