@@ -267,6 +267,9 @@ good-looking number before the window closes is not a result. Everything below i
 1. **Save the public responses as they come.** On a machine you control, request
    `GET https://api.bybit.com/v5/market/funding/history?category=linear&symbol=BTCUSDT&startTime=<ms>&endTime=<ms>&limit=200`
    (at most 200 rows a page, ordering unspecified: page by `endTime`) and save each response UNEDITED. Keep them.
+   Or let `python3 tools/funding_capture.py --start-ms <ms> --out-dir <NEW dir>` do exactly that loop: one unauthenticated GET per page to the registry host, no redirects,
+   each body written byte-for-byte (never overwritten, mode 0600) plus a `manifest.json` with every page's SHA-256 and the gaps on the 8-hour grid (reported, never filled). It is
+   never run by tests or CI; you run it. Its pages feed step 2 unchanged.
 2. **Make the registered input.** `python3 tools/prospective_prints.py --in page1.json --in page2.json ... --out prints.jsonl`. It converts the
    venue's fraction to basis points itself (never type a unit), refuses anything that is not a clean BTCUSDT print on the 8-hour grid (a symbol that
    moves to a different funding interval is refused: the plan is an 8-hour plan), merges overlapping pages, never overwrites `--out`, and reports gaps
