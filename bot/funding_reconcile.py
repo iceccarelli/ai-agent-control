@@ -36,6 +36,7 @@ Anything else is PROVISIONAL with the reasons listed. Estimates never enter.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import ledger as L
@@ -49,6 +50,31 @@ SIZE_SEMANTICS = "documented_signed_unconfirmed_on_live_account"
 
 def _qty(journal: L.Journal, ms: int) -> float:
     return L._perp_qty_at(journal, ms)
+
+
+_FILL_PRICE = re.compile(r"@ ([0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\s*$")
+#: A funding payment is rate x qty x MARK. The only price this book holds is the one it filled the perp at; a mark that has moved by more than
+#: this factor either way since the last fill is itself unusual, and a payment outside the resulting bracket is not reconciled either.
+MAGNITUDE_BRACKET = 2.0
+MAGNITUDE_FLOOR_USD = 0.02
+
+
+def _last_perp_price(journal: L.Journal, ms: int) -> Optional[float]:
+    """Price of the latest perp fill stamped at or before `ms`: the decision mark if journalled, else the price in the entry's own memo."""
+    best = None
+    for e in journal.entries:
+        if e.kind in ("perp_open", "perp_close") and e.ms <= ms and (best is None or e.ms >= best.ms):
+            best = e
+    if best is None:
+        return None
+    if best.decision_mark is not None and best.decision_mark > 0:
+        return float(best.decision_mark)
+    m = _FILL_PRICE.search(best.memo or "")
+    try:
+        px = float(m.group(1)) if m else 0.0
+    except ValueError:
+        px = 0.0
+    return px if px > 0 else None
 
 
 def _classify_print(journal: L.Journal, t: int) -> str:
@@ -168,6 +194,8 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
     # conventions is wrong, and every funding dollar in the statement would be
     # inverted, so the lifecycle cannot be called reconciled.
     sign_contradictions = 0
+    magnitude_contradictions = 0
+    magnitude_unchecked = 0
     if history_whole and history is not None:
         for e in attributed:
             t, usd = int(e.fee_raw["venue_ms"]), float(e.fee_raw["venue_usd"])
@@ -182,8 +210,23 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
             expected = (-1.0 if qty > 0 else 1.0) * (1.0 if rate > 0 else -1.0)
             if (usd > 0) != (expected > 0):
                 sign_contradictions += 1
+                continue
+            # MAGNITUDE SCREEN. rate x |qty| x price, bracketed by MAGNITUDE_BRACKET on the price. Without a price the row is counted as
+            # UNCHECKED (reported, never silently passed); an amount outside the bracket (a x10 slip, a cumulative field) is a contradiction.
+            px = _last_perp_price(journal, t)
+            if px is None:
+                magnitude_unchecked += 1
+                continue
+            base = abs(qty) * abs(rate) / 10_000.0 * px
+            lo_usd, hi_usd = base / MAGNITUDE_BRACKET - MAGNITUDE_FLOOR_USD, base * MAGNITUDE_BRACKET + MAGNITUDE_FLOOR_USD
+            if not (lo_usd <= abs(usd) <= hi_usd):
+                magnitude_contradictions += 1
     if sign_contradictions:
         reasons.append("FUNDING_SIGN_CONTRADICTS_PUBLIC_RATE")
+    if magnitude_contradictions:
+        reasons.append("FUNDING_MAGNITUDE_CONTRADICTS_PUBLIC_RATE")
+    if magnitude_unchecked:
+        reasons.append("FUNDING_MAGNITUDE_NOT_CHECKABLE")
     if missing or flagged_missing:
         reasons.append("EXPECTED_SETTLEMENT_MISSING")
     if ambiguous:
@@ -219,6 +262,8 @@ def assess_lifecycle(journal: L.Journal, lc: L.Lifecycle, *, history: Any,
             "ambiguous_ownership": len(ambiguous),
             "pending_delivery_grace": len(pending),
             "rows_contradicting_public_rate_sign": sign_contradictions,
+            "rows_contradicting_public_rate_magnitude": magnitude_contradictions,
+            "rows_magnitude_not_checkable": magnitude_unchecked,
             "account_rows_attributed": len(attributed),
             "account_rows_unattributed": len(unattributed),
             "account_rows_identity_conflict": len(conflicts),

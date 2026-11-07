@@ -507,7 +507,7 @@ class TestReconciliationOutcomes:
 
     def test_a_held_settlement_with_its_row_is_fully_reconciled(self):
         j = hedged()
-        recon(j, [T0 + 3 * H], [pay(1, 2.0, T0 + 3 * H)], now=T0 + 12 * H)
+        recon(j, [T0 + 3 * H], [pay(1, 5.0, T0 + 3 * H)], now=T0 + 12 * H)
         lc = state(j)[0]
         assert lc["state"] == "FULLY_RECONCILED"
         assert lc["evidence"]["matched_settlements"] == 1
@@ -649,7 +649,7 @@ class TestPaymentSignAgreesWithThePublicRate:
 
     def test_a_row_that_agrees_with_the_public_rate_reconciles(self):
         j = hedged()
-        recon(j, [T0 + 3 * H], [pay(1, 2.0, T0 + 3 * H)], now=T0 + 12 * H)
+        recon(j, [T0 + 3 * H], [pay(1, 5.0, T0 + 3 * H)], now=T0 + 12 * H)
         assert state(j)[0]["state"] == "FULLY_RECONCILED"
         assert state(j)[0]["evidence"]["rows_contradicting_public_rate_sign"] == 0
 
@@ -666,7 +666,7 @@ class TestPaymentSignAgreesWithThePublicRate:
         negative = CB.FundingHistory(
             start_ms=T0 - 2 * H, end_ms=T0 + 12 * H,
             prints=[(-1.0, T0 + 3 * H)])
-        recon(j, [], [pay(1, -2.0, T0 + 3 * H)], now=T0 + 12 * H,
+        recon(j, [], [pay(1, -5.0, T0 + 3 * H)], now=T0 + 12 * H,
               history=negative)
         assert state(j)[0]["state"] == "FULLY_RECONCILED"
 
@@ -1025,3 +1025,39 @@ class TestExitAfterTheSettlementRule:
         assert a["evidence"]["expected_settlements"] == 2 and a["evidence"]["matched_settlements"] == 2           # A held t1 and t2, and had both rows
         assert b["evidence"]["expected_settlements"] == 1 and b["evidence"]["matched_settlements"] == 1           # B held only the settlement after it opened
         assert "OWNERSHIP_AMBIGUOUS_AT_SETTLEMENT" in b["reasons"] and b["state"] == "PROVISIONAL"            # the print it opened just after stays ambiguous
+
+
+# ---------------------------------------------------------------- magnitude screen (a x10 slip is not "reconciled")
+
+@pytest.mark.parametrize("usd,reconciled", [(5.0, True), (3.0, True), (9.0, True), (50.0, False), (500.0, False), (5000.0, False), (0.5, False)])
+def test_a_payment_far_from_rate_times_notional_is_not_reconciled(usd, reconciled):
+    j = hedged(); now = T0 + 3 * H8 + 10 * H
+    p = T0 + H8                                         # public 1 bps on a 0.5 BTC short at 100k: the correct payment is $5
+    recon(j, [p], [pay(1, usd, p)], now=now)
+    rec = L.lifecycle_reconciliation(j)[0]
+    if reconciled:
+        assert "FUNDING_MAGNITUDE_CONTRADICTS_PUBLIC_RATE" not in rec["reasons"]
+    else:
+        assert rec["state"] == "PROVISIONAL" and "FUNDING_MAGNITUDE_CONTRADICTS_PUBLIC_RATE" in rec["reasons"]
+        assert rec["evidence"]["rows_contradicting_public_rate_magnitude"] == 1
+
+
+def test_a_row_whose_magnitude_cannot_be_checked_is_not_silently_reconciled():
+    j = L.Journal()                                      # a short with NO price anywhere in its entry: the screen has nothing to compare with
+    j.post(L.Entry(ms=T0, kind="perp_open", ref="o1", lines=[L.Line(L.PERP, 0.0, qty=-0.5), L.Line(L.FEES, 1.0), L.Line(L.USDT, -1.0, qty=-1.0)],
+                   memo="short", fee_status="confirmed"))
+    now = T0 + 3 * H8 + 10 * H; p = T0 + H8
+    recon(j, [p], [pay(1, 5.0, p)], now=now)
+    rec = L.lifecycle_reconciliation(j)[0]
+    assert rec["state"] == "PROVISIONAL" and "FUNDING_MAGNITUDE_NOT_CHECKABLE" in rec["reasons"]
+    assert rec["evidence"]["rows_magnitude_not_checkable"] == 1
+
+
+def test_pair_net_is_confirmed_only_when_every_input_is_confirmed():
+    j = hedged()
+    assert j.statement()["pair_net_confirmed"] is False             # funding never reconciled: a number, but not a confirmed result
+    now = T0 + 3 * H8 + 10 * H; p = T0 + H8
+    recon(j, [p], [pay(1, 5.0, p)], now=now)                          # positive control: reconciled funding, confirmed fee
+    assert j.statement()["pair_net_confirmed"] is True
+    L.mark_funding_unread(j, ms=now + 1, why="venue unreadable")      # one unread read makes it provisional again
+    assert j.statement()["pair_net_confirmed"] is False

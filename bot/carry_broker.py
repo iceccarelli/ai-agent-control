@@ -666,6 +666,7 @@ class CarryBroker:
         #: NEVER guessed: an unreadable rule raises and the engine refuses.
         self._lot_rules: Dict[Tuple[str, str], Dict[str, float]] = {}
         self._fee_rates: Dict[Tuple[str, str], Dict[str, float]] = {}
+        self._fee_rates_read_at: Dict[Tuple[str, str], float] = {}
         if link_id_builder is None or duplicate_ret_codes is None:
             import bybit_connection as _bybit_connection
         if link_id_builder is None:
@@ -1485,6 +1486,10 @@ class CarryBroker:
 
     #: No Bybit tier charges more than 1 % per fill; above it the number is a unit slip.
     _MAX_PLAUSIBLE_FEE_BPS = 100.0
+    #: A maker REBATE (negative maker rate) is a real tier; a rebate larger than this is a unit slip or the wrong field. A negative TAKER rate is never accepted.
+    _MAX_MAKER_REBATE_BPS = 10.0
+    #: A fee tier changes (volume, VIP, referral); a rate read once is not served for the life of the process.
+    _FEE_RATE_TTL_S = 3600.0
     #: One settlement's funding can never be more than 5 % (500 bps) on any instrument this book trades; the venue's own cap in the row is tighter.
     _MAX_PLAUSIBLE_FUNDING_RATE = 0.05
     #: The engine's income, staleness and break-even arithmetic assume an 8-hour funding interval (3 settlements a day).
@@ -1613,8 +1618,11 @@ class CarryBroker:
         on a cost it cannot price.
         """
         key = (symbol, product)
-        if key in self._fee_rates:
+        read_at = self._fee_rates_read_at.get(key)
+        if key in self._fee_rates and read_at is not None and time.monotonic() - read_at <= self._FEE_RATE_TTL_S:
             return dict(self._fee_rates[key])
+        self._fee_rates.pop(key, None)              # expired: re-read; if the venue cannot be read now this RAISES rather than serve a stale price
+        self._fee_rates_read_at.pop(key, None)
         result = self.client._request(
             "GET", "/v5/account/fee-rate", signed=True,
             params={"category": product, "symbol": symbol})
@@ -1636,7 +1644,8 @@ class CarryBroker:
             raise PairIncident(
                 f"fee rate for {symbol}/{product} is malformed: {row!r}"
             ) from exc
-        if not all(math.isfinite(v) and v >= 0 for v in rates.values()):
+        if not (all(math.isfinite(v) for v in rates.values()) and rates["taker_bps"] >= 0
+                and rates["maker_bps"] >= -self._MAX_MAKER_REBATE_BPS):
             raise PairIncident(
                 f"fee rate for {symbol}/{product} is unusable: {rates}")
         # The venue states a FRACTION (0.00055 = 5.5 bps). A percent-style 0.055 would read as 550 bps; no tier charges 100 bps, so anything above
@@ -1646,6 +1655,7 @@ class CarryBroker:
                 f"fee rate for {symbol}/{product} is implausible ({rates} bps; "
                 f"above {self._MAX_PLAUSIBLE_FEE_BPS:g}): the venue states a fraction, not a percent")
         self._fee_rates[key] = dict(rates)
+        self._fee_rates_read_at[key] = time.monotonic()
         return dict(rates)
 
     def get_spot_inventory(self, symbol: str) -> float:

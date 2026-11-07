@@ -158,6 +158,7 @@ jobs:
           tests/test_trial_journal.py
           tests/test_prospective_prints.py
           tests/test_funding_capture.py
+          tests/test_fee_rate_freshness.py
           tests/test_execution_model.py
           tests/test_live_gate_recomputed.py
           tests/test_environment_read_surface.py
