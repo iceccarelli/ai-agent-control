@@ -173,6 +173,7 @@ jobs:
           tests/test_supabase_migrations.py
           tests/test_owner_import.py
           tests/test_md_broker_funding_interval.py
+          tests/test_entry_authority_e2e.py
           tests/test_state_backup_promote.py
           tests/test_execution_model.py
           tests/test_live_gate_recomputed.py
