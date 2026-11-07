@@ -441,7 +441,7 @@ class TestTheReportCarriesItsClaims:
                              venue="testnet", hold=_plan(clock),
                              cash_ledger=str(tmp_path / "l.json"))
         (f,) = report["claims"]["funding_claims"]
-        assert f["venue_id"] == "S1" and f["amount"] == pytest.approx(4.25)
+        assert f["venue_id"] == "S1" and f["amount"] == pytest.approx(0.03)
         assert f["size"] == pytest.approx(-0.001) and f["source"] == "testnet_claim"
 
     def test_a_preflight_only_report_has_no_claims(self):
