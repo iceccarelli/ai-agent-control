@@ -66,13 +66,13 @@ jobs:
       run:
         working-directory: bot
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
         with:
           # Two commits: for a pull request the checked-out commit is the merge
           # of the PR into its base, so HEAD^1 is the base tip.
           fetch-depth: 2
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip
@@ -442,7 +442,7 @@ jobs:
       # image THIS run just built from THIS commit.
       IMAGE: ai-agent-control-carry-smoke:${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
 
       - name: Build the production image (bot/Dockerfile, context ./bot)
         run: docker build --pull --tag "$IMAGE" ./bot
@@ -499,7 +499,7 @@ jobs:
     env:
       IMAGE: ai-agent-control-shadow-smoke:${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
 
       - name: Build the production image (bot/Dockerfile, context ./bot)
         run: docker build --pull --tag "$IMAGE" ./bot
@@ -560,11 +560,11 @@ jobs:
       run:
         working-directory: bot
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # actions/checkout v7.0.1
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # actions/setup-python v7.1.0
         with:
           python-version: ${{ matrix.python }}
           cache: pip

@@ -51,7 +51,7 @@ def _steps(code):
 
 def test_no_secret_is_visible_to_a_third_party_action():
     # a job-level env hands every secret to every step's action, including the
-    # unpinned setup-flyctl: each secret must sit only on the step that uses it
+    # third-party setup-flyctl (pinned, still untrusted): each secret must sit only on the step that uses it
     job_head = CODE.split("steps:", 1)[0]
     assert "secrets." not in job_head, "a secret is exposed at job level"
     steps = _steps(CODE)

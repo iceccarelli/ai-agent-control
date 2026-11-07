@@ -143,9 +143,18 @@ class TestTheSchedule:
 
 class TestThePinnedActionsAndTheArtifact:
     def test_actions_are_the_ones_the_gate_already_uses(self, text):
-        used = set(re.findall(r"uses: (actions/[a-z-]+@v\d+)", text))
-        assert used == {"actions/checkout@v4", "actions/setup-python@v5",
-                        "actions/upload-artifact@v4"}
+        used = set(re.findall(
+            r"uses: (actions/[a-z-]+@[0-9a-f]{40} # actions/[a-z-]+ v\d+\.\d+\.\d+)",
+            text))
+        assert used == {
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+            " # actions/checkout v7.0.1",
+            "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+            " # actions/setup-python v7.1.0",
+            "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
+            " # actions/upload-artifact v7.0.2"}
+        # no mutable ref survives next to the pinned ones
+        assert not re.findall(r"uses: actions/[a-z-]+@(?![0-9a-f]{40}\b)", text)
 
     def test_the_artifact_is_kept_briefly(self, text):
         assert "retention-days: 14" in text
@@ -272,3 +281,49 @@ class TestTheProbeFailsClosed:
         script = step_script(text, "Can this runner reach the testnet")
         assert '[ "$code" != "200" ]' in script and "exit 1" in script
         assert "NOT reachable" in script
+
+
+class TestEveryWorkflowActionIsPinnedToACommit:
+    """Every third-party `uses:` in every workflow is a 40-hex commit SHA with a
+    trailing comment naming the release. A tag or branch can be moved."""
+
+    WORKFLOWS = os.path.join(ROOT, ".github", "workflows")
+    USES = re.compile(r"^\s*(?:-\s+)?uses:\s*(\S+)(?:[ \t]+#[ \t]*(.*))?$")
+
+    def uses_lines(self):
+        found = []
+        for name in sorted(os.listdir(self.WORKFLOWS)):
+            if not name.endswith((".yml", ".yaml")):
+                continue
+            for n, line in enumerate(open(os.path.join(self.WORKFLOWS, name),
+                                          encoding="utf-8"), 1):
+                if re.match(r"^\s*(?:-\s+)?uses:", line):
+                    found.append((name, n, line.rstrip("\n")))
+        return found
+
+    def test_there_are_uses_lines_to_check(self):
+        assert len(self.uses_lines()) >= 10
+
+    def test_every_uses_is_a_40_hex_sha(self):
+        bad = []
+        for name, n, line in self.uses_lines():
+            m = self.USES.match(line)
+            ref = m.group(1) if m else ""
+            if ref.startswith("./"):
+                continue
+            if not re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", ref):
+                bad.append(f"{name}:{n}")
+        assert not bad, bad
+
+    def test_every_pin_carries_a_release_comment_naming_the_action(self):
+        bad = []
+        for name, n, line in self.uses_lines():
+            m = self.USES.match(line)
+            ref, comment = (m.group(1), m.group(2) or "") if m else ("", "")
+            if ref.startswith("./"):
+                continue
+            repo = ref.split("@")[0]
+            owner_repo = "/".join(repo.split("/")[:2])
+            if not re.fullmatch(re.escape(owner_repo) + r" v?\d+(\.\d+)+", comment.strip()):
+                bad.append(f"{name}:{n}")
+        assert not bad, bad
