@@ -480,6 +480,9 @@ class BybitClient:
         #: THE common authority for new exposure (entry_authority.EntryAuthority), consulted in ``_request`` for every exposure-increasing ``/v5/order/create``. None =
         #: the module default (None in production) = a refusal: this client cannot open anything.
         self.entry_authority: Any = None
+        #: Optional runtime ROLE limit (``runtime_capability.Capability``): consulted in ``_request`` BEFORE anything is signed or sent. A public collector, a read-only monitor and an
+        #: evidence/backup process are built with a capability that cannot sign or POST. None = no role limit (the entry authority still gates new exposure).
+        self.capability: Any = None
 
         # The venue is resolved ONCE, centrally, and refused when the config
         # contradicts itself or states nothing (resolve_client_venue). USE_TESTNET
@@ -735,6 +738,11 @@ class BybitClient:
             # authority (reproduced: POST '/v5/order/create?x=1' on a mainnet-venue client reached the transport). A write endpoint must be canonical and supported.
             raise OrderNotSent(f"ENDPOINT_REFUSED: {endpoint!r} is not a canonical, supported write endpoint")
         url = f"{self.base_url}{endpoint}"
+        if self.capability is not None:
+            refusal = self.capability.check(method, endpoint, bool(signed), _venues.host_of(url))
+            if refusal:
+                logger.critical("request REFUSED by the runtime capability: %s %s (%s)", method, endpoint, refusal)
+                raise OrderNotSent(f"CAPABILITY_REFUSED: {refusal}")
         self._assert_endpoint_matches_venue(url)
         if (_venues.requires_live_authorisation(self.venue)
                 and endpoint in EXPOSURE_ENDPOINTS):
