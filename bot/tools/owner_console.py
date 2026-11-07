@@ -122,6 +122,16 @@ def section_backup(path: Optional[str]) -> Dict[str, Any]:
             "note": "verify only compares the file with its manifest and runs integrity_check; it does not prove the backup is recent or restorable onto the live path"}
 
 
+def section_testnet(env: Mapping[str, str]) -> Dict[str, Any]:
+    """The offline testnet qualification (guard probes) and the count of venue facts still unread. Never 'certified': only an owner-run bounded preflight can read the venue."""
+    import testnet_certificate as TCERT
+    rep = TCERT.build(env)
+    failing = [p["probe"] for p in rep["section_a_offline_probes"] if p["status"] != TCERT.PASS]
+    return {"status": PROVISIONAL, "offline_qualification": rep["offline_qualification"], "failing_probes": failing,
+            "venue_facts_not_read": len(rep["section_b_venue_facts"]), "testnet_certified": False,
+            "note": "guard logic only; see tools/testnet_certificate.py for the bounded plan the owner would authorise"}
+
+
 def section_pnl() -> Dict[str, Any]:
     return {"actual_realised": {"status": UNAVAILABLE, "why": "no owner-account export is supplied to this read-out; run tools/owner_ledger.py on an export you hold"},
             "modelled": {"status": ESTIMATED, "why": "any carry figure from the research tools is a model, never a result; keep it apart from the actual line above"}}
@@ -130,12 +140,12 @@ def section_pnl() -> Dict[str, Any]:
 def build(env: Mapping[str, str], *, funding: Optional[str] = None, backup: Optional[str] = None, now_ms: Optional[int] = None) -> Dict[str, Any]:
     now = _now_ms() if now_ms is None else min(int(now_ms), _now_ms())          # a caller can only move the clock earlier
     rep = {"environment": section_environment(env), "evidence": section_evidence(funding, now), "capital": section_capital(),
-           "eligibility": section_eligibility(env), "backup": section_backup(backup), "pnl": section_pnl(), "as_of_ms": now}
+           "eligibility": section_eligibility(env), "testnet": section_testnet(env), "backup": section_backup(backup), "pnl": section_pnl(), "as_of_ms": now}
     for k, v in rep.items():
         if isinstance(v, dict) and "status" in v and v["status"] not in STATUSES:
             raise AssertionError(f"section {k} has a status outside the vocabulary")
     rep["headline"] = (f"live={'ARMED' if rep['environment']['live_authorized'] else 'off'}; capital=${rep['capital']['capital_usd']:.0f}; "
-                       f"evidence={rep['evidence']['status']}; backup={rep['backup']['status']}; actual P&L={rep['pnl']['actual_realised']['status']}")
+                       f"evidence={rep['evidence']['status']}; testnet_offline={rep['testnet']['offline_qualification']}; backup={rep['backup']['status']}; actual P&L={rep['pnl']['actual_realised']['status']}")
     return rep
 
 

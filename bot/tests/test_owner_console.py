@@ -16,6 +16,8 @@ sys.path.insert(0, os.path.join(BOT, "tools"))
 import carry_prospective as CP  # noqa: E402
 import owner_console as OC  # noqa: E402
 
+pytestmark = pytest.mark.real_entry_ledger      # the console runs the drill's real entry-limiter probe
+
 LIVE = {"USE_TESTNET": "0", "PAPER_TRADING": "0", "LIVE_TRADING_ACK": "I_UNDERSTAND", "BYBIT_API_KEY": "KEYVALUE12345", "BYBIT_API_SECRET": "SECRETVALUE6789", "BYBIT_VENUE": "mainnet"}
 LATER = CP.WINDOW_START_MS + 10 * 86_400_000
 
@@ -104,3 +106,12 @@ def test_the_console_is_read_only(tmp_path):
     before = sorted(os.listdir(tmp_path))
     OC.build({}, now_ms=LATER)
     assert sorted(os.listdir(tmp_path)) == before
+
+
+def test_the_console_reports_the_offline_testnet_qualification_but_never_certifies():
+    rep = OC.build({}, now_ms=LATER)
+    t = rep["testnet"]
+    assert t["status"] in OC.STATUSES and t["testnet_certified"] is False and t["venue_facts_not_read"] >= 10
+    assert t["offline_qualification"] in ("PASS", "FAIL") and "testnet_offline=" in rep["headline"]
+    armed = OC.build(LIVE, now_ms=LATER)["testnet"]
+    assert armed["offline_qualification"] == "FAIL" and armed["failing_probes"]
