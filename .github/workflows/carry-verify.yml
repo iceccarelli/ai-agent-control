@@ -371,6 +371,7 @@ jobs:
           tests/test_carry_replay.py
           tests/test_acquire_economics_oracle.py
           tests/test_testnet_offline_safety.py
+          tests/test_testnet_lifecycle_offline.py
           tests/test_carry_replay_liquidation.py
           tests/test_carry_risk_evidence.py
           tests/test_operator_verdicts.py

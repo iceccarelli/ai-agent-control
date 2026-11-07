@@ -1032,6 +1032,11 @@ class CarryBroker:
             raise PairIncident(
                 f"touch for {symbol}/{product} is unusable: "
                 f"bid {bid!r} ask {ask!r}")
+        if bid >= ask:
+            # A crossed or locked touch has a zero or NEGATIVE spread: it is not a price anyone can trade at, and it would book a negative cost.
+            raise PairIncident(
+                f"touch for {symbol}/{product} is crossed or locked: "
+                f"bid {bid!r} ask {ask!r}")
         return {"bid": bid, "ask": ask}
 
     #: Levels asked of the public order book. 50 is accepted for both spot and
@@ -1478,6 +1483,19 @@ class CarryBroker:
                 f"ticker row is for {named!r}, not {symbol!r}; refusing to "
                 "price one instrument from another's row")
 
+    #: No Bybit tier charges more than 1 % per fill; above it the number is a unit slip.
+    _MAX_PLAUSIBLE_FEE_BPS = 100.0
+    #: One settlement's funding can never be more than 5 % (500 bps) on any instrument this book trades; the venue's own cap in the row is tighter.
+    _MAX_PLAUSIBLE_FUNDING_RATE = 0.05
+    #: The engine's income, staleness and break-even arithmetic assume an 8-hour funding interval (3 settlements a day).
+    _ASSUMED_FUNDING_INTERVAL_H = 8
+
+    @classmethod
+    def _rate_is_plausible(cls, rate: float) -> bool:
+        """A funding rate is a FRACTION per settlement; no instrument this book trades ever exceeds 5 % in one. Anything above is a unit slip, the wrong
+        field or a hostile row, and must never reach a decision (shared by the ticker forecast and every settled-print reader)."""
+        return math.isfinite(rate) and abs(rate) <= cls._MAX_PLAUSIBLE_FUNDING_RATE
+
     def get_funding_bps(self, symbol: str) -> float:
         """Current 8h funding on the perp, in basis points.
 
@@ -1496,12 +1514,42 @@ class CarryBroker:
         if not rows:
             raise PairIncident(f"no ticker for {symbol}; funding unknown")
         self._assert_ticker_symbol(rows[0], symbol)
-        raw = rows[0].get("fundingRate")
+        row = rows[0]
+        raw = row.get("fundingRate")
         if raw is None:
             raise PairIncident(f"ticker for {symbol} carries no fundingRate")
-        rate = float(raw)
+        try:
+            rate = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise PairIncident(f"funding for {symbol} is unreadable: {raw!r}") from exc
         if not math.isfinite(rate):
             raise PairIncident(f"funding for {symbol} is {raw!r}")
+        # The same row states the funding interval. Every number downstream (income per day, break-even, the staleness of the last print) assumes
+        # 8 hours, so a different interval is refused rather than priced as if it were eight (reproduced: the field was ignored).
+        interval = row.get("fundingIntervalHour")
+        if interval is not None and str(interval).strip() != "":
+            try:
+                hours = float(interval)
+            except (TypeError, ValueError):
+                hours = float("nan")
+            if hours != self._ASSUMED_FUNDING_INTERVAL_H:
+                raise PairIncident(
+                    f"ticker for {symbol} states a funding interval of {interval!r} "
+                    f"hours; this book prices {self._ASSUMED_FUNDING_INTERVAL_H}-hour settlements only")
+        bound = self._MAX_PLAUSIBLE_FUNDING_RATE
+        cap_raw = row.get("fundingCap")
+        if cap_raw is not None and str(cap_raw).strip() != "":
+            try:
+                cap = float(cap_raw)
+            except (TypeError, ValueError) as exc:
+                raise PairIncident(f"ticker for {symbol} states an unreadable fundingCap: {cap_raw!r}") from exc
+            if not (math.isfinite(cap) and cap > 0):
+                raise PairIncident(f"ticker for {symbol} states an unusable fundingCap: {cap_raw!r}")
+            bound = min(bound, cap * (1.0 + 1e-9))
+        if abs(rate) > bound:
+            raise PairIncident(
+                f"funding for {symbol} is {rate!r} (a fraction per settlement), beyond the "
+                f"{bound!r} bound / the venue's own cap in the same row: a unit slip or a wrong field")
         return rate * 1e4
 
     def get_lot_rules(self, symbol: str, product: str) -> Dict[str, float]:
@@ -1574,6 +1622,13 @@ class CarryBroker:
         if not rows:
             raise PairIncident(f"no fee rate for {symbol} on {product}")
         row = rows[0]
+        # A row that NAMES another instrument prices the wrong market (reproduced: an ETHUSDT row of zeros read as BTCUSDT's fee, was cached for the
+        # life of the process, and the cost gate then priced the round trip at nothing). A row that names none is accepted, as for tickers.
+        named = row.get("symbol") if isinstance(row, dict) else None
+        if named not in (None, "") and str(named) != symbol:
+            raise PairIncident(
+                f"fee-rate row is for {named!r}, not {symbol!r}; refusing to "
+                "price one instrument from another's row")
         try:
             rates = {"maker_bps": float(row["makerFeeRate"]) * 1e4,
                      "taker_bps": float(row["takerFeeRate"]) * 1e4}
@@ -1584,6 +1639,12 @@ class CarryBroker:
         if not all(math.isfinite(v) and v >= 0 for v in rates.values()):
             raise PairIncident(
                 f"fee rate for {symbol}/{product} is unusable: {rates}")
+        # The venue states a FRACTION (0.00055 = 5.5 bps). A percent-style 0.055 would read as 550 bps; no tier charges 100 bps, so anything above
+        # that is a unit slip or the wrong field, never a price.
+        if any(v > self._MAX_PLAUSIBLE_FEE_BPS for v in rates.values()):
+            raise PairIncident(
+                f"fee rate for {symbol}/{product} is implausible ({rates} bps; "
+                f"above {self._MAX_PLAUSIBLE_FEE_BPS:g}): the venue states a fraction, not a percent")
         self._fee_rates[key] = dict(rates)
         return dict(rates)
 
@@ -1654,6 +1715,10 @@ class CarryBroker:
         if not math.isfinite(rate) or stamp <= 0:
             raise PairIncident(
                 f"settled funding print for {symbol} is unusable: {row!r}")
+        if not self._rate_is_plausible(rate):
+            raise PairIncident(
+                f"settled funding print for {symbol} is implausible ({rate!r} as a "
+                f"fraction per settlement): a unit slip or a wrong field")
         return rate * 1e4, stamp
 
     def get_margin_mode(self) -> str:
@@ -1918,6 +1983,10 @@ class CarryBroker:
             except (KeyError, TypeError, ValueError):
                 continue
             if math.isfinite(rate) and stamp > 0:
+                if not self._rate_is_plausible(rate):
+                    raise PairIncident(
+                        f"funding history row for {symbol} is implausible ({rate!r} as a "
+                        f"fraction per settlement): refusing to seed the entry gate with it")
                 out.append((rate * 1e4, stamp))
         out.sort(key=lambda entry: entry[1])
         return out
@@ -1990,6 +2059,11 @@ class CarryBroker:
                     continue
                 if not math.isfinite(rate) or stamp <= 0:
                     out.errors.append("a funding row is unusable")
+                    bad = True
+                    continue
+                if not self._rate_is_plausible(rate):
+                    out.errors.append(
+                        f"a funding row is implausible ({rate!r} as a fraction per settlement)")
                     bad = True
                     continue
                 if str(row.get("symbol", symbol)) != symbol:
@@ -2078,7 +2152,14 @@ class CarryBroker:
                 if isinstance(parsed, str):
                     if parsed == "other_symbol":
                         ev.other_symbol_rows += 1
-                    elif parsed != "no_funding":
+                    elif parsed == "no_funding":
+                        # A SETTLEMENT row for THIS symbol that does not state its funding moved cash we cannot attribute. Skipping it left the
+                        # evidence "complete" with no payment (reproduced), so a charged settlement became "no settlement". A stated "0" is a
+                        # legitimate zero and is not this case.
+                        ev.errors.append(
+                            f"a SETTLEMENT row for {symbol} carries no funding field "
+                            f"(id {row.get('id')!r}): its payment cannot be read")
+                    else:
                         ev.rejected[parsed] = ev.rejected.get(parsed, 0) + 1
                         if parsed in ("out_of_window",):
                             ev.errors.append(
@@ -2128,7 +2209,14 @@ class CarryBroker:
             return "wrong_category"
         raw = row.get("funding")
         if raw is None or str(raw).strip() == "":
-            return "no_funding"
+            # The window first: a row the venue returned OUTSIDE the asked interval is not this evidence's concern whatever it states.
+            try:
+                stamp = int(row["transactionTime"])
+                outside = ((start_ms is not None and stamp < start_ms)
+                           or (end_ms is not None and stamp > end_ms))
+            except (KeyError, TypeError, ValueError):
+                outside = False
+            return "out_of_window" if outside else "no_funding"
         try:
             usd = float(raw)
             stamp = int(row["transactionTime"])

@@ -2515,9 +2515,10 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             logger.warning(
                 "carry ledger: resumed %d entries, CASH net $%.2f (funding - "
                 "fees + perp realised; excludes the inventory mark), hedged "
-                "pair net $%.2f",
+                "pair net %s",
                 len(bot.carry_journal.entries), _st["net_usd"],
-                _st["pair_net_usd"])
+                ("UNKNOWN (an inventory leg was not valued)"
+                 if _st["pair_net_usd"] is None else f"${_st['pair_net_usd']:.2f}"))
 
         bot.carry = CarryEngine(
             broker=_ledger.LedgerBroker(

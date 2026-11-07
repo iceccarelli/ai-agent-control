@@ -466,6 +466,11 @@ class Journal:
             and (from_ms is None or entry.ms >= from_ms)
             and (to_ms is None or entry.ms <= to_ms)
             for line in entry.lines if line.account == REALISED)
+        inventory_unbooked = sum(
+            1 for entry in self.entries
+            if entry.kind == INVENTORY_UNBOOKED_KIND
+            and (from_ms is None or entry.ms >= from_ms)
+            and (to_ms is None or entry.ms <= to_ms))
         realised_usd = -acc[REALISED].usd - inventory_mark_usd
         net = funding_usd - fees_usd - borrow_usd + realised_usd
 
@@ -486,7 +491,11 @@ class Journal:
             # spot prices and never sold. `pair_net_usd` is the hedged pair's
             # economic result (cash net + the mark), labelled as such.
             "inventory_mark_usd": inventory_mark_usd,
-            "pair_net_usd": net + inventory_mark_usd,
+            # None when an overlay cycle's inventory leg was not valued in this period: net + 0 would then be the perp's gain or loss with nothing
+            # against it (reproduced: +89.06 reported for a pair that lost its 10.95 of fees). The CASH net above is unaffected.
+            "inventory_leg_booked": inventory_unbooked == 0,
+            "inventory_legs_unbooked": inventory_unbooked,
+            "pair_net_usd": None if inventory_unbooked else net + inventory_mark_usd,
             "fees_unknown": fee_counts["unknown"],
             "fees_unresolved": fee_counts["unresolved"],
             "fees_unlabelled": fee_counts["unlabelled"],
@@ -1244,6 +1253,25 @@ def mark_funding_unread(journal: Journal, *, ms: int, why: str) -> None:
                        basis="unread"))
 
 
+INVENTORY_UNBOOKED_KIND = "inventory_unbooked"
+
+
+def mark_inventory_unbooked(journal: Journal, *, ms: int, ref: str, why: str) -> None:
+    """Record that an overlay cycle's inventory leg was NOT valued.
+
+    The hedged pair's economic result is the perp's P&L PLUS the mark on the coin it hedges. When that mark cannot be taken (no spot reference, a
+    partial open, a failed read) the cash net still stands, but a "pair net" computed from the books would silently equal the cash net: the perp's gain
+    or loss with nothing against it. A $0 entry, so it persists; ``statement`` then withholds ``pair_net_usd`` instead of reporting that figure.
+    """
+    eref = f"invunbooked:{ref}"
+    if any(e.ref == eref for e in journal.entries):
+        return
+    stamp = max(int(ms), journal.entries[-1].ms if journal.entries else 0)
+    journal.post(Entry(ms=stamp, kind=INVENTORY_UNBOOKED_KIND, ref=eref,
+                       lines=[Line(USDT, 0.0), Line(REALISED, 0.0)],
+                       memo=f"overlay inventory leg not valued for {ref}: {why}"[:300]))
+
+
 def borrow(journal: Journal, *, ms: int, ref: str, usd: float) -> Entry:
     return journal.post(Entry(ms=ms, kind="borrow", ref=ref, lines=[
         Line(BORROW, usd),
@@ -1985,9 +2013,15 @@ class LedgerBroker:
             if self._perp_qty <= 0:
                 self._hedge_ref_qty = self._hedge_ref_cost = 0.0
             if not known:
+                mark_inventory_unbooked(
+                    self.journal, ms=ms, ref=ref,
+                    why="the entry reference does not cover the quantity just closed")
                 return
             seen = self._hedge_reference_now(symbol)
             if seen is None:
+                mark_inventory_unbooked(
+                    self.journal, ms=ms, ref=ref,
+                    why="no spot reference could be read at the close")
                 return
             exit_spot, source, observed_ms = seen
             entry_spot = entry_cost / entry_qty
@@ -2005,6 +2039,12 @@ class LedgerBroker:
         except Exception:  # noqa: BLE001
             logging.getLogger(__name__).warning(
                 "overlay inventory leg not booked for %s", ref, exc_info=True)
+            try:
+                mark_inventory_unbooked(self.journal, ms=ms, ref=ref,
+                                        why="the inventory valuation raised")
+            except Exception:  # noqa: BLE001  (the close is booked; never raise from here)
+                logging.getLogger(__name__).warning(
+                    "could not record the unbooked inventory leg for %s", ref, exc_info=True)
 
     def _note_unbooked(self, result: Any, *, side: str, product: str,
                        symbol: str, requested_qty: Any, order_type: str,
