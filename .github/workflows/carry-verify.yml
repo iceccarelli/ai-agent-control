@@ -177,6 +177,9 @@ jobs:
           tests/test_runtime_roles.py
           tests/test_testnet_action_manifest.py
           tests/test_capability_wiring.py
+          tests/test_risk_input_provider.py
+          tests/test_order_path_inventory.py
+          tests/test_market_collector.py
           tests/test_md_broker_funding_interval.py
           tests/test_entry_authority_e2e.py
           tests/test_state_backup_promote.py

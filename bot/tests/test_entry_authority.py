@@ -297,7 +297,8 @@ def test_the_production_book_installs_the_authority_on_the_client_every_order_pa
     bot.client.transport = type("T", (), {"request": lambda self, *a, **k: (sent.append(a), (200, "{}"))[1]})()
     with pytest.raises(bc.PermanentAPIError, match="NO_APPROVED_POLICY"):
         bot.client._request("POST", "/v5/order/create", body=order(), signed=True)
-    assert sent == []
+    # The authority's RiskInputProvider may make READ-ONLY measurement requests (e.g. the order book for liquidity); what must never happen is an ORDER reaching the transport.
+    assert [a for a in sent if a[0] == "POST" or "/order/create" in str(a[1])] == []
 
 
 def test_an_order_refused_by_ANY_check_reserves_nothing(store, tmp_path):

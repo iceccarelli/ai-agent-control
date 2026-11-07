@@ -2377,14 +2377,23 @@ def _entry_mark(bot: Any, symbol: str) -> Optional[float]:
 
 
 def _entry_risk_state(bot: Any) -> "Any":
-    """The risk inputs this book can honestly MEASURE now. Everything else is None, and risk_policy refuses on a missing input: so an approved policy still blocks entry
-    until the corresponding measurement exists. That is the intended present state, not a defect to paper over with defaults."""
+    """The entry authority's risk inputs, from the authoritative RiskInputProvider: venue quantities and account state, the book's own snapshot, deterministic derivations. Anything it
+    cannot establish is None and risk_policy refuses on it. A provider that cannot even be built yields the fully-unknown state (every entry refused), never a default."""
     import risk_policy as _RP
-    carry = getattr(bot, "carry", None)
-    halted = None
-    if carry is not None and getattr(carry, "state", None) is not None:
-        halted = getattr(carry.state, "name", str(carry.state)) == "HALTED"
-    return _RP.State(operational_fault=halted)
+    try:
+        prov = getattr(bot, "_risk_input_provider", None)
+        if prov is None:
+            import risk_input_provider as _RIP
+            c = bot.carry
+            prov = _RIP.RiskInputProvider(
+                broker=getattr(c.broker, "inner", c.broker), perp_symbol=c.perp_symbol, spot_symbol=c.spot_symbol,
+                snapshot_getter=lambda: getattr(c, "snapshot", None),
+                opened_ms_getter=lambda: getattr(getattr(c, "position", None), "opened_ms", None),
+                halted_getter=lambda: (getattr(c.state, "name", str(c.state)) == "HALTED") if getattr(c, "state", None) is not None else None)
+            bot._risk_input_provider = prov
+        return prov.state()
+    except Exception:                                              # noqa: BLE001 - never raise out of the authority's state read
+        return _RP.State()
 
 
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
