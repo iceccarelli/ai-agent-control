@@ -53,6 +53,10 @@ REVIEWED_FIXTURES = {
     ("bot/tests/test_paper_agent_certification.py", "credential-assignment"): 5,
     ("bot/tests/test_owner_tools.py", "credential-assignment"): 1,
     ("bot/tests/test_project_status.py", "credential-assignment"): 1,
+    # Reviewed in the economic-engine integration: the manifest names environment-variable NAMES (a mapping of "api_key" -> a variable name, never a value), and its test feeds
+    # an obviously fake literal to prove that credential VALUES are never echoed. Count-pinned like the rest.
+    ("bot/tools/testnet_action_manifest.py", "credential-assignment"): 1,
+    ("bot/tests/test_testnet_action_manifest.py", "credential-assignment"): 1,
 }
 
 #: Files that are binary or generated and carry no reviewable text.
