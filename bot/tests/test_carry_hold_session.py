@@ -264,6 +264,7 @@ class TestTheHoldSurvivesWhatARealDaySends:
 
     def test_a_few_unusable_polls_are_tolerated_a_run_of_them_is_not(
             self, clock, tmp_path):
+        ledger = tmp_path / "drill_entries_per_test.jsonl"     # conftest's per-test entry ledger
         class Flaky(HoldVenue):
             fail = 0
 
@@ -276,6 +277,7 @@ class TestTheHoldSurvivesWhatARealDaySends:
         report, _ = _run(Flaky(clock), clock, tmp_path)
         assert report["verdict"] == "PASSED"
         Flaky.fail = 99
+        ledger.unlink()                  # a second armed drill in ONE UTC day is refused by design; this test models a different day
         venue = Flaky(clock)
         report, _ = _run(venue, clock, tmp_path)
         assert report["verdict"] == "FAILED" and report["failed_stage"] == "hold"

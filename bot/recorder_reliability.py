@@ -31,7 +31,13 @@ def report(rows: Sequence[Mapping[str, Any]], *, now_ms: int, cadence_s: float =
     if not rows:
         return {"verdict": "NO_DATA", "why": "no validated rows: nothing can be called healthy",
                 "now_ms": now_ms}
-    ts = [r["at_ms"] for r in rows]
+    raw_ts = [r["at_ms"] for r in rows]
+    out_of_order = raw_ts != sorted(raw_ts)
+    duplicates = len(raw_ts) - len(set(raw_ts))
+    # Judge the DISTINCT times in order: a repeated row is not a second observation (reproduced: rows at k=0,1,1,1,1,4,5 read as complete), and
+    # unsorted input must not produce a negative window.
+    rows = sorted(rows, key=lambda r: r["at_ms"])
+    ts = sorted(set(raw_ts))
     first, last = ts[0], ts[-1]
     cad_ms = cadence_s * 1000.0
     window_s = (last - first) / 1000.0
@@ -59,7 +65,8 @@ def report(rows: Sequence[Mapping[str, Any]], *, now_ms: int, cadence_s: float =
         "now_ms": now_ms, "first_ms": first, "last_ms": last, "last_row_age_s": age_s,
         "stale": stale, "stale_after_s": STALE_AFTER_CADENCES * cadence_s,
         "window_hours": window_s / 3600.0, "rows": len(rows), "expected_rows": expected,
-        "cadence_s": cadence_s, "completeness": min(1.0, len(rows) / expected) if expected else None,
+        "cadence_s": cadence_s, "completeness": min(1.0, len(ts) / expected) if expected else None,
+        "duplicate_rows": duplicates, "rows_out_of_order": out_of_order,
         "gaps": gaps, "missing_intervals": missing, "max_gap_s": max((g["seconds"] for g in gaps), default=0.0),
         "uptime_fraction_in_window": (1.0 - gap_s / window_s) if window_s > 0 else None,
         "receive_minus_exchange_ms": {"n": len(skew), "median": _pct(skew, 0.5), "p95": _pct(skew, 0.95),
@@ -78,7 +85,7 @@ def report(rows: Sequence[Mapping[str, Any]], *, now_ms: int, cadence_s: float =
     }
     recent_gap = any(g["to_ms"] >= last - RECENT_WINDOW_S * 1000 and g["seconds"] > RECENT_GAP_S for g in gaps)
     out["recent_gap"] = recent_gap
-    degraded = recent_gap or bool(faults) or (out["completeness"] or 1.0) < 0.9
+    degraded = recent_gap or bool(faults) or (out["completeness"] or 1.0) < 0.9 or duplicates > 0 or out_of_order
     ahead = age_s < -CLOCK_AHEAD_TOLERANCE_S
     out["clock_ahead"] = ahead
     out["verdict"] = "CLOCK_AHEAD" if ahead else ("STALE" if stale else ("DEGRADED" if degraded else "HEALTHY"))
@@ -86,5 +93,5 @@ def report(rows: Sequence[Mapping[str, Any]], *, now_ms: int, cadence_s: float =
                   if ahead else
                   (f"last row is {age_s / 60:.0f} min old (limit {STALE_AFTER_CADENCES * cadence_s / 60:.0f} min): "
                   "the recorder is not collecting" if stale else
-                  ("a recent gap, store faults or incomplete cadence in the window" if degraded else "collecting at cadence")))
+                  ("a recent gap, store faults, duplicate or out-of-order rows, or incomplete cadence in the window" if degraded else "collecting at cadence")))
     return out

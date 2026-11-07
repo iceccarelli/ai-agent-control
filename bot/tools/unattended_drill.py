@@ -302,6 +302,16 @@ def records_path_for(run_dir: str) -> str:
                         "execution_records.jsonl")
 
 
+def kill_file_for(run_dir: str) -> str:
+    """Beside the run folders (like the execution records): ``touch <this>`` stops the current armed drill at its next gate and blocks the next one."""
+    return os.path.join(os.path.dirname(os.path.abspath(run_dir)), "DRILL_KILL")
+
+
+def entry_ledger_for(run_dir: str) -> str:
+    """One ledger for every run under the same root, so the per-UTC-day entry limit holds across processes."""
+    return os.path.join(os.path.dirname(os.path.abspath(run_dir)), "drill_entries.jsonl")
+
+
 def run_once(run_dir: str, *, env: Mapping[str, str],
              now_ms: Optional[int] = None,
              prober: Callable[[], int] = probe,
@@ -403,7 +413,9 @@ def run_once(run_dir: str, *, env: Mapping[str, str],
                      "--poll-seconds", "30", "--settle-wait-hours", "0",
                      "--min-settlements", "1", "--evidence-path", ev,
                      "--out", out, "--cash-ledger", led,
-                     "--execution-records", records],
+                     "--execution-records", records,
+                     "--kill-file", kill_file_for(run_dir),
+                     "--entry-ledger", entry_ledger_for(run_dir)],
                     cenv, log_path=log, timeout_s=DRILL_TIMEOUT_S))
     finally:
         # ALWAYS, even if this process was told to stop (the child has already

@@ -817,11 +817,65 @@ HOLD_MAX_BLIND_POLLS = 5
 HOLD_AGING_MARGIN_MS = 15_000
 
 
+def kill_file_engaged(path: str) -> "tuple[bool, str]":
+    """A drill-owned kill switch: ``touch`` the file and the next gate refuses. The scratch database the drill's engine runs on can never hold a switch,
+    so without this an armed unattended drill had no stop but killing the process. An empty path is "none configured"; a path that exists in ANY form
+    (file, directory, link) is engaged; one that cannot be examined is treated as engaged (arming on an unreadable safety control is the wrong default)."""
+    if not path:
+        return False, ""
+    try:
+        return (True, f"kill file present: {os.path.basename(path)}") if os.path.lexists(path) else (False, "")
+    except OSError as exc:
+        return True, f"kill file unreadable ({type(exc).__name__})"
+
+
+def claim_entry_slot(path: str, now_ms: int, max_per_day: Optional[int] = None) -> "tuple[bool, str]":
+    """Claim one armed entry for the current UTC day in a LOCAL ledger shared by every process that names the same path (flock-serialised).
+
+    ``carry_risk``'s per-day allowance lives in memory, so two drill processes on the same day each saw a fresh allowance (reproduced). This is the
+    cross-process version. A slot is spent when claimed, before any order, and is not given back if the run later fails: the limit is on attempts.
+    A ledger that cannot be read or parsed REFUSES. Returns (granted, why)."""
+    import datetime
+    import fcntl
+    from carry_risk import MAX_ENTRIES_PER_UTC_DAY
+    limit = MAX_ENTRIES_PER_UTC_DAY if max_per_day is None else int(max_per_day)
+    if not path:
+        return False, "no entry ledger named: an armed drill needs one so the per-day limit holds across processes"
+    day = datetime.datetime.fromtimestamp(now_ms / 1000.0, tz=datetime.timezone.utc).strftime("%Y-%m-%d")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    except OSError as exc:
+        return False, f"entry ledger cannot be opened ({exc.strerror})"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        used = 0
+        for line in raw.decode("utf-8", "replace").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rec = json.loads(line)
+                if not isinstance(rec, dict) or not isinstance(rec.get("day"), str):
+                    raise ValueError("bad row")
+            except ValueError:
+                return False, "entry ledger holds an unreadable row; refusing rather than guess how many entries were used"
+            used += 1 if rec["day"] == day else 0
+        if used >= limit:
+            return False, f"ENTRY_LIMIT_REACHED_TODAY: {used} of {limit} armed entries already claimed for {day} (UTC)"
+        os.write(fd, (json.dumps({"day": day, "ts_ms": int(now_ms), "pid": os.getpid()}, sort_keys=True) + "\n").encode("utf-8"))
+        os.fsync(fd)
+        return True, f"slot {used + 1} of {limit} for {day}"
+    finally:
+        os.close(fd)
+
+
 def run_drill(*, broker: Any, notional: Optional[float] = None,
               arm: bool = False, out: str = "", venue: str = "unknown",
               engine_factory: Any = None, hold: Optional[HoldPlan] = None,
               cash_ledger: str = "", capture_final: bool = False,
-              execution_records: str = ""
+              execution_records: str = "", kill_file: str = "",
+              entry_ledger: str = ""
               ) -> Dict[str, Any]:
     """The whole sequence. Returns the transcript whatever happens.
 
@@ -936,6 +990,21 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
         else:
             s.failed(why, **evidence)
 
+    def position_mode(s: Stage) -> None:
+        """One-way mode only. The adapter sends no positionIdx, so in hedge mode every order, including the buy-back of the held short, is rejected."""
+        reader = getattr(broker, "get_position_mode", None)
+        if reader is None:
+            if arm:
+                s.failed("the broker cannot read the position mode; an armed drill will not guess it")
+            else:
+                s.passed(mode="not_readable", note="preflight only: nothing is sent")
+            return
+        mode = reader(PERP_SYMBOL)
+        if mode != "one_way":
+            s.failed(f"{PERP_SYMBOL} is in {mode!r} mode; this adapter sends no positionIdx. Switch the account to one-way mode", mode=mode)
+            return
+        s.passed(mode=mode)
+
     def cap_check(s: Stage) -> None:
         if d.notional > cap:
             s.failed(
@@ -949,13 +1018,32 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
     for name, fn in (("reachability", reachability), ("flat", flat),
                      ("venue_rules", venue_rules), ("fee_tier", fee_tier),
                      ("inventory", inventory), ("warmup", warmup),
-                     ("margin", margin),
+                     ("margin", margin), ("position_mode", position_mode),
                      ("cap", cap_check)):
         if not d.run_stage(name, fn):
             return _report(d, state, out, cap, verdict="FAILED")
 
     if not arm:
         return _report(d, state, out, cap, verdict="PREFLIGHT_ONLY")
+
+    # ---- the drill's own stops, checked BEFORE the first order ----
+    def kill_switch_stage(s: Stage) -> None:
+        engaged_now, engaged_why = kill_file_engaged(kill_file)
+        if engaged_now:
+            s.failed(engaged_why)
+        else:
+            s.passed(kill_file=bool(kill_file))
+
+    def entry_limit_stage(s: Stage) -> None:
+        granted, slot_why = claim_entry_slot(entry_ledger, int(time.time() * 1000))
+        if granted:
+            s.passed(why=slot_why)
+        else:
+            s.failed(slot_why)
+
+    for name, fn in (("kill_switch", kill_switch_stage), ("entry_limit", entry_limit_stage)):
+        if not d.run_stage(name, fn):
+            return _report(d, state, out, cap, verdict="FAILED")
 
     # ---- from here orders are sent, through the engine and nothing else ----
     import ledger as L
@@ -972,7 +1060,7 @@ def run_drill(*, broker: Any, notional: Optional[float] = None,
 
     class _Store:
         def is_kill_switch_engaged(self):
-            return (False, "")
+            return kill_file_engaged(kill_file)
 
         def trip_kill_switch(self, reason):
             state["killed"] = reason
@@ -1554,6 +1642,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="append this run's measured fills (decision-time "
                          "execution records) to this JSONL file, labelled "
                          "with the venue, for tools/execution_samples_report.py")
+    ap.add_argument("--kill-file", default="",
+                    help="touch this path to stop an armed drill at its next gate (and refuse to arm while it exists)")
+    ap.add_argument("--entry-ledger", default="",
+                    help="REQUIRED with --arm: local ledger of armed entries per UTC day, shared by every drill process that names it")
     args = ap.parse_args(argv)
     if args.hold_for_settlement and not args.arm:
         print("REFUSED: --hold-for-settlement sends orders and needs --arm.",
@@ -1634,6 +1726,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 2
 
     if args.arm:
+        stopped, stop_why = kill_file_engaged(args.kill_file)
+        if stopped:
+            print(f"REFUSED: the drill kill file is engaged ({stop_why}); a human removes it before anything is armed.", file=sys.stderr)
+            return 2
+
+    if args.arm:
         # an interrupt closes the pair and writes the report; a second one
         # while that happens is ignored (it would leave the short open)
         InterruptGuard().install()
@@ -1647,6 +1745,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                            arm=args.arm, out=args.out, hold=plan,
                            cash_ledger=args.cash_ledger,
                            execution_records=args.execution_records,
+                           kill_file=args.kill_file, entry_ledger=args.entry_ledger,
                            capture_final=bool(args.evidence_path),
                            venue=str(getattr(bot.cfg, "BYBIT_VENUE", "unknown")
                                      if hasattr(bot, "cfg") else "unknown"))
