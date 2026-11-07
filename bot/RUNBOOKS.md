@@ -288,5 +288,11 @@ good-looking number before the window closes is not a result. Everything below i
 6. **Do not change the plan, the coverage floor, the hurdles or the prints after looking.** A different data set is a data revision
    (`--accept-data-revision`), it is recorded permanently in the chain, and it is a different test.
 
+### Owner read-out (offline)
+`python3 tools/owner_console.py [--funding prints.jsonl] [--backup FILE]` prints, in one place and without a request or a credential value: whether real money is armed
+(`config.is_live_authorized`), the prospective evaluation's progress and the age of the newest print, what capital is (zero until a strategy has an ALLOCATE verdict),
+four separate eligibility questions (research / simulated / testnet / owner-authorised), a backup's verification, and the actual-vs-modelled P&L lines. Each section has
+one status word: VERIFIED, ESTIMATED, PROVISIONAL, STALE or UNAVAILABLE. UNAVAILABLE is "nothing supplied", never "fine". It exits 3 if the environment arms live.
+
 ## Backups: what is not done
 Nothing here schedules a backup, stores one off-volume, or has restored one. That needs the owner.
