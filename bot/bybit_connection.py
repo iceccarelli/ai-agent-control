@@ -678,6 +678,11 @@ class BybitClient:
         if authority is None:
             logger.critical("order REFUSED at the transport: this client has no entry authority (%s)", self.venue)
             raise OrderNotSent("ENTRY_REFUSED: NO_ENTRY_AUTHORITY")
+        bound = getattr(authority, "bound_transport", None)
+        if bound is not None and bound is not self.transport:
+            # An authority bound to an in-process simulated transport (the backtester's) approves nothing on any other transport.
+            logger.critical("order REFUSED: the entry authority is bound to a different transport")
+            raise OrderNotSent("ENTRY_REFUSED: AUTHORITY_BOUND_TO_ANOTHER_TRANSPORT")
         try:
             authority.authorize(snapshot, venue=self.venue)
         except _ea.EntryRefused as exc:

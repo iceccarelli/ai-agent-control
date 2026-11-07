@@ -452,3 +452,20 @@ def test_a_symlinked_policy_file_is_not_a_policy(tmp_path):
     real = tmp_path / "real.json"; real.write_text(json.dumps(dataclasses.asdict(POLICY)))
     link = tmp_path / "link.json"; os.symlink(real, link)
     assert EA.load_policy(str(real)).approved_by_owner is True and EA.load_policy(str(link)) is None
+
+
+def test_the_backtests_simulated_authority_works_only_on_its_own_simulated_transport(store):
+    """Found by CI: the backtester drives an in-process SimulatedExchange through a BybitClient; a bare client refused every order (0 trades). Its authority is bound to that transport."""
+    from backtest import SimulatedVenueAuthority
+    sim = Recorder()
+    auth = SimulatedVenueAuthority(sim)
+    c = bc.BybitClient(config=Cfg(), store=store, transport=sim)
+    c.entry_authority = auth
+    c._request("POST", "/v5/order/create", body=order(orderLinkId="BT1"), signed=True)
+    assert len(sent_orders(sim)) == 1
+    other = Recorder()                                              # the same authority on ANY other transport (a real venue's) approves nothing
+    c2 = bc.BybitClient(config=Cfg(), store=store, transport=other)
+    c2.entry_authority = auth
+    with pytest.raises(bc.OrderNotSent, match="BOUND_TO_ANOTHER_TRANSPORT"):
+        c2._request("POST", "/v5/order/create", body=order(orderLinkId="BT2"), signed=True)
+    assert sent_orders(other) == []
