@@ -1,0 +1,942 @@
+"""Owner-invoked, PUBLIC-data-only collector: one bounded, point-in-time capture CYCLE of the Bybit USDT-linear perpetual market, and the seal / check / backup
+machinery that makes a lost or altered cycle detectable.
+
+Why. ``universe_capture`` and ``funding_capture`` are single shots. A research record that cannot show what it missed, cannot survive an interrupted run and
+cannot detect a lost day is not an asset. This module only ORCHESTRATES: it reuses ``universe_capture`` for the universe and ticker snapshot and adds the
+order-book and recent-trade artifacts for a bounded, auditable set of symbols. It never filters by performance and never fills a gap.
+
+    GET <mainnet REST host from bot/venues.py>/v5/market/instruments-info | /v5/market/tickers          (via universe_capture; instruments cursor-paginated)
+    GET <mainnet REST host from bot/venues.py>/v5/market/orderbook?category=linear&symbol=S&limit=N       (top N levels, bounded symbol budget)
+    GET <mainnet REST host from bot/venues.py>/v5/market/recent-trade?category=linear&symbol=S&limit=M    (bounded rows, same symbols)
+
+What it is NOT. No credential is read, nothing is signed, no order, position or account path exists in this module (a test asserts by AST that it imports no
+connection/broker/signing module and builds URLs only from ``venues.rest_for`` plus the four paths above). It is never run by the test suite or CI: tests
+inject ``fetch``, ``clock`` and ``sleep``. The agent that wrote it has not executed it against an exchange; the owner runs it.
+
+SYMBOL SELECTION RULE (``turnover24h_desc_symbol_asc_v1``). From THIS cycle's ticker snapshot only: eligible = symbols that are accepted USDT-linear perpetuals in
+THIS cycle's universe with status ``Trading`` and a valid ticker row with ``turnover24h`` > 0; sort by turnover24h DESCENDING (exact decimal), ties by symbol
+ASCENDING; take the first ``max_symbols``. It reads no other cycle, no price history and no return. The rule id, the as-of time (the ticker receive time), the
+source file hash and the chosen symbols with their turnover are written to the manifest, so the choice is auditable and not retroactive.
+
+Cycle layout (a NEW directory per run, nothing overwritten, files 0600, directories 0700):
+    cycle-<now_ms>/universe/...   universe_capture's own output (raw pages, tickers.json, universe-*.jsonl, manifest.json)
+    cycle-<now_ms>/tickers.jsonl  validated ticker rows (derived; the raw bytes are universe/tickers.json)
+    cycle-<now_ms>/books/<S>.json, trades/<S>.json   raw response bytes exactly as received
+    cycle-<now_ms>/manifest.json  every artifact: request, receive ts, SHA-256, validation; gaps; selection; set-aside cycles
+    cycle-<now_ms>/COMPLETE       written LAST: the manifest's SHA-256. No COMPLETE => the cycle is set aside as ``.INCOMPLETE`` on the next run.
+    <out_root>/cycles.jsonl       evidence_chain-hashed row per COMPLETE cycle (id, manifest sha, counts, gaps)
+
+What it cannot show: that the bytes came from the exchange (a hash proves what was read, not who produced it), or that the venue's data is complete.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+
+BOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, BOT)
+sys.path.insert(0, os.path.join(BOT, "tools"))
+
+import evidence_chain as EC  # noqa: E402
+import universe_capture as UC  # noqa: E402
+import venues  # noqa: E402
+
+SCHEMA_VERSION = 1
+PATH_BOOK = "/v5/market/orderbook"
+PATH_TRADES = "/v5/market/recent-trade"
+PUBLIC_PATHS = (UC.PATH_INSTRUMENTS, UC.PATH_TICKERS, PATH_BOOK, PATH_TRADES)
+CATEGORY = "linear"
+SELECTION_RULE = "turnover24h_desc_symbol_asc_v1"
+RATE_LIMIT_RETCODE = 10006
+MAX_BODY_BYTES = UC.MAX_BODY_BYTES
+TIMEOUT_S = 15.0
+PAUSE_S = 0.25
+SKEW_WARN_MS = UC.SKEW_WARN_MS
+DEFAULT_MAX_SYMBOLS = 20
+DEFAULT_DEPTH = 50
+DEFAULT_TRADES = 100
+MAX_DEPTH = 200
+MAX_TRADES = 1000
+DEFAULT_INTERVAL_MS = 60_000
+MAX_RETRIES = 3
+BACKOFF_S = 1.0
+BACKOFF_CAP_S = 30.0
+DEFAULT_RESERVE_BYTES = 1 << 30
+DEFAULT_MAX_BYTES = 50 << 30
+LOG_NAME = "cycles.jsonl"
+COMPLETE = "COMPLETE"
+
+_SYMBOL = re.compile(r"^[A-Z0-9]{2,24}$", re.ASCII)
+_DEC = re.compile(r"^[0-9]+(\.[0-9]+)?$", re.ASCII)
+_SDEC = re.compile(r"^-?[0-9]+(\.[0-9]+)?$", re.ASCII)
+_UINT = re.compile(r"^[0-9]{1,19}$", re.ASCII)
+_CYCLE = re.compile(r"^cycle-[0-9]{1,16}$", re.ASCII)
+_HEX = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+
+
+class CollectorError(ValueError):
+    """The cycle (or seal operation) cannot continue safely."""
+
+
+class SealError(CollectorError):
+    pass
+
+
+class RateLimited(Exception):
+    """The venue throttled the request (HTTP 429). Raised by a fetch; handled with bounded backoff."""
+
+
+class RateLimitExhausted(Exception):
+    """Bounded backoff ran out: the cycle becomes a recorded PARTIAL cycle, never a loop."""
+
+
+# ---------------------------------------------------------------- transport (the ONLY network primitive: ``http_fetch``)
+
+def _base() -> str:
+    base = venues.rest_for("mainnet")
+    if not base.startswith("https://"):
+        raise CollectorError("the registry's host is not https")
+    return base
+
+
+def request_url(path: str, *, symbol: Optional[str] = None, limit: Optional[int] = None) -> str:
+    """Constants + one validated symbol + one bounded integer. Anything else is refused."""
+    if path not in (PATH_BOOK, PATH_TRADES):
+        raise CollectorError("refusing a path that is not a pinned per-symbol public path")
+    if not isinstance(symbol, str) or not _SYMBOL.match(symbol):
+        raise CollectorError("refusing a symbol that is not a short upper-case token")
+    cap = MAX_DEPTH if path == PATH_BOOK else MAX_TRADES
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= cap:
+        raise CollectorError(f"limit must be a whole number in 1..{cap}")
+    q = [("category", CATEGORY), ("symbol", symbol), ("limit", limit)]
+    return f"{_base()}{path}?{urllib.parse.urlencode(q)}"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *_a, **_k):                      # a redirect is a different host: refuse it
+        return None
+
+
+def http_fetch(url: str) -> bytes:
+    """One unauthenticated GET, no redirects, bounded body, host from the registry. Tests never reach it."""
+    base = _base()
+    if not any(url.startswith(base + p + "?") for p in PUBLIC_PATHS):
+        raise CollectorError("refusing a URL that is not the registry host and a pinned public market path")
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, method="GET", headers={"Accept": "application/json", "User-Agent": "market-collector/1"})
+    try:
+        with opener.open(req, timeout=TIMEOUT_S) as resp:
+            if resp.status != 200:
+                raise CollectorError(f"HTTP {resp.status}")
+            body = resp.read(MAX_BODY_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            raise RateLimited("HTTP 429") from exc
+        raise CollectorError(f"HTTP {exc.code}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise CollectorError(f"request failed ({type(exc).__name__})") from exc
+    if len(body) > MAX_BODY_BYTES:
+        raise CollectorError("response larger than any market page")
+    return body
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _is_rate_limit_body(body: bytes) -> bool:
+    try:
+        doc = json.loads(body.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return False
+    rc = doc.get("retCode") if isinstance(doc, dict) else None
+    return isinstance(rc, int) and not isinstance(rc, bool) and rc == RATE_LIMIT_RETCODE
+
+
+class _Fetcher:
+    """Wraps the injected fetch: HTTP 429 / retCode 10006 => bounded backoff through the injected sleep, then RateLimitExhausted. Events are recorded."""
+
+    def __init__(self, fetch: Callable[[str], bytes], sleep: Callable[[float], None], max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S):
+        self.fetch, self.sleep, self.max_retries, self.backoff_s = fetch, sleep, max_retries, backoff_s
+        self.events: List[Dict[str, Any]] = []
+        self.requests = 0
+        self.exhausted = False
+
+    def __call__(self, url: str) -> bytes:
+        path = urllib.parse.urlsplit(url).path
+        attempt = 0
+        while True:
+            self.requests += 1
+            reason = ""
+            body = b""
+            try:
+                body = self.fetch(url)
+                if _is_rate_limit_body(body):
+                    reason = f"retCode {RATE_LIMIT_RETCODE}"
+            except RateLimited:
+                reason = "HTTP 429"
+            if not reason:
+                return body
+            if attempt >= self.max_retries:
+                self.exhausted = True
+                self.events.append({"path": path, "attempt": attempt, "reason": reason, "action": "exhausted", "body_sha256": _sha(body) if body else ""})
+                raise RateLimitExhausted(f"{path}: rate limited ({reason}) after {attempt} retries")
+            delay = min(BACKOFF_CAP_S, self.backoff_s * (2 ** attempt))
+            self.events.append({"path": path, "attempt": attempt, "reason": reason, "action": "backoff", "sleep_s": delay})
+            self.sleep(delay)
+            attempt += 1
+
+
+# ---------------------------------------------------------------- validation (counted rejects, never silent drops)
+
+def _dec(v: Any, *, signed: bool = False, positive: bool = False, nonneg: bool = False) -> Optional[Decimal]:
+    if not isinstance(v, str) or not (_SDEC if signed else _DEC).match(v):
+        return None
+    try:
+        d = Decimal(v)
+    except InvalidOperation:
+        return None
+    if positive and not d > 0:
+        return None
+    if nonneg and d < 0:
+        return None
+    return d
+
+
+def _bump(rejects: Dict[str, int], key: str, n: int = 1) -> None:
+    rejects[key] = rejects.get(key, 0) + n
+
+
+def _venue_time(doc: Any) -> Optional[int]:
+    t = doc.get("time") if isinstance(doc, dict) else None
+    if isinstance(t, int) and not isinstance(t, bool) and t > 0:
+        return t
+    if isinstance(t, str) and _UINT.match(t):
+        return int(t)
+    return None
+
+
+def _load_doc(body: bytes, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    try:
+        doc = json.loads(body.decode("utf-8", "strict"))
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        _bump(info["rejects"], "envelope:not_utf8_json")
+        return None
+    if not isinstance(doc, dict):
+        _bump(info["rejects"], "envelope:not_an_object")
+        return None
+    info["venue_time_ms"] = _venue_time(doc)
+    rc = doc.get("retCode")
+    if isinstance(rc, bool) or rc != 0:
+        _bump(info["rejects"], f"envelope:retCode_{rc if isinstance(rc, int) else 'bad'}")
+        return None
+    res = doc.get("result")
+    if not isinstance(res, dict):
+        _bump(info["rejects"], "envelope:no_result")
+        return None
+    return res
+
+
+def _new_info() -> Dict[str, Any]:
+    return {"ok": False, "rows": 0, "rejects": {}, "duplicates_identical": 0, "conflicts": 0, "venue_time_ms": None}
+
+
+def validate_book(body: bytes, symbol: str, depth: int) -> Dict[str, Any]:
+    info = _new_info()
+    rej = info["rejects"]
+    res = _load_doc(body, info)
+    if res is None:
+        return info
+    if res.get("s") != symbol:
+        _bump(rej, "wrong_symbol")
+    ts = res.get("ts")
+    if isinstance(ts, bool) or not (isinstance(ts, int) and ts > 0 or isinstance(ts, str) and _UINT.match(ts)):
+        _bump(rej, "bad_ts")
+    sides: Dict[str, List[Tuple[Decimal, str]]] = {}
+    for key, name in (("b", "bid"), ("a", "ask")):
+        raw = res.get(key)
+        if not isinstance(raw, list):
+            _bump(rej, f"{name}s_not_a_list")
+            sides[key] = []
+            continue
+        if len(raw) > depth:
+            _bump(rej, "too_many_levels", len(raw) - depth)
+        seen: Dict[Decimal, str] = {}
+        levels: List[Tuple[Decimal, str]] = []
+        for lv in raw:
+            if not (isinstance(lv, list) and len(lv) >= 2):
+                _bump(rej, "bad_level")
+                continue
+            p, q = _dec(lv[0], positive=True), _dec(lv[1], positive=True)
+            if p is None or q is None:
+                _bump(rej, "bad_level")
+                continue
+            if p in seen:
+                if Decimal(seen[p]) == q:
+                    info["duplicates_identical"] += 1
+                else:
+                    info["conflicts"] += 1
+                    _bump(rej, "conflicting_duplicate_level")
+                continue
+            seen[p] = lv[1]
+            levels.append((p, lv[1]))
+        info["rows"] += len(levels)
+        prices = [p for p, _ in levels]
+        if prices != sorted(prices, reverse=(key == "b")):
+            _bump(rej, f"unsorted_{name}s")
+        if not levels:
+            _bump(rej, "empty_side")
+        sides[key] = levels
+    if sides.get("b") and sides.get("a") and max(p for p, _ in sides["b"]) >= min(p for p, _ in sides["a"]):
+        _bump(rej, "crossed_book")
+    info["ok"] = not rej
+    return info
+
+
+def validate_trades(body: bytes, symbol: str, limit: int, recv_ms: int) -> Dict[str, Any]:
+    info = _new_info()
+    rej = info["rejects"]
+    res = _load_doc(body, info)
+    if res is None:
+        return info
+    if res.get("category") != CATEGORY:
+        _bump(rej, "wrong_category")
+    rows = res.get("list")
+    if not isinstance(rows, list):
+        _bump(rej, "list_not_a_list")
+        return info
+    if len(rows) > limit:
+        _bump(rej, "too_many_rows", len(rows) - limit)
+    seen: Dict[str, Tuple[str, str, str, int]] = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            _bump(rej, "not_an_object")
+            continue
+        eid, price, size, side, t = r.get("execId"), r.get("price"), r.get("size"), r.get("side"), r.get("time")
+        tt = int(t) if isinstance(t, str) and _UINT.match(t) else (t if isinstance(t, int) and not isinstance(t, bool) and t > 0 else None)
+        if r.get("symbol") != symbol:
+            _bump(rej, "wrong_symbol")
+            continue
+        if not isinstance(eid, str) or not eid or len(eid) > 64 or not eid.isascii():
+            _bump(rej, "bad_execId")
+            continue
+        if _dec(price, positive=True) is None or _dec(size, positive=True) is None or side not in ("Buy", "Sell") or tt is None:
+            _bump(rej, "bad_field")
+            continue
+        key = (price, size, side, tt)
+        if eid in seen:
+            if seen[eid] == key:
+                info["duplicates_identical"] += 1
+            else:
+                info["conflicts"] += 1
+                _bump(rej, "conflicting_duplicate_execId")
+            continue
+        seen[eid] = key
+        if tt > recv_ms + SKEW_WARN_MS:
+            _bump(rej, "trade_time_in_the_future")
+    info["rows"] = len(seen)
+    info["ok"] = not rej
+    return info
+
+
+def validate_tickers(body: bytes) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    """(valid rows by symbol, info). Required: valid mark/index/funding/OI/bid1/ask1/volume/turnover. Every other row is a COUNTED reject with its symbol."""
+    info = _new_info()
+    info["rejected_symbols"] = {}
+    res = _load_doc(body, info)
+    out: Dict[str, Dict[str, Any]] = {}
+    if res is None:
+        return out, info
+    rows = res.get("list")
+    if res.get("category") != CATEGORY or not isinstance(rows, list):
+        _bump(info["rejects"], "envelope:not_the_linear_list")
+        return out, info
+    conflicted: Set[str] = set()
+    raw_by_symbol: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        sym = r.get("symbol") if isinstance(r, dict) else None
+        if not isinstance(sym, str) or not _SYMBOL.match(sym):
+            _bump(info["rejects"], "bad_symbol")
+            continue
+        if sym in raw_by_symbol:
+            if raw_by_symbol[sym] == r:
+                info["duplicates_identical"] += 1
+            else:
+                info["conflicts"] += 1
+                conflicted.add(sym)
+                _bump(info["rejects"], "conflicting_duplicate_ticker")
+            continue
+        raw_by_symbol[sym] = r
+    for sym, r in raw_by_symbol.items():
+        if sym in conflicted:
+            info["rejected_symbols"][sym] = "conflicting_duplicate_ticker"
+            continue
+        why = ""
+        vals: Dict[str, Any] = {}
+        for k, kw in (("markPrice", {"positive": True}), ("indexPrice", {"positive": True}), ("fundingRate", {"signed": True}),
+                      ("openInterest", {"nonneg": True}), ("bid1Price", {"positive": True}), ("ask1Price", {"positive": True}),
+                      ("volume24h", {"nonneg": True}), ("turnover24h", {"nonneg": True})):
+            v = r.get(k)
+            if v in (None, ""):
+                why = f"missing:{k}"
+                break
+            if _dec(v, **kw) is None:
+                why = f"invalid:{k}"
+                break
+            vals[k] = v
+        if not why and _dec(vals["bid1Price"]) >= _dec(vals["ask1Price"]):          # type: ignore[operator]
+            why = "crossed_bid1_ask1"
+        if why:
+            _bump(info["rejects"], why)
+            info["rejected_symbols"][sym] = why
+            continue
+        for k in ("nextFundingTime", "openInterestValue", "lastPrice", "fundingIntervalHour", "bid1Size", "ask1Size"):
+            if isinstance(r.get(k), str) and r[k] != "":
+                vals[k] = r[k]
+        out[sym] = vals
+    info["rows"] = len(out)
+    info["ok"] = bool(out)
+    return out, info
+
+
+# ---------------------------------------------------------------- symbol selection (same-cycle data only; never a return)
+
+def select_symbols(tickers: Mapping[str, Mapping[str, Any]], eligible: Set[str], max_symbols: int) -> List[Dict[str, str]]:
+    """``turnover24h_desc_symbol_asc_v1``: highest 24h turnover first, ties by symbol. Pure function of THIS cycle's ticker snapshot and universe."""
+    if isinstance(max_symbols, bool) or not isinstance(max_symbols, int) or max_symbols < 0:
+        raise CollectorError("max_symbols must be a non-negative whole number")
+    cand = [(Decimal(t["turnover24h"]), s) for s, t in tickers.items() if s in eligible and Decimal(t["turnover24h"]) > 0]
+    cand.sort(key=lambda c: (-c[0], c[1]))
+    return [{"symbol": s, "turnover24h": tickers[s]["turnover24h"]} for _, s in cand[:max_symbols]]
+
+
+# ---------------------------------------------------------------- filesystem helpers
+
+def _write(path: str, data: bytes) -> None:
+    UC._create_exclusive(path, data)
+
+
+def _mkdir_exclusive(path: str) -> None:
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError as exc:
+        raise CollectorError(f"{os.path.basename(path)} exists: a cycle goes in a NEW directory, nothing is overwritten") from exc
+
+
+def _rel_files(cycle_dir: str) -> List[str]:
+    out: List[str] = []
+    for dp, dn, fn in os.walk(cycle_dir):
+        dn.sort()
+        for f in fn:
+            out.append(os.path.relpath(os.path.join(dp, f), cycle_dir).replace(os.sep, "/"))
+    return sorted(out)
+
+
+def _file_sha(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _listing(cycle_dir: str, skip: Sequence[str] = ("manifest.json", COMPLETE)) -> Dict[str, Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for rel in _rel_files(cycle_dir):
+        if rel in skip:
+            continue
+        p = os.path.join(cycle_dir, *rel.split("/"))
+        out[rel] = {"sha256": _file_sha(p), "bytes": os.path.getsize(p)}
+    return out
+
+
+def _tree_sha(listing: Mapping[str, Mapping[str, Any]], manifest_sha: str) -> str:
+    h = hashlib.sha256(manifest_sha.encode())
+    for rel in sorted(listing):
+        h.update(f"\n{rel}\t{listing[rel]['sha256']}\t{listing[rel]['bytes']}".encode())
+    return h.hexdigest()
+
+
+def _tree_bytes(root: str) -> int:
+    total = 0
+    for dp, _dn, fn in os.walk(root):
+        for f in fn:
+            try:
+                total += os.lstat(os.path.join(dp, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _aside(path: str, suffix: str) -> str:
+    cand = path + suffix
+    n = 1
+    while os.path.lexists(cand):
+        n += 1
+        cand = f"{path}{suffix}.{n}"
+    os.rename(path, cand)
+    return cand
+
+
+def _log_rows(log: str) -> List[Dict[str, Any]]:
+    return [r for r in EC.rows_of(EC.read_lines(log)[0]) if isinstance(r, dict)]
+
+
+def verify_cycle_dir(cycle_dir: str) -> List[str]:
+    """Problems found comparing a cycle directory with its own manifest and COMPLETE marker (independent of any log)."""
+    problems: List[str] = []
+    mp, cp = os.path.join(cycle_dir, "manifest.json"), os.path.join(cycle_dir, COMPLETE)
+    if not os.path.isfile(mp):
+        return ["manifest.json is missing"]
+    if not os.path.isfile(cp):
+        return ["COMPLETE marker is missing"]
+    msha = _file_sha(mp)
+    with open(cp, "rb") as fh:
+        marker = fh.read().decode("ascii", "replace").strip()
+    if marker != msha:
+        problems.append("ALTERED: manifest.json does not match the COMPLETE marker")
+    try:
+        with open(mp, "rb") as fh:
+            man = json.loads(fh.read().decode("utf-8"))
+        want = man["files"]
+    except (ValueError, KeyError, UnicodeDecodeError):
+        return problems + ["manifest.json is not a cycle manifest"]
+    have = set(_rel_files(cycle_dir)) - {"manifest.json", COMPLETE}
+    for rel in sorted(set(want) - have):
+        problems.append(f"MISSING: {rel}")
+    for rel in sorted(have - set(want)):
+        problems.append(f"ALTERED: unexpected file {rel}")
+    for rel in sorted(have & set(want)):
+        p = os.path.join(cycle_dir, *rel.split("/"))
+        size = os.path.getsize(p)
+        if size < want[rel]["bytes"]:
+            problems.append(f"TRUNCATED: {rel} ({size} bytes, {want[rel]['bytes']} recorded)")
+        elif size != want[rel]["bytes"] or _file_sha(p) != want[rel]["sha256"]:
+            problems.append(f"ALTERED: {rel}")
+    return problems
+
+
+def cycle_dirs(root: str, *, complete_only: bool = True) -> List[str]:
+    names = sorted(n for n in os.listdir(root) if _CYCLE.match(n) and os.path.isdir(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n)))
+    if complete_only:
+        names = [n for n in names if os.path.isfile(os.path.join(root, n, COMPLETE))]
+    return names
+
+
+# ---------------------------------------------------------------- one capture cycle
+
+def _artifact(kind: str, symbol: str, file: str, body: bytes, url: str, recv: int, info: Dict[str, Any]) -> Dict[str, Any]:
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+    return {"kind": kind, "symbol": symbol, "file": file, "sha256": _sha(body), "bytes": len(body),
+            "request": {"path": urllib.parse.urlsplit(url).path, "params": q, "url": url}, "recv_ms": recv, "schema_version": SCHEMA_VERSION,
+            **UC._skew(recv, info.get("venue_time_ms")), "validation": {k: v for k, v in info.items() if k != "venue_time_ms"}}
+
+
+def _refuse(status: str, **kw: Any) -> Dict[str, Any]:
+    return {"status": status, **kw}
+
+
+def run_once(out_root: str, now_ms: int, fetch: Callable[[str], bytes] = http_fetch, clock: Callable[[], int] = lambda: int(time.time() * 1000), *,
+             sleep: Callable[[float], None] = time.sleep, max_symbols: int = DEFAULT_MAX_SYMBOLS, depth: int = DEFAULT_DEPTH,
+             trades_limit: int = DEFAULT_TRADES, interval_ms: int = DEFAULT_INTERVAL_MS, reserve_bytes: int = DEFAULT_RESERVE_BYTES,
+             max_bytes: int = DEFAULT_MAX_BYTES, free_bytes_fn: Callable[[str], int] = lambda p: shutil.disk_usage(p).free,
+             max_retries: int = MAX_RETRIES, backoff_s: float = BACKOFF_S) -> Dict[str, Any]:
+    """ONE capture cycle into a NEW directory. Returns a report; refusals (storage, a broken log, a non-advancing clock) are reported, not raised."""
+    for name, v in (("now_ms", now_ms), ("interval_ms", interval_ms)):
+        if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+            raise CollectorError(f"{name} must be a positive whole number")
+    if not 0 <= max_symbols <= 500 or not 1 <= depth <= MAX_DEPTH or not 1 <= trades_limit <= MAX_TRADES:
+        raise CollectorError("max_symbols/depth/trades_limit out of bounds")
+    root = os.path.abspath(out_root)
+    parent = os.path.dirname(root)
+    if os.path.islink(root) or os.path.islink(parent) or not os.path.isdir(parent):
+        raise CollectorError("the output root must be a real directory, not a link")
+    UC.AR._refuse_protected(os.path.join(root, LOG_NAME))
+    os.makedirs(root, mode=0o700, exist_ok=True)
+
+    # storage budget: refuse BEFORE anything is created, and report
+    used, free = _tree_bytes(root), int(free_bytes_fn(root))
+    if free < reserve_bytes or used > max_bytes:
+        return _refuse("REFUSED_STORAGE", free_bytes=free, reserve_bytes=reserve_bytes, root_bytes=used, max_bytes=max_bytes,
+                       reason="free space below the reserve" if free < reserve_bytes else "the root exceeds max_bytes")
+
+    log = os.path.join(root, LOG_NAME)
+    if os.path.isfile(log):
+        ver = EC.verify(log)
+        if not ver.get("ok", False):
+            return _refuse("REFUSED_LOG", reason="cycles.jsonl does not verify; a new cycle would be unrecordable", detail=str(ver.get("problems") or ver.get("state") or ver)[:300])
+    rows = _log_rows(log)
+
+    # resume: an interrupted cycle is set aside, never reused or overwritten; a COMPLETE-but-unrecorded one is recorded late
+    set_aside: List[Dict[str, str]] = []
+    recorded = {r.get("cycle") for r in rows}
+    for name in cycle_dirs(root, complete_only=False):
+        path = os.path.join(root, name)
+        if not os.path.isfile(os.path.join(path, COMPLETE)):
+            set_aside.append({"cycle": name, "moved_to": os.path.basename(_aside(path, ".INCOMPLETE")), "reason": "no COMPLETE marker"})
+        elif name not in recorded:
+            if verify_cycle_dir(path):
+                set_aside.append({"cycle": name, "moved_to": os.path.basename(_aside(path, ".INCOMPLETE")), "reason": "COMPLETE but failed verification"})
+            else:
+                with open(os.path.join(path, "manifest.json"), "rb") as fh:
+                    old = json.loads(fh.read())
+                EC.append(log, {"at_ms": int(clock()), "cycle": name, "cycle_ms": old.get("cycle_ms"), "manifest_sha256": _file_sha(os.path.join(path, "manifest.json")),
+                                "status": old.get("status"), "counts": old.get("counts"), "gaps": old.get("gaps", []), "recovered": True})
+    rows = _log_rows(log)
+
+    prev = rows[-1] if rows else None
+    gaps: List[Dict[str, Any]] = []
+    if prev is not None and isinstance(prev.get("cycle_ms"), int):
+        if now_ms <= prev["cycle_ms"]:
+            return _refuse("REFUSED_CLOCK", reason="now_ms does not advance past the previous recorded cycle", previous_cycle_ms=prev["cycle_ms"])
+        delta = now_ms - prev["cycle_ms"]
+        missed = max(0, round(delta / interval_ms) - 1)
+        if missed:
+            gaps.append({"previous_cycle": prev["cycle"], "previous_ms": prev["cycle_ms"], "gap_ms": delta, "interval_ms": interval_ms,
+                         "missed_expected_cycles": missed, "note": "recorded, never filled or interpolated"})
+
+    cid = f"cycle-{now_ms}"
+    cdir = os.path.join(root, cid)
+    _mkdir_exclusive(cdir)
+    started = int(clock())
+    fx = _Fetcher(fetch, sleep, max_retries, backoff_s)
+    errors: List[str] = []
+    artifacts: List[Dict[str, Any]] = []
+    counts: Dict[str, Any] = {}
+    selection: Dict[str, Any] = {"rule": SELECTION_RULE, "as_of_ms": None, "source": None, "max_symbols": max_symbols, "selected": []}
+    umanifest: Optional[Dict[str, Any]] = None
+    try:
+        # (a) universe + (b) ticker snapshot: universe_capture's own capture (raw bytes, cursor chain, duplicates, skew)
+        try:
+            umanifest = UC.capture(os.path.join(cdir, "universe"), fetch=fx, clock_ms=lambda: int(clock()), sleep=sleep)
+        except (UC.CaptureError, CollectorError) as exc:
+            errors.append(f"universe: {exc}")
+        except RateLimitExhausted as exc:
+            errors.append(f"universe: {exc}")
+        tickers: Dict[str, Dict[str, Any]] = {}
+        eligible: Set[str] = set()
+        if umanifest is not None:
+            tbody_path = os.path.join(cdir, "universe", "tickers.json")
+            with open(tbody_path, "rb") as fh:
+                tbody = fh.read()
+            tickers, tinfo = validate_tickers(tbody)
+            lines = [json.dumps(dict(tickers[s], symbol=s, recv_ms=umanifest["tickers"]["recv_ms"]), sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n"
+                     for s in sorted(tickers)]
+            tj = "".join(lines).encode()
+            _write(os.path.join(cdir, "tickers.jsonl"), tj)
+            artifacts.append({"kind": "tickers", "symbol": "*", "file": "universe/tickers.json", "sha256": umanifest["tickers"]["sha256"], "bytes": umanifest["tickers"]["bytes"],
+                              "derived_file": "tickers.jsonl", "derived_sha256": _sha(tj), "request": {"path": UC.PATH_TICKERS, "params": {"category": CATEGORY}},
+                              "recv_ms": umanifest["tickers"]["recv_ms"], "schema_version": SCHEMA_VERSION, "venue_time_ms": umanifest["tickers"]["venue_time_ms"],
+                              "skew_ms": umanifest["tickers"]["skew_ms"], "skew_flag": umanifest["tickers"]["skew_flag"],
+                              "validation": {k: v for k, v in tinfo.items() if k != "venue_time_ms"}})
+            ufile = os.path.join(cdir, "universe", umanifest["universe"]["file"])
+            uni = UC.load_universe(ufile)
+            eligible = {s for s, r in uni.items() if r.get("status") == "Trading"}
+            selection.update({"as_of_ms": umanifest["tickers"]["recv_ms"], "source": {"file": "universe/tickers.json", "sha256": umanifest["tickers"]["sha256"]}})
+            selection["selected"] = select_symbols(tickers, eligible, max_symbols)
+            selection["eligible_count"] = sum(1 for s in tickers if s in eligible and Decimal(tickers[s]["turnover24h"]) > 0)
+
+            # (c) order books, (d) recent trades: same bounded symbols, in selection order
+            os.makedirs(os.path.join(cdir, "books"), mode=0o700)
+            os.makedirs(os.path.join(cdir, "trades"), mode=0o700)
+            aborted = False
+            for item in selection["selected"]:
+                sym = item["symbol"]
+                for kind, path, lim, validator in (("book", PATH_BOOK, depth, validate_book), ("trades", PATH_TRADES, trades_limit, validate_trades)):
+                    if aborted:
+                        artifacts.append({"kind": kind, "symbol": sym, "file": None, "validation": {"ok": False, "rejects": {"not_fetched:rate_limited": 1}}})
+                        continue
+                    url = request_url(path, symbol=sym, limit=lim)
+                    try:
+                        body = fx(url)
+                    except RateLimitExhausted as exc:
+                        errors.append(str(exc))
+                        aborted = True
+                        artifacts.append({"kind": kind, "symbol": sym, "file": None, "validation": {"ok": False, "rejects": {"not_fetched:rate_limited": 1}}})
+                        continue
+                    except (CollectorError, UC.CaptureError, OSError) as exc:
+                        errors.append(f"{kind} {sym}: {exc}")
+                        artifacts.append({"kind": kind, "symbol": sym, "file": None, "validation": {"ok": False, "rejects": {"fetch_error": 1}}})
+                        continue
+                    recv = int(clock())
+                    if len(body) > MAX_BODY_BYTES:
+                        errors.append(f"{kind} {sym}: response larger than any market page")
+                        artifacts.append({"kind": kind, "symbol": sym, "file": None, "validation": {"ok": False, "rejects": {"body_too_large": 1}}})
+                        continue
+                    fname = f"{'books' if kind == 'book' else 'trades'}/{sym}.json"
+                    _write(os.path.join(cdir, *fname.split("/")), body)          # unedited, before anything is concluded about it
+                    info = validate_book(body, sym, lim) if kind == "book" else validate_trades(body, sym, lim, recv)
+                    artifacts.append(_artifact(kind, sym, fname, body, url, recv, info))
+                    sleep(PAUSE_S)
+    except OSError as exc:                                  # e.g. disk full mid-cycle: the directory has no COMPLETE and is set aside next run
+        return _refuse("ABORTED", cycle=cid, reason=f"{type(exc).__name__}: {exc}")
+
+    # ------------------------------------------------------------ manifest
+    def _n(kind: str, ok: bool) -> int:
+        return sum(1 for a in artifacts if a["kind"] == kind and bool(a["validation"]["ok"]) == ok)
+    skew_flags = [a for a in artifacts if a.get("skew_flag")]
+    if umanifest is not None:
+        skew_flags += [{"kind": "universe_page", "page": p["page"]} for p in umanifest["pages"] if p["skew_flag"]]
+    rejects_total: Dict[str, int] = {}
+    for a in artifacts:
+        for k, v in a["validation"]["rejects"].items():
+            _bump(rejects_total, f"{a['kind']}:{k}", v)
+    counts = {"instruments": umanifest["rows_accepted"] if umanifest else 0, "instrument_rows_rejected": umanifest["rows_rejected"] if umanifest else 0,
+              "ticker_rows_valid": next((a["validation"]["rows"] for a in artifacts if a["kind"] == "tickers"), 0),
+              "symbols_selected": len(selection["selected"]), "books_ok": _n("book", True), "books_failed": _n("book", False),
+              "trades_ok": _n("trades", True), "trades_failed": _n("trades", False), "requests": fx.requests,
+              "rate_limit_events": len(fx.events), "skew_flags": len(skew_flags), "rejects_total": dict(sorted(rejects_total.items())),
+              "duplicates_identical": sum(a["validation"].get("duplicates_identical", 0) for a in artifacts),
+              "conflicts": sum(a["validation"].get("conflicts", 0) for a in artifacts)}
+    partial = bool(errors) or umanifest is None or counts["books_failed"] or counts["trades_failed"] or counts["conflicts"]
+    status = "PARTIAL" if partial else "OK"
+    manifest = {
+        "schema_version": SCHEMA_VERSION, "cycle": cid, "cycle_ms": now_ms, "started_ms": started, "status": status,
+        "request": {"host": venues.host_of(_base()), "paths": list(PUBLIC_PATHS), "category": CATEGORY, "depth": depth, "trades_limit": trades_limit},
+        "selection": selection, "artifacts": artifacts, "universe_manifest": {"file": "universe/manifest.json"} if umanifest else None,
+        "counts": counts, "errors": errors, "rate_limit_events": fx.events, "gaps": gaps, "set_aside": set_aside,
+        "clock": {"skew_warn_ms": SKEW_WARN_MS, "flagged": skew_flags},
+        "note": "point-in-time; selection uses this cycle's tickers only; gaps and rejects are recorded, never filled or hidden; a hash shows what was read, not who produced it",
+    }
+    manifest["finished_ms"] = int(clock())
+    try:
+        manifest["files"] = _listing(cdir)
+        mbytes = (json.dumps(manifest, indent=2, sort_keys=True, allow_nan=False) + "\n").encode("utf-8")
+        _write(os.path.join(cdir, "manifest.json"), mbytes)
+        msha = _sha(mbytes)
+        _write(os.path.join(cdir, COMPLETE), (msha + "\n").encode("ascii"))
+        EC.append(log, {"at_ms": int(clock()), "cycle": cid, "cycle_ms": now_ms, "manifest_sha256": msha, "status": status, "counts": counts, "gaps": gaps})
+    except OSError as exc:
+        return _refuse("ABORTED", cycle=cid, reason=f"{type(exc).__name__}: {exc}")
+    return {"status": status, "cycle": cid, "manifest_sha256": msha, "counts": counts, "gaps": gaps, "errors": errors, "set_aside": set_aside}
+
+
+# ---------------------------------------------------------------- seal / check (the outside memory; compare with EVERY earlier row)
+
+def _describe_cycle(root: str, name: str) -> Dict[str, Any]:
+    path = os.path.join(root, name)
+    msha = _file_sha(os.path.join(path, "manifest.json"))
+    lst = _listing(path)
+    return {"cycle": name, "manifest_sha256": msha, "files": lst, "tree_sha256": _tree_sha(lst, msha)}
+
+
+def seal_cycles(root: str, manifest: str, *, now_ms: Optional[int] = None, accept_problems: bool = False) -> Dict[str, Any]:
+    """Append one chained row describing every COMPLETE cycle not yet sealed (and the ids in cycles.jsonl now). REFUSES over existing problems."""
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    if os.path.dirname(os.path.abspath(manifest)) == os.path.abspath(root):
+        raise SealError("the seal manifest must not live in the collector's own directory: it is the outside memory")
+    if os.path.isfile(manifest) and not accept_problems:
+        prior = check_cycles(root, manifest)
+        if not prior["ok"]:
+            raise SealError(f"refusing to seal over existing problems (that would make them the new baseline): {prior['problems'][:3]}")
+    already: Set[str] = set()
+    if os.path.isfile(manifest):
+        for r in EC.rows_of(EC.read_lines(manifest)[0]):
+            if isinstance(r, dict):
+                already |= {c["cycle"] for c in r.get("cycles", [])}
+    names = cycle_dirs(root)
+    bad = [n for n in names if n not in already and verify_cycle_dir(os.path.join(root, n))]
+    if bad and not accept_problems:
+        raise SealError(f"refusing to seal a cycle that fails its own manifest: {bad[:3]}")
+    new = [_describe_cycle(root, n) for n in names if n not in already]
+    if not names:
+        raise SealError("no COMPLETE cycles to seal")
+    log_ids = [r["cycle"] for r in _log_rows(os.path.join(root, LOG_NAME))]
+    n, head = EC.append(manifest, {"at_ms": now, "cycles": new, "log_cycles": log_ids})
+    return {"manifest_rows": n, "head": head, "sealed_new": len(new), "cycles_total": len(names)}
+
+
+def check_cycles(root: str, manifest: str) -> Dict[str, Any]:
+    """Compare the directory with EVERY sealed row: MISSING (a cycle or a file gone), TRUNCATED (a file shorter / a log row lost), ALTERED (a hash changed)."""
+    problems: List[str] = []
+    if not os.path.isfile(manifest):
+        return {"ok": False, "problems": ["no seal manifest: nothing outside the collector remembers what it captured"], "rows_checked": 0}
+    ver = EC.verify(manifest)
+    if not ver.get("ok", False):
+        problems.append(f"the seal manifest's own chain does not verify: {ver.get('problems') or ver.get('state') or ver}")
+    rows = [r for r in EC.rows_of(EC.read_lines(manifest)[0]) if isinstance(r, dict)]
+    sealed_log: Set[str] = set()
+    for row in rows:
+        sealed_log |= set(row.get("log_cycles", []))
+        for c in row.get("cycles", []):
+            name, path = c["cycle"], os.path.join(root, c["cycle"])
+            if not os.path.isdir(path):
+                problems.append(f"{name}: MISSING (it was sealed with {len(c['files'])} files)")
+                continue
+            if not os.path.isfile(os.path.join(path, "manifest.json")) or not os.path.isfile(os.path.join(path, COMPLETE)):
+                problems.append(f"{name}: MISSING (manifest.json or COMPLETE marker gone)")
+                continue
+            if _file_sha(os.path.join(path, "manifest.json")) != c["manifest_sha256"]:
+                problems.append(f"{name}: ALTERED (manifest.json hash changed)")
+            have = set(_rel_files(path)) - {"manifest.json", COMPLETE}
+            for rel in sorted(set(c["files"]) - have):
+                problems.append(f"{name}: MISSING file {rel}")
+            for rel in sorted(have - set(c["files"])):
+                problems.append(f"{name}: ALTERED (unexpected file {rel})")
+            for rel in sorted(have & set(c["files"])):
+                p = os.path.join(path, *rel.split("/"))
+                size = os.path.getsize(p)
+                if size < c["files"][rel]["bytes"]:
+                    problems.append(f"{name}: TRUNCATED {rel} ({size} bytes, {c['files'][rel]['bytes']} sealed)")
+                elif size != c["files"][rel]["bytes"] or _file_sha(p) != c["files"][rel]["sha256"]:
+                    problems.append(f"{name}: ALTERED {rel}")
+    log = os.path.join(root, LOG_NAME)
+    if sealed_log:
+        if not os.path.isfile(log):
+            problems.append(f"{LOG_NAME}: MISSING ({len(sealed_log)} cycles were recorded)")
+        else:
+            lv = EC.verify(log)
+            if not lv.get("ok", False):
+                problems.append(f"{LOG_NAME}: its own chain does not verify")
+            have_ids = {r.get("cycle") for r in _log_rows(log)}
+            for cid in sorted(sealed_log - have_ids):
+                problems.append(f"{LOG_NAME}: TRUNCATED (the row for {cid} is gone)")
+    if os.path.isfile(log):
+        for r in _log_rows(log):
+            p = os.path.join(root, r.get("cycle", ""), "manifest.json")
+            if os.path.isfile(p) and _file_sha(p) != r.get("manifest_sha256"):
+                problems.append(f"{r['cycle']}: ALTERED (manifest.json differs from its {LOG_NAME} row)")
+            elif not os.path.isfile(p):
+                problems.append(f"{r.get('cycle')}: MISSING (recorded in {LOG_NAME} but its manifest is gone)")
+    return {"ok": not problems, "problems": sorted(set(problems)), "rows_checked": len(rows)}
+
+
+# ---------------------------------------------------------------- backup / restore-check
+
+def copy_cycle_dir(src: str, dst: str) -> None:
+    """Default transfer: every file re-created exclusively (never overwriting) at 0600."""
+    _mkdir_exclusive(dst)
+    for rel in _rel_files(src):
+        target = os.path.join(dst, *rel.split("/"))
+        os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
+        with open(os.path.join(src, *rel.split("/")), "rb") as fh:
+            _write(target, fh.read())
+
+
+def backup_cycles(src: str, dest: str, receipts: str, copy_fn: Callable[[str, str], None] = copy_cycle_dir, *, now_ms: Optional[int] = None) -> Dict[str, Any]:
+    """Copy every COMPLETE, self-consistent, recorded cycle to ``dest`` (never overwriting), re-hash the COPY, then write a chained receipt.
+    A corrupt copy is set aside as ``.REJECTED`` and gets no receipt."""
+    now = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    rs, rd = os.path.realpath(src), os.path.realpath(dest)
+    if rd == rs or rd.startswith(rs + os.sep):
+        raise SealError("the backup destination is the collector's own directory: a copy beside the original is lost with it")
+    os.makedirs(dest, exist_ok=True)
+    have: Set[str] = set()
+    if os.path.isfile(receipts):
+        have = {r.get("cycle") for r in _log_rows(receipts)}
+    recorded = {r.get("cycle") for r in _log_rows(os.path.join(src, LOG_NAME))}
+    done: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    rejected: List[str] = []
+    for name in cycle_dirs(src, complete_only=False):
+        sp = os.path.join(src, name)
+        if not os.path.isfile(os.path.join(sp, COMPLETE)):
+            skipped.append(f"{name}: no COMPLETE marker (not backed up)")
+            continue
+        if name in have:
+            skipped.append(f"{name}: already backed up")
+            continue
+        if name not in recorded:
+            skipped.append(f"{name}: not recorded in {LOG_NAME}")
+            continue
+        prob = verify_cycle_dir(sp)
+        if prob:
+            skipped.append(f"{name}: the source fails its own manifest ({prob[0]}); not copied")
+            continue
+        dp = os.path.join(dest, name)
+        if os.path.lexists(dp):
+            raise SealError(f"{dp} already exists and has no receipt: refusing to overwrite or trust it")
+        copy_fn(sp, dp)
+        bad = verify_cycle_dir(dp) if os.path.isdir(dp) else ["the copy is missing"]
+        if not bad and _file_sha(os.path.join(dp, "manifest.json")) != _file_sha(os.path.join(sp, "manifest.json")):
+            bad = ["the copy's manifest differs from the source's"]
+        if bad:
+            if os.path.lexists(dp):
+                _aside(dp, ".REJECTED")
+            rejected.append(f"{name}: {bad[0]}")
+            continue
+        d = _describe_cycle(dest, name)
+        EC.append(receipts, {"at_ms": now, "cycle": name, "manifest_sha256": d["manifest_sha256"], "tree_sha256": d["tree_sha256"], "files": len(d["files"]),
+                             "bytes": sum(f["bytes"] for f in d["files"].values())})
+        done.append({"cycle": name, "files": len(d["files"])})
+    return {"ok": not rejected, "backed_up": done, "skipped": skipped, "rejected": rejected}
+
+
+def restore_check(backup_dir: str, receipts: str) -> Dict[str, Any]:
+    """A backup is not proven until this passes: every receipted copy exists, is self-consistent and hashes as receipted."""
+    problems: List[str] = []
+    if not os.path.isfile(receipts):
+        return {"ok": False, "problems": ["no receipts"], "checked": 0}
+    if not EC.verify(receipts).get("ok", False):
+        problems.append("the receipts' own chain does not verify")
+    n = 0
+    for r in _log_rows(receipts):
+        name = r["cycle"]
+        path = os.path.join(backup_dir, name)
+        n += 1
+        if not os.path.isdir(path):
+            problems.append(f"{name}: receipted but missing from the backup")
+            continue
+        sub = verify_cycle_dir(path)
+        if sub:
+            problems += [f"{name}: {p}" for p in sub]
+            continue
+        d = _describe_cycle(backup_dir, name)
+        if d["manifest_sha256"] != r["manifest_sha256"] or d["tree_sha256"] != r["tree_sha256"]:
+            problems.append(f"{name}: hash differs from its receipt")
+    return {"ok": not problems, "problems": problems, "checked": n}
+
+
+# ---------------------------------------------------------------- CLI
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="Owner-invoked PUBLIC-data market collector (one capture cycle) with seal/check/backup/restore-check.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run-once")
+    r.add_argument("--out-root", required=True)
+    r.add_argument("--max-symbols", type=int, default=DEFAULT_MAX_SYMBOLS)
+    r.add_argument("--depth", type=int, default=DEFAULT_DEPTH)
+    r.add_argument("--trades-limit", type=int, default=DEFAULT_TRADES)
+    r.add_argument("--interval-ms", type=int, default=DEFAULT_INTERVAL_MS)
+    r.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE_BYTES)
+    r.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES)
+    s = sub.add_parser("seal"); s.add_argument("--root", required=True); s.add_argument("--manifest", required=True)
+    s.add_argument("--accept-problems", action="store_true")
+    c = sub.add_parser("check"); c.add_argument("--root", required=True); c.add_argument("--manifest", required=True)
+    b = sub.add_parser("backup"); b.add_argument("--root", required=True); b.add_argument("--to", required=True); b.add_argument("--receipts", required=True)
+    k = sub.add_parser("restore-check"); k.add_argument("--backup", required=True); k.add_argument("--receipts", required=True)
+    a = ap.parse_args(argv)
+    try:
+        if a.cmd == "run-once":
+            res = run_once(a.out_root, int(time.time() * 1000), max_symbols=a.max_symbols, depth=a.depth, trades_limit=a.trades_limit,
+                           interval_ms=a.interval_ms, reserve_bytes=a.reserve_bytes, max_bytes=a.max_bytes)
+            ok = res["status"] in ("OK", "PARTIAL")
+            res = {**res, "ok": ok}
+        elif a.cmd == "seal":
+            res = seal_cycles(a.root, a.manifest, accept_problems=a.accept_problems)
+        elif a.cmd == "check":
+            res = check_cycles(a.root, a.manifest)
+        elif a.cmd == "backup":
+            res = backup_cycles(a.root, a.to, a.receipts)
+        else:
+            res = restore_check(a.backup, a.receipts)
+    except (CollectorError, UC.CaptureError, UC.AR.RecordError, OSError, EC.ChainDesync) as exc:
+        print(f"market_collector: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(res, indent=2, sort_keys=True, default=str))
+    return 0 if res.get("ok", True) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
