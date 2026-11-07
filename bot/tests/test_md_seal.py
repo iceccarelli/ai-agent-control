@@ -176,3 +176,79 @@ def test_the_tool_never_writes_into_the_recorders_directory(world):
     seal(world); SL.check(world["md"], world["manifest"])
     SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off" / "r.jsonl"), now_ms=NOW)
     assert names() == before
+
+
+# ---------------------------------------------------------------- red-team reproductions (8c7a716)
+
+def test_backup_of_a_segment_the_writer_still_has_open_keeps_every_record(tmp_path):
+    """Reproduced: a plain copy of the main .db lost 10 of 20 records (the rest were in the WAL) and the receipt + restore-check still passed."""
+    md = tmp_path / "md"
+    st = ST.MarketStore(str(md), commit_every=1, environment="mainnet")
+    for i in range(20):
+        st.append("frame", wall_ms=DAY1 + i * 1000, mono_s=float(i), category="linear", conn_id="c", topic="t", payload=f'{{"i":{i}}}')
+        if i == 9:
+            c = sqlite3.connect(os.path.join(str(md), SL.segment_names(str(md))[0])); c.execute("PRAGMA wal_checkpoint(PASSIVE)"); c.close()
+    # the writer is deliberately NOT closed: yesterday's segment is still open in WAL mode
+    dest = str(tmp_path / "offvol"); rec = str(tmp_path / "off" / "r.jsonl"); os.makedirs(str(tmp_path / "off"))
+    res = SL.backup(str(md), dest, rec, now_ms=DAY2 + 2 * 3_600_000)
+    assert res["backed_up"][0]["records"] == 20
+    assert SL.restore_check(dest, rec)["ok"]
+    # and a copy function that silently drops records is now caught by the content comparison
+    def lossy(src, dst):
+        SL.online_copy(src, dst)
+        c = sqlite3.connect(dst)
+        for (n,) in c.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
+            c.execute(f'DROP TRIGGER "{n}"')
+        c.execute("DELETE FROM log WHERE id > 10"); c.commit(); c.close()
+    with pytest.raises(SL.SealError, match="records were lost"):
+        SL.backup(str(md), str(tmp_path / "off2"), str(tmp_path / "off" / "r2.jsonl"), now_ms=DAY2 + 2 * 3_600_000, copy_fn=lossy)
+    st.close()
+
+
+def test_a_day_that_ended_minutes_ago_is_not_yet_closed(world):
+    res = SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off_r.jsonl"), now_ms=DAY2 - (DAY2 % 86_400_000) + 60_000)
+    assert res["backed_up"] == [] and any("still being written" in x for x in res["skipped"])
+    later = SL.backup(world["md"], str(world["tmp"] / "offvol"), str(world["tmp"] / "off_r.jsonl"), now_ms=DAY2 + 3_600_000)     # an hour+ after midnight: now it is closed
+    assert [d["segment"] for d in later["backed_up"]] == [SL.segment_names(world["md"])[0]]
+
+
+def test_sealing_over_a_truncation_is_refused_so_it_cannot_become_the_new_baseline(world):
+    seal(world)
+    _truncate(seg(world, 1), keep=3)
+    assert not SL.check(world["md"], world["manifest"])["ok"]
+    with pytest.raises(SL.SealError, match="refusing to seal over existing problems"):
+        SL.seal(world["md"], world["manifest"], now_ms=NOW)
+    assert not SL.check(world["md"], world["manifest"])["ok"]                       # still detected afterwards
+    SL.seal(world["md"], world["manifest"], now_ms=NOW, accept_problems=True)        # the owner's explicit re-baseline
+
+
+def test_every_earlier_seal_is_checked_not_only_the_latest(world):
+    seal(world)
+    s = ST.MarketStore(world["md"], commit_every=1, environment="mainnet")
+    s.append("frame", wall_ms=DAY2 + 50_000, mono_s=50.0, category="linear", conn_id="c1", topic="t", payload="{}"); s.close()
+    SL.seal(world["md"], world["manifest"], now_ms=NOW)                              # a second seal with 5 records on day 2
+    _truncate(seg(world, 2), keep=2)                                                 # cut below BOTH seals
+    probs = SL.check(world["md"], world["manifest"])["problems"]
+    assert any("TRUNCATED" in p for p in probs)
+
+
+def test_an_edit_inside_an_open_segment_is_caught_by_the_deep_check_only(world):
+    seal(world)
+    con = sqlite3.connect(seg(world, 2))
+    for (n,) in con.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
+        con.execute(f'DROP TRIGGER "{n}"')
+    con.execute("UPDATE log SET topic='tampered' WHERE id=12"); con.commit(); con.close()      # ids are global across segments: day 2 holds 11-14
+    assert SL.check(world["md"], world["manifest"])["ok"], "the cheap check cannot see a mid-segment edit (documented)"
+    deep = SL.check(world["md"], world["manifest"], deep=True)
+    assert not deep["ok"] and any("chain mismatch" in p for p in deep["problems"])
+
+
+def test_a_closed_day_that_gained_a_record_is_altered(world):
+    seal(world)
+    con = sqlite3.connect(seg(world, 1))
+    for (n,) in con.execute("SELECT name FROM sqlite_master WHERE type='trigger'").fetchall():
+        con.execute(f'DROP TRIGGER "{n}"')
+    con.execute("INSERT INTO log (id, kind, wall_ms, mono_s, category, conn_id, topic, payload, chain) SELECT 999, kind, wall_ms, mono_s, category, conn_id, topic, payload, chain FROM log WHERE id=1")
+    con.commit(); con.close()
+    probs = SL.check(world["md"], world["manifest"])["problems"]
+    assert any("ALTERED" in p and "records" in p for p in probs), probs

@@ -80,21 +80,33 @@ def describe(directory: str, name: str, *, closed: bool) -> Dict[str, Any]:
     return out
 
 
-def seal(directory: str, manifest: str, *, now_ms: Optional[int] = None) -> Dict[str, Any]:
-    """Append one manifest row describing every segment now. Segments dated before today (UTC) are 'closed' and hash-pinned."""
+#: A day is treated as closed only an hour after it ended: the recorder closes yesterday's segment on its first append of the new day, so right after
+#: midnight the writer may still hold it (a backup of an open WAL segment lost records at exactly this point).
+CLOSE_MARGIN_MS = 3_600_000
+
+
+def seal(directory: str, manifest: str, *, now_ms: Optional[int] = None, accept_problems: bool = False) -> Dict[str, Any]:
+    """Append one manifest row describing every segment now. Segments whose day ended over an hour ago are 'closed' and hash-pinned.
+    REFUSES when ``check`` already finds a problem: sealing over a truncation would launder it into the new baseline (reproduced). ``accept_problems`` is
+    the owner's explicit decision to re-baseline after investigating."""
     now = int(time.time() * 1000) if now_ms is None else min(int(now_ms), int(time.time() * 1000))
     if os.path.abspath(os.path.dirname(os.path.abspath(manifest))) == os.path.abspath(directory):
         raise SealError("the manifest must not live in the recorder's own directory: it is the outside memory")
-    today = _today(now)
+    today = _today(now - CLOSE_MARGIN_MS)
     segs = [describe(directory, n, closed=n[3:11] < today) for n in segment_names(directory)]
     if not segs:
         raise SealError("no segments to seal")
+    if os.path.isfile(manifest) and not accept_problems:
+        prior = check(directory, manifest)
+        if not prior["ok"]:
+            raise SealError(f"refusing to seal over existing problems (that would make them the new baseline): {prior['problems'][:3]}")
     n, head = EC.append(manifest, {"at_ms": now, "segments": segs})
     return {"manifest_rows": n, "head": head, "segments": len(segs)}
 
 
-def check(directory: str, manifest: str) -> Dict[str, Any]:
-    """Compare the directory with every sealed row. Returns {'ok', 'problems', 'rows_checked'}."""
+def check(directory: str, manifest: str, *, deep: bool = False) -> Dict[str, Any]:
+    """Compare the directory with every sealed row. ``deep`` also recomputes every record's chain from its payload (catches an edit INSIDE an open segment, which the
+    cheap checks cannot; slow on a large day). Returns {'ok', 'problems', 'rows_checked'}."""
     problems: List[str] = []
     if not os.path.isfile(manifest):
         return {"ok": False, "problems": ["no manifest: nothing outside the recorder remembers how far it got"], "rows_checked": 0}
@@ -104,31 +116,40 @@ def check(directory: str, manifest: str) -> Dict[str, Any]:
     lines, _q = EC.read_lines(manifest)
     rows = EC.rows_of(lines)
     present = set(segment_names(directory))
-    seen: Dict[str, Dict[str, Any]] = {}
+    by_segment: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         for seg in row.get("segments", []):
-            name = seg["segment"]
-            seen[name] = seg                                # the latest description of each segment is what it must still satisfy
-    for name, seg in sorted(seen.items()):
+            by_segment.setdefault(seg["segment"], []).append(seg)       # EVERY description of the segment, oldest first
+    for name, descs in sorted(by_segment.items()):
         if name not in present:
-            problems.append(f"{name}: MISSING (it was sealed with {seg['records']} records)")
+            problems.append(f"{name}: MISSING (it was sealed with {max(d['records'] for d in descs)} records)")
             continue
         try:
             con = _ro(os.path.join(directory, name))
             try:
                 n = con.execute("SELECT COUNT(*) FROM log").fetchone()[0]
-                at = con.execute("SELECT chain FROM log WHERE id=?", (seg["last_id"],)).fetchone() if seg["last_id"] is not None else None
+                for d in descs:                                          # each earlier seal must still hold, not only the latest
+                    at = con.execute("SELECT chain FROM log WHERE id=?", (d["last_id"],)).fetchone() if d["last_id"] is not None else None
+                    if d["last_id"] is not None and at is None:
+                        problems.append(f"{name}: TRUNCATED (sealed id {d['last_id']} is gone; {n} records remain)")
+                    elif at is not None and bytes(at[0]).hex() != d["last_chain"]:
+                        problems.append(f"{name}: ALTERED (the chain value at sealed id {d['last_id']} changed)")
             finally:
                 con.close()
         except sqlite3.DatabaseError as exc:
             problems.append(f"{name}: unreadable ({type(exc).__name__})")
             continue
-        if seg["last_id"] is not None and at is None:
-            problems.append(f"{name}: TRUNCATED (last sealed id {seg['last_id']} is gone; {n} of {seg['records']} sealed records remain)")
-        elif at is not None and bytes(at[0]).hex() != seg["last_chain"]:
-            problems.append(f"{name}: ALTERED (the chain value at sealed id {seg['last_id']} changed)")
-        if seg.get("sha256") and _sha256(os.path.join(directory, name)) != seg["sha256"]:
-            problems.append(f"{name}: ALTERED (a closed day's file hash changed)")
+        top = max(d["records"] for d in descs)
+        if n < top:
+            problems.append(f"{name}: TRUNCATED ({n} records, {top} were sealed)")
+        closed = [d for d in descs if d.get("closed")]
+        if closed:
+            if n != closed[-1]["records"]:
+                problems.append(f"{name}: ALTERED (a closed day now holds {n} records, was sealed with {closed[-1]['records']})")
+            if _sha256(os.path.join(directory, name)) != closed[-1]["sha256"]:
+                problems.append(f"{name}: ALTERED (a closed day's file hash changed)")
+        if deep:
+            problems += [f"{name}: {p}" for p in recompute_chain(os.path.join(directory, name))]
     return {"ok": not problems, "problems": problems, "rows_checked": len(rows)}
 
 
@@ -161,15 +182,28 @@ def recompute_chain(path: str) -> List[str]:
     return problems
 
 
+def online_copy(src: str, dst: str) -> None:
+    """SQLite's online backup: includes records still in the WAL (a plain file copy of the main .db lost 10 of 20 records while the writer was open)."""
+    a = _ro(src)
+    try:
+        b = sqlite3.connect(dst)
+        try:
+            a.backup(b)
+        finally:
+            b.close()
+    finally:
+        a.close()
+
+
 def backup(directory: str, dest: str, receipts: str, *, now_ms: Optional[int] = None,
-           copy_fn: Callable[[str, str], None] = shutil.copyfile) -> Dict[str, Any]:
+           copy_fn: Callable[[str, str], None] = online_copy) -> Dict[str, Any]:
     """Copy every CLOSED day to ``dest`` (never overwriting), verify the copy, then write a chained receipt. The injected ``copy_fn`` lets a test (or an
     object-store uploader) replace the transfer; verification always re-reads the copy."""
     now = int(time.time() * 1000) if now_ms is None else min(int(now_ms), int(time.time() * 1000))
     if os.path.realpath(dest) == os.path.realpath(directory) or os.path.realpath(dest).startswith(os.path.realpath(directory) + os.sep):
         raise SealError("the backup destination is the recorder's own directory: a copy beside the original is lost with it")
     os.makedirs(dest, exist_ok=True)
-    today = _today(now)
+    today = _today(now - CLOSE_MARGIN_MS)
     done: List[Dict[str, Any]] = []
     skipped: List[str] = []
     have = set()
@@ -187,13 +221,15 @@ def backup(directory: str, dest: str, receipts: str, *, now_ms: Optional[int] = 
         if os.path.exists(dst):
             raise SealError(f"{dst} already exists and has no receipt: refusing to overwrite or trust it")
         copy_fn(src, dst)
-        d_src = describe(directory, name, closed=True)
+        d_src = describe(directory, name, closed=False)
         bad = []
         d_dst: Dict[str, Any] = {}
         try:
             d_dst = describe(dest, name, closed=True)
-            if d_src["sha256"] != d_dst["sha256"]:
-                bad.append("the copy's SHA-256 differs from the source")
+            # The copy's BYTES legitimately differ from the source's (an online backup rewrites the file); what must agree is the CONTENT.
+            for k in ("records", "first_id", "last_id", "last_chain"):
+                if d_src[k] != d_dst[k]:
+                    bad.append(f"the copy's {k} ({d_dst[k]!r}) differs from the source's ({d_src[k]!r}): records were lost in the copy")
             bad += [f"copy: {p}" for p in recompute_chain(dst)]
         except sqlite3.DatabaseError as exc:                 # a copy SQLite cannot even open is the clearest failure of all
             bad.append(f"copy is not a readable database ({exc})")
@@ -232,15 +268,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("seal"); s.add_argument("--dir", required=True); s.add_argument("--manifest", required=True)
+    s.add_argument("--accept-problems", action="store_true", help="re-baseline over problems you have investigated (otherwise sealing refuses)")
     c = sub.add_parser("check"); c.add_argument("--dir", required=True); c.add_argument("--manifest", required=True)
+    c.add_argument("--deep", action="store_true", help="also recompute every record's chain (slow on a large day)")
     b = sub.add_parser("backup"); b.add_argument("--dir", required=True); b.add_argument("--to", required=True); b.add_argument("--receipts", required=True)
     r = sub.add_parser("restore-check"); r.add_argument("--backup", required=True); r.add_argument("--receipts", required=True)
     a = ap.parse_args(argv)
     try:
         if a.cmd == "seal":
-            res = seal(a.dir, a.manifest)
+            res = seal(a.dir, a.manifest, accept_problems=a.accept_problems)
         elif a.cmd == "check":
-            res = check(a.dir, a.manifest)
+            res = check(a.dir, a.manifest, deep=a.deep)
         elif a.cmd == "backup":
             res = backup(a.dir, a.to, a.receipts)
         else:

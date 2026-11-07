@@ -147,3 +147,52 @@ def test_registration_fields_cannot_be_changed_by_an_amendment():
     assert hr.verify(reg) == []
     reg["trials"][0]["costs"] = "cheaper"                              # editing the registered field itself is the tamper
     assert any("ALTERED" in p for p in hr.verify(reg))
+
+
+# ---------------------------------------------------------------- red-team reproductions (8c7a716)
+
+def _sealed_pair(tmp_path):
+    reg = {"trials": []}
+    hr.register_experiment(reg, "t1", **REG); hr.register_experiment(reg, "t2", **REG)
+    hr.add_evidence(reg, "t1", "BACKTEST", result="FAIL", provenance="run 1")
+    path = str(tmp_path / "r.json"); hr.save(reg, path)
+    return hr.load(path), path
+
+
+def test_a_save_cannot_launder_a_removed_or_altered_trial(tmp_path):
+    reg, path = _sealed_pair(tmp_path)
+    reg["trials"][0]["parameter_grid"] = {"x": [999]}; del reg["trials"][1]
+    assert hr.verify(reg)
+    with pytest.raises(hr.RegistryError, match="refusing to save over tampering"):
+        hr.save(reg, path)
+    hr.save(reg, path, accept_tampering=True)                           # the owner's explicit, named re-baseline
+
+
+def test_evidence_cannot_be_edited_wiped_or_have_abandonment_removed(tmp_path):
+    reg, path = _sealed_pair(tmp_path)
+    edited = copy.deepcopy(reg); edited["trials"][0]["evidence"][0]["result"] = "PASS"
+    assert any("evidence was ALTERED" in p for p in hr.verify(edited))
+    wiped = copy.deepcopy(reg); wiped["trials"][0]["evidence"] = []
+    assert any("evidence was ALTERED" in p for p in hr.verify(wiped))
+    ok = copy.deepcopy(reg); hr.add_evidence(ok, "t1", "OUT_OF_SAMPLE", result="x", provenance="p")
+    assert hr.verify(ok) == []                                          # appending is allowed (positive control)
+    hr.abandon(reg, "t2", "no data"); hr.save(reg, path); reg = hr.load(path)
+    gone = copy.deepcopy(reg); del gone["trials"][1]["abandoned"]
+    assert any("abandonment was removed" in p for p in hr.verify(gone))
+    with pytest.raises(hr.RegistryError):
+        hr.save(gone, path)
+
+
+def test_evidence_cannot_be_added_to_a_superseded_trial():
+    reg = {"trials": []}
+    hr.register_experiment(reg, "old", **REG); hr.register_experiment(reg, "new", **REG)
+    hr.supersede(reg, "old", "new", "replaced")
+    with pytest.raises(ValueError, match="superseded"):
+        hr.add_evidence(reg, "old", "BACKTEST", result="x", provenance="p")
+    hr.add_evidence(reg, "new", "BACKTEST", result="x", provenance="p")
+
+
+def test_a_nan_in_an_entry_is_reported_not_crashed_into_a_false_pass(tmp_path):
+    reg, _ = _sealed_pair(tmp_path)
+    reg["trials"][0]["evidence"][0]["details"] = {"x": float("nan")}
+    assert any("cannot be read" in p or "ALTERED" in p for p in hr.verify(reg))

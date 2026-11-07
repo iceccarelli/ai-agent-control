@@ -10,6 +10,7 @@ see tools/risk_policy_proposal.py for the proposed limits and their financial ef
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
@@ -88,18 +89,25 @@ def _finite(x: Any) -> bool:
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+#: A measured value that is negative where a negative is impossible (an age, an exposure, a loss magnitude, a margin multiple) is a broken measurement, not a
+#: very small number: it must not slip under a 'max' limit. Funding may legitimately be negative.
+_MAY_BE_NEGATIVE = frozenset({"recent_mean_funding_bps"})
+#: Limits are magnitudes; a negative one is a typo that would make a 'min' limit never bind.
+_LIMIT_MAY_BE_NEGATIVE = frozenset({"min_recent_funding_bps"})
+
+
 def evaluate(policy: Optional[Policy], state: State) -> Decision:
     """ALLOW only if the policy is owner-approved, every input is measured and no limit is breached and no fault is flagged."""
-    if policy is None or not policy.approved_by_owner:
+    if policy is None or policy.approved_by_owner is not True:          # strictly True: the string "False" is truthy and must not approve anything
         return Decision(REFUSE, ("NO_APPROVED_POLICY",))
     reasons: List[str] = []
     latch: List[str] = []
     for lim_name, field_name, direction, latches in _RULES:
         limit, value = getattr(policy, lim_name), getattr(state, field_name)
-        if not _finite(limit):
+        if not _finite(limit) or (limit < 0 and lim_name not in _LIMIT_MAY_BE_NEGATIVE):
             reasons.append(f"POLICY_INVALID:{lim_name}")
             continue
-        if not _finite(value):
+        if not _finite(value) or (value < 0 and field_name not in _MAY_BE_NEGATIVE):
             reasons.append(f"MISSING_INPUT:{field_name}")
             continue
         if (direction == "max" and value > limit) or (direction == "min" and value < limit):
@@ -136,26 +144,40 @@ class RiskLatch:
             return {"__unreadable__": {"reasons": ["LATCH_FILE_UNREADABLE"]}}      # an unreadable latch is a SUSPENDED latch
 
     def _write(self, doc: Mapping[str, Any]) -> None:
-        tmp = self.path + ".tmp"
+        tmp = f"{self.path}.{os.getpid()}.tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(doc, fh, sort_keys=True)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, self.path)
 
+    def _locked(self):
+        """Exclusive lock for a read-modify-write (two processes latching at once must not lose one)."""
+        class _L:
+            def __enter__(inner):
+                inner.fd = os.open(self.path + ".lock", os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+                fcntl.flock(inner.fd, fcntl.LOCK_EX)
+                return inner
+
+            def __exit__(inner, *a):
+                os.close(inner.fd)
+        return _L()
+
     def is_suspended(self, strategy: str) -> Tuple[bool, Tuple[str, ...]]:
         doc = self._read()
         for key in (strategy, "__unreadable__"):
             if key in doc:
-                return True, tuple(doc[key].get("reasons", ()))
+                entry = doc[key]
+                return True, tuple(entry.get("reasons", ())) if isinstance(entry, dict) else ("LATCH_ENTRY_UNREADABLE",)    # a malformed entry still suspends
         return False, ()
 
     def apply(self, strategy: str, decision: Decision, *, at_ms: int) -> Decision:
         """Record a latching decision; return the decision actually in force (a latched strategy is SUSPENDED whatever this check said)."""
         if decision.latch:
-            doc = self._read()
-            doc[strategy] = {"reasons": list(decision.latch), "since_ms": int(at_ms)}
-            self._write(doc)
+            with self._locked():
+                doc = self._read()
+                doc[strategy] = {"reasons": list(decision.latch), "since_ms": int(at_ms)}
+                self._write(doc)
         sus, reasons = self.is_suspended(strategy)
         if sus and decision.status != SUSPEND:
             return Decision(SUSPEND, tuple(dict.fromkeys(("LATCHED",) + tuple(reasons) + decision.reasons)), tuple(reasons))
@@ -164,9 +186,10 @@ class RiskLatch:
     def clear(self, strategy: str, *, reason: str, at_ms: int) -> None:
         if not str(reason).strip():
             raise ValueError("clearing a latch needs a stated reason")
-        doc = self._read()
-        if "__unreadable__" in doc:
-            raise ValueError("the latch file is unreadable: repair or replace it by hand before clearing anything")
-        was = doc.pop(strategy, None)
-        doc.setdefault("__history__", []).append({"cleared": strategy, "was": was, "reason": reason, "at_ms": int(at_ms)})      # the clearing is itself on record
-        self._write(doc)
+        with self._locked():
+            doc = self._read()
+            if "__unreadable__" in doc:
+                raise ValueError("the latch file is unreadable: repair or replace it by hand before clearing anything")
+            was = doc.pop(strategy, None)
+            doc.setdefault("__history__", []).append({"cleared": strategy, "was": was, "reason": reason, "at_ms": int(at_ms)})      # the clearing is itself on record
+            self._write(doc)

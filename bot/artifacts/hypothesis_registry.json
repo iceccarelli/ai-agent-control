@@ -1,6 +1,236 @@
 {
-  "git_commit": "7ad37d237a73888afb0cc13b30dab5b9a362bc21-dirty",
+  "git_commit": "8c7a716771027ea39d7dba98a5f32a7d4c731377-dirty",
   "integrity": {
+    "appended": {
+      "btc_alt_spillover_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "btc_alt_spillover_v1@ETHUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "btc_alt_spillover_v1@SOLUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "btcusdt_funding_carry_overlay@prospective-1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "carry_cost_gates_v1@BTCUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": "carry_entry_gate_v1@BTCUSDT"
+      },
+      "carry_entry_gate_v1@BTCUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "carry_overlay_v1@BTCUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": "carry_entry_gate_v1@BTCUSDT"
+      },
+      "carry_rule_sweep@59feb30d2328": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "carry_rule_sweep@d7d7d4141a05": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "carry_ungated_v1@BTCUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "carry_walkforward@69b08ab2ab84": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "closed_analyser": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "closed_regression@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "compression_breakout_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "compression_breakout_v1@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "donchian_breakout_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "donchian_breakout_v1@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "donchian_regression@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "edge_real_1h@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "edge_real_4h@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "edge_recheck@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "funding_carry_fade_btc_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "funding_carry_fade_btc_v1@BTCUSDT_OOS": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "funding_carry_fade_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "funding_carry_fade_v1@BTCUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "funding_carry_fade_v1@ETHUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "funding_carry_fade_v1@SOLUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "mainnet_public_protocol_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "open_gap_fade_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "post_shock_fade_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "post_shock_fade_v1@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "range_location_fade_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "sign_flip_momentum_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "sign_flip_momentum_v1@BTCUSD": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "sign_flip_momentum_v1@ETHUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "sign_flip_momentum_v1@SOLUSDT": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "technical_analysis": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      },
+      "ts_momentum_v1": {
+        "abandoned": null,
+        "amendments": [],
+        "evidence": [],
+        "superseded_by": null
+      }
+    },
     "entries": {
       "btc_alt_spillover_v1": "af9cd5550924cf38abbfba56e4e580ae1d72b06a035f0b624ee12e6786fcd8f8",
       "btc_alt_spillover_v1@ETHUSDT": "26dbeaadc4b9a48d4d25ab4bd5e4c7401355b12897028eed0cc21f892cbf3f64",
@@ -41,7 +271,7 @@
       "technical_analysis": "44c3ec1c5d9388c697b688b7a06672e0a0ca15fc988c960c6bc44841cfc54fbd",
       "ts_momentum_v1": "43c1bd11ade06f2c38d42a786510e3a8a25d7a47a53dd701b8e8263f43a26ac6"
     },
-    "scheme": "sha256-per-entry/1"
+    "scheme": "sha256-per-entry/2"
   },
   "schema": "hypothesis_registry/1",
   "search_width": {
@@ -371,6 +601,6 @@
       ]
     }
   ],
-  "updated_utc": "2026-11-07T14:55:21Z",
+  "updated_utc": "2026-11-07T15:12:10Z",
   "width_note_slice77": "Family-level counting understated the search. The census of artifacts/*_edge_*_summary.json shows 17 distinct family x symbol measurements and 38 control runs. P(>=1 clears a 95th-percentile bar under a global null): 43.12% at N=11, 58.19% at N=17, 85.76% at N=38. This is STILL a floor \u2014 abandoned variants left no artefact."
 }

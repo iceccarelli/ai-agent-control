@@ -115,6 +115,8 @@ def verify(backup_file: str) -> Dict[str, Any]:
     mpath = backup_file + MANIFEST_SUFFIX
     try:
         manifest = json.load(open(mpath, encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError("not an object")
     except (OSError, ValueError):
         return {"ok": False, "problems": [f"manifest {os.path.basename(mpath)} missing or unreadable"]}
     problems = []
@@ -210,14 +212,20 @@ def promote(restored: str, live_db: str, *, confirm_owner: bool, now: Optional[f
             if os.path.lexists(kept):
                 raise SystemExit(f"refusing: {os.path.basename(kept)} already exists")
             os.rename(live_db, kept)
-        os.replace(staged, live_db)
+        try:
+            os.replace(staged, live_db)
+        except BaseException:
+            # The old file was already moved aside: put it back, or the next start would find NO database and make an empty one (reproduced by the red team).
+            if kept and not os.path.lexists(live_db):
+                os.rename(kept, live_db)
+            raise
     except BaseException:
         if os.path.lexists(staged):
             os.remove(staged)
         raise
     got = _inspect(live_db)
     ok = got["integrity_ok"] and got["tables"] == v["tables"] and _sha256(live_db) == v["sha256"]
-    return {"ok": ok, "live": live_db, "previous_kept_as": kept, "tables": got["tables"],
+    return {"ok": ok, "live": live_db, "previous_kept_as": kept, "tables": got["tables"], "warnings": v.get("warnings", []),
             "note": "the previous database was renamed, not deleted; start the machine only after you have checked this result"}
 
 

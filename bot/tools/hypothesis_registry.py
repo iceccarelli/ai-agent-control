@@ -107,27 +107,58 @@ def entry_digest(entry: Dict[str, Any]) -> str:
     return hashlib.sha256(json.dumps(frozen, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
 
 
+def _item_hash(item: Any) -> str:
+    return hashlib.sha256(json.dumps(item, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _appended_state(t: Dict[str, Any]) -> Dict[str, Any]:
+    """What may only GROW: evidence and amendments (append-only lists), abandonment and supersession (once set, never unset or changed)."""
+    ab = t.get("abandoned")
+    return {"evidence": [_item_hash(x) for x in t.get("evidence", [])], "amendments": [_item_hash(x) for x in t.get("amendments", [])],
+            "abandoned": None if ab is None else _item_hash(ab), "superseded_by": t.get("superseded_by")}
+
+
 def seal(registry: Dict[str, Any]) -> None:
-    """Record every trial's digest. Called by `save()`; a trial added without it is reported by `verify()` as unsealed."""
-    registry["integrity"] = {"scheme": "sha256-per-entry/1",
-                             "entries": {t["trial_id"]: entry_digest(t) for t in registry.get("trials", [])}}
+    """Record every trial's digest AND the state of its append-only fields. Called by `save()`, which first refuses if the previous seal no longer holds."""
+    registry["integrity"] = {"scheme": "sha256-per-entry/2",
+                             "entries": {t["trial_id"]: entry_digest(t) for t in registry.get("trials", [])},
+                             "appended": {t["trial_id"]: _appended_state(t) for t in registry.get("trials", [])}}
 
 
 def verify(registry: Dict[str, Any], *, require_ids: Iterable[str] = ()) -> List[str]:
-    """Problems found, empty if none. Removal and alteration are named; so is a missing seal and any required id that is absent."""
+    """Problems found, empty if none. Removal and alteration are named; so is a missing seal, an append-only field that shrank or changed (evidence edited
+    or wiped, abandonment or supersession removed) and any required id that is absent."""
     problems: List[str] = []
     trials = {t.get("trial_id"): t for t in registry.get("trials", [])}
     block = registry.get("integrity")
     if not isinstance(block, dict) or not isinstance(block.get("entries"), dict):
         problems.append("registry is not sealed: no per-trial digests, so a removed or edited trial cannot be detected")
         sealed: Dict[str, str] = {}
+        appended: Dict[str, Any] = {}
     else:
         sealed = block["entries"]
+        appended = block.get("appended") if isinstance(block.get("appended"), dict) else {}      # absent in a v1 seal: adopted by the next save()
     for tid, dig in sealed.items():
         if tid not in trials:
             problems.append(f"trial {tid!r} was REMOVED after it was sealed")
         elif entry_digest(trials[tid]) != dig:
             problems.append(f"trial {tid!r} was ALTERED after it was sealed")
+    for tid, was in appended.items():
+        t = trials.get(tid)
+        if t is None:
+            continue
+        try:
+            now = _appended_state(t)
+        except (ValueError, TypeError):
+            problems.append(f"trial {tid!r} has an append-only field that cannot be read (NaN or non-JSON value)")
+            continue
+        for key in ("evidence", "amendments"):
+            if now[key][:len(was.get(key, []))] != was.get(key, []):
+                problems.append(f"trial {tid!r}: {key} was ALTERED or removed after it was sealed")
+        if was.get("abandoned") is not None and now["abandoned"] != was["abandoned"]:
+            problems.append(f"trial {tid!r}: abandonment was removed or changed after it was sealed")
+        if was.get("superseded_by") is not None and now["superseded_by"] != was["superseded_by"]:
+            problems.append(f"trial {tid!r}: supersession was removed or changed after it was sealed")
     for tid in trials:
         if sealed and tid not in sealed:
             problems.append(f"trial {tid!r} is not sealed (added without save())")
@@ -165,7 +196,13 @@ def load(path: Optional[str] = None, *, missing_ok: Optional[bool] = None) -> Di
     return doc
 
 
-def save(registry: Dict[str, Any], path: str = DEFAULT_PATH) -> None:
+def save(registry: Dict[str, Any], path: str = DEFAULT_PATH, *, accept_tampering: bool = False) -> None:
+    """Write the registry. REFUSES if the previous seal no longer holds (a removed/altered trial or shrunk evidence): re-sealing then would launder the
+    tampering into the new baseline (reproduced: any save() made verify() clean again). ``accept_tampering`` is the owner's explicit re-baseline."""
+    if isinstance(registry.get("integrity"), dict) and not accept_tampering:
+        broken = [p for p in verify(registry) if "not sealed" not in p]
+        if broken:
+            raise RegistryError(f"refusing to save over tampering (it would become the new baseline): {broken[:3]}")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     seal(registry)
     registry["git_commit"] = _provenance.git_commit(ROOT)
@@ -276,6 +313,8 @@ def add_evidence(registry: Dict[str, Any], trial_id: str, level: str, *, result:
     entry = _entry(registry, trial_id)
     if entry.get("abandoned"):
         raise ValueError(f"{trial_id!r} is abandoned; evidence cannot be added to it")
+    if entry.get("superseded_by"):
+        raise ValueError(f"{trial_id!r} is superseded by {entry['superseded_by']!r}; add the evidence to the trial that replaced it")
     item = {"level": level, "result": str(result), "provenance": str(provenance), "details": dict(details or {}), "recorded_utc": _now()}
     entry.setdefault("evidence", []).append(item)
     return item

@@ -102,3 +102,44 @@ def test_a_non_latching_breach_refuses_but_does_not_latch(tmp_path):
     latch = RP.RiskLatch(str(tmp_path / "latch.json"))
     d = RP.evaluate(POLICY, dataclasses.replace(GOOD, data_age_s=500.0))
     assert d.status == RP.REFUSE and latch.apply("s", d, at_ms=1).status == RP.REFUSE and not latch.is_suspended("s")[0]
+
+
+# ---------------------------------------------------------------- red-team reproductions (8c7a716)
+
+@pytest.mark.parametrize("field,bad", [("data_age_s", -1e9), ("unhedged_usd", -1e9), ("exposure_usd", -5.0), ("hold_hours", -1.0), ("margin_multiple", -3.0)])
+def test_a_negative_measurement_where_a_negative_is_impossible_is_a_broken_input_not_a_pass(field, bad):
+    d = RP.evaluate(POLICY, dataclasses.replace(GOOD, **{field: bad}))
+    assert d.status != RP.ALLOW and f"MISSING_INPUT:{field}" in d.reasons
+
+
+def test_negative_funding_is_a_legitimate_measurement_and_trips_its_minimum():
+    d = RP.evaluate(POLICY, dataclasses.replace(GOOD, recent_mean_funding_bps=-1.5))
+    assert "BREACH:min_recent_funding_bps" in d.reasons
+
+
+@pytest.mark.parametrize("approved", ["False", "yes", 1, "true", [], "0"])
+def test_only_the_boolean_true_approves(approved):
+    d = RP.evaluate(dataclasses.replace(POLICY, approved_by_owner=approved), GOOD)
+    assert d.status == RP.REFUSE and d.reasons == ("NO_APPROVED_POLICY",)
+
+
+@pytest.mark.parametrize("lim", ["max_data_age_s", "min_margin_multiple", "max_exposure_usd", "min_liquidity_usd"])
+def test_a_negative_limit_is_an_invalid_policy(lim):
+    d = RP.evaluate(dataclasses.replace(POLICY, **{lim: -1.0}), GOOD)
+    assert d.status != RP.ALLOW and f"POLICY_INVALID:{lim}" in d.reasons
+
+
+def test_a_malformed_latch_entry_still_suspends(tmp_path):
+    p = tmp_path / "latch.json"; p.write_text('{"s": "garbage"}')
+    assert RP.RiskLatch(str(p)).is_suspended("s") == (True, ("LATCH_ENTRY_UNREADABLE",))
+
+
+def test_concurrent_latches_on_different_strategies_are_both_kept(tmp_path):
+    import subprocess
+    path = str(tmp_path / "latch.json")
+    code = ("import sys; sys.path.insert(0, %r); import risk_policy as RP; l=RP.RiskLatch(%r); "
+            "l.apply(sys.argv[1], RP.Decision(RP.SUSPEND, ('BREACH:x',), ('BREACH:x',)), at_ms=1)" % (BOT, path))
+    procs = [subprocess.Popen([sys.executable, "-I", "-c", code, f"s{i}"]) for i in range(12)]
+    assert all(p.wait(timeout=120) == 0 for p in procs)
+    latch = RP.RiskLatch(path)
+    assert all(latch.is_suspended(f"s{i}")[0] for i in range(12))

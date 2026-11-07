@@ -118,3 +118,32 @@ def test_verify_catches_a_schema_version_change_and_warns_on_an_old_manifest(wor
     m = json.load(open(mp)); m["sha256"] = SB._sha256(bk); m.pop("max_rowid"); m.pop("user_version"); json.dump(m, open(mp, "w"))
     old = SB.verify(bk)
     assert old["ok"] and old["warnings"]                         # accepted, but never silently
+
+
+# ---------------------------------------------------------------- red-team reproductions (8c7a716)
+
+def test_a_failed_final_rename_puts_the_old_database_back(world, monkeypatch):
+    real_replace = os.replace
+    def boom(src, dst):
+        if os.path.basename(dst) == os.path.basename(world["live"]):
+            raise OSError("disk full")
+        return real_replace(src, dst)
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        SB.promote(world["restored"], world["live"], confirm_owner=True)
+    assert os.path.isfile(world["live"]) and rows(world["live"]) == 2                  # the live path is NOT left absent
+    assert not [f for f in os.listdir(os.path.dirname(world["live"])) if f.startswith(".promote-")]
+
+
+def test_a_manifest_that_is_valid_json_but_not_an_object_is_a_clean_refusal(world):
+    open(world["restored"] + SB.MANIFEST_SUFFIX, "w").write("[1, 2]")
+    assert SB.verify(world["restored"])["ok"] is False
+    with pytest.raises(SystemExit, match="does not verify"):
+        SB.promote(world["restored"], world["live"], confirm_owner=True)
+
+
+def test_promote_surfaces_the_legacy_manifest_warning(world):
+    mp = world["restored"] + SB.MANIFEST_SUFFIX
+    m = json.load(open(mp)); m.pop("max_rowid"); m.pop("user_version"); json.dump(m, open(mp, "w"))
+    res = SB.promote(world["restored"], world["live"], confirm_owner=True)
+    assert res["ok"] and res["warnings"]
