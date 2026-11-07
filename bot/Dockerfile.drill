@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir -r requirements.txt -c constraints.txt
 
 COPY bybit_connection.py capital_reservations.py carry_broker.py carry_capital.py close_executor.py close_plan.py close_policy.py \
      carry_costs.py carry_engine.py portfolio_state.py \
-     carry_risk.py carry_shadow.py config.py directional_funding.py features.py forward_status.py funding_reconcile.py ledger.py main.py \
+     carry_risk.py carry_shadow.py config.py entry_authority.py risk_policy.py directional_funding.py features.py forward_status.py funding_reconcile.py ledger.py main.py \
      market_data.py \
      market_snapshot.py memory.py ml_strategy.py operator_verdicts.py \
      order_lifecycle.py order_recovery.py persistence.py \

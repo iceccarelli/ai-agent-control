@@ -249,3 +249,30 @@ def _drill_entry_ledger_per_test(request, tmp_path, monkeypatch):
     with_ledger.__wrapped__ = original
     monkeypatch.setattr(drill, "claim_entry_slot", with_ledger)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _entry_authority_for_tests(request, monkeypatch):
+    """Opening orders now need an entry authority (a bare client refuses). Tests that are not ABOUT the authority get a permissive stand-in, defined HERE only: no permissive
+    authority exists in production code. A test of the real thing marks itself ``real_entry_authority`` and sees the production objects."""
+    if request.node.get_closest_marker("real_entry_authority"):
+        yield
+        return
+    import sys
+    bot = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if bot not in sys.path:
+        sys.path.insert(0, bot)
+    try:
+        import bybit_connection
+        import entry_authority
+    except Exception:                                              # noqa: BLE001
+        yield
+        return
+
+    class _PermissiveForTests:
+        def authorize(self, body, *, venue):
+            return None
+
+    monkeypatch.setattr(bybit_connection, "DEFAULT_ENTRY_AUTHORITY", _PermissiveForTests())
+    monkeypatch.setattr(entry_authority, "build_for_book", lambda **kw: _PermissiveForTests())
+    yield

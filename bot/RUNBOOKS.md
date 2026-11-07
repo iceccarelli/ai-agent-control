@@ -327,3 +327,16 @@ writes into the recorder's directory:
 overwritten or deleted. A backup is not proven until `restore-check` passes. Keep the manifest and receipts off the recorder's volume and record the printed head somewhere the
 recorder's host cannot write (a printed page, another account): the code cannot protect a manifest its own writer can rewrite. The recorder's default retention deletes depth-log
 segments after 2 days; do not rely on retention for evidence you have not backed up and restore-checked. Nothing here schedules itself; the schedule and the storage are yours.
+
+## The entry authority: why an opening order is refused, and what you must do (owner)
+Every order that can ADD exposure now passes one authority inside `BybitClient._request` (`entry_authority.py`), whoever the caller is: the carry book, `place_order`, the drills, the
+linear-stop drill, the unattended runner. A client with no authority refuses (`NO_ENTRY_AUTHORITY`). A reduce-only exit, and a spot sell, are not gated by it. The production book installs
+one that checks, in order: the venue, the persistent kill switch (read now; unreadable = engaged), your approved risk policy with MEASURED inputs (`risk_policy.py`), the order's notional cap,
+and a durable per-`orderLinkId` reservation (an identical resend passes, a different order under the same id is refused, at most 2 distinct unresolved entries).
+
+**Nothing is approved by default, so today the book refuses to open on testnet or mainnet.** The refusal reasons name what is missing: `NO_APPROVED_POLICY` until you write a policy file and
+point `RISK_POLICY_PATH` at it (JSON with every `risk_policy.Policy` field and `"approved_by_owner": true`; strict: the string "true" does not count, an unknown or missing field is "no policy");
+then `MISSING_INPUT:<name>` for every limit whose value the running book does not yet measure (only `operational_fault` is measured today; see `tools/risk_policy_proposal.py` for the
+unmeasured list). That is the intended fail-closed state: do not work around it by editing limits to match what is measured. A loss/hedge/fault breach latches the strategy SUSPENDED in
+`risk_latch.json` beside the state database; it survives restarts and clears only by `RiskLatch.clear(strategy, reason=..., at_ms=...)`, which records why. The reservation ledger
+(`entry_reservations.jsonl`, same directory) is evidence: do not delete it to "unblock" an entry. Paper and shadow runs send no orders, so they are unaffected.

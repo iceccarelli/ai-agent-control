@@ -167,6 +167,7 @@ jobs:
           tests/test_testnet_certificate.py
           tests/test_risk_policy.py
           tests/test_risk_policy_proposal.py
+          tests/test_entry_authority.py
           tests/test_state_backup_promote.py
           tests/test_execution_model.py
           tests/test_live_gate_recomputed.py

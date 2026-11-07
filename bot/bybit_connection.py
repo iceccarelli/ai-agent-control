@@ -140,6 +140,10 @@ VENUE_HOSTS = _venues.rest_hosts()
 #: to cancel an order on an unarmed mainnet client would be the unsafe choice.
 EXPOSURE_ENDPOINTS = frozenset({"/v5/order/create", "/v5/position/set-leverage"})
 
+#: The authority a client consults when it was given none of its own (see ``entry_authority``). None in production: a bare client REFUSES to open anything. Only the test
+#: suite's conftest sets it (to a permissive stand-in that exists nowhere in production code), and the tests of the guard itself opt out of that.
+DEFAULT_ENTRY_AUTHORITY: Any = None
+
 
 def resolve_client_venue(cfg: Any) -> str:
     """Which venue this config means, or a refusal. Never a guess.
@@ -460,6 +464,9 @@ class BybitClient:
         #: gate (tools that build their own client). A value that is not
         #: callable refuses every entry.
         self.entry_gate: Optional[Callable[[], Tuple[bool, str]]] = None
+        #: THE common authority for new exposure (entry_authority.EntryAuthority), consulted in ``_request`` for every exposure-increasing ``/v5/order/create``. None =
+        #: the module default (None in production) = a refusal: this client cannot open anything.
+        self.entry_authority: Any = None
 
         # The venue is resolved ONCE, centrally, and refused when the config
         # contradicts itself or states nothing (resolve_client_venue). USE_TESTNET
@@ -645,6 +652,24 @@ class BybitClient:
             f"{k}={v}" for k, v in params.items() if v is not None and v != ""
         )
 
+    def _authorize_new_exposure(self, body: Any) -> None:
+        """Every order that is not provably an exit passes the entry authority; a client without one refuses (``NO_ENTRY_AUTHORITY``). A reduce-only exit does not pass
+        through it and is not made weaker or stronger by it."""
+        import entry_authority as _ea
+        if not isinstance(body, dict):
+            raise PermanentAPIError("ENTRY_REFUSED: ORDER_BODY_NOT_AN_OBJECT")
+        if not _ea.increases_exposure(body):
+            return
+        authority = self.entry_authority if self.entry_authority is not None else DEFAULT_ENTRY_AUTHORITY
+        if authority is None:
+            logger.critical("order REFUSED at the transport: this client has no entry authority (%s)", self.venue)
+            raise PermanentAPIError("ENTRY_REFUSED: NO_ENTRY_AUTHORITY")
+        try:
+            authority.authorize(body, venue=self.venue)
+        except _ea.EntryRefused as exc:
+            logger.critical("order REFUSED at the transport by the entry authority: %s", ", ".join(exc.reasons))
+            raise PermanentAPIError(str(exc)) from exc
+
     def _request(
         self,
         method: str,
@@ -699,6 +724,7 @@ class BybitClient:
         # response was lost still left the process, and a session log that
         # under-counts those is the one that would lie.
         if endpoint == "/v5/order/create":
+            self._authorize_new_exposure(body)                     # the LAST responsible boundary: refuses BEFORE the count and before the transport
             self.orders_submitted += 1
         if (method == "GET" and endpoint in self.COOLDOWN_READ_ENDPOINTS
                 and time.monotonic() < self._read_cooldown_until.get(endpoint, 0.0)):
