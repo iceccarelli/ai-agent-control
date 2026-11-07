@@ -808,6 +808,9 @@ def is_live_authorized(cfg: Any = None) -> Tuple[bool, str]:
             use_testnet=cfg.USE_TESTNET, paper_trading=cfg.PAPER_TRADING,
             ack=cfg.LIVE_TRADING_ACK, api_key=cfg.BYBIT_API_KEY,
             api_secret=cfg.BYBIT_API_SECRET)
+        if derived is True and str(getattr(cfg, "BYBIT_VENUE", "")).strip().lower() not in _venues.live_names():
+            # A replace() onto a sandbox or unknown venue cannot keep live authority: the venue registry, not the flags, says what is real money.
+            return False, f"LIVE_BLOCKED: venue {getattr(cfg, 'BYBIT_VENUE', None)!r} is not a registered live venue"
         if cfg.LIVE_AUTHORIZED is True and derived is True:
             return True, cfg.LIVE_BLOCK_REASON
         if cfg.LIVE_AUTHORIZED is not True:
@@ -832,6 +835,9 @@ def is_live_authorized(cfg: Any = None) -> Tuple[bool, str]:
         api_key=str(get("BYBIT_API_KEY", "") or ""),
         api_secret=str(get("BYBIT_API_SECRET", "") or ""),
     )
+    venue = get("BYBIT_VENUE", None)
+    if authorized and venue is not None and str(venue).strip().lower() not in _venues.live_names():
+        return False, f"LIVE_BLOCKED: venue {venue!r} is not a registered live venue"
     return authorized, reason
 
 
@@ -879,6 +885,9 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
         use_testnet=use_testnet, paper_trading=paper_trading,
         ack=ack, api_key=api_key, api_secret=api_secret,
     )
+    if authorized and parse_choice(env, "CARRY_ENTRY_BENEFIT_MODE", "enforce", ("enforce", "observe")) == "observe":
+        # "observe" records what the net-benefit gate would refuse and enters anyway. Real money never runs on a gate that only watches.
+        raise ConfigError("CARRY_ENTRY_BENEFIT_MODE=observe is refused when live trading is authorised: the entry gate must enforce")
     if requested and not authorized:
         # Fail closed: degrade to paper rather than crash-loop or arm live.
         logger.warning("%s; loading in PAPER mode.", reason)
