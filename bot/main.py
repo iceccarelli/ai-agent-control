@@ -2376,9 +2376,10 @@ def _entry_mark(bot: Any, symbol: str) -> Optional[float]:
     return None
 
 
-def _entry_risk_state(bot: Any) -> "Any":
-    """The entry authority's risk inputs, from the authoritative RiskInputProvider: venue quantities and account state, the book's own snapshot, deterministic derivations. Anything it
-    cannot establish is None and risk_policy refuses on it. A provider that cannot even be built yields the fully-unknown state (every entry refused), never a default."""
+def _entry_risk_state(bot: Any, pending_notional_usd: Optional[float] = None) -> "Any":
+    """The entry authority's risk inputs, from the authoritative RiskInputProvider: venue quantities and account state, the book's own snapshot, deterministic derivations. Every
+    getter is STAMPED with the time it was read (a bare value is not accepted). Anything it cannot establish is None and risk_policy refuses on it. ``pending_notional_usd`` is the
+    order being decided, so the policy sees post-trade exposure. A provider that cannot be built yields the all-unknown state (every entry refused), never a default."""
     import risk_policy as _RP
     try:
         prov = getattr(bot, "_risk_input_provider", None)
@@ -2389,9 +2390,9 @@ def _entry_risk_state(bot: Any) -> "Any":
                 broker=getattr(c.broker, "inner", c.broker), perp_symbol=c.perp_symbol, spot_symbol=c.spot_symbol,
                 snapshot_getter=lambda: getattr(c, "snapshot", None),
                 opened_ms_getter=lambda: getattr(getattr(c, "position", None), "opened_ms", None),
-                halted_getter=lambda: (getattr(c.state, "name", str(c.state)) == "HALTED") if getattr(c, "state", None) is not None else None)
+                book_state_getter=lambda: (getattr(c, "state", None), int(time.time() * 1000)))
             bot._risk_input_provider = prov
-        return prov.state()
+        return prov.state(pending_notional_usd=pending_notional_usd)
     except Exception:                                              # noqa: BLE001 - never raise out of the authority's state read
         return _RP.State()
 
@@ -2631,7 +2632,7 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD) * _EA.NOTIONAL_TOLERANCE,
             mark_provider=lambda symbol: _entry_mark(bot, symbol),
             policy_path=(str(cfg.RISK_POLICY_PATH) or None),
-            state_provider=lambda: _entry_risk_state(bot),
+            state_provider=lambda pending_notional_usd=None: _entry_risk_state(bot, pending_notional_usd),
             require_risk_policy=True)
         # The staged close is built only from an OWNER-APPROVED close policy
         # (close_policy.py). Anything less leaves the original single-order

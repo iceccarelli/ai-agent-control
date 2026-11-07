@@ -123,45 +123,59 @@ def kill_switch_check(reader: Callable[[], Tuple[bool, str]]) -> Check:
     return check
 
 
-def notional_cap_check(max_usd: float, mark_provider: Optional[Callable[[str], Optional[float]]] = None) -> Check:
-    """The order's notional (qty x price) must be finite and within the cap. A market order has no price in the body: the mark is asked for; no price = refusal."""
-    def check(i: OrderIntent, _v: str) -> Optional[str]:
+def order_notional(i: OrderIntent, mark_provider: Optional[Callable[[str], Optional[float]]] = None) -> Tuple[Optional[Decimal], Optional[str]]:
+    """(worst-case notional in USD, refusal code). The worst case: a market order at the mark; a limit SELL at max(limit, mark) (a limit of '1' for 100 BTC must not read as $100); a limit
+    BUY at its own limit (it cannot fill above it). No usable price = a refusal, never a guess."""
+    try:
+        qty = Decimal(i.qty)
+        px = Decimal(i.price) if i.price else None
+    except (InvalidOperation, ValueError):
+        return None, "ORDER_QTY_OR_PRICE_UNPARSABLE"
+    if not qty.is_finite() or qty <= 0:
+        return None, "ORDER_QTY_INVALID"
+    mark: Optional[Decimal] = None
+    if mark_provider is not None:
         try:
-            qty = Decimal(i.qty)
-            px = Decimal(i.price) if i.price else None
-        except (InvalidOperation, ValueError):
-            return "ORDER_QTY_OR_PRICE_UNPARSABLE"
-        if not qty.is_finite() or qty <= 0:
-            return "ORDER_QTY_INVALID"
-        mark: Optional[Decimal] = None
-        if mark_provider is not None:
-            try:
-                m = mark_provider(i.symbol)
-            except Exception:                                      # noqa: BLE001
-                m = None
-            if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and m > 0:
-                mark = Decimal(str(m))
-        side = i.side.strip().lower()
-        if px is None:
-            px = mark                                              # a market order: priced at the mark
-        elif side == "sell":
-            # A limit SELL can fill at the best bid however low its limit: declaring price "1" must not make 100 BTC look like $100. Cost it at the larger of limit and mark.
-            if mark is None:
-                return "NO_PRICE_FOR_NOTIONAL"
-            px = max(px, mark)
-        # a limit BUY cannot fill above its limit: its own price is the worst case
-        if px is None or not px.is_finite() or px <= 0:
-            return "NO_PRICE_FOR_NOTIONAL"
-        return None if float(qty * px) <= float(max_usd) else "NOTIONAL_ABOVE_CAP"
+            m = mark_provider(i.symbol)
+        except Exception:                                          # noqa: BLE001
+            m = None
+        if isinstance(m, (int, float)) and not isinstance(m, bool) and math.isfinite(m) and m > 0:
+            mark = Decimal(str(m))
+    side = i.side.strip().lower()
+    if px is None:
+        px = mark
+    elif side == "sell":
+        if mark is None:
+            return None, "NO_PRICE_FOR_NOTIONAL"
+        px = max(px, mark)
+    if px is None or not px.is_finite() or px <= 0:
+        return None, "NO_PRICE_FOR_NOTIONAL"
+    return qty * px, None
+
+
+def notional_cap_check(max_usd: float, mark_provider: Optional[Callable[[str], Optional[float]]] = None) -> Check:
+    """The order's notional must be finite and within the cap (see ``order_notional``)."""
+    def check(i: OrderIntent, _v: str) -> Optional[str]:
+        notional, why = order_notional(i, mark_provider)
+        if notional is None:
+            return why
+        return None if float(notional) <= float(max_usd) else "NOTIONAL_ABOVE_CAP"
     return check
 
 
-def risk_policy_check(provider: Callable[[], Tuple[Optional[RP.Policy], RP.State]], latch: Optional[RP.RiskLatch], strategy: str,
-                      clock: Callable[[], float] = time.time) -> Check:
-    """The owner-approved policy with measured inputs; a latched suspension refuses. ``provider`` failing refuses (no policy = NO_APPROVED_POLICY)."""
-    def check(_i: OrderIntent, _v: str) -> Optional[str]:
+def risk_policy_check(provider: Callable[..., Tuple[Optional[RP.Policy], RP.State]], latch: Optional[RP.RiskLatch], strategy: str,
+                      clock: Callable[[], float] = time.time,
+                      pending_notional: Optional[Callable[[OrderIntent], Optional[float]]] = None) -> Check:
+    """The owner-approved policy with measured inputs; a latched suspension refuses. ``provider`` failing refuses (no policy = NO_APPROVED_POLICY). The policy is evaluated on
+    POST-trade exposure: the provider is handed this order's own worst-case notional (``pending_notional``); a notional that cannot be established is passed as NaN so the
+    provider reports exposure UNKNOWN rather than ignoring the order."""
+    def check(i: OrderIntent, _v: str) -> Optional[str]:
         try:
-            policy, state = provider()
+            if pending_notional is not None:
+                pend = pending_notional(i)
+                policy, state = provider(float("nan") if pend is None else pend)
+            else:
+                policy, state = provider()
         except Exception:                                          # noqa: BLE001
             return "RISK_STATE_UNAVAILABLE"
         decision = RP.evaluate(policy, state)
@@ -303,11 +317,19 @@ def build_for_book(*, venue: str, store: Any, state_dir: Optional[str], max_noti
     reader = getattr(store, "is_kill_switch_engaged", None)
     checks.append(kill_switch_check(reader) if callable(reader) else (lambda _i, _v: "KILL_SWITCH_UNREADABLE"))
     if require_risk_policy:
-        sp = state_provider or (lambda: RP.State())
+        sp = state_provider or (lambda pending_notional_usd=None: RP.State())
 
-        def provider() -> Tuple[Optional[RP.Policy], RP.State]:
-            return load_policy(policy_path), sp()
-        checks.append(risk_policy_check(provider, latch, strategy))
+        def provider(pending: Optional[float] = None) -> Tuple[Optional[RP.Policy], RP.State]:
+            try:
+                state = sp(pending_notional_usd=pending)
+            except TypeError:                                      # a legacy zero-argument provider: it cannot see the pending order (and says so by not using it)
+                state = sp()
+            return load_policy(policy_path), state
+
+        def pend(i: OrderIntent) -> Optional[float]:
+            n, _why = order_notional(i, mark_provider)
+            return None if n is None else float(n)
+        checks.append(risk_policy_check(provider, latch, strategy, pending_notional=pend))
     checks.append(notional_cap_check(max_notional_usd, mark_provider))
     checks.append(reservation_check(ReservationStore(os.path.join(state_dir, "entry_reservations.jsonl"))))
     return EntryAuthority(checks, name=f"book:{venue}")
