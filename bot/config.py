@@ -616,6 +616,9 @@ class Config:
     #: what it WOULD refuse and lets the entry continue (an explicit operator
     #: choice for gathering evidence). Anything else is rejected at load.
     CARRY_ENTRY_BENEFIT_MODE: str = "enforce"
+    #: Path of the OWNER-APPROVED risk policy (JSON; see entry_authority.load_policy). Empty/missing/malformed = no approved policy = every exposure-increasing order is
+    #: refused on a venue that can hold exposure. The loader never supplies one and nothing sets ``approved_by_owner`` for the owner.
+    RISK_POLICY_PATH: str = ""
     #: Share of the expected funding income not believed, in [0, 1]. The gate
     #: already requires the net benefit to exceed one sigma of that income's
     #: uncertainty; this is an extra operator-owned haircut, 0 unless set.
@@ -1078,6 +1081,7 @@ def load(env: Optional[Mapping[str, str]] = None) -> Config:
             env, "CARRY_OPPORTUNITY_COST_APR", 0.0, low=0.0, high=1.0),
         CARRY_OPPORTUNITY_COST_APR_SUPPLIED=bool(
             str(env.get("CARRY_OPPORTUNITY_COST_APR") or "").strip()),
+        RISK_POLICY_PATH=parse_str(env, "RISK_POLICY_PATH", ""),
         CARRY_ENTRY_BENEFIT_MODE=parse_choice(
             env, "CARRY_ENTRY_BENEFIT_MODE", "enforce", ("enforce", "observe")),
         CARRY_INCOME_HAIRCUT_FRACTION=parse_float(

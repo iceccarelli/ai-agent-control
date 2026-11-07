@@ -99,7 +99,13 @@ class LiveFeedBroker:
     def get_funding_bps(self, symbol: str) -> float:
         """The venue's forecast funding rate for the next settlement, in bps."""
         self._check_symbol(symbol, self.perp_symbol)
-        return self._need(self._current().funding_rate, "funding_rate") * 1e4
+        view = self._current()
+        # The rate is per SETTLEMENT and the engine's economics assume the 8-hour one (as carry_broker.get_funding_bps already enforces on the REST path). A feed
+        # that states another interval, or none, is refused rather than priced as if it were 8h.
+        interval = view.funding_interval_h
+        if isinstance(interval, bool) or interval != 8:
+            raise S.MarketUnusable(S.ENTRY, [f"funding_interval:NOT_8H({interval!r})"])
+        return self._need(view.funding_rate, "funding_rate") * 1e4
 
     def get_funding_print(self, symbol: str):
         """The last SETTLED print (bps, settlement ms), from REST history. Raises

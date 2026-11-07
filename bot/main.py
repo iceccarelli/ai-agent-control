@@ -36,6 +36,7 @@ positions on top of forgotten ones.
 from __future__ import annotations
 
 import json
+import os
 import logging
 import signal
 import sys
@@ -2363,6 +2364,29 @@ def build_close_executor(cfg: Any, store: Any, broker: Any) -> Optional[Any]:
         policy_factory=planner_policy, absence_window_s=window)
 
 
+def _entry_mark(bot: Any, symbol: str) -> Optional[float]:
+    """The book's own current mark for the symbol an order names (a market order carries no price). None = unknown = the authority refuses."""
+    snap = getattr(getattr(bot, "carry", None), "snapshot", None)
+    if snap is None:
+        return None
+    if symbol == getattr(bot.carry, "perp_symbol", None):
+        return getattr(snap, "perp_mark", None)
+    if symbol == getattr(bot.carry, "spot_symbol", None):
+        return getattr(snap, "spot_mark", None)
+    return None
+
+
+def _entry_risk_state(bot: Any) -> "Any":
+    """The risk inputs this book can honestly MEASURE now. Everything else is None, and risk_policy refuses on a missing input: so an approved policy still blocks entry
+    until the corresponding measurement exists. That is the intended present state, not a defect to paper over with defaults."""
+    import risk_policy as _RP
+    carry = getattr(bot, "carry", None)
+    halted = None
+    if carry is not None and getattr(carry, "state", None) is not None:
+        halted = getattr(carry.state, "name", str(carry.state)) == "HALTED"
+    return _RP.State(operational_fault=halted)
+
+
 def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> TradingBot:
     """Construct the stack in dependency order.
 
@@ -2587,6 +2611,19 @@ def build_bot(attach_strategy: Optional[bool] = None, **overrides: Any) -> Tradi
         bot.carry.pair_risk = CarryRisk(
             store=bot.store,
             max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD))
+        # THE COMMON ENTRY AUTHORITY (entry_authority.py), installed on the client every order passes through. Without it the client refuses to open anything; with it
+        # the persistent kill switch, the owner-approved risk policy (measured inputs; none approved = refusal), the order's notional cap and a durable per-orderLinkId
+        # reservation are all evaluated at the last boundary before the transport, whoever the caller is.
+        import entry_authority as _EA
+
+        bot.client.entry_authority = _EA.build_for_book(
+            venue=bot.client.venue, store=bot.store,
+            state_dir=(os.path.dirname(os.path.abspath(str(cfg.STATE_DB_PATH))) if cfg.STATE_DB_PATH else None),
+            max_notional_usd=float(_shadow.SHADOW_MAX_NOTIONAL_USD) * _EA.NOTIONAL_TOLERANCE,
+            mark_provider=lambda symbol: _entry_mark(bot, symbol),
+            policy_path=(str(cfg.RISK_POLICY_PATH) or None),
+            state_provider=lambda: _entry_risk_state(bot),
+            require_risk_policy=True)
         # The staged close is built only from an OWNER-APPROVED close policy
         # (close_policy.py). Anything less leaves the original single-order
         # close exactly as it was; the reason is logged, never defaulted.

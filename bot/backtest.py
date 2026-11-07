@@ -675,6 +675,17 @@ from carry_costs import TAKER_BPS_PERP as PERP_TAKER_FEE_BPS  # noqa: E402
 PERP_MAKER_FEE_BPS = 2.0
 
 
+class SimulatedVenueAuthority:
+    """Entry authority for a client whose transport is an in-process simulated exchange (backtest/replay). Approves because nothing can leave the process; the binding
+    to ``exchange`` is enforced by ``BybitClient._authorize_new_exposure`` (``bound_transport``), so this object is inert on a real transport."""
+
+    def __init__(self, exchange: Any) -> None:
+        self.bound_transport = exchange
+
+    def authorize(self, body: Any, *, venue: str) -> None:
+        return None
+
+
 class PositionReconciliationError(RuntimeError):
     """The simulated venue's position and the caller's book disagree."""
 
@@ -1973,6 +1984,9 @@ class Backtester:
         self._clock_exchange = exchange
         store = StateStore(self.db_path)
         client = BybitClient(config=view, store=store, transport=exchange)
+        # The backtester trades an IN-PROCESS simulated exchange: no order can reach a venue. Its authority is bound to that exact transport object, and BybitClient
+        # refuses a bound authority on any other transport, so it cannot be reused to open exposure anywhere real.
+        client.entry_authority = SimulatedVenueAuthority(exchange)
         client.book_feed_required = False      # replay: no recorded book = no feed
         risk = BillionaireRiskManager(config=view, store=store)
         sizer = BillionairePositionSizing(config=view, risk_manager=risk)

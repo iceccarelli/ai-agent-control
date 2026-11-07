@@ -452,6 +452,10 @@ class MarketState:
                 perp_ticker_ok, why = False, f"STALE_{tage:.1f}s:{','.join(stale)}"
             elif f["nextFundingTime"] < now_wall_ms - p.funding_rollover_grace_s * 1000:
                 perp_ticker_ok, why = False, "FUNDING_TIME_IN_THE_PAST"
+            elif "fundingCap" in f and not f["fundingCap"] > 0:
+                perp_ticker_ok, why = False, "FUNDING_CAP_UNUSABLE"          # same refusal as carry_broker.get_funding_bps
+            elif "fundingCap" in f and abs(f["fundingRate"]) > f["fundingCap"] * (1.0 + 1e-9):
+                perp_ticker_ok, why = False, "FUNDING_BEYOND_CAP"            # a rate past its own cap is a unit slip / wrong field
         statuses.append(ComponentStatus("perp_ticker", perp_ticker_ok, why, tage))
 
         skew, skew_why = self.clock_status()

@@ -928,6 +928,8 @@ class CarryBroker:
         Anything without a venue retCode - a timeout, a connection reset, a
         5xx, a garbled 200 - leaves the order's fate open.
         """
+        if getattr(exc, "not_sent", False) is True:
+            return True        # refused locally before any byte left the process: its fate is KNOWN (it does not exist at the venue)
         try:
             code = int(getattr(exc, "ret_code", 0) or 0)
         except (TypeError, ValueError):
