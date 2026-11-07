@@ -67,3 +67,26 @@ def test_an_old_deploy_gap_stays_in_the_list_but_does_not_make_todays_evidence_d
     recent = series(base_row(), 3, lambda T, t: 0.6, lambda T: 0.6, skip=lambda i, t: 150 <= i <= 180)    # a 2.5 h hole inside the last day
     r2 = RR.report(recent, now_ms=recent[-1]["at_ms"] + 60_000)
     assert r2["verdict"] == "DEGRADED" and r2["recent_gap"] is True
+
+
+# ---------------------------------------------------------------- duplicates and ordering (reproduced: duplicates masked a gap; unsorted input gave a negative window)
+
+def _rows_at(ks, cadence_s=300.0, base=1_700_000_000_000):
+    return [{"at_ms": int(base + k * cadence_s * 1000), "times": {}, "recorder": {}} for k in ks]
+
+
+def test_duplicate_rows_do_not_count_as_completeness_and_are_reported():
+    import recorder_reliability as RR
+    ks = [0, 1, 1, 1, 1, 4, 5]
+    now = 1_700_000_000_000 + 5 * 300_000 + 1000
+    rep = RR.report(_rows_at(ks), now_ms=now)
+    assert rep["duplicate_rows"] == 3 and rep["completeness"] < 1.0 and rep["verdict"] == "DEGRADED"
+    clean = RR.report(_rows_at([0, 1, 2, 3, 4, 5]), now_ms=now)               # positive control
+    assert clean["verdict"] == "HEALTHY" and clean["duplicate_rows"] == 0 and clean["completeness"] == 1.0
+
+
+def test_unsorted_rows_are_ordered_before_judging_and_flagged():
+    import recorder_reliability as RR
+    now = 1_700_000_000_000 + 2 * 300_000 + 1000
+    rep = RR.report(_rows_at([2, 0, 1]), now_ms=now)
+    assert rep["window_hours"] > 0 and rep["last_row_age_s"] < 5 and rep["rows_out_of_order"] is True and rep["verdict"] == "DEGRADED"

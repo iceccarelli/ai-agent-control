@@ -312,3 +312,18 @@ The armed drill (`tools/drill.py --arm`, and the unattended runner that calls it
 the scratch database it runs on cannot hold a kill switch), and a second armed entry on the same UTC day **across processes**
 (`--entry-ledger`, required with `--arm`; the unattended runner uses `<run root>/drill_entries.jsonl`; a slot is spent when claimed and not returned if the run fails).
 The unattended runner therefore makes at most one armed drill per UTC day. The drill is still off unless you enable it, and nothing here enables it.
+
+## The market-data log: seal, back up, restore-check (owner-run; offline)
+The recorder's `md-YYYYMMDD.db` segments are hash-chained inside each file, but nothing outside a file remembered how far it got: deleting the newest records of a segment passed
+`MarketStore.verify()` and the writer resumed at the shortened end (reproduced). `tools/md_seal.py` is the outside memory and the tested copy. It opens segments read-only and never
+writes into the recorder's directory:
+
+    python3 tools/md_seal.py seal          --dir <MD_DIR> --manifest <OTHER-VOLUME>/manifest.jsonl     # run at least daily; append-only, chained
+    python3 tools/md_seal.py check         --dir <MD_DIR> --manifest <OTHER-VOLUME>/manifest.jsonl     # TRUNCATED / MISSING / ALTERED against EVERY earlier seal
+    python3 tools/md_seal.py backup        --dir <MD_DIR> --to <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl
+    python3 tools/md_seal.py restore-check --backup <OFF-VOLUME-DIR> --receipts <OTHER-VOLUME>/receipts.jsonl
+
+`backup` copies only closed days (before today UTC), re-hashes and re-opens each copy and writes a receipt only if it recomputes; a failed copy is set aside as `.REJECTED`, nothing is
+overwritten or deleted. A backup is not proven until `restore-check` passes. Keep the manifest and receipts off the recorder's volume and record the printed head somewhere the
+recorder's host cannot write (a printed page, another account): the code cannot protect a manifest its own writer can rewrite. The recorder's default retention deletes depth-log
+segments after 2 days; do not rely on retention for evidence you have not backed up and restore-checked. Nothing here schedules itself; the schedule and the storage are yours.
