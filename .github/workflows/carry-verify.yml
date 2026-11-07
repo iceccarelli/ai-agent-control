@@ -180,6 +180,8 @@ jobs:
           tests/test_risk_input_provider.py
           tests/test_order_path_inventory.py
           tests/test_market_collector.py
+          tests/test_economic_model.py
+          tests/test_economic_faults.py
           tests/test_md_broker_funding_interval.py
           tests/test_entry_authority_e2e.py
           tests/test_state_backup_promote.py
