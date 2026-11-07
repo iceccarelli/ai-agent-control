@@ -115,3 +115,10 @@ def test_the_console_reports_the_offline_testnet_qualification_but_never_certifi
     assert t["offline_qualification"] in ("PASS", "FAIL") and "testnet_offline=" in rep["headline"]
     armed = OC.build(LIVE, now_ms=LATER)["testnet"]
     assert armed["offline_qualification"] == "FAIL" and armed["failing_probes"]
+
+
+def test_the_console_shows_the_risk_policy_as_proposed_and_not_active():
+    r = OC.build({}, now_ms=LATER)["risk"]
+    assert r["status"] == OC.ESTIMATED and r["policy_active"] is False and r["evaluation_without_an_approved_policy"] == ("NO_APPROVED_POLICY",)
+    assert "OWNER DECISION REQUIRED" in r["decision"] and "per_trade_loss_usd" in r["unmeasured_limits"]
+    assert 0.0 <= r["share_of_history_below_hurdle_requirement"] <= 1.0

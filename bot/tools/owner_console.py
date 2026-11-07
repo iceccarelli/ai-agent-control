@@ -132,6 +132,22 @@ def section_testnet(env: Mapping[str, str]) -> Dict[str, Any]:
             "note": "guard logic only; see tools/testnet_certificate.py for the bounded plan the owner would authorise"}
 
 
+def section_risk() -> Dict[str, Any]:
+    """The risk policy is PROPOSED, not active: no limit is owner-approved, so ``risk_policy.evaluate`` refuses everything. Shows the data-derived proposals."""
+    import risk_policy as RP
+    import risk_policy_proposal as RPP
+    try:
+        prop = RPP.propose(RPP.load_bps(RPP.DEFAULT_FUNDING), notional_usd=100.0)
+    except (OSError, ValueError, KeyError) as exc:
+        return {"status": UNAVAILABLE, "why": f"no proposal could be derived ({type(exc).__name__})", "policy_active": False}
+    bal = next(o for o in prop["strategy_drawdown_funding_only"]["options"] if o["setting"] == "balanced")
+    return {"status": ESTIMATED, "policy_active": False, "evaluation_without_an_approved_policy": RP.evaluate(None, RP.State()).reasons,
+            "proposed_strategy_drawdown_bps_balanced": bal["strategy_drawdown_limit_bps_of_notional"],
+            "proposed_max_hold_days": prop["max_hold"]["recommended_days"], "break_even_days_at_last_365d_mean": prop["max_hold"]["break_even_days"],
+            "share_of_history_below_hurdle_requirement": prop["persistent_shortfall"]["share_of_history_below_required_trailing_90_prints"],
+            "unmeasured_limits": prop["unmeasured_limits"], "decision": prop["decision"]}
+
+
 def section_pnl() -> Dict[str, Any]:
     return {"actual_realised": {"status": UNAVAILABLE, "why": "no owner-account export is supplied to this read-out; run tools/owner_ledger.py on an export you hold"},
             "modelled": {"status": ESTIMATED, "why": "any carry figure from the research tools is a model, never a result; keep it apart from the actual line above"}}
@@ -140,7 +156,7 @@ def section_pnl() -> Dict[str, Any]:
 def build(env: Mapping[str, str], *, funding: Optional[str] = None, backup: Optional[str] = None, now_ms: Optional[int] = None) -> Dict[str, Any]:
     now = _now_ms() if now_ms is None else min(int(now_ms), _now_ms())          # a caller can only move the clock earlier
     rep = {"environment": section_environment(env), "evidence": section_evidence(funding, now), "capital": section_capital(),
-           "eligibility": section_eligibility(env), "testnet": section_testnet(env), "backup": section_backup(backup), "pnl": section_pnl(), "as_of_ms": now}
+           "eligibility": section_eligibility(env), "testnet": section_testnet(env), "risk": section_risk(), "backup": section_backup(backup), "pnl": section_pnl(), "as_of_ms": now}
     for k, v in rep.items():
         if isinstance(v, dict) and "status" in v and v["status"] not in STATUSES:
             raise AssertionError(f"section {k} has a status outside the vocabulary")
