@@ -1,0 +1,93 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "later orders only; the timeout/offset grid is frozen first"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": true,
+    "hedge_completeness_modelled": true,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": true,
+    "point_in_time_universe": true
+  },
+  "candidate_id": "passive_execution@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 1000.0,
+    "note": "execution layer; capacity is the host strategy's"
+  },
+  "counterparty": "takers crossing our resting order; the fill-conditioned drift is the cost",
+  "drawdown_model": "implementation shortfall distribution vs immediate-cross benchmark; not measured",
+  "economic_mechanism": "Counterparty: the taker who crosses against our resting order pays the spread; we pay in opportunity cost when price runs away and in adverse selection when we are filled just before it moves. An execution-cost saving, not an alpha: it can only improve another strategy's net edge, and the saving shrinks to nothing when fill-conditional price drift is adverse.",
+  "eligibility_rules": [
+    "only attached to an upstream strategy that already has a counted net edge",
+    "post-only orders only"
+  ],
+  "entry": "post-only at touch with a registered re-quote and give-up rule",
+  "execution_model": "post-only limit with a timeout-cross fallback",
+  "exit": "cross after the give-up timeout",
+  "family": "passive_execution",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "provenance": "assumed",
+      "value": 5.5
+    }
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.05
+    }
+  },
+  "holding_period": "seconds to minutes per order",
+  "hypothesis": "Working entries/exits passively (post-only) instead of crossing saves more in avoided spread and fees than it loses in missed or adverse fills.",
+  "multiple_testing_family": "passive_execution",
+  "prospective_protocol": "paired comparison on testnet mechanics then owner-account fills, same decisions executed both ways",
+  "rejection_conditions": [
+    "no measured fill outcomes exist for passive orders",
+    "implementation shortfall vs immediate-cross benchmark not lower after counting unfilled orders as cost",
+    "adjusted p-value above 0.05",
+    "benefit disappears when unfilled orders are charged the subsequent price move",
+    "net saving after measured fees not positive"
+  ],
+  "required_data": [
+    {
+      "gap": "testnet mechanics evidence only; no measured passive-fill history",
+      "name": "order-by-order outcomes at the venue: fills, cancels, timestamps, fees",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "gap": "snapshots only",
+      "name": "concurrent L2 book/trades for the same windows",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "gap": "assumed",
+      "name": "maker/taker fee as charged to the account",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "missed fills leave the host strategy unhedged; the fallback cross may be at a worse price than crossing at once",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 1.0
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 1.0
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. bias_declarations state what the protocol must rule out before any evidence counts, not that it has been ruled out."
+}

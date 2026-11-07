@@ -1,0 +1,93 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "later days of the recorded book/trade tape"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": true,
+    "hedge_completeness_modelled": true,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": true,
+    "point_in_time_universe": true
+  },
+  "candidate_id": "spread_microstructure@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 10000.0,
+    "note": "tiny; edge, not size, is the question"
+  },
+  "counterparty": "liquidity takers crossing the spread; informed flow is the loss side",
+  "drawdown_model": "inventory mark-to-market; not measured",
+  "economic_mechanism": "Counterparty: impatient takers who pay the spread; informed takers who win against stale quotes are the adverse-selection cost and usually exceed the spread for a slow, small participant. Persists for fast, well-queued makers; disappears for anyone slower than the informed flow, which describes this repo's latency (REST, no co-location).",
+  "eligibility_rules": [
+    "spread wider than 2 * (maker fee + expected adverse selection)",
+    "instrument depth stated"
+  ],
+  "entry": "post both sides at registered offsets",
+  "execution_model": "passive limit orders, queue position modelled from real depth",
+  "exit": "inventory limit or time stop, cross to flatten",
+  "family": "spread_microstructure",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "provenance": "assumed",
+      "value": 5.5
+    }
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.1
+    }
+  },
+  "holding_period": "seconds to minutes",
+  "hypothesis": "A market maker quoting both sides captures the bid-ask spread net of adverse selection and inventory cost.",
+  "multiple_testing_family": "spread_microstructure",
+  "prospective_protocol": "forward shadow quoting with measured fills before any order",
+  "rejection_conditions": [
+    "no trade tape: fills cannot be simulated honestly, the test is refused",
+    "realised spread minus adverse selection at the modelled horizon not positive",
+    "adjusted p-value above 0.05",
+    "fill rate depends on optimistic queue assumptions",
+    "net edge after measured maker fee not positive"
+  ],
+  "required_data": [
+    {
+      "gap": "only periodic snapshots/quotes; no tick trade tape",
+      "name": "L2 book plus trade-by-trade history with exchange timestamps",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "gap": "none",
+      "name": "own order latency and queue position measurements",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "gap": "venue_fees assumptions only",
+      "name": "maker fee/rebate schedule as measured on the account",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "adverse selection; inventory accumulation in a trend; stale quotes on a connection fault",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 1.0
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. bias_declarations state what the protocol must rule out before any evidence counts, not that it has been ruled out."
+}

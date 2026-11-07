@@ -1,0 +1,93 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "later period of the aligned two-venue history"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": true,
+    "hedge_completeness_modelled": true,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": true,
+    "point_in_time_universe": true
+  },
+  "candidate_id": "cross_venue_funding@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 50000.0,
+    "note": "two margin accounts must each cover the move; transfer cost not modelled"
+  },
+  "counterparty": "longs on the high-funding venue; venue-specific funding formula, not a person",
+  "drawdown_model": "per-venue margin drawdown; not measured",
+  "economic_mechanism": "Counterparty: longs on the high-funding venue pay; the long on the low-funding venue receives or pays less. Persists because capital and margin are fragmented across venues and transfers take time; disappears as arbitrageurs move collateral, and is capped by withdrawal friction, venue counterparty risk and different funding clocks and caps.",
+  "eligibility_rules": [
+    "both venues registered order-capable in bot/venues.py (currently only Bybit is)",
+    "same symbol, same notional"
+  ],
+  "entry": "open opposite perps when the as-of funding gap exceeds a registered threshold",
+  "execution_model": "two venues, taker, legs not atomic; second venue is outside this repo's order-capable set",
+  "exit": "gap closes, or either venue's margin buffer falls below a registered floor",
+  "family": "cross_venue_funding",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "provenance": "assumed",
+      "value": 5.5
+    }
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.4
+    }
+  },
+  "holding_period": "registered number of settlements",
+  "hypothesis": "The same perpetual pays different funding on two venues; short the higher, long the lower, and the gap exceeds costs.",
+  "multiple_testing_family": "cross_venue_funding",
+  "prospective_protocol": "forward observation of the funding gap on both venues; no trading on a venue not qualified by the owner",
+  "rejection_conditions": [
+    "no second order-capable venue is qualified (hard stop: strategy is untradeable by this repo)",
+    "gap net of two-venue costs and transfer friction not positive",
+    "adjusted p-value above 0.05",
+    "gap explained by differing funding formulas/caps rather than a persistent imbalance",
+    "funding clocks cannot be aligned to the same settlement"
+  ],
+  "required_data": [
+    {
+      "gap": "BTC on Binance and Bybit exists; different intervals and no collateral-transfer cost data",
+      "name": "funding history for the same symbol on two venues, aligned to settlement clocks",
+      "point_in_time": true,
+      "repo_has": true
+    },
+    {
+      "gap": "owner has a Bybit account only; second venue is unqualified (venues.py)",
+      "name": "per-venue fees, margin, withdrawal and transfer cost/latency",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "gap": "none",
+      "name": "per-venue depth",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "venue default/withdrawal halt; margin on the losing leg during a squeeze; funding clock mismatch",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 2.5
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 2.5
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. bias_declarations state what the protocol must rule out before any evidence counts, not that it has been ruled out."
+}

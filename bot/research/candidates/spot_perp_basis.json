@@ -1,0 +1,93 @@
+{
+  "OOS_protocol": {
+    "data_window": "to be fixed in the registration before any data is read",
+    "method": "purged+embargoed walk-forward (tools/research_harness.walk_forward_folds), embargo >= label horizon",
+    "min_independent_observations": {
+      "historical_test": 100,
+      "oos_test": 50
+    },
+    "train_test_boundary": "final holdout window never used for threshold selection"
+  },
+  "bias_declarations": {
+    "fills_modelled_against_real_depth": true,
+    "hedge_completeness_modelled": true,
+    "no_future_funding_knowledge": true,
+    "no_look_ahead": true,
+    "point_in_time_universe": true
+  },
+  "candidate_id": "spot_perp_basis@spec-1",
+  "capacity_model": {
+    "min_viable_capacity_usd": 25000.0,
+    "note": "limited by the thinner of spot and perp depth; borrow for spot shorts not available to the owner"
+  },
+  "counterparty": "leveraged perp traders paying a premium/discount; forced liquidations at extremes",
+  "drawdown_model": "mark-to-market basis drawdown measured on synchronised prices",
+  "economic_mechanism": "Counterparty: the leveraged directional trader who pays a premium to be long through the perp (or discount to be short) and the liquidation-driven flow at extremes. Persists while perp leverage demand outstrips arbitrage balance sheet; disappears as basis desks compete, and when basis widens further before converging (mark-to-market and margin risk on the hedge).",
+  "eligibility_rules": [
+    "BTC and ETH only until a larger PIT universe exists",
+    "both legs tradable at the timestamp"
+  ],
+  "entry": "enter when basis z-score (trailing, as-of) exceeds a registered threshold: long spot/short perp (positive basis) or the reverse where spot shorting is available",
+  "execution_model": "taker perp + taker spot; legs not atomic: leg risk modelled",
+  "exit": "basis back inside a registered band or a time stop",
+  "family": "spot_perp_basis",
+  "fee_model": {
+    "maker_bps": {
+      "provenance": "assumed",
+      "value": 2.0
+    },
+    "taker_bps": {
+      "provenance": "assumed",
+      "value": 6.0
+    }
+  },
+  "funding_model": {
+    "expected_bps_per_settlement": {
+      "provenance": "assumed",
+      "value": 0.3
+    }
+  },
+  "holding_period": "hours to days (registered)",
+  "hypothesis": "The perp-minus-spot basis mean-reverts after dislocations beyond costs.",
+  "multiple_testing_family": "spot_perp_basis",
+  "prospective_protocol": "register thresholds then observe forward basis excursions and fills on testnet mechanics",
+  "rejection_conditions": [
+    "no synchronised spot/perp data of at least 1-minute resolution exists for the test window",
+    "adjusted p-value above 0.05",
+    "net edge after assumed costs not positive",
+    "profit concentrated in fewer than 5 independent excursions",
+    "basis widens beyond the stop in more than a registered share of entries"
+  ],
+  "required_data": [
+    {
+      "gap": "spot BTC 1h/4h OHLCV and Bybit linear 1d exist; not synchronised tick or 1m",
+      "name": "synchronised spot and perp mid/mark prices at settlement and intra-8h",
+      "point_in_time": true,
+      "repo_has": false
+    },
+    {
+      "gap": "BTC/ETH/SOL Binance; BTC Bybit",
+      "name": "perp funding history",
+      "point_in_time": true,
+      "repo_has": true
+    },
+    {
+      "gap": "BTC/ETH spot L2 only; no perp book history",
+      "name": "spot and perp L2 depth",
+      "point_in_time": true,
+      "repo_has": false
+    }
+  ],
+  "risk_model": "basis widens before it converges; perp margin calls on the short leg; spot custody",
+  "slippage_model": {
+    "entry_bps": {
+      "provenance": "assumed",
+      "value": 3.0
+    },
+    "exit_bps": {
+      "provenance": "assumed",
+      "value": 3.0
+    }
+  },
+  "status_note": "SPECIFICATION ONLY. Nothing has been tested; this is not a winner. bias_declarations state what the protocol must rule out before any evidence counts, not that it has been ruled out."
+}
