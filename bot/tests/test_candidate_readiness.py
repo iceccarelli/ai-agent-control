@@ -970,8 +970,10 @@ def test_the_holding_grid_is_non_overlapping_day_aligned_and_inside_the_data():
 
 def test_the_row_requirement_states_exactly_what_window_yields_60_rows():
     r = CR.grid_requirements(formation_days=30, hold_days=7, min_rows=60, span_days=100)
-    assert r["holding_span_days_required"] == 420 and r["window_days_required"] == 450 and r["shortfall_days"] == 350 and r["rows_possible_by_calendar"] == 10
-    assert "450 days" in r["statement"] and "60 non-overlapping 7-day" in r["statement"]
+    assert r["holding_span_days_required"] == 420 and r["window_days_required"] == 457 and r["shortfall_days"] == 357 and r["rows_possible_by_calendar"] == 9
+    assert "457 days" in r["statement"] and "60 non-overlapping 7-day" in r["statement"] and "warmup 7" in r["statement"]
+    import backfill_plan as BP                                                                     # the number is backfill_plan's, not a second derivation
+    assert BP.required_window(None, 1, 30, 7, 60, 7)["needed_days"] == r["window_days_required"]
 
 
 def _flat(sym, rate, **kw):
@@ -1087,7 +1089,7 @@ def test_too_few_rows_states_the_window_and_counts_every_variant_in_a_persistent
     lp = str(tmp_path / "led.jsonl")
     out = CR.evaluate_family(ser, CR.FAMILY_SPREAD, ledger_path=lp, formation_days_grid=(7, 14), top_k_grid=(1,), hold_days=7, min_rows=60)
     assert out["verdict"] == "INSUFFICIENT_DATA" and out["status"] == "TOO_FEW_HOLDING_ROWS" and out["is_carry"] is False
-    assert out["grid"]["window_days_required"] == 14 + 420 and "434 days" in out["grid"]["statement"] and out["grid"]["shortfall_days"] > 0
+    assert out["grid"]["window_days_required"] == 7 + 14 + 420 and "441 days" in out["grid"]["statement"] and out["grid"]["shortfall_days"] > 0
     assert out["independent_holding_rows"] < 60 and out["survivorship_free_claim"] is False
     n1 = out["n_variants_counted"]
     assert n1 == 4 and out["multiple_testing_scope"] == "PERSISTENT_LEDGER_FILE"                       # 2 formations x 1 k x 2 cost scenarios
@@ -1149,7 +1151,7 @@ def test_the_cross_sectional_entry_point_runs_all_three_families_on_the_real_wri
     out = CR.evaluate_cross_sectional(root, universe_dir=uni, ledger_path=str(tmp_path / "x.jsonl"), spot_dir=spot, mark_interval=MARK_IV)
     assert set(out["families"]) == set(CR.FAMILIES)
     for k, f in out["families"].items():
-        assert f["verdict"] in ("INSUFFICIENT_DATA", "UNTESTED") and f["family"] == k and f["grid"]["window_days_required"] == 30 + 420
+        assert f["verdict"] in ("INSUFFICIENT_DATA", "UNTESTED") and f["family"] == k and f["grid"]["window_days_required"] == 7 + 30 + 420
     assert out["families"]["SPOT_PERP_CARRY"]["is_carry"] is True and out["families"]["PERP_FUNDING_SPREAD"]["is_carry"] is False
     assert os.path.exists(str(tmp_path / "x.perp_funding_spread.jsonl"))
 
@@ -1217,3 +1219,84 @@ def test_mutation_without_the_ledger_requirement_a_fresh_process_would_reset_the
 def test_mutation_the_grid_anchored_without_the_formation_lead_in_would_rank_on_a_short_window():
     m = _mutant("first = -(-(t_first_ms + formation_days * MS_DAY) // MS_DAY) * MS_DAY", "first = -(-t_first_ms // MS_DAY) * MS_DAY")
     assert m.holding_grid(T0_, T0_ + 100 * DAY, formation_days=30, hold_days=7)[0] < CR.holding_grid(T0_, T0_ + 100 * DAY, formation_days=30, hold_days=7)[0]
+
+
+# ================================================================== owner-data findings: sibling universe, parent dir, few symbols, required span, Closed credit
+def test_a_universe_capture_beside_the_scanned_root_is_a_loud_finding_not_a_silent_empty_list(tmp_path, offline):
+    base = tmp_path / "datasets"
+    os.mkdir(base)
+    md = base / "md-1"
+    os.mkdir(md)
+    uni = TMH._universe_dir(base, name="universe-1")
+    s = CR.scan_data_root(str(md))
+    assert s["universe_capture_dirs"] == [] and s["sibling_universe_captures_outside_scanned_root"][0]["schema"] == "universe_capture/v2"
+    assert any("BESIDE" in f and "--universe-dir" in f for f in s["findings"])
+    rep = CR.build_report(data_root=str(md), with_economics=False)
+    assert any("BESIDE" in f for f in rep["findings"])
+    assert CR.scan_data_root(str(md), universe_dirs=[str(uni)])["universe_dir_supplied"] is True
+
+
+def test_a_parent_dir_with_exactly_one_capture_is_accepted_and_an_ambiguous_one_refused(tmp_path, offline):
+    base = tmp_path / "datasets"
+    os.mkdir(base)
+    TMH._universe_dir(base, name="universe-1")
+    assert CR.resolve_universe_dir(str(base))[0] == str(base / "universe-1")
+    assert CR.scan_data_root(None, universe_dirs=[str(base)])["universe_dir_supplied"] is True
+    TMH._universe_dir(base, name="universe-2")
+    d, why = CR.resolve_universe_dir(str(base))
+    assert d is None and "ambiguous" in why
+    s = CR.scan_data_root(None, universe_dirs=[str(base)])
+    assert s["universe_dir_supplied"] is False and "ambiguous" in s["universe_dirs_rejected"][0]["reason"]
+
+
+def test_a_legacy_schema_1_capture_is_reported_not_counted(tmp_path, offline):
+    base = tmp_path / "datasets"
+    os.mkdir(base)
+    TMH._universe_dir(base, name="old", v2=False)
+    s = CR.scan_data_root(str(base))
+    assert s["universe_capture_dirs"] == [] and s["legacy_universe_captures_not_counted"] and any("legacy" in f for f in s["findings"])
+    assert "LEGACY" in CR.resolve_universe_dir(str(base / "old"))[1]
+
+
+def test_a_history_holding_few_of_the_eligible_symbols_is_flagged(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False, skip_history=("ETHUSDT", "FASTUSDT", "OLDUSDT"))
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    hc = info["history_coverage"]
+    assert hc["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" and hc["symbols_in_history"] == 1 and hc["universe_eligible_symbols"] == 4
+    assert any("HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" in w for w in info["warnings"])
+    out = CR.evaluate_ranked_funding(series, universe_info=info)
+    assert out["history_coverage"]["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS"
+    ok_root, ok_uni, _ = _hist(tmp_path / "b" if (tmp_path / "b").mkdir() is None else tmp_path, spot=False)
+    assert CR.load_history_root(ok_root, universe_dir=ok_uni, mark_interval=MARK_IV)[1]["history_coverage"]["status"] == "OK"
+
+
+def test_too_few_rows_states_the_457_day_requirement_from_backfill_plan(tmp_path, offline):
+    root, uni, _ = _hist(tmp_path, spot=False)
+    series, info = CR.load_history_root(root, universe_dir=uni, mark_interval=MARK_IV)
+    out = CR.evaluate_ranked_funding(series, universe_info=info, formation_days_grid=(30,), min_rows=60)
+    assert out["status"] == "TOO_FEW_HOLDING_ROWS" and out["required_span"]["window_days_required"] == 457 and "457 days" in out["reason"]
+
+
+@pytest.mark.parametrize("closed", ["PARTIAL", "PARTIAL:cursor_unfinished", "CONFLICTED:duplicate", "UNDOCUMENTED_STATUS_ROWS", "UNDOCUMENTED_STATUS_EMPTY", "OBSERVED_EMPTY", None])
+def test_only_closed_rows_actually_observed_credit_delistings(closed):
+    inv = {"universes": [{"verified": True, "delisting_observability": "OBSERVED", "status_coverage": {"Closed": closed}}]}
+    assert CR.survivorship_of_universes(inv) == CR.SURVIVORS_ONLY
+    inv["universes"][0]["status_coverage"]["Closed"] = "OBSERVED_ROWS"
+    assert CR.survivorship_of_universes(inv) == CR.DELISTINGS_OBSERVED
+    inv["universes"][0]["delisting_observability"] = "NOT_OBSERVED"
+    assert CR.survivorship_of_universes(inv) == CR.SURVIVORS_ONLY
+
+
+def test_mutation_the_sibling_finding_removed_leaves_the_empty_list_silent():
+    m = _mutant('    if res["sibling_universe_captures_outside_scanned_root"] and not res["universe_capture_dirs"]:', '    if False:')
+    import tempfile
+    d = tempfile.mkdtemp(dir="/tmp/claude-0")
+    try:
+        os.makedirs(os.path.join(d, "md"))
+        os.makedirs(os.path.join(d, "u"))
+        with open(os.path.join(d, "u", "manifest.json"), "w") as fh:
+            fh.write(json.dumps({"schema": "universe_capture/v2"}))
+        assert m.scan_data_root(os.path.join(d, "md"))["findings"] == [] and CR.scan_data_root(os.path.join(d, "md"))["findings"]
+    finally:
+        import shutil
+        shutil.rmtree(d)

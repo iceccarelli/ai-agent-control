@@ -111,6 +111,40 @@ def _read_manifest(path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+WARMUP_DAYS = 7                       # backfill_plan's registered warm-up; the required span is ITS number (backfill_plan.required_window), never re-derived here
+
+
+def required_span(formation_days: int, hold_days: int, min_rows: int = 60, warmup_days: int = WARMUP_DAYS) -> Dict[str, Any]:
+    """The exact history span 60 independent holding rows need: warmup + formation + min_rows x hold (backfill_plan.required_window, 7 + 30 + 60 x 7 = 457 days at the registered values)."""
+    import backfill_plan as BP
+    w = BP.required_window(None, 1, formation_days, hold_days, min_rows, warmup_days)
+    return {"needed_days": w["needed_days"], "components": w["components"], "formula": w["formula"]}
+
+
+def resolve_universe_dir(path: Any) -> Tuple[Optional[str], Optional[str]]:
+    """(dir, None) for a universe_capture directory, or for a PARENT dir holding exactly one capture below it; (None, reason) otherwise (ambiguous parents are refused, never guessed)."""
+    if not isinstance(path, str) or not path or not os.path.isdir(path) or os.path.islink(path):
+        return None, "not a directory"
+    m = _read_manifest(os.path.join(path, "manifest.json"))
+    sch = None if m is None else (m.get("schema") if m.get("schema") is not None else m.get("schema_version"))
+    if sch == RH.UNIVERSE_CAPTURE_SCHEMA:
+        return path, None
+    kids = []
+    for n in sorted(os.listdir(path))[:500]:
+        d = os.path.join(path, n)
+        if n == "state" or os.path.islink(d) or not os.path.isdir(d):
+            continue
+        mk = _read_manifest(os.path.join(d, "manifest.json"))
+        if mk is not None and (mk.get("schema") == RH.UNIVERSE_CAPTURE_SCHEMA):
+            kids.append(d)
+    if len(kids) == 1:
+        return kids[0], None
+    if len(kids) > 1:
+        return None, f"ambiguous: {len(kids)} universe captures below it ({[os.path.basename(k) for k in kids][:5]}); pass one"
+    legacy = m is not None and m.get("schema_version") is not None
+    return None, ("a LEGACY schema_version " + str(m.get("schema_version")) + " capture: no status partitions, never counted") if legacy else f"manifest schema is {sch!r}, not {RH.UNIVERSE_CAPTURE_SCHEMA}"
+
+
 def scan_data_root(root: Optional[str], *, max_depth: int = 4, universe_dirs: Sequence[str] = ()) -> Dict[str, Any]:
     """Find capture manifests (schema universe_capture/v2, market_history/v1) under ``root``. No root = nothing was looked for = MISSING, not assumed present.
 
@@ -118,18 +152,19 @@ def scan_data_root(root: Optional[str], *, max_depth: int = 4, universe_dirs: Se
     ``root``) and listed in ``universe_capture_dirs`` / ``universe_dirs_explicit``; a path that is not a universe_capture/v2 directory is listed in ``universe_dirs_rejected`` with the
     reason, never silently dropped. ``universe_dir_supplied`` is True iff at least one explicit directory was given and recognised."""
     res: Dict[str, Any] = {"root": root, "universe_capture_dirs": [], "universe_dirs_explicit": [], "universe_dirs_rejected": [], "universe_dir_supplied": False,
-                           "market_history": [], "spot_snapshots": [], "checked": root is not None}
+                           "market_history": [], "spot_snapshots": [], "checked": root is not None,
+                           "legacy_universe_captures_not_counted": [], "sibling_universe_captures_outside_scanned_root": [], "findings": [],
+                           "rule": "only manifests UNDER the scanned root are found (depth <= 4, no symlinks, 'state' skipped); a universe capture counts only when schema is exactly 'universe_capture/v2'"}
     explicit: List[str] = []
     for ud in universe_dirs or ():
         if not isinstance(ud, str) or not ud:
             res["universe_dirs_rejected"].append({"dir": str(ud), "reason": "empty universe dir"})
             continue
-        m = _read_manifest(os.path.join(ud, "manifest.json")) if os.path.isdir(ud) and not os.path.islink(ud) else None
-        schema = None if m is None else (m.get("schema") if m.get("schema") is not None else m.get("schema_version"))
-        if schema != RH.UNIVERSE_CAPTURE_SCHEMA:
-            res["universe_dirs_rejected"].append({"dir": ud, "reason": "not a directory with a universe_capture/v2 manifest.json" if m is None else f"manifest schema is {schema!r}, not {RH.UNIVERSE_CAPTURE_SCHEMA}"})
+        resolved, why = resolve_universe_dir(ud)
+        if resolved is None:
+            res["universe_dirs_rejected"].append({"dir": ud, "reason": why})
             continue
-        explicit.append(os.path.realpath(ud))
+        explicit.append(os.path.realpath(resolved))
     res["universe_dirs_explicit"] = sorted(set(explicit))
     res["universe_dir_supplied"] = bool(explicit)
     found: List[str] = list(explicit)
@@ -147,11 +182,27 @@ def scan_data_root(root: Optional[str], *, max_depth: int = 4, universe_dirs: Se
             schema = None if m is None else (m.get("schema") if m.get("schema") is not None else m.get("schema_version"))
             if schema == RH.UNIVERSE_CAPTURE_SCHEMA:
                 found.append(dp)
+            elif m is not None and m.get("schema_version") is not None and m.get("schema") is None and (m.get("universe") or m.get("universe_file")):
+                res["legacy_universe_captures_not_counted"].append({"dir": dp, "schema_version": m.get("schema_version")})
             elif schema == "market_history/v1" and m.get("dataset") == MH.SPOT:
                 res["spot_snapshots"].append({"dir": dp, "dataset_status": m.get("dataset_status")})
             elif schema == "market_history/v1":
                 res["market_history"].append({"dir": dp, "dataset_status": m.get("dataset_status"), "coverage": m.get("coverage")})
     res["universe_capture_dirs"] = sorted(set(found))
+    parent = os.path.dirname(base)
+    if os.path.isdir(parent):                                       # a capture BESIDE the scanned root (datasets/universe-... next to datasets/md-...) is invisible to a scan of the root
+        for n in sorted(os.listdir(parent))[:200]:
+            d = os.path.join(parent, n)
+            if n == "state" or os.path.islink(d) or os.path.realpath(d) == base or not os.path.isfile(os.path.join(d, "manifest.json")):
+                continue
+            mk = _read_manifest(os.path.join(d, "manifest.json"))
+            sch = None if mk is None else (mk.get("schema") if mk.get("schema") is not None else mk.get("schema_version"))
+            if sch == RH.UNIVERSE_CAPTURE_SCHEMA or (mk is not None and mk.get("schema_version") is not None and mk.get("schema") is None):
+                res["sibling_universe_captures_outside_scanned_root"].append({"dir": d, "schema": sch, "counted": False, "why": "beside, not under, the scanned root: pass it with --universe-dir"})
+    if res["sibling_universe_captures_outside_scanned_root"] and not res["universe_capture_dirs"]:
+        res["findings"].append("LOUD: universe_capture_dirs is empty because the universe capture lies BESIDE the scanned root, not under it: " + str([x["dir"] for x in res["sibling_universe_captures_outside_scanned_root"]][:3]) + "; pass --universe-dir (required by the cross-sectional path)")
+    if res["legacy_universe_captures_not_counted"]:
+        res["findings"].append("LOUD: legacy (schema_version 1) universe captures were found and NOT counted: they carry no status partitions, so they cannot show delistings")
     res["market_history"].sort(key=lambda x: x["dir"])
     res["spot_snapshots"].sort(key=lambda x: x["dir"])
     return res
@@ -627,7 +678,7 @@ def build_report(*, data_root: Optional[str] = None, with_economics: bool = True
     inv = verified_inventory(scan) if (scan["checked"] or scan["universe_capture_dirs"]) else None
     econ = btc_carry_economics() if with_economics else None
     rows = [candidate_row(n, s, scan, econ, inv, (evaluations or {}).get(n)) for n, s in load_candidates()]
-    return {"schema": SCHEMA, "tool": "tools/candidate_readiness.py", "data_scan": scan, "inventory": inv, "cost_constants": cost_constants(), "owner_observed": OWNER_INTERVAL_NOTE,
+    return {"schema": SCHEMA, "tool": "tools/candidate_readiness.py", "data_scan": scan, "findings": list(scan.get("findings", [])), "inventory": inv, "cost_constants": cost_constants(), "owner_observed": OWNER_INTERVAL_NOTE,
             "economics": {"btc_carry_corpus": econ}, "candidates": rows, "readiness_levels": list(READINESS_LEVELS),
             "caveats": ["every number sourced from the committed corpus is IN-SAMPLE; no out-of-sample settlement exists in this repository",
                         "MAKER_FIRST figures are a MODELLED execution scenario, never measured; fee tier is the published BASE tier, the account's tier is read at run time",
@@ -937,6 +988,7 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
                            "hold_days_grid": holds, "top_k_grid": ks, "cost_scenarios_bps": dict(costs), "survivorship": survivorship, "warnings": warnings,
                            "closed_in_universe_not_in_series": cin, "key_basis_unverified": bool(unkeyed),
                            "survivorship_free_claim": survivorship == DELISTINGS_OBSERVED,
+                           "history_coverage": (universe_info or {}).get("history_coverage") if isinstance(universe_info, Mapping) else None,
                            "survivorship_claim_note": ("DELISTINGS_OBSERVED: Closed contracts the venue still serves were observed; an absent symbol is still not proof it was never delisted"
                                                        if survivorship == DELISTINGS_OBSERVED else "SURVIVORS_ONLY: no survivorship-free claim can be made from this evaluation"),
                            "universe_info_verified": verdict is not None,
@@ -994,7 +1046,10 @@ def evaluate_ranked_funding(series: Sequence[SymbolSeries], *, spec: Optional[Ma
             ledger.record_rejected(name, params_of[name], f"only {n_rows} non-overlapping holding rows (< {min_rows})")
         out.update({"verdict": "INSUFFICIENT_DATA", "status": "TOO_FEW_HOLDING_ROWS", "family": fam, "n_variants_counted": ledger.n_variants,
                     "n_variants_tried_in_call": len(out["variants_tried"]),
-                    "reason": f"{n_rows} non-overlapping {hold_days}-day holding rows after the formation lead-in; need >= {min_rows}. The same-window trailing sums below are "
+                    "required_span": grid_requirements(formation_days=max(formation_days_grid), hold_days=hold_days, min_rows=min_rows, span_days=(t1 - t0) / MS_DAY),
+                    "reason": f"{n_rows} non-overlapping {hold_days}-day holding rows after the formation lead-in; need >= {min_rows}, which needs "
+                              f"{grid_requirements(formation_days=max(formation_days_grid), hold_days=hold_days, min_rows=min_rows)['window_days_required']} days of history (warmup + formation + {min_rows} x {hold_days}); "
+                              f"this capture spans {(t1 - t0) / MS_DAY:.1f} days. The same-window trailing sums below are "
                               f"{LABEL_TRAILING}, selected after the fact, not an expectation and not a verdict"})
         return out
     cut = {k: v[:n_rows] for k, v in per.items()}
@@ -1247,7 +1302,15 @@ def load_history_root(root: str, *, universe_dir: str, spot_dir: Optional[str] =
         warnings.append(f"{len(non_complete)} symbols are not COMPLETE in a dataset (kept, listed in non_complete_symbols)")
     if excluded:
         warnings.append(f"{len(excluded)} symbols excluded (listed in excluded)")
-    info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv,
+    ended_or_trading = [sy for sy, r in recs.items() if r.get("status") in ("Trading",) + tuple(RH.ENDED_STATUSES) and r.get("quoteCoin", "USDT") == "USDT"]
+    cov_frac = (len(series) / len(ended_or_trading)) if ended_or_trading else None
+    history_cov = {"universe_eligible_symbols": len(ended_or_trading), "symbols_in_history": len(series), "fraction": cov_frac,
+                   "status": "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS" if cov_frac is not None and cov_frac < 0.5 else ("OK" if cov_frac is not None else "NO_ELIGIBLE_SYMBOLS"),
+                   "note": "eligible = Trading + Closed/Delivering USDT perpetuals in the universe record; the history datasets hold only the symbols they were collected for (an explicit --symbols list "
+                           "gives a small cross-section): the evaluation is over THOSE symbols, not the venue"}
+    if history_cov["status"] == "HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS":
+        warnings.append(f"HISTORY_COVERS_FEW_ELIGIBLE_SYMBOLS: the history datasets hold {len(series)} of {len(ended_or_trading)} eligible universe symbols; collect the rest (backfill_plan.plan) before trusting a cross-section")
+    info = LoadedInfo({"root": os.path.abspath(root), "mark_interval": mark_iv, "history_coverage": history_cov,
                             "datasets": {"funding": {"verified": True, "dataset_status": fman.get("dataset_status"), "manifest_digest": fman.get("manifest_digest")},
                                          mark_name: {"verified": True, "dataset_status": mman.get("dataset_status"), "manifest_digest": mman.get("manifest_digest")}},
                             "universe": {"dir": uinfo.get("dir"), "dataset_status": uinfo.get("dataset_status"), "manifest_sha256": uinfo.get("manifest_sha256"), "symbols": uinfo.get("symbols"),
@@ -1310,16 +1373,18 @@ def holding_grid(t_first_ms: int, t_last_ms: int, *, formation_days: int, hold_d
     return out
 
 
-def grid_requirements(*, formation_days: int, hold_days: int, min_rows: int = 60, span_days: Optional[float] = None) -> Dict[str, Any]:
-    """Exactly what window yields ``min_rows`` independent holding rows: formation lead-in + min_rows x hold_days of data on the common window (e.g. 60 x 7 + 30 = 450 days)."""
-    need = formation_days + min_rows * hold_days
-    out: Dict[str, Any] = {"formation_days": formation_days, "hold_days": hold_days, "rows_required": min_rows, "holding_span_days_required": min_rows * hold_days,
-                           "window_days_required": need,
-                           "statement": f"{min_rows} non-overlapping {hold_days}-day holding rows need {min_rows * hold_days} days of holding span after a {formation_days}-day formation lead-in = {need} days "
-                                        f"of funding + mark history on the symbols ranked (one row per {hold_days} days, whatever the number of symbols)"}
+def grid_requirements(*, formation_days: int, hold_days: int, min_rows: int = 60, span_days: Optional[float] = None, warmup_days: int = WARMUP_DAYS) -> Dict[str, Any]:
+    """Exactly what window yields ``min_rows`` independent holding rows, using backfill_plan's numbers: warmup + formation + min_rows x hold_days (7 + 30 + 60 x 7 = 457 days at the
+    registered values), one row per ``hold_days`` whatever the number of symbols."""
+    w = required_span(formation_days, hold_days, min_rows, warmup_days)
+    need = w["needed_days"]
+    out: Dict[str, Any] = {"formation_days": formation_days, "hold_days": hold_days, "warmup_days": warmup_days, "rows_required": min_rows, "holding_span_days_required": min_rows * hold_days,
+                           "window_days_required": need, "components": w["components"],
+                           "statement": f"{min_rows} non-overlapping {hold_days}-day holding rows need {need} days of funding + mark history = warmup {warmup_days} + formation {formation_days} + "
+                                        f"{min_rows} x {hold_days} (backfill_plan.required_window); one row per {hold_days} days, whatever the number of symbols"}
     if span_days is not None:
         out["window_days_available"] = round(span_days, 3)
-        out["rows_possible_by_calendar"] = max(0, int((span_days - formation_days) // hold_days))
+        out["rows_possible_by_calendar"] = max(0, int((span_days - formation_days - warmup_days) // hold_days))
         out["shortfall_days"] = round(max(0.0, need - span_days), 3)
     return out
 
