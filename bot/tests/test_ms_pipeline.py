@@ -684,7 +684,7 @@ def test_the_derived_policy_is_explicit_conservative_and_closed():
     pol = MP.derive_risk_policy(syms, candidate_id=CAND, spec_digest=DIGEST, portfolio=PF.PortfolioPolicy(style="MAKER_FIRST"), equity_usd=100_000.0)
     assert MR.policy_refusals(pol) == [] and pol["allowed_symbols"] == ["AAAUSDT", "BBBUSDT"] and pol["venue"] == "testnet"
     assert pol["max_aggregate_notional_usd"] == 50_000.0 and pol["max_aggregate_notional_usd"] < 100_000.0
-    assert set(pol) == set(MR.POLICY_KEYS)
+    assert set(pol) == set(MR.POLICY_KEYS) | {"max_drawdown_frac"}              # the hard drawdown limit is on by default (the replay state carries equity, peak)
     with pytest.raises(MP.PipelineRefused):
         MP.derive_risk_policy([], candidate_id=CAND, spec_digest=DIGEST, portfolio=PF.PortfolioPolicy(), equity_usd=1.0)
     with pytest.raises(MP.PipelineRefused):

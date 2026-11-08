@@ -34,7 +34,7 @@ CAND_PATH = os.path.join(BOT, "research", "candidates", "cash_and_carry.json")
 CAND_SPEC = json.load(open(CAND_PATH, encoding="utf-8"))
 CAND_ID = CAND_SPEC["candidate_id"]
 PROMISING = {"candidate": CAND_ID, "name": "cash_and_carry", "verdict": "INSUFFICIENT_DATA", "readiness_level": "PROMISING", "rejection_reasons": []}
-ALL_FILES = MP.ARTIFACT_FILES + (MP.SUMMARY_FILE,)
+ALL_FILES = MP.ARTIFACT_FILES + (MP.SUMMARY_FILE, MP.RECONCILE_FILE)
 
 
 @pytest.fixture(autouse=True)
@@ -308,7 +308,7 @@ def test_validate_checks_inputs_only_and_writes_nothing(world, tmp_path, capsys)
 
 
 def check_identity(d):
-    """The seven files carry ONE identity (the RunIdentity.as_dict() of the run) and agree with the summary."""
+    """The eight files carry ONE identity (the RunIdentity.as_dict() of the run) and agree with the summary."""
     a = arts(d)
     ids = {n: json.dumps(x.get("identity"), sort_keys=True) for n, x in a.items()}
     assert len(set(ids.values())) == 1 and all(v != "null" for v in ids.values()), ids
@@ -559,3 +559,98 @@ def test_mutation_letting_a_rejected_candidate_allocate_is_caught(tmp_path, monk
     check_rejected_cannot_allocate(tmp_path)
     monkeypatch.setattr(MP, "evaluate_gate", lambda row, *, candidate_id: MP.AllocationGate(True, "MUTANT", "REJECTED", "x", candidate_id))
     fails(check_rejected_cannot_allocate, tmp_path / "mut")
+
+
+# ------------------------------------------------------------------------------------------------ reconciliation, hard loss limits, exit sequencing (library seams)
+
+class PhantomVenue(TMP.EX.SimVenue):
+    """A venue whose own position read shows a position nobody opened: every derived view disagrees with it."""
+    def positions(self):
+        out = super().positions()
+        out["linear:AAAUSDT"] = out.get("linear:AAAUSDT", 0.0) + 1.0
+        return out
+
+
+def check_reconcile_halts(tmp_path, name="rec"):
+    pr = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name=name, venue=PhantomVenue())
+    r = TMP.art(pr, "reconcile_report.json") if os.path.exists(pr.files.get("reconcile_report.json", "")) else json.load(open(pr.files[MP.RECONCILE_FILE]))
+    assert r["schema"] == "reconcile_report/v1" and r["halt_new_exposure"] is True and r["findings"] and r["ever_disagreed"] is True
+    assert {"code", "key", "views", "detail"} <= set(r["findings"][0]) and r["identity"] == pr.summary["identity"]
+    assert "UNKNOWN_OR_UNRECONCILED" in pr.summary["status"]["codes"] and pr.summary["reconcile"]["ever_disagreed"] is True
+    assert pr.result.fills == [] and any(h.startswith("RECONCILE_DISAGREEMENT") for h in pr.result.engine.halts)             # new exposure was halted, nothing was overwritten
+    return pr
+
+
+def test_a_disagreement_between_the_venue_read_and_the_books_halts_new_exposure_and_is_reported(tmp_path):
+    check_reconcile_halts(tmp_path)
+
+
+def test_mutation_skipping_the_per_step_reconciliation_is_caught(tmp_path, monkeypatch):
+    check_reconcile_halts(tmp_path)
+    monkeypatch.setattr(MP.AuthorityGates, "reconcile_step", lambda self, now: None)
+    fails(check_reconcile_halts, tmp_path / "mut", "mut")
+
+
+def test_a_clean_run_reconciles_at_every_step_and_the_report_carries_the_identity(tmp_path):
+    pr = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name="clean")
+    d = os.path.dirname(pr.files["replay_report.json"])
+    r = json.load(open(os.path.join(d, MP.RECONCILE_FILE)))
+    assert r["findings"] == [] and r["halt_new_exposure"] is False and r["n_steps_checked"] > 100 and r["ever_disagreed"] is False and r["compared"]["reference"] == "venue"
+    assert pr.result.fills and "UNKNOWN_OR_UNRECONCILED" not in pr.summary["status"]["codes"]
+    check_identity(d)
+
+
+def test_the_artifacts_net_is_the_ledgers_canonical_net_and_null_when_incomplete(tmp_path):
+    from dataclasses import replace
+    pr = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name="canon")
+    assert TMP.art(pr, "replay_report.json")["net_pnl_usd"] == pr.ledger.ledger.canonical_net()["net"]
+    a = TMP.ser("AAAUSDT", 480, 6.0)
+    gap = replace(a, mark=tuple((t, p) for t, p in a.mark if not (TMP.T0 + 2 * TMP.D + 2 * TMP.H < t < TMP.T0 + 4 * TMP.D)))
+    pr2 = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name="canon2", series=[gap], c=TMP.cfg(end_ms=TMP.T0 + 6 * TMP.D))
+    assert pr2.ledger.ledger.canonical_net()["net"] is None and TMP.art(pr2, "replay_report.json")["net_pnl_usd"] is None and TMP.art(pr2, "ledger_pnl.json")["net_usd"] is None
+
+
+def test_hard_loss_limits_reach_the_policy_and_the_state_carries_what_they_need(tmp_path):
+    pr = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name="lim", max_daily_loss_usd=5_000.0, max_drawdown_frac=0.5)
+    assert pr.policy["max_daily_loss_usd"] == 5_000.0 and pr.policy["max_drawdown_frac"] == 0.5
+    assert pr.result.fills, pr.summary["decision_reason_counts"]
+    assert not any(k.startswith(("DAILY_LOSS_INPUT_UNKNOWN", "DRAWDOWN_INPUT_UNKNOWN")) for k in pr.summary["decision_reason_counts"]), pr.summary["decision_reason_counts"]
+    tiny = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name="tiny", max_daily_loss_usd=0.01)
+    assert len(tiny.result.groups) < len(pr.result.groups)                                      # the hard daily-loss limit actually bites once fees have been paid
+    assert MP.derive_risk_policy(["AAAUSDT"], candidate_id="c", spec_digest="d", portfolio=MP.PF.PortfolioPolicy(), equity_usd=1e5)["max_drawdown_frac"] == MP.PF.PortfolioPolicy().max_drawdown_frac
+
+
+def test_loss_limit_flags_are_validated_and_conflict_with_a_policy_file(world, tmp_path, capsys):
+    refusal(capsys, argv(world, str(tmp_path / "a"), max_daily_loss_usd="0"), "LOSS_LIMIT_INVALID")
+    refusal(capsys, argv(world, str(tmp_path / "a"), max_daily_loss_usd="abc"), "LOSS_LIMIT_INVALID")
+    refusal(capsys, argv(world, str(tmp_path / "a"), max_drawdown_frac="1.5"), "LOSS_LIMIT_INVALID")
+    f = tmp_path / "p.json"
+    f.write_text(json.dumps(MP.derive_risk_policy(["BTCUSDT"], candidate_id=CAND_ID, spec_digest=SV.spec_digest(CAND_SPEC), portfolio=MP.PF.PortfolioPolicy(), equity_usd=1e5)))
+    refusal(capsys, argv(world, str(tmp_path / "a"), derive_risk_policy=None, risk_policy=str(f), max_drawdown_frac="0.2"), "LOSS_LIMIT_NEEDS_DERIVED_POLICY")
+
+
+def test_cli_loss_limits_land_in_the_summarys_policy(world, tmp_path, capsys, monkeypatch):
+    allowed_competition(monkeypatch)
+    d = str(tmp_path / "ll")
+    assert cli(capsys, argv(world, d, max_daily_loss_usd="1234.5", max_drawdown_frac="0.2"))[0] == 0
+    p = arts(d)[MP.SUMMARY_FILE]["risk_policy"]
+    assert p["max_daily_loss_usd"] == 1234.5 and p["max_drawdown_frac"] == 0.2
+    check_identity(d)
+
+
+def test_the_perp_exit_is_filled_before_the_spot_exit_and_no_exit_is_refused_or_halted(tmp_path):
+    pr = lib_run(tmp_path, {**PROMISING, "candidate": TMP.CAND}, name="seq")
+    ast = pr.gates.stats()
+    assert ast["orders_refused"] == 0 and "SPOT_SELL_NOT_PROVEN_HEDGE_KEEPING" not in ast["order_refusal_codes"], ast
+    assert not any(h.startswith("EXIT_ORDERS_REJECTED") for h in pr.result.engine.halts), pr.result.engine.halts
+    by = {}
+    for f in pr.result.fills:
+        by.setdefault(f.group_id, []).append((f, pr.result.fills_cat.get(f.fill_id, "linear")))
+    checked = 0
+    for gid, fs in by.items():
+        perp_close = [f.ts_ms for f, c in fs if c == "linear" and f.side == "Buy"]                  # the short perp is closed by a Buy
+        spot_sell = [f.ts_ms for f, c in fs if c == "spot" and f.side == "Sell"]
+        if perp_close and spot_sell:
+            checked += 1
+            assert min(spot_sell) >= min(perp_close), gid                                              # the spot sell only after the perp exit fill is on the venue book
+    assert checked > 0

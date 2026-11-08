@@ -45,6 +45,7 @@ import ms_authority as MAUTH  # noqa: E402
 import ms_execution as EX  # noqa: E402
 from ms_fillmodel import Tick as FM_Tick  # noqa: E402
 import ms_portfolio as PF  # noqa: E402
+import ms_reconcile as RC  # noqa: E402
 import ms_replay as RP  # noqa: E402
 import ms_risk as MR  # noqa: E402
 import ms_scanner as SC  # noqa: E402
@@ -65,6 +66,7 @@ POLICY_VENUE = "testnet"                      # the policy's registered SANDBOX 
 AUTHORITY_STRATEGY = "multi_symbol_funding_carry_replay"
 ARTIFACT_FILES = ("replay_report.json", "portfolio_state.json", "risk_state.json", "ledger_pnl.json", "competition.json", "opportunities.json")
 SUMMARY_FILE = "pipeline_summary.json"
+RECONCILE_FILE = "reconcile_report.json"           # schema reconcile_report/v1 (the result of ms_reconcile; the control centre reads it)
 MAX_ITEMS = 500
 MIN_INDEPENDENT = RP.MIN_INDEPENDENT_FOR_ANY_CLAIM
 DAY_MS = 86_400_000
@@ -238,6 +240,7 @@ class LedgerAdapter:
         self.exit_fee_bps = {"linear": float(exit_fee_bps_perp), "spot": float(exit_fee_bps_spot)}
         self.books: Dict[Tuple[str, str], Tuple[Optional[float], Optional[float]]] = {}      # (symbol, category) -> (best bid, best ask) of the latest mark that carried a book
         self.ledger = MACC.Ledger()
+        self.ledger.set_exit_fee_bps(float(exit_fee_bps_perp), float(exit_fee_bps_spot))
         self.mark_prov = mark_prov
         self.slip = {"adverse": 0.0, "taker": 0.0}
         self.slip_by_symbol: Dict[str, Dict[str, float]] = {}
@@ -259,6 +262,7 @@ class LedgerAdapter:
 
     def record_slippage(self, usd: float, kind: str, symbol: Optional[str] = None) -> None:
         k = "adverse" if kind == "adverse" else "taker"
+        self.ledger.record_slippage(float(usd), k, symbol)                       # the ledger's canonical_net charges them (each once)
         self.slip[k] += float(usd)
         d = self.slip_by_symbol.setdefault(symbol or "", {"adverse": 0.0, "taker": 0.0})
         d[k] += float(usd)
@@ -270,7 +274,7 @@ class LedgerAdapter:
             sym, cat = symbol[5:], "spot"
         else:
             sym, cat = symbol, "linear"
-        self.ledger.mark(sym, int(ts_ms), price, category=cat, prov=self.mark_prov)
+        self.ledger.mark(sym, int(ts_ms), price, category=cat, prov=self.mark_prov, bid=bid, ask=ask)
         self.marks[(sym, cat)] = float(price)
         if bid is not None and ask is not None and 0 < float(bid) <= float(ask) and math.isfinite(float(ask)):
             self.books[(sym, cat)] = (float(bid), float(ask))
@@ -327,6 +331,10 @@ class LedgerAdapter:
         mid_fb = self._mid_fallback(p)
         price_leg += adj
         net = price_leg + funding - fees - taker - adverse
+        canon = self.ledger.canonical_net()
+        if canon["net"] is not None:                                              # a COMPLETE ledger: THE net is ms_accounting's canonical_net (one definition; reconcile compares against it)
+            price_leg, funding, fees, adj, net = canon["price_leg"], canon["funding"], canon["fees"], canon["exit_adjustment"], canon["net"]
+            mid_fb = canon["valuation"] == "MID_FALLBACK"
         unreal = p["unrealised_price"]
         unreal = None if unreal is None else unreal + adj                         # the value of closing what is open NOW (exit side of the book, less the taker exit fee)
         return {"price_leg": price_leg, "funding": funding, "fees": fees, "slippage": taker + adverse, "adverse_selection": adverse, "taker_slippage": taker,
@@ -337,7 +345,8 @@ class LedgerAdapter:
 # ======================================================================== risk policy (ms_risk's CLOSED schema, derived from the symbols actually in the series)
 
 def derive_risk_policy(symbols: Sequence[str], *, candidate_id: str, spec_digest: str, portfolio: PF.PortfolioPolicy, equity_usd: float,
-                       aggregate_notional_usd: Optional[float] = None, exec_policy: Optional[EX.ExecPolicy] = None, venue: str = POLICY_VENUE) -> Dict[str, Any]:
+                       aggregate_notional_usd: Optional[float] = None, exec_policy: Optional[EX.ExecPolicy] = None, venue: str = POLICY_VENUE,
+                       max_daily_loss_usd: Optional[float] = None, max_drawdown_frac: Optional[float] = None) -> Dict[str, Any]:
     """A conservative ms_risk policy: an EXPLICIT allow-list of the symbols in the series (never a wildcard), the portfolio policy's own limits with 5% headroom for the price drift between
     sizing (mark) and sending (touch), and a SMALL explicit aggregate ceiling (default half of equity: a hedged pair counts once). The venue names a registered SANDBOX; nothing connects."""
     if not symbols or len(set(symbols)) != len(symbols):
@@ -349,12 +358,16 @@ def derive_risk_policy(symbols: Sequence[str], *, candidate_id: str, spec_digest
     leg_cap = min(portfolio.max_symbol_notional_usd, portfolio.max_symbol_frac * eq, portfolio.max_symbol_leverage * eq, agg)
     ex = exec_policy or EX.ExecPolicy()
     head = 1.05
-    return {"policy_version": portfolio.policy_version, "candidate_id": candidate_id, "spec_digest": spec_digest, "venue": venue, "allowed_symbols": sorted(symbols),
+    out = {"policy_version": portfolio.policy_version, "candidate_id": candidate_id, "spec_digest": spec_digest, "venue": venue, "allowed_symbols": sorted(symbols),
             "allowed_sides": {"linear": ["Buy", "Sell"], "spot": ["Buy", "Sell"]}, "allowed_order_types": ["Limit", "Market"],
             "max_notional_per_symbol_usd": 2.0 * leg_cap * head, "max_aggregate_notional_usd": agg, "max_gross_exposure_usd": 2.0 * agg * head,
             "max_net_exposure_usd": max(portfolio.max_net_frac * eq, 0.01 * eq) * head, "max_active_groups": int(portfolio.max_groups), "max_unhedged_usd": leg_cap * head,
             "max_leverage": max(1.0, portfolio.max_aggregate_leverage * head), "max_market_age_ms": int(min(portfolio.max_market_age_ms, ex.max_market_age_ms)),
             "max_account_age_ms": int(min(portfolio.max_account_age_ms, ex.max_account_age_ms)), "execution_styles": [portfolio.style]}
+    if max_daily_loss_usd is not None:                                       # hard loss limits (ms_risk, fail-closed): the state must then carry equity / day-start / peak or every entry is rejected
+        out["max_daily_loss_usd"] = float(max_daily_loss_usd)
+    out["max_drawdown_frac"] = float(max_drawdown_frac if max_drawdown_frac is not None else portfolio.max_drawdown_frac)
+    return out
 
 
 # ======================================================================== the authority in the replay loop
@@ -401,6 +414,12 @@ class AuthorityGates:
         self.refusals: List[Tuple[str, Tuple[str, ...]]] = []
         self.plan_refusals: List[Tuple[str, Tuple[str, ...]]] = []
         self.transport = SimulatedTransport()
+        self.ledger_getter: Optional[Callable[[], Any]] = None
+        self._halter: Optional[Tuple[int, Any]] = None
+        self.rc_steps = 0
+        self.rc_history: Dict[str, Dict[str, Any]] = {}
+        self.rc_last: Optional[RC.ReconcileReport] = None
+        self.rc_error: Optional[str] = None
         try:
             self.authority = MAUTH.MultiSymbolAuthority(policy=self.policy, transport=self.transport, state_dir=state_dir, strategy=AUTHORITY_STRATEGY, state_provider=self._state,
                                                         snapshot_provider=self._snapshots, kill_switch_reader=lambda: (False, "replay: no kill switch engaged"), clock=self._clock,
@@ -510,6 +529,31 @@ class AuthorityGates:
             if g.state in (T.GroupState.CLOSED, T.GroupState.FAILED) and gid not in self._resolved:
                 self._resolved.add(gid)
                 self.authority.resolve_group(gid)
+        self.reconcile_step(now)
+
+    def reconcile_step(self, now: int) -> None:
+        """ms_reconcile at the end of EVERY step: the venue's own position read is the reference; engine, portfolio and ledger must agree with it, and the authority's reservations with the
+        engine. A disagreement HALTS new exposure (``HaltOnDisagreement.for_engine``); nothing is overwritten. Exits and the lifecycle continue."""
+        eng = self.probe.engine()
+        led = self.ledger_getter() if self.ledger_getter is not None else None
+        try:
+            vs = self.venue.venue_state()
+            read = {"positions": vs["positions"], "complete": vs["complete"]}
+        except (TimeoutError, OSError, KeyError):
+            read = None
+        snaps = self.probe.snapshots()
+        marks = {**{k: s.mark for k, s in snaps.items()}, **{"SPOT:" + k: (s.spot_mark or s.mark) for k, s in snaps.items()}}
+        pf = self.probe.portfolio_state() if self.probe.portfolio_state is not None else None
+        views = RC.collect_views(engine=eng, portfolio=pf, ledger=led, authority=self.authority, venue_read=read, now_ms=now, portfolio_marks=marks)
+        rep = RC.reconcile(views)
+        if self._halter is None or self._halter[0] != id(eng):               # a restarted engine is a new object with its own halts
+            self._halter = (id(eng), RC.HaltOnDisagreement.for_engine(eng))
+        self._halter[1](rep, now)
+        self.rc_steps += 1
+        self.rc_last = rep
+        for f in rep.findings:
+            h = self.rc_history.setdefault(f.reason(), {"code": f.code, "key": f.key, "views": list(f.views), "detail": f.detail, "first_ms": now, "n_steps": 0})
+            h["last_ms"], h["n_steps"] = now, h["n_steps"] + 1
 
     def stats(self) -> Dict[str, Any]:
         refused: Dict[str, int] = {}
@@ -865,7 +909,7 @@ def _build_artifacts(res: RP.ReplayResult, led: LedgerAdapter, rec: ScanRecorder
 # ======================================================================== the run
 
 def classify_status(*, gate: AllocationGate, res: RP.ReplayResult, rec: ScanRecorder, report: Mapping[str, Any], ledger_pnl: Mapping[str, Any], authority: Mapping[str, Any],
-                    history: Mapping[str, Any], min_rows: int, decision_reasons: Mapping[str, int]) -> Dict[str, Any]:
+                    history: Mapping[str, Any], min_rows: int, decision_reasons: Mapping[str, int], reconcile: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The explicit, machine-readable reason a run produced what it produced. An empty result is a VALID result with one of these codes, never a failure. ``codes`` lists every code that
     applies (in STATUS_CODES order); ``primary`` is the first, the most fundamental one."""
     codes: Dict[str, str] = {}
@@ -894,6 +938,10 @@ def classify_status(*, gate: AllocationGate, res: RP.ReplayResult, rec: ScanReco
     bad = [g for g, st in res.states.items() if (st.value if hasattr(st, "value") else st) in ("UNHEDGED", "UNKNOWN_OUTCOME")]
     if fills and (not ledger_pnl["net_complete"] or bad):
         codes["UNKNOWN_OR_UNRECONCILED"] = ("a ledger component is unknown: net is not stated" if not ledger_pnl["net_complete"] else f"{len(bad)} group(s) UNHEDGED or UNKNOWN_OUTCOME at the end of the window")
+    if reconcile is not None and reconcile["ever_disagreed"]:                  # ms_reconcile found components that disagree (and halted new exposure): the books are NOT reconciled
+        prior = codes.get("UNKNOWN_OR_UNRECONCILED")
+        codes["UNKNOWN_OR_UNRECONCILED"] = (prior + "; " if prior else "") + \
+            f"reconciliation disagreed on {len(reconcile['history'])} finding(s): {', '.join(sorted({h['code'] for h in reconcile['history']}))}; new exposure was halted"
     indep = int(report["observations"]["independent"]) if isinstance(report.get("observations"), Mapping) else 0
     if fills and indep < min_rows:
         codes["INADEQUATE_SAMPLE"] = f"{indep} independent closed round trip(s) < {min_rows} required (min_holding_rows)"
@@ -904,12 +952,34 @@ def classify_status(*, gate: AllocationGate, res: RP.ReplayResult, rec: ScanReco
             "independent_observations": indep, "positive_opportunity_scans": n_pos, "n_scans": n_scans, "n_groups": n_groups, "n_fills": len(fills)}
 
 
+def _reconcile_document(gates: AuthorityGates, led: LedgerAdapter, ident: T.RunIdentity, label: str, generated_ms: int, evidence: Mapping[str, Any]) -> Dict[str, Any]:
+    """``reconcile_report.json`` (schema reconcile_report/v1): the LAST step's ms_reconcile report plus the net comparison (the ledger's canonical net against the artifacts' net), and the
+    history of every finding raised at any step. ``halt_new_exposure`` is the end-of-window state; ``ever_disagreed`` says a disagreement happened at any step."""
+    last = gates.rc_last
+    canon = led.ledger.canonical_net()["net"]
+    p = led.pnl()
+    net_rep = RC.reconcile(RC.Views(net_pnl={"ledger": canon, "artifact": p["net"] if p["net_complete"] else None}), require_venue=False)
+    findings = list(last.findings) if last is not None else []
+    have = {x.reason() for x in findings}
+    findings += [f for f in net_rep.findings if f.reason() not in have]
+    hist = [dict(v, reason=k) for k, v in sorted(gates.rc_history.items())]
+    seen = {h["reason"] for h in hist}
+    hist += [{"reason": f.reason(), "code": f.code, "key": f.key, "views": list(f.views), "detail": f.detail, "first_ms": generated_ms, "last_ms": generated_ms, "n_steps": 1}
+             for f in net_rep.findings if f.reason() not in seen]
+    return {"schema": "reconcile_report/v1", "basis": "SIMULATED", "generated_ms": int(generated_ms), "data_label": label, "evidence_basis": dict(evidence), "identity": ident.as_dict(),
+            "findings": [{"code": f.code, "key": f.key, "views": list(f.views), "detail": _short(f.detail, 200)} for f in findings], "halt_new_exposure": bool(findings),
+            "reasons": [f.reason() for f in findings], "compared": dict(last.compared) if last is not None else {}, "n_steps_checked": gates.rc_steps, "ever_disagreed": bool(hist),
+            "history": [{k: (_short(v, 200) if isinstance(v, str) else v) for k, v in h.items()} for h in hist],
+            "reference": "venue position read (SimVenue book in REPLAY / PAPER); engine, portfolio, ledger and artifacts are derived views"}
+
+
 def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[str] = None, mark_interval: Optional[str] = None, spec: Mapping[str, Any], candidate_id: str,
         spec_digest: str, risk_policy: Optional[Mapping[str, Any]] = None, replay_cfg: RP.ReplayConfig, artifacts_dir: str, mode: str = "REPLAY",
         scan_params: Optional[Mapping[str, Any]] = None, generated_ms: Optional[int] = None, clock: Optional[Callable[[], int]] = None, state_dir: Optional[str] = None,
         aggregate_notional_usd: Optional[float] = None, venue: Optional[EX.SimVenue] = None, store: Optional[Any] = None,
         competition_row: Optional[Mapping[str, Any]] = None, code_revision: str = "UNKNOWN", min_holding_rows: int = 60, trial_ledger: Optional[str] = None,
-        data_parts: Optional[Mapping[str, str]] = None, micro: Any = None) -> PipelineResult:
+        data_parts: Optional[Mapping[str, str]] = None, micro: Any = None,
+        max_daily_loss_usd: Optional[float] = None, max_drawdown_frac: Optional[float] = None) -> PipelineResult:
     """Run the whole stack on SIMULATED transport and write the control-centre artifacts + ``pipeline_summary.json``. ``source`` is a history-root path or a ``LoadedHistory`` (both go
     through the VERIFIED loader) or a list of injected series. ``competition_row`` is the candidate's candidate_competition row: a candidate that is REJECTED / UNTESTED / INSUFFICIENT_DATA
     there (or has no row) allocates NOTHING (the scan is still run and shown). ``generated_ms`` (default: the end of the window) and the PAPER ``clock`` are injected: the same inputs give
@@ -955,7 +1025,8 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
 
     policy = dict(risk_policy) if risk_policy is not None else derive_risk_policy(symbols, candidate_id=candidate_id, spec_digest=spec_digest, portfolio=replay_cfg.portfolio,
                                                                                     equity_usd=replay_cfg.equity0, aggregate_notional_usd=aggregate_notional_usd,
-                                                                                    exec_policy=replay_cfg.exec_policy)
+                                                                                    exec_policy=replay_cfg.exec_policy, max_daily_loss_usd=max_daily_loss_usd,
+                                                                                    max_drawdown_frac=max_drawdown_frac)
     bad = MR.policy_refusals(policy)
     if bad:
         raise PipelineRefused("RISK_POLICY_REFUSED:" + ",".join(bad))
@@ -979,6 +1050,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
                 pass
     sim_venue = venue or EX.SimVenue()
     gates = AuthorityGates(policy, state_dir=auth_dir, venue=sim_venue, start_ms=replay_cfg.start_ms)
+    gates.ledger_getter = lambda: holder[0].ledger if holder else None
     params = dict(scan_params or {})
     params.setdefault("hold_days", replay_cfg.hold_ms / DAY_MS)
     recorder = ScanRecorder(spec, candidate_id, spec_digest, params)
@@ -1025,17 +1097,22 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
             reasons[k] = reasons.get(k, 0) + 1
     assumed = sorted(set(res.assumed) | ({"INSTRUMENT_FILTERS_DEFAULTED"} if label == DATA_HISTORY else set()))
     pnl = led.pnl()
-    status = classify_status(gate=gate, res=res, rec=recorder, report=report, ledger_pnl=pnl, authority=gates.stats(), history=history, min_rows=min_holding_rows, decision_reasons=reasons)
+    rec_doc = _reconcile_document(gates, led, ident, label, gen, evidence)
+    status = classify_status(gate=gate, res=res, rec=recorder, report=report, ledger_pnl=pnl, authority=gates.stats(), history=history, min_rows=min_holding_rows, decision_reasons=reasons, reconcile=rec_doc)
     summary = {"schema": SCHEMA, "mode": mode, "data_label": label, "generated_ms": gen, "identity": ident.as_dict(), "data_parts": dict(sorted(parts.items())), "evidence_basis": evidence, "symbols": symbols, "spec": dict(spec),
                "candidate_id": candidate_id, "spec_digest": spec_digest, "status": status, "gate": gate.as_dict(), "history": history,
                "sample": {"independent": status["independent_observations"], "min_holding_rows": min_holding_rows, "closed_groups": sum(1 for g in res.groups.values() if g.closed)},
                "execution": {"evidence": "MODELLED", "books": evidence["books"], "fills": evidence["fills"], "bar_policy": replay_cfg.fill.bar_policy},
                "trials_total": trials_total, "risk_policy": policy, "authority": gates.stats(), "decision_reason_counts": dict(sorted(reasons.items())), "assumed_inputs": assumed,
                "ledger": {"net": pnl["net"], "net_complete": pnl["net_complete"], "flags": pnl["flags"][:20], "status": pnl["status"]},
+               "reconcile": {"ever_disagreed": rec_doc["ever_disagreed"], "halt_new_exposure": rec_doc["halt_new_exposure"], "n_steps_checked": rec_doc["n_steps_checked"],
+                             "codes": sorted({h["code"] for h in rec_doc["history"]})},
                "journal_head": res.journal_head, "promotion_eligible": False, "report": report,
                "note": "REPLAY/PAPER on a simulated transport. ONE net everywhere (artifacts, equity curve, observations, this summary): net = gross (price leg AT MID + funding) - fees - "
                        "taker slippage - adverse selection. The taker walk is inside the fill prices (added back to reach mid, then charged once); adverse selection is a modelled "
                        "post-fill markout that is in no fill price, so ms_accounting's own net (the 'ledger' dict) omits it and the pipeline deducts it once"}
+    files[RECONCILE_FILE] = os.path.join(artifacts_dir, RECONCILE_FILE)
+    _write_json(files[RECONCILE_FILE], rec_doc)
     files[SUMMARY_FILE] = os.path.join(artifacts_dir, SUMMARY_FILE)
     _write_json(files[SUMMARY_FILE], summary)
     return PipelineResult(mode, label, res, report, summary, files, led, recorder, gates, policy, arts)
@@ -1044,7 +1121,7 @@ def run(source: Any, *, universe_dir: Optional[str] = None, spot_dir: Optional[s
 def file_digests(artifacts_dir: str) -> Dict[str, str]:
     """sha256 of the six artifacts and the summary (for the determinism check)."""
     out = {}
-    for name in ARTIFACT_FILES + (SUMMARY_FILE,):
+    for name in ARTIFACT_FILES + (SUMMARY_FILE, RECONCILE_FILE):
         with open(os.path.join(artifacts_dir, name), "rb") as fh:
             out[name] = hashlib.sha256(fh.read()).hexdigest()
     return out
@@ -1085,6 +1162,8 @@ class Validated:
     decision_every_hours: int
     execution_policy: str
     risk_policy: Optional[Dict[str, Any]]
+    max_daily_loss_usd: Optional[float]
+    max_drawdown_frac: Optional[float]
     mode: str
     clock_ms: int
     code_revision: str
@@ -1252,6 +1331,23 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
         raise CliRefused("CODE_REVISION_INVALID", "--code-revision must be a 40-hex git object name or UNKNOWN")
     if ns.risk_policy is not None and ns.derive_risk_policy:
         raise CliRefused("RISK_POLICY_CONFLICT", "give EITHER --risk-policy FILE OR --derive-risk-policy, not both")
+    daily = frac = None
+    if ns.max_daily_loss_usd is not None:
+        try:
+            daily = float(ns.max_daily_loss_usd)
+        except ValueError:
+            daily = float("nan")
+        if not (math.isfinite(daily) and daily > 0):
+            raise CliRefused("LOSS_LIMIT_INVALID", "--max-daily-loss-usd must be a finite number > 0")
+    if ns.max_drawdown_frac is not None:
+        try:
+            frac = float(ns.max_drawdown_frac)
+        except ValueError:
+            frac = float("nan")
+        if not (math.isfinite(frac) and 0 < frac <= 1):
+            raise CliRefused("LOSS_LIMIT_INVALID", "--max-drawdown-frac must be a number in (0, 1]")
+    if ns.risk_policy is not None and (daily is not None or frac is not None):
+        raise CliRefused("LOSS_LIMIT_NEEDS_DERIVED_POLICY", "--max-daily-loss-usd / --max-drawdown-frac set the DERIVED policy; a --risk-policy file carries its own limits")
     if ns.risk_policy is None and not ns.derive_risk_policy:
         raise CliRefused("RISK_POLICY_REQUIRED", "a risk policy is required: --risk-policy FILE (ms_risk closed schema) or an explicit --derive-risk-policy")
     hist = _require_dir(ns.history_root, "HISTORY_ROOT_MISSING", "--history-root")
@@ -1302,7 +1398,7 @@ def validate_inputs(ns: argparse.Namespace) -> Validated:
         lacks = sorted({s.symbol for s in loaded.series} - set(policy["allowed_symbols"]))
         if lacks:
             raise CliRefused("RISK_POLICY_ALLOW_LIST_LACKS", "the risk policy allow-list lacks verified symbols (it is never widened): " + ",".join(lacks)[:200])
-    return Validated(hist, uni, spot, col, art, led, start, end, ns.mark_interval, rows, hold, every, ns.execution_policy, policy, ns.mode, clock, rev, os.path.abspath(ns.candidate), spec, cid,
+    return Validated(hist, uni, spot, col, art, led, start, end, ns.mark_interval, rows, hold, every, ns.execution_policy, policy, daily, frac, ns.mode, clock, rev, os.path.abspath(ns.candidate), spec, cid,
                      digest, kind, loaded, micro, coll_digest, data_digest_of(parts), parts)
 
 
@@ -1310,6 +1406,8 @@ def build_replay_config(v: Validated) -> RP.ReplayConfig:
     style = v.execution_policy
     portfolio = PF.PortfolioPolicy(style=style, max_wait_ms=3 * RP.MS_H) if style == "MAKER_FIRST" else PF.PortfolioPolicy(style=style)
     # the conservative fill policy: bar_policy NO_FILL (a bar never fills an order; no measured trades => no maker fill)
+    limits = {k: x for k, x in (("max_daily_loss_usd", v.max_daily_loss_usd), ("max_drawdown_frac", v.max_drawdown_frac)) if x is not None}
+    portfolio = dataclasses.replace(portfolio, **limits)                      # the allocator enforces the same hard limits the derived policy gives ms_risk
     return RP.ReplayConfig(start_ms=v.start_ms, end_ms=v.end_ms, hold_ms=v.hold_days * DAY_MS, decision_every_ms=v.decision_every_hours * RP.MS_H, spec_digest=v.spec_digest, portfolio=portfolio)
 
 
@@ -1336,6 +1434,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--execution-policy", required=True, help="MAKER_FIRST or TAKER")
     p.add_argument("--risk-policy", default=None, help="risk policy JSON, validated by ms_risk's closed schema")
     p.add_argument("--derive-risk-policy", action="store_true", help="derive a conservative policy from the verified symbol allow-list (explicit opt-in)")
+    p.add_argument("--max-daily-loss-usd", default=None, help="hard daily-loss limit (USD) for the derived policy and the allocator; entries are refused when breached or when the inputs are unknown")
+    p.add_argument("--max-drawdown-frac", default=None, help="hard drawdown limit in (0, 1] (default: the portfolio policy's 0.10)")
     p.add_argument("--mode", default="REPLAY", help="REPLAY or PAPER (simulated transport both; TESTNET is not accepted here)")
     p.add_argument("--clock-ms", default=None, help="the run's fixed timestamp for determinism (default: --end-ms; the wall clock is never read)")
     p.add_argument("--code-revision", default=None, help="40-hex git revision stamped on the artifacts (default: git rev-parse HEAD, else UNKNOWN)")
@@ -1369,7 +1469,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg = build_replay_config(v)
         pr = run(v.loaded, spec={"kind": v.kind, "style": v.execution_policy}, candidate_id=v.candidate_id, spec_digest=v.spec_digest, risk_policy=v.risk_policy, replay_cfg=cfg,
                  artifacts_dir=v.artifacts_dir, mode=v.mode, generated_ms=v.clock_ms, clock=StepClock(v.start_ms, cfg.step_ms) if v.mode == "PAPER" else None, competition_row=row, micro=v.micro,
-                 code_revision=v.code_revision, min_holding_rows=v.min_holding_rows, trial_ledger=os.path.join(v.ledger_dir, "ms_pipeline_trials.jsonl"), data_parts=v.data_parts)
+                 code_revision=v.code_revision, min_holding_rows=v.min_holding_rows, max_daily_loss_usd=v.max_daily_loss_usd, max_drawdown_frac=v.max_drawdown_frac, trial_ledger=os.path.join(v.ledger_dir, "ms_pipeline_trials.jsonl"), data_parts=v.data_parts)
         _emit({**base, "artifacts_dir": v.artifacts_dir, "identity": pr.summary["identity"], "status": {"primary": pr.summary["status"]["primary"], "codes": pr.summary["status"]["codes"]},
                "files": {n: os.path.basename(p) for n, p in sorted(pr.files.items())}, "digests": file_digests(v.artifacts_dir), "warnings": warnings})
         return 0
